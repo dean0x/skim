@@ -168,6 +168,29 @@ impl NgramIndexBuilder {
         let bytes = content.as_bytes();
         let token_of_byte = crate::lexical::word_token_indices(content);
         debug_assert_eq!(token_of_byte.len(), content.len());
+
+        // AD-411-7: precompute the byte length of the word token containing
+        // each byte position.  For a word byte (ASCII [A-Za-z0-9_]) this is the
+        // total byte span of its maximal word run; for non-word bytes it is 0
+        // (they are never the first byte of a query trigram so the value is never
+        // checked in search_exact_intersection).
+        let mut token_length_of_byte = vec![0u32; bytes.len()];
+        {
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if crate::lexical::is_word_byte(bytes[i]) {
+                    let start = i;
+                    while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    let len = (i - start) as u32;
+                    token_length_of_byte[start..i].fill(len);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         let mut range_idx = 0usize;
         for (pos, window) in bytes.windows(3).enumerate() {
             // Advance past any ranges that have ended before `pos`.
@@ -180,6 +203,7 @@ impl NgramIndexBuilder {
                 SearchField::Other.discriminant()
             };
             let token_position = token_of_byte[pos];
+            let token_length = token_length_of_byte[pos];
             // PF-004: widen to u32 before shifting — never shift on a bare u8.
             let key =
                 (u32::from(window[0]) << 16) | (u32::from(window[1]) << 8) | u32::from(window[2]);
@@ -188,6 +212,7 @@ impl NgramIndexBuilder {
                 field_id,
                 position: pos as u32,
                 token_position,
+                token_length,
             });
         }
 

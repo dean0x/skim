@@ -431,10 +431,10 @@ impl NgramIndexReader {
     ///
     /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
     /// Used by `check_staleness` to detect a stale/below-current lexical
-    /// FORMAT_VERSION (currently v6) and trigger a rebuild before
+    /// FORMAT_VERSION (currently v7) and trigger a rebuild before
     /// `NgramIndexReader::open` hard-errors on the version mismatch.
-    /// For example, a v5 index on disk (pre-AD-411-1 field_id semantic change)
-    /// reads version=5 here, which is less than FORMAT_VERSION=6, so the
+    /// For example, a v6 index on disk (pre-AD-411-7 token_length posting field)
+    /// reads version=6 here, which is less than FORMAT_VERSION=7, so the
     /// staleness check fires and a full rebuild is triggered.
     ///
     /// # Errors
@@ -870,6 +870,13 @@ impl NgramIndexReader {
                 // Seed candidates from the first trigram of this word.
                 // candidates: (token_position, min_field_id, byte_position)
                 // — the byte_position is from the first trigram for snippet highlighting.
+                //
+                // AD-411-7: only accept postings whose token_length equals the
+                // query word's byte length.  This rejects postings where the
+                // query word is a substring of a longer document token (e.g.
+                // the query "check_staleness" must NOT match the token
+                // "test_check_staleness_present" even though all query trigrams
+                // appear at the same token_position in both cases).
                 let first = &word.trigrams[0];
                 let first_posts = match postings_by_key.get(&first.key()) {
                     Some(p) => p,
@@ -880,7 +887,10 @@ impl NgramIndexReader {
                 let mut idx = lo;
                 while idx < first_posts.len() && first_posts[idx].doc_id == doc_id {
                     let p = &first_posts[idx];
-                    candidates.push((p.token_position, p.field_id, p.position));
+                    // Exact-token length gate: reject postings in longer tokens.
+                    if p.token_length == word.byte_len {
+                        candidates.push((p.token_position, p.field_id, p.position));
+                    }
                     idx += 1;
                 }
                 if candidates.is_empty() {

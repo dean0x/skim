@@ -403,9 +403,15 @@ pub fn is_single_token(query: &str) -> bool {
 /// (0-based, contiguous in query order). `trigrams` are the DEDUPED trigrams that
 /// lie ENTIRELY within the word (all three bytes share this word); a word < 3
 /// bytes yields an empty `trigrams` (it cannot be located positionally).
+///
+/// `byte_len` is the byte length of this word in the query. Used by
+/// `search_exact_intersection` (v7, AD-411-7) to verify that a candidate posting
+/// belongs to a document token of exactly this length, rejecting substring matches.
 #[derive(Debug, Clone)]
 pub struct QueryToken {
     pub token_off: u32,
+    /// Byte length of this query word (number of ASCII word bytes in the token).
+    pub byte_len: u32,
     pub trigrams: Vec<Ngram>,
 }
 
@@ -444,6 +450,7 @@ pub fn extract_query_positional_tokens(query: &str) -> Vec<QueryToken> {
         }
         tokens.push(QueryToken {
             token_off,
+            byte_len: (end - start) as u32,
             trigrams,
         });
     }

@@ -1995,8 +1995,8 @@ fn test_ac9_multi_word_union_path_preserved() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// AC #8: an index built by the current builder must be queryable with the
-/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 5
-/// (v4→v5, #392 / #380 Phase 2).  The existing
+/// new single-token exact path WITHOUT `--rebuild`.  FORMAT_VERSION must be 7
+/// (v6→v7, #411 alignment fix).  The existing
 /// `test_ac6_result_set_non_regression_v4_codec` test is the companion guard;
 /// this test focuses on the #372 exact-symbol path.
 #[test]
@@ -2006,7 +2006,7 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
     let token = "exact_symbol_token";
     let dir = tmp_dir();
 
-    // Build a v5 index.
+    // Build a v7 index.
     {
         let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
         builder
@@ -2026,8 +2026,7 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
         builder.build().unwrap();
     }
 
-    // Verify the on-disk format version is unchanged by #372 (still equals
-    // FORMAT_VERSION, currently v5).
+    // Verify the on-disk format version matches current FORMAT_VERSION (currently v7).
     let version = NgramIndexReader::lexical_index_version(dir.path()).unwrap();
     assert_eq!(
         version, FORMAT_VERSION,
@@ -2325,6 +2324,93 @@ fn test_ac_bench_surface_ranking_definition_ranks_first() {
         matches!((pos0, pos3), (Some(a), Some(b)) if a < b),
         "AD-411-4: large file (FileId 0, 3 body occurrences) must out-rank the tiny \
          comment file (FileId 3) — length-norm-free; got ranked ids {ids:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AD-411-7: Exact-token filter — definer ranks above test helpers whose names
+// merely CONTAIN the query as a substring of a longer identifier
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// AD-411-7 / AC2 regression guard: `search_exact_intersection` must rank the
+/// file that *defines* the symbol as a standalone token (FunctionSignature)
+/// ABOVE files that only contain the symbol as a SUBSTRING of longer test-helper
+/// function names.
+///
+/// Root cause that this test guards against (PF-014: verified against HEAD):
+/// the whole-token aligned counting (AD-411-2) intersects `token_position` sets
+/// across all query trigrams to confirm alignment.  For a query "check_staleness"
+/// (length 15) and a document token "test_check_staleness_present" (length 28),
+/// ALL 13 query trigrams appear at the same `token_position` (the big token's
+/// ordinal).  Without the `token_length` check added in v7 (AD-411-7), the
+/// alignment passes and the test-helper receives FunctionSignature credit (boost
+/// 8.0) for every helper function — easily outscoring the one real definition.
+///
+/// With the v7 fix: postings whose `token_length ≠ word.byte_len` are filtered
+/// out during seeding, so test-helper names contribute only FunctionBody credit
+/// (for call-site occurrences), which BM25F can no longer elevate above the
+/// actual definition.
+///
+/// Setup:
+/// - File 0 (definer): `fn check_staleness(db: &str) -> bool { false }` →
+///   token "check_staleness" in FunctionSignature (exact match, boost 8.0).
+/// - File 1 (test file): five test functions whose names CONTAIN "check_staleness"
+///   as a substring: `fn test_check_staleness_present() {}` × 5 →
+///   tokens "test_check_staleness_present", etc. each in FunctionSignature but
+///   length ≠ 15 → filtered by AD-411-7 → only FunctionBody call-site credit.
+///
+/// PF-007: the definer-rank assertion fires the moment the token_length seeding
+/// filter is removed or the FORMAT_VERSION bump is rolled back.
+#[test]
+fn test_ac2_exact_token_filter_definer_ranks_above_test_helpers() {
+    let symbol = "check_staleness";
+
+    // File 0: the definition — symbol as a standalone function name.
+    let definer = format!("fn {symbol}(db: &str) -> bool {{ false }}");
+
+    // File 1: a test file with 5 helper functions whose names CONTAIN the symbol
+    // as a substring but are longer tokens.  Without the token_length guard each
+    // helper's FunctionSignature occurrence would credit the full boost=8.0,
+    // accumulating far more score than the single definition.
+    let test_file = [
+        format!("fn test_{symbol}_present() {{ assert!(crate::{symbol}(\"a\")); }}"),
+        format!("fn test_{symbol}_absent() {{ assert!(!crate::{symbol}(\"b\")); }}"),
+        format!("fn test_{symbol}_empty() {{ assert!(!crate::{symbol}(\"\")); }}"),
+        format!("fn test_{symbol}_cache() {{ let _ = crate::{symbol}(\"c\"); }}"),
+        format!("fn test_{symbol}_bench() {{ let _ = crate::{symbol}(\"d\"); }}"),
+    ]
+    .join("\n");
+
+    let (_dir, reader) = build_reader_with(&[
+        (FileId(0), &definer, rskim_core::Language::Rust),
+        (FileId(1), &test_file, rskim_core::Language::Rust),
+    ]);
+
+    let mut q = SearchQuery::new(symbol);
+    q.limit = Some(10);
+    let results = reader.search(&q).unwrap();
+    let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
+
+    // Both files must be returned (both contain the literal token as a substring
+    // — the definer exactly, the test file via call-site occurrences like
+    // `crate::check_staleness("a")`).
+    assert!(
+        ids.contains(&0) && ids.contains(&1),
+        "AD-411-7: both definer (FileId 0) and test file (FileId 1) must appear \
+         in results; got {ids:?}"
+    );
+
+    // The DEFINER must rank strictly ABOVE the test file.
+    let pos_definer = ids.iter().position(|&x| x == 0).unwrap();
+    let pos_test = ids.iter().position(|&x| x == 1).unwrap();
+    assert!(
+        pos_definer < pos_test,
+        "AD-411-7 / AC2: definer (FileId 0, `fn {symbol}`) must rank above the test file \
+         (FileId 1, five test helpers whose names contain '{symbol}' as a substring); \
+         got ranked ids {ids:?}; definer at rank {} test at rank {} — \
+         this means the token_length seeding filter (v7 AD-411-7) is absent or broken",
+        pos_definer + 1,
+        pos_test + 1
     );
 }
 

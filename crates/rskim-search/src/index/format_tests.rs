@@ -121,9 +121,9 @@ fn test_v2_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 6.
+    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 7.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v2 header must be rejected by v6 reader");
+    assert!(result.is_err(), "v2 header must be rejected by v7 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -158,9 +158,9 @@ fn test_v3_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 3 — FORMAT_VERSION is now 6.
+    // decode_header must NOT accept version 3 — FORMAT_VERSION is now 7.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v3 header must be rejected by v6 reader");
+    assert!(result.is_err(), "v3 header must be rejected by v7 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -196,9 +196,9 @@ fn test_v4_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 4 — FORMAT_VERSION is now 6.
+    // decode_header must NOT accept version 4 — FORMAT_VERSION is now 7.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v4 header must be rejected by v6 reader");
+    assert!(result.is_err(), "v4 header must be rejected by v7 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -238,9 +238,9 @@ fn test_v5_header_rejected_with_please_rebuild_message() {
         checksum: 0,
     };
     let encoded = encode_header(&h);
-    // decode_header must NOT accept version 5 — FORMAT_VERSION is now 6.
+    // decode_header must NOT accept version 5 — FORMAT_VERSION is now 7.
     let result = decode_header(&encoded);
-    assert!(result.is_err(), "v5 header must be rejected by v6 reader");
+    assert!(result.is_err(), "v5 header must be rejected by v7 reader");
     let err = format!("{}", result.unwrap_err());
     assert!(
         err.contains("please rebuild"),
@@ -249,6 +249,48 @@ fn test_v5_header_rejected_with_please_rebuild_message() {
     assert!(
         err.contains("format version") || err.contains("unsupported"),
         "v5 rejection must mention 'format version' or 'unsupported': {err}"
+    );
+}
+
+/// Format v6 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AD-411-7: After the v6→v7 format bump (#411 alignment fix), the v7 reader must
+/// reject v6 indexes cleanly so the staleness check triggers a full rebuild — the
+/// old index is NOT corrupted, only the posting codec changed (v7 adds a
+/// `delta_token_length` 5th varint per entry for exact-token verification in
+/// `search_exact_intersection`). A v6 on-disk index lacks `token_length` data and
+/// would cause `decode_postings_varint` to desync or read across entry boundaries,
+/// making clean rejection the only safe response (ADR-006, self-heal via the
+/// existing `v < LEXICAL_INDEX_FORMAT_VERSION` guard in `staleness.rs`).
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v6_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 6 (pre-v7 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 6, // old v6 format (pre-AD-411-7 token_length posting field)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 6 — FORMAT_VERSION is now 7.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v6 header must be rejected by v7 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v6 rejection must include 'please rebuild' (actionable per ADR-006 / AD-411-7): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v6 rejection must mention 'format version' or 'unsupported': {err}"
     );
 }
 
@@ -748,6 +790,7 @@ fn test_posting_codec_single_entry() {
         field_id: crate::SearchField::FunctionSignature.discriminant(),
         position: 1024,
         token_position: 7,
+        token_length: 12,
     };
     let decoded = posting_roundtrip(&[p]);
     assert_eq!(
@@ -771,30 +814,35 @@ fn test_posting_codec_multi_doc_roundtrip() {
             field_id: crate::SearchField::TypeDefinition.discriminant(),
             position: 0,
             token_position: 0,
+            token_length: 8,
         },
         PostingEntry {
             doc_id: 0,
             field_id: crate::SearchField::FunctionSignature.discriminant(),
             position: 5,
             token_position: 2,
+            token_length: 10,
         },
         PostingEntry {
             doc_id: 1,
             field_id: crate::SearchField::Other.discriminant(),
             position: 10,
             token_position: 4,
+            token_length: 5,
         },
         PostingEntry {
             doc_id: 3,
             field_id: crate::SearchField::TypeDefinition.discriminant(),
             position: 100,
             token_position: 50,
+            token_length: 7,
         },
         PostingEntry {
             doc_id: 3,
             field_id: crate::SearchField::Other.discriminant(),
             position: 200,
             token_position: 55,
+            token_length: 3,
         },
     ];
     let decoded = posting_roundtrip(&postings);
@@ -824,12 +872,14 @@ fn test_posting_codec_max_gap_docid() {
             field_id: 0,
             position: 0,
             token_position: 0,
+            token_length: 5,
         },
         PostingEntry {
             doc_id: u32::MAX,
             field_id: 0,
             position: 0,
             token_position: 0,
+            token_length: 5,
         },
     ];
     let decoded = posting_roundtrip(&postings);
@@ -855,18 +905,21 @@ fn test_posting_codec_large_positions() {
             field_id: 0,
             position: 0,
             token_position: 0,
+            token_length: 6,
         },
         PostingEntry {
             doc_id: 5,
             field_id: 0,
             position: 1_000_000,
             token_position: 1,
+            token_length: 6,
         },
         PostingEntry {
             doc_id: 5,
             field_id: 0,
             position: u32::MAX,
             token_position: 2,
+            token_length: 6,
         },
     ];
     let decoded = posting_roundtrip(&postings);
@@ -878,48 +931,53 @@ fn test_posting_codec_large_positions() {
 
 /// AC4 / Finding 1+3 — cross-field position-decrease round-trip within the same doc.
 ///
-/// Verifies that the encoder resets `prev_position` AND `prev_token_position`
-/// (v5, AD-LXFMT-4) when `field_id` changes (even if `doc_id` is unchanged) so
-/// that the first position/token_position in field N+1 does NOT produce a
-/// near-u32::MAX delta when it is lower than the last value of field N.
+/// Verifies that the encoder resets `prev_position`, `prev_token_position`, AND
+/// `prev_token_length` (v7, AD-411-7) when `field_id` changes (even if `doc_id`
+/// is unchanged) so that the first position/token_position/token_length in field
+/// N+1 does NOT produce a near-u32::MAX delta when it is lower than the last
+/// value of field N.
 ///
 /// Example scenario: within doc 0, field TypeDefinition (=0) covers bytes
-/// 200..300 (position 250, token_position 25), then field Other (=7) covers
-/// bytes 0..200 (position 10, token_position 1).  Sorted by (doc_id, field_id,
-/// position) the TypeDefinition entry (pos 250) comes before the Other entry
-/// (pos 10).  Without the field-boundary reset, the encoder would compute
-/// `10.wrapping_sub(250)` = 4294967056 for delta_position (and an analogous
-/// wraparound for delta_token_position) and emit maximum 5-byte varints —
-/// worst case, defeating compression.  With the fix, both accumulators reset
-/// to 0 on the field boundary so `delta_position = 10 - 0 = 10` and
-/// `delta_token_position = 1 - 0 = 1`, each encoding as a 1-byte varint.
+/// 200..300 (position 250, token_position 25, token_length 10), then field Other
+/// (=7) covers bytes 0..200 (position 10, token_position 1, token_length 3).
+/// Sorted by (doc_id, field_id, position) the TypeDefinition entry (pos 250)
+/// comes before the Other entry (pos 10).  Without the field-boundary reset, the
+/// encoder would compute `10.wrapping_sub(250)` = 4294967056 for delta_position
+/// (and analogous wraparounds for delta_token_position and delta_token_length)
+/// and emit maximum 5-byte varints — worst case, defeating compression.  With
+/// the fix, all three accumulators reset to 0 on the field boundary so
+/// `delta_position = 10`, `delta_token_position = 1`, and `delta_token_length =
+/// 3`, each encoding as a 1-byte varint.
 ///
 /// PF-007 compliance (primary + compression guard):
-/// 1. Exact decoded `(doc_id, field_id, position, token_position)` tuples are
-///    asserted — a round-trip that silently wraps-and-recovers would still
-///    pass otherwise.
+/// 1. Exact decoded `(doc_id, field_id, position, token_position, token_length)`
+///    tuples are asserted — a round-trip that silently wraps-and-recovers would
+///    still pass otherwise.
 /// 2. Encoded buffer byte-length is asserted against the expected compact size
-///    (9 bytes for this input).  Removing the field-boundary reset from BOTH
-///    encoder and decoder keeps round-trip lossless (wrapping arithmetic is
-///    always invertible) but regresses the encoded size, making this test
-///    fail the moment the compression feature is deleted or broken.
+///    (11 bytes for this input with v7 token_length field).  Removing the
+///    field-boundary reset from BOTH encoder and decoder keeps round-trip
+///    lossless (wrapping arithmetic is always invertible) but regresses the
+///    encoded size, making this test fail the moment the compression feature is
+///    deleted or broken.
 ///
-/// Expected encoding (with field-boundary reset):
-///   Entry 0 (doc=0, field=0=TypeDefinition, pos=250, token_pos=25):
+/// Expected encoding (with field-boundary reset, v7):
+///   Entry 0 (doc=0, field=0=TypeDefinition, pos=250, tok_pos=25, tok_len=10):
 ///     [0x00]               1 byte  delta_doc_id=0
 ///     [0x00]               1 byte  field_id=0
 ///     [0xfa, 0x01]         2 bytes varint(250)
 ///     [0x19]               1 byte  varint(25)
-///   Entry 1 (doc=0, field=7=Other, pos=10, token_pos=1): both reset to 0
+///     [0x0a]               1 byte  varint(10)
+///   Entry 1 (doc=0, field=7=Other, pos=10, tok_pos=1, tok_len=3): all reset to 0
 ///     [0x00]               1 byte  delta_doc_id=0
 ///     [0x07]               1 byte  field_id=7
 ///     [0x0a]               1 byte  varint(10 - 0 = 10)
 ///     [0x01]               1 byte  varint(1 - 0 = 1)
-///   Total: 9 bytes
+///     [0x03]               1 byte  varint(3 - 0 = 3)
+///   Total: 11 bytes
 ///
-/// Without the reset, entry 1's delta_position and delta_token_position both
-/// wrap to near-u32::MAX (5-byte varints each), growing the total well beyond
-/// 9 bytes.
+/// Without the reset, entry 1's delta_position, delta_token_position, and
+/// delta_token_length all wrap to near-u32::MAX (5-byte varints each), growing
+/// the total well beyond 11 bytes.
 #[test]
 fn test_posting_codec_cross_field_position_decrease_roundtrip() {
     // doc_id = 0, field TypeDefinition (discriminant 0), high position (250)
@@ -936,12 +994,14 @@ fn test_posting_codec_cross_field_position_decrease_roundtrip() {
             field_id: td,
             position: 250,
             token_position: 25,
+            token_length: 10,
         },
         PostingEntry {
             doc_id: 0,
             field_id: other,
             position: 10,
             token_position: 1,
+            token_length: 3,
         },
     ];
     // Verify the input is sorted (as the builder would produce it).
@@ -951,18 +1011,19 @@ fn test_posting_codec_cross_field_position_decrease_roundtrip() {
     );
 
     // Assert encoded buffer length (PF-007 compression guard): without the
-    // field-boundary reset (position AND token_position) the encoded size
-    // balloons via 5-byte wrapping-delta varints; with the reset it is 9 bytes.
+    // field-boundary reset (position, token_position, AND token_length) the
+    // encoded size balloons via 5-byte wrapping-delta varints; with the reset
+    // it is 11 bytes (v7 adds one varint per entry for token_length).
     // Removing or disabling the reset must fail this assertion.
     let mut encoded_buf = Vec::new();
     encode_postings_varint(&postings, &mut encoded_buf);
     assert_eq!(
         encoded_buf.len(),
-        9,
-        "encoded cross-field posting list must be 9 bytes (field-boundary \
-         prev_position/prev_token_position reset keeps delta_position=10 and \
-         delta_token_position=1, both 1-byte varints; without the reset either \
-         delta would wrap near u32::MAX and cost a 5-byte varint)"
+        11,
+        "encoded cross-field posting list must be 11 bytes (v7: field-boundary reset \
+         keeps delta_position=10, delta_token_position=1, delta_token_length=3, all \
+         1-byte varints; without the reset each delta wraps near u32::MAX and costs \
+         a 5-byte varint)"
     );
 
     let decoded = posting_roundtrip(&postings);
@@ -981,11 +1042,11 @@ fn test_posting_codec_cross_field_position_decrease_roundtrip() {
     );
 }
 
-/// AD-LXFMT-4 — v5 round-trip: multiple docs plus a field_id change within a
-/// doc, with varied `token_position` values.  Exercises the same reset logic
-/// as the cross-field test above but across a 3-entry, 2-doc posting list
-/// (doc_id delta > 1 on one hop) to broaden coverage beyond the single
-/// field-boundary case.
+/// AD-LXFMT-4 / AD-411-7 — v7 round-trip: multiple docs plus a field_id change
+/// within a doc, with varied `token_position` and `token_length` values.
+/// Exercises the same reset logic as the cross-field test above but across a
+/// 3-entry, 2-doc posting list (doc_id delta > 1 on one hop) to broaden
+/// coverage beyond the single field-boundary case.
 #[test]
 fn test_posting_codec_v5_token_position_roundtrip() {
     let td = crate::SearchField::TypeDefinition.discriminant(); // 0
@@ -996,20 +1057,23 @@ fn test_posting_codec_v5_token_position_roundtrip() {
             field_id: td,
             position: 50,
             token_position: 20,
+            token_length: 8,
         },
         PostingEntry {
             doc_id: 0,
             field_id: other,
-            // Lower than the previous entry's position/token_position —
-            // exercises the field-boundary reset for BOTH coordinates.
+            // Lower than the previous entry's position/token_position/token_length —
+            // exercises the field-boundary reset for ALL three coordinates.
             position: 12,
             token_position: 3,
+            token_length: 4,
         },
         PostingEntry {
             doc_id: 2,
             field_id: td,
             position: 400,
             token_position: 150,
+            token_length: 12,
         },
     ];
     assert!(
@@ -1040,6 +1104,7 @@ fn test_posting_codec_invalid_field_id_returns_err() {
         field_id: 200, // invalid — not a valid SearchField discriminant
         position: 0,
         token_position: 0,
+        token_length: 5,
     };
     let mut buf = Vec::new();
     encode_postings_varint(&[p], &mut buf);
