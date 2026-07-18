@@ -876,8 +876,8 @@ impl NgramIndexReader {
     /// ```
     ///
     /// `field_b = 0` (set by [`BM25FConfig::for_exact_symbol`]) means large-file
-    /// definers are not penalised by BM25F length normalisation (ADR-001 length-
-    /// norm-free property from AD-372-6 is preserved).
+    /// definers are not penalised by BM25F length normalisation (AD-411-3:
+    /// length-norm-free via `field_b=0`, not raw counts as in AD-372-6).
     ///
     /// # AD-411-3: Per-field-saturated BM25F scoring
     ///
@@ -1029,8 +1029,8 @@ impl NgramIndexReader {
         // hoisted above the intersection loop to avoid reconstructing a stack-only
         // struct on every scored document.
         // BM25FConfig::for_exact_symbol() has field_b=[0;8], so large-file
-        // definers are NOT penalised by length normalisation (ADR-001 /
-        // AD-372-6 property preserved).
+        // definers are NOT penalised by length normalisation (AD-411-3:
+        // length-norm-free via field_b=0, not raw counts as in AD-372-6).
         let exact_symbol_config = BM25FConfig::for_exact_symbol();
 
         for &doc_id in &intersection {
