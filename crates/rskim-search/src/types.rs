@@ -1204,17 +1204,17 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
 
     let k = q_words.len();
 
-    // Single O(C) pass: pre-populate word_positions with all query words then
-    // scan content once, using get_mut as a combined membership-check and append.
-    // This is O(k + C) vs the prior k-pass loop which was O(k*C).
-    let mut word_positions: HashMap<&str, Vec<usize>> = q_words
-        .iter()
-        .map(|&(qs, qe)| (&query[qs..qe], Vec::new()))
-        .collect();
+    // Single O(k + C) pass: build a HashSet of query words for O(1) membership
+    // checks, then scan content once and record ordinals only for query words
+    // actually found.  Without pre-population, word_positions.get(absent_word)
+    // returns None, which is the correct absent-word early-out signal below.
+    let q_word_set: std::collections::HashSet<&str> =
+        q_words.iter().map(|&(qs, qe)| &query[qs..qe]).collect();
+    let mut word_positions: HashMap<&str, Vec<usize>> = HashMap::new();
     for (ci, &(cs, ce)) in c_words.iter().enumerate() {
         let cw = &content[cs..ce];
-        if let Some(positions) = word_positions.get_mut(cw) {
-            positions.push(ci);
+        if q_word_set.contains(cw) {
+            word_positions.entry(cw).or_default().push(ci);
         }
     }
 
@@ -1223,10 +1223,8 @@ pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<
     let mut d: Vec<Vec<usize>> = Vec::with_capacity(k);
     for &(qs, qe) in &q_words {
         let qw = &query[qs..qe];
-        match word_positions.get(qw) {
-            Some(positions) => d.push(positions.clone()),
-            None => return None, // this query word absent from content
-        }
+        let positions = word_positions.get(qw)?; // None → query word absent from content
+        d.push(positions.clone());
     }
 
     // k == 1: any occurrence of the single word is a valid match with span 0.
