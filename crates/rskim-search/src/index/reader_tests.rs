@@ -997,12 +997,15 @@ fn test_1000_file_benchmark() {
 /// modeled on ast_index_size_ratio (~1.23-1.3x measured, <2.2x guard,
 /// ast_index/store/reader_tests.rs:574-666) and issue #273.
 ///
-/// Measured lexical baseline (trigram, v4 delta+varint, 1000 diverse Rust
-/// modules, 4 fns each ~1055 bytes (~1.05 MB total source), multi-field
-/// classified path): 3.53x.
+/// Measured lexical baseline (trigram, v7 delta+varint+token_length, 1000
+/// diverse Rust modules, 4 fns each ~1055 bytes (~1.05 MB total source),
+/// multi-field classified path): 5.57x (index=5878841, source=1055560).
+/// v4 delta+varint baseline was 3.53x; v5 (+token_position) was ~4.4x;
+/// v7 (+token_length, this branch) adds a 5th varint per posting (~+1
+/// byte/entry), raising the measured ratio to ~5.57x.
 /// v3 uncompressed baseline was 9.04x; delta+varint compression (#358 Item 2)
 /// reduced postings ~61%.
-/// Guard ceiling: measured_baseline + 1.5x headroom = 5.0x (round number).
+/// Guard ceiling: measured_v7_baseline + ~1.5x absolute headroom = 7.0x.
 /// The test fails on a genuine bloat regression (discriminating per PF-007
 /// -- a vacuous assert(>0) would pass even with 100x bloat).
 ///
@@ -1077,8 +1080,7 @@ fn test_lexical_index_size_ratio() {
          n_files={n_files}, fns_per_file={fns_per_file})"
     );
 
-    // Guard ceiling: v4 delta+varint baseline + estimated v5 token_position
-    // overhead + headroom.
+    // Guard ceiling: v7 delta+varint+token_length baseline + headroom.
     //
     // Rationale for the ceiling value:
     //   - Measured v4 trigram baseline on this corpus (1000 diverse Rust modules,
@@ -1093,27 +1095,29 @@ fn test_lexical_index_size_ratio() {
     //     (delta_token_position), almost always 0 or 1 → ~1 extra byte/entry over
     //     the v4 ~3.5 B/entry average, i.e. an estimated v5 ratio ~4.4x
     //     (v4 3.53x baseline × ~4.5/3.5). CI on a009a2c empirically CONFIRMS the v5
-    //     index stays < 5.0x on this fixed corpus. Headroom is now ~1.13x (tighter
-    //     than v4's 1.42x) but the corpus is deterministic, so the guard is stable;
-    //     a full-revert 9x posting explosion still fires it decisively.
-    //     (To re-ground to the exact v5 ratio: set this ceiling low, push, and read
-    //     the printed ratio from the CI failure message — not done here to avoid a
-    //     throwaway red CI run.)
-    //   - True sensitivity threshold: ~1.13x bloat (5.0 / ~4.4 estimated v5
-    //     baseline).  The FIRST regression that actually fires the assertion is
-    //     ~1.13x above the estimated v5 baseline (tighter than v4's ~1.42x
-    //     margin, since token_position adds bytes without raising the ceiling).
-    //     A genuine posting-list explosion (full revert to v3 fixed-9-byte
-    //     encoding gives 9.04x >> 5.0x) still definitively fires the gate (ADR-003).
+    //     index stays < 5.0x on this fixed corpus.
+    //   - v7 (#411, token_length added): each posting gains a 5th varint
+    //     (delta_token_length, encoding the byte span of the word run at the
+    //     trigram's first byte). Within a word run the delta is always 0 (+1
+    //     byte/entry); at word boundaries or (doc_id, field_id) resets the
+    //     absolute token_length encodes to 1-2 bytes. Net effect: ~+1 byte/entry
+    //     over v5's ~4.5 B/entry average. Empirically measured on this
+    //     deterministic corpus: 5.57x (index=5878841, source=1055560 bytes).
+    //     The ceiling is raised to 7.0x: 5.57 + ~1.47 absolute headroom
+    //     (matching the original v4→ceiling design margin).
+    //   - True sensitivity threshold: ~1.26x bloat (7.0 / 5.57 measured v7
+    //     baseline). A genuine posting-list explosion (full revert to v3
+    //     fixed-9-byte encoding gives 9.04x >> 7.0x) still definitively fires
+    //     the gate (ADR-003).
     //
     // ADR-003: regression guard must be empirically grounded, not the
     // baseless 0.30x inherited from the original ticket text.
-    const LEXICAL_SIZE_RATIO_CEILING: f64 = 5.0;
+    const LEXICAL_SIZE_RATIO_CEILING: f64 = 7.0;
     assert!(
         ratio < LEXICAL_SIZE_RATIO_CEILING,
         "AD-LXSZ-1: lexical index size ratio {ratio:.4} exceeds the \
-         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v5 token_position baseline ~4.4x, \
-         CI-confirmed < 5.0x). \
+         <{LEXICAL_SIZE_RATIO_CEILING}x bloat guard (v7 token_length baseline ~5.57x, \
+         empirically measured on this corpus). \
          If ratio exceeded: check for O(files^2) posting growth, \
          missing dedup, unbounded trigram emission, or codec regression. \
          index={total_index_bytes} bytes, source={total_source_bytes} bytes."
