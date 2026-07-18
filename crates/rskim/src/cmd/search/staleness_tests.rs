@@ -1258,6 +1258,44 @@ fn test_temporal_db_data_version_forward_compat() {
     );
 }
 
+/// AD-408-4: A temporal.db whose stored data_version is a VALID INTEGER strictly
+/// less than `TEMPORAL_DATA_VERSION` is reported stale — this is the primary
+/// numeric rebuild trigger for a versioned-but-outdated pre-fix DB (e.g. a DB
+/// written by a binary that produced version 0 before the ghost-filter was
+/// introduced).
+///
+/// Applies ADR-006: the gate uses `stored < current` so any lower integer
+/// version forces a self-heal rebuild.  An inverted or mis-wired numeric
+/// comparison for this branch would pass all other data-version tests
+/// (forward_compat only guards the `>` direction) while silently leaving ghost
+/// rows in older-versioned DBs.
+///
+/// PF-007 discriminating: `data_version = "0"` (valid integer, present,
+/// strictly less than TEMPORAL_DATA_VERSION) MUST return true.  Without the
+/// `n < current` check the predicate would return false and ghost rows would
+/// never be evicted from pre-fix DBs.
+#[test]
+fn test_temporal_db_data_version_lower_integer_is_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+
+    // Write via sync() to establish a current-format DB, then overwrite
+    // data_version with "0" — a valid integer strictly less than the current
+    // TEMPORAL_DATA_VERSION, simulating a versioned-but-outdated pre-fix DB.
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    db.set_meta(rskim_search::META_DATA_VERSION, "0").unwrap();
+    drop(db);
+
+    assert!(
+        temporal_db_is_stale(dir.path(), head),
+        "AD-408-4: data_version=\"0\" (valid integer < TEMPORAL_DATA_VERSION) must be \
+         stale — the `stored < current` numeric gate must fire for any lower version \
+         (self-heal trigger for versioned-but-outdated pre-fix DBs, applies ADR-006)"
+    );
+}
+
 // ============================================================================
 // #357 BUG B — auto_refresh_if_stale self-heals stale temporal.db when
 // lexical index is Current (AD-TMP-2)
