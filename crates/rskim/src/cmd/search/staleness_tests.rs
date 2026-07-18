@@ -561,7 +561,7 @@ fn test_check_staleness_lexical_v3_below_version_triggers_rebuild_returns_manife
 
 /// AC-P2-3 / #392: a v4 lexical stub (pre-token_position format, the version this
 /// #392/#380-Phase-2 change upgrades FROM) must trigger `NoStoredHead` so the
-/// staleness check self-heals via full rebuild under the v5 binary — the generic
+/// staleness check self-heals via full rebuild under the v7 binary — the generic
 /// `v < LEXICAL_INDEX_FORMAT_VERSION` guard (staleness.rs), same code path as v2/v3.
 ///
 /// PF-007: asserts the exact `NoStoredHead` observable + manifest returned.
