@@ -369,7 +369,7 @@ pub(super) fn rebuild_temporal(
 /// 1. **Containment guard** via [`crate::cmd::is_repo_relative_safe`] — rejects
 ///    any `rel` with absolute, `..` (ParentDir), or drive-relative (Prefix)
 ///    components to mitigate path-traversal risk (applies ADR-008; single
-///    canonical helper shared with `walk::list_tracked_files` and `heatmap::run`).
+///    canonical helper shared with `walk::list_tracked_files` and `heatmap::resolve_diff_files`).
 ///    Git never emits such components in tree-diff output, so no legitimate row
 ///    is dropped by this guard.
 /// 2. **`is_file()` existence check** — the correct predicate for "a path an

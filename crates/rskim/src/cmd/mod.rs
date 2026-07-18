@@ -294,7 +294,7 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
 /// own variant — so the invariant stays in one place and cannot drift:
 /// - `cmd::search::walk::list_tracked_files` (git index paths)
 /// - `cmd::search::temporal_build::rel_is_regular_file` (temporal history paths)
-/// - `cmd::heatmap::run` (git diff paths)
+/// - `cmd::heatmap::resolve_diff_files` (git diff paths)
 ///
 /// Note: the guard does NOT defend against in-tree symlinks whose targets resolve
 /// outside `root` — that is a low-severity, defense-in-depth concern noted for
