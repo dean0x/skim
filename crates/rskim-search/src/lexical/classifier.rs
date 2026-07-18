@@ -140,10 +140,31 @@ fn is_value_decl_kind(kind: &str) -> bool {
 /// forward-compatibility: when their identifier types are added to
 /// [`is_identifier_kind`] they will automatically inherit the correct tier.
 ///
-/// Rust `impl_item`'s name child uses field `type:` (not `name:`), and Go's
-/// `interface_type` / `struct_type` hold the type name in a parent `type_spec`,
-/// so neither kind will hit the `field_name == Some("name")` branch — including
-/// them here is harmless.
+/// # Effect of `impl_item` on ranking
+///
+/// Including `impl_item` in this function is **not** inert.  Its priority is 2
+/// in `rskim_core::node_kind_priority`, so without this function `parent_is_decl`
+/// would be `false` for `impl` blocks and their type/trait identifier children
+/// (`type_identifier` in `impl Foo` / `impl Trait for Foo`) would classify as
+/// [`SearchField::FunctionBody`].  With `impl_item` here, `parent_is_decl` is
+/// `true`; since the grammar field for those identifiers is `type:` / `trait:`
+/// (never `name:`), they route through the `field_name != Some("name")` branch
+/// and return [`SearchField::SymbolName`] — an intentional elevation above the
+/// call-site tier.  `impl` blocks bind behaviour to a named type or trait;
+/// ranking their identifiers at `SymbolName` improves search relevance for
+/// type/trait names without misclassifying them as full type definitions.
+///
+/// Go's `struct_type` and `interface_type` truly are inert: the type name lives
+/// in the enclosing `type_spec`, not as a direct identifier child of those nodes.
+///
+/// # Maintenance — keep in sync with priority-2 container kinds
+///
+/// This list intentionally duplicates the priority-2 container kinds from
+/// `rskim_core::node_kind_priority`.  The `>= 3` check in [`map_identifier_to_field`]
+/// cannot include priority-2 kinds (priority 2 governs body-retention ordering in
+/// the truncation algorithm, not semantic tier), so this function bridges the gap.
+/// When a new grammar assigns priority 2 to a container kind, add it here as well
+/// so its definition name receives the correct [`SearchField::TypeDefinition`] tier.
 #[inline]
 fn is_container_decl_kind(kind: &str) -> bool {
     matches!(
@@ -157,12 +178,15 @@ fn is_container_decl_kind(kind: &str) -> bool {
             // Ruby / TS / JS — module (name: constant or identifier)
             | "module"
             | "module_declaration"
-            // Rust — impl blocks (child field is `type:`, not `name:` — never matches)
+            // Rust — impl blocks (field `type:`/`trait:`, not `name:`): identifier
+            // children return SymbolName via field_name != Some("name") — intentional
+            // elevation of impl type/trait references above call-site tier.
             | "impl_item"
             // C++ / C# — namespaces (name: namespace_identifier — not in is_identifier_kind)
             | "namespace_definition"
             | "namespace_declaration"
-            // Go — interface_type / struct_type: name lives in parent type_spec, harmless
+            // Go — interface_type / struct_type: type name lives in the enclosing
+            // type_spec, not as a direct identifier child — truly inert.
             | "interface_type"
             | "struct_type"
     )
