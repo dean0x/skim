@@ -349,11 +349,18 @@ struct CandidateEntry {
 ///
 /// # Scratch-buffer contract
 ///
-/// `candidates` and `trig_scratch` are caller-owned reusable allocations.
-/// This function clears both at the appropriate phase boundaries and returns
-/// with them empty, so the caller may re-use the capacity across the doc loop
-/// without re-allocating (reliability guideline: prefer pools/pre-sized
-/// collections over per-iteration allocations).
+/// `candidates`, `trig_scratch`, and `byte_pos_vec` are caller-owned reusable
+/// allocations passed in to avoid per-word heap allocations.
+/// - `candidates` is cleared at the call boundary and drained (empty) before
+///   return; callers may safely assume it is empty on return.
+/// - `trig_scratch` is cleared *before* each trigram iteration (not on
+///   return); after any word with ≥2 trigrams it retains the last trigram's
+///   entries on return.  Callers must not rely on it being empty after the
+///   call.
+/// - `byte_pos_vec` receives the newly aligned byte-ranges appended to
+///   whatever the caller already holds; the function sorts the newly appended
+///   slice by `start` before returning to restore deterministic order
+///   (HashMap drain order is non-deterministic per RandomState seed).
 ///
 /// Pure, free function (no I/O) — unit-testable without building an index.
 /// Matches the convention at lines 91–96 (`intersect_sorted_u32`, etc.).
@@ -363,15 +370,15 @@ fn align_whole_token(
     postings_by_key: &HashMap<u32, Vec<super::format::PostingEntry>>,
     candidates: &mut HashMap<u32, CandidateEntry>,
     trig_scratch: &mut HashMap<u32, u8>,
-) -> ([f32; FIELD_COUNT], Vec<std::ops::Range<usize>>) {
+    byte_pos_vec: &mut Vec<std::ops::Range<usize>>,
+) -> [f32; FIELD_COUNT] {
     let mut field_tf = [0.0f32; FIELD_COUNT];
-    let mut byte_pos_vec: Vec<std::ops::Range<usize>> = Vec::new();
 
     // Reuse the caller-provided allocation; clear at call boundary.
     candidates.clear();
 
     if word.trigrams.is_empty() {
-        return (field_tf, byte_pos_vec);
+        return field_tf;
     }
 
     // --- Seed phase: first trigram → candidates keyed by token_position ---
@@ -384,7 +391,7 @@ fn align_whole_token(
     let first = &word.trigrams[0];
     let first_posts = match postings_by_key.get(&first.key()) {
         Some(p) => p,
-        None => return (field_tf, byte_pos_vec),
+        None => return field_tf,
     };
     let lo = first_posts.partition_point(|p| p.doc_id < doc_id);
     let mut idx = lo;
@@ -403,7 +410,7 @@ fn align_whole_token(
         idx += 1;
     }
     if candidates.is_empty() {
-        return (field_tf, byte_pos_vec);
+        return field_tf;
     }
 
     // --- Narrow phase: subsequent trigrams narrow the candidate set ---
@@ -448,7 +455,12 @@ fn align_whole_token(
     }
 
     // --- Accumulate: one whole-token occurrence per aligned position ---
+    // Push byte-ranges directly into the caller-supplied vec (eliminates the
+    // intermediate per-word allocation).  Record the slice start so we can
+    // sort only the newly appended ranges, restoring deterministic output
+    // order (HashMap drain order is non-deterministic per RandomState seed).
     // drain() leaves the map empty but retains its capacity for the next call.
+    let pos_start = byte_pos_vec.len();
     for (_tok_pos, entry) in candidates.drain() {
         let fidx = entry.min_field as usize;
         if fidx < FIELD_COUNT {
@@ -456,8 +468,9 @@ fn align_whole_token(
         }
         byte_pos_vec.push(entry.byte_pos as usize..entry.byte_pos as usize + 3);
     }
+    byte_pos_vec[pos_start..].sort_unstable_by_key(|r| r.start);
 
-    (field_tf, byte_pos_vec)
+    field_tf
 }
 
 // ============================================================================
@@ -1069,17 +1082,17 @@ impl NgramIndexReader {
             // token_position counts exactly once, even if the seed trigram recurs
             // at the same position within the document token.
             for word in &positional_words {
-                let (word_tf, word_positions) = align_whole_token(
+                let word_tf = align_whole_token(
                     doc_id,
                     word,
                     &postings_by_key,
                     &mut scratch_cands,
                     &mut scratch_trig,
+                    &mut byte_pos_vec,
                 );
                 for i in 0..FIELD_COUNT {
                     field_tf[i] += word_tf[i];
                 }
-                byte_pos_vec.extend(word_positions);
             }
 
             // Score: exact-token matches → BM25F; substring-only (passes the AND-
