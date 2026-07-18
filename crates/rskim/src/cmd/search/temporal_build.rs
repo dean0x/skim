@@ -22,7 +22,7 @@
 //! returns `Ok(())` with a debug-gated warning on recoverable errors; only
 //! unexpected internal errors propagate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -448,7 +448,7 @@ fn apply_ghost_filter(
     cochange_rows: &mut Vec<rskim_search::CochangeRow>,
 ) {
     // Collect each unique path referenced by any row type (1× stat per path).
-    let unique_paths: std::collections::HashSet<&str> = hotspot_rows
+    let unique_paths: HashSet<&str> = hotspot_rows
         .iter()
         .map(|r| r.file_path.as_str())
         .chain(risk_rows.iter().map(|r| r.file_path.as_str()))
@@ -459,7 +459,7 @@ fn apply_ghost_filter(
         )
         .collect();
     // Resolve existence once per unique path.
-    let existing: std::collections::HashSet<String> = unique_paths
+    let existing: HashSet<String> = unique_paths
         .into_iter()
         .filter(|p| rel_is_regular_file(root, p))
         .map(String::from)
