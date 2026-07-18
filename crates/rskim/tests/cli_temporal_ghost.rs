@@ -181,12 +181,7 @@ fn assert_ghost_absent(stdout: &[u8], label: &str) {
 /// (PF-007: a test asserting only exit-0 is worthless — assert a DISCRIMINATING
 /// observable).  Pass `false` for the `--blast-radius` arm where all co-change
 /// partners are ghosts and an empty result set is the correct post-filter state.
-fn assert_json_paths_present(
-    json_bytes: &[u8],
-    root: &Path,
-    label: &str,
-    require_nonempty: bool,
-) {
+fn assert_json_paths_present(json_bytes: &[u8], root: &Path, label: &str, require_nonempty: bool) {
     let v: serde_json::Value = serde_json::from_slice(json_bytes)
         .unwrap_or_else(|e| panic!("'{label}' --json output is not valid JSON: {e}"));
     let results = v
@@ -493,9 +488,7 @@ fn test_heatmap_diff_path_replaced_by_directory_warns() {
         .current_dir(dir.path())
         .output()
         .expect("git rev-parse HEAD");
-    let base_sha = String::from_utf8_lossy(&base_out.stdout)
-        .trim()
-        .to_string();
+    let base_sha = String::from_utf8_lossy(&base_out.stdout).trim().to_string();
     assert_eq!(base_sha.len(), 40, "base SHA must be 40 chars");
 
     // Commit B: modify changed.rs so it appears in `git diff <base>...HEAD`.
@@ -527,7 +520,8 @@ fn test_heatmap_diff_path_replaced_by_directory_warns() {
 
     // Run `skim heatmap --diff <base_sha>`.
     // git diff base...HEAD lists changed.rs as modified.
-    // is_file() on the absolute path returns false → warning emitted to stderr.
+    // is_file() on the absolute path returns false (it is a directory)
+    // → "is not a regular file on current branch" warning emitted to stderr.
     let out = Command::cargo_bin("skim")
         .unwrap()
         .args(["heatmap", "--diff"])
@@ -538,9 +532,9 @@ fn test_heatmap_diff_path_replaced_by_directory_warns() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("deleted on current branch"),
-        "AD-408-2: expected 'deleted on current branch' warning when a diffed \
-         path is occupied by a directory (is_file()==false, exists()==true); \
+        stderr.contains("is not a regular file on current branch"),
+        "AD-408-2: expected 'is not a regular file on current branch' warning when a \
+         diffed path is occupied by a directory (is_file()==false, exists()==true); \
          stderr was: {stderr:?}"
     );
 }

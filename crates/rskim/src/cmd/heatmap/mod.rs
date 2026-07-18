@@ -107,13 +107,15 @@ fn resolve_diff_files(
                     continue;
                 }
                 let abs = std::path::Path::new(&root).join(f);
-                // AD-408-2 (OD2, 2026-07-17): use is_file() not exists() so that
-                // a former-file path that is now a directory is excluded from heatmap
-                // output — same existence semantic as the temporal ghost filter.
-                // is_file() is the correct predicate for "a path an agent can Read".
+                // AD-408-2 (OD2, 2026-07-17): use is_file() not exists() so that a
+                // path now occupied by a directory or dangling symlink triggers the
+                // warning below, just as a genuinely deleted path does.
+                // NOTE: this gates only the warning; `args.files` still receives the
+                // full diff list.  Actual output filtering happens downstream in
+                // apply_file_scope via set intersection.
                 if !abs.is_file() {
                     eprintln!(
-                        "skim heatmap: warning: file '{}' deleted on current branch",
+                        "skim heatmap: warning: '{}' is not a regular file on current branch",
                         f
                     );
                 }

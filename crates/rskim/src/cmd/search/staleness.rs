@@ -905,8 +905,7 @@ pub(super) fn create_real_git_repo_with_dates(
         let mut cmd = Command::new("git");
         cmd.args(["commit", "-m", msg]).current_dir(dir);
         if let Some(d) = date {
-            cmd.env("GIT_AUTHOR_DATE", d)
-                .env("GIT_COMMITTER_DATE", d);
+            cmd.env("GIT_AUTHOR_DATE", d).env("GIT_COMMITTER_DATE", d);
         }
         cmd.output().expect("git commit");
     }

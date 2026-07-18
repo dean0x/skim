@@ -1601,7 +1601,11 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
     // Build commit specs: (message, date, files).
     let mut commit_specs: Vec<(&str, Option<&str>, &[(&str, &str)])> = Vec::new();
     for (i, msg) in ghost_msgs.iter().enumerate() {
-        commit_specs.push((msg.as_str(), Some(ghost_date), ghost_file_lists[i].as_slice()));
+        commit_specs.push((
+            msg.as_str(),
+            Some(ghost_date),
+            ghost_file_lists[i].as_slice(),
+        ));
     }
     for (i, msg) in present_msgs.iter().enumerate() {
         commit_specs.push((
