@@ -237,12 +237,17 @@ fn map_identifier_to_field(
             // caught by is_value_decl_kind above).
             // AD-411-6 (option a): map to FunctionSignature.
             // Rationale for option a over option b: mapping const/value names to
-            // FunctionSignature keeps the multi-word BM25FConfig::default() SymbolName
-            // boost (3.5) unchanged — it remains the degradation tier for grammars
-            // without a "name:" field rather than being re-tuned as the primary
-            // const-definition tier.  FunctionSignature (boost 4.0 default, 8.0
-            // exact-symbol) is semantically loose but rank-correct: these are
-            // definitions, and definition-tier boost is what the scorer needs.
+            // FunctionSignature keeps SymbolName as the degradation tier for grammars
+            // without a "name:" field rather than the primary const-definition tier.
+            // FunctionSignature (boost 4.0 default, 8.0 exact-symbol) is semantically
+            // loose but rank-correct: these are definitions, and definition-tier boost
+            // is what the scorer needs.
+            //
+            // Note: BM25FConfig::default() FunctionBody was raised from 1.0 to 2.0
+            // (AD-411-1 retuning) because call-site identifiers now route here instead
+            // of the old unconditional SymbolName (3.5).  The new ordering
+            // FnSig(4.0) > FnBody(2.0) preserves multi-word ranking quality without
+            // fully collapsing the definition vs call-site signal gap.
             SearchField::FunctionSignature
         }
     }

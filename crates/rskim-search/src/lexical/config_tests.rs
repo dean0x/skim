@@ -33,8 +33,8 @@ fn test_default_boosts() {
         "ImportExport boost"
     );
     assert!(
-        (cfg.field_boosts[4] - 1.0).abs() < f32::EPSILON,
-        "FunctionBody boost"
+        (cfg.field_boosts[4] - 2.0).abs() < f32::EPSILON,
+        "FunctionBody boost (AD-411-1 retuning: call-site identifiers now route here)"
     );
     assert!(
         (cfg.field_boosts[5] - 0.8).abs() < f32::EPSILON,
@@ -47,6 +47,56 @@ fn test_default_boosts() {
     assert!(
         (cfg.field_boosts[7] - 1.0).abs() < f32::EPSILON,
         "Other boost"
+    );
+}
+
+/// Multi-word query path uses `BM25FConfig::default()`.  Under AD-411-1,
+/// call-site identifiers now route to `FunctionBody` instead of the old
+/// unconditional `SymbolName`.  Assert the ordering invariant that preserves
+/// multi-word ranking quality: definitions (FnSig/TypeDef) rank above call
+/// sites (FnBody), and call sites rank above noise (Comment/StringLit).
+///
+/// Ordering: TypeDef(5) > FnSig(4) > SymbolName(3.5) > Import(3)
+///          > FnBody(2) > Other(1) > Comment(0.8) > StringLit(0.5)
+#[test]
+fn test_default_multi_word_ordering_invariants() {
+    let cfg = BM25FConfig::default();
+    let typedef = cfg.field_boosts[0]; // TypeDefinition
+    let fnsig = cfg.field_boosts[1]; // FunctionSignature
+    let symbol = cfg.field_boosts[2]; // SymbolName (degradation tier)
+    let import = cfg.field_boosts[3]; // ImportExport
+    let fnbody = cfg.field_boosts[4]; // FunctionBody (call sites)
+    let comment = cfg.field_boosts[5]; // Comment
+    let strlit = cfg.field_boosts[6]; // StringLiteral
+    let other = cfg.field_boosts[7]; // Other
+
+    assert!(
+        typedef > fnsig,
+        "TypeDef ({typedef}) must be above FnSig ({fnsig}) for multi-word"
+    );
+    assert!(
+        fnsig > symbol,
+        "FnSig ({fnsig}) must be above SymbolName ({symbol}) for multi-word"
+    );
+    assert!(
+        symbol > import,
+        "SymbolName ({symbol}) must be above Import ({import}) for multi-word"
+    );
+    assert!(
+        import > fnbody,
+        "Import ({import}) must be above FnBody ({fnbody}) for multi-word"
+    );
+    assert!(
+        fnbody > other,
+        "FnBody ({fnbody}) must be above Other ({other}): call-site identifiers outrank unclassified bytes (AD-411-1 retuning)"
+    );
+    assert!(
+        other > comment,
+        "Other ({other}) must be above Comment ({comment}) for multi-word"
+    );
+    assert!(
+        comment > strlit,
+        "Comment ({comment}) must be above StringLit ({strlit}) for multi-word"
     );
 }
 

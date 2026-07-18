@@ -11,7 +11,7 @@
 //! | 1     | FunctionSignature | 4.0         |
 //! | 2     | SymbolName      | 3.5           |
 //! | 3     | ImportExport    | 3.0           |
-//! | 4     | FunctionBody    | 1.0           |
+//! | 4     | FunctionBody    | 2.0           |
 //! | 5     | Comment         | 0.8           |
 //! | 6     | StringLiteral   | 0.5           |
 //! | 7     | Other           | 1.0           |
@@ -90,11 +90,27 @@ impl Default for BM25FConfig {
     /// Sensible defaults that boost structural fields above implementation fields.
     ///
     /// Boosts: TypeDef=5.0, FnSig=4.0, Symbol=3.5, Import=3.0,
-    ///         FnBody=1.0, Comment=0.8, StringLit=0.5, Other=1.0
+    ///         FnBody=2.0, Comment=0.8, StringLit=0.5, Other=1.0
+    ///
+    /// # AD-411-1 retuning
+    ///
+    /// Under AD-411-1, non-declaration identifiers (call sites, type references)
+    /// now route to [`crate::SearchField::FunctionBody`] instead of the old
+    /// unconditional `SymbolName` (3.5).  `FunctionBody` at the old 1.0 was
+    /// calibrated as a noise suppressor for body code *text* and is too low for
+    /// the call-site identifier case — a 3.5× drop from SymbolName.  Raising it
+    /// to 2.0 preserves the strict ordering
+    ///
+    ///   TypeDef(5) > FnSig(4) > SymbolName(3.5) > Import(3) > FnBody(2) > Other(1) > Comment(0.8) > StringLit(0.5)
+    ///
+    /// and limits the regression for multi-word queries where call-site frequency
+    /// is a legitimate relevance signal (ADR-007 dog-food gate).  Definition names
+    /// still rank above call sites (4.0–5.0 vs 2.0), so the core #411 ordering
+    /// improvement is preserved.
     fn default() -> Self {
         Self {
             k1: 1.2,
-            field_boosts: [5.0, 4.0, 3.5, 3.0, 1.0, 0.8, 0.5, 1.0],
+            field_boosts: [5.0, 4.0, 3.5, 3.0, 2.0, 0.8, 0.5, 1.0],
             field_b: [0.75; FIELD_COUNT],
         }
     }
@@ -131,7 +147,7 @@ impl BM25FConfig {
     /// | TypeDefinition  | 0     | 4.0   |  ← struct/type defs; below FnSig (OD3)
     /// | SymbolName      | 2     | 2.0   |  ← degradation tier (above FunctionBody)
     /// | ImportExport    | 3     | 1.5   |
-    /// | FunctionBody    | 4     | 1.0   |  ← call sites
+    /// | FunctionBody    | 4     | 1.0   |  ← call sites (exact-symbol path stays at 1.0; default() uses 2.0)
     /// | Comment         | 5     | 0.5   |
     /// | Other           | 7     | 0.5   |
     /// | StringLiteral   | 6     | 0.3   |
