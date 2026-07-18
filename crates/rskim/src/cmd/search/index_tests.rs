@@ -3038,10 +3038,11 @@ fn test_manifest_old_version_triggers_auto_rebuild_on_next_query() {
 
     // Static: confirm FORMAT_VERSION constant matches the current binary format.
     // #395 bumped this from 4 → 5 (persisted skip section, AD-395-3).
+    // #411 bumped this from 5 → 6 → 7 (CLASSIFIER_SCHEMA_VERSION SSOT alignment, AD-411-5).
     assert_eq!(
         FileManifest::FORMAT_VERSION,
-        5,
-        "manifest::FORMAT_VERSION must be 5 after #395 (persisted skip section). \
+        7,
+        "manifest::FORMAT_VERSION must be 7 after #411 (CLASSIFIER_SCHEMA_VERSION SSOT, AD-411-5). \
          If this fails, the constant was changed without updating this test."
     );
 }
