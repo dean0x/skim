@@ -281,6 +281,86 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
     );
 }
 
+/// Create a hermetic git repo where the worker clone is 1 commit ahead of origin.
+///
+/// Layout: bare repo (remote) ← seed (initial push) ← worker (1 unpushed commit).
+/// The worker clone has `origin/main` as upstream and is exactly 1 ahead.
+/// Returns the temp dir (caller must keep alive) and the worker clone path.
+fn make_hermetic_ahead_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let base = dir.path();
+
+    // Bare repo acts as the remote.
+    let bare = base.join("bare.git");
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&bare)
+        .output()
+        .expect("git init --bare");
+
+    // Seed: one empty commit, push to bare so it is non-empty.
+    let seed = base.join("seed");
+    std::process::Command::new("git")
+        .args(["init"])
+        .arg(&seed)
+        .output()
+        .expect("git init seed");
+    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(&seed)
+            .output()
+            .expect("git config seed");
+    }
+    std::process::Command::new("git")
+        .args(["commit", "--allow-empty", "-m", "init"])
+        .current_dir(&seed)
+        .output()
+        .expect("git commit seed");
+    std::process::Command::new("git")
+        .args(["remote", "add", "origin"])
+        .arg(bare.to_str().unwrap())
+        .current_dir(&seed)
+        .output()
+        .expect("git remote add seed");
+    std::process::Command::new("git")
+        .args(["push", "origin", "HEAD:refs/heads/main"])
+        .current_dir(&seed)
+        .output()
+        .expect("git push seed");
+
+    // Worker: clone from bare so origin/main is configured.
+    let worker = base.join("worker");
+    std::process::Command::new("git")
+        .args(["clone"])
+        .arg(bare.to_str().unwrap())
+        .arg(&worker)
+        .output()
+        .expect("git clone worker");
+    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(&worker)
+            .output()
+            .expect("git config worker");
+    }
+
+    // Add 1 commit to the worker without pushing — worker is now 1 ahead of origin.
+    std::fs::write(worker.join("ahead.txt"), "ahead\n").expect("write ahead.txt");
+    std::process::Command::new("git")
+        .args(["add", "ahead.txt"])
+        .current_dir(&worker)
+        .output()
+        .expect("git add ahead.txt");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "ahead commit"])
+        .current_dir(&worker)
+        .output()
+        .expect("git commit ahead");
+
+    (dir, worker)
+}
+
 /// Fix 1: `skim git status -sb` on a hermetic repo with an upstream must not
 /// silently drop the branch header.
 ///
@@ -289,12 +369,20 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
 /// short-format output (`## main...origin/main`).  `parse_status` then discarded
 /// that line (it starts with `##`, not `# branch.head `), producing "clean"
 /// with no branch detail — information loss on clean trees.
+///
+/// The assertion triple guards the CORRECTED render format:
+///   - `branch:` fails on pre-fix behavior (bare "clean" with no branch line)
+///   - `origin/` fails if the upstream is dropped
+///   - `ahead`   fails on wrong render (raw `+1 -0`) AND on pre-fix silence
 #[test]
 fn test_skim_git_status_sb_shows_branch() {
-    // A fresh hermetic fetch repo (bare + worker clone) already has an upstream
-    // configured (origin/main), which is exactly what we need to exercise the
-    // `# branch.upstream` and `# branch.ab` lines in porcelain v2 output.
-    let (_dir, worker) = make_hermetic_fetch_repo();
+    // Use a hermetic "ahead" repo: worker clone has origin/main as upstream
+    // and is exactly 1 commit ahead, so porcelain v2 emits:
+    //   # branch.head main
+    //   # branch.upstream origin/main
+    //   # branch.ab +1 -0
+    // The corrected render must produce: "branch: main...origin/main [ahead 1]"
+    let (_dir, worker) = make_hermetic_ahead_repo();
 
     let output = common::skim()
         .args(["git", "status", "-sb"])
@@ -312,20 +400,34 @@ fn test_skim_git_status_sb_shows_branch() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // The output must contain branch information.  On a clean tree the only
-    // content is the branch line; if the fix is missing, stdout is just "clean"
-    // with no branch name.
+
+    // The C-7 net-savings guard may fire for a clean-ahead repo when the raw
+    // `git status -sb` output is shorter than skim's compressed form.  When it
+    // fires, skim emits the raw `## main...origin/main [ahead 1]` line verbatim;
+    // when it does not, skim emits `branch: main...origin/main [ahead 1]`.
+    // Both are correct — the key invariant is that the upstream reference and
+    // ahead count are NOT silently dropped (which is what the old bug did:
+    // it produced `status  clean` or `branch: main` with no upstream info).
+    //
+    // Three assertions guard distinct failure modes:
+    //   • "branch:" OR "##" — fails if no branch line emitted at all
+    //   • "origin/"          — fails if upstream is dropped
+    //   • "ahead"            — fails on old raw "+1 -0" AND on pre-fix silence
     assert!(
-        stdout.contains("branch:") || stdout.contains("main") || stdout.contains("clean"),
-        "Fix 1: -sb output must contain branch info (not just an empty body); \
+        stdout.contains("branch:") || stdout.contains("##"),
+        "Fix 1: -sb output must contain either 'branch:' (compressed) or '##' (raw passthrough); \
+         old bug produced bare 'clean' with no upstream info; \
          stdout={stdout:?}  stderr={:?}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // Must NOT be completely empty — even a clean repo shows the branch line.
     assert!(
-        !stdout.trim().is_empty(),
-        "Fix 1: -sb output must not be empty on a clean repo with an upstream; \
-         stdout={stdout:?}"
+        stdout.contains("origin/"),
+        "Fix 1: -sb output must show the upstream (origin/main); stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("ahead"),
+        "Fix 1: -sb output must show ahead count in native [ahead N] format \
+         (not raw '+1 -0', and not absent); stdout={stdout:?}"
     );
 }
 

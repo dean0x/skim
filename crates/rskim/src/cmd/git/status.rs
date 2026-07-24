@@ -197,13 +197,19 @@ impl StatusCategories {
         let mut details: Vec<String> = Vec::new();
 
         if !self.branch.is_empty() {
-            let mut branch_line = format!("branch: {}", self.branch);
-            if !self.upstream.is_empty() {
-                branch_line.push_str(&format!(" → {}", self.upstream));
-                if !self.ahead_behind.is_empty() {
-                    branch_line.push_str(&format!(" ({})", self.ahead_behind));
+            let branch_line = if self.upstream.is_empty() {
+                // No upstream configured: just show the head name.
+                format!("branch: {}", self.branch)
+            } else {
+                // Upstream present: mirror native `git status -sb` header format
+                // "## main...origin/main [ahead 1]" exactly.
+                let bracket = build_ahead_behind_bracket(&self.ahead_behind);
+                if bracket.is_empty() {
+                    format!("branch: {}...{}", self.branch, self.upstream)
+                } else {
+                    format!("branch: {}...{} {}", self.branch, self.upstream, bracket)
                 }
-            }
+            };
             details.push(branch_line);
         }
         for f in &self.staged {
@@ -325,6 +331,27 @@ fn worktree_prefix(c: char) -> &'static str {
     }
 }
 
+/// Build the `[ahead A]`, `[behind B]`, or `[ahead A, behind B]` bracket string
+/// from a porcelain v2 `# branch.ab` value (format: `+<ahead> -<behind>`).
+///
+/// Returns an empty string when both counts are zero — matching native
+/// `git status -sb` which omits the bracket entirely when in sync with upstream.
+fn build_ahead_behind_bracket(ab: &str) -> String {
+    // Expected format: "+A -B" where A and B are non-negative integers.
+    let mut parts = ab.split_whitespace();
+    let ahead_str = parts.next().unwrap_or("+0");
+    let behind_str = parts.next().unwrap_or("-0");
+    let ahead: u64 = ahead_str.trim_start_matches('+').parse().unwrap_or(0);
+    let behind: u64 = behind_str.trim_start_matches('-').parse().unwrap_or(0);
+
+    match (ahead, behind) {
+        (0, 0) => String::new(),
+        (a, 0) => format!("[ahead {a}]"),
+        (0, b) => format!("[behind {b}]"),
+        (a, b) => format!("[ahead {a}, behind {b}]"),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -422,8 +449,77 @@ mod tests {
             "upstream must appear: {branch_detail}"
         );
         assert!(
-            branch_detail.contains("+3 -0"),
-            "ahead/behind must appear: {branch_detail}"
+            branch_detail.contains("..."),
+            "separator '...' must appear (not ' → '): {branch_detail}"
+        );
+        assert!(
+            branch_detail.contains("[ahead 3]"),
+            "ahead count must appear in native [ahead N] format (not raw '+3 -0'): {branch_detail}"
+        );
+    }
+
+    /// Branch-detail render: when both ahead and behind are 0, the bracket is
+    /// omitted entirely — matching native `git status -sb` `## main...origin/main`
+    /// with no `[...]` suffix.
+    #[test]
+    fn test_parse_status_upstream_both_zero_no_bracket() {
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert!(
+            branch_detail.contains("..."),
+            "separator '...' must appear when upstream is set: {branch_detail}"
+        );
+        assert!(
+            branch_detail.contains("origin/main"),
+            "upstream must appear: {branch_detail}"
+        );
+        // Both counts zero → NO bracket at all.
+        assert!(
+            !branch_detail.contains('['),
+            "both-zero case must have NO bracket: {branch_detail}"
+        );
+    }
+
+    /// Branch-detail render: when ahead > 0 AND behind > 0, both components
+    /// must appear in the bracket — `[ahead A, behind B]`.
+    #[test]
+    fn test_parse_status_upstream_both_nonzero_bracket() {
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert!(
+            branch_detail.contains("[ahead 2, behind 3]"),
+            "both-nonzero case must show '[ahead 2, behind 3]': {branch_detail}"
+        );
+    }
+
+    /// Branch-detail render: when only behind > 0, only the `[behind B]` bracket
+    /// must appear (no `ahead` component).
+    #[test]
+    fn test_parse_status_upstream_behind_only_bracket() {
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -5\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert!(
+            branch_detail.contains("[behind 5]"),
+            "behind-only case must show '[behind 5]': {branch_detail}"
+        );
+        assert!(
+            !branch_detail.contains("ahead"),
+            "behind-only case must NOT contain 'ahead': {branch_detail}"
         );
     }
 
@@ -478,7 +574,8 @@ mod tests {
             result.summary
         );
 
-        // Fix 1: branch detail must include upstream and ahead/behind from the fixture.
+        // Fix 1: branch detail must include upstream and ahead/behind from the fixture
+        // in native git -sb format: "branch: main...origin/main [ahead 1]".
         let branch_detail = result
             .details
             .iter()
@@ -489,8 +586,12 @@ mod tests {
             "upstream must appear in branch detail: {branch_detail}"
         );
         assert!(
-            branch_detail.contains("+1 -0"),
-            "ahead/behind must appear in branch detail: {branch_detail}"
+            branch_detail.contains("..."),
+            "separator '...' must appear (not ' → '): {branch_detail}"
+        );
+        assert!(
+            branch_detail.contains("[ahead 1]"),
+            "ahead count must appear in native [ahead N] format (not raw '+1 -0'): {branch_detail}"
         );
     }
 
