@@ -113,6 +113,7 @@ fn test_guardrail_triggers_when_output_inflates() {
     std::fs::write(&file, &source).unwrap();
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .arg(file.to_str().unwrap())
         .arg("--mode=structure")
         .arg("--no-cache")

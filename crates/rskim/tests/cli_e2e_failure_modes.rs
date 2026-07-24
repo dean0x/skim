@@ -90,6 +90,7 @@ fn test_grep_no_match_exits_1_silently() {
 #[test]
 fn test_grep_missing_file_forwards_error_raw() {
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .args(["grep", "pat", "/nonexistent/skim-317-test"])
         .assert()
         .code(2)
@@ -288,6 +289,7 @@ fn test_kubectl_unexpected_failure_raw_forwards_everything() {
     );
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("PATH", stub_path(dir.path()))
         .args(["kubectl", "get", "pods"])
         .assert()
@@ -375,6 +377,7 @@ fn test_lint_unexpected_exit_code_goes_raw() {
     );
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("PATH", stub_path(dir.path()))
         .args(["eslint", "a.js"])
         .assert()

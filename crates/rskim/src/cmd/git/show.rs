@@ -683,7 +683,7 @@ fn passthrough_file_content(
     duration: std::time::Duration,
     tier: u8,
 ) {
-    eprintln!("[skim] git show: falling back to raw (tier {tier})");
+    crate::debug_log!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
     // raw == output (passthrough); move raw into finalize_git_output_passthrough
     // so the analytics path clones once and moves once — 1 allocation total

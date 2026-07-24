@@ -125,6 +125,7 @@ fn test_no_marker_when_guardrail_fires() {
     fs::write(&file, &source).unwrap();
 
     let output = skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("SKIM_REWRITTEN_FROM", "cat")
         .arg(&file)
         .arg("--mode=structure")
@@ -134,10 +135,10 @@ fn test_no_marker_when_guardrail_fires() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Guardrail must have fired.
+    // Guardrail must have fired — detectable via SKIM_DEBUG=1.
     assert!(
         stderr.contains("[skim:guardrail]"),
-        "expected guardrail notice on stderr, got: {stderr}"
+        "expected guardrail notice on stderr (with SKIM_DEBUG=1), got: {stderr}"
     );
 
     // Transparency marker must be absent — guardrail served raw bytes so view_differs=false.

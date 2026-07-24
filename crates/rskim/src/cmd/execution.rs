@@ -683,9 +683,13 @@ where
     if classify_exit(output.exit_code, expected_exit_codes) == ExitDisposition::UnexpectedFailure {
         match output.exit_code {
             Some(code) => {
-                eprintln!("[skim] {program} exited {code}; raw output (not compressed).")
+                crate::debug_log!("[skim] {program} exited {code}; raw output (not compressed).")
             }
-            None => eprintln!("[skim] {program} killed by signal; raw output (not compressed)."),
+            None => {
+                crate::debug_log!(
+                    "[skim] {program} killed by signal; raw output (not compressed)."
+                );
+            }
         }
         let label = format_analytics_label(family, program, &args.join(" "));
         crate::analytics::try_record_command(

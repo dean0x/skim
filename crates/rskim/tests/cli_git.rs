@@ -464,6 +464,7 @@ fn test_skim_git_show_head_commit_mode() {
     let raw_bytes = raw_output.stdout.len();
 
     let output = common::skim()
+        .env("SKIM_DEBUG", "1")
         .args(["git", "show", "HEAD"])
         .output()
         .unwrap();
@@ -471,6 +472,7 @@ fn test_skim_git_show_head_commit_mode() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
 
+    // Detectable because SKIM_DEBUG=1 is set above.
     let guardrail_triggered = stderr.contains("[skim:guardrail]");
     let has_emdash = stdout.contains('\u{2014}');
 
