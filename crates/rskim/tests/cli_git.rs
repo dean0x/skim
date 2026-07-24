@@ -418,6 +418,99 @@ fn test_skim_git_log_contains_hashes() {
     );
 }
 
+/// Create a hermetic git repo with N commits.
+///
+/// Returns the temp dir (caller must keep alive) and the repo path.
+fn make_hermetic_repo_with_commits(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let path = dir.path().to_path_buf();
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&path)
+        .output()
+        .expect("git init");
+    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
+        std::process::Command::new("git")
+            .args(["config", k, v])
+            .current_dir(&path)
+            .output()
+            .expect("git config");
+    }
+    for i in 0..n {
+        let filename = format!("file{i}.txt");
+        std::fs::write(path.join(&filename), format!("content {i}\n")).expect("write file");
+        std::process::Command::new("git")
+            .args(["add", &filename])
+            .current_dir(&path)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", &format!("commit {i}")])
+            .current_dir(&path)
+            .output()
+            .expect("git commit");
+    }
+    (dir, path)
+}
+
+/// Fix 4 regression: `skim git log --oneline` on a repo with 25 commits shows
+/// ALL 25 — the old silent `-n 20` cap must no longer inject.
+#[test]
+fn test_git_log_no_cap_shows_all_commits() {
+    let (_dir, repo) = make_hermetic_repo_with_commits(25);
+
+    let output = common::skim()
+        .current_dir(&repo)
+        .args(["git", "log", "--oneline"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "skim git log must exit 0");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Count lines that look like commit entries: a 7-char hex prefix.
+    let commit_lines: usize = stdout
+        .lines()
+        .filter(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .count();
+    assert_eq!(
+        commit_lines, 25,
+        "expected all 25 commits, got {commit_lines}; output:\n{stdout}"
+    );
+}
+
+/// Fix 4: user-supplied `-n 5` is still honoured (the handler no longer injects
+/// its own default limit, so user limits must pass through unchanged).
+#[test]
+fn test_git_log_user_n_flag_respected() {
+    let (_dir, repo) = make_hermetic_repo_with_commits(25);
+
+    let output = common::skim()
+        .current_dir(&repo)
+        .args(["git", "log", "--oneline", "-n", "5"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "skim git log -n 5 must exit 0");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let commit_lines: usize = stdout
+        .lines()
+        .filter(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .count();
+    assert_eq!(
+        commit_lines, 5,
+        "expected exactly 5 commits with -n 5, got {commit_lines}; output:\n{stdout}"
+    );
+}
+
 // ============================================================================
 // Show — new subcommand (#132)
 // ============================================================================

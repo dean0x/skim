@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use crate::cmd::{extract_output_format, user_has_flag};
 use crate::output::canonical::GitResult;
 
-use super::{has_limit_flag, run_parsed_command, run_passthrough};
+use super::{run_parsed_command, run_passthrough};
 
 /// Run `git log` with compression.
 ///
@@ -34,11 +34,6 @@ pub(super) fn run_log(
 
     let mut full_args: Vec<String> = global_flags.to_vec();
     full_args.extend(["log".to_string(), "--format=%h %s (%cr) <%an>".to_string()]);
-
-    if !has_limit_flag(&filtered_args) {
-        full_args.extend(["-n".to_string(), "20".to_string()]);
-    }
-
     full_args.extend_from_slice(&filtered_args);
 
     let label = super::build_analytics_label("log", args, show_stats, rec.enabled);
