@@ -92,11 +92,14 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 // Does NOT handle `git diff` output (which has `diff --git a/path b/path` headers).
 // ============================================================================
 
-/// Per-file diff statistics.
+/// Per-file diff statistics and patch content.
 struct FileStat {
     path: String,
     insertions: usize,
     deletions: usize,
+    /// Hunk headers (`@@ ... @@`) and patch body lines (`+`, `-`, ` `).
+    /// Retained so `build_file_result` can emit actual content, not just a stat.
+    patch_lines: Vec<String>,
 }
 
 /// Mutable accumulator state for the standalone unified diff parser.
@@ -105,6 +108,8 @@ struct DiffParserState {
     current_path: Option<String>,
     current_insertions: usize,
     current_deletions: usize,
+    /// Hunk lines accumulated for the current file.
+    current_patch_lines: Vec<String>,
     in_hunk: bool,
 }
 
@@ -115,6 +120,7 @@ impl DiffParserState {
             current_path: None,
             current_insertions: 0,
             current_deletions: 0,
+            current_patch_lines: Vec::new(),
             in_hunk: false,
         }
     }
@@ -126,6 +132,7 @@ impl DiffParserState {
                 path,
                 insertions: self.current_insertions,
                 deletions: self.current_deletions,
+                patch_lines: std::mem::take(&mut self.current_patch_lines),
             });
         }
         self.current_insertions = 0;
@@ -178,9 +185,10 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
             continue;
         }
 
-        // `@@ ... @@` hunk header — entering a hunk
+        // `@@ ... @@` hunk header — entering a hunk; retain for content rendering.
         if line.starts_with("@@ ") {
             state.in_hunk = true;
+            state.current_patch_lines.push(line.to_string());
             continue;
         }
 
@@ -188,7 +196,9 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
             continue;
         }
 
-        // Count insertions and deletions (not the +++ / --- header lines)
+        // Count insertions/deletions and retain the line for content rendering.
+        // Context lines (` `) are also retained so hunks are readable.
+        state.current_patch_lines.push(line.to_string());
         if line.starts_with('+') {
             state.current_insertions += 1;
         } else if line.starts_with('-') {
@@ -202,7 +212,12 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
     build_file_result(state.file_stats)
 }
 
-/// Aggregate per-file stats into a `FileResult` summary.
+/// Aggregate per-file stats and patch content into a `FileResult`.
+///
+/// Each shown file contributes a stat header (`path: +N, -M`) followed by its
+/// hunk lines (`@@ ... @@`, `+line`, `-line`, ` context`).  This preserves
+/// the actual changed content rather than emitting a diffstat-only summary
+/// (which would violate the compress-never-truncate rule, #317).
 ///
 /// Returns `None` if no file stats were collected (unrecognised format).
 fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
@@ -215,11 +230,22 @@ fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
     let total_deletions: usize = file_stats.iter().map(|f| f.deletions).sum();
 
     let shown = file_count.min(MAX_DISPLAY_ENTRIES);
-    let entries: Vec<String> = file_stats
-        .iter()
-        .take(MAX_DISPLAY_ENTRIES)
-        .map(|f| format!("{}: +{}, -{}", f.path, f.insertions, f.deletions))
-        .collect();
+    let mut entries: Vec<String> = Vec::new();
+
+    for file in file_stats.iter().take(MAX_DISPLAY_ENTRIES) {
+        // Per-file stat header (compact — no timestamps or `---`/`+++` lines).
+        entries.push(format!(
+            "{}: +{}, -{}",
+            file.path, file.insertions, file.deletions
+        ));
+        // Actual patch content: hunk headers + insertion/deletion/context lines.
+        entries.extend(file.patch_lines.iter().cloned());
+    }
+
+    // Elision marker when the directory diff exceeds the display cap (#317).
+    if let Some(marker) = crate::output::elision_marker(shown, file_count, "files") {
+        entries.push(marker);
+    }
 
     let footer = format!(
         "{file_count} file{} changed, {total_insertions} insertion{}(+), {total_deletions} deletion{}(-)",
@@ -418,11 +444,111 @@ mod tests {
         let result = try_parse_standalone_unified(input);
         assert!(result.is_some(), "must parse clean unified diff");
         let result = result.unwrap();
-        // Path must be the clean "a/src/lib.rs", not fused with the mtime
+        // entries[0] is the per-file stat header — path must not be fused with mtime.
         assert_eq!(
             result.entries[0], "a/src/lib.rs: +1, -1",
             "path must not be fused with mtime; got: {}",
             result.entries[0]
+        );
+        // Fix 2: patch content must follow the stat header.
+        assert!(
+            result.entries.iter().any(|e| e.starts_with("@@")),
+            "hunk header must appear in entries: {:?}",
+            result.entries
+        );
+        assert!(
+            result.entries.iter().any(|e| e == "-old"),
+            "deletion line must appear: {:?}",
+            result.entries
+        );
+        assert!(
+            result.entries.iter().any(|e| e == "+new"),
+            "insertion line must appear: {:?}",
+            result.entries
+        );
+    }
+
+    /// Fix 2: `skim diff a b` must include actual changed lines, not just a
+    /// diffstat.  Each file gets a stat header followed by its patch content.
+    #[test]
+    fn test_patch_content_included_in_entries() {
+        // Use concat! so the leading space in context lines is preserved.
+        // Rust's backslash line-continuation strips all leading whitespace on
+        // the next source line, which would silently drop the diff's ` ` prefix.
+        let input = concat!(
+            "--- old.txt\t2026-07-25 10:00:00\n",
+            "+++ new.txt\t2026-07-25 10:05:00\n",
+            "@@ -1,4 +1,4 @@\n",
+            " context before\n",
+            "-removed line\n",
+            "+added line\n",
+            " context after\n",
+        );
+        let result = try_parse_standalone_unified(input).expect("must parse");
+        // Stat header is entries[0]
+        assert!(
+            result.entries[0].contains("old.txt"),
+            "stat header must have path: {:?}",
+            result.entries[0]
+        );
+        // Hunk header
+        assert!(
+            result.entries.iter().any(|e| e.starts_with("@@ -1,4")),
+            "hunk header must be present: {:?}",
+            result.entries
+        );
+        // Deletion line
+        assert!(
+            result.entries.iter().any(|e| e == "-removed line"),
+            "deletion must be present: {:?}",
+            result.entries
+        );
+        // Insertion line
+        assert!(
+            result.entries.iter().any(|e| e == "+added line"),
+            "insertion must be present: {:?}",
+            result.entries
+        );
+        // Context lines
+        assert!(
+            result.entries.iter().any(|e| e == " context before"),
+            "context line must be present: {:?}",
+            result.entries
+        );
+    }
+
+    /// Fix 2: directory diff with more than MAX_DISPLAY_ENTRIES files must emit
+    /// an elision marker rather than silently dropping files (#317).
+    #[test]
+    fn test_dir_diff_capped_with_elision_marker() {
+        // Build a synthetic dir diff with MAX_DISPLAY_ENTRIES + 1 files.
+        let cap = super::super::MAX_DISPLAY_ENTRIES;
+        let mut input = String::new();
+        for i in 0..=cap {
+            input.push_str(&format!(
+                "diff -ru dir1/file{i}.txt dir2/file{i}.txt\n\
+                 --- dir1/file{i}.txt\t2026-07-25\n\
+                 +++ dir2/file{i}.txt\t2026-07-25\n\
+                 @@ -1,1 +1,1 @@\n\
+                 -old {i}\n\
+                 +new {i}\n"
+            ));
+        }
+        let result = try_parse_standalone_unified(&input).expect("must parse");
+        assert_eq!(
+            result.total_count,
+            cap + 1,
+            "total_count must be cap+1 files"
+        );
+        assert_eq!(result.shown_count, cap, "shown_count must be capped");
+        // Elision marker must appear in entries
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.contains("[skim]") && e.contains("omitted")),
+            "elision marker must appear when files are capped: {:?}",
+            result.entries.last()
         );
     }
 
