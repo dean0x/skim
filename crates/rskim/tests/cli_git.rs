@@ -286,25 +286,32 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
 /// Layout: bare repo (remote) ← seed (initial push) ← worker (1 unpushed commit).
 /// The worker clone has `origin/main` as upstream and is exactly 1 ahead.
 /// Returns the temp dir (caller must keep alive) and the worker clone path.
+///
+/// `-b main` is passed to both `git init` calls so the helper is deterministic
+/// regardless of the runner's `init.defaultBranch` setting (Linux CI defaults to
+/// `master`; without `-b main` the bare's HEAD dangles at the nonexistent
+/// `refs/heads/master` after the push to `refs/heads/main`, breaking the clone).
+/// `-b/--initial-branch` is supported since git 2.28, which CI requires.
 fn make_hermetic_ahead_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let base = dir.path();
 
-    // Bare repo acts as the remote.
+    // Bare repo acts as the remote.  Pin the initial branch to `main` so that
+    // `git clone` can check out `main` tracking `origin/main` deterministically.
     let bare = base.join("bare.git");
     std::process::Command::new("git")
-        .args(["init", "--bare"])
+        .args(["init", "--bare", "-b", "main"])
         .arg(&bare)
         .output()
-        .expect("git init --bare");
+        .expect("git init --bare -b main");
 
     // Seed: one empty commit, push to bare so it is non-empty.
     let seed = base.join("seed");
     std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .arg(&seed)
         .output()
-        .expect("git init seed");
+        .expect("git init -b main seed");
     for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
         std::process::Command::new("git")
             .args(["config", k, v])
@@ -344,19 +351,64 @@ fn make_hermetic_ahead_repo() -> (tempfile::TempDir, std::path::PathBuf) {
             .output()
             .expect("git config worker");
     }
+    // Belt-and-suspenders: explicitly place the worker on `main` tracking
+    // `origin/main` before adding the ahead commit.  This is a no-op when the
+    // clone already checked out `main` correctly, but on runners where git
+    // defaults to `master` it guarantees the upstream is wired up correctly.
+    let checkout = std::process::Command::new("git")
+        .args(["checkout", "-B", "main", "--track", "origin/main"])
+        .current_dir(&worker)
+        .output()
+        .expect("git checkout -B main --track origin/main");
+    assert!(
+        checkout.status.success(),
+        "hermetic setup: worker must be on main tracking origin/main; stderr={}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
 
     // Add 1 commit to the worker without pushing — worker is now 1 ahead of origin.
     std::fs::write(worker.join("ahead.txt"), "ahead\n").expect("write ahead.txt");
-    std::process::Command::new("git")
+    let add = std::process::Command::new("git")
         .args(["add", "ahead.txt"])
         .current_dir(&worker)
         .output()
         .expect("git add ahead.txt");
-    std::process::Command::new("git")
+    assert!(
+        add.status.success(),
+        "hermetic setup: git add must succeed; stderr={}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let commit = std::process::Command::new("git")
         .args(["commit", "-m", "ahead commit"])
         .current_dir(&worker)
         .output()
         .expect("git commit ahead");
+    assert!(
+        commit.status.success(),
+        "hermetic setup: git commit must succeed; stderr={}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // Fail-loud setup assertion: verify the hermetic repo is genuinely 1-ahead.
+    // A failure here means the test-helper itself is broken, not skim — surfaces
+    // setup regressions with a clear message instead of a confusing skim-output
+    // assertion failure.
+    let rev_list = std::process::Command::new("git")
+        .args(["rev-list", "--count", "origin/main..HEAD"])
+        .current_dir(&worker)
+        .output()
+        .expect("git rev-list --count origin/main..HEAD");
+    assert!(
+        rev_list.status.success(),
+        "hermetic setup: git rev-list must succeed; stderr={}",
+        String::from_utf8_lossy(&rev_list.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rev_list.stdout).trim(),
+        "1",
+        "hermetic ahead-repo setup must produce exactly 1 ahead commit; \
+         setup is broken if this fails"
+    );
 
     (dir, worker)
 }
