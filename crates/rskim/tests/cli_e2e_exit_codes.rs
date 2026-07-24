@@ -234,6 +234,13 @@ fn test_diff_differing_files_exit1_full_tier_hint_suppressed() {
         // FileResult::render produces "diff 1" header when shown == total.
         .stdout(predicate::str::contains("diff"))
         .stdout(predicate::str::contains("changed"))
+        // Fix 2 (#317): the actual changed lines must survive to stdout, not
+        // just a diffstat header/footer. "beta" (deletion) and "gamma"
+        // (insertion) come from the patch body; a diffstat-only regression
+        // would drop them. These hold whether the net-savings guard emits the
+        // compressed FileResult (`-beta`/`+gamma`) or falls back to raw diff.
+        .stdout(predicate::str::contains("beta"))
+        .stdout(predicate::str::contains("gamma"))
         // The hint must NOT appear: diff exit 1 is benign ("files differ"),
         // not an error. Printing the hint would mislead agents.
         .stderr(predicate::str::contains("[skim] compressed output").not());
