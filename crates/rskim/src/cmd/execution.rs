@@ -683,7 +683,7 @@ where
     if classify_exit(output.exit_code, expected_exit_codes) == ExitDisposition::UnexpectedFailure {
         match output.exit_code {
             Some(code) => {
-                crate::debug_log!("[skim] {program} exited {code}; raw output (not compressed).")
+                crate::debug_log!("[skim] {program} exited {code}; raw output (not compressed).");
             }
             None => {
                 crate::debug_log!(

@@ -24,7 +24,7 @@ fn is_conflicting_status_flag(s: &str) -> bool {
     // Short flag clusters: conflicting when they contain `s` (short-format char).
     // Must be a single-dash flag (not `--`) to qualify as a short cluster.
     if s.starts_with('-') && !s.starts_with("--") {
-        return s[1..].chars().any(|c| c == 's');
+        return s[1..].contains('s');
     }
     false
 }
