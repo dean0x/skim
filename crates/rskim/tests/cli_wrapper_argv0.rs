@@ -385,26 +385,16 @@ mod argv0_dispatch {
         );
     }
 
-    /// Control test for D2b: when stdout is a pipe (assert_cmd's default),
-    /// the wrapper STILL compresses — the regular-file guard must not fire.
+    /// D2b surface-contract: when stdout is a pipe, the wrapper emits native
+    /// `path:line:content` grep output (passthrough).  The regular-file guard
+    /// (`stdout_is_regular_file`) must NOT fire — that guard only suppresses
+    /// output transformation when stdout is redirected to a file.
     ///
-    /// Uses a grep stub large enough that the compressed grouped-by-file form
-    /// is strictly smaller than raw (ADR-001 net-savings guard passes), so the
-    /// canonical `grep N` header appears in the output.  Raw passthrough (i.e.
-    /// the file guard erroneously fired on a pipe) would emit raw
-    /// `file:line:content` lines with no `grep ` header — that fails this
-    /// assertion and catches the regression this test guards.
-    ///
-    /// Both this test and `argv0_wrapper_stdout_file_passes_raw_bytes` are
-    /// required for full D2b coverage (avoids PF-004 false-negative):
-    ///   - file  → raw bytes (no skim header) — the guard fires
-    ///   - pipe  → compressed (skim `grep N` header present) — the guard must NOT fire
+    /// Fix 3: grep now always passes through native output, so `grep N` headers
+    /// no longer appear.  The test verifies that all 40 match lines reach the pipe
+    /// (line count == match count — no header/footer inflation).
     #[test]
     fn argv0_wrapper_stdout_pipe_still_compresses() {
-        // 2 files × 20 matches: compressed grouped form is strictly smaller
-        // than raw so the ADR-001 net-savings guard passes and the `grep N`
-        // header is emitted.  A tiny ls input trips the net-savings fallback
-        // (raw passthrough); this grep input does not (applies ADR-001).
         let mut raw_output = String::new();
         for i in 1..=20 {
             raw_output.push_str(&format!("src/a.rs:{i}:fn item{i}() {{}}\n"));
@@ -431,27 +421,29 @@ mod argv0_dispatch {
         assert_eq!(output.status.code(), Some(0), "must exit 0");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Compressed output must contain the `grep N` skim header.
-        // Raw passthrough would emit `src/a.rs:1:fn item1() {}` lines with NO
-        // `grep ` header — this assertion fails if the file guard erroneously
-        // fired on a pipe (applies ADR-001, avoids PF-004).
+        // Fix 3: native passthrough — all 40 match lines must be present.
+        // Line count == match count (no header/footer inflating the count).
+        let line_count = stdout.trim().lines().count();
+        assert_eq!(
+            line_count, 40,
+            "pipe stdout must contain all 40 match lines (native passthrough, guard did not fire); \
+             got {line_count} lines: {stdout:?}"
+        );
         assert!(
-            stdout.contains("grep "),
-            "pipe stdout must contain 'grep N' skim header (compressed, guard did not fire); \
-             got: {stdout:?}"
+            stdout.contains("src/a.rs:"),
+            "a.rs lines must appear in native output: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("src/b.rs:"),
+            "b.rs lines must appear in native output: {stdout:?}"
         );
     }
 
-    /// D1 wrapper-layer (#370): grep through the wrapper surface emits a single
-    /// `grep N` header and a `M file(s)` footer — no `GREP:` or `matches in`.
+    /// Fix 3 (wrapper surface): grep through the wrapper surface emits native
+    /// `path:line:content` output — no grouped `grep N` header or `M files` footer.
+    /// Both files' matches and no header/footer lines guarantee line count parity.
     #[test]
     fn argv0_grep_wrapper_single_header_and_footer() {
-        // Stub grep emitting two files with MANY matches each. The input must be
-        // large enough that the grouped/compressed form (each filename printed
-        // once) is strictly smaller than raw — otherwise the ADR-001 net-savings
-        // guard correctly falls back to raw passthrough and emits no skim
-        // header/footer. A 2-line input trips that guard; 2 files × 20 matches
-        // compresses, so the D1 header/footer is exercised on the wrapper surface.
         let mut raw_output = String::new();
         for i in 1..=20 {
             raw_output.push_str(&format!("src/a.rs:{i}:fn item{i}() {{}}\n"));
@@ -477,21 +469,24 @@ mod argv0_dispatch {
         assert_eq!(output.status.code(), Some(0), "wrapper grep must exit 0");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("grep "),
-            "compressed output must contain 'grep N' header; got: {stdout:?}"
-        );
+        // Fix 3: native passthrough — no grouped header or footer.
         assert!(
             !stdout.contains("GREP:"),
-            "must not contain 'GREP:' double-header; got: {stdout:?}"
+            "must not contain 'GREP:' prefix: {stdout:?}"
         );
         assert!(
             !stdout.contains("matches in"),
-            "must not contain 'matches in' double-header; got: {stdout:?}"
+            "must not contain 'matches in' header: {stdout:?}"
         );
         assert!(
-            stdout.contains("2 files"),
-            "footer must say '2 files'; got: {stdout:?}"
+            !stdout.contains("2 files"),
+            "Fix 3: no grouped footer — got: {stdout:?}"
+        );
+        // All 40 match lines must be present (line count == match count).
+        let line_count = stdout.trim().lines().count();
+        assert_eq!(
+            line_count, 40,
+            "must have 40 match lines (no header/footer); got {line_count}: {stdout:?}"
         );
     }
 

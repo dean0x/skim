@@ -108,8 +108,11 @@ fn test_file_long_help_still_triggers_help() {
 /// line numbers.  This test exercises the HANDLER surface (direct `skim grep -hn`
 /// dispatch), not the rewrite engine (PF-004 two-surfaces distinction).  The
 /// fileops dispatcher must NOT intercept `-h` as help; `-h` must reach the grep
-/// handler unchanged.  The output should contain the matched content and the
-/// `(no filename)` fallback label.
+/// handler unchanged.
+///
+/// Fix 3: grep now passes through native output byte-faithfully.  With `-h`, grep
+/// emits `lineno:content` (no file prefix), so each match appears on its own line
+/// with only the line number — no `(no filename)` label from the old grouped renderer.
 #[test]
 fn test_grep_h_multifile_produces_no_filename_label() {
     let dir = TempDir::new().unwrap();
@@ -140,10 +143,19 @@ fn test_grep_h_multifile_produces_no_filename_label() {
         stdout.contains("hello"),
         "grep -hn output must contain matched content; got: {stdout}"
     );
-    // When grep -h suppresses filenames, lines without the `file:lineno:` prefix
-    // fall into the `(no filename)` bucket in the structured parser.
+    // Fix 3: native passthrough — no (no filename) label from old grouped renderer.
+    // With -h, grep omits file prefixes; native output is `lineno:content`.
     assert!(
-        stdout.contains("(no filename)"),
-        "grep -hn output should contain '(no filename)' label; got: {stdout}"
+        !stdout.contains("(no filename)"),
+        "Fix 3: native passthrough must not inject (no filename) label; got: {stdout}"
+    );
+    // Both matches must appear (line count == match count — no header/footer).
+    assert!(
+        stdout.contains("hello world"),
+        "first match must appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("hello again"),
+        "second match must appear: {stdout}"
     );
 }
