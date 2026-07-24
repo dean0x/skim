@@ -87,7 +87,10 @@ mod tests {
         assert!(content.contains("src/b.rs:2:fn run"), "{content}");
         // Line count == match count (no header/footer lines).
         let line_count = content.trim().lines().count();
-        assert_eq!(line_count, 2, "line count must equal match count: {content}");
+        assert_eq!(
+            line_count, 2,
+            "line count must equal match count: {content}"
+        );
     }
 
     #[test]
