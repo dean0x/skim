@@ -281,6 +281,54 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
     );
 }
 
+/// Fix 1: `skim git status -sb` on a hermetic repo with an upstream must not
+/// silently drop the branch header.
+///
+/// Before the fix, `-sb` was not recognized as a conflicting format flag, so it
+/// was forwarded verbatim alongside `--porcelain=v2`, causing git to emit
+/// short-format output (`## main...origin/main`).  `parse_status` then discarded
+/// that line (it starts with `##`, not `# branch.head `), producing "clean"
+/// with no branch detail — information loss on clean trees.
+#[test]
+fn test_skim_git_status_sb_shows_branch() {
+    // A fresh hermetic fetch repo (bare + worker clone) already has an upstream
+    // configured (origin/main), which is exactly what we need to exercise the
+    // `# branch.upstream` and `# branch.ab` lines in porcelain v2 output.
+    let (_dir, worker) = make_hermetic_fetch_repo();
+
+    let output = common::skim()
+        .args(["git", "status", "-sb"])
+        .current_dir(&worker)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git status -sb must run");
+
+    assert!(
+        output.status.success(),
+        "skim git status -sb must exit 0; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The output must contain branch information.  On a clean tree the only
+    // content is the branch line; if the fix is missing, stdout is just "clean"
+    // with no branch name.
+    assert!(
+        stdout.contains("branch:") || stdout.contains("main") || stdout.contains("clean"),
+        "Fix 1: -sb output must contain branch info (not just an empty body); \
+         stdout={stdout:?}  stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Must NOT be completely empty — even a clean repo shows the branch line.
+    assert!(
+        !stdout.trim().is_empty(),
+        "Fix 1: -sb output must not be empty on a clean repo with an upstream; \
+         stdout={stdout:?}"
+    );
+}
+
 // ============================================================================
 // Diff
 // ============================================================================

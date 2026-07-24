@@ -7,10 +7,26 @@ use crate::output::canonical::GitResult;
 use crate::runner::CommandRunner;
 
 /// Returns `true` for flags that conflict with the `--porcelain=v2` flag the
-/// handler injects.  These are `-s`, `--short`, `--porcelain`, and any
-/// `--porcelain=*` variant.
+/// handler injects.
+///
+/// Conflicting flags are those that change the output format to something other
+/// than porcelain v2:
+/// - `--short` / `--porcelain` / `--porcelain=*` (long forms)
+/// - Short clusters that contain `s` (short format): `-s`, `-sb`, `-bs`, etc.
+///
+/// `-b` alone is NOT conflicting — it enables branch display, same as the
+/// `--branch` flag the handler already injects.
 fn is_conflicting_status_flag(s: &str) -> bool {
-    s == "-s" || s == "--short" || s == "--porcelain" || s.starts_with("--porcelain=")
+    // Long-form format flags
+    if s == "--short" || s == "--porcelain" || s.starts_with("--porcelain=") {
+        return true;
+    }
+    // Short flag clusters: conflicting when they contain `s` (short-format char).
+    // Must be a single-dash flag (not `--`) to qualify as a short cluster.
+    if s.starts_with('-') && !s.starts_with("--") {
+        return s[1..].chars().any(|c| c == 's');
+    }
+    false
 }
 
 /// Run `git status` with compression.
@@ -103,6 +119,10 @@ pub(super) fn run_status(
 #[derive(Default)]
 struct StatusCategories {
     branch: String,
+    /// Upstream tracking branch from `# branch.upstream <name>`.
+    upstream: String,
+    /// Ahead/behind counts from `# branch.ab +<ahead> -<behind>`.
+    ahead_behind: String,
     staged: Vec<String>,
     modified: Vec<String>,
     untracked: Vec<String>,
@@ -115,6 +135,16 @@ impl StatusCategories {
     fn classify_line(&mut self, line: &str) {
         if let Some(head) = line.strip_prefix("# branch.head ") {
             self.branch = head.to_string();
+            return;
+        }
+
+        if let Some(upstream) = line.strip_prefix("# branch.upstream ") {
+            self.upstream = upstream.to_string();
+            return;
+        }
+
+        if let Some(ab) = line.strip_prefix("# branch.ab ") {
+            self.ahead_behind = ab.to_string();
             return;
         }
 
@@ -167,7 +197,14 @@ impl StatusCategories {
         let mut details: Vec<String> = Vec::new();
 
         if !self.branch.is_empty() {
-            details.push(format!("branch: {}", self.branch));
+            let mut branch_line = format!("branch: {}", self.branch);
+            if !self.upstream.is_empty() {
+                branch_line.push_str(&format!(" → {}", self.upstream));
+                if !self.ahead_behind.is_empty() {
+                    branch_line.push_str(&format!(" ({})", self.ahead_behind));
+                }
+            }
+            details.push(branch_line);
         }
         for f in &self.staged {
             details.push(format!("staged: {f}"));
@@ -359,8 +396,59 @@ mod tests {
         let output = "# branch.oid abc123\n# branch.head main\n";
         let result = parse_status(output);
         assert_eq!(result.summary, "clean");
-        // Details should contain branch info only
+        // Details should contain branch info only (no upstream on this fixture)
         assert!(result.details.iter().any(|d| d.contains("branch: main")));
+    }
+
+    /// Fix 1: `# branch.upstream` and `# branch.ab` lines must appear in the
+    /// branch detail, not be silently discarded.  This catches the root cause of
+    /// the `git status -sb` branch-header info-loss on clean trees.
+    #[test]
+    fn test_parse_status_upstream_and_ahead_behind() {
+        let output = include_str!("../../../tests/fixtures/cmd/git/status_clean_ahead.txt");
+        let result = parse_status(output);
+        assert_eq!(result.summary, "clean", "clean tree with upstream");
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert!(
+            branch_detail.contains("feature/my-branch"),
+            "branch name must appear: {branch_detail}"
+        );
+        assert!(
+            branch_detail.contains("origin/feature/my-branch"),
+            "upstream must appear: {branch_detail}"
+        );
+        assert!(
+            branch_detail.contains("+3 -0"),
+            "ahead/behind must appear: {branch_detail}"
+        );
+    }
+
+    /// Fix 1: `git status -sb` — the `-sb` cluster must be detected as
+    /// conflicting (contains `s` = short format) so it is stripped before
+    /// forwarding to git, preventing the short-format `##` branch line from
+    /// overriding the porcelain v2 output and causing info-loss.
+    #[test]
+    fn test_short_cluster_with_s_is_conflicting() {
+        for flag in &["-s", "-sb", "-bs", "-sbu", "-us"] {
+            assert!(
+                is_conflicting_status_flag(flag),
+                "{flag:?} contains 's' (short format) — must be conflicting"
+            );
+        }
+        // `-b` alone: NOT conflicting — branch flag, same as our --branch injection.
+        assert!(
+            !is_conflicting_status_flag("-b"),
+            "-b alone must NOT be conflicting"
+        );
+        // `-u` alone: NOT conflicting — untracked-files flag.
+        assert!(
+            !is_conflicting_status_flag("-u"),
+            "-u alone must NOT be conflicting"
+        );
     }
 
     #[test]
@@ -388,6 +476,21 @@ mod tests {
             result.summary.contains("renamed"),
             "expected 'renamed' in summary, got: {}",
             result.summary
+        );
+
+        // Fix 1: branch detail must include upstream and ahead/behind from the fixture.
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert!(
+            branch_detail.contains("origin/main"),
+            "upstream must appear in branch detail: {branch_detail}"
+        );
+        assert!(
+            branch_detail.contains("+1 -0"),
+            "ahead/behind must appear in branch detail: {branch_detail}"
         );
     }
 
@@ -540,6 +643,15 @@ mod tests {
             strip_conflicting_flags(&["-s"]).is_empty(),
             "-s must be stripped"
         );
+        // Fix 1: short clusters containing 's' must be stripped too.
+        assert!(
+            strip_conflicting_flags(&["-sb"]).is_empty(),
+            "-sb must be stripped"
+        );
+        assert!(
+            strip_conflicting_flags(&["-bs"]).is_empty(),
+            "-bs must be stripped"
+        );
         assert!(
             strip_conflicting_flags(&["--short"]).is_empty(),
             "--short must be stripped"
@@ -600,6 +712,8 @@ mod tests {
         // All substitution-triggering flags must be detected.
         for flag in &[
             "-s",
+            "-sb", // Fix 1: short cluster with 's'
+            "-bs", // Fix 1: short cluster with 's'
             "--short",
             "--porcelain",
             "--porcelain=v1",
@@ -611,7 +725,7 @@ mod tests {
             );
         }
         // Non-conflicting flags must NOT trigger the override.
-        for flag in &["--branch", "--untracked-files", "-u", "--", "HEAD"] {
+        for flag in &["--branch", "--untracked-files", "-u", "-b", "--", "HEAD"] {
             assert!(
                 !is_conflicting_status_flag(flag),
                 "{flag:?} must NOT trigger C-7 raw-override path"
