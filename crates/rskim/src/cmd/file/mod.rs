@@ -16,10 +16,7 @@ pub(crate) mod wc;
 
 use std::process::ExitCode;
 
-use std::collections::BTreeMap;
-
 use super::extract_show_stats;
-use crate::output::canonical::FileResult;
 
 /// Known file tools that the file handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &[
@@ -115,155 +112,11 @@ fn print_help() {
 }
 
 // ============================================================================
-// Shared grep/rg regex constants and parser
-// ============================================================================
-
-/// Matches `file:line_number:content` format produced by both `grep -n` and `rg`.
-pub(super) static RE_FILE_LINE_CONTENT: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
-
-/// Parse `file:line:content` text output shared by grep and rg.
-///
-/// Groups ALL matches by file path — grouping is re-encoding, never truncation:
-/// every match line in the input appears in the output. (#317)
-///
-/// `tool` — binary name used in the result summary (e.g. `"grep"`, `"rg"`).
-/// `text` — raw stdout from the tool.
-/// `fallback_label` — when `Some`, lines that do not match the regex are
-///   bucketed under this label (e.g. `"<stdin>"` when grep ran with no file
-///   operands, `"(no filename)"` under `-h`). When `None`, an unattributable
-///   line aborts the structured parse (returns `None`) so the caller degrades
-///   to lossless `Passthrough` instead of dropping or mislabeling lines.
-pub(super) fn try_parse_file_line_content(
-    tool: &str,
-    text: &str,
-    fallback_label: Option<&str>,
-) -> Option<FileResult> {
-    if text.lines().nth(MAX_INPUT_LINES).is_some() {
-        return None;
-    }
-
-    let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut binary_notices: Vec<String> = Vec::new();
-    let mut total_matches = 0usize;
-
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line == "--" {
-            // Context-group separator (grep -A/-B/-C) — pure formatting noise.
-            continue;
-        }
-        if line.starts_with("Binary file ") {
-            binary_notices.push(line.to_string());
-            continue;
-        }
-        if let Some(caps) = RE_FILE_LINE_CONTENT.captures(line) {
-            let file = caps[1].to_string();
-            let lineno = &caps[2];
-            let content = caps[3].trim_end();
-            total_matches += 1;
-            file_matches
-                .entry(file)
-                .or_default()
-                .push(format!("  :{lineno}: {content}"));
-        } else {
-            let label = fallback_label?;
-            total_matches += 1;
-            file_matches
-                .entry(label.to_string())
-                .or_default()
-                .push(format!("  {line}"));
-        }
-    }
-
-    if total_matches == 0 {
-        return None;
-    }
-
-    build_file_result(tool, total_matches, file_matches, binary_notices)
-}
-
-// ============================================================================
-// Shared result builder for grep/rg parsers
-// ============================================================================
-
-/// Build a [`FileResult`] from grouped file matches.
-///
-/// Emits every match in every file — no per-file or file-count caps, no
-/// elision footer. `shown_count == total_count` so the canonical header
-/// renders as `tool N` (no truncation ratio; Fix F). (#317)
-///
-/// The file count is folded into the FOOTER instead of a prepended
-/// `TOOL: N matches in M files` double-header (the no-double-header pattern
-/// from ls FIX 5). Pluralization ("1 file" / "3 files") follows the
-/// `diff.rs` footer idiom — ls/tree intentionally do not pluralize their
-/// `N dirs, M files` breakdown. (#370, #317)
-///
-/// `tool` — binary name (e.g. `"grep"`, `"rg"`).
-/// `total_matches` — total match count across all files.
-/// `file_matches` — map from file path to formatted match lines.
-/// `extra_entries` — verbatim lines appended after the groups (e.g.
-///   `Binary file x matches` notices); not counted as matches.
-pub(super) fn build_file_result(
-    tool: &str,
-    total_matches: usize,
-    file_matches: BTreeMap<String, Vec<String>>,
-    extra_entries: Vec<String>,
-) -> Option<FileResult> {
-    let file_count = file_matches.len();
-    if file_count == 0 && extra_entries.is_empty() {
-        return None;
-    }
-
-    // No summary prepend — the `tool N` canonical header renders separately.
-    // Fold the file count into the footer with correct pluralization. (#370)
-    let mut all_entries: Vec<String> = Vec::new();
-    for (file, matches) in &file_matches {
-        all_entries.push(file.clone());
-        all_entries.extend(matches.iter().cloned());
-    }
-    all_entries.extend(extra_entries);
-
-    let footer = (file_count > 0).then(|| {
-        format!(
-            "{file_count} file{}",
-            if file_count == 1 { "" } else { "s" }
-        )
-    });
-
-    Some(FileResult::new(
-        tool.to_string(),
-        total_matches,
-        total_matches,
-        all_entries,
-        footer,
-    ))
-}
-
-// ============================================================================
 // Unit tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
-    /// R7: file:line:content path must preserve leading whitespace.
-    #[test]
-    fn test_r7_file_line_content_preserves_leading_indent() {
-        let input = "src/mod.py:5:    def __init__(self):\nsrc/mod.py:8:        pass\n";
-        let result = super::try_parse_file_line_content("grep", input, None).unwrap();
-        let rendered = format!("{result}");
-        assert!(
-            rendered.contains("    def __init__"),
-            "leading 4-space indent must be preserved in file:line:content output (R7): {rendered}"
-        );
-        assert!(
-            rendered.contains("        pass"),
-            "8-space indent must be preserved (R7): {rendered}"
-        );
-    }
-
     #[test]
     fn test_sanitize_for_display_clean_input() {
         assert_eq!(crate::cmd::sanitize_for_display("find"), "find");
