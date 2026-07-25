@@ -69,6 +69,8 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "pnpm",        // package manager
     "prettier",    // linter
     "printenv",    // file operations
+    #[cfg(feature = "proxy")]
+    "proxy", // meta: skim Layer-3 HTTP reverse proxy (#303)
     "ps",          // file operations
     "psql",        // database
     "pytest",      // test runner
@@ -121,6 +123,8 @@ pub(crate) const META_SUBCOMMANDS: &[&str] = &[
     "init",
     "learn",
     "log",
+    #[cfg(feature = "proxy")]
+    "proxy", // meta: skim Layer-3 HTTP reverse proxy (server, not a tool to intercept)
     "rewrite",
     "search",
     "stats",
@@ -390,5 +394,37 @@ mod tests {
                 "is_read_only('{name}') returned true — write-capable tools must return false"
             );
         }
+    }
+
+    // ========================================================================
+    // proxy feature-gate invariant test (#352)
+    // ========================================================================
+
+    /// `proxy` must be in KNOWN_SUBCOMMANDS and META_SUBCOMMANDS together, or in
+    /// neither. A META-only mis-gate would create a bogus `~/.skim/bin/proxy`
+    /// wrapper symlink at `skim init --wrappers` time (since wrapper_targets()
+    /// = KNOWN − META, a META-only entry would appear in KNOWN and therefore in
+    /// wrapper_targets). The assertion is meaningful in BOTH feature configs:
+    /// - proxy feature ON: both return true → equal.
+    /// - proxy feature OFF: both return false → equal.
+    ///
+    /// A mis-gate (one true, one false) fails immediately in either config.
+    ///
+    /// The second assertion guards against proxy ever becoming a PATH-wrapper
+    /// target, which would cause `skim init --wrappers` to create a confusing
+    /// recursive `~/.skim/bin/proxy` → skim symlink.
+    #[test]
+    fn test_proxy_registry_entries_gated_as_a_pair() {
+        assert_eq!(
+            is_known_subcommand("proxy"),
+            is_meta_subcommand("proxy"),
+            "proxy must be in KNOWN and META together (both under the `proxy` feature, or neither); \
+             a META-only mis-gate leaks proxy into wrapper_targets() and creates a bogus symlink"
+        );
+        assert!(
+            !wrapper_targets().contains(&"proxy"),
+            "proxy must never be a wrapper target — it is a meta/management subcommand, not an \
+             external tool"
+        );
     }
 }

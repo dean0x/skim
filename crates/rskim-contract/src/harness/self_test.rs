@@ -44,10 +44,13 @@
 //! - [`SameSlotShrinkViolatorContract`] — violates the `SameSlotShrink` narrowed rule
 //!   (waiver rule 2) by growing bytes instead of shrinking; fails `verify_shrink_rule`
 //!
-//! ## Extension invariant broken impl (1)
+//! ## Extension invariant broken impls (2)
 //!
 //! - [`MarkerDroppingContract`] — violates the marker-immutability extension
 //!   invariant; fails `ext:marker-immutability`
+//! - [`LossyEngineContract`] — stubs a JSON number to `0` (not raw-byte-equivalent
+//!   to `1e10`); fails `ext:lossless-content` on `ANTHROPIC_JSON_NUMBER_TOKENS`;
+//!   passes all core invariants (PF-007 falsifiability proof)
 
 use crate::contract::{Contract, IdentityContract, Outcome};
 use crate::log::{Decision, DecisionRecord};
@@ -680,6 +683,214 @@ pub fn assert_same_slot_shrink_violator_fails_rule(request_id: &str) {
     }
 }
 
+// ============================================================================
+// Broken impl 9: LossyEngineContract (violates ext:lossless-content)
+// ============================================================================
+
+/// Stubs the first JSON number in a JSON content block to `0`.
+///
+/// Violates the `ext:lossless-content` extension invariant: `value_equivalent_raw`
+/// compares numbers by raw bytes, so `1e10 → 0` is NOT value-equivalent.
+///
+/// # Isolation guarantee (PF-007)
+///
+/// All core invariants PASS for this component:
+/// - **AC4-never-inflate**: stubbing `1e10` (4 bytes) to `0` (1 byte) shrinks the
+///   text; the outer body re-serialized as compact JSON is also smaller than the
+///   original pretty-printed input. ✓
+/// - **AC8-append-only**: the messages array is structurally unchanged. ✓
+/// - **AC13-logged-never-silent**: `Outcome::modified` is returned when a stub is
+///   applied; passthrough for all other corpus inputs. ✓
+/// - **AC3-fail-open**: adversarial inputs are returned as passthrough (JSON parse
+///   fails → `try_stub_json_number` returns `None`). ✓
+///
+/// For all corpus inputs that do NOT contain a JSON text block with a number
+/// (`ANTHROPIC_MINIMAL`, `ANTHROPIC_LOG_DEDUP`, OpenAI fixtures, etc.),
+/// `try_stub_json_number` returns `None` → passthrough → `ext:lossless-content`
+/// trivially passes.
+///
+/// Only `ANTHROPIC_JSON_NUMBER_TOKENS` has a JSON text block with `1e10`. That is
+/// the single corpus fixture where `ext:lossless-content` fails.
+///
+/// # Connection to falsifiability (PF-007)
+///
+/// `assert_lossy_engine_fails_lossless_content_only` runs this component through
+/// `run_conformance_suite_with_extensions` and asserts:
+/// 1. Exactly `ext:lossless-content` fails (non-vacuously).
+/// 2. All core invariants pass.
+#[derive(Debug, Clone, Copy)]
+pub struct LossyEngineContract;
+
+impl Contract for LossyEngineContract {
+    fn component_name(&self) -> &'static str {
+        "broken-lossy-engine"
+    }
+
+    fn transform(&self, input: &[u8], request_id: &str) -> Outcome {
+        if let Some(modified) = try_stub_json_number(input) {
+            // Guard: compact re-serialization must not inflate vs. original input.
+            if modified.len() <= input.len() {
+                return Outcome::modified(modified, input.len(), request_id, self.component_name());
+            }
+        }
+        Outcome::passthrough(input.to_vec(), request_id, self.component_name())
+    }
+}
+
+/// Parse `input` as an Anthropic JSON body, navigate to the first JSON text block
+/// that contains a JSON value with at least one number, stub the first number to `0`,
+/// and re-serialize.
+///
+/// Returns `None` if:
+/// - The body is not valid UTF-8 or JSON.
+/// - No messages or content blocks are present.
+/// - No text block contains a JSON value with a number.
+fn try_stub_json_number(input: &[u8]) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(input).ok()?;
+    let mut body: serde_json::Value = serde_json::from_str(s).ok()?;
+    let messages = body.get_mut("messages")?.as_array_mut()?;
+    let mut found_stub = false;
+
+    'msg_loop: for msg in messages.iter_mut() {
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+        match content {
+            serde_json::Value::Array(blocks) => {
+                for block in blocks.iter_mut() {
+                    if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+                        continue;
+                    }
+                    // Clone the text to release the immutable borrow before mutating.
+                    let text_clone = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_owned());
+                    let Some(text_str) = text_clone else {
+                        continue;
+                    };
+                    let Some(stubbed) = try_stub_in_text(&text_str) else {
+                        continue;
+                    };
+                    if let Some(text_field) = block.get_mut("text") {
+                        *text_field = serde_json::Value::String(stubbed);
+                        found_stub = true;
+                        break 'msg_loop;
+                    }
+                }
+            }
+            serde_json::Value::String(s) => {
+                let text_clone = s.clone();
+                let Some(stubbed) = try_stub_in_text(&text_clone) else {
+                    continue;
+                };
+                *s = stubbed;
+                found_stub = true;
+                break 'msg_loop;
+            }
+            _ => {}
+        }
+    }
+
+    if !found_stub {
+        return None;
+    }
+    serde_json::to_vec(&body).ok()
+}
+
+/// Parse `text` as a JSON value, stub the first number to `0`, re-serialize.
+///
+/// Returns `None` if `text` is not valid JSON or contains no numbers.
+fn try_stub_in_text(text: &str) -> Option<String> {
+    let mut v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if stub_first_number_value(&mut v) {
+        serde_json::to_string(&v).ok()
+    } else {
+        None
+    }
+}
+
+/// Recursively find and stub the first JSON number in a `serde_json::Value` tree.
+///
+/// Returns `true` if a number was found and replaced with `0`.
+fn stub_first_number_value(v: &mut serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Number(_) => {
+            *v = serde_json::Value::Number(serde_json::Number::from(0u64));
+            true
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                if stub_first_number_value(val) {
+                    return true;
+                }
+            }
+            false
+        }
+        serde_json::Value::Array(arr) => {
+            for val in arr.iter_mut() {
+                if stub_first_number_value(val) {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Verify that `LossyEngineContract` fails ONLY `ext:lossless-content` while all
+/// core invariants pass — proving the check is non-vacuous (PF-007) and isolated
+/// to its targeted invariant (AC18).
+///
+/// # Isolation proof
+///
+/// - `ANTHROPIC_JSON_NUMBER_TOKENS` text block contains `1e10`.
+///   `LossyEngineContract` stubs it to `0`; `value_equivalent_raw` returns
+///   `Some(false)` for that raw-byte change → `ext:lossless-content` fails.
+/// - All other corpus inputs produce passthrough (no JSON number in text block)
+///   → `ext:lossless-content` trivially passes on those inputs.
+/// - **AC4-never-inflate**: the stubbed + compact-serialized body is strictly
+///   shorter than the original pretty-printed input. ✓
+/// - **AC8-append-only**: messages array count is unchanged. ✓
+/// - **AC13-logged-never-silent**: `Outcome::modified` is returned. ✓
+/// - **AC3-fail-open**: adversarial inputs fail parse → passthrough. ✓
+pub fn assert_lossy_engine_fails_lossless_content_only(request_id: &str) {
+    use super::run_conformance_suite_with_extensions;
+    use crate::extension::{ExtensionRegistry, lossless_content_check};
+
+    let mut registry = ExtensionRegistry::new();
+    registry.register("lossless-content", lossless_content_check());
+
+    let report =
+        run_conformance_suite_with_extensions(&LossyEngineContract, request_id, Some(&registry));
+
+    // Must fail ext:lossless-content on at least one corpus input.
+    let ext_failures: Vec<_> = report
+        .results
+        .iter()
+        .filter(|r| r.invariant == "ext:lossless-content" && !r.passed)
+        .collect();
+    assert!(
+        !ext_failures.is_empty(),
+        "LossyEngineContract must fail ext:lossless-content on ANTHROPIC_JSON_NUMBER_TOKENS, \
+         but all ext:lossless-content checks passed — the invariant is vacuous or not observing \
+         the 1e10→0 stub violation"
+    );
+
+    // AC18 isolation: all core invariants (non-ext) must pass.
+    let core_failures: Vec<_> = report
+        .results
+        .iter()
+        .filter(|r| !r.invariant.starts_with("ext:") && !r.passed)
+        .collect();
+    assert!(
+        core_failures.is_empty(),
+        "LossyEngineContract must fail ONLY ext:lossless-content; \
+         unexpected core invariant failures: {core_failures:#?}"
+    );
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -728,6 +939,13 @@ mod tests {
     #[test]
     fn same_slot_shrink_violator_fails_rule() {
         assert_same_slot_shrink_violator_fails_rule("self-test-009");
+    }
+
+    /// PF-007 falsifiability: `LossyEngineContract` must fail `ext:lossless-content`
+    /// while passing all core invariants (AC18 isolation).
+    #[test]
+    fn lossy_engine_fails_lossless_content_only() {
+        assert_lossy_engine_fails_lossless_content_only("self-test-010");
     }
 
     // ========================================================================

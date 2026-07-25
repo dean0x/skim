@@ -1,0 +1,4 @@
+# Ensure golden test fixtures always use LF line endings.
+# Integration tests embed fixtures via include_str! / include_bytes!; a CRLF
+# checkout on Windows or misconfigured git would break byte-exact assertions.
+crates/rskim/tests/fixtures/** text eol=lf

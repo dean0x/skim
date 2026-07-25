@@ -1055,12 +1055,18 @@ impl fmt::Display for FileResult {
 // ============================================================================
 
 /// A single log entry with optional level and deduplication count
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct LogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) level: Option<String>,
     pub(crate) message: String,
     pub(crate) count: usize,
+    /// Lossless mode: earliest timestamp seen for this dedup group (ISO-8601 prefix, trimmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_timestamp: Option<String>,
+    /// Lossless mode: latest timestamp seen for this dedup group (ISO-8601 prefix, trimmed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_timestamp: Option<String>,
 }
 
 /// Result of log compression
@@ -1183,24 +1189,24 @@ impl LogResult {
         }
 
         for entry in entries {
+            // Lossless mode: when count > 1 and timestamps were captured, append range.
+            let count_annotation = if entry.count > 1 {
+                match (&entry.min_timestamp, &entry.max_timestamp) {
+                    (Some(min_ts), Some(max_ts)) => {
+                        format!(" (\u{d7}{}, [{min_ts}..{max_ts}])", entry.count)
+                    }
+                    _ => format!(" (\u{d7}{})", entry.count),
+                }
+            } else {
+                String::new()
+            };
+
             match &entry.level {
                 Some(level) => {
-                    if entry.count > 1 {
-                        let _ = write!(
-                            output,
-                            "\n {level}: {} (\u{d7}{})",
-                            entry.message, entry.count
-                        );
-                    } else {
-                        let _ = write!(output, "\n {level}: {}", entry.message);
-                    }
+                    let _ = write!(output, "\n {level}: {}{count_annotation}", entry.message);
                 }
                 None => {
-                    if entry.count > 1 {
-                        let _ = write!(output, "\n {} (\u{d7}{})", entry.message, entry.count);
-                    } else {
-                        let _ = write!(output, "\n {}", entry.message);
-                    }
+                    let _ = write!(output, "\n {}{count_annotation}", entry.message);
                 }
             }
         }
@@ -2203,11 +2209,13 @@ mod tests {
                 level: Some("ERROR".to_string()),
                 message: "connection refused".to_string(),
                 count: 47,
+                ..Default::default()
             },
             LogEntry {
                 level: Some("INFO".to_string()),
                 message: "request completed".to_string(),
                 count: 312,
+                ..Default::default()
             },
         ];
         let result = LogResult::new(4281, 87, 0, 3194, entries, false);
@@ -2225,6 +2233,7 @@ mod tests {
             level: Some("ERROR".to_string()),
             message: "connection refused".to_string(),
             count: 47,
+            ..Default::default()
         }];
         let result = LogResult::new(4281, 87, 847, 3194, entries, false);
         let output = format!("{result}");
@@ -2238,6 +2247,7 @@ mod tests {
             level: Some("DEBUG".to_string()),
             message: "cache miss for key=user:123".to_string(),
             count: 203,
+            ..Default::default()
         }];
         let result = LogResult::new(847, 1, 847, 846, entries, true);
         let output = format!("{result}");
@@ -2252,6 +2262,7 @@ mod tests {
             level: Some("WARN".to_string()),
             message: "retrying".to_string(),
             count: 5,
+            ..Default::default()
         }];
         let original = LogResult::new(100, 10, 0, 90, entries, false);
         let json = serde_json::to_string(&original).unwrap();
@@ -2284,6 +2295,7 @@ mod tests {
             level: None,
             message: "plain message".to_string(),
             count: 1,
+            ..Default::default()
         }];
         let result = LogResult::new(1, 1, 0, 0, entries, false);
         let output = format!("{result}");

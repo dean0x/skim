@@ -113,6 +113,22 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Composable: `skim search "parse config" --risky --blast-radius src/config.rs` finds risky matches near a file's co-change cluster
 - `--json` for structured output, `--limit N` to cap results, `--root` for explicit project root
 
+### LLM Proxy (`skim proxy`)
+- Resident loopback HTTP/1.1 reverse proxy that sits between your agent and the LLM API
+- **Availability**: prebuilt release binaries (GitHub Releases, npm, Homebrew) include `skim proxy`.
+  Source builds opt in: `cargo build -p rskim --features proxy` or
+  `cargo install --path crates/rskim --features proxy`. Default source builds are HTTP/TLS-free.
+  Note: `cargo install rskim` (crates.io) does not currently include the proxy subcommand (tracked in #453).
+- **Lossless-only egress guarantee** — all compression on the proxy path is information-preserving:
+  - JSON minification (structural whitespace removal; value-equivalent, dup-key-safe)
+  - Log deduplication with ×N counts and timestamp min–max ranges (all unique content preserved)
+  - Code blocks always pass through byte-identical (no tree-sitter rewriting on the egress path)
+- **Two policy tiers**: `LosslessOnly` (byte-exact passthrough for subscription/Bearer auth) and
+  `Default` (lossless re-encoding allowed for API key auth)
+- Per-engine runtime certification gate — every engine must prove value-equivalence before the
+  modified bytes leave the proxy; fail-open to byte-identical passthrough on any uncertainty
+- `SKIM_PASSTHROUGH=1` bypasses all compression; `--port` / `--bind` configure the listener
+
 ### Intelligence
 - `skim discover` scans agent session history for optimization opportunities
 - `skim learn` detects CLI error-retry patterns and generates correction rules

@@ -64,6 +64,121 @@ pub fn generate_deep_nesting(depth: usize) -> Vec<u8> {
     buf
 }
 
+/// Anthropic request with a JSON content block containing number tokens
+/// `1e10`, `1.0`, and `100.00` (pretty-printed so the JSON minifier compresses it).
+///
+/// # Purpose: `ext:lossless-content` invariant testing (#427 Pass 3)
+///
+/// After JSON minification, number tokens must be preserved byte-identical (AC11).
+/// `value_equivalent_raw` catches normalization violations (`1e10` → `10000000000`)
+/// while passing lossless minification (`1e10` → `1e10`).
+///
+/// # One-class convention
+///
+/// Each corpus fixture is dominated by one content class so the `ext:lossless-content`
+/// check can apply the correct oracle. This fixture's text content block is a
+/// pretty-printed JSON object → `Class::Json`.
+pub const ANTHROPIC_JSON_NUMBER_TOKENS: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "{\n  \"count\": 1e10,\n  \"ratio\": 1.0,\n  \"total\": 100.00\n}"
+        }
+      ]
+    }
+  ]
+}"#;
+
+/// Anthropic request with a duplicate-heavy log block — tests dedup-only compression
+/// via the `ext:lossless-content` log oracle.
+///
+/// # Design constraints (critical sequencing — log engine is still LOSSY until Pass 5)
+///
+/// The ONLY compression triggered is line deduplication with `×N` count rendering.
+/// To satisfy the oracle under the current engine:
+/// - **No timestamps** — timestamp stripping changes the line text, violating the
+///   verbatim-substring oracle check.
+/// - **No DEBUG/TRACE lines** — they are hidden (`debug_hidden > 0`), which changes
+///   the Σ-count oracle. `LogFlags::default()` has `keep_debug = false`.
+/// - **No case-variant duplicates** — the dedup key uses lowercased message text;
+///   case variants create separate entries, complicating the oracle.
+/// - **No stack traces** — frame elision (last-3 rule) is non-lossless until Pass 5.
+/// - **Below truncation limits** — `MAX_INPUT_LINES = 100_000`; 5 lines is safe.
+///
+/// # Oracle verification (Pass 3 empirical check)
+///
+/// After BlockRouter processes this fixture via the log engine:
+/// - Oracle check 1 (distinct input lines verbatim in output):
+///   "ERROR: connection refused" ⊆ " ERROR: connection refused (×3)" ✓
+///   "INFO: request processed"  ⊆ " INFO: request processed (×2)"   ✓
+/// - Oracle check 2 (Σ of ×N counts == non-blank input lines):
+///   Output header: "5 lines → 2 unique (3 duplicates removed)"; parsed total = 5 == 5 ✓
+///
+/// Pass 5 will add a fixture with timestamps to exercise oracle condition 3
+/// (min/max timestamp range extremes).
+///
+/// # One-class convention
+///
+/// This fixture's text content block is log output → `Class::Log`.
+pub const ANTHROPIC_LOG_DEDUP: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "ERROR: connection refused\nERROR: connection refused\nERROR: connection refused\nINFO: request processed\nINFO: request processed"
+        }
+      ]
+    }
+  ]
+}"#;
+
+/// Anthropic request with a timestamped log block — exercises the oracle's
+/// min/max timestamp-extremes check (Pass 5 / ADR-007 check 3).
+///
+/// # Design constraints
+///
+/// - Three duplicate ERROR lines with different ISO-8601 timestamps so the Lossless
+///   engine emits a `×3, [ts_min..ts_max]` range annotation.
+/// - One INFO line without a timestamp so the fixture also exercises mixed input.
+/// - All timestamps are strictly ordered (lexicographic min = first, max = last).
+///
+/// # Oracle verification (check 3)
+///
+/// After BlockRouter processes this fixture via the Lossless log engine:
+/// - Check 1 (verbatim substring): "ERROR: connection refused" ⊆ rendered output ✓
+/// - Check 2 (count conservation): header total == 4 non-blank lines ✓
+/// - Check 3 (timestamp extremes):
+///   min "2024-01-01T10:00:00Z" appears in `[2024-01-01T10:00:00Z..2024-01-01T10:10:00Z]` ✓
+///   max "2024-01-01T10:10:00Z" appears in the same range annotation ✓
+///
+/// # One-class convention
+///
+/// This fixture's text content block is timestamped log output → `Class::Log`.
+pub const ANTHROPIC_LOG_TIMESTAMPED: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "2024-01-01T10:00:00Z ERROR: connection refused\n2024-01-01T10:05:00Z ERROR: connection refused\n2024-01-01T10:10:00Z ERROR: connection refused\nINFO: retrying"
+        }
+      ]
+    }
+  ]
+}"#;
+
 /// Anthropic schema with thinking blocks (sacrosanct content class).
 pub const ANTHROPIC_WITH_THINKING: &[u8] = br#"{
   "model": "claude-3-5-sonnet-20241022",
@@ -290,6 +405,53 @@ pub fn generate_large_openai(target_bytes: usize) -> Vec<u8> {
     body.into_bytes()
 }
 
+/// Anthropic request with a mixed-content text block (prose + compact json fence).
+///
+/// # Purpose: ext:lossless-content invariant coverage for the Mixed engine
+///
+/// This fixture exercises the `Class::Mixed` path through BlockRouter:
+/// the text block contains prose with an embedded fenced JSON block.
+/// The JSON fence body is already compact (no insignificant whitespace),
+/// so `compress_json` returns `Passthrough` → the whole text block is byte-identical
+/// → the lossless-content oracle passes via the byte-identical fast-path.
+///
+/// # Oracle interaction
+///
+/// The `ext:lossless-content` oracle's `check_text_block_lossless` function classifies
+/// text blocks by their first non-whitespace byte. A mixed block starts with prose
+/// (`H` in "Here is"), not `{` or `[`, so it does NOT match the JSON arm. After the
+/// fence body minifier returns Passthrough (already compact), the whole block is
+/// byte-identical → `check_lossless_content` sees `i_text == o_text` → passes.
+///
+/// # What is NOT exercised here (and where it IS exercised)
+///
+/// The actual json-fence minification path (pretty-printed → compact, with
+/// value_equivalent_raw gate) is exercised by the discriminating unit tests in
+/// `crates/rskim-compress/src/engines/mixed.rs`:
+/// - `json_fence_body_is_minified` — Gate-1 restore; requires Compressed output.
+/// - `json_fence_number_tokens_byte_exact` — number token byte-exact after gate.
+/// - `json_fence_dup_key_is_byte_identical` — gate/passthrough for dup-key objects.
+///
+/// # One-class convention (relaxed)
+///
+/// This fixture's text block is `Class::Mixed` (prose + fence). The lossless-content
+/// oracle exercises the byte-identical arm, not the JSON or log oracle arms.
+pub const ANTHROPIC_MIXED_JSON_FENCE: &[u8] = br#"{
+  "model": "claude-3-5-sonnet-20241022",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Here is some data:\n```json\n{\"key\":\"value\",\"count\":42}\n```\nEnd."
+        }
+      ]
+    }
+  ]
+}"#;
+
 /// All valid corpus inputs (static, both schemas).
 pub const VALID_CORPUS: &[&[u8]] = &[
     ANTHROPIC_MINIMAL,
@@ -299,6 +461,10 @@ pub const VALID_CORPUS: &[&[u8]] = &[
     ANTHROPIC_TOOL_RESULT,
     ANTHROPIC_SACROSANCT,
     ANTHROPIC_WITH_THINKING,
+    ANTHROPIC_JSON_NUMBER_TOKENS,
+    ANTHROPIC_LOG_DEDUP,
+    ANTHROPIC_LOG_TIMESTAMPED,
+    ANTHROPIC_MIXED_JSON_FENCE,
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,
     OPENAI_TOOL_CALLS,
@@ -326,6 +492,10 @@ pub const ALL_CORPUS: &[&[u8]] = &[
     ANTHROPIC_TOOL_RESULT,
     ANTHROPIC_SACROSANCT,
     ANTHROPIC_WITH_THINKING,
+    ANTHROPIC_JSON_NUMBER_TOKENS,
+    ANTHROPIC_LOG_DEDUP,
+    ANTHROPIC_LOG_TIMESTAMPED,
+    ANTHROPIC_MIXED_JSON_FENCE,
     // Valid — OpenAI
     OPENAI_MINIMAL,
     OPENAI_MULTI_TURN,

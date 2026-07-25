@@ -1,0 +1,13 @@
+{"level":"info","msg":"server starting","port":8080,"ts":"2024-01-15T10:00:00Z"}
+{"level":"info","msg":"database connected","host":"localhost","ts":"2024-01-15T10:00:01Z"}
+{"level":"info","msg":"request received","path":"/api/users","ts":"2024-01-15T10:00:05Z"}
+{"level":"debug","msg":"cache miss for key=user:123","ts":"2024-01-15T10:00:05Z"}
+{"level":"debug","msg":"cache miss for key=user:123","ts":"2024-01-15T10:00:06Z"}
+{"level":"debug","msg":"cache miss for key=user:456","ts":"2024-01-15T10:00:06Z"}
+{"level":"info","msg":"request received","path":"/api/users","ts":"2024-01-15T10:00:07Z"}
+{"level":"warn","msg":"slow query detected","duration_ms":1200,"ts":"2024-01-15T10:00:08Z"}
+{"level":"error","msg":"connection refused","host":"redis:6379","ts":"2024-01-15T10:00:09Z"}
+{"level":"info","msg":"request completed","status":200,"ts":"2024-01-15T10:00:09Z"}
+{"level":"error","msg":"connection refused","host":"redis:6379","ts":"2024-01-15T10:00:10Z"}
+{"level":"error","msg":"connection refused","host":"redis:6379","ts":"2024-01-15T10:00:11Z"}
+{"level":"info","msg":"request completed","status":500,"ts":"2024-01-15T10:00:11Z"}
