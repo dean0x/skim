@@ -13,7 +13,9 @@
 //! - 2: Error (e.g., file not found) → Passthrough
 //!
 //! Tiers:
-//! - **Tier 1 (Full)**: Parse unified diff, count insertions/deletions per file
+//! - **Tier 1 (Full)**: Parse unified diff; emit a stat header and full patch content
+//!   per file (up to `MAX_DISPLAY_ENTRIES`). Files past the cap are noted in the footer
+//!   via an exact-count elision marker (`[skim] N files omitted … SKIM_PASSTHROUGH=1`).
 //! - **Tier 3 (Passthrough)**: Exit code 2 (error) or unrecognized output
 
 use std::process::ExitCode;
@@ -22,7 +24,7 @@ use crate::output::canonical::FileResult;
 use crate::output::{ParseResult, strip_ansi};
 use crate::runner::CommandOutput;
 
-use super::MAX_DISPLAY_ENTRIES;
+use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
 use crate::analytics::CommandType;
 use crate::cmd::{ToolRunConfig, run_tool};
 
@@ -99,7 +101,14 @@ struct FileStat {
     deletions: usize,
     /// Hunk headers (`@@ ... @@`) and patch body lines (`+`, `-`, ` `).
     /// Retained so `build_file_result` can emit actual content, not just a stat.
+    /// Empty for files past `MAX_DISPLAY_ENTRIES` (retention stops at the display cap;
+    /// `patch_line_count` carries the accurate total for those files).
     patch_lines: Vec<String>,
+    /// Total count of lines that were or would have been pushed to `patch_lines`
+    /// (hunk headers + body lines).  Always incremented even for files past the
+    /// display cap where `patch_lines` is empty, so `build_file_result` can
+    /// compute an accurate `total_count` without re-scanning (security-03 / Issue 1b).
+    patch_line_count: usize,
 }
 
 /// Mutable accumulator state for the standalone unified diff parser.
@@ -109,8 +118,20 @@ struct DiffParserState {
     current_insertions: usize,
     current_deletions: usize,
     /// Hunk lines accumulated for the current file.
+    /// Empty for files past `MAX_DISPLAY_ENTRIES` — only `current_patch_line_count`
+    /// is incremented once the display cap is reached (security-03 / Issue 1b).
     current_patch_lines: Vec<String>,
+    /// Total patch lines (hunk headers + body) for the current file.
+    /// Always incremented regardless of the display cap so `build_file_result`
+    /// can produce an accurate `total_count`.
+    current_patch_line_count: usize,
     in_hunk: bool,
+    /// Remaining old-side lines expected in the current hunk (`-a,b` → `b`).
+    /// Decremented by `-` (deletion) and ` ` (context) lines.
+    hunk_old_remaining: usize,
+    /// Remaining new-side lines expected in the current hunk (`+c,d` → `d`).
+    /// Decremented by `+` (insertion) and ` ` (context) lines.
+    hunk_new_remaining: usize,
 }
 
 impl DiffParserState {
@@ -121,23 +142,70 @@ impl DiffParserState {
             current_insertions: 0,
             current_deletions: 0,
             current_patch_lines: Vec::new(),
+            current_patch_line_count: 0,
             in_hunk: false,
+            hunk_old_remaining: 0,
+            hunk_new_remaining: 0,
         }
     }
 
     /// Flush the current in-progress file stat and reset all accumulators.
+    ///
+    /// Both `current_patch_lines` and `current_patch_line_count` are taken
+    /// unconditionally (rust-07): taking only inside the `if let Some(path)` arm
+    /// would allow orphan lines/counts to leak into the next file's patch content
+    /// when a flush fires with no current path.
     fn flush_current(&mut self) {
+        let patch_lines = std::mem::take(&mut self.current_patch_lines);
+        let patch_line_count = self.current_patch_line_count;
         if let Some(path) = self.current_path.take() {
             self.file_stats.push(FileStat {
                 path,
                 insertions: self.current_insertions,
                 deletions: self.current_deletions,
-                patch_lines: std::mem::take(&mut self.current_patch_lines),
+                patch_lines,
+                patch_line_count,
             });
         }
         self.current_insertions = 0;
         self.current_deletions = 0;
+        self.current_patch_line_count = 0;
         self.in_hunk = false;
+        self.hunk_old_remaining = 0;
+        self.hunk_new_remaining = 0;
+    }
+}
+
+/// Parse the old-side and new-side line counts from a `@@ -a[,b] +c[,d] @@ …`
+/// hunk header.  Returns `(old_count, new_count)` where each count is the number
+/// of lines from that file side appearing in the hunk body.
+///
+/// Per unified-diff convention the `,count` suffix is omitted when count == 1,
+/// so `@@ -5 +5 @@` is read as `(1, 1)`.  A `,0` suffix (e.g. `-0,0`) is
+/// explicit and means 0 lines — used for pure-insertion or pure-deletion hunks.
+fn parse_hunk_counts(header: &str) -> (usize, usize) {
+    let after_prefix = header.strip_prefix("@@ ").unwrap_or(header);
+    let mut tokens = after_prefix.split_ascii_whitespace();
+    let old_range = tokens.next().unwrap_or("-0,0");
+    let new_range = tokens.next().unwrap_or("+0,0");
+    (
+        parse_hunk_range_count(old_range),
+        parse_hunk_range_count(new_range),
+    )
+}
+
+/// Extract the line count from a hunk range token (`-a`, `-a,b`, `+c`, `+c,d`).
+///
+/// Returns `b` / `d`.  When the comma-and-count suffix is absent, returns 1
+/// (the implicit count for single-line ranges per unified-diff convention).
+fn parse_hunk_range_count(range: &str) -> usize {
+    let digits = range.trim_start_matches(['-', '+']);
+    if let Some(comma_pos) = digits.find(',') {
+        digits[comma_pos + 1..].parse().unwrap_or(0)
+    } else {
+        // No comma: unified-diff convention = count of 1 (unless the number
+        // itself is 0, which means the whole range is empty — very rare).
+        if digits == "0" { 0 } else { 1 }
     }
 }
 
@@ -146,11 +214,74 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
+    // Sibling-standard bound (security-03, complexity-05, architecture-03,
+    // performance-05): on very large diffs (e.g. vendor bumps) the stateful
+    // parser accumulates O(diff bytes) of heap Strings per line.  Return None
+    // here so the caller degrades to lossless Passthrough (#317).  A mid-loop
+    // `break` on a stateful hunk-budget parser leaves inconsistent state, so the
+    // early-return is the safe implementation for this parser (per `mod.rs` doc).
+    if stdout.lines().count() > MAX_INPUT_LINES {
+        return None;
+    }
+
     let mut state = DiffParserState::new();
 
     for line in stdout.lines() {
+        // CRITICAL (security-01, rust-05): while inside a hunk body, ALL lines
+        // are body content — regardless of their prefix.  A deleted SQL/Lua/
+        // Haskell comment `-- …` is emitted by diff as `--- …`; without this
+        // guard it would match the `--- ` file-header check below, trigger a
+        // false flush_current(), fabricate a phantom path, and silently drop
+        // the remainder of the hunk (violating #317 compress-never-truncate).
+        //
+        // The line-count budget from `@@ -a,b +c,d @@` is the authority:
+        // while either old or new remaining count is non-zero, we are in the
+        // hunk body and no line can be a structural header.
+        if state.in_hunk {
+            // Only retain patch content for files within the display cap
+            // (security-03 / Issue 1b): stop accumulating once we have
+            // MAX_DISPLAY_ENTRIES complete files to avoid O(entire diff) heap
+            // retention.  `current_patch_line_count` always increments so that
+            // `build_file_result` can compute an accurate `total_count`.
+            if state.file_stats.len() < MAX_DISPLAY_ENTRIES {
+                state.current_patch_lines.push(line.to_string());
+            }
+            state.current_patch_line_count += 1;
+            match line.chars().next() {
+                Some('+') => {
+                    state.current_insertions += 1;
+                    state.hunk_new_remaining = state.hunk_new_remaining.saturating_sub(1);
+                }
+                Some('-') => {
+                    state.current_deletions += 1;
+                    state.hunk_old_remaining = state.hunk_old_remaining.saturating_sub(1);
+                }
+                Some(' ') => {
+                    // Context line: counts against both sides.
+                    state.hunk_old_remaining = state.hunk_old_remaining.saturating_sub(1);
+                    state.hunk_new_remaining = state.hunk_new_remaining.saturating_sub(1);
+                }
+                // A fully empty line inside an open hunk is a blank context
+                // line: diff emits it as a lone space, but whitespace-stripping
+                // tools reduce it to "" — both count against both sides.
+                None => {
+                    state.hunk_old_remaining = state.hunk_old_remaining.saturating_sub(1);
+                    state.hunk_new_remaining = state.hunk_new_remaining.saturating_sub(1);
+                }
+                // `\ No newline at end of file` and similar annotation lines
+                // are not content lines and must not consume the budget.
+                _ => {}
+            }
+            if state.hunk_old_remaining == 0 && state.hunk_new_remaining == 0 {
+                state.in_hunk = false;
+            }
+            continue;
+        }
+
+        // Outside a hunk — process structural diff lines.
+
         // `diff -ru` recursive header line: "diff -ru dir1/file dir2/file"
-        // This precedes the --- / +++ headers; skip it but use it as a hint
+        // This precedes the --- / +++ headers; skip it but use it as a hint.
         if line.starts_with("diff ") && !line.starts_with("diff --git ") {
             state.flush_current();
             continue;
@@ -174,9 +305,9 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
             continue;
         }
 
-        // `+++ path\tdate` — confirms the new-file side; update path if `---` was /dev/null
+        // `+++ path\tdate` — confirms the new-file side; update path if `---` was /dev/null.
         if let Some(rest) = line.strip_prefix("+++ ") {
-            // If the old path was /dev/null, use the new path
+            // If the old path was /dev/null, use the new path.
             if state.current_path.as_deref() == Some("/dev/null") {
                 // Same as --- case: split('\t') already consumed the tab; PF-006 safe.
                 let path = strip_ansi(rest.split('\t').next().unwrap_or(rest).trim());
@@ -185,24 +316,21 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
             continue;
         }
 
-        // `@@ ... @@` hunk header — entering a hunk; retain for content rendering.
+        // `@@ … @@` hunk header — parse the line-count budget and enter hunk mode.
         if line.starts_with("@@ ") {
-            state.in_hunk = true;
-            state.current_patch_lines.push(line.to_string());
+            let (old_count, new_count) = parse_hunk_counts(line);
+            state.hunk_old_remaining = old_count;
+            state.hunk_new_remaining = new_count;
+            // Only enter body-scan mode when the budget is non-empty; an
+            // all-zero hunk (`@@ -0,0 +0,0 @@`) is valid but has no body lines.
+            state.in_hunk = old_count > 0 || new_count > 0;
+            // Conditional retention: only push the header for files within the
+            // display cap; always count it for accurate total_count (Issue 1b).
+            if state.file_stats.len() < MAX_DISPLAY_ENTRIES {
+                state.current_patch_lines.push(line.to_string());
+            }
+            state.current_patch_line_count += 1;
             continue;
-        }
-
-        if !state.in_hunk {
-            continue;
-        }
-
-        // Count insertions/deletions and retain the line for content rendering.
-        // Context lines (` `) are also retained so hunks are readable.
-        state.current_patch_lines.push(line.to_string());
-        if line.starts_with('+') {
-            state.current_insertions += 1;
-        } else if line.starts_with('-') {
-            state.current_deletions += 1;
         }
     }
 
@@ -229,37 +357,56 @@ fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
     let total_insertions: usize = file_stats.iter().map(|f| f.insertions).sum();
     let total_deletions: usize = file_stats.iter().map(|f| f.deletions).sum();
 
-    let shown = file_count.min(MAX_DISPLAY_ENTRIES);
+    // Total entry count across ALL files (including those past the display cap):
+    // each file contributes 1 stat-header entry plus N patch-body lines.
+    // Use `patch_line_count` (not `patch_lines.len()`) because files past the
+    // display cap have `patch_lines` cleared while `patch_line_count` stays
+    // accurate (security-03 / Issue 1b).  This keeps total_count entry-denominated,
+    // satisfying the FileResult contract: shown_count == entries.len() and
+    // total_count >= shown_count (architecture-05, complexity-09, regression-11).
+    let total_entry_count: usize = file_stats.iter().map(|f| 1 + f.patch_line_count).sum();
+
+    let shown_file_count = file_count.min(MAX_DISPLAY_ENTRIES);
     let mut entries: Vec<String> = Vec::new();
 
-    for file in file_stats.iter().take(MAX_DISPLAY_ENTRIES) {
+    for file in file_stats.into_iter().take(MAX_DISPLAY_ENTRIES) {
         // Per-file stat header (compact — no timestamps or `---`/`+++` lines).
         entries.push(format!(
             "{}: +{}, -{}",
             file.path, file.insertions, file.deletions
         ));
-        // Actual patch content: hunk headers + insertion/deletion/context lines.
-        entries.extend(file.patch_lines.iter().cloned());
+        // Move patch_lines without cloning — `file_stats` is owned and all
+        // `.iter()` aggregations above have already completed (performance-04,
+        // complexity-04, rust-01).
+        entries.extend(file.patch_lines);
     }
 
-    // Elision marker when the directory diff exceeds the display cap (#317).
-    if let Some(marker) = crate::output::elision_marker(shown, file_count, "files") {
-        entries.push(marker);
-    }
+    // shown_count == entries.len() — the FileResult contract.
+    let shown_entry_count = entries.len();
 
-    let footer = format!(
+    let stats_footer = format!(
         "{file_count} file{} changed, {total_insertions} insertion{}(+), {total_deletions} deletion{}(-)",
         if file_count == 1 { "" } else { "s" },
         if total_insertions == 1 { " " } else { "s " },
         if total_deletions == 1 { " " } else { "s " },
     );
 
+    // Elision marker (loss-bearing, unconditional per ADR-011 — must carry exact
+    // counts and SKIM_PASSTHROUGH=1 hint).  Passed as the footer parameter to
+    // match the sibling-handler pattern (du/df/env/find/ps/wc/ls all pass the
+    // marker as `footer`, not as an entry — consistency-09).  The stats summary
+    // is appended after the marker so both remain visible to the reader.
+    let footer = match crate::output::elision_marker(shown_file_count, file_count, "files") {
+        Some(marker) => Some(format!("{marker}\n{stats_footer}")),
+        None => Some(stats_footer),
+    };
+
     Some(FileResult::new(
         "diff".to_string(),
-        file_count,
-        shown,
+        total_entry_count,
+        shown_entry_count,
         entries,
-        Some(footer),
+        footer,
     ))
 }
 
@@ -330,10 +477,23 @@ mod tests {
         let result = try_parse_standalone_unified(&input);
         assert!(result.is_some(), "Expected parse to succeed");
         let result = result.unwrap();
-        assert_eq!(result.total_count, 1, "Single file diff");
+        // total_count and shown_count are now entry-denominated (stat headers +
+        // patch lines), not file-denominated.  Verify the FileResult contract
+        // (architecture-05): shown_count == entries.len().
+        assert_eq!(
+            result.shown_count,
+            result.entries.len(),
+            "shown_count must equal entries.len()"
+        );
+        // The single-file summary is visible in the footer.
+        assert!(
+            result.footer.as_deref().unwrap_or("").contains("1 file"),
+            "Footer should report 1 file changed; footer={:?}",
+            result.footer
+        );
         assert!(
             result.entries[0].contains("src/main.rs"),
-            "Entry should contain file path, got: {}",
+            "First entry should contain file path, got: {}",
             result.entries[0]
         );
     }
@@ -344,7 +504,18 @@ mod tests {
         let result = try_parse_standalone_unified(&input);
         assert!(result.is_some(), "Expected parse to succeed");
         let result = result.unwrap();
-        assert_eq!(result.total_count, 3, "Three files in diff_multi_file.txt");
+        // File count is now carried in the footer, not in total_count (which is
+        // entry-denominated).  Verify the FileResult contract and the footer.
+        assert_eq!(
+            result.shown_count,
+            result.entries.len(),
+            "shown_count must equal entries.len()"
+        );
+        assert!(
+            result.footer.as_deref().unwrap_or("").contains("3 files"),
+            "Footer should report 3 files changed; footer={:?}",
+            result.footer
+        );
     }
 
     #[test]
@@ -519,9 +690,18 @@ mod tests {
 
     /// Fix 2: directory diff with more than MAX_DISPLAY_ENTRIES files must emit
     /// an elision marker rather than silently dropping files (#317).
+    ///
+    /// After the architecture-05 / consistency-09 fixes:
+    /// - total_count and shown_count are ENTRY-denominated (1 stat header +
+    ///   N patch lines per file), not file-denominated.
+    /// - The elision marker lives in the `footer` field (matching all sibling
+    ///   handlers: du/df/env/find/ps/wc/ls), NOT in `entries`.
     #[test]
     fn test_dir_diff_capped_with_elision_marker() {
         // Build a synthetic dir diff with MAX_DISPLAY_ENTRIES + 1 files.
+        // Each file produces: @@ -1,1 +1,1 @@  →  1 old line, 1 new line.
+        // Body: "@@ -1,1 +1,1 @@" + "-old N" + "+new N" = 3 patch lines.
+        // Total entries per file = 1 stat header + 3 patch lines = 4.
         let cap = super::super::MAX_DISPLAY_ENTRIES;
         let mut input = String::new();
         for i in 0..=cap {
@@ -535,20 +715,49 @@ mod tests {
             ));
         }
         let result = try_parse_standalone_unified(&input).expect("must parse");
+
+        const ENTRIES_PER_FILE: usize = 4; // 1 stat header + 3 patch lines
         assert_eq!(
             result.total_count,
-            cap + 1,
-            "total_count must be cap+1 files"
+            (cap + 1) * ENTRIES_PER_FILE,
+            "total_count is entry-denominated: (cap+1) files × {ENTRIES_PER_FILE} entries each"
         );
-        assert_eq!(result.shown_count, cap, "shown_count must be capped");
-        // Elision marker must appear in entries
+        assert_eq!(
+            result.shown_count,
+            cap * ENTRIES_PER_FILE,
+            "shown_count is entry-denominated: cap files × {ENTRIES_PER_FILE} entries each"
+        );
+        // FileResult contract (architecture-05): shown_count == entries.len().
+        assert_eq!(
+            result.shown_count,
+            result.entries.len(),
+            "shown_count must equal entries.len()"
+        );
+
+        // Elision marker must appear in the FOOTER (consistency-09), not in entries.
+        // Assert the full first line of the footer — ADR-011 requires loss-bearing
+        // markers to carry exact counts and the SKIM_PASSTHROUGH=1 hint (testing-11).
+        let footer = result.footer.as_deref().unwrap_or("");
+        let marker_line = footer.lines().next().unwrap_or("");
+        let total_files = cap + 1;
+        let omitted = total_files - cap; // = 1
+        let expected_marker = format!(
+            "[skim] {omitted} files omitted ({cap} of {total_files} shown) \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+        assert_eq!(
+            marker_line,
+            expected_marker.as_str(),
+            "elision marker must carry exact counts and SKIM_PASSTHROUGH=1 hint (ADR-011); footer={footer:?}"
+        );
+        // Stats summary must also be in the footer.
         assert!(
-            result
-                .entries
-                .iter()
-                .any(|e| e.contains("[skim]") && e.contains("omitted")),
-            "elision marker must appear when files are capped: {:?}",
-            result.entries.last()
+            footer.contains("changed"),
+            "stats summary must be in footer; footer={footer:?}"
+        );
+        // Entries must NOT contain the elision marker (it has moved to footer).
+        assert!(
+            !result.entries.iter().any(|e| e.contains("[skim]")),
+            "elision marker must not appear in entries after move to footer"
         );
     }
 
@@ -568,5 +777,147 @@ mod tests {
                 "Should report files are identical"
             );
         }
+    }
+
+    // ---- regression tests for security-01 / rust-05: hunk-body-confusion ----
+    //
+    // A deleted line whose content begins with `-- ` (SQL/Lua/Haskell comment)
+    // is emitted by diff as `--- …` (the `-` diff prefix plus the `-- ` content).
+    // Before the hunk-budget fix, `--- …` matched the file-header check BEFORE
+    // the in-hunk guard, triggering flush_current() + a phantom path + silent
+    // content drop — a #317 violation.
+
+    /// Core regression: deleting a SQL comment `-- SELECT 1` produces a diff
+    /// body line `--- SELECT 1` that must be treated as body content, never as
+    /// a `--- path` file header.
+    #[test]
+    fn test_sql_comment_deletion_not_treated_as_file_header() {
+        // Unified diff that removes a SQL/Lua comment line.
+        // The hunk header `@@ -1,3 +1,2 @@` budgets 3 old lines and 2 new lines.
+        // The deleted comment line `-- SELECT 1` → `--- SELECT 1` in diff output
+        // (starts with `--- ` — the false-positive header pattern).
+        let input = concat!(
+            "--- old.sql\t2026-07-25 10:00:00\n",
+            "+++ new.sql\t2026-07-25 10:05:00\n",
+            "@@ -1,3 +1,2 @@\n",
+            " SELECT 1;\n",
+            "--- SELECT 1 -- remove this comment\n", // deleted SQL comment line
+            " SELECT 2;\n",
+        );
+        let result = try_parse_standalone_unified(input);
+        assert!(
+            result.is_some(),
+            "must parse diff containing deleted SQL comment"
+        );
+        let result = result.unwrap();
+
+        // Contract: exactly 1 file — no phantom file fabricated from the comment line.
+        assert!(
+            result.footer.as_deref().unwrap_or("").contains("1 file"),
+            "must parse as exactly 1 file, not more; footer={:?}",
+            result.footer
+        );
+
+        // The deleted SQL comment must appear in entries as a patch body line.
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.contains("-- SELECT 1 -- remove this comment")),
+            "deleted SQL comment must appear as body line; entries={:?}",
+            result.entries
+        );
+
+        // The hunk header must appear.
+        assert!(
+            result.entries.iter().any(|e| e.starts_with("@@ -1,3")),
+            "hunk header must appear in entries; entries={:?}",
+            result.entries
+        );
+
+        // FileResult contract: shown_count == entries.len().
+        assert_eq!(
+            result.shown_count,
+            result.entries.len(),
+            "shown_count must equal entries.len()"
+        );
+    }
+
+    /// Edge case: the `+++ ` header false-positive.  An added C++ increment line
+    /// `++ counter` would appear as `+++ counter` in diff output and could
+    /// previously misfire the `+++ ` header check while in a hunk.
+    #[test]
+    fn test_added_plus_plus_line_not_treated_as_new_file_header() {
+        // Diff that adds a line beginning with `++ ` (e.g. C++ `++counter`).
+        // In diff output this becomes `+++ counter` — the `+++ ` header pattern.
+        let input = concat!(
+            "--- old.cpp\t2026-07-25 10:00:00\n",
+            "+++ new.cpp\t2026-07-25 10:05:00\n",
+            "@@ -1,1 +1,2 @@\n",
+            " int x = 0;\n",
+            "+++ x; // C++ increment\n", // added line starting with `++ ` → `+++ ` in diff
+        );
+        let result = try_parse_standalone_unified(input);
+        assert!(result.is_some(), "must parse diff with added `++ ` line");
+        let result = result.unwrap();
+
+        // Exactly 1 file — no phantom file created from the `+++ x` insertion line.
+        assert!(
+            result.footer.as_deref().unwrap_or("").contains("1 file"),
+            "must parse as exactly 1 file; footer={:?}",
+            result.footer
+        );
+
+        // The added `++ x` line must appear in entries as a body line.
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|e| e.contains("++ x; // C++ increment")),
+            "added `++ ` line must appear as body line; entries={:?}",
+            result.entries
+        );
+
+        assert_eq!(
+            result.shown_count,
+            result.entries.len(),
+            "shown_count must equal entries.len()"
+        );
+    }
+
+    /// rust-07 regression: patch lines must not leak across file boundaries
+    /// when flush_current fires with no current_path (e.g., from a `diff -ru`
+    /// header before the first `---` line).  Before the fix, patch_lines were
+    /// only taken inside the `if let Some(path)` arm, so orphan lines could
+    /// accumulate and be attributed to the next file.
+    #[test]
+    fn test_flush_without_path_does_not_leak_patch_lines() {
+        // This diff starts with a `diff -ru` header (no preceding `---`), which
+        // fires flush_current with current_path == None.  The subsequent file's
+        // patch content must contain only its own lines, not any phantom lines
+        // from the orphaned accumulator.
+        let input = concat!(
+            "diff -ru dir1/a.txt dir2/a.txt\n",
+            "--- dir1/a.txt\t2026-07-25\n",
+            "+++ dir2/a.txt\t2026-07-25\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-old\n",
+            "+new\n",
+        );
+        let result = try_parse_standalone_unified(input).expect("must parse");
+        // Exactly 1 file — the flush with no path must not create a phantom file.
+        assert!(
+            result.footer.as_deref().unwrap_or("").contains("1 file"),
+            "must parse as exactly 1 file; footer={:?}",
+            result.footer
+        );
+        // The sole file's entries are the stat header + 3 patch lines.
+        assert_eq!(
+            result.entries.len(),
+            4, // stat header + @@ header + deletion + insertion
+            "exactly 4 entries expected; entries={:?}",
+            result.entries
+        );
+        assert_eq!(result.shown_count, result.entries.len());
     }
 }
