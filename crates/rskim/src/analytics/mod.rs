@@ -1029,8 +1029,17 @@ fn record_fire_and_forget(
         let Ok(raw_tokens) = tokens::count_tokens(&raw_text) else {
             return;
         };
-        let Ok(comp_tokens) = tokens::count_tokens(&compressed_text) else {
-            return;
+        // Short-circuit: when raw and compressed are byte-identical (e.g. a grep/rg
+        // RawPassthrough where both contain the same original stdout content), reuse
+        // the raw token count rather than running a second BPE pass. An O(n) memcmp
+        // beats a second BPE pass; 0% savings — no point tokenising twice.
+        let comp_tokens = if compressed_text == raw_text {
+            raw_tokens
+        } else {
+            let Ok(ct) = tokens::count_tokens(&compressed_text) else {
+                return;
+            };
+            ct
         };
         let record = TokenSavingsRecord {
             timestamp: now_unix_secs(),

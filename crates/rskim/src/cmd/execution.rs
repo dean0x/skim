@@ -683,19 +683,29 @@ where
     if classify_exit(output.exit_code, expected_exit_codes) == ExitDisposition::UnexpectedFailure {
         match output.exit_code {
             Some(code) => {
+                // Lossless raw fallback (tool exited unexpectedly): the raw bytes
+                // are forwarded intact, so this is an informational banner — debug-gated
+                // per ADR-011 (no-loss notices are suppressed by default).
                 crate::debug_log!("[skim] {program} exited {code}; raw output (not compressed).");
             }
             None => {
-                crate::debug_log!(
-                    "[skim] {program} killed by signal; raw output (not compressed)."
+                // Loss-bearing: the process was killed mid-write, so stdout may be
+                // partial.  Unconditional per ADR-011 — signal kill is data-loss class,
+                // not a lossless banner.  Carries the SKIM_PASSTHROUGH=1 hint so the
+                // agent can observe the discrepancy and request the full stream.
+                eprintln!(
+                    "[skim] {program} killed by signal; output may be partial — SKIM_PASSTHROUGH=1 for raw output"
                 );
             }
         }
         let label = format_analytics_label(family, program, &args.join(" "));
+        // Collapse to one clone: raw tier records raw == compressed.
+        // The identical-input short-circuit in analytics avoids double BPE tokenization.
+        let raw_stdout = output.stdout.clone();
         crate::analytics::try_record_command(
             rec.with_tier("raw"),
-            output.stdout.clone(),
-            output.stdout.clone(),
+            raw_stdout.clone(),
+            raw_stdout,
             label,
             output.duration,
         );
@@ -718,10 +728,21 @@ where
     let output = if skip_ansi_strip {
         output
     } else {
-        CommandOutput {
-            stdout: crate::output::strip_ansi(&output.stdout),
-            stderr: crate::output::strip_ansi(&output.stderr),
-            ..output
+        // strip_ansi_cow returns Cow::Borrowed when no 0x1b byte is present —
+        // the common case for grep/rg/diff/log output — avoiding allocation entirely.
+        // Only rebuild CommandOutput when ANSI was actually stripped (Cow::Owned).
+        let stdout_cow = crate::output::strip_ansi_cow(&output.stdout);
+        let stderr_cow = crate::output::strip_ansi_cow(&output.stderr);
+        if matches!(stdout_cow, Cow::Owned(_)) || matches!(stderr_cow, Cow::Owned(_)) {
+            CommandOutput {
+                stdout: stdout_cow.into_owned(),
+                stderr: stderr_cow.into_owned(),
+                ..output
+            }
+        } else {
+            drop(stdout_cow);
+            drop(stderr_cow);
+            output
         }
     };
 
@@ -744,11 +765,32 @@ where
     // - JSON output: must never be rewritten to non-JSON.
     // - Already-passthrough tier: compressed IS the raw body (no re-encoding);
     //   guard would be a no-op but skipping avoids double tokenization.
+    // - RawPassthrough: payload-less variant handled separately below.
     //
     // "raw" baseline for this sink = post-ANSI-strip stdout (`output.stdout`).
     // This is the correct baseline because ANSI stripping is already applied
     // above; the user's terminal would see the same stripped bytes.
-    let (mut compressed, effective_tier) = if output_format == OutputFormat::Text
+    let (mut compressed, effective_tier) = if matches!(result, ParseResult::RawPassthrough) {
+        // Payload-less passthrough: serve output.stdout byte-faithfully without
+        // going through the parse result, which carries no payload for this
+        // variant. One clone for analytics; original_stdout is moved below.
+        //
+        // Text mode: emit raw then clone for analytics.
+        // JSON mode: build {"tier":"passthrough","raw":"..."} from output.stdout
+        //            directly (to_json_envelope() is unreachable for RawPassthrough).
+        if output_format == OutputFormat::Json {
+            let val = serde_json::json!({"tier": "passthrough", "raw": &output.stdout});
+            let mut json_str = serde_json::to_string(&val)?;
+            if !json_str.ends_with('\n') {
+                json_str.push('\n');
+            }
+            write_to_stdout(&json_str)?;
+            (json_str, tier_name)
+        } else {
+            let tier = emit_raw_passthrough(&output.stdout)?;
+            (output.stdout.clone(), tier)
+        }
+    } else if output_format == OutputFormat::Text
         && tier_name != "passthrough"
         && !skip_net_savings_guard
     {
@@ -768,7 +810,7 @@ where
             }
         }
     } else {
-        // JSON or already-passthrough: write normally, no guard needed.
+        // JSON or Passthrough(String): write normally, no guard needed.
         let s = render_output(&result, output_format)?;
         (s, tier_name)
     };
@@ -1093,6 +1135,33 @@ mod tests {
             ExitDisposition::UnexpectedFailure
         );
         assert_eq!(classify_exit(None, &[]), ExitDisposition::UnexpectedFailure);
+    }
+
+    /// Signal-killed BENIGN_EXIT1_PROGRAMS (grep/rg/diff) must still be
+    /// UnexpectedFailure — NOT benign-exit-1 — so the loss-bearing marker
+    /// fires unconditionally per ADR-011 rather than silently exiting 1.
+    ///
+    /// This distinguishes a SIGKILL'd half-completed `skim grep` (partial output,
+    /// unconditional marker) from a clean no-match run (silent exit 1).
+    #[test]
+    fn test_signal_kill_is_loss_bearing_even_for_benign_programs() {
+        for program in BENIGN_EXIT1_PROGRAMS {
+            // None exit takes the UnexpectedFailure branch in run_parsed_command_with_exit,
+            // which emits an unconditional stderr marker, regardless of whether exit 1
+            // would otherwise be benign for this program.
+            assert_eq!(
+                classify_exit(None, &[1]),
+                ExitDisposition::UnexpectedFailure,
+                "signal kill must be UnexpectedFailure even for benign program '{program}'"
+            );
+            // Confirm that benign-exit-1 (code=Some(1)) is correctly ExpectedFailure,
+            // so the two cases remain distinguishable.
+            assert_eq!(
+                classify_exit(Some(1), &[1]),
+                ExitDisposition::ExpectedFailure,
+                "exit 1 with 1 in expected must be ExpectedFailure for '{program}'"
+            );
+        }
     }
 
     // ========================================================================

@@ -2,6 +2,16 @@
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
 //! `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc`.
+//!
+//! ## Shared passthrough helper
+//!
+//! [`passthrough_parse`] is the single implementation of the byte-faithful native
+//! passthrough contract (ADR-009) for pure-passthrough file handlers (grep, rg).
+//! Both modules delegate to it so a future fidelity fix lands in one place.
+
+use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
+use crate::runner::CommandOutput;
 
 pub(crate) mod df;
 pub(crate) mod diff;
@@ -22,6 +32,22 @@ use super::extract_show_stats;
 const KNOWN_TOOLS: &[&str] = &[
     "df", "diff", "du", "env", "find", "grep", "ls", "printenv", "ps", "rg", "tree", "wc",
 ];
+
+/// Shared pure-passthrough parse helper for grep, rg, and any future
+/// byte-faithful pass-through file handlers.
+///
+/// Returns [`ParseResult::RawPassthrough`] — a payload-less signal that
+/// `execution.rs` should serve `CommandOutput::stdout` byte-faithfully without
+/// cloning it into the parse result.  The byte-faithful contract (ADR-009) lives
+/// in one place; a future fidelity fix (e.g., adjusting how TAB bytes are
+/// handled) touches only this function, not N identical copies.
+///
+/// The `_output` parameter is intentionally ignored: the whole point of
+/// `RawPassthrough` is that the parse result carries no payload — the original
+/// `CommandOutput::stdout` buffer is served directly by the caller.
+pub(super) fn passthrough_parse(_output: &CommandOutput) -> ParseResult<FileResult> {
+    ParseResult::RawPassthrough
+}
 
 /// Maximum path/match entries shown in output (truncation cap).
 pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;

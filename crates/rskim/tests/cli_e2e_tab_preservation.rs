@@ -195,3 +195,87 @@ fn test_diff_tab_header_path_not_glued() {
         "path must not be fused with mtime; got: {stdout}"
     );
 }
+
+// ============================================================================
+// grep — tab-bearing match content must survive ANSI-strip
+// ============================================================================
+
+/// Stub grep emits output with a literal TAB in the match content (Makefile recipe).
+///
+/// With `skip_ansi_strip: true` on grep's CONFIG, the TAB byte (0x09) survives
+/// execution.rs's ANSI-strip step and appears in skim's stdout byte-faithfully.
+/// Without the flag, strip_ansi_escapes::strip_str destroys 0x09 before
+/// parse_impl clones stdout — a #317 fidelity violation (ADR-009 / PF-006).
+#[test]
+fn test_grep_tab_content_preserved() {
+    // Makefile recipe lines begin with a mandatory literal TAB.
+    // Simulates: grep -n 'install:' Makefile → "Makefile:2:\tcp foo"
+    let fixture = "Makefile:2:\tcp install: $(DEPS)\n";
+    let stub_dir = make_stub("grep", fixture, 0);
+    let path = prepend_path(stub_dir.path());
+    let skim = common::skim_bin();
+
+    let out = std::process::Command::new(&skim)
+        .args(["grep", "-n", "install:", "Makefile"])
+        .env("PATH", &path)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .output()
+        .expect("skim grep must be spawnable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exit 0 must propagate; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains('\t'),
+        "TAB (0x09) must survive the ANSI-strip step — grep output is byte-faithful \
+         (ADR-009 / PF-006); skip_ansi_strip must be true; got: {stdout:?}"
+    );
+}
+
+// ============================================================================
+// rg — tab-bearing match content must survive ANSI-strip
+// ============================================================================
+
+/// Stub rg emits output with a literal TAB in the match content (Makefile recipe).
+///
+/// With `skip_ansi_strip: true` on rg's CONFIG, the TAB byte (0x09) survives
+/// execution.rs's ANSI-strip step and appears in skim's stdout byte-faithfully.
+/// Without the flag, strip_ansi_escapes::strip_str destroys 0x09 before
+/// parse_impl clones stdout — a #317 fidelity violation (ADR-009 / PF-006).
+#[test]
+fn test_rg_tab_content_preserved() {
+    // Makefile recipe lines begin with a mandatory literal TAB.
+    // Simulates: rg 'install:' Makefile → "Makefile:2:\tcp foo"
+    let fixture = "Makefile:2:\tcp install: $(DEPS)\n";
+    let stub_dir = make_stub("rg", fixture, 0);
+    let path = prepend_path(stub_dir.path());
+    let skim = common::skim_bin();
+
+    let out = std::process::Command::new(&skim)
+        .args(["rg", "install:", "Makefile"])
+        .env("PATH", &path)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .output()
+        .expect("skim rg must be spawnable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "exit 0 must propagate; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains('\t'),
+        "TAB (0x09) must survive the ANSI-strip step — rg output is byte-faithful \
+         (ADR-009 / PF-006); skip_ansi_strip must be true; got: {stdout:?}"
+    );
+}

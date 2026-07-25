@@ -35,6 +35,9 @@ pub(crate) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
             ParseResult::Degraded(log_result_to_infra(log_result, "kubectl", "logs"), warnings)
         }
         ParseResult::Passthrough(raw) => ParseResult::Passthrough(raw),
+        ParseResult::RawPassthrough => {
+            unreachable!("compress_log never returns RawPassthrough")
+        }
     }
 }
 
@@ -67,6 +70,9 @@ mod tests {
                 assert!(r.to_string().contains("kubectl"));
             }
             ParseResult::Passthrough(_) => panic!("should not passthrough structured logs"),
+            ParseResult::RawPassthrough => {
+                unreachable!("parse_impl never returns RawPassthrough")
+            }
         }
     }
 

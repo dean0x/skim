@@ -100,6 +100,9 @@ pub(crate) fn run(
                 _ => ExitCode::FAILURE,
             }
         }
+        ParseResult::RawPassthrough => {
+            unreachable!("go test local parser never returns RawPassthrough")
+        }
     };
 
     if show_stats {

@@ -1,11 +1,10 @@
 //! ripgrep (rg) pass-through handler (#116, #317).
 //!
 //! rg's native `path:line:content` format is already structurally minimal and
-//! truncation-safe.  The previous `--json` injection produced a grouped
-//! header/footer envelope that inflates the line count and breaks downstream
-//! pipes (`head -N`, `wc -l`, `sed -n`): a `head` cut can produce a dangling
-//! bare path with no matches.  We therefore emit native output byte-faithfully,
-//! mirroring the grep handler (see grep.rs).
+//! truncation-safe.  A grouped 2-line-per-match envelope inflates the line count
+//! and breaks downstream pipes (`head -N`, `wc -l`, `sed -n`): a `head` cut can
+//! produce a dangling bare path with no matches.  We therefore emit native output
+//! byte-faithfully, mirroring the grep handler (see grep.rs).
 //!
 //! - **Match-listing modes**: Passthrough — native `path:line:content` from rg.
 //! - **Count / file-list modes** (`-c/-l/--files/--files-with-matches`): Passthrough
@@ -23,13 +22,15 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "Install ripgrep: https://github.com/BurntSushi/ripgrep",
     family: "file",
-    skip_ansi_strip: false,
+    // skip_ansi_strip: true preserves TAB bytes (0x09) — native rg output is
+    // byte-faithful (ADR-009); strip_ansi_escapes destroys \t per PF-006.
+    skip_ansi_strip: true,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
     forward_stderr: true,
-    // parse_impl always returns Passthrough, so the net-savings guard never
-    // runs.  The flag is false (its semantically correct default) to avoid
-    // implying a skip is needed when there is nothing to compare.
+    // parse_impl always returns RawPassthrough, so the net-savings guard
+    // never runs.  The flag is false (its semantically correct default) to
+    // avoid implying a skip is needed when there is nothing to compare.
     skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
@@ -52,8 +53,11 @@ pub(crate) fn run(
 /// A grouped header/footer envelope inflates the line count and can produce
 /// dangling bare-path lines after `head` truncation, so we emit native output
 /// byte-faithfully instead.
+///
+/// Delegates to [`super::passthrough_parse`] so the byte-faithful contract
+/// (ADR-009) has a single implementation across all pure-passthrough handlers.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    ParseResult::Passthrough(output.stdout.clone())
+    super::passthrough_parse(output)
 }
 
 // ============================================================================
@@ -71,25 +75,23 @@ mod tests {
 
     #[test]
     fn test_parse_impl_is_passthrough() {
-        // parse_impl must always return Passthrough so that downstream pipes
-        // (head -N / wc -l / sed -n) receive the native path:line:content
-        // format rg already provides.  Line count == match count.
+        // parse_impl must always return RawPassthrough so that execution.rs
+        // serves output.stdout byte-faithfully (native path:line:content format).
+        // The content is NOT in the parse result payload — it comes from
+        // CommandOutput::stdout directly, avoiding an unnecessary clone.
+        // Line-count invariant (count == match count) is verified by e2e tests.
         let input = "src/a.rs:1:fn main() {}\nsrc/b.rs:2:fn run() {}\n";
         let output = make_output(input);
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "parse_impl must be Passthrough (native path:line:content): got {}",
+            "parse_impl must be Passthrough tier (native path:line:content): got {}",
             result.tier_name()
         );
-        let content = result.content();
-        assert!(content.contains("src/a.rs:1:fn main"), "{content}");
-        assert!(content.contains("src/b.rs:2:fn run"), "{content}");
-        // Line count == match count (no header/footer lines).
-        let line_count = content.trim().lines().count();
-        assert_eq!(
-            line_count, 2,
-            "line count must equal match count: {content}"
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough (zero-clone stdout pass-through): got {}",
+            result.tier_name()
         );
     }
 
@@ -104,8 +106,9 @@ mod tests {
         );
     }
 
-    /// Native output preserves content verbatim — match lines and no extra
-    /// header/footer lines (line count parity).
+    /// parse_impl returns RawPassthrough regardless of input volume — confirming that
+    /// the line-count invariant (count == match count) is enforced by execution.rs
+    /// emitting output.stdout directly, not by any parse-result transformation.
     #[test]
     fn test_native_output_line_count_parity() {
         let input: String = (1..=10)
@@ -113,12 +116,37 @@ mod tests {
             .collect();
         let output = make_output(&input);
         let result = parse_impl(&output);
-        assert!(result.is_passthrough());
-        let content = result.content();
-        let line_count = content.trim().lines().count();
-        assert_eq!(
-            line_count, 10,
-            "line count must equal match count — no header/footer: {content}"
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough for lossless stdout pass-through"
+        );
+    }
+
+    /// Count mode (`-c`) output: parse_impl returns RawPassthrough so execution.rs
+    /// serves the raw `path:count` lines verbatim without mislabelling them.
+    #[test]
+    fn test_count_mode_c_is_passthrough() {
+        let input = "src/main.rs:3\nsrc/lib.rs:1\n";
+        let output = make_output(input);
+        let result = parse_impl(&output);
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "rg -c output must use RawPassthrough; got {}",
+            result.tier_name()
+        );
+    }
+
+    /// File-list mode (`--files`) output: parse_impl returns RawPassthrough so
+    /// execution.rs serves the raw path-per-line output verbatim.
+    #[test]
+    fn test_files_mode_is_passthrough() {
+        let input = "src/main.rs\nsrc/lib.rs\n";
+        let output = make_output(input);
+        let result = parse_impl(&output);
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "rg --files output must use RawPassthrough; got {}",
+            result.tier_name()
         );
     }
 }
