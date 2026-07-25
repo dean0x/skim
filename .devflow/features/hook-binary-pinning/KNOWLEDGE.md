@@ -151,7 +151,7 @@ Marker format:
 
 `guidance_content(version)` in `init/helpers.rs` is the single source of truth. `guidance_content_mdc(version)` wraps the same body in Cursor `.mdc` YAML frontmatter.
 
-**"Command wrapping" section — current wording (v2.12.0+)**: the section now explicitly names `cat`/`head`/`tail` file-read rewrites with a concrete example (`cat file.ts` becomes `skim file.ts --mode=pseudo`). It describes that skim emits a one-line stderr notice whenever the served view differs from raw file bytes. The earlier false claim "Compression condenses how results are presented — it does not change what the command did." was removed. The "flag it to the user" sentence remained byte-identical (ADR-005).
+**"Command wrapping" section — current wording (unreleased — post-#446)**: the section now explicitly names `cat`/`head`/`tail` file-read rewrites with a concrete example (`cat file.ts` becomes `skim file.ts --mode=pseudo`). It describes that skim emits a one-line stderr notice whenever the served view differs from raw file bytes. The earlier false claim "Compression condenses how results are presented — it does not change what the command did." was removed. The "flag it to the user" sentence remained byte-identical (ADR-005).
 
 **Pinned test asserts in `test_guidance_content_has_version_markers`:**
 - Positive: `content.contains("`cat`, `head`, `tail`")` — cat/head/tail rewrites must be named
