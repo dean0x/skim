@@ -1,8 +1,8 @@
 //! AST-aware diff pipeline (#103).
 //!
 //! Parses unified diff output, overlays changed line ranges on tree-sitter
-//! ASTs, and renders changed nodes with full function boundaries and standard
-//! `+`/`-` markers.
+//! ASTs, and renders changed nodes in a hunk-scoped view (breadcrumb +
+//! hunk lines) with standard `+`/`-` markers.
 
 mod ast;
 mod parse;
@@ -121,7 +121,7 @@ fn print_diff_help() {
     println!();
     println!("SKIM OPTIONS:");
     println!("    --mode <MODE>    Diff rendering mode (no short flag; -m conflicts with git):");
-    println!("                       (default)    Changed functions with boundaries");
+    println!("                       (default)    Hunk-scoped view (breadcrumb + changed lines)");
     println!("                       structure    + unchanged functions as signatures");
     println!("                       full         Entire files with change markers");
     println!("    --json           Machine-readable JSON output");
@@ -248,7 +248,7 @@ fn render_and_format<'a>(
 /// - `--json` for machine-readable output
 ///
 /// Default: parses unified diff, overlays changed lines on tree-sitter AST,
-/// renders changed nodes with full function boundaries and `+`/`-` markers.
+/// renders changed nodes in hunk-scoped view (breadcrumb + changed lines) with `+`/`-` markers.
 pub(super) fn run_diff(
     global_flags: &[String],
     args: &[String],

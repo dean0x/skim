@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--language` flag, no `--filename` hint, and no recognisable shebang previously
   errored (non-zero). It now degrades to lossless passthrough (exit 0,
   applies ADR-002). See **Fixed** below for full details.
+- **`skim grep`/`rg` output format changed to native passthrough — grouped renderer removed (ADR-009)** —
+  `skim grep` and `skim rg` now emit output byte-identical to raw `grep`/`rg`
+  (one `path:line:content` line per match), replacing the previous grouped
+  file-header-per-match envelope. **Consumers that parsed the grouped format (bare file
+  path lines followed by indented `:line: content` entries) must switch to the native
+  `path:line:content` shape.** Tabs and leading whitespace are preserved. Line-count
+  consumers (`| head -N`, `| wc -l`, `| sed -n`, `awk NR<=`) now see line-count ==
+  match-count as expected.
+- **`skim git log` silent 20-commit cap removed (ADR-010)** — `skim git log` no longer
+  injects a silent `-n 20` limit on invocations without an explicit count flag.
+  **Scripts or agents that relied on log output being bounded to 20 commits will now
+  see the full log.** Explicit caps (`-n N`, `--max-count=N`, rev-ranges such as
+  `HEAD~N..HEAD`) still work as supplied. Note: `git log -p` on large repos may
+  approach the 64 MiB output ceiling.
 
 ### Added
 - **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
@@ -57,6 +71,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim git status` branch header now mirrors native `git status -sb` format** — The
+  branch line now renders as `## branch...upstream [ahead N, behind M]` (matching native
+  `git status -sb` output exactly), with counts derived from the `# branch.ab`
+  porcelain-v2 field. A missing `# branch.ab` line (upstream ref deleted) renders
+  `[gone]`. Previously the bracket format differed from native git output.
+- **`skim diff` now includes unified patch content alongside file statistics** — In
+  addition to the per-file `+N,-M` stat header, the diff renderer now emits the actual
+  changed lines (unified patch body). Files beyond the display cap produce an elision
+  marker with exact counts and a `SKIM_PASSTHROUGH=1` hint for lossless access
+  (applies ADR-011).
+- **No-loss raw-fallback stderr banners now gated behind `SKIM_DEBUG`/`--debug` (ADR-011)** —
+  Notices that fire when skim chose to emit raw bytes (guardrail chose raw, unexpected
+  tool exit, tool killed by signal) are now silent by default and appear only when
+  `SKIM_DEBUG=1` (or `--debug`) is set. **Loss-bearing elision markers** (truncation
+  notices with exact counts and a `SKIM_PASSTHROUGH=1` hint) and the ADR-008 lossy-view
+  transparency marker **remain unconditional.** Set `SKIM_DEBUG=1` to restore diagnostic
+  banner output.
 - **Fileops dispatcher no longer intercepts tool-level `-h` as help** — `file/mod.rs`
   narrowed its help guard to `--help` only, mirroring the `db/mod.rs` hostname-flag
   precedent. `grep -h` (no-filename), `ls -h`/`du -h`/`df -h` (human-readable sizes)
@@ -129,14 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section headers, rendering each section with its label header. Empty directories now
   produce a labelled section with 0 entries rather than disappearing.
 
-- **grep/rg stripped semantically significant leading whitespace from matched content** —
-  `.trim()` was applied to match content in three extraction sites
-  (`try_parse_single_target` for grep, `try_parse_file_line_content` for the shared
-  file:line:content parser, and `extract_match_fields` in the rg JSON tier). This was
-  destructive for Python (indented function defs), YAML, and any language where leading
-  spaces carry meaning. Fixed by switching to `trim_end()` — trailing whitespace is
-  still removed, leading whitespace is preserved. Both the rewrite-hook and PATH-wrapper
-  surfaces share these handlers and benefit from the fix.
+- **`skim grep`/`rg` matched-content parser removed — native byte-faithful passthrough (ADR-009)** —
+  The grouped parser (`try_parse_single_target`, `try_parse_file_line_content`,
+  `extract_match_fields`) has been removed along with its content-normalization logic.
+  `skim grep`/`rg` now emit output byte-identical to raw `grep`/`rg`, preserving all
+  tabs and leading whitespace intact. See **Breaking Changes** for consumer impact
+  (applies ADR-009).
 
 - **Hook scripts used a bare `skim` exec that silently ran the wrong binary after
   `skim` was updated or reinstalled** — Generated hook scripts now embed `SKIM_HOOK_BINARY`
@@ -265,10 +294,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--max-files`, `--index-dir`); with any query flag or extra positional terms it searches for the
   literal string "index". `skim search -- index` forces a search via the POSIX `--` escape. Bare
   `skim search index` (no extra args) still triggers a build (backward-compatible).
-
-- **`skim grep`/`rg` now group matches by file at any match volume** — Small result sets
-  previously fell back to raw `file:line:content` output instead of the grouped-by-file layout.
-  Grouping is now applied consistently regardless of match count.
 
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
