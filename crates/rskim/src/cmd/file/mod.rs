@@ -6,8 +6,9 @@
 //! ## Shared passthrough helper
 //!
 //! [`passthrough_parse`] is the single implementation of the byte-faithful native
-//! passthrough contract (ADR-009) for pure-passthrough file handlers (grep, rg).
-//! Both modules delegate to it so a future fidelity fix lands in one place.
+//! passthrough contract (ADR-009) for pure-passthrough file handlers (df, du,
+//! find, grep, ps, rg, wc).  All modules delegate to it so a future fidelity
+//! fix lands in one place.
 
 use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
@@ -33,8 +34,8 @@ const KNOWN_TOOLS: &[&str] = &[
     "df", "diff", "du", "env", "find", "grep", "ls", "printenv", "ps", "rg", "tree", "wc",
 ];
 
-/// Shared pure-passthrough parse helper for grep, rg, and any future
-/// byte-faithful pass-through file handlers.
+/// Shared pure-passthrough parse helper for df, du, find, grep, ps, rg, wc,
+/// and any future byte-faithful pass-through file handlers.
 ///
 /// Returns [`ParseResult::RawPassthrough`] — a payload-less signal that
 /// `execution.rs` should serve `CommandOutput::stdout` byte-faithfully without
