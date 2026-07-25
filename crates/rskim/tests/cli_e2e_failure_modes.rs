@@ -114,24 +114,64 @@ fn test_grep_single_file_attributed_and_complete() {
 
     // Native single-file grep output with -n is: `lineno:content` (no file prefix).
     // Every match must appear; no header/footer lines.
-    let mut assert = skim_cmd()
+    let output = skim_cmd()
         .args(["grep", "-n", "needle", file.to_str().unwrap()])
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("<stdin>").not())
-        // Fix 3: native passthrough — no grouped header or footer lines.
-        .stdout(predicate::str::contains("grep 10").not())
-        .stdout(predicate::str::contains("1 file").not());
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "grep must exit 0; stderr: {stderr}"
+    );
+
+    // Fix 3: native passthrough — no grouped header or footer lines.
+    assert!(
+        !stdout.contains("grep 10"),
+        "must not contain old grouped header; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("1 file"),
+        "must not contain old grouped footer; stdout: {stdout}"
+    );
+
+    // Single-file grep -n emits `lineno:content` with no file prefix.
+    // (The previous `<stdin>` guard was vacuous post-Fix-3 — GrepArgs::fallback_label removed.)
+    assert!(
+        !stdout.contains("t.txt"),
+        "single-file grep -n must not emit file prefix; stdout: {stdout}"
+    );
+
+    // testing-07: line count must equal match count — no header/footer inflating the count.
+    let line_count = stdout.lines().count();
+    assert_eq!(
+        line_count, 10,
+        "line count must equal match count (10 needles); got {line_count}\nstdout: {stdout}"
+    );
+
+    // testing-07: native lineno:content format — every output line starts with a line number.
+    for line in stdout.lines() {
+        assert!(
+            line.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "native grep -n: each line must start with a line number; offending line: {line:?}\nfull stdout: {stdout}"
+        );
+    }
+
     // Every match line must be present — no cap.
     for i in 1..=10 {
-        assert = assert.stdout(predicate::str::contains(format!("needle {i}")));
+        assert!(
+            stdout.contains(&format!("needle {i}")),
+            "match needle {i} missing from stdout; stdout: {stdout}"
+        );
     }
 }
 
 /// Fix 3: multi-file grep emits native `file:line:content` passthrough so that
 /// downstream pipes (`head -N`, `wc -l`, `sed -n`) get one line per match.
+/// No grouped header or footer — one output line per match.
 #[test]
-fn test_grep_small_multifile_groups_consistently() {
+fn test_grep_small_multifile_emits_native_path_line_content() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.txt");
     let b = dir.path().join("b.txt");
@@ -166,16 +206,19 @@ fn test_grep_small_multifile_groups_consistently() {
 
 /// Fix 3 (rg): rg emits native path:line:content passthrough so that downstream
 /// pipes (`head -N`, `wc -l`, `sed -n`) get one line per match.
+/// No grouped header or footer — one output line per match.
 ///
 /// Gated on rg availability — skips gracefully when ripgrep is not installed.
 #[test]
-fn test_rg_small_multifile_groups_consistently() {
+fn test_rg_small_multifile_emits_native_path_line_content() {
     if std::process::Command::new("rg")
         .arg("--version")
         .output()
         .is_err()
     {
-        eprintln!("skipping test_rg_small_multifile_groups_consistently: rg not installed");
+        eprintln!(
+            "skipping test_rg_small_multifile_emits_native_path_line_content: rg not installed"
+        );
         return;
     }
 
@@ -196,7 +239,10 @@ fn test_rg_small_multifile_groups_consistently() {
         .stdout(predicate::str::contains("a.txt"))
         .stdout(predicate::str::contains("b.txt"))
         .stdout(predicate::str::contains("alpha MARK one"))
-        .stdout(predicate::str::contains("beta MARK two"));
+        .stdout(predicate::str::contains("beta MARK two"))
+        // regression-09: native path:line:content format assertion — a grouped or
+        // JSON renderer could satisfy the above; this pins the exact format.
+        .stdout(predicate::str::contains("a.txt:1:alpha MARK one"));
 }
 
 // ============================================================================

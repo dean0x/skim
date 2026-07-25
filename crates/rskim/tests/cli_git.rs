@@ -11,6 +11,25 @@ mod common;
 // Helpers
 // ============================================================================
 
+/// Run a git command in `dir`, asserting success with a step-labelled panic message.
+///
+/// Centralises exit-status checking for hermetic repo helpers so that each
+/// setup step fails with an unambiguous message ("hermetic setup: `git add foo`
+/// failed") rather than surfacing as a confusing product assertion later.
+fn git_in(dir: &std::path::Path, args: &[&str]) {
+    let step = args.join(" ");
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|e| panic!("hermetic setup: `git {step}` spawn failed: {e}"));
+    assert!(
+        out.status.success(),
+        "hermetic setup: `git {step}` failed;\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Create a hermetic local git repo with an `origin` remote pointing at a
 /// local bare repo. Returns the temp dir (caller must keep alive) and the
 /// path of the worker clone directory.
@@ -18,57 +37,60 @@ mod common;
 /// This avoids hitting the project's own git remote during `skim git fetch`
 /// tests, preventing flakiness caused by stale remote tracking refs on the
 /// host machine (e.g. `cannot lock ref refs/remotes/origin/...`).
+///
+/// `-b main` is passed to both `git init` calls so the helper is deterministic
+/// regardless of the runner's `init.defaultBranch` setting (avoids PF-009:
+/// bare HEAD would dangle at nonexistent `refs/heads/master` on Linux CI).
 fn make_hermetic_fetch_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let base = dir.path();
-
-    // Bare repo acts as the remote.
     let bare = base.join("bare.git");
-    std::process::Command::new("git")
-        .args(["init", "--bare"])
-        .arg(&bare)
-        .output()
-        .expect("git init --bare");
-
-    // Seed repo: one empty commit, then push to bare so it is non-empty.
     let seed = base.join("seed");
-    std::process::Command::new("git")
-        .args(["init"])
-        .arg(&seed)
-        .output()
-        .expect("git init seed");
-    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
-        std::process::Command::new("git")
-            .args(["config", k, v])
-            .current_dir(&seed)
-            .output()
-            .expect("git config");
-    }
-    std::process::Command::new("git")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&seed)
-        .output()
-        .expect("git commit seed");
-    std::process::Command::new("git")
-        .args(["remote", "add", "origin"])
-        .arg(bare.to_str().unwrap())
-        .current_dir(&seed)
-        .output()
-        .expect("git remote add seed");
-    std::process::Command::new("git")
-        .args(["push", "origin", "HEAD:refs/heads/main"])
-        .current_dir(&seed)
-        .output()
-        .expect("git push seed");
+    let worker = base.join("worker");
+
+    // Bare repo acts as the remote.  Pin the initial branch to `main`.
+    git_in(
+        base,
+        &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+    );
+
+    // Seed: one empty commit → push to bare so it is non-empty.
+    git_in(base, &["init", "-b", "main", seed.to_str().unwrap()]);
+    git_in(&seed, &["config", "user.email", "test@example.com"]);
+    git_in(&seed, &["config", "user.name", "Test"]);
+    git_in(&seed, &["commit", "--allow-empty", "-m", "init"]);
+    git_in(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git_in(&seed, &["push", "origin", "HEAD:refs/heads/main"]);
 
     // Worker: clone from bare — this is the repo tests run `skim git fetch` in.
-    let worker = base.join("worker");
-    std::process::Command::new("git")
-        .args(["clone"])
-        .arg(bare.to_str().unwrap())
-        .arg(&worker)
+    git_in(
+        base,
+        &["clone", bare.to_str().unwrap(), worker.to_str().unwrap()],
+    );
+    // Belt-and-suspenders: explicitly place the worker on `main` tracking
+    // `origin/main`.  No-op when clone already checked out `main` correctly;
+    // recovers on runners where git defaults to `master` (avoids PF-009).
+    git_in(
+        &worker,
+        &["checkout", "-B", "main", "--track", "origin/main"],
+    );
+
+    // Precondition: worker must have exactly 1 commit (the seed) and be in sync.
+    let rev_count = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&worker)
         .output()
-        .expect("git clone worker");
+        .expect("git rev-list --count HEAD");
+    assert!(
+        rev_count.status.success(),
+        "hermetic fetch setup: git rev-list --count HEAD must succeed; stderr={}",
+        String::from_utf8_lossy(&rev_count.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&rev_count.stdout).trim(),
+        "1",
+        "hermetic fetch-repo setup must have exactly 1 commit; setup is broken if this fails"
+    );
 
     (dir, worker)
 }
@@ -295,99 +317,45 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
 fn make_hermetic_ahead_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let base = dir.path();
-
-    // Bare repo acts as the remote.  Pin the initial branch to `main` so that
-    // `git clone` can check out `main` tracking `origin/main` deterministically.
     let bare = base.join("bare.git");
-    std::process::Command::new("git")
-        .args(["init", "--bare", "-b", "main"])
-        .arg(&bare)
-        .output()
-        .expect("git init --bare -b main");
-
-    // Seed: one empty commit, push to bare so it is non-empty.
     let seed = base.join("seed");
-    std::process::Command::new("git")
-        .args(["init", "-b", "main"])
-        .arg(&seed)
-        .output()
-        .expect("git init -b main seed");
-    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
-        std::process::Command::new("git")
-            .args(["config", k, v])
-            .current_dir(&seed)
-            .output()
-            .expect("git config seed");
-    }
-    std::process::Command::new("git")
-        .args(["commit", "--allow-empty", "-m", "init"])
-        .current_dir(&seed)
-        .output()
-        .expect("git commit seed");
-    std::process::Command::new("git")
-        .args(["remote", "add", "origin"])
-        .arg(bare.to_str().unwrap())
-        .current_dir(&seed)
-        .output()
-        .expect("git remote add seed");
-    std::process::Command::new("git")
-        .args(["push", "origin", "HEAD:refs/heads/main"])
-        .current_dir(&seed)
-        .output()
-        .expect("git push seed");
+    let worker = base.join("worker");
+
+    // Bare remote: pin the initial branch to `main` so `git clone` can check
+    // out `main` tracking `origin/main` deterministically.
+    git_in(
+        base,
+        &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+    );
+
+    // Seed: one empty commit → push to bare so it is non-empty.
+    git_in(base, &["init", "-b", "main", seed.to_str().unwrap()]);
+    git_in(&seed, &["config", "user.email", "test@example.com"]);
+    git_in(&seed, &["config", "user.name", "Test"]);
+    git_in(&seed, &["commit", "--allow-empty", "-m", "init"]);
+    git_in(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git_in(&seed, &["push", "origin", "HEAD:refs/heads/main"]);
 
     // Worker: clone from bare so origin/main is configured.
-    let worker = base.join("worker");
-    std::process::Command::new("git")
-        .args(["clone"])
-        .arg(bare.to_str().unwrap())
-        .arg(&worker)
-        .output()
-        .expect("git clone worker");
-    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
-        std::process::Command::new("git")
-            .args(["config", k, v])
-            .current_dir(&worker)
-            .output()
-            .expect("git config worker");
-    }
+    git_in(
+        base,
+        &["clone", bare.to_str().unwrap(), worker.to_str().unwrap()],
+    );
+    git_in(&worker, &["config", "user.email", "test@example.com"]);
+    git_in(&worker, &["config", "user.name", "Test"]);
     // Belt-and-suspenders: explicitly place the worker on `main` tracking
-    // `origin/main` before adding the ahead commit.  This is a no-op when the
-    // clone already checked out `main` correctly, but on runners where git
-    // defaults to `master` it guarantees the upstream is wired up correctly.
-    let checkout = std::process::Command::new("git")
-        .args(["checkout", "-B", "main", "--track", "origin/main"])
-        .current_dir(&worker)
-        .output()
-        .expect("git checkout -B main --track origin/main");
-    assert!(
-        checkout.status.success(),
-        "hermetic setup: worker must be on main tracking origin/main; stderr={}",
-        String::from_utf8_lossy(&checkout.stderr)
+    // `origin/main` before adding the ahead commit.  No-op when the clone
+    // already checked out `main`; recovers on runners where git defaults to
+    // `master` (avoids PF-009).
+    git_in(
+        &worker,
+        &["checkout", "-B", "main", "--track", "origin/main"],
     );
 
     // Add 1 commit to the worker without pushing — worker is now 1 ahead of origin.
     std::fs::write(worker.join("ahead.txt"), "ahead\n").expect("write ahead.txt");
-    let add = std::process::Command::new("git")
-        .args(["add", "ahead.txt"])
-        .current_dir(&worker)
-        .output()
-        .expect("git add ahead.txt");
-    assert!(
-        add.status.success(),
-        "hermetic setup: git add must succeed; stderr={}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    let commit = std::process::Command::new("git")
-        .args(["commit", "-m", "ahead commit"])
-        .current_dir(&worker)
-        .output()
-        .expect("git commit ahead");
-    assert!(
-        commit.status.success(),
-        "hermetic setup: git commit must succeed; stderr={}",
-        String::from_utf8_lossy(&commit.stderr)
-    );
+    git_in(&worker, &["add", "ahead.txt"]);
+    git_in(&worker, &["commit", "-m", "ahead commit"]);
 
     // Fail-loud setup assertion: verify the hermetic repo is genuinely 1-ahead.
     // A failure here means the test-helper itself is broken, not skim — surfaces
@@ -542,23 +510,14 @@ fn test_skim_git_log_oneline_compresses() {
 // Fetch
 // ============================================================================
 
-/// Run `skim git fetch` using a hermetic local bare-repo remote so the test
-/// is not affected by stale remote tracking refs on the host machine.
+/// Case 1: no-op fetch when worker is already up to date with origin.
 ///
-/// The setup creates a bare repo (the "remote") and a worker clone. Fetching
-/// from the local bare repo always succeeds and is already up to date.
-///
-/// `git fetch` when up-to-date writes its progress/result to STDERR only,
-/// leaving combined stdout empty. `parse_fetch("")` produces a GitResult
-/// with summary "up to date", but the net-savings guard fires because the
-/// compressed form ("fetch  up to date\n") is not strictly smaller than
-/// the empty raw combined output → skim emits empty stdout (faithful passthrough).
-///
-/// The test therefore verifies exit 0 and accepts either:
-/// - compressed skim-format stdout containing "fetch " or "up to date", OR
-/// - empty stdout (faithful passthrough of empty raw) with exit 0.
+/// `git fetch` when up-to-date writes progress to STDERR only, leaving stdout empty.
+/// `parse_fetch("")` produces summary "up to date", but the net-savings guard fires
+/// because the compressed form is not smaller than the empty raw → skim emits empty
+/// stdout (faithful passthrough of empty raw).
 #[test]
-fn test_skim_git_fetch_in_repo() {
+fn test_skim_git_fetch_up_to_date_emits_empty_stdout() {
     let (_dir, worker) = make_hermetic_fetch_repo();
     let output = common::skim()
         .args(["git", "fetch"])
@@ -567,17 +526,51 @@ fn test_skim_git_fetch_in_repo() {
         .expect("skim git fetch must run");
     assert!(output.status.success(), "skim git fetch must exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Accept: compressed skim-format in stdout, OR faithful empty passthrough.
-    // The "up to date" message may appear on stderr from the real git process.
-    let ok = stdout.contains("fetch ")
-        || stdout.contains("up to date")
-        || stdout.trim().is_empty()
-        || stderr.contains("up to date")
-        || stderr.contains("fetch");
+    // Net-savings guard fires (compressed > empty raw) → skim emits the raw empty string.
     assert!(
-        ok,
-        "Expected success with fetch content in stdout/stderr or faithful empty passthrough; \
+        stdout.trim().is_empty(),
+        "up-to-date fetch must produce empty stdout (raw-empty passthrough); \
+         got: {stdout:?}"
+    );
+}
+
+/// Case 2: fetch after a new commit is pushed to origin reports the updated ref.
+///
+/// A second clone pushes one commit to the bare remote; the worker then fetches.
+/// git writes the updated-ref line (`main`) to its own stderr; skim must forward
+/// it so the caller sees evidence of fetch activity, and must exit 0.
+#[test]
+fn test_skim_git_fetch_with_new_origin_commit_reports_update() {
+    let (dir, worker) = make_hermetic_fetch_repo();
+    let bare = dir.path().join("bare.git");
+
+    // Push a new commit to origin from a second clone so the worker falls behind.
+    let pusher = dir.path().join("pusher");
+    git_in(
+        dir.path(),
+        &["clone", bare.to_str().unwrap(), pusher.to_str().unwrap()],
+    );
+    git_in(&pusher, &["config", "user.email", "test@example.com"]);
+    git_in(&pusher, &["config", "user.name", "Test"]);
+    std::fs::write(pusher.join("new.txt"), "new\n").expect("write new.txt");
+    git_in(&pusher, &["add", "new.txt"]);
+    git_in(&pusher, &["commit", "-m", "new commit"]);
+    git_in(&pusher, &["push", "origin", "HEAD:refs/heads/main"]);
+
+    // Worker is now 1 behind origin.  Fetch must exit 0 and report the updated ref.
+    let output = common::skim()
+        .args(["git", "fetch"])
+        .current_dir(&worker)
+        .output()
+        .expect("skim git fetch must run");
+    assert!(output.status.success(), "skim git fetch must exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // git fetch reports the updated ref ("main") to its own stderr; skim forwards it.
+    assert!(
+        stdout.contains("main") || stderr.contains("main"),
+        "fetch of a new commit must mention the updated ref 'main'; \
          stdout={stdout:?} stderr={stderr:?}"
     );
 }
@@ -623,36 +616,46 @@ fn test_skim_git_log_contains_hashes() {
 /// Create a hermetic git repo with N commits.
 ///
 /// Returns the temp dir (caller must keep alive) and the repo path.
+///
+/// `-b main` is passed to `git init` so the helper is deterministic regardless
+/// of the runner's `init.defaultBranch` setting (avoids PF-009).  All git steps
+/// are checked for success via `git_in`; a closing `rev-list --count HEAD`
+/// assertion verifies the fixture's own correctness before tests run.
 fn make_hermetic_repo_with_commits(n: usize) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let path = dir.path().to_path_buf();
 
-    std::process::Command::new("git")
-        .args(["init"])
-        .current_dir(&path)
-        .output()
-        .expect("git init");
-    for (k, v) in [("user.email", "test@example.com"), ("user.name", "Test")] {
-        std::process::Command::new("git")
-            .args(["config", k, v])
-            .current_dir(&path)
-            .output()
-            .expect("git config");
-    }
+    git_in(&path, &["init", "-b", "main"]);
+    git_in(&path, &["config", "user.email", "test@example.com"]);
+    git_in(&path, &["config", "user.name", "Test"]);
+
     for i in 0..n {
         let filename = format!("file{i}.txt");
+        let commit_msg = format!("commit {i}");
         std::fs::write(path.join(&filename), format!("content {i}\n")).expect("write file");
-        std::process::Command::new("git")
-            .args(["add", &filename])
-            .current_dir(&path)
-            .output()
-            .expect("git add");
-        std::process::Command::new("git")
-            .args(["commit", "-m", &format!("commit {i}")])
-            .current_dir(&path)
-            .output()
-            .expect("git commit");
+        git_in(&path, &["add", &filename]);
+        git_in(&path, &["commit", "-m", &commit_msg]);
     }
+
+    // Precondition: verify the hermetic repo has exactly n commits.
+    let rev_list = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&path)
+        .output()
+        .expect("git rev-list --count HEAD");
+    assert!(
+        rev_list.status.success(),
+        "hermetic setup: git rev-list --count HEAD must succeed; stderr={}",
+        String::from_utf8_lossy(&rev_list.stderr)
+    );
+    let expected = n.to_string();
+    assert_eq!(
+        String::from_utf8_lossy(&rev_list.stdout).trim(),
+        expected.as_str(),
+        "hermetic repo-with-commits setup must produce exactly {n} commits; \
+         setup is broken if this fails"
+    );
+
     (dir, path)
 }
 
@@ -710,6 +713,42 @@ fn test_git_log_user_n_flag_respected() {
     assert_eq!(
         commit_lines, 5,
         "expected exactly 5 commits with -n 5, got {commit_lines}; output:\n{stdout}"
+    );
+}
+
+/// ADR-010 regression: a rev-range passed to `skim git log` must not be capped.
+///
+/// Before Fix 4, `has_limit_flag` did not recognise rev-ranges such as
+/// `HEAD~N..HEAD`, so the old `-n 20` injector silently truncated a range of 22
+/// commits to 20.  This test pins that the explicit range is passed through intact
+/// and all commits in range are shown.
+#[test]
+fn test_git_log_rev_range_not_capped() {
+    let (_dir, repo) = make_hermetic_repo_with_commits(25);
+
+    let output = common::skim()
+        .current_dir(&repo)
+        .args(["git", "log", "--oneline", "HEAD~22..HEAD"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "skim git log HEAD~22..HEAD must exit 0"
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let commit_lines: usize = stdout
+        .lines()
+        .filter(|l| {
+            l.split_whitespace()
+                .next()
+                .is_some_and(|w| w.len() >= 7 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .count();
+    assert_eq!(
+        commit_lines, 22,
+        "rev-range HEAD~22..HEAD must show exactly 22 commits, not be capped at 20; \
+         got {commit_lines};\noutput:\n{stdout}"
     );
 }
 
@@ -913,6 +952,121 @@ fn test_skim_git_show_head_commit_mode_json() {
     assert!(
         !hash.is_empty(),
         "ShowCommitResult.hash must not be empty; got: {stdout}"
+    );
+
+    // Assertion 5 (paired, revert-detectable): with SKIM_DEBUG=1 the JSON-mode
+    // guardrail bypass (commit 71a8ce6) must still suppress the banner.  A revert
+    // of that commit would re-enable the guardrail call in the JSON path and this
+    // assertion would fail even when Fix 5's debug-gating is in place.
+    let debug_output = common::skim()
+        .args(["git", "show", "HEAD", "--json"])
+        .env("SKIM_DEBUG", "1")
+        .output()
+        .expect("skim git show HEAD --json with SKIM_DEBUG=1 must run");
+    assert!(
+        !String::from_utf8_lossy(&debug_output.stderr).contains("[skim:guardrail]"),
+        "JSON mode must never emit [skim:guardrail] even with SKIM_DEBUG=1 \
+         (guardrail call must stay outside the JSON branch, per commit 71a8ce6); \
+         got stderr: {:?}",
+        String::from_utf8_lossy(&debug_output.stderr)
+    );
+}
+
+// ============================================================================
+// Show — commit mode guardrail pairing (Fix 5 regression guard)
+// ============================================================================
+
+/// Fix 5 regression guard: the guardrail banner for `git show` commit mode
+/// is gated behind `SKIM_DEBUG` and must not appear in normal operation.
+///
+/// Root cause note: `git show HEAD:file` (file-content mode) uses Pseudo mode,
+/// which only removes content (type annotations, decorators, semicolons) and
+/// therefore can never inflate output.  The `apply_to_stderr` guardrail on that
+/// path (show.rs Tier-1) is a safety net that cannot be triggered in practice.
+/// This test targets commit mode (`skim git show HEAD`, no colon-path), which
+/// calls `apply_to_stderr` in `emit_show_commit` (show.rs) and CAN inflate when
+/// the AST-aware hunk renderer adds breadcrumbs and per-line numbers that exceed
+/// the raw diff metadata saved.
+///
+/// Inflation scenario: two-commit hermetic repo where the second commit modifies
+/// an existing TypeScript file by appending 20 functions (f20..f39, two-digit
+/// names).  The skim commit render adds line numbers and AST breadcrumbs to each
+/// diff line; the overhead exceeds the diff-metadata savings, so compressed >
+/// raw (verified empirically: raw ~745 bytes, compressed inflates past that).
+///
+/// Paired assertions (avoids PF-009 by using a hermetic repo):
+///   SKIM_DEBUG=1        → banner PRESENT  (catches a revert of Fix 5 that makes
+///                                          the banner unconditional)
+///   SKIM_DEBUG removed  → banner ABSENT   (the `.not()` assertion is revert-detectable
+///                                          via the PRESENT case above)
+#[test]
+fn test_skim_git_show_commit_guardrail_is_debug_gated() {
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let repo = dir.path().to_path_buf();
+
+    git_in(&repo, &["init", "-b", "main"]);
+    git_in(&repo, &["config", "user.email", "test@example.com"]);
+    git_in(&repo, &["config", "user.name", "Test"]);
+
+    // First commit: establish inflate.ts with f0..f19 (single/double-digit names).
+    let mut ts_src_v1 = String::new();
+    for i in 0..20 {
+        ts_src_v1.push_str(&format!("function f{i}() {{ }}\n"));
+    }
+    std::fs::write(repo.join("inflate.ts"), &ts_src_v1).expect("write inflate.ts v1");
+    git_in(&repo, &["add", "inflate.ts"]);
+    git_in(&repo, &["commit", "-m", "add inflate fixture"]);
+
+    // Second commit: append f20..f39 (all two-digit names).
+    // The commit diff shows the f17..f19 context lines plus the 20 additions.
+    // skim commit render adds per-line numbers (+20, +21, …) and AST breadcrumbs
+    // to each hunk line, inflating past the raw diff size (≥ 256 bytes) so the
+    // guardrail at apply_to_stderr in emit_show_commit fires.
+    let mut ts_src_v2 = ts_src_v1.clone();
+    for i in 20..40 {
+        ts_src_v2.push_str(&format!("function f{i}() {{ }}\n"));
+    }
+    std::fs::write(repo.join("inflate.ts"), &ts_src_v2).expect("write inflate.ts v2");
+    git_in(&repo, &["add", "inflate.ts"]);
+    git_in(&repo, &["commit", "-m", "extend inflate fixture"]);
+
+    // With SKIM_DEBUG=1: guardrail fires AND banner is visible → PRESENT.
+    let debug_out = common::skim()
+        .args(["git", "show", "HEAD"])
+        .current_dir(&repo)
+        .env("SKIM_DEBUG", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .output()
+        .expect("skim git show HEAD with SKIM_DEBUG=1 must run");
+    assert!(
+        debug_out.status.success(),
+        "skim git show HEAD must exit 0 with SKIM_DEBUG=1; stderr={}",
+        String::from_utf8_lossy(&debug_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&debug_out.stderr).contains("[skim:guardrail]"),
+        "Fix 5: SKIM_DEBUG=1 must expose the guardrail banner when output inflates; \
+         got stderr: {:?}",
+        String::from_utf8_lossy(&debug_out.stderr)
+    );
+
+    // Without SKIM_DEBUG: same guardrail fires but Fix 5 gates the banner → ABSENT.
+    let nodebug_out = common::skim()
+        .args(["git", "show", "HEAD"])
+        .current_dir(&repo)
+        .env_remove("SKIM_DEBUG")
+        .env_remove("SKIM_PASSTHROUGH")
+        .output()
+        .expect("skim git show HEAD without SKIM_DEBUG must run");
+    assert!(
+        nodebug_out.status.success(),
+        "skim git show HEAD must exit 0 without SKIM_DEBUG"
+    );
+    assert!(
+        !String::from_utf8_lossy(&nodebug_out.stderr).contains("[skim:guardrail]"),
+        "Fix 5: without SKIM_DEBUG the guardrail banner must be absent (debug-gated); \
+         got stderr: {:?}",
+        String::from_utf8_lossy(&nodebug_out.stderr)
     );
 }
 

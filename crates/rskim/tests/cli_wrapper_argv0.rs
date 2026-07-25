@@ -323,10 +323,19 @@ mod argv0_dispatch {
     }
 
     // ========================================================================
-    // Test: D2b (#370) — wrapper with stdout redirected to a file passes raw bytes
+    // Test: D2b (#370) — stdout-destination fidelity on the wrapper (argv0) surface
     //
-    // These tests cover the WRAPPER surface. The D2-A tests in cli_rewrite.rs
-    // cover the rewrite/hook surface. Both surfaces are needed for full coverage.
+    // These tests cover the WRAPPER surface.  The D2-A tests in cli_rewrite.rs
+    // cover the rewrite/hook surface.  Both surfaces are needed for full coverage.
+    //
+    // D2b paired-coverage contract (PF-004) — two tests, one tool (ls):
+    //   • `argv0_wrapper_stdout_file_passes_raw_bytes` — stdout → regular file:
+    //     fstat gate fires, raw bytes reach the file unmodified (no skim header).
+    //   • `argv0_ls_wrapper_stdout_pipe_compresses` — stdout → pipe:
+    //     fstat gate does NOT fire, skim's ls handler runs (compresses, header
+    //     present).  Uses `ls` (still compresses via long-form parser) rather than
+    //     grep (always-passthrough after Fix 3) so the two branches emit DIFFERENT
+    //     bytes — a discriminating pair that fails if either gate breaks.
     // ========================================================================
 
     /// D2b (#370): when the wrapper's stdout (fd 1) is a regular file, the
@@ -385,32 +394,45 @@ mod argv0_dispatch {
         );
     }
 
-    /// D2b surface-contract: when stdout is a pipe, the wrapper emits native
-    /// `path:line:content` grep output (passthrough).  The regular-file guard
-    /// (`stdout_is_regular_file`) must NOT fire — that guard only suppresses
-    /// output transformation when stdout is redirected to a file.
+    /// D2b control: when stdout is a PIPE, the wrapper runs skim's handler normally —
+    /// the `stdout_is_regular_file()` fstat gate must NOT fire.
     ///
-    /// Fix 3: grep now always passes through native output, so `grep N` headers
-    /// no longer appear.  The test verifies that all 40 match lines reach the pipe
-    /// (line count == match count — no header/footer inflation).
+    /// Uses `ls` (which still compresses via the long-form parser, unlike grep after
+    /// Fix 3) with a large `ls -la` stub (120 files plus `total` and dotdir lines).
+    /// Skim's long-form parser strips `total`/`.`/`..`, caps at MAX_DISPLAY_ENTRIES
+    /// (100), and emits a `ls 100/120` ratio header — output structurally distinct
+    /// from the raw bytes and clearly shorter.
+    ///
+    /// Paired with `argv0_wrapper_stdout_file_passes_raw_bytes` (file-stdout side):
+    /// that test proves fstat fires (raw bytes reach the file); this test proves
+    /// fstat does NOT fire on a pipe (skim processes and compresses).  If fstat
+    /// incorrectly fired on pipes too, stdout would equal raw bytes — no `ls ` header,
+    /// `total` line present, same byte length — and at least one assertion below fails.
     #[test]
-    fn argv0_wrapper_stdout_pipe_still_compresses() {
-        let mut raw_output = String::new();
-        for i in 1..=20 {
-            raw_output.push_str(&format!("src/a.rs:{i}:fn item{i}() {{}}\n"));
+    fn argv0_ls_wrapper_stdout_pipe_compresses() {
+        // Large ls -la stub: 120 real files + total + dotdir lines.
+        // MAX_DISPLAY_ENTRIES (100) < 120 real files → skim truncates, footer shows
+        // omission count, total bytes drops well below raw → net-savings guard allows
+        // skim's compressed output through instead of falling back to raw.
+        let mut raw_output = String::from("total 120\n");
+        raw_output.push_str("drwxr-xr-x  2 user group  4096 Jan 01 .\n");
+        raw_output.push_str("drwxr-xr-x  2 user group  4096 Jan 01 ..\n");
+        for i in 1..=120 {
+            raw_output.push_str(&format!(
+                "-rw-r--r--  1 user group {:>5} Jan 01 file_{i:03}.txt\n",
+                i * 10
+            ));
         }
-        for i in 1..=20 {
-            raw_output.push_str(&format!("src/b.rs:{i}:fn other{i}() {{}}\n"));
-        }
-        let stub_dir = make_stub_dir("grep", &raw_output, 0);
+        let stub_dir = make_stub_dir("ls", &raw_output, 0);
         let path = prepend_path(stub_dir.path());
 
         let skim = skim_bin();
+        assert!(skim.exists(), "skim binary must exist");
 
         // Default invocation — stdout is a pipe (.output()), NOT a regular file.
+        // The fstat gate must not intercept this path.
         let output = std::process::Command::new(&skim)
-            .arg0("grep")
-            .args(["-rn", "fn", "src/"])
+            .arg0("ls")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
             .env_remove("SKIM_PASSTHROUGH")
@@ -421,72 +443,28 @@ mod argv0_dispatch {
         assert_eq!(output.status.code(), Some(0), "must exit 0");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Fix 3: native passthrough — all 40 match lines must be present.
-        // Line count == match count (no header/footer inflating the count).
-        let line_count = stdout.trim().lines().count();
-        assert_eq!(
-            line_count, 40,
-            "pipe stdout must contain all 40 match lines (native passthrough, guard did not fire); \
-             got {line_count} lines: {stdout:?}"
-        );
-        assert!(
-            stdout.contains("src/a.rs:"),
-            "a.rs lines must appear in native output: {stdout:?}"
-        );
-        assert!(
-            stdout.contains("src/b.rs:"),
-            "b.rs lines must appear in native output: {stdout:?}"
-        );
-    }
 
-    /// Fix 3 (wrapper surface): grep through the wrapper surface emits native
-    /// `path:line:content` output — no grouped `grep N` header or `M files` footer.
-    /// Both files' matches and no header/footer lines guarantee line count parity.
-    #[test]
-    fn argv0_grep_wrapper_single_header_and_footer() {
-        let mut raw_output = String::new();
-        for i in 1..=20 {
-            raw_output.push_str(&format!("src/a.rs:{i}:fn item{i}() {{}}\n"));
-        }
-        for i in 1..=20 {
-            raw_output.push_str(&format!("src/b.rs:{i}:fn other{i}() {{}}\n"));
-        }
-        let stub_dir = make_stub_dir("grep", &raw_output, 0);
-        let path = prepend_path(stub_dir.path());
-
-        let skim = skim_bin();
-
-        let output = std::process::Command::new(&skim)
-            .arg0("grep")
-            .args(["-rn", "fn", "src/"])
-            .env("PATH", &path)
-            .env("SKIM_DISABLE_ANALYTICS", "1")
-            .env_remove("SKIM_PASSTHROUGH")
-            .env_remove("SKIM_DEBUG")
-            .output()
-            .expect("skim binary must be spawnable");
-
-        assert_eq!(output.status.code(), Some(0), "wrapper grep must exit 0");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Fix 3: native passthrough — no grouped header or footer.
+        // Skim header must appear: long-form ls parser ran and emitted "ls N/M".
+        // If fstat incorrectly fired, stdout == raw bytes → no skim header, has "total ".
         assert!(
-            !stdout.contains("GREP:"),
-            "must not contain 'GREP:' prefix: {stdout:?}"
+            stdout.starts_with("ls "),
+            "skim 'ls N/M' header must appear on pipe path \
+             (fstat gate must NOT fire on pipes); got: {stdout:?}"
         );
+
+        // `total` and dotdir lines stripped by skim's long-form ls parser.
         assert!(
-            !stdout.contains("matches in"),
-            "must not contain 'matches in' header: {stdout:?}"
+            !stdout.contains("total "),
+            "ls 'total' line must be stripped by skim parser on pipe path; got: {stdout:?}"
         );
+
+        // Compression: skim capped at 100 entries; output shorter than 123-line raw.
         assert!(
-            !stdout.contains("2 files"),
-            "Fix 3: no grouped footer — got: {stdout:?}"
-        );
-        // All 40 match lines must be present (line count == match count).
-        let line_count = stdout.trim().lines().count();
-        assert_eq!(
-            line_count, 40,
-            "must have 40 match lines (no header/footer); got {line_count}: {stdout:?}"
+            stdout.len() < raw_output.len(),
+            "pipe stdout must be shorter than raw ls -la output (skim compressed and capped at 100); \
+             raw={} bytes, skim={} bytes\nskim_stdout={stdout:?}",
+            raw_output.len(),
+            stdout.len()
         );
     }
 

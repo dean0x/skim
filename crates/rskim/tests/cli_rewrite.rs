@@ -333,7 +333,7 @@ fn test_rewrite_redirect_stdout_json_append() {
 //   Wrapper surface: stdout_is_regular_file() in main.rs — passes raw bytes
 //     through; tested in cli_wrapper_argv0.rs
 //     (argv0_wrapper_stdout_file_passes_raw_bytes and
-//     argv0_wrapper_stdout_pipe_still_compresses).
+//     argv0_ls_wrapper_stdout_pipe_compresses).
 // ============================================================================
 
 /// D2 (#370) false-negative fix 1b: `>&2x` routes both streams to file `2x`
