@@ -35,6 +35,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   see the full log.** Explicit caps (`-n N`, `--max-count=N`, rev-ranges such as
   `HEAD~N..HEAD`) still work as supplied. Note: `git log -p` on large repos may
   approach the 64 MiB output ceiling.
+- **`wc`, `df`, `du`, `find`, `ps` output format changed to native passthrough (ADR-009)** —
+  These wrappers now emit output byte-identical to the raw tool, replacing the previous
+  `<tool> N` header/entry envelope and its silent 100-entry display cap. Measured impact of
+  the old path: `find crates -name '*.rs'` lost 355 of 457 paths; `ps aux` dropped 705 of
+  805 processes and produced output 180 bytes larger than native for the records it did show;
+  `wc` reformatted `      300 total` into ` total: 300`, silently breaking
+  `| tail -1 | awk '{print $1}'` pipes. **Consumers parsing the old envelope format must switch
+  to native output.** For `ps` specifically, truncation was the only mechanism reducing output
+  volume — callers wanting fewer rows should pipe through `head`.
+- **`skim ls` output format changed to native passthrough (ADR-009)** — `skim ls` now emits
+  output byte-identical to raw `ls`, including the native `total <blocks>` header. The previous
+  path silently dropped 102 of 202 entries at the display cap and omitted the `total` header.
+  **`tree` is unchanged** and still compresses. Consumers parsing the old skim-formatted `ls`
+  output must switch to native format.
 
 ### Added
 - **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
@@ -440,6 +454,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`skim search index` subcommand** — Build or update the n-gram search index for the current project. Walk/classify/build pipeline with parallel tree-sitter classification (rayon), JSONL manifest sidecar for incremental builds (SHA-256 cache hits skip re-classification), atomic write ordering, minified file detection, and 50K file cap. `--force` flag for full rebuild, `--root` for explicit project root, `--max-files` override. (#182)
 - **`skim dig` / `skim nslookup` subcommands** — DNS query output compression via two independent parsers: `dig` uses section-based parsing (QUESTION/ANSWER sections), `nslookup` uses key-value line parsing. Both support three-tier degradation, `--json` structured output, error state compression, and macOS + Linux format variants. `nslookup` includes no-args guard. 2 new rewrite rules (total: 148) (#168)
 - **`skim make` / `skim gmake` subcommands** — GNU Make build output compression via three-tier parser: Tier 1 (GCC/Clang diagnostics regex + make failure lines), Tier 2 (noise-stripped invocation/directory-change lines), Tier 3 (passthrough). Includes `gmake` rewrite rule for hook integration. 17 unit tests, 2 E2E tests (#167)
+
+### Fixed
+- **`skim env` no longer leaks short credentials** — Credential redaction was previously gated
+  behind the ADR-001 net-savings guard: a redacted view that was not shorter than raw lost to
+  raw passthrough, emitting secrets verbatim. Measured leaks included `GITHUB_TOKEN=ab`,
+  `GITHUB_TOKEN=abcd1234`, and `NPM_TOKEN=xy`. Redaction is a security control and is no longer
+  subject to byte arithmetic; the redacted view is always served.
+- **Lossless degrade at `MAX_INPUT_LINES` cap for system-utility wrappers** — `wc`, `df`,
+  `du`, `find`, `ps`, and `env` previously used `break` / `.take(..)` at `MAX_INPUT_LINES`,
+  silently truncating output with an elision marker that understated the true loss (totals were
+  computed after the break, omitting dropped records). These wrappers now return `None` at the
+  cap for a lossless passthrough degrade, consistent with the documented degrade policy;
+  `env` returns `None` explicitly.
+
+### Changed
+- **ADR-012: escape sequences in wrapped-tool CONTENT are not filtered** — Skim does not strip
+  terminal escape sequences originating in content processed by wrappers (e.g. `skim diff`
+  patch-content lines), matching what the raw tool emits and the #317 byte-faithfulness MUST.
+  A wrapped tool's own colorization is still neutralized at the child-invocation boundary via
+  `--no-color`.
 
 ## [2.11.0] - 2026-07-11
 
