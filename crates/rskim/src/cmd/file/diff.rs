@@ -33,9 +33,26 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "diff is typically pre-installed on Unix systems",
     family: "file",
-    // standalone `diff -u` emits `--- path\t<mtime>` headers and the parser
-    // splits on `\t` (see `try_parse_standalone_unified`); diff emits no ANSI.
-    // `strip_ansi_escapes` drops `\t`, fusing path and mtime before parsing.
+    // skip_ansi_strip MUST be true for two independent reasons (ADR-012):
+    //
+    // 1. PF-006 tab-preservation: standalone `diff -u` emits
+    //    `--- path\t<mtime>` headers; the parser splits on `\t`
+    //    (see `try_parse_standalone_unified`).  `strip_ansi_escapes::strip_str`
+    //    drops `\t`, fusing path and mtime before the delimiter can be parsed.
+    //
+    // 2. ADR-012 content-byte fidelity: hunk body lines (`+`/`-`/` `) carry
+    //    file CONTENT that may contain ESC/CSI bytes.  Stripping them would
+    //    diverge from the raw `diff` output without a loss marker — a #317
+    //    compress-never-truncate violation.  The tool's OWN colorization is
+    //    neutralized at the child-invocation boundary via `--no-color` (on
+    //    `git diff`/`git show`; standalone `diff` never emits ANSI itself).
+    //    Content bytes must reach the reader byte-faithfully on both passthrough
+    //    and skim-synthesized renders.
+    //
+    // Corollary: per-field `strip_ansi` on the already-split PATH field (lines
+    // ~303/313) remains correct — the `\t` delimiter has been consumed by
+    // `split('\t')` before `strip_ansi` sees the token, so PF-006 does not
+    // apply and ANSI in PATH metadata is safely stripped without data loss.
     skip_ansi_strip: true,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[1],
@@ -421,11 +438,15 @@ mod tests {
 
     // --- config-lock tests ---
     //
-    // skip_ansi_strip MUST be true: standalone `diff -u` emits
-    // `--- path\t<mtime>` headers and the parser splits on `\t`
-    // (see `try_parse_standalone_unified` — the `--- `/`+++ ` header handlers).
-    // `strip_ansi_escapes` would drop the `\t`, fusing path and timestamp
-    // into a single token before the parser sees it. diff emits no ANSI.
+    // skip_ansi_strip MUST be true for two independent reasons (ADR-012):
+    // (1) PF-006: `strip_ansi_escapes::strip_str` drops `\t`, gluing path to
+    //     mtime in `--- path\t<mtime>` headers before `split('\t')` can separate
+    //     them (see `try_parse_standalone_unified` — the `---`/`+++` handlers).
+    // (2) ADR-012: hunk body lines are file CONTENT; stripping ESC/CSI bytes
+    //     from them would diverge from the raw tool without a loss marker (#317).
+    //     See `test_adr012_esc_in_diff_body_line_survives` for the content half,
+    //     which pairs with `test_ansi_in_diff_path_is_stripped` to document the
+    //     metadata-vs-content split ADR-012 draws.
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
@@ -433,7 +454,8 @@ mod tests {
         assert!(
             CONFIG.skip_ansi_strip,
             "diff CONFIG.skip_ansi_strip must be true — \
-             strip_ansi_escapes drops \\t, gluing path to mtime in --- headers"
+             (1) PF-006: strip_ansi_escapes drops \\t, gluing path to mtime in --- headers; \
+             (2) ADR-012: ESC/CSI bytes in diff body CONTENT must survive byte-faithfully"
         );
     }
 
@@ -597,6 +619,61 @@ mod tests {
             !result.entries[0].contains('\x1b'),
             "entry must not contain ESC bytes; got: {}",
             result.entries[0]
+        );
+    }
+
+    /// ESC/CSI bytes present in a diff BODY line (file CONTENT) must survive
+    /// byte-faithfully into the rendered entries (ADR-012).
+    ///
+    /// This is the complement of `test_ansi_in_diff_path_is_stripped`, which
+    /// pins the opposite behavior for the PATH field.  Together the two tests
+    /// document the metadata-vs-content split ADR-012 draws:
+    ///
+    ///   - PATH field (metadata): ANSI is stripped via per-field `strip_ansi`
+    ///     after `split('\t')` has already consumed the tab delimiter, so
+    ///     PF-006 does not apply and stripping is safe.
+    ///   - Body lines (CONTENT): ESC/CSI bytes pass through unmodified —
+    ///     stripping them would diverge from the raw `diff` tool without a
+    ///     loss marker, violating #317 compress-never-truncate.
+    #[test]
+    fn test_adr012_esc_in_diff_body_line_survives() {
+        // A body line whose CONTENT contains an ESC/CSI sequence.  Simulates a
+        // file that stores ANSI bytes verbatim (e.g. a snapshot of coloured
+        // terminal output stored as a text fixture).
+        let input = "--- a/file.txt\t2026-07-25 10:00:00.000000000 +0000\n\
+                     +++ b/file.txt\t2026-07-25 10:05:00.000000000 +0000\n\
+                     @@ -1,1 +1,1 @@\n\
+                     -old line\n\
+                     +\x1b[32mcolored new line\x1b[0m\n";
+        let result = try_parse_standalone_unified(input);
+        assert!(
+            result.is_some(),
+            "must parse diff containing ESC bytes in a body line"
+        );
+        let result = result.unwrap();
+
+        // entries[0] is the stat header; subsequent entries include the hunk
+        // header and body lines.  Find the insertion body line by prefix.
+        let insertion = result
+            .entries
+            .iter()
+            .find(|e| e.starts_with('+') && e.contains("colored new line"));
+        assert!(
+            insertion.is_some(),
+            "insertion body line must appear in entries: {:?}",
+            result.entries
+        );
+        let insertion = insertion.unwrap();
+        assert!(
+            insertion.contains('\x1b'),
+            "ADR-012: ESC byte in diff body CONTENT must survive byte-faithfully \
+             (skip_ansi_strip: true covers both \\t delimiters AND content-borne \
+             ESC sequences); got: {insertion:?}"
+        );
+        assert!(
+            insertion.contains("\x1b[32m"),
+            "ADR-012: full CSI sequence must survive intact in diff body CONTENT; \
+             got: {insertion:?}"
         );
     }
 

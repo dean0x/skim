@@ -239,6 +239,73 @@ fn test_grep_tab_content_preserved() {
 }
 
 // ============================================================================
+// diff — ESC bytes in file CONTENT must survive byte-faithfully (ADR-012)
+// ============================================================================
+
+/// Stub diff emits a unified diff whose BODY lines contain ESC/CSI bytes
+/// originating from file CONTENT (not tool colorization).
+///
+/// ADR-012 rules that skim NEVER filters ESC/CSI bytes that originate in
+/// wrapped-file CONTENT: stripping them would show the reader something
+/// different from the raw tool without a loss marker, violating the
+/// compress-never-truncate rule (#317).  The tool's OWN colorization is
+/// neutralized separately at the child-invocation boundary via `--no-color`
+/// (on `git diff`/`git show`; standalone `diff` never emits ANSI itself).
+///
+/// This test exercises the **hook / direct-invocation surface** end-to-end
+/// (the full `run_tool` pipeline including the `skip_ansi_strip` gate) and
+/// pairs with `test_adr012_esc_in_diff_body_line_survives` in diff.rs, which
+/// pins the same property at the unit level.
+///
+/// Asserts: exit 1 propagates, and the ESC byte (0x1b) from the file CONTENT
+/// body line appears in skim's stdout byte-faithfully.
+#[test]
+fn test_diff_esc_in_body_content_survives_adr012() {
+    // A unified diff body line whose CONTENT contains an ESC/CSI sequence.
+    // Simulates a file that stores ANSI bytes verbatim (e.g. a snapshot of
+    // coloured terminal output kept as a text fixture).
+    let fixture = concat!(
+        "--- a/file.txt\t2026-07-25 10:00:00.000000000 +0000\n",
+        "+++ b/file.txt\t2026-07-25 10:05:00.000000000 +0000\n",
+        "@@ -1,1 +1,1 @@\n",
+        "-old line\n",
+        "+\x1b[32mcolored new line\x1b[0m\n",
+    );
+    let stub_dir = make_stub("diff", fixture, 1);
+    let path = prepend_path(stub_dir.path());
+    let skim = common::skim_bin();
+
+    let out = std::process::Command::new(&skim)
+        .args(["diff", "a/file.txt", "b/file.txt"])
+        .env("PATH", &path)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .output()
+        .expect("skim diff must be spawnable");
+
+    let stdout_bytes = &out.stdout;
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "exit 1 must propagate (files differ); stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The ESC byte (0x1b) from the file CONTENT body line must appear in
+    // skim's stdout.  With skip_ansi_strip: true, the byte is never removed
+    // by the strip_ansi_escapes step in run_tool (the same flag that also
+    // preserves the \t delimiter in --- path\t<mtime> headers).
+    assert!(
+        stdout_bytes.contains(&0x1b_u8),
+        "ADR-012: ESC byte (0x1b) from file CONTENT must survive byte-faithfully \
+         through the full skim diff pipeline; skip_ansi_strip: true covers both \
+         \\t header delimiters (PF-006) and content-borne ESC sequences (ADR-012); \
+         got: {:?}",
+        String::from_utf8_lossy(stdout_bytes)
+    );
+}
+
+// ============================================================================
 // rg — tab-bearing match content must survive ANSI-strip
 // ============================================================================
 
