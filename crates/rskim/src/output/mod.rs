@@ -1372,4 +1372,43 @@ mod tests {
             "Passthrough should have no result key"
         );
     }
+
+    /// Pins the exact field set of the passthrough JSON envelope so that
+    /// `Passthrough(String)` (via `to_json_envelope`) and `RawPassthrough`
+    /// (inline `serde_json::json!` in `execution.rs`) cannot drift apart.
+    ///
+    /// Both variants must produce exactly two fields — `tier` and `raw` — with
+    /// no legacy `tool` field or any other additions.  Eight wrappers rely on
+    /// this equivalence: `grep`, `rg` (Passthrough(String)) and `find`, `wc`,
+    /// `df`, `du`, `ps`, `ls` (RawPassthrough).  The `RawPassthrough` half is
+    /// covered by the `test_subcommand_file_json_passthrough_envelope`
+    /// integration test in `cli_subcommand.rs`.
+    #[test]
+    fn test_to_json_envelope_passthrough_exact_fields() {
+        let raw = "./src/main.rs\n./src/lib.rs\n";
+        let result: ParseResult<String> = ParseResult::Passthrough(raw.to_string());
+        let json_str = result.to_json_envelope().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = parsed.as_object().unwrap();
+        // Exactly two fields: tier and raw.
+        assert_eq!(
+            obj.len(),
+            2,
+            "passthrough envelope must have exactly 2 fields (tier, raw), got: {obj:?}"
+        );
+        assert_eq!(
+            parsed["tier"], "passthrough",
+            "tier field must be \"passthrough\""
+        );
+        assert_eq!(
+            parsed["raw"].as_str(),
+            Some(raw),
+            "raw field must carry the payload verbatim"
+        );
+        // No 'tool' field — this was the pre-ADR-009 Full(FileResult) shape.
+        assert!(
+            parsed.get("tool").is_none(),
+            "passthrough envelope must not contain 'tool' field"
+        );
+    }
 }
