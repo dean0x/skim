@@ -34,6 +34,84 @@ impl HookProtocol for ClaudeCodeHook {
         })
     }
 
+    /// Attach drift advisory in-band to a Claude Code hook response.
+    ///
+    /// Adds:
+    /// - `hookSpecificOutput.additionalContext` — model-facing advisory text
+    ///   (~1 KB; detailed provenance diff + remedies). Nested inside
+    ///   `hookSpecificOutput` because Claude Code silently ignores top-level
+    ///   `additionalContext`.
+    /// - `systemMessage` — user-facing one-liner (≤200 chars). Top-level per
+    ///   Claude Code hook protocol: shown in the UI, not model context.
+    ///
+    /// Non-blocking: does NOT set `permissionDecision` — ADR-006 must be
+    /// preserved. Never writes to stderr — GRANITE #361 Bug 3 invariant.
+    ///
+    /// ADR-011: the advisory is loss-bearing (the agent may have already acted
+    /// on output from the wrong binary), therefore it is NOT debug-gated.
+    fn attach_advisory(
+        &self,
+        response: &mut serde_json::Value,
+        advisory_text: &str,
+        system_msg: &str,
+    ) {
+        // Add model-facing advisory inside hookSpecificOutput.
+        if let Some(hso) = response
+            .get_mut("hookSpecificOutput")
+            .and_then(|v| v.as_object_mut())
+        {
+            hso.insert(
+                "additionalContext".to_string(),
+                serde_json::Value::String(advisory_text.to_string()),
+            );
+        }
+        // Add user-facing one-liner at top level (Claude Code protocol).
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "systemMessage".to_string(),
+                serde_json::Value::String(system_msg.to_string()),
+            );
+        }
+    }
+
+    /// Build an advisory-only Claude Code hook response (no rewrite).
+    ///
+    /// Used when no command rewrite matched but drift was detected.
+    /// The response carries only the advisory fields — `updatedInput` is
+    /// intentionally absent so the agent runs the original command unchanged.
+    ///
+    /// Without this method the advisory is swallowed for exactly the call that
+    /// matters most: the FIRST Bash call of a session frequently does not match
+    /// a rewrite rule, but is also the first time the agent acts on skim output
+    /// and most needs the provenance warning.
+    ///
+    /// Response shape (Claude Code):
+    /// ```json
+    /// {
+    ///   "hookSpecificOutput": {
+    ///     "hookEventName": "PreToolUse",
+    ///     "additionalContext": "<advisory>"
+    ///   },
+    ///   "systemMessage": "<one-liner>"
+    /// }
+    /// ```
+    ///
+    /// Security: never sets `permissionDecision` (ADR-006).
+    /// Zero stderr (GRANITE #361 Bug 3).
+    fn format_advisory_only(
+        &self,
+        advisory_text: &str,
+        system_msg: &str,
+    ) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "additionalContext": advisory_text
+            },
+            "systemMessage": system_msg
+        }))
+    }
+
     fn generate_script(&self, version: &str, binary_path: &str) -> String {
         super::generate_hook_script(version, "claude-code", binary_path)
     }
