@@ -50,6 +50,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applies ADR-002). See **Fixed** below for full details.
 
 ### Added
+- **`skim doctor` subcommand** — Reports the running binary (absolute path + commit),
+  every `skim` binary on `$PATH` with its commit and which one wins, hook pin state for
+  each installed agent (pinned commit vs running commit, staleness verdict), the wrapper
+  directory, and the cache/analytics database locations. Exit `0` when no drift is
+  detected; exit `1` on any drift, so the command works as a CI pre-flight check. Commit
+  resolution reads from `--version` output (`skim x.y.z (sha)`) rather than a `--commit`
+  flag, so it correctly identifies binaries that predate the doctor subcommand itself.
+
+- **Build-provenance drift is now surfaced in-band to the agent** — When the rewrite hook
+  detects that the running binary differs from the one pinned in the hook script (different
+  path or different commit SHA), skim delivers a provenance advisory through the
+  hook-response channel (`hookSpecificOutput.additionalContext` + a ≤200-char
+  `systemMessage`) instead of routing only to `hook.log`. The advisory is deduped per
+  session via a stamp file at `<cache>/hook-drift/{session_id}.stamp`; the stamp content
+  includes the version, commit, and a 12-char hash of the canonical binary path, so a
+  second build at the same version re-arms the advisory. The advisory fires
+  unconditionally — it is not `SKIM_DEBUG`-gated — because drift invalidates the agent's
+  interpretation of every measurement in the session, not just data in transit. The
+  PATH-wrapper surface emits no in-band advisory by design: stdout must stay byte-faithful
+  per #317, and a stderr banner would be `SKIM_DEBUG`-gated (invisible by default),
+  reproducing the original failure. Delivery is absent when `SKIM_HOOK_VERSION` is unset
+  (not running under a skim-generated script). Scripts that predate `SKIM_HOOK_VERSION`
+  are not detected in-band; `skim doctor` covers that residual gap.
+
 - **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
   rewrites `cat`/`head`/`tail` on a code file into `skim <file> --mode=pseudo` (or
   `--mode=structure` for declaration files), the rewritten command now carries a
@@ -84,6 +108,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim init --yes` now re-pins the hook script after an in-place rebuild at the same
+  version (#466)** — `hook_is_current()` previously compared only the binary path and
+  version string, so a `cargo build` that incremented the commit SHA while keeping the
+  same `x.y.z` version was treated as "already up to date" and the stale commit pin was
+  left in place. The predicate now additionally compares `SKIM_HOOK_COMMIT` against the
+  compiled-in SHA, so any rebuild triggers a re-pin.
+
+- **`skim init` now fails loudly if it cannot resolve its own binary path** — A
+  `.unwrap_or_default()` fallback in `generate_hook_script` would silently produce a hook
+  script with an empty `SKIM_HOOK_BINARY` value, writing an unpinned script with no
+  error. This is replaced by a loud `Result` failure and an empty-path assertion, so the
+  error surfaces before any script is written.
+
+- **`SKIM_DEBUG=1` startup provenance line routes to `hook.log` in hook mode, not
+  stderr** — In prior versions, enabling `SKIM_DEBUG` while running under the hook emitted
+  a startup notice to stderr, violating the GRANITE #361 Bug 3 requirement (skim must
+  never write to stderr in hook mode). The startup line is now routed to `hook.log` when
+  the hook context is active, keeping stderr byte-clean.
+
 - **Fileops dispatcher no longer intercepts tool-level `-h` as help** — `file/mod.rs`
   narrowed its help guard to `--help` only, mirroring the `db/mod.rs` hostname-flag
   precedent. `grep -h` (no-filename), `ls -h`/`du -h`/`df -h` (human-readable sizes)
