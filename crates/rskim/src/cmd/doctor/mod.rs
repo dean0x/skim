@@ -149,13 +149,12 @@ fn scan_path_for_skim(running_path: Option<&std::path::Path>) -> Vec<PathEntry> 
             winner_set = true;
         }
 
-        let version = query_binary_version(&canonical);
-        let commit = query_binary_commit(&canonical);
+        let info = query_binary_info(&canonical);
 
         entries.push(PathEntry {
             path: canonical,
-            version,
-            commit,
+            version: info.version,
+            commit: info.commit,
             is_running,
             wins,
         });
@@ -179,11 +178,29 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-/// Query the version from an arbitrary skim binary via `--version`.
+/// Combined binary info resolved in a single `--version` invocation.
+struct BinaryInfo {
+    version: Option<String>,
+    commit: Option<String>,
+}
+
+/// Query version and commit from an arbitrary skim binary.
 ///
-/// Clap outputs `skim X.Y.Z (COMMIT)\n`; we extract the `X.Y.Z` part.
-fn query_binary_version(path: &std::path::Path) -> Option<String> {
-    let output = run_bounded(
+/// Strategy (single subprocess):
+///   1. Invoke `--version`. Clap always outputs `skim X.Y.Z (COMMIT)\n`.
+///      Parse both the version and the SHA from that single call.
+///   2. If `--version` succeeded but produced no parenthetical (e.g. tarball/
+///      crates.io builds baked without `SKIM_GIT_COMMIT`), fall back to `--commit`.
+///      The `--commit` flag is hidden and was introduced in B4; old binaries reject
+///      it, so a non-zero exit means "commit legitimately unknown".
+///
+/// This avoids spawning the child twice per PATH entry. Pre-B4 binaries that do
+/// not support `--commit` still report the correct version+commit through
+/// `--version` as long as they were built with `SKIM_GIT_COMMIT` set (i.e. any
+/// git-based build, regardless of branch).
+fn query_binary_info(path: &std::path::Path) -> BinaryInfo {
+    // --- Step 1: --version (works on every skim binary) ---------------------
+    let version_output = run_bounded(
         {
             let path = path.to_path_buf();
             move || {
@@ -198,14 +215,28 @@ fn query_binary_version(path: &std::path::Path) -> Option<String> {
         },
         SUBPROCESS_TIMEOUT,
     )
-    .flatten()?;
+    .flatten();
 
-    if !output.status.success() {
-        return None;
-    }
+    let (version, commit_from_version) = match version_output {
+        Some(ref o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let v = parse_version_from_version_output(&text);
+            let c = parse_commit_from_version_output(&text);
+            (v, c)
+        }
+        _ => (None, None),
+    };
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_version_from_version_output(&text)
+    // --- Step 2: --commit fallback (B4+ binaries only) ----------------------
+    // Only invoked when --version didn't yield a commit (e.g. tarball builds
+    // that omit the parenthetical). Old binaries return non-zero → None.
+    let commit = if commit_from_version.is_some() {
+        commit_from_version
+    } else {
+        query_binary_commit_flag(path)
+    };
+
+    BinaryInfo { version, commit }
 }
 
 /// Parse version from clap `--version` output: `skim X.Y.Z (sha)\n`.
@@ -221,12 +252,34 @@ fn parse_version_from_version_output(text: &str) -> Option<String> {
     }
 }
 
+/// Parse the git SHA from clap `--version` output: `skim X.Y.Z (sha)\n`.
+///
+/// Returns `None` when no parenthetical is present (tarball/non-git builds).
+/// Does not panic on malformed input; treats any unparseable text as `None`.
+fn parse_commit_from_version_output(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    // Format: "skim X.Y.Z (sha)"
+    let after_name = trimmed.strip_prefix("skim ")?;
+    let paren_pos = after_name.find(" (")?;
+    let rest = after_name.get(paren_pos + 2..)?;
+    let sha = rest.strip_suffix(')')?;
+    let sha = sha.trim();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha.to_string())
+    }
+}
+
 /// Query the git commit from an arbitrary skim binary via `--commit`.
 ///
 /// `--commit` is a hidden early-exit flag added in B4: it prints the
 /// compiled `SKIM_GIT_COMMIT` and exits 0. Old binaries without the flag
 /// return non-zero; we treat that as "unknown commit".
-fn query_binary_commit(path: &std::path::Path) -> Option<String> {
+///
+/// Prefer `query_binary_info` which calls this only as a fallback after
+/// `--version` yields no parenthetical.
+fn query_binary_commit_flag(path: &std::path::Path) -> Option<String> {
     let output = run_bounded(
         {
             let path = path.to_path_buf();
@@ -333,7 +386,7 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
             // Unpinned hook format — drift.
             any_drift = true;
             println!(
-                "  ✗ {}  installed (v{hook_version})  unpinned — run `skim init --yes` to pin",
+                "  ✗ {}  installed (v{hook_version})  unpinned — run `./target/release/skim init --yes` to pin",
                 agent.cli_name()
             );
         } else if !facts.hook_is_current {
@@ -342,15 +395,19 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
             let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
             let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
             let commit_ok = facts.hook_commit.as_deref() == Some(compiled_commit);
-            let reason = if !version_ok {
-                format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
-            } else if !commit_ok {
+            // Report the most specific cause first: commit mismatch is more
+            // precise than version mismatch, and a None version should not
+            // masquerade as a version mismatch when the real issue is a commit
+            // mismatch.
+            let reason = if !commit_ok {
                 format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
+            } else if !version_ok {
+                format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
             } else {
                 "stale".to_string()
             };
             println!(
-                "  ✗ {}  installed  pin: {pin}  [{reason}]  — run `skim init --yes` to update",
+                "  ✗ {}  installed  pin: {pin}  [{reason}]  — run `./target/release/skim init --yes` to update",
                 agent.cli_name()
             );
         } else {
@@ -740,5 +797,173 @@ mod tests {
         }];
         let drift = print_path_section(&entries);
         assert!(drift, "non-running binary winning must report drift");
+    }
+
+    // ---- parse_commit_from_version_output ----
+
+    #[test]
+    fn test_parse_commit_from_version_output_standard() {
+        // Happy path: "skim X.Y.Z (sha)" emits both version and commit.
+        assert_eq!(
+            parse_commit_from_version_output("skim 2.11.0 (d5695c1)\n"),
+            Some("d5695c1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_from_version_output_no_parenthetical() {
+        // Tarball/crates.io build: no parenthetical → commit is legitimately unknown.
+        assert_eq!(parse_commit_from_version_output("skim 2.11.0\n"), None);
+    }
+
+    #[test]
+    fn test_parse_commit_from_version_output_wrong_prefix() {
+        // Non-skim binary output must not panic and must return None.
+        assert_eq!(
+            parse_commit_from_version_output("other 1.0.0 (abc)\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_from_version_output_empty() {
+        assert_eq!(parse_commit_from_version_output(""), None);
+    }
+
+    #[test]
+    fn test_parse_commit_from_version_output_empty_parens() {
+        // Malformed: empty parens must not produce an empty string commit.
+        assert_eq!(parse_commit_from_version_output("skim 2.11.0 ()\n"), None);
+    }
+
+    // ---- query_binary_info acquisition-path test ----
+    //
+    // This is the regression test whose absence caused Defect 1.
+    // It drives the acquisition path against a stub binary that:
+    //   - emits  "skim 2.11.0 (d5695c1)\n"  on  --version
+    //   - exits non-zero on  --commit  (simulating a pre-B4 binary)
+    //
+    // Before the fix, query_binary_commit called --commit, got non-zero,
+    // and returned None, yielding "commit ?" in the output. The fix extracts
+    // the commit from --version and never falls through to --commit.
+
+    #[cfg(unix)]
+    #[test]
+    fn test_query_binary_info_commit_from_version_no_commit_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = dir.path().join("skim-stub");
+
+        // Write a shell stub: emits version+commit on --version, fails on --commit.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             if [ \"$1\" = '--version' ]; then\n\
+               echo 'skim 2.11.0 (d5695c1)'\n\
+               exit 0\n\
+             fi\n\
+             # Simulate pre-B4 binary: unknown flags → non-zero exit\n\
+             echo 'error: unexpected argument' >&2\n\
+             exit 1\n",
+        )
+        .unwrap();
+
+        let meta = std::fs::metadata(&stub).unwrap();
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let info = query_binary_info(&stub);
+
+        assert_eq!(
+            info.version.as_deref(),
+            Some("2.11.0"),
+            "version must be resolved from --version output"
+        );
+        assert_eq!(
+            info.commit.as_deref(),
+            Some("d5695c1"),
+            "commit must be resolved from --version parenthetical even when --commit fails (pre-B4 binary)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_query_binary_info_no_parenthetical_falls_back_to_commit_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = dir.path().join("skim-stub2");
+
+        // Stub: --version has no parenthetical; --commit returns a sha.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             if [ \"$1\" = '--version' ]; then\n\
+               echo 'skim 2.11.0'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = '--commit' ]; then\n\
+               echo 'abc1234'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+        )
+        .unwrap();
+
+        let meta = std::fs::metadata(&stub).unwrap();
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let info = query_binary_info(&stub);
+
+        assert_eq!(info.version.as_deref(), Some("2.11.0"));
+        assert_eq!(
+            info.commit.as_deref(),
+            Some("abc1234"),
+            "must fall back to --commit when --version has no parenthetical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_query_binary_info_non_skim_binary_returns_none() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let stub = dir.path().join("not-skim");
+
+        // A realistic non-skim binary: --version output lacks "skim " prefix,
+        // and unknown flags (like --commit) are rejected with non-zero exit.
+        // Both conditions must produce None for version and commit.
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n\
+             if [ \"$1\" = '--version' ]; then\n\
+               echo 'some-other-tool 1.2.3 (xyz)'\n\
+               exit 0\n\
+             fi\n\
+             # Unknown flag → non-zero exit (realistic non-skim behavior)\n\
+             exit 1\n",
+        )
+        .unwrap();
+
+        let meta = std::fs::metadata(&stub).unwrap();
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let info = query_binary_info(&stub);
+
+        assert!(
+            info.version.is_none(),
+            "non-skim binary must yield version: None (output doesn't start with 'skim ')"
+        );
+        assert!(
+            info.commit.is_none(),
+            "non-skim binary must yield commit: None (--version has no 'skim ' prefix, --commit rejected)"
+        );
     }
 }

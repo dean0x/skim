@@ -136,6 +136,19 @@ pub(super) fn detect_state(
                         &hook_config_dir,
                         hook_script_contents.as_deref(),
                     );
+                    // Fallback: read version from the same script file used for
+                    // hook_commit and hook_binary_pin, so there is ONE source of
+                    // truth per file. This covers agents (e.g. Cursor) whose
+                    // settings entry format is flat (no nested "hooks" array) and
+                    // is therefore not understood by extract_hook_version_from_entry.
+                    // Also covers the path-containment failure case: a failed
+                    // security check returns None and must not masquerade as a
+                    // version mismatch.
+                    if hook_version.is_none() {
+                        hook_version = hook_script_contents
+                            .as_deref()
+                            .and_then(parse_version_from_script);
+                    }
                 }
             }
         }
@@ -835,6 +848,105 @@ mod tests {
                 "hook_is_current() should return true when version, pinned, and commit all match"
             );
         }
+    }
+
+    // ---- Defect 2 regression: hook_version fallback for flat-format entries ----
+
+    /// `extract_hook_version_from_entry` returns `None` for Cursor's flat format
+    /// (top-level "command" field, no nested "hooks" array).  The fix in
+    /// `detect_state` falls back to `parse_version_from_script` from the
+    /// pre-read `hook_script_contents`, ensuring version is extracted from the
+    /// same source as `hook_commit` and `hook_binary_pin`.
+    #[test]
+    fn test_extract_hook_version_from_entry_returns_none_for_cursor_flat_format() {
+        // Cursor flat format: top-level "command", no nested "hooks".
+        let entry = serde_json::json!({
+            "matcher": "Shell",
+            "command": "/path/with spaces/hooks/skim-rewrite.sh"
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        // No nested "hooks" key → None immediately, before containment check.
+        let result = extract_hook_version_from_entry(&entry, dir.path(), None);
+        assert!(
+            result.is_none(),
+            "flat Cursor entry (no nested 'hooks' key) must yield None from extract_hook_version_from_entry"
+        );
+    }
+
+    /// After `extract_hook_version_from_entry` returns `None`, the fallback to
+    /// `parse_version_from_script` must resolve the version from the script text.
+    /// This is the integration property the fix provides.
+    #[test]
+    fn test_hook_version_fallback_from_script_for_cursor_flat_format() {
+        let script = "#!/usr/bin/env bash\n\
+                      # skim-hook v2.11.0\n\
+                      export SKIM_HOOK_VERSION=\"2.11.0\"\n\
+                      export SKIM_HOOK_BINARY='/path/with spaces/target/release/skim'\n\
+                      export SKIM_HOOK_COMMIT=d5695c1\n\
+                      exec skim rewrite --hook --agent cursor\n";
+
+        // extract_hook_version_from_entry returns None (flat format).
+        let entry = serde_json::json!({
+            "matcher": "Shell",
+            "command": "/path/with spaces/hooks/skim-rewrite.sh"
+        });
+        let dir = tempfile::TempDir::new().unwrap();
+        let ver_from_entry = extract_hook_version_from_entry(&entry, dir.path(), Some(script));
+        assert!(
+            ver_from_entry.is_none(),
+            "flat format should still return None"
+        );
+
+        // Fallback path: parse_version_from_script succeeds.
+        let ver_from_script = parse_version_from_script(script);
+        assert_eq!(
+            ver_from_script,
+            Some("2.11.0".to_string()),
+            "fallback via parse_version_from_script must resolve version from script text"
+        );
+    }
+
+    /// A hook script at a path with spaces must still yield the correct version
+    /// through `parse_version_from_script` (the fallback path used by the fix).
+    #[test]
+    fn test_hook_version_extracted_from_script_path_with_space() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Simulate a hooks dir whose path contains a space (e.g. ~/Library/Application Support/Cursor/hooks/).
+        let hooks_dir = dir.path().join("Cursor hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let script_path = hooks_dir.join(super::super::helpers::HOOK_SCRIPT_NAME);
+        let script_contents = "#!/usr/bin/env bash\n\
+                               export SKIM_HOOK_VERSION=\"2.11.0\"\n\
+                               export SKIM_HOOK_COMMIT=d5695c1\n\
+                               export SKIM_HOOK_BINARY='/path/with spaces/target/release/skim'\n\
+                               exec skim rewrite --hook --agent cursor\n";
+        std::fs::write(&script_path, script_contents).unwrap();
+
+        let contents = std::fs::read_to_string(&script_path).unwrap();
+
+        // Version from script.
+        let ver = parse_version_from_script(&contents);
+        assert_eq!(
+            ver,
+            Some("2.11.0".to_string()),
+            "version must be extracted from a script at a path with a space"
+        );
+
+        // Commit from script.
+        let commit = parse_commit_from_script(&contents);
+        assert_eq!(
+            commit,
+            Some("d5695c1".to_string()),
+            "commit must be extracted from a script at a path with a space"
+        );
+
+        // Binary pin from script.
+        let pin = parse_binary_pin_from_script(&contents);
+        assert_eq!(
+            pin,
+            Some("/path/with spaces/target/release/skim".to_string()),
+            "binary pin must be extracted from a script at a path with a space"
+        );
     }
 
     // ---- parse_version_from_script ----

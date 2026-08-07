@@ -389,7 +389,7 @@ fn format_drift_advisory(drifts: &[DriftKind], env: &DriftEnv) -> String {
          read during this session may show a different build's view of the code.\n\
          \n\
          Remedies (in order):\n\
-           1. Rebuild and re-pin:  cargo build -p rskim && skim init --yes\n\
+           1. Rebuild and re-pin:  cargo build --release -p rskim && ./target/release/skim init --yes\n\
            2. Verify a single read without skim (bypasses rewriting entirely):\n\
               SKIM_PASSTHROUGH=1 <your-command>\n\
            3. Full diagnosis: skim doctor\n\
@@ -425,7 +425,7 @@ fn format_drift_system_message(drifts: &[DriftKind]) -> String {
         })
         .collect();
     let msg = format!(
-        "[skim] Provenance drift ({}). Distrust skim output. Fix: cargo build -p rskim && skim init --yes",
+        "[skim] Provenance drift ({}). Distrust skim output. Fix: cargo build --release -p rskim && ./target/release/skim init --yes",
         kinds.join(", ")
     );
     if msg.len() > CAP {
@@ -523,7 +523,7 @@ fn log_drift_warnings(
                     agent_name,
                     &format!(
                         "version mismatch: hook script v{hook_version}, binary v{} \
-                         (run `skim init --yes` to update)",
+                         (run `./target/release/skim init --yes` to update)",
                         env.compiled_version
                     ),
                 );
@@ -535,7 +535,7 @@ fn log_drift_warnings(
                     agent_name,
                     &format!(
                         "binary path mismatch: hook was installed from {hook_binary}, \
-                         running from {current_str} (run `skim init --yes` to update)"
+                         running from {current_str} (run `./target/release/skim init --yes` to update)"
                     ),
                 );
             }
@@ -546,7 +546,7 @@ fn log_drift_warnings(
                     agent_name,
                     &format!(
                         "binary rebuilt in-place: hook commit {hook_commit}, \
-                         running commit {} (run `skim init --yes` to update)",
+                         running commit {} (run `./target/release/skim init --yes` to update)",
                         env.compiled_commit
                     ),
                 );
@@ -557,7 +557,7 @@ fn log_drift_warnings(
                     "unpinned",
                     agent_name,
                     "hook script predates binary pinning (SKIM_HOOK_BINARY not set); \
-                     run `skim init --yes` to upgrade the hook script",
+                     run `./target/release/skim init --yes` to upgrade the hook script",
                 );
             }
         }
