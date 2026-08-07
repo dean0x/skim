@@ -23,6 +23,12 @@ pub(super) struct DetectedState {
     pub(super) settings_exists: bool,
     pub(super) hook_installed: bool,
     pub(super) hook_version: Option<String>,
+    /// SKIM_HOOK_COMMIT recorded in the installed hook script.
+    /// `None` when the script is absent or predates commit pinning.
+    pub(super) hook_commit: Option<String>,
+    /// Absolute path that the hook script's `SKIM_HOOK_BINARY` exports.
+    /// `None` when the script is absent or predates binary pinning.
+    pub(super) hook_binary_pin: Option<String>,
     /// Whether the hook script uses the pinned binary format (exports `SKIM_HOOK_BINARY`).
     pub(super) hook_uses_pinned_binary: bool,
     /// If installing to one scope and the other scope also has a hook
@@ -34,10 +40,41 @@ pub(super) struct DetectedState {
 }
 
 impl DetectedState {
-    /// Returns `true` when the installed hook is at the current version and
-    /// already uses the pinned binary format (no reinstall needed).
+    /// Returns `true` when the installed hook is at the current version, uses
+    /// the pinned binary format, AND pins the same git commit as this binary.
+    ///
+    /// # B5c — commit-pin comparison
+    ///
+    /// A plain version-only check misses in-place rebuilds at the same semver:
+    /// the hook may pin an older commit while the binary has a newer one. When
+    /// `SKIM_GIT_COMMIT` is "unknown" (tarball builds) the commit check is
+    /// skipped to avoid spurious "not current" verdicts on every invocation.
     pub(super) fn hook_is_current(&self) -> bool {
-        self.hook_version.as_deref() == Some(&self.skim_version) && self.hook_uses_pinned_binary
+        if !(self.hook_version.as_deref() == Some(&self.skim_version)
+            && self.hook_uses_pinned_binary)
+        {
+            return false;
+        }
+
+        // B5c: also require that the hook's recorded commit matches the
+        // compiled-in commit. Skip the check when the compiled commit is
+        // "unknown" (tarball/non-git build) — we have no reliable anchor.
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if compiled_commit != "unknown" {
+            if let Some(ref hook_commit) = self.hook_commit {
+                if hook_commit != compiled_commit {
+                    return false;
+                }
+            }
+            // hook_commit is None → script predates commit pinning → not current
+            // (hook_uses_pinned_binary is true but commit is absent means the
+            // script format is inconsistent; treat as stale to force a reinstall).
+            else {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -119,6 +156,14 @@ pub(super) fn detect_state(
         .map(uses_pinned_binary)
         .unwrap_or(false);
 
+    // B5c / B4: extract the commit and binary-pin from the hook script.
+    let hook_commit = hook_script_contents
+        .as_deref()
+        .and_then(parse_commit_from_script);
+    let hook_binary_pin = hook_script_contents
+        .as_deref()
+        .and_then(parse_binary_pin_from_script);
+
     Ok(DetectedState {
         skim_binary,
         skim_version,
@@ -128,6 +173,8 @@ pub(super) fn detect_state(
         settings_exists,
         hook_installed,
         hook_version,
+        hook_commit,
+        hook_binary_pin,
         hook_uses_pinned_binary,
         dual_scope_warning,
         existing_hooks,
@@ -310,6 +357,53 @@ pub(crate) fn has_skim_hook_entry(entry: &serde_json::Value) -> bool {
                     .is_some_and(|cmd| cmd.contains("skim-rewrite"))
             })
         })
+}
+
+/// Extract the git commit recorded in the hook script (`export SKIM_HOOK_COMMIT=<sha>`).
+///
+/// Returns `None` when the line is absent (script predates commit pinning).
+/// The commit value is unquoted in the generated script (hex only), so no
+/// quote stripping is needed.
+pub(crate) fn parse_commit_from_script(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        if let Some(val) = line.trim_start().strip_prefix("export SKIM_HOOK_COMMIT=") {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the binary path recorded in the hook script (`export SKIM_HOOK_BINARY=...`).
+///
+/// The value is single-quoted in the generated script (see `shell_single_quote`
+/// in `hooks/mod.rs`). This parser handles:
+/// - `'...'` (single-quoted, normal form)
+/// - `'...'\''...'` (single-quote escape sequences inside the path)
+/// - Bare unquoted values (forward-compat safety net)
+///
+/// Returns `None` when the line is absent (script predates binary pinning).
+pub(crate) fn parse_binary_pin_from_script(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("export SKIM_HOOK_BINARY=") {
+            let val = if rest.starts_with('\'') {
+                // Single-quoted: strip outer quotes and unescape `'\''` → `'`
+                let inner = rest
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .unwrap_or(rest);
+                inner.replace("'\\''", "'")
+            } else {
+                rest.to_string()
+            };
+            if !val.is_empty() {
+                return Some(val);
+            }
+        }
+    }
+    None
 }
 
 /// Extract the skim hook version from the text contents of a hook script.
@@ -603,6 +697,144 @@ mod tests {
 
         let result = scan_existing_hooks(Some(&settings), "preToolUse", "bash", &CopilotCliHook);
         assert!(result.is_empty(), "Copilot skim entry should be excluded");
+    }
+
+    // ---- parse_commit_from_script ----
+
+    #[test]
+    fn test_parse_commit_from_script_present() {
+        let script = "#!/usr/bin/env bash\nexport SKIM_HOOK_COMMIT=abc1234\nexec skim rewrite\n";
+        assert_eq!(
+            parse_commit_from_script(script),
+            Some("abc1234".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_commit_from_script_absent() {
+        let script = "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim rewrite\n";
+        assert_eq!(parse_commit_from_script(script), None);
+    }
+
+    #[test]
+    fn test_parse_commit_from_script_empty() {
+        assert_eq!(parse_commit_from_script(""), None);
+    }
+
+    // ---- parse_binary_pin_from_script ----
+
+    #[test]
+    fn test_parse_binary_pin_from_script_single_quoted() {
+        let script =
+            "#!/usr/bin/env bash\nexport SKIM_HOOK_BINARY='/usr/local/bin/skim'\nexec skim\n";
+        assert_eq!(
+            parse_binary_pin_from_script(script),
+            Some("/usr/local/bin/skim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_pin_from_script_with_space_in_path() {
+        let script =
+            "#!/usr/bin/env bash\nexport SKIM_HOOK_BINARY='/path/with spaces/skim'\nexec skim\n";
+        assert_eq!(
+            parse_binary_pin_from_script(script),
+            Some("/path/with spaces/skim".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_pin_from_script_absent() {
+        let script = "#!/usr/bin/env bash\nexport SKIM_HOOK_VERSION=\"2.5.1\"\nexec skim\n";
+        assert_eq!(parse_binary_pin_from_script(script), None);
+    }
+
+    // ---- hook_is_current: B5c regression test ----
+
+    /// B5c: hook_is_current() must return false when versions match, binary is
+    /// pinned, but the recorded SKIM_HOOK_COMMIT differs from the compiled commit.
+    ///
+    /// This is the exact scenario observed live: hook pinned `ca6e756`, binary
+    /// `d5695c1`, `skim init --yes` printed "Already up to date" and left the
+    /// hook byte-identical.
+    #[test]
+    fn test_hook_is_current_commit_mismatch_returns_false() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        // Only meaningful when the binary has a real commit (not a tarball build).
+        if compiled_commit == "unknown" {
+            return; // Nothing to test without a real compile-time commit.
+        }
+
+        let state = DetectedState {
+            skim_binary: std::path::PathBuf::from("/usr/local/bin/skim"),
+            skim_version: env!("CARGO_PKG_VERSION").to_string(),
+            config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            hook_config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            settings_path: std::path::PathBuf::from("/tmp/test-config/settings.json"),
+            settings_exists: true,
+            hook_installed: true,
+            hook_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // Record a DIFFERENT commit (not the compiled one)
+            hook_commit: Some("aaaaaaaastale".to_string()),
+            hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
+            hook_uses_pinned_binary: true,
+            dual_scope_warning: None,
+            existing_hooks: vec![],
+            agent_cli_name: "claude-code",
+        };
+
+        assert!(
+            !state.hook_is_current(),
+            "hook_is_current() must return false when commit pin differs from compiled commit"
+        );
+    }
+
+    /// B5c: hook_is_current() returns true when version, binary pin, AND commit
+    /// all match the compiled binary.
+    #[test]
+    fn test_hook_is_current_all_matching_returns_true() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        // When commit is "unknown" the commit check is skipped, so version+pinned is enough.
+        let hook_commit = if compiled_commit == "unknown" {
+            None // test the skip-check branch
+        } else {
+            Some(compiled_commit.to_string()) // test the matching branch
+        };
+
+        let state = DetectedState {
+            skim_binary: std::path::PathBuf::from("/usr/local/bin/skim"),
+            skim_version: env!("CARGO_PKG_VERSION").to_string(),
+            config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            hook_config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            settings_path: std::path::PathBuf::from("/tmp/test-config/settings.json"),
+            settings_exists: true,
+            hook_installed: true,
+            hook_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            hook_commit,
+            hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
+            hook_uses_pinned_binary: true,
+            dual_scope_warning: None,
+            existing_hooks: vec![],
+            agent_cli_name: "claude-code",
+        };
+
+        // When the compiled commit is "unknown" (tarball), the commit check is
+        // skipped and hook_is_current() only checks version + pinned.
+        // When hook_commit is None and compiled_commit is "unknown", the function
+        // should return true (no commit to compare).
+        if compiled_commit == "unknown" {
+            // Tarball build: commit check skipped → true (version + pinned match)
+            assert!(
+                state.hook_is_current(),
+                "tarball build: hook_is_current() should return true when version and pinned match"
+            );
+        } else {
+            // Real git build: all three match
+            assert!(
+                state.hook_is_current(),
+                "hook_is_current() should return true when version, pinned, and commit all match"
+            );
+        }
     }
 
     // ---- parse_version_from_script ----
