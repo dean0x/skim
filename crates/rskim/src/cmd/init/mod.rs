@@ -23,6 +23,7 @@ mod state;
 mod uninstall;
 pub(super) mod wrappers;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use flags::parse_flags;
@@ -37,6 +38,71 @@ pub(crate) use helpers::backup_settings_file;
 pub(crate) use helpers::load_or_create_settings;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;
+
+// ============================================================================
+// B4: HookFacts DTO seam — cross-module hook state projection for `skim doctor`
+// ============================================================================
+
+/// Snapshot of hook installation facts for `skim doctor`.
+///
+/// This is a projection of [`state::DetectedState`] with only the fields that
+/// cross the `cmd::init` module boundary. Internal state structs stay private.
+pub(crate) struct HookFacts {
+    /// True when any skim hook entry is present in the agent's config.
+    pub(crate) hook_installed: bool,
+    /// Version string recorded in the hook script (`SKIM_HOOK_VERSION`).
+    pub(crate) hook_version: Option<String>,
+    /// Git commit recorded in the hook script (`SKIM_HOOK_COMMIT`).
+    pub(crate) hook_commit: Option<String>,
+    /// Absolute path that the hook script pins as the binary (`SKIM_HOOK_BINARY`).
+    pub(crate) hook_binary_pin: Option<String>,
+    /// Whether the hook uses the pinned-binary format (exports `SKIM_HOOK_BINARY`).
+    pub(crate) hook_uses_pinned_binary: bool,
+    /// Whether the hook is fully current (version + pinned binary + commit all match).
+    pub(crate) hook_is_current: bool,
+    /// Path to the hook script file (`hook_config_dir/hooks/skim-rewrite.sh`).
+    pub(crate) hook_script_path: PathBuf,
+}
+
+/// Gather hook installation facts for a given agent — used by `skim doctor`.
+///
+/// Runs `detect_state` with the real process environment using global scope
+/// (`project: false`), which is the scope that fires for every session.
+/// Returns an error only if the config-dir resolver itself fails (e.g.,
+/// cannot determine home directory).
+pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Result<HookFacts> {
+    let init_flags = flags::InitFlags {
+        project: false,
+        yes: false,
+        dry_run: false,
+        uninstall: false,
+        force: false,
+        no_guidance: false,
+        agent: Some(agent),
+        wrappers: None,
+        permissions: None,
+        permissions_tier: flags::PermissionsTier::Seed,
+    };
+    let env = DetectionEnv::from_process();
+    let detected = state::detect_state(&init_flags, agent, &env)?;
+
+    // Evaluate hook_is_current() before partially moving out of `detected`.
+    let is_current = detected.hook_is_current();
+    let hook_script_path = detected
+        .hook_config_dir
+        .join("hooks")
+        .join(helpers::HOOK_SCRIPT_NAME);
+
+    Ok(HookFacts {
+        hook_installed: detected.hook_installed,
+        hook_version: detected.hook_version,
+        hook_commit: detected.hook_commit,
+        hook_binary_pin: detected.hook_binary_pin,
+        hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
+        hook_is_current: is_current,
+        hook_script_path,
+    })
+}
 
 /// Run the `init` subcommand.
 pub(crate) fn run(

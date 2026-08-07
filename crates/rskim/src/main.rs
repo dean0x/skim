@@ -778,6 +778,42 @@ fn main() -> ExitCode {
         debug::force_enable_debug();
     }
 
+    // B4: hidden early-exit used by `skim doctor` to identify each binary on $PATH.
+    //
+    // Must fire before analytics setup and thread spawning — it exits immediately.
+    // Hidden from `--help` output (not a clap flag); handled here, before clap parsing.
+    // Old skim binaries without this flag return non-zero; doctor treats that as "unknown".
+    if std::env::args().skip(1).any(|a| a == "--commit") {
+        println!("{}", option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown"));
+        return ExitCode::SUCCESS;
+    }
+
+    // B5a: emit a structured startup line when debug is active.
+    //
+    // MUST be suppressed in hook mode: Claude Code treats any stderr output on
+    // exit 0 as an error (GRANITE #361). When `--hook` is present in argv we
+    // route the startup line to hook.log instead. The `SKIM_DEBUG=1` env var
+    // is a per-session global that could otherwise pollute every hook call.
+    //
+    // Zero-cost when off: `debug::is_debug_enabled()` is a single atomic load.
+    // `current_exe()` and `id()` are never evaluated when debug is disabled —
+    // they are inside the `if` branch, not eagerly computed before it.
+    if debug::is_debug_enabled() {
+        let in_hook_mode = std::env::args().any(|a| a == "--hook");
+        let pid = std::process::id();
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let msg = format!("[skim] {VERSION} exe={exe} pid={pid}");
+        if in_hook_mode {
+            // Route to hook.log — never stderr in hook mode (GRANITE #361).
+            cmd::hook_log::log_hook_warning(&msg);
+        } else {
+            eprintln!("{msg}");
+        }
+    }
+
     // Read analytics config from env + CLI flag once at the system boundary.
     // Thread the struct down to all callers — no per-call env reads.
     let cli_disable_analytics = std::env::args().any(|a| a == "--disable-analytics");

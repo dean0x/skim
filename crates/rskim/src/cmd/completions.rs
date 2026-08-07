@@ -72,6 +72,7 @@ fn build_full_command() -> Command {
 
     // Add subcommands with full arg definitions for accurate completions
     cmd = cmd.subcommand(super::agents::command());
+    cmd = cmd.subcommand(super::doctor::command());
     cmd = cmd.subcommand(super::rewrite::command());
     cmd = cmd.subcommand(super::init::command());
     cmd = cmd.subcommand(super::discover::command());
@@ -100,6 +101,7 @@ fn build_full_command() -> Command {
         "cargo",
         "completions",
         "discover",
+        "doctor",
         "go",
         "init",
         "learn",
