@@ -43,32 +43,9 @@ use crate::cmd::{ToolRunConfig, run_tool};
 /// preventing unbounded allocation on pathological or adversarial responses.
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
-const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
-    program: "ls",
-    env_overrides: &[],
-    install_hint: "ls is typically pre-installed on Unix systems",
-    family: "file",
-    // skip_ansi_strip: true — execution.rs runs the ANSI-strip step BEFORE parse()
-    // and shadows the `output` binding; the shadowed `output` is what RawPassthrough
-    // serves to the reader.  With no parser consuming these bytes, "served without
-    // parsing" is precisely WHY this flag must be true, not false.  With false,
-    // any ESC byte in ls output (e.g. `ls -G`/`CLICOLOR_FORCE=1`) triggers
-    // strip_ansi_cow → Cow::Owned → strip_ansi_escapes drops ALL C0 controls
-    // including \t (0x09) from the entire buffer, destroying file-listing tabs.
-    // Contrast with CONFIG_TREE below, which stays false because tree genuinely
-    // parses its output and RE_TREE_ENTRY would not match ANSI-prefixed lines.
-    // (ADR-014 / PF-006)
-    skip_ansi_strip: true,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    // parse_ls_impl always returns RawPassthrough, so the net-savings guard
-    // never runs.  skip_net_savings_guard: false is the correct default because
-    // there is nothing to guard against — the guard is a no-op for RawPassthrough.
-    skip_net_savings_guard: false,
-    synthesize_success_line: None,
-    injected_format_flag: None,
-};
+// CONFIG_LS is removed — `passthrough_config` in mod.rs is now the single
+// source of `skip_ansi_strip: true` for the whole passthrough family (ADR-014).
+// The ls arm in `run` below calls `super::run_passthrough_tool` instead.
 
 const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     program: "tree",
@@ -112,7 +89,17 @@ pub(crate) fn run(
 ) -> anyhow::Result<std::process::ExitCode> {
     match tool_name {
         "tree" => run_tool(CONFIG_TREE, args, ctx, prepare_tree_args, parse_tree),
-        _ => run_tool(CONFIG_LS, args, ctx, |_| {}, parse_ls_impl),
+        _ => super::run_passthrough_tool(
+            super::PassthroughSpec {
+                program: "ls",
+                install_hint: "ls is typically pre-installed on Unix systems",
+                // ls exits 0 on success and non-zero on errors (no benign non-zero codes).
+                expected_exit_codes: &[],
+            },
+            args,
+            ctx,
+            parse_ls_impl,
+        ),
     }
 }
 

@@ -3,13 +3,18 @@
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
 //! `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc`.
 //!
-//! ## Shared passthrough helper
+//! ## Shared passthrough helpers
 //!
 //! [`passthrough_parse`] is the single implementation of the byte-faithful native
 //! passthrough contract (ADR-009) for pure-passthrough file handlers (df, du,
 //! find, grep, ps, rg, wc).  All modules delegate to it so a future fidelity
 //! fix lands in one place.
+//!
+//! [`passthrough_config`] is the SINGLE write-point for `skip_ansi_strip: true`
+//! across the whole passthrough family; [`run_passthrough_tool`] combines it with
+//! [`super::run_tool`] so each handler's `run` function reduces to one call.
 
+use super::{RunContext, ToolRunConfig, run_tool};
 use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
@@ -48,6 +53,72 @@ const KNOWN_TOOLS: &[&str] = &[
 /// `CommandOutput::stdout` buffer is served directly by the caller.
 pub(super) fn passthrough_parse(_output: &CommandOutput) -> ParseResult<FileResult> {
     ParseResult::RawPassthrough
+}
+
+/// Per-tool variation for a pure-passthrough file handler.
+///
+/// Pass to [`passthrough_config`] or [`run_passthrough_tool`] so all
+/// boilerplate — including the single write of `skip_ansi_strip: true` —
+/// lives in exactly one place for the whole family.
+pub(super) struct PassthroughSpec<'a> {
+    /// Binary name (e.g. `"grep"`, `"wc"`).
+    pub program: &'a str,
+    /// Text printed when the tool binary is not found.
+    pub install_hint: &'a str,
+    /// Non-zero exit codes the tool exits on a benign outcome.
+    ///
+    /// `grep`/`rg` use `&[1]` (no match is not an error).
+    /// Most passthrough tools use `&[]`.
+    pub expected_exit_codes: &'a [i32],
+}
+
+/// Build a [`ToolRunConfig`] for a pure-passthrough file handler.
+///
+/// `skip_ansi_strip: true` is written **here and only here** for the whole
+/// passthrough family.  The ANSI-strip step in `cmd/execution.rs` runs BEFORE
+/// `parse()` and shadows the `output` binding, so a `RawPassthrough` result
+/// serves the already-stripped bytes; any wrapper whose bytes reach the reader
+/// unparsed MUST have this flag set to `true`.
+///
+/// This is a `const fn` so callers can use it in `const` contexts with zero
+/// run-time allocation.  The 64 MiB ceiling is enforced upstream by the runner;
+/// no second buffer is created here.
+///
+/// # Convention note
+///
+/// Rust cannot prevent a future author from hand-rolling a `ToolRunConfig`
+/// literal and bypassing this constructor.  This is a convention backed by
+/// `test_passthrough_config_always_sets_skip_ansi_strip` in this module —
+/// not a compiler guarantee.
+pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRunConfig<'a> {
+    ToolRunConfig {
+        program: spec.program,
+        env_overrides: &[],
+        install_hint: spec.install_hint,
+        family: "file",
+        skip_ansi_strip: true, // THE single write for the whole passthrough family
+        command_type: crate::analytics::CommandType::FileOps,
+        expected_exit_codes: spec.expected_exit_codes,
+        forward_stderr: true,
+        skip_net_savings_guard: false,
+        synthesize_success_line: None,
+        injected_format_flag: None,
+    }
+}
+
+/// Execute a pure-passthrough file tool.
+///
+/// Combines [`passthrough_config`] and [`run_tool`] so each handler's `run`
+/// function is a single call.  `parse_fn` is kept as a parameter — the 16
+/// existing `test_parse_impl_is_passthrough` unit tests call each module's
+/// `parse_impl` directly, keeping that symbol reachable and dead-code-lint-clean.
+pub(super) fn run_passthrough_tool(
+    spec: PassthroughSpec<'_>,
+    args: &[String],
+    ctx: &RunContext,
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<FileResult>,
+) -> anyhow::Result<std::process::ExitCode> {
+    run_tool(passthrough_config(spec), args, ctx, |_| {}, parse_fn)
 }
 
 /// Maximum path/match entries shown in output (truncation cap).
@@ -144,6 +215,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn test_sanitize_for_display_clean_input() {
         assert_eq!(crate::cmd::sanitize_for_display("find"), "find");
@@ -154,5 +227,70 @@ mod tests {
         let input = "tool\x1b[31mred\x1b[0m";
         let sanitized = crate::cmd::sanitize_for_display(input);
         assert!(!sanitized.contains('\x1b'));
+    }
+
+    // ========================================================================
+    // passthrough_config: reintroduction guard
+    // ========================================================================
+
+    /// Verify that every call to `passthrough_config` produces a config with
+    /// `skip_ansi_strip: true`.
+    ///
+    /// Because all passthrough tools call this constructor (via
+    /// `run_passthrough_tool`), a newly added passthrough tool is covered
+    /// automatically — no new assertion needed.
+    ///
+    /// NOTE: This is a convention backed by this audit test, not a compiler
+    /// guarantee.  A future author can hand-roll a `ToolRunConfig` literal
+    /// and bypass the constructor.
+    #[test]
+    fn test_passthrough_config_always_sets_skip_ansi_strip() {
+        let spec = PassthroughSpec {
+            program: "test-tool",
+            install_hint: "install hint",
+            expected_exit_codes: &[],
+        };
+        let config = passthrough_config(spec);
+        assert!(
+            config.skip_ansi_strip,
+            "passthrough_config must always set skip_ansi_strip: true — \
+             the ANSI-strip step in execution.rs runs before parse() and \
+             shadows the output binding; RawPassthrough serves those stripped \
+             bytes, so any unparsed passthrough MUST set this flag"
+        );
+    }
+
+    /// Verify that `expected_exit_codes` passes through the constructor unchanged.
+    ///
+    /// `grep` and `rg` exit 1 on no match — this is benign.  Dropping `&[1]`
+    /// from their spec silently reclassifies exit 1 as `UnexpectedFailure`, a
+    /// real regression.  The test covers both the grep/rg case (`&[1]`) and the
+    /// common case (`&[]`) to confirm neither inherits the other's codes.
+    #[test]
+    fn test_passthrough_config_expected_exit_codes_pass_through() {
+        // grep and rg: exit 1 == "no match" (benign)
+        for program in &["grep", "rg"] {
+            let config = passthrough_config(PassthroughSpec {
+                program,
+                install_hint: "hint",
+                expected_exit_codes: &[1],
+            });
+            assert_eq!(
+                config.expected_exit_codes,
+                &[1],
+                "{program} config must carry expected_exit_codes: [1]"
+            );
+        }
+
+        // A tool with no special exit codes must not inherit &[1]
+        let config = passthrough_config(PassthroughSpec {
+            program: "wc",
+            install_hint: "hint",
+            expected_exit_codes: &[],
+        });
+        assert!(
+            config.expected_exit_codes.is_empty(),
+            "wc config must not carry any expected_exit_codes"
+        );
     }
 }

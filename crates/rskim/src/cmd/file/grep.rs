@@ -16,35 +16,23 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use crate::analytics::CommandType;
-use crate::cmd::{ToolRunConfig, run_tool};
-
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "grep",
-    env_overrides: &[],
-    install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
-    family: "file",
-    // skip_ansi_strip: true preserves TAB bytes (0x09) — native grep output is
-    // byte-faithful (ADR-009); strip_ansi_escapes destroys \t per PF-006.
-    skip_ansi_strip: true,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[1],
-    forward_stderr: true,
-    // parse_impl always returns RawPassthrough, so the net-savings guard
-    // never runs.  The flag is false (its semantically correct default) to
-    // avoid implying a skip is needed when there is nothing to compare.
-    skip_net_savings_guard: false,
-    synthesize_success_line: None,
-    injected_format_flag: None,
-};
-
 /// Run `skim grep [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
     // No flag injection for grep — native path:line:content is already minimal.
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "grep",
+            install_hint: "grep is typically pre-installed. For better compression, install ripgrep: https://github.com/BurntSushi/ripgrep",
+            // grep exits 1 when there is no match — this is benign, not an error.
+            expected_exit_codes: &[1],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
 }
 
 /// Parse function: always native passthrough.

@@ -17,35 +17,21 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use crate::analytics::CommandType;
-use crate::cmd::{ToolRunConfig, run_tool};
-
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "df",
-    env_overrides: &[],
-    install_hint: "df is typically pre-installed on Unix systems",
-    family: "file",
-    // skip_ansi_strip: true — execution.rs runs the ANSI-strip step BEFORE parse()
-    // and shadows the `output` binding.  df's parse_impl returns RawPassthrough
-    // (ignoring its argument), so the stripped bytes ARE what the reader receives.
-    // strip_ansi_escapes drops ALL C0 controls including \t (0x09) whenever any
-    // ESC byte appears in the buffer.  Setting true ensures byte-faithful passthrough
-    // (ADR-014 / PF-006).
-    skip_ansi_strip: true,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    skip_net_savings_guard: false,
-    synthesize_success_line: None,
-    injected_format_flag: None,
-};
-
 /// Run `skim df [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "df",
+            install_hint: "df is typically pre-installed on Unix systems",
+            expected_exit_codes: &[],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
 }
 
 /// Parse function: always native passthrough.
