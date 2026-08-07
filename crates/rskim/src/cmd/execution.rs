@@ -761,6 +761,23 @@ where
     };
 
     let result = parse(&output);
+
+    // INVARIANT (ADR-014 / PF-006): `RawPassthrough` serves `output.stdout` straight
+    // to the reader with no parser in between, so it MUST come from a config that
+    // disabled the strip above — otherwise the reader receives bytes the raw tool
+    // never emitted.  `cmd::file::passthrough_config` is the conventional write-point
+    // for that flag, but a hand-rolled `ToolRunConfig` literal can bypass it; this
+    // assertion is what catches the bypass, for EVERY family rather than just
+    // cmd/file/.  `debug_assert` (not `assert`): a misconfigured wrapper must fail the
+    // test suite loudly, but must never abort a user's command in release — aborting
+    // would show LESS than the raw tool, the exact #317 violation this guards.
+    debug_assert!(
+        skip_ansi_strip || !matches!(result, ParseResult::RawPassthrough),
+        "{program}: parse() returned RawPassthrough while skip_ansi_strip is false — \
+         the ANSI-strip step above already shadowed `output`, so the reader would get \
+         stripped bytes (tabs included).  Build this config via passthrough_config."
+    );
+
     let _ = result.emit_markers(&mut io::stderr().lock());
     // max(child, derived): the stdin path fabricates child exit 0, so a
     // parser-derived failure code (e.g. cargo fail count > 0) wins (#317).

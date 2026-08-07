@@ -87,9 +87,14 @@ pub(super) struct PassthroughSpec<'a> {
 /// # Convention note
 ///
 /// Rust cannot prevent a future author from hand-rolling a `ToolRunConfig`
-/// literal and bypassing this constructor.  This is a convention backed by
-/// `test_passthrough_config_always_sets_skip_ansi_strip` in this module —
-/// not a compiler guarantee.
+/// literal and bypassing this constructor, so this is a convention, not a
+/// compiler guarantee.  Two things back it up:
+///
+/// - `test_passthrough_config_always_sets_skip_ansi_strip` (this module) pins
+///   the constructor itself, so the flag cannot be flipped here.
+/// - a `debug_assert!` in `cmd/execution.rs` (just after `parse()`) rejects any
+///   `RawPassthrough` result produced under `skip_ansi_strip: false`, which is
+///   what catches a hand-rolled bypass — in any family, not just this one.
 pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRunConfig<'a> {
     ToolRunConfig {
         program: spec.program,
@@ -236,13 +241,14 @@ mod tests {
     /// Verify that every call to `passthrough_config` produces a config with
     /// `skip_ansi_strip: true`.
     ///
-    /// Because all passthrough tools call this constructor (via
-    /// `run_passthrough_tool`), a newly added passthrough tool is covered
-    /// automatically — no new assertion needed.
-    ///
-    /// NOTE: This is a convention backed by this audit test, not a compiler
-    /// guarantee.  A future author can hand-roll a `ToolRunConfig` literal
-    /// and bypass the constructor.
+    /// SCOPE — read before citing this test as coverage.  It pins the
+    /// CONSTRUCTOR, so a new tool that goes through `run_passthrough_tool` is
+    /// correct by construction and needs no assertion of its own.  It does NOT
+    /// detect a new tool that hand-rolls a `ToolRunConfig` literal with
+    /// `skip_ansi_strip: false` — this test would still pass.  That case is
+    /// caught instead by the `debug_assert!` in `cmd/execution.rs` after
+    /// `parse()`, which fires on any `RawPassthrough` produced under a
+    /// `false` flag.  Neither mechanism is a compiler guarantee.
     #[test]
     fn test_passthrough_config_always_sets_skip_ansi_strip() {
         let spec = PassthroughSpec {

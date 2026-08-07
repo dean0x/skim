@@ -63,20 +63,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HEAD~N..HEAD`) still work as supplied. Note: `git log -p` on large repos may
   approach the 64 MiB output ceiling.
 - **`wc`, `df`, `du`, `find`, `ps` output format changed to native passthrough (ADR-009)** —
-  These wrappers now emit output byte-identical to the raw tool, including all control bytes
-  (TAB 0x09, ESC 0x1b). Byte-identical means every byte the raw tool emits — replacing the
-  previous `<tool> N` header/entry envelope and its silent 100-entry display cap. `du`'s POSIX
-  `size<TAB>path` format is preserved; `CLICOLOR`-enabled invocations of these tools preserve
-  their ESC color sequences. Measured impact of the old path: `find crates -name '*.rs'` lost
-  355 of 457 paths; `ps aux` dropped 705 of 805 processes and produced output 180 bytes larger
-  than native for the records it did show; `wc` reformatted `      300 total` into ` total: 300`,
+  These wrappers now emit output byte-identical to the raw tool, including control bytes:
+  TAB (0x09) column separators and ESC (0x1b) sequences are no longer stripped. This replaces
+  the previous `<tool> N` header/entry envelope and its silent 100-entry display cap. `du`'s
+  POSIX `size<TAB>path` format is preserved, and an ESC byte anywhere in the output — in a
+  colorized path or in a file name — no longer destroys the tabs on every line. Two documented
+  limits remain: output is decoded as lossy UTF-8, so non-UTF-8 bytes in path names become
+  U+FFFD, and a trailing newline is appended when the tool's output does not end with one.
+  Measured impact of the old path: `find crates -name '*.rs'` lost 355 of 457 paths; `ps aux`
+  dropped 705 of 805 processes and produced output 180 bytes larger than native for the records
+  it did show; `wc` reformatted `      300 total` into ` total: 300`,
   silently breaking `| tail -1 | awk '{print $1}'` pipes. **Consumers parsing the old envelope
   format must switch to native output.** For `ps` specifically, truncation was the only mechanism
   reducing output volume — callers wanting fewer rows should pipe through `head`.
 - **`skim ls` output format changed to native passthrough (ADR-009)** — `skim ls` now emits
-  output byte-identical to raw `ls`, including the native `total <blocks>` header and all control
-  bytes (TAB, ESC). `ls -G` / `CLICOLOR_FORCE=1 ls` color sequences are preserved. The previous
-  path silently dropped 102 of 202 entries at the display cap and omitted the `total` header.
+  output byte-identical to raw `ls`, including the native `total <blocks>` header and control
+  bytes (TAB, ESC) — `ls -G` / `CLICOLOR_FORCE=1 ls` color sequences are preserved, subject to
+  the same lossy-UTF-8 and trailing-newline limits noted above. The previous path silently
+  dropped 102 of 202 entries at the display cap and omitted the `total` header.
   **`tree` is unchanged** and still compresses. Consumers parsing the old skim-formatted `ls`
   output must switch to native format.
 
