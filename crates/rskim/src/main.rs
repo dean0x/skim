@@ -228,9 +228,11 @@ SUBCOMMANDS:\n  \
     agents                                   Show detected AI agents\n  \
     completions <SHELL>                      Generate shell completions\n  \
     discover                                 Identify missed optimizations\n  \
+    doctor                                   Check skim installation health and report provenance drift\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns\n  \
     rewrite <COMMAND>...                     Rewrite commands into skim equivalents\n  \
+    search                                   Code search over project index\n  \
     stats [--since N] [--format json]        Token analytics dashboard\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
@@ -1880,5 +1882,34 @@ mod tests {
         // This test intentionally has no assertions — its purpose is to be a
         // discoverable marker in the test suite for this limitation.
         let _note = "syntactic-only PATH filter: symlink bypass is a known limitation (PF-003)";
+    }
+
+    // ========================================================================
+    // after_help drift guard
+    // ========================================================================
+
+    /// Every META_SUBCOMMAND (except `proxy`, which is cfg-gated and intentionally
+    /// excluded from the user-facing help text) must appear in the `--help` after_help
+    /// SUBCOMMANDS section.  This test fires whenever a meta subcommand is added to
+    /// the registry without also listing it in the `SUBCOMMANDS:` block in `main.rs`.
+    #[test]
+    fn test_meta_subcommands_in_after_help() {
+        let cmd = <Args as clap::CommandFactory>::command();
+        let after_help = cmd
+            .get_after_help()
+            .expect("after_help must be set on Args")
+            .to_string();
+        for &name in cmd::META_SUBCOMMANDS {
+            // `proxy` is #[cfg(feature = "proxy")]-gated and intentionally omitted
+            // from the user-facing help text — it is an internal/advanced capability.
+            if name == "proxy" {
+                continue;
+            }
+            assert!(
+                after_help.contains(name),
+                "META_SUBCOMMANDS entry '{name}' is missing from the after_help \
+                 SUBCOMMANDS section — add it to the SUBCOMMANDS list in main.rs"
+            );
+        }
     }
 }

@@ -69,6 +69,8 @@ mod registry;
 pub(crate) use registry::{
     KNOWN_SUBCOMMANDS, is_known_subcommand, is_meta_subcommand, wrapper_targets,
 };
+#[cfg(test)]
+pub(crate) use registry::META_SUBCOMMANDS;
 
 mod security;
 pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
