@@ -1,6 +1,9 @@
-//! E2E tests proving that tab characters survive the ANSI-strip step for `gh`
-//! and `diff` wrappers, and that `gh` exit-8 is treated as a parseable result
-//! rather than an unexpected failure.
+//! E2E tests proving that tab characters and ESC bytes survive the ANSI-strip step
+//! for the `gh` and `diff` wrappers (tab-parsing family), the `grep` and `rg`
+//! wrappers (passthrough search tools), and the passthrough-only `wc`, `ls`,
+//! `find`, `df`, `du`, and `ps` wrappers (ADR-014 / PF-006 fourth wave).
+//! Also covers `gh` exit-8 being treated as a parseable result rather than an
+//! unexpected failure.
 //!
 //! ## Why stubs drive the REAL pipeline
 //!

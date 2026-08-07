@@ -105,6 +105,10 @@ pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRun
         command_type: crate::analytics::CommandType::FileOps,
         expected_exit_codes: spec.expected_exit_codes,
         forward_stderr: true,
+        // `parse_impl` always returns `RawPassthrough`, so the net-savings guard
+        // never runs for any passthrough-family tool; `false` is the semantically
+        // correct default (ADR-001 — guard is for tools that might emit a larger
+        // compressed view than the raw; passthrough has no compressed view at all).
         skip_net_savings_guard: false,
         synthesize_success_line: None,
         injected_format_flag: None,

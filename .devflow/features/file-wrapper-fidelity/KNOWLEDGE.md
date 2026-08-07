@@ -94,29 +94,44 @@ Converting a wrapper to passthrough IS the moment the flag must flip — with no
 Both failure modes are #317 violations. The flag must be `true` for both cases.
 
 ```rust
-// grep.rs — tab-parsing wrapper: skip_ansi_strip: true so parser sees raw tabs
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "grep",
-    // skip_ansi_strip: true — execution.rs runs the strip BEFORE parse(); with
-    // false, strip_ansi_escapes destroys \t before the parser sees them (PF-006).
-    skip_ansi_strip: true,
-    expected_exit_codes: &[1],  // grep exit 1 = no matches (benign)
-    ..
-};
+// grep.rs — passthrough-only: parse_impl always returns RawPassthrough;
+// bytes reach the reader unparsed, so skip_ansi_strip: true is mandatory.
+pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "grep",
+            install_hint: "...",
+            // grep exits 1 on no match — benign, not an error.
+            expected_exit_codes: &[1],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
+}
+// passthrough_config() (cmd/file/mod.rs) bakes skip_ansi_strip: true into the
+// ToolRunConfig produced for every PassthroughSpec — one write-point for the
+// whole family.
 
-// du.rs — passthrough-only wrapper: skip_ansi_strip: true so reader sees raw bytes
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "du",
-    // skip_ansi_strip: true — parse_impl returns RawPassthrough (ignores its
-    // argument); the strip shadows `output` before parse() runs, so the reader
-    // receives the stripped bytes.  du's POSIX format is size<TAB>path; with false,
-    // any ESC in the buffer destroys all tabs on all lines (ADR-014 / PF-006).
-    skip_ansi_strip: true,
-    ..
-};
+// du.rs — same run_passthrough_tool pattern; size<TAB>path format means one
+// ESC byte anywhere in the buffer destroys all tabs on every line (ADR-014 / PF-006).
+pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "du",
+            install_hint: "...",
+            expected_exit_codes: &[],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
+}
 ```
 
-**Exception — tree:** `CONFIG_TREE.skip_ansi_strip` stays `false` because tree genuinely parses its output via `RE_TREE_ENTRY`, which matches box-drawing characters at line-start. An ANSI prefix ahead of a box-drawing character would break the regex. This is a deliberate asymmetry with `CONFIG_LS` (which uses the same ls.rs file but returns `RawPassthrough`). A unit test in `ls.rs` pins `CONFIG_TREE.skip_ansi_strip == false` to make the asymmetry visible.
+A cross-family backstop backs up the convention: `cmd/execution.rs` contains a `debug_assert!` (added in the same wave as `passthrough_config`) that fires whenever `parse()` returns `RawPassthrough` while `skip_ansi_strip` is `false` — catching any future hand-rolled `ToolRunConfig` literal that bypasses `passthrough_config`. The assert uses `debug_assert` rather than `assert` so a misconfigured wrapper fails the test suite without aborting a user's live command (which would show less than the raw tool — the very #317 violation it guards).
+
+**Exception — tree:** `CONFIG_TREE.skip_ansi_strip` stays `false` because tree genuinely parses its output via `RE_TREE_ENTRY`, which matches box-drawing characters at line-start. An ANSI prefix ahead of a box-drawing character would break the regex. This is a deliberate asymmetry with the ls passthrough arm (in the same `ls.rs` file), which returns `RawPassthrough` and therefore requires `skip_ansi_strip: true`. A unit test in `ls.rs` pins `CONFIG_TREE.skip_ansi_strip == false` to make the asymmetry visible.
 
 **Audit discipline:** Whenever adding a new wrapper or converting one to passthrough, audit `skip_ansi_strip` for ALL sibling handlers — PF-006 has had four waves because the rule was always stated as "wrappers that parse tabs" rather than the correct "wrappers that serve bytes unparsed."
 

@@ -43,10 +43,6 @@ use crate::cmd::{ToolRunConfig, run_tool};
 /// preventing unbounded allocation on pathological or adversarial responses.
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
-// CONFIG_LS is removed — `passthrough_config` in mod.rs is now the single
-// source of `skip_ansi_strip: true` for the whole passthrough family (ADR-014).
-// The ls arm in `run` below calls `super::run_passthrough_tool` instead.
-
 const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     program: "tree",
     env_overrides: &[],
@@ -56,7 +52,7 @@ const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     // matches box-drawing characters at the start of each line, and an ANSI
     // prefix (`\x1b[...m`) ahead of the box-drawing character would prevent the
     // regex from matching, silently dropping the line.  Keeping false is the
-    // correct trade-off here (unlike CONFIG_LS above, where no parser runs).
+    // correct trade-off here (unlike the ls passthrough arm in `run()`, where no parser runs).
     // This asymmetry is DELIBERATE — do not change it to true without also
     // confirming that try_parse_tree_text handles ANSI-prefixed box-drawing lines.
     // The unit test below asserts CONFIG_TREE.skip_ansi_strip == false to make
@@ -296,7 +292,7 @@ mod tests {
     use crate::cmd::test_utils::{load_fixture, make_output};
 
     // ========================================================================
-    // Config asymmetry: CONFIG_LS vs CONFIG_TREE
+    // Config asymmetry: ls passthrough arm vs CONFIG_TREE
     // ========================================================================
 
     /// CONFIG_TREE.skip_ansi_strip must stay false.
@@ -307,13 +303,13 @@ mod tests {
     /// drop the line.  The strip (skip_ansi_strip: false) neutralises ANSI
     /// before the regex runs, preserving parse correctness.
     ///
-    /// CONFIG_LS by contrast returns RawPassthrough (no parser), so its
+    /// The ls passthrough arm by contrast returns RawPassthrough (no parser), so its
     /// bytes reach the reader after the strip step — the opposite situation.
     ///
     /// This test pins the asymmetry explicitly so it does not read as an
-    /// oversight and is not accidentally homogenised with CONFIG_LS.
-    /// The assertion is intentionally on a constant: we want a compile-time
-    /// signal if someone changes CONFIG_TREE.skip_ansi_strip to true without
+    /// oversight and is not accidentally homogenised with the ls passthrough arm.
+    /// The assertion is intentionally on a constant: the test suite will fail
+    /// if someone changes CONFIG_TREE.skip_ansi_strip to true without
     /// verifying that try_parse_tree_text handles ANSI-prefixed box-drawing lines.
     #[test]
     #[allow(clippy::assertions_on_constants)]
