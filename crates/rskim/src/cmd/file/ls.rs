@@ -48,15 +48,23 @@ const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "ls is typically pre-installed on Unix systems",
     family: "file",
-    // skip_ansi_strip: false — ls is a pure passthrough (ADR-009); ANSI stripping
-    // is not needed because native output is served byte-faithfully without parsing.
-    skip_ansi_strip: false,
+    // skip_ansi_strip: true — execution.rs runs the ANSI-strip step BEFORE parse()
+    // and shadows the `output` binding; the shadowed `output` is what RawPassthrough
+    // serves to the reader.  With no parser consuming these bytes, "served without
+    // parsing" is precisely WHY this flag must be true, not false.  With false,
+    // any ESC byte in ls output (e.g. `ls -G`/`CLICOLOR_FORCE=1`) triggers
+    // strip_ansi_cow → Cow::Owned → strip_ansi_escapes drops ALL C0 controls
+    // including \t (0x09) from the entire buffer, destroying file-listing tabs.
+    // Contrast with CONFIG_TREE below, which stays false because tree genuinely
+    // parses its output and RE_TREE_ENTRY would not match ANSI-prefixed lines.
+    // (ADR-014 / PF-006)
+    skip_ansi_strip: true,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
     // parse_ls_impl always returns RawPassthrough, so the net-savings guard
-    // never runs.  The flag is false (its semantically correct default) to
-    // avoid implying a skip is needed when there is nothing to compare.
+    // never runs.  skip_net_savings_guard: false is the correct default because
+    // there is nothing to guard against — the guard is a no-op for RawPassthrough.
     skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
@@ -67,6 +75,15 @@ const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "Install tree via your package manager (e.g., brew install tree)",
     family: "file",
+    // skip_ansi_strip: false — tree GENUINELY PARSES its output: RE_TREE_ENTRY
+    // matches box-drawing characters at the start of each line, and an ANSI
+    // prefix (`\x1b[...m`) ahead of the box-drawing character would prevent the
+    // regex from matching, silently dropping the line.  Keeping false is the
+    // correct trade-off here (unlike CONFIG_LS above, where no parser runs).
+    // This asymmetry is DELIBERATE — do not change it to true without also
+    // confirming that try_parse_tree_text handles ANSI-prefixed box-drawing lines.
+    // The unit test below asserts CONFIG_TREE.skip_ansi_strip == false to make
+    // this asymmetry visible and prevent accidental homogenisation.
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
@@ -290,6 +307,38 @@ fn count_tree_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use crate::cmd::test_utils::{load_fixture, make_output};
+
+    // ========================================================================
+    // Config asymmetry: CONFIG_LS vs CONFIG_TREE
+    // ========================================================================
+
+    /// CONFIG_TREE.skip_ansi_strip must stay false.
+    ///
+    /// tree genuinely parses its output via RE_TREE_ENTRY, which matches
+    /// box-drawing characters at line-start.  An ANSI prefix ahead of the
+    /// box-drawing character would prevent the regex from matching and silently
+    /// drop the line.  The strip (skip_ansi_strip: false) neutralises ANSI
+    /// before the regex runs, preserving parse correctness.
+    ///
+    /// CONFIG_LS by contrast returns RawPassthrough (no parser), so its
+    /// bytes reach the reader after the strip step — the opposite situation.
+    ///
+    /// This test pins the asymmetry explicitly so it does not read as an
+    /// oversight and is not accidentally homogenised with CONFIG_LS.
+    /// The assertion is intentionally on a constant: we want a compile-time
+    /// signal if someone changes CONFIG_TREE.skip_ansi_strip to true without
+    /// verifying that try_parse_tree_text handles ANSI-prefixed box-drawing lines.
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_config_tree_skip_ansi_strip_is_false() {
+        assert!(
+            !CONFIG_TREE.skip_ansi_strip,
+            "CONFIG_TREE.skip_ansi_strip must stay false: tree genuinely parses \
+             its output via RE_TREE_ENTRY and requires ANSI stripping before the \
+             regex runs; see the CONFIG_TREE comment for the full rationale. \
+             If tree is ever made passthrough, flip this to true at that time."
+        );
+    }
 
     // ========================================================================
     // parse_ls_impl: always passthrough

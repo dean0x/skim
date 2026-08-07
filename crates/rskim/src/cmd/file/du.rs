@@ -23,7 +23,14 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "du is typically pre-installed on Unix systems",
     family: "file",
-    skip_ansi_strip: false,
+    // skip_ansi_strip: true — execution.rs runs the ANSI-strip step BEFORE parse()
+    // and shadows the `output` binding.  du's parse_impl returns RawPassthrough
+    // (ignoring its argument), so the stripped bytes ARE what the reader receives.
+    // du's POSIX format is `size<TAB>path`; strip_ansi_escapes drops ALL C0
+    // controls including \t (0x09) whenever any ESC byte appears anywhere in the
+    // buffer, destroying the tab on every line.  Setting true ensures byte-faithful
+    // passthrough (ADR-014 / PF-006).
+    skip_ansi_strip: true,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,

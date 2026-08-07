@@ -720,11 +720,25 @@ where
         None
     };
 
-    // Some tools must NOT have ANSI escape sequences stripped: strip_ansi_escapes
-    // treats ASCII control codes — including \t (0x09) — as part of escape
-    // sequences and drops them. DB tools emit tab-separated (TSV) output; stripping
-    // would remove tab separators and cause all DB parsers to fall through to
-    // Passthrough. Callers signal this via `config.skip_ansi_strip`.
+    // ORDERING: this strip runs BEFORE parse() and SHADOWS the `output` binding.
+    // RawPassthrough does NOT bypass this step — it returns a payload-less signal
+    // whose bytes come from `output.stdout` as it exists AFTER this block.  Any
+    // wrapper whose bytes reach the reader unparsed (i.e. whose parse_impl returns
+    // RawPassthrough) MUST set config.skip_ansi_strip = true, or the reader
+    // receives the already-stripped bytes.
+    //
+    // strip_ansi_escapes treats ALL ASCII C0 controls — including \t (0x09) — as
+    // part of escape sequences and drops them.  strip_ansi_cow is all-or-nothing
+    // across the whole buffer: one ESC byte anywhere causes Cow::Owned, and the
+    // subsequent strip removes ALL 0x09 bytes from every line, not just the
+    // line that contained the ESC.
+    //
+    // Wrappers that set skip_ansi_strip: false and parse tabs (DB tools, gh, diff)
+    // are broken by the strip before their parsers even run; those that set false
+    // and return RawPassthrough (the passthrough family: wc/df/du/find/ps/ls)
+    // serve the stripped bytes directly to the reader — the same class of failure
+    // from two directions.  The flag must be true for both cases.  Callers signal
+    // this via `config.skip_ansi_strip`.
     let output = if skip_ansi_strip {
         output
     } else {

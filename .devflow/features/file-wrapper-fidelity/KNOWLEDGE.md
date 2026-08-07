@@ -74,30 +74,51 @@ let (mut compressed, effective_tier) = if matches!(result, ParseResult::RawPasst
 
 **Takeaway:** Only use `RawPassthrough` when the parse function truly has nothing to return. Never call `content()` on a `RawPassthrough` result expecting the raw bytes.
 
-### skip_ansi_strip: true — Mandatory for Tab-Emitting Handlers
+### skip_ansi_strip: true — Mandatory for Any Wrapper Whose Bytes Reach the Reader Unparsed
 
-`strip_ansi_escapes::strip_str` (used inside `execution.rs` when `skip_ansi_strip: false`) treats ASCII control codes — including `\t` (0x09) — as part of escape sequences and silently drops them. This destroys tab-delimited output before the parser sees it (PF-006).
+`strip_ansi_escapes::strip_str` (used inside `execution.rs` when `skip_ansi_strip: false`) treats ASCII control codes — including `\t` (0x09) — as part of escape sequences and silently drops them. The strip runs **before** `parse()` and **shadows the `output` binding** — `RawPassthrough` does NOT bypass it. The stripped bytes are what both the parser and the passthrough path serve to the reader.
 
-Every wrapper for a tool that emits tabs — grep, rg, diff, database tools — MUST set `skip_ansi_strip: true` in its `ToolRunConfig`:
+**The rule is not "wrappers that parse tabs opt out."** The correct rule is:
+
+> **Any wrapper whose bytes reach the reader unparsed (`RawPassthrough`) MUST set `skip_ansi_strip: true`.**
+
+Converting a wrapper to passthrough IS the moment the flag must flip — with no parser consuming the bytes, the stripped output IS what the reader receives. (ADR-014 / PF-006)
+
+`strip_ansi_cow` is all-or-nothing across the whole buffer: one ESC byte anywhere in the output causes `Cow::Owned`, and `strip_ansi_escapes` then drops ALL C0 controls (including `\t`) from the entire buffer — not just the line that contained the ESC. One colorized filename in `du` output silently destroys the POSIX tab separator on every other line.
+
+**Two failure modes, same root cause:**
+
+1. **Tab-parsing wrappers (gh, diff):** `skip_ansi_strip: false` → strip destroys tabs → parser fails to match tab-separated fields → falls through to `Passthrough` of the already-mangled bytes.
+2. **Passthrough-only wrappers (wc, df, du, find, ps, ls):** `skip_ansi_strip: false` → strip runs → `RawPassthrough` serves the STRIPPED bytes to the reader (the stripped bytes ARE the output because there is no parser between the strip and the reader).
+
+Both failure modes are #317 violations. The flag must be `true` for both cases.
 
 ```rust
-// grep.rs — correctness-critical comment; DO NOT remove or change to false
+// grep.rs — tab-parsing wrapper: skip_ansi_strip: true so parser sees raw tabs
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     program: "grep",
-    // skip_ansi_strip: true preserves TAB bytes (0x09) — native grep output is
-    // byte-faithful (ADR-009); strip_ansi_escapes destroys \t per PF-006.
+    // skip_ansi_strip: true — execution.rs runs the strip BEFORE parse(); with
+    // false, strip_ansi_escapes destroys \t before the parser sees them (PF-006).
     skip_ansi_strip: true,
     expected_exit_codes: &[1],  // grep exit 1 = no matches (benign)
     ..
 };
-// rg.rs has the identical flag and identical rationale comment.
-// diff.rs: standalone diff emits "--- path\tdate" headers; strip_ansi would
-// fuse path and timestamp before the tab-split in try_parse_standalone_unified.
+
+// du.rs — passthrough-only wrapper: skip_ansi_strip: true so reader sees raw bytes
+const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
+    program: "du",
+    // skip_ansi_strip: true — parse_impl returns RawPassthrough (ignores its
+    // argument); the strip shadows `output` before parse() runs, so the reader
+    // receives the stripped bytes.  du's POSIX format is size<TAB>path; with false,
+    // any ESC in the buffer destroys all tabs on all lines (ADR-014 / PF-006).
+    skip_ansi_strip: true,
+    ..
+};
 ```
 
-When `skip_ansi_strip: false`, `execution.rs` calls `strip_ansi_cow` on `output.stdout` before passing to the parse function. The parse function then sees mangled (tab-collapsed) bytes and falls through to `Passthrough` — emitting the already-mangled bytes, a #317 fidelity violation.
+**Exception — tree:** `CONFIG_TREE.skip_ansi_strip` stays `false` because tree genuinely parses its output via `RE_TREE_ENTRY`, which matches box-drawing characters at line-start. An ANSI prefix ahead of a box-drawing character would break the regex. This is a deliberate asymmetry with `CONFIG_LS` (which uses the same ls.rs file but returns `RawPassthrough`). A unit test in `ls.rs` pins `CONFIG_TREE.skip_ansi_strip == false` to make the asymmetry visible.
 
-**Takeaway:** Any new wrapper for a tool with tab-delimited output starts with `skip_ansi_strip: true`. Audit sibling handlers whenever adding a new tab-aware handler.
+**Audit discipline:** Whenever adding a new wrapper or converting one to passthrough, audit `skip_ansi_strip` for ALL sibling handlers — PF-006 has had four waves because the rule was always stated as "wrappers that parse tabs" rather than the correct "wrappers that serve bytes unparsed."
 
 ### diff.rs Hunk-Budget Parser
 
@@ -194,7 +215,7 @@ SavingsDecision::Passthrough => {
 
 **Returning `Passthrough(output.stdout.clone())` from a pure-passthrough handler.** This clones the entire stdout buffer into the parse result only to have `serialize_output` read it back immediately. Use `RawPassthrough` instead — `passthrough_parse` is the shared implementation.
 
-**Setting `skip_ansi_strip: false` for any tool with tab-separated output.** The bug is silent: the parser sees tab-fused tokens, fails to parse, and emits `Passthrough` of the already-mangled bytes. The mangling is invisible in test output unless the fixture contains actual tab bytes.
+**Setting `skip_ansi_strip: false` for any wrapper that returns `RawPassthrough` or parses tabs.** There are two failure modes, both silent: (1) for tab-parsing wrappers, the parser sees tab-fused tokens, fails to match, and emits `Passthrough` of the already-mangled bytes; (2) for passthrough-only wrappers, `RawPassthrough` serves the stripped bytes directly to the reader — the strip runs before `parse()` and shadows `output`, so there is no parser to fall through. The mangling is invisible in test output unless the fixture contains actual `\x1b` bytes (to trigger `Cow::Owned`) AND actual `\t` bytes (to witness their destruction). The correct rule is: any wrapper whose bytes reach the reader unparsed MUST set `skip_ansi_strip: true` (ADR-014).
 
 **Treating `AheadBehind::Absent` as `Counts(0, 0)`.** Absent means the remote ref is gone — rendering it as in-sync silently drops the `[gone]` signal that mirrors `git status -sb`.
 
