@@ -388,6 +388,27 @@ impl AnalyticsDb {
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
 
+        // AD-AN-5: future-version rejection — the FIRST step after Connection::open,
+        // before chmod, busy_timeout, WAL, and run_migrations (AC3).
+        //
+        // Opening the connection is unavoidable (needed to read PRAGMA user_version),
+        // but `Connection::open` does not mutate the DB file on its own.  Checking
+        // the version here ensures a future-version DB receives no schema write,
+        // no WAL journal_mode flip, and no permission chmod from this skim build.
+        {
+            let db_version: i64 =
+                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if db_version > schema::CURRENT_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "analytics database schema version {} is newer than this skim \
+                     build (supports up to v{}); upgrade skim or delete {:?} to reset",
+                    db_version,
+                    schema::CURRENT_SCHEMA_VERSION,
+                    path
+                );
+            }
+        }
+
         // Restrict DB file permissions to owner-only on Unix.
         #[cfg(unix)]
         {
@@ -2072,17 +2093,21 @@ mod tests {
         );
     }
 
-    /// AD-AN-4: verify schema version is 3 after all migrations.
+    /// Verify schema version is at the current head after all migrations.
+    ///
+    /// Updated from v3 to v4 when the v4 migration was added (#305).
     #[test]
-    fn test_schema_version_is_3() {
+    fn test_schema_version_is_current() {
         let (db, _tmp) = test_db();
         let version: i64 = db
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 3,
-            "schema version should be 3 after all migrations"
+            version,
+            schema::CURRENT_SCHEMA_VERSION,
+            "schema version should equal CURRENT_SCHEMA_VERSION ({}) after all migrations",
+            schema::CURRENT_SCHEMA_VERSION
         );
     }
 
@@ -2421,5 +2446,695 @@ mod tests {
         // Call both queries to ensure they do not panic with expansion-heavy data.
         db.query_daily(None).unwrap();
         db.query_by_command(None).unwrap();
+    }
+
+    // ========================================================================
+    // Schema v4 migration tests (AC1–AC4, #305)
+    //
+    // AD-AN-5: covers the single-transaction table-rebuild migration that adds
+    // nullable provider/model/turn_id/upstream_error_status columns, the
+    // breakdown index idx_ts_provider_model, the proxy_block_decisions detail
+    // table with its FK + idx_pbd_savings_id, and PRAGMA user_version = 4 as
+    // the last statement (ADR-006 fail-safe ordering).
+    // ========================================================================
+
+    /// Helper: create a raw v3 DB at `path` (bypasses AnalyticsDb::open so we can
+    /// test the migration rather than always starting at the current head).
+    ///
+    /// Inserts two representative CLI rows so aggregate assertions are non-trivial.
+    fn setup_v3_db_raw(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_savings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                command_type TEXT NOT NULL,
+                original_cmd TEXT NOT NULL,
+                raw_tokens INTEGER NOT NULL,
+                compressed_tokens INTEGER NOT NULL,
+                savings_pct REAL NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                project_path TEXT NOT NULL,
+                mode TEXT,
+                language TEXT,
+                parse_tier TEXT,
+                session_id TEXT
+            );
+            CREATE TABLE analytics_meta (key TEXT PRIMARY KEY, value INTEGER);
+            CREATE INDEX idx_ts_timestamp ON token_savings(timestamp);
+            CREATE INDEX idx_ts_command_type ON token_savings(command_type);
+            CREATE INDEX idx_ts_session_id ON token_savings(session_id);
+            INSERT INTO token_savings
+                (timestamp, command_type, original_cmd, raw_tokens,
+                 compressed_tokens, savings_pct, duration_ms, project_path,
+                 mode, language, parse_tier, session_id)
+                VALUES
+                (1711300000, 'file', 'skim test.rs', 1000, 200, 80.0, 15,
+                 '/tmp/test', 'structure', 'rust', NULL, 'sess-abc'),
+                (1711300100, 'test', 'cargo test', 500, 100, 80.0, 200,
+                 '/tmp/test', NULL, NULL, 'full', NULL);
+            PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+
+    /// AC1 — fresh DB is created at schema version 4 with all expected columns,
+    /// the proxy_block_decisions detail table, the FK from savings_id to
+    /// token_savings(id), and both new indexes; breakdown-index shape is
+    /// validated via EXPLAIN QUERY PLAN (SEARCH, not SCAN).
+    #[test]
+    fn test_schema_v4_fresh_db_creates_v4_schema() {
+        use std::collections::HashSet;
+        let (db, _tmp) = test_db();
+
+        // 1. Schema version.
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 4,
+            "fresh DB must be at schema version 4 after all migrations"
+        );
+
+        // 2. token_savings columns include all v4 additions (nullable).
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(token_savings)")
+            .unwrap();
+        let cols: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for expected in &[
+            "id",
+            "timestamp",
+            "command_type",
+            "original_cmd",
+            "raw_tokens",
+            "compressed_tokens",
+            "savings_pct",
+            "duration_ms",
+            "project_path",
+            "mode",
+            "language",
+            "parse_tier",
+            "session_id",
+            "provider",
+            "model",
+            "turn_id",
+            "upstream_error_status",
+        ] {
+            assert!(
+                cols.contains(*expected),
+                "AC1: token_savings must have column '{expected}' after v4 migration; \
+                 found: {cols:?}"
+            );
+        }
+
+        // 3. provider, model, turn_id, upstream_error_status are nullable
+        //    (notnull flag == 0 in PRAGMA table_info column 3).
+        let mut stmt2 = db
+            .conn
+            .prepare("PRAGMA table_info(token_savings)")
+            .unwrap();
+        let nullable_check: Vec<(String, i64)> = stmt2
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "provider" | "model" | "turn_id" | "upstream_error_status"
+                )
+            })
+            .collect();
+        assert_eq!(
+            nullable_check.len(),
+            4,
+            "AC1: all four new v4 columns must be present"
+        );
+        for (col, notnull) in &nullable_check {
+            assert_eq!(
+                *notnull, 0,
+                "AC1: column '{col}' must be nullable (notnull=0), got notnull={notnull}"
+            );
+        }
+
+        // 4. proxy_block_decisions table exists with expected columns.
+        let mut pbd_stmt = db
+            .conn
+            .prepare("PRAGMA table_info(proxy_block_decisions)")
+            .unwrap();
+        let pbd_cols: Vec<String> = pbd_stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in &[
+            "id",
+            "savings_id",
+            "block_index",
+            "component",
+            "outcome",
+            "bytes_in",
+            "bytes_out",
+        ] {
+            assert!(
+                pbd_cols.contains(&(*expected).to_string()),
+                "AC1: proxy_block_decisions must have column '{expected}'; found: {pbd_cols:?}"
+            );
+        }
+
+        // 5. FK from proxy_block_decisions.savings_id to token_savings(id).
+        let mut fk_stmt = db
+            .conn
+            .prepare("PRAGMA foreign_key_list(proxy_block_decisions)")
+            .unwrap();
+        // Columns: id, seq, table, from, to, ...
+        let fks: Vec<(String, String, String)> = fk_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(2)?, // table
+                    r.get::<_, String>(3)?, // from
+                    r.get::<_, String>(4)?, // to
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            !fks.is_empty(),
+            "AC1: proxy_block_decisions must have a foreign key"
+        );
+        let (ref_table, from_col, to_col) = &fks[0];
+        assert_eq!(
+            ref_table, "token_savings",
+            "AC1: FK must reference token_savings"
+        );
+        assert_eq!(from_col, "savings_id", "AC1: FK from-column must be savings_id");
+        assert_eq!(to_col, "id", "AC1: FK to-column must be id");
+
+        // 6. idx_ts_provider_model index exists.
+        let idx_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_ts_provider_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            idx_count, 1,
+            "AC1: idx_ts_provider_model must exist after v4 migration"
+        );
+
+        // 7. idx_pbd_savings_id index exists on proxy_block_decisions.
+        let pbd_idx_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' \
+                 AND name='idx_pbd_savings_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pbd_idx_count, 1,
+            "AC1: idx_pbd_savings_id must exist after v4 migration"
+        );
+
+        // 8. Breakdown-index column shape via PRAGMA index_info — deterministic
+        //    regardless of table size/stats. Verifies the three-column index is
+        //    ordered (command_type, provider, model), which enables the optimizer
+        //    to use it for both by-provider (WHERE command_type=? GROUP BY provider)
+        //    and by-model (WHERE command_type=? GROUP BY provider, model) queries.
+        let mut iinfo_stmt = db
+            .conn
+            .prepare("PRAGMA index_info(idx_ts_provider_model)")
+            .unwrap();
+        // Columns: seqno, cid, name
+        let idx_cols: Vec<(i64, String)> = iinfo_stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(2)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            idx_cols.len(),
+            3,
+            "AC1: idx_ts_provider_model must have exactly 3 columns; got: {idx_cols:?}"
+        );
+        assert_eq!(
+            idx_cols[0].1, "command_type",
+            "AC1: idx_ts_provider_model leading column must be 'command_type'"
+        );
+        assert_eq!(
+            idx_cols[1].1, "provider",
+            "AC1: idx_ts_provider_model second column must be 'provider'"
+        );
+        assert_eq!(
+            idx_cols[2].1, "model",
+            "AC1: idx_ts_provider_model third column must be 'model'"
+        );
+
+        // 9. EXPLAIN QUERY PLAN best-effort: insert enough rows that the optimizer
+        //    will choose the index over a full scan, then verify it appears in
+        //    the plan detail for the representative by-provider and by-model queries.
+        for i in 0..120i64 {
+            db.conn
+                .execute(
+                    "INSERT INTO token_savings \
+                     (timestamp, command_type, original_cmd, raw_tokens, \
+                      compressed_tokens, savings_pct, duration_ms, project_path, \
+                      provider, model) \
+                     VALUES (?1, 'proxy', 'proxy', 1000, 200, 80.0, 15, '/tmp', \
+                     'anthropic', 'claude-3-5-sonnet-20241022')",
+                    rusqlite::params![1711300000i64 + i],
+                )
+                .unwrap();
+        }
+        for i in 0..120i64 {
+            db.conn
+                .execute(
+                    "INSERT INTO token_savings \
+                     (timestamp, command_type, original_cmd, raw_tokens, \
+                      compressed_tokens, savings_pct, duration_ms, project_path) \
+                     VALUES (?1, 'file', 'skim a.rs', 800, 160, 80.0, 5, '/tmp')",
+                    rusqlite::params![1711500000i64 + i],
+                )
+                .unwrap();
+        }
+        db.conn.execute_batch("ANALYZE;").unwrap();
+
+        // by-provider representative query
+        let mut eqp1 = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT provider, COUNT(*) \
+                 FROM token_savings WHERE command_type = 'proxy' \
+                 GROUP BY provider ORDER BY provider IS NULL, provider",
+            )
+            .unwrap();
+        let plan1: Vec<String> = eqp1
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let plan1_str = plan1.join(" | ");
+        assert!(
+            plan1_str.contains("idx_ts_provider_model")
+                || plan1_str.contains("USING INDEX"),
+            "AC1: by-provider query plan must reference idx_ts_provider_model; \
+             got: {plan1_str}"
+        );
+
+        // by-model representative query
+        let mut eqp2 = db
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN \
+                 SELECT provider, model, COUNT(*) \
+                 FROM token_savings WHERE command_type = 'proxy' \
+                 GROUP BY provider, model \
+                 ORDER BY provider IS NULL, provider, model IS NULL, model",
+            )
+            .unwrap();
+        let plan2: Vec<String> = eqp2
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let plan2_str = plan2.join(" | ");
+        assert!(
+            plan2_str.contains("idx_ts_provider_model")
+                || plan2_str.contains("USING INDEX"),
+            "AC1: by-model query plan must reference idx_ts_provider_model; \
+             got: {plan2_str}"
+        );
+    }
+
+    /// AC2 — opening an existing v3 DB with CLI rows upgrades it to v4 inside a
+    /// single transaction, preserves every row with NULL for the four new columns,
+    /// and leaves every pre-existing CLI aggregate numerically identical.
+    #[test]
+    fn test_schema_v4_v3_to_v4_migration_preserves_data() {
+        let tmp = NamedTempFile::new().unwrap();
+        setup_v3_db_raw(tmp.path());
+
+        // Snapshot the pre-migration state with raw rusqlite (v3 schema).
+        let pre_invocations: i64 = {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(
+            pre_invocations, 2,
+            "test setup must have 2 rows before migration"
+        );
+
+        // Trigger the v4 migration by opening with AnalyticsDb.
+        let db = AnalyticsDb::open(tmp.path()).unwrap();
+
+        // Version is now 4.
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "AC2: version must be 4 after migration");
+
+        // All 2 original rows are still there.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "AC2: all v3 rows must survive migration");
+
+        // The four new v4 columns default to NULL for existing rows.
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT provider, model, turn_id, upstream_error_status FROM token_savings",
+            )
+            .unwrap();
+        let new_cols: Vec<(Option<String>, Option<String>, Option<String>, Option<i64>)> =
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for (provider, model, turn_id, upstream_error_status) in &new_cols {
+            assert!(
+                provider.is_none(),
+                "AC2: pre-migration rows must have NULL provider"
+            );
+            assert!(
+                model.is_none(),
+                "AC2: pre-migration rows must have NULL model"
+            );
+            assert!(
+                turn_id.is_none(),
+                "AC2: pre-migration rows must have NULL turn_id"
+            );
+            assert!(
+                upstream_error_status.is_none(),
+                "AC2: pre-migration rows must have NULL upstream_error_status"
+            );
+        }
+
+        // Pre-existing CLI aggregates are numerically identical after migration.
+        // (The v4 migration preserves raw_tokens, compressed_tokens, savings_pct.)
+        let summary = db.query_summary(None).unwrap();
+        assert_eq!(
+            summary.invocations, 2,
+            "AC2: invocation count must equal pre-migration value"
+        );
+        // Row 1: raw=1000, compressed=200 → saved=800
+        // Row 2: raw=500, compressed=100 → saved=400
+        assert_eq!(
+            summary.raw_tokens, 1500,
+            "AC2: raw_tokens aggregate must be unchanged after migration"
+        );
+        assert_eq!(
+            summary.compressed_tokens, 300,
+            "AC2: compressed_tokens aggregate must be unchanged after migration"
+        );
+        assert_eq!(
+            summary.tokens_saved, 1200,
+            "AC2: tokens_saved aggregate must be unchanged after migration"
+        );
+
+        // proxy_block_decisions table exists (but is empty — no proxy rows yet).
+        let pbd_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_block_decisions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pbd_count, 0,
+            "AC2: proxy_block_decisions must exist and be empty after migration"
+        );
+    }
+
+    /// AC3 — opening a database whose user_version > CURRENT_SCHEMA_VERSION returns
+    /// an error that names the version mismatch, performs no schema write, does not
+    /// create proxy_block_decisions, and leaves user_version unchanged.
+    ///
+    /// Deleting the future-version check in open() makes this test fail (an
+    /// unexpected migration or no error is returned) — PF-007 discriminating guard.
+    #[test]
+    fn test_schema_v4_future_version_rejected_without_write() {
+        let tmp = NamedTempFile::new().unwrap();
+
+        // Set up a "future version" DB manually (user_version = 99).
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 99;
+                 CREATE TABLE token_savings (id INTEGER PRIMARY KEY, future_col TEXT);",
+            )
+            .unwrap();
+        }
+
+        // Attempt to open — must fail.
+        let result = AnalyticsDb::open(tmp.path());
+        assert!(
+            result.is_err(),
+            "AC3: opening a future-version DB must return Err"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("99"),
+            "AC3: error message must name version 99; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("4") || err_msg.contains(&schema::CURRENT_SCHEMA_VERSION.to_string()),
+            "AC3: error message must name CURRENT_SCHEMA_VERSION; got: {err_msg}"
+        );
+
+        // No migration ran: user_version is still 99.
+        let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+        let version_after: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version_after, 99,
+            "AC3: user_version must remain 99 after rejected open"
+        );
+
+        // proxy_block_decisions was NOT created (migration did not run).
+        let pbd_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name='proxy_block_decisions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pbd_exists, 0,
+            "AC3: proxy_block_decisions must NOT be created after future-version rejection"
+        );
+
+        // The token_savings table retains only the future schema (no new v4 columns
+        // were injected by migration).
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(token_savings)")
+            .unwrap();
+        let col_names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            !col_names.contains(&"provider".to_string()),
+            "AC3: v4 'provider' column must NOT be added after future-version rejection; \
+             found cols: {col_names:?}"
+        );
+    }
+
+    /// AC4 — an injected failure EARLY in the v3→v4 rebuild (pre-creating
+    /// token_savings_new so the first CREATE TABLE fails) leaves user_version = 3
+    /// with all v3 rows intact; a subsequent clean open migrates to v4 successfully.
+    ///
+    /// PF-007 discriminating guard: removing the BEGIN..COMMIT wrapping would allow
+    /// a partially-rebuilt table to persist, breaking this assertion.
+    #[test]
+    fn test_schema_v4_injected_early_migration_failure_stays_v3() {
+        let tmp = NamedTempFile::new().unwrap();
+        setup_v3_db_raw(tmp.path());
+
+        // Pre-create token_savings_new to make the migration's first CREATE TABLE fail.
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE token_savings_new (poison_col TEXT);",
+            )
+            .unwrap();
+        }
+
+        // Open attempt must fail (CREATE TABLE token_savings_new errors).
+        let result = AnalyticsDb::open(tmp.path());
+        assert!(
+            result.is_err(),
+            "AC4 (early): AnalyticsDb::open must return Err when migration fails at first DDL"
+        );
+
+        // After failure the DB is at v3 with all original rows intact.
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                version, 3,
+                "AC4 (early): user_version must still be 3 after failed migration"
+            );
+
+            let row_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                row_count, 2,
+                "AC4 (early): all v3 rows must survive an interrupted migration"
+            );
+
+            // The original v3 columns are present; v4 columns are absent.
+            let mut stmt = conn.prepare("PRAGMA table_info(token_savings)").unwrap();
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(
+                !cols.contains(&"provider".to_string()),
+                "AC4 (early): v4 'provider' column must not exist after failed migration"
+            );
+        }
+
+        // Drop the blocking table and re-open — must now migrate to v4 cleanly.
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch("DROP TABLE token_savings_new;").unwrap();
+        }
+
+        let db = AnalyticsDb::open(tmp.path()).expect("AC4 (early): clean re-open must succeed");
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            version, 4,
+            "AC4 (early): clean re-open must migrate to v4"
+        );
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "AC4 (early): all rows must survive the clean re-migration to v4"
+        );
+    }
+
+    /// AC4 — an injected failure at the DETAIL-TABLE DDL step
+    /// (pre-creating proxy_block_decisions so that statement fails) leaves the DB
+    /// at user_version = 3 with all v3 rows intact.
+    ///
+    /// This specifically tests the ADR-006 property that PRAGMA user_version = 4
+    /// being the LAST statement ensures the whole transaction rolls back — including
+    /// the earlier DROP + RENAME of token_savings — leaving v3 untouched.
+    ///
+    /// PF-007 discriminating guard: without the single-transaction BEGIN..COMMIT,
+    /// the DROP+RENAME would have committed before the detail-table DDL failed,
+    /// leaving a partially-upgraded (and corrupt) token_savings table.
+    #[test]
+    fn test_schema_v4_injected_detail_table_failure_stays_v3() {
+        let tmp = NamedTempFile::new().unwrap();
+        setup_v3_db_raw(tmp.path());
+
+        // Pre-create proxy_block_decisions to make the migration fail at the
+        // detail-table DDL step (after DROP+RENAME of token_savings already ran
+        // within the transaction).
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE proxy_block_decisions (poison_col TEXT);",
+            )
+            .unwrap();
+        }
+
+        // Open attempt must fail.
+        let result = AnalyticsDb::open(tmp.path());
+        assert!(
+            result.is_err(),
+            "AC4 (detail-table): AnalyticsDb::open must return Err when migration \
+             fails at proxy_block_decisions DDL"
+        );
+
+        // After failure the DB is at v3 with all original rows intact.
+        // Crucially: token_savings still has the v3 schema (DROP+RENAME rolled back).
+        {
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                version, 3,
+                "AC4 (detail-table): user_version must still be 3 after failed detail-table DDL"
+            );
+
+            let row_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                row_count, 2,
+                "AC4 (detail-table): all v3 rows must survive an interrupted migration \
+                 at the detail-table DDL step — verifies the whole transaction rolled back"
+            );
+
+            // v4 columns were NOT added (the rename rolled back).
+            let mut stmt = conn.prepare("PRAGMA table_info(token_savings)").unwrap();
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(
+                !cols.contains(&"provider".to_string()),
+                "AC4 (detail-table): v4 'provider' column must not exist after \
+                 failed detail-table migration; found: {cols:?}"
+            );
+
+            // The pre-existing proxy_block_decisions table (created before the migration
+            // BEGIN) survives the rollback — the transaction rolled back the DDL inside
+            // BEGIN..COMMIT, but not the conflict table created before the transaction.
+            // Drop it so a clean re-open can migrate to v4.
+            conn.execute_batch("DROP TABLE proxy_block_decisions;").unwrap();
+        }
+
+        // Clean re-open must migrate to v4 with data preserved.
+        let db = AnalyticsDb::open(tmp.path())
+            .expect("AC4 (detail-table): clean re-open must succeed after removing conflict");
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "AC4 (detail-table): clean re-open must reach v4");
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "AC4 (detail-table): all rows must survive the clean re-migration"
+        );
     }
 }
