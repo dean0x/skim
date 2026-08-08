@@ -816,6 +816,19 @@ fn test_hook_version_mismatch_warning() {
         "Rewrite should succeed despite version mismatch"
     );
 
+    // ADR-013 split-gate: systemMessage is unconditional (user-facing, zero
+    // model context — "shown to you, not to Claude").  SKIM_DEBUG is not set,
+    // so additionalContext must be absent.
+    let system_msg = json["systemMessage"].as_str().unwrap_or("");
+    assert!(
+        system_msg.contains("drift") || system_msg.contains("Provenance"),
+        "systemMessage must be present and reference drift on version mismatch, got: {system_msg:?}"
+    );
+    assert!(
+        json["hookSpecificOutput"]["additionalContext"].is_null(),
+        "additionalContext must be absent when SKIM_DEBUG is not set (SKIM_DEBUG gate closed)"
+    );
+
     // Verify warning went to hook.log file instead
     let hook_log = cache_dir.path().join("hook.log");
     assert!(
@@ -865,6 +878,18 @@ fn test_hook_binary_mismatch_warning() {
             .unwrap()
             .contains("skim cargo test"),
         "Rewrite must succeed despite binary mismatch"
+    );
+
+    // ADR-013 split-gate: systemMessage is unconditional (user-facing, zero
+    // model context).  SKIM_DEBUG is not set, so additionalContext must be absent.
+    let system_msg = json["systemMessage"].as_str().unwrap_or("");
+    assert!(
+        system_msg.contains("drift") || system_msg.contains("Provenance"),
+        "systemMessage must be present and reference drift on binary mismatch, got: {system_msg:?}"
+    );
+    assert!(
+        json["hookSpecificOutput"]["additionalContext"].is_null(),
+        "additionalContext must be absent when SKIM_DEBUG is not set (SKIM_DEBUG gate closed)"
     );
 
     // Warning must appear in hook.log.

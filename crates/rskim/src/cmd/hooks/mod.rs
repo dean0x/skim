@@ -121,14 +121,18 @@ pub(crate) trait HookProtocol {
     /// Attach a drift advisory to an already-built hook response JSON value.
     ///
     /// Called when both a command rewrite AND drift were detected. Modifies
-    /// `response` in place to add `additionalContext` inside `hookSpecificOutput`
-    /// and `systemMessage` at top level.
+    /// `response` in place.
+    ///
+    /// ADR-013 split-gate:
+    /// - `system_msg` is always present → added as top-level `systemMessage`.
+    /// - `advisory_text` is `Some` only when `SKIM_DEBUG=1` → added as
+    ///   `hookSpecificOutput.additionalContext` when present.
     ///
     /// Default: no-op (non-Claude agents have no advisory channel).
     fn attach_advisory(
         &self,
         _response: &mut serde_json::Value,
-        _advisory_text: &str,
+        _advisory_text: Option<&str>,
         _system_msg: &str,
     ) {
     }
@@ -141,13 +145,20 @@ pub(crate) trait HookProtocol {
     /// (e.g. `ls`, a one-off diagnostic) yet that is exactly when the agent
     /// should learn that skim output may come from a stale binary.
     ///
+    /// ADR-013 split-gate:
+    /// - `system_msg` always present → always emitted as top-level `systemMessage`.
+    /// - `advisory_text` is `Some` only when `SKIM_DEBUG=1` → included as
+    ///   `hookSpecificOutput.additionalContext` when present; omitted otherwise.
+    /// - When `advisory_text` is `None`, `hookSpecificOutput` is omitted entirely
+    ///   (a response of `{ "systemMessage": "..." }` is valid per the hook spec).
+    ///
     /// Returns `None` when the agent has no advisory channel.
     /// ClaudeCodeHook returns `Some(advisory-only JSON)`.
     ///
     /// Default: `None` (non-Claude agents have no advisory channel).
     fn format_advisory_only(
         &self,
-        _advisory_text: &str,
+        _advisory_text: Option<&str>,
         _system_msg: &str,
     ) -> Option<serde_json::Value> {
         None

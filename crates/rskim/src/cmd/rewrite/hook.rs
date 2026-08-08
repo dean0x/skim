@@ -439,41 +439,67 @@ fn format_drift_advisory(drifts: &[DriftKind], env: &DriftEnv) -> String {
 
 /// Format the one-line system message for the user-facing channel.
 ///
-/// Capped at 200 characters. The model cannot reinstall skim or run
-/// `init`; the cap ensures the message is addressed to the person who can.
-fn format_drift_system_message(drifts: &[DriftKind], env: &DriftEnv) -> String {
-    const CAP: usize = 200;
+/// ADR-013 (split-gate): `systemMessage` costs zero model context and is
+/// user-facing only ("shown to you, not to Claude" — hooks.md). It fires
+/// unconditionally whenever drift is detected and the dedup stamp passes.
+///
+/// The binary path is deliberately omitted:
+/// 1. Paths can be arbitrarily long and would risk mid-string truncation.
+/// 2. `skim doctor` reports the full path breakdown; this message is the
+///    nudge to run it, not the diagnosis.
+///
+/// The message is bounded by construction (four short kind tokens + fixed
+/// framing ≈ 140 chars max) — no truncation cap is needed.
+fn format_drift_system_message(drifts: &[DriftKind]) -> String {
     let kinds: Vec<&str> = drifts
         .iter()
         .map(|d| match d {
             DriftKind::HookScriptUnpinned => "unpinned",
-            DriftKind::BinaryPathMismatch => "binary-mismatch",
-            DriftKind::HookVersionMismatch => "version-mismatch",
-            DriftKind::CommitMismatch => "commit-mismatch",
+            DriftKind::BinaryPathMismatch => "binary path",
+            DriftKind::HookVersionMismatch => "version",
+            DriftKind::CommitMismatch => "commit",
         })
         .collect();
-    let remedy = format_remedy_1(env);
-    let msg = format!(
-        "[skim] Provenance drift ({}). Distrust skim output. Fix: {}",
-        kinds.join(", "),
-        remedy
-    );
-    if msg.len() > CAP {
-        msg[..CAP].to_string()
-    } else {
-        msg
-    }
+    format!(
+        "[skim] Provenance drift detected ({}). skim-mediated output may reflect a different build. Run `skim doctor` for details.",
+        kinds.join(", ")
+    )
 }
 
 // ============================================================================
 // B2/B3 — Advisory construction (stamp check + format)
 // ============================================================================
 
-/// Check stamp and build advisory strings if this session hasn't seen this drift
+/// Both channels of a drift advisory.
+///
+/// ADR-013 (split-gate): the two fields land in different ADR-011 classes:
+/// - `system_msg`: user-facing (zero model context). Unconditional when drift
+///   is detected and the dedup stamp passes.
+/// - `advisory_text`: model-facing (`additionalContext`, session-persisted).
+///   `Some` only when `SKIM_DEBUG=1`; `None` otherwise. Gated because the
+///   platform replays `additionalContext` on `--continue`/`--resume` rather
+///   than re-running the hook, making its cost permanent and its SHAs stale.
+#[derive(Debug)]
+pub(super) struct Advisory {
+    /// User-facing one-liner. Emitted as top-level `systemMessage`.
+    pub(super) system_msg: String,
+    /// Model-facing advisory text. Emitted as `hookSpecificOutput.additionalContext`
+    /// when `Some`. `None` when `SKIM_DEBUG` is off.
+    pub(super) advisory_text: Option<String>,
+}
+
+/// Check stamp and build the advisory if this session hasn't seen this drift
 /// state yet.
 ///
-/// Returns `Some((advisory_text, system_message))` if the advisory should fire,
-/// `None` otherwise (already emitted or drifts is empty).
+/// Returns `Some(Advisory)` if the advisory should fire, `None` otherwise
+/// (already emitted or drifts is empty).
+///
+/// ## ADR-013 split-gate
+///
+/// `systemMessage` fires unconditionally (non-nil advisory, debug OFF or ON).
+/// `additionalContext` populates only when `is_debug_enabled()` is true.
+/// ONE shared dedup stamp is consumed whenever anything is emitted — there
+/// is no separate stamp for each channel.
 ///
 /// ## Healthy path
 ///
@@ -484,16 +510,7 @@ fn build_advisory(
     drifts: &[DriftKind],
     drift_env: Option<&DriftEnv>,
     session_id: Option<&str>,
-) -> Option<(String, String)> {
-    // ADR-011/ADR-013 (amended): the in-band advisory is SKIM_DEBUG-gated.
-    // Drift triggers (multiple clones, install-from-source, same-version rebuilds)
-    // are developer-specific; ordinary users essentially never encounter drift.
-    // A context-optimising tool must not spend context by default.
-    // hook.log recording stays unconditional; `skim doctor` is the primary
-    // diagnosis path.
-    if !crate::debug::is_debug_enabled() {
-        return None;
-    }
+) -> Option<Advisory> {
     if drifts.is_empty() {
         return None; // Healthy path — zero filesystem access beyond DriftEnv::from_process()
     }
@@ -509,12 +526,15 @@ fn build_advisory(
 ///
 /// Returns `None` immediately when `drifts` is empty (healthy path) — callers
 /// can test this guard directly without routing through `build_advisory`.
+///
+/// ADR-013: `advisory_text` is `Some` only when `SKIM_DEBUG=1`. The dedup
+/// stamp is consumed regardless of debug state — ONE stamp gates both channels.
 fn build_advisory_inner(
     drifts: &[DriftKind],
     de: &DriftEnv,
     session_id: Option<&str>,
     cache_dir: &std::path::Path,
-) -> Option<(String, String)> {
+) -> Option<Advisory> {
     if drifts.is_empty() {
         return None; // Healthy path — zero filesystem access
     }
@@ -524,9 +544,20 @@ fn build_advisory_inner(
     if !write_drift_stamp(&stamp, &key) {
         return None; // Already emitted for this session/day and drift state
     }
-    let advisory_text = format_drift_advisory(drifts, de);
-    let system_msg = format_drift_system_message(drifts, de);
-    Some((advisory_text, system_msg))
+    let system_msg = format_drift_system_message(drifts);
+    // ADR-013: additionalContext is SKIM_DEBUG-gated. It is persisted to the
+    // session transcript and replayed on --continue/--resume, making its cost
+    // permanent and its commit SHAs stale. Gate it to avoid spending context
+    // by default.
+    let advisory_text = if crate::debug::is_debug_enabled() {
+        Some(format_drift_advisory(drifts, de))
+    } else {
+        None
+    };
+    Some(Advisory {
+        system_msg,
+        advisory_text,
+    })
 }
 
 // ============================================================================
@@ -831,9 +862,10 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // consume the stamp, silently preventing the advisory for the rest of that
     // session.
     //
-    // build_advisory returns None immediately when SKIM_DEBUG is off (normal
-    // path) or when drifts is empty (healthy path). No filesystem access on
-    // either short-circuit path.
+    // ADR-013 split-gate: build_advisory returns None only when drifts is empty
+    // (healthy path) or cache dir is unavailable. When drift is detected,
+    // Advisory.system_msg is always present; Advisory.advisory_text is Some
+    // only when SKIM_DEBUG=1. No filesystem access on the healthy (empty) path.
     let advisory = build_advisory(&drifts, drift_env.as_ref(), session_id.as_deref());
 
     // Check for compound operator characters on the original string directly
@@ -873,8 +905,14 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             let mut response = protocol.format_response(&final_cmd);
             // B2: Attach drift advisory to the response if armed (non-blocking,
             // exit 0 preserved, no permissionDecision added — ADR-006 intact).
-            if let Some((advisory_text, system_msg)) = &advisory {
-                protocol.attach_advisory(&mut response, advisory_text, system_msg);
+            // ADR-013 split-gate: system_msg always present; advisory_text only
+            // when SKIM_DEBUG=1.
+            if let Some(adv) = &advisory {
+                protocol.attach_advisory(
+                    &mut response,
+                    adv.advisory_text.as_deref(),
+                    &adv.system_msg,
+                );
             }
             write_hook_response(&response)?;
         }
@@ -888,9 +926,11 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // Without format_advisory_only, the advisory is swallowed for exactly
             // the call where the agent most needs it — before any skim output has
             // been trusted.
-            if let Some((advisory_text, system_msg)) = &advisory
+            // ADR-013 split-gate: system_msg always fires; advisory_text only
+            // when SKIM_DEBUG=1.
+            if let Some(adv) = &advisory
                 && let Some(advisory_response) =
-                    protocol.format_advisory_only(advisory_text, system_msg)
+                    protocol.format_advisory_only(adv.advisory_text.as_deref(), &adv.system_msg)
             {
                 write_hook_response(&advisory_response)?;
             }
@@ -1550,18 +1590,54 @@ mod tests {
 
     #[test]
     fn test_system_message_under_200_chars() {
-        let env = healthy_drift_env();
         let drifts = vec![
             DriftKind::HookVersionMismatch,
             DriftKind::BinaryPathMismatch,
             DriftKind::CommitMismatch,
             DriftKind::HookScriptUnpinned,
         ];
-        let msg = format_drift_system_message(&drifts, &env);
+        let msg = format_drift_system_message(&drifts);
         assert!(
             msg.len() <= 200,
             "system message must be ≤ 200 chars, got {}",
             msg.len()
+        );
+    }
+
+    /// The system message must never truncate mid-string, even for a pathological
+    /// exe path. Because the path is deliberately omitted from `systemMessage`,
+    /// this property holds by construction — we verify it explicitly.
+    #[test]
+    fn test_system_message_no_mid_string_truncation() {
+        // Pathological: a very long exe path that would have caused mid-path
+        // truncation under the old format that included the binary path.
+        let very_long_path = "/home/user/".to_string() + &"a".repeat(300) + "/skim";
+        let env_with_long_path = DriftEnv {
+            current_exe: Some(std::path::PathBuf::from(&very_long_path)),
+            ..healthy_drift_env()
+        };
+        let _ = env_with_long_path; // env is no longer used by format_drift_system_message
+
+        let drifts = vec![
+            DriftKind::HookVersionMismatch,
+            DriftKind::BinaryPathMismatch,
+        ];
+        let msg = format_drift_system_message(&drifts);
+
+        // The path must NOT appear in the system message (omitted by design).
+        assert!(
+            !msg.contains(&very_long_path),
+            "system message must not contain the binary path: {msg}"
+        );
+        // The message must be a complete, well-formed sentence.
+        assert!(
+            msg.contains("skim doctor"),
+            "system message must reference skim doctor: {msg}"
+        );
+        // No mid-string truncation: message ends with a period.
+        assert!(
+            msg.ends_with('.'),
+            "system message must end with complete punctuation (no mid-string cut): {msg}"
         );
     }
 
@@ -1629,17 +1705,31 @@ mod tests {
     }
 
     // ========================================================================
-    // TASK 1 — Advisory is SKIM_DEBUG-gated
+    // TASK 1 — ADR-013 split-gate: systemMessage unconditional,
+    //           additionalContext SKIM_DEBUG-gated
     //
-    // build_advisory must return None when SKIM_DEBUG is off, even with active
-    // drift. The stamp must not be consumed when the gate is closed.
+    // build_advisory_inner always returns Some(Advisory) when drift is detected
+    // and the stamp passes — regardless of debug state.
+    //
+    // Advisory.system_msg  is always present  (user-facing, zero model cost).
+    // Advisory.advisory_text is Some only when SKIM_DEBUG=1 (model-facing;
+    //   replayed on --continue/--resume — cost is permanent, gate is justified).
+    //
+    // The shared stamp IS consumed whenever system_msg fires — one stamp gates
+    // both channels. No second stamp; no double-fire.
     // ========================================================================
 
-    /// With debug OFF (default), build_advisory_inner returns Some (the gate is
-    /// upstream in build_advisory). Verify that directly — and then verify that
-    /// build_advisory (the gated entry point) returns None with debug OFF.
+    /// With debug OFF (default), build_advisory_inner returns Some with
+    /// system_msg present and advisory_text absent.  The stamp is created
+    /// because system_msg fires unconditionally.
+    ///
+    /// Rationale: systemMessage costs zero model context (user-facing only,
+    /// "shown to you, not to Claude" — hooks.md §systemMessage). Gating a
+    /// human-facing nudge behind a flag the human must consciously set defeats
+    /// its only purpose — the warning appears precisely for the user who does
+    /// not know to look for it.
     #[test]
-    fn test_advisory_gated_off_by_default() {
+    fn test_advisory_system_message_unconditional_additional_context_gated() {
         let _guard = crate::debug::DebugTestGuard::acquire();
         // Debug is OFF after acquire().
 
@@ -1656,38 +1746,41 @@ mod tests {
         };
         let drifts = detect_drift(&env);
         assert!(!drifts.is_empty(), "test requires drift to be detected");
-
-        // build_advisory_inner is the stamp-creating layer. With debug OFF,
-        // build_advisory gates before reaching it — no stamp is written.
-        // Verify by calling build_advisory_inner directly (unhinted) and noting
-        // it would return Some if we got there.
-        let inner_result = build_advisory_inner(&drifts, &env, Some("sid-gate"), temp.path());
-        assert!(
-            inner_result.is_some(),
-            "build_advisory_inner itself does not gate on debug — gate is upstream"
-        );
-        // Reset: clear the stamp so the gate test below starts clean.
-        let _ = std::fs::remove_dir_all(&stamp_dir);
-
-        // Now verify build_advisory (the gated function) returns None when debug is OFF.
-        // It returns before calling resolve_cache_dir(), so no filesystem access occurs.
-        // We cannot call build_advisory through its resolve_cache_dir path without
-        // SKIM_CACHE_DIR set, so instead confirm the gate logic directly:
         assert!(
             !crate::debug::is_debug_enabled(),
             "debug must be OFF for this test"
         );
-        // The gate is: if !is_debug_enabled() { return None }
-        // Since is_debug_enabled() == false, build_advisory would return None.
-        // Stamp dir was removed above; verify it stays gone (gate never reaches inner).
+
+        // build_advisory_inner must return Some even with debug OFF.
+        let result = build_advisory_inner(&drifts, &env, Some("sid-gate"), temp.path());
         assert!(
-            !stamp_dir.exists(),
-            "stamp dir must not exist when gate is closed: {stamp_dir:?}"
+            result.is_some(),
+            "build_advisory_inner must return Some when drift detected, even with debug OFF"
+        );
+        let adv = result.unwrap();
+
+        // system_msg is unconditional — always present.
+        assert!(
+            !adv.system_msg.is_empty(),
+            "system_msg must be present with debug OFF: got empty string"
+        );
+
+        // advisory_text is None — SKIM_DEBUG gate is closed.
+        assert!(
+            adv.advisory_text.is_none(),
+            "advisory_text must be None when debug OFF (SKIM_DEBUG gate): got Some"
+        );
+
+        // Stamp IS created — shared stamp gates both channels; system_msg fires
+        // so stamp is consumed.
+        assert!(
+            stamp_dir.exists(),
+            "stamp dir must be created when drift fires (system_msg unconditional): {stamp_dir:?}"
         );
     }
 
-    /// With debug ON, build_advisory_inner fires and creates the stamp.
-    /// This is the positive gate test.
+    /// With debug ON, build_advisory_inner returns Some with both channels
+    /// populated and the stamp created.
     #[test]
     fn test_advisory_fires_when_debug_on() {
         let _guard = crate::debug::DebugTestGuard::acquire();
@@ -1705,11 +1798,21 @@ mod tests {
         let drifts = detect_drift(&env);
         assert!(!drifts.is_empty());
 
-        // With debug ON, build_advisory_inner is reached and returns Some.
+        // With debug ON, both channels are present.
         let result = build_advisory_inner(&drifts, &env, Some("sid-debug-on"), temp.path());
         assert!(
             result.is_some(),
             "advisory must fire when debug is ON and drift is detected"
+        );
+        let adv = result.unwrap();
+
+        assert!(
+            !adv.system_msg.is_empty(),
+            "system_msg must be present with debug ON"
+        );
+        assert!(
+            adv.advisory_text.is_some(),
+            "advisory_text must be Some when debug ON (SKIM_DEBUG gate open)"
         );
 
         // Stamp was written.
@@ -1843,7 +1946,7 @@ mod tests {
 
         // format_advisory_only must return None (no response JSON).
         assert!(
-            hook.format_advisory_only(advisory_text, system_msg)
+            hook.format_advisory_only(Some(advisory_text), system_msg)
                 .is_none(),
             "Non-Claude protocol: format_advisory_only must be None \
              (wrapper surface has no in-band advisory channel)"
@@ -1852,7 +1955,7 @@ mod tests {
         // attach_advisory must be a no-op — response unchanged.
         let mut response = serde_json::json!({"test": "value"});
         let original = response.clone();
-        hook.attach_advisory(&mut response, advisory_text, system_msg);
+        hook.attach_advisory(&mut response, Some(advisory_text), system_msg);
         assert_eq!(
             response, original,
             "Non-Claude protocol: attach_advisory must be a no-op \

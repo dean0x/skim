@@ -36,40 +36,38 @@ impl HookProtocol for ClaudeCodeHook {
 
     /// Attach drift advisory in-band to a Claude Code hook response.
     ///
-    /// Adds:
-    /// - `hookSpecificOutput.additionalContext` — model-facing advisory text
-    ///   (~1 KB; detailed provenance diff + remedies). Nested inside
-    ///   `hookSpecificOutput` because Claude Code silently ignores top-level
-    ///   `additionalContext`.
-    /// - `systemMessage` — user-facing one-liner (≤200 chars). Top-level per
-    ///   Claude Code hook protocol: shown in the UI, not model context.
+    /// ADR-013 split-gate — two channels, different ADR-011 classes:
     ///
-    /// Non-blocking: does NOT set `permissionDecision` — ADR-006 must be
-    /// preserved. Never writes to stderr — GRANITE #361 Bug 3 invariant.
+    /// - `system_msg` (always present): top-level `systemMessage`. User-facing
+    ///   only ("shown to you, not to Claude" — hooks.md). Zero model context.
+    ///   Fires unconditionally whenever drift is detected and stamp passes.
     ///
-    /// ADR-011/ADR-013 (amended): the advisory is SKIM_DEBUG-gated. The drift
-    /// trigger (multiple clones, install-from-source, same-version rebuilds) is
-    /// developer-specific; ordinary users essentially never encounter it. A
-    /// context-optimising tool must not spend context by default. The gate lives
-    /// in `build_advisory` (hook.rs), upstream of this method — `attach_advisory`
-    /// is only called when the gate is open and the stamp passes the dedup check.
+    /// - `advisory_text` (`Some` only when `SKIM_DEBUG=1`): nested inside
+    ///   `hookSpecificOutput.additionalContext`. Model-facing; persisted to the
+    ///   session transcript and replayed on `--continue`/`--resume`. Gated to
+    ///   avoid permanently spending context by default.
+    ///
+    /// Non-blocking: does NOT set `permissionDecision` — ADR-006 preserved.
+    /// Zero stderr — GRANITE #361 Bug 3 invariant.
     fn attach_advisory(
         &self,
         response: &mut serde_json::Value,
-        advisory_text: &str,
+        advisory_text: Option<&str>,
         system_msg: &str,
     ) {
-        // Add model-facing advisory inside hookSpecificOutput.
-        if let Some(hso) = response
-            .get_mut("hookSpecificOutput")
-            .and_then(|v| v.as_object_mut())
+        // ADR-013: add model-facing advisory inside hookSpecificOutput only when
+        // SKIM_DEBUG=1 (advisory_text is Some).
+        if let Some(text) = advisory_text
+            && let Some(hso) = response
+                .get_mut("hookSpecificOutput")
+                .and_then(|v| v.as_object_mut())
         {
             hso.insert(
                 "additionalContext".to_string(),
-                serde_json::Value::String(advisory_text.to_string()),
+                serde_json::Value::String(text.to_string()),
             );
         }
-        // Add user-facing one-liner at top level (Claude Code protocol).
+        // Always add user-facing one-liner at top level (Claude Code protocol).
         if let Some(obj) = response.as_object_mut() {
             obj.insert(
                 "systemMessage".to_string(),
@@ -84,36 +82,47 @@ impl HookProtocol for ClaudeCodeHook {
     /// The response carries only the advisory fields — `updatedInput` is
     /// intentionally absent so the agent runs the original command unchanged.
     ///
-    /// Without this method the advisory is swallowed for exactly the call that
-    /// matters most: the FIRST Bash call of a session frequently does not match
-    /// a rewrite rule, but is also the first time the agent acts on skim output
-    /// and most needs the provenance warning.
+    /// ADR-013 split-gate — response shape varies by debug state:
     ///
-    /// Response shape (Claude Code):
+    /// Debug OFF (`advisory_text` is `None`):
+    /// ```json
+    /// { "systemMessage": "<one-liner>" }
+    /// ```
+    ///
+    /// Debug ON (`advisory_text` is `Some`):
     /// ```json
     /// {
     ///   "hookSpecificOutput": {
     ///     "hookEventName": "PreToolUse",
-    ///     "additionalContext": "<advisory>"
+    ///     "additionalContext": "<full advisory>"
     ///   },
     ///   "systemMessage": "<one-liner>"
     /// }
     /// ```
     ///
+    /// Both shapes are valid per the hook spec: `systemMessage` is a universal
+    /// top-level field; `hookSpecificOutput` is only required when making a
+    /// PreToolUse-specific decision (`permissionDecision`, `updatedInput`, etc.).
+    ///
     /// Security: never sets `permissionDecision` (ADR-006).
     /// Zero stderr (GRANITE #361 Bug 3).
     fn format_advisory_only(
         &self,
-        advisory_text: &str,
+        advisory_text: Option<&str>,
         system_msg: &str,
     ) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": advisory_text
-            },
-            "systemMessage": system_msg
-        }))
+        match advisory_text {
+            Some(text) => Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "additionalContext": text
+                },
+                "systemMessage": system_msg
+            })),
+            None => Some(serde_json::json!({
+                "systemMessage": system_msg
+            })),
+        }
     }
 
     fn generate_script(&self, version: &str, binary_path: &str) -> String {

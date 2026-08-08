@@ -58,18 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution reads from `--version` output (`skim x.y.z (sha)`) rather than a `--commit`
   flag, so it correctly identifies binaries that predate the doctor subcommand itself.
 
-- **Build-provenance drift is surfaced in-band to the agent when `SKIM_DEBUG=1`** — When
-  the rewrite hook detects that the running binary differs from the one pinned in the hook
-  script (different path or different commit SHA), skim delivers a provenance advisory
-  through the hook-response channel (`hookSpecificOutput.additionalContext` + a ≤200-char
-  `systemMessage`) instead of routing only to `hook.log`. The advisory is deduped per
-  session via a stamp file at `<cache>/hook-drift/{session_id}.stamp`; the stamp content
+- **Build-provenance drift surfaces a user-facing notice unconditionally and a model-facing
+  advisory when `SKIM_DEBUG=1` (ADR-013 split-gate)** — When the rewrite hook detects that
+  the running binary differs from the one pinned in the hook script (different path or
+  different commit SHA), skim delivers two channels: (1) a `systemMessage` one-liner —
+  always emitted regardless of `SKIM_DEBUG`, because it costs zero model context ("shown to
+  you, not to Claude" per the hook spec) and warns the person who does not know to look;
+  (2) a model-facing `hookSpecificOutput.additionalContext` advisory — gated behind
+  `SKIM_DEBUG=1` because the platform replays `additionalContext` from the session
+  transcript on `--continue`/`--resume`, making its context cost permanent and its commit
+  SHAs stale. The two channels are in different ADR-011 classes: the `systemMessage` is an
+  unconditional notice; the `additionalContext` is a debug-gated banner. Both share a
+  single dedup stamp per `<cache>/hook-drift/{session_id}.stamp`; the stamp is consumed
+  whenever `systemMessage` fires (once per session per drift state). The stamp content
   includes the version, commit, and a 12-char hash of the canonical binary path, so a
-  second build at the same version re-arms the advisory. The advisory is `SKIM_DEBUG`-gated
-  (off by default): the drift trigger (multiple clones, install-from-source, same-version
-  rebuilds) is developer-specific; ordinary users essentially never encounter it, and a
-  context-optimising tool must not spend context unconditionally. `hook.log` recording
-  stays unconditional; `skim doctor` is the primary diagnosis path. The advisory stamp is
+  second build at the same version re-arms the advisory. `hook.log` recording stays
+  unconditional; `skim doctor` is the primary diagnosis path. The advisory stamp is
   consumed only when the advisory is actually delivered — a prior defect that silently
   burned the stamp on indefinite (`npm run dev`) or multi-line (`git commit -m "a\nb"`)
   commands has been fixed. Remediation text is now install-agnostic: source builds (binary
