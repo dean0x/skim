@@ -28,6 +28,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::tokens;
+use rskim_tokens::{Encoding, encoding_for_model};
 
 // ============================================================================
 // Shared time constant
@@ -71,6 +72,12 @@ pub(crate) enum CommandType {
     Log,
     Heatmap,
     Db,
+    /// Proxy request (L3 compression proxy — recorded by `record_proxy`, not `record`).
+    /// AD-AN-6: CLI-scope query methods exclude rows with `command_type = 'proxy'`
+    /// so proxy analytics never inflate CLI figures.
+    // Phase 6 (proxy_analytics.rs bridge) calls record_proxy which uses this variant.
+    #[allow(dead_code)]
+    Proxy,
 }
 
 impl CommandType {
@@ -87,6 +94,7 @@ impl CommandType {
             CommandType::Log => "log",
             CommandType::Heatmap => "heatmap",
             CommandType::Db => "db",
+            CommandType::Proxy => "proxy",
         }
     }
 }
@@ -192,6 +200,163 @@ pub(crate) struct SessionStats {
     pub(crate) avg_tokens_per_session: f64,
     /// Invocations without a session_id (NULL rows, excluded from averages).
     pub(crate) untagged_invocations: u64,
+}
+
+// ============================================================================
+// Proxy recording types (always compiled — no rskim-proxy dependency)
+// ============================================================================
+
+/// Provider classification for proxy analytics recording.
+///
+/// AD-PXY-21: Local enum (no rskim-proxy dependency) so the recording core
+/// compiles in default builds without the HTTP/TLS stack (ADR-008).  The
+/// feature-gated bridge in `proxy_analytics.rs` converts from
+/// `rskim_proxy::detect::ProxyProvider` to this type.
+///
+/// Column mapping in `token_savings.provider`:
+/// - `Unknown`   → `NULL`
+/// - `Anthropic` → `"anthropic"`
+/// - `OpenAI`    → `"openai"`
+// Phase 6 (proxy_analytics.rs bridge) constructs RecordingProvider values and
+// passes them to record_proxy / select_encoding.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingProvider {
+    /// Provider could not be determined from the request.
+    Unknown,
+    /// Anthropic API (Claude family).
+    Anthropic,
+    /// OpenAI API (GPT / o-series family).
+    OpenAI,
+}
+
+/// Per-block decision record from the proxy's BlockRouter.
+///
+/// AD-AN-13: the unit is bytes (not tokens); `bytes_in`/`bytes_out` are exact
+/// and always present (verified log.rs:390-393).  One row per
+/// `rskim_contract::log::DecisionRecord` projected from the collecting sink in
+/// `server.rs` (AD-PXY-21).
+///
+/// **Byte-reconciliation caveat:** the `Σ bytes_in` over all `ProxyBlockDecision`
+/// rows for a parent equals the sum of the *live-zone candidate* block lengths,
+/// NOT the full raw body length.  `BlockRouter` partitions only live-zone
+/// mutable classified blocks (zone.rs AC-27); stale/orientation/immutable
+/// blocks are forwarded byte-identical and do NOT emit `DecisionRecord`s.
+/// This was verified against the `#304` BlockRouter implementation.
+// Phase 6 (proxy_analytics.rs bridge) constructs ProxyBlockDecision values.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyBlockDecision {
+    /// Zero-indexed position of this block in the decision sequence.
+    pub block_index: usize,
+    /// Component/engine identifier (e.g. `"block-router"`, `"json"`, `"log"`).
+    pub component: String,
+    /// Decision outcome string (e.g. `"passthrough"`, `"modified"`, `"degraded"`).
+    pub outcome: String,
+    /// Input bytes fed into this block.
+    pub bytes_in: u64,
+    /// Output bytes produced by this block.
+    pub bytes_out: u64,
+}
+
+/// Input to [`AnalyticsDb::record_proxy`] — bundles all fields for one proxy
+/// request recording.
+///
+/// **Pair-jointly-NULL semantics (AD-AN-7):** `raw_tokens`, `compressed_tokens`,
+/// and `savings_pct` are **all** `None` when token counting was unavailable
+/// (counter construction failed, or either body was not valid UTF-8).  They are
+/// **all** `Some` otherwise — no mixed state, never a fabricated or estimated
+/// value.
+///
+/// The consumer thread in `proxy_analytics.rs` populates the three token fields
+/// after calling [`select_encoding`] and constructing a
+/// [`rskim_tokens::Counter`] for the resolved encoding.
+// Phase 6 (proxy_analytics.rs bridge) constructs ProxyRecordInput values.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyRecordInput {
+    /// Unix timestamp of the request (seconds since epoch).
+    pub timestamp: i64,
+    /// Provider classification.
+    pub provider: RecordingProvider,
+    /// Model identifier — verbatim as extracted from the request body, no
+    /// casing/alias folding (AD-PXY-22).  `None` when the model could not be
+    /// detected.
+    pub model: Option<String>,
+    /// Turn-level attribution.  `None` until `#344` emits it.
+    pub turn_id: Option<String>,
+    /// Request tier: `"passthrough"`, `"full"`, or `"degraded"`.
+    pub tier: String,
+    /// Duration from first request byte to last relayed response byte (AC4).
+    pub duration_ms: u64,
+    /// Project path for grouping (current working directory at recording time).
+    pub project_path: String,
+    /// Session ID for per-session attribution (AD-AN-4).
+    pub session_id: Option<String>,
+    /// Original command string (e.g. the request URL path `/v1/messages`).
+    pub original_cmd: String,
+    /// Pre-counted raw (pre-transform) tokens.  `None` per AD-AN-7 when
+    /// counting is unavailable; paired with `compressed_tokens` and
+    /// `savings_pct`.
+    pub raw_tokens: Option<i64>,
+    /// Pre-counted compressed (post-transform) tokens.
+    pub compressed_tokens: Option<i64>,
+    /// Pre-computed savings percentage.
+    pub savings_pct: Option<f64>,
+    /// HTTP status code generated by the proxy when the upstream errored
+    /// (502 or 504).  `None` for normal relayed rows (AD-PXY-25).
+    pub upstream_error_status: Option<i64>,
+    /// Per-block decision log (AD-AN-13).
+    pub blocks: Vec<ProxyBlockDecision>,
+}
+
+// ============================================================================
+// select_encoding — provider + model → token counting basis (AD-AN-11)
+// ============================================================================
+
+/// Select the token encoding for a proxy request based on provider and model.
+///
+/// **AD-AN-11:** reconciles `#300`'s model-string API with the provider-enum
+/// fallback.  `encoding_for_model` (rskim-tokens) is model-string-only and
+/// returns `Heuristic` for unknown strings (verified encoding.rs:138), so this
+/// function adds provider-level family defaults so an unrecognized model within
+/// a known family uses the family encoding rather than the conservative
+/// `Heuristic`.
+///
+/// ## Fallback table (AC21)
+///
+/// | Provider  | `model = None`     | recognized model   | unrecognized model |
+/// |-----------|--------------------|--------------------|---------------------|
+/// | `Unknown` | `Heuristic`        | `Heuristic`        | `Heuristic`         |
+/// | `Anthropic` | `AnthropicOffline` | family encoding | `AnthropicOffline`  |
+/// | `OpenAI`  | `O200k`            | family encoding    | `O200k`             |
+///
+/// All 9 cases are pinned by a table-driven unit test (AC21).
+// Phase 6 (proxy_analytics.rs bridge) calls select_encoding.
+#[allow(dead_code)]
+pub(crate) fn select_encoding(provider: &RecordingProvider, model: Option<&str>) -> Encoding {
+    match provider {
+        // AD-AN-11 challenge #5b: unknown provider → Heuristic even when a model
+        // string is present (the model may belong to an unclassifiable provider).
+        RecordingProvider::Unknown => Encoding::Heuristic,
+        RecordingProvider::Anthropic => match model {
+            // AD-AN-11 challenge #5a: family default when model absent.
+            None => Encoding::AnthropicOffline,
+            // AD-AN-11: unrecognized-within-family → family default;
+            // recognized model keeps its own encoding.
+            Some(m) => match encoding_for_model(m) {
+                Encoding::Heuristic => Encoding::AnthropicOffline,
+                e => e,
+            },
+        },
+        RecordingProvider::OpenAI => match model {
+            None => Encoding::O200k,
+            Some(m) => match encoding_for_model(m) {
+                Encoding::Heuristic => Encoding::O200k,
+                e => e,
+            },
+        },
+    }
 }
 
 // ============================================================================
@@ -784,6 +949,120 @@ impl AnalyticsDb {
             avg_tokens_per_session,
             untagged_invocations,
         })
+    }
+
+    /// Record a proxy request analytics row and its per-block decision log.
+    ///
+    /// **AD-AN-13:** the parent `token_savings` row and all
+    /// `proxy_block_decisions` detail rows are written inside **one
+    /// transaction** — a parent never exists without its block rows and vice
+    /// versa.  Any INSERT failure rolls back the entire batch before persisting,
+    /// leaving the database intact (ADR-006).
+    ///
+    /// **AD-AN-7 / pair-jointly-NULL:** `raw_tokens`, `compressed_tokens`, and
+    /// `savings_pct` are bound from `Option` fields.  When all three are `None`
+    /// the columns are stored as `NULL`; when all are `Some` the measured values
+    /// are stored.  Never a fabricated or estimated value.
+    ///
+    /// **AD-PXY-25:** `upstream_error_status` is non-`NULL` for
+    /// transformed-but-upstream-errored rows (502/504).  These rows are excluded
+    /// from savings and tier aggregates by the query layer.
+    // Phase 6 (proxy_analytics.rs bridge) calls record_proxy.
+    #[allow(dead_code)]
+    pub(crate) fn record_proxy(&mut self, r: &ProxyRecordInput) -> anyhow::Result<()> {
+        // AD-PXY-21: map provider enum to the nullable TEXT column value.
+        let provider_str: Option<&str> = match &r.provider {
+            RecordingProvider::Unknown => None,
+            RecordingProvider::Anthropic => Some("anthropic"),
+            RecordingProvider::OpenAI => Some("openai"),
+        };
+
+        // AD-AN-13: single transaction — parent row and per-block detail rows
+        // are committed together.  `Transaction::commit` is required; if it is
+        // not called (e.g. on `?` early return), rusqlite rolls back on Drop
+        // (ADR-006: abort before persisting, old state survives).
+        let tx = self.conn.transaction()?;
+
+        tx.execute(
+            "INSERT INTO token_savings \
+             (timestamp, command_type, original_cmd, \
+              raw_tokens, compressed_tokens, savings_pct, \
+              duration_ms, project_path, parse_tier, session_id, \
+              provider, model, turn_id, upstream_error_status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                r.timestamp,
+                CommandType::Proxy.as_str(),
+                r.original_cmd,
+                r.raw_tokens,
+                r.compressed_tokens,
+                r.savings_pct,
+                r.duration_ms as i64,
+                r.project_path,
+                r.tier,
+                r.session_id,
+                provider_str,
+                r.model,
+                r.turn_id,
+                r.upstream_error_status,
+            ],
+        )?;
+
+        let parent_id = tx.last_insert_rowid();
+
+        // AD-AN-13: per-block detail rows — same transaction.
+        for block in &r.blocks {
+            tx.execute(
+                "INSERT INTO proxy_block_decisions \
+                 (savings_id, block_index, component, outcome, bytes_in, bytes_out) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    parent_id,
+                    block.block_index as i64,
+                    block.component,
+                    block.outcome,
+                    block.bytes_in as i64,
+                    block.bytes_out as i64,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist accumulated proxy event drop count to `analytics_meta`.
+    ///
+    /// **AD-AN-8:** uses an upsert so the counter is monotonically additive
+    /// across process restarts.  The key `proxy_dropped_records` accumulates
+    /// the total drops ever observed.
+    ///
+    /// The `count` parameter is the number of drops that occurred since the
+    /// last persist call (from the process-local `AtomicU64` in the bridge).
+    ///
+    /// Persist failure is fail-open per AD-AN-8 — the **caller** is responsible
+    /// for deciding whether to log or discard the error.
+    ///
+    /// **Bounded default constants (ADR-003/PF-005):** the bridge's queue
+    /// capacities (`PROXY_QUEUE_RECORD_CAPACITY = 2048`,
+    /// `PROXY_QUEUE_BYTE_BUDGET = 128 MiB`) are **bounded defaults chosen to
+    /// minimise drop-bias, NOT empirically-derived thresholds**.  A persistently
+    /// non-zero `proxy_dropped_records` is the disclosure counter that signals
+    /// these constants should be raised (or that the workload is unusually
+    /// large).
+    // Phase 6 (proxy_analytics.rs bridge) calls analytics_meta_add_drop_count.
+    #[allow(dead_code)]
+    pub(crate) fn analytics_meta_add_drop_count(&self, count: u64) -> anyhow::Result<()> {
+        // INSERT … ON CONFLICT(key) DO UPDATE is the upsert syntax available in
+        // SQLite ≥ 3.24.0 (2018-06-04).  rusqlite "bundled" (0.31) ships
+        // SQLite 3.49+.  The monotonic absolute-add ensures drops are never
+        // lost across restarts.
+        self.conn.execute(
+            "INSERT INTO analytics_meta (key, value) VALUES ('proxy_dropped_records', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = value + ?1",
+            [count as i64],
+        )?;
+        Ok(())
     }
 }
 
@@ -3136,5 +3415,454 @@ mod tests {
             count, 2,
             "AC4 (detail-table): all rows must survive the clean re-migration"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: proxy recording-core tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a minimal [`ProxyRecordInput`] with full token counts and
+    /// two blocks.  Callers override individual fields for targeted cases.
+    fn sample_proxy_input() -> ProxyRecordInput {
+        ProxyRecordInput {
+            timestamp: 1_700_000_000,
+            provider: RecordingProvider::Anthropic,
+            model: Some("claude-3-opus-20240229".to_string()),
+            turn_id: Some("turn-abc".to_string()),
+            tier: "premium".to_string(),
+            duration_ms: 42,
+            project_path: "/tmp/proj".to_string(),
+            session_id: Some("sess-1".to_string()),
+            original_cmd: "proxy-request".to_string(),
+            raw_tokens: Some(1000),
+            compressed_tokens: Some(400),
+            savings_pct: Some(60.0),
+            upstream_error_status: None,
+            blocks: vec![
+                ProxyBlockDecision {
+                    block_index: 0,
+                    component: "assistant".to_string(),
+                    outcome: "compressed".to_string(),
+                    bytes_in: 500,
+                    bytes_out: 200,
+                },
+                ProxyBlockDecision {
+                    block_index: 1,
+                    component: "tool_result".to_string(),
+                    outcome: "passthrough".to_string(),
+                    bytes_in: 300,
+                    bytes_out: 300,
+                },
+            ],
+        }
+    }
+
+    /// AC21 — `select_encoding` covers all 9 cells of the
+    /// {Unknown, Anthropic, OpenAI} × {None, recognized, unrecognized} matrix.
+    ///
+    /// The OpenAI + "gpt-4" cell is the **discriminating case**: gpt-4 maps to
+    /// `Cl100k` (not `O200k`), so a regression that always returns the family
+    /// default would produce the wrong answer here.
+    #[test]
+    fn test_select_encoding_table_driven() {
+        use Encoding::*;
+        use RecordingProvider::*;
+
+        let cases: &[(&str, RecordingProvider, Option<&str>, Encoding)] = &[
+            // Unknown provider → always Heuristic regardless of model
+            ("Unknown+None", Unknown, None, Heuristic),
+            ("Unknown+recognized", Unknown, Some("gpt-4o"), Heuristic),
+            ("Unknown+unrecognized", Unknown, Some("mystery-llm"), Heuristic),
+            // Anthropic + None → AnthropicOffline family default
+            ("Anthropic+None", Anthropic, None, AnthropicOffline),
+            // Anthropic + recognized model → keeps its encoding (also AnthropicOffline
+            // for claude-3-opus, but the mechanism is the keep-encoding path)
+            (
+                "Anthropic+recognized",
+                Anthropic,
+                Some("claude-3-opus-20240229"),
+                AnthropicOffline,
+            ),
+            // Anthropic + unrecognized → falls back to AnthropicOffline family default
+            (
+                "Anthropic+unrecognized",
+                Anthropic,
+                Some("mystery-llm"),
+                AnthropicOffline,
+            ),
+            // OpenAI + None → O200k family default
+            ("OpenAI+None", OpenAI, None, O200k),
+            // OpenAI + "gpt-4" → Cl100k (recognized, DIFFERENT from O200k family default).
+            // This is the discriminating case: a function that blindly returns the
+            // family default would return O200k here instead of Cl100k.
+            ("OpenAI+gpt-4(Cl100k)", OpenAI, Some("gpt-4"), Cl100k),
+            // OpenAI + unrecognized → falls back to O200k family default
+            ("OpenAI+unrecognized", OpenAI, Some("mystery-llm"), O200k),
+        ];
+
+        for &(label, ref provider, model, expected) in cases {
+            let got = select_encoding(provider, model);
+            assert_eq!(
+                got, expected,
+                "select_encoding case '{label}': expected {expected:?} got {got:?}"
+            );
+        }
+    }
+
+    /// AD-AN-13 + AD-PXY-21 — record_proxy writes a correctly-populated parent
+    /// row and two child block rows inside a single transaction.
+    ///
+    /// Verifies: provider column mapping (Anthropic→"anthropic"), model, turn_id,
+    /// session_id, command_type ("proxy"), token values, block fields.
+    #[test]
+    fn test_record_proxy_normal_row_stored_correctly() {
+        let (mut db, _tmp) = test_db();
+        let input = sample_proxy_input();
+        db.record_proxy(&input).unwrap();
+
+        // --- parent row ---
+        let (cmd_type, provider, model, turn_id, raw_tok, comp_tok, savings, err_status): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<f64>,
+            Option<i64>,
+        ) = db
+            .conn
+            .query_row(
+                // last_insert_rowid() reflects the last proxy_block_decisions row
+                // after record_proxy commits; use LIMIT 1 on the fresh DB instead.
+                "SELECT command_type, provider, model, turn_id, \
+                 raw_tokens, compressed_tokens, savings_pct, upstream_error_status \
+                 FROM token_savings LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cmd_type, "proxy", "command_type must be 'proxy'");
+        // AD-PXY-21: Anthropic maps to "anthropic" string
+        assert_eq!(
+            provider.as_deref(),
+            Some("anthropic"),
+            "provider must be 'anthropic' for RecordingProvider::Anthropic"
+        );
+        assert_eq!(model.as_deref(), Some("claude-3-opus-20240229"));
+        assert_eq!(turn_id.as_deref(), Some("turn-abc"));
+        // AD-AN-7: all three token columns are present (Some)
+        assert_eq!(raw_tok, Some(1000));
+        assert_eq!(comp_tok, Some(400));
+        assert!(
+            savings.map(|s| (s - 60.0).abs() < 0.001).unwrap_or(false),
+            "savings_pct must be ~60.0"
+        );
+        assert_eq!(err_status, None, "upstream_error_status must be NULL for normal rows");
+
+        // --- block rows ---
+        let block_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_block_decisions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(block_count, 2, "must have exactly 2 block rows");
+
+        // verify first block
+        let (bi, comp, outcome, b_in, b_out): (i64, String, String, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT block_index, component, outcome, bytes_in, bytes_out \
+                 FROM proxy_block_decisions WHERE block_index = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(bi, 0);
+        assert_eq!(comp, "assistant");
+        assert_eq!(outcome, "compressed");
+        assert_eq!(b_in, 500);
+        assert_eq!(b_out, 200);
+    }
+
+    /// AD-AN-7 (pair-jointly-NULL) — when token counts are not available, all
+    /// three token columns must be stored as NULL together, never as fabricated
+    /// or partial values.
+    ///
+    /// A regression that defaults any of the three columns to 0 instead of NULL
+    /// would fail this test.
+    #[test]
+    fn test_record_proxy_pair_jointly_null_when_counting_unavailable() {
+        let (mut db, _tmp) = test_db();
+        let mut input = sample_proxy_input();
+        // AD-AN-7: simulate a request where token counting was not performed
+        input.raw_tokens = None;
+        input.compressed_tokens = None;
+        input.savings_pct = None;
+        db.record_proxy(&input).unwrap();
+
+        let (raw, comp, savings): (Option<i64>, Option<i64>, Option<f64>) = db
+            .conn
+            .query_row(
+                "SELECT raw_tokens, compressed_tokens, savings_pct FROM token_savings LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        assert!(
+            raw.is_none(),
+            "AD-AN-7: raw_tokens must be NULL when counting unavailable"
+        );
+        assert!(
+            comp.is_none(),
+            "AD-AN-7: compressed_tokens must be NULL when counting unavailable"
+        );
+        assert!(
+            savings.is_none(),
+            "AD-AN-7: savings_pct must be NULL when counting unavailable"
+        );
+    }
+
+    /// AD-PXY-25 — `upstream_error_status` is stored non-NULL for
+    /// transformed-but-upstream-errored requests (e.g. the upstream returned 502
+    /// after the proxy had already compressed the body).
+    ///
+    /// Also verifies that `RecordingProvider::OpenAI` maps to the "openai"
+    /// column string (AD-PXY-21) and that `RecordingProvider::Unknown` maps
+    /// to NULL provider column.
+    #[test]
+    fn test_record_proxy_upstream_error_status_stored() {
+        let (mut db, _tmp) = test_db();
+
+        // AD-PXY-25: 502 upstream error — tokens still present (transformation ran)
+        let mut input = sample_proxy_input();
+        input.provider = RecordingProvider::OpenAI;
+        input.upstream_error_status = Some(502);
+        db.record_proxy(&input).unwrap();
+
+        let (provider, err_status): (Option<String>, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT provider, upstream_error_status FROM token_savings LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        // AD-PXY-21: OpenAI → "openai"
+        assert_eq!(
+            provider.as_deref(),
+            Some("openai"),
+            "provider must be 'openai' for RecordingProvider::OpenAI"
+        );
+        assert_eq!(
+            err_status,
+            Some(502),
+            "AD-PXY-25: upstream_error_status must store the HTTP error code"
+        );
+
+        // Also verify Unknown → NULL (second insert)
+        let mut input2 = sample_proxy_input();
+        input2.provider = RecordingProvider::Unknown;
+        db.record_proxy(&input2).unwrap();
+
+        let provider_unknown: Option<String> = db
+            .conn
+            .query_row(
+                // After inserting block rows, last_insert_rowid() no longer
+                // points to token_savings; ORDER BY id DESC picks the latest row.
+                "SELECT provider FROM token_savings ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            provider_unknown.is_none(),
+            "AD-PXY-21: Unknown provider must map to NULL"
+        );
+    }
+
+    /// PF-007 discriminating — byte-reconciliation invariant test.
+    ///
+    /// Verifies that Σ bytes_in and Σ bytes_out across all recorded block rows
+    /// exactly match the sum of bytes inserted via `ProxyRecordInput.blocks`.
+    /// A missing block row, a duplicated block row, or a mis-attributed block
+    /// row (wrong savings_id FK) would each cause this assertion to fail.
+    ///
+    /// **Important caveat documented here:** this invariant holds over the SET
+    /// OF RECORDED BLOCKS ONLY — it is NOT a claim that Σ bytes_in equals the
+    /// total raw request body length.  BlockRouter (rskim-compress #304) only
+    /// emits `DecisionRecord`s for live-zone mutable classified candidates (AC-27
+    /// three-way join).  Non-candidate blocks (stale / orientation / immutable)
+    /// are not represented in the decision log.  The invariant is self-consistency
+    /// of what was recorded, not full-body coverage.
+    #[test]
+    fn test_record_proxy_byte_reconciliation_invariant() {
+        let (mut db, _tmp) = test_db();
+
+        // Build three blocks with known byte counts.
+        let blocks = vec![
+            ProxyBlockDecision {
+                block_index: 0,
+                component: "assistant".to_string(),
+                outcome: "compressed".to_string(),
+                bytes_in: 800,
+                bytes_out: 320,
+            },
+            ProxyBlockDecision {
+                block_index: 1,
+                component: "tool_result".to_string(),
+                outcome: "passthrough".to_string(),
+                bytes_in: 600,
+                bytes_out: 600,
+            },
+            ProxyBlockDecision {
+                block_index: 2,
+                component: "system".to_string(),
+                outcome: "dropped".to_string(),
+                bytes_in: 200,
+                bytes_out: 0,
+            },
+        ];
+
+        let expected_bytes_in: u64 = blocks.iter().map(|b| b.bytes_in).sum();
+        let expected_bytes_out: u64 = blocks.iter().map(|b| b.bytes_out).sum();
+
+        let mut input = sample_proxy_input();
+        input.blocks = blocks;
+        db.record_proxy(&input).unwrap();
+
+        // Query the parent id so we query only OUR block rows (discriminating
+        // against leftover rows from other tests that share the same DB).
+        let parent_id: i64 = db
+            .conn
+            .query_row(
+                // last_insert_rowid() reflects the last proxy_block_decisions row;
+                // use LIMIT 1 — only one token_savings row exists in this fresh DB.
+                "SELECT id FROM token_savings LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let (row_count, actual_bytes_in, actual_bytes_out): (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*), SUM(bytes_in), SUM(bytes_out) \
+                 FROM proxy_block_decisions WHERE savings_id = ?1",
+                [parent_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            row_count, 3,
+            "PF-007: row count must equal the number of blocks inserted \
+             (missing, duplicated, or mis-attributed rows detected)"
+        );
+        assert_eq!(
+            actual_bytes_in as u64, expected_bytes_in,
+            "PF-007: Σ bytes_in over recorded blocks must match input sum \
+             ({} vs {expected_bytes_in})",
+            actual_bytes_in
+        );
+        assert_eq!(
+            actual_bytes_out as u64, expected_bytes_out,
+            "PF-007: Σ bytes_out over recorded blocks must match input sum \
+             ({} vs {expected_bytes_out})",
+            actual_bytes_out
+        );
+    }
+
+    /// AD-AN-8 — `analytics_meta_add_drop_count` is a monotonic upsert: two
+    /// calls with counts 10 and 5 must accumulate to 15, not overwrite.
+    ///
+    /// Also verifies: a key absent from `analytics_meta` is created on first
+    /// call (INSERT path), and subsequent calls UPDATE not INSERT again.
+    #[test]
+    fn test_analytics_meta_add_drop_count_upsert() {
+        use rusqlite::OptionalExtension;
+        let (db, _tmp) = test_db();
+
+        // Precondition: key must not exist yet.
+        let pre: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT value FROM analytics_meta WHERE key = 'proxy_dropped_records'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(pre.is_none(), "key must be absent before first call");
+
+        // First call (INSERT path)
+        db.analytics_meta_add_drop_count(10).unwrap();
+        let after_first: i64 = db
+            .conn
+            .query_row(
+                "SELECT value FROM analytics_meta WHERE key = 'proxy_dropped_records'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_first, 10, "first call must create key with value 10");
+
+        // Second call (UPDATE path — must accumulate, not overwrite)
+        db.analytics_meta_add_drop_count(5).unwrap();
+        let after_second: i64 = db
+            .conn
+            .query_row(
+                "SELECT value FROM analytics_meta WHERE key = 'proxy_dropped_records'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_second, 15,
+            "AD-AN-8: second call must accumulate to 15, not overwrite with 5"
+        );
+
+        // Third call with zero — must not reset
+        db.analytics_meta_add_drop_count(0).unwrap();
+        let after_zero: i64 = db
+            .conn
+            .query_row(
+                "SELECT value FROM analytics_meta WHERE key = 'proxy_dropped_records'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_zero, 15,
+            "AD-AN-8: adding zero must leave value unchanged"
+        );
+
+        // Verify no duplicate rows were created (single key row always)
+        let row_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM analytics_meta WHERE key = 'proxy_dropped_records'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "upsert must never create duplicate key rows");
     }
 }
