@@ -20,8 +20,8 @@ use super::types::CompoundSplitResult;
 /// A specific kind of binary-provenance drift detected between the hook script
 /// and the currently running binary.
 ///
-/// See ADR-013: drift is a TRUST fact about the bytes the agent is reasoning
-/// over — surfacing it in-band prevents false "current behavior" reports.
+/// Drift is detected and recorded to `hook.log`; `skim doctor` is the
+/// on-demand diagnostic. The hook response JSON never carries drift information.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DriftKind {
     /// SKIM_HOOK_BINARY is absent — hook script predates binary pinning.
@@ -1069,19 +1069,17 @@ mod tests {
     }
 
     // ========================================================================
-    // Advisory removal: drift records to hook.log only, never to stdout
-    //
-    // The in-band provenance advisory (systemMessage / additionalContext) was
-    // removed. The fix for drift is absolute-path pinning + `skim init` refresh
-    // + `skim doctor` on-demand. Drift is still detected and logged to hook.log
-    // via log_drift_warnings; it is never pushed into the hook response JSON.
-    // No `hook-drift/` stamp directory is ever created (stamp mechanism removed).
+    // Drift logging invariants: drift is detected and recorded to hook.log
+    // only, never injected into the hook response JSON. The fix for drift is
+    // absolute-path pinning + `skim init` refresh + `skim doctor` on-demand.
+    // The hook-drift/ directory is never created — warn_once_daily stamps
+    // (e.g. .hook-version-warned-<agent>) are the per-day dedup mechanism.
     // ========================================================================
 
-    /// End-state invariant: when drift is detected, the logging path fires
-    /// (stamp written → warn_once_daily triggered) but no in-band advisory
-    /// appears in the hook response JSON (no `systemMessage`, no
-    /// `additionalContext`), and no `hook-drift/` directory is ever created.
+    /// Invariant: when drift is detected, the logging path fires
+    /// (warn_once_daily stamps written) but the hook response JSON carries no
+    /// drift information — no `systemMessage`, no `additionalContext`.
+    /// The `hook-drift/` directory is never created.
     #[test]
     fn test_drift_logs_to_hook_log_never_to_hook_response() {
         use crate::cmd::hooks::HookProtocol;
@@ -1118,10 +1116,10 @@ mod tests {
             "warn_once_daily must have created a per-kind stamp file — logging path was not triggered"
         );
 
-        // The stamp mechanism (hook-drift/ directory) must NOT exist.
+        // The hook-drift/ directory must never be created.
         assert!(
             !hook_drift_dir.exists(),
-            "hook-drift/ stamp directory must NEVER be created (advisory removed): {hook_drift_dir:?}"
+            "hook-drift/ directory must never be created: {hook_drift_dir:?}"
         );
 
         // The hook response JSON must contain no systemMessage or additionalContext.
@@ -1129,11 +1127,11 @@ mod tests {
         let json_str = response.to_string();
         assert!(
             !json_str.contains("systemMessage"),
-            "hook response must not contain systemMessage (advisory removed): {json_str}"
+            "hook response must not contain systemMessage: {json_str}"
         );
         assert!(
             !json_str.contains("additionalContext"),
-            "hook response must not contain additionalContext (advisory removed): {json_str}"
+            "hook response must not contain additionalContext: {json_str}"
         );
         // Verify the response only has updatedInput (the correct rewrite shape).
         let updated = response

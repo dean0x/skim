@@ -816,17 +816,18 @@ fn test_hook_version_mismatch_warning() {
         "Rewrite should succeed despite version mismatch"
     );
 
-    // Advisory removed: hook response must contain no systemMessage or additionalContext.
-    // Drift is logged to hook.log only (skim doctor is the on-demand path).
+    // The hook response carries no drift information: systemMessage and
+    // additionalContext are absent. Drift is recorded to hook.log only;
+    // skim doctor is the on-demand diagnostic.
     assert!(
         json.get("systemMessage").is_none(),
-        "hook response must not contain systemMessage (advisory removed): {json}"
+        "hook response must not contain systemMessage: {json}"
     );
     assert!(
         json["hookSpecificOutput"]
             .get("additionalContext")
             .is_none(),
-        "hook response must not contain additionalContext (advisory removed): {json}"
+        "hook response must not contain additionalContext: {json}"
     );
 
     // Verify warning went to hook.log file instead
@@ -880,17 +881,18 @@ fn test_hook_binary_mismatch_warning() {
         "Rewrite must succeed despite binary mismatch"
     );
 
-    // Advisory removed: hook response must contain no systemMessage or additionalContext.
-    // Drift is logged to hook.log only (skim doctor is the on-demand path).
+    // The hook response carries no drift information: systemMessage and
+    // additionalContext are absent. Drift is recorded to hook.log only;
+    // skim doctor is the on-demand diagnostic.
     assert!(
         json.get("systemMessage").is_none(),
-        "hook response must not contain systemMessage (advisory removed): {json}"
+        "hook response must not contain systemMessage: {json}"
     );
     assert!(
         json["hookSpecificOutput"]
             .get("additionalContext")
             .is_none(),
-        "hook response must not contain additionalContext (advisory removed): {json}"
+        "hook response must not contain additionalContext: {json}"
     );
 
     // Warning must appear in hook.log.

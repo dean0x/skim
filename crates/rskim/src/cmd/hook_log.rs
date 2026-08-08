@@ -133,7 +133,7 @@ fn timestamp_string() -> String {
 
 /// Convert days since Unix epoch to (year, month, day).
 /// Algorithm from http://howardhinnant.github.io/date_algorithms.html
-pub(crate) fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
+pub(super) fn days_to_date(days_since_epoch: u64) -> (u64, u64, u64) {
     let z = days_since_epoch + 719468;
     let era = z / 146097;
     let doe = z - era * 146097;
