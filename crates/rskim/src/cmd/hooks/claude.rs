@@ -47,8 +47,12 @@ impl HookProtocol for ClaudeCodeHook {
     /// Non-blocking: does NOT set `permissionDecision` — ADR-006 must be
     /// preserved. Never writes to stderr — GRANITE #361 Bug 3 invariant.
     ///
-    /// ADR-011: the advisory is loss-bearing (the agent may have already acted
-    /// on output from the wrong binary), therefore it is NOT debug-gated.
+    /// ADR-011/ADR-013 (amended): the advisory is SKIM_DEBUG-gated. The drift
+    /// trigger (multiple clones, install-from-source, same-version rebuilds) is
+    /// developer-specific; ordinary users essentially never encounter it. A
+    /// context-optimising tool must not spend context by default. The gate lives
+    /// in `build_advisory` (hook.rs), upstream of this method — `attach_advisory`
+    /// is only called when the gate is open and the stamp passes the dedup check.
     fn attach_advisory(
         &self,
         response: &mut serde_json::Value,

@@ -58,21 +58,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution reads from `--version` output (`skim x.y.z (sha)`) rather than a `--commit`
   flag, so it correctly identifies binaries that predate the doctor subcommand itself.
 
-- **Build-provenance drift is now surfaced in-band to the agent** — When the rewrite hook
-  detects that the running binary differs from the one pinned in the hook script (different
-  path or different commit SHA), skim delivers a provenance advisory through the
-  hook-response channel (`hookSpecificOutput.additionalContext` + a ≤200-char
+- **Build-provenance drift is surfaced in-band to the agent when `SKIM_DEBUG=1`** — When
+  the rewrite hook detects that the running binary differs from the one pinned in the hook
+  script (different path or different commit SHA), skim delivers a provenance advisory
+  through the hook-response channel (`hookSpecificOutput.additionalContext` + a ≤200-char
   `systemMessage`) instead of routing only to `hook.log`. The advisory is deduped per
   session via a stamp file at `<cache>/hook-drift/{session_id}.stamp`; the stamp content
   includes the version, commit, and a 12-char hash of the canonical binary path, so a
-  second build at the same version re-arms the advisory. The advisory fires
-  unconditionally — it is not `SKIM_DEBUG`-gated — because drift invalidates the agent's
-  interpretation of every measurement in the session, not just data in transit. The
-  PATH-wrapper surface emits no in-band advisory by design: stdout must stay byte-faithful
-  per #317, and a stderr banner would be `SKIM_DEBUG`-gated (invisible by default),
-  reproducing the original failure. Delivery is absent when `SKIM_HOOK_VERSION` is unset
-  (not running under a skim-generated script). Scripts that predate `SKIM_HOOK_VERSION`
-  are not detected in-band; `skim doctor` covers that residual gap.
+  second build at the same version re-arms the advisory. The advisory is `SKIM_DEBUG`-gated
+  (off by default): the drift trigger (multiple clones, install-from-source, same-version
+  rebuilds) is developer-specific; ordinary users essentially never encounter it, and a
+  context-optimising tool must not spend context unconditionally. `hook.log` recording
+  stays unconditional; `skim doctor` is the primary diagnosis path. The advisory stamp is
+  consumed only when the advisory is actually delivered — a prior defect that silently
+  burned the stamp on indefinite (`npm run dev`) or multi-line (`git commit -m "a\nb"`)
+  commands has been fixed. Remediation text is now install-agnostic: source builds (binary
+  under `target/`) see the `cargo build` instruction; other installs (Homebrew, npm, cargo
+  install) see a generic "reinstall skim" instruction that names the resolved binary path
+  for unambiguity. The PATH-wrapper surface emits no in-band advisory by design: stdout
+  must stay byte-faithful per #317. Delivery is absent when `SKIM_HOOK_VERSION` is unset
+  (not running under a skim-generated script); `skim doctor` covers that gap.
 
 - **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
   rewrites `cat`/`head`/`tail` on a code file into `skim <file> --mode=pseudo` (or
