@@ -816,17 +816,17 @@ fn test_hook_version_mismatch_warning() {
         "Rewrite should succeed despite version mismatch"
     );
 
-    // ADR-013 split-gate: systemMessage is unconditional (user-facing, zero
-    // model context — "shown to you, not to Claude").  SKIM_DEBUG is not set,
-    // so additionalContext must be absent.
-    let system_msg = json["systemMessage"].as_str().unwrap_or("");
+    // Advisory removed: hook response must contain no systemMessage or additionalContext.
+    // Drift is logged to hook.log only (skim doctor is the on-demand path).
     assert!(
-        system_msg.contains("drift") || system_msg.contains("Provenance"),
-        "systemMessage must be present and reference drift on version mismatch, got: {system_msg:?}"
+        json.get("systemMessage").is_none(),
+        "hook response must not contain systemMessage (advisory removed): {json}"
     );
     assert!(
-        json["hookSpecificOutput"]["additionalContext"].is_null(),
-        "additionalContext must be absent when SKIM_DEBUG is not set (SKIM_DEBUG gate closed)"
+        json["hookSpecificOutput"]
+            .get("additionalContext")
+            .is_none(),
+        "hook response must not contain additionalContext (advisory removed): {json}"
     );
 
     // Verify warning went to hook.log file instead
@@ -880,16 +880,17 @@ fn test_hook_binary_mismatch_warning() {
         "Rewrite must succeed despite binary mismatch"
     );
 
-    // ADR-013 split-gate: systemMessage is unconditional (user-facing, zero
-    // model context).  SKIM_DEBUG is not set, so additionalContext must be absent.
-    let system_msg = json["systemMessage"].as_str().unwrap_or("");
+    // Advisory removed: hook response must contain no systemMessage or additionalContext.
+    // Drift is logged to hook.log only (skim doctor is the on-demand path).
     assert!(
-        system_msg.contains("drift") || system_msg.contains("Provenance"),
-        "systemMessage must be present and reference drift on binary mismatch, got: {system_msg:?}"
+        json.get("systemMessage").is_none(),
+        "hook response must not contain systemMessage (advisory removed): {json}"
     );
     assert!(
-        json["hookSpecificOutput"]["additionalContext"].is_null(),
-        "additionalContext must be absent when SKIM_DEBUG is not set (SKIM_DEBUG gate closed)"
+        json["hookSpecificOutput"]
+            .get("additionalContext")
+            .is_none(),
+        "hook response must not contain additionalContext (advisory removed): {json}"
     );
 
     // Warning must appear in hook.log.

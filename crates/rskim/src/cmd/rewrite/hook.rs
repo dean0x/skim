@@ -172,403 +172,12 @@ pub(super) fn detect_drift(env: &DriftEnv) -> Vec<DriftKind> {
 }
 
 // ============================================================================
-// B3 — Session-keyed dedup stamp helpers
-// ============================================================================
-
-/// Compute the drift stamp key for this binary state.
-///
-/// Format: `{version}-{commit}-{hash(canonical_exe)[..12]}`
-///
-/// The exe hash is what re-arms the advisory when two builds share the same
-/// version string but live at different paths — the exact scenario that caused
-/// two false "current behavior" reports in one session (ADR-013).
-fn drift_stamp_key(env: &DriftEnv) -> String {
-    let exe_hash = env
-        .current_exe
-        .as_deref()
-        .map(hash_path_12)
-        .unwrap_or_else(|| "000000000000".to_string());
-    format!(
-        "{}-{}-{}",
-        env.compiled_version, env.compiled_commit, exe_hash
-    )
-}
-
-/// Compute a 12-character hex FNV-1a hash of a path string.
-///
-/// Used to distinguish builds that share a version string but live at different
-/// paths, without storing the full path in the stamp file.
-fn hash_path_12(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
-    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
-    for byte in s.bytes() {
-        h ^= u64::from(byte);
-        h = h.wrapping_mul(0x100000001b3); // FNV prime
-    }
-    let hex = format!("{h:016x}");
-    // SAFETY: hex is always 16 ASCII chars; slicing at byte 12 is safe.
-    hex[..12].to_string()
-}
-
-/// Resolve the stamp path for the current session/day.
-///
-/// Session-keyed when `session_id` is set and passes `is_safe_session_id`.
-/// Falls back to a daily stamp when no session is available — this makes
-/// emit-every-call structurally impossible.
-///
-/// # Security
-///
-/// `session_id` is untrusted input. The `is_safe_session_id` guard is the
-/// trust boundary; only validated session IDs reach `format!("{sid}.stamp")`.
-/// We never use a bare `.join()` on unvalidated input to prevent path traversal.
-fn drift_stamp_path(
-    cache_dir: &std::path::Path,
-    session_id: Option<&str>,
-    today: &str,
-) -> std::path::PathBuf {
-    let dir = cache_dir.join("hook-drift");
-    let filename = if let Some(sid) = session_id.filter(|s| crate::analytics::is_safe_session_id(s))
-    {
-        // Session-keyed: one advisory per session per drift state.
-        // B3: reject warn_once_daily for this channel — a new session on the same
-        // day MUST re-arm the advisory (daily-per-key misses new sessions, which
-        // is precisely the observed failure: two sessions, two false measurements).
-        format!("{sid}.stamp")
-    } else {
-        // Fallback: daily stamp when no session_id is available.
-        format!("daily-{today}.stamp")
-    };
-    dir.join(filename)
-}
-
-/// Check whether the drift advisory should fire for this stamp path/key pair.
-///
-/// Returns `true` (and writes the stamp) if the advisory should fire.
-/// Returns `false` if the stamp already exists with the same key.
-///
-/// # Idempotency
-///
-/// The stamp key encodes `{version}-{commit}-{exe_hash}`. If the binary is
-/// rebuilt or replaced, the key changes and the advisory re-arms.
-fn write_drift_stamp(stamp_path: &std::path::Path, key: &str) -> bool {
-    if let Ok(existing) = std::fs::read_to_string(stamp_path)
-        && existing.trim() == key
-    {
-        return false; // Already emitted for this drift state in this session
-    }
-    let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
-    let _ = std::fs::write(stamp_path, key);
-    true
-}
-
-/// Prune drift stamps older than 7 days; if still over 64, trim oldest to 32.
-///
-/// Called post-flush (best-effort). The 5 s watchdog may call `process::exit(0)`
-/// after flush; pruning is post-flush so it never delays the hook response.
-///
-/// All loops are bounded by the directory entry count.
-fn prune_drift_stamps(dir: &std::path::Path) {
-    use std::time::{Duration, SystemTime};
-
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    // Collect entries (bounded: at most N entries in the directory).
-    let entries: Vec<_> = read_dir
-        .flatten()
-        .filter(|e| e.path().extension().map(|x| x == "stamp").unwrap_or(false))
-        .collect();
-
-    let cutoff = SystemTime::now()
-        .checked_sub(Duration::from_secs(7 * 24 * 3600))
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-
-    let mut survivors: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
-    // Bounded: at most entries.len() iterations.
-    for entry in &entries {
-        let path = entry.path();
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-            if modified < cutoff {
-                let _ = std::fs::remove_file(&path);
-                continue;
-            }
-            survivors.push((modified, path));
-        }
-    }
-
-    // If still over 64, trim oldest to 32 (bounded: survivors.len() iterations).
-    if survivors.len() > 64 {
-        survivors.sort_by_key(|(t, _)| *t); // oldest first
-        let to_remove = survivors.len().saturating_sub(32);
-        for (_, path) in survivors.iter().take(to_remove) {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-// ============================================================================
-// B2 — Advisory message formatting
-// ============================================================================
-
-/// Format the full advisory text for the model-facing `additionalContext` field.
-///
-/// # ADR-005 tension
-///
-/// This text names `SKIM_PASSTHROUGH=1`, which steady-state guidance deliberately
-/// omits (per ADR-005 Corollary, protected by a negative test). The tension is
-/// justified here because:
-/// (1) this advisory fires only on detected drift, not on every invocation, and
-/// (2) it scopes passthrough to a single verification read, not habitual bypass.
-///
-/// # Size
-///
-/// Target ≈1.1 KB; hard-capped at 4 000 characters against Claude Code's
-/// `hookSpecificOutput` limit. The cap is implemented defensively — normal
-/// advisory text is well under 4 000 characters.
-/// Returns `true` when `exe` lives under a Cargo `target/` output directory.
-///
-/// Used to decide whether the source-build (`cargo build`) remedy is appropriate
-/// or whether a generic "reinstall skim" instruction should be shown instead.
-fn is_under_cargo_target(exe: &std::path::Path) -> bool {
-    exe.components().any(|c| {
-        if let std::path::Component::Normal(s) = c {
-            s == "target"
-        } else {
-            false
-        }
-    })
-}
-
-/// Format the first remedy line for the drift advisory.
-///
-/// If the running binary is a source build (lives under a `target/` directory),
-/// the instruction is to rebuild and re-pin. Otherwise a generic "reinstall
-/// skim" instruction is used. Either way the resolved binary path is named
-/// explicitly so it is unambiguous which binary gets pinned by `skim init`.
-fn format_remedy_1(env: &DriftEnv) -> String {
-    let exe_str = env
-        .current_exe
-        .as_deref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "skim".to_string());
-
-    if env
-        .current_exe
-        .as_deref()
-        .map(is_under_cargo_target)
-        .unwrap_or(false)
-    {
-        format!("Rebuild and re-pin:  cargo build --release -p rskim && {exe_str} init --yes")
-    } else {
-        format!("Reinstall skim, then re-pin:  {exe_str} init --yes")
-    }
-}
-
-fn format_drift_advisory(drifts: &[DriftKind], env: &DriftEnv) -> String {
-    const HARD_CAP: usize = 4_000;
-
-    let current_exe_str = env
-        .current_exe
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(unknown)".to_string());
-    let hook_version = env.hook_version.as_deref().unwrap_or("(none)");
-    let hook_binary = env.hook_binary.as_deref().unwrap_or("(absent — unpinned)");
-    let hook_commit = env.hook_commit.as_deref().unwrap_or("(absent)");
-
-    let mut drift_lines = String::new();
-    for kind in drifts {
-        match kind {
-            DriftKind::HookScriptUnpinned => {
-                drift_lines.push_str(
-                    "  - UNPINNED SCRIPT   SKIM_HOOK_BINARY not set; hook predates binary pinning\n",
-                );
-            }
-            DriftKind::BinaryPathMismatch => {
-                drift_lines.push_str(&format!(
-                    "  - BINARY PATH       Hook installed from: {hook_binary}\n\
-                     \x20                     Running from:        {current_exe_str}\n"
-                ));
-            }
-            DriftKind::HookVersionMismatch => {
-                drift_lines.push_str(&format!(
-                    "  - VERSION MISMATCH  Hook v{hook_version} vs binary v{}\n",
-                    env.compiled_version
-                ));
-            }
-            DriftKind::CommitMismatch => {
-                drift_lines.push_str(&format!(
-                    "  - COMMIT MISMATCH   Hook commit: {hook_commit}  Binary commit: {}\n",
-                    env.compiled_commit
-                ));
-            }
-        }
-    }
-
-    let remedy_1 = format_remedy_1(env);
-    let text = format!(
-        "[skim provenance advisory]\n\
-         \n\
-         Binary provenance drift detected. The skim binary currently serving\n\
-         rewrites may not match the source tree under review. Output from skim\n\
-         during this session may reflect a stale or sibling-clone build's behavior.\n\
-         \n\
-         Drift detected:\n\
-         {drift_lines}\n\
-         ACTION REQUIRED: Distrust skim-mediated output until resolved. Any skim\n\
-         read during this session may show a different build's view of the code.\n\
-         \n\
-         Remedies (in order):\n\
-           1. {remedy_1}\n\
-           2. Verify a single read without skim (bypasses rewriting entirely):\n\
-              SKIM_PASSTHROUGH=1 <your-command>\n\
-           3. Full diagnosis: skim doctor\n",
-    );
-
-    // Defensive cap — normal text is well under HARD_CAP.
-    if text.len() > HARD_CAP {
-        let mut truncated = text[..HARD_CAP.saturating_sub(40)].to_string();
-        truncated.push_str("\n... [advisory truncated at 4000 chars]");
-        truncated
-    } else {
-        text
-    }
-}
-
-/// Format the one-line system message for the user-facing channel.
-///
-/// ADR-013 (split-gate): `systemMessage` costs zero model context and is
-/// user-facing only ("shown to you, not to Claude" — hooks.md). It fires
-/// unconditionally whenever drift is detected and the dedup stamp passes.
-///
-/// The binary path is deliberately omitted:
-/// 1. Paths can be arbitrarily long and would risk mid-string truncation.
-/// 2. `skim doctor` reports the full path breakdown; this message is the
-///    nudge to run it, not the diagnosis.
-///
-/// The message is bounded by construction (four short kind tokens + fixed
-/// framing ≈ 140 chars max) — no truncation cap is needed.
-fn format_drift_system_message(drifts: &[DriftKind]) -> String {
-    let kinds: Vec<&str> = drifts
-        .iter()
-        .map(|d| match d {
-            DriftKind::HookScriptUnpinned => "unpinned",
-            DriftKind::BinaryPathMismatch => "binary path",
-            DriftKind::HookVersionMismatch => "version",
-            DriftKind::CommitMismatch => "commit",
-        })
-        .collect();
-    format!(
-        "[skim] Provenance drift detected ({}). skim-mediated output may reflect a different build. Run `skim doctor` for details.",
-        kinds.join(", ")
-    )
-}
-
-// ============================================================================
-// B2/B3 — Advisory construction (stamp check + format)
-// ============================================================================
-
-/// Both channels of a drift advisory.
-///
-/// ADR-013 (split-gate): the two fields land in different ADR-011 classes:
-/// - `system_msg`: user-facing (zero model context). Unconditional when drift
-///   is detected and the dedup stamp passes.
-/// - `advisory_text`: model-facing (`additionalContext`, session-persisted).
-///   `Some` only when `SKIM_DEBUG=1`; `None` otherwise. Gated because the
-///   platform replays `additionalContext` on `--continue`/`--resume` rather
-///   than re-running the hook, making its cost permanent and its SHAs stale.
-#[derive(Debug)]
-pub(super) struct Advisory {
-    /// User-facing one-liner. Emitted as top-level `systemMessage`.
-    pub(super) system_msg: String,
-    /// Model-facing advisory text. Emitted as `hookSpecificOutput.additionalContext`
-    /// when `Some`. `None` when `SKIM_DEBUG` is off.
-    pub(super) advisory_text: Option<String>,
-}
-
-/// Check stamp and build the advisory if this session hasn't seen this drift
-/// state yet.
-///
-/// Returns `Some(Advisory)` if the advisory should fire, `None` otherwise
-/// (already emitted or drifts is empty).
-///
-/// ## ADR-013 split-gate
-///
-/// `systemMessage` fires unconditionally (non-nil advisory, debug OFF or ON).
-/// `additionalContext` populates only when `is_debug_enabled()` is true.
-/// ONE shared dedup stamp is consumed whenever anything is emitted — there
-/// is no separate stamp for each channel.
-///
-/// ## Healthy path
-///
-/// When `drifts` is empty the function returns `None` immediately — no cache
-/// directory is resolved, no filesystem is touched. This preserves the <10 ms
-/// startup budget in the common case.
-fn build_advisory(
-    drifts: &[DriftKind],
-    drift_env: Option<&DriftEnv>,
-    session_id: Option<&str>,
-) -> Option<Advisory> {
-    if drifts.is_empty() {
-        return None; // Healthy path — zero filesystem access beyond DriftEnv::from_process()
-    }
-    let de = drift_env?;
-    let cache_dir = crate::cmd::resolve_cache_dir()?;
-    build_advisory_inner(drifts, de, session_id, &cache_dir)
-}
-
-/// Inner helper: build advisory using an explicit `cache_dir`.
-///
-/// Separated from `build_advisory` for testability — tests can supply a temp
-/// dir without touching `SKIM_CACHE_DIR`.
-///
-/// Returns `None` immediately when `drifts` is empty (healthy path) — callers
-/// can test this guard directly without routing through `build_advisory`.
-///
-/// ADR-013: `advisory_text` is `Some` only when `SKIM_DEBUG=1`. The dedup
-/// stamp is consumed regardless of debug state — ONE stamp gates both channels.
-fn build_advisory_inner(
-    drifts: &[DriftKind],
-    de: &DriftEnv,
-    session_id: Option<&str>,
-    cache_dir: &std::path::Path,
-) -> Option<Advisory> {
-    if drifts.is_empty() {
-        return None; // Healthy path — zero filesystem access
-    }
-    let key = drift_stamp_key(de);
-    let today = today_date_string();
-    let stamp = drift_stamp_path(cache_dir, session_id, &today);
-    if !write_drift_stamp(&stamp, &key) {
-        return None; // Already emitted for this session/day and drift state
-    }
-    let system_msg = format_drift_system_message(drifts);
-    // ADR-013: additionalContext is SKIM_DEBUG-gated. It is persisted to the
-    // session transcript and replayed on --continue/--resume, making its cost
-    // permanent and its commit SHAs stale. Gate it to avoid spending context
-    // by default.
-    let advisory_text = if crate::debug::is_debug_enabled() {
-        Some(format_drift_advisory(drifts, de))
-    } else {
-        None
-    };
-    Some(Advisory {
-        system_msg,
-        advisory_text,
-    })
-}
-
-// ============================================================================
-// Log channel helpers (hook.log, kept for audit trail per B3)
+// Log channel helpers (hook.log)
 // ============================================================================
 
 /// Emit rate-limited log warnings for detected drifts to hook.log.
 ///
-/// B3: The log channel continues to use `warn_once_daily` (daily rate-limit).
-/// The in-band advisory channel uses session-keyed stamps (via `build_advisory`).
-/// Both may fire; they are independent channels.
+/// Uses `warn_once_daily` (daily rate-limit per kind per agent).
 fn log_drift_warnings(
     drifts: &[DriftKind],
     env: &DriftEnv,
@@ -692,8 +301,10 @@ pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 /// 3. On parse/extract failure: exit 0, empty stdout (passthrough)
 /// 4. Run command through rewrite logic
 /// 5. On match: emit hook response JSON, exit 0
-/// 6. On no match: exit 0, empty stdout (passthrough); OR emit advisory-only
-///    response if drift was detected (B2: `format_advisory_only`)
+/// 6. On no match: exit 0, empty stdout (passthrough)
+///
+/// Drift is detected and logged to hook.log on every invocation. For diagnosis
+/// run `skim doctor`.
 ///
 /// When `agent` is None or ClaudeCode, uses existing Claude Code logic.
 /// Other agents passthrough (exit 0) until Phase 2 adds implementations.
@@ -734,40 +345,30 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
-    // B1: Build DriftEnv early. DriftEnv::from_process() reads env vars and
-    // resolves the current executable path. detect_drift() is a pure function
-    // of its argument (no env reads, no hidden state). Both operations are cheap.
-    //
-    // Drift detection is currently scoped to ClaudeCode only — it has the hook
-    // script infrastructure (SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).
-    // TODO: Extend to Cursor, Gemini, and Copilot once their hook script install
-    // paths are validated.
-    //
-    // The log channel (warn_once_daily → hook.log) fires immediately for audit.
-    // The in-band advisory channel fires after session_id is known (further below).
-    let (drift_env, drifts) = if agent_kind == AgentKind::ClaudeCode {
+    // Drift detection — scoped to ClaudeCode (has the hook script provenance
+    // fields: SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).
+    // Findings are recorded to hook.log unconditionally (rate-limited per kind
+    // per agent per day). No in-band advisory is emitted; use `skim doctor`
+    // for on-demand diagnosis.
+    if agent_kind == AgentKind::ClaudeCode {
         // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
         let integrity_failed = check_hook_integrity(agent_kind);
 
         let de = DriftEnv::from_process();
         // Only detect drift if integrity is intact; integrity failure subsumes drift.
-        let ds = if !integrity_failed {
+        let drifts = if !integrity_failed {
             detect_drift(&de)
         } else {
             vec![]
         };
 
-        // Log channel: rate-limited daily warnings to hook.log (kept per B3).
-        if !ds.is_empty()
+        // Log channel: rate-limited daily warnings to hook.log.
+        if !drifts.is_empty()
             && let Some(dir) = crate::cmd::resolve_cache_dir()
         {
-            log_drift_warnings(&ds, &de, agent_kind.cli_name(), &dir);
+            log_drift_warnings(&drifts, &de, agent_kind.cli_name(), &dir);
         }
-
-        (Some(de), ds)
-    } else {
-        (None, vec![])
-    };
+    }
 
     // Read stdin (bounded)
     let mut stdin_buf = String::new();
@@ -852,22 +453,6 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
-    // B2/B3: Check if in-band advisory should fire for this session.
-    //
-    // Placed AFTER all four early returns (already-skim, needs-passthrough,
-    // empty-tokens, indefinite-command) that never deliver a hook response.
-    // This ensures the stamp is consumed if and only if the advisory is
-    // actually in-flight — fixing a stamp-burn defect where a multi-line
-    // `git commit` or `npm run dev` as the first Bash call of a session would
-    // consume the stamp, silently preventing the advisory for the rest of that
-    // session.
-    //
-    // ADR-013 split-gate: build_advisory returns None only when drifts is empty
-    // (healthy path) or cache dir is unavailable. When drift is detected,
-    // Advisory.system_msg is always present; Advisory.advisory_text is Some
-    // only when SKIM_DEBUG=1. No filesystem access on the healthy (empty) path.
-    let advisory = build_advisory(&drifts, drift_env.as_ref(), session_id.as_deref());
-
     // Check for compound operator characters on the original string directly
     // rather than scanning the token slice, since operators may appear mid-token.
     let has_operator_chars = command.contains("&&")
@@ -902,51 +487,12 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // ancestry walk (read_session_id) or SKIM_SESSION_ID env var.
             let final_cmd = result.tokens.join(" ");
             audit_hook(&command, true, &final_cmd);
-            let mut response = protocol.format_response(&final_cmd);
-            // B2: Attach drift advisory to the response if armed (non-blocking,
-            // exit 0 preserved, no permissionDecision added — ADR-006 intact).
-            // ADR-013 split-gate: system_msg always present; advisory_text only
-            // when SKIM_DEBUG=1.
-            if let Some(adv) = &advisory {
-                protocol.attach_advisory(
-                    &mut response,
-                    adv.advisory_text.as_deref(),
-                    &adv.system_msg,
-                );
-            }
+            let response = protocol.format_response(&final_cmd);
             write_hook_response(&response)?;
         }
         None => {
             audit_hook(&command, false, "");
-            // B2: format_advisory_only is essential, not optional.
-            //
-            // A no-match currently exits 0 with empty stdout. The FIRST Bash call
-            // of a session frequently does not match a rewrite rule (e.g. a bare
-            // `ls` that is already a wrapper, or a one-off diagnostic command).
-            // Without format_advisory_only, the advisory is swallowed for exactly
-            // the call where the agent most needs it — before any skim output has
-            // been trusted.
-            // ADR-013 split-gate: system_msg always fires; advisory_text only
-            // when SKIM_DEBUG=1.
-            if let Some(adv) = &advisory
-                && let Some(advisory_response) =
-                    protocol.format_advisory_only(adv.advisory_text.as_deref(), &adv.system_msg)
-            {
-                write_hook_response(&advisory_response)?;
-            }
         }
-    }
-
-    // B3: Post-flush stamp pruning (best-effort).
-    // Called after write_hook_response so the response is on the wire before we
-    // do any extra work. The 5 s watchdog may call process::exit(0) after flush;
-    // pruning is intentionally post-flush so it never delays the agent's response.
-    // Only runs when drift was detected (drifts non-empty) to avoid any filesystem
-    // access on the healthy path.
-    if !drifts.is_empty()
-        && let Some(dir) = crate::cmd::resolve_cache_dir()
-    {
-        prune_drift_stamps(&dir.join("hook-drift"));
     }
 
     Ok(ExitCode::SUCCESS)
@@ -1133,7 +679,6 @@ fn today_date_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::hooks::HookProtocol;
 
     // ========================================================================
     // parse_agent_flag
@@ -1258,20 +803,8 @@ mod tests {
     }
 
     // ========================================================================
-    // B1 — detect_drift: scoping rule and inversion fixes
+    // detect_drift: scoping rule and inversion fixes
     // ========================================================================
-
-    /// Helper: build a DriftEnv with all fields matching (healthy state).
-    fn healthy_drift_env() -> DriftEnv {
-        DriftEnv {
-            hook_version: Some("2.11.0".to_string()),
-            hook_binary: Some("/usr/local/bin/skim".to_string()),
-            hook_commit: Some("abc1234f".to_string()),
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        }
-    }
 
     /// Scoping rule: when hook_version is None, detect_drift returns empty.
     ///
@@ -1425,545 +958,6 @@ mod tests {
     }
 
     // ========================================================================
-    // B3 — Stamp helpers
-    // ========================================================================
-
-    /// hash_path_12 produces a 12-character hex string.
-    #[test]
-    fn test_hash_path_12_length() {
-        let h = hash_path_12(std::path::Path::new("/usr/local/bin/skim"));
-        assert_eq!(h.len(), 12, "hash must be exactly 12 hex chars: {h}");
-        assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit()),
-            "hash must be hex: {h}"
-        );
-    }
-
-    /// hash_path_12 is deterministic.
-    #[test]
-    fn test_hash_path_12_deterministic() {
-        let a = hash_path_12(std::path::Path::new("/usr/local/bin/skim"));
-        let b = hash_path_12(std::path::Path::new("/usr/local/bin/skim"));
-        assert_eq!(a, b);
-    }
-
-    /// hash_path_12 distinguishes different paths.
-    #[test]
-    fn test_hash_path_12_distinct_paths() {
-        let a = hash_path_12(std::path::Path::new("/usr/local/bin/skim"));
-        let b = hash_path_12(std::path::Path::new("/home/user/.cargo/bin/skim"));
-        assert_ne!(a, b, "different paths must produce different hashes");
-    }
-
-    /// Healthy path: detect_drift returns empty → build_advisory returns None
-    /// → stamp directory is NOT created.
-    ///
-    /// B3: "The healthy path must touch the filesystem ZERO times."
-    /// This test proves that when drifts = [] (the common production case),
-    /// the hook-drift/ stamp directory is never created.
-    #[test]
-    fn test_no_stamp_dir_on_healthy_path() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let stamp_dir = temp.path().join("hook-drift");
-
-        // Healthy env: all fields match.
-        let env = DriftEnv {
-            hook_version: Some("2.11.0".to_string()),
-            hook_binary: Some("/usr/local/bin/skim".to_string()),
-            hook_commit: Some("abc1234f".to_string()),
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-
-        // Empty drifts → build_advisory_inner is never called → no stamp dir.
-        let drifts: Vec<DriftKind> = vec![];
-        let result = build_advisory_inner(&drifts, &env, None, temp.path());
-        assert!(
-            result.is_none(),
-            "empty drifts must yield no advisory: {result:?}"
-        );
-
-        assert!(
-            !stamp_dir.exists(),
-            "hook-drift stamp directory must NOT be created on the healthy path: {stamp_dir:?}"
-        );
-    }
-
-    /// Drift detected → stamp directory IS created.
-    #[test]
-    fn test_stamp_dir_created_on_drift() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let stamp_dir = temp.path().join("hook-drift");
-
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-        assert!(!drifts.is_empty());
-
-        let result = build_advisory_inner(&drifts, &env, None, temp.path());
-        assert!(
-            result.is_some(),
-            "drift must produce an advisory on first call"
-        );
-        assert!(stamp_dir.exists(), "stamp dir must be created on drift");
-    }
-
-    /// Advisory is deduped: second call with same key returns None.
-    #[test]
-    fn test_advisory_deduped_same_session() {
-        let temp = tempfile::TempDir::new().unwrap();
-
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-
-        // First call: advisory fires.
-        let first = build_advisory_inner(&drifts, &env, Some("test-session-123"), temp.path());
-        assert!(first.is_some(), "first call must produce advisory");
-
-        // Second call same session: suppressed.
-        let second = build_advisory_inner(&drifts, &env, Some("test-session-123"), temp.path());
-        assert!(
-            second.is_none(),
-            "second call with same session must be suppressed"
-        );
-    }
-
-    /// Advisory re-arms for a different session.
-    #[test]
-    fn test_advisory_rearmed_for_different_session() {
-        let temp = tempfile::TempDir::new().unwrap();
-
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-
-        let first = build_advisory_inner(&drifts, &env, Some("session-aaa"), temp.path());
-        assert!(first.is_some());
-
-        let second = build_advisory_inner(&drifts, &env, Some("session-bbb"), temp.path());
-        assert!(
-            second.is_some(),
-            "different session must re-arm the advisory"
-        );
-    }
-
-    // ========================================================================
-    // B2 — Advisory message format and size
-    // ========================================================================
-
-    #[test]
-    fn test_advisory_text_under_4000_chars() {
-        let env = healthy_drift_env();
-        let drifts = vec![
-            DriftKind::HookVersionMismatch,
-            DriftKind::BinaryPathMismatch,
-            DriftKind::CommitMismatch,
-            DriftKind::HookScriptUnpinned,
-        ];
-        let text = format_drift_advisory(&drifts, &env);
-        assert!(
-            text.len() <= 4_000,
-            "advisory text must be ≤ 4000 chars, got {}",
-            text.len()
-        );
-    }
-
-    #[test]
-    fn test_system_message_under_200_chars() {
-        let drifts = vec![
-            DriftKind::HookVersionMismatch,
-            DriftKind::BinaryPathMismatch,
-            DriftKind::CommitMismatch,
-            DriftKind::HookScriptUnpinned,
-        ];
-        let msg = format_drift_system_message(&drifts);
-        assert!(
-            msg.len() <= 200,
-            "system message must be ≤ 200 chars, got {}",
-            msg.len()
-        );
-    }
-
-    /// The system message must never truncate mid-string, even for a pathological
-    /// exe path. Because the path is deliberately omitted from `systemMessage`,
-    /// this property holds by construction — we verify it explicitly.
-    #[test]
-    fn test_system_message_no_mid_string_truncation() {
-        // Pathological: a very long exe path that would have caused mid-path
-        // truncation under the old format that included the binary path.
-        let very_long_path = "/home/user/".to_string() + &"a".repeat(300) + "/skim";
-        let env_with_long_path = DriftEnv {
-            current_exe: Some(std::path::PathBuf::from(&very_long_path)),
-            ..healthy_drift_env()
-        };
-        let _ = env_with_long_path; // env is no longer used by format_drift_system_message
-
-        let drifts = vec![
-            DriftKind::HookVersionMismatch,
-            DriftKind::BinaryPathMismatch,
-        ];
-        let msg = format_drift_system_message(&drifts);
-
-        // The path must NOT appear in the system message (omitted by design).
-        assert!(
-            !msg.contains(&very_long_path),
-            "system message must not contain the binary path: {msg}"
-        );
-        // The message must be a complete, well-formed sentence.
-        assert!(
-            msg.contains("skim doctor"),
-            "system message must reference skim doctor: {msg}"
-        );
-        // No mid-string truncation: message ends with a period.
-        assert!(
-            msg.ends_with('.'),
-            "system message must end with complete punctuation (no mid-string cut): {msg}"
-        );
-    }
-
-    #[test]
-    fn test_advisory_text_names_passthrough() {
-        // ADR-005 tension: advisory deliberately names SKIM_PASSTHROUGH=1.
-        let env = healthy_drift_env();
-        let drifts = vec![DriftKind::HookVersionMismatch];
-        let text = format_drift_advisory(&drifts, &env);
-        assert!(
-            text.contains("SKIM_PASSTHROUGH"),
-            "advisory must name SKIM_PASSTHROUGH as a verification escape hatch"
-        );
-    }
-
-    #[test]
-    fn test_advisory_text_contains_remedies_non_source_build() {
-        // healthy_drift_env() has current_exe=/usr/local/bin/skim — not under target/,
-        // so the generic "reinstall skim" remedy is used rather than "cargo build".
-        let env = healthy_drift_env();
-        let drifts = vec![DriftKind::HookScriptUnpinned];
-        let text = format_drift_advisory(&drifts, &env);
-        assert!(
-            !text.contains("cargo build"),
-            "non-source-build path must NOT include cargo build: {text}"
-        );
-        assert!(
-            text.contains("skim init"),
-            "advisory must name the re-pin command: {text}"
-        );
-        assert!(
-            text.contains("/usr/local/bin/skim"),
-            "advisory must name the resolved binary path for unambiguity: {text}"
-        );
-        assert!(
-            text.contains("skim doctor"),
-            "advisory must reference skim doctor: {text}"
-        );
-    }
-
-    #[test]
-    fn test_advisory_text_contains_remedies_source_build() {
-        // When current_exe is under a target/ directory, the source-build
-        // "cargo build" remedy is appropriate.
-        let env = DriftEnv {
-            current_exe: Some(std::path::PathBuf::from(
-                "/home/user/skim-issues/target/debug/skim",
-            )),
-            ..healthy_drift_env()
-        };
-        let drifts = vec![DriftKind::HookScriptUnpinned];
-        let text = format_drift_advisory(&drifts, &env);
-        assert!(
-            text.contains("cargo build"),
-            "source-build path must include cargo build: {text}"
-        );
-        assert!(
-            text.contains("skim init"),
-            "advisory must name the re-pin command: {text}"
-        );
-        assert!(
-            text.contains("skim doctor"),
-            "advisory must reference skim doctor: {text}"
-        );
-    }
-
-    // ========================================================================
-    // TASK 1 — ADR-013 split-gate: systemMessage unconditional,
-    //           additionalContext SKIM_DEBUG-gated
-    //
-    // build_advisory_inner always returns Some(Advisory) when drift is detected
-    // and the stamp passes — regardless of debug state.
-    //
-    // Advisory.system_msg  is always present  (user-facing, zero model cost).
-    // Advisory.advisory_text is Some only when SKIM_DEBUG=1 (model-facing;
-    //   replayed on --continue/--resume — cost is permanent, gate is justified).
-    //
-    // The shared stamp IS consumed whenever system_msg fires — one stamp gates
-    // both channels. No second stamp; no double-fire.
-    // ========================================================================
-
-    /// With debug OFF (default), build_advisory_inner returns Some with
-    /// system_msg present and advisory_text absent.  The stamp is created
-    /// because system_msg fires unconditionally.
-    ///
-    /// Rationale: systemMessage costs zero model context (user-facing only,
-    /// "shown to you, not to Claude" — hooks.md §systemMessage). Gating a
-    /// human-facing nudge behind a flag the human must consciously set defeats
-    /// its only purpose — the warning appears precisely for the user who does
-    /// not know to look for it.
-    #[test]
-    fn test_advisory_system_message_unconditional_additional_context_gated() {
-        let _guard = crate::debug::DebugTestGuard::acquire();
-        // Debug is OFF after acquire().
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let stamp_dir = temp.path().join("hook-drift");
-
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-        assert!(!drifts.is_empty(), "test requires drift to be detected");
-        assert!(
-            !crate::debug::is_debug_enabled(),
-            "debug must be OFF for this test"
-        );
-
-        // build_advisory_inner must return Some even with debug OFF.
-        let result = build_advisory_inner(&drifts, &env, Some("sid-gate"), temp.path());
-        assert!(
-            result.is_some(),
-            "build_advisory_inner must return Some when drift detected, even with debug OFF"
-        );
-        let adv = result.unwrap();
-
-        // system_msg is unconditional — always present.
-        assert!(
-            !adv.system_msg.is_empty(),
-            "system_msg must be present with debug OFF: got empty string"
-        );
-
-        // advisory_text is None — SKIM_DEBUG gate is closed.
-        assert!(
-            adv.advisory_text.is_none(),
-            "advisory_text must be None when debug OFF (SKIM_DEBUG gate): got Some"
-        );
-
-        // Stamp IS created — shared stamp gates both channels; system_msg fires
-        // so stamp is consumed.
-        assert!(
-            stamp_dir.exists(),
-            "stamp dir must be created when drift fires (system_msg unconditional): {stamp_dir:?}"
-        );
-    }
-
-    /// With debug ON, build_advisory_inner returns Some with both channels
-    /// populated and the stamp created.
-    #[test]
-    fn test_advisory_fires_when_debug_on() {
-        let _guard = crate::debug::DebugTestGuard::acquire();
-        crate::debug::force_enable_debug();
-
-        let temp = tempfile::TempDir::new().unwrap();
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-        assert!(!drifts.is_empty());
-
-        // With debug ON, both channels are present.
-        let result = build_advisory_inner(&drifts, &env, Some("sid-debug-on"), temp.path());
-        assert!(
-            result.is_some(),
-            "advisory must fire when debug is ON and drift is detected"
-        );
-        let adv = result.unwrap();
-
-        assert!(
-            !adv.system_msg.is_empty(),
-            "system_msg must be present with debug ON"
-        );
-        assert!(
-            adv.advisory_text.is_some(),
-            "advisory_text must be Some when debug ON (SKIM_DEBUG gate open)"
-        );
-
-        // Stamp was written.
-        let stamp_dir = temp.path().join("hook-drift");
-        assert!(
-            stamp_dir.exists(),
-            "stamp dir must be created when debug is ON"
-        );
-    }
-
-    // ========================================================================
-    // TASK 2 — Stamp-burn defect: stamp is only consumed when advisory fires
-    //
-    // Before the fix, build_advisory was called BEFORE the four early returns
-    // (already-skim, needs-passthrough, empty-tokens, indefinite-command).
-    // A multi-line `git commit` or `npm run dev` as the session's first Bash
-    // call would consume the stamp, silently preventing the advisory for the
-    // rest of the session.
-    //
-    // After the fix, build_advisory is called AFTER all early returns, so the
-    // stamp is consumed iff the advisory is actually delivered.
-    // ========================================================================
-
-    /// Regression: the stamp must NOT be pre-consumed by a hook call that exits
-    /// early (indefinite command / multi-line command / passthrough).
-    ///
-    /// Simulates: call 1 = early-return command (stamp not written because
-    /// build_advisory is not called on that path); call 2 = normal matching
-    /// command (stamp IS written, advisory fired).
-    #[test]
-    fn test_stamp_not_burned_before_advisory_delivery_indefinite() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-        assert!(!drifts.is_empty());
-
-        // Reproduce the OLD buggy behaviour: calling build_advisory_inner for an
-        // early-return command (e.g. the hook was called before the early returns)
-        // consumes the stamp, causing the second call to return None.
-        let first_buggy =
-            build_advisory_inner(&drifts, &env, Some("stamp-burn-session"), temp.path());
-        assert!(
-            first_buggy.is_some(),
-            "first call fires advisory (stamp write)"
-        );
-
-        let second_buggy =
-            build_advisory_inner(&drifts, &env, Some("stamp-burn-session"), temp.path());
-        assert!(
-            second_buggy.is_none(),
-            "DEMONSTRATES THE BUG: second call gets None because stamp was burned by first"
-        );
-
-        // Prove the FIX: with the stamp cleared (simulating a fresh session where
-        // the early-return call did NOT consume the stamp), the first real call fires.
-        let _ = std::fs::remove_dir_all(temp.path().join("hook-drift"));
-
-        // Call 2 (after early-return call that did NOT write the stamp):
-        let after_fix =
-            build_advisory_inner(&drifts, &env, Some("stamp-burn-session"), temp.path());
-        assert!(
-            after_fix.is_some(),
-            "with the fix: first real call fires advisory (stamp not pre-burned)"
-        );
-    }
-
-    /// Regression: multi-line `git commit -m "a\nb"` is an early-return path;
-    /// the next normal call must still deliver the advisory.
-    #[test]
-    fn test_stamp_not_burned_before_advisory_delivery_multiline() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let env = DriftEnv {
-            hook_version: Some("2.10.0".to_string()),
-            hook_binary: None,
-            hook_commit: None,
-            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
-            compiled_version: "2.11.0".to_string(),
-            compiled_commit: "abc1234f".to_string(),
-        };
-        let drifts = detect_drift(&env);
-
-        // Multi-line command hits command_needs_passthrough → early return.
-        // With the fix, build_advisory is NEVER called for this command — so no
-        // stamp is written. Verify by checking the stamp dir does not exist after
-        // the simulated early-return call (we simply don't call build_advisory_inner).
-        let stamp_dir = temp.path().join("hook-drift");
-        assert!(
-            !stamp_dir.exists(),
-            "stamp dir must not exist before any call"
-        );
-
-        // Simulate call 2: a normal command that reaches build_advisory.
-        let result = build_advisory_inner(&drifts, &env, Some("multiline-session"), temp.path());
-        assert!(
-            result.is_some(),
-            "advisory must fire on the first real call (stamp not pre-burned by early-return path)"
-        );
-    }
-
-    // ========================================================================
-    // B6 — Wrapper surface: no in-band provenance advisory
-    //
-    // The hook-response channel exists ONLY on the rewrite surface. On the
-    // PATH-wrapper surface (argv[0] dispatch via detect_argv0_dispatch) the only
-    // channels are stdout (must stay byte-faithful, #317) and stderr (ADR-011
-    // would class a provenance banner as a no-loss raw-fallback banner →
-    // SKIM_DEBUG-gated → invisible by default, reproducing the exact failure
-    // mode this task fixes).
-    //
-    // Wrappers therefore get NO in-band advisory. This test proves the property
-    // at the protocol boundary: non-Claude protocols (which map structurally to
-    // the non-hook dispatch paths) return no-op responses from attach_advisory
-    // and format_advisory_only.
-    // ========================================================================
-
-    #[test]
-    fn wrapper_surface_emits_no_provenance_advisory() {
-        // CopilotCliHook represents a non-Claude protocol — its default-trait
-        // implementation must be a no-op for both advisory methods.
-        use crate::cmd::hooks::copilot::CopilotCliHook;
-        let hook = CopilotCliHook;
-        let advisory_text = "drift detected";
-        let system_msg = "drift system message";
-
-        // format_advisory_only must return None (no response JSON).
-        assert!(
-            hook.format_advisory_only(Some(advisory_text), system_msg)
-                .is_none(),
-            "Non-Claude protocol: format_advisory_only must be None \
-             (wrapper surface has no in-band advisory channel)"
-        );
-
-        // attach_advisory must be a no-op — response unchanged.
-        let mut response = serde_json::json!({"test": "value"});
-        let original = response.clone();
-        hook.attach_advisory(&mut response, Some(advisory_text), system_msg);
-        assert_eq!(
-            response, original,
-            "Non-Claude protocol: attach_advisory must be a no-op \
-             (wrapper surface has no in-band advisory channel)"
-        );
-    }
-
-    // ========================================================================
     // Hook/rewrite surface: NO --session-id in rewritten commands (#1.1)
     //
     // The hook drops flag injection; attribution is out-of-band via sidecar.
@@ -2072,5 +1066,84 @@ mod tests {
     fn test_hook_constants_unchanged() {
         assert_eq!(HOOK_TIMEOUT_SECS, 5);
         assert_eq!(HOOK_MAX_STDIN_BYTES, 64 * 1024);
+    }
+
+    // ========================================================================
+    // Advisory removal: drift records to hook.log only, never to stdout
+    //
+    // The in-band provenance advisory (systemMessage / additionalContext) was
+    // removed. The fix for drift is absolute-path pinning + `skim init` refresh
+    // + `skim doctor` on-demand. Drift is still detected and logged to hook.log
+    // via log_drift_warnings; it is never pushed into the hook response JSON.
+    // No `hook-drift/` stamp directory is ever created (stamp mechanism removed).
+    // ========================================================================
+
+    /// End-state invariant: when drift is detected, the logging path fires
+    /// (stamp written → warn_once_daily triggered) but no in-band advisory
+    /// appears in the hook response JSON (no `systemMessage`, no
+    /// `additionalContext`), and no `hook-drift/` directory is ever created.
+    #[test]
+    fn test_drift_logs_to_hook_log_never_to_hook_response() {
+        use crate::cmd::hooks::HookProtocol;
+        use crate::cmd::hooks::claude::ClaudeCodeHook;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let hook_drift_dir = temp.path().join("hook-drift");
+
+        // Build a drift env with a clear version mismatch.
+        let env = DriftEnv {
+            hook_version: Some("2.10.0".to_string()),
+            hook_binary: None, // absent → HookScriptUnpinned
+            hook_commit: None,
+            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            !drifts.is_empty(),
+            "test requires drift to be detected; got: {drifts:?}"
+        );
+
+        // Call log_drift_warnings — this is the only path drift now takes.
+        // It should write warn_once_daily stamps under temp, triggering log_hook_warning.
+        log_drift_warnings(&drifts, &env, "claude-code", temp.path());
+
+        // Stamp files must exist (warn_once_daily was triggered).
+        let version_stamp = temp.path().join(".hook-version-warned-claude-code");
+        let unpinned_stamp = temp.path().join(".hook-unpinned-warned-claude-code");
+        assert!(
+            version_stamp.exists() || unpinned_stamp.exists(),
+            "warn_once_daily must have created a per-kind stamp file — logging path was not triggered"
+        );
+
+        // The stamp mechanism (hook-drift/ directory) must NOT exist.
+        assert!(
+            !hook_drift_dir.exists(),
+            "hook-drift/ stamp directory must NEVER be created (advisory removed): {hook_drift_dir:?}"
+        );
+
+        // The hook response JSON must contain no systemMessage or additionalContext.
+        let response = ClaudeCodeHook.format_response("skim git status");
+        let json_str = response.to_string();
+        assert!(
+            !json_str.contains("systemMessage"),
+            "hook response must not contain systemMessage (advisory removed): {json_str}"
+        );
+        assert!(
+            !json_str.contains("additionalContext"),
+            "hook response must not contain additionalContext (advisory removed): {json_str}"
+        );
+        // Verify the response only has updatedInput (the correct rewrite shape).
+        let updated = response
+            .get("hookSpecificOutput")
+            .and_then(|o| o.get("updatedInput"))
+            .and_then(|u| u.get("command"));
+        assert_eq!(
+            updated.and_then(|v| v.as_str()),
+            Some("skim git status"),
+            "hook response must contain updatedInput.command with rewritten command"
+        );
     }
 }

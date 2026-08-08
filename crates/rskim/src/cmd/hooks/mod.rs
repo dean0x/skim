@@ -103,68 +103,6 @@ pub(crate) trait HookProtocol {
     fn generate_script(&self, version: &str, binary_path: &str) -> String;
 
     // -------------------------------------------------------------------------
-    // B2 — In-band drift advisory methods
-    //
-    // These methods surface binary provenance drift to the agent via the hook
-    // response JSON. They exist ONLY on the rewrite surface (PreToolUse hook
-    // channel). The PATH-wrapper surface has no in-band advisory:
-    //
-    //   - stdout must stay byte-faithful (#317) — raw bytes only
-    //   - stderr would be debug-gated per ADR-011 and invisible by default,
-    //     reproducing the exact log-only failure mode this task fixes (PF-014)
-    //
-    // Default implementations are no-ops so all non-Claude protocols
-    // automatically satisfy the "no advisory on wrapper surface" invariant.
-    // ClaudeCodeHook overrides both to produce advisory-bearing JSON.
-    // -------------------------------------------------------------------------
-
-    /// Attach a drift advisory to an already-built hook response JSON value.
-    ///
-    /// Called when both a command rewrite AND drift were detected. Modifies
-    /// `response` in place.
-    ///
-    /// ADR-013 split-gate:
-    /// - `system_msg` is always present → added as top-level `systemMessage`.
-    /// - `advisory_text` is `Some` only when `SKIM_DEBUG=1` → added as
-    ///   `hookSpecificOutput.additionalContext` when present.
-    ///
-    /// Default: no-op (non-Claude agents have no advisory channel).
-    fn attach_advisory(
-        &self,
-        _response: &mut serde_json::Value,
-        _advisory_text: Option<&str>,
-        _system_msg: &str,
-    ) {
-    }
-
-    /// Build a hook response that carries ONLY the drift advisory (no rewrite).
-    ///
-    /// Called when no command rewrite matched but drift was detected. Without
-    /// this method the advisory is swallowed for the call that matters most:
-    /// the first Bash call of a session often does not match a rewrite rule
-    /// (e.g. `ls`, a one-off diagnostic) yet that is exactly when the agent
-    /// should learn that skim output may come from a stale binary.
-    ///
-    /// ADR-013 split-gate:
-    /// - `system_msg` always present → always emitted as top-level `systemMessage`.
-    /// - `advisory_text` is `Some` only when `SKIM_DEBUG=1` → included as
-    ///   `hookSpecificOutput.additionalContext` when present; omitted otherwise.
-    /// - When `advisory_text` is `None`, `hookSpecificOutput` is omitted entirely
-    ///   (a response of `{ "systemMessage": "..." }` is valid per the hook spec).
-    ///
-    /// Returns `None` when the agent has no advisory channel.
-    /// ClaudeCodeHook returns `Some(advisory-only JSON)`.
-    ///
-    /// Default: `None` (non-Claude agents have no advisory channel).
-    fn format_advisory_only(
-        &self,
-        _advisory_text: Option<&str>,
-        _system_msg: &str,
-    ) -> Option<serde_json::Value> {
-        None
-    }
-
-    // -------------------------------------------------------------------------
     // Hook artifact location seam
     //
     // `hook_config_dir` is the single point of indirection that decouples where
