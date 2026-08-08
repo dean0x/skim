@@ -15,7 +15,8 @@ use std::time::UNIX_EPOCH;
 use colored::{ColoredString, Colorize};
 
 use crate::analytics::{
-    AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel, SessionStats,
+    AnalyticsDb, AnalyticsStore, OriginalCommandStats, PricingModel, ProxyModelStats,
+    ProxyProviderStats, SessionStats,
 };
 use crate::cmd::session::types::parse_duration_ago;
 use crate::tokens;
@@ -173,6 +174,74 @@ fn run_json(
         "tokens_saved": summary.tokens_saved,
     });
 
+    // AC10 / AD-AN-9: proxy section is present only when proxy rows exist.
+    // AD-AN-9: ordering is guaranteed by query_by_model (NULL-last SQL ORDER BY),
+    // so identical row sets produce byte-identical JSON (AC13).
+    let by_model = db.query_by_model(since)?;
+    let proxy_section = if !by_model.is_empty() {
+        let by_provider = db.query_by_provider(since)?;
+        let upstream_errors = db.query_by_upstream_error(since)?;
+        let dropped_records = db.query_proxy_dropped_records()?;
+
+        // Serialise by_model: per-row basis disclosure + uncounted_rows (AC12).
+        // AD-AN-9: mixed-basis provider rows carry null token sums (already
+        // encoded as Option<u64> None in the struct).
+        let model_json: Vec<serde_json::Value> = by_model
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "provider": r.provider,
+                    "model": r.model,
+                    "requests": r.requests,
+                    "upstream_errors": r.upstream_errors,
+                    "raw_tokens": r.raw_tokens,
+                    "compressed_tokens": r.compressed_tokens,
+                    "avg_savings_pct": r.avg_savings_pct,
+                    "tier_full_pct": r.tier_full_pct,
+                    "tier_degraded_pct": r.tier_degraded_pct,
+                    "tier_passthrough_pct": r.tier_passthrough_pct,
+                    "basis": r.basis,
+                    "counted_rows": r.counted_rows,
+                    "uncounted_rows": r.uncounted_rows,
+                })
+            })
+            .collect();
+
+        // AD-AN-9: provider rollup spans multiple bases → token sums are null
+        // (mixed-basis; combining would be meaningless).
+        let provider_json: Vec<serde_json::Value> = by_provider
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "provider": r.provider,
+                    "requests": r.requests,
+                    "upstream_errors": r.upstream_errors,
+                    "raw_tokens": r.raw_tokens,
+                    "compressed_tokens": r.compressed_tokens,
+                    "avg_savings_pct": r.avg_savings_pct,
+                    "tier_full_pct": r.tier_full_pct,
+                    "tier_degraded_pct": r.tier_degraded_pct,
+                    "tier_passthrough_pct": r.tier_passthrough_pct,
+                    "basis": r.basis,
+                    "counted_rows": r.counted_rows,
+                    "uncounted_rows": r.uncounted_rows,
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "by_provider": provider_json,
+            "by_model": model_json,
+            // AD-PXY-25: upstream-errored rows excluded from savings/tier aggregates;
+            // count is surfaced separately so consumers can distinguish relay success
+            // from total requests.
+            "upstream_errors": upstream_errors,
+            "dropped_records": dropped_records,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
     let root = serde_json::json!({
         "summary": {
             "invocations": summary.invocations,
@@ -195,6 +264,9 @@ fn run_json(
             "untagged_invocations": session_stats.untagged_invocations,
         },
         "cost_estimate": cost_estimate,
+        // AC10: null when no proxy rows; omitting entirely vs null is a protocol
+        // choice — using null keeps the key stable for downstream consumers.
+        "proxy": proxy_section,
     });
 
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
@@ -594,6 +666,134 @@ fn render_cost_section(
 }
 
 // ============================================================================
+// Proxy dashboard — section renderers
+// ============================================================================
+
+/// Format an optional token count; None renders as a dash.
+fn fmt_opt_tokens(v: Option<u64>) -> String {
+    match v {
+        Some(n) => format_tokens(n),
+        None => "-".to_string(),
+    }
+}
+
+/// Render the per-provider proxy breakdown.
+///
+/// AD-AN-9: per-(provider,model) is the authoritative token-sum unit; the
+/// provider row omits the combined token figure when `basis == "mixed"` (models
+/// span different tokenizers and the sum would be meaningless).
+/// AD-PXY-25: upstream_errors is shown separately — those rows are excluded
+/// from savings/tier aggregates.
+fn render_proxy_by_provider(
+    w: &mut dyn Write,
+    rows: &[ProxyProviderStats],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("Proxy — By Provider"))?;
+    writeln!(w)?;
+    // Column widths: provider(16) | reqs(6) | errors(6) | tokens_raw(10) |
+    //                tokens_cmp(10) | avg_savings(9) | basis(14) | uncounted(9)
+    writeln!(
+        w,
+        "  {:<16}  {:>6}  {:>6}  {:>10}  {:>10}  {:<9}  {:<14}  {:>9}",
+        "PROVIDER", "REQS", "ERRORS", "RAW", "COMPRESSED", "REDUCTION", "BASIS", "UNCOUNTED"
+    )?;
+    for row in rows {
+        let provider = row.provider.as_deref().unwrap_or("(unknown)");
+        let avg_pct = row.avg_savings_pct.unwrap_or(0.0);
+        writeln!(
+            w,
+            "  {:<16}  {:>6}  {:>6}  {:>10}  {:>10}  {}  {:<14}  {:>9}",
+            &provider[..provider.len().min(16)],
+            tokens::format_number(row.requests as usize),
+            tokens::format_number(row.upstream_errors as usize),
+            fmt_opt_tokens(row.raw_tokens),
+            fmt_opt_tokens(row.compressed_tokens),
+            color_pct(avg_pct),
+            row.basis,
+            tokens::format_number(row.uncounted_rows as usize),
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Render the per-model proxy breakdown.
+///
+/// AD-AN-9 / AC10: rendered only when at least one proxy row exists.
+/// AD-PXY-25: upstream_errors shown separately from success-scope metrics.
+/// AC12: uncounted_rows disclosed alongside basis label.
+fn render_proxy_by_model(
+    w: &mut dyn Write,
+    rows: &[ProxyModelStats],
+) -> anyhow::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    writeln!(w, "{}", section_header("Proxy — By Model"))?;
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  {:<16}  {:<26}  {:>6}  {:>6}  {:>10}  {:>10}  {:<9}  {:<14}  {:>9}",
+        "PROVIDER", "MODEL", "REQS", "ERRORS", "RAW", "COMPRESSED", "REDUCTION", "BASIS", "UNCOUNTED"
+    )?;
+    for row in rows {
+        let provider = row.provider.as_deref().unwrap_or("(unknown)");
+        let model = row.model.as_deref().unwrap_or("(unknown)");
+        let avg_pct = row.avg_savings_pct.unwrap_or(0.0);
+        writeln!(
+            w,
+            "  {:<16}  {:<26}  {:>6}  {:>6}  {:>10}  {:>10}  {}  {:<14}  {:>9}",
+            &provider[..provider.len().min(16)],
+            &model[..model.len().min(26)],
+            tokens::format_number(row.requests as usize),
+            tokens::format_number(row.upstream_errors as usize),
+            fmt_opt_tokens(row.raw_tokens),
+            fmt_opt_tokens(row.compressed_tokens),
+            color_pct(avg_pct),
+            row.basis,
+            tokens::format_number(row.uncounted_rows as usize),
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Render upstream-error count (AD-PXY-25).
+///
+/// AD-PXY-25: upstream-errored rows are excluded from savings/tier aggregates
+/// and reported separately so the operator can distinguish "proxy saw the
+/// request" from "savings were computed for the request".
+fn render_proxy_upstream_errors(w: &mut dyn Write, count: u64) -> anyhow::Result<()> {
+    if count > 0 {
+        writeln!(
+            w,
+            "  Upstream errors:     {} (excluded from savings aggregates)",
+            tokens::format_number(count as usize)
+        )?;
+    }
+    Ok(())
+}
+
+/// Render dropped-record count (AD-AN-8).
+///
+/// Dropped records are rows that were queued but never persisted (queue
+/// overflow). The count is monotonically accumulated via
+/// `analytics_meta_add_drop_count` and surfaced here when nonzero.
+fn render_proxy_dropped_records(w: &mut dyn Write, count: u64) -> anyhow::Result<()> {
+    if count > 0 {
+        writeln!(
+            w,
+            "  Dropped records:     {} (recording queue overflowed)",
+            tokens::format_number(count as usize)
+        )?;
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Terminal dashboard — orchestrator
 // ============================================================================
 
@@ -631,6 +831,28 @@ fn run_dashboard(
         render_session_stats(w, &session_stats)?;
         render_parse_quality(w, &db.query_tier_distribution(since)?)?;
     }
+
+    // AC10: proxy sections only when proxy rows exist (render-when-present).
+    // AD-PXY-25 / AD-AN-9: upstream-error and dropped-record counts are surfaced
+    // alongside the breakdown tables.
+    let by_model = db.query_by_model(since)?;
+    if !by_model.is_empty() {
+        let by_provider = db.query_by_provider(since)?;
+        render_proxy_by_provider(w, &by_provider)?;
+        render_proxy_by_model(w, &by_model)?;
+
+        // Inline advisory lines: upstream errors + dropped records.
+        let upstream_errors = db.query_by_upstream_error(since)?;
+        let dropped_records = db.query_proxy_dropped_records()?;
+        if upstream_errors > 0 || dropped_records > 0 {
+            writeln!(w, "{}", section_header("Proxy — Notices"))?;
+            writeln!(w)?;
+            render_proxy_upstream_errors(w, upstream_errors)?;
+            render_proxy_dropped_records(w, dropped_records)?;
+            writeln!(w)?;
+        }
+    }
+
     render_cost_section(w, summary.tokens_saved, cost_override)?;
 
     Ok(ExitCode::SUCCESS)
@@ -706,6 +928,11 @@ mod tests {
         tier_dist: TierDistribution,
         by_original_cmd: Vec<OriginalCommandStats>,
         session_stats: SessionStats,
+        // Phase 3: proxy query fields (default empty / zero)
+        by_model: Vec<ProxyModelStats>,
+        by_provider: Vec<ProxyProviderStats>,
+        upstream_errors: u64,
+        dropped_records: u64,
     }
 
     impl MockStore {
@@ -734,6 +961,10 @@ mod tests {
                     avg_tokens_per_session: 0.0,
                     untagged_invocations: 0,
                 },
+                by_model: vec![],
+                by_provider: vec![],
+                upstream_errors: 0,
+                dropped_records: 0,
             }
         }
 
@@ -815,6 +1046,10 @@ mod tests {
                     avg_tokens_per_session: 0.0,
                     untagged_invocations: 0,
                 },
+                by_model: vec![],
+                by_provider: vec![],
+                upstream_errors: 0,
+                dropped_records: 0,
             }
         }
 
@@ -861,6 +1096,24 @@ mod tests {
         }
         fn clear(&self) -> anyhow::Result<()> {
             Ok(())
+        }
+        fn query_by_model(
+            &self,
+            _since: Option<i64>,
+        ) -> anyhow::Result<Vec<ProxyModelStats>> {
+            Ok(self.by_model.clone())
+        }
+        fn query_by_provider(
+            &self,
+            _since: Option<i64>,
+        ) -> anyhow::Result<Vec<ProxyProviderStats>> {
+            Ok(self.by_provider.clone())
+        }
+        fn query_by_upstream_error(&self, _since: Option<i64>) -> anyhow::Result<u64> {
+            Ok(self.upstream_errors)
+        }
+        fn query_proxy_dropped_records(&self) -> anyhow::Result<u64> {
+            Ok(self.dropped_records)
         }
     }
 
@@ -1671,5 +1924,434 @@ mod tests {
         );
         assert_eq!(ss["distinct_sessions"].as_u64().unwrap(), 0);
         assert_eq!(ss["untagged_invocations"].as_u64().unwrap(), 0);
+    }
+
+    // ========================================================================
+    // Phase 3: proxy dashboard rendering tests (AC9–AC13, AC25)
+    // ========================================================================
+
+    /// Build a minimal ProxyModelStats row for MockStore tests.
+    fn proxy_model_row(
+        provider: Option<&str>,
+        model: Option<&str>,
+        requests: u64,
+        raw_tokens: Option<u64>,
+        compressed_tokens: Option<u64>,
+        avg_savings_pct: Option<f64>,
+        basis: &str,
+        upstream_errors: u64,
+        uncounted_rows: u64,
+    ) -> ProxyModelStats {
+        ProxyModelStats {
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+            requests,
+            upstream_errors,
+            raw_tokens,
+            compressed_tokens,
+            avg_savings_pct,
+            tier_full_pct: 100.0,
+            tier_degraded_pct: 0.0,
+            tier_passthrough_pct: 0.0,
+            basis: basis.to_string(),
+            counted_rows: requests.saturating_sub(uncounted_rows),
+            uncounted_rows,
+        }
+    }
+
+    fn proxy_provider_row(
+        provider: Option<&str>,
+        requests: u64,
+        raw_tokens: Option<u64>,
+        compressed_tokens: Option<u64>,
+        avg_savings_pct: Option<f64>,
+        basis: &str,
+        upstream_errors: u64,
+    ) -> ProxyProviderStats {
+        ProxyProviderStats {
+            provider: provider.map(str::to_string),
+            requests,
+            upstream_errors,
+            raw_tokens,
+            compressed_tokens,
+            avg_savings_pct,
+            tier_full_pct: 100.0,
+            tier_degraded_pct: 0.0,
+            tier_passthrough_pct: 0.0,
+            basis: basis.to_string(),
+            counted_rows: requests,
+            uncounted_rows: 0,
+        }
+    }
+
+    /// AC9 (POSITIVE) — proxy section absent from JSON when no proxy rows exist.
+    ///
+    /// The `"proxy"` key must be JSON null when query_by_model returns empty —
+    /// a non-null proxy key with no data would mislead consumers.
+    #[test]
+    fn test_run_json_proxy_null_when_no_proxy_rows() {
+        let store = MockStore::empty(); // by_model is empty by default
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        // The "proxy" key must be present and null.
+        assert!(
+            parsed.get("proxy").is_some(),
+            "AC9: JSON output must contain the 'proxy' key"
+        );
+        assert!(
+            parsed["proxy"].is_null(),
+            "AC9: 'proxy' key must be null when no proxy rows exist; got: {:?}",
+            parsed["proxy"]
+        );
+    }
+
+    /// AC10 (POSITIVE) — proxy section present and non-null when proxy rows exist.
+    ///
+    /// A MockStore with by_model populated must yield a non-null "proxy" key
+    /// with "by_model" and "by_provider" sub-arrays.
+    #[test]
+    fn test_run_json_proxy_present_when_proxy_rows_exist() {
+        let mut store = MockStore::empty();
+        store.by_model = vec![proxy_model_row(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            10,
+            Some(5_000),
+            Some(500),
+            Some(90.0),
+            "approximation",
+            0,
+            0,
+        )];
+        store.by_provider = vec![proxy_provider_row(
+            Some("anthropic"),
+            10,
+            Some(5_000),
+            Some(500),
+            Some(90.0),
+            "approximation",
+            0,
+        )];
+
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+
+        assert!(
+            !parsed["proxy"].is_null(),
+            "AC10: 'proxy' key must be non-null when by_model is non-empty"
+        );
+        let proxy = &parsed["proxy"];
+        assert!(
+            proxy["by_model"].is_array(),
+            "AC10: proxy.by_model must be a JSON array"
+        );
+        assert_eq!(
+            proxy["by_model"].as_array().unwrap().len(),
+            1,
+            "AC10: proxy.by_model must have 1 row"
+        );
+        assert!(
+            proxy["by_provider"].is_array(),
+            "AC10: proxy.by_provider must be present"
+        );
+    }
+
+    /// AC11 — mixed-basis provider: combined token figure is null in JSON.
+    ///
+    /// AD-AN-9: when a provider's models span different counting bases,
+    /// the provider-level token sum is meaningless and must be null (not 0).
+    #[test]
+    fn test_run_json_proxy_mixed_basis_tokens_are_null() {
+        let mut store = MockStore::empty();
+        // Two model rows for "openai" with different bases.
+        store.by_model = vec![
+            proxy_model_row(
+                Some("openai"),
+                Some("gpt-4"),
+                5,
+                Some(2_000),
+                Some(400),
+                Some(80.0),
+                "exact",
+                0,
+                0,
+            ),
+            proxy_model_row(
+                Some("openai"),
+                Some("gpt-4o"),
+                5,
+                Some(1_000),
+                Some(200),
+                Some(80.0),
+                "exact",
+                0,
+                0,
+            ),
+        ];
+        // Provider row with mixed basis (tokens null).
+        store.by_provider = vec![ProxyProviderStats {
+            provider: Some("openai".to_string()),
+            requests: 10,
+            upstream_errors: 0,
+            raw_tokens: None,   // mixed-basis → null
+            compressed_tokens: None,
+            avg_savings_pct: Some(80.0),
+            tier_full_pct: 100.0,
+            tier_degraded_pct: 0.0,
+            tier_passthrough_pct: 0.0,
+            basis: "mixed".to_string(),
+            counted_rows: 10,
+            uncounted_rows: 0,
+        }];
+
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let provider_row = &parsed["proxy"]["by_provider"][0];
+
+        assert_eq!(
+            provider_row["basis"].as_str().unwrap(),
+            "mixed",
+            "AC11: mixed-basis provider must have basis='mixed'"
+        );
+        assert!(
+            provider_row["raw_tokens"].is_null(),
+            "AC11: mixed-basis provider must have null raw_tokens in JSON; \
+             got: {:?}",
+            provider_row["raw_tokens"]
+        );
+        assert!(
+            provider_row["compressed_tokens"].is_null(),
+            "AC11: mixed-basis provider must have null compressed_tokens in JSON"
+        );
+    }
+
+    /// AC12 — basis disclosure: counted_rows + uncounted_rows are both present in JSON.
+    ///
+    /// Uncounted rows (NULL token pairs) must be disclosed alongside the basis
+    /// label so consumers can assess confidence in the token aggregate.
+    #[test]
+    fn test_run_json_proxy_basis_and_uncounted_rows_disclosed() {
+        let mut store = MockStore::empty();
+        store.by_model = vec![proxy_model_row(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            10,
+            None,   // all NULL token pairs → 0 counted
+            None,
+            None,
+            "approximation",
+            0,
+            10,     // all 10 are uncounted
+        )];
+        store.by_provider = vec![proxy_provider_row(
+            Some("anthropic"),
+            10,
+            None,
+            None,
+            None,
+            "approximation",
+            0,
+        )];
+
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let model_row = &parsed["proxy"]["by_model"][0];
+
+        assert_eq!(
+            model_row["counted_rows"].as_u64().unwrap(),
+            0,
+            "AC12: counted_rows must be 0 when all tokens are NULL"
+        );
+        assert_eq!(
+            model_row["uncounted_rows"].as_u64().unwrap(),
+            10,
+            "AC12: uncounted_rows must be 10"
+        );
+        assert_eq!(
+            model_row["basis"].as_str().unwrap(),
+            "approximation",
+            "AC12: basis must be disclosed per model row"
+        );
+    }
+
+    /// AC13 — JSON determinism: identical MockStore data produces the same output
+    /// on two calls.
+    ///
+    /// AD-AN-9: ordering is NULL-last by SQL ORDER BY — identical row sets must
+    /// produce byte-identical JSON.
+    #[test]
+    fn test_run_json_proxy_deterministic() {
+        let mut store = MockStore::empty();
+        store.by_model = vec![
+            proxy_model_row(
+                Some("anthropic"),
+                Some("claude-3-5-sonnet-20241022"),
+                5,
+                Some(1_000),
+                Some(200),
+                Some(80.0),
+                "approximation",
+                0,
+                0,
+            ),
+            proxy_model_row(
+                Some("openai"),
+                Some("gpt-4o"),
+                3,
+                Some(600),
+                Some(120),
+                Some(80.0),
+                "exact",
+                0,
+                0,
+            ),
+        ];
+        store.by_provider = vec![
+            proxy_provider_row(Some("anthropic"), 5, Some(1_000), Some(200), Some(80.0), "approximation", 0),
+            proxy_provider_row(Some("openai"), 3, Some(600), Some(120), Some(80.0), "exact", 0),
+        ];
+
+        let out1 = capture(|w| run_json(w, &store, None, None));
+        let out2 = capture(|w| run_json(w, &store, None, None));
+        assert_eq!(
+            out1, out2,
+            "AC13: identical MockStore state must produce byte-identical JSON"
+        );
+    }
+
+    /// AC25 — upstream errors count: surfaced separately in JSON (not conflated
+    /// with success-scope request counts).
+    ///
+    /// AD-PXY-25: a nonzero upstream_errors must appear in proxy.upstream_errors;
+    /// the by_model rows' own upstream_errors field is an error count too, but
+    /// the top-level proxy.upstream_errors is the sum across all models (total
+    /// for the time window).
+    #[test]
+    fn test_run_json_proxy_upstream_errors_surfaced() {
+        let mut store = MockStore::empty();
+        store.by_model = vec![proxy_model_row(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            2,
+            Some(1_000),
+            Some(200),
+            Some(80.0),
+            "approximation",
+            3,  // 3 upstream errors for this model
+            0,
+        )];
+        store.by_provider = vec![proxy_provider_row(
+            Some("anthropic"),
+            2,
+            Some(1_000),
+            Some(200),
+            Some(80.0),
+            "approximation",
+            3,
+        )];
+        store.upstream_errors = 3;
+
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        assert_eq!(
+            parsed["proxy"]["upstream_errors"].as_u64().unwrap(),
+            3,
+            "AC25: upstream_errors must be 3 in proxy section"
+        );
+    }
+
+    /// AC10 — dashboard render-when-present: proxy sections appear only when
+    /// by_model is non-empty.
+    #[test]
+    fn test_dashboard_proxy_sections_absent_when_no_proxy_rows() {
+        let store = MockStore::with_data(); // no proxy rows
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            !output.contains("Proxy — By Provider"),
+            "AC10: 'Proxy — By Provider' section must not appear without proxy rows"
+        );
+        assert!(
+            !output.contains("Proxy — By Model"),
+            "AC10: 'Proxy — By Model' section must not appear without proxy rows"
+        );
+    }
+
+    /// AC10 — dashboard render-when-present: proxy sections appear when by_model
+    /// is non-empty.
+    #[test]
+    fn test_dashboard_proxy_sections_present_when_proxy_rows_exist() {
+        let mut store = MockStore::with_data();
+        store.by_model = vec![proxy_model_row(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            10,
+            Some(5_000),
+            Some(500),
+            Some(90.0),
+            "approximation",
+            0,
+            0,
+        )];
+        store.by_provider = vec![proxy_provider_row(
+            Some("anthropic"),
+            10,
+            Some(5_000),
+            Some(500),
+            Some(90.0),
+            "approximation",
+            0,
+        )];
+        // with_data() has non-zero invocations so dashboard proceeds past the empty-check.
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            output.contains("Proxy"),
+            "AC10: dashboard must show 'Proxy' sections when proxy rows exist"
+        );
+        assert!(
+            output.contains("anthropic"),
+            "AC10: dashboard must show provider name in proxy section"
+        );
+    }
+
+    /// AC25 — dashboard notices section: upstream errors shown separately.
+    #[test]
+    fn test_dashboard_proxy_notices_shows_upstream_errors() {
+        let mut store = MockStore::with_data();
+        store.by_model = vec![proxy_model_row(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            5,
+            Some(2_000),
+            Some(400),
+            Some(80.0),
+            "approximation",
+            7,
+            0,
+        )];
+        store.by_provider = vec![proxy_provider_row(
+            Some("anthropic"),
+            5,
+            Some(2_000),
+            Some(400),
+            Some(80.0),
+            "approximation",
+            7,
+        )];
+        store.upstream_errors = 7;
+
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            output.contains("Upstream errors"),
+            "AC25: dashboard must show 'Upstream errors' notice when count > 0"
+        );
+        assert!(
+            output.contains("excluded from savings aggregates"),
+            "AC25: upstream-errors notice must clarify exclusion from savings"
+        );
     }
 }

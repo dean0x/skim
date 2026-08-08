@@ -203,6 +203,106 @@ pub(crate) struct SessionStats {
 }
 
 // ============================================================================
+// Proxy query result types (Phase 3 — always compiled)
+// ============================================================================
+
+/// Per-(provider, model) proxy breakdown row — the authoritative token-sum unit.
+///
+/// **AD-AN-9:** per-(provider,model) is the single-encoding unit.  A per-provider
+/// rollup that spans multiple bases (e.g. openai = cl100k + o200k) carries
+/// `basis = "mixed"` and omits the combined token figure (JSON null).
+///
+/// Token aggregates exclude rows where `upstream_error_status IS NOT NULL`
+/// (AD-PXY-25), so only successfully-relayed requests contribute.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ProxyModelStats {
+    /// Provider name — `None` for unknown / undetected provider (NULL column).
+    pub provider: Option<String>,
+    /// Model identifier — verbatim as stored (AD-PXY-22), `None` when undetected.
+    pub model: Option<String>,
+    /// Number of successfully forwarded+relayed requests
+    /// (rows with `upstream_error_status IS NULL`).
+    pub requests: u64,
+    /// Number of transformed-but-upstream-errored requests
+    /// (rows with `upstream_error_status IS NOT NULL`).
+    pub upstream_errors: u64,
+    /// Combined raw token count.  `None` when no counted rows exist
+    /// (all rows have NULL token columns).
+    pub raw_tokens: Option<u64>,
+    /// Combined compressed token count.  `None` when no counted rows exist.
+    pub compressed_tokens: Option<u64>,
+    /// Average savings percentage across success-scope counted rows.
+    /// `None` when no counted rows exist.
+    pub avg_savings_pct: Option<f64>,
+    /// Fraction of success-scope requests with tier=full (0.0 – 100.0).
+    pub tier_full_pct: f64,
+    /// Fraction of success-scope requests with tier=degraded (0.0 – 100.0).
+    pub tier_degraded_pct: f64,
+    /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
+    pub tier_passthrough_pct: f64,
+    /// Counting basis: one of `"exact"`, `"approximation"`, or `"heuristic"`.
+    /// Derived from `select_encoding(provider, model)` (AD-AN-9).
+    pub basis: String,
+    /// Success-scope rows with non-NULL token columns (countable).
+    pub counted_rows: u64,
+    /// Success-scope rows with NULL token columns (uncountable).
+    pub uncounted_rows: u64,
+}
+
+/// Per-provider proxy rollup.
+///
+/// **AD-AN-9:** when a provider spans multiple counting bases (e.g. openai with
+/// both cl100k models and o200k models), `basis = "mixed"` and `raw_tokens` /
+/// `compressed_tokens` are `None` — the per-model rows carry the authoritative
+/// token figures.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ProxyProviderStats {
+    /// Provider name — `None` for unknown / undetected.
+    pub provider: Option<String>,
+    /// Number of successfully forwarded+relayed requests.
+    pub requests: u64,
+    /// Number of transformed-but-upstream-errored requests.
+    pub upstream_errors: u64,
+    /// Combined raw token count.
+    /// `None` when `basis = "mixed"` or no countable rows exist.
+    pub raw_tokens: Option<u64>,
+    /// Combined compressed token count.
+    /// `None` when `basis = "mixed"` or no countable rows exist.
+    pub compressed_tokens: Option<u64>,
+    /// Average savings percentage.
+    /// `None` when `basis = "mixed"` or no countable rows.
+    pub avg_savings_pct: Option<f64>,
+    /// Fraction of success-scope requests with tier=full (0.0 – 100.0).
+    pub tier_full_pct: f64,
+    /// Fraction of success-scope requests with tier=degraded (0.0 – 100.0).
+    pub tier_degraded_pct: f64,
+    /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
+    pub tier_passthrough_pct: f64,
+    /// Counting basis: `"exact"`, `"approximation"`, `"heuristic"`, or `"mixed"`.
+    pub basis: String,
+    /// Success-scope rows with non-NULL token columns (countable).
+    pub counted_rows: u64,
+    /// Success-scope rows with NULL token columns (uncountable).
+    pub uncounted_rows: u64,
+}
+
+/// Row returned by `query_block_decisions` (via `AnalyticsStore` trait).
+///
+/// Only constructed in the trait impl and consumed in tests / the deferred
+/// `--audit` CLI path (#469). Suppress dead_code in non-test builds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[allow(dead_code)]
+pub(crate) struct ProxyBlockDecisionRow {
+    pub id: i64,
+    pub savings_id: i64,
+    pub block_index: u64,
+    pub component: String,
+    pub outcome: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+// ============================================================================
 // Proxy recording types (always compiled — no rskim-proxy dependency)
 // ============================================================================
 
@@ -534,6 +634,47 @@ pub(crate) trait AnalyticsStore {
     fn clear(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    // ---- Proxy-scope methods (default impls return empty/zero) ----
+    // Default impls allow existing MockStore implementations to compile without
+    // change; proxy-aware mocks override only the methods they need.
+
+    /// Per-(provider, model) proxy breakdown.  Default returns empty.
+    /// **AD-AN-9:** see [`AnalyticsDb::query_by_model`] for the full contract.
+    fn query_by_model(&self, _since: Option<i64>) -> anyhow::Result<Vec<ProxyModelStats>> {
+        Ok(vec![])
+    }
+
+    /// Per-provider proxy rollup.  Default returns empty.
+    /// **AD-AN-9:** see [`AnalyticsDb::query_by_provider`] for the full contract.
+    fn query_by_provider(&self, _since: Option<i64>) -> anyhow::Result<Vec<ProxyProviderStats>> {
+        Ok(vec![])
+    }
+
+    /// Count of transformed-but-upstream-errored requests.  Default returns 0.
+    /// **AD-PXY-25:** see [`AnalyticsDb::query_by_upstream_error`].
+    fn query_by_upstream_error(&self, _since: Option<i64>) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Accumulated proxy event drop count from analytics_meta.  Default returns 0.
+    /// **AD-AN-8:** see [`AnalyticsDb::query_proxy_dropped_records`].
+    fn query_proxy_dropped_records(&self) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    /// Per-block decision rows for a parent savings_id.  Default returns empty.
+    /// **AD-AN-13:** implementation inlined in `impl AnalyticsStore for AnalyticsDb`.
+    ///
+    /// Called only from tests (and the deferred `--audit` CLI path — #469). The
+    /// `#[allow(dead_code)]` suppresses the warning in non-test builds.
+    #[allow(dead_code)]
+    fn query_block_decisions(
+        &self,
+        _savings_id: i64,
+    ) -> anyhow::Result<Vec<ProxyBlockDecisionRow>> {
+        Ok(vec![])
+    }
 }
 
 // ============================================================================
@@ -647,8 +788,11 @@ impl AnalyticsDb {
     }
 
     /// Query aggregate summary.
+    ///
+    /// **AD-AN-6:** excludes `command_type = 'proxy'` rows via
+    /// [`cli_scope_clause`] so proxy savings never inflate the CLI headline.
     pub(crate) fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
-        let (where_clause, params) = since_clause(since);
+        let (where_clause, params) = cli_scope_clause(since);
         // Fifth column: per-row floored tokens_saved — consistent with
         // query_by_command/query_by_lang/query_by_mode.  Rows where
         // compressed_tokens > raw_tokens (expansion) contribute 0 to tokens_saved
@@ -681,8 +825,10 @@ impl AnalyticsDb {
     }
 
     /// Query daily breakdown.
+    ///
+    /// **AD-AN-6:** excludes proxy rows so CLI daily figures stay unaffected.
     pub(crate) fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
-        let (where_clause, params) = since_clause(since);
+        let (where_clause, params) = cli_scope_clause(since);
         // CASE WHEN flooring is consistent with query_by_command/lang/mode/session.
         // Expansion rows (compressed_tokens > raw_tokens) contribute 0 to tokens_saved.
         let sql = format!(
@@ -704,8 +850,10 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by command type.
+    ///
+    /// **AD-AN-6:** excludes proxy rows from all CLI aggregates.
     pub(crate) fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
-        let (where_clause, params) = since_clause(since);
+        let (where_clause, params) = cli_scope_clause(since);
         let sql = format!(
             "SELECT command_type, COUNT(*), \
              COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
@@ -728,11 +876,13 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by language (file operations only).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI language aggregates.
     pub(crate) fn query_by_language(
         &self,
         since: Option<i64>,
     ) -> anyhow::Result<Vec<LanguageStats>> {
-        let (clause, params) = since_clause_with_extra(since, "language IS NOT NULL");
+        let (clause, params) = cli_scope_clause_with_extra(since, "language IS NOT NULL");
         let sql = format!(
             "SELECT language, COUNT(*), \
              COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
@@ -754,8 +904,10 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by mode (file operations only).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI mode aggregates.
     pub(crate) fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
-        let (clause, params) = since_clause_with_extra(since, "mode IS NOT NULL");
+        let (clause, params) = cli_scope_clause_with_extra(since, "mode IS NOT NULL");
         let sql = format!(
             "SELECT mode, COUNT(*), \
              COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
@@ -776,12 +928,15 @@ impl AnalyticsDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Query parse tier distribution (command operations only).
+    /// Query parse tier distribution (CLI command operations only).
+    ///
+    /// **AD-AN-6:** excludes proxy rows.  The proxy tier distribution uses
+    /// `query_by_model` / `query_by_provider` (success-scope only, per AD-PXY-25).
     pub(crate) fn query_tier_distribution(
         &self,
         since: Option<i64>,
     ) -> anyhow::Result<TierDistribution> {
-        let (clause, params) = since_clause_with_extra(since, "parse_tier IS NOT NULL");
+        let (clause, params) = cli_scope_clause_with_extra(since, "parse_tier IS NOT NULL");
         let sql = format!(
             "SELECT COALESCE(SUM(CASE WHEN parse_tier = 'full' THEN 1 ELSE 0 END), 0), \
              COALESCE(SUM(CASE WHEN parse_tier = 'degraded' THEN 1 ELSE 0 END), 0), \
@@ -805,11 +960,13 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by original command string (top 15 by tokens saved).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI command breakdown.
     pub(crate) fn query_by_original_cmd(
         &self,
         since: Option<i64>,
     ) -> anyhow::Result<Vec<OriginalCommandStats>> {
-        let (where_clause, params) = since_clause(since);
+        let (where_clause, params) = cli_scope_clause(since);
         let sql = format!(
             "SELECT original_cmd, COUNT(*) as cnt, \
              SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END) as saved, \
@@ -915,9 +1072,11 @@ impl AnalyticsDb {
     ///
     /// Division by zero is guarded: when `distinct_sessions == 0`,
     /// `avg_tokens_per_session` is 0.0 (computed in Rust after the query).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI session stats.
     pub(crate) fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
         // F2: Single query using conditional aggregation — eliminates the two-query pattern.
-        let (where_clause, params) = since_clause(since);
+        let (where_clause, params) = cli_scope_clause(since);
         let sql = format!(
             "SELECT \
              COUNT(DISTINCT session_id), \
@@ -1064,6 +1223,264 @@ impl AnalyticsDb {
         )?;
         Ok(())
     }
+
+    /// Query per-(provider, model) proxy breakdown rows.
+    ///
+    /// **AD-AN-9:** per-(provider,model) is the authoritative single-encoding
+    /// token-sum unit.  Token and tier aggregates exclude rows where
+    /// `upstream_error_status IS NOT NULL` (AD-PXY-25).  Rows are ordered
+    /// `(provider IS NULL, provider, model IS NULL, model)` — NULL-last — so
+    /// identical input produces byte-identical JSON (AC13).
+    ///
+    /// The `basis` field is derived via [`counting_basis_label`] from the stored
+    /// provider+model strings.
+    #[allow(dead_code)]
+    pub(crate) fn query_by_model(
+        &self,
+        since: Option<i64>,
+    ) -> anyhow::Result<Vec<ProxyModelStats>> {
+        let (proxy_clause, params) = proxy_scope_clause(since);
+        let sql = format!(
+            "SELECT \
+             provider, model, \
+             COUNT(CASE WHEN upstream_error_status IS NULL THEN 1 END), \
+             COUNT(CASE WHEN upstream_error_status IS NOT NULL THEN 1 END), \
+             SUM(CASE WHEN upstream_error_status IS NULL THEN raw_tokens END), \
+             SUM(CASE WHEN upstream_error_status IS NULL THEN compressed_tokens END), \
+             AVG(CASE WHEN upstream_error_status IS NULL THEN savings_pct END), \
+             COUNT(CASE WHEN upstream_error_status IS NULL AND raw_tokens IS NOT NULL THEN 1 END), \
+             COUNT(CASE WHEN upstream_error_status IS NULL AND raw_tokens IS NULL THEN 1 END), \
+             COALESCE(SUM(CASE WHEN upstream_error_status IS NULL AND parse_tier = 'full' THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN upstream_error_status IS NULL AND parse_tier = 'degraded' THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN upstream_error_status IS NULL AND parse_tier = 'passthrough' THEN 1 ELSE 0 END), 0) \
+             FROM token_savings {proxy_clause} \
+             GROUP BY provider, model \
+             ORDER BY (provider IS NULL), provider, (model IS NULL), model"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            let provider: Option<String> = row.get(0)?;
+            let model: Option<String> = row.get(1)?;
+            let requests: u64 = row.get(2)?;
+            let upstream_errors: u64 = row.get(3)?;
+            let raw_tokens: Option<i64> = row.get(4)?;
+            let compressed_tokens: Option<i64> = row.get(5)?;
+            let avg_savings_pct: Option<f64> = row.get(6)?;
+            let counted_rows: u64 = row.get(7)?;
+            let uncounted_rows: u64 = row.get(8)?;
+            let tier_full: i64 = row.get(9)?;
+            let tier_degraded: i64 = row.get(10)?;
+            let tier_passthrough: i64 = row.get(11)?;
+            let t = if requests > 0 { requests as f64 } else { 1.0 };
+            Ok((
+                provider,
+                model,
+                requests,
+                upstream_errors,
+                raw_tokens,
+                compressed_tokens,
+                avg_savings_pct,
+                counted_rows,
+                uncounted_rows,
+                tier_full,
+                tier_degraded,
+                tier_passthrough,
+                t,
+            ))
+        })?;
+
+        let mut result = Vec::new();
+        for row_res in rows {
+            let (
+                provider,
+                model,
+                requests,
+                upstream_errors,
+                raw_tokens,
+                compressed_tokens,
+                avg_savings_pct,
+                counted_rows,
+                uncounted_rows,
+                tier_full,
+                tier_degraded,
+                tier_passthrough,
+                t,
+            ) = row_res?;
+
+            let basis =
+                counting_basis_label(provider.as_deref(), model.as_deref()).to_string();
+
+            result.push(ProxyModelStats {
+                provider,
+                model,
+                requests,
+                upstream_errors,
+                raw_tokens: raw_tokens.map(|v| v.max(0) as u64),
+                compressed_tokens: compressed_tokens.map(|v| v.max(0) as u64),
+                avg_savings_pct,
+                tier_full_pct: tier_full as f64 / t * 100.0,
+                tier_degraded_pct: tier_degraded as f64 / t * 100.0,
+                tier_passthrough_pct: tier_passthrough as f64 / t * 100.0,
+                basis,
+                counted_rows,
+                uncounted_rows,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Query per-provider proxy rollup.
+    ///
+    /// **AD-AN-9:** Derives provider-level stats from [`query_by_model`] by
+    /// grouping model rows in Rust.  When a provider spans multiple encoding
+    /// bases (e.g. openai = cl100k + o200k models), `basis = "mixed"` is set
+    /// and `raw_tokens` / `compressed_tokens` / `avg_savings_pct` are `None`
+    /// (AC11) — the per-model rows carry the authoritative figures.
+    ///
+    /// Ordering is preserved from the underlying model query: non-NULL providers
+    /// appear first (alphabetic), unknown (NULL) providers appear last (AC13).
+    #[allow(dead_code)]
+    pub(crate) fn query_by_provider(
+        &self,
+        since: Option<i64>,
+    ) -> anyhow::Result<Vec<ProxyProviderStats>> {
+        let models = self.query_by_model(since)?;
+
+        // Group model rows by provider, preserving order from the SQL query.
+        // AD-AN-9: the SQL ORDER BY (provider IS NULL, provider, ...) ensures
+        // NULL-last ordering; grouping in Rust preserves that order.
+        let mut provider_groups: Vec<(Option<String>, Vec<&ProxyModelStats>)> = Vec::new();
+        for m in &models {
+            if let Some(entry) = provider_groups.iter_mut().find(|(p, _)| p == &m.provider) {
+                entry.1.push(m);
+            } else {
+                provider_groups.push((m.provider.clone(), vec![m]));
+            }
+        }
+
+        let mut result = Vec::with_capacity(provider_groups.len());
+        for (provider, rows) in provider_groups {
+            let requests: u64 = rows.iter().map(|r| r.requests).sum();
+            let upstream_errors: u64 = rows.iter().map(|r| r.upstream_errors).sum();
+            let counted_rows: u64 = rows.iter().map(|r| r.counted_rows).sum();
+            let uncounted_rows: u64 = rows.iter().map(|r| r.uncounted_rows).sum();
+
+            // Recompute tier counts from model-row percentages × requests.
+            let t = if requests > 0 { requests as f64 } else { 1.0 };
+            let full_count: f64 = rows
+                .iter()
+                .map(|r| r.tier_full_pct / 100.0 * r.requests as f64)
+                .sum();
+            let deg_count: f64 = rows
+                .iter()
+                .map(|r| r.tier_degraded_pct / 100.0 * r.requests as f64)
+                .sum();
+            let pass_count: f64 = rows
+                .iter()
+                .map(|r| r.tier_passthrough_pct / 100.0 * r.requests as f64)
+                .sum();
+
+            // Mixed-basis detection: re-derive the Encoding per model and compare
+            // *encoding variants*, not display labels.
+            //
+            // AD-AN-9: even when all models share the same basis *label*
+            // (e.g. both Cl100k and O200k resolve to "exact"), they use
+            // different vocabularies whose token counts are not addable.
+            // Comparing `ProxyModelStats::basis` strings would miss that case;
+            // comparing `Encoding` discriminants catches it.
+            let encodings: Vec<Encoding> = rows
+                .iter()
+                .map(|r| {
+                    let prov = recording_provider_from_str(r.provider.as_deref());
+                    select_encoding(&prov, r.model.as_deref())
+                })
+                .collect();
+            let first_encoding = encodings.first().copied().unwrap_or(Encoding::Heuristic);
+            let is_mixed = encodings.iter().any(|&e| e != first_encoding);
+            // Display basis: use the model row's label (derived from first_encoding).
+            let first_basis = rows.first().map(|r| r.basis.as_str()).unwrap_or("heuristic");
+
+            let (basis, raw_tokens, compressed_tokens, avg_savings_pct) = if is_mixed {
+                // AD-AN-9: mixed basis — omit combined token figure (JSON null).
+                ("mixed".to_string(), None, None, None)
+            } else if counted_rows > 0 {
+                let raw: u64 = rows.iter().filter_map(|r| r.raw_tokens).sum();
+                let comp: u64 = rows.iter().filter_map(|r| r.compressed_tokens).sum();
+                // Weighted average savings_pct over counted model rows.
+                let counted_models: Vec<&ProxyModelStats> =
+                    rows.iter().filter(|r| r.avg_savings_pct.is_some()).copied().collect();
+                let avg_pct: Option<f64> = if counted_models.is_empty() {
+                    None
+                } else {
+                    let s: f64 = counted_models
+                        .iter()
+                        .filter_map(|r| r.avg_savings_pct)
+                        .sum();
+                    Some(s / counted_models.len() as f64)
+                };
+                (first_basis.to_string(), Some(raw), Some(comp), avg_pct)
+            } else {
+                (first_basis.to_string(), None, None, None)
+            };
+
+            result.push(ProxyProviderStats {
+                provider,
+                requests,
+                upstream_errors,
+                raw_tokens,
+                compressed_tokens,
+                avg_savings_pct,
+                tier_full_pct: full_count / t * 100.0,
+                tier_degraded_pct: deg_count / t * 100.0,
+                tier_passthrough_pct: pass_count / t * 100.0,
+                basis,
+                counted_rows,
+                uncounted_rows,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Count transformed-but-upstream-errored proxy requests.
+    ///
+    /// **AD-PXY-25:** these rows have `upstream_error_status IS NOT NULL` and
+    /// are excluded from savings/tier aggregates.  The count is surfaced
+    /// separately in `skim stats` so the gap is never silent (AC17/AC25).
+    #[allow(dead_code)]
+    pub(crate) fn query_by_upstream_error(&self, since: Option<i64>) -> anyhow::Result<u64> {
+        // Compose proxy scope + the upstream-error filter.
+        // proxy_scope_clause returns "WHERE command_type = 'proxy' ..." so we
+        // append the extra condition with AND.
+        let (base_clause, params) = proxy_scope_clause(since);
+        let sql = format!(
+            "SELECT COUNT(*) FROM token_savings {base_clause} \
+             AND upstream_error_status IS NOT NULL"
+        );
+        let count: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(params), |r| r.get(0))?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Read the accumulated proxy event drop count from `analytics_meta`.
+    ///
+    /// **AD-AN-8:** the `proxy_dropped_records` key is written by
+    /// [`analytics_meta_add_drop_count`] at proxy shutdown.  Returns 0 when no
+    /// drops have been recorded (key absent).
+    #[allow(dead_code)]
+    pub(crate) fn query_proxy_dropped_records(&self) -> anyhow::Result<u64> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM analytics_meta \
+                 WHERE key = 'proxy_dropped_records'), 0)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        Ok(count.max(0) as u64)
+    }
+
 }
 
 impl AnalyticsStore for AnalyticsDb {
@@ -1098,29 +1515,120 @@ impl AnalyticsStore for AnalyticsDb {
         self.conn.execute("DELETE FROM token_savings", [])?;
         Ok(())
     }
-}
 
-/// Build WHERE clause for optional since filter.
-fn since_clause(since: Option<i64>) -> (String, Vec<i64>) {
-    match since {
-        Some(ts) => ("WHERE timestamp >= ?1".to_string(), vec![ts]),
-        None => (String::new(), vec![]),
+    fn query_by_model(&self, since: Option<i64>) -> anyhow::Result<Vec<ProxyModelStats>> {
+        self.query_by_model(since)
+    }
+
+    fn query_by_provider(&self, since: Option<i64>) -> anyhow::Result<Vec<ProxyProviderStats>> {
+        self.query_by_provider(since)
+    }
+
+    fn query_by_upstream_error(&self, since: Option<i64>) -> anyhow::Result<u64> {
+        self.query_by_upstream_error(since)
+    }
+
+    fn query_proxy_dropped_records(&self) -> anyhow::Result<u64> {
+        self.query_proxy_dropped_records()
+    }
+
+    /// Query per-block decision rows for a specific parent `token_savings` row.
+    ///
+    /// **AD-AN-13:** used for testing the byte-reconciliation invariant and for
+    /// audit queries (the deferred `--audit` flag, Ticket #469).
+    fn query_block_decisions(
+        &self,
+        savings_id: i64,
+    ) -> anyhow::Result<Vec<ProxyBlockDecisionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, savings_id, block_index, component, outcome, bytes_in, bytes_out \
+             FROM proxy_block_decisions WHERE savings_id = ?1 \
+             ORDER BY block_index",
+        )?;
+        let rows = stmt.query_map([savings_id], |row| {
+            Ok(ProxyBlockDecisionRow {
+                id: row.get(0)?,
+                savings_id: row.get(1)?,
+                block_index: row.get::<_, i64>(2)? as u64,
+                component: row.get(3)?,
+                outcome: row.get(4)?,
+                bytes_in: row.get::<_, i64>(5)?.max(0) as u64,
+                bytes_out: row.get::<_, i64>(6)?.max(0) as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 
-/// Build WHERE clause with an optional extra condition appended.
+// since_clause and since_clause_with_extra were replaced by cli_scope_clause and
+// cli_scope_clause_with_extra (AD-AN-6) and proxy_scope_clause in Phase 3.
+
+/// Build WHERE clause for CLI-scope queries — excludes proxy rows.
 ///
-/// Composes the `since` filter with an additional SQL predicate (e.g.
-/// `"language IS NOT NULL"`). The extra condition is AND-ed to the since
-/// clause when present, or becomes its own WHERE clause when since is None.
-fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String, Vec<i64>) {
-    let (base, params) = since_clause(since);
-    let clause = if base.is_empty() {
-        format!("WHERE {extra_condition}")
-    } else {
-        format!("{base} AND {extra_condition}")
-    };
-    (clause, params)
+/// **AD-AN-6:** all eight CLI-scope aggregates (`query_summary`, `query_daily`,
+/// `query_by_command`, `query_by_language`, `query_by_mode`,
+/// `query_by_original_cmd`, `query_session_stats`, `query_tier_distribution`)
+/// exclude `command_type = 'proxy'` rows so proxy analytics never inflate
+/// CLI figures.  The constraint comes from the PRISM #83 lesson (constraint 12).
+///
+/// **Discriminating guard (PF-007):** removing this predicate from any CLI
+/// query allows proxy savings to inflate the CLI headline, breaking the
+/// AC8 equality assertion.
+fn cli_scope_clause(since: Option<i64>) -> (String, Vec<i64>) {
+    match since {
+        Some(ts) => (
+            "WHERE command_type != 'proxy' AND timestamp >= ?1".to_string(),
+            vec![ts],
+        ),
+        None => ("WHERE command_type != 'proxy'".to_string(), vec![]),
+    }
+}
+
+/// Build WHERE clause for CLI-scope queries with an extra condition (AD-AN-6).
+fn cli_scope_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String, Vec<i64>) {
+    let (base, params) = cli_scope_clause(since);
+    (format!("{base} AND {extra_condition}"), params)
+}
+
+/// Build WHERE clause scoped to proxy rows only.
+fn proxy_scope_clause(since: Option<i64>) -> (String, Vec<i64>) {
+    match since {
+        Some(ts) => (
+            "WHERE command_type = 'proxy' AND timestamp >= ?1".to_string(),
+            vec![ts],
+        ),
+        None => ("WHERE command_type = 'proxy'".to_string(), vec![]),
+    }
+}
+
+// ============================================================================
+// Proxy query helpers
+// ============================================================================
+
+/// Map a stored provider column value back to a [`RecordingProvider`].
+fn recording_provider_from_str(s: Option<&str>) -> RecordingProvider {
+    match s {
+        Some("anthropic") => RecordingProvider::Anthropic,
+        Some("openai") => RecordingProvider::OpenAI,
+        _ => RecordingProvider::Unknown,
+    }
+}
+
+/// Derive the coarse 3-way counting-basis label from the stored provider+model.
+///
+/// **AD-AN-9:** the label is stable across additive `encoding.rs` changes that
+/// stay within the same bucket.  Residual drift on a re-bucketing binary upgrade
+/// is documented; stored token counts are immutable and never change.
+///
+/// Returns `"exact"` (Cl100k/O200k), `"approximation"` (AnthropicOffline),
+/// or `"heuristic"` (Heuristic).
+fn counting_basis_label(provider: Option<&str>, model: Option<&str>) -> &'static str {
+    let rp = recording_provider_from_str(provider);
+    match select_encoding(&rp, model) {
+        Encoding::Cl100k | Encoding::O200k => "exact",
+        Encoding::AnthropicOffline => "approximation",
+        Encoding::Heuristic => "heuristic",
+    }
 }
 
 // ============================================================================
@@ -2116,24 +2624,6 @@ mod tests {
             is_safe_session_id("session-2024-01-15_abc123"),
             "typical session ID format should be accepted"
         );
-    }
-
-    // ========================================================================
-    // since_clause_with_extra helper test
-    // ========================================================================
-
-    #[test]
-    fn test_since_clause_with_extra_no_since() {
-        let (clause, params) = since_clause_with_extra(None, "language IS NOT NULL");
-        assert_eq!(clause, "WHERE language IS NOT NULL");
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn test_since_clause_with_extra_with_since() {
-        let (clause, params) = since_clause_with_extra(Some(12345), "mode IS NOT NULL");
-        assert_eq!(clause, "WHERE timestamp >= ?1 AND mode IS NOT NULL");
-        assert_eq!(params, vec![12345]);
     }
 
     // ========================================================================
@@ -3787,6 +4277,403 @@ mod tests {
             "PF-007: Σ bytes_out over recorded blocks must match input sum \
              ({} vs {expected_bytes_out})",
             actual_bytes_out
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: scope-separation + new proxy query tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: insert a proxy row into the DB (bypasses record_proxy for speed).
+    fn insert_proxy_row(
+        db: &AnalyticsDb,
+        provider: Option<&str>,
+        model: Option<&str>,
+        raw_tokens: Option<i64>,
+        compressed_tokens: Option<i64>,
+        savings_pct: Option<f64>,
+        upstream_error_status: Option<i64>,
+        tier: &str,
+        ts: i64,
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO token_savings \
+                 (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, \
+                  savings_pct, duration_ms, project_path, parse_tier, \
+                  provider, model, upstream_error_status) \
+                 VALUES (?1, 'proxy', 'proxy', ?2, ?3, ?4, 10, '/tmp', ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    ts,
+                    raw_tokens,
+                    compressed_tokens,
+                    savings_pct,
+                    tier,
+                    provider,
+                    model,
+                    upstream_error_status
+                ],
+            )
+            .unwrap();
+    }
+
+    /// AC8 (NEGATIVE) — scope separation: CLI aggregates must be numerically
+    /// identical with proxy rows present vs. with proxy rows removed.
+    ///
+    /// PF-007: removing `command_type != 'proxy'` from any CLI query would allow
+    /// proxy savings to inflate the CLI headline, breaking the equality assertion.
+    #[test]
+    fn test_scope_separation_cli_aggregates_exclude_proxy_rows() {
+        let (db, _tmp) = test_db();
+
+        // Insert two CLI rows.
+        let mut r1 = sample_record();
+        r1.raw_tokens = 1000;
+        r1.compressed_tokens = 200;
+        r1.savings_pct = 80.0;
+        r1.timestamp = 1_711_300_000;
+        db.record(&r1).unwrap();
+
+        let mut r2 = sample_record();
+        r2.raw_tokens = 500;
+        r2.compressed_tokens = 150;
+        r2.savings_pct = 70.0;
+        r2.timestamp = 1_711_301_000;
+        db.record(&r2).unwrap();
+
+        // Snapshot CLI aggregates before inserting proxy rows.
+        let before_summary = db.query_summary(None).unwrap();
+        let before_daily = db.query_daily(None).unwrap();
+        let before_by_cmd = db.query_by_command(None).unwrap();
+
+        // Now insert proxy rows with larger token counts — these must NOT appear
+        // in any CLI aggregate.
+        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-opus-20240229"),
+            Some(10_000), Some(1_000), Some(90.0), None, "full", 1_711_302_000);
+        insert_proxy_row(&db, Some("openai"), Some("gpt-4"),
+            Some(8_000), Some(800), Some(90.0), None, "full", 1_711_303_000);
+
+        // CLI aggregates after proxy rows are inserted must be identical.
+        let after_summary = db.query_summary(None).unwrap();
+        let after_daily = db.query_daily(None).unwrap();
+        let after_by_cmd = db.query_by_command(None).unwrap();
+
+        assert_eq!(
+            before_summary.invocations, after_summary.invocations,
+            "AC8: invocations must exclude proxy rows; \
+             expected {}, got {}",
+            before_summary.invocations, after_summary.invocations
+        );
+        assert_eq!(
+            before_summary.tokens_saved, after_summary.tokens_saved,
+            "AC8: CLI tokens_saved must exclude proxy rows; \
+             expected {}, got {}",
+            before_summary.tokens_saved, after_summary.tokens_saved
+        );
+        assert_eq!(
+            before_summary.raw_tokens, after_summary.raw_tokens,
+            "AC8: CLI raw_tokens must exclude proxy rows"
+        );
+
+        assert_eq!(
+            before_daily.len(),
+            after_daily.len(),
+            "AC8: CLI daily rows count must be identical before/after proxy insertion"
+        );
+
+        assert_eq!(
+            before_by_cmd.len(),
+            after_by_cmd.len(),
+            "AC8: CLI by_command count must be identical before/after proxy insertion"
+        );
+
+        // Verify that none of the by-command rows have command_type 'proxy'.
+        for row in &after_by_cmd {
+            assert_ne!(
+                row.command_type, "proxy",
+                "AC8: query_by_command must never return a proxy row"
+            );
+        }
+    }
+
+    /// AC9 (POSITIVE) — scope separation: proxy savings appear ONLY in the
+    /// proxy scope (query_by_model / query_by_provider), never in the CLI
+    /// headline summary.
+    ///
+    /// A proxy-only DB shows a zero CLI headline with all savings in the proxy
+    /// scope — verifying the predicate is the only thing keeping them apart.
+    #[test]
+    fn test_scope_separation_proxy_savings_only_in_proxy_scope() {
+        let (db, _tmp) = test_db();
+
+        // Insert only proxy rows.
+        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
+            Some(5_000), Some(500), Some(90.0), None, "full", 1_711_300_000);
+        insert_proxy_row(&db, Some("openai"), Some("gpt-4o"),
+            Some(3_000), Some(600), Some(80.0), None, "full", 1_711_301_000);
+
+        // CLI headline must be zero (no CLI rows).
+        let summary = db.query_summary(None).unwrap();
+        assert_eq!(
+            summary.invocations, 0,
+            "AC9: CLI invocations must be 0 in a proxy-only DB"
+        );
+        assert_eq!(
+            summary.tokens_saved, 0,
+            "AC9: CLI tokens_saved must be 0 in a proxy-only DB"
+        );
+
+        // Proxy scope must carry the savings.
+        let by_model = db.query_by_model(None).unwrap();
+        assert_eq!(
+            by_model.len(),
+            2,
+            "AC9: query_by_model must return 2 rows (one per model)"
+        );
+
+        let total_proxy_requests: u64 = by_model.iter().map(|r| r.requests).sum();
+        assert_eq!(
+            total_proxy_requests, 2,
+            "AC9: proxy scope must have 2 request rows"
+        );
+
+        // Both proxy rows are countable — raw_tokens must be non-None.
+        for row in &by_model {
+            assert!(
+                row.raw_tokens.is_some(),
+                "AC9: proxy model row must have non-NULL raw_tokens for counted rows"
+            );
+        }
+
+        // Provider rollup must aggregate correctly.
+        let by_provider = db.query_by_provider(None).unwrap();
+        assert_eq!(
+            by_provider.len(),
+            2,
+            "AC9: query_by_provider must return 2 provider rows"
+        );
+    }
+
+    /// AC8 — byte-reconciliation invariant for a compressed proxy row: the sum
+    /// of block bytes_in and bytes_out must match the recorded values exactly.
+    ///
+    /// PF-007: this assertion is golden-independent (pure arithmetic, no golden
+    /// token value). Dropping or mis-attributing a block row breaks it.
+    #[test]
+    fn test_query_block_decisions_byte_reconciliation() {
+        let (mut db, _tmp) = test_db();
+        let mut input = sample_proxy_input();
+        input.blocks = vec![
+            ProxyBlockDecision {
+                block_index: 0,
+                component: "block-router".to_string(),
+                outcome: "modified".to_string(),
+                bytes_in: 600,
+                bytes_out: 120,
+            },
+            ProxyBlockDecision {
+                block_index: 1,
+                component: "block-router".to_string(),
+                outcome: "passthrough".to_string(),
+                bytes_in: 400,
+                bytes_out: 400,
+            },
+        ];
+        db.record_proxy(&input).unwrap();
+
+        // Get the parent id.
+        let parent_id: i64 = db
+            .conn
+            .query_row("SELECT id FROM token_savings LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        let blocks = db.query_block_decisions(parent_id).unwrap();
+        assert_eq!(blocks.len(), 2, "must return 2 block decision rows");
+        let sum_in: u64 = blocks.iter().map(|b| b.bytes_in).sum();
+        let sum_out: u64 = blocks.iter().map(|b| b.bytes_out).sum();
+        assert_eq!(sum_in, 1000, "Σ bytes_in must match input (600+400)");
+        assert_eq!(sum_out, 520, "Σ bytes_out must match input (120+400)");
+    }
+
+    /// query_by_model — ordering is NULL-last (provider IS NULL, provider,
+    /// model IS NULL, model).
+    ///
+    /// AD-AN-9: identical ordering ensures byte-identical JSON across runs (AC13).
+    #[test]
+    fn test_query_by_model_ordering_null_last() {
+        let (db, _tmp) = test_db();
+
+        // Insert rows in a scrambled order: unknown provider, openai, anthropic.
+        insert_proxy_row(&db, None, None, Some(100), Some(50), Some(50.0),
+            None, "passthrough", 1_711_300_001);
+        insert_proxy_row(&db, Some("openai"), Some("gpt-4o"),
+            Some(200), Some(100), Some(50.0), None, "full", 1_711_300_002);
+        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
+            Some(300), Some(150), Some(50.0), None, "full", 1_711_300_003);
+
+        let rows = db.query_by_model(None).unwrap();
+
+        // Expected order: anthropic (non-NULL, alphabetic first) → openai → NULL.
+        assert_eq!(rows.len(), 3, "must return 3 model rows");
+        assert_eq!(
+            rows[0].provider.as_deref(),
+            Some("anthropic"),
+            "first row must be anthropic (NULL-last ordering)"
+        );
+        assert_eq!(
+            rows[1].provider.as_deref(),
+            Some("openai"),
+            "second row must be openai"
+        );
+        assert_eq!(
+            rows[2].provider, None,
+            "last row must have NULL provider"
+        );
+    }
+
+    /// query_by_model — upstream_error_status IS NOT NULL rows are excluded from
+    /// token aggregates and tier counts (success-scope only).
+    ///
+    /// AD-PXY-25: removing the exclusion would inflate token sums and tier
+    /// counts, breaking the equality assertions.
+    #[test]
+    fn test_query_by_model_excludes_upstream_error_rows_from_aggregates() {
+        let (db, _tmp) = test_db();
+
+        // One normal relayed row.
+        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
+            Some(1000), Some(100), Some(90.0), None, "full", 1_711_300_001);
+        // One upstream-errored row for the same model (must NOT count in aggregates).
+        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
+            None, None, None, Some(502), "full", 1_711_300_002);
+
+        let rows = db.query_by_model(None).unwrap();
+        assert_eq!(rows.len(), 1, "must be 1 model group (same provider+model)");
+
+        let row = &rows[0];
+        assert_eq!(row.requests, 1,
+            "AD-PXY-25: success-scope request count must be 1 (errored row excluded)");
+        assert_eq!(row.upstream_errors, 1,
+            "AD-PXY-25: upstream_errors must be 1");
+        assert_eq!(row.raw_tokens, Some(1000),
+            "AD-PXY-25: raw_tokens must reflect only the relayed row");
+        // Tier counts should reflect only the relayed row.
+        assert!(
+            row.tier_full_pct > 99.0,
+            "AD-PXY-25: tier_full_pct must be ~100% (from the relayed row only)"
+        );
+    }
+
+    /// query_by_model — all-NULL-token group reports 0 counted / N uncounted.
+    ///
+    /// AD-AN-9 / AC12: a group with all NULL tokens shows "0 counted, N uncounted"
+    /// rather than implying counts exist.
+    #[test]
+    fn test_query_by_model_all_null_token_group() {
+        let (db, _tmp) = test_db();
+
+        // Three rows with NULL tokens (pair-jointly-NULL).
+        for i in 0..3i64 {
+            insert_proxy_row(&db, Some("anthropic"), Some("claude-3-opus-20240229"),
+                None, None, None, None, "passthrough", 1_711_300_000 + i);
+        }
+
+        let rows = db.query_by_model(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.requests, 3);
+        assert_eq!(row.counted_rows, 0, "AC12: no countable rows");
+        assert_eq!(row.uncounted_rows, 3, "AC12: all 3 rows are uncounted");
+        assert!(row.raw_tokens.is_none(), "AC12: raw_tokens must be None");
+        assert!(row.compressed_tokens.is_none(), "AC12: compressed_tokens must be None");
+    }
+
+    /// query_by_provider — mixed-basis detection: openai with gpt-4 (Cl100k)
+    /// and gpt-4o (O200k) → basis = "mixed", combined token figure is None.
+    ///
+    /// AD-AN-9 / AC11: cross-tokenizer sum is never emitted at the provider
+    /// level when models use different bases.
+    #[test]
+    fn test_query_by_provider_mixed_basis_omits_combined_tokens() {
+        let (db, _tmp) = test_db();
+
+        // gpt-4 → Cl100k encoding
+        insert_proxy_row(&db, Some("openai"), Some("gpt-4"),
+            Some(2000), Some(400), Some(80.0), None, "full", 1_711_300_001);
+        // gpt-4o → O200k encoding
+        insert_proxy_row(&db, Some("openai"), Some("gpt-4o"),
+            Some(1000), Some(200), Some(80.0), None, "full", 1_711_300_002);
+
+        let providers = db.query_by_provider(None).unwrap();
+        assert_eq!(providers.len(), 1, "must be 1 provider group (openai)");
+        let prov = &providers[0];
+
+        assert_eq!(prov.provider.as_deref(), Some("openai"));
+        assert_eq!(prov.requests, 2);
+        assert_eq!(prov.basis, "mixed",
+            "AC11: openai spanning cl100k+o200k must be 'mixed'");
+        assert!(prov.raw_tokens.is_none(),
+            "AC11: combined raw_tokens must be None for mixed-basis provider");
+        assert!(prov.compressed_tokens.is_none(),
+            "AC11: combined compressed_tokens must be None for mixed-basis provider");
+
+        // Per-model rows must carry the authoritative figures.
+        let models = db.query_by_model(None).unwrap();
+        assert_eq!(models.len(), 2, "must have 2 per-model rows");
+        let gpt4 = models.iter().find(|m| m.model.as_deref() == Some("gpt-4")).unwrap();
+        assert_eq!(gpt4.basis, "exact",
+            "gpt-4 (Cl100k) must have basis=exact");
+        assert_eq!(gpt4.raw_tokens, Some(2000));
+    }
+
+    /// query_by_upstream_error — counts only rows with upstream_error_status IS NOT NULL.
+    ///
+    /// AD-PXY-25 / AC25: the errored count is separate from success-scope
+    /// request counts and never conflated with normal rows.
+    #[test]
+    fn test_query_by_upstream_error_counts_correctly() {
+        let (db, _tmp) = test_db();
+
+        // One normal row.
+        insert_proxy_row(&db, Some("anthropic"), None,
+            Some(1000), Some(100), Some(90.0), None, "full", 1_711_300_001);
+        // Two errored rows.
+        insert_proxy_row(&db, Some("anthropic"), None,
+            None, None, None, Some(502), "passthrough", 1_711_300_002);
+        insert_proxy_row(&db, Some("openai"), None,
+            None, None, None, Some(504), "passthrough", 1_711_300_003);
+
+        let errored = db.query_by_upstream_error(None).unwrap();
+        assert_eq!(errored, 2, "AD-PXY-25: must count exactly 2 upstream-errored rows");
+    }
+
+    /// query_proxy_dropped_records — returns 0 when no drops recorded, and the
+    /// accumulated value after analytics_meta_add_drop_count calls.
+    #[test]
+    fn test_query_proxy_dropped_records() {
+        let (db, _tmp) = test_db();
+
+        // Initially 0.
+        assert_eq!(
+            db.query_proxy_dropped_records().unwrap(),
+            0,
+            "must return 0 when no drops recorded"
+        );
+
+        // Record some drops.
+        db.analytics_meta_add_drop_count(7).unwrap();
+        assert_eq!(
+            db.query_proxy_dropped_records().unwrap(),
+            7,
+            "must return the persisted drop count"
+        );
+
+        // Accumulates.
+        db.analytics_meta_add_drop_count(3).unwrap();
+        assert_eq!(
+            db.query_proxy_dropped_records().unwrap(),
+            10,
+            "must accumulate across calls"
         );
     }
 
