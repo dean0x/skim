@@ -16,7 +16,7 @@ diff -ru dir1/src/lib.rs dir2/src/lib.rs
  pub fn init() {
      setup();
  }
-@@ -10,6 +11,8 @@
+@@ -10,3 +11,5 @@
  fn setup() {
      // setup code
 +    let config = load_config();

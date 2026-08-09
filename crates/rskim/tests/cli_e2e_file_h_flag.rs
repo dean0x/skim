@@ -108,10 +108,14 @@ fn test_file_long_help_still_triggers_help() {
 /// line numbers.  This test exercises the HANDLER surface (direct `skim grep -hn`
 /// dispatch), not the rewrite engine (PF-004 two-surfaces distinction).  The
 /// fileops dispatcher must NOT intercept `-h` as help; `-h` must reach the grep
-/// handler unchanged.  The output should contain the matched content and the
-/// `(no filename)` fallback label.
+/// handler unchanged.
+///
+/// Fix 3: grep now passes through native output byte-faithfully.  With `-h`, grep
+/// emits `lineno:content` (no file prefix), so each match appears on its own line
+/// with only the line number.  The filename prefix is omitted by grep itself — no
+/// skim-injected `(no filename)` label and no file path in any output line.
 #[test]
-fn test_grep_h_multifile_produces_no_filename_label() {
+fn test_grep_h_multifile_omits_filename_prefix() {
     let dir = TempDir::new().unwrap();
     let f1 = dir.path().join("a.txt");
     let f2 = dir.path().join("b.txt");
@@ -128,7 +132,7 @@ fn test_grep_h_multifile_produces_no_filename_label() {
         ])
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
     // Must NOT be help text
     assert!(
@@ -140,10 +144,44 @@ fn test_grep_h_multifile_produces_no_filename_label() {
         stdout.contains("hello"),
         "grep -hn output must contain matched content; got: {stdout}"
     );
-    // When grep -h suppresses filenames, lines without the `file:lineno:` prefix
-    // fall into the `(no filename)` bucket in the structured parser.
+    // Fix 3: native passthrough — no (no filename) label from old grouped renderer.
+    // With -h, grep omits file prefixes; native output is `lineno:content`.
     assert!(
-        stdout.contains("(no filename)"),
-        "grep -hn output should contain '(no filename)' label; got: {stdout}"
+        !stdout.contains("(no filename)"),
+        "Fix 3: native passthrough must not inject (no filename) label; got: {stdout}"
     );
+    // Both matches must appear.
+    assert!(
+        stdout.contains("hello world"),
+        "first match must appear: {stdout}"
+    );
+    assert!(
+        stdout.contains("hello again"),
+        "second match must appear: {stdout}"
+    );
+
+    // testing-07: line count must equal match count (2 hellos) — no header/footer.
+    let line_count = stdout.lines().count();
+    assert_eq!(
+        line_count, 2,
+        "line count must equal match count (2 hellos with -h); got {line_count}\nstdout: {stdout}"
+    );
+
+    // testing-07: -h suppresses filename prefix — no file path should appear in output.
+    assert!(
+        !stdout.contains("a.txt"),
+        "grep -hn must not emit file prefix with -h; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("b.txt"),
+        "grep -hn must not emit file prefix with -h; stdout: {stdout}"
+    );
+
+    // testing-07: native lineno:content format — every output line starts with a line number.
+    for line in stdout.lines() {
+        assert!(
+            line.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "native grep -hn: each line must start with a line number; offending line: {line:?}\nfull stdout: {stdout}"
+        );
+    }
 }

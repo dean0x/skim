@@ -244,6 +244,15 @@ pub(super) fn run_parsed_command(
                 _ => ExitCode::FAILURE,
             }
         }
+        ParseResult::RawPassthrough => {
+            // RawPassthrough: payload-less passthrough — use original process exit code,
+            // same semantics as Passthrough(_). Output was already emitted by the
+            // net-savings guard above (content() returns "" for this variant).
+            match output.exit_code {
+                Some(0) => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
     };
 
     // Record analytics (fire-and-forget, non-blocking).

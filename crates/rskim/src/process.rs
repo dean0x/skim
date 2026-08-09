@@ -496,12 +496,10 @@ fn passthrough_with_truncation(
 /// (stdin cannot be re-read, so the buffer must travel with the result for
 /// background tokenization).
 fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> ProcessResult {
-    if std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
-        eprintln!(
-            "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
-             Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
-        );
-    }
+    crate::debug_log!(
+        "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
+         Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
+    );
     let output =
         passthrough_with_truncation(&buffer, options.trunc.max_lines, options.trunc.last_lines);
     let stdin_raw = if !options.show_stats {
@@ -611,10 +609,10 @@ pub(crate) fn process_stdin(
         }
     };
 
-    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough due to a
-    // structural safety cap. The notice goes to stderr to avoid polluting stdout output.
-    if stdin_degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
-        eprintln!(
+    // Emit notice when debug output is enabled and the transform degraded to passthrough
+    // due to a structural safety cap. The notice goes to stderr to avoid polluting stdout.
+    if stdin_degraded {
+        crate::debug_log!(
             "[skim] notice: file too large to compress in {:?} mode \
              (structural cap exceeded) — degraded to passthrough",
             options.mode
@@ -707,21 +705,21 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let (result, mode_used, has_errors, line_map, degraded) =
         run_transform(&contents, path, &options)?;
 
-    // Emit notice when SKIM_DEBUG=1 and the transform degraded to passthrough.
+    // Emit notice when debug output is enabled and the transform degraded to passthrough.
     // Two distinct degrade reasons: unknown language (no extension/shebang match)
     // or file too large to compress (structural safety cap exceeded).
-    if degraded && std::env::var("SKIM_DEBUG").as_deref() == Ok("1") {
+    if degraded {
         let lang_detected = options.explicit_lang.is_some()
             || detect_language_from_path(path).is_some()
             || detect_language_from_shebang(&contents).is_some();
         if lang_detected {
-            eprintln!(
+            crate::debug_log!(
                 "[skim] notice: file too large to compress in {:?} mode \
                  (structural cap exceeded) — degraded to passthrough",
                 options.mode
             );
         } else {
-            eprintln!(
+            crate::debug_log!(
                 "[skim] notice: unknown language for '{}' — degraded to lossless passthrough. \
                  Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass.",
                 path.display()

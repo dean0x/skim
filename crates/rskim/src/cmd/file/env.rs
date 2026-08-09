@@ -26,7 +26,7 @@ use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
+use super::MAX_INPUT_LINES;
 use crate::analytics::CommandType;
 use crate::cmd::{ToolRunConfig, run_tool};
 
@@ -40,7 +40,15 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
-    skip_net_savings_guard: false,
+    // SECURITY: Redaction is a security control, not a compression tier.  The
+    // net-savings guard normally rejects compressed output that is no shorter
+    // than the raw tool output and falls back to the verbatim raw value.  For
+    // credential-bearing keys (GITHUB_TOKEN, NPM_TOKEN, …) whose secret is
+    // only a few characters long, replacing the secret with `***` does NOT
+    // shrink the line — the guard would therefore emit the raw secret verbatim,
+    // defeating the entire purpose of redaction.  Setting this to `true` ensures
+    // the redacted view always wins, regardless of byte arithmetic. (#317)
+    skip_net_savings_guard: true,
     synthesize_success_line: None,
     injected_format_flag: None,
 };
@@ -108,13 +116,25 @@ fn try_parse_env(stdout: &str) -> Option<FileResult> {
         return None;
     }
 
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
+    // Sibling-standard bound (#317, mod.rs:56-59): on very large env dumps return
+    // None so the caller degrades to lossless Passthrough.  A mid-loop `break`
+    // would leave `total_count` understated and cause the elision marker to
+    // misreport the loss — early-return is the safe choice here (per diff.rs
+    // precedent).
+    if stdout.lines().count() > MAX_INPUT_LINES {
+        return None;
+    }
+
+    // No display cap: every env variable is a unique, non-redundant datum.
+    // A 100-entry cap would silently drop variables whose keys sort late
+    // alphabetically (e.g. TOKEN_*, STRIPE_*) — precisely the high-value secrets
+    // redaction exists to protect.  MAX_INPUT_LINES already bounds pathological
+    // inputs; an additional per-entry display cap buys nothing here and actively
+    // harms completeness.
+    let mut entries: Vec<String> = Vec::new();
     let mut total_count = 0usize;
 
-    for (i, line) in stdout.lines().enumerate() {
-        if i >= MAX_INPUT_LINES {
-            break;
-        }
+    for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -127,16 +147,14 @@ fn try_parse_env(stdout: &str) -> Option<FileResult> {
         let value = &line[eq_pos + 1..];
 
         total_count += 1;
-        if entries.len() < MAX_DISPLAY_ENTRIES {
-            let displayed_value = if is_sensitive_key(key) {
-                "***".to_string()
-            } else if value.contains("://") && value.contains('@') {
-                redact_url_credentials(value)
-            } else {
-                value.to_string()
-            };
-            entries.push(format!("{key}={displayed_value}"));
-        }
+        let displayed_value = if is_sensitive_key(key) {
+            "***".to_string()
+        } else if value.contains("://") && value.contains('@') {
+            redact_url_credentials(value)
+        } else {
+            value.to_string()
+        };
+        entries.push(format!("{key}={displayed_value}"));
     }
 
     if total_count == 0 {
@@ -144,6 +162,8 @@ fn try_parse_env(stdout: &str) -> Option<FileResult> {
     }
 
     let shown_count = entries.len();
+    // elision_marker returns None when shown >= total, so no footer when all
+    // variables are shown (the common case now that the display cap is removed).
     let footer = crate::output::elision_marker(shown_count, total_count, "variables");
 
     Some(FileResult::new(
@@ -412,6 +432,98 @@ mod tests {
                 result.entries[0]
             );
         }
+    }
+
+    // =========================================================================
+    // Regression tests for fam-env-security fixes
+    // =========================================================================
+
+    // ISSUE 1 (SECURITY): Short-secret redaction must not be subject to byte
+    // arithmetic.  Before the fix, `skip_net_savings_guard: false` caused the
+    // net-savings guard to fall back to verbatim raw output when the redacted
+    // form was no shorter — leaking secrets whose ciphertext is shorter than
+    // "***".  These tests exercise the `try_parse_env` layer directly; the
+    // guard itself lives in execution.rs and is not reachable from a unit test.
+    // The unit tests confirm that `try_parse_env` always redacts regardless of
+    // secret length.  An e2e test in crates/rskim/tests/ would be the honest
+    // place to verify the guard is actually bypassed end-to-end — these unit
+    // tests are the closest observable layer available without a running binary.
+    #[test]
+    fn test_redacts_short_github_token() {
+        // 2-char secret: redacted form "***" is LONGER than "ab" in bytes.
+        // Before the fix the guard rejected the compressed view and leaked "ab".
+        let input = "GITHUB_TOKEN=ab\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(
+            result.entries[0], "GITHUB_TOKEN=***",
+            "Short GITHUB_TOKEN must be redacted regardless of byte length"
+        );
+    }
+
+    #[test]
+    fn test_redacts_short_npm_token() {
+        // 2-char secret: same guard-bypass scenario as GITHUB_TOKEN=ab.
+        let input = "NPM_TOKEN=xy\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(
+            result.entries[0], "NPM_TOKEN=***",
+            "Short NPM_TOKEN must be redacted regardless of byte length"
+        );
+    }
+
+    #[test]
+    fn test_redacts_medium_github_token() {
+        // 8-char secret: previously verified to leak verbatim (issue evidence).
+        let input = "GITHUB_TOKEN=abcd1234\n";
+        let result = try_parse_env(input).unwrap();
+        assert_eq!(
+            result.entries[0], "GITHUB_TOKEN=***",
+            "8-char GITHUB_TOKEN must be redacted"
+        );
+    }
+
+    // ISSUE 2: MAX_INPUT_LINES must cause `try_parse_env` to return None (lossless
+    // Passthrough) rather than break mid-loop and silently truncate.
+    #[test]
+    fn test_max_input_lines_returns_none() {
+        // Build a string with MAX_INPUT_LINES + 1 valid KEY=VALUE pairs.
+        let mut input = String::new();
+        for i in 0..=MAX_INPUT_LINES {
+            input.push_str(&format!("VAR_{i}=val_{i}\n"));
+        }
+        let result = try_parse_env(&input);
+        assert!(
+            result.is_none(),
+            "try_parse_env must return None when input exceeds MAX_INPUT_LINES \
+             so the caller can degrade to lossless Passthrough (mod.rs:56-59)"
+        );
+    }
+
+    // ISSUE 3: All variables must be shown when count <= MAX_INPUT_LINES.
+    // Before the fix, entries past MAX_DISPLAY_ENTRIES (100) were silently dropped.
+    #[test]
+    fn test_no_silent_variable_drop_above_display_cap() {
+        // Build an input with 159 variables (previously measured to drop 59 entries).
+        let count = 159usize;
+        let mut input = String::new();
+        for i in 0..count {
+            input.push_str(&format!("MY_VAR_{i:03}=value_{i}\n"));
+        }
+        let result = try_parse_env(&input).unwrap();
+        assert_eq!(
+            result.total_count, count,
+            "total_count must reflect all {count} variables"
+        );
+        assert_eq!(
+            result.entries.len(),
+            count,
+            "All {count} variables must appear in entries; none should be silently dropped"
+        );
+        // No elision footer when all variables are shown.
+        assert!(
+            result.footer.is_none(),
+            "elision footer must be absent when all variables are shown"
+        );
     }
 
     #[test]

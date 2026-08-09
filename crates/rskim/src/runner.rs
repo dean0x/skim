@@ -244,6 +244,76 @@ impl CommandRunner {
             }
         }
     }
+
+    /// Execute `program` with `args`, capturing stdout with graceful degrade at
+    /// the [`MAX_OUTPUT_BYTES`] ceiling rather than hard-erroring.
+    ///
+    /// When stdout exceeds the cap, the read end of the stdout pipe is dropped
+    /// on return from the reader thread, causing the child process to receive
+    /// SIGPIPE on its next write and exit promptly.  `wait()` then unblocks.
+    /// The second element of the return tuple is `true` when this occurred.
+    ///
+    /// Stderr still uses the hard-error [`read_pipe`] cap: git log errors are
+    /// typically short, and a flooded stderr is a real problem worth surfacing.
+    ///
+    /// Applies ADR-002 (degrade instead of error at the size cap) scoped to
+    /// the git-log output path (reliability-01 / #317 compress-never-truncate).
+    pub(crate) fn run_stdout_degrade(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> anyhow::Result<(CommandOutput, bool)> {
+        let start = Instant::now();
+
+        let mut cmd = Command::new(program);
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let child = cmd.spawn().map_err(|source| RunnerError::SpawnFailed {
+            program: program.to_string(),
+            source,
+        })?;
+
+        let mut child = ChildGuard(child);
+
+        let child_stdout = child
+            .0
+            .stdout
+            .take()
+            .ok_or(RunnerError::PipeCaptureFailed { pipe: "stdout" })?;
+        let child_stderr = child
+            .0
+            .stderr
+            .take()
+            .ok_or(RunnerError::PipeCaptureFailed { pipe: "stderr" })?;
+
+        // stdout: degrade (partial data + flag) on cap.
+        // stderr: hard-error on cap (same as run_with_env).
+        let stdout_handle = thread::spawn(move || read_pipe_degrade(child_stdout));
+        let stderr_handle = thread::spawn(move || read_pipe(child_stderr));
+
+        // Wait before joining: when stdout is truncated the reader thread drops
+        // its pipe end, the child exits via SIGPIPE, and wait() unblocks.
+        let status = child.0.wait()?;
+
+        let (stdout, stdout_truncated) = stdout_handle
+            .join()
+            .map_err(|_| RunnerError::ReaderPanicked { pipe: "stdout" })??;
+        let stderr = stderr_handle
+            .join()
+            .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
+
+        let duration = start.elapsed();
+
+        Ok((
+            CommandOutput {
+                stdout,
+                stderr,
+                exit_code: status.code(),
+                duration,
+            },
+            stdout_truncated,
+        ))
+    }
 }
 
 // ============================================================================
@@ -328,6 +398,47 @@ fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
 
     Ok(String::from_utf8(buf)
         .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()))
+}
+
+/// Degrade variant of [`read_pipe`]: returns partial output when the byte
+/// ceiling is reached rather than erroring.
+///
+/// The second element of the tuple is `true` when the ceiling was reached and
+/// the output is incomplete.  Dropping the reader on early return causes SIGPIPE
+/// in the writer process, which exits promptly (no orphan child, no deadlock).
+///
+/// `limit` is parameterised for unit-testing with sub-ceiling sizes; call-sites
+/// should use [`read_pipe_degrade`], which hard-codes [`MAX_OUTPUT_BYTES`].
+fn read_pipe_degrade_impl<R: Read>(mut reader: R, limit: usize) -> io::Result<(String, bool)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len() + n > limit {
+            // Accumulated bytes fit within the limit; the current chunk would
+            // push past it.  Return what we have and signal truncation.
+            // Dropping `reader` here propagates SIGPIPE to the writing child.
+            let s = String::from_utf8(buf)
+                .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
+            return Ok((s, true));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    Ok((
+        String::from_utf8(buf)
+            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+        false,
+    ))
+}
+
+/// Wrapper around [`read_pipe_degrade_impl`] using the crate-wide ceiling.
+fn read_pipe_degrade<R: Read>(reader: R) -> io::Result<(String, bool)> {
+    read_pipe_degrade_impl(reader, MAX_OUTPUT_BYTES)
 }
 
 #[cfg(test)]
@@ -623,6 +734,76 @@ mod tests {
             "Expected 'byte limit' in error, got: {}",
             err
         );
+    }
+
+    // ========================================================================
+    // read_pipe_degrade_impl tests
+    // ========================================================================
+
+    /// A reader that emits `remaining` bytes of `b'A'` in chunks of at most
+    /// `chunk_size` bytes, then EOF.  Small, controllable chunk sizes let tests
+    /// exercise the degrade boundary without allocating MiB of memory.
+    struct ChunkedReader {
+        remaining: usize,
+        chunk_size: usize,
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.remaining).min(self.chunk_size);
+            for b in buf[..n].iter_mut() {
+                *b = b'A';
+            }
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_pipe_degrade_impl_under_limit_returns_full_data() {
+        // 100 bytes, limit 1024 — should not truncate.
+        let reader = ChunkedReader {
+            remaining: 100,
+            chunk_size: 32,
+        };
+        let (s, truncated) = read_pipe_degrade_impl(reader, 1024).unwrap();
+        assert_eq!(s.len(), 100);
+        assert!(!truncated, "under-limit must not set truncated flag");
+    }
+
+    #[test]
+    fn read_pipe_degrade_impl_at_exact_limit_returns_full_data() {
+        // Exactly limit bytes: the condition `buf.len() + n > limit` is false
+        // for the last chunk, so no truncation occurs.
+        let reader = ChunkedReader {
+            remaining: 256,
+            chunk_size: 64,
+        };
+        let (s, truncated) = read_pipe_degrade_impl(reader, 256).unwrap();
+        assert_eq!(s.len(), 256, "all bytes must be returned at exact limit");
+        assert!(!truncated, "exact-limit must not set truncated flag");
+    }
+
+    #[test]
+    fn read_pipe_degrade_impl_over_limit_returns_partial_and_truncated() {
+        // 300 bytes, limit 200, chunk_size 64.
+        // Chunks: read 64 → buf 64 (ok), 64 → buf 128 (ok), 64 → buf 192 (ok),
+        // 64 → 192+64=256 > 200 → truncate; return 192 bytes.
+        let reader = ChunkedReader {
+            remaining: 300,
+            chunk_size: 64,
+        };
+        let (s, truncated) = read_pipe_degrade_impl(reader, 200).unwrap();
+        assert_eq!(s.len(), 192, "expected 192 bytes (3 accepted chunks of 64)");
+        assert!(truncated, "must set truncated flag when ceiling is reached");
+    }
+
+    #[test]
+    fn read_pipe_degrade_impl_empty_input_not_truncated() {
+        let reader = std::io::Cursor::new(Vec::<u8>::new());
+        let (s, truncated) = read_pipe_degrade_impl(reader, 1024).unwrap();
+        assert!(s.is_empty(), "empty input must produce empty string");
+        assert!(!truncated, "empty input must not truncate");
     }
 
     // ========================================================================

@@ -426,6 +426,12 @@ Need structure + signatures? → Use Structure mode (default)
 | JSON       | ✅     | `.json`            | Structure extraction     |
 | YAML       | ✅     | `.yaml`, `.yml`    | Structure extraction     |
 | TOML       | ✅     | `.toml`            | Structure extraction     |
+| C#         | ✅     | `.cs`              | Full grammar, structs/interfaces |
+| Ruby       | ✅     | `.rb`              | Classes, modules, methods |
+| SQL        | ✅     | `.sql`             | DDL/DML via tree-sitter-sequel |
+| Kotlin     | ✅     | `.kt`, `.kts`      | Data classes, coroutines, sealed classes |
+| Swift      | ✅     | `.swift`           | Protocols, generics, SwiftUI structs |
+| Bash       | ✅     | `.sh`, `.bash`     | Functions + shebang auto-detect; also `#!/bin/sh`, `zsh`, `ksh` |
 
 ### Language-Specific Notes
 

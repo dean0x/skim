@@ -24,12 +24,28 @@ use crate::tokens;
 /// - `Full`: clean parse, no issues
 /// - `Degraded`: partially parsed with warning markers
 /// - `Passthrough`: unparseable, returned as-is (always `String`)
+/// - `RawPassthrough`: payload-less signal — execution.rs serves `CommandOutput::stdout`
+///   byte-faithfully without cloning it into the parse result
 #[derive(Debug, Clone)]
 pub(crate) enum ParseResult<T> {
     Full(T),
     Degraded(T, Vec<String>),
     /// Always `String` regardless of `T` — content could not be parsed.
     Passthrough(String),
+    /// Payload-less passthrough signal: execution.rs serves `CommandOutput::stdout`
+    /// byte-faithfully without cloning it into the parse result.
+    ///
+    /// Used by pure-passthrough handlers (grep, rg) where the parse function would
+    /// otherwise clone the entire stdout into the enum payload only to have it
+    /// re-read immediately by `serialize_output`.  The caller
+    /// (`run_parsed_command_with_exit`) detects this variant and emits from
+    /// `output.stdout` directly — no content round-trip through the enum.
+    ///
+    /// `content()` returns `""` for this variant; callers that need the
+    /// original bytes must read from `CommandOutput::stdout` directly.
+    /// `to_json_envelope()` is unreachable for this variant (execution.rs handles
+    /// it before reaching `serialize_output`).
+    RawPassthrough,
 }
 
 impl<T> ParseResult<T> {
@@ -43,9 +59,12 @@ impl<T> ParseResult<T> {
         matches!(self, ParseResult::Degraded(_, _))
     }
 
-    /// Returns `true` if this is a `Passthrough` result.
+    /// Returns `true` if this is a `Passthrough` or `RawPassthrough` result.
     pub(crate) fn is_passthrough(&self) -> bool {
-        matches!(self, ParseResult::Passthrough(_))
+        matches!(
+            self,
+            ParseResult::Passthrough(_) | ParseResult::RawPassthrough
+        )
     }
 
     /// Returns the tier name as a static string.
@@ -53,17 +72,21 @@ impl<T> ParseResult<T> {
         match self {
             ParseResult::Full(_) => "full",
             ParseResult::Degraded(_, _) => "degraded",
-            ParseResult::Passthrough(_) => "passthrough",
+            ParseResult::Passthrough(_) | ParseResult::RawPassthrough => "passthrough",
         }
     }
 }
 
 impl<T: AsRef<str>> ParseResult<T> {
     /// Read access to inner content for all tiers.
+    ///
+    /// Returns `""` for [`ParseResult::RawPassthrough`]; callers must read from
+    /// `CommandOutput::stdout` directly for that variant.
     pub(crate) fn content(&self) -> &str {
         match self {
             ParseResult::Full(inner) | ParseResult::Degraded(inner, _) => inner.as_ref(),
             ParseResult::Passthrough(s) => s.as_str(),
+            ParseResult::RawPassthrough => "",
         }
     }
 
@@ -87,7 +110,7 @@ impl<T: AsRef<str>> ParseResult<T> {
                 }
                 Ok(())
             }
-            ParseResult::Passthrough(_) => {
+            ParseResult::Passthrough(_) | ParseResult::RawPassthrough => {
                 writeln!(
                     writer,
                     "[skim:notice] output passed through without parsing"
@@ -121,16 +144,29 @@ impl<T: serde::Serialize> ParseResult<T> {
                 });
                 serde_json::to_string(&val)
             }
+            ParseResult::RawPassthrough => {
+                // RawPassthrough carries no payload; execution.rs handles this variant
+                // directly from CommandOutput::stdout before reaching to_json_envelope().
+                // This arm is unreachable in correct usage.
+                unreachable!(
+                    "RawPassthrough has no payload for JSON serialization; \
+                     execution.rs must handle it before calling to_json_envelope()"
+                )
+            }
         }
     }
 }
 
 impl<T: Into<String>> ParseResult<T> {
     /// Consuming access to inner content as `String`.
+    ///
+    /// Returns `String::new()` for [`ParseResult::RawPassthrough`]; callers must
+    /// read from `CommandOutput::stdout` directly for that variant.
     pub(crate) fn into_content(self) -> String {
         match self {
             ParseResult::Full(inner) | ParseResult::Degraded(inner, _) => inner.into(),
             ParseResult::Passthrough(s) => s,
+            ParseResult::RawPassthrough => String::new(),
         }
     }
 }
@@ -408,6 +444,7 @@ impl PassthroughTruncator {
 /// | release / workflow assets  | `"assets"`        |
 /// | object keys (JSON/curl)    | `"object keys"`   |
 /// | generic line output        | `"lines"`         |
+/// | diff file counts           | `"files"`         |
 ///
 /// For streaming sites where the total is unknowable, use
 /// [`elision_marker_unbounded`] instead (its `unit` follows the same table).
@@ -665,15 +702,53 @@ mod tests {
     }
 
     #[test]
+    fn test_raw_passthrough_is_passthrough() {
+        // RawPassthrough is the payload-less passthrough variant; is_passthrough()
+        // must return true so execution.rs routes it through the same passthrough
+        // path as Passthrough(String).
+        let result: ParseResult<String> = ParseResult::RawPassthrough;
+        assert!(
+            result.is_passthrough(),
+            "RawPassthrough must be recognised as passthrough tier"
+        );
+        assert!(!result.is_full());
+        assert!(!result.is_degraded());
+    }
+
+    #[test]
+    fn test_raw_passthrough_tier_name() {
+        let result: ParseResult<String> = ParseResult::RawPassthrough;
+        assert_eq!(
+            result.tier_name(),
+            "passthrough",
+            "RawPassthrough tier_name must be \"passthrough\""
+        );
+    }
+
+    #[test]
+    fn test_raw_passthrough_content_is_empty() {
+        // content() returns "" for RawPassthrough — the actual bytes live in
+        // CommandOutput::stdout, not in the parse result.
+        let result: ParseResult<String> = ParseResult::RawPassthrough;
+        assert_eq!(
+            result.content(),
+            "",
+            "RawPassthrough content() must be empty; bytes come from CommandOutput::stdout"
+        );
+    }
+
+    #[test]
     fn test_tier_names() {
         let full: ParseResult<String> = ParseResult::Full("a".to_string());
         let degraded: ParseResult<String> =
             ParseResult::Degraded("b".to_string(), vec!["w".to_string()]);
         let passthrough: ParseResult<String> = ParseResult::Passthrough("c".to_string());
+        let raw_passthrough: ParseResult<String> = ParseResult::RawPassthrough;
 
         assert_eq!(full.tier_name(), "full");
         assert_eq!(degraded.tier_name(), "degraded");
         assert_eq!(passthrough.tier_name(), "passthrough");
+        assert_eq!(raw_passthrough.tier_name(), "passthrough");
     }
 
     #[test]
@@ -683,10 +758,14 @@ mod tests {
             ParseResult::Degraded("degraded content".to_string(), vec![]);
         let passthrough: ParseResult<String> =
             ParseResult::Passthrough("passthrough content".to_string());
+        let raw_passthrough: ParseResult<String> = ParseResult::RawPassthrough;
 
         assert_eq!(full.content(), "full content");
         assert_eq!(degraded.content(), "degraded content");
         assert_eq!(passthrough.content(), "passthrough content");
+        // RawPassthrough carries no payload; content() returns "" so callers
+        // know to read from CommandOutput::stdout directly.
+        assert_eq!(raw_passthrough.content(), "");
     }
 
     #[test]
@@ -1291,6 +1370,45 @@ mod tests {
         assert!(
             parsed.get("result").is_none(),
             "Passthrough should have no result key"
+        );
+    }
+
+    /// Pins the exact field set of the passthrough JSON envelope so that
+    /// `Passthrough(String)` (via `to_json_envelope`) and `RawPassthrough`
+    /// (inline `serde_json::json!` in `execution.rs`) cannot drift apart.
+    ///
+    /// Both variants must produce exactly two fields — `tier` and `raw` — with
+    /// no legacy `tool` field or any other additions.  Eight wrappers rely on
+    /// this equivalence: `grep`, `rg` (Passthrough(String)) and `find`, `wc`,
+    /// `df`, `du`, `ps`, `ls` (RawPassthrough).  The `RawPassthrough` half is
+    /// covered by the `test_subcommand_file_json_passthrough_envelope`
+    /// integration test in `cli_subcommand.rs`.
+    #[test]
+    fn test_to_json_envelope_passthrough_exact_fields() {
+        let raw = "./src/main.rs\n./src/lib.rs\n";
+        let result: ParseResult<String> = ParseResult::Passthrough(raw.to_string());
+        let json_str = result.to_json_envelope().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = parsed.as_object().unwrap();
+        // Exactly two fields: tier and raw.
+        assert_eq!(
+            obj.len(),
+            2,
+            "passthrough envelope must have exactly 2 fields (tier, raw), got: {obj:?}"
+        );
+        assert_eq!(
+            parsed["tier"], "passthrough",
+            "tier field must be \"passthrough\""
+        );
+        assert_eq!(
+            parsed["raw"].as_str(),
+            Some(raw),
+            "raw field must carry the payload verbatim"
+        );
+        // No 'tool' field — this was the pre-ADR-009 Full(FileResult) shape.
+        assert!(
+            parsed.get("tool").is_none(),
+            "passthrough envelope must not contain 'tool' field"
         );
     }
 }

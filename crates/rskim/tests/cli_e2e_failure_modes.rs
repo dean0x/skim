@@ -90,6 +90,7 @@ fn test_grep_no_match_exits_1_silently() {
 #[test]
 fn test_grep_missing_file_forwards_error_raw() {
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .args(["grep", "pat", "/nonexistent/skim-317-test"])
         .assert()
         .code(2)
@@ -99,9 +100,11 @@ fn test_grep_missing_file_forwards_error_raw() {
 }
 
 // ============================================================================
-// grep: single-file attribution + every match emitted
+// grep: native path:line:content passthrough — every match emitted, line=match
 // ============================================================================
 
+/// Fix 3: grep emits native path:line:content (or lineno:content for single-file).
+/// Line count must equal match count — no header/footer lines inflating the count.
 #[test]
 fn test_grep_single_file_attributed_and_complete() {
     let dir = tempfile::tempdir().unwrap();
@@ -109,29 +112,66 @@ fn test_grep_single_file_attributed_and_complete() {
     let content: String = (1..=10).map(|i| format!("needle {i}\n")).collect();
     fs::write(&file, content).unwrap();
 
-    // grep now groups-by-file ALWAYS (skip_net_savings_guard), so the output is
-    // deterministic regardless of match volume: canonical `grep N` header, the
-    // attributed file path, every match, no `<stdin>` mislabel, no truncation.
-    let mut assert = skim_cmd()
+    // Native single-file grep output with -n is: `lineno:content` (no file prefix).
+    // Every match must appear; no header/footer lines.
+    let output = skim_cmd()
         .args(["grep", "-n", "needle", file.to_str().unwrap()])
-        .assert()
-        .code(0)
-        .stdout(predicate::str::contains("<stdin>").not())
-        .stdout(predicate::str::contains("showing").not())
-        // Deterministic grouped header (was a volume-dependent flip before #issues-4/5).
-        .stdout(predicate::str::contains("grep 10"));
-    // Every match line must be present — no per-file cap.
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "grep must exit 0; stderr: {stderr}"
+    );
+
+    // Fix 3: native passthrough — no grouped header or footer lines.
+    assert!(
+        !stdout.contains("grep 10"),
+        "must not contain old grouped header; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("1 file"),
+        "must not contain old grouped footer; stdout: {stdout}"
+    );
+
+    // Single-file grep -n emits `lineno:content` with no file prefix.
+    // (The previous `<stdin>` guard was vacuous post-Fix-3 — GrepArgs::fallback_label removed.)
+    assert!(
+        !stdout.contains("t.txt"),
+        "single-file grep -n must not emit file prefix; stdout: {stdout}"
+    );
+
+    // testing-07: line count must equal match count — no header/footer inflating the count.
+    let line_count = stdout.lines().count();
+    assert_eq!(
+        line_count, 10,
+        "line count must equal match count (10 needles); got {line_count}\nstdout: {stdout}"
+    );
+
+    // testing-07: native lineno:content format — every output line starts with a line number.
+    for line in stdout.lines() {
+        assert!(
+            line.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "native grep -n: each line must start with a line number; offending line: {line:?}\nfull stdout: {stdout}"
+        );
+    }
+
+    // Every match line must be present — no cap.
     for i in 1..=10 {
-        assert = assert.stdout(predicate::str::contains(format!("needle {i}")));
+        assert!(
+            stdout.contains(&format!("needle {i}")),
+            "match needle {i} missing from stdout; stdout: {stdout}"
+        );
     }
 }
 
-/// Issues #4/#5: a SMALL multi-file grep must use the SAME grouped shape as a
-/// large one. Before the fix the net-savings guard flipped small result sets
-/// back to raw `file:line:content`, so the same `grep -n` produced two different
-/// formats depending on match volume. Now grep groups consistently.
+/// Fix 3: multi-file grep emits native `file:line:content` passthrough so that
+/// downstream pipes (`head -N`, `wc -l`, `sed -n`) get one line per match.
+/// No grouped header or footer — one output line per match.
 #[test]
-fn test_grep_small_multifile_groups_consistently() {
+fn test_grep_small_multifile_emits_native_path_line_content() {
     let dir = tempfile::tempdir().unwrap();
     let a = dir.path().join("a.txt");
     let b = dir.path().join("b.txt");
@@ -148,37 +188,37 @@ fn test_grep_small_multifile_groups_consistently() {
         ])
         .assert()
         .code(0)
-        // Canonical grouped header + footer (grouped even though only 2 matches).
-        .stdout(predicate::str::contains("grep 2"))
-        .stdout(predicate::str::contains("2 files"))
-        // Both files appear as group headers and both matches are present.
+        // Fix 3: native path:line:content — no grouped header or footer.
+        .stdout(predicate::str::contains("grep 2").not())
+        .stdout(predicate::str::contains("2 files").not())
+        // Both files and both matches must appear.
         .stdout(predicate::str::contains("a.txt"))
         .stdout(predicate::str::contains("b.txt"))
         .stdout(predicate::str::contains("alpha MARK one"))
         .stdout(predicate::str::contains("beta MARK two"))
-        // Grouped form uses indented `:line:` entries, not raw `file:line:content`.
-        .stdout(predicate::str::contains(":1: alpha MARK one"));
+        // Native format: `a.txt:1:alpha MARK one` (file:line:content, no indent).
+        .stdout(predicate::str::contains("a.txt:1:alpha MARK one"));
 }
 
 // ============================================================================
-// rg: small multi-file match set must group consistently (issues #4/#5 — rg half)
+// rg: native path:line:content passthrough (Fix 3 — rg half, PF-004 sibling)
 // ============================================================================
 
-/// B1: Issues #4/#5 (rg sibling): a SMALL multi-file rg must use the SAME grouped
-/// shape as a large one. This guards the `skip_net_savings_guard = true` flip in
-/// `rg.rs::CONFIG`: all existing rg unit tests call the renderer directly and never
-/// reach `execution.rs`'s guard branch, so reverting the flag would leave the rg
-/// test suite green while re-introducing the volume-dependent shape flip.
+/// Fix 3 (rg): rg emits native path:line:content passthrough so that downstream
+/// pipes (`head -N`, `wc -l`, `sed -n`) get one line per match.
+/// No grouped header or footer — one output line per match.
 ///
-/// Gated on rg availability — skips gracefully when ripgrep is not installed. applies ADR-001.
+/// Gated on rg availability — skips gracefully when ripgrep is not installed.
 #[test]
-fn test_rg_small_multifile_groups_consistently() {
+fn test_rg_small_multifile_emits_native_path_line_content() {
     if std::process::Command::new("rg")
         .arg("--version")
         .output()
         .is_err()
     {
-        eprintln!("skipping test_rg_small_multifile_groups_consistently: rg not installed");
+        eprintln!(
+            "skipping test_rg_small_multifile_emits_native_path_line_content: rg not installed"
+        );
         return;
     }
 
@@ -192,16 +232,17 @@ fn test_rg_small_multifile_groups_consistently() {
         .args(["rg", "-n", "MARK", a.to_str().unwrap(), b.to_str().unwrap()])
         .assert()
         .code(0)
-        // Canonical grouped header + footer (grouped even though only 2 matches).
-        .stdout(predicate::str::contains("rg 2"))
-        .stdout(predicate::str::contains("2 files"))
-        // Both files appear as group headers and both matches are present.
+        // Fix 3: native path:line:content — no grouped header or footer.
+        .stdout(predicate::str::contains("rg 2").not())
+        .stdout(predicate::str::contains("2 files").not())
+        // Both files and both matches must appear.
         .stdout(predicate::str::contains("a.txt"))
         .stdout(predicate::str::contains("b.txt"))
         .stdout(predicate::str::contains("alpha MARK one"))
         .stdout(predicate::str::contains("beta MARK two"))
-        // Grouped form uses indented `:line:` entries, not raw `file:line:content`.
-        .stdout(predicate::str::contains(":1: alpha MARK one"));
+        // regression-09: native path:line:content format assertion — a grouped or
+        // JSON renderer could satisfy the above; this pins the exact format.
+        .stdout(predicate::str::contains("a.txt:1:alpha MARK one"));
 }
 
 // ============================================================================
@@ -288,6 +329,7 @@ fn test_kubectl_unexpected_failure_raw_forwards_everything() {
     );
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("PATH", stub_path(dir.path()))
         .args(["kubectl", "get", "pods"])
         .assert()
@@ -375,6 +417,7 @@ fn test_lint_unexpected_exit_code_goes_raw() {
     );
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("PATH", stub_path(dir.path()))
         .args(["eslint", "a.js"])
         .assert()

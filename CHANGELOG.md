@@ -48,6 +48,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--language` flag, no `--filename` hint, and no recognisable shebang previously
   errored (non-zero). It now degrades to lossless passthrough (exit 0,
   applies ADR-002). See **Fixed** below for full details.
+- **`skim grep`/`rg` output format changed to native passthrough — grouped renderer removed (ADR-009)** —
+  `skim grep` and `skim rg` now emit output byte-identical to raw `grep`/`rg`
+  (one `path:line:content` line per match), replacing the previous grouped
+  file-header-per-match envelope. **Consumers that parsed the grouped format (bare file
+  path lines followed by indented `:line: content` entries) must switch to the native
+  `path:line:content` shape.** Tabs and leading whitespace are preserved. Line-count
+  consumers (`| head -N`, `| wc -l`, `| sed -n`, `awk NR<=`) now see line-count ==
+  match-count as expected.
+- **`skim git log` silent 20-commit cap removed (ADR-010)** — `skim git log` no longer
+  injects a silent `-n 20` limit on invocations without an explicit count flag.
+  **Scripts or agents that relied on log output being bounded to 20 commits will now
+  see the full log.** Explicit caps (`-n N`, `--max-count=N`, rev-ranges such as
+  `HEAD~N..HEAD`) still work as supplied. Note: `git log -p` on large repos may
+  approach the 64 MiB output ceiling.
+- **`wc`, `df`, `du`, `find`, `ps` output format changed to native passthrough (ADR-009)** —
+  These wrappers now emit output byte-identical to the raw tool, including control bytes:
+  TAB (0x09) column separators and ESC (0x1b) sequences are no longer stripped. This replaces
+  the previous `<tool> N` header/entry envelope and its silent 100-entry display cap. `du`'s
+  POSIX `size<TAB>path` format is preserved, and an ESC byte anywhere in the output — in a
+  colorized path or in a file name — no longer destroys the tabs on every line. Two documented
+  limits remain: output is decoded as lossy UTF-8, so non-UTF-8 bytes in path names become
+  U+FFFD, and a trailing newline is appended when the tool's output does not end with one.
+  Measured impact of the old path: `find crates -name '*.rs'` lost 355 of 457 paths; `ps aux`
+  dropped 705 of 805 processes and produced output 180 bytes larger than native for the records
+  it did show; `wc` reformatted `      300 total` into ` total: 300`,
+  silently breaking `| tail -1 | awk '{print $1}'` pipes. **Consumers parsing the old envelope
+  format must switch to native output.** For `ps` specifically, truncation was the only mechanism
+  reducing output volume — callers wanting fewer rows should pipe through `head`.
+- **`skim ls` output format changed to native passthrough (ADR-009)** — `skim ls` now emits
+  output byte-identical to raw `ls`, including the native `total <blocks>` header and control
+  bytes (TAB, ESC) — `ls -G` / `CLICOLOR_FORCE=1 ls` color sequences are preserved, subject to
+  the same lossy-UTF-8 and trailing-newline limits noted above. The previous path silently
+  dropped 102 of 202 entries at the display cap and omitted the `total` header.
+  **`tree` is unchanged** and still compresses. Consumers parsing the old skim-formatted `ls`
+  output must switch to native format.
 
 ### Added
 - **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
@@ -84,6 +119,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim git status` branch header now mirrors native `git status -sb` format** — The
+  branch line now renders as `## branch...upstream [ahead N, behind M]` (matching native
+  `git status -sb` output exactly), with counts derived from the `# branch.ab`
+  porcelain-v2 field. A missing `# branch.ab` line (upstream ref deleted) renders
+  `[gone]`. Previously the bracket format differed from native git output.
+- **`skim diff` now includes unified patch content alongside file statistics** — In
+  addition to the per-file `+N,-M` stat header, the diff renderer now emits the actual
+  changed lines (unified patch body). Files beyond the display cap produce an elision
+  marker with exact counts and a `SKIM_PASSTHROUGH=1` hint for lossless access
+  (applies ADR-011).
+- **No-loss raw-fallback stderr banners now gated behind `SKIM_DEBUG`/`--debug` (ADR-011)** —
+  Notices that fire when skim chose to emit raw bytes (guardrail chose raw, unexpected
+  tool exit, tool killed by signal) are now silent by default and appear only when
+  `SKIM_DEBUG=1` (or `--debug`) is set. **Loss-bearing elision markers** (truncation
+  notices with exact counts and a `SKIM_PASSTHROUGH=1` hint) and the ADR-008 lossy-view
+  transparency marker **remain unconditional.** Set `SKIM_DEBUG=1` to restore diagnostic
+  banner output.
 - **Fileops dispatcher no longer intercepts tool-level `-h` as help** — `file/mod.rs`
   narrowed its help guard to `--help` only, mirroring the `db/mod.rs` hostname-flag
   precedent. `grep -h` (no-filename), `ls -h`/`du -h`/`df -h` (human-readable sizes)
@@ -156,14 +208,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section headers, rendering each section with its label header. Empty directories now
   produce a labelled section with 0 entries rather than disappearing.
 
-- **grep/rg stripped semantically significant leading whitespace from matched content** —
-  `.trim()` was applied to match content in three extraction sites
-  (`try_parse_single_target` for grep, `try_parse_file_line_content` for the shared
-  file:line:content parser, and `extract_match_fields` in the rg JSON tier). This was
-  destructive for Python (indented function defs), YAML, and any language where leading
-  spaces carry meaning. Fixed by switching to `trim_end()` — trailing whitespace is
-  still removed, leading whitespace is preserved. Both the rewrite-hook and PATH-wrapper
-  surfaces share these handlers and benefit from the fix.
+- **`skim grep`/`rg` matched-content parser removed — native byte-faithful passthrough (ADR-009)** —
+  The grouped parser (`try_parse_single_target`, `try_parse_file_line_content`,
+  `extract_match_fields`) has been removed along with its content-normalization logic.
+  `skim grep`/`rg` now emit output byte-identical to raw `grep`/`rg`, preserving all
+  tabs and leading whitespace intact. See **Breaking Changes** for consumer impact
+  (applies ADR-009).
 
 - **Hook scripts used a bare `skim` exec that silently ran the wrong binary after
   `skim` was updated or reinstalled** — Generated hook scripts now embed `SKIM_HOOK_BINARY`
@@ -292,10 +342,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--max-files`, `--index-dir`); with any query flag or extra positional terms it searches for the
   literal string "index". `skim search -- index` forces a search via the POSIX `--` escape. Bare
   `skim search index` (no extra args) still triggers a build (backward-compatible).
-
-- **`skim grep`/`rg` now group matches by file at any match volume** — Small result sets
-  previously fell back to raw `file:line:content` output instead of the grouped-by-file layout.
-  Grouping is now applied consistently regardless of match count.
 
 ### Added
 - **`rskim-tokens` crate (L3 Wave-1)** — Multi-provider token counting library (cl100k /
@@ -442,6 +488,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`skim search index` subcommand** — Build or update the n-gram search index for the current project. Walk/classify/build pipeline with parallel tree-sitter classification (rayon), JSONL manifest sidecar for incremental builds (SHA-256 cache hits skip re-classification), atomic write ordering, minified file detection, and 50K file cap. `--force` flag for full rebuild, `--root` for explicit project root, `--max-files` override. (#182)
 - **`skim dig` / `skim nslookup` subcommands** — DNS query output compression via two independent parsers: `dig` uses section-based parsing (QUESTION/ANSWER sections), `nslookup` uses key-value line parsing. Both support three-tier degradation, `--json` structured output, error state compression, and macOS + Linux format variants. `nslookup` includes no-args guard. 2 new rewrite rules (total: 148) (#168)
 - **`skim make` / `skim gmake` subcommands** — GNU Make build output compression via three-tier parser: Tier 1 (GCC/Clang diagnostics regex + make failure lines), Tier 2 (noise-stripped invocation/directory-change lines), Tier 3 (passthrough). Includes `gmake` rewrite rule for hook integration. 17 unit tests, 2 E2E tests (#167)
+
+### Fixed
+- **`skim env` no longer leaks short credentials** — Credential redaction was previously gated
+  behind the ADR-001 net-savings guard: a redacted view that was not shorter than raw lost to
+  raw passthrough, emitting secrets verbatim. Measured leaks included `GITHUB_TOKEN=ab`,
+  `GITHUB_TOKEN=abcd1234`, and `NPM_TOKEN=xy`. Redaction is a security control and is no longer
+  subject to byte arithmetic; the redacted view is always served.
+- **Lossless degrade at `MAX_INPUT_LINES` cap for system-utility wrappers** — `wc`, `df`,
+  `du`, `find`, `ps`, and `env` previously used `break` / `.take(..)` at `MAX_INPUT_LINES`,
+  silently truncating output with an elision marker that understated the true loss (totals were
+  computed after the break, omitting dropped records). These wrappers now return `None` at the
+  cap for a lossless passthrough degrade, consistent with the documented degrade policy;
+  `env` returns `None` explicitly.
+
+### Changed
+- **ADR-012: escape sequences in wrapped-tool CONTENT are not filtered** — Skim does not strip
+  terminal escape sequences originating in content processed by wrappers (e.g. `skim diff`
+  patch-content lines), matching what the raw tool emits and the #317 byte-faithfulness MUST.
+  A wrapped tool's own colorization is still neutralized at the child-invocation boundary via
+  `--no-color`.
 
 ## [2.11.0] - 2026-07-11
 

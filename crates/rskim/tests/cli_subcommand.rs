@@ -406,8 +406,17 @@ fn test_file_find_empty_stdin_falls_through_to_spawn() {
 // JSON output
 // ============================================================================
 
+/// Verifies the `--json` contract for file wrappers that use byte-faithful native
+/// passthrough (ADR-009: `find`, `wc`, `df`, `du`, `ps`, `ls`, `grep`, `rg`).
+///
+/// These tools return `RawPassthrough` from their parse function, which
+/// `execution.rs` serialises inline to `{"tier":"passthrough","raw":"..."}`.
+/// The `tool` field present before the ADR-009 byte-faithful conversion (when
+/// `find` returned `Full(FileResult)`) is now absent — this test pins the correct
+/// post-conversion envelope shape so regressions are caught rather than silently
+/// changing the public JSON contract.
 #[test]
-fn test_subcommand_file_json() {
+fn test_subcommand_file_json_passthrough_envelope() {
     let output = skim_cmd()
         .args(["find", "--json"])
         .write_stdin(FIND_FIXTURE)
@@ -416,7 +425,28 @@ fn test_subcommand_file_json() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert!(json.get("tool").is_some(), "JSON should have 'tool' field");
+    // Tier must be "passthrough" — not "full" (the pre-ADR-009 shape that
+    // silently dropped paths past the 100-entry cap).
+    assert_eq!(
+        json.get("tier").and_then(|v| v.as_str()),
+        Some("passthrough"),
+        "JSON tier must be 'passthrough' for byte-faithful file wrappers (ADR-009)"
+    );
+    // Raw field must be present and contain actual find output.
+    assert!(
+        json.get("raw").is_some(),
+        "JSON envelope must have 'raw' field containing native find output"
+    );
+    let raw = json["raw"].as_str().unwrap_or("");
+    assert!(
+        raw.contains("main.rs"),
+        "raw field must contain find output from fixture, got: {raw}"
+    );
+    // The old 'tool' field (from Full(FileResult) serde) must be absent.
+    assert!(
+        json.get("tool").is_none(),
+        "passthrough envelope must not have 'tool' field (pre-ADR-009 Full shape)"
+    );
 }
 
 #[test]

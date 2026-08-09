@@ -190,12 +190,6 @@ fn split_global_flags(args: &[String]) -> (Vec<String>, Vec<String>) {
 // Helpers
 // ============================================================================
 
-/// Check whether the user has specified a limit flag (`-n`, `--max-count`).
-fn has_limit_flag(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| a.starts_with("-n") || a == "--max-count" || a.starts_with("--max-count="))
-}
-
 /// Build the analytics label string for a git subcommand invocation.
 ///
 /// Returns `"skim git {subcmd} {args}"` when either `--show-stats` or analytics
@@ -664,28 +658,6 @@ mod tests {
     fn test_map_exit_code_none() {
         let code = map_exit_code(None);
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::FAILURE));
-    }
-
-    // ========================================================================
-    // has_limit detection for log
-    // ========================================================================
-
-    #[test]
-    fn test_log_detects_n_flag() {
-        let args: Vec<String> = vec!["-n".into(), "10".into()];
-        assert!(has_limit_flag(&args));
-    }
-
-    #[test]
-    fn test_log_detects_max_count() {
-        let args: Vec<String> = vec!["--max-count=5".into()];
-        assert!(has_limit_flag(&args));
-    }
-
-    #[test]
-    fn test_log_no_limit_flag() {
-        let args: Vec<String> = vec!["--all".into()];
-        assert!(!has_limit_flag(&args));
     }
 
     // ========================================================================
