@@ -704,8 +704,7 @@ impl AnalyticsDb {
         // the version here ensures a future-version DB receives no schema write,
         // no WAL journal_mode flip, and no permission chmod from this skim build.
         {
-            let db_version: i64 =
-                conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            let db_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
             if db_version > schema::CURRENT_SCHEMA_VERSION {
                 anyhow::bail!(
                     "analytics database schema version {} is newer than this skim \
@@ -1330,8 +1329,7 @@ impl AnalyticsDb {
                 t,
             ) = row_res?;
 
-            let basis =
-                counting_basis_label(provider.as_deref(), model.as_deref()).to_string();
+            let basis = counting_basis_label(provider.as_deref(), model.as_deref()).to_string();
 
             result.push(ProxyModelStats {
                 provider,
@@ -1421,7 +1419,10 @@ impl AnalyticsDb {
             let first_encoding = encodings.first().copied().unwrap_or(Encoding::Heuristic);
             let is_mixed = encodings.iter().any(|&e| e != first_encoding);
             // Display basis: use the model row's label (derived from first_encoding).
-            let first_basis = rows.first().map(|r| r.basis.as_str()).unwrap_or("heuristic");
+            let first_basis = rows
+                .first()
+                .map(|r| r.basis.as_str())
+                .unwrap_or("heuristic");
 
             let (basis, raw_tokens, compressed_tokens, avg_savings_pct) = if is_mixed {
                 // AD-AN-9: mixed basis — omit combined token figure (JSON null).
@@ -1430,8 +1431,11 @@ impl AnalyticsDb {
                 let raw: u64 = rows.iter().filter_map(|r| r.raw_tokens).sum();
                 let comp: u64 = rows.iter().filter_map(|r| r.compressed_tokens).sum();
                 // Weighted average savings_pct over counted model rows.
-                let counted_models: Vec<&ProxyModelStats> =
-                    rows.iter().filter(|r| r.avg_savings_pct.is_some()).copied().collect();
+                let counted_models: Vec<&ProxyModelStats> = rows
+                    .iter()
+                    .filter(|r| r.avg_savings_pct.is_some())
+                    .copied()
+                    .collect();
                 let avg_pct: Option<f64> = if counted_models.is_empty() {
                     None
                 } else {
@@ -1503,7 +1507,6 @@ impl AnalyticsDb {
             .unwrap_or(0);
         Ok(count.max(0) as u64)
     }
-
 }
 
 impl AnalyticsStore for AnalyticsDb {
@@ -1570,10 +1573,7 @@ impl AnalyticsStore for AnalyticsDb {
     ///
     /// **AD-AN-13:** used for testing the byte-reconciliation invariant and for
     /// audit queries (the deferred `--audit` flag, Ticket #469).
-    fn query_block_decisions(
-        &self,
-        savings_id: i64,
-    ) -> anyhow::Result<Vec<ProxyBlockDecisionRow>> {
+    fn query_block_decisions(&self, savings_id: i64) -> anyhow::Result<Vec<ProxyBlockDecisionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, savings_id, block_index, component, outcome, bytes_in, bytes_out \
              FROM proxy_block_decisions WHERE savings_id = ?1 \
@@ -3318,10 +3318,7 @@ mod tests {
         );
 
         // 2. token_savings columns include all v4 additions (nullable).
-        let mut stmt = db
-            .conn
-            .prepare("PRAGMA table_info(token_savings)")
-            .unwrap();
+        let mut stmt = db.conn.prepare("PRAGMA table_info(token_savings)").unwrap();
         let cols: HashSet<String> = stmt
             .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
@@ -3356,10 +3353,7 @@ mod tests {
 
         // 3. provider, model, turn_id, upstream_error_status are nullable
         //    (notnull flag == 0 in PRAGMA table_info column 3).
-        let mut stmt2 = db
-            .conn
-            .prepare("PRAGMA table_info(token_savings)")
-            .unwrap();
+        let mut stmt2 = db.conn.prepare("PRAGMA table_info(token_savings)").unwrap();
         let nullable_check: Vec<(String, i64)> = stmt2
             .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))
             .unwrap()
@@ -3434,7 +3428,10 @@ mod tests {
             ref_table, "token_savings",
             "AC1: FK must reference token_savings"
         );
-        assert_eq!(from_col, "savings_id", "AC1: FK from-column must be savings_id");
+        assert_eq!(
+            from_col, "savings_id",
+            "AC1: FK from-column must be savings_id"
+        );
         assert_eq!(to_col, "id", "AC1: FK to-column must be id");
 
         // 6. idx_ts_provider_model index exists.
@@ -3546,8 +3543,7 @@ mod tests {
             .collect();
         let plan1_str = plan1.join(" | ");
         assert!(
-            plan1_str.contains("idx_ts_provider_model")
-                || plan1_str.contains("USING INDEX"),
+            plan1_str.contains("idx_ts_provider_model") || plan1_str.contains("USING INDEX"),
             "AC1: by-provider query plan must reference idx_ts_provider_model; \
              got: {plan1_str}"
         );
@@ -3570,8 +3566,7 @@ mod tests {
             .collect();
         let plan2_str = plan2.join(" | ");
         assert!(
-            plan2_str.contains("idx_ts_provider_model")
-                || plan2_str.contains("USING INDEX"),
+            plan2_str.contains("idx_ts_provider_model") || plan2_str.contains("USING INDEX"),
             "AC1: by-model query plan must reference idx_ts_provider_model; \
              got: {plan2_str}"
         );
@@ -3616,12 +3611,10 @@ mod tests {
         // The four new v4 columns default to NULL for existing rows.
         let mut stmt = db
             .conn
-            .prepare(
-                "SELECT provider, model, turn_id, upstream_error_status FROM token_savings",
-            )
+            .prepare("SELECT provider, model, turn_id, upstream_error_status FROM token_savings")
             .unwrap();
-        let new_cols: Vec<_> =
-            stmt.query_map([], |r| {
+        let new_cols: Vec<_> = stmt
+            .query_map([], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
                     r.get::<_, Option<String>>(1)?,
@@ -3676,11 +3669,9 @@ mod tests {
         // proxy_block_decisions table exists (but is empty — no proxy rows yet).
         let pbd_count: i64 = db
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM proxy_block_decisions",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM proxy_block_decisions", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(
             pbd_count, 0,
@@ -3797,9 +3788,7 @@ mod tests {
 
         // The token_savings table retains only the future schema (no new v4 columns
         // were injected by migration).
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(token_savings)")
-            .unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(token_savings)").unwrap();
         let col_names: Vec<String> = stmt
             .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
@@ -3826,10 +3815,8 @@ mod tests {
         // Pre-create token_savings_new to make the migration's first CREATE TABLE fail.
         {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE token_savings_new (poison_col TEXT);",
-            )
-            .unwrap();
+            conn.execute_batch("CREATE TABLE token_savings_new (poison_col TEXT);")
+                .unwrap();
         }
 
         // Open attempt must fail (CREATE TABLE token_savings_new errors).
@@ -3882,10 +3869,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            version, 4,
-            "AC4 (early): clean re-open must migrate to v4"
-        );
+        assert_eq!(version, 4, "AC4 (early): clean re-open must migrate to v4");
         let count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
@@ -3917,10 +3901,8 @@ mod tests {
         // within the transaction).
         {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE proxy_block_decisions (poison_col TEXT);",
-            )
-            .unwrap();
+            conn.execute_batch("CREATE TABLE proxy_block_decisions (poison_col TEXT);")
+                .unwrap();
         }
 
         // Open attempt must fail.
@@ -3969,7 +3951,8 @@ mod tests {
             // BEGIN) survives the rollback — the transaction rolled back the DDL inside
             // BEGIN..COMMIT, but not the conflict table created before the transaction.
             // Drop it so a clean re-open can migrate to v4.
-            conn.execute_batch("DROP TABLE proxy_block_decisions;").unwrap();
+            conn.execute_batch("DROP TABLE proxy_block_decisions;")
+                .unwrap();
         }
 
         // Clean re-open must migrate to v4 with data preserved.
@@ -3979,7 +3962,10 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "AC4 (detail-table): clean re-open must reach v4");
+        assert_eq!(
+            version, 4,
+            "AC4 (detail-table): clean re-open must reach v4"
+        );
         let count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
@@ -4033,7 +4019,9 @@ mod tests {
     /// Count rows left in the `proxy_block_decisions` detail table.
     fn detail_row_count(db: &AnalyticsDb) -> i64 {
         db.conn
-            .query_row("SELECT COUNT(*) FROM proxy_block_decisions", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM proxy_block_decisions", [], |r| {
+                r.get(0)
+            })
             .unwrap()
     }
 
@@ -4090,7 +4078,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(attached, 2, "surviving detail rows stay attached to their parent");
+        assert_eq!(
+            attached, 2,
+            "surviving detail rows stay attached to their parent"
+        );
 
         // --- clean_invalid_records() ---
         let (mut db, _tmp) = test_db();
@@ -4123,7 +4114,12 @@ mod tests {
             // Unknown provider → always Heuristic regardless of model
             ("Unknown+None", Unknown, None, Heuristic),
             ("Unknown+recognized", Unknown, Some("gpt-4o"), Heuristic),
-            ("Unknown+unrecognized", Unknown, Some("mystery-llm"), Heuristic),
+            (
+                "Unknown+unrecognized",
+                Unknown,
+                Some("mystery-llm"),
+                Heuristic,
+            ),
             // Anthropic + None → AnthropicOffline family default
             ("Anthropic+None", Anthropic, None, AnthropicOffline),
             // Anthropic + recognized model → keeps its encoding (also AnthropicOffline
@@ -4212,16 +4208,17 @@ mod tests {
             savings.map(|s| (s - 60.0).abs() < 0.001).unwrap_or(false),
             "savings_pct must be ~60.0"
         );
-        assert_eq!(err_status, None, "upstream_error_status must be NULL for normal rows");
+        assert_eq!(
+            err_status, None,
+            "upstream_error_status must be NULL for normal rows"
+        );
 
         // --- block rows ---
         let block_count: i64 = db
             .conn
-            .query_row(
-                "SELECT COUNT(*) FROM proxy_block_decisions",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM proxy_block_decisions", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(block_count, 2, "must have exactly 2 block rows");
 
@@ -4506,10 +4503,28 @@ mod tests {
 
         // Now insert proxy rows with larger token counts — these must NOT appear
         // in any CLI aggregate.
-        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-opus-20240229"),
-            Some(10_000), Some(1_000), Some(90.0), None, "full", 1_711_302_000);
-        insert_proxy_row(&db, Some("openai"), Some("gpt-4"),
-            Some(8_000), Some(800), Some(90.0), None, "full", 1_711_303_000);
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            Some("claude-3-opus-20240229"),
+            Some(10_000),
+            Some(1_000),
+            Some(90.0),
+            None,
+            "full",
+            1_711_302_000,
+        );
+        insert_proxy_row(
+            &db,
+            Some("openai"),
+            Some("gpt-4"),
+            Some(8_000),
+            Some(800),
+            Some(90.0),
+            None,
+            "full",
+            1_711_303_000,
+        );
 
         // CLI aggregates after proxy rows are inserted must be identical.
         let after_summary = db.query_summary(None).unwrap();
@@ -4565,10 +4580,28 @@ mod tests {
         let (db, _tmp) = test_db();
 
         // Insert only proxy rows.
-        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
-            Some(5_000), Some(500), Some(90.0), None, "full", 1_711_300_000);
-        insert_proxy_row(&db, Some("openai"), Some("gpt-4o"),
-            Some(3_000), Some(600), Some(80.0), None, "full", 1_711_301_000);
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            Some(5_000),
+            Some(500),
+            Some(90.0),
+            None,
+            "full",
+            1_711_300_000,
+        );
+        insert_proxy_row(
+            &db,
+            Some("openai"),
+            Some("gpt-4o"),
+            Some(3_000),
+            Some(600),
+            Some(80.0),
+            None,
+            "full",
+            1_711_301_000,
+        );
 
         // CLI headline must be zero (no CLI rows).
         let summary = db.query_summary(None).unwrap();
@@ -4662,12 +4695,39 @@ mod tests {
         let (db, _tmp) = test_db();
 
         // Insert rows in a scrambled order: unknown provider, openai, anthropic.
-        insert_proxy_row(&db, None, None, Some(100), Some(50), Some(50.0),
-            None, "passthrough", 1_711_300_001);
-        insert_proxy_row(&db, Some("openai"), Some("gpt-4o"),
-            Some(200), Some(100), Some(50.0), None, "full", 1_711_300_002);
-        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
-            Some(300), Some(150), Some(50.0), None, "full", 1_711_300_003);
+        insert_proxy_row(
+            &db,
+            None,
+            None,
+            Some(100),
+            Some(50),
+            Some(50.0),
+            None,
+            "passthrough",
+            1_711_300_001,
+        );
+        insert_proxy_row(
+            &db,
+            Some("openai"),
+            Some("gpt-4o"),
+            Some(200),
+            Some(100),
+            Some(50.0),
+            None,
+            "full",
+            1_711_300_002,
+        );
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            Some(300),
+            Some(150),
+            Some(50.0),
+            None,
+            "full",
+            1_711_300_003,
+        );
 
         let rows = db.query_by_model(None).unwrap();
 
@@ -4683,10 +4743,7 @@ mod tests {
             Some("openai"),
             "second row must be openai"
         );
-        assert_eq!(
-            rows[2].provider, None,
-            "last row must have NULL provider"
-        );
+        assert_eq!(rows[2].provider, None, "last row must have NULL provider");
     }
 
     /// query_by_model — upstream_error_status IS NOT NULL rows are excluded from
@@ -4699,22 +4756,47 @@ mod tests {
         let (db, _tmp) = test_db();
 
         // One normal relayed row.
-        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
-            Some(1000), Some(100), Some(90.0), None, "full", 1_711_300_001);
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            Some(1000),
+            Some(100),
+            Some(90.0),
+            None,
+            "full",
+            1_711_300_001,
+        );
         // One upstream-errored row for the same model (must NOT count in aggregates).
-        insert_proxy_row(&db, Some("anthropic"), Some("claude-3-5-sonnet-20241022"),
-            None, None, None, Some(502), "full", 1_711_300_002);
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            None,
+            None,
+            None,
+            Some(502),
+            "full",
+            1_711_300_002,
+        );
 
         let rows = db.query_by_model(None).unwrap();
         assert_eq!(rows.len(), 1, "must be 1 model group (same provider+model)");
 
         let row = &rows[0];
-        assert_eq!(row.requests, 1,
-            "AD-PXY-25: success-scope request count must be 1 (errored row excluded)");
-        assert_eq!(row.upstream_errors, 1,
-            "AD-PXY-25: upstream_errors must be 1");
-        assert_eq!(row.raw_tokens, Some(1000),
-            "AD-PXY-25: raw_tokens must reflect only the relayed row");
+        assert_eq!(
+            row.requests, 1,
+            "AD-PXY-25: success-scope request count must be 1 (errored row excluded)"
+        );
+        assert_eq!(
+            row.upstream_errors, 1,
+            "AD-PXY-25: upstream_errors must be 1"
+        );
+        assert_eq!(
+            row.raw_tokens,
+            Some(1000),
+            "AD-PXY-25: raw_tokens must reflect only the relayed row"
+        );
         // Tier counts should reflect only the relayed row.
         assert!(
             row.tier_full_pct > 99.0,
@@ -4732,8 +4814,17 @@ mod tests {
 
         // Three rows with NULL tokens (pair-jointly-NULL).
         for i in 0..3i64 {
-            insert_proxy_row(&db, Some("anthropic"), Some("claude-3-opus-20240229"),
-                None, None, None, None, "passthrough", 1_711_300_000 + i);
+            insert_proxy_row(
+                &db,
+                Some("anthropic"),
+                Some("claude-3-opus-20240229"),
+                None,
+                None,
+                None,
+                None,
+                "passthrough",
+                1_711_300_000 + i,
+            );
         }
 
         let rows = db.query_by_model(None).unwrap();
@@ -4743,7 +4834,10 @@ mod tests {
         assert_eq!(row.counted_rows, 0, "AC12: no countable rows");
         assert_eq!(row.uncounted_rows, 3, "AC12: all 3 rows are uncounted");
         assert!(row.raw_tokens.is_none(), "AC12: raw_tokens must be None");
-        assert!(row.compressed_tokens.is_none(), "AC12: compressed_tokens must be None");
+        assert!(
+            row.compressed_tokens.is_none(),
+            "AC12: compressed_tokens must be None"
+        );
     }
 
     /// query_by_provider — mixed-basis detection: openai with gpt-4 (Cl100k)
@@ -4756,11 +4850,29 @@ mod tests {
         let (db, _tmp) = test_db();
 
         // gpt-4 → Cl100k encoding
-        insert_proxy_row(&db, Some("openai"), Some("gpt-4"),
-            Some(2000), Some(400), Some(80.0), None, "full", 1_711_300_001);
+        insert_proxy_row(
+            &db,
+            Some("openai"),
+            Some("gpt-4"),
+            Some(2000),
+            Some(400),
+            Some(80.0),
+            None,
+            "full",
+            1_711_300_001,
+        );
         // gpt-4o → O200k encoding
-        insert_proxy_row(&db, Some("openai"), Some("gpt-4o"),
-            Some(1000), Some(200), Some(80.0), None, "full", 1_711_300_002);
+        insert_proxy_row(
+            &db,
+            Some("openai"),
+            Some("gpt-4o"),
+            Some(1000),
+            Some(200),
+            Some(80.0),
+            None,
+            "full",
+            1_711_300_002,
+        );
 
         let providers = db.query_by_provider(None).unwrap();
         assert_eq!(providers.len(), 1, "must be 1 provider group (openai)");
@@ -4768,19 +4880,27 @@ mod tests {
 
         assert_eq!(prov.provider.as_deref(), Some("openai"));
         assert_eq!(prov.requests, 2);
-        assert_eq!(prov.basis, "mixed",
-            "AC11: openai spanning cl100k+o200k must be 'mixed'");
-        assert!(prov.raw_tokens.is_none(),
-            "AC11: combined raw_tokens must be None for mixed-basis provider");
-        assert!(prov.compressed_tokens.is_none(),
-            "AC11: combined compressed_tokens must be None for mixed-basis provider");
+        assert_eq!(
+            prov.basis, "mixed",
+            "AC11: openai spanning cl100k+o200k must be 'mixed'"
+        );
+        assert!(
+            prov.raw_tokens.is_none(),
+            "AC11: combined raw_tokens must be None for mixed-basis provider"
+        );
+        assert!(
+            prov.compressed_tokens.is_none(),
+            "AC11: combined compressed_tokens must be None for mixed-basis provider"
+        );
 
         // Per-model rows must carry the authoritative figures.
         let models = db.query_by_model(None).unwrap();
         assert_eq!(models.len(), 2, "must have 2 per-model rows");
-        let gpt4 = models.iter().find(|m| m.model.as_deref() == Some("gpt-4")).unwrap();
-        assert_eq!(gpt4.basis, "exact",
-            "gpt-4 (Cl100k) must have basis=exact");
+        let gpt4 = models
+            .iter()
+            .find(|m| m.model.as_deref() == Some("gpt-4"))
+            .unwrap();
+        assert_eq!(gpt4.basis, "exact", "gpt-4 (Cl100k) must have basis=exact");
         assert_eq!(gpt4.raw_tokens, Some(2000));
     }
 
@@ -4793,16 +4913,46 @@ mod tests {
         let (db, _tmp) = test_db();
 
         // One normal row.
-        insert_proxy_row(&db, Some("anthropic"), None,
-            Some(1000), Some(100), Some(90.0), None, "full", 1_711_300_001);
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            None,
+            Some(1000),
+            Some(100),
+            Some(90.0),
+            None,
+            "full",
+            1_711_300_001,
+        );
         // Two errored rows.
-        insert_proxy_row(&db, Some("anthropic"), None,
-            None, None, None, Some(502), "passthrough", 1_711_300_002);
-        insert_proxy_row(&db, Some("openai"), None,
-            None, None, None, Some(504), "passthrough", 1_711_300_003);
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            None,
+            None,
+            None,
+            None,
+            Some(502),
+            "passthrough",
+            1_711_300_002,
+        );
+        insert_proxy_row(
+            &db,
+            Some("openai"),
+            None,
+            None,
+            None,
+            None,
+            Some(504),
+            "passthrough",
+            1_711_300_003,
+        );
 
         let errored = db.query_by_upstream_error(None).unwrap();
-        assert_eq!(errored, 2, "AD-PXY-25: must count exactly 2 upstream-errored rows");
+        assert_eq!(
+            errored, 2,
+            "AD-PXY-25: must count exactly 2 upstream-errored rows"
+        );
     }
 
     /// query_proxy_dropped_records — returns 0 when no drops recorded, and the

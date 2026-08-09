@@ -49,17 +49,17 @@ impl TransformStage for BlockRouterFullStage {
         "block-router"
     }
 
-    fn apply(
-        &self,
-        body: &[u8],
-        ctx: &TransformContext<'_>,
-        _sink: &dyn DecisionSink,
-    ) -> Outcome {
+    fn apply(&self, body: &[u8], ctx: &TransformContext<'_>, _sink: &dyn DecisionSink) -> Outcome {
         if body.is_empty() {
             return Outcome::passthrough(body.to_vec(), ctx.request_id, self.name());
         }
         // Return one fewer byte — `guarded_transform` in the pipeline emits Full.
-        Outcome::modified(body[..body.len() - 1].to_vec(), body.len(), ctx.request_id, self.name())
+        Outcome::modified(
+            body[..body.len() - 1].to_vec(),
+            body.len(),
+            ctx.request_id,
+            self.name(),
+        )
     }
 }
 
@@ -102,16 +102,16 @@ impl TransformStage for CacheAlignFullStage {
         "cache-align"
     }
 
-    fn apply(
-        &self,
-        body: &[u8],
-        ctx: &TransformContext<'_>,
-        _sink: &dyn DecisionSink,
-    ) -> Outcome {
+    fn apply(&self, body: &[u8], ctx: &TransformContext<'_>, _sink: &dyn DecisionSink) -> Outcome {
         if body.is_empty() {
             return Outcome::passthrough(body.to_vec(), ctx.request_id, self.name());
         }
-        Outcome::modified(body[..body.len() - 1].to_vec(), body.len(), ctx.request_id, self.name())
+        Outcome::modified(
+            body[..body.len() - 1].to_vec(),
+            body.len(),
+            ctx.request_id,
+            self.name(),
+        )
     }
 }
 
@@ -193,10 +193,7 @@ async fn start_proxy_with_hook_and_pipeline(
         .build()
         .expect("proxy config");
     let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
-        listener,
-        config,
-        pipeline,
-        analytics,
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -219,10 +216,7 @@ async fn start_proxy_no_upstream_with_hook(
         .expect("proxy config (no upstream)");
     let pipeline = TransformPipeline::identity();
     let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
-        listener,
-        config,
-        pipeline,
-        analytics,
+        listener, config, pipeline, analytics,
     ));
     let abort = task.abort_handle();
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -397,7 +391,11 @@ async fn test_duration_measures_stream_end_not_time_to_headers() {
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     let recorded = events.lock().unwrap();
-    assert_eq!(recorded.len(), 1, "exactly one event for one relayed request");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one event for one relayed request"
+    );
     assert!(
         recorded[0].duration >= TAIL_DELAY,
         "AC20: duration must span the whole exchange to stream end \
@@ -440,7 +438,10 @@ async fn test_tier_full_when_block_router_modifies() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let count = fired_count.load(Ordering::SeqCst);
-    assert_eq!(count, 1, "AD-PXY-24: exactly one event for success path (got {count})");
+    assert_eq!(
+        count, 1,
+        "AD-PXY-24: exactly one event for success path (got {count})"
+    );
 
     let recorded = events.lock().unwrap();
     assert_eq!(recorded.len(), 1);
@@ -584,8 +585,7 @@ async fn test_model_detected_in_analytics_event() {
     let (upstream_url, up_abort) = start_echo_upstream().await;
 
     let (hook, events, _) = FullCapturingHook::new();
-    let (proxy_abort, proxy_addr) =
-        start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
+    let (proxy_abort, proxy_addr) = start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
 
     let body = br#"{"model":"claude-3-opus-20240229","messages":[]}"#;
     let status = post_to_messages(proxy_addr, body).await;
@@ -611,8 +611,7 @@ async fn test_model_none_when_body_has_no_model_key() {
     let (upstream_url, up_abort) = start_echo_upstream().await;
 
     let (hook, events, _) = FullCapturingHook::new();
-    let (proxy_abort, proxy_addr) =
-        start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
+    let (proxy_abort, proxy_addr) = start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
 
     // Valid JSON but no "model" key.
     let body = br#"{"messages":[]}"#;
@@ -730,8 +729,7 @@ async fn test_analytics_fires_at_stream_end_not_header_time() {
     let (upstream_url, up_abort) = start_echo_upstream().await;
 
     let (hook, events, fired_count) = FullCapturingHook::new();
-    let (proxy_abort, proxy_addr) =
-        start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
+    let (proxy_abort, proxy_addr) = start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
 
     let body = br#"{"model":"claude-3-haiku","messages":[]}"#;
     let status = post_to_messages(proxy_addr, body).await;
@@ -836,7 +834,9 @@ async fn test_analytics_does_not_mutate_forwarded_bytes() {
         let addr = listener.local_addr().expect("local_addr");
         let task = tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { break };
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let cap = Arc::clone(&captured);
                 let resp_body = response_body.clone();
                 tokio::spawn(async move {
@@ -871,14 +871,15 @@ async fn test_analytics_does_not_mutate_forwarded_bytes() {
             start_capturing_upstream(Arc::clone(&received_with_analytics), fixed_response.clone())
                 .await;
         let (hook, _, _) = FullCapturingHook::new();
-        let (proxy_abort, proxy_addr) =
-            start_proxy_with_hook(&up_url, Arc::new(hook)).await;
+        let (proxy_abort, proxy_addr) = start_proxy_with_hook(&up_url, Arc::new(hook)).await;
 
         use hyper::Uri;
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
-        let url: Uri = format!("http://{}/v1/messages", proxy_addr).parse().unwrap();
+        let url: Uri = format!("http://{}/v1/messages", proxy_addr)
+            .parse()
+            .unwrap();
         let req = Request::post(url)
             .header("content-type", "application/json")
             .header("x-api-key", "test-key")
@@ -903,7 +904,9 @@ async fn test_analytics_does_not_mutate_forwarded_bytes() {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
-        let url: Uri = format!("http://{}/v1/messages", proxy_addr).parse().unwrap();
+        let url: Uri = format!("http://{}/v1/messages", proxy_addr)
+            .parse()
+            .unwrap();
         let req = Request::post(url)
             .header("content-type", "application/json")
             .header("x-api-key", "test-key")
@@ -924,9 +927,15 @@ async fn test_analytics_does_not_mutate_forwarded_bytes() {
     );
 
     // Upstream received the same forwarded bytes in both runs.
-    let with_on = received_with_analytics.lock().unwrap().clone()
+    let with_on = received_with_analytics
+        .lock()
+        .unwrap()
+        .clone()
         .expect("analytics-on upstream received nothing");
-    let with_off = received_without.lock().unwrap().clone()
+    let with_off = received_without
+        .lock()
+        .unwrap()
+        .clone()
         .expect("analytics-off upstream received nothing");
     assert_eq!(
         with_on, with_off,
@@ -1087,8 +1096,11 @@ async fn test_one_errored_event_for_502_connection_refused() {
         "AD-PXY-25: 502 (connection-refused) must fire exactly one errored event"
     );
     let recorded = events.lock().unwrap();
-    assert_eq!(recorded[0].upstream_error_status, Some(502),
-        "event upstream_error_status must be Some(502)");
+    assert_eq!(
+        recorded[0].upstream_error_status,
+        Some(502),
+        "event upstream_error_status must be Some(502)"
+    );
     drop(recorded);
 
     proxy_abort.abort();
@@ -1109,7 +1121,9 @@ async fn test_one_errored_event_for_504_upstream_timeout() {
     let hanging_addr = hanging_listener.local_addr().unwrap();
     let _hanging_task = tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = hanging_listener.accept().await else { break };
+            let Ok((stream, _)) = hanging_listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 // Hold stream open without sending any data.
                 tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1149,8 +1163,11 @@ async fn test_one_errored_event_for_504_upstream_timeout() {
         "AD-PXY-25: 504 (timeout) must fire exactly one errored event"
     );
     let recorded = events.lock().unwrap();
-    assert_eq!(recorded[0].upstream_error_status, Some(504),
-        "event upstream_error_status must be Some(504)");
+    assert_eq!(
+        recorded[0].upstream_error_status,
+        Some(504),
+        "event upstream_error_status must be Some(504)"
+    );
     drop(recorded);
 
     proxy_abort.abort();
@@ -1182,7 +1199,11 @@ async fn test_real_proxy_e2e_full_tier() {
     assert_eq!(status, 200, "E2E request must succeed");
     tokio::time::sleep(Duration::from_millis(30)).await;
 
-    assert_eq!(fired_count.load(Ordering::SeqCst), 1, "AC23: exactly one event");
+    assert_eq!(
+        fired_count.load(Ordering::SeqCst),
+        1,
+        "AC23: exactly one event"
+    );
     let recorded = events.lock().unwrap();
     assert_eq!(recorded.len(), 1);
     let event = &recorded[0];
@@ -1195,13 +1216,20 @@ async fn test_real_proxy_e2e_full_tier() {
         event.tier
     );
     // raw_body is the original; final_body is 1 byte shorter.
-    assert_eq!(event.raw_body.as_ref(), body.as_ref(), "raw_body must equal original");
+    assert_eq!(
+        event.raw_body.as_ref(),
+        body.as_ref(),
+        "raw_body must equal original"
+    );
     assert_eq!(
         event.final_body.len(),
         body.len() - 1,
         "final_body must be 1 byte shorter (BlockRouterFullStage)"
     );
-    assert_eq!(event.upstream_error_status, None, "successful relay: no error");
+    assert_eq!(
+        event.upstream_error_status, None,
+        "successful relay: no error"
+    );
     drop(recorded);
 
     proxy_abort.abort();

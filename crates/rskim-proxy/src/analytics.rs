@@ -363,8 +363,14 @@ mod tests {
     fn test_event_fields_populated() {
         let event = make_event();
         assert_eq!(event.provider, ProxyProvider::Anthropic);
-        assert_eq!(event.request_bytes, 1024, "request_bytes derived from raw_body.len()");
-        assert_eq!(event.response_bytes, 0, "response_bytes always 0 (deferred OQ3)");
+        assert_eq!(
+            event.request_bytes, 1024,
+            "request_bytes derived from raw_body.len()"
+        );
+        assert_eq!(
+            event.response_bytes, 0,
+            "response_bytes always 0 (deferred OQ3)"
+        );
         assert_eq!(event.duration, Duration::from_millis(42));
         assert_eq!(event.tier, RequestTier::Passthrough);
         assert!(event.model.is_none());

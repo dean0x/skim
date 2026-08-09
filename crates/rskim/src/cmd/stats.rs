@@ -718,10 +718,7 @@ fn display_cell(s: &str, max: usize) -> String {
         .collect()
 }
 
-fn render_proxy_by_provider(
-    w: &mut dyn Write,
-    rows: &[ProxyProviderStats],
-) -> anyhow::Result<()> {
+fn render_proxy_by_provider(w: &mut dyn Write, rows: &[ProxyProviderStats]) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -759,10 +756,7 @@ fn render_proxy_by_provider(
 /// AD-AN-9 / AC10: rendered only when at least one proxy row exists.
 /// AD-PXY-25: upstream_errors shown separately from success-scope metrics.
 /// AC12: uncounted_rows disclosed alongside basis label.
-fn render_proxy_by_model(
-    w: &mut dyn Write,
-    rows: &[ProxyModelStats],
-) -> anyhow::Result<()> {
+fn render_proxy_by_model(w: &mut dyn Write, rows: &[ProxyModelStats]) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -771,7 +765,15 @@ fn render_proxy_by_model(
     writeln!(
         w,
         "  {:<16}  {:<26}  {:>6}  {:>6}  {:>10}  {:>10}  {:<9}  {:<14}  {:>9}",
-        "PROVIDER", "MODEL", "REQS", "ERRORS", "RAW", "COMPRESSED", "REDUCTION", "BASIS", "UNCOUNTED"
+        "PROVIDER",
+        "MODEL",
+        "REQS",
+        "ERRORS",
+        "RAW",
+        "COMPRESSED",
+        "REDUCTION",
+        "BASIS",
+        "UNCOUNTED"
     )?;
     for row in rows {
         let provider = row.provider.as_deref().unwrap_or("(unknown)");
@@ -1145,10 +1147,7 @@ mod tests {
         fn clear(&self) -> anyhow::Result<()> {
             Ok(())
         }
-        fn query_by_model(
-            &self,
-            _since: Option<i64>,
-        ) -> anyhow::Result<Vec<ProxyModelStats>> {
+        fn query_by_model(&self, _since: Option<i64>) -> anyhow::Result<Vec<ProxyModelStats>> {
             Ok(self.by_model.clone())
         }
         fn query_by_provider(
@@ -2279,7 +2278,7 @@ mod tests {
             provider: Some("openai".to_string()),
             requests: 10,
             upstream_errors: 0,
-            raw_tokens: None,   // mixed-basis → null
+            raw_tokens: None, // mixed-basis → null
             compressed_tokens: None,
             avg_savings_pct: Some(80.0),
             tier_full_pct: 100.0,
@@ -2323,12 +2322,12 @@ mod tests {
             Some("anthropic"),
             Some("claude-3-5-sonnet-20241022"),
             10,
-            None,   // all NULL token pairs → 0 counted
+            None, // all NULL token pairs → 0 counted
             None,
             None,
             "approximation",
             0,
-            10,     // all 10 are uncounted
+            10, // all 10 are uncounted
         )];
         store.by_provider = vec![proxy_provider_row(
             Some("anthropic"),
@@ -2395,8 +2394,24 @@ mod tests {
             ),
         ];
         store.by_provider = vec![
-            proxy_provider_row(Some("anthropic"), 5, Some(1_000), Some(200), Some(80.0), "approximation", 0),
-            proxy_provider_row(Some("openai"), 3, Some(600), Some(120), Some(80.0), "exact", 0),
+            proxy_provider_row(
+                Some("anthropic"),
+                5,
+                Some(1_000),
+                Some(200),
+                Some(80.0),
+                "approximation",
+                0,
+            ),
+            proxy_provider_row(
+                Some("openai"),
+                3,
+                Some(600),
+                Some(120),
+                Some(80.0),
+                "exact",
+                0,
+            ),
         ];
 
         let out1 = capture(|w| run_json(w, &store, None, None));
@@ -2425,7 +2440,7 @@ mod tests {
             Some(200),
             Some(80.0),
             "approximation",
-            3,  // 3 upstream errors for this model
+            3, // 3 upstream errors for this model
             0,
         )];
         store.by_provider = vec![proxy_provider_row(

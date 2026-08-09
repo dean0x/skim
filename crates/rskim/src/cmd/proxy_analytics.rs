@@ -270,7 +270,9 @@ pub(crate) fn spawn_consumer(
         // Channel is closed. Persist accumulated drop count EXACTLY ONCE (AD-AN-8).
         let total_drops = drop_count.load(Ordering::Relaxed);
         // if-let chain (Rust 2024): collapse the guard + binding into one expression.
-        if total_drops > 0 && let Some(ref db) = db {
+        if total_drops > 0
+            && let Some(ref db) = db
+        {
             // Persist failure is fail-open (AD-AN-8) — drop silently.
             let _ = db.analytics_meta_add_drop_count(total_drops);
         }
@@ -511,7 +513,9 @@ mod tests {
             }
             let total = drop_count.load(Ordering::Relaxed);
             // if-let chain (Rust 2024): mirror the production spawn_consumer form.
-            if total > 0 && let Some(ref db) = db {
+            if total > 0
+                && let Some(ref db) = db
+            {
                 let _ = db.analytics_meta_add_drop_count(total);
             }
             let _ = done_tx.send(());
@@ -536,7 +540,9 @@ mod tests {
         hook.on_request(&event);
 
         // The event must be in the channel (try_send happened).
-        let received = rx.try_recv().expect("event must be in channel after on_request");
+        let received = rx
+            .try_recv()
+            .expect("event must be in channel after on_request");
         assert_eq!(
             received.raw_body.len(),
             event.raw_body.len(),
@@ -545,12 +551,18 @@ mod tests {
 
         // No drops on an uncrowded channel.
         let drop_count = hook.drop_count.load(Ordering::Relaxed);
-        assert_eq!(drop_count, 0, "AC14: drop_count must be 0 on uncrowded channel");
+        assert_eq!(
+            drop_count, 0,
+            "AC14: drop_count must be 0 on uncrowded channel"
+        );
 
         // queued_bytes must be positive while event was in-channel (consumer has
         // not yet decremented it — we drained via try_recv, not the consumer).
         let qb = hook.queued_bytes.load(Ordering::Relaxed);
-        assert!(qb > 0, "queued_bytes must be positive while event was in-channel");
+        assert!(
+            qb > 0,
+            "queued_bytes must be positive while event was in-channel"
+        );
     }
 
     /// AC14 / PF-007: overflow → bounded `try_send` fails rather than blocking.
@@ -652,7 +664,9 @@ mod tests {
 
         // Close the sender and wait for consumer to finish.
         drop(hook);
-        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let consumer_finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
         let _ = handle.join();
 
         assert!(
@@ -714,7 +728,9 @@ mod tests {
 
         // Close the sender and verify consumer finishes (fail-open, no panic/hang).
         drop(hook);
-        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let consumer_finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
         let _ = handle.join();
 
         assert!(
@@ -762,7 +778,9 @@ mod tests {
 
         // Close sender and verify consumer finishes without panic.
         drop(hook);
-        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let consumer_finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
         let _ = handle.join();
 
         // Restore permissions so tempdir cleanup can succeed.
@@ -808,7 +826,9 @@ mod tests {
         }
 
         drop(hook);
-        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let consumer_finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
         let _ = handle.join();
 
         assert!(
@@ -890,7 +910,10 @@ mod tests {
         hook.on_request(&event); // 78 bytes — OVER 60-byte budget → drop
 
         let drops = hook.drop_count.load(Ordering::Relaxed);
-        assert!(drops >= 1, "byte-budget overflow must increment drop_count; got {drops}");
+        assert!(
+            drops >= 1,
+            "byte-budget overflow must increment drop_count; got {drops}"
+        );
     }
 
     /// AC17: single event with payload > byte budget is immediately dropped
@@ -922,13 +945,19 @@ mod tests {
         let provider = RecordingProvider::Anthropic;
         let (raw, comp, pct) = compute_token_counts(&event, &provider);
         assert!(raw.is_some(), "raw_tokens must be Some for valid UTF-8");
-        assert!(comp.is_some(), "compressed_tokens must be Some for valid UTF-8");
+        assert!(
+            comp.is_some(),
+            "compressed_tokens must be Some for valid UTF-8"
+        );
         assert!(pct.is_some(), "savings_pct must be Some for valid UTF-8");
         let raw = raw.unwrap();
         let comp = comp.unwrap();
         assert!(raw > 0, "raw_tokens must be positive");
         assert!(comp > 0, "compressed_tokens must be positive");
-        assert!(raw >= comp, "raw_tokens >= compressed_tokens for a shrunk body");
+        assert!(
+            raw >= comp,
+            "raw_tokens >= compressed_tokens for a shrunk body"
+        );
     }
 
     /// AD-AN-7: non-UTF-8 raw body → all three token fields are None.
@@ -941,7 +970,10 @@ mod tests {
         let provider = RecordingProvider::Anthropic;
         let (raw, comp, pct) = compute_token_counts(&event, &provider);
         assert!(raw.is_none(), "non-UTF-8 raw must yield None raw_tokens");
-        assert!(comp.is_none(), "non-UTF-8 raw must yield None compressed_tokens");
+        assert!(
+            comp.is_none(),
+            "non-UTF-8 raw must yield None compressed_tokens"
+        );
         assert!(pct.is_none(), "non-UTF-8 raw must yield None savings_pct");
     }
 
@@ -955,7 +987,10 @@ mod tests {
         let provider = RecordingProvider::Anthropic;
         let (raw, comp, pct) = compute_token_counts(&event, &provider);
         assert!(raw.is_none(), "non-UTF-8 final must yield None raw_tokens");
-        assert!(comp.is_none(), "non-UTF-8 final must yield None compressed_tokens");
+        assert!(
+            comp.is_none(),
+            "non-UTF-8 final must yield None compressed_tokens"
+        );
         assert!(pct.is_none(), "non-UTF-8 final must yield None savings_pct");
     }
 
@@ -1191,7 +1226,10 @@ mod tests {
         let _ = handle.join();
 
         // Consumer must finish — no panic, no hang (AC15).
-        assert!(consumer_finished, "consumer must signal completion after channel closes");
+        assert!(
+            consumer_finished,
+            "consumer must signal completion after channel closes"
+        );
     }
 
     /// AC23 / AC5: real `BlockRouter` with a compressible body produces a proxy
@@ -1274,7 +1312,10 @@ mod tests {
         let db = AnalyticsDb::open(&db_path).expect("open DB");
         let rows = db.query_by_model(None).expect("query_by_model");
 
-        assert!(!rows.is_empty(), "AC23: at least one proxy row must be recorded");
+        assert!(
+            !rows.is_empty(),
+            "AC23: at least one proxy row must be recorded"
+        );
 
         let row = &rows[0];
         assert!(row.requests > 0, "AC23: requests count must be positive");
@@ -1328,15 +1369,16 @@ mod tests {
     /// Derive `RequestTier` from a slice of `DecisionRecord`s.
     ///
     /// Cross-Plan Amendment #3: filter to `"block-router"` component only.
-    fn derive_tier_from_decisions(
-        records: &[rskim_contract::log::DecisionRecord],
-    ) -> RequestTier {
+    fn derive_tier_from_decisions(records: &[rskim_contract::log::DecisionRecord]) -> RequestTier {
         use rskim_contract::log::OutcomeReason;
         let block_router: Vec<_> = records
             .iter()
             .filter(|r| r.component == "block-router")
             .collect();
-        if block_router.iter().any(|r| r.reason == OutcomeReason::Degraded) {
+        if block_router
+            .iter()
+            .any(|r| r.reason == OutcomeReason::Degraded)
+        {
             RequestTier::Degraded
         } else if block_router.iter().any(|r| r.reason == OutcomeReason::Full) {
             RequestTier::Full

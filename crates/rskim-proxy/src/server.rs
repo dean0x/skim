@@ -780,7 +780,12 @@ async fn handle_request(
     // AD-PXY-14: upstream_timeout = 60s (evidence-cited in config.rs).
     let forward_result = timeout(
         config.upstream_timeout,
-        forward_request(parts, transformed_body.clone(), &upstream_url, &upstream_client),
+        forward_request(
+            parts,
+            transformed_body.clone(),
+            &upstream_url,
+            &upstream_client,
+        ),
     )
     .await;
 
@@ -1406,7 +1411,7 @@ mod tests {
     fn test_derive_tier_mixed_components_only_block_router_counts() {
         let records = vec![
             DecisionRecord::modified("req-1", "cache-align", 100, 80), // Full, excluded
-            DecisionRecord::passthrough("req-1", "block-router", 80),   // Passthrough, included
+            DecisionRecord::passthrough("req-1", "block-router", 80),  // Passthrough, included
         ];
         // Only the block-router Passthrough record counts — result: Passthrough.
         assert_eq!(derive_tier(&records), RequestTier::Passthrough);
