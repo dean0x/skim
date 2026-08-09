@@ -186,11 +186,11 @@ pub fn plan_injection(
     // v1 cap: inject at most V1_SKIM_CAP markers, and at most as many eligible positions as we have budget for
     let skim_count = eligible_positions.min(budget).min(V1_SKIM_CAP);
 
-    // Decide which positions get markers (priority: tools first, then system)
+    // Decide which positions get markers (priority: tools first, then system).
+    // When tools is eligible, system requires budget ≥ 2 (tools takes slot 1).
+    // When tools is not eligible, system gets slot 1 if budget ≥ 1.
     let inject_tools = tools_eligible && skim_count >= 1;
-    let inject_system = system_eligible && skim_count >= 2 && tools_eligible;
-    // If tools is not eligible but system is, and skim_count >= 1:
-    let inject_system = inject_system || (system_eligible && !tools_eligible && skim_count >= 1);
+    let inject_system = system_eligible && skim_count >= if tools_eligible { 2 } else { 1 };
 
     BreakpointPlan {
         inject_tools,
@@ -873,9 +873,4 @@ mod tests {
         assert_eq!(MAX_MARKERS, 4);
     }
 
-    #[test]
-    fn v1_skim_cap() {
-        // v1 hard cap is 2
-        assert_eq!(V1_SKIM_CAP, 2);
-    }
 }

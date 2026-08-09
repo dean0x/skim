@@ -947,13 +947,6 @@ mod tests {
         assert!(detect_provider(b"garbage").is_none());
     }
 
-    // ── MAX_ALIGN_SCHEMA_DEPTH ────────────────────────────────────────────────
-
-    #[test]
-    fn max_align_schema_depth_constant() {
-        assert_eq!(MAX_ALIGN_SCHEMA_DEPTH, 32);
-    }
-
     // ── Stats ─────────────────────────────────────────────────────────────────
 
     #[test]

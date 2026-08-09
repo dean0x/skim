@@ -2295,23 +2295,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Verify schema version is 4 after all migrations (bumped from 3→4 by #305 analytics-v4).
-    ///
-    /// `test_schema_version_is_4_after_migration` is the canonical assertion;
-    /// this test was updated in-place rather than deleted to preserve the `AD-AN-4` tag trail.
-    #[test]
-    fn test_schema_version_is_3() {
-        let (db, _tmp) = test_db();
-        let version: i64 = db
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            version, 4,
-            "schema version should be 4 after all migrations"
-        );
-    }
-
     // ========================================================================
     // B8: query_session_stats — tagged and untagged invocations
     // ========================================================================
