@@ -97,6 +97,11 @@ fn detect_by_path(path: &str) -> Option<ProxyProvider> {
 /// [`detect_provider`].
 pub(crate) const SHAPE_SNIFF_LIMIT: usize = 8 * 1024;
 
+/// Return the bounded sniff window for `body`: at most [`SHAPE_SNIFF_LIMIT`] bytes.
+fn sniff_window(body: &[u8]) -> &[u8] {
+    &body[..body.len().min(SHAPE_SNIFF_LIMIT)]
+}
+
 /// Classify a request body by shallow JSON shape analysis.
 ///
 /// Reads only the discriminator keys of the JSON object using a
@@ -114,12 +119,7 @@ fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
     use serde::Deserialize;
     use serde::de::IgnoredAny;
 
-    // Only inspect up to SHAPE_SNIFF_LIMIT bytes.
-    let sniff = if body.len() > SHAPE_SNIFF_LIMIT {
-        &body[..SHAPE_SNIFF_LIMIT]
-    } else {
-        body
-    };
+    let sniff = sniff_window(body);
 
     let Ok(text) = std::str::from_utf8(sniff) else {
         // Not valid UTF-8 → cannot be a valid JSON request body → Unknown.
@@ -217,11 +217,7 @@ pub(crate) fn detect_model(body: &[u8]) -> Option<String> {
     use serde::Deserialize;
 
     // Bound the sniff to SHAPE_SNIFF_LIMIT — same budget as provider detection.
-    let sniff = if body.len() > SHAPE_SNIFF_LIMIT {
-        &body[..SHAPE_SNIFF_LIMIT]
-    } else {
-        body
-    };
+    let sniff = sniff_window(body);
 
     let Ok(text) = std::str::from_utf8(sniff) else {
         return None;

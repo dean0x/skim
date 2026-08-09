@@ -75,6 +75,17 @@ use tokio::sync::Semaphore;
 use tokio::time::{Sleep, timeout};
 use tracing::{info, warn};
 
+use rskim_contract::log::{DecisionRecord, DecisionSink, OutcomeReason, SinkFull};
+
+use crate::analytics::{AnalyticsHook, BlockDecisionProjection, ProxyEvent, RequestTier};
+use crate::authmode::classify_auth;
+use crate::config::ProxyConfig;
+use crate::detect::{ProxyProvider, detect_model, detect_provider};
+use crate::errors::ProxyError;
+use crate::forward::{ForwardError, UpstreamClient, forward_request, is_hop_by_hop};
+use crate::health::{ReadinessState, is_health_path, livez_response, readyz_response};
+use crate::seam::{HeaderView, TransformContext, TransformPipeline};
+
 /// Unified response body type: either a buffered error body (Full<Bytes>) or a
 /// streaming upstream body (Incoming). Using BoxBody allows `handle_request` to
 /// return streaming responses without buffering (AC5 / AC7).
@@ -502,17 +513,6 @@ fn fire_upstream_error_event(
         analytics.on_request(&event);
     }));
 }
-
-use rskim_contract::log::{DecisionRecord, DecisionSink, OutcomeReason, SinkFull};
-
-use crate::analytics::{AnalyticsHook, BlockDecisionProjection, ProxyEvent, RequestTier};
-use crate::authmode::classify_auth;
-use crate::config::ProxyConfig;
-use crate::detect::{ProxyProvider, detect_model, detect_provider};
-use crate::errors::ProxyError;
-use crate::forward::{ForwardError, UpstreamClient, forward_request, is_hop_by_hop};
-use crate::health::{ReadinessState, is_health_path, livez_response, readyz_response};
-use crate::seam::{HeaderView, TransformContext, TransformPipeline};
 
 // ============================================================================
 // Connection cap (AD-PXY-13)

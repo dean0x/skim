@@ -220,7 +220,6 @@ pub(crate) fn event_payload_bytes(event: &ProxyEvent) -> u64 {
 ///
 /// Token counting happens HERE on the consumer thread, never on the request
 /// path (AC14 / AD-AN-8).
-/// Spawn the background analytics consumer thread.
 ///
 /// Cross-Plan Amendment #5 (#306 forward annotation): #305 swaps:
 /// - `NullSink` → `ChannelDecisionSink` (collector) in `server.rs:422`
