@@ -673,8 +673,11 @@ fn run_show_commit(
 /// `--show-stats` nor analytics are enabled, so each branch allocates at most
 /// one String — allocation is deferred to branch-time, not cached (MEDIUM-24).
 ///
-/// Emits a stderr notice matching `diff/mod.rs:301` `[skim:guardrail]` style so
-/// callers can observe which tier was selected without parsing structured output.
+/// The raw-fallback notice (`[skim] git show: falling back to raw (tier N)`)
+/// is only emitted to stderr when debug output is enabled
+/// (`--debug` / `SKIM_DEBUG=1` per ADR-011).  On the default silent path the
+/// passthrough still fires and analytics are recorded — only the informational
+/// banner is suppressed (no-loss notices are debug-gated per ADR-011).
 fn passthrough_file_content(
     raw: String,
     label: String,
@@ -683,7 +686,7 @@ fn passthrough_file_content(
     duration: std::time::Duration,
     tier: u8,
 ) {
-    eprintln!("[skim] git show: falling back to raw (tier {tier})");
+    crate::debug_log!("[skim] git show: falling back to raw (tier {tier})");
     print!("{raw}");
     // raw == output (passthrough); move raw into finalize_git_output_passthrough
     // so the analytics path clones once and moves once — 1 allocation total

@@ -234,6 +234,9 @@ pub(crate) fn parse_logs(output: &CommandOutput) -> ParseResult<InfraResult> {
             warnings,
         ),
         ParseResult::Passthrough(raw) => ParseResult::Passthrough(raw),
+        ParseResult::RawPassthrough => {
+            unreachable!("compress_log never returns RawPassthrough")
+        }
     }
 }
 

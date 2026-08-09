@@ -76,8 +76,8 @@ fn line_number_width(hunks: &[DiffHunk<'_>]) -> usize {
 
 /// Render a single file diff with AST-aware context.
 ///
-/// For supported languages: shows changed AST nodes with full boundaries,
-/// preserving `+`/`-` markers from the patch.
+/// For supported languages: shows changed AST nodes in hunk-scoped view
+/// (breadcrumb + hunk lines), preserving `+`/`-` markers from the patch.
 ///
 /// For unsupported languages or parse failures: falls back to raw hunks.
 ///

@@ -138,11 +138,13 @@ Use `-n` / `--line-numbers` to enrich the output with original source line numbe
 
 ### Command wrapping
 
-The rewrite hook may also wrap supported shell commands (`ls`, `grep`,
+The rewrite hook may also wrap supported shell commands (`ls`, `wc`,
 `git diff`, `gh`, test runners, ...) as `skim <tool>`: the same command
 runs with the same arguments and exit code, and skim compresses its
 output. Seeing `skim ls` run in place of `ls` is expected behavior, not
-an error. File reads (`cat`, `head`, `tail` on code files) are rewritten
+an error. Search commands (`grep`, `rg`) are also wrapped but pass through
+output byte-for-byte identical to the raw tool, with no compression.
+File reads (`cat`, `head`, `tail` on code files) are rewritten
 into direct skim reads (example: `cat file.ts` becomes
 `skim file.ts --mode=pseudo`), so the output is a structured view, not
 raw file contents; seeing `skim` run in place of the original command

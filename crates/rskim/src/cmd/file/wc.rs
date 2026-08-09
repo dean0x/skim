@@ -1,154 +1,52 @@
-//! wc parser.
+//! wc pass-through handler (ADR-009).
 //!
-//! Parses `wc` output (line/word/byte counts per file) into structured `FileResult`.
+//! wc's native `count [file]` format is already minimal; any re-encoding
+//! silently breaks downstream pipes:
 //!
-//! Tiers:
-//! - **Tier 1 (Full)**: Parse wc output lines, detect total, format entries
-//! - **Tier 3 (Passthrough)**: Empty output on non-zero exit
-
-use std::process::ExitCode;
-use std::sync::LazyLock;
-
-use regex::Regex;
+//! - Below 7 files output is byte-identical to native.
+//! - The structured parser added a `wc N` header line and reformatted
+//!   `      300 total` into ` total: 300`, so `| tail -1 | awk '{print $1}'`
+//!   yielded `total:` instead of `300`.
+//! - Past 100 files `elision_marker` displaced the grand total entirely
+//!   (silent lossy truncation — a contract violation: parsers must return
+//!   `None` at MAX_INPUT_LINES, not `break`, per cmd/file/mod.rs).
+//!
+//! We therefore emit native output byte-faithfully (ADR-009) via
+//! [`super::passthrough_parse`].
 
 use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::analytics::CommandType;
-use crate::cmd::{ToolRunConfig, run_tool};
-
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "wc",
-    env_overrides: &[],
-    install_hint: "wc is typically pre-installed on Unix systems",
-    family: "file",
-    skip_ansi_strip: false,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    skip_net_savings_guard: false,
-    synthesize_success_line: None,
-    injected_format_flag: None,
-};
-
-/// Matches full wc output: lines words bytes filename
-static RE_WC_FULL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.+)$").unwrap());
-
-/// Matches single-stat wc output: count filename (e.g., `wc -l`)
-static RE_WC_SINGLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+)\s+(.+)$").unwrap());
-
 /// Run `skim wc [args...]`.
-pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+pub(crate) fn run(
+    args: &[String],
+    ctx: &crate::cmd::RunContext,
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "wc",
+            install_hint: "wc is typically pre-installed on Unix systems",
+            expected_exit_codes: &[],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
 }
 
-/// Three-tier parse function for wc output.
+/// Parse function: always native passthrough.
+///
+/// wc's stdout is already in native `count [file]` format — structurally
+/// minimal and pipe-safe.  Re-encoding the output reformats numeric columns
+/// and adds a header line that breaks `tail -1 | awk '{print $1}'` and
+/// similar pipeline patterns.  Past the 100-entry cap the grand total row
+/// was displaced entirely, violating the lossless-degrade contract (ADR-009).
+///
+/// Delegates to [`super::passthrough_parse`] so the byte-faithful contract
+/// has a single implementation across all pure-passthrough handlers.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    // Non-zero exit with empty stdout is an error condition
-    if output.exit_code != Some(0) && output.stdout.trim().is_empty() {
-        return ParseResult::Passthrough(output.stdout.clone());
-    }
-
-    if let Some(result) = try_parse_wc(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
-}
-
-// ============================================================================
-// Tier 1: wc output parsing
-// ============================================================================
-
-fn try_parse_wc(stdout: &str) -> Option<FileResult> {
-    if stdout.trim().is_empty() {
-        return None;
-    }
-
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
-    let mut total_count = 0usize;
-    let mut footer_entry: Option<String> = None;
-
-    for (i, line) in stdout.lines().enumerate() {
-        if i >= MAX_INPUT_LINES {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Try full mode: lines words bytes filename
-        if let Some(caps) = RE_WC_FULL.captures(trimmed) {
-            let lines_n: u64 = caps[1].parse().unwrap_or(0);
-            let words_n: u64 = caps[2].parse().unwrap_or(0);
-            let bytes_n: u64 = caps[3].parse().unwrap_or(0);
-            let filename = caps[4].trim();
-
-            if filename == "total" {
-                footer_entry = Some(format!(
-                    "total: {lines_n} lines, {words_n} words, {bytes_n} bytes"
-                ));
-            } else {
-                total_count += 1;
-                if entries.len() < MAX_DISPLAY_ENTRIES {
-                    entries.push(format!(
-                        "{filename}: {lines_n} lines, {words_n} words, {bytes_n} bytes"
-                    ));
-                }
-            }
-            continue;
-        }
-
-        // Try single-stat mode: count filename (e.g., wc -l)
-        if let Some(caps) = RE_WC_SINGLE.captures(trimmed) {
-            let count: u64 = caps[1].parse().unwrap_or(0);
-            let filename = caps[2].trim();
-
-            if filename == "total" {
-                footer_entry = Some(format!("total: {count}"));
-            } else {
-                total_count += 1;
-                if entries.len() < MAX_DISPLAY_ENTRIES {
-                    entries.push(format!("{count} {filename}"));
-                }
-            }
-        }
-    }
-
-    // Handle stdin-only output (just a bare count with no filename)
-    if total_count == 0 && entries.is_empty() && footer_entry.is_none() {
-        // Try bare number (stdin mode)
-        let trimmed = stdout.trim();
-        if !trimmed.is_empty()
-            && trimmed
-                .chars()
-                .all(|c| c.is_ascii_digit() || c.is_whitespace())
-        {
-            return Some(FileResult::new(
-                "wc".to_string(),
-                1,
-                1,
-                vec![trimmed.to_string()],
-                None,
-            ));
-        }
-        return None;
-    }
-
-    let shown_count = entries.len();
-    let footer = crate::output::elision_marker(shown_count, total_count, "lines").or(footer_entry);
-
-    Some(FileResult::new(
-        "wc".to_string(),
-        total_count,
-        shown_count,
-        entries,
-        footer,
-    ))
+    super::passthrough_parse(output)
 }
 
 // ============================================================================
@@ -158,95 +56,65 @@ fn try_parse_wc(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_utils::{load_fixture, make_output_full};
+    use crate::cmd::test_utils::make_output;
 
     #[test]
-    fn test_tier1_wc_full_mode() {
-        let input = load_fixture("file", "wc_small.txt");
-        let result = try_parse_wc(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 5, "5 files, not counting total line");
-        assert!(result.footer.is_some(), "total line should become footer");
-        let footer = result.footer.as_ref().unwrap();
-        assert!(footer.contains("total"), "footer should mention total");
-    }
-
-    #[test]
-    fn test_tier1_wc_lines_only() {
-        let input = load_fixture("file", "wc_lines_only.txt");
-        let result = try_parse_wc(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 5, "5 files in single-stat mode");
-        // Each entry shows count then filename
-        assert!(
-            result.entries.iter().any(|e| e.contains("src/main.rs")),
-            "entries should contain file names"
-        );
-    }
-
-    #[test]
-    fn test_tier1_wc_stdin_no_filename() {
-        // wc with stdin input just produces a bare number
-        let input = "      42\n";
-        let result = try_parse_wc(input);
-        assert!(result.is_some(), "Expected parse to succeed for stdin mode");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 1);
-    }
-
-    #[test]
-    fn test_tier1_wc_total_as_footer() {
-        let input = load_fixture("file", "wc_small.txt");
-        let result = try_parse_wc(&input).unwrap();
-        let footer = result.footer.as_ref().expect("total should become footer");
-        assert!(
-            footer.contains("total"),
-            "Footer should reference the total line"
-        );
-        // The total line should NOT appear as a regular entry
-        assert!(
-            !result.entries.iter().any(|e| e == "total"),
-            "total should not appear as a regular entry"
-        );
-    }
-
-    #[test]
-    fn test_tier3_empty_on_error() {
-        let output = make_output_full("", "", Some(1));
+    fn test_parse_impl_is_passthrough() {
+        // parse_impl must always return RawPassthrough so that execution.rs
+        // serves output.stdout byte-faithfully (native count [file] format).
+        let input = "      42    170   1234 src/main.rs\n     100    400   5678 src/lib.rs\n";
+        let output = make_output(input);
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "Empty output on error should be passthrough, got {}",
+            "parse_impl must be Passthrough tier (native wc output): got {}",
+            result.tier_name()
+        );
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough (zero-clone stdout pass-through): got {}",
             result.tier_name()
         );
     }
 
     #[test]
-    fn test_parse_impl_produces_full() {
-        let input = load_fixture("file", "wc_small.txt");
-        let output = make_output_full(&input, "", Some(0));
+    fn test_parse_impl_empty_is_passthrough() {
+        let output = make_output("");
         let result = parse_impl(&output);
         assert!(
-            result.is_full(),
-            "parse_impl with exit code 0 and valid wc output should return Full, got {}",
+            result.is_passthrough(),
+            "Empty wc output should be Passthrough, got {}",
             result.tier_name()
         );
     }
 
+    /// parse_impl returns RawPassthrough regardless of input volume — confirming that
+    /// execution.rs emits output.stdout directly, not a parse-result transformation.
     #[test]
-    fn test_display_format() {
-        let input = load_fixture("file", "wc_small.txt");
-        let result = try_parse_wc(&input).unwrap();
-        let rendered = format!("{result}");
+    fn test_native_output_line_count_parity() {
+        let input: String = (1..=10)
+            .map(|i| format!("      {i}      {i}     {i} file{i}.rs\n"))
+            .collect();
+        let output = make_output(&input);
+        let result = parse_impl(&output);
         assert!(
-            rendered.contains("wc "),
-            "Header should start with tool name"
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough for lossless stdout pass-through"
         );
+    }
+
+    /// The grand total row (`total` label) must reach the caller verbatim.
+    /// The previous structured parser displaced it past the 100-entry cap
+    /// via `elision_marker(...).or(footer_entry)`.
+    #[test]
+    fn test_grand_total_line_passes_through() {
+        let input = "      10     20     30 a.rs\n      20     40     60 b.rs\n      30     60     90 total\n";
+        let output = make_output(input);
+        let result = parse_impl(&output);
         assert!(
-            rendered.contains("src/main.rs"),
-            "Entries should appear in output"
+            matches!(result, ParseResult::RawPassthrough),
+            "total row must use RawPassthrough so stdout is served verbatim: {}",
+            result.tier_name()
         );
     }
 }

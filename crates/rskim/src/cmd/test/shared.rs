@@ -208,6 +208,14 @@ where
             let _ = result.emit_markers(&mut io::stderr().lock());
             resolve_exit_code(0, exit_source)
         }
+        ParseResult::RawPassthrough => {
+            // RawPassthrough: payload-less passthrough — serve raw_output byte-faithfully.
+            // Shared plumbing, behavior-preserving: mirrors execution.rs text-mode arm.
+            // effective_tier is already "passthrough" from result.tier_name() above.
+            let _ = result.emit_markers(&mut io::stderr().lock());
+            crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+            resolve_exit_code(0, exit_source)
+        }
     };
 
     if show_stats {

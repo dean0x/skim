@@ -2,6 +2,22 @@
 //!
 //! Called via flat dispatch: `skim <tool> [args...]`. Supported tools:
 //! `df`, `diff`, `du`, `env`, `find`, `grep`, `ls`, `printenv`, `ps`, `rg`, `tree`, `wc`.
+//!
+//! ## Shared passthrough helpers
+//!
+//! [`passthrough_parse`] is the single implementation of the byte-faithful native
+//! passthrough contract (ADR-009) for pure-passthrough file handlers (df, du,
+//! find, grep, ps, rg, wc).  All modules delegate to it so a future fidelity
+//! fix lands in one place.
+//!
+//! [`passthrough_config`] is the SINGLE write-point for `skip_ansi_strip: true`
+//! across the whole passthrough family; [`run_passthrough_tool`] combines it with
+//! [`super::run_tool`] so each handler's `run` function reduces to one call.
+
+use super::{RunContext, ToolRunConfig, run_tool};
+use crate::output::ParseResult;
+use crate::output::canonical::FileResult;
+use crate::runner::CommandOutput;
 
 pub(crate) mod df;
 pub(crate) mod diff;
@@ -16,15 +32,103 @@ pub(crate) mod wc;
 
 use std::process::ExitCode;
 
-use std::collections::BTreeMap;
-
 use super::extract_show_stats;
-use crate::output::canonical::FileResult;
 
 /// Known file tools that the file handler can dispatch to.
 const KNOWN_TOOLS: &[&str] = &[
     "df", "diff", "du", "env", "find", "grep", "ls", "printenv", "ps", "rg", "tree", "wc",
 ];
+
+/// Shared pure-passthrough parse helper for df, du, find, grep, ps, rg, wc,
+/// and any future byte-faithful pass-through file handlers.
+///
+/// Returns [`ParseResult::RawPassthrough`] — a payload-less signal that
+/// `execution.rs` should serve `CommandOutput::stdout` byte-faithfully without
+/// cloning it into the parse result.  The byte-faithful contract (ADR-009) lives
+/// in one place; a future fidelity fix (e.g., adjusting how TAB bytes are
+/// handled) touches only this function, not N identical copies.
+///
+/// The `_output` parameter is intentionally ignored: the whole point of
+/// `RawPassthrough` is that the parse result carries no payload — the original
+/// `CommandOutput::stdout` buffer is served directly by the caller.
+pub(super) fn passthrough_parse(_output: &CommandOutput) -> ParseResult<FileResult> {
+    ParseResult::RawPassthrough
+}
+
+/// Per-tool variation for a pure-passthrough file handler.
+///
+/// Pass to [`passthrough_config`] or [`run_passthrough_tool`] so all
+/// boilerplate — including the single write of `skip_ansi_strip: true` —
+/// lives in exactly one place for the whole family.
+pub(super) struct PassthroughSpec<'a> {
+    /// Binary name (e.g. `"grep"`, `"wc"`).
+    pub program: &'a str,
+    /// Text printed when the tool binary is not found.
+    pub install_hint: &'a str,
+    /// Non-zero exit codes the tool exits on a benign outcome.
+    ///
+    /// `grep`/`rg` use `&[1]` (no match is not an error).
+    /// Most passthrough tools use `&[]`.
+    pub expected_exit_codes: &'a [i32],
+}
+
+/// Build a [`ToolRunConfig`] for a pure-passthrough file handler.
+///
+/// `skip_ansi_strip: true` is written **here and only here** for the whole
+/// passthrough family.  The ANSI-strip step in `cmd/execution.rs` runs BEFORE
+/// `parse()` and shadows the `output` binding, so a `RawPassthrough` result
+/// serves the already-stripped bytes; any wrapper whose bytes reach the reader
+/// unparsed MUST have this flag set to `true`.
+///
+/// This is a `const fn` so callers can use it in `const` contexts with zero
+/// run-time allocation.  The 64 MiB ceiling is enforced upstream by the runner;
+/// no second buffer is created here.
+///
+/// # Convention note
+///
+/// Rust cannot prevent a future author from hand-rolling a `ToolRunConfig`
+/// literal and bypassing this constructor, so this is a convention, not a
+/// compiler guarantee.  Two things back it up:
+///
+/// - `test_passthrough_config_always_sets_skip_ansi_strip` (this module) pins
+///   the constructor itself, so the flag cannot be flipped here.
+/// - a `debug_assert!` in `cmd/execution.rs` (just after `parse()`) rejects any
+///   `RawPassthrough` result produced under `skip_ansi_strip: false`, which is
+///   what catches a hand-rolled bypass — in any family, not just this one.
+pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRunConfig<'a> {
+    ToolRunConfig {
+        program: spec.program,
+        env_overrides: &[],
+        install_hint: spec.install_hint,
+        family: "file",
+        skip_ansi_strip: true, // THE single write for the whole passthrough family
+        command_type: crate::analytics::CommandType::FileOps,
+        expected_exit_codes: spec.expected_exit_codes,
+        forward_stderr: true,
+        // `parse_impl` always returns `RawPassthrough`, so the net-savings guard
+        // never runs for any passthrough-family tool; `false` is the semantically
+        // correct default (ADR-001 — guard is for tools that might emit a larger
+        // compressed view than the raw; passthrough has no compressed view at all).
+        skip_net_savings_guard: false,
+        synthesize_success_line: None,
+        injected_format_flag: None,
+    }
+}
+
+/// Execute a pure-passthrough file tool.
+///
+/// Combines [`passthrough_config`] and [`run_tool`] so each handler's `run`
+/// function is a single call.  `parse_fn` is kept as a parameter — the 16
+/// existing `test_parse_impl_is_passthrough` unit tests call each module's
+/// `parse_impl` directly, keeping that symbol reachable and dead-code-lint-clean.
+pub(super) fn run_passthrough_tool(
+    spec: PassthroughSpec<'_>,
+    args: &[String],
+    ctx: &RunContext,
+    parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<FileResult>,
+) -> anyhow::Result<std::process::ExitCode> {
+    run_tool(passthrough_config(spec), args, ctx, |_| {}, parse_fn)
+}
 
 /// Maximum path/match entries shown in output (truncation cap).
 pub(crate) const MAX_DISPLAY_ENTRIES: usize = 100;
@@ -115,154 +219,12 @@ fn print_help() {
 }
 
 // ============================================================================
-// Shared grep/rg regex constants and parser
-// ============================================================================
-
-/// Matches `file:line_number:content` format produced by both `grep -n` and `rg`.
-pub(super) static RE_FILE_LINE_CONTENT: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^([^:]+):(\d+):(.*)$").unwrap());
-
-/// Parse `file:line:content` text output shared by grep and rg.
-///
-/// Groups ALL matches by file path — grouping is re-encoding, never truncation:
-/// every match line in the input appears in the output. (#317)
-///
-/// `tool` — binary name used in the result summary (e.g. `"grep"`, `"rg"`).
-/// `text` — raw stdout from the tool.
-/// `fallback_label` — when `Some`, lines that do not match the regex are
-///   bucketed under this label (e.g. `"<stdin>"` when grep ran with no file
-///   operands, `"(no filename)"` under `-h`). When `None`, an unattributable
-///   line aborts the structured parse (returns `None`) so the caller degrades
-///   to lossless `Passthrough` instead of dropping or mislabeling lines.
-pub(super) fn try_parse_file_line_content(
-    tool: &str,
-    text: &str,
-    fallback_label: Option<&str>,
-) -> Option<FileResult> {
-    if text.lines().nth(MAX_INPUT_LINES).is_some() {
-        return None;
-    }
-
-    let mut file_matches: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut binary_notices: Vec<String> = Vec::new();
-    let mut total_matches = 0usize;
-
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line == "--" {
-            // Context-group separator (grep -A/-B/-C) — pure formatting noise.
-            continue;
-        }
-        if line.starts_with("Binary file ") {
-            binary_notices.push(line.to_string());
-            continue;
-        }
-        if let Some(caps) = RE_FILE_LINE_CONTENT.captures(line) {
-            let file = caps[1].to_string();
-            let lineno = &caps[2];
-            let content = caps[3].trim_end();
-            total_matches += 1;
-            file_matches
-                .entry(file)
-                .or_default()
-                .push(format!("  :{lineno}: {content}"));
-        } else {
-            let label = fallback_label?;
-            total_matches += 1;
-            file_matches
-                .entry(label.to_string())
-                .or_default()
-                .push(format!("  {line}"));
-        }
-    }
-
-    if total_matches == 0 {
-        return None;
-    }
-
-    build_file_result(tool, total_matches, file_matches, binary_notices)
-}
-
-// ============================================================================
-// Shared result builder for grep/rg parsers
-// ============================================================================
-
-/// Build a [`FileResult`] from grouped file matches.
-///
-/// Emits every match in every file — no per-file or file-count caps, no
-/// elision footer. `shown_count == total_count` so the canonical header
-/// renders as `tool N` (no truncation ratio; Fix F). (#317)
-///
-/// The file count is folded into the FOOTER instead of a prepended
-/// `TOOL: N matches in M files` double-header (the no-double-header pattern
-/// from ls FIX 5). Pluralization ("1 file" / "3 files") follows the
-/// `diff.rs` footer idiom — ls/tree intentionally do not pluralize their
-/// `N dirs, M files` breakdown. (#370, #317)
-///
-/// `tool` — binary name (e.g. `"grep"`, `"rg"`).
-/// `total_matches` — total match count across all files.
-/// `file_matches` — map from file path to formatted match lines.
-/// `extra_entries` — verbatim lines appended after the groups (e.g.
-///   `Binary file x matches` notices); not counted as matches.
-pub(super) fn build_file_result(
-    tool: &str,
-    total_matches: usize,
-    file_matches: BTreeMap<String, Vec<String>>,
-    extra_entries: Vec<String>,
-) -> Option<FileResult> {
-    let file_count = file_matches.len();
-    if file_count == 0 && extra_entries.is_empty() {
-        return None;
-    }
-
-    // No summary prepend — the `tool N` canonical header renders separately.
-    // Fold the file count into the footer with correct pluralization. (#370)
-    let mut all_entries: Vec<String> = Vec::new();
-    for (file, matches) in &file_matches {
-        all_entries.push(file.clone());
-        all_entries.extend(matches.iter().cloned());
-    }
-    all_entries.extend(extra_entries);
-
-    let footer = (file_count > 0).then(|| {
-        format!(
-            "{file_count} file{}",
-            if file_count == 1 { "" } else { "s" }
-        )
-    });
-
-    Some(FileResult::new(
-        tool.to_string(),
-        total_matches,
-        total_matches,
-        all_entries,
-        footer,
-    ))
-}
-
-// ============================================================================
 // Unit tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
-    /// R7: file:line:content path must preserve leading whitespace.
-    #[test]
-    fn test_r7_file_line_content_preserves_leading_indent() {
-        let input = "src/mod.py:5:    def __init__(self):\nsrc/mod.py:8:        pass\n";
-        let result = super::try_parse_file_line_content("grep", input, None).unwrap();
-        let rendered = format!("{result}");
-        assert!(
-            rendered.contains("    def __init__"),
-            "leading 4-space indent must be preserved in file:line:content output (R7): {rendered}"
-        );
-        assert!(
-            rendered.contains("        pass"),
-            "8-space indent must be preserved (R7): {rendered}"
-        );
-    }
+    use super::*;
 
     #[test]
     fn test_sanitize_for_display_clean_input() {
@@ -274,5 +236,71 @@ mod tests {
         let input = "tool\x1b[31mred\x1b[0m";
         let sanitized = crate::cmd::sanitize_for_display(input);
         assert!(!sanitized.contains('\x1b'));
+    }
+
+    // ========================================================================
+    // passthrough_config: reintroduction guard
+    // ========================================================================
+
+    /// Verify that every call to `passthrough_config` produces a config with
+    /// `skip_ansi_strip: true`.
+    ///
+    /// SCOPE — read before citing this test as coverage.  It pins the
+    /// CONSTRUCTOR, so a new tool that goes through `run_passthrough_tool` is
+    /// correct by construction and needs no assertion of its own.  It does NOT
+    /// detect a new tool that hand-rolls a `ToolRunConfig` literal with
+    /// `skip_ansi_strip: false` — this test would still pass.  That case is
+    /// caught instead by the `debug_assert!` in `cmd/execution.rs` after
+    /// `parse()`, which fires on any `RawPassthrough` produced under a
+    /// `false` flag.  Neither mechanism is a compiler guarantee.
+    #[test]
+    fn test_passthrough_config_always_sets_skip_ansi_strip() {
+        let spec = PassthroughSpec {
+            program: "test-tool",
+            install_hint: "install hint",
+            expected_exit_codes: &[],
+        };
+        let config = passthrough_config(spec);
+        assert!(
+            config.skip_ansi_strip,
+            "passthrough_config must always set skip_ansi_strip: true — \
+             the ANSI-strip step in execution.rs runs before parse() and \
+             shadows the output binding; RawPassthrough serves those stripped \
+             bytes, so any unparsed passthrough MUST set this flag"
+        );
+    }
+
+    /// Verify that `expected_exit_codes` passes through the constructor unchanged.
+    ///
+    /// `grep` and `rg` exit 1 on no match — this is benign.  Dropping `&[1]`
+    /// from their spec silently reclassifies exit 1 as `UnexpectedFailure`, a
+    /// real regression.  The test covers both the grep/rg case (`&[1]`) and the
+    /// common case (`&[]`) to confirm neither inherits the other's codes.
+    #[test]
+    fn test_passthrough_config_expected_exit_codes_pass_through() {
+        // grep and rg: exit 1 == "no match" (benign)
+        for program in &["grep", "rg"] {
+            let config = passthrough_config(PassthroughSpec {
+                program,
+                install_hint: "hint",
+                expected_exit_codes: &[1],
+            });
+            assert_eq!(
+                config.expected_exit_codes,
+                &[1],
+                "{program} config must carry expected_exit_codes: [1]"
+            );
+        }
+
+        // A tool with no special exit codes must not inherit &[1]
+        let config = passthrough_config(PassthroughSpec {
+            program: "wc",
+            install_hint: "hint",
+            expected_exit_codes: &[],
+        });
+        assert!(
+            config.expected_exit_codes.is_empty(),
+            "wc config must not carry any expected_exit_codes"
+        );
     }
 }

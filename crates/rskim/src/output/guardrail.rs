@@ -82,9 +82,22 @@ pub(crate) fn apply(
     }
 }
 
-/// Convenience wrapper: apply the guardrail with stderr as the warning writer.
+/// Convenience wrapper: apply the guardrail.
+///
+/// The warning (`[skim:guardrail] compressed output larger than raw; emitting
+/// raw`) is only emitted to stderr when debug output is enabled
+/// (`--debug` / `SKIM_DEBUG=1`).  On the default silent path the guardrail
+/// still fires and returns the raw output — only the informational banner is
+/// suppressed.
+///
+/// The `apply` function (and its unit tests) are unaffected: they accept an
+/// explicit writer so test assertions on the banner text still work.
 pub(crate) fn apply_to_stderr(raw: String, compressed: String) -> Result<GuardrailOutcome> {
-    apply(raw, compressed, &mut io::stderr())
+    if crate::debug::is_debug_enabled() {
+        apply(raw, compressed, &mut io::stderr())
+    } else {
+        apply(raw, compressed, &mut io::sink())
+    }
 }
 
 // ============================================================================

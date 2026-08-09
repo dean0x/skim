@@ -111,6 +111,9 @@ pub(crate) fn run(
                     }
                 }
                 ParseResult::Passthrough(_) => ExitCode::FAILURE,
+                ParseResult::RawPassthrough => {
+                    unreachable!("pytest local parser never returns RawPassthrough")
+                }
             }
         }
     };
@@ -504,6 +507,9 @@ fn emit_result(
         ParseResult::Passthrough(raw) => {
             write!(out, "{raw}")?;
             result.emit_markers(&mut err)?;
+        }
+        ParseResult::RawPassthrough => {
+            unreachable!("pytest local parser never returns RawPassthrough")
         }
     }
 

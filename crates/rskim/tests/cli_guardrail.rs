@@ -113,10 +113,54 @@ fn test_guardrail_triggers_when_output_inflates() {
     std::fs::write(&file, &source).unwrap();
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .arg(file.to_str().unwrap())
         .arg("--mode=structure")
         .arg("--no-cache")
         .assert()
         .success()
         .stderr(predicate::str::contains("[skim:guardrail]"));
+}
+
+/// SKIM_DEBUG-unset negative twin of `test_guardrail_triggers_when_output_inflates`.
+///
+/// Same inflating-file scenario (guardrail DOES fire), but with SKIM_DEBUG removed
+/// by `skim_cmd()`.  Per ADR-011, when the guardrail fires the banner routes to
+/// `io::sink()` when debug mode is off — stderr must be empty.
+///
+/// Paired with the SKIM_DEBUG=1 positive assertion above to make the gate
+/// revert-detectable: reverting `apply_to_stderr` to always-write leaves the
+/// positive test green (banner still appears) but breaks this test (stderr would no
+/// longer be empty) — CI catches the regression.  Without this twin, all four Fix-5
+/// gating edits can be reverted and the suite stays green.
+#[test]
+fn test_guardrail_fires_silently_without_debug() {
+    // Identical inflating source to test_guardrail_triggers_when_output_inflates:
+    // 20 functions with empty bodies inflate under --mode=structure above the
+    // MIN_RAW_SIZE_FOR_GUARDRAIL threshold.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("inflating.ts");
+
+    let mut source = String::new();
+    for i in 0..20 {
+        source.push_str(&format!("function f{i}() {{ }}\n"));
+    }
+    assert!(
+        source.len() >= 256,
+        "Test file must be >= 256 bytes for guardrail to activate, got {}",
+        source.len()
+    );
+
+    std::fs::write(&file, &source).unwrap();
+
+    // SKIM_DEBUG is unset — skim_cmd() removes it at construction.
+    // The guardrail fires (output inflates) but apply_to_stderr routes the banner
+    // to io::sink() when debug mode is off.  Stderr must be empty.
+    skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--mode=structure")
+        .arg("--no-cache")
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
 }
