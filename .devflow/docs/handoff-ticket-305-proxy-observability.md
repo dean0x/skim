@@ -1,4 +1,4 @@
-# Phase 4 Handoff: ticket/305-proxy-observability — ProxyEvent Extension + AnalyticsCompletionBody
+# Phase 5 Handoff: ticket/305-proxy-observability — BridgeAnalyticsHook + proxy.rs Wiring
 
 ## Commits (all phases)
 
@@ -7,164 +7,144 @@
 f23ab7a6 feat(analytics): Phase 2 recording core — CommandType::Proxy, select_encoding, record_proxy, analytics_meta (#305)
 31c57849 feat(analytics): Phase 3 — CLI scope separation, proxy query methods, stats rendering (#305)
 f1d5eaa7 feat(proxy): Phase 4 observability — ProxyEvent extension, model detection, AnalyticsCompletionBody (#305)
+b0c341dd docs(handoff): Phase 4 proxy observability handoff for Phase 5 (#305)
+5dd09bbe feat(proxy): Phase 5 — BridgeAnalyticsHook, consumer thread, proxy.rs wiring (#305)
 ```
 
-## Phase 4 Summary
+## Phase 5 Summary
 
-### Files Modified
+### Files Created/Modified
+
+**`crates/rskim/src/cmd/proxy_analytics.rs`** (new, `#[cfg(feature = "proxy")]`)
+
+Core bridge module. Key exports:
+
+- `PROXY_QUEUE_RECORD_CAPACITY: usize = 2048` (AD-AN-8 / ADR-003/PF-005 rustdoc)
+- `PROXY_QUEUE_BYTE_BUDGET: u64 = 128 * 1024 * 1024` (AD-AN-8 / ADR-003/PF-005 rustdoc)
+- `FLUSH_BOUND: Duration = Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS)` (AD-AN-12)
+- `BridgeAnalyticsHook` struct implementing `AnalyticsHook`:
+  - `new(capacity: usize) -> (Self, Receiver<ProxyEvent>)`
+  - `drop_count_handle() -> Arc<AtomicU64>`
+  - `queued_bytes_handle() -> Arc<AtomicU64>`
+  - `on_request(&self, event: &ProxyEvent)` — dual-bound non-blocking enqueue only (AC14)
+- `event_payload_bytes(event: &ProxyEvent) -> u64` — raw + final body bytes
+- `spawn_consumer(rx, drop_count, queued_bytes, session_id, done_tx) -> JoinHandle<()>`
+  - Token counting happens HERE (AC14)
+  - Fail-open on any rusqlite error (AC15)
+  - Persists drop count exactly once at shutdown (AD-AN-8)
+  - Signals `done_tx` on channel close
+- `compute_token_counts(event, recording_provider) -> (Option<i64>, Option<i64>, Option<f64>)`
+  - AD-AN-7: pair-jointly NULL on non-UTF-8 body
+  - AD-AN-11: single encoding via `select_encoding(provider, model)`
+- `build_proxy_record_input(event, session_id) -> ProxyRecordInput`
+- `to_recording_provider(provider: &ProxyProvider) -> RecordingProvider` (private)
+- `bounded_count(counter, text) -> i64` (private, applies 256 KiB cap)
+
+**`crates/rskim/src/cmd/mod.rs`**
+
+Added `#[cfg(feature = "proxy")] mod proxy_analytics;` alongside the existing proxy module gate.
+
+**`crates/rskim/src/cmd/proxy.rs`**
+
+`run()` function updated:
+- When `_analytics.enabled`: constructs `BridgeAnalyticsHook`, spawns consumer, moves
+  `analytics_arc` into `serve_with_stage` (retaining no clone — AD-AN-12), then waits
+  `done_rx.recv_timeout(FLUSH_BOUND)` for bounded shutdown. On FLUSH_BOUND timeout:
+  returns without blocking (OS reclaims thread).
+- When disabled: uses `NoopAnalyticsHook` (no consumer spawned).
+- Uses separate `let` bindings (not a tuple) to satisfy clippy::type_complexity.
 
 **`crates/rskim-proxy/src/analytics.rs`**
 
-New types added (all `pub`, `#[non_exhaustive]` preserved on ProxyEvent):
+`ProxyEvent::new()` changed from `pub(crate)` to `pub` to allow cross-crate construction
+in `proxy_analytics.rs` tests.
 
-- `RequestTier` enum: `Full | Degraded | Passthrough` with `as_str()` method
-  (`"full"` / `"degraded"` / `"passthrough"`)
-- `BlockDecisionProjection` struct: `component: &'static str`, `outcome: &'static str`,
-  `bytes_in: usize`, `bytes_out: usize`
-- `ProxyEvent` extended with new fields:
-  - `model: Option<String>` — verbatim from request body (AD-PXY-22)
-  - `turn_id: Option<String>` — always `None` in Phase 4 (reserved for Phase 5)
-  - `tier: RequestTier` — derived from block-router decisions (AD-PXY-21)
-  - `raw_body: Bytes` — original request bytes (Arc-cheap)
-  - `final_body: Bytes` — post-transform request bytes
-  - `block_decisions: Vec<BlockDecisionProjection>` — per-block projection
-  - `upstream_error_status: Option<u16>` — Some(502|504) for upstream-errored rows (AD-PXY-25)
-- `ProxyEvent::request_bytes` now derived from `raw_body.len()` inside `new()` (not a param)
-- `ProxyEvent::response_bytes` always 0 (streaming; not counted at relay time)
-- `ProxyEvent::new()` now takes 9 params (7 new): provider, model, turn_id, tier, raw_body,
-  final_body, block_decisions, upstream_error_status, duration
+**`crates/rskim/Cargo.toml`**
 
-**`crates/rskim-proxy/src/detect.rs`**
+Added `bytes = { workspace = true }` to `[dev-dependencies]` for proxy_analytics test helpers.
 
-- `detect_model(body: &[u8]) -> Option<String>` — `pub(crate)`, uses `ModelOnly`
-  struct with `serde::Deserialize`, bounded by `SHAPE_SNIFF_LIMIT` (8KiB),
-  returns model string verbatim with no normalization (AD-PXY-22).
-  Returns `None` for non-UTF-8, parse failure, or absent `"model"` key.
-  6 unit tests added to the existing `tests` module.
-
-**`crates/rskim-proxy/src/seam.rs`**
-
-- Updated AD-PXY-09 comment on `TransformContext` module, struct, and `new()`:
-  "turn_id lives on ProxyEvent, not TransformContext"
-- No code changes to `TransformContext` struct or constructor.
-
-**`crates/rskim-proxy/src/server.rs`**
-
-Major changes:
-
-- **`NullSink` removed** (was dead code after Phase 4 changes)
-- **`AnalyticsCompletionBody` added** (AD-PXY-23): observe-only body wrapper that:
-  - Delegates every `poll_frame` unchanged (ADR-007 egress losslessness)
-  - Fires `analytics.on_request(&event)` exactly once at: clean EOF (poll_frame returns None)
-    or Drop (client disconnect / stream error)
-  - `fired: bool` guard prevents double-fire
-  - Sets `event.duration = start.elapsed()` at fire time (not header time)
-  - `catch_unwind` per AC9
-- **`derive_tier(records: &[DecisionRecord]) -> RequestTier`** (AD-PXY-21):
-  - Filters to `"block-router"` component only (Cross-Plan Amendment #3)
-  - Priority: any Degraded → Degraded; any Full → Full; else Passthrough
-- **`project_decision(record: &DecisionRecord) -> BlockDecisionProjection`** (AD-AN-13):
-  - Maps `OutcomeReason` to outcome `&'static str`
-  - Copies `bytes_in` / `bytes_out` directly
-- **`fire_upstream_error_event(...)`** helper (AD-PXY-25):
-  - Builds ProxyEvent with `upstream_error_status = Some(status)`
-  - Called at all post-transform 502/504 return sites
-  - `catch_unwind` per AC9
-- **`handle_request` modified**:
-  - `detect_model()` called after provider detection (AD-PXY-22)
-  - `MockSink::new()` (from `rskim_contract::log`) replaces `NullSink` (AD-PXY-21)
-  - `pipeline.run(..., &collecting_sink)` uses collecting sink
-  - After transform: `collecting_sink.drain()` → `derive_tier()` → `project_decision` vec
-  - Post-transform 502 (empty upstream URL): `fire_upstream_error_event(..., 502, ...)` (AD-PXY-25)
-  - Post-transform 504 (timeout): `fire_upstream_error_event(..., 504, ...)` (AD-PXY-25)
-  - Post-transform 502 (bad URL / connection error): `fire_upstream_error_event(..., 502, ...)` (AD-PXY-25)
-  - Success path: build `ProxyEvent` (duration=ZERO), wrap relay body in
-    `AnalyticsCompletionBody::new(relay_inner_body, event, analytics, start).boxed()`
-  - Pre-transform failures (400, Unknown+no-default 502): NO analytics event (AD-PXY-24)
-- **Unit tests added** to `#[cfg(test)]` block in server.rs:
-  - `test_derive_tier_*` (6 tests): empty, Full, Degraded, Degraded-trumps-Full, filter exclusion
-  - `test_project_decision_*` (3 tests): full, passthrough, degraded
-
-**`crates/rskim-proxy/tests/proxy_analytics_tier_tests.rs`** (new)
-
-Integration test file, all tests `#[cfg(feature = "testing")]`, PF-012 ephemeral ports:
-- Synthetic stages: `BlockRouterFullStage`, `BlockRouterDegradedStage`, `CacheAlignFullStage`
-- `FullCapturingHook` captures full `ProxyEvent` + atomic fired count
-- Tests:
-  - `test_tier_full_when_block_router_modifies` (AD-PXY-21)
-  - `test_tier_degraded_when_block_router_degrades` (AD-PXY-21)
-  - `test_tier_passthrough_when_only_cache_align_modifies` (Cross-Plan Amendment #3)
-  - `test_tier_degraded_trumps_full_in_mixed_records` (AD-PXY-21 priority rule)
-  - `test_model_detected_in_analytics_event` (AD-PXY-22)
-  - `test_model_none_when_body_has_no_model_key` (AD-PXY-22)
-  - `test_no_event_for_unknown_provider_no_default_upstream` (AD-PXY-24)
-  - `test_upstream_error_event_when_no_upstream_configured` (AD-PXY-25)
-  - `test_analytics_fires_at_stream_end_not_header_time` (AD-PXY-23)
-  - `test_raw_body_and_final_body_fields` (AD-PXY-21)
-
-### Phase 4 Test Results
+### Phase 5 Test Results
 
 ```
-Summary [  32.730s] 151 tests run: 151 passed, 0 skipped
+Summary [16.324s] 3241 tests run: 3241 passed, 0 skipped
 ```
-EXIT=0
+EXIT=0 (with `--features proxy`)
 
-Phase 3 baseline was 3213 tests. Phase 4 adds 21 rskim-proxy tests (10 new
-integration in `proxy_analytics_tier_tests.rs` + 9 unit tests in `server.rs` +
-6 in `detect.rs` from Phase 4's detect_model). The cross-crate total after
-Phase 4 is not measured here (rskim-proxy-only run).
+Phase 4 baseline was 3213 tests. Phase 5 adds 14 new `proxy_analytics` tests:
+- `test_on_request_only_enqueues_no_db_no_counting` (AC14 structural / PF-007)
+- `test_on_request_drops_on_record_overflow_without_blocking` (AC14/AC17)
+- `test_small_event_within_byte_budget_is_enqueued` (AC17)
+- `test_byte_budget_overflow_drops_without_blocking` (AC17)
+- `test_single_event_oversize_for_byte_budget` (AC17)
+- `test_compute_token_counts_valid_utf8` (AD-AN-7)
+- `test_compute_token_counts_non_utf8_raw_yields_null` (AD-AN-7)
+- `test_compute_token_counts_non_utf8_final_yields_null` (AD-AN-7)
+- `test_to_recording_provider_unknown/anthropic/openai` (AD-AN-11, 3 tests)
+- `test_drop_counter_persisted_at_shutdown` (AC17 / AD-AN-8 persist-once)
+- `test_concurrent_clear_does_not_crash_consumer` (AC15 arm e)
+- `test_e2e_block_router_full_tier_row_with_real_token_delta` (AC23 semi-E2E)
 
-### Key Constraints for Phase 5
+Default build: 3213 tests, 0 regressions. EXIT=0.
 
-**`turn_id`**: always `None` in Phase 4. Phase 5 should extract it from the
-request body (same sniff window as `detect_model`). The field is already on
-`ProxyEvent` (with `#[non_exhaustive]` in place) — Phase 5 passes the real value.
+### Gate Results
 
-**`response_bytes`**: still 0 (sentinel). `AnalyticsCompletionBody` fires before
-the downstream consumer reads the body, so response byte counting requires
-accumulating frames. This is deferred; do NOT count response bytes in Phase 5
-unless the plan explicitly scopes it.
+**Dep-gate 1** (rskim default: no HTTP/TLS): `PASS`
+```
+cargo tree -p rskim -e normal | grep -Eq 'ureq|reqwest|hyper|rustls|native-tls|openssl' && echo FAIL || echo PASS
+```
 
-**`AnalyticsCompletionBody` fire order**: the event fires when `poll_frame`
-returns `Poll::Ready(None)` (clean EOF) OR on `Drop`. In the existing
-`test_ac6_capturing_hook_one_event_per_request`, the 20ms sleep after
-`post_body().await` is sufficient because `post_body` calls `.collect().await`
-which exhausts the body before returning, triggering the clean EOF fire.
+**Dep-gate 2** (rskim-compress: no tokio/proxy): `PASS`
+```
+cargo tree -p rskim-compress -e normal | grep -Eq 'tokio|hyper|axum|rskim-proxy' && echo FAIL || echo PASS
+```
 
-**Imports in server.rs**:
-- `use rskim_contract::log::{DecisionRecord, MockSink, OutcomeReason};`
-- `use crate::analytics::{AnalyticsHook, BlockDecisionProjection, ProxyEvent, RequestTier};`
-- `use crate::detect::{ProxyProvider, detect_model, detect_provider};`
-- `NullSink` is gone — do not re-add
+**AC22** (`skim proxy --help` absent in default build): PASS
 
-**`#[non_exhaustive]`** on `ProxyEvent`, `ProxyProvider`, `AuthMode`, `RequestTier` (added in
-Phase 4). Wildcard match arms are required everywhere they're matched outside the defining crate.
+**Clippy** (`cargo clippy -p rskim --bins --features proxy -- -D warnings`): EXIT=0
 
-**`cargo nextest run -p rskim-proxy --features testing -j 4`** — do NOT use `--all-targets`
-(stalls on bench binaries per project gotchas).
+### Key Implementation Decisions
 
-**`SKIM_PASSTHROUGH=1`** required for cargo/nextest commands to avoid skim hook buffering.
+**AC14 structural test approach**: `on_request` is tested by asserting the event arrives
+in the channel via `try_recv()` and `drop_count == 0`. The discriminating property: if
+`try_send` is deleted or replaced with a blocking call, either `try_recv()` returns Err
+(no event) or the test deadlocks. Both outcomes fail the test (PF-007).
 
-### Cross-Plan Amendment #3 (active)
+**Consumer DB path in tests**: `run_inline_consumer()` test helper uses `AnalyticsDb::open(path)`
+with `tempfile::tempdir()` paths rather than the env-var-based `open_default()`, avoiding
+thread-unsafe `std::env::set_var` races between parallel tests.
 
-`derive_tier()` filters to `"block-router"` component only. `CacheAlignStage` (#306)
-records at `component = "cache-align"` — excluded from tier derivation by design.
-The discriminating integration test `test_tier_passthrough_when_only_cache_align_modifies`
-verifies this. Do NOT change `derive_tier()` to include other components without updating
-Cross-Plan Amendment #3.
+**ProxyEvent::new() visibility**: made `pub` (was `pub(crate)`) in rskim-proxy to allow
+cross-crate test construction. The `#[non_exhaustive]` attribute on `ProxyEvent` still
+prevents external struct-literal construction; `new()` is the only constructor.
 
-### Prior Phase Notes (preserved from Phase 3 handoff)
+**Bench deviation from plan**: The plan mentioned `rskim-bench` for criterion latency bench.
+`rskim-bench` is a BM25F tuning harness with no criterion/proxy deps. Phase 5 did NOT add
+a criterion bench (the plan's note was aspirational — no bench entry in `[[bench]]` was
+ever defined in the plan's acceptance criteria). The AC23 E2E test covers the functional
+path; latency bench is deferred.
 
-`record_proxy()` and `record()` remain separate paths. CLI rows use `record()`,
-proxy rows use `record_proxy()`.
+**if-let chains (Rust 2024)**: `if total_drops > 0 && let Some(ref db) = db { ... }`
+in `spawn_consumer()` — satisfies clippy's `collapsible_if` lint. Requires Rust 2024
+edition (rskim uses edition = "2024").
 
-`select_encoding(provider, model)` is the canonical provider+model → Encoding mapping.
-NOT stored in DB.
+### Constraints for Any Subsequent Phase
 
-`cli_scope_clause` and `proxy_scope_clause` are module-private helpers in analytics/mod.rs.
-Any new CLI aggregate method must call `cli_scope_clause`. Never use raw `WHERE` without it.
+**`spawn_consumer` opens `AnalyticsDb::open_default()`**: relies on `SKIM_ANALYTICS_DB`
+or `SKIM_CACHE_DIR` env vars for path. No path parameter is passed.
 
-Schema is v4 (committed in Phase 1). No schema changes in Phases 2, 3, or 4.
+**`ProxyEvent::new()` is now `pub`**: if rskim-proxy makes further API changes, this
+function's visibility cannot be reduced back to `pub(crate)` without breaking
+`proxy_analytics.rs` tests.
 
-`ProxyBlockDecisionRow` carries `#[allow(dead_code)]`; deferred `--audit` CLI (#469)
-is the consumer. Do not remove the struct.
+**14 new proxy_analytics tests**: all gated behind `#[cfg(feature = "proxy")]` inside
+`proxy_analytics.rs`. They run only with `--features proxy`. Default build still has
+3213 tests.
+
+**`turn_id`**: always `None` in Phase 5 (per Phase 4 handoff). `ProxyEvent::turn_id`
+is `Option<String>` on the struct; `build_proxy_record_input` passes it through
+unchanged. The #344 ticket handles live derivation.
+
+**No bench added**: the plan's reference to a criterion bench was not an AC (no `[[bench]]`
+entry in rskim Cargo.toml). If needed, add `criterion = { workspace = true }` to
+rskim dev-deps and a `[[bench]] name = "proxy_analytics_latency" required-features = ["proxy"]`
+entry, then create `crates/rskim/benches/proxy_analytics_latency.rs`.
