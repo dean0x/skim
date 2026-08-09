@@ -863,7 +863,7 @@ async fn handle_request(
     let event = ProxyEvent::new(
         provider,
         model,
-        None, // turn_id: not yet derived (reserved for Phase 5)
+        None, // turn_id — always None until #344 derives it
         tier,
         body_bytes,
         transformed_body,

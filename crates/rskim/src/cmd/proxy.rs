@@ -146,7 +146,7 @@ const CLEARTEXT_WARNING: &str = "WARNING: skim proxy is bound to a non-loopback 
 /// shutdown (SIGINT/SIGTERM received and drain complete).
 pub(crate) fn run(
     args: &[String],
-    _analytics: &crate::analytics::AnalyticsConfig,
+    analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     // Help flag.
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -234,7 +234,7 @@ pub(crate) fn run(
     let consumer_handle: Option<std::thread::JoinHandle<()>>;
     let done_rx: Option<crossbeam_channel::Receiver<()>>;
 
-    if _analytics.enabled {
+    if analytics.enabled {
         let (hook, rx) = super::proxy_analytics::BridgeAnalyticsHook::new(
             super::proxy_analytics::PROXY_QUEUE_RECORD_CAPACITY,
         );
@@ -245,7 +245,7 @@ pub(crate) fn run(
             rx,
             drop_count,
             queued_bytes,
-            _analytics.session_id.clone(),
+            analytics.session_id.clone(),
             done_tx,
         );
         analytics_arc = Arc::new(hook);

@@ -75,7 +75,7 @@ pub(crate) enum CommandType {
     /// Proxy request (L3 compression proxy — recorded by `record_proxy`, not `record`).
     /// AD-AN-6: CLI-scope query methods exclude rows with `command_type = 'proxy'`
     /// so proxy analytics never inflate CLI figures.
-    // Phase 6 (proxy_analytics.rs bridge) calls record_proxy which uses this variant.
+    // Used only by `record_proxy` (proxy feature build); dead_code in default build.
     #[allow(dead_code)]
     Proxy,
 }
@@ -203,7 +203,7 @@ pub(crate) struct SessionStats {
 }
 
 // ============================================================================
-// Proxy query result types (Phase 3 — always compiled)
+// Proxy query result types
 // ============================================================================
 
 /// Per-(provider, model) proxy breakdown row — the authoritative token-sum unit.
@@ -317,8 +317,7 @@ pub(crate) struct ProxyBlockDecisionRow {
 /// - `Unknown`   → `NULL`
 /// - `Anthropic` → `"anthropic"`
 /// - `OpenAI`    → `"openai"`
-// Phase 6 (proxy_analytics.rs bridge) constructs RecordingProvider values and
-// passes them to record_proxy / select_encoding.
+// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordingProvider {
@@ -343,7 +342,7 @@ pub(crate) enum RecordingProvider {
 /// mutable classified blocks (zone.rs AC-27); stale/orientation/immutable
 /// blocks are forwarded byte-identical and do NOT emit `DecisionRecord`s.
 /// This was verified against the `#304` BlockRouter implementation.
-// Phase 6 (proxy_analytics.rs bridge) constructs ProxyBlockDecision values.
+// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyBlockDecision {
@@ -371,7 +370,7 @@ pub(crate) struct ProxyBlockDecision {
 /// The consumer thread in `proxy_analytics.rs` populates the three token fields
 /// after calling [`select_encoding`] and constructing a
 /// [`rskim_tokens::Counter`] for the resolved encoding.
-// Phase 6 (proxy_analytics.rs bridge) constructs ProxyRecordInput values.
+// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ProxyRecordInput {
@@ -432,7 +431,7 @@ pub(crate) struct ProxyRecordInput {
 /// | `OpenAI`  | `O200k`            | family encoding    | `O200k`             |
 ///
 /// All 9 cases are pinned by a table-driven unit test (AC21).
-// Phase 6 (proxy_analytics.rs bridge) calls select_encoding.
+// Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
 #[allow(dead_code)]
 pub(crate) fn select_encoding(provider: &RecordingProvider, model: Option<&str>) -> Encoding {
     match provider {
@@ -1126,7 +1125,7 @@ impl AnalyticsDb {
     /// **AD-PXY-25:** `upstream_error_status` is non-`NULL` for
     /// transformed-but-upstream-errored rows (502/504).  These rows are excluded
     /// from savings and tier aggregates by the query layer.
-    // Phase 6 (proxy_analytics.rs bridge) calls record_proxy.
+    // Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
     #[allow(dead_code)]
     pub(crate) fn record_proxy(&mut self, r: &ProxyRecordInput) -> anyhow::Result<()> {
         // AD-PXY-21: map provider enum to the nullable TEXT column value.
@@ -1209,7 +1208,7 @@ impl AnalyticsDb {
     /// non-zero `proxy_dropped_records` is the disclosure counter that signals
     /// these constants should be raised (or that the workload is unusually
     /// large).
-    // Phase 6 (proxy_analytics.rs bridge) calls analytics_meta_add_drop_count.
+    // Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
     #[allow(dead_code)]
     pub(crate) fn analytics_meta_add_drop_count(&self, count: u64) -> anyhow::Result<()> {
         // INSERT … ON CONFLICT(key) DO UPDATE is the upsert syntax available in
@@ -1559,9 +1558,6 @@ impl AnalyticsStore for AnalyticsDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
-
-// since_clause and since_clause_with_extra were replaced by cli_scope_clause and
-// cli_scope_clause_with_extra (AD-AN-6) and proxy_scope_clause in Phase 3.
 
 /// Build WHERE clause for CLI-scope queries — excludes proxy rows.
 ///
