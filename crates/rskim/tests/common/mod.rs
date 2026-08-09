@@ -36,6 +36,38 @@ pub fn skim() -> assert_cmd::Command {
     c
 }
 
+/// Build a `skim` command sandboxed against a temporary home directory.
+///
+/// Sets the following env vars to paths inside `home`, so the command cannot
+/// read from or write to the developer's real home directory:
+///
+/// - `HOME` — redirects all `dirs::home_dir()` lookups in the child process.
+/// - `CLAUDE_CONFIG_DIR` — Claude Code hook / settings / guidance.
+/// - `SKIM_CACHE_DIR` — parser cache, analytics DB, and hook.log.
+/// - `SKIM_WRAPPERS_DIR` — `~/.skim/bin/` wrapper symlink directory.
+/// - `GEMINI_CONFIG_DIR` — Gemini CLI hook / settings / guidance.
+/// - `COPILOT_CONFIG_DIR` — Copilot CLI hook / settings / guidance.
+///
+/// Also removes env vars that carry real-session state (`SKIM_PASSTHROUGH`,
+/// `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY`) so test invocations start clean.
+///
+/// Use this for any `skim init`, `skim init --uninstall`, or `skim doctor`
+/// invocation.  Tests may chain additional `.env(...)` calls to add or
+/// override specific vars after calling this helper.
+pub fn skim_sandboxed(home: &std::path::Path) -> assert_cmd::Command {
+    let mut c = skim();
+    c.env("HOME", home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("SKIM_CACHE_DIR", home.join(".cache/skim"))
+        .env("SKIM_WRAPPERS_DIR", home.join(".skim").join("bin"))
+        .env("GEMINI_CONFIG_DIR", home.join(".gemini"))
+        .env("COPILOT_CONFIG_DIR", home.join(".copilot"))
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_HOOK_VERSION")
+        .env_remove("SKIM_HOOK_BINARY");
+    c
+}
+
 /// Return the path to the skim binary built by cargo.
 ///
 /// Use this when you need a `std::process::Command` rather than an
