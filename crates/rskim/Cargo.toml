@@ -70,3 +70,5 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 filetime = { workspace = true }
 rskim-contract = { path = "../rskim-contract" }
+# proxy_analytics tests construct Bytes values for ProxyEvent::new (feature = "proxy" only).
+bytes = { workspace = true }

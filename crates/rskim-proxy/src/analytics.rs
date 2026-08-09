@@ -202,7 +202,7 @@ impl ProxyEvent {
     /// `upstream_error_status` is `None` for normal relayed rows and `Some(502|504)`
     /// for the distinct transformed-but-upstream-errored path (AD-PXY-25).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         provider: ProxyProvider,
         model: Option<String>,
         turn_id: Option<String>,
