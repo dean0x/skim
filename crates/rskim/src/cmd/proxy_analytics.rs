@@ -484,10 +484,9 @@ mod tests {
                 }
             }
             let total = drop_count.load(Ordering::Relaxed);
-            if total > 0 {
-                if let Some(ref db) = db {
-                    let _ = db.analytics_meta_add_drop_count(total);
-                }
+            // if-let chain (Rust 2024): mirror the production spawn_consumer form.
+            if total > 0 && let Some(ref db) = db {
+                let _ = db.analytics_meta_add_drop_count(total);
             }
             let _ = done_tx.send(());
         })

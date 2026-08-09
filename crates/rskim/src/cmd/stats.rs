@@ -1931,6 +1931,9 @@ mod tests {
     // ========================================================================
 
     /// Build a minimal ProxyModelStats row for MockStore tests.
+    // Nine positional args mirror all fields of ProxyModelStats — grouping them
+    // into a sub-struct would move the same fields to the call sites unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn proxy_model_row(
         provider: Option<&str>,
         model: Option<&str>,

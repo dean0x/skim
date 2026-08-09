@@ -3589,9 +3589,14 @@ mod tests {
                 "SELECT provider, model, turn_id, upstream_error_status FROM token_savings",
             )
             .unwrap();
-        let new_cols: Vec<(Option<String>, Option<String>, Option<String>, Option<i64>)> =
+        let new_cols: Vec<_> =
             stmt.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
             })
             .unwrap()
             .filter_map(|r| r.ok())
@@ -4011,16 +4016,7 @@ mod tests {
         db.record_proxy(&input).unwrap();
 
         // --- parent row ---
-        let (cmd_type, provider, model, turn_id, raw_tok, comp_tok, savings, err_status): (
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<i64>,
-            Option<i64>,
-            Option<f64>,
-            Option<i64>,
-        ) = db
+        let (cmd_type, provider, model, turn_id, raw_tok, comp_tok, savings, err_status) = db
             .conn
             .query_row(
                 // last_insert_rowid() reflects the last proxy_block_decisions row
@@ -4031,14 +4027,14 @@ mod tests {
                 [],
                 |r| {
                     Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<f64>>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
                     ))
                 },
             )
@@ -4285,6 +4281,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: insert a proxy row into the DB (bypasses record_proxy for speed).
+    // Nine positional args mirror the INSERT columns exactly — adding a wrapper
+    // struct would move the same fields to the call sites without improving clarity.
+    #[allow(clippy::too_many_arguments)]
     fn insert_proxy_row(
         db: &AnalyticsDb,
         provider: Option<&str>,
