@@ -2586,6 +2586,7 @@ name = "rskim-align"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "log",
  "proptest",
  "rskim-contract",
  "rskim-llm",

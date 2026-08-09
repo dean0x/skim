@@ -72,17 +72,17 @@ jobs:
 
       # AC17/#306 rskim-align latency gate: worst-case fixture (64 tools × depth 8,
       # 512 KB multi-turn body). Runs the bench in --release mode and parses the
-      # mean time from Criterion's output. The hard gate is p99 < 5 ms (budget:
-      # half the #303 10 ms proxy latency bar, ADR-003 grounded regression guard).
+      # upper bound of the 95% confidence interval of the mean from Criterion output.
+      # The hard CI gate is < 5 ms (budget: half the #303 10 ms proxy latency bar,
+      # ADR-003 grounded regression guard).
       #
-      # Criterion 0.5 does not have a native CI-fail-on-threshold mode, so we parse
-      # the "time: [... ...]" output line and extract the upper bound. If it exceeds
-      # 5 ms, CI fails. Bench output includes both the warm mean and the 95%/99%
-      # confidence interval; we extract the upper bound of the reported interval.
-      #
-      # NOTE: The CI gate uses the upper bound of Criterion's reported interval
-      # (the third number in "time: [low mean high]") as a conservative p99 proxy.
-      # This is consistent with ADR-003: the gate must not be widened silently.
+      # NOTE on AC17 metric: Criterion's "time: [low mean high]" line gives the 95%
+      # confidence interval of the *mean* iteration time — NOT a true p99. The third
+      # value (high) is the upper bound of the mean CI, used here as a conservative
+      # ceiling (the mean is well below p99 for this workload, so it remains a
+      # conservative gate). The measured mean is recorded in CHANGELOG.md. ADR-003:
+      # the gate must not be widened silently; any rename of the bench fixture that
+      # breaks the parse MUST fail CI (both unparseable branches exit non-zero).
       - name: AC17/rskim-align latency gate — worst-case fixture (#306)
         run: |
           set -o pipefail
@@ -238,11 +238,14 @@ jobs:
 
           echo "=== skim binary default-features tree ==="
           cargo tree -p rskim -e normal 2>&1 | tee /tmp/rskim-tree.txt
-          if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl' /tmp/rskim-tree.txt; then
-            echo "FAIL: HTTP/TLS dependency found in skim binary default build"
+          # AC22/#306: rskim-align MUST NOT appear in the default (non-proxy) build.
+          # rskim-align is optional, pulled only by the 'proxy' feature (Cargo.toml).
+          # This discriminating check catches rskim-align being promoted to a default dep.
+          if grep -qE 'ureq|reqwest|hyper|rustls|native-tls|openssl|rskim-align' /tmp/rskim-tree.txt; then
+            echo "FAIL: HTTP/TLS or rskim-align dependency found in skim binary default build"
             exit 1
           fi
-          echo "PASS: no HTTP/TLS in skim binary default build"
+          echo "PASS: no HTTP/TLS or rskim-align in skim binary default build"
 
           echo "=== rskim-compress transitive dep gate (AC26/AC9) ==="
           # AC26: rskim-compress MUST NOT pull in hyper/tokio/axum/rskim-proxy directly

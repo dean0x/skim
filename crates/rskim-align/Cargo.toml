@@ -20,6 +20,10 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 rskim-contract = { path = "../rskim-contract" }
 rskim-llm = { path = "../rskim-llm" }
+# AC7/AD-CA-1: structured logging facade — zero overhead when no subscriber is
+# installed. Does not violate the no-clock/no-RNG constraint (log::debug! emits
+# no wall-clock or entropy reads). The log crate is a pure synchronous facade.
+log = "0.4"
 
 [dev-dependencies]
 rskim-contract = { path = "../rskim-contract", features = ["harness"] }

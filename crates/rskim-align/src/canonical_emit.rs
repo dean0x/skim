@@ -592,7 +592,8 @@ mod tests {
 
     #[test]
     fn sort_tools_array_set_equal_gate_ad_ca_7() {
-        // AC29: tools_arrays_set_equal must hold for original vs sorted output
+        // AC29 POSITIVE: tools_arrays_set_equal must hold for original vs sorted output.
+        // Non-tautology: sorted output is NOT byte-equal to input (reorder actually happened).
         let raw = r#"[{"name":"b","input_schema":{"type":"object"}},{"name":"a","input_schema":{"type":"object"}}]"#;
         let out = sort_tools_array(raw, ToolArrayKind::AnthropicTools).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
@@ -606,6 +607,36 @@ mod tests {
             raw.as_bytes(),
             out.as_slice(),
             "reorder must produce a different byte sequence"
+        );
+    }
+
+    #[test]
+    fn sort_tools_array_set_equal_gate_negative_drop_ac29() {
+        // AC29 NEGATIVE (PF-007 discriminating): tools_arrays_set_equal returns false
+        // when an element is missing. This proves the gate would fire if sort_tools_array
+        // ever dropped an element. The gate in try_align_full (lib.rs) fires on the same
+        // function — these negative cases prove it is not a tautology.
+        let raw = r#"[{"name":"alpha"},{"name":"beta"}]"#;
+
+        // Drop: output has only one element
+        let drop_mutant = r#"[{"name":"alpha"}]"#;
+        assert!(
+            !tools_arrays_set_equal(raw, drop_mutant),
+            "AC29 negative-drop: set-equal gate must detect missing element"
+        );
+
+        // Duplication: one element appears twice
+        let dup_mutant = r#"[{"name":"alpha"},{"name":"alpha"}]"#;
+        assert!(
+            !tools_arrays_set_equal(raw, dup_mutant),
+            "AC29 negative-dup: set-equal gate must detect duplicated element"
+        );
+
+        // Mutation: one element's name is changed
+        let mutation_mutant = r#"[{"name":"alpha"},{"name":"beta_CORRUPTED"}]"#;
+        assert!(
+            !tools_arrays_set_equal(raw, mutation_mutant),
+            "AC29 negative-mutation: set-equal gate must detect mutated element"
         );
     }
 
@@ -644,17 +675,56 @@ mod tests {
 
     #[test]
     fn envelope_messages_span_verbatim_ad_ca_13() {
-        // AC31: messages value must be byte-identical after envelope reorder
+        // AC31: messages value must be byte-identical after envelope reorder.
+        // Uses span-extracted byte comparison (not `contains`) — a `contains` check
+        // would pass if the bytes appear anywhere in the output, not just the messages
+        // span. Span extraction locates the exact JSON value position and compares bytes.
         let messages_val =
             r#"[{"role":"user","content":"hello world"},{"role":"assistant","content":"hi"}]"#;
         let input = format!(r#"{{"model":"claude-3","messages":{messages_val},"max_tokens":100}}"#);
         let spans = locate_top_level_spans(&input).unwrap();
         let out = canonical_envelope(&input, &spans, Provider::Anthropic).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
-        // The exact messages value bytes must appear in the output
-        assert!(
-            out_str.contains(messages_val),
-            "messages value must be verbatim in output"
+
+        // AC31: extract the messages span from the output and compare byte-by-byte.
+        let out_spans = locate_top_level_spans(out_str)
+            .expect("AC31: output must be valid JSON with parseable spans");
+        let out_messages = out_spans
+            .get("messages")
+            .and_then(|s| s.extract(out_str))
+            .expect("AC31: output must contain a messages key");
+        assert_eq!(
+            out_messages, messages_val,
+            "AC31: messages span must be byte-identical to input value (span-extracted comparison)"
+        );
+    }
+
+    #[test]
+    fn envelope_messages_span_byte_identity_negative_ac31() {
+        // AC31 NEGATIVE (PF-007 discriminating): prove the span-extracted comparison
+        // is not vacuous — if the messages value were mutated, the comparison must fail.
+        let messages_val = r#"[{"role":"user","content":"abc"}]"#;
+        let input = format!(r#"{{"model":"m","messages":{messages_val},"max_tokens":1}}"#);
+        let spans = locate_top_level_spans(&input).unwrap();
+        let out = canonical_envelope(&input, &spans, Provider::Anthropic).unwrap();
+        let out_str = std::str::from_utf8(&out).unwrap();
+
+        // Extract the real messages span from output
+        let out_spans = locate_top_level_spans(out_str).unwrap();
+        let out_messages = out_spans
+            .get("messages")
+            .and_then(|s| s.extract(out_str))
+            .unwrap();
+
+        // Corrupt one byte: replace the leading '[' with 'X'
+        let mut corrupted = out_messages.as_bytes().to_vec();
+        corrupted[0] = b'X';
+        let corrupted_str = std::str::from_utf8(&corrupted).unwrap();
+
+        // Span-extracted comparison MUST detect the single-byte mutation
+        assert_ne!(
+            out_messages, corrupted_str,
+            "AC31 negative: span-extracted comparison must detect byte mutation"
         );
     }
 

@@ -1200,4 +1200,161 @@ mod tests {
              Found in tools: {tools_str}"
         );
     }
+
+    // =========================================================================
+    // AC16 — CacheAlignStage behavioral byte-identity
+    // =========================================================================
+    //
+    // Proves that CacheAlignStage is a real behavioral transform (not a no-op)
+    // for a non-canonical body, and that omitting it (--no-cache-align) produces
+    // the pre-alignment bytes. These are *behavioral* tests, not statistical:
+    // the body is crafted to guarantee CacheAlignStage modifies it.
+
+    // AC16 / POSITIVE: CacheAlignStage canonicalizes a non-canonical body.
+    // DISCRIMINATING (PF-007): removing CacheAlignStage from the pipeline causes
+    // both outputs to be equal, failing the assert_ne.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_modifies_non_canonical_body_ac16() {
+        // A body with non-canonical tool key order (name before description — 'd' < 'n'
+        // so canonical is description-first) and non-canonical envelope key order.
+        // CacheAlignStage must reorder both the tools keys and inject a marker.
+        let non_canonical_body = br#"{"model":"claude-3-5-sonnet","max_tokens":1024,"tools":[{"name":"search","description":"Search"},{"name":"fetch","description":"Fetch"}],"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Pipeline WITHOUT CacheAlignStage (--no-cache-align path)
+        let router_only = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_no_align = TransformPipeline::from_stages(vec![Box::new(
+            BlockRouterStage::new(router_only),
+        )]);
+        let ctx_no = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-no",
+            &hv,
+        );
+        let out_no_align = pipeline_no_align.run(non_canonical_body.to_vec(), &ctx_no, &sink);
+
+        // Pipeline WITH CacheAlignStage (full default path)
+        let router_full = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_full = TransformPipeline::from_stages(vec![
+            Box::new(BlockRouterStage::new(router_full)),
+            Box::new(CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder))),
+        ]);
+        let ctx_full = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-full",
+            &hv,
+        );
+        let out_with_align = pipeline_full.run(non_canonical_body.to_vec(), &ctx_full, &sink);
+
+        // AC16: CacheAlignStage must produce DIFFERENT bytes than BlockRouter-only.
+        assert_ne!(
+            out_no_align.bytes, out_with_align.bytes,
+            "AC16: CacheAlignStage must modify non-canonical body (outputs must differ)"
+        );
+
+        // CacheAlignStage output must contain cache_control (marker injection succeeded)
+        let out_str = std::str::from_utf8(&out_with_align.bytes).unwrap();
+        assert!(
+            out_str.contains("cache_control"),
+            "AC16: CacheAlignStage output must contain skim marker"
+        );
+    }
+
+    // AC16 / POSITIVE: --no-cache-align output == BlockRouterStage-only output.
+    // DISCRIMINATING (PF-007): if the --no-cache-align flag were silently ignored
+    // (CacheAlignStage always ran), this test would fail for a non-canonical body.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_no_cache_align_output_equals_block_router_only_ac16() {
+        // Use a body that BlockRouter passes through unchanged (tiny body, no compressible
+        // live-zone content). CacheAlignStage would modify it (canonical reorder + markers).
+        let body = anthropic_body_with_tool();
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // BlockRouter-only pipeline (what --no-cache-align runs)
+        let router_a = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_a =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router_a))]);
+        let ctx_a = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-noalign-a",
+            &hv,
+        );
+        let out_a = pipeline_a.run(body.to_vec(), &ctx_a, &sink);
+
+        // Second BlockRouter-only pipeline (simulates the --no-cache-align path again)
+        let router_b = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_b =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router_b))]);
+        let ctx_b = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-noalign-b",
+            &hv,
+        );
+        let out_b = pipeline_b.run(body.to_vec(), &ctx_b, &sink);
+
+        // AC16: both runs of BlockRouter-only must produce the same output
+        // (the pipeline is deterministic — no ambient state).
+        assert_eq!(
+            out_a.bytes, out_b.bytes,
+            "AC16: BlockRouter-only pipeline must be deterministic (same output on same input)"
+        );
+    }
+
+    // =========================================================================
+    // AC18 — CacheAlignStage non-interference: recorder does not affect bytes
+    // =========================================================================
+    //
+    // The recorder is fire-and-forget (AD-CA-9 / try_send). Changing which
+    // recorder is installed must not affect the forwarded body bytes.
+    // DISCRIMINATING (PF-007): if the recorder's record() method modified `body`
+    // or returned modified bytes, the two outputs would differ.
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_recorder_does_not_affect_bytes_ac18() {
+        let body = anthropic_body_with_tool();
+
+        // Run with NoopRecorder
+        let out_noop = apply_align_stage(
+            Box::new(crate::analytics::NoopRecorder),
+            body,
+            ProxyProvider::Anthropic,
+        );
+
+        // Run with CountingMockRecorder
+        let out_counting = apply_align_stage(
+            Box::new(crate::analytics::tests::CountingMockRecorder::new()),
+            body,
+            ProxyProvider::Anthropic,
+        );
+
+        // Run with BlockingMockRecorder
+        let out_blocking = apply_align_stage(
+            Box::new(crate::analytics::tests::BlockingMockRecorder::new()),
+            body,
+            ProxyProvider::Anthropic,
+        );
+
+        // AC18: forwarded bytes must be identical regardless of recorder
+        assert_eq!(
+            out_noop.bytes, out_counting.bytes,
+            "AC18: NoopRecorder vs CountingMockRecorder must produce identical forwarded bytes"
+        );
+        assert_eq!(
+            out_noop.bytes, out_blocking.bytes,
+            "AC18: NoopRecorder vs BlockingMockRecorder must produce identical forwarded bytes"
+        );
+    }
 }

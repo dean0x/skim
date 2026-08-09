@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     No `canonical_version` marker is injected; the warm cost is intentional and documented.
   - Disable with `skim proxy --no-cache-align` (BlockRouter compression still runs).
     `SKIM_PASSTHROUGH=1` bypasses all transforms entirely.
+  - **AC17 / R6 latency measurement (recorded per plan):** criterion bench
+    `align_anthropic_64tools/42070B` measured `7.09 ms mean` (95% CI:
+    7.08 ms–7.09 ms) on a loaded local dev machine (macOS, sccache, parallel
+    builds). This exceeds the plan's 2.5 ms PR-recording threshold. Per the plan,
+    if CI confirms p99 > 2.5 ms the R6 single-parse optimisation (collapse the
+    two `locate_top_level_spans` passes to one borrowed-span pass) MUST be applied
+    before merging. The CI gate is < 5 ms absolute; local dev measurements under
+    build load are not CI-authoritative.
 
 ### Changed
 - **`skim proxy` is now gated behind a non-default `proxy` cargo feature** — default builds are

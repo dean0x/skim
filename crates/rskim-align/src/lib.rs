@@ -138,9 +138,18 @@ struct AlignResult {
 ///
 /// Returns the original input bytes on any error. The `stats.fail_open` flag
 /// is set to `true` in that case.
-pub fn align(body: &[u8], provider: Provider, _request_id: &str) -> AlignOutcome {
+pub fn align(body: &[u8], provider: Provider, request_id: &str) -> AlignOutcome {
     match try_align_full(body, provider) {
         Some(result) => {
+            // AC7/AD-CA-1: emit debug log when the alignment is a genuine no-op
+            // (already-canonical body with no eligible injection positions). The log
+            // crate is a pure synchronous facade — no clock, no entropy, no I/O.
+            if result.bytes == body {
+                log::debug!(
+                    "rskim-align: canonical no-op request_id={request_id} len={}",
+                    body.len()
+                );
+            }
             let s = AlignStats::success(
                 body,
                 &result.bytes,
@@ -155,10 +164,16 @@ pub fn align(body: &[u8], provider: Provider, _request_id: &str) -> AlignOutcome
                 stats: s,
             }
         }
-        None => AlignOutcome {
-            bytes: body.to_vec(),
-            stats: AlignStats::fail_open_from_input(body),
-        },
+        None => {
+            log::debug!(
+                "rskim-align: fail-open passthrough request_id={request_id} len={}",
+                body.len()
+            );
+            AlignOutcome {
+                bytes: body.to_vec(),
+                stats: AlignStats::fail_open_from_input(body),
+            }
+        }
     }
 }
 
@@ -675,7 +690,9 @@ mod tests {
 
     #[test]
     fn align_string_system_no_tools_passthrough_no_markers_ac7() {
-        // AC7(a): string system + string content + no tools → no markers, canonical output
+        // AC7(a): string system + string content + no tools → no markers, canonical output.
+        // Body keys are already in canonical order (messages < model < system) and compact,
+        // so the output must be byte-identical to the input (genuine no-op).
         let body = br#"{"messages":[{"content":"hi","role":"user"}],"model":"claude-3","system":"You are helpful."}"#;
         let out = align(body, Provider::Anthropic, "req-ac7a");
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
@@ -687,6 +704,11 @@ mod tests {
         assert_eq!(out.stats.skim_breakpoints_injected, 0);
         // System string preserved verbatim
         assert!(out_str.contains("\"You are helpful.\""));
+        // AC7(a): SHA-256(output) == SHA-256(stage input) — byte-identical genuine no-op
+        assert_eq!(
+            &out.bytes, body,
+            "AC7(a): already-canonical body with no eligible positions must be byte-identical to input"
+        );
     }
 
     #[test]
@@ -1058,6 +1080,245 @@ mod tests {
         assert!(out.stats.fail_open);
         assert_eq!(out.stats.input_sha256, sha256(body));
         assert_eq!(out.stats.output_sha256, sha256(body));
+    }
+
+    // ── AC2 — OpenAI convergence + legacy functions ───────────────────────────
+
+    #[test]
+    fn align_openai_convergence_two_key_orders_ac2() {
+        // AC2: two OpenAI bodies identical except top-level key order + tool key order
+        // must converge to the same canonical output bytes.
+        let body_a = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"description":"search","name":"search"}}]}"#;
+        let body_b = br#"{"tools":[{"type":"function","function":{"name":"search","description":"search"}}],"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+        let out_a = align(body_a, Provider::OpenAi, "req-ac2a");
+        let out_b = align(body_b, Provider::OpenAi, "req-ac2b");
+        assert_eq!(
+            out_a.bytes, out_b.bytes,
+            "AC2: OpenAI bodies differing only in key/element order must converge"
+        );
+        // No markers injected (OpenAI path)
+        let out_str = std::str::from_utf8(&out_a.bytes).unwrap();
+        assert!(
+            !out_str.contains("cache_control"),
+            "AC2: OpenAI output must not contain cache_control"
+        );
+    }
+
+    #[test]
+    fn align_openai_legacy_functions_sorted_ac2() {
+        // AC2: OpenAI legacy `functions` array is sorted by top-level "name" field.
+        // Verifies ToolArrayKind::OpenAiLegacyFunctions path through align().
+        let body = br#"{"model":"gpt-4","messages":[],"functions":[{"name":"zoo","description":"z"},{"name":"alpha","description":"a"}]}"#;
+        let out = align(body, Provider::OpenAi, "req-ac2-legacy");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        let alpha_pos = out_str.find("\"alpha\"").unwrap_or(usize::MAX);
+        let zoo_pos = out_str.find("\"zoo\"").unwrap_or(0);
+        assert!(
+            alpha_pos < zoo_pos,
+            "AC2 legacy: alpha must appear before zoo in sorted functions array"
+        );
+        assert!(
+            !out_str.contains("cache_control"),
+            "AC2 legacy: legacy functions body must not get cache_control (OpenAI path)"
+        );
+    }
+
+    // ── AC3b/AC26 — Depth fail-open end-to-end through align() ───────────────
+
+    #[test]
+    fn align_depth_exceeded_fail_open_ac3b_ac26() {
+        // AC3b/AC26: a tools body with a schema nested deeper than MAX_ALIGN_SCHEMA_DEPTH
+        // must fail-open (passthrough) with SHA-256-equal bytes.
+        let leaf = r#"{"type":"string"}"#;
+        // Build a JSON object nested MAX_ALIGN_SCHEMA_DEPTH + 1 levels deep
+        let mut deep = leaf.to_string();
+        for _ in 0..=(MAX_ALIGN_SCHEMA_DEPTH + 1) {
+            deep = format!(r#"{{"nested":{deep}}}"#);
+        }
+        let body_str = format!(
+            r#"{{"messages":[],"model":"claude-3","tools":[{{"name":"t","input_schema":{deep}}}]}}"#
+        );
+        let body = body_str.as_bytes();
+        let out = align(body, Provider::Anthropic, "req-ac26-depth");
+        // AC26: fail-open → byte-identical to input
+        assert_eq!(
+            &out.bytes, body,
+            "AC26: depth-exceeded body must fail-open to byte-identical passthrough"
+        );
+        assert!(out.stats.fail_open, "AC26: depth-exceeded must set fail_open=true");
+        // SHA-256 equality (passthrough assertion)
+        assert_eq!(
+            out.stats.input_sha256, out.stats.output_sha256,
+            "AC26: fail-open SHA-256s must be equal"
+        );
+    }
+
+    // ── AC11 — JSONPath-restricted verbatim checks ────────────────────────────
+
+    #[test]
+    fn align_messages_span_byte_identical_ac11() {
+        // AC11: the messages value must be byte-identical in the output regardless
+        // of what else gets canonicalized. Use a complex messages value with
+        // array-form content including unicode and nested structure.
+        let messages_json = r#"[{"role":"user","content":[{"text":"Hello world","type":"text"},{"text":"foo\nbar","type":"text"}]},{"role":"assistant","content":"response 123"}]"#;
+        let body_str = format!(
+            r#"{{"model":"claude-3","tools":[{{"name":"b"}},{{"name":"a"}}],"messages":{messages_json}}}"#
+        );
+        let body = body_str.as_bytes();
+        let out = align(body, Provider::Anthropic, "req-ac11a");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+
+        // Extract the messages value from the output using span-location
+        let out_spans = crate::span::locate_top_level_spans(out_str)
+            .expect("AC11: output must be valid JSON");
+        let out_messages = out_spans
+            .get("messages")
+            .and_then(|s| s.extract(out_str))
+            .expect("AC11: output must have messages key");
+        assert_eq!(
+            out_messages, messages_json,
+            "AC11: messages value must be byte-identical to input value"
+        );
+    }
+
+    #[test]
+    fn align_non_tools_system_values_verbatim_ac11() {
+        // AC11: non-tools, non-system top-level values (model, max_tokens, stream)
+        // must be byte-verbatim in the output (only tools/system are canonicalized).
+        let body =
+            br#"{"messages":[],"max_tokens":1e3,"model":"claude-3","stream":false,"tools":[{"name":"t"}]}"#;
+        let out = align(body, Provider::Anthropic, "req-ac11b");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        // These values must be present verbatim
+        assert!(
+            out_str.contains("\"max_tokens\":1e3"),
+            "AC11: number token 1e3 must be verbatim (not reformatted)"
+        );
+        assert!(
+            out_str.contains("\"stream\":false"),
+            "AC11: stream value must be verbatim"
+        );
+        assert!(
+            out_str.contains("\"model\":\"claude-3\""),
+            "AC11: model value must be verbatim"
+        );
+    }
+
+    // ── AC24 — Structural edge shapes ────────────────────────────────────────
+
+    #[test]
+    fn align_tools_empty_array_no_marker_ac24() {
+        // AC24: tools:[] (empty array) → no markers, no panic, idempotent
+        let body = br#"{"messages":[{"role":"user","content":"hi"}],"model":"m","tools":[]}"#;
+        let out = align(body, Provider::Anthropic, "req-ac24-empty");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        assert!(
+            !out_str.contains("cache_control"),
+            "AC24: empty tools array must not get a marker"
+        );
+        assert_eq!(out.stats.skim_breakpoints_injected, 0);
+        assert!(!out.stats.fail_open, "AC24: empty tools array is not an error");
+    }
+
+    #[test]
+    fn align_tools_non_array_fail_open_ac24() {
+        // AC24: tools:5 (non-array scalar) → fail-open (sort_tools_array requires array input)
+        let body = br#"{"messages":[],"model":"m","tools":5}"#;
+        let out = align(body, Provider::Anthropic, "req-ac24-nonarray");
+        assert_eq!(
+            &out.bytes, body,
+            "AC24: non-array tools must fail-open to byte-identical passthrough"
+        );
+        assert!(out.stats.fail_open, "AC24: non-array tools must set fail_open");
+    }
+
+    #[test]
+    fn align_system_absent_tools_present_one_marker_ac24() {
+        // AC24: system key absent, tools present → 1 marker on last tool only
+        let body = br#"{"messages":[],"model":"m","tools":[{"name":"x"}]}"#;
+        let out = align(body, Provider::Anthropic, "req-ac24-nosys");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        assert_eq!(
+            count_cache_control_occurrences(out_str),
+            1,
+            "AC24: tools without system must inject exactly 1 marker"
+        );
+    }
+
+    #[test]
+    fn align_system_array_empty_no_extra_markers_ac24() {
+        // AC24: system:[] (empty block array) → no system marker, 1 tool marker if tools present.
+        // An empty system array has no last block, so it is ineligible for injection.
+        let body = br#"{"messages":[],"model":"m","system":[],"tools":[{"name":"x"}]}"#;
+        let out = align(body, Provider::Anthropic, "req-ac24-emptysys");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        // No system marker (empty array → no last block); 1 tool marker
+        assert_eq!(
+            count_cache_control_occurrences(out_str),
+            1,
+            "AC24: empty system array yields 1 tool marker only"
+        );
+    }
+
+    // ── AC29 — AD-CA-7 reorder gate fault-injection tests ────────────────────
+
+    #[test]
+    fn ac29_set_equal_gate_detects_element_drop() {
+        // AC29 NEGATIVE (PF-007 discriminating): tools_arrays_set_equal returns false
+        // when the canonical output is missing an element. This proves the gate in
+        // try_align_full would fire if sort_tools_array ever dropped an element.
+        use rskim_contract::canonical::tools_arrays_set_equal;
+        let original = r#"[{"name":"a"},{"name":"b"}]"#;
+        // Mutant: element "b" dropped
+        let drop_mutant = r#"[{"name":"a"}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, drop_mutant),
+            "AC29: gate must detect element drop"
+        );
+    }
+
+    #[test]
+    fn ac29_set_equal_gate_detects_element_duplication() {
+        // AC29 NEGATIVE (PF-007): gate must fire when an element is duplicated.
+        use rskim_contract::canonical::tools_arrays_set_equal;
+        let original = r#"[{"name":"a"},{"name":"b"}]"#;
+        let dup_mutant = r#"[{"name":"a"},{"name":"a"}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, dup_mutant),
+            "AC29: gate must detect element duplication"
+        );
+    }
+
+    #[test]
+    fn ac29_set_equal_gate_detects_element_mutation() {
+        // AC29 NEGATIVE (PF-007): gate must fire when a tool name is mutated.
+        use rskim_contract::canonical::tools_arrays_set_equal;
+        let original = r#"[{"name":"alpha"},{"name":"beta"}]"#;
+        let mutation_mutant = r#"[{"name":"alpha"},{"name":"beta_MUTATED"}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, mutation_mutant),
+            "AC29: gate must detect element mutation"
+        );
+    }
+
+    #[test]
+    fn ac29_set_equal_gate_passes_correct_sort() {
+        // AC29 POSITIVE companion: gate passes for a correctly sorted output.
+        // Non-tautology: the sorted output is NOT byte-equal to the input (reorder happened).
+        use rskim_contract::canonical::tools_arrays_set_equal;
+        use crate::canonical_emit::sort_tools_array;
+        use crate::canonical_emit::ToolArrayKind;
+        let original = r#"[{"name":"beta","x":1},{"name":"alpha","x":2}]"#;
+        let sorted = sort_tools_array(original, ToolArrayKind::AnthropicTools).unwrap();
+        let sorted_str = std::str::from_utf8(&sorted).unwrap();
+        assert!(
+            tools_arrays_set_equal(original, sorted_str),
+            "AC29: correct sort must pass the set-equal gate"
+        );
+        assert_ne!(
+            original.as_bytes(), sorted.as_slice(),
+            "AC29: sort must have actually reordered elements (non-tautology)"
+        );
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────
