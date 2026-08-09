@@ -343,6 +343,120 @@ pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
     matches!((&a, &b), (RawNode::Array(_), RawNode::Array(_))) && raw_nodes_equal(&a, &b)
 }
 
+/// Check **multiset (bag) equality** between two tools arrays.
+///
+/// This is the **set-equality gate** used exclusively by `#306` (`CacheAlignStage`)
+/// to verify that a deterministic element-reorder of the tools array dropped, duplicated,
+/// and mutated nothing. It is the complement of the order-sensitive [`tools_arrays_equal`],
+/// which remains the gate for every other transform (preserving strict byte round-trip
+/// globally and narrowing the set-equality relaxation to this one deliberate reorder).
+///
+/// # AD-CA-7 — ADR-007 re-argued for element reorder
+///
+/// A deliberate tools-array element reorder cannot satisfy byte-round-trip (the elements
+/// appear in a different order). ADR-007's losslessness gate for this specific transform
+/// is therefore **set-equality + total-order determinism** (approved by the user's
+/// 2026-07-17 sign-off). This function proves the reorder lost, duplicated, and mutated
+/// nothing, while permitting a deliberate order change; [`tools_arrays_equal`] stays
+/// order-sensitive so every other transform keeps strict round-trip.
+///
+/// # Algorithm
+///
+/// Parse both `raw_a` and `raw_b` as JSON arrays. Require equal length. For each element
+/// of `raw_a`, find one as-yet-unused element in `raw_b` that is canonically equal under
+/// raw-token element equality ([`raw_nodes_equal`]). Return `true` iff every element in
+/// `raw_a` matches exactly one element in `raw_b`.
+///
+/// The matching is **greedy**: elements are matched left-to-right in `raw_a` against the
+/// first unused canonical-equal element in `raw_b`. This produces a correct multiset
+/// equality check because duplicate elements are handled by the "as-yet-unused" invariant:
+/// a `raw_b` with a duplicated element requires two matching requests from `raw_a`, so the
+/// presence of a genuine duplicate in `raw_a` is correctly verified.
+///
+/// # Number comparison
+///
+/// Uses **raw source-token bytes** (the AC11 / Decision 1 invariant). `1e3` and `1000`
+/// are treated as distinct tokens even though they are mathematically equal. This is
+/// the correct invariant for cache-key faithfulness.
+///
+/// # Returns
+///
+/// - `true` — both arrays have the same elements under canonical equality (any order)
+/// - `false` — either array fails to parse, arrays differ in length, or any element in
+///   `raw_a` has no matching unused canonical-equal element in `raw_b`
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_contract::canonical::tools_arrays_set_equal;
+///
+/// // Permutation → equal under set equality
+/// let a = r#"[{"name":"a"},{"name":"b"}]"#;
+/// let b = r#"[{"name":"b"},{"name":"a"}]"#;
+/// assert!(tools_arrays_set_equal(a, b));
+///
+/// // Same order → also equal
+/// assert!(tools_arrays_set_equal(a, a));
+///
+/// // Drop one element → false
+/// let dropped = r#"[{"name":"a"}]"#;
+/// assert!(!tools_arrays_set_equal(a, dropped));
+///
+/// // Duplicate one element → false (b has two "a", a has one "a" + one "b")
+/// let dup = r#"[{"name":"a"},{"name":"a"}]"#;
+/// assert!(!tools_arrays_set_equal(a, dup));
+///
+/// // Mutated element → false
+/// let mutated = r#"[{"name":"a"},{"name":"CHANGED"}]"#;
+/// assert!(!tools_arrays_set_equal(a, mutated));
+/// ```
+pub fn tools_arrays_set_equal(raw_a: &str, raw_b: &str) -> bool {
+    // Parse both arrays using the raw-node path so numbers are compared as
+    // token bytes (AC11 invariant). Fail-open (false) on any parse error.
+    let (a_node, b_node) = match (parse_raw_node(raw_a, 0), parse_raw_node(raw_b, 0)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+
+    // Both must be arrays.
+    let (a_elems, b_elems) = match (a_node, b_node) {
+        (RawNode::Array(a), RawNode::Array(b)) => (a, b),
+        _ => return false,
+    };
+
+    // Require equal length — a drop or duplication changes the count.
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+
+    // Greedy multiset match: for each element in `a`, find the first unused
+    // canonically-equal element in `b`. Use a boolean "used" mask to prevent
+    // the same `b` element from being matched twice (handles duplicate elements
+    // in `a` correctly — each must consume a distinct `b` slot).
+    //
+    // O(n²) in the number of tools; safe in practice (real requests have at
+    // most ~64 tools, and this function runs at most once per request per
+    // transform invocation). A HashMap-based O(n) alternative would require
+    // a stable serialization step to key the map; the O(n²) scan is cheaper
+    // for this cardinality range.
+    let mut used = vec![false; b_elems.len()];
+
+    for a_elem in &a_elems {
+        // Find the first unused b element that is canonically equal to a_elem.
+        let matched = b_elems.iter().enumerate().find(|(j, b_elem)| {
+            !used[*j] && raw_nodes_equal(a_elem, b_elem)
+        });
+        match matched {
+            Some((j, _)) => used[j] = true,
+            None => return false, // no unused match → set mismatch
+        }
+    }
+
+    // All elements in `a` matched; since lengths are equal, all `b` slots
+    // are also used (pigeon-hole: n elements consumed n of n slots).
+    true
+}
+
 // ============================================================================
 // value_equivalent_raw — O(n) value-equivalence comparator (#427 Pass 2)
 // ============================================================================
@@ -767,6 +881,138 @@ mod tests {
         let a = r#"[{"name":"a"},{"name":"b"}]"#;
         let b = r#"[{"name":"a"}]"#;
         assert!(!tools_arrays_equal(a, b));
+    }
+
+    // ========================================================================
+    // tools_arrays_set_equal tests (AD-CA-7 multiset gate, AC29)
+    // ========================================================================
+
+    /// Permutation → true (the primary use case: element reorder is still set-equal).
+    ///
+    /// Discriminating: if this were [`tools_arrays_equal`] (order-sensitive), it would
+    /// return `false` for a permuted array, proving the two functions serve different roles.
+    #[test]
+    fn tools_arrays_set_equal_permutation_is_true() {
+        let a = r#"[{"name":"search","description":"Search files"},{"name":"compile","description":"Compile"}]"#;
+        let b = r#"[{"name":"compile","description":"Compile"},{"name":"search","description":"Search files"}]"#;
+        assert!(
+            tools_arrays_set_equal(a, b),
+            "permuted arrays must be set-equal"
+        );
+        // Confirm the order-sensitive check disagrees (non-tautology proof).
+        assert!(
+            !tools_arrays_equal(a, b),
+            "permuted arrays must NOT be order-equal (proves tools_arrays_equal is distinct)"
+        );
+    }
+
+    /// Same order → also set-equal (symmetric, reflexive).
+    #[test]
+    fn tools_arrays_set_equal_same_order_is_true() {
+        let a = r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#;
+        assert!(tools_arrays_set_equal(a, a), "identical arrays must be set-equal");
+    }
+
+    /// Drop one element → false (length mismatch catches it).
+    ///
+    /// Discriminating: if the length check is removed, the greedy matcher would
+    /// still pass (all elements of the shorter array find a match), returning true
+    /// for a dropped element.
+    #[test]
+    fn tools_arrays_set_equal_drop_is_false() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let dropped = r#"[{"name":"a"}]"#;
+        assert!(
+            !tools_arrays_set_equal(a, dropped),
+            "dropped element must fail set-equality"
+        );
+        assert!(
+            !tools_arrays_set_equal(dropped, a),
+            "set-equality must be symmetric: drop fails in both directions"
+        );
+    }
+
+    /// Duplicate one element → false.
+    ///
+    /// `b` has two copies of `{"name":"a"}` and zero copies of `{"name":"b"}`.
+    /// The greedy matcher assigns the first `{"name":"a"}` in `a` to the first
+    /// `{"name":"a"}` in `b`, and then cannot find an unused match for `{"name":"b"}`.
+    ///
+    /// Discriminating: if the `used` mask is removed, the second element of `a`
+    /// (`{"name":"b"}`) could incorrectly match the second `{"name":"a"}` in `b`
+    /// via a buggy implementation. The `used` mask prevents this.
+    #[test]
+    fn tools_arrays_set_equal_duplicate_is_false() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let dup = r#"[{"name":"a"},{"name":"a"}]"#; // "b" replaced with second "a"
+        assert!(
+            !tools_arrays_set_equal(a, dup),
+            "array with duplicated element must fail set-equality"
+        );
+    }
+
+    /// Single-element mutation → false.
+    ///
+    /// One element in `b` has its description changed. The raw-token comparison
+    /// (`raw_nodes_equal`) catches the content mutation.
+    ///
+    /// Discriminating: if raw-token comparison were replaced with structural
+    /// type-only comparison (ignoring string values), this would return true,
+    /// letting a mutated description through the gate.
+    #[test]
+    fn tools_arrays_set_equal_mutation_is_false() {
+        let original = r#"[{"name":"search","description":"Search files"},{"name":"compile","description":"Compile"}]"#;
+        let mutated = r#"[{"name":"compile","description":"Compile"},{"name":"search","description":"MUTATED"}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, mutated),
+            "mutated element must fail set-equality"
+        );
+    }
+
+    /// Empty arrays → set-equal (vacuous).
+    #[test]
+    fn tools_arrays_set_equal_empty_is_true() {
+        assert!(tools_arrays_set_equal("[]", "[]"), "empty arrays are set-equal");
+    }
+
+    /// Non-array inputs → false.
+    #[test]
+    fn tools_arrays_set_equal_non_array_is_false() {
+        assert!(
+            !tools_arrays_set_equal(r#"{"name":"a"}"#, r#"[{"name":"a"}]"#),
+            "object is not set-equal to array"
+        );
+    }
+
+    /// Raw-number token faithfulness in set-equality (AC11 invariant preserved).
+    ///
+    /// `1e3` and `1000` are different raw tokens; set-equality must treat them as
+    /// distinct elements. Without raw-token comparison, they would normalise to f64
+    /// and the mutation would be invisible.
+    #[test]
+    fn tools_arrays_set_equal_raw_number_mutation_is_false() {
+        let original =
+            r#"[{"name":"t","parameters":{"default":1e3}},{"name":"u"}]"#;
+        let mutated =
+            r#"[{"name":"u"},{"name":"t","parameters":{"default":1000}}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, mutated),
+            "1e3 vs 1000 raw-token mutation must fail set-equality (AC11)"
+        );
+    }
+
+    /// Genuine duplicates in both arrays are handled correctly (count-preserving).
+    ///
+    /// If both `a` and `b` contain two identical elements, set-equality must pass —
+    /// the multiset {x, x} equals the multiset {x, x}.
+    #[test]
+    fn tools_arrays_set_equal_genuine_duplicates_both_sides() {
+        let a = r#"[{"name":"x"},{"name":"x"}]"#;
+        let b = r#"[{"name":"x"},{"name":"x"}]"#;
+        assert!(
+            tools_arrays_set_equal(a, b),
+            "identical arrays with genuine duplicates must be set-equal"
+        );
     }
 
     // ========================================================================

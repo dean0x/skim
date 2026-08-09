@@ -91,7 +91,97 @@ pub fn byte_gate(input_len: usize, candidate_len: usize) -> ByteGateVerdict {
     }
 }
 
-/// Apply the guarded transform pipeline with sink-failure rule.
+/// Apply the guarded transform pipeline with sink-failure rule and configurable growth allowance.
+///
+/// # AD-GR-1 — Single home for the byte-gate, sink rule, and Modified record
+///
+/// This is the **single function** that interleaves the byte-length gate, the
+/// sink-failure rule (invariant 8), and the `Modified` `DecisionRecord`. Callers
+/// MUST NOT re-implement any of these three concerns — route all guarded mutations
+/// through this function. `guarded_transform` (the zero-growth convenience wrapper)
+/// delegates here at `max_growth = 0`.
+///
+/// # AD-CA-5 / AD-PXY-21 — Bounded growth for the `#306` cache-alignment stage
+///
+/// `#306` (`CacheAlignStage`) injects up to 2 `cache_control` markers, each
+/// `MARKER_BYTES = 37` bytes, for a maximum growth of `2 × 37 = 74` bytes. The
+/// stage sets `max_growth = 2 × rskim_contract::waiver::MARKER_BYTES` in its
+/// `TransformStage::max_growth()` implementation; the seam passes that value here.
+/// Every other stage uses the zero-growth default (`guarded_transform`), so this
+/// allowance is isolated to `#306` by construction.
+///
+/// # Accept condition
+///
+/// Accepts iff `candidate_len ≤ input_len + max_growth`, which is structurally
+/// equivalent to `byte_gate(input_len, candidate_len.saturating_sub(max_growth))`.
+/// Saturating subtraction ensures the comparison is always correct without overflow:
+/// when `candidate_len < max_growth` the gate trivially passes (net shrinkage is
+/// always acceptable regardless of `max_growth`).
+///
+/// # Arguments
+///
+/// - `input` — original input bytes (owned; moved into the passthrough `Outcome`
+///   on gate rejection or `SinkFull`, avoiding a copy on the most common paths)
+/// - `candidate` — proposed output bytes (owned; moved into the modification `Outcome`
+///   on acceptance, also avoiding a copy)
+/// - `max_growth` — how many bytes beyond `input.len()` the candidate is permitted
+///   to be; 0 means strict never-inflate (the default for all non-waivered stages)
+/// - `request_id` — caller-assigned request identifier
+/// - `component` — stable component name for the decision record
+/// - `sink` — injected decision sink
+///
+/// # Returns
+///
+/// Always returns an `Outcome` (no error variant). Passthrough occurs when:
+/// - `candidate.len() > input.len() + max_growth` (gate rejected)
+/// - `sink.try_send` returns `SinkFull` (sink-failure rule, invariant 8)
+pub fn guarded_transform_with_growth(
+    input: Vec<u8>,
+    candidate: Vec<u8>,
+    max_growth: usize,
+    request_id: &str,
+    component: &'static str,
+    sink: &dyn DecisionSink,
+) -> Outcome {
+    let input_len = input.len();
+    let candidate_len = candidate.len();
+
+    // Step 1: byte gate with growth allowance (invariant 2, no tokenizer).
+    //
+    // Equivalent to: candidate_len <= input_len + max_growth
+    // Using saturating_sub to avoid overflow: candidate_len.saturating_sub(max_growth) <= input_len
+    if byte_gate(input_len, candidate_len.saturating_sub(max_growth)) == ByteGateVerdict::Rejected {
+        // Gate rejected: emit passthrough (no decision record for rejected attempts).
+        return Outcome::passthrough(input, request_id, component);
+    }
+
+    // Step 2: attempt to record the decision before emitting the modification.
+    // Invariant 8: a modification whose record was not accepted MUST NOT be emitted.
+    let record = DecisionRecord::modified(request_id, component, input_len, candidate_len);
+    match sink.try_send(record) {
+        Ok(()) => {
+            // Record accepted; emit the modification.
+            Outcome::modified(candidate, input_len, request_id, component)
+        }
+        Err(SinkFull) => {
+            // Sink full: emit passthrough rather than an unlogged modification.
+            Outcome::passthrough(input, request_id, component)
+        }
+    }
+}
+
+/// Apply the guarded transform pipeline with sink-failure rule (zero-growth variant).
+///
+/// This is the standard never-inflate path for all non-waivered transform stages.
+/// It delegates to [`guarded_transform_with_growth`] with `max_growth = 0`, keeping
+/// `#304` (`BlockRouter`) and `#307` (stale-compaction) byte-identical to their
+/// behaviour before `#306` introduced the growth-aware variant.
+///
+/// # AD-GR-1
+///
+/// `guarded_transform` is the canonical call site for stages without a growth waiver.
+/// It MUST NOT be called by `#306`'s `CacheAlignStage` — that stage uses
+/// [`guarded_transform_with_growth`] directly with its own `max_growth` value.
 ///
 /// This function enforces the full L3 transform contract:
 ///
@@ -100,9 +190,6 @@ pub fn byte_gate(input_len: usize, candidate_len: usize) -> ByteGateVerdict {
 /// 3. If accepted → attempt `sink.try_send(modification_record)`.
 /// 4. If `try_send` returns `SinkFull` → return passthrough `Outcome`.
 /// 5. If `try_send` returns `Ok` → return the modification `Outcome`.
-///
-/// This is the only function in the codebase that interleaves the gate check
-/// and the sink dispatch, making the sink-failure rule observable at one site.
 ///
 /// # Arguments
 ///
@@ -135,28 +222,9 @@ pub fn guarded_transform(
     component: &'static str,
     sink: &dyn DecisionSink,
 ) -> Outcome {
-    let input_len = input.len();
-    let candidate_len = candidate.len();
-
-    // Step 1: byte gate (invariant 2, no tokenizer).
-    if byte_gate(input_len, candidate_len) == ByteGateVerdict::Rejected {
-        // Gate rejected: emit passthrough (no decision record for rejected attempts).
-        return Outcome::passthrough(input, request_id, component);
-    }
-
-    // Step 2: attempt to record the decision before emitting the modification.
-    // Invariant 8: a modification whose record was not accepted MUST NOT be emitted.
-    let record = DecisionRecord::modified(request_id, component, input_len, candidate_len);
-    match sink.try_send(record) {
-        Ok(()) => {
-            // Record accepted; emit the modification.
-            Outcome::modified(candidate, input_len, request_id, component)
-        }
-        Err(SinkFull) => {
-            // Sink full: emit passthrough rather than an unlogged modification.
-            Outcome::passthrough(input, request_id, component)
-        }
-    }
+    // AD-GR-1: delegate to the growth-aware variant at max_growth = 0 so the
+    // byte-gate, sink-failure rule, and Modified record have a single implementation.
+    guarded_transform_with_growth(input, candidate, 0, request_id, component, sink)
 }
 
 /// Whole-request defense-in-depth byte check.
@@ -246,6 +314,100 @@ mod tests {
     fn whole_request_check_rejects_inflate() {
         let err = whole_request_check(100, 101).expect_err("must fail");
         assert_eq!(err, 101);
+    }
+
+    // ========================================================================
+    // guarded_transform_with_growth tests — AC21 (growth-aware gate)
+    // ========================================================================
+
+    /// AD-GR-1: candidate within growth allowance is accepted.
+    #[test]
+    fn guarded_transform_with_growth_accepted_within_allowance() {
+        let sink = Arc::new(MockSink::new());
+        let input = b"hello".to_vec(); // 5 bytes
+        // candidate is 6 bytes — 1 over input but within max_growth=2
+        let candidate = b"hello!".to_vec();
+        let outcome =
+            guarded_transform_with_growth(input.clone(), candidate.clone(), 2, "req-g1", "test", &*sink);
+        assert_eq!(outcome.bytes, candidate, "candidate within growth must be accepted");
+        assert!(!outcome.is_passthrough());
+        assert_eq!(sink.len(), 1);
+    }
+
+    /// AD-GR-1: candidate exactly at growth allowance boundary is accepted.
+    #[test]
+    fn guarded_transform_with_growth_accepted_at_boundary() {
+        let sink = Arc::new(MockSink::new());
+        let input = b"hello".to_vec(); // 5 bytes
+        // candidate is 7 bytes — exactly input + max_growth (2)
+        let candidate = b"hello!!".to_vec();
+        let outcome =
+            guarded_transform_with_growth(input.clone(), candidate.clone(), 2, "req-g2", "test", &*sink);
+        assert_eq!(outcome.bytes, candidate, "candidate at growth boundary must be accepted");
+        assert!(!outcome.is_passthrough());
+    }
+
+    /// AD-GR-1: candidate one byte beyond growth allowance is rejected to passthrough.
+    #[test]
+    fn guarded_transform_with_growth_rejected_beyond_allowance() {
+        let sink = Arc::new(MockSink::new());
+        let input = b"hello".to_vec(); // 5 bytes
+        // candidate is 8 bytes — 3 over input, beyond max_growth=2
+        let candidate = b"hello!!!".to_vec();
+        let outcome =
+            guarded_transform_with_growth(input.clone(), candidate, 2, "req-g3", "test", &*sink);
+        assert_eq!(outcome.bytes, input, "candidate beyond growth must be rejected to passthrough");
+        assert!(outcome.is_passthrough());
+        assert!(sink.is_empty(), "no record sent on gate rejection");
+    }
+
+    /// AD-GR-1: max_growth=0 behaves identically to guarded_transform (AC21 regression).
+    #[test]
+    fn guarded_transform_with_growth_zero_matches_guarded_transform() {
+        let sink1 = Arc::new(MockSink::new());
+        let sink2 = Arc::new(MockSink::new());
+        let input = b"hello world extra".to_vec();
+        let candidate = b"hello world".to_vec();
+
+        let outcome1 =
+            guarded_transform_with_growth(input.clone(), candidate.clone(), 0, "req-r1", "test", &*sink1);
+        let outcome2 =
+            guarded_transform(input.clone(), candidate.clone(), "req-r1", "test", &*sink2);
+
+        assert_eq!(outcome1.bytes, outcome2.bytes, "zero-growth must match guarded_transform");
+        assert_eq!(
+            outcome1.is_passthrough(),
+            outcome2.is_passthrough(),
+            "passthrough flag must match"
+        );
+        assert_eq!(sink1.len(), sink2.len(), "sink record count must match");
+    }
+
+    /// AD-GR-1: SinkFull with growth allowance still falls back to passthrough (invariant 8).
+    #[test]
+    fn guarded_transform_with_growth_sink_full_falls_back() {
+        let sink = Arc::new(MockSink::new());
+        sink.set_full(true);
+        let input = b"hello".to_vec();
+        let candidate = b"hello!".to_vec(); // within max_growth=5
+        let outcome =
+            guarded_transform_with_growth(input.clone(), candidate, 5, "req-g4", "test", &*sink);
+        assert_eq!(outcome.bytes, input, "SinkFull must fall back to passthrough even with growth");
+        assert!(outcome.is_passthrough());
+        assert!(sink.is_empty(), "no record accepted on SinkFull");
+    }
+
+    /// AD-GR-1: max_growth larger than candidate_len always passes the gate (saturating_sub).
+    #[test]
+    fn guarded_transform_with_growth_large_allowance_always_accepts() {
+        let sink = Arc::new(MockSink::new());
+        let input = b"x".to_vec(); // 1 byte
+        let candidate = b"xxxxx".to_vec(); // 5 bytes — normally would fail strict gate
+        // max_growth=10 > candidate_len=5 → saturating_sub(10) = 0 ≤ 1 = input_len → accepted
+        let outcome =
+            guarded_transform_with_growth(input.clone(), candidate.clone(), 10, "req-g5", "test", &*sink);
+        assert_eq!(outcome.bytes, candidate, "large growth allowance must pass");
+        assert!(!outcome.is_passthrough());
     }
 
     // ========================================================================
