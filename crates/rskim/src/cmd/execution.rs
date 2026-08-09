@@ -299,11 +299,12 @@ pub(crate) struct ParsedCommandConfig<'a> {
     pub family: &'a str,
     /// When `true`, skip ANSI escape stripping on the raw command output.
     ///
-    /// `strip_ansi_escapes` treats ASCII control codes — including `\t` (0x09) —
-    /// as part of escape sequences and drops them. DB tools emit tab-separated
-    /// (TSV) output; stripping would remove tab separators and cause all DB
-    /// parsers to fall through to Passthrough. DB tools set `true`;
-    /// all other families set `false`.
+    /// `strip_escape_sequences` (via `strip_ansi_cow`) removes ESC-rooted
+    /// sequences from the output buffer while preserving all other bytes.
+    /// Wrappers that pass content-bearing ESC bytes to the reader (ADR-012),
+    /// or whose bytes reach the reader unparsed (RawPassthrough, PF-006),
+    /// must set `true` to prevent any stripping.  DB tools, diff, and
+    /// grep-class tools use `true`; most other families use `false`.
     pub skip_ansi_strip: bool,
     /// Recording context constructed once by the family dispatcher.
     /// `run_parsed_command_with_mode` annotates `parse_tier` via
@@ -727,18 +728,18 @@ where
     // RawPassthrough) MUST set config.skip_ansi_strip = true, or the reader
     // receives the already-stripped bytes.
     //
-    // strip_ansi_escapes treats ALL ASCII C0 controls — including \t (0x09) — as
-    // part of escape sequences and drops them.  strip_ansi_cow is all-or-nothing
-    // across the whole buffer: one ESC byte anywhere causes Cow::Owned, and the
-    // subsequent strip removes ALL 0x09 bytes from every line, not just the
-    // line that contained the ESC.
+    // strip_escape_sequences (via strip_ansi_cow) removes ESC-rooted sequences
+    // (CSI, OSC, 2-byte) while preserving all other bytes including TABs.
+    // When any ESC byte is present the whole buffer is re-encoded as Cow::Owned.
     //
-    // Wrappers that set skip_ansi_strip: false and parse tabs (DB tools, gh, diff)
-    // are broken by the strip before their parsers even run; those that set false
-    // and return RawPassthrough (the passthrough family: wc/df/du/find/ps/ls)
-    // serve the stripped bytes directly to the reader — the same class of failure
-    // from two directions.  The flag must be true for both cases.  Callers signal
-    // this via `config.skip_ansi_strip`.
+    // Two wrapper classes must set skip_ansi_strip: true to opt out entirely:
+    // (1) Content-bearing wrappers: ESC/CSI bytes from file or tool CONTENT must
+    //     reach the reader byte-faithfully (ADR-012); stripping them would diverge
+    //     from raw without a loss marker — a #317 violation.
+    // (2) RawPassthrough wrappers: bytes in output.stdout are served directly
+    //     to the reader after this block; even with ESC sequences removed the
+    //     stripping step can affect content the reader expects intact (PF-006).
+    // Callers signal this via `config.skip_ansi_strip`.
     let output = if skip_ansi_strip {
         output
     } else {

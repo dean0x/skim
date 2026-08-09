@@ -324,8 +324,9 @@ src/app.py:12:        return self.value\n";
     /// `du` TAB and ESC byte-faithful passthrough on both interception surfaces.
     ///
     /// du's POSIX format is `size<TAB>path`; with `skip_ansi_strip: false` an
-    /// ESC byte anywhere triggers `strip_ansi_cow` → `Cow::Owned`, destroying
-    /// ALL tabs in the entire buffer via `strip_ansi_escapes`.
+    /// ESC byte anywhere triggers `strip_ansi_cow` → `Cow::Owned`, and
+    /// `strip_escape_sequences` then scans the entire buffer — content-level
+    /// ESC bytes are removed and any bytes the reader expects intact are at risk.
     ///
     /// Both the hook surface (`skim du -a`) and the argv0/wrapper surface
     /// (`argv[0]="du"`) must produce byte-identical output matching the fixture,
