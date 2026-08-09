@@ -81,7 +81,10 @@ pub(crate) enum ToolArrayKind {
 ///
 /// The returned pairs are in source order (before key-sort). Values are owned
 /// `Box<RawValue>` containing the raw JSON bytes of each value.
-fn parse_object_pairs(raw: &str) -> Option<Vec<(String, Box<RawValue>)>> {
+/// This function is `pub(crate)` so that `breakpoint.rs` can rebuild tool/system
+/// elements with `cache_control` inserted at the canonically-sorted position (AD-CA-7
+/// injection path idempotence). Only the crate-internal injection helpers call it.
+pub(crate) fn parse_object_pairs(raw: &str) -> Option<Vec<(String, Box<RawValue>)>> {
     struct PairsVisitor;
 
     impl<'de> Visitor<'de> for PairsVisitor {
