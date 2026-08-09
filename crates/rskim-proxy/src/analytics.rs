@@ -17,8 +17,7 @@
 //! #305 connects [`ChannelAnalyticsHook`] into `serve()` with a spawned consumer.
 //!
 //! The concrete [`ChannelAnalyticsHook`] ships a bounded `crossbeam_channel`
-//! sender. #305 will extend [`ProxyEvent`] with usage counters (token fields)
-//! without a breaking change, because the struct is `#[non_exhaustive]`.
+//! sender. The struct is `#[non_exhaustive]`.
 //!
 //! ## AC6 — ProxyEvent is non-exhaustive and fires exactly once
 //!
@@ -30,7 +29,77 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::Bytes;
+
 use crate::detect::ProxyProvider;
+
+// ============================================================================
+// RequestTier — per-request compression tier (AD-PXY-21)
+// ============================================================================
+
+/// Per-request compression tier, derived from the collected per-block
+/// [`rskim_contract::log::DecisionRecord`]s after the transform pipeline runs.
+///
+/// ## AD-PXY-21 — tier derivation rule
+///
+/// Derived by filtering collected records to the `"block-router"` component
+/// (Cross-Plan Amendment #3, to exclude future CacheAlignStage records) and
+/// then applying: any `Degraded` → `Degraded`; else any `Full` → `Full`; else
+/// `Passthrough`. This derivation is pure in-memory with no I/O and no token
+/// counting on the request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestTier {
+    /// All blocks forwarded byte-identically (passthrough, fail-open, or
+    /// lossless-only policy). Matches the passthrough-family
+    /// [`rskim_contract::log::OutcomeReason`] variants.
+    #[default]
+    Passthrough,
+    /// At least one block was compressed with a clean parse (no degraded
+    /// blocks). Maps to `OutcomeReason::Full`.
+    Full,
+    /// At least one block was compressed but with parse errors. Maps to
+    /// `OutcomeReason::Degraded`. Takes precedence over `Full`.
+    Degraded,
+}
+
+impl RequestTier {
+    /// Stable string representation used in analytics DB rows.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestTier::Passthrough => "passthrough",
+            RequestTier::Full => "full",
+            RequestTier::Degraded => "degraded",
+        }
+    }
+}
+
+// ============================================================================
+// BlockDecisionProjection — compact per-block decision for the detail table
+// ============================================================================
+
+/// Compact projection of one [`rskim_contract::log::DecisionRecord`] for the
+/// `proxy_block_decisions` detail table.
+///
+/// ## AD-AN-13 / AD-PXY-21
+///
+/// The unit is **bytes** (not tokens): `bytes_in` / `bytes_out` are always
+/// present and exactly additive across blocks. Token counting is non-additive
+/// across block boundaries; the parent `token_savings` row carries the whole-body
+/// single-`Counter` counts. The byte-reconciliation invariant:
+/// `Σ bytes_in == raw_content_len` and `Σ bytes_out == forwarded_content_len`.
+#[derive(Debug, Clone)]
+pub struct BlockDecisionProjection {
+    /// Stage component name (e.g., `"block-router"`, `"identity"`).
+    pub component: &'static str,
+    /// Outcome string derived from [`rskim_contract::log::OutcomeReason`]:
+    /// one of `"full"`, `"degraded"`, `"passthrough"`, `"failed_open"`,
+    /// `"policy_passthrough"`, `"lossy_rejected"`, or `"unknown"`.
+    pub outcome: &'static str,
+    /// Input byte count for this block.
+    pub bytes_in: usize,
+    /// Output byte count for this block.
+    pub bytes_out: usize,
+}
 
 // ============================================================================
 // ProxyEvent
@@ -38,13 +107,26 @@ use crate::detect::ProxyProvider;
 
 /// Per-request analytics payload.
 ///
-/// Fired exactly once per completed request (AC6). Extensible: #305 adds
-/// usage-counter fields (tokens in/out, model name) without a breaking change
-/// because the struct is `#[non_exhaustive]`.
+/// Fired exactly once per completed request (AC6). `#[non_exhaustive]` so future
+/// fields can be added without breaking external match/construction patterns.
+///
+/// ## AD-PXY-21 / AD-PXY-22 / AD-PXY-23
+///
+/// - `model` — verbatim model string extracted by `detect_model`; no
+///   normalization (AD-PXY-22).
+/// - `tier` — derived from collected `DecisionRecord`s filtered to the
+///   `"block-router"` component after the transform pipeline (AD-PXY-21).
+/// - `raw_body` / `final_body` — original and transformed request bodies as
+///   `Bytes` (cheap Arc-clone) for background token counting in the consumer
+///   thread.
+/// - `upstream_error_status` — set only on the distinct transformed-but-
+///   upstream-errored path (AD-PXY-25); `None` for a normally relayed request.
+/// - `duration` — set at fire time (AD-PXY-23), measuring request receipt →
+///   final relayed response frame / stream end.
 ///
 /// # Non-exhaustive construction
 ///
-/// External crates must use `..` in struct literals (AC24). In-crate construction
+/// External crates must use `..` in struct literals. In-crate construction
 /// uses [`ProxyEvent::new`].
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -54,27 +136,54 @@ pub struct ProxyEvent {
 
     /// Bytes received from the client (request body).
     ///
-    /// Equal to the client-sent body length. The proxy MUST NOT modify this —
-    /// byte-identity is the forwarding invariant.
+    /// Derived from `raw_body.len()` — equals the client-sent body length.
     pub request_bytes: u64,
 
     /// Bytes received from the upstream (response body).
     ///
-    /// Measured at the proxy, not at the client. For streaming responses this
-    /// is the total bytes forwarded to the client.
+    /// Currently always `0` (deferred OQ3 — response byte counting requires a
+    /// separate response-body wrapping layer not yet implemented).
     pub response_bytes: u64,
 
-    /// Wall-clock duration from first request byte to last response byte.
+    /// Wall-clock duration from first request byte to last response byte
+    /// (stream end), set at fire time by [`crate::server::AnalyticsCompletionBody`].
     ///
-    /// Includes upstream latency + forwarding overhead. Does NOT subtract
-    /// upstream time; the absolute figure is more useful for analytics.
-    /// Per ADR-003 / PF-005: not used as a CI gate — latency regression
-    /// detection uses criterion bench baselines (AD-PXY-16).
-    ///
-    /// Note: [`crate::seam::TransformStage`] transforms are deterministic
-    /// (no clocks per #301 invariant 5). The proxy's server layer LEGITIMATELY
-    /// uses clocks (AC18 — do not copy rskim-contract's disallowed-methods gate).
+    /// AD-PXY-23: `duration` is computed as `start.elapsed()` at the moment
+    /// the completion wrapper fires, not at response-header time.
     pub duration: Duration,
+
+    /// Verbatim model string extracted from the request body's top-level
+    /// `"model"` key (AD-PXY-22). `None` when undetected or non-UTF-8.
+    pub model: Option<String>,
+
+    /// Turn-level attribution. Always `None` in #305; live derivation is
+    /// owned by #344 (filed per ADR-004).
+    pub turn_id: Option<String>,
+
+    /// Per-request compression tier derived from block-router DecisionRecords
+    /// (AD-PXY-21). `Passthrough` when no modification occurred.
+    pub tier: RequestTier,
+
+    /// Original (untransformed) request body.
+    ///
+    /// Cheap `Bytes` clone (Arc-based). Used by the background consumer thread
+    /// for token counting (AD-AN-7 / AD-AN-8).
+    pub raw_body: Bytes,
+
+    /// Transformed (forwarded) request body.
+    ///
+    /// Cheap `Bytes` clone. Used together with `raw_body` for token delta
+    /// counting on the background consumer thread.
+    pub final_body: Bytes,
+
+    /// Compact per-block decision projection for the `proxy_block_decisions`
+    /// detail table (AD-AN-13 / AD-PXY-21).
+    pub block_decisions: Vec<BlockDecisionProjection>,
+
+    /// Set only on the distinct transformed-but-upstream-errored path
+    /// (AD-PXY-25): `Some(502)` for no-upstream / bad-URL / connection-error,
+    /// `Some(504)` for upstream timeout. `None` for a normally relayed row.
+    pub upstream_error_status: Option<u16>,
 }
 
 impl ProxyEvent {
@@ -82,21 +191,41 @@ impl ProxyEvent {
     ///
     /// External consumers use the `#[non_exhaustive]` struct literal with `..`.
     ///
-    /// Called by the #303 request-completion path in `server.rs::handle_request`
-    /// exactly once per completed request (AC6). #305 extends [`ProxyEvent`] with
-    /// usage counters (token fields, turn-level attribution); the constructor
-    /// signature will remain backward-compatible.
+    /// `request_bytes` is derived from `raw_body.len()`. `response_bytes` is
+    /// always `0` (deferred OQ3).
+    ///
+    /// ## AD-PXY-21 / AD-PXY-22 / AD-PXY-23
+    ///
+    /// `tier`, `block_decisions`, and `model` are derived on the request path
+    /// before this constructor is called (see `server.rs::handle_request`).
+    /// `duration` is set at fire time (stream end or Drop).
+    /// `upstream_error_status` is `None` for normal relayed rows and `Some(502|504)`
+    /// for the distinct transformed-but-upstream-errored path (AD-PXY-25).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: ProxyProvider,
-        request_bytes: u64,
-        response_bytes: u64,
+        model: Option<String>,
+        turn_id: Option<String>,
+        tier: RequestTier,
+        raw_body: Bytes,
+        final_body: Bytes,
+        block_decisions: Vec<BlockDecisionProjection>,
+        upstream_error_status: Option<u16>,
         duration: Duration,
     ) -> Self {
+        let request_bytes = raw_body.len() as u64;
         Self {
             provider,
             request_bytes,
-            response_bytes,
+            response_bytes: 0, // deferred OQ3
             duration,
+            model,
+            turn_id,
+            tier,
+            raw_body,
+            final_body,
+            block_decisions,
+            upstream_error_status,
         }
     }
 }
@@ -207,10 +336,16 @@ mod tests {
     use crate::detect::ProxyProvider;
 
     fn make_event() -> ProxyEvent {
+        // raw_body of 1024 bytes so request_bytes == 1024 (AC6 field check).
         ProxyEvent::new(
             ProxyProvider::Anthropic,
-            1024,
-            2048,
+            None,
+            None,
+            RequestTier::Passthrough,
+            Bytes::from(vec![0u8; 1024]),
+            Bytes::from(vec![0u8; 1024]),
+            vec![],
+            None,
             Duration::from_millis(42),
         )
     }
@@ -228,9 +363,22 @@ mod tests {
     fn test_event_fields_populated() {
         let event = make_event();
         assert_eq!(event.provider, ProxyProvider::Anthropic);
-        assert_eq!(event.request_bytes, 1024);
-        assert_eq!(event.response_bytes, 2048);
+        assert_eq!(event.request_bytes, 1024, "request_bytes derived from raw_body.len()");
+        assert_eq!(event.response_bytes, 0, "response_bytes always 0 (deferred OQ3)");
         assert_eq!(event.duration, Duration::from_millis(42));
+        assert_eq!(event.tier, RequestTier::Passthrough);
+        assert!(event.model.is_none());
+        assert!(event.turn_id.is_none());
+        assert!(event.upstream_error_status.is_none());
+        assert!(event.block_decisions.is_empty());
+    }
+
+    // RequestTier: as_str returns stable strings.
+    #[test]
+    fn test_request_tier_as_str() {
+        assert_eq!(RequestTier::Passthrough.as_str(), "passthrough");
+        assert_eq!(RequestTier::Full.as_str(), "full");
+        assert_eq!(RequestTier::Degraded.as_str(), "degraded");
     }
 
     // AC15: channel hook is non-blocking; event is received by consumer.
@@ -266,21 +414,76 @@ mod tests {
         assert_eq!(rx.len(), 2);
     }
 
-    // AC24: ProxyEvent is non-exhaustive — compile-time check via struct literal
+    // AD-PXY-25: upstream_error_status is set correctly for error events.
+    #[test]
+    fn test_upstream_error_status_field() {
+        let event = ProxyEvent::new(
+            ProxyProvider::Unknown,
+            None,
+            None,
+            RequestTier::Full,
+            Bytes::from_static(b"raw"),
+            Bytes::from_static(b"final"),
+            vec![],
+            Some(502),
+            Duration::from_millis(10),
+        );
+        assert_eq!(event.upstream_error_status, Some(502));
+        assert_eq!(event.tier, RequestTier::Full);
+        assert_eq!(event.request_bytes, 3, "raw.len() == 3");
+    }
+
+    // AD-PXY-21: block_decisions are stored correctly.
+    #[test]
+    fn test_block_decisions_stored() {
+        let decisions = vec![BlockDecisionProjection {
+            component: "block-router",
+            outcome: "full",
+            bytes_in: 100,
+            bytes_out: 80,
+        }];
+        let event = ProxyEvent::new(
+            ProxyProvider::Anthropic,
+            Some("claude-3-5-sonnet-20241022".to_owned()),
+            None,
+            RequestTier::Full,
+            Bytes::from(vec![0u8; 100]),
+            Bytes::from(vec![0u8; 80]),
+            decisions.clone(),
+            None,
+            Duration::from_millis(5),
+        );
+        assert_eq!(event.block_decisions.len(), 1);
+        assert_eq!(event.block_decisions[0].component, "block-router");
+        assert_eq!(event.block_decisions[0].outcome, "full");
+        assert_eq!(event.block_decisions[0].bytes_in, 100);
+        assert_eq!(event.block_decisions[0].bytes_out, 80);
+        assert_eq!(event.model.as_deref(), Some("claude-3-5-sonnet-20241022"));
+    }
+
+    // AD-PXY-24: ProxyEvent is non-exhaustive — compile-time check via struct literal
     // with `..`. This cannot be asserted at runtime; the type system enforces it.
     // The comment is the acceptance criterion documentation.
     //
     // Proof: the following would not compile without `..`:
     //   let _ = ProxyEvent { provider: ProxyProvider::Unknown, request_bytes: 0,
-    //                        response_bytes: 0, duration: Duration::ZERO };
-    // External crates must write:
-    //   ProxyEvent { provider: ..., request_bytes: ..., ..
-    //                rskim_proxy::analytics::ProxyEvent::new(...) }
+    //                        response_bytes: 0, duration: Duration::ZERO, ... };
+    // External crates must use struct-update syntax.
     // (This is enforced by #[non_exhaustive] on the struct.)
     #[test]
     fn test_proxy_event_non_exhaustive_marker() {
         // Use the constructor — cannot use struct literal without `..` from outside.
-        let event = ProxyEvent::new(ProxyProvider::Unknown, 0, 0, Duration::ZERO);
+        let event = ProxyEvent::new(
+            ProxyProvider::Unknown,
+            None,
+            None,
+            RequestTier::default(),
+            Bytes::new(),
+            Bytes::new(),
+            vec![],
+            None,
+            Duration::ZERO,
+        );
         assert!(event.duration.is_zero());
     }
 }

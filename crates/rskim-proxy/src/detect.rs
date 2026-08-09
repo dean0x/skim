@@ -194,6 +194,59 @@ fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
 }
 
 // ============================================================================
+// Model extraction (AD-PXY-22)
+// ============================================================================
+
+/// Extract the model string from a request body, verbatim.
+///
+/// ## AD-PXY-22 — verbatim model extraction
+///
+/// Reuses the bounded shallow-JSON sniff infrastructure (`SHAPE_SNIFF_LIMIT`)
+/// to read only the top-level `"model"` key. The string is stored exactly as
+/// supplied — no casing, alias, or version normalization. Grouping in analytics
+/// is exact-string.
+///
+/// Returns `None` when:
+/// - The body is non-UTF-8
+/// - JSON parse fails (truncated or malformed)
+/// - No top-level `"model"` key is present
+///
+/// The function MUST NOT delay or reject the request — it is infallible and
+/// always fails to `None`.
+pub(crate) fn detect_model(body: &[u8]) -> Option<String> {
+    use serde::Deserialize;
+    use serde::de::IgnoredAny;
+
+    // Bound the sniff to SHAPE_SNIFF_LIMIT — same budget as provider detection.
+    let sniff = if body.len() > SHAPE_SNIFF_LIMIT {
+        &body[..SHAPE_SNIFF_LIMIT]
+    } else {
+        body
+    };
+
+    let Ok(text) = std::str::from_utf8(sniff) else {
+        return None;
+    };
+
+    // Minimal struct: only materialise the `model` key; all other fields are
+    // consumed as IgnoredAny (no allocation). This mirrors the `ShallowBody`
+    // technique in `detect_by_shape` (AD-PXY-22).
+    #[derive(Deserialize)]
+    struct ModelOnly {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(flatten)]
+        _rest: std::collections::HashMap<String, IgnoredAny>,
+    }
+
+    let Ok(parsed) = serde_json::from_str::<ModelOnly>(text) else {
+        return None;
+    };
+
+    parsed.model
+}
+
+// ============================================================================
 // Public detection API
 // ============================================================================
 
@@ -409,6 +462,69 @@ mod tests {
             detect_provider("/v1/messages/and/more", b""),
             ProxyProvider::Unknown,
             "non-suffix match must NOT classify as Anthropic"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // detect_model (AD-PXY-22)
+    // -------------------------------------------------------------------------
+
+    // AD-PXY-22: model is stored verbatim (no normalization).
+    #[test]
+    fn test_detect_model_verbatim_anthropic() {
+        let body = br#"{"model": "claude-3-5-sonnet-20241022", "messages": []}"#;
+        assert_eq!(
+            detect_model(body),
+            Some("claude-3-5-sonnet-20241022".to_owned()),
+            "model string must be stored verbatim with no normalization (AD-PXY-22)"
+        );
+    }
+
+    // AD-PXY-22: verbatim storage — uppercase is kept as-is.
+    #[test]
+    fn test_detect_model_verbatim_no_normalization() {
+        let body = br#"{"model": "GPT-4O-MINI", "messages": []}"#;
+        assert_eq!(
+            detect_model(body),
+            Some("GPT-4O-MINI".to_owned()),
+            "uppercase model name must NOT be lowercased (AD-PXY-22)"
+        );
+    }
+
+    // AD-PXY-22: model absent → None.
+    #[test]
+    fn test_detect_model_absent() {
+        let body = br#"{"messages": [], "system": "be helpful"}"#;
+        assert_eq!(detect_model(body), None, "no model field → None");
+    }
+
+    // AD-PXY-22: non-UTF-8 → None.
+    #[test]
+    fn test_detect_model_non_utf8() {
+        let body: &[u8] = b"\xff\xfe{\"model\": \"gpt-4\"}";
+        assert_eq!(detect_model(body), None, "non-UTF-8 → None (fail-open)");
+    }
+
+    // AD-PXY-22: malformed JSON → None.
+    #[test]
+    fn test_detect_model_malformed_json() {
+        assert_eq!(detect_model(b"{broken"), None, "malformed JSON → None");
+    }
+
+    // AD-PXY-22: empty body → None.
+    #[test]
+    fn test_detect_model_empty_body() {
+        assert_eq!(detect_model(b""), None, "empty body → None");
+    }
+
+    // AD-PXY-22: OpenAI model string verbatim.
+    #[test]
+    fn test_detect_model_openai_verbatim() {
+        let body = br#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}"#;
+        assert_eq!(
+            detect_model(body),
+            Some("gpt-4o".to_owned()),
+            "OpenAI model string stored verbatim"
         );
     }
 }
