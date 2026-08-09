@@ -91,6 +91,7 @@ pub(in crate::cmd::git) fn render_diff_file(
     args: &[String],
     diff_mode: DiffMode,
     skip_ast: bool,
+    is_show: bool,
 ) -> String {
     let mut output = String::new();
 
@@ -145,7 +146,15 @@ pub(in crate::cmd::git) fn render_diff_file(
             e.insert(p);
         }
         let parser = cache.get_mut(&lang)?;
-        try_ast_render(file_diff, global_flags, args, diff_mode, parser, ln_width)
+        try_ast_render(
+            file_diff,
+            global_flags,
+            args,
+            diff_mode,
+            parser,
+            ln_width,
+            is_show,
+        )
     });
 
     match ast_result {
@@ -155,6 +164,61 @@ pub(in crate::cmd::git) fn render_diff_file(
         }
         None => render_raw_hunks(file_diff, &output, ln_width),
     }
+}
+
+/// Check that every context and added patch line in `hunks` matches the
+/// corresponding line in `source_lines`.
+///
+/// Returns `true` when all checks pass (source is consistent with the diff),
+/// `false` when any check fails (source is from the wrong revision).
+///
+/// ## Line categories
+/// - `+` (added) and ` ` (context) lines: content after the leading marker
+///   must equal `source_lines[new_line - 1]`. `new_line` advances by 1.
+/// - `-` (removed) lines: not present in the new-side file; no check, no
+///   advance of `new_line`.
+/// - `\` (no-newline marker, e.g. `\ No newline at end of file`): not a
+///   real content line; no check, no advance.
+///
+/// ## Edge cases
+/// - `new_start == 0`: git only emits this for a hunk with `new_count == 0`
+///   (a pure deletion), which by definition contains no `+`/` ` lines — so the
+///   indexing branch is never reached and the hunk passes vacuously.  Note that
+///   `checked_sub(1)` returning `None` means **fail**, not pass: a `+`/` ` line
+///   at `new_line == 0` would be an impossible state and is rejected.
+/// - Past-end: `source_lines.get(i)` returns `None` → check fails → `false`.
+///
+/// The check is a one-directional backstop: it can only *reject* a source, never
+/// bless a wrong one into rendering more than it already would.  A false negative
+/// (rejecting a valid source, e.g. because a CRLF or trailing-whitespace
+/// difference perturbs the comparison) costs only the AST breadcrumbs — the
+/// caller falls back to raw hunks, which is always safe.
+fn source_matches_diff(source_lines: &[&str], hunks: &[DiffHunk<'_>]) -> bool {
+    for hunk in hunks {
+        let mut new_line = hunk.new_start;
+        for patch_line in &hunk.patch_lines {
+            match patch_line.as_bytes().first() {
+                Some(b'-') => {
+                    // Removed line — not in new file; skip check, don't advance new_line.
+                }
+                Some(b'+') | Some(b' ') => {
+                    let content = patch_line.get(1..).unwrap_or("");
+                    let matches = new_line
+                        .checked_sub(1)
+                        .and_then(|i| source_lines.get(i))
+                        .is_some_and(|s| *s == content);
+                    if !matches {
+                        return false;
+                    }
+                    new_line += 1;
+                }
+                _ => {
+                    // `\ No newline at end of file` or empty — no delta, no check.
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Attempt AST-aware rendering for a modified/renamed file.
@@ -173,11 +237,15 @@ fn try_ast_render(
     diff_mode: DiffMode,
     parser: &mut rskim_core::Parser,
     ln_width: usize,
+    is_show: bool,
 ) -> Option<String> {
-    let source = match get_file_source(&file_diff.path, global_flags, args) {
+    let source = match get_file_source(&file_diff.path, global_flags, args, is_show) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("skim: AST fallback for {}: {e}", file_diff.path);
+            // Source fetch failed; the reader still gets the full raw hunks via the
+            // caller's fallback — nothing is lost.  ADR-011: no-loss raw-fallback →
+            // debug-gated banner.
+            crate::debug_log!("skim: AST fallback for {}: {e}", file_diff.path);
             return None;
         }
     };
@@ -195,6 +263,25 @@ fn try_ast_render(
     }
 
     let source_lines: Vec<&str> = source.lines().collect();
+
+    // Correctness backstop (ADR-011: no-loss raw fallback → debug-gated banner).
+    //
+    // Verify that the resolved source actually corresponds to the diff by
+    // checking every context (' ') and added ('+') patch line against the
+    // corresponding line in source_lines. A mismatch means the wrong revision
+    // was loaded (e.g. working-tree file diverged from the committed blob) and
+    // AST breadcrumbs would be fabricated from unrelated content.
+    //
+    // This check catches what the ADR-001 net-savings size guard cannot: a
+    // corrupt render may be *smaller* than raw (fewer context lines) and
+    // therefore passes the size guard even though it shows wrong content.
+    if !source_matches_diff(&source_lines, &file_diff.hunks) {
+        crate::debug_log!(
+            "[skim] git diff AST: source revision mismatch for {}; falling back to raw hunks",
+            file_diff.path
+        );
+        return None;
+    }
     let mut output = String::new();
 
     if diff_mode != DiffMode::Default {
@@ -928,7 +1015,7 @@ mod tests {
             status: DiffFileStatus::Binary,
             hunks: vec![],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false, false);
         assert!(rendered.contains("logo.png"));
         assert!(rendered.contains("binary"));
         assert!(rendered.contains("Binary file differs"));
@@ -948,7 +1035,7 @@ mod tests {
                 patch_lines: vec!["+const x = 1;", "+const y = 2;"],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false, false);
         assert!(rendered.contains("added"), "header should show 'added'");
         assert!(
             rendered.contains("const x = 1;"),
@@ -975,7 +1062,7 @@ mod tests {
                 patch_lines: vec!["-const x = 1;", "-const y = 2;"],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false, false);
         assert!(rendered.contains("deleted"), "header should show 'deleted'");
         assert!(
             rendered.contains("const x = 1;"),
@@ -996,7 +1083,7 @@ mod tests {
             status: DiffFileStatus::Renamed,
             hunks: vec![],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false, false);
         assert!(rendered.contains("helpers.ts"), "should show old path");
         assert!(rendered.contains("format.ts"), "should show new path");
         assert!(rendered.contains("renamed"), "header should show 'renamed'");
@@ -1080,8 +1167,8 @@ mod tests {
             }],
         };
 
-        let out_a = render_diff_file(&file_diff_a, &[], &[], DiffMode::Default, false);
-        let out_b = render_diff_file(&file_diff_b, &[], &[], DiffMode::Default, false);
+        let out_a = render_diff_file(&file_diff_a, &[], &[], DiffMode::Default, false, false);
+        let out_b = render_diff_file(&file_diff_b, &[], &[], DiffMode::Default, false, false);
 
         // Each output should contain only its own added line, not content
         // from the other file — proving cache reuse doesn't bleed state.
@@ -1138,6 +1225,7 @@ mod tests {
             &[],
             DiffMode::Structure,
             true, // skip_ast
+            false,
         );
 
         // Should contain file header
@@ -1179,7 +1267,7 @@ mod tests {
                 patch_lines: vec!["-const a = 1;", "-const b = 2;", "-const c = 3;"],
             }],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false, false);
         // Removed lines should use old-file line numbers (10, 11, 12)
         assert!(
             rendered.contains("-10 const a = 1;"),
@@ -1220,7 +1308,7 @@ mod tests {
                 },
             ],
         };
-        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false);
+        let rendered = render_diff_file(&file_diff, &[], &[], DiffMode::Default, false, false);
         // First hunk: lines 1 and 2
         assert!(
             rendered.contains("+1 const A = 1;") || rendered.contains("+ 1 const A = 1;"),
@@ -2018,6 +2106,86 @@ mod tests {
         assert!(
             gamma_old_count <= 1,
             "fn gamma_old must appear at most once; got {gamma_old_count}:\n{output}"
+        );
+    }
+
+    // =========================================================================
+    // source_matches_diff unit tests
+    // =========================================================================
+
+    fn make_hunk<'a>(new_start: usize, patch_lines: Vec<&'a str>) -> DiffHunk<'a> {
+        DiffHunk {
+            old_start: 1,
+            old_count: 1,
+            new_start,
+            new_count: patch_lines.len(),
+            patch_lines,
+        }
+    }
+
+    #[test]
+    fn test_source_matches_diff_matching_returns_true() {
+        // Source has three lines; patch has one context + one added line.
+        let source_lines = vec!["fn original() {}", "fn added_in_commit2() {}", "};"];
+        let hunk = make_hunk(1, vec![" fn original() {}", "+fn added_in_commit2() {}"]);
+        assert!(
+            source_matches_diff(&source_lines, &[hunk]),
+            "matching source and diff should return true"
+        );
+    }
+
+    #[test]
+    fn test_source_matches_diff_mismatch_returns_false() {
+        // Source has working-tree content that differs from the diff.
+        let source_lines = vec!["fn completely_different() {}"];
+        let hunk = make_hunk(1, vec![" fn original() {}"]);
+        assert!(
+            !source_matches_diff(&source_lines, &[hunk]),
+            "mismatched source and diff should return false"
+        );
+    }
+
+    #[test]
+    fn test_source_matches_diff_pure_deletion_returns_true() {
+        // A pure-deletion hunk: new_start = 0, only '-' lines; nothing to check.
+        let source_lines: Vec<&str> = vec![];
+        let hunk = make_hunk(0, vec!["-fn removed() {}"]);
+        assert!(
+            source_matches_diff(&source_lines, &[hunk]),
+            "pure-deletion hunk (new_start=0) should return true"
+        );
+    }
+
+    #[test]
+    fn test_source_matches_diff_new_start_one_context_line() {
+        // new_start = 1: first context line should match source_lines[0].
+        let source_lines = vec!["fn alpha() {}"];
+        let hunk = make_hunk(1, vec![" fn alpha() {}"]);
+        assert!(
+            source_matches_diff(&source_lines, &[hunk]),
+            "context line at new_start=1 should match source_lines[0]"
+        );
+    }
+
+    #[test]
+    fn test_source_matches_diff_past_end_of_source_returns_false() {
+        // Patch claims a context line at line 5 but source only has 2 lines.
+        let source_lines = vec!["line1", "line2"];
+        let hunk = make_hunk(5, vec![" line5"]);
+        assert!(
+            !source_matches_diff(&source_lines, &[hunk]),
+            "context line past end of source should return false"
+        );
+    }
+
+    #[test]
+    fn test_source_matches_diff_no_newline_marker_skipped() {
+        // '\ No newline at end of file' must not advance new_line or fail.
+        let source_lines = vec!["fn last() {}"]; // one line, no trailing newline
+        let hunk = make_hunk(1, vec![" fn last() {}", r"\ No newline at end of file"]);
+        assert!(
+            source_matches_diff(&source_lines, &[hunk]),
+            r"'\ No newline at end of file' marker must be skipped"
         );
     }
 }

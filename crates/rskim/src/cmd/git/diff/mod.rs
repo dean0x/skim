@@ -187,7 +187,14 @@ fn render_and_format<'a>(
 ) -> anyhow::Result<String> {
     let render_one = |i: usize, file_diff: &types::FileDiff<'_>| {
         let skip_ast = i >= MAX_AST_FILE_COUNT;
-        let rendered = render_diff_file(file_diff, global_flags, git_args, diff_mode, skip_ast);
+        let rendered = render_diff_file(
+            file_diff,
+            global_flags,
+            git_args,
+            diff_mode,
+            skip_ast,
+            false,
+        );
         let entry = DiffFileEntry {
             path: file_diff.path.clone(),
             status: file_diff.status.clone(),

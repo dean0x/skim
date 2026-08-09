@@ -485,6 +485,7 @@ fn render_show_diff(
             git_args,
             DiffMode::Default,
             i >= MAX_AST_FILE_COUNT,
+            true, // is_show: source must be read from the commit, not the working tree
         );
         let entry = DiffFileEntry {
             path: fd.path.clone(),
@@ -1063,7 +1064,7 @@ mod tests {
 
         // Render each file — should not panic.
         for (i, fd) in file_diffs.iter().enumerate() {
-            let rendered = render_diff_file(fd, &[], &[], DiffMode::Default, i >= 200);
+            let rendered = render_diff_file(fd, &[], &[], DiffMode::Default, i >= 200, false);
             assert!(!rendered.is_empty(), "render should produce output");
         }
 
