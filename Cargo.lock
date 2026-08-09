@@ -2562,6 +2562,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "rskim-align",
  "rskim-compress",
  "rskim-contract",
  "rskim-core",

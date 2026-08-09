@@ -49,5 +49,33 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         )?;
     }
 
+    if version < 4 {
+        // AD-CA-9 / AD-AN-5: alignment_decisions table — records per-request
+        // cache-alignment outcomes (tools sorted, markers injected, fail-open flag,
+        // SHA-256 pair for losslessness audit). Migration is UNCONDITIONAL (not
+        // proxy-gated) so DB versions never fork across build variants (finding 19).
+        // ADR-006: PRAGMA user_version = 4 is the FINAL statement in this batch.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS alignment_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                request_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                tools_key_sorted INTEGER NOT NULL,
+                spans_compacted INTEGER NOT NULL,
+                skim_breakpoints_injected INTEGER NOT NULL,
+                client_breakpoint_count INTEGER NOT NULL,
+                volatile_warn_count INTEGER NOT NULL,
+                fail_open INTEGER NOT NULL,
+                input_len INTEGER NOT NULL,
+                output_len INTEGER NOT NULL,
+                input_sha256 BLOB NOT NULL,
+                output_sha256 BLOB NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ad_timestamp ON alignment_decisions(timestamp);
+            PRAGMA user_version = 4;",
+        )?;
+    }
+
     Ok(())
 }

@@ -56,7 +56,10 @@ use crate::stats::AlignStats;
 use rskim_contract::canonical::tools_arrays_set_equal;
 use rskim_contract::contract::{Contract, Outcome};
 use rskim_contract::waiver::{MetadataReorderWithMarkers, MARKER_BYTES};
-use rskim_llm::{ParsedBody, Provider};
+use rskim_llm::ParsedBody;
+/// Re-exported from `rskim_llm` so callers can construct a provider value
+/// without adding `rskim-llm` as a separate direct dependency.
+pub use rskim_llm::Provider;
 use std::collections::HashMap;
 
 // ============================================================================

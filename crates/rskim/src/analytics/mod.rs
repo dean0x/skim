@@ -21,6 +21,12 @@ mod schema;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+// Arc, AtomicUsize, and Ordering are only used in the proxy-gated
+// ChannelAlignmentRecorder and its test helpers (AD-CA-9).
+#[cfg(feature = "proxy")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "proxy")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -720,6 +726,45 @@ impl AnalyticsDb {
         Ok(count)
     }
 
+    /// Record an alignment decision into the `alignment_decisions` table.
+    ///
+    /// # AD-CA-9 / AD-AN-5
+    ///
+    /// Called by the `ChannelAlignmentRecorder` consumer thread. Silently
+    /// ignores errors (fire-and-forget analytics path). Gated on `proxy`
+    /// feature because only the proxy-gated consumer thread calls this.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn record_alignment(&self, r: &AlignmentDecisionRecord) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO alignment_decisions (
+                timestamp, request_id, provider,
+                tools_key_sorted, spans_compacted,
+                skim_breakpoints_injected, client_breakpoint_count,
+                volatile_warn_count, fail_open,
+                input_len, output_len,
+                input_sha256, output_sha256
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+            )",
+            rusqlite::params![
+                r.timestamp,
+                r.request_id,
+                r.provider,
+                r.tools_key_sorted as i64,
+                r.spans_compacted as i64,
+                r.skim_breakpoints_injected as i64,
+                r.client_breakpoint_count as i64,
+                r.volatile_warn_count as i64,
+                r.fail_open as i64,
+                r.input_len as i64,
+                r.output_len as i64,
+                r.input_sha256.as_ref(),
+                r.output_sha256.as_ref(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Query per-session statistics grouped by session_id.
     ///
     /// Uses a single conditional-aggregation query instead of two separate queries
@@ -996,6 +1041,186 @@ pub(crate) fn flush_pending() {
     };
     for handle in handles.drain(..) {
         let _ = handle.join();
+    }
+}
+
+// ============================================================================
+// AlignmentDecisionRecord — per-request cache-alignment record (AD-CA-9)
+// ============================================================================
+
+/// A single per-request cache-alignment decision record.
+///
+/// # AD-CA-9 / AD-AN-5
+///
+/// The record type is **unconditional** (no proxy feature gate) so the schema
+/// migration and this type are always present regardless of build variant.
+/// Only the writer wiring (`ChannelAlignmentRecorder`) is proxy-gated.
+///
+/// Fields mirror [`crate::analytics::AlignStats`] from rskim-align, plus
+/// `timestamp`, `request_id`, and `provider` for the DB row context.
+///
+/// # Note on dead_code in non-proxy builds
+///
+/// AD-CA-9 keeps this struct unconditional so the schema migration always
+/// runs regardless of build variant. Non-proxy builds define but never
+/// construct it — `#[allow(dead_code)]` is the correct suppression here.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct AlignmentDecisionRecord {
+    /// Unix timestamp (seconds) recorded at the point of the alignment call.
+    pub timestamp: i64,
+    /// Caller-assigned request identifier (forwarded from the proxy seam).
+    pub request_id: String,
+    /// Detected provider — `"Anthropic"` or `"OpenAi"`.
+    pub provider: String,
+    /// True when at least one tool/schema span had its keys sorted.
+    pub tools_key_sorted: bool,
+    /// True when at least one span was compacted (whitespace removed).
+    pub spans_compacted: bool,
+    /// Number of `cache_control` markers injected by skim (0–2 in v1).
+    pub skim_breakpoints_injected: usize,
+    /// Number of client-supplied `cache_control` markers found in the body.
+    pub client_breakpoint_count: usize,
+    /// Number of volatile-pattern detections (warn/stats only — no effect on placement).
+    pub volatile_warn_count: usize,
+    /// True when the stage returned the input unchanged (fail-open passthrough).
+    pub fail_open: bool,
+    /// Input byte length.
+    pub input_len: usize,
+    /// Output byte length.
+    pub output_len: usize,
+    /// SHA-256 of the stage input.
+    pub input_sha256: [u8; 32],
+    /// SHA-256 of the stage output.
+    pub output_sha256: [u8; 32],
+}
+
+// ============================================================================
+// AlignmentRecorder trait — proxy-gated (AD-CA-9: writer proxy-gated)
+// ============================================================================
+
+/// Writer trait for alignment decision records.
+///
+/// # AD-CA-9 / AD-AN-5
+///
+/// A focused writer trait — NOT an extension of the query-only
+/// [`AnalyticsStore`] trait (verified `AnalyticsStore` exposes only `query_*`
+/// methods and `clear`, mod.rs:326-372). Implementations are fire-and-forget:
+/// a blocked, slow, or panicking recorder MUST NEVER delay or alter request
+/// forwarding. The production implementation (`ChannelAlignmentRecorder`) uses
+/// `try_send` with drop-on-overflow to enforce this.
+#[cfg(feature = "proxy")]
+pub(crate) trait AlignmentRecorder: Send + Sync {
+    /// Record one alignment decision.
+    ///
+    /// Must return immediately without blocking. Drop-on-overflow is the
+    /// correct failure mode (see `ChannelAlignmentRecorder`).
+    fn record(&self, rec: AlignmentDecisionRecord);
+}
+
+// ============================================================================
+// NoopRecorder — no-op implementation for disabled analytics (proxy-gated)
+// ============================================================================
+
+/// No-op recorder used when `analytics.enabled` is false.
+///
+/// # AD-CA-9
+///
+/// Returned by [`ChannelAlignmentRecorder::new_boxed`] when analytics are
+/// disabled so call sites need not check `enabled` on every invocation.
+#[cfg(feature = "proxy")]
+pub(crate) struct NoopRecorder;
+
+#[cfg(feature = "proxy")]
+impl AlignmentRecorder for NoopRecorder {
+    fn record(&self, _rec: AlignmentDecisionRecord) {}
+}
+
+// ============================================================================
+// ChannelAlignmentRecorder — production implementation (proxy-gated)
+// ============================================================================
+
+/// Bounded channel capacity for alignment decision records.
+///
+/// 256 slots is generous for typical proxy throughput (a few requests/second).
+/// When the channel is full, records are dropped and counted — the proxy path
+/// is never stalled.
+#[cfg(feature = "proxy")]
+const ALIGN_CHANNEL_CAP: usize = 256;
+
+/// Production [`AlignmentRecorder`] backed by a bounded crossbeam channel.
+///
+/// # Design (AD-CA-9 / AD-AN-5)
+///
+/// - **Bounded channel + `try_send`**: a blocked/full channel causes drop-on-overflow,
+///   never a stall. The drop counter is observable for diagnostics.
+/// - **One registered consumer thread**: opens `AnalyticsDb::open_default()` once
+///   (WAL + `busy_timeout(5000)`, honouring `SKIM_ANALYTICS_DB` > `SKIM_CACHE_DIR`)
+///   and drains the channel until the sender is dropped.
+/// - **`register_thread` registration**: the consumer handle is registered so
+///   `flush_pending()` joins it before process exit, ensuring all queued records
+///   reach the DB when the proxy shuts down.
+///
+/// # Drain sequence (proxy shutdown)
+///
+/// When `serve_with_stage()` returns (SIGINT / SIGTERM), the
+/// `TransformPipeline` drops, which drops `CacheAlignStage`, which drops this
+/// recorder, which drops the `Sender`. The channel is then closed; the consumer
+/// thread drains remaining records and exits. `flush_pending()` in `main()` joins
+/// it before the process exits.
+#[cfg(feature = "proxy")]
+pub(crate) struct ChannelAlignmentRecorder {
+    sender: crossbeam_channel::Sender<AlignmentDecisionRecord>,
+    /// Observable overflow count — incremented on every `try_send` failure.
+    /// Never fatal: a dropped record is less harmful than a stalled request.
+    drop_count: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "proxy")]
+impl ChannelAlignmentRecorder {
+    /// Construct a recorder and spawn its consumer thread.
+    ///
+    /// Returns a [`NoopRecorder`] (boxed) when `analytics.enabled` is false.
+    /// Otherwise constructs a bounded channel, registers the consumer thread
+    /// via [`register_thread`], and returns the recorder (boxed).
+    pub(crate) fn new_boxed(analytics: &AnalyticsConfig) -> Box<dyn AlignmentRecorder> {
+        if !analytics.enabled {
+            return Box::new(NoopRecorder);
+        }
+        let (tx, rx) =
+            crossbeam_channel::bounded::<AlignmentDecisionRecord>(ALIGN_CHANNEL_CAP);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let handle = std::thread::spawn(move || {
+            // Open once — WAL + busy_timeout(5000) inherited from open_default.
+            // Honouring SKIM_ANALYTICS_DB > SKIM_CACHE_DIR (mod.rs:414).
+            let db = match AnalyticsDb::open_default() {
+                Ok(d) => d,
+                Err(_) => return, // Fail-open: silently skip all records.
+            };
+            while let Ok(rec) = rx.recv() {
+                let _ = db.record_alignment(&rec);
+            }
+            // Channel closed (sender dropped) → drain complete.
+        });
+        register_thread(handle);
+        Box::new(Self {
+            sender: tx,
+            drop_count,
+        })
+    }
+
+}
+
+#[cfg(feature = "proxy")]
+impl AlignmentRecorder for ChannelAlignmentRecorder {
+    /// Send a record via `try_send`.
+    ///
+    /// On overflow (`Err(Full)`) or disconnected (`Err(Disconnected)`), increments
+    /// `drop_count` and returns immediately. Never blocks.
+    fn record(&self, rec: AlignmentDecisionRecord) {
+        if self.sender.try_send(rec).is_err() {
+            self.drop_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1281,7 +1506,7 @@ pub(crate) fn try_record_command_with_counts(
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
@@ -2421,5 +2646,238 @@ mod tests {
         // Call both queries to ensure they do not panic with expansion-heavy data.
         db.query_daily(None).unwrap();
         db.query_by_command(None).unwrap();
+    }
+
+    // ========================================================================
+    // Schema migration v4 tests — alignment_decisions table (AD-CA-9)
+    // ========================================================================
+
+    /// POSITIVE: v4 migration creates the alignment_decisions table.
+    /// DISCRIMINATING (PF-007): if the migration were removed, this test fails.
+    #[test]
+    fn test_alignment_decisions_table_created_by_migration() {
+        let (db, _tmp) = test_db();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='alignment_decisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "alignment_decisions table must be created by migration v4"
+        );
+    }
+
+    /// POSITIVE: schema version is 4 after migration.
+    /// DISCRIMINATING: if PRAGMA user_version = 4 were not the last statement, version would be wrong.
+    #[test]
+    fn test_schema_version_is_4_after_migration() {
+        let (db, _tmp) = test_db();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "schema version must be 4 after all migrations");
+    }
+
+    /// POSITIVE: record_alignment inserts a row into alignment_decisions.
+    /// DISCRIMINATING: deleting record_alignment would cause this to return 0.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_record_alignment_inserts_row() {
+        let (db, _tmp) = test_db();
+        let rec = AlignmentDecisionRecord {
+            timestamp: 1711300000,
+            request_id: "req-test-001".to_string(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: true,
+            spans_compacted: true,
+            skim_breakpoints_injected: 1,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: false,
+            input_len: 512,
+            output_len: 486,
+            input_sha256: [0u8; 32],
+            output_sha256: [1u8; 32],
+        };
+        db.record_alignment(&rec).unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM alignment_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "one alignment decision row must be inserted");
+
+        // Verify round-trip of key fields.
+        let (stored_req, stored_provider, stored_injected): (String, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT request_id, provider, skim_breakpoints_injected FROM alignment_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_req, "req-test-001");
+        assert_eq!(stored_provider, "Anthropic");
+        assert_eq!(stored_injected, 1);
+    }
+
+    /// POSITIVE: fail_open=true record round-trips correctly (SHA-256 pair equal).
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_record_alignment_fail_open_row() {
+        let (db, _tmp) = test_db();
+        let sha = [0xAB_u8; 32];
+        let rec = AlignmentDecisionRecord {
+            timestamp: 1711300001,
+            request_id: "req-failopen".to_string(),
+            provider: "OpenAi".to_string(),
+            tools_key_sorted: false,
+            spans_compacted: false,
+            skim_breakpoints_injected: 0,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: true,
+            input_len: 100,
+            output_len: 100,
+            input_sha256: sha,
+            output_sha256: sha,
+        };
+        db.record_alignment(&rec).unwrap();
+
+        let (stored_fail_open, stored_in_len, stored_out_len): (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT fail_open, input_len, output_len FROM alignment_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_fail_open, 1, "fail_open must be stored as 1");
+        assert_eq!(stored_in_len, 100);
+        assert_eq!(stored_out_len, 100);
+    }
+
+    // ========================================================================
+    // AlignmentRecorder test helper types (AC18 / AD-CA-9) — proxy-gated
+    // ========================================================================
+
+    /// Synchronous mock recorder — stores all records for test assertion.
+    ///
+    /// Shares the internal list via `Arc<Mutex<...>>` so callers can inspect
+    /// records after moving the recorder into a stage.
+    ///
+    /// Used in proxy.rs tests (AC18): prove that a call to `CacheAlignStage::apply`
+    /// records exactly one `AlignmentDecisionRecord` per request.
+    #[cfg(feature = "proxy")]
+    pub(crate) struct BlockingMockRecorder {
+        records: Arc<Mutex<Vec<AlignmentDecisionRecord>>>,
+    }
+
+    #[cfg(feature = "proxy")]
+    impl BlockingMockRecorder {
+        pub(crate) fn new() -> Self {
+            Self {
+                records: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Return a cloned handle to the shared record list.
+        pub(crate) fn handle(&self) -> Arc<Mutex<Vec<AlignmentDecisionRecord>>> {
+            Arc::clone(&self.records)
+        }
+    }
+
+    #[cfg(feature = "proxy")]
+    impl AlignmentRecorder for BlockingMockRecorder {
+        fn record(&self, rec: AlignmentDecisionRecord) {
+            let mut g = self.records.lock().unwrap_or_else(|p| p.into_inner());
+            g.push(rec);
+        }
+    }
+
+    /// Counting mock recorder — counts record calls and overflow drops.
+    ///
+    /// Used in proxy.rs tests (AC18): prove that drop-on-overflow behaviour of
+    /// `ChannelAlignmentRecorder` increments an observable counter.
+    #[cfg(feature = "proxy")]
+    pub(crate) struct CountingMockRecorder {
+        pub(crate) count: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "proxy")]
+    impl CountingMockRecorder {
+        pub(crate) fn new() -> Self {
+            Self {
+                count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        pub(crate) fn handle(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.count)
+        }
+    }
+
+    #[cfg(feature = "proxy")]
+    impl AlignmentRecorder for CountingMockRecorder {
+        fn record(&self, _rec: AlignmentDecisionRecord) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // AC18 / AD-CA-9: NoopRecorder never panics.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_noop_recorder_does_not_panic() {
+        let rec = NoopRecorder;
+        rec.record(AlignmentDecisionRecord {
+            timestamp: 0,
+            request_id: String::new(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: false,
+            spans_compacted: false,
+            skim_breakpoints_injected: 0,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: true,
+            input_len: 0,
+            output_len: 0,
+            input_sha256: [0u8; 32],
+            output_sha256: [0u8; 32],
+        });
+    }
+
+    // AC18 / AD-CA-9: ChannelAlignmentRecorder returns NoopRecorder when disabled.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_channel_recorder_noop_when_disabled() {
+        let cfg = AnalyticsConfig {
+            enabled: false,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+        let recorder = ChannelAlignmentRecorder::new_boxed(&cfg);
+        // Must not panic — NoopRecorder::record is a no-op.
+        recorder.record(AlignmentDecisionRecord {
+            timestamp: 0,
+            request_id: "r".to_string(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: false,
+            spans_compacted: false,
+            skim_breakpoints_injected: 0,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: true,
+            input_len: 0,
+            output_len: 0,
+            input_sha256: [0u8; 32],
+            output_sha256: [0u8; 32],
+        });
     }
 }
