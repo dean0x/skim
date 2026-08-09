@@ -224,7 +224,7 @@ fn run_uninstall_for_agent(
         );
     }
 
-    // Delete hook script and hash manifest
+    // Delete hook script
     if script_exists {
         std::fs::remove_file(&hook_script_path)?;
         println!(
@@ -232,10 +232,12 @@ fn run_uninstall_for_agent(
             check_mark(true),
             hook_script_path.display()
         );
-
-        // Clean up hash manifest (#57)
-        let _ = crate::cmd::integrity::remove_hash_manifest(&hook_config_dir, agent.cli_name());
     }
+
+    // Clean up hash manifest (#57) — always attempt, even if the script was
+    // already absent.  This prevents an orphaned manifest from a previous failed
+    // uninstall from persisting and causing false tamper reports on re-install.
+    let _ = crate::cmd::integrity::remove_hash_manifest(&hook_config_dir, agent.cli_name());
 
     // Remove permissions sidecar and seeded entries (non-fatal).
     // Copilot CLI permissions live in hook_config_dir; all others in config_dir.

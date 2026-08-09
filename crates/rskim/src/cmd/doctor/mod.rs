@@ -358,6 +358,136 @@ fn print_path_section(entries: &[PathEntry]) -> bool {
 // Hooks
 // ============================================================================
 
+/// Compute the hook status line and drift verdict for one agent.
+///
+/// Returns `(is_drift, status_line)`.
+///
+/// The four [`crate::cmd::integrity::ScriptIntegrity`] states are checked
+/// **before** any pin/currency branches so that the verdict is always derived
+/// from the SHA-256 manifest (an independent artefact) rather than from the
+/// hook script bytes themselves — which is what a tamper modifies (PF-016).
+///
+/// Design decisions:
+/// - `Tampered`   → drift (`✗`), names the suppression coupling.
+/// - `Unreadable` → drift (`✗`), names the suppression coupling.
+/// - `NoManifest` → advisory only (`⚠`), **not** drift — users who installed
+///   before manifests existed have done nothing wrong and must not have their
+///   `skim doctor` exit-0 broken (applies ADR-004 backward-compat intent).
+/// - `Verified`   → fall through to existing pin/currency logic.
+fn hook_status_line(
+    facts: &crate::cmd::init::HookFacts,
+    agent_cli_name: &str,
+    compiled_version: &str,
+    compiled_commit: &str,
+) -> (bool, String) {
+    use crate::cmd::integrity::ScriptIntegrity;
+
+    if !facts.hook_installed {
+        return (false, format!("  –  {agent_cli_name}  not installed"));
+    }
+
+    let hook_version = facts.hook_version.as_deref().unwrap_or("?");
+    let hook_commit_str = facts.hook_commit.as_deref().unwrap_or("?");
+
+    // Gate on integrity first — verdict is derived from the manifest, not from
+    // the hook bytes that a tamper would modify.
+    //
+    // `no_manifest_advisory` captures the advisory message for `NoManifest` so
+    // the function can fall through to pin/currency checks and append the note
+    // to whatever verdict those produce (rather than returning early and silently
+    // skipping drift detection — Group 3 fix).
+    let no_manifest_advisory: Option<String> = match facts.script_integrity {
+        ScriptIntegrity::Tampered => {
+            return (
+                true,
+                format!(
+                    "  ✗ {agent_cli_name}  installed — script tampered (hash mismatch); \
+                     note: a failed integrity check also silences drift detection on this \
+                     agent's hook channel — run `skim init --agent {agent_cli_name}` to reinstall"
+                ),
+            );
+        }
+        ScriptIntegrity::Unreadable => {
+            return (
+                true,
+                format!(
+                    "  ✗ {agent_cli_name}  installed — hook script unreadable (cannot hash); \
+                     note: an unreadable script also silences drift detection on this \
+                     agent's hook channel — run `skim init --agent {agent_cli_name}` to reinstall"
+                ),
+            );
+        }
+        ScriptIntegrity::NoManifest => {
+            // Advisory only — a pre-manifest install is not tampering.
+            // Not setting drift so that existing installations do not regress
+            // to exit 1 just because they predate the manifest feature.
+            //
+            // Fall through to the pin/currency checks below rather than returning
+            // early: an install without a manifest still needs drift detection for
+            // the pin and version state (#471 / Group 3).  The advisory is appended
+            // to whatever verdict those checks produce.
+            Some(format!(
+                "⚠ no integrity manifest (pre-manifest install); \
+                 run `skim init --agent {agent_cli_name}` to add tamper detection"
+            ))
+        }
+        ScriptIntegrity::Verified => {
+            // Hash verified — fall through to pin/currency checks below.
+            None
+        }
+    };
+
+    // Helper: append the no-manifest advisory (if any) to a status line.
+    let append_advisory = |msg: String| -> String {
+        if let Some(ref note) = no_manifest_advisory {
+            format!("{msg}\n     {note}")
+        } else {
+            msg
+        }
+    };
+
+    // NoManifest / Verified: check pin format and currency.
+    if !facts.hook_uses_pinned_binary {
+        return (
+            true,
+            append_advisory(format!(
+                "  ✗ {agent_cli_name}  installed (v{hook_version})  unpinned — \
+                 run `./target/release/skim init --yes` to pin"
+            )),
+        );
+    }
+
+    if !facts.hook_is_current {
+        let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
+        let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
+        let commit_ok = facts.hook_commit.as_deref() == Some(compiled_commit);
+        // Report the most specific cause first.
+        let reason = if !commit_ok {
+            format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
+        } else if !version_ok {
+            format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
+        } else {
+            "stale".to_string()
+        };
+        return (
+            true,
+            append_advisory(format!(
+                "  ✗ {agent_cli_name}  installed  pin: {pin}  [{reason}]  — \
+                 run `./target/release/skim init --yes` to update"
+            )),
+        );
+    }
+
+    // Fully current (with or without manifest).
+    let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
+    (
+        false,
+        append_advisory(format!(
+            "  ✓ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}"
+        )),
+    )
+}
+
 /// Print the hooks section and return true if any drift is detected.
 fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::Result<bool> {
     println!("Hooks");
@@ -373,53 +503,17 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
             }
         };
 
-        if !facts.hook_installed {
-            println!("  –  {}  not installed", agent.cli_name());
-            continue;
-        }
-
-        let hook_version = facts.hook_version.as_deref().unwrap_or("?");
-        let hook_commit_str = facts.hook_commit.as_deref().unwrap_or("?");
-        let script = facts.hook_script_path.display().to_string();
-
-        if !facts.hook_uses_pinned_binary {
-            // Unpinned hook format — drift.
+        let (drift, line) =
+            hook_status_line(&facts, agent.cli_name(), compiled_version, compiled_commit);
+        if drift {
             any_drift = true;
-            println!(
-                "  ✗ {}  installed (v{hook_version})  unpinned — run `./target/release/skim init --yes` to pin",
-                agent.cli_name()
-            );
-        } else if !facts.hook_is_current {
-            // Pinned but version or commit mismatch — drift.
-            any_drift = true;
-            let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
-            let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
-            let commit_ok = facts.hook_commit.as_deref() == Some(compiled_commit);
-            // Report the most specific cause first: commit mismatch is more
-            // precise than version mismatch, and a None version should not
-            // masquerade as a version mismatch when the real issue is a commit
-            // mismatch.
-            let reason = if !commit_ok {
-                format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
-            } else if !version_ok {
-                format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
-            } else {
-                "stale".to_string()
-            };
-            println!(
-                "  ✗ {}  installed  pin: {pin}  [{reason}]  — run `./target/release/skim init --yes` to update",
-                agent.cli_name()
-            );
-        } else {
-            // Fully current.
-            let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
-            println!(
-                "  ✓ {}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}",
-                agent.cli_name()
-            );
         }
+        println!("{line}");
 
-        println!("       script: {script}");
+        // Script path is only meaningful for installed hooks.
+        if facts.hook_installed {
+            println!("       script: {}", facts.hook_script_path.display());
+        }
     }
 
     Ok(any_drift)
@@ -834,6 +928,157 @@ mod tests {
     fn test_parse_commit_from_version_output_empty_parens() {
         // Malformed: empty parens must not produce an empty string commit.
         assert_eq!(parse_commit_from_version_output("skim 2.11.0 ()\n"), None);
+    }
+
+    // ---- hook_status_line: all four ScriptIntegrity states ----
+
+    fn make_installed_facts(
+        integrity: crate::cmd::integrity::ScriptIntegrity,
+    ) -> crate::cmd::init::HookFacts {
+        crate::cmd::init::HookFacts {
+            hook_installed: true,
+            hook_version: Some("2.11.0".to_string()),
+            hook_commit: Some("abc1234".to_string()),
+            hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
+            hook_uses_pinned_binary: true,
+            hook_is_current: true,
+            hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
+            script_integrity: integrity,
+        }
+    }
+
+    #[test]
+    fn test_hook_status_line_tampered_is_drift_and_actionable() {
+        let facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Tampered);
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(drift, "Tampered must report drift");
+        assert!(
+            line.contains("tampered"),
+            "message must name the tamper: {line}"
+        );
+        // The suppression coupling must be named.
+        assert!(
+            line.contains("silences drift detection"),
+            "message must name the drift-detection suppression coupling: {line}"
+        );
+        assert!(
+            line.contains("skim init"),
+            "message must include skim init fix command: {line}"
+        );
+        assert!(
+            line.contains("claude-code"),
+            "message must name the agent for the fix command: {line}"
+        );
+    }
+
+    #[test]
+    fn test_hook_status_line_unreadable_is_drift_and_actionable() {
+        let facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Unreadable);
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(drift, "Unreadable must report drift");
+        assert!(
+            line.contains("silences drift detection"),
+            "message must name the drift-detection suppression coupling: {line}"
+        );
+        assert!(
+            line.contains("skim init"),
+            "message must include skim init fix command: {line}"
+        );
+    }
+
+    #[test]
+    fn test_hook_status_line_no_manifest_is_advisory_not_drift() {
+        let facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::NoManifest);
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(
+            !drift,
+            "NoManifest must NOT report drift (pre-manifest install is backward-compatible): {line}"
+        );
+        // Should still advise the user.
+        assert!(
+            line.contains("skim init"),
+            "advisory should mention skim init to add detection: {line}"
+        );
+    }
+
+    /// The whole point of routing `NoManifest` through the pin/currency checks
+    /// (rather than returning early) is that pin drift is still reported when the
+    /// manifest is absent.  This pins that composition: drift must be `true`, the
+    /// pin verdict must be present, and the advisory must be appended — not
+    /// substituted for it.
+    #[test]
+    fn test_hook_status_line_no_manifest_still_reports_pin_drift() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::NoManifest);
+        facts.hook_uses_pinned_binary = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(
+            drift,
+            "an unpinned hook is drift whether or not a manifest exists: {line}"
+        );
+        assert!(
+            line.contains("unpinned"),
+            "the pin verdict must survive the advisory composition: {line}"
+        );
+        assert!(
+            line.contains("no integrity manifest"),
+            "the advisory must be appended to the pin verdict: {line}"
+        );
+    }
+
+    /// Same composition on the currency branch: a stale hook with no manifest
+    /// must report the version/commit mismatch AND the advisory.
+    #[test]
+    fn test_hook_status_line_no_manifest_still_reports_currency_drift() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::NoManifest);
+        facts.hook_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "zzz9999");
+
+        assert!(drift, "a stale hook is drift: {line}");
+        assert!(
+            line.contains("commit mismatch"),
+            "the currency verdict must survive the advisory composition: {line}"
+        );
+        assert!(
+            line.contains("no integrity manifest"),
+            "the advisory must be appended to the currency verdict: {line}"
+        );
+    }
+
+    #[test]
+    fn test_hook_status_line_verified_current_is_healthy() {
+        let facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(!drift, "Verified+current must not report drift");
+        assert!(
+            line.contains('✓'),
+            "healthy state must show checkmark: {line}"
+        );
+    }
+
+    #[test]
+    fn test_hook_status_line_not_installed() {
+        let facts = crate::cmd::init::HookFacts {
+            hook_installed: false,
+            hook_version: None,
+            hook_commit: None,
+            hook_binary_pin: None,
+            hook_uses_pinned_binary: false,
+            hook_is_current: false,
+            hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
+            script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
+        };
+        let (drift, line) = hook_status_line(&facts, "gemini", "2.11.0", "abc1234");
+
+        assert!(!drift, "not-installed must not be drift");
+        assert!(
+            line.contains("not installed"),
+            "not-installed must say so: {line}"
+        );
     }
 
     // ---- query_binary_info acquisition-path test ----
