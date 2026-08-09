@@ -901,4 +901,314 @@ mod tests {
             "no_cache_align must default to false when flag is absent"
         );
     }
+
+    // =========================================================================
+    // AC5 — Cross-turn content-prefix stability with moving tail marker
+    // =========================================================================
+    //
+    // Verifies that in a simulated 8-turn conversation:
+    // (a) After masking all cache_control, the tools value and system value are
+    //     byte-identical across all turns (canonicalization is stable).
+    // (b) Skim-injected static-zone markers sit at identical byte offsets within
+    //     the tools value on every turn.
+    // Negative arm A: without CacheAlignStage, tool key order varies → tools values differ.
+    // Negative arm B: with max_growth=0 (seam reverted), markers are rejected → absent.
+    //
+    // NOTE: these tests use per-crate-scoped build (`-p rskim --bins --features proxy`).
+    // They must NOT be run with `cargo test -p rskim --lib` (no library target).
+
+    /// Build a messages array with N user+assistant pairs.
+    ///
+    /// All assistant messages use array-form content. The LAST assistant message
+    /// carries a client `cache_control` marker (moving tail). Tool key order is
+    /// controlled by `build_turn_body` (not here).
+    fn build_turn_messages_json(n: usize) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for i in 1..=n {
+            parts.push(format!(
+                r#"{{"content":"Turn {i} question","role":"user"}}"#
+            ));
+            if i == n {
+                // Last assistant message: client cache_control marker (moving tail).
+                parts.push(format!(
+                    r#"{{"content":[{{"cache_control":{{"type":"ephemeral"}},"text":"Turn {i} answer","type":"text"}}],"role":"assistant"}}"#
+                ));
+            } else {
+                // Non-last assistant: simple content (no CC), array form.
+                parts.push(format!(
+                    r#"{{"content":[{{"text":"Turn {i} answer","type":"text"}}],"role":"assistant"}}"#
+                ));
+            }
+        }
+        format!("[{}]", parts.join(","))
+    }
+
+    /// Build a request body for turn N with alternating tool key order.
+    ///
+    /// Odd turns use "name-first" key order; even turns use "description-first".
+    /// This ensures that without CacheAlignStage, the tools value differs between
+    /// consecutive turns (the discriminating signal for negative arm A).
+    fn build_turn_body(n: usize) -> Vec<u8> {
+        let messages = build_turn_messages_json(n);
+        // Alternate tool key order to make the discriminating signal clear.
+        let tool_json = if n.is_multiple_of(2) {
+            // Even: description before name (non-canonical order).
+            r#"{"description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},"name":"search"}"#
+        } else {
+            // Odd: name before description (also non-canonical vs alphabetic).
+            r#"{"name":"search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},"description":"Search the web"}"#
+        };
+        format!(
+            r#"{{"max_tokens":1024,"messages":{messages},"model":"claude-3-5-sonnet-20241022","system":[{{"text":"You are helpful.","type":"text"}}],"tools":[{tool_json}]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Mask all `cache_control` entries from a JSON string (byte-level replacement).
+    fn mask_cache_control_in_str(s: &str) -> String {
+        s.replace(",\"cache_control\":{\"type\":\"ephemeral\"}", "")
+            .replace("\"cache_control\":{\"type\":\"ephemeral\"},", "")
+            .replace("\"cache_control\":{\"type\":\"ephemeral\"}", "")
+    }
+
+    /// Extract the JSON value for a top-level key as a compact JSON string.
+    ///
+    /// Uses `serde_json::Value` (preserve_order) to extract; produces compact output.
+    fn extract_json_key_compact(s: &str, key: &str) -> Option<String> {
+        let val: serde_json::Value = serde_json::from_str(s).ok()?;
+        let v = val.get(key)?;
+        serde_json::to_string(v).ok()
+    }
+
+    // AC5 / POSITIVE — 8-turn cross-turn prefix stability.
+    //
+    // DISCRIMINATING (PF-007): fails if CacheAlignStage is deleted (negative arm A:
+    // tool key order varies across turns without canonicalization) and fails if the
+    // seam max_growth is zero (negative arm B: markers rejected, offset test fails).
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_cross_turn_prefix_stability_ac5() {
+        let router = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline = TransformPipeline::from_stages(vec![
+            Box::new(BlockRouterStage::new(router)),
+            Box::new(CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder))),
+        ]);
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Run 8 turns through the pipeline and collect aligned outputs.
+        let aligned: Vec<Vec<u8>> = (1..=8)
+            .map(|n| {
+                let body = build_turn_body(n);
+                let req_id = format!("ac5-turn-{n:02}");
+                let ctx = TransformContext::new(
+                    ProxyProvider::Anthropic,
+                    AuthMode::ApiKey,
+                    &req_id,
+                    &hv,
+                );
+                pipeline.run(body, &ctx, &sink).bytes
+            })
+            .collect();
+
+        // (a) Tools value must be byte-identical across all 8 turns after masking CC.
+        let tools_masked: Vec<String> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).unwrap();
+                let masked = mask_cache_control_in_str(s);
+                extract_json_key_compact(&masked, "tools")
+                    .expect("aligned output must contain tools key")
+            })
+            .collect();
+
+        let reference_tools = &tools_masked[0];
+        for (i, tv) in tools_masked.iter().enumerate().skip(1) {
+            assert_eq!(
+                tv, reference_tools,
+                "AC5(a): tools value in turn {} differs from turn 1 after masking CC. \
+                 CacheAlignStage canonical key-sort must stabilize tools across turns.",
+                i + 1
+            );
+        }
+
+        // (a) System value must be byte-identical across all 8 turns after masking CC.
+        let system_masked: Vec<String> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).unwrap();
+                let masked = mask_cache_control_in_str(s);
+                extract_json_key_compact(&masked, "system")
+                    .expect("aligned output must contain system key")
+            })
+            .collect();
+
+        let reference_system = &system_masked[0];
+        for (i, sv) in system_masked.iter().enumerate().skip(1) {
+            assert_eq!(
+                sv, reference_system,
+                "AC5(a): system value in turn {} differs from turn 1 after masking CC.",
+                i + 1
+            );
+        }
+
+        // (b) Skim static markers must sit at identical byte offsets within the
+        // tools value on every turn. The marker is injected at the last tool object.
+        let cc_marker = "\"cache_control\"";
+        let tools_cc_offsets: Vec<Option<usize>> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).ok()?;
+                let tools_str = extract_json_key_compact(s, "tools")?;
+                tools_str.find(cc_marker)
+            })
+            .collect();
+
+        // All 8 turns must have a skim marker in the tools value.
+        for (i, offset) in tools_cc_offsets.iter().enumerate() {
+            assert!(
+                offset.is_some(),
+                "AC5(b): turn {} must have a skim cache_control marker in tools value. \
+                 Marker injection requires CacheAlignStage AND max_growth > 0.",
+                i + 1
+            );
+        }
+
+        // All markers at the same offset within the tools value (static zone).
+        let ref_offset = tools_cc_offsets[0].unwrap();
+        for (i, offset) in tools_cc_offsets.iter().enumerate().skip(1) {
+            assert_eq!(
+                *offset,
+                Some(ref_offset),
+                "AC5(b): skim marker offset in tools value differs in turn {} vs turn 1. \
+                 Static-zone markers must be at identical byte positions on every turn.",
+                i + 1
+            );
+        }
+    }
+
+    // AC5 / NEGATIVE (arm A) — Without CacheAlignStage, tool key order varies between
+    // turns (client alternates key order), so the masked tools value differs.
+    //
+    // DISCRIMINATING (PF-007): proves test_cross_turn_prefix_stability_ac5 requires
+    // CacheAlignStage to pass (canonical key sort is essential for cross-turn stability).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cross_turn_no_align_stage_tools_vary_ac5_negative_a() {
+        // Pipeline WITHOUT CacheAlignStage — BlockRouterStage only.
+        let router = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router))]);
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Run 2 turns (turn 1: odd key order, turn 2: even key order).
+        let aligned: Vec<Vec<u8>> = (1..=2)
+            .map(|n| {
+                let body = build_turn_body(n);
+                let req_id = format!("ac5-neg-a-turn-{n:02}");
+                let ctx = TransformContext::new(
+                    ProxyProvider::Anthropic,
+                    AuthMode::ApiKey,
+                    &req_id,
+                    &hv,
+                );
+                pipeline.run(body, &ctx, &sink).bytes
+            })
+            .collect();
+
+        let tools_values: Vec<String> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).unwrap();
+                let masked = mask_cache_control_in_str(s);
+                extract_json_key_compact(&masked, "tools").unwrap()
+            })
+            .collect();
+
+        // Without CacheAlignStage, alternating key order must survive into output →
+        // tools values MUST differ (proving CacheAlignStage is needed for stability).
+        assert_ne!(
+            tools_values[0],
+            tools_values[1],
+            "AC5 negative arm A: without CacheAlignStage, tools key order must vary \
+             between turns (confirming CacheAlignStage is required for cross-turn stability)"
+        );
+    }
+
+    // AC5 / NEGATIVE (arm B) — With max_growth=0, the seam rejects any marker-injected
+    // output (guarded_transform_with_growth falls back to passthrough). The tools value
+    // has no skim marker — the AC5(b) offset check would fail.
+    //
+    // DISCRIMINATING (PF-007): proves the seam max_growth fix is required for markers
+    // to survive into the forwarded body.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cross_turn_zero_growth_no_markers_ac5_negative_b() {
+        // ZeroGrowthCacheAlignStage: delegates apply() to CacheAlignStage but
+        // overrides max_growth() to 0. The seam's guarded_transform_with_growth
+        // gate then rejects the marker-injected output and falls back to passthrough.
+        struct ZeroGrowthCacheAlignStage {
+            inner: CacheAlignStage,
+        }
+
+        impl TransformStage for ZeroGrowthCacheAlignStage {
+            fn name(&self) -> &'static str {
+                "cache-align-zero-growth"
+            }
+
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                sink: &dyn DecisionSink,
+            ) -> Outcome {
+                self.inner.apply(body, ctx, sink)
+            }
+
+            /// Override: return 0 — the seam rejects any output > input bytes.
+            fn max_growth(&self, _input_len: usize) -> usize {
+                0
+            }
+        }
+
+        let router = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline = TransformPipeline::from_stages(vec![
+            Box::new(BlockRouterStage::new(router)),
+            Box::new(ZeroGrowthCacheAlignStage {
+                inner: CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder)),
+            }),
+        ]);
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Use turn 1 (odd key order — non-canonical; aligner tries to grow body).
+        let body = build_turn_body(1);
+        let ctx = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "ac5-neg-b",
+            &hv,
+        );
+        let out = pipeline.run(body, &ctx, &sink);
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+
+        // With max_growth=0, the seam gate rejects the marker-injected (inflated) output,
+        // and the pipeline falls back to the pre-CacheAlignStage bytes. The tools value
+        // in those pre-stage bytes has no skim marker.
+        let tools_str = extract_json_key_compact(out_str, "tools").unwrap_or_default();
+        assert!(
+            !tools_str.contains("\"cache_control\""),
+            "AC5 negative arm B: with max_growth=0, skim markers must be rejected — \
+             no cache_control should appear in tools value. \
+             This proves the seam max_growth fix is required for marker injection. \
+             Found in tools: {tools_str}"
+        );
+    }
 }

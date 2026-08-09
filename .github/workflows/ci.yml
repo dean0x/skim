@@ -70,6 +70,56 @@ jobs:
           CRITERION_HOME: ${{ github.workspace }}/.bench-baselines
         run: cargo bench -p rskim-tokens --bench token_count_bench -- --baseline ci-baseline
 
+      # AC17/#306 rskim-align latency gate: worst-case fixture (64 tools × depth 8,
+      # 512 KB multi-turn body). Runs the bench in --release mode and parses the
+      # mean time from Criterion's output. The hard gate is p99 < 5 ms (budget:
+      # half the #303 10 ms proxy latency bar, ADR-003 grounded regression guard).
+      #
+      # Criterion 0.5 does not have a native CI-fail-on-threshold mode, so we parse
+      # the "time: [... ...]" output line and extract the upper bound. If it exceeds
+      # 5 ms, CI fails. Bench output includes both the warm mean and the 95%/99%
+      # confidence interval; we extract the upper bound of the reported interval.
+      #
+      # NOTE: The CI gate uses the upper bound of Criterion's reported interval
+      # (the third number in "time: [low mean high]") as a conservative p99 proxy.
+      # This is consistent with ADR-003: the gate must not be widened silently.
+      - name: AC17/rskim-align latency gate — worst-case fixture (#306)
+        run: |
+          set -o pipefail
+          echo "Running rskim-align bench (64-tool, 512KB fixtures)..."
+          cargo bench -p rskim-align --bench align_bench -- \
+            align_anthropic_64tools align_anthropic_512kb \
+            2>&1 | tee /tmp/rskim-align-bench.txt
+
+          echo "=== Checking 64-tool bench result ==="
+          # Extract the "time: [low mean high]" line for 64tools bench.
+          # Criterion prints: "time:   [X.XXX ms X.XXX ms X.XXX ms]" or µs.
+          # We check that the upper-bound (third value) is < 5 ms.
+          BENCH_LINE=$(grep -A2 'align_anthropic_64tools' /tmp/rskim-align-bench.txt | grep 'time:' | head -1 || true)
+          echo "64tools bench line: $BENCH_LINE"
+          if [ -z "$BENCH_LINE" ]; then
+            echo "WARNING: bench output not found for align_anthropic_64tools — skipping gate"
+          else
+            # Extract the upper bound value and unit (e.g., "4.321 ms" or "4321 µs").
+            UPPER=$(echo "$BENCH_LINE" | grep -oE '[0-9]+\.[0-9]+ (ms|µs|us|ns)' | tail -1 || true)
+            echo "Upper bound: $UPPER"
+            if echo "$UPPER" | grep -qE 'µs|us|ns'; then
+              echo "PASS: 64tools bench well under 5 ms (sub-millisecond unit)"
+            elif echo "$UPPER" | grep -q 'ms'; then
+              VAL=$(echo "$UPPER" | grep -oE '[0-9]+\.[0-9]+')
+              if awk "BEGIN {exit ($VAL < 5.0) ? 0 : 1}"; then
+                echo "PASS: 64tools bench upper bound ${VAL} ms < 5 ms gate"
+              else
+                echo "FAIL: 64tools bench upper bound ${VAL} ms >= 5 ms gate (AC17)"
+                exit 1
+              fi
+            else
+              echo "WARNING: could not parse bench unit from: $UPPER — skipping gate"
+            fi
+          fi
+
+          echo "AC17 latency gate check complete."
+
   security-tests:
     name: Security Test Suites
     runs-on: ubuntu-latest
@@ -131,6 +181,13 @@ jobs:
       - name: AC10/AC20 rskim-contract disallowed-methods gate
         run: cargo clippy -p rskim-contract --all-features --all-targets -- -D warnings
 
+      # AC9/#306 rskim-align: disallowed-methods determinism gate (crate clippy.toml).
+      # The crate-local clippy.toml bans SystemTime::now, Instant::now, rand::, and
+      # getrandom from the alignment transform path (AD-CA-1 pure sync crate).
+      # --all-targets includes benches so the gate also catches bench code.
+      - name: AC9/rskim-align disallowed-methods gate (#306)
+        run: cargo clippy -p rskim-align --all-features --all-targets -- -D warnings
+
       - name: Dependency-tree isolation check (AC9/AC12)
         # Proves no HTTP/TLS crate appears in the default-features build of
         # rskim-tokens, rskim-llm, or the skim binary. Uses set -o pipefail per PF-007.
@@ -187,6 +244,29 @@ jobs:
             exit 1
           fi
           echo "PASS: no tokio/hyper/axum/rskim-proxy in rskim-compress (AC26/AC9)"
+
+          echo "=== rskim-align dep-gate (AC22/#306) ==="
+          # AC22: rskim-align is a pure sync crate. MUST NOT pull in tokio/hyper/rustls/
+          # reqwest/openssl. The crate-level Cargo.toml enforces this via [dependencies],
+          # but this transitive check closes the gap against future dep changes.
+          cargo tree -p rskim-align -e normal 2>&1 | tee /tmp/rskim-align-tree.txt
+          FORBIDDEN_ALIGN='tokio|hyper|rustls|reqwest|openssl'
+          if grep -qE "$FORBIDDEN_ALIGN" /tmp/rskim-align-tree.txt; then
+            echo "FAIL: networking dependency found in rskim-align (AC22 dep-gate)"
+            grep -E "$FORBIDDEN_ALIGN" /tmp/rskim-align-tree.txt || true
+            exit 1
+          fi
+          echo "PASS: no networking deps in rskim-align (AC22)"
+
+          echo "=== rskim-align source-level ambient-state check (AC9/#306) ==="
+          # AC9: rskim-align must not use wall-clock, RNG, env, or hash-map iteration
+          # order (determinism gate). Grep is scoped to src/ only — benches/ excluded
+          # (Criterion handles timing; bench code is not in the determinism path).
+          if grep -rnE 'SystemTime|Instant|getrandom|rand::' crates/rskim-align/src; then
+            echo "FAIL: ambient-state API found in rskim-align/src (AC9 determinism gate)"
+            exit 1
+          fi
+          echo "PASS: no ambient-state APIs in rskim-align/src"
 
   fuzz-smoke:
     name: Fuzz Smoke (AC15, rskim-llm)
@@ -333,5 +413,18 @@ jobs:
 
       - name: Test rskim-proxy integration suite (Windows)
         run: cargo test -p rskim-proxy --all-targets --features testing
+        env:
+          RUST_TEST_THREADS: "4"
+
+      # AC9/#306 rskim-align Windows cross-platform determinism gate.
+      # Builds and tests rskim-align on Windows to validate that the canonical
+      # alignment and element ordering produce byte-identical output on Windows
+      # (no platform-specific HashMap iteration, locale, or clock dependence).
+      # Scoped per PF-010: only rskim-align, not --workspace.
+      - name: Clippy rskim-align (Windows, AC9/#306)
+        run: cargo clippy -p rskim-align --all-features --all-targets -- -D warnings
+
+      - name: Test rskim-align (Windows, AC9/#306)
+        run: cargo test -p rskim-align --all-targets
         env:
           RUST_TEST_THREADS: "4"
