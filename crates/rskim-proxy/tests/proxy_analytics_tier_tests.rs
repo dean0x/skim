@@ -291,6 +291,124 @@ async fn start_echo_upstream() -> (String, tokio::task::AbortHandle) {
 }
 
 // ============================================================================
+// Slow-tail upstream (AC20 discriminator)
+// ============================================================================
+
+/// Delay the slow-tail upstream injects between response headers and body EOF.
+const TAIL_DELAY: Duration = Duration::from_millis(300);
+
+/// Response body that emits one frame immediately, then stalls for
+/// [`TAIL_DELAY`] before signalling end-of-stream.
+///
+/// Hyper writes the response headers as soon as the service returns, so the
+/// stall lands strictly *after* time-to-headers. This is what makes the AC20
+/// assertion discriminating: a fire site that measured time-to-headers (the
+/// pre-#305 behaviour) records a duration far below `TAIL_DELAY`.
+struct DelayedTailBody {
+    first: Option<Bytes>,
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    done: bool,
+}
+
+impl http_body::Body for DelayedTailBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let this = self.as_mut().get_mut();
+        if let Some(chunk) = this.first.take() {
+            return Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
+        }
+        if this.done {
+            return Poll::Ready(None);
+        }
+        match this.sleep.as_mut().poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => {
+                this.done = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+/// Upstream that answers 200 with headers immediately and delays stream end.
+async fn start_slow_tail_upstream() -> (String, tokio::task::AbortHandle) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("slow-tail upstream bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let task = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    let _ = req.into_body().collect().await;
+                    let body = DelayedTailBody {
+                        first: Some(Bytes::from_static(b"{\"ok\":true}")),
+                        sleep: Box::pin(tokio::time::sleep(TAIL_DELAY)),
+                        done: false,
+                    };
+                    let resp = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+    (format!("http://{}", addr), task.abort_handle())
+}
+
+/// AC20 / AD-PXY-23 (PF-007 discriminating): `duration` measures request receipt
+/// → final relayed frame, NOT time-to-response-headers.
+///
+/// The upstream returns headers immediately and stalls [`TAIL_DELAY`] before
+/// EOF, so a stream-end fire must record at least that delay. Moving the fire
+/// back to header time (the pre-#305 `start.elapsed()` at the response-build
+/// site) records a few milliseconds and fails this assertion — which the
+/// existing `duration > 0` check cannot detect.
+#[tokio::test]
+async fn test_duration_measures_stream_end_not_time_to_headers() {
+    let (upstream_url, up_abort) = start_slow_tail_upstream().await;
+
+    let (hook, events, _) = FullCapturingHook::new();
+    let (proxy_abort, proxy_addr) = start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
+
+    let body = br#"{"model":"claude-3-haiku","messages":[]}"#;
+    let status = post_to_messages(proxy_addr, body).await;
+    assert_eq!(status, 200);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let recorded = events.lock().unwrap();
+    assert_eq!(recorded.len(), 1, "exactly one event for one relayed request");
+    assert!(
+        recorded[0].duration >= TAIL_DELAY,
+        "AC20: duration must span the whole exchange to stream end \
+         (>= {TAIL_DELAY:?}), got {:?} — a time-to-headers measurement would \
+         land far below the injected tail delay",
+        recorded[0].duration
+    );
+
+    proxy_abort.abort();
+    up_abort.abort();
+}
+
+// ============================================================================
 // AC23 / AD-PXY-21 — Tier derivation via synthetic stages
 // ============================================================================
 

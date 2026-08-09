@@ -215,7 +215,6 @@ fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
 /// always fails to `None`.
 pub(crate) fn detect_model(body: &[u8]) -> Option<String> {
     use serde::Deserialize;
-    use serde::de::IgnoredAny;
 
     // Bound the sniff to SHAPE_SNIFF_LIMIT — same budget as provider detection.
     let sniff = if body.len() > SHAPE_SNIFF_LIMIT {
@@ -228,15 +227,15 @@ pub(crate) fn detect_model(body: &[u8]) -> Option<String> {
         return None;
     };
 
-    // Minimal struct: only materialise the `model` key; all other fields are
-    // consumed as IgnoredAny (no allocation). This mirrors the `ShallowBody`
-    // technique in `detect_by_shape` (AD-PXY-22).
+    // Minimal struct: only materialise the `model` key. Serde skips unknown
+    // fields without allocating for them, so no catch-all field is needed —
+    // adding a `#[serde(flatten)]` map would force serde's intermediate
+    // content-buffering and allocate a String key for every top-level field.
+    // This mirrors the `ShallowBody` technique in `detect_by_shape` (AD-PXY-22).
     #[derive(Deserialize)]
     struct ModelOnly {
         #[serde(default)]
         model: Option<String>,
-        #[serde(flatten)]
-        _rest: std::collections::HashMap<String, IgnoredAny>,
     }
 
     let Ok(parsed) = serde_json::from_str::<ModelOnly>(text) else {

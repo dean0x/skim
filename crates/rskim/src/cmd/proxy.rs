@@ -259,13 +259,16 @@ pub(crate) fn run(
 
     // Call serve_with_stage() — blocks until SIGINT/SIGTERM and drain completes (AC23).
     // AD-AN-12: analytics_arc is moved in; the sender closes on return.
-    match rskim_proxy::serve_with_stage(config, pipeline, analytics_arc) {
-        Ok(()) => {}
+    // The exit code is captured rather than returned immediately so the bounded
+    // consumer flush below still runs on the failure path; a serve error must
+    // still surface as a non-zero exit (fail loud).
+    let exit = match rskim_proxy::serve_with_stage(config, pipeline, analytics_arc) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("skim proxy: error: {e}");
-            // Fall through to flush consumer before returning failure.
+            ExitCode::FAILURE
         }
-    }
+    };
 
     // AD-AN-12: bounded shutdown flush — wait up to FLUSH_BOUND for the
     // consumer to drain and persist drop counts. If the bound elapses
@@ -282,7 +285,7 @@ pub(crate) fn run(
         }
     }
 
-    Ok(ExitCode::SUCCESS)
+    Ok(exit)
 }
 
 // ============================================================================

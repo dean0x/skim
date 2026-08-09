@@ -392,7 +392,10 @@ pub(crate) struct ProxyRecordInput {
     pub project_path: String,
     /// Session ID for per-session attribution (AD-AN-4).
     pub session_id: Option<String>,
-    /// Original command string (e.g. the request URL path `/v1/messages`).
+    /// Original command string.  The bridge stores the constant `"proxy"` —
+    /// the request URL path is deliberately NOT stored, because
+    /// `query_by_original_cmd` is CLI-scoped (AD-AN-6) and a path would put
+    /// caller-controlled, unbounded text into the column for no consumer.
     pub original_cmd: String,
     /// Pre-counted raw (pre-transform) tokens.  `None` per AD-AN-7 when
     /// counting is unavailable; paired with `compressed_tokens` and
@@ -989,15 +992,27 @@ impl AnalyticsDb {
     }
 
     /// Prune records older than N days.
+    ///
+    /// **AD-AN-13:** the child `proxy_block_decisions` rows are deleted in the
+    /// same transaction as their parents.  `PRAGMA foreign_keys` is off (SQLite
+    /// default), so the declared FK does not cascade — without the explicit
+    /// child DELETE the detail rows would have no deletion path at all and would
+    /// accumulate past the retention window (ADR-006: never persist a partial
+    /// state — children first, then parents, committed together).
     pub(crate) fn prune_older_than(&self, days: u64) -> anyhow::Result<usize> {
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64
             - (days as i64 * SECONDS_PER_DAY as i64);
-        let count = self
-            .conn
-            .execute("DELETE FROM token_savings WHERE timestamp < ?1", [cutoff])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM proxy_block_decisions WHERE savings_id IN \
+             (SELECT id FROM token_savings WHERE timestamp < ?1)",
+            [cutoff],
+        )?;
+        let count = tx.execute("DELETE FROM token_savings WHERE timestamp < ?1", [cutoff])?;
+        tx.commit()?;
         Ok(count)
     }
 
@@ -1048,10 +1063,19 @@ impl AnalyticsDb {
             return Ok(0);
         }
 
-        let count = self.conn.execute(
+        // AD-AN-13: delete the child detail rows in the same transaction (the
+        // declared FK does not cascade — `PRAGMA foreign_keys` is off).
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM proxy_block_decisions WHERE savings_id IN \
+             (SELECT id FROM token_savings WHERE compressed_tokens > raw_tokens)",
+            [],
+        )?;
+        let count = tx.execute(
             "DELETE FROM token_savings WHERE compressed_tokens > raw_tokens",
             [],
         )?;
+        tx.commit()?;
 
         // Write sentinel so this never runs again.
         let _ = self.conn.execute(
@@ -1510,8 +1534,19 @@ impl AnalyticsStore for AnalyticsDb {
     fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
         self.query_session_stats(since)
     }
+    /// Clear all analytics rows.
+    ///
+    /// **AD-AN-13 / AC22:** the `proxy_block_decisions` detail rows are cleared
+    /// with their parents in one transaction.  `PRAGMA foreign_keys` is off
+    /// (SQLite default) so the declared FK does not cascade; deleting only the
+    /// parents would strand the detail rows with no way to ever remove them.
     fn clear(&self) -> anyhow::Result<()> {
-        self.conn.execute("DELETE FROM token_savings", [])?;
+        self.conn.execute_batch(
+            "BEGIN;
+             DELETE FROM proxy_block_decisions;
+             DELETE FROM token_savings;
+             COMMIT;",
+        )?;
         Ok(())
     }
 
@@ -3948,6 +3983,84 @@ mod tests {
         }
     }
 
+    /// Count rows left in the `proxy_block_decisions` detail table.
+    fn detail_row_count(db: &AnalyticsDb) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM proxy_block_decisions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// AD-AN-13 (PF-007 discriminating): every path that deletes a parent
+    /// `token_savings` row also deletes its `proxy_block_decisions` children.
+    ///
+    /// `PRAGMA foreign_keys` is off (SQLite default), so the declared FK does
+    /// NOT cascade.  Dropping the explicit child DELETE from `clear`,
+    /// `prune_older_than`, or `clean_invalid_records` leaves detail rows with no
+    /// deletion path at all — they would survive both `skim stats --clear` and
+    /// the 90-day retention prune forever.  Removing any of the three child
+    /// DELETEs fails this test.
+    #[test]
+    fn test_deleting_parent_rows_also_deletes_block_decision_rows() {
+        // --- clear() ---
+        let (mut db, _tmp) = test_db();
+        db.record_proxy(&sample_proxy_input()).unwrap();
+        assert_eq!(detail_row_count(&db), 2, "fixture inserts two detail rows");
+        AnalyticsStore::clear(&db).unwrap();
+        assert_eq!(
+            detail_row_count(&db),
+            0,
+            "clear() must not strand orphaned proxy_block_decisions rows"
+        );
+
+        // --- prune_older_than() ---
+        let (mut db, _tmp) = test_db();
+        let mut old = sample_proxy_input();
+        old.timestamp = now_unix_secs() - (100 * SECONDS_PER_DAY as i64);
+        db.record_proxy(&old).unwrap();
+        let mut fresh = sample_proxy_input();
+        fresh.timestamp = now_unix_secs();
+        db.record_proxy(&fresh).unwrap();
+        assert_eq!(detail_row_count(&db), 4);
+
+        let pruned = db.prune_older_than(90).unwrap();
+        assert_eq!(pruned, 1, "only the 100-day-old parent is pruned");
+        assert_eq!(
+            detail_row_count(&db),
+            2,
+            "prune must delete the pruned parent's detail rows and keep the rest"
+        );
+        // The survivors must still belong to the surviving parent — an
+        // over-broad child DELETE would leave 0 here.
+        let surviving_parent: i64 = db
+            .conn
+            .query_row("SELECT id FROM token_savings LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        let attached: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM proxy_block_decisions WHERE savings_id = ?1",
+                [surviving_parent],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, 2, "surviving detail rows stay attached to their parent");
+
+        // --- clean_invalid_records() ---
+        let (mut db, _tmp) = test_db();
+        let mut expanded = sample_proxy_input();
+        expanded.raw_tokens = Some(100);
+        expanded.compressed_tokens = Some(500); // compressed > raw ⇒ "invalid"
+        db.record_proxy(&expanded).unwrap();
+        assert_eq!(detail_row_count(&db), 2);
+        let cleaned = db.clean_invalid_records().unwrap();
+        assert_eq!(cleaned, 1);
+        assert_eq!(
+            detail_row_count(&db),
+            0,
+            "clean_invalid_records must not strand orphaned detail rows"
+        );
+    }
+
     /// AC21 — `select_encoding` covers all 9 cells of the
     /// {Unknown, Anthropic, OpenAI} × {None, recognized, unrecognized} matrix.
     ///
@@ -4132,7 +4245,10 @@ mod tests {
     fn test_record_proxy_upstream_error_status_stored() {
         let (mut db, _tmp) = test_db();
 
-        // AD-PXY-25: 502 upstream error — tokens still present (transformation ran)
+        // AD-PXY-25: `record_proxy` stores exactly what it is handed; NULLing the
+        // token columns for an upstream-errored request is the bridge's job
+        // (`build_proxy_record_input`), pinned by
+        // `proxy_analytics::tests::test_upstream_errored_event_has_null_token_columns`.
         let mut input = sample_proxy_input();
         input.provider = RecordingProvider::OpenAI;
         input.upstream_error_status = Some(502);

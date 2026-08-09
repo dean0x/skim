@@ -327,6 +327,67 @@ impl http_body::Body for AnalyticsCompletionBody {
 }
 
 // ============================================================================
+// CollectingSink — production request-scoped decision sink (AD-PXY-21)
+// ============================================================================
+
+/// Upper bound on `DecisionRecord`s collected for a single request.
+///
+/// ## Honest rationale (ADR-003 / PF-005)
+///
+/// **This is a safety bound, not a measured threshold.** It exists because the
+/// reliability rule requires every accumulating resource to carry an explicit
+/// bound: without it a stage emitting one record per block could grow the
+/// per-request vector in proportion to attacker-influenced body structure. A
+/// request that exceeds it degrades to passthrough (the `SinkFull` contract),
+/// never to unbounded memory.
+const MAX_COLLECTED_RECORDS: usize = 4096;
+
+/// Request-scoped [`DecisionSink`] that collects per-block decision records.
+///
+/// ## AD-PXY-21 — the production collecting sink
+///
+/// Replaces the #303 `NullSink` now that the request tier and the
+/// `proxy_block_decisions` detail table are derived from per-block records.
+///
+/// This is deliberately **not** [`rskim_contract::log::MockSink`]: that type is
+/// a test double (it carries a `set_full` failure-injection toggle and an
+/// unbounded `Vec`) and must not run on the request path.
+///
+/// Bounded per [`MAX_COLLECTED_RECORDS`]. Past the cap `try_send` returns
+/// `Err(SinkFull)`, which the `DecisionSink` contract defines as "the caller
+/// MUST fall back to passthrough" — the correct fail-open outcome.
+struct CollectingSink {
+    records: std::sync::Mutex<Vec<DecisionRecord>>,
+}
+
+impl CollectingSink {
+    fn new() -> Self {
+        Self {
+            records: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take the collected records, leaving the sink empty.
+    ///
+    /// Poison-tolerant: a stage that panicked while holding the lock must not
+    /// turn into a panic on the request path (AC9 fail-open).
+    fn drain(&self) -> Vec<DecisionRecord> {
+        std::mem::take(&mut *self.records.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl DecisionSink for CollectingSink {
+    fn try_send(&self, record: DecisionRecord) -> Result<(), SinkFull> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= MAX_COLLECTED_RECORDS {
+            return Err(SinkFull);
+        }
+        guard.push(record);
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Tier derivation helpers (AD-PXY-21)
 // ============================================================================
 
@@ -442,7 +503,7 @@ fn fire_upstream_error_event(
     }));
 }
 
-use rskim_contract::log::{DecisionRecord, MockSink, OutcomeReason};
+use rskim_contract::log::{DecisionRecord, DecisionSink, OutcomeReason, SinkFull};
 
 use crate::analytics::{AnalyticsHook, BlockDecisionProjection, ProxyEvent, RequestTier};
 use crate::authmode::classify_auth;
@@ -636,14 +697,13 @@ async fn handle_request(
 
     // ---- Transform pipeline (with collecting sink for tier derivation) ----
     //
-    // AD-PXY-21: replace NullSink with a request-scoped MockSink so per-block
-    // DecisionRecords are captured for tier derivation and the
-    // proxy_block_decisions detail table. MockSink is always available from
-    // rskim_contract (not feature-gated).
+    // AD-PXY-21: replace NullSink with a request-scoped CollectingSink so
+    // per-block DecisionRecords are captured for tier derivation and the
+    // proxy_block_decisions detail table.
     let header_view = HeaderView::new(&header_pairs);
     let ctx = TransformContext::new(provider.clone(), auth_mode, &request_id, &header_view);
 
-    let collecting_sink = MockSink::new();
+    let collecting_sink = CollectingSink::new();
 
     // AC9: per-transform panic containment — catch_unwind around pipeline.run.
     // A panicking stage falls back to the original body bytes (fail-open).

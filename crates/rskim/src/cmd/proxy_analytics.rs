@@ -95,9 +95,12 @@ pub(crate) const PROXY_QUEUE_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
 /// reclaims the thread; its last action is to persist the drop total.
 pub(crate) const FLUSH_BOUND: Duration = Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS);
 
-/// Token-size cap for proxy-side counting (mirrors CLI analytics cap, ADR-001).
+/// Token-size cap for proxy-side counting (mirrors the CLI analytics cap, ADR-001).
 ///
-/// Inputs above this threshold skip BPE tokenisation and use `len / 4` as a proxy.
+/// A body above this size skips BPE tokenisation to bound the consumer thread's
+/// cost.  Unlike the CLI recorder it does **not** substitute a `len / 4`
+/// estimate: the row is recorded with pair-jointly NULL token columns (AC6 —
+/// measured, never estimated) and disclosed via `uncounted_rows` (AC12).
 const PROXY_TOKEN_SIZE_CAP: usize = 256 * 1024;
 
 // ============================================================================
@@ -298,6 +301,7 @@ fn to_recording_provider(provider: &ProxyProvider) -> RecordingProvider {
 /// (AC14). `raw_tokens`, `compressed_tokens`, and `savings_pct` are **all**
 /// `None` when:
 /// - Either `raw_body` or `final_body` is not valid UTF-8, OR
+/// - Either body exceeds [`PROXY_TOKEN_SIZE_CAP`] (BPE cost bound), OR
 /// - The `Counter` construction fails (practically unreachable).
 ///
 /// They are **all** `Some` with measured values otherwise — no fabricated or
@@ -322,6 +326,20 @@ pub(crate) fn compute_token_counts(
         Err(_) => return (None, None, None),
     };
 
+    // AC6 / AD-AN-7: measured-never-estimated.  A body above the BPE cost cap is
+    // NOT tokenised, and it MUST NOT be recorded with a byte-length estimate
+    // either — the proxy scope publishes a `basis` label (exact / approximation /
+    // heuristic), so a `len / 4` guess stored under `basis = exact` would present
+    // a fabricated number as a measurement (ADR-003).  The row is written
+    // pair-jointly NULL instead and is disclosed through `uncounted_rows` (AC12).
+    //
+    // This differs deliberately from the CLI recorder's `count_tokens_bounded`,
+    // which does fall back to `len / 4`: CLI rows carry no counting-basis
+    // disclosure, proxy rows do.
+    if raw_str.len() > PROXY_TOKEN_SIZE_CAP || final_str.len() > PROXY_TOKEN_SIZE_CAP {
+        return (None, None, None);
+    }
+
     // AD-AN-11: single encoding derived from provider + model.
     let encoding = select_encoding(recording_provider, event.model.as_deref());
 
@@ -331,9 +349,9 @@ pub(crate) fn compute_token_counts(
         Err(_) => return (None, None, None),
     };
 
-    // Apply size cap (mirrors CLI analytics TOKEN_SIZE_CAP, ADR-001).
-    let raw_tokens = bounded_count(&counter, raw_str);
-    let compressed_tokens = bounded_count(&counter, final_str);
+    // Both sides are counted with the SAME `Counter` instance (AD-AN-7).
+    let raw_tokens = counter.count(raw_str) as i64;
+    let compressed_tokens = counter.count(final_str) as i64;
 
     let savings_pct = if raw_tokens > 0 {
         (1.0 - compressed_tokens as f64 / raw_tokens as f64) * 100.0
@@ -344,12 +362,23 @@ pub(crate) fn compute_token_counts(
     (Some(raw_tokens), Some(compressed_tokens), Some(savings_pct))
 }
 
-/// Count tokens with a cap to avoid O(n²) BPE cost on huge inputs (ADR-001).
-fn bounded_count(counter: &rskim_tokens::Counter, text: &str) -> i64 {
-    if text.len() > PROXY_TOKEN_SIZE_CAP {
-        return (text.len() / 4) as i64;
-    }
-    counter.count(text) as i64
+/// Maximum stored length of the verbatim `model` string, in characters.
+///
+/// Bounded default (ADR-003 / PF-005): not a measured value. Published model
+/// identifiers are well under 100 characters; the cap exists because `model` is
+/// verbatim client-supplied text (AD-PXY-22) that would otherwise write up to a
+/// full JSON sniff window of arbitrary text into every row and into the
+/// `GROUP BY` key of the per-model breakdown.
+const MAX_MODEL_LEN: usize = 128;
+
+/// Bound the verbatim model string at the recording boundary.
+///
+/// Parse at the boundary, trust internally: everything downstream of this point
+/// (the DB column, the `GROUP BY` key, the rendered table) can assume a bounded
+/// value. Truncation is by *character*, so the stored string is always valid
+/// UTF-8 — never a panic-inducing byte slice.
+fn bounded_model(model: Option<&str>) -> Option<String> {
+    model.map(|m| m.chars().take(MAX_MODEL_LEN).collect())
 }
 
 /// Build a `ProxyRecordInput` from a `ProxyEvent` and session context.
@@ -358,8 +387,19 @@ pub(crate) fn build_proxy_record_input(
     session_id: &Option<String>,
 ) -> ProxyRecordInput {
     let recording_provider = to_recording_provider(&event.provider);
-    let (raw_tokens, compressed_tokens, savings_pct) =
-        compute_token_counts(event, &recording_provider);
+
+    // AC25 / AD-PXY-25: a transformed-but-upstream-errored request is NOT a
+    // successful savings row.  Its token columns are pair-jointly NULL so it can
+    // never contribute to a token sum or a savings %, and it stays
+    // distinguishable from a NULL-token passthrough row via
+    // `upstream_error_status IS NOT NULL`.  Counting is skipped entirely — the
+    // response never reached the client, so there is no relayed saving to
+    // measure.  This is what `server.rs::fire_upstream_error_event` documents.
+    let (raw_tokens, compressed_tokens, savings_pct) = if event.upstream_error_status.is_some() {
+        (None, None, None)
+    } else {
+        compute_token_counts(event, &recording_provider)
+    };
 
     // AD-AN-13: project block decisions into the detail-row format.
     let blocks: Vec<ProxyBlockDecision> = event
@@ -387,7 +427,7 @@ pub(crate) fn build_proxy_record_input(
     ProxyRecordInput {
         timestamp,
         provider: recording_provider,
-        model: event.model.clone(),
+        model: bounded_model(event.model.as_deref()),
         turn_id: event.turn_id.clone(),
         tier: event.tier.as_str().to_string(),
         duration_ms: event.duration.as_millis() as u64,
@@ -652,6 +692,127 @@ mod tests {
         assert!(raw.is_none(), "non-UTF-8 final must yield None raw_tokens");
         assert!(comp.is_none(), "non-UTF-8 final must yield None compressed_tokens");
         assert!(pct.is_none(), "non-UTF-8 final must yield None savings_pct");
+    }
+
+    /// AC6 (PF-007 discriminating): a body above `PROXY_TOKEN_SIZE_CAP` is
+    /// recorded pair-jointly NULL, never with a `len / 4` estimate.
+    ///
+    /// Discriminator: restoring a byte-length fallback makes `raw` `Some(...)`
+    /// and fails the assertion — the point is that no fabricated number is ever
+    /// stored under the `basis = exact` label the proxy scope publishes.
+    #[test]
+    fn test_compute_token_counts_oversize_body_yields_null_not_estimate() {
+        let big = Bytes::from(vec![b'a'; PROXY_TOKEN_SIZE_CAP + 1]);
+        let event = make_event_with_bodies(big, Bytes::from_static(b"small"));
+        let provider = RecordingProvider::Anthropic;
+        let (raw, comp, pct) = compute_token_counts(&event, &provider);
+        assert!(
+            raw.is_none() && comp.is_none() && pct.is_none(),
+            "AC6: an oversize body must yield pair-jointly NULL token columns, \
+             not an estimated len/4 value (got raw={raw:?}, comp={comp:?}, pct={pct:?})"
+        );
+
+        // The mirror case: an oversize *transformed* body is equally uncountable.
+        let event = make_event_with_bodies(
+            Bytes::from_static(b"small"),
+            Bytes::from(vec![b'a'; PROXY_TOKEN_SIZE_CAP + 1]),
+        );
+        let (raw, comp, pct) = compute_token_counts(&event, &provider);
+        assert!(
+            raw.is_none() && comp.is_none() && pct.is_none(),
+            "AC6: an oversize transformed body must also yield NULL token columns"
+        );
+
+        // Control: a body just under the cap IS counted, proving the guard is
+        // the cap and not a blanket "never count" regression.
+        let event = make_event_with_bodies(
+            Bytes::from(vec![b'a'; 1024]),
+            Bytes::from_static(b"small"),
+        );
+        let (raw, _, _) = compute_token_counts(&event, &provider);
+        assert!(
+            raw.is_some(),
+            "a body below the cap must still be measured"
+        );
+    }
+
+    /// AC25 (PF-007 discriminating): a transformed-but-upstream-errored event is
+    /// recorded with pair-jointly NULL token columns.
+    ///
+    /// Discriminator: deleting the `upstream_error_status.is_some()` branch in
+    /// `build_proxy_record_input` makes the token columns `Some(...)` and fails
+    /// the assertion, which is exactly the "errored request wrongly counted as a
+    /// successful savings row" defect AC25 forbids.
+    #[test]
+    fn test_upstream_errored_event_has_null_token_columns() {
+        let errored = ProxyEvent::new(
+            ProxyProvider::Anthropic,
+            Some("claude-3-5-sonnet-20241022".to_string()),
+            None,
+            RequestTier::Full,
+            Bytes::from_static(b"{\"model\":\"claude-3-5-sonnet-20241022\"}"),
+            Bytes::from_static(b"{\"model\":\"claude\"}"),
+            vec![BlockDecisionProjection {
+                component: "block-router",
+                outcome: "full",
+                bytes_in: 37,
+                bytes_out: 18,
+            }],
+            Some(502),
+            Duration::from_millis(7),
+        );
+        let input = build_proxy_record_input(&errored, &None);
+        assert_eq!(input.upstream_error_status, Some(502));
+        assert!(
+            input.raw_tokens.is_none()
+                && input.compressed_tokens.is_none()
+                && input.savings_pct.is_none(),
+            "AC25: an upstream-errored row must never carry token counts (got \
+             raw={:?}, comp={:?}, pct={:?})",
+            input.raw_tokens,
+            input.compressed_tokens,
+            input.savings_pct
+        );
+        assert_eq!(
+            input.blocks.len(),
+            1,
+            "AC24: per-block detail rows are still recorded for an errored row"
+        );
+
+        // Control: the same event WITHOUT an upstream error is counted, proving
+        // the NULLing is scoped to the error outcome and not a blanket change.
+        let ok = make_small_event();
+        let ok_input = build_proxy_record_input(&ok, &None);
+        assert!(
+            ok_input.raw_tokens.is_some(),
+            "a normally relayed row must still carry measured token counts"
+        );
+    }
+
+    /// The verbatim client-supplied `model` string is bounded before it reaches
+    /// the database, and truncation never splits a UTF-8 character.
+    #[test]
+    fn test_bounded_model_caps_length_on_char_boundary() {
+        assert_eq!(bounded_model(None), None);
+        assert_eq!(
+            bounded_model(Some("claude-3-5-sonnet-20241022")).as_deref(),
+            Some("claude-3-5-sonnet-20241022"),
+            "a normal model identifier passes through verbatim (AD-PXY-22)"
+        );
+
+        // Multi-byte input longer than the cap: bounded by chars, still valid UTF-8.
+        let hostile = "日".repeat(MAX_MODEL_LEN * 4);
+        let bounded = bounded_model(Some(&hostile)).unwrap();
+        assert_eq!(
+            bounded.chars().count(),
+            MAX_MODEL_LEN,
+            "model must be capped at MAX_MODEL_LEN characters"
+        );
+        assert_eq!(
+            bounded,
+            "日".repeat(MAX_MODEL_LEN),
+            "character-wise truncation must not corrupt multi-byte input"
+        );
     }
 
     /// AD-AN-11: Unknown provider maps to `RecordingProvider::Unknown`.

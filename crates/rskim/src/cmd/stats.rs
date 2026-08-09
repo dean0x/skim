@@ -177,11 +177,16 @@ fn run_json(
     // AC10 / AD-AN-9: proxy section is present only when proxy rows exist.
     // AD-AN-9: ordering is guaranteed by query_by_model (NULL-last SQL ORDER BY),
     // so identical row sets produce byte-identical JSON (AC13).
+    //
+    // AC17 / AD-AN-8: a non-zero drop counter also materialises the section even
+    // when no proxy row survived — that is precisely the case the disclosure
+    // exists for.  With no proxy activity at all the section stays `null`, so
+    // pre-#305 output is unchanged (AC10).
     let by_model = db.query_by_model(since)?;
-    let proxy_section = if !by_model.is_empty() {
+    let upstream_errors = db.query_by_upstream_error(since)?;
+    let dropped_records = db.query_proxy_dropped_records()?;
+    let proxy_section = if !by_model.is_empty() || upstream_errors > 0 || dropped_records > 0 {
         let by_provider = db.query_by_provider(since)?;
-        let upstream_errors = db.query_by_upstream_error(since)?;
-        let dropped_records = db.query_proxy_dropped_records()?;
 
         // Serialise by_model: per-row basis disclosure + uncounted_rows (AC12).
         // AD-AN-9: mixed-basis provider rows carry null token sums (already
@@ -684,6 +689,28 @@ fn fmt_opt_tokens(v: Option<u64>) -> String {
 /// span different tokenizers and the sum would be meaningless).
 /// AD-PXY-25: upstream_errors is shown separately — those rows are excluded
 /// from savings/tier aggregates.
+/// Render an untrusted string into a fixed-width table cell.
+///
+/// The `model` column carries **verbatim client-supplied text** (AD-PXY-22):
+/// the proxy stores whatever a caller put in the request body's `"model"` key.
+/// It therefore reaches this renderer unvalidated, and two hazards must close
+/// here:
+///
+/// - **Panic.** `&s[..n]` slices by *byte* index and panics when byte `n` is not
+///   a UTF-8 character boundary, so any multi-byte model string long enough to
+///   be truncated would crash `skim stats`. Taking `max` *chars* is boundary-safe
+///   by construction.
+/// - **Terminal injection.** Control characters — ANSI escape introducers,
+///   `\r`, `\n` — would be interpreted by the operator's terminal and could
+///   rewrite the rendered table. Each is replaced with U+FFFD (A03: escape
+///   output for its context).
+fn display_cell(s: &str, max: usize) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .take(max)
+        .collect()
+}
+
 fn render_proxy_by_provider(
     w: &mut dyn Write,
     rows: &[ProxyProviderStats],
@@ -706,7 +733,7 @@ fn render_proxy_by_provider(
         writeln!(
             w,
             "  {:<16}  {:>6}  {:>6}  {:>10}  {:>10}  {}  {:<14}  {:>9}",
-            &provider[..provider.len().min(16)],
+            display_cell(provider, 16),
             tokens::format_number(row.requests as usize),
             tokens::format_number(row.upstream_errors as usize),
             fmt_opt_tokens(row.raw_tokens),
@@ -746,8 +773,8 @@ fn render_proxy_by_model(
         writeln!(
             w,
             "  {:<16}  {:<26}  {:>6}  {:>6}  {:>10}  {:>10}  {}  {:<14}  {:>9}",
-            &provider[..provider.len().min(16)],
-            &model[..model.len().min(26)],
+            display_cell(provider, 16),
+            display_cell(model, 26),
             tokens::format_number(row.requests as usize),
             tokens::format_number(row.upstream_errors as usize),
             fmt_opt_tokens(row.raw_tokens),
@@ -807,7 +834,16 @@ fn run_dashboard(
 ) -> anyhow::Result<ExitCode> {
     let summary = db.query_summary(since)?;
 
-    if summary.invocations == 0 {
+    // AD-AN-6: `summary` is CLI-scope — it excludes `command_type = 'proxy'`
+    // rows.  The empty-dashboard shortcut must therefore also consult the proxy
+    // scope, otherwise a proxy-only database (AC9) would print "No analytics
+    // data found." and the per-provider/per-model breakdowns would be
+    // unreachable in text output.  `dropped_records` is included so a run whose
+    // events were all dropped still discloses the counter (AC17 / AD-AN-8).
+    let by_model = db.query_by_model(since)?;
+    let dropped_records = db.query_proxy_dropped_records()?;
+
+    if summary.invocations == 0 && by_model.is_empty() && dropped_records == 0 {
         writeln!(w, "{}", "No analytics data found.".dimmed())?;
         writeln!(w)?;
         writeln!(
@@ -835,22 +871,27 @@ fn run_dashboard(
     // AC10: proxy sections only when proxy rows exist (render-when-present).
     // AD-PXY-25 / AD-AN-9: upstream-error and dropped-record counts are surfaced
     // alongside the breakdown tables.
-    let by_model = db.query_by_model(since)?;
     if !by_model.is_empty() {
         let by_provider = db.query_by_provider(since)?;
         render_proxy_by_provider(w, &by_provider)?;
         render_proxy_by_model(w, &by_model)?;
+    }
 
-        // Inline advisory lines: upstream errors + dropped records.
-        let upstream_errors = db.query_by_upstream_error(since)?;
-        let dropped_records = db.query_proxy_dropped_records()?;
-        if upstream_errors > 0 || dropped_records > 0 {
-            writeln!(w, "{}", section_header("Proxy — Notices"))?;
-            writeln!(w)?;
-            render_proxy_upstream_errors(w, upstream_errors)?;
-            render_proxy_dropped_records(w, dropped_records)?;
-            writeln!(w)?;
-        }
+    // Inline advisory lines: upstream errors + dropped records.
+    //
+    // AC17 / AD-AN-8: the drop counter is the disclosure that justifies the
+    // bounded-default queue constants, so it is rendered independently of
+    // whether any proxy row survived — a run whose every event was dropped has
+    // an empty `by_model` and is exactly the case that must not stay silent.
+    // Both lines render only when non-zero, so a database with no proxy
+    // activity at all still produces byte-identical pre-#305 output (AC10).
+    let upstream_errors = db.query_by_upstream_error(since)?;
+    if upstream_errors > 0 || dropped_records > 0 {
+        writeln!(w, "{}", section_header("Proxy — Notices"))?;
+        writeln!(w)?;
+        render_proxy_upstream_errors(w, upstream_errors)?;
+        render_proxy_dropped_records(w, dropped_records)?;
+        writeln!(w)?;
     }
 
     render_cost_section(w, summary.tokens_saved, cost_override)?;
@@ -1194,6 +1235,136 @@ mod tests {
         assert!(
             output.contains("No analytics data found"),
             "empty dashboard should show empty message"
+        );
+    }
+
+    /// AC9 (PF-007 discriminating): a proxy-only database renders the proxy
+    /// breakdowns with a zero CLI headline — it must NOT take the
+    /// "No analytics data found." shortcut.
+    ///
+    /// `query_summary` is CLI-scope (AD-AN-6), so a proxy-only database has
+    /// `invocations == 0`.  Restoring the bare `summary.invocations == 0`
+    /// early-return blanks the entire proxy scope in text output and fails this
+    /// test.
+    #[test]
+    fn test_run_dashboard_proxy_only_store_renders_proxy_scope() {
+        let mut store = MockStore::empty();
+        store.by_model = vec![proxy_model_row(
+            Some("anthropic"),
+            Some("claude-3-5-sonnet-20241022"),
+            5,
+            Some(10_000),
+            Some(4_000),
+            Some(60.0),
+            "approximation",
+            0,
+            0,
+        )];
+        store.by_provider = vec![proxy_provider_row(
+            Some("anthropic"),
+            5,
+            Some(10_000),
+            Some(4_000),
+            Some(60.0),
+            "approximation",
+            0,
+        )];
+
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            !output.contains("No analytics data found"),
+            "a proxy-only database must not report an empty dashboard; got:\n{output}"
+        );
+        assert!(
+            output.contains("claude-3-5-sonnet-20241022"),
+            "proxy per-model breakdown must render for a proxy-only database; got:\n{output}"
+        );
+        assert!(
+            output.contains("Invocations:  0"),
+            "the CLI headline must stay zero for a proxy-only database (AC9); got:\n{output}"
+        );
+    }
+
+    /// PF-007 discriminating: a multi-byte `model` string must not panic the
+    /// renderer, and control characters must not reach the terminal.
+    ///
+    /// `model` is verbatim client-supplied text (AD-PXY-22), so any proxy caller
+    /// controls it. Restoring the byte slice `&model[..model.len().min(26)]`
+    /// panics on the CJK row ("byte index 26 is not a char boundary"); dropping
+    /// the control-character replacement lets the ESC byte through and fails the
+    /// second assertion.
+    #[test]
+    fn test_proxy_render_survives_hostile_model_strings() {
+        let mut store = MockStore::empty();
+        store.by_model = vec![
+            // 30 CJK chars — byte 26 falls mid-character.
+            proxy_model_row(
+                Some("openai"),
+                Some(&"日".repeat(30)),
+                1,
+                Some(10),
+                Some(5),
+                Some(50.0),
+                "exact",
+                0,
+                0,
+            ),
+            // ANSI escape + newline injection attempt.
+            proxy_model_row(
+                Some("openai"),
+                Some("gpt\u{1b}[31m-evil\nINJECTED"),
+                1,
+                Some(10),
+                Some(5),
+                Some(50.0),
+                "exact",
+                0,
+                0,
+            ),
+        ];
+        store.by_provider = vec![proxy_provider_row(
+            Some("openai"),
+            2,
+            Some(20),
+            Some(10),
+            Some(50.0),
+            "exact",
+            0,
+        )];
+
+        // Must not panic.
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+
+        assert!(
+            !output.contains('\u{1b}'),
+            "an ESC byte from a client-supplied model string must never reach the terminal"
+        );
+        assert!(
+            !output.contains("\nINJECTED"),
+            "a newline inside a model cell must not start a forged output line"
+        );
+    }
+
+    /// AC17 (PF-007 discriminating): a non-zero drop counter is disclosed even
+    /// when no proxy row survived to be recorded.
+    ///
+    /// The drop counter is the disclosure that justifies the bounded-default
+    /// queue constants (ADR-003), so gating it behind `!by_model.is_empty()`
+    /// silences it in exactly the case it exists for.  Restoring that gate
+    /// fails this test.
+    #[test]
+    fn test_run_dashboard_surfaces_drops_with_no_surviving_proxy_rows() {
+        let mut store = MockStore::empty();
+        store.dropped_records = 17;
+
+        let output = capture(|w| run_dashboard(w, &store, None, false, None, None));
+        assert!(
+            output.contains("Dropped records"),
+            "a non-zero drop total must be surfaced even with zero proxy rows; got:\n{output}"
+        );
+        assert!(
+            output.contains("17"),
+            "the drop total itself must be shown; got:\n{output}"
         );
     }
 
