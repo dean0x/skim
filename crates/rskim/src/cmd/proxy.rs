@@ -273,6 +273,13 @@ pub(crate) fn run(
     // AD-AN-12: bounded shutdown flush — wait up to FLUSH_BOUND for the
     // consumer to drain and persist drop counts. If the bound elapses
     // (pathological wedge), return without blocking; OS reclaims the thread.
+    //
+    // Cross-Plan Amendment #4 (bounded-consumer ownership): this
+    // `recv_timeout(FLUSH_BOUND)` is THE ONE bounded-consumer shutdown mechanism
+    // for the resident proxy (ADR-003 / PF-005). When #306's AlignmentRecorder
+    // consumer lands, it must reuse this same registered/bounded lifecycle
+    // (extend this block) rather than adding a second divergent flush_pending()
+    // drain. One shutdown mechanism → one flush gate → one exit path.
     if let (Some(done_rx), Some(handle)) = (done_rx, consumer_handle) {
         match done_rx.recv_timeout(super::proxy_analytics::FLUSH_BOUND) {
             Ok(()) => {

@@ -247,7 +247,11 @@ fn run_json(
         serde_json::Value::Null
     };
 
-    let root = serde_json::json!({
+    // AC10: when NO proxy rows exist, the "proxy" key is OMITTED entirely so
+    // output is byte-identical to pre-#305 output (not even "proxy": null is
+    // emitted). When proxy rows exist, the key is present with the section value.
+    // Build via a mutable Object so the key is conditionally inserted.
+    let mut root = serde_json::json!({
         "summary": {
             "invocations": summary.invocations,
             "raw_tokens": summary.raw_tokens,
@@ -269,10 +273,13 @@ fn run_json(
             "untagged_invocations": session_stats.untagged_invocations,
         },
         "cost_estimate": cost_estimate,
-        // AC10: null when no proxy rows; omitting entirely vs null is a protocol
-        // choice — using null keeps the key stable for downstream consumers.
-        "proxy": proxy_section,
     });
+    // AC10 / PF-007 discriminating: omit "proxy" when section is null.
+    // Adding "proxy": null here unconditionally would change pre-#305 output
+    // for proxy-free databases — exactly the deviation the criterion forbids.
+    if !proxy_section.is_null() {
+        root["proxy"] = proxy_section;
+    }
 
     writeln!(w, "{}", serde_json::to_string_pretty(&root)?)?;
     Ok(ExitCode::SUCCESS)
@@ -2168,15 +2175,18 @@ mod tests {
         let output = capture(|w| run_json(w, &store, None, None));
         let parsed: serde_json::Value =
             serde_json::from_str(&output).expect("output should be valid JSON");
-        // The "proxy" key must be present and null.
+        // AC10: the "proxy" key must be ABSENT when no proxy rows exist —
+        // not present-as-null. Pre-#305 consumers never saw this key; adding
+        // "proxy": null would break byte-identical output.
+        //
+        // PF-007 discriminating guard: adding an unconditional "proxy": proxy_section
+        // line in run_json would reintroduce a "proxy": null key here, failing this
+        // assertion and proving the conditional-omit logic is load-bearing.
         assert!(
-            parsed.get("proxy").is_some(),
-            "AC9: JSON output must contain the 'proxy' key"
-        );
-        assert!(
-            parsed["proxy"].is_null(),
-            "AC9: 'proxy' key must be null when no proxy rows exist; got: {:?}",
-            parsed["proxy"]
+            parsed.get("proxy").is_none(),
+            "AC10 / PF-007: 'proxy' key must be ABSENT (not null) when no proxy rows exist; \
+             got: {:?}",
+            parsed.get("proxy")
         );
     }
 

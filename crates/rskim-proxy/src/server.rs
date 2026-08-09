@@ -722,6 +722,14 @@ async fn handle_request(
         }
     };
 
+    // Cross-Plan Amendment #2 (measurement-point scope): `transformed_body` here
+    // reflects the post-#304 BlockRouter output — the CONTENT-compression stage.
+    // When #306's CacheAlignStage lands, its byte delta must NOT be attributed to
+    // compressed_tokens here; instead, update this measurement point to capture the
+    // post-BlockRouter / pre-CacheAlign body (the seam between content-compression
+    // and cache-alignment is at the stage boundary). Record #306's alignment deltas
+    // only in its own alignment_decisions table (AD-AN-13 / Cross-Plan Amendment #2).
+    //
     // AD-PXY-21: drain the collecting sink and derive the request tier.
     // Cross-Plan Amendment #3: derive_tier filters to "block-router" component
     // to exclude future CacheAlignStage (#306) records.

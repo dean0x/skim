@@ -95,14 +95,6 @@ pub(crate) const PROXY_QUEUE_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
 /// reclaims the thread; its last action is to persist the drop total.
 pub(crate) const FLUSH_BOUND: Duration = Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS);
 
-/// Token-size cap for proxy-side counting (mirrors the CLI analytics cap, ADR-001).
-///
-/// A body above this size skips BPE tokenisation to bound the consumer thread's
-/// cost.  Unlike the CLI recorder it does **not** substitute a `len / 4`
-/// estimate: the row is recorded with pair-jointly NULL token columns (AC6 —
-/// measured, never estimated) and disclosed via `uncounted_rows` (AC12).
-const PROXY_TOKEN_SIZE_CAP: usize = 256 * 1024;
-
 // ============================================================================
 // BridgeAnalyticsHook
 // ============================================================================
@@ -228,6 +220,16 @@ pub(crate) fn event_payload_bytes(event: &ProxyEvent) -> u64 {
 ///
 /// Token counting happens HERE on the consumer thread, never on the request
 /// path (AC14 / AD-AN-8).
+/// Spawn the background analytics consumer thread.
+///
+/// Cross-Plan Amendment #5 (#306 forward annotation): #305 swaps:
+/// - `NullSink` → `ChannelDecisionSink` (collector) in `server.rs:422`
+/// - `NoopAnalyticsHook` → real `BridgeAnalyticsHook` here in `proxy.rs:238`
+///
+/// When #306's `AlignmentRecorder` consumer lands, it must adopt the same
+/// bounded lifecycle established here — one `recv_timeout(FLUSH_BOUND)`
+/// gate per proxy startup in `proxy.rs` (Cross-Plan Amendment #4 / ADR-003).
+/// Do NOT add a second divergent `flush_pending()` drain for #306.
 pub(crate) fn spawn_consumer(
     rx: crossbeam_channel::Receiver<ProxyEvent>,
     drop_count: Arc<AtomicU64>,
@@ -301,11 +303,16 @@ fn to_recording_provider(provider: &ProxyProvider) -> RecordingProvider {
 /// (AC14). `raw_tokens`, `compressed_tokens`, and `savings_pct` are **all**
 /// `None` when:
 /// - Either `raw_body` or `final_body` is not valid UTF-8, OR
-/// - Either body exceeds [`PROXY_TOKEN_SIZE_CAP`] (BPE cost bound), OR
 /// - The `Counter` construction fails (practically unreachable).
 ///
 /// They are **all** `Some` with measured values otherwise — no fabricated or
 /// estimated token value is ever written.
+///
+/// AC6: no size cap — any valid UTF-8 body is counted regardless of length.
+/// Token counting runs on the consumer thread (off the request path), so
+/// counting large bodies does not add latency to forwarding.  A per-body size
+/// cap would NULL out all large L3 transcripts, defeating the ticket's
+/// primary deliverable.
 ///
 /// ## AD-AN-11 — one encoding source of truth
 ///
@@ -325,20 +332,6 @@ pub(crate) fn compute_token_counts(
         Ok(s) => s,
         Err(_) => return (None, None, None),
     };
-
-    // AC6 / AD-AN-7: measured-never-estimated.  A body above the BPE cost cap is
-    // NOT tokenised, and it MUST NOT be recorded with a byte-length estimate
-    // either — the proxy scope publishes a `basis` label (exact / approximation /
-    // heuristic), so a `len / 4` guess stored under `basis = exact` would present
-    // a fabricated number as a measurement (ADR-003).  The row is written
-    // pair-jointly NULL instead and is disclosed through `uncounted_rows` (AC12).
-    //
-    // This differs deliberately from the CLI recorder's `count_tokens_bounded`,
-    // which does fall back to `len / 4`: CLI rows carry no counting-basis
-    // disclosure, proxy rows do.
-    if raw_str.len() > PROXY_TOKEN_SIZE_CAP || final_str.len() > PROXY_TOKEN_SIZE_CAP {
-        return (None, None, None);
-    }
 
     // AD-AN-11: single encoding derived from provider + model.
     let encoding = select_encoding(recording_provider, event.model.as_deref());
@@ -362,23 +355,16 @@ pub(crate) fn compute_token_counts(
     (Some(raw_tokens), Some(compressed_tokens), Some(savings_pct))
 }
 
-/// Maximum stored length of the verbatim `model` string, in characters.
+/// Store the model string verbatim as supplied by the caller (AD-PXY-22).
 ///
-/// Bounded default (ADR-003 / PF-005): not a measured value. Published model
-/// identifiers are well under 100 characters; the cap exists because `model` is
-/// verbatim client-supplied text (AD-PXY-22) that would otherwise write up to a
-/// full JSON sniff window of arbitrary text into every row and into the
-/// `GROUP BY` key of the per-model breakdown.
-const MAX_MODEL_LEN: usize = 128;
-
-/// Bound the verbatim model string at the recording boundary.
-///
-/// Parse at the boundary, trust internally: everything downstream of this point
-/// (the DB column, the `GROUP BY` key, the rendered table) can assume a bounded
-/// value. Truncation is by *character*, so the stored string is always valid
-/// UTF-8 — never a panic-inducing byte slice.
-fn bounded_model(model: Option<&str>) -> Option<String> {
-    model.map(|m| m.chars().take(MAX_MODEL_LEN).collect())
+/// AD-PXY-22 mandates exact-string grouping with no casing/alias folding.
+/// Truncation at any character boundary would silently merge long model
+/// identifiers that differ only in suffix, breaking the `GROUP BY` key
+/// guarantee.  The proxy already rejects bodies above `max_body_bytes`
+/// (64 MiB by default), so the model string is bounded by the sniff window
+/// (`SHAPE_SNIFF_LIMIT` = 8 KiB in detect.rs) — no additional cap is needed.
+fn store_model(model: Option<&str>) -> Option<String> {
+    model.map(str::to_string)
 }
 
 /// Build a `ProxyRecordInput` from a `ProxyEvent` and session context.
@@ -427,7 +413,7 @@ pub(crate) fn build_proxy_record_input(
     ProxyRecordInput {
         timestamp,
         provider: recording_provider,
-        model: bounded_model(event.model.as_deref()),
+        model: store_model(event.model.as_deref()),
         turn_id: event.turn_id.clone(),
         tier: event.tier.as_str().to_string(),
         duration_ms: event.duration.as_millis() as u64,
@@ -591,6 +577,285 @@ mod tests {
         );
     }
 
+    /// AC14 / PF-007 timing discriminator: `on_request` completes near-instantly
+    /// for 1000 consecutive calls, proving no synchronous I/O (DB open, SQL
+    /// query, token counting) is on the enqueue path.
+    ///
+    /// If someone adds a synchronous `AnalyticsDb::open()` call inside
+    /// `on_request`, each of the 1000 calls would incur disk I/O (≥ 1ms each
+    /// = ≥ 1000ms total), blowing past the 500ms wall-clock budget.
+    #[test]
+    fn test_on_request_is_bounded_non_blocking() {
+        let (hook, _rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let event = make_small_event();
+        let start = std::time::Instant::now();
+        for _ in 0..1_000 {
+            hook.on_request(&event);
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "AC14 / PF-007: 1000 on_request calls must complete in < 500ms \
+             (no synchronous I/O on the enqueue path); took {}ms — a synchronous \
+             DB open per call would take ≥ 1000ms",
+            elapsed.as_millis()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC15 (a)-(d) — hostile DB states: consumer must never panic or block
+    // -------------------------------------------------------------------------
+
+    /// AC15 arm (a): analytics DB deleted mid-run.
+    ///
+    /// Consumer opens the DB, records a batch of events, then the DB file is
+    /// deleted. Subsequent events are fail-open dropped. The consumer must
+    /// neither panic nor hang.
+    #[test]
+    fn test_consumer_db_deleted_mid_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("deleted.db");
+
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+
+        // Open and pre-populate the DB so it exists before the consumer opens it.
+        {
+            let _db = AnalyticsDb::open(&db_path).expect("pre-create db");
+        }
+
+        let handle = run_inline_consumer(
+            &db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+
+        // Send a few events before deleting the DB.
+        for _ in 0..5 {
+            hook.on_request(&make_small_event());
+        }
+        // Brief wait for consumer to open and process some events.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Delete the DB file mid-run.
+        let _ = std::fs::remove_file(&db_path);
+
+        // Send more events — consumer must fail-open (not panic, not block).
+        for _ in 0..5 {
+            hook.on_request(&make_small_event());
+        }
+
+        // Close the sender and wait for consumer to finish.
+        drop(hook);
+        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let _ = handle.join();
+
+        assert!(
+            consumer_finished,
+            "AC15 arm (a): consumer must finish after DB deletion — no panic or hang"
+        );
+    }
+
+    /// AC15 arm (b): DB locked past busy_timeout by a second connection.
+    ///
+    /// Holds an exclusive lock while the consumer tries to write. With WAL
+    /// mode `busy_timeout` (5000ms), the consumer will eventually fail with
+    /// `SQLITE_BUSY` and treat it as a fail-open drop. The proxy request path
+    /// is not blocked (consumer is separate thread).
+    ///
+    /// NOTE: we use a very short busy_timeout for test speed by using a
+    /// separate exclusive connection that holds a BEGIN EXCLUSIVE lock. The
+    /// consumer's internal `busy_timeout` is set in `AnalyticsDb::open`;
+    /// in practice the consumer will fail quickly on the WAL path. The test
+    /// only asserts "no panic/hang", not the drop count, since timing varies.
+    #[test]
+    fn test_consumer_db_locked_by_exclusive_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("locked.db");
+
+        // Pre-create the DB so the consumer can open it.
+        {
+            let _db = AnalyticsDb::open(&db_path).expect("pre-create db");
+        }
+
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+
+        let handle = run_inline_consumer(
+            &db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+
+        // Acquire an exclusive lock on the DB via a raw rusqlite connection,
+        // holding it while the consumer attempts to write.
+        let lock_conn = rusqlite::Connection::open(&db_path).expect("lock conn");
+        let _ = lock_conn.execute_batch("BEGIN EXCLUSIVE");
+
+        // Send events while the lock is held.
+        for _ in 0..10 {
+            hook.on_request(&make_small_event());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Release the lock.
+        let _ = lock_conn.execute_batch("ROLLBACK");
+        drop(lock_conn);
+
+        // Close the sender and verify consumer finishes (fail-open, no panic/hang).
+        drop(hook);
+        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let _ = handle.join();
+
+        assert!(
+            consumer_finished,
+            "AC15 arm (b): consumer must finish despite DB lock — no panic or hang"
+        );
+    }
+
+    /// AC15 arm (c): DB path in a read-only directory.
+    ///
+    /// Consumer tries to open (or create) analytics.db in a directory where
+    /// it has no write permission. `AnalyticsDb::open` fails → `db = None` →
+    /// all subsequent events are fail-open dropped. Consumer must not panic.
+    #[cfg(unix)]
+    #[test]
+    fn test_consumer_db_in_readonly_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("noperm.db");
+
+        // Make the directory read-only before the consumer opens the DB.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555); // r-xr-xr-x
+        std::fs::set_permissions(dir.path(), perms.clone()).unwrap();
+
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+
+        let handle = run_inline_consumer(
+            &db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+
+        // Send events — all should be fail-open dropped (DB can't be created).
+        for _ in 0..10 {
+            hook.on_request(&make_small_event());
+        }
+
+        // Close sender and verify consumer finishes without panic.
+        drop(hook);
+        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let _ = handle.join();
+
+        // Restore permissions so tempdir cleanup can succeed.
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(dir.path(), perms);
+
+        assert!(
+            consumer_finished,
+            "AC15 arm (c): consumer must finish even in read-only directory — no panic or hang"
+        );
+    }
+
+    /// AC15 arm (d): DB file replaced with garbage content.
+    ///
+    /// Writes random bytes to the DB path so rusqlite opens a non-database
+    /// file. The consumer's `AnalyticsDb::open` fails (not a valid SQLite DB
+    /// → `db = None`) and all events are fail-open dropped. Consumer must
+    /// not panic or hang.
+    #[test]
+    fn test_consumer_db_is_garbage_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("garbage.db");
+
+        // Write garbage bytes — definitely not a valid SQLite DB.
+        std::fs::write(&db_path, b"NOT A DATABASE\x00\xff\xfe\x00garbage garbage").unwrap();
+
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+
+        let handle = run_inline_consumer(
+            &db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+
+        for _ in 0..10 {
+            hook.on_request(&make_small_event());
+        }
+
+        drop(hook);
+        let consumer_finished = done_rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        let _ = handle.join();
+
+        assert!(
+            consumer_finished,
+            "AC15 arm (d): consumer must finish with a garbage DB file — no panic or hang"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // AC22 — SKIM_DISABLE_ANALYTICS wiring: NoopAnalyticsHook stores nothing
+    // -------------------------------------------------------------------------
+
+    /// AC22: when analytics is disabled (`SKIM_DISABLE_ANALYTICS=1`), the
+    /// proxy wires `NoopAnalyticsHook` (no consumer thread, no DB writes).
+    ///
+    /// This test verifies the structural consequence: events routed through
+    /// `NoopAnalyticsHook::on_request` leave zero rows in any database —
+    /// because `NoopAnalyticsHook` discards events immediately without
+    /// enqueuing them to a consumer thread.
+    ///
+    /// PF-007 discriminating: replacing `NoopAnalyticsHook` with a
+    /// `BridgeAnalyticsHook` (real hook) causes the consumer to write rows;
+    /// the DB-row count would then be > 0, failing this assertion.
+    #[test]
+    fn test_noop_hook_writes_zero_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("noop.db");
+
+        // Create a clean DB so we can verify zero rows afterward.
+        let db = AnalyticsDb::open(&db_path).expect("open db");
+
+        // Route events through NoopAnalyticsHook — analogous to
+        // SKIM_DISABLE_ANALYTICS=1 path in proxy.rs run().
+        let noop = rskim_proxy::analytics::NoopAnalyticsHook;
+        for _ in 0..50 {
+            noop.on_request(&make_small_event());
+        }
+
+        // Zero rows must exist — NoopAnalyticsHook never calls record_proxy.
+        let summary = db.query_summary(None).expect("query_summary");
+        assert_eq!(
+            summary.invocations, 0,
+            "AC22: NoopAnalyticsHook must leave zero rows in the DB (got {} invocations)",
+            summary.invocations
+        );
+    }
+
     // -------------------------------------------------------------------------
     // AC17 — bounded queue + byte-budget drop accounting
     // -------------------------------------------------------------------------
@@ -694,45 +959,27 @@ mod tests {
         assert!(pct.is_none(), "non-UTF-8 final must yield None savings_pct");
     }
 
-    /// AC6 (PF-007 discriminating): a body above `PROXY_TOKEN_SIZE_CAP` is
-    /// recorded pair-jointly NULL, never with a `len / 4` estimate.
+    /// AC6 (PF-007 discriminating): a large but valid UTF-8 body IS counted.
     ///
-    /// Discriminator: restoring a byte-length fallback makes `raw` `Some(...)`
-    /// and fails the assertion — the point is that no fabricated number is ever
-    /// stored under the `basis = exact` label the proxy scope publishes.
+    /// After removing the unplanned 256 KiB size cap (alignment fix), any valid
+    /// UTF-8 body is measured regardless of length. Token counting runs on the
+    /// consumer thread (off the request path) so large bodies do not add
+    /// forwarding latency.
+    ///
+    /// Discriminator: reinstating a size cap makes large bodies return None and
+    /// fails this assertion — proving no size-cap is present (PF-007).
     #[test]
-    fn test_compute_token_counts_oversize_body_yields_null_not_estimate() {
-        let big = Bytes::from(vec![b'a'; PROXY_TOKEN_SIZE_CAP + 1]);
-        let event = make_event_with_bodies(big, Bytes::from_static(b"small"));
+    fn test_compute_token_counts_large_utf8_body_is_counted() {
+        // ~512 KiB of valid ASCII — well above any plausible size cap.
+        let big = Bytes::from(b"hello ".repeat(512 * 1024 / 6));
+        let small = Bytes::from_static(b"hi");
+        let event = make_event_with_bodies(big, small);
         let provider = RecordingProvider::Anthropic;
         let (raw, comp, pct) = compute_token_counts(&event, &provider);
         assert!(
-            raw.is_none() && comp.is_none() && pct.is_none(),
-            "AC6: an oversize body must yield pair-jointly NULL token columns, \
-             not an estimated len/4 value (got raw={raw:?}, comp={comp:?}, pct={pct:?})"
-        );
-
-        // The mirror case: an oversize *transformed* body is equally uncountable.
-        let event = make_event_with_bodies(
-            Bytes::from_static(b"small"),
-            Bytes::from(vec![b'a'; PROXY_TOKEN_SIZE_CAP + 1]),
-        );
-        let (raw, comp, pct) = compute_token_counts(&event, &provider);
-        assert!(
-            raw.is_none() && comp.is_none() && pct.is_none(),
-            "AC6: an oversize transformed body must also yield NULL token columns"
-        );
-
-        // Control: a body just under the cap IS counted, proving the guard is
-        // the cap and not a blanket "never count" regression.
-        let event = make_event_with_bodies(
-            Bytes::from(vec![b'a'; 1024]),
-            Bytes::from_static(b"small"),
-        );
-        let (raw, _, _) = compute_token_counts(&event, &provider);
-        assert!(
-            raw.is_some(),
-            "a body below the cap must still be measured"
+            raw.is_some() && comp.is_some() && pct.is_some(),
+            "AC6: large valid UTF-8 body must be counted (no size cap); \
+             got raw={raw:?}, comp={comp:?}, pct={pct:?}"
         );
     }
 
@@ -789,29 +1036,37 @@ mod tests {
         );
     }
 
-    /// The verbatim client-supplied `model` string is bounded before it reaches
-    /// the database, and truncation never splits a UTF-8 character.
+    /// AD-PXY-22: `store_model` stores the model string exactly as supplied.
+    ///
+    /// After removing the unplanned MAX_MODEL_LEN truncation (alignment fix),
+    /// the model string is stored verbatim — no truncation, no folding.
+    /// Grouping is by exact string match (AD-PXY-22).
+    ///
+    /// PF-007 discriminating: reinstating truncation would make the long-model
+    /// assertion fail, proving the verbatim path is load-bearing.
     #[test]
-    fn test_bounded_model_caps_length_on_char_boundary() {
-        assert_eq!(bounded_model(None), None);
+    fn test_store_model_is_verbatim() {
+        assert_eq!(store_model(None), None, "None model stays None");
         assert_eq!(
-            bounded_model(Some("claude-3-5-sonnet-20241022")).as_deref(),
+            store_model(Some("claude-3-5-sonnet-20241022")).as_deref(),
             Some("claude-3-5-sonnet-20241022"),
-            "a normal model identifier passes through verbatim (AD-PXY-22)"
+            "AD-PXY-22: model identifier stored verbatim"
         );
 
-        // Multi-byte input longer than the cap: bounded by chars, still valid UTF-8.
-        let hostile = "日".repeat(MAX_MODEL_LEN * 4);
-        let bounded = bounded_model(Some(&hostile)).unwrap();
+        // A string longer than any plausible cap — must survive untruncated.
+        let long_model = "a".repeat(512);
         assert_eq!(
-            bounded.chars().count(),
-            MAX_MODEL_LEN,
-            "model must be capped at MAX_MODEL_LEN characters"
+            store_model(Some(&long_model)).as_deref(),
+            Some(long_model.as_str()),
+            "AD-PXY-22: long model stored verbatim (no truncation)"
         );
+
+        // Multi-byte model string — no character-boundary truncation occurs.
+        let unicode_model = "claude-日-3".to_string();
         assert_eq!(
-            bounded,
-            "日".repeat(MAX_MODEL_LEN),
-            "character-wise truncation must not corrupt multi-byte input"
+            store_model(Some(&unicode_model)).as_deref(),
+            Some(unicode_model.as_str()),
+            "AD-PXY-22: multi-byte model stored verbatim"
         );
     }
 

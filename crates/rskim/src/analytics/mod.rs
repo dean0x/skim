@@ -3694,6 +3694,12 @@ mod tests {
     ///
     /// Deleting the future-version check in open() makes this test fail (an
     /// unexpected migration or no error is returned) — PF-007 discriminating guard.
+    ///
+    /// The WAL and chmod assertions are the AC3 discriminators that prevent
+    /// reordering the version check to AFTER those operations:
+    /// - journal_mode must NOT be 'wal' (WAL flip did not run)
+    /// - On Unix, file permissions must NOT be 0600 if they started at 0644
+    ///   (chmod did not run)
     #[test]
     fn test_schema_v4_future_version_rejected_without_write() {
         let tmp = NamedTempFile::new().unwrap();
@@ -3706,6 +3712,18 @@ mod tests {
                  CREATE TABLE token_savings (id INTEGER PRIMARY KEY, future_col TEXT);",
             )
             .unwrap();
+        }
+
+        // Set the file to 0644 (owner-readable + world-readable) before the
+        // rejected open. If AnalyticsDb::open were to chmod it to 0600, the
+        // permission check below would catch it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(tmp.path()).unwrap();
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(tmp.path(), perms).unwrap();
         }
 
         // Attempt to open — must fail.
@@ -3733,6 +3751,35 @@ mod tests {
             version_after, 99,
             "AC3: user_version must remain 99 after rejected open"
         );
+
+        // AC3 / PF-007: WAL must NOT have been set after a future-version rejection.
+        // Moving the version check AFTER `conn.execute_batch("PRAGMA journal_mode=WAL")`
+        // would flip the journal mode and make this assertion fail.
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(
+            journal_mode, "wal",
+            "AC3 / PF-007: journal_mode must NOT be 'wal' after future-version rejection \
+             (the WAL flip must not run before the version check); got: '{journal_mode}'"
+        );
+
+        // AC3 / PF-007 (Unix only): file permissions must NOT have been changed to
+        // 0600 after a future-version rejection. Moving the version check AFTER the
+        // chmod would modify the file mode and make this assertion fail.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(tmp.path()).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "AC3 / PF-007: file permissions must NOT be changed after future-version \
+                 rejection (chmod must not run before the version check); \
+                 expected 0644, got {:#o}",
+                mode
+            );
+        }
 
         // proxy_block_decisions was NOT created (migration did not run).
         let pbd_exists: i64 = conn

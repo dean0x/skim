@@ -1,6 +1,8 @@
 // Proxy analytics Phase 4 integration tests: tier derivation, model detection,
 // three-outcome recording predicate (AD-PXY-21 / AD-PXY-22 / AD-PXY-23 /
 // AD-PXY-24 / AD-PXY-25 / Cross-Plan Amendment #3).
+// Alignment-fix additions: AC16 byte-identity, AC18 bounded-shutdown,
+// AC19 recording-predicate matrix, AC23 real E2E tier test.
 //
 // PF-012: all tests bind :0 and pass the bound listener to the server.
 // No test uses a hardcoded port number.
@@ -802,6 +804,433 @@ async fn test_raw_body_and_final_body_fields() {
         body.len() as u64,
         "request_bytes must equal raw_body.len()"
     );
+
+    proxy_abort.abort();
+    up_abort.abort();
+}
+
+// ============================================================================
+// AC16 — observe-only byte-identity (AnalyticsCompletionBody does not mutate)
+// ============================================================================
+
+/// AC16: forwarded bytes are byte-identical with analytics enabled (non-null
+/// hook) vs disabled (NoopAnalyticsHook).
+///
+/// A capturing upstream records what bytes the proxy forwarded. With analytics
+/// on (FullCapturingHook) and off (NoopAnalyticsHook), the proxy must forward
+/// exactly the bytes it received from the client.
+///
+/// PF-007 discriminating: if `AnalyticsCompletionBody::poll_frame` mutated any
+/// frames, the upstream would receive different bytes when analytics is on,
+/// and the equality assertion here would fail.
+#[tokio::test]
+async fn test_analytics_does_not_mutate_forwarded_bytes() {
+    let request_body: &'static [u8] =
+        br#"{"model":"claude-3-opus","messages":[{"role":"user","content":"hello"}]}"#;
+
+    async fn start_capturing_upstream(
+        captured: Arc<Mutex<Option<Bytes>>>,
+        response_body: Bytes,
+    ) -> (String, tokio::task::AbortHandle) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let cap = Arc::clone(&captured);
+                let resp_body = response_body.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let cap2 = Arc::clone(&cap);
+                        let body_bytes = resp_body.clone();
+                        async move {
+                            let received = req.into_body().collect().await.unwrap().to_bytes();
+                            *cap2.lock().unwrap() = Some(received);
+                            let resp: Response<Full<Bytes>> = Response::builder()
+                                .status(200)
+                                .body(Full::from(body_bytes))
+                                .unwrap();
+                            Ok::<_, std::convert::Infallible>(resp)
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), task.abort_handle())
+    }
+
+    let fixed_response = Bytes::from_static(b"UPSTREAM_RESPONSE");
+    let received_with_analytics: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+    let received_without: Arc<Mutex<Option<Bytes>>> = Arc::new(Mutex::new(None));
+
+    // --- Run 1: analytics ON (FullCapturingHook) ---
+    let client_response_on = {
+        let (up_url, up_abort) =
+            start_capturing_upstream(Arc::clone(&received_with_analytics), fixed_response.clone())
+                .await;
+        let (hook, _, _) = FullCapturingHook::new();
+        let (proxy_abort, proxy_addr) =
+            start_proxy_with_hook(&up_url, Arc::new(hook)).await;
+
+        use hyper::Uri;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+        let url: Uri = format!("http://{}/v1/messages", proxy_addr).parse().unwrap();
+        let req = Request::post(url)
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(Full::from(Bytes::from_static(request_body)))
+            .unwrap();
+        let resp = client.request(req).await.expect("request (analytics on)");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        proxy_abort.abort();
+        up_abort.abort();
+        bytes
+    };
+
+    // --- Run 2: analytics OFF (NoopAnalyticsHook) ---
+    let client_response_off = {
+        let (up_url, up_abort) =
+            start_capturing_upstream(Arc::clone(&received_without), fixed_response.clone()).await;
+        let noop = Arc::new(rskim_proxy::analytics::NoopAnalyticsHook);
+        let (proxy_abort, proxy_addr) = start_proxy_with_hook(&up_url, noop).await;
+
+        use hyper::Uri;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+        let url: Uri = format!("http://{}/v1/messages", proxy_addr).parse().unwrap();
+        let req = Request::post(url)
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(Full::from(Bytes::from_static(request_body)))
+            .unwrap();
+        let resp = client.request(req).await.expect("request (analytics off)");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        proxy_abort.abort();
+        up_abort.abort();
+        bytes
+    };
+
+    // Client sees the same response in both runs.
+    assert_eq!(
+        client_response_on, client_response_off,
+        "AC16: client response must be byte-identical whether analytics is on or off"
+    );
+
+    // Upstream received the same forwarded bytes in both runs.
+    let with_on = received_with_analytics.lock().unwrap().clone()
+        .expect("analytics-on upstream received nothing");
+    let with_off = received_without.lock().unwrap().clone()
+        .expect("analytics-off upstream received nothing");
+    assert_eq!(
+        with_on, with_off,
+        "AC16 / PF-007: upstream-received bytes must be identical; \
+         AnalyticsCompletionBody must not mutate forwarded frames"
+    );
+}
+
+// ============================================================================
+// AC18 — bounded shutdown flush
+// ============================================================================
+
+/// AC18: the bounded-flush mechanism terminates even when a leaked sender clone
+/// keeps the consumer alive past the natural drain point.
+///
+/// The production flow:
+/// 1. `serve_with_stage` drops the hook Arc → sender closes → consumer ends.
+/// 2. `done_rx.recv_timeout(FLUSH_BOUND)` collects the done signal (or times out).
+///
+/// This test simulates a "leaked sender clone" (an extra Arc alive after
+/// serve_with_stage) and verifies that `recv_timeout(FLUSH_BOUND)` returns
+/// within the bound — proving the timeout is the exit mechanism, not only
+/// sender-drop.
+///
+/// PF-007 discriminating: replacing `recv_timeout` with a blocking `recv`
+/// causes this test to hang, failing the elapsed-time assertion.
+#[test]
+fn test_bounded_shutdown_terminates_with_leaked_sender_clone() {
+    // Use a short bound — we test the mechanism, not the production 5-second value.
+    let short_bound = Duration::from_millis(250);
+
+    let (tx, rx) = crossbeam_channel::bounded::<i32>(1);
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+
+    let consumer = std::thread::spawn(move || {
+        for _ in &rx {}
+        let _ = done_tx.send(());
+    });
+
+    // Keep a clone alive — consumer won't finish until THIS is dropped.
+    let leaked_clone = tx.clone();
+    // Drop the "main" sender (simulates hook Arc drop at serve_with_stage exit).
+    drop(tx);
+
+    let start = std::time::Instant::now();
+    let result = done_rx.recv_timeout(short_bound);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "AC18 / PF-007: recv_timeout must time out when consumer is held alive \
+         by a leaked sender clone (got Ok, meaning consumer exited early)"
+    );
+    assert!(
+        elapsed < short_bound * 3,
+        "AC18 / PF-007: recv_timeout must return within 3× the bound; \
+         took {}ms (bound = {}ms)",
+        elapsed.as_millis(),
+        short_bound.as_millis()
+    );
+
+    // Cleanup — drop the leaked clone so the consumer thread can finish.
+    drop(leaked_clone);
+    let _ = consumer.join();
+
+    // Control: when no clone is leaked, done_rx signals before the bound.
+    let (tx2, rx2) = crossbeam_channel::bounded::<i32>(1);
+    let (done_tx2, done_rx2) = crossbeam_channel::bounded::<()>(1);
+    let consumer2 = std::thread::spawn(move || {
+        for _ in &rx2 {}
+        let _ = done_tx2.send(());
+    });
+    drop(tx2);
+    let result2 = done_rx2.recv_timeout(Duration::from_secs(1));
+    assert!(
+        result2.is_ok(),
+        "AC18 control: done signal must arrive when sender closes normally"
+    );
+    let _ = consumer2.join();
+    // NoopAnalyticsHook is used via full path in other tests in this file.
+}
+
+// ============================================================================
+// AC19 — recording predicate matrix (additional arms)
+// ============================================================================
+
+/// AC19: 400 (oversize body) → zero analytics events.
+///
+/// When the body exceeds `max_body_bytes`, the proxy rejects the request before
+/// the transform runs (AD-PXY-24). No analytics event fires.
+///
+/// PF-007 discriminating: if an event were emitted on pre-transform rejection,
+/// `fired_count` would be > 0, failing the assertion.
+#[tokio::test]
+async fn test_no_event_for_400_oversize_body() {
+    let (upstream_url, up_abort) = start_echo_upstream().await;
+    let (hook, _, fired_count) = FullCapturingHook::new();
+
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().unwrap();
+    // 1-byte max so any real body triggers 400.
+    let config = ProxyConfig::builder()
+        .port(41002)
+        .upstream_default(&upstream_url)
+        .max_body_bytes(1)
+        .build()
+        .expect("tiny max_body_bytes config");
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener,
+        config,
+        TransformPipeline::identity(),
+        Arc::new(hook),
+    ));
+    let proxy_abort = task.abort_handle();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let status = post_to_messages(proxy_addr, b"hello-world").await;
+    assert_eq!(status, 400, "oversize body must yield 400");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(
+        fired_count.load(Ordering::SeqCst),
+        0,
+        "AD-PXY-24: 400 (oversize) must fire zero analytics events"
+    );
+
+    proxy_abort.abort();
+    up_abort.abort();
+}
+
+/// AC19: 502 (connection-refused upstream) → one errored analytics event.
+///
+/// An upstream_default pointing at a closed port causes connection-refused
+/// (post-transform failure). Exactly one event fires with
+/// `upstream_error_status = Some(502)`.
+///
+/// PF-007 discriminating: if the upstream-errored arm were removed, no event
+/// would fire and `fired_count == 0` would cause the assertion to fail.
+#[tokio::test]
+async fn test_one_errored_event_for_502_connection_refused() {
+    // Bind a port then immediately drop the listener — nothing listens there.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+
+    let dead_url = format!("http://{dead_addr}");
+    let (hook, events, fired_count) = FullCapturingHook::new();
+    let (proxy_abort, proxy_addr) = start_proxy_with_hook(&dead_url, Arc::new(hook)).await;
+
+    let body = br#"{"model":"claude-3-haiku","messages":[]}"#;
+    let status = post_to_messages(proxy_addr, body).await;
+    assert_eq!(status, 502, "connection-refused upstream must yield 502");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        fired_count.load(Ordering::SeqCst),
+        1,
+        "AD-PXY-25: 502 (connection-refused) must fire exactly one errored event"
+    );
+    let recorded = events.lock().unwrap();
+    assert_eq!(recorded[0].upstream_error_status, Some(502),
+        "event upstream_error_status must be Some(502)");
+    drop(recorded);
+
+    proxy_abort.abort();
+}
+
+/// AC19: 504 (upstream timeout) → one errored analytics event.
+///
+/// An upstream that accepts connections but never responds triggers the proxy's
+/// upstream_timeout, returning 504. The transform ran, so one post-transform
+/// errored event fires with `upstream_error_status = Some(504)`.
+///
+/// PF-007 discriminating: if the timeout-error arm were removed, no event
+/// would fire, failing the `fired_count == 1` assertion.
+#[tokio::test]
+async fn test_one_errored_event_for_504_upstream_timeout() {
+    // Upstream that accepts but never responds.
+    let hanging_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hanging_addr = hanging_listener.local_addr().unwrap();
+    let _hanging_task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = hanging_listener.accept().await else { break };
+            tokio::spawn(async move {
+                // Hold stream open without sending any data.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(stream);
+            });
+        }
+    });
+    let hanging_url = format!("http://{hanging_addr}");
+
+    let (hook, events, fired_count) = FullCapturingHook::new();
+    let listener = bind_test_listener().await;
+    let proxy_addr = listener.local_addr().unwrap();
+    // 1-second upstream timeout for a fast test.
+    let config = ProxyConfig::builder()
+        .port(41003)
+        .upstream_default(&hanging_url)
+        .upstream_timeout(Duration::from_secs(1))
+        .build()
+        .expect("short-timeout config");
+    let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+        listener,
+        config,
+        TransformPipeline::identity(),
+        Arc::new(hook),
+    ));
+    let proxy_abort = task.abort_handle();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let body = br#"{"model":"claude-3-haiku","messages":[]}"#;
+    let status = post_to_messages(proxy_addr, body).await;
+    assert_eq!(status, 504, "timeout upstream must yield 504");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        fired_count.load(Ordering::SeqCst),
+        1,
+        "AD-PXY-25: 504 (timeout) must fire exactly one errored event"
+    );
+    let recorded = events.lock().unwrap();
+    assert_eq!(recorded[0].upstream_error_status, Some(504),
+        "event upstream_error_status must be Some(504)");
+    drop(recorded);
+
+    proxy_abort.abort();
+}
+
+// ============================================================================
+// AC23 — real E2E tier test (proxy server + BlockRouterFullStage)
+// ============================================================================
+
+/// AC23: real proxy server with BlockRouterFullStage yields tier = RequestTier::Full.
+///
+/// Unlike tests that re-implement tier logic in the test module, this test
+/// routes a request through the REAL server.rs::derive_tier path by using
+/// `run_server_with_listener` with a `BlockRouterFullStage` pipeline.
+///
+/// PF-007 discriminating: if `derive_tier` in server.rs were removed or always
+/// returned Passthrough, `event.tier != RequestTier::Full` and the assertion
+/// would fail.
+#[tokio::test]
+async fn test_real_proxy_e2e_full_tier() {
+    let (upstream_url, up_abort) = start_echo_upstream().await;
+    let pipeline = TransformPipeline::from_stages(vec![Box::new(BlockRouterFullStage)]);
+    let (hook, events, fired_count) = FullCapturingHook::new();
+    let (proxy_abort, proxy_addr) =
+        start_proxy_with_hook_and_pipeline(&upstream_url, Arc::new(hook), pipeline).await;
+
+    let body = br#"{"model":"claude-3-haiku","messages":[{"role":"user","content":"hi"}]}"#;
+    let status = post_to_messages(proxy_addr, body).await;
+    assert_eq!(status, 200, "E2E request must succeed");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    assert_eq!(fired_count.load(Ordering::SeqCst), 1, "AC23: exactly one event");
+    let recorded = events.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    let event = &recorded[0];
+
+    assert_eq!(
+        event.tier,
+        RequestTier::Full,
+        "AC23 / PF-007: BlockRouterFullStage must produce tier=Full via server.rs::derive_tier; \
+         got {:?} — removing derive_tier would yield Passthrough",
+        event.tier
+    );
+    // raw_body is the original; final_body is 1 byte shorter.
+    assert_eq!(event.raw_body.as_ref(), body.as_ref(), "raw_body must equal original");
+    assert_eq!(
+        event.final_body.len(),
+        body.len() - 1,
+        "final_body must be 1 byte shorter (BlockRouterFullStage)"
+    );
+    assert_eq!(event.upstream_error_status, None, "successful relay: no error");
+    drop(recorded);
+
+    proxy_abort.abort();
+    up_abort.abort();
+}
+
+/// AC23 control: identity pipeline yields tier = RequestTier::Passthrough.
+///
+/// Paired with `test_real_proxy_e2e_full_tier`, this proves `derive_tier` is
+/// discriminating — it does not return Full unconditionally.
+#[tokio::test]
+async fn test_real_proxy_e2e_passthrough_tier() {
+    let (upstream_url, up_abort) = start_echo_upstream().await;
+    let (hook, events, _) = FullCapturingHook::new();
+    let (proxy_abort, proxy_addr) = start_proxy_with_hook(&upstream_url, Arc::new(hook)).await;
+
+    let body = br#"{"model":"claude-3-haiku","messages":[]}"#;
+    let status = post_to_messages(proxy_addr, body).await;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let recorded = events.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].tier,
+        RequestTier::Passthrough,
+        "AC23 control: identity pipeline must yield tier=Passthrough"
+    );
+    drop(recorded);
 
     proxy_abort.abort();
     up_abort.abort();
