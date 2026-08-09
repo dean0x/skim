@@ -2581,6 +2581,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rskim-align"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "proptest",
+ "rskim-contract",
+ "rskim-llm",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "rskim-bench"
 version = "0.1.0"
 dependencies = [
