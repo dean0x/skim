@@ -10,7 +10,9 @@ use super::helpers::{
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
-use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
+use super::state::{
+    DetectedState, detect_state, has_skim_hook_entry, parse_commit_from_script, read_settings_json,
+};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
@@ -781,19 +783,44 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
 // Hook script generation (B7)
 // ============================================================================
 
-/// Return `true` when the script at `script_path` already contains the
-/// expected version marker *and* exports `SKIM_HOOK_BINARY` (the pinned binary
-/// format introduced in F6), meaning the file is already up to date and can be
-/// skipped.
+/// Return `true` when the script at `script_path` is fully current: correct
+/// version marker, pinned-binary format (F6), **and** the same git commit as
+/// the running binary.
 ///
-/// Old scripts that only have a bare `exec skim …` line (pre-F6) are treated as
-/// stale: they lack the pinned-binary exports and must be regenerated.
+/// Three conditions must all hold:
+/// 1. The `# skim-hook v{version}` marker matches the current semver.
+/// 2. The script exports `SKIM_HOOK_BINARY` (F6 pinned-binary format; old
+///    bare-exec scripts lack it and must be regenerated).
+/// 3. The `export SKIM_HOOK_COMMIT=` line matches the compiled-in
+///    `SKIM_GIT_COMMIT`. When the compiled commit is `"unknown"` (tarball /
+///    crates.io builds have no git SHA) the commit check is **skipped** so
+///    these builds do not rewrite on every invocation.
+///
+/// # #466 follow-up — the second gate
+///
+/// `hook_is_current()` on `DetectedState` (state.rs) was fixed by PR #468 to
+/// include the commit comparison, but `create_hook_script` had its own
+/// independent version-only gate here that was not updated. This function is
+/// the fix: it mirrors the same commit logic so both gates agree.
 fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool {
     let Ok(contents) = std::fs::read_to_string(script_path) else {
         return false;
     };
     let version_line = format!("# skim-hook v{version}");
-    contents.contains(&version_line) && super::script_has_pinned_marker(&contents)
+    if !(contents.contains(&version_line) && super::script_has_pinned_marker(&contents)) {
+        return false;
+    }
+    // B5c follow-up: also require the recorded commit to match the compiled one.
+    // Skip when the compiled commit is "unknown" (tarball builds have no git SHA).
+    let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+    if compiled_commit != "unknown" {
+        match parse_commit_from_script(&contents) {
+            Some(ref hook_commit) if hook_commit == compiled_commit => {}
+            // Absent commit (pre-commit-pinning script) or mismatched commit → stale.
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
@@ -1438,20 +1465,88 @@ mod tests {
 
     #[test]
     fn test_is_hook_script_current_pinned_format_returns_true() {
+        // B5c follow-up: the commit in the script must match the compiled commit.
+        // Use the actual compiled commit so the check passes, or any placeholder
+        // when the compiled commit is "unknown" (tarball build, check skipped).
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        let hook_commit = if compiled_commit == "unknown" {
+            "abc1234".to_string()
+        } else {
+            compiled_commit.to_string()
+        };
+
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("skim-rewrite.sh");
-        // New F6 pinned format: version comment + SKIM_HOOK_BINARY export.
+        // New F6 pinned format: version comment + SKIM_HOOK_BINARY export + current commit.
+        let content = format!(
+            "#!/bin/sh\n# skim-hook v1.2.3\n\
+             export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+             export SKIM_HOOK_COMMIT={hook_commit}\n\
+             _SKIM_BIN='/usr/local/bin/skim'\n\
+             if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
+             exec skim rewrite --hook --agent claude-code\n"
+        );
+        std::fs::write(&path, content).unwrap();
+
+        assert!(
+            is_hook_script_current(&path, "1.2.3"),
+            "matching version + SKIM_HOOK_BINARY export + matching commit must return true"
+        );
+    }
+
+    /// B5c follow-up (#466 second gate): `is_hook_script_current` must return
+    /// `false` when the version matches but the recorded commit differs from the
+    /// compiled binary's commit.
+    ///
+    /// This is the unit-level companion to the CLI regression test in
+    /// `cli_init.rs::test_init_rewrites_hook_on_stale_commit_same_version`.
+    #[test]
+    fn test_is_hook_script_current_stale_commit_returns_false() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if compiled_commit == "unknown" {
+            // Tarball build: commit check is skipped; nothing to assert.
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skim-rewrite.sh");
+        // Script has the right version and pinned-binary marker, but a STALE commit.
         let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
                        export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       export SKIM_HOOK_COMMIT=abc1234\n\
+                       export SKIM_HOOK_COMMIT=000000000stale\n\
                        _SKIM_BIN='/usr/local/bin/skim'\n\
                        if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
                        exec skim rewrite --hook --agent claude-code\n";
         std::fs::write(&path, content).unwrap();
 
         assert!(
-            is_hook_script_current(&path, "1.2.3"),
-            "matching version + SKIM_HOOK_BINARY export must return true"
+            !is_hook_script_current(&path, "1.2.3"),
+            "stale commit must cause is_hook_script_current to return false even when version matches"
+        );
+    }
+
+    /// B5c follow-up: a script that has the right version and pinned binary but
+    /// NO commit line (predates commit pinning) must be treated as stale.
+    #[test]
+    fn test_is_hook_script_current_missing_commit_returns_false() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if compiled_commit == "unknown" {
+            // Tarball build: commit check is skipped; nothing to assert.
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("skim-rewrite.sh");
+        // Script has correct version + pinned-binary marker but NO SKIM_HOOK_COMMIT.
+        let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
+                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+                       _SKIM_BIN='/usr/local/bin/skim'\n\
+                       exec skim rewrite --hook --agent claude-code\n";
+        std::fs::write(&path, content).unwrap();
+
+        assert!(
+            !is_hook_script_current(&path, "1.2.3"),
+            "script without SKIM_HOOK_COMMIT must be treated as stale (predates commit pinning)"
         );
     }
 
