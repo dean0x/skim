@@ -1,0 +1,11 @@
+# nextest configuration for skim workspace.
+#
+# slow-timeout: mark tests as SLOW after 120 s; terminate after 30 minutes.
+# Rationale: on macOS, subprocess execution under heavy cargo build load
+# (e.g., during the full Phase-5 test suite after a cold compile) can delay
+# the OS scheduler for serial-annotated tests by 10-15 minutes before they
+# resume and pass normally. A 30-minute hard ceiling converts any truly
+# indefinite hang into an explicit timeout failure while allowing the known-
+# slow tests (runner::tests::test_node_fallback_local_bin_found) to complete.
+[profile.default]
+slow-timeout = { period = "120s", terminate-after = 15 }
