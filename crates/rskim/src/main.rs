@@ -228,9 +228,11 @@ SUBCOMMANDS:\n  \
     agents                                   Show detected AI agents\n  \
     completions <SHELL>                      Generate shell completions\n  \
     discover                                 Identify missed optimizations\n  \
+    doctor                                   Check skim installation health and report provenance drift\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns\n  \
     rewrite <COMMAND>...                     Rewrite commands into skim equivalents\n  \
+    search                                   Code search over project index\n  \
     stats [--since N] [--format json]        Token analytics dashboard\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
@@ -776,6 +778,42 @@ fn main() -> ExitCode {
     // Extract --debug before routing so it applies to all subcommands.
     if std::env::args().any(|a| a == "--debug") {
         debug::force_enable_debug();
+    }
+
+    // B4: hidden early-exit used by `skim doctor` to identify each binary on $PATH.
+    //
+    // Must fire before analytics setup and thread spawning — it exits immediately.
+    // Hidden from `--help` output (not a clap flag); handled here, before clap parsing.
+    // Old skim binaries without this flag return non-zero; doctor treats that as "unknown".
+    if std::env::args().skip(1).any(|a| a == "--commit") {
+        println!("{}", option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown"));
+        return ExitCode::SUCCESS;
+    }
+
+    // B5a: emit a structured startup line when debug is active.
+    //
+    // MUST be suppressed in hook mode: Claude Code treats any stderr output on
+    // exit 0 as an error (GRANITE #361). When `--hook` is present in argv we
+    // route the startup line to hook.log instead. The `SKIM_DEBUG=1` env var
+    // is a per-session global that could otherwise pollute every hook call.
+    //
+    // Zero-cost when off: `debug::is_debug_enabled()` is a single atomic load.
+    // `current_exe()` and `id()` are never evaluated when debug is disabled —
+    // they are inside the `if` branch, not eagerly computed before it.
+    if debug::is_debug_enabled() {
+        let in_hook_mode = std::env::args().any(|a| a == "--hook");
+        let pid = std::process::id();
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let msg = format!("[skim] {VERSION} exe={exe} pid={pid}");
+        if in_hook_mode {
+            // Route to hook.log — never stderr in hook mode (GRANITE #361).
+            cmd::hook_log::log_hook_warning(&msg);
+        } else {
+            eprintln!("{msg}");
+        }
     }
 
     // Read analytics config from env + CLI flag once at the system boundary.
@@ -1844,5 +1882,34 @@ mod tests {
         // This test intentionally has no assertions — its purpose is to be a
         // discoverable marker in the test suite for this limitation.
         let _note = "syntactic-only PATH filter: symlink bypass is a known limitation (PF-003)";
+    }
+
+    // ========================================================================
+    // after_help drift guard
+    // ========================================================================
+
+    /// Every META_SUBCOMMAND (except `proxy`, which is cfg-gated and intentionally
+    /// excluded from the user-facing help text) must appear in the `--help` after_help
+    /// SUBCOMMANDS section.  This test fires whenever a meta subcommand is added to
+    /// the registry without also listing it in the `SUBCOMMANDS:` block in `main.rs`.
+    #[test]
+    fn test_meta_subcommands_in_after_help() {
+        let cmd = <Args as clap::CommandFactory>::command();
+        let after_help = cmd
+            .get_after_help()
+            .expect("after_help must be set on Args")
+            .to_string();
+        for &name in cmd::META_SUBCOMMANDS {
+            // `proxy` is #[cfg(feature = "proxy")]-gated and intentionally omitted
+            // from the user-facing help text — it is an internal/advanced capability.
+            if name == "proxy" {
+                continue;
+            }
+            assert!(
+                after_help.contains(name),
+                "META_SUBCOMMANDS entry '{name}' is missing from the after_help \
+                 SUBCOMMANDS section — add it to the SUBCOMMANDS list in main.rs"
+            );
+        }
     }
 }

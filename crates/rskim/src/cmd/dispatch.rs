@@ -10,8 +10,8 @@ use std::process::{Command, ExitCode};
 #[cfg(feature = "proxy")]
 use super::proxy;
 use super::{
-    KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git, heatmap, infra, init,
-    learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
+    KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, doctor, file, git, heatmap, infra,
+    init, learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
 
 // ============================================================================
@@ -590,6 +590,7 @@ pub(crate) fn dispatch(
         "agents" => agents::run(args, analytics),
         "completions" => completions::run(args, analytics),
         "discover" => discover::run(args, analytics),
+        "doctor" => doctor::run(args, analytics),
         "git" => git::run(args, analytics),
         "heatmap" => heatmap::run(args, analytics),
         "init" => init::run(args, analytics),

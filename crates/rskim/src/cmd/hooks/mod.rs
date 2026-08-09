@@ -552,6 +552,14 @@ pub(crate) fn generate_hook_script(
             .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
         "agent_cli_name contains unsafe characters for shell interpolation: {agent_cli_name}"
     );
+    // B5b: empty binary_path produces an unpinned hook script — the dangerous
+    // state that `skim init` exists to eliminate. Callers must resolve the path
+    // before calling this function (see `create_hook_script` in install.rs).
+    assert!(
+        !binary_path.is_empty(),
+        "binary_path is empty — cannot generate a pinned hook script; \
+         ensure current_exe() succeeded before calling generate_hook_script"
+    );
     let git_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
     // Defense-in-depth: git_commit is embedded unquoted in the script, so it must be
     // shell-safe. Hex SHAs (0-9, a-f) and "unknown" are both strictly alphanumeric.

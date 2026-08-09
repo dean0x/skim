@@ -28,10 +28,11 @@ pub(crate) mod build;
 mod completions;
 mod db;
 mod discover;
+mod doctor;
 mod file;
 mod git;
 mod heatmap;
-mod hook_log;
+pub(crate) mod hook_log;
 mod hooks;
 mod infra;
 mod init;
@@ -65,6 +66,8 @@ pub(crate) use execution::{
 };
 
 mod registry;
+#[cfg(test)]
+pub(crate) use registry::META_SUBCOMMANDS;
 pub(crate) use registry::{
     KNOWN_SUBCOMMANDS, is_known_subcommand, is_meta_subcommand, wrapper_targets,
 };

@@ -85,6 +85,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output must switch to native format.
 
 ### Added
+- **`skim doctor` subcommand** — Reports the running binary (absolute path + commit),
+  every `skim` binary on `$PATH` with its commit and which one wins, hook pin state for
+  each installed agent (pinned commit vs running commit, staleness verdict), the wrapper
+  directory, and the cache/analytics database locations. Exit `0` when no drift is
+  detected; exit `1` on any drift, so the command works as a CI pre-flight check. Commit
+  resolution reads from `--version` output (`skim x.y.z (sha)`) rather than a `--commit`
+  flag, so it correctly identifies binaries that predate the doctor subcommand itself.
+
 - **Transparency marker for hook-rewritten file reads** — When the PreToolUse hook
   rewrites `cat`/`head`/`tail` on a code file into `skim <file> --mode=pseudo` (or
   `--mode=structure` for declaration files), the rewritten command now carries a
@@ -119,6 +127,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim init --yes` now re-pins the hook script after an in-place rebuild at the same
+  version (#466)** — `hook_is_current()` previously compared only the binary path and
+  version string, so a `cargo build` that incremented the commit SHA while keeping the
+  same `x.y.z` version was treated as "already up to date" and the stale commit pin was
+  left in place. The predicate now additionally compares `SKIM_HOOK_COMMIT` against the
+  compiled-in SHA, so any rebuild triggers a re-pin.
+
+- **`skim init` now fails loudly if it cannot resolve its own binary path** — A
+  `.unwrap_or_default()` fallback in `generate_hook_script` would silently produce a hook
+  script with an empty `SKIM_HOOK_BINARY` value, writing an unpinned script with no
+  error. This is replaced by a loud `Result` failure and an empty-path assertion, so the
+  error surfaces before any script is written.
+
+- **`SKIM_DEBUG=1` startup provenance line routes to `hook.log` in hook mode, not
+  stderr** — In prior versions, enabling `SKIM_DEBUG` while running under the hook emitted
+  a startup notice to stderr, violating the GRANITE #361 Bug 3 requirement (skim must
+  never write to stderr in hook mode). The startup line is now routed to `hook.log` when
+  the hook context is active, keeping stderr byte-clean.
+
 - **`skim git status` branch header now mirrors native `git status -sb` format** — The
   branch line now renders as `## branch...upstream [ahead N, behind M]` (matching native
   `git status -sb` output exactly), with counts derived from the `# branch.ab`

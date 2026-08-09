@@ -537,11 +537,13 @@ fn run_install_single(
 /// Print the detected state summary to stdout.
 pub(super) fn print_detected_state(state: &DetectedState) {
     println!("  Checking current state...");
+    let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
     println!(
-        "  {} skim binary: {} (v{})",
+        "  {} skim binary: {} (v{}, commit {})",
         check_mark(true),
         state.skim_binary.display(),
-        state.skim_version
+        state.skim_version,
+        compiled_commit,
     );
 
     let config_label = if state.settings_exists {
@@ -836,11 +838,22 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     }
 
     // Canonicalize the current binary path for embedding in the hook script.
-    // Falls back gracefully: canonicalize → current_exe → empty string.
-    // The path is single-quoted inside generate_hook_script, so spaces are safe.
+    // B5b: failure here must be loud — a silent empty path produces an
+    // unpinned hook script, which is exactly the state this whole change
+    // exists to eliminate. `create_hook_script` returns `Result`, so we
+    // thread the error instead of falling back to an empty string.
     let binary_path = std::env::current_exe()
-        .and_then(|p| std::fs::canonicalize(&p).or(Ok(p)))
-        .unwrap_or_default();
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot determine the skim binary path: {e}\n\
+                 hint: re-run `skim init` from the skim binary directly"
+            )
+        })
+        .map(|p| {
+            // Prefer the canonical path (resolves symlinks); fall back to the
+            // original path when canonicalize fails (rare: e.g. deleted-while-open).
+            std::fs::canonicalize(&p).unwrap_or(p)
+        })?;
     let binary_path_str = binary_path.to_string_lossy();
 
     // Delegate to the shared generator in hooks/mod.rs so install.rs and per-agent
@@ -1795,6 +1808,8 @@ mod tests {
             settings_exists: false,
             hook_installed: false,
             hook_version: None,
+            hook_commit: None,
+            hook_binary_pin: None,
             hook_uses_pinned_binary: false,
             dual_scope_warning: None,
             existing_hooks: vec![],

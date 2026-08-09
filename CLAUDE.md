@@ -80,6 +80,7 @@ Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql,
 - `heatmap` — git-history risk/coupling analysis: churn, co-change, stability, fix-after-touch (`--json`, `--since`, `--window`, `--path`, `--insights`).
 - `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception; `--permissions` seeds consent-gated allowlist entries (tiers: seed|mirror|blanket).
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
+- `doctor` — provenance check: reports the running binary (path + commit), every `skim` on `$PATH` with its commit and which one wins, hook pin state per agent (pinned SHA vs running SHA), wrapper directory, and cache/analytics locations. Exit `0` healthy / `1` on any drift — works as a CI pre-flight. Commit resolution reads `--version` output rather than a `--commit` flag, so it correctly identifies binaries that predate `skim doctor` itself.
 - `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 
 ### Two interception surfaces (they work differently — don't conflate them)
@@ -95,7 +96,7 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 ## Environment Variables
 
 - `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
-- `SKIM_DEBUG=1` (or `--debug`) — enables raw-fallback diagnostic banners on stderr (see **Stderr notice taxonomy** in Design Constraints below; loss-bearing elision markers and the ADR-008 transparency marker are unconditional and not gated by this variable).
+- `SKIM_DEBUG=1` (or `--debug`) — enables raw-fallback diagnostic banners on stderr for no-loss raw-fallback paths (see **Stderr notice taxonomy** in Design Constraints below; loss-bearing elision markers and the ADR-008 transparency marker are unconditional and not gated by this variable). In hook mode the startup provenance line goes to `hook.log`, never stderr (GRANITE #361 Bug 3); drift events are also logged to `hook.log` unconditionally — `skim doctor` is the primary on-demand diagnosis path.
 - `SKIM_SESSION_ID` — analytics session attribution; priority sidecar > env > `--session-id` flag (flag is a forward-compat fallback only — the hook no longer injects it). Set it alongside the PATH export so sub-agents inherit it.
 - `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
   tee output (`tee/`), and the **default** `analytics.db` location. An empty value is

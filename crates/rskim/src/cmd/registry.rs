@@ -35,6 +35,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "dig",         // infrastructure
     "discover",    // meta: skim management
     "docker",      // infrastructure
+    "doctor",      // meta: skim management
     "dotnet",      // test runner / passthrough
     "dprint",      // linter
     "du",          // file operations
@@ -119,6 +120,7 @@ pub(crate) const META_SUBCOMMANDS: &[&str] = &[
     "agents",
     "completions",
     "discover",
+    "doctor",
     "heatmap",
     "init",
     "learn",

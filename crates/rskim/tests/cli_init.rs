@@ -816,6 +816,20 @@ fn test_hook_version_mismatch_warning() {
         "Rewrite should succeed despite version mismatch"
     );
 
+    // The hook response carries no drift information: systemMessage and
+    // additionalContext are absent. Drift is recorded to hook.log only;
+    // skim doctor is the on-demand diagnostic.
+    assert!(
+        json.get("systemMessage").is_none(),
+        "hook response must not contain systemMessage: {json}"
+    );
+    assert!(
+        json["hookSpecificOutput"]
+            .get("additionalContext")
+            .is_none(),
+        "hook response must not contain additionalContext: {json}"
+    );
+
     // Verify warning went to hook.log file instead
     let hook_log = cache_dir.path().join("hook.log");
     assert!(
@@ -865,6 +879,20 @@ fn test_hook_binary_mismatch_warning() {
             .unwrap()
             .contains("skim cargo test"),
         "Rewrite must succeed despite binary mismatch"
+    );
+
+    // The hook response carries no drift information: systemMessage and
+    // additionalContext are absent. Drift is recorded to hook.log only;
+    // skim doctor is the on-demand diagnostic.
+    assert!(
+        json.get("systemMessage").is_none(),
+        "hook response must not contain systemMessage: {json}"
+    );
+    assert!(
+        json["hookSpecificOutput"]
+            .get("additionalContext")
+            .is_none(),
+        "hook response must not contain additionalContext: {json}"
     );
 
     // Warning must appear in hook.log.
