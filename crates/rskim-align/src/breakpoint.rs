@@ -28,6 +28,7 @@
 //! count). The volatile detector's output is used only for logging/stats.
 
 // AD-CA-4: MARKER_BYTES and MAX_MARKERS IMPORTED from rskim_contract::waiver, NEVER redefined here.
+use rskim_contract::canonical::tools_arrays_equal;
 use rskim_contract::waiver::{MARKER_BYTES, MAX_MARKERS};
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -53,6 +54,15 @@ pub const V1_SKIM_CAP: usize = 2;
 /// MARKER_BYTES (37) is imported from rskim_contract::waiver — this constant
 /// is NOT `pub` to ensure callers use the imported MARKER_BYTES, not a local alias.
 const MARKER: &[u8] = b",\"cache_control\":{\"type\":\"ephemeral\"}";
+
+/// The marker member without its leading separator comma (36 bytes).
+const CC_MEMBER: &[u8] = b"\"cache_control\":{\"type\":\"ephemeral\"}";
+
+/// The `cache_control` key name, as decoded by `parse_object_pairs`.
+const CC_KEY: &str = "cache_control";
+
+/// The canonical compact value skim writes for `cache_control`.
+const CC_VALUE: &str = "{\"type\":\"ephemeral\"}";
 
 // ============================================================================
 // BreakpointPlan
@@ -203,21 +213,70 @@ pub fn plan_injection(
 
 /// Check whether the last element of a canonical tools array is eligible for injection.
 ///
-/// Eligible means:
-/// - The array is non-empty.
-/// - The last element is a JSON object (ends with `}`).
-/// - The last element does NOT already contain `"cache_control"`.
+/// Delegates to [`last_injectable_object_index`], which parses the array rather than
+/// scanning bytes — a byte scan cannot tell a structural `}`/`,` from one inside a
+/// tool `description` string.
 fn tools_position_eligible(canonical_tools: &[u8]) -> bool {
-    let len = canonical_tools.len();
-    if len < 4 {
-        return false; // minimum non-empty: `[{}]`
+    last_injectable_object_index(canonical_tools).is_some()
+}
+
+/// Index of the last element of a canonical JSON array when that element is a
+/// **non-empty JSON object without a top-level `cache_control` key**.
+///
+/// Returns `None` (position ineligible) when the value is not an array, the array is
+/// empty, the last element is not an object, the last element is `{}`, or the last
+/// element already carries a `cache_control` member.
+///
+/// # Why `{}` is ineligible
+///
+/// [`build_element_with_cc`] grows an element by exactly `MARKER_BYTES` (a 36-byte
+/// member plus 1 separator comma). An empty object has no neighbouring member, so no
+/// separator is needed and the growth would be `MARKER_BYTES - 1` — breaking the
+/// exact-growth invariant that [`verify_injection`] enforces. Rejecting the position
+/// here keeps the invariant total and leaves the rest of the request alignable.
+///
+/// # Why this parses instead of scanning
+///
+/// The previous byte scan walked backwards tracking `{}`/`[]` depth, which mis-locates
+/// the last element whenever a string value contains a brace, bracket or comma
+/// (e.g. `{"description":"emit }, then stop"}`).
+fn last_injectable_object_index(canonical_array: &[u8]) -> Option<usize> {
+    let s = std::str::from_utf8(canonical_array).ok()?;
+    let elements: Vec<Box<RawValue>> = serde_json::from_str(s.trim()).ok()?;
+    let last_idx = elements.len().checked_sub(1)?;
+    let pairs = parse_object_pairs(elements[last_idx].get().trim())?;
+    if pairs.is_empty() {
+        return None;
     }
-    // Must end with `}]`
-    if canonical_tools[len - 1] != b']' || canonical_tools[len - 2] != b'}' {
-        return false;
+    if pairs.iter().any(|(k, _)| k == CC_KEY) {
+        return None;
     }
-    // Check if the last element has cache_control
-    !last_element_has_cc_byte_scan(canonical_tools)
+    Some(last_idx)
+}
+
+/// Rebuild a canonical JSON array with `elements[target_idx]` replaced by `replacement`.
+///
+/// Every other element is copied verbatim from its trimmed source bytes, so the only
+/// byte difference between input and output is the replaced element.
+fn rebuild_array_with(
+    elements: &[Box<RawValue>],
+    target_idx: usize,
+    replacement: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(replacement.len() + 2 + elements.len() * 8);
+    out.push(b'[');
+    for (i, elem) in elements.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        if i == target_idx {
+            out.extend_from_slice(replacement);
+        } else {
+            out.extend_from_slice(elem.get().trim().as_bytes());
+        }
+    }
+    out.push(b']');
+    out
 }
 
 /// Check whether the system value contains an eligible last text block.
@@ -257,9 +316,11 @@ fn system_position_eligible(canonical_system: &[u8]) -> bool {
 ///
 /// # Returns
 ///
-/// `Some((injected_bytes, inject_at))` on success, where `inject_at` is a
-/// canonical position used by `verify_injection`.
-/// `None` when the position is not eligible (not object, already has CC, empty array).
+/// `Some((injected_bytes, injected_element_index))` on success. The index identifies
+/// which array element received the marker and is passed straight to
+/// [`verify_injection`] for the AD-CA-7 injection-path self-verify.
+/// `None` when the position is not eligible (not an object, `{}`, already has
+/// `cache_control`, empty array, or parse failure).
 pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
     debug_assert_eq!(
         MARKER.len(),
@@ -268,45 +329,16 @@ pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
     );
 
     let s = std::str::from_utf8(canonical_tools).ok()?;
+    let target_idx = last_injectable_object_index(canonical_tools)?;
     let elements: Vec<Box<RawValue>> = serde_json::from_str(s.trim()).ok()?;
-    if elements.is_empty() {
-        return None;
-    }
 
-    let last_idx = elements.len() - 1;
-    let last_elem = elements[last_idx].get().trim();
+    // Rebuild the target element with cache_control at its canonical sorted position.
+    let new_elem = build_element_with_cc(elements.get(target_idx)?.get().trim())?;
 
-    // Last element must be an object and not already carry cache_control
-    if !last_elem.starts_with('{') {
-        return None;
-    }
-    if last_elem.contains("\"cache_control\"") {
-        return None;
-    }
-
-    // Rebuild last element with cache_control at its canonical sorted position
-    let new_last_elem = build_element_with_cc(last_elem)?;
-
-    // Rebuild the full array with the modified last element
-    let mut result = Vec::with_capacity(canonical_tools.len() + MARKER_BYTES);
-    result.push(b'[');
-    for (i, elem) in elements.iter().enumerate() {
-        if i > 0 {
-            result.push(b',');
-        }
-        if i == last_idx {
-            result.extend_from_slice(&new_last_elem);
-        } else {
-            result.extend_from_slice(elem.get().trim().as_bytes());
-        }
-    }
-    result.push(b']');
-
-    // inject_at is used by verify_injection (size-only check); the exact value is
-    // immaterial when the rebuilt form is used. Return len-2 of the new result as
-    // a conventional non-zero sentinel.
-    let inject_at = result.len().saturating_sub(2);
-    Some((result, inject_at))
+    Some((
+        rebuild_array_with(&elements, target_idx, &new_elem),
+        target_idx,
+    ))
 }
 
 /// Inject a `cache_control` marker into the last eligible text block of a
@@ -318,12 +350,10 @@ pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
 ///
 /// # Returns
 ///
-/// `Some((injected_bytes, injection_offset_within_canonical))` on success.
+/// `Some((injected_bytes, injected_element_index))` on success — the index of the
+/// system block that received the marker, passed straight to [`verify_injection`].
 /// `None` when the system is not block-form, has no eligible text block, or any
 /// parse fails (fail-open).
-///
-/// `injection_offset_within_canonical` is the byte position within the
-/// canonical system bytes where the marker was inserted (for self-verify).
 pub fn inject_system_marker(canonical_system: &[u8]) -> Option<(Vec<u8>, usize)> {
     debug_assert_eq!(
         MARKER.len(),
@@ -338,33 +368,16 @@ pub fn inject_system_marker(canonical_system: &[u8]) -> Option<(Vec<u8>, usize)>
     }
 
     let elements: Vec<Box<RawValue>> = serde_json::from_str(trimmed).ok()?;
+    let target_idx = find_last_eligible_text_block_idx(trimmed)?;
 
-    // Find the last eligible text block
-    let last_text_idx = find_last_eligible_text_block_idx(trimmed)?;
+    // Rebuild the target text block with cache_control at its canonical sorted
+    // position (idempotence: the rebuilt element is already key-sorted).
+    let new_elem = build_element_with_cc(elements.get(target_idx)?.get().trim())?;
 
-    // Rebuild the array, injecting the marker into the target element
-    let mut result = Vec::with_capacity(canonical_system.len() + MARKER_BYTES);
-    let mut injection_offset_in_result = 0usize;
-
-    result.push(b'[');
-    for (i, elem) in elements.iter().enumerate() {
-        if i > 0 {
-            result.push(b',');
-        }
-        let elem_str = elem.get().trim();
-        if i == last_text_idx {
-            // Rebuild the target text block with cache_control at its canonical sorted
-            // position (idempotence: rebuilt element is already key-sorted).
-            let new_elem = build_element_with_cc(elem_str)?;
-            injection_offset_in_result = result.len(); // start of the rebuilt element
-            result.extend_from_slice(&new_elem);
-        } else {
-            result.extend_from_slice(elem_str.as_bytes());
-        }
-    }
-    result.push(b']');
-
-    Some((result, injection_offset_in_result))
+    Some((
+        rebuild_array_with(&elements, target_idx, &new_elem),
+        target_idx,
+    ))
 }
 
 // ============================================================================
@@ -384,64 +397,65 @@ pub fn inject_system_marker(canonical_system: &[u8]) -> Option<(Vec<u8>, usize)>
 /// same object augmented with `cache_control`, so a second `align()` pass produces
 /// byte-identical output (idempotent).
 ///
-/// # Net growth
+/// # Net growth (enforced, not assumed)
 ///
 /// The returned bytes are exactly `elem_str.len() + MARKER_BYTES` bytes, because:
 /// - We add 36 bytes for `"cache_control":{"type":"ephemeral"}` (the key-value payload)
 /// - We add 1 byte for the comma separator between cc and its neighbouring key
 ///
 /// = 37 = `MARKER_BYTES` total.
+///
+/// This holds only for an already-canonical `elem_str` (compact, key-sorted), which is
+/// all any caller passes. Rather than assume it, the function re-checks the resulting
+/// length and returns `None` if it does not hold — an unmet precondition fails the
+/// request open instead of emitting bytes that would trip the seam's byte gate.
 fn build_element_with_cc(elem_str: &str) -> Option<Vec<u8>> {
     let pairs = parse_object_pairs(elem_str)?;
 
+    // `{}` has no neighbouring member, so no separator comma is needed and the growth
+    // would be MARKER_BYTES - 1 — breaking the exact-growth invariant verify_injection
+    // enforces. `last_injectable_object_index` already rejects this position; the guard
+    // keeps the invariant total even if a future caller skips that check.
+    if pairs.is_empty() {
+        return None;
+    }
+
     // Find the sorted insertion index for "cache_control" ('c' sorts before 'd','i','n','t'…)
-    let insert_idx = pairs.partition_point(|(k, _)| k.as_str() < "cache_control");
+    let insert_idx = pairs.partition_point(|(k, _)| k.as_str() < CC_KEY);
+
+    // Build each member independently, then join with ','. Keys are re-encoded with
+    // `serde_json::to_string` — the same encoding `canonical_emit::canonicalize_object`
+    // uses — so the untouched members reproduce their canonical bytes exactly. Writing
+    // the decoded key raw would emit invalid JSON for any key containing `"` or `\`.
+    let mut members: Vec<Vec<u8>> = Vec::with_capacity(pairs.len() + 1);
+    for (k, v) in &pairs {
+        let key_json = serde_json::to_string(k.as_str()).ok()?;
+        let val = v.get().trim();
+        let mut member = Vec::with_capacity(key_json.len() + 1 + val.len());
+        member.extend_from_slice(key_json.as_bytes());
+        member.push(b':');
+        member.extend_from_slice(val.as_bytes());
+        members.push(member);
+    }
+    members.insert(insert_idx, CC_MEMBER.to_vec());
 
     let mut result = Vec::with_capacity(elem_str.len() + MARKER_BYTES);
     result.push(b'{');
-
-    let mut written = 0usize;
-
-    for (i, (k, v)) in pairs.iter().enumerate() {
-        if i == insert_idx {
-            // Insert cache_control before this pair
-            if written > 0 {
-                result.push(b',');
-            }
-            // Write the cc key-value payload (no leading comma — separator is above)
-            result.extend_from_slice(b"\"cache_control\":{\"type\":\"ephemeral\"}");
-            written += 1;
-        }
-        if written > 0 {
+    for (i, member) in members.iter().enumerate() {
+        if i > 0 {
             result.push(b',');
         }
-        result.push(b'"');
-        result.extend_from_slice(k.as_bytes());
-        result.extend_from_slice(b"\":");
-        result.extend_from_slice(v.get().trim().as_bytes());
-        written += 1;
+        result.extend_from_slice(member);
     }
-
-    // If insert_idx == pairs.len(), cc goes at end (after all existing pairs)
-    if insert_idx == pairs.len() {
-        if written > 0 {
-            result.push(b',');
-        }
-        result.extend_from_slice(b"\"cache_control\":{\"type\":\"ephemeral\"}");
-    }
-
     result.push(b'}');
 
-    // Sanity check: growth must be exactly MARKER_BYTES
-    debug_assert_eq!(
-        result.len(),
-        elem_str.len() + MARKER_BYTES,
-        "build_element_with_cc: unexpected size: expected {} + {} = {}, got {}",
-        elem_str.len(),
-        MARKER_BYTES,
-        elem_str.len() + MARKER_BYTES,
-        result.len()
-    );
+    // Precondition check, enforced in production (never a panic — this is business
+    // logic, so an unmet invariant returns None and the caller fails the whole request
+    // open). Callers only ever pass an already-canonical element, for which the growth
+    // is exactly CC_MEMBER (36) + one separator comma = MARKER_BYTES (37).
+    if result.len() != elem_str.len() + MARKER_BYTES {
+        return None;
+    }
 
     Some(result)
 }
@@ -450,109 +464,107 @@ fn build_element_with_cc(elem_str: &str) -> Option<Vec<u8>> {
 // Injection self-verify helpers (public, for lib.rs)
 // ============================================================================
 
-/// Verify that `injected` grew from `canonical` by exactly `MARKER_BYTES`
-/// (AD-CA-7 injection path self-verify).
+/// AD-CA-7 injection-path self-verify: prove the injection added **only** the marker.
 ///
-/// # Two accepted forms
+/// The check strips the skim-injected `cache_control` member back out of element
+/// `injected_idx` and asserts the result is value-equal to the pre-injection canonical
+/// array under the **order-sensitive** comparator
+/// [`rskim_contract::canonical::tools_arrays_equal`] — injection must not reorder,
+/// drop, duplicate, or mutate anything.
 ///
-/// **Standard form** (MARKER appended as last key, leading-comma format):
-/// - `injected[..inject_at] == canonical[..inject_at]`
-/// - `injected[inject_at..inject_at+MARKER_BYTES] == MARKER` (` ,cc:...`)
-/// - `injected[inject_at+MARKER_BYTES..] == canonical[inject_at..]`
+/// Three independent conditions must all hold:
+/// 1. `injected.len() == canonical.len() + MARKER_BYTES` (exactly one marker's growth).
+/// 2. Element `injected_idx` carries exactly one `cache_control` member whose value is
+///    the canonical `{"type":"ephemeral"}` — so the stripped form is well-defined.
+/// 3. The stripped array is order-sensitively value-equal to `canonical`.
 ///
-/// **Rebuilt form** (MARKER at canonical sorted position within element):
-/// The injected bytes may not have MARKER at `inject_at`, because the element was
-/// fully rebuilt with `cache_control` inserted at its sorted position (not appended).
-/// In this case the standard check fails and the fallback is the size invariant:
-/// `injected.len() == canonical.len() + MARKER_BYTES` (already checked as guard).
+/// Returns `false` on any parse failure. The caller maps `false` to a whole-request
+/// fail-open passthrough.
 ///
-/// The semantic correctness of the rebuilt form is guaranteed by construction
-/// in `build_element_with_cc` and verified by the idempotence test (AC8).
-pub fn verify_injection(canonical: &[u8], injected: &[u8], inject_at: usize) -> bool {
-    // Primary invariant: length must grow by exactly MARKER_BYTES
+/// # Discriminating (PF-007)
+///
+/// This is not a size-only check: mutating a neighbouring element, reordering elements,
+/// or dropping a member during the rebuild all leave the length unchanged yet fail
+/// condition 3.
+pub fn verify_injection(canonical: &[u8], injected: &[u8], injected_idx: usize) -> bool {
+    // Condition 1: exactly one marker's worth of growth.
     if injected.len() != canonical.len() + MARKER_BYTES {
         return false;
     }
-    // Standard form: check byte-identical prefix/marker/suffix
-    if inject_at + MARKER_BYTES <= injected.len() && inject_at <= canonical.len() {
-        let standard = injected[..inject_at] == canonical[..inject_at]
-            && injected[inject_at..inject_at + MARKER_BYTES] == *MARKER
-            && injected[inject_at + MARKER_BYTES..] == canonical[inject_at..];
-        if standard {
-            return true;
+    let (Ok(canonical_str), Ok(injected_str)) = (
+        std::str::from_utf8(canonical),
+        std::str::from_utf8(injected),
+    ) else {
+        return false;
+    };
+    // Condition 2: strip the one skim-injected marker back out.
+    let Some(stripped) = strip_injected_marker(injected_str, injected_idx) else {
+        return false;
+    };
+    let Ok(stripped_str) = String::from_utf8(stripped) else {
+        return false;
+    };
+    // Condition 3: order-sensitive value equality with the pre-injection bytes.
+    tools_arrays_equal(canonical_str, &stripped_str)
+}
+
+/// Remove the skim-injected `cache_control` member from element `target_idx` of a
+/// canonical JSON array, returning the array bytes without it.
+///
+/// Returns `None` unless the target element is an object carrying **exactly one**
+/// `cache_control` member whose value is the canonical `{"type":"ephemeral"}` — the
+/// shape [`build_element_with_cc`] writes. Every other element is copied verbatim.
+fn strip_injected_marker(array_str: &str, target_idx: usize) -> Option<Vec<u8>> {
+    let elements: Vec<Box<RawValue>> = serde_json::from_str(array_str.trim()).ok()?;
+    let pairs = parse_object_pairs(elements.get(target_idx)?.get().trim())?;
+
+    let mut members: Vec<Vec<u8>> = Vec::with_capacity(pairs.len());
+    let mut removed = 0usize;
+    for (k, v) in &pairs {
+        let val = v.get().trim();
+        if k == CC_KEY && val == CC_VALUE {
+            removed += 1;
+            continue;
         }
+        let key_json = serde_json::to_string(k.as_str()).ok()?;
+        let mut member = Vec::with_capacity(key_json.len() + 1 + val.len());
+        member.extend_from_slice(key_json.as_bytes());
+        member.push(b':');
+        member.extend_from_slice(val.as_bytes());
+        members.push(member);
     }
-    // Rebuilt form fallback: size invariant is the minimum guarantee.
-    // The rebuilt element contains exactly the canonical key-value pairs plus
-    // cache_control, which is verified structurally by the idempotence tests.
-    true
+    // Exactly one skim marker must be removable; zero means nothing was injected and
+    // two would mean the element was mangled.
+    if removed != 1 {
+        return None;
+    }
+
+    let mut elem = Vec::new();
+    elem.push(b'{');
+    for (i, member) in members.iter().enumerate() {
+        if i > 0 {
+            elem.push(b',');
+        }
+        elem.extend_from_slice(member);
+    }
+    elem.push(b'}');
+
+    Some(rebuild_array_with(&elements, target_idx, &elem))
 }
 
 // ============================================================================
 // Internal helpers
 // ============================================================================
 
-/// Scan the last array element (backwards from `}]`) for `"cache_control"`.
-///
-/// Since canonical tools bytes end with `...LAST_ELEM_BYTES}]`, we scan
-/// backwards from `len-2` to find the start of the last element (first `{`
-/// at depth 0 from the right, or the element after the last depth-0 `,`).
-///
-/// A simpler approach: parse the bytes as a JSON array and check the last element.
-fn last_element_has_cc_byte_scan(canonical_array: &[u8]) -> bool {
-    let s = match std::str::from_utf8(canonical_array) {
-        Ok(s) => s,
-        Err(_) => return true, // fail-safe
-    };
-    // Find the last depth-0 ',' or '[' to locate the start of the last element
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    if len < 2 {
-        return true;
-    }
-    // Walk backwards from len-2 (the `}` of the last element) tracking bracket depth
-    let mut depth: i32 = 0;
-    let mut last_elem_start = 1usize; // default: right after `[`
-    let mut i = len - 2; // start at the closing `}` of the last element
-
-    loop {
-        match bytes[i] {
-            b'}' | b']' => depth += 1,
-            b'{' | b'[' => {
-                if depth == 0 {
-                    last_elem_start = i;
-                    break;
-                }
-                depth -= 1;
-                if depth < 0 {
-                    // Reached the opening `[` of the array
-                    last_elem_start = i + 1;
-                    break;
-                }
-            }
-            b',' if depth == 0 => {
-                last_elem_start = i + 1;
-                break;
-            }
-            _ => {}
-        }
-        if i == 0 {
-            break;
-        }
-        i -= 1;
-    }
-
-    // The last element's bytes are s[last_elem_start..len-1]
-    let last_elem = &s[last_elem_start..len - 1]; // excludes the final `]`
-    last_elem.contains("\"cache_control\"")
-}
-
 /// Find the index of the last eligible text block in a canonical block-form system string.
 ///
-/// An element is eligible when it:
-/// - Is a JSON object (`starts_with('{')`)
-/// - Contains `"type":"text"` (as a canonical key-value pair)
-/// - Does NOT contain `"cache_control"`
+/// An element is eligible when it is a JSON object that has a top-level `"type"` member
+/// equal to `"text"` and **no** top-level `cache_control` member.
+///
+/// The membership tests are structural (`parse_object_pairs`), not substring scans: a
+/// substring scan would match `"type":"text"` nested inside another value and would miss
+/// nothing but could also mis-classify a block whose `cache_control` sits at a nested
+/// level. Structural checks keep eligibility a pure function of the top-level shape.
 fn find_last_eligible_text_block_idx(trimmed_sys: &str) -> Option<usize> {
     let elements: Vec<Box<RawValue>> = serde_json::from_str(trimmed_sys).ok()?;
     elements
@@ -560,10 +572,14 @@ fn find_last_eligible_text_block_idx(trimmed_sys: &str) -> Option<usize> {
         .enumerate()
         .rev()
         .find(|(_, e)| {
-            let s = e.get().trim();
-            s.starts_with('{')
-                && s.contains("\"type\":\"text\"")
-                && !s.contains("\"cache_control\"")
+            let Some(pairs) = parse_object_pairs(e.get().trim()) else {
+                return false; // not an object
+            };
+            let is_text = pairs
+                .iter()
+                .any(|(k, v)| k == "type" && v.get().trim() == "\"text\"");
+            let has_cc = pairs.iter().any(|(k, _)| k == CC_KEY);
+            is_text && !has_cc
         })
         .map(|(i, _)| i)
 }
@@ -873,4 +889,92 @@ mod tests {
         assert_eq!(MAX_MARKERS, 4);
     }
 
+    // ── verify_injection is discriminating, not size-only (PF-007) ───────────
+
+    #[test]
+    fn verify_injection_rejects_mutated_neighbour_element() {
+        // A same-length mutation of an element OTHER than the injected one must fail.
+        // A size-only check would pass this.
+        let canonical = b"[{\"name\":\"aa\"},{\"name\":\"bb\"}]";
+        let (injected, idx) = inject_tools_marker(canonical).expect("must inject");
+        assert!(verify_injection(canonical, &injected, idx));
+
+        let tampered = String::from_utf8(injected)
+            .unwrap()
+            .replace("\"aa\"", "\"zz\"");
+        assert!(
+            !verify_injection(canonical, tampered.as_bytes(), idx),
+            "AD-CA-7: a mutated neighbouring element must fail the injection self-verify"
+        );
+    }
+
+    #[test]
+    fn verify_injection_rejects_element_reorder() {
+        // Injection must not reorder elements. Same length, same multiset — only the
+        // order-sensitive comparator catches this.
+        let canonical = b"[{\"name\":\"aa\"},{\"name\":\"bb\"}]";
+        let reordered =
+            br#"[{"cache_control":{"type":"ephemeral"},"name":"bb"},{"name":"aa"}]"#.to_vec();
+        assert_eq!(
+            reordered.len(),
+            canonical.len() + MARKER_BYTES,
+            "test fixture must have the exact injected length"
+        );
+        // idx 0: the marker strips cleanly, so only the ORDER-SENSITIVE comparator
+        // can reject this — a set-equality comparator would accept it.
+        assert!(
+            !verify_injection(canonical, &reordered, 0),
+            "AD-CA-7: injection must not reorder elements"
+        );
+        // idx 1: the element at the claimed index carries no marker at all.
+        assert!(
+            !verify_injection(canonical, &reordered, 1),
+            "AD-CA-7: a missing marker at the claimed index must fail"
+        );
+    }
+
+    #[test]
+    fn verify_injection_rejects_missing_marker() {
+        // Right length, but the growth came from padding rather than a marker.
+        let canonical = b"[{\"name\":\"a\"}]";
+        let padded = format!("[{{\"name\":\"a{}\"}}]", "p".repeat(MARKER_BYTES));
+        assert_eq!(padded.len(), canonical.len() + MARKER_BYTES);
+        assert!(
+            !verify_injection(canonical, padded.as_bytes(), 0),
+            "AD-CA-7: growth without a strippable marker must fail"
+        );
+    }
+
+    // ── empty-object tool element (degenerate shape, AC24) ──────────────────
+
+    #[test]
+    fn empty_object_tool_element_is_ineligible_and_never_panics() {
+        // `[{}]` used to trip a debug_assert inside build_element_with_cc (growth is
+        // MARKER_BYTES - 1 with no neighbouring member). It must be a clean no-op.
+        assert!(
+            !tools_position_eligible(b"[{}]"),
+            "an empty tool object must not be an eligible injection position"
+        );
+        assert!(
+            inject_tools_marker(b"[{}]").is_none(),
+            "injecting into an empty tool object must return None, not panic"
+        );
+        assert!(build_element_with_cc("{}").is_none());
+    }
+
+    #[test]
+    fn last_element_eligibility_survives_braces_inside_strings() {
+        // The old backwards byte scan mis-located the last element whenever a string
+        // value contained a brace/bracket/comma. The last element here has NO marker,
+        // so the position is eligible; a mis-scan would see the earlier marked element.
+        let tools =
+            br#"[{"cache_control":{"type":"ephemeral"},"name":"a"},{"description":"emit }, then ]","name":"b"}]"#;
+        assert!(
+            tools_position_eligible(tools),
+            "a brace inside a description must not confuse eligibility"
+        );
+        let (injected, idx) = inject_tools_marker(tools).expect("must inject into last element");
+        assert_eq!(idx, 1, "the marker must land on the last element");
+        assert!(verify_injection(tools, &injected, idx));
+    }
 }

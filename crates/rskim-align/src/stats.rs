@@ -32,9 +32,11 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct AlignStats {
-    /// Whether any tools/functions value was key-sorted.
+    /// Whether the `tools` or `functions` value actually changed during canonicalization
+    /// (key-sort, element reorder, or whitespace removal). False when the span was
+    /// already canonical or absent.
     pub tools_key_sorted: bool,
-    /// Whether any span was compacted (whitespace removed via canonical form).
+    /// Whether canonicalization made the body strictly smaller (whitespace removed).
     pub spans_compacted: bool,
     /// Number of `cache_control` markers injected by skim.
     pub skim_breakpoints_injected: usize,

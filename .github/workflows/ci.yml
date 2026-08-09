@@ -87,35 +87,46 @@ jobs:
         run: |
           set -o pipefail
           echo "Running rskim-align bench (64-tool, 512KB fixtures)..."
+          # Criterion 0.5 accepts a SINGLE positional filter (a regex) — passing two
+          # would abort with "unexpected argument" and break the job.
           cargo bench -p rskim-align --bench align_bench -- \
-            align_anthropic_64tools align_anthropic_512kb \
+            'align_anthropic_(64tools|512kb)' \
             2>&1 | tee /tmp/rskim-align-bench.txt
 
           echo "=== Checking 64-tool bench result ==="
           # Extract the "time: [low mean high]" line for 64tools bench.
           # Criterion prints: "time:   [X.XXX ms X.XXX ms X.XXX ms]" or µs.
           # We check that the upper-bound (third value) is < 5 ms.
+          # A gate that cannot read its measurement MUST fail, never "skip" (ADR-003 /
+          # PF-007): a silently-skipped gate is indistinguishable from a passing one, so
+          # a renamed bench or a Criterion output-format change would silently retire the
+          # AC17 guard. Every unparseable branch below exits non-zero.
           BENCH_LINE=$(grep -A2 'align_anthropic_64tools' /tmp/rskim-align-bench.txt | grep 'time:' | head -1 || true)
           echo "64tools bench line: $BENCH_LINE"
           if [ -z "$BENCH_LINE" ]; then
-            echo "WARNING: bench output not found for align_anthropic_64tools — skipping gate"
-          else
-            # Extract the upper bound value and unit (e.g., "4.321 ms" or "4321 µs").
-            UPPER=$(echo "$BENCH_LINE" | grep -oE '[0-9]+\.[0-9]+ (ms|µs|us|ns)' | tail -1 || true)
-            echo "Upper bound: $UPPER"
-            if echo "$UPPER" | grep -qE 'µs|us|ns'; then
-              echo "PASS: 64tools bench well under 5 ms (sub-millisecond unit)"
-            elif echo "$UPPER" | grep -q 'ms'; then
-              VAL=$(echo "$UPPER" | grep -oE '[0-9]+\.[0-9]+')
-              if awk "BEGIN {exit ($VAL < 5.0) ? 0 : 1}"; then
-                echo "PASS: 64tools bench upper bound ${VAL} ms < 5 ms gate"
-              else
-                echo "FAIL: 64tools bench upper bound ${VAL} ms >= 5 ms gate (AC17)"
-                exit 1
-              fi
+            echo "FAIL: bench output not found for align_anthropic_64tools — AC17 gate cannot be evaluated"
+            exit 1
+          fi
+          # Extract the upper bound value and unit (e.g., "4.321 ms" or "4321 µs").
+          UPPER=$(echo "$BENCH_LINE" | grep -oE '[0-9]+\.[0-9]+ (ms|µs|us|ns)' | tail -1 || true)
+          echo "Upper bound: $UPPER"
+          if [ -z "$UPPER" ]; then
+            echo "FAIL: could not parse a timing value from: $BENCH_LINE — AC17 gate cannot be evaluated"
+            exit 1
+          fi
+          if echo "$UPPER" | grep -qE 'µs|us|ns'; then
+            echo "PASS: 64tools bench well under 5 ms (sub-millisecond unit)"
+          elif echo "$UPPER" | grep -q 'ms'; then
+            VAL=$(echo "$UPPER" | grep -oE '[0-9]+\.[0-9]+')
+            if awk "BEGIN {exit ($VAL < 5.0) ? 0 : 1}"; then
+              echo "PASS: 64tools bench upper bound ${VAL} ms < 5 ms gate"
             else
-              echo "WARNING: could not parse bench unit from: $UPPER — skipping gate"
+              echo "FAIL: 64tools bench upper bound ${VAL} ms >= 5 ms gate (AC17)"
+              exit 1
             fi
+          else
+            echo "FAIL: unrecognised bench unit in: $UPPER — AC17 gate cannot be evaluated"
+            exit 1
           fi
 
           echo "AC17 latency gate check complete."

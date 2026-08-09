@@ -55,7 +55,7 @@ use crate::span::locate_top_level_spans;
 use crate::stats::AlignStats;
 use rskim_contract::canonical::tools_arrays_set_equal;
 use rskim_contract::contract::{Contract, Outcome};
-use rskim_contract::waiver::{MARKER_BYTES, MetadataReorderWithMarkers};
+use rskim_contract::waiver::MetadataReorderWithMarkers;
 use rskim_llm::ParsedBody;
 /// Re-exported from `rskim_llm` so callers can construct a provider value
 /// without adding `rskim-llm` as a separate direct dependency.
@@ -221,9 +221,23 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
     }
 
     // ── Stats bookkeeping ────────────────────────────────────────────────────
-    let tools_key_sorted =
-        input_spans.contains_key("tools") || input_spans.contains_key("functions");
-    let spans_compacted = canonical_bytes.len() <= body.len();
+    //
+    // These are *measured*, not inferred from key presence (ADR-003): report what the
+    // canonicalization actually did. `tools_key_sorted` is true only when a tools or
+    // functions span was genuinely rewritten; `spans_compacted` only when the canonical
+    // body is strictly smaller than the input.
+    let tools_key_sorted = ["tools", "functions"].iter().any(|key| {
+        match (
+            input_spans.get(*key).and_then(|s| s.extract(input_str)),
+            canonical_spans
+                .get(*key)
+                .and_then(|s| s.extract(canonical_str)),
+        ) {
+            (Some(before), Some(after)) => before != after,
+            _ => false,
+        }
+    });
+    let spans_compacted = canonical_bytes.len() < body.len();
 
     // ── Step 3: Count client markers in original input ───────────────────────
     let client_count = breakpoint::count_client_markers(input_str, &input_spans);
@@ -310,29 +324,36 @@ fn apply_injection(
     let mut result = canonical_bytes.to_vec();
     let mut skim_count = 0usize;
 
+    // Precondition (AD-CA-13): the canonical envelope emits top-level keys in sorted
+    // order, so the `system` value always precedes the `tools` value. The splice order
+    // below (tools first, then system) depends on it — injecting into the LATER span
+    // first leaves the EARLIER span's offset valid. Verify rather than assume: if the
+    // ordering ever changed, splicing at a stale offset would corrupt the body.
+    if let (Some(sys), Some(tools)) = (canonical_spans.get("system"), canonical_spans.get("tools"))
+        && sys.start >= tools.start
+    {
+        return None; // fail-open rather than splice at a stale offset
+    }
+
     // Inject into tools (at higher byte offset in canonical output — 't' > 's').
     // Doing tools first leaves system's span offset unaffected.
     if plan.inject_tools
         && let (Some(tools_bytes), Some(tools_span)) =
             (canonical_tools_bytes, canonical_spans.get("tools"))
     {
-        let (injected_tools, inject_at_in_tools) = breakpoint::inject_tools_marker(tools_bytes)?;
+        let (injected_tools, tools_elem_idx) = breakpoint::inject_tools_marker(tools_bytes)?;
 
         // AD-CA-7 injection path self-verify for tools
-        if !breakpoint::verify_injection(tools_bytes, &injected_tools, inject_at_in_tools) {
+        if !breakpoint::verify_injection(tools_bytes, &injected_tools, tools_elem_idx) {
             return None;
         }
 
         // Replace tools value span in result with injected bytes.
         // canonical_spans.get("tools").start is the offset of the tools VALUE in
         // canonical_bytes, which is still valid in `result` (no earlier insertions yet).
-        let span_start = tools_span.start;
-        let span_end = tools_span.start + tools_span.len;
-        let mut new_result = Vec::with_capacity(result.len() + MARKER_BYTES);
-        new_result.extend_from_slice(&result[..span_start]);
-        new_result.extend_from_slice(&injected_tools);
-        new_result.extend_from_slice(&result[span_end..]);
-        result = new_result;
+        // Bounds are resolved with checked slicing: an out-of-range span fails the
+        // request open rather than panicking inside the proxy's forwarding path.
+        result = splice_span(&result, tools_span.start, tools_span.len, &injected_tools)?;
         skim_count += 1;
     }
 
@@ -343,11 +364,10 @@ fn apply_injection(
         && let (Some(system_bytes), Some(system_span)) =
             (canonical_system_bytes, canonical_spans.get("system"))
     {
-        let (injected_system, inject_at_in_system) =
-            breakpoint::inject_system_marker(system_bytes)?;
+        let (injected_system, system_elem_idx) = breakpoint::inject_system_marker(system_bytes)?;
 
         // AD-CA-7 injection path self-verify for system
-        if !breakpoint::verify_injection(system_bytes, &injected_system, inject_at_in_system) {
+        if !breakpoint::verify_injection(system_bytes, &injected_system, system_elem_idx) {
             return None;
         }
 
@@ -356,17 +376,32 @@ fn apply_injection(
         // tools_span.start > system_span.start, the tools injection did NOT
         // shift any bytes at position ≤ system_span.start. The system span
         // offset is still valid.
-        let span_start = system_span.start;
-        let span_end = system_span.start + system_span.len;
-        let mut new_result = Vec::with_capacity(result.len() + MARKER_BYTES);
-        new_result.extend_from_slice(&result[..span_start]);
-        new_result.extend_from_slice(&injected_system);
-        new_result.extend_from_slice(&result[span_end..]);
-        result = new_result;
+        result = splice_span(
+            &result,
+            system_span.start,
+            system_span.len,
+            &injected_system,
+        )?;
         skim_count += 1;
     }
 
     Some((result, skim_count))
+}
+
+/// Replace `buf[start..start + len]` with `replacement`, returning the new buffer.
+///
+/// Returns `None` when the span is out of bounds — the caller maps that to a
+/// whole-request fail-open. Index-based slicing would panic instead, and a panic
+/// inside the proxy's forwarding path is never an acceptable failure mode.
+fn splice_span(buf: &[u8], start: usize, len: usize, replacement: &[u8]) -> Option<Vec<u8>> {
+    let end = start.checked_add(len)?;
+    let head = buf.get(..start)?;
+    let tail = buf.get(end..)?;
+    let mut out = Vec::with_capacity(head.len() + replacement.len() + tail.len());
+    out.extend_from_slice(head);
+    out.extend_from_slice(replacement);
+    out.extend_from_slice(tail);
+    Some(out)
 }
 
 // ============================================================================
@@ -958,6 +993,62 @@ mod tests {
         assert_ne!(out.stats.output_sha256, [0u8; 32]);
         assert_eq!(out.stats.input_len, body.len());
         assert_eq!(out.stats.output_len, out.bytes.len());
+    }
+
+    #[test]
+    fn align_stats_report_measured_work_not_key_presence() {
+        // `tools_key_sorted` must reflect that the tools span ACTUALLY changed, and
+        // `spans_compacted` that the body ACTUALLY shrank (ADR-003: never report a
+        // number/flag that was not measured).
+        let non_canonical = br#"{"messages":[],"tools":[ {"name":"b"} , {"name":"a"} ]}"#;
+        let out = align(non_canonical, Provider::Anthropic, "req-stats-measured");
+        assert!(
+            out.stats.tools_key_sorted,
+            "a reordered + compacted tools span must report tools_key_sorted"
+        );
+        assert!(
+            out.stats.spans_compacted,
+            "removing whitespace must report spans_compacted"
+        );
+
+        // Already-canonical body with no tools: nothing was rewritten, nothing shrank.
+        let canonical = br#"{"max_tokens":10,"messages":[],"model":"claude-3"}"#;
+        let out = align(canonical, Provider::Anthropic, "req-stats-noop");
+        assert_eq!(out.bytes.as_slice(), canonical.as_slice());
+        assert!(
+            !out.stats.tools_key_sorted,
+            "no tools span means no key sort happened"
+        );
+        assert!(
+            !out.stats.spans_compacted,
+            "a byte-identical output did not compact anything"
+        );
+    }
+
+    #[test]
+    fn align_trailing_content_passthrough() {
+        // ADR-007: a body with bytes after the top-level object must NOT be silently
+        // truncated to the first object — it must pass through byte-identical.
+        let body = br#"{"messages":[],"model":"claude-3"}TRAILING"#;
+        let out = align(body, Provider::Anthropic, "req-trailing");
+        assert_eq!(&out.bytes, body, "trailing bytes must not be dropped");
+        assert!(out.stats.fail_open);
+    }
+
+    #[test]
+    fn align_empty_tool_object_no_panic_ac24() {
+        // AC24 structural edge shape: `tools:[{}]` must resolve deterministically with
+        // no panic. The empty object is an ineligible marker position, so the body is
+        // canonicalized without any injection.
+        let body = br#"{"messages":[],"tools":[{}]}"#;
+        let out = align(body, Provider::Anthropic, "req-empty-tool");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        assert!(!out_str.contains("cache_control"));
+        assert_eq!(out.stats.skim_breakpoints_injected, 0);
+        assert!(!out.stats.fail_open, "an empty tool object is not an error");
+        // Determinism: a second pass produces the same bytes.
+        let out2 = align(&out.bytes, Provider::Anthropic, "req-empty-tool-2");
+        assert_eq!(out.bytes, out2.bytes);
     }
 
     #[test]

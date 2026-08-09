@@ -70,7 +70,18 @@ impl Span {
 /// therefore well-defined for all values in a valid JSON object parsed from `input`.
 pub fn locate_top_level_spans(input: &str) -> Option<HashMap<String, Span>> {
     let mut de = serde_json::Deserializer::from_str(input);
-    SpanLocator { src: input }.deserialize(&mut de).ok()
+    let spans = SpanLocator { src: input }.deserialize(&mut de).ok()?;
+    // Reject trailing content after the top-level object.
+    //
+    // `Deserializer::deserialize_map` stops at the closing `}` of the first value and
+    // does NOT check what follows (only `serde_json::from_str` calls `end()` for you).
+    // Without this check a body such as `{"a":1}JUNK` or `{"a":1}{"b":2}` would locate
+    // spans successfully and `canonical_emit::canonical_envelope` would re-emit only the
+    // first object — silently DROPPING the trailing bytes on egress. That violates
+    // ADR-007 (lossless / meaning-preserving egress), so any trailing content forces a
+    // whole-request fail-open passthrough instead.
+    de.end().ok()?;
+    Some(spans)
 }
 
 // ============================================================================
@@ -211,6 +222,34 @@ mod tests {
     #[test]
     fn malformed_json_returns_none() {
         assert!(locate_top_level_spans("{not valid json").is_none());
+    }
+
+    #[test]
+    fn trailing_content_returns_none() {
+        // ADR-007: bytes after the top-level object would be dropped by the envelope
+        // re-emit. Reject the whole request instead of silently truncating it.
+        assert!(
+            locate_top_level_spans(r#"{"a":1}JUNK"#).is_none(),
+            "trailing garbage must force fail-open"
+        );
+        assert!(
+            locate_top_level_spans(r#"{"a":1}{"b":2}"#).is_none(),
+            "a second top-level object must force fail-open"
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_is_accepted() {
+        // Insignificant trailing whitespace is not content — it must still parse.
+        let input = "{\"a\":1}\n  ";
+        let spans = locate_top_level_spans(input).expect("trailing whitespace is valid JSON");
+        assert_eq!(spans["a"].extract(input).unwrap(), "1");
+    }
+
+    #[test]
+    fn non_object_top_level_returns_none() {
+        assert!(locate_top_level_spans("[1,2,3]").is_none());
+        assert!(locate_top_level_spans("\"just a string\"").is_none());
     }
 
     #[test]

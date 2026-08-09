@@ -1207,6 +1207,18 @@ impl ChannelAlignmentRecorder {
             drop_count,
         })
     }
+
+    /// Number of records dropped because the bounded channel was full or disconnected.
+    ///
+    /// # AC18 — Observable drop counter
+    ///
+    /// Drop-on-overflow is the correct failure mode for a fire-and-forget analytics
+    /// path, but a silent drop is not observable. This accessor makes the counter
+    /// readable so overflow is diagnosable (and testable) rather than invisible.
+    #[cfg(test)]
+    pub(crate) fn drop_count(&self) -> usize {
+        self.drop_count.load(Ordering::Relaxed)
+    }
 }
 
 #[cfg(feature = "proxy")]
@@ -1214,10 +1226,20 @@ impl AlignmentRecorder for ChannelAlignmentRecorder {
     /// Send a record via `try_send`.
     ///
     /// On overflow (`Err(Full)`) or disconnected (`Err(Disconnected)`), increments
-    /// `drop_count` and returns immediately. Never blocks.
+    /// `drop_count`, emits a `SKIM_DEBUG` notice, and returns immediately. Never blocks.
+    ///
+    /// # AC18 — Observable drop counter
+    ///
+    /// The counter is readable via [`ChannelAlignmentRecorder::drop_count`] and each
+    /// drop emits a debug-gated stderr notice, so overflow is diagnosable rather than
+    /// silent. Dropping is still the correct failure mode: a stalled request is worse
+    /// than a missing analytics row.
     fn record(&self, rec: AlignmentDecisionRecord) {
         if self.sender.try_send(rec).is_err() {
-            self.drop_count.fetch_add(1, Ordering::Relaxed);
+            let dropped = self.drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::debug_log!(
+                "skim proxy: alignment analytics channel full — record dropped (total dropped: {dropped})"
+            );
         }
     }
 }
@@ -2786,10 +2808,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// Counting mock recorder — counts record calls and overflow drops.
+    /// Counting mock recorder — counts `record` calls.
     ///
-    /// Used in proxy.rs tests (AC18): prove that drop-on-overflow behaviour of
-    /// `ChannelAlignmentRecorder` increments an observable counter.
+    /// Used in proxy.rs tests (AC18) to prove `CacheAlignStage::apply` emits exactly
+    /// one record per request. Drop-on-overflow is covered separately by
+    /// `test_channel_recorder_overflow_increments_observable_drop_count`, which
+    /// exercises the real `ChannelAlignmentRecorder`.
     #[cfg(feature = "proxy")]
     pub(crate) struct CountingMockRecorder {
         pub(crate) count: Arc<AtomicUsize>,
@@ -2835,6 +2859,61 @@ pub(crate) mod tests {
             input_sha256: [0u8; 32],
             output_sha256: [0u8; 32],
         });
+    }
+
+    /// Build an `AlignmentDecisionRecord` for tests (content-free by construction).
+    #[cfg(feature = "proxy")]
+    fn sample_alignment_record(request_id: &str) -> AlignmentDecisionRecord {
+        AlignmentDecisionRecord {
+            timestamp: 0,
+            request_id: request_id.to_string(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: true,
+            spans_compacted: true,
+            skim_breakpoints_injected: 1,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: false,
+            input_len: 10,
+            output_len: 10,
+            input_sha256: [0u8; 32],
+            output_sha256: [0u8; 32],
+        }
+    }
+
+    // AC18 / AD-CA-9: bounded-channel overflow drops the record AND increments an
+    // OBSERVABLE counter. DISCRIMINATING (PF-007): if `record` blocked instead of
+    // using try_send, this test would hang; if the counter were not incremented,
+    // the final assertion fails.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_channel_recorder_overflow_increments_observable_drop_count() {
+        // Capacity 1, and no consumer draining it: the second send must overflow.
+        let (tx, rx) = crossbeam_channel::bounded::<AlignmentDecisionRecord>(1);
+        let recorder = ChannelAlignmentRecorder {
+            sender: tx,
+            drop_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        recorder.record(sample_alignment_record("fits"));
+        assert_eq!(recorder.drop_count(), 0, "first record fits in the channel");
+
+        recorder.record(sample_alignment_record("overflows"));
+        recorder.record(sample_alignment_record("overflows-again"));
+        assert_eq!(
+            recorder.drop_count(),
+            2,
+            "AC18: each overflow must increment the observable drop counter"
+        );
+
+        // The one record that fit is still intact and content-free.
+        let received = rx.try_recv().expect("first record must be queued");
+        assert_eq!(received.request_id, "fits");
+        drop(rx);
+
+        // A disconnected channel also counts as a drop, never a block.
+        recorder.record(sample_alignment_record("disconnected"));
+        assert_eq!(recorder.drop_count(), 3);
     }
 
     // AC18 / AD-CA-9: ChannelAlignmentRecorder returns NoopRecorder when disabled.

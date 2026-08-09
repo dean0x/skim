@@ -319,13 +319,6 @@ pub(crate) fn run(
         eprintln!("{CLEARTEXT_WARNING}");
     }
 
-    // AD-CA-9 / AD-AN-5: build the AlignmentRecorder from the analytics config.
-    // ChannelAlignmentRecorder::new_boxed returns NoopRecorder when analytics are
-    // disabled, so the stage is always safe to construct.
-    // The local name is `align_recorder` to avoid shadowing the `analytics_cfg` param
-    // or the proxy-layer hook below (AD-CA-9 name-shadow resolution).
-    let align_recorder = crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
-
     // Build the transform pipeline.
     //
     // SKIM_PASSTHROUGH=1 → identity pipeline (no compression). Consistent with
@@ -346,11 +339,8 @@ pub(crate) fn run(
         TransformPipeline::identity()
     } else if parsed.no_cache_align {
         // --no-cache-align: run BlockRouterStage only; omit CacheAlignStage.
-        // align_recorder is not moved into any stage; it is dropped when run()
-        // returns. If analytics is enabled, the consumer thread runs idle (no
-        // records are sent) and exits when the sender drops at run() return.
-        // flush_pending() in main() joins the thread before process exit.
-        // If analytics is disabled, new_boxed() returned NoopRecorder (no thread).
+        // No AlignmentRecorder is constructed on this path, so no consumer thread
+        // is spawned and analytics.db is never opened by the proxy.
         let router = BlockRouter::new(Arc::new(BinarySinkStub));
         let block_stage = BlockRouterStage::new(router);
         TransformPipeline::from_stages(vec![Box::new(block_stage)])
@@ -359,17 +349,24 @@ pub(crate) fn run(
         // AD-CA-8: CacheAlignStage appended LAST per AD-PXY-06.
         let router = BlockRouter::new(Arc::new(BinarySinkStub));
         let block_stage = BlockRouterStage::new(router);
+        // AD-CA-9 / AD-AN-5: build the AlignmentRecorder from the analytics config
+        // ONLY on the path that uses it — `new_boxed` spawns a consumer thread and
+        // opens analytics.db, which must not happen under --no-cache-align or
+        // SKIM_PASSTHROUGH. It returns a NoopRecorder (no thread) when analytics
+        // are disabled, so the stage is always safe to construct.
+        //
         // AD-CA-9: CacheAlignStage takes ownership of the recorder. When
         // serve_with_stage() returns, the pipeline is dropped, which drops
         // CacheAlignStage, which drops the recorder, which drops the Sender.
         // The consumer thread drains remaining records and exits.
         // flush_pending() in main() joins the thread before process exit.
+        let align_recorder = crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
         let align_stage = CacheAlignStage::new(align_recorder);
         TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
     };
 
     // Call serve_with_stage() — blocks until SIGINT/SIGTERM and drain completes (AC23).
-    // After it returns, the pipeline is dropped (align_recorder sender closes),
+    // After it returns, the pipeline is dropped (the alignment recorder's sender closes),
     // allowing the consumer thread to drain and exit (joined by flush_pending in main).
     match rskim_proxy::serve_with_stage(config, pipeline, proxy_analytics_hook) {
         Ok(()) => Ok(ExitCode::SUCCESS),
