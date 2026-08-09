@@ -793,7 +793,11 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn test_cache_align_stage_noop_recorder_does_not_block() {
         let recorder = Box::new(crate::analytics::NoopRecorder);
-        let outcome = apply_align_stage(recorder, anthropic_body_with_tool(), ProxyProvider::Anthropic);
+        let outcome = apply_align_stage(
+            recorder,
+            anthropic_body_with_tool(),
+            ProxyProvider::Anthropic,
+        );
         assert!(
             !outcome.bytes.is_empty(),
             "CacheAlignStage must produce non-empty output"
@@ -812,10 +816,7 @@ mod tests {
             anthropic_body_with_tool(),
             ProxyProvider::Anthropic,
         );
-        assert!(
-            !outcome.bytes.is_empty(),
-            "output must be non-empty"
-        );
+        assert!(!outcome.bytes.is_empty(), "output must be non-empty");
         let records = handle.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(
             records.len(),
@@ -991,7 +992,9 @@ mod tests {
         let router = BlockRouter::new(Arc::new(BinarySinkStub));
         let pipeline = TransformPipeline::from_stages(vec![
             Box::new(BlockRouterStage::new(router)),
-            Box::new(CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder))),
+            Box::new(CacheAlignStage::new(Box::new(
+                crate::analytics::NoopRecorder,
+            ))),
         ]);
 
         let headers: Vec<(String, String)> = vec![];
@@ -1003,12 +1006,8 @@ mod tests {
             .map(|n| {
                 let body = build_turn_body(n);
                 let req_id = format!("ac5-turn-{n:02}");
-                let ctx = TransformContext::new(
-                    ProxyProvider::Anthropic,
-                    AuthMode::ApiKey,
-                    &req_id,
-                    &hv,
-                );
+                let ctx =
+                    TransformContext::new(ProxyProvider::Anthropic, AuthMode::ApiKey, &req_id, &hv);
                 pipeline.run(body, &ctx, &sink).bytes
             })
             .collect();
@@ -1027,7 +1026,8 @@ mod tests {
         let reference_tools = &tools_masked[0];
         for (i, tv) in tools_masked.iter().enumerate().skip(1) {
             assert_eq!(
-                tv, reference_tools,
+                tv,
+                reference_tools,
                 "AC5(a): tools value in turn {} differs from turn 1 after masking CC. \
                  CacheAlignStage canonical key-sort must stabilize tools across turns.",
                 i + 1
@@ -1048,7 +1048,8 @@ mod tests {
         let reference_system = &system_masked[0];
         for (i, sv) in system_masked.iter().enumerate().skip(1) {
             assert_eq!(
-                sv, reference_system,
+                sv,
+                reference_system,
                 "AC5(a): system value in turn {} differs from turn 1 after masking CC.",
                 i + 1
             );
@@ -1111,12 +1112,8 @@ mod tests {
             .map(|n| {
                 let body = build_turn_body(n);
                 let req_id = format!("ac5-neg-a-turn-{n:02}");
-                let ctx = TransformContext::new(
-                    ProxyProvider::Anthropic,
-                    AuthMode::ApiKey,
-                    &req_id,
-                    &hv,
-                );
+                let ctx =
+                    TransformContext::new(ProxyProvider::Anthropic, AuthMode::ApiKey, &req_id, &hv);
                 pipeline.run(body, &ctx, &sink).bytes
             })
             .collect();
@@ -1133,8 +1130,7 @@ mod tests {
         // Without CacheAlignStage, alternating key order must survive into output →
         // tools values MUST differ (proving CacheAlignStage is needed for stability).
         assert_ne!(
-            tools_values[0],
-            tools_values[1],
+            tools_values[0], tools_values[1],
             "AC5 negative arm A: without CacheAlignStage, tools key order must vary \
              between turns (confirming CacheAlignStage is required for cross-turn stability)"
         );
@@ -1190,12 +1186,8 @@ mod tests {
 
         // Use turn 1 (odd key order — non-canonical; aligner tries to grow body).
         let body = build_turn_body(1);
-        let ctx = TransformContext::new(
-            ProxyProvider::Anthropic,
-            AuthMode::ApiKey,
-            "ac5-neg-b",
-            &hv,
-        );
+        let ctx =
+            TransformContext::new(ProxyProvider::Anthropic, AuthMode::ApiKey, "ac5-neg-b", &hv);
         let out = pipeline.run(body, &ctx, &sink);
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
 

@@ -40,7 +40,7 @@
 use rskim_align::CacheAlignContract;
 use rskim_contract::canonical::tools_arrays_set_equal;
 use rskim_contract::contract::{Contract, Outcome};
-use rskim_contract::extension::{marker_immutability_check, ExtensionRegistry};
+use rskim_contract::extension::{ExtensionRegistry, marker_immutability_check};
 use rskim_contract::harness::run_conformance_suite_with_extensions;
 use rskim_contract::waiver::MetadataReorderWithMarkers;
 
@@ -198,10 +198,7 @@ fn message_content_unchanged(
     if in_texts.len() != out_texts.len() {
         return false;
     }
-    in_texts
-        .iter()
-        .zip(out_texts.iter())
-        .all(|(a, b)| a == b)
+    in_texts.iter().zip(out_texts.iter()).all(|(a, b)| a == b)
 }
 
 fn extract_message_texts(val: &serde_json::Value) -> Vec<String> {
@@ -318,7 +315,10 @@ fn ac20_cache_align_contract_passes_non_growth_invariants() {
     assert!(
         ac12_results.iter().all(|r| r.passed),
         "AC20: all AC12 invariants must pass. Failures: {:#?}",
-        ac12_results.iter().filter(|r| !r.passed).collect::<Vec<_>>()
+        ac12_results
+            .iter()
+            .filter(|r| !r.passed)
+            .collect::<Vec<_>>()
     );
 
     // ext:lossless-content: must PASS (set-equality permits the element reorder).
@@ -519,8 +519,7 @@ fn mutate_first_tool_description(input: &[u8]) -> Option<Vec<u8>> {
 fn ac20_description_mutator_fails_lossless_content_harness() {
     let contract = DescriptionMutator;
     let registry = build_extension_registry();
-    let report =
-        run_conformance_suite_with_extensions(&contract, "ac20-desc-mut", Some(&registry));
+    let report = run_conformance_suite_with_extensions(&contract, "ac20-desc-mut", Some(&registry));
 
     let lossless_results: Vec<_> = report
         .results

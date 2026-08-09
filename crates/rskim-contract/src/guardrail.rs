@@ -327,9 +327,18 @@ mod tests {
         let input = b"hello".to_vec(); // 5 bytes
         // candidate is 6 bytes — 1 over input but within max_growth=2
         let candidate = b"hello!".to_vec();
-        let outcome =
-            guarded_transform_with_growth(input.clone(), candidate.clone(), 2, "req-g1", "test", &*sink);
-        assert_eq!(outcome.bytes, candidate, "candidate within growth must be accepted");
+        let outcome = guarded_transform_with_growth(
+            input.clone(),
+            candidate.clone(),
+            2,
+            "req-g1",
+            "test",
+            &*sink,
+        );
+        assert_eq!(
+            outcome.bytes, candidate,
+            "candidate within growth must be accepted"
+        );
         assert!(!outcome.is_passthrough());
         assert_eq!(sink.len(), 1);
     }
@@ -341,9 +350,18 @@ mod tests {
         let input = b"hello".to_vec(); // 5 bytes
         // candidate is 7 bytes — exactly input + max_growth (2)
         let candidate = b"hello!!".to_vec();
-        let outcome =
-            guarded_transform_with_growth(input.clone(), candidate.clone(), 2, "req-g2", "test", &*sink);
-        assert_eq!(outcome.bytes, candidate, "candidate at growth boundary must be accepted");
+        let outcome = guarded_transform_with_growth(
+            input.clone(),
+            candidate.clone(),
+            2,
+            "req-g2",
+            "test",
+            &*sink,
+        );
+        assert_eq!(
+            outcome.bytes, candidate,
+            "candidate at growth boundary must be accepted"
+        );
         assert!(!outcome.is_passthrough());
     }
 
@@ -356,7 +374,10 @@ mod tests {
         let candidate = b"hello!!!".to_vec();
         let outcome =
             guarded_transform_with_growth(input.clone(), candidate, 2, "req-g3", "test", &*sink);
-        assert_eq!(outcome.bytes, input, "candidate beyond growth must be rejected to passthrough");
+        assert_eq!(
+            outcome.bytes, input,
+            "candidate beyond growth must be rejected to passthrough"
+        );
         assert!(outcome.is_passthrough());
         assert!(sink.is_empty(), "no record sent on gate rejection");
     }
@@ -369,12 +390,21 @@ mod tests {
         let input = b"hello world extra".to_vec();
         let candidate = b"hello world".to_vec();
 
-        let outcome1 =
-            guarded_transform_with_growth(input.clone(), candidate.clone(), 0, "req-r1", "test", &*sink1);
+        let outcome1 = guarded_transform_with_growth(
+            input.clone(),
+            candidate.clone(),
+            0,
+            "req-r1",
+            "test",
+            &*sink1,
+        );
         let outcome2 =
             guarded_transform(input.clone(), candidate.clone(), "req-r1", "test", &*sink2);
 
-        assert_eq!(outcome1.bytes, outcome2.bytes, "zero-growth must match guarded_transform");
+        assert_eq!(
+            outcome1.bytes, outcome2.bytes,
+            "zero-growth must match guarded_transform"
+        );
         assert_eq!(
             outcome1.is_passthrough(),
             outcome2.is_passthrough(),
@@ -392,7 +422,10 @@ mod tests {
         let candidate = b"hello!".to_vec(); // within max_growth=5
         let outcome =
             guarded_transform_with_growth(input.clone(), candidate, 5, "req-g4", "test", &*sink);
-        assert_eq!(outcome.bytes, input, "SinkFull must fall back to passthrough even with growth");
+        assert_eq!(
+            outcome.bytes, input,
+            "SinkFull must fall back to passthrough even with growth"
+        );
         assert!(outcome.is_passthrough());
         assert!(sink.is_empty(), "no record accepted on SinkFull");
     }
@@ -404,8 +437,14 @@ mod tests {
         let input = b"x".to_vec(); // 1 byte
         let candidate = b"xxxxx".to_vec(); // 5 bytes — normally would fail strict gate
         // max_growth=10 > candidate_len=5 → saturating_sub(10) = 0 ≤ 1 = input_len → accepted
-        let outcome =
-            guarded_transform_with_growth(input.clone(), candidate.clone(), 10, "req-g5", "test", &*sink);
+        let outcome = guarded_transform_with_growth(
+            input.clone(),
+            candidate.clone(),
+            10,
+            "req-g5",
+            "test",
+            &*sink,
+        );
         assert_eq!(outcome.bytes, candidate, "large growth allowance must pass");
         assert!(!outcome.is_passthrough());
     }

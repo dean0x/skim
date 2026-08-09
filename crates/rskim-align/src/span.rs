@@ -130,7 +130,13 @@ impl<'de, 'src: 'de> Visitor<'de> for SpanVisitor<'src> {
             }
 
             let offset = val_ptr - src_start;
-            result.insert(key, Span { start: offset, len: val_len });
+            result.insert(
+                key,
+                Span {
+                    start: offset,
+                    len: val_len,
+                },
+            );
         }
         Ok(result)
     }

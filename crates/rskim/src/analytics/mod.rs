@@ -24,9 +24,9 @@ use std::sync::Mutex;
 // Arc, AtomicUsize, and Ordering are only used in the proxy-gated
 // ChannelAlignmentRecorder and its test helpers (AD-CA-9).
 #[cfg(feature = "proxy")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(feature = "proxy")]
 use std::sync::Arc;
+#[cfg(feature = "proxy")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -1187,8 +1187,7 @@ impl ChannelAlignmentRecorder {
         if !analytics.enabled {
             return Box::new(NoopRecorder);
         }
-        let (tx, rx) =
-            crossbeam_channel::bounded::<AlignmentDecisionRecord>(ALIGN_CHANNEL_CAP);
+        let (tx, rx) = crossbeam_channel::bounded::<AlignmentDecisionRecord>(ALIGN_CHANNEL_CAP);
         let drop_count = Arc::new(AtomicUsize::new(0));
         let handle = std::thread::spawn(move || {
             // Open once — WAL + busy_timeout(5000) inherited from open_default.
@@ -1208,7 +1207,6 @@ impl ChannelAlignmentRecorder {
             drop_count,
         })
     }
-
 }
 
 #[cfg(feature = "proxy")]

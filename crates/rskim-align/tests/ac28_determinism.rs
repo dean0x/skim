@@ -167,10 +167,7 @@ fn ac28_hundred_runs_byte_identical() {
             Provider::Anthropic,
             &format!("ac28-run-{i:03}"),
         );
-        assert!(
-            !out.stats.fail_open,
-            "AC28(b): run {i} must not fail-open"
-        );
+        assert!(!out.stats.fail_open, "AC28(b): run {i} must not fail-open");
         assert_eq!(
             out.bytes, reference.bytes,
             "AC28(b): run {i} produced different bytes than the reference"
@@ -256,7 +253,11 @@ fn ac28_cyclic_rotations_converge() {
             r#"{{"model":"claude-3-5-sonnet-20241022","max_tokens":2048,"messages":[{{"role":"user","content":"List all tools"}}],"tools":[{tools_json}]}}"#
         );
 
-        let out = align(body.as_bytes(), Provider::Anthropic, &format!("ac28-cyc-{rotation}"));
+        let out = align(
+            body.as_bytes(),
+            Provider::Anthropic,
+            &format!("ac28-cyc-{rotation}"),
+        );
         assert!(
             !out.stats.fail_open,
             "AC28(b): rotation {rotation} must not fail-open"
@@ -298,8 +299,7 @@ fn ac28_name_collision_sorts_deterministically() {
         // Fail-open is acceptable for name-collision inputs.
         // If either fails open, both should fail open (same deterministic decision).
         assert_eq!(
-            out_a.stats.fail_open,
-            out_b.stats.fail_open,
+            out_a.stats.fail_open, out_b.stats.fail_open,
             "AC28(c): both or neither must fail-open on name collision"
         );
         // If fail-open, output must be byte-identical to input.

@@ -646,7 +646,11 @@ mod tests {
         let pipeline = TransformPipeline::from_stages(vec![Box::new(ShrinkStage)]);
         let outcome = pipeline.run(body, &ctx, &sink);
         // Half of 20 bytes = 10 bytes — well within zero-growth gate.
-        assert_eq!(outcome.bytes.len(), 10, "shrink must pass the zero-growth gate");
+        assert_eq!(
+            outcome.bytes.len(),
+            10,
+            "shrink must pass the zero-growth gate"
+        );
     }
 
     /// AC21 (NEGATIVE, seam regression): a stage with default max_growth=0 that

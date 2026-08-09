@@ -95,10 +95,7 @@ pub struct BreakpointPlan {
 ///
 /// This count is the sole input to the budget calculation. A client that
 /// fills all 4 slots (`client_count >= 4`) receives 0 skim markers.
-pub fn count_client_markers(
-    input_str: &str,
-    spans: &HashMap<String, Span>,
-) -> usize {
+pub fn count_client_markers(input_str: &str, spans: &HashMap<String, Span>) -> usize {
     let mut count = 0;
 
     // Count in tools/functions span
@@ -264,7 +261,11 @@ fn system_position_eligible(canonical_system: &[u8]) -> bool {
 /// canonical position used by `verify_injection`.
 /// `None` when the position is not eligible (not object, already has CC, empty array).
 pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
-    debug_assert_eq!(MARKER.len(), MARKER_BYTES, "AD-CA-4: MARKER must equal MARKER_BYTES");
+    debug_assert_eq!(
+        MARKER.len(),
+        MARKER_BYTES,
+        "AD-CA-4: MARKER must equal MARKER_BYTES"
+    );
 
     let s = std::str::from_utf8(canonical_tools).ok()?;
     let elements: Vec<Box<RawValue>> = serde_json::from_str(s.trim()).ok()?;
@@ -324,7 +325,11 @@ pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
 /// `injection_offset_within_canonical` is the byte position within the
 /// canonical system bytes where the marker was inserted (for self-verify).
 pub fn inject_system_marker(canonical_system: &[u8]) -> Option<(Vec<u8>, usize)> {
-    debug_assert_eq!(MARKER.len(), MARKER_BYTES, "AD-CA-4: MARKER must equal MARKER_BYTES");
+    debug_assert_eq!(
+        MARKER.len(),
+        MARKER_BYTES,
+        "AD-CA-4: MARKER must equal MARKER_BYTES"
+    );
 
     let sys_str = std::str::from_utf8(canonical_system).ok()?;
     let trimmed = sys_str.trim();
@@ -587,7 +592,8 @@ mod tests {
 
     #[test]
     fn count_cc_multiple_markers() {
-        let s = r#"[{"cache_control":{"type":"ephemeral"}},{"cache_control":{"type":"ephemeral"}}]"#;
+        let s =
+            r#"[{"cache_control":{"type":"ephemeral"}},{"cache_control":{"type":"ephemeral"}}]"#;
         assert_eq!(count_cc_in_span(s), 2);
     }
 
@@ -602,7 +608,8 @@ mod tests {
 
     #[test]
     fn count_client_markers_in_tools() {
-        let input = r#"{"tools":[{"name":"t","cache_control":{"type":"ephemeral"}}],"messages":[]}"#;
+        let input =
+            r#"{"tools":[{"name":"t","cache_control":{"type":"ephemeral"}}],"messages":[]}"#;
         let spans = crate::span::locate_top_level_spans(input).unwrap();
         assert_eq!(count_client_markers(input, &spans), 1);
     }
@@ -731,10 +738,16 @@ mod tests {
         // Verify: cc appears AFTER the 'b' element (i.e., it's in the 'c' element, not earlier).
         let last_b_name_pos = injected_str.rfind("\"name\":\"b\"").unwrap();
         let cc_pos = injected_str.rfind("\"cache_control\"").unwrap();
-        assert!(cc_pos > last_b_name_pos, "marker must be in the last element (c), not in earlier elements");
+        assert!(
+            cc_pos > last_b_name_pos,
+            "marker must be in the last element (c), not in earlier elements"
+        );
         // The 'a' and 'b' elements must NOT have cache_control
         let a_elem_end = injected_str.find("\"name\":\"a\"").unwrap() + 10;
-        assert!(!injected_str[..a_elem_end].contains("cache_control"), "a element must not have cc");
+        assert!(
+            !injected_str[..a_elem_end].contains("cache_control"),
+            "a element must not have cc"
+        );
         assert!(verify_injection(tools, &injected, offset));
     }
 
@@ -752,7 +765,8 @@ mod tests {
     #[test]
     fn inject_tools_nested_schema_correct_position() {
         // Element keys: input_schema (i), name (n) — both > 'c', so cc sorts FIRST.
-        let tools = b"[{\"input_schema\":{\"properties\":{\"x\":{\"type\":\"string\"}}},\"name\":\"a\"}]";
+        let tools =
+            b"[{\"input_schema\":{\"properties\":{\"x\":{\"type\":\"string\"}}},\"name\":\"a\"}]";
         let (injected, offset) = inject_tools_marker(tools).unwrap();
         assert_eq!(injected.len(), tools.len() + MARKER_BYTES);
         assert!(verify_injection(tools, &injected, offset));
@@ -816,7 +830,8 @@ mod tests {
 
     #[test]
     fn inject_system_already_has_cc_returns_none() {
-        let sys = b"[{\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"a\",\"type\":\"text\"}]";
+        let sys =
+            b"[{\"cache_control\":{\"type\":\"ephemeral\"},\"text\":\"a\",\"type\":\"text\"}]";
         assert!(inject_system_marker(sys).is_none());
     }
 

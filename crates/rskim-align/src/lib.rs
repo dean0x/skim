@@ -49,13 +49,13 @@ pub mod span;
 pub mod stats;
 pub mod volatile;
 
-use crate::breakpoint::{plan_injection, BreakpointPlan};
+use crate::breakpoint::{BreakpointPlan, plan_injection};
 use crate::canonical_emit::canonical_envelope;
 use crate::span::locate_top_level_spans;
 use crate::stats::AlignStats;
 use rskim_contract::canonical::tools_arrays_set_equal;
 use rskim_contract::contract::{Contract, Outcome};
-use rskim_contract::waiver::{MetadataReorderWithMarkers, MARKER_BYTES};
+use rskim_contract::waiver::{MARKER_BYTES, MetadataReorderWithMarkers};
 use rskim_llm::ParsedBody;
 /// Re-exported from `rskim_llm` so callers can construct a provider value
 /// without adding `rskim-llm` as a separate direct dependency.
@@ -211,7 +211,9 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
     // tools_arrays_set_equal(original_tools_span, canonicalized_reordered_tools_span)
     // Proves the element sort dropped, duplicated, or mutated nothing.
     let orig_tools_str = input_spans.get("tools").and_then(|s| s.extract(input_str));
-    let canon_tools_str = canonical_spans.get("tools").and_then(|s| s.extract(canonical_str));
+    let canon_tools_str = canonical_spans
+        .get("tools")
+        .and_then(|s| s.extract(canonical_str));
     if let (Some(orig), Some(canon)) = (orig_tools_str, canon_tools_str)
         && !tools_arrays_set_equal(orig, canon)
     {
@@ -219,7 +221,8 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
     }
 
     // ── Stats bookkeeping ────────────────────────────────────────────────────
-    let tools_key_sorted = input_spans.contains_key("tools") || input_spans.contains_key("functions");
+    let tools_key_sorted =
+        input_spans.contains_key("tools") || input_spans.contains_key("functions");
     let spans_compacted = canonical_bytes.len() <= body.len();
 
     // ── Step 3: Count client markers in original input ───────────────────────
@@ -313,8 +316,7 @@ fn apply_injection(
         && let (Some(tools_bytes), Some(tools_span)) =
             (canonical_tools_bytes, canonical_spans.get("tools"))
     {
-        let (injected_tools, inject_at_in_tools) =
-            breakpoint::inject_tools_marker(tools_bytes)?;
+        let (injected_tools, inject_at_in_tools) = breakpoint::inject_tools_marker(tools_bytes)?;
 
         // AD-CA-7 injection path self-verify for tools
         if !breakpoint::verify_injection(tools_bytes, &injected_tools, inject_at_in_tools) {
@@ -436,11 +438,7 @@ impl Contract for CacheAlignContract {
                 // Verify the waiver marker cap (AC20: use verify_marker_cap,
                 // not the strict never-inflate check, for a growing component).
                 if !self.verify_marker_cap(input.len(), candidate.len()) {
-                    return Outcome::passthrough(
-                        input.to_vec(),
-                        request_id,
-                        self.component_name(),
-                    );
+                    return Outcome::passthrough(input.to_vec(), request_id, self.component_name());
                 }
                 Outcome::modified(candidate, input.len(), request_id, self.component_name())
             }
@@ -542,7 +540,10 @@ mod tests {
         let body = br#"{"messages":[],"count":1e3}"#;
         let out = align(body, Provider::Anthropic, "req-005");
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
-        assert!(out_str.contains("1e3"), "number token 1e3 must not be reformatted");
+        assert!(
+            out_str.contains("1e3"),
+            "number token 1e3 must not be reformatted"
+        );
     }
 
     // ── AC4 — v1 marker budget ────────────────────────────────────────────────
@@ -554,7 +555,10 @@ mod tests {
         let out = align(body, Provider::Anthropic, "req-ac4");
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
         let cc_count = count_cache_control_occurrences(out_str);
-        assert_eq!(cc_count, 2, "expected exactly 2 skim markers (one in tools, one in system)");
+        assert_eq!(
+            cc_count, 2,
+            "expected exactly 2 skim markers (one in tools, one in system)"
+        );
         assert_eq!(out.stats.skim_breakpoints_injected, 2);
         assert!(!out.stats.fail_open);
     }
@@ -603,7 +607,8 @@ mod tests {
     #[test]
     fn align_volatile_body_same_placement_ac6() {
         // AC6: same body with/without UUID injected into system → identical marker placement
-        let body_stable = br#"{"messages":[],"system":[{"text":"stable","type":"text"}],"tools":[{"name":"a"}]}"#;
+        let body_stable =
+            br#"{"messages":[],"system":[{"text":"stable","type":"text"}],"tools":[{"name":"a"}]}"#;
         let body_volatile = br#"{"messages":[],"system":[{"text":"550e8400-e29b-41d4-a716-446655440000","type":"text"}],"tools":[{"name":"a"}]}"#;
 
         let out_stable = align(body_stable, Provider::Anthropic, "req-ac6a");
@@ -614,12 +619,21 @@ mod tests {
         let volatile_str = std::str::from_utf8(&out_volatile.bytes).unwrap();
         let stable_cc = count_cache_control_occurrences(stable_str);
         let volatile_cc = count_cache_control_occurrences(volatile_str);
-        assert_eq!(stable_cc, volatile_cc, "AC6: volatile content must not affect marker count");
+        assert_eq!(
+            stable_cc, volatile_cc,
+            "AC6: volatile content must not affect marker count"
+        );
 
         // Volatile body triggers a warn
-        assert!(out_volatile.stats.volatile_warn_count > 0, "volatile body must have warn count > 0");
+        assert!(
+            out_volatile.stats.volatile_warn_count > 0,
+            "volatile body must have warn count > 0"
+        );
         // Stable body has no warn
-        assert_eq!(out_stable.stats.volatile_warn_count, 0, "stable body must have no warn");
+        assert_eq!(
+            out_stable.stats.volatile_warn_count, 0,
+            "stable body must have no warn"
+        );
     }
 
     // ── AC7 — Shape eligibility ───────────────────────────────────────────────
@@ -631,7 +645,10 @@ mod tests {
         let out = align(body, Provider::Anthropic, "req-ac7a");
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
         // No cache_control injected
-        assert!(!out_str.contains("cache_control"), "AC7(a): no markers for string-only body");
+        assert!(
+            !out_str.contains("cache_control"),
+            "AC7(a): no markers for string-only body"
+        );
         assert_eq!(out.stats.skim_breakpoints_injected, 0);
         // System string preserved verbatim
         assert!(out_str.contains("\"You are helpful.\""));
@@ -646,8 +663,15 @@ mod tests {
         );
         let out = align(body_str.as_bytes(), Provider::Anthropic, "req-ac7b");
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
-        assert_eq!(count_cache_control_occurrences(out_str), 1, "AC7(b): exactly 1 marker on last tool");
-        assert!(out_str.contains(system_str), "AC7(b): system string must be verbatim");
+        assert_eq!(
+            count_cache_control_occurrences(out_str),
+            1,
+            "AC7(b): exactly 1 marker on last tool"
+        );
+        assert!(
+            out_str.contains(system_str),
+            "AC7(b): system string must be verbatim"
+        );
         assert_eq!(out.stats.skim_breakpoints_injected, 1);
     }
 
@@ -669,10 +693,19 @@ mod tests {
         let out1 = align(body, Provider::Anthropic, "req-ac8c");
         // Second pass: marker already in the last tool → idempotent (no double injection)
         let out2 = align(&out1.bytes, Provider::Anthropic, "req-ac8d");
-        assert_eq!(out1.bytes, out2.bytes, "AC8: must be idempotent with pre-marked body");
+        assert_eq!(
+            out1.bytes, out2.bytes,
+            "AC8: must be idempotent with pre-marked body"
+        );
         // Stats: second pass has 1 client marker (from first pass) and 0 skim markers
-        assert_eq!(out2.stats.skim_breakpoints_injected, 0, "second pass must not re-inject");
-        assert_eq!(out2.stats.client_breakpoint_count, 1, "second pass sees 1 client marker (skim's marker)");
+        assert_eq!(
+            out2.stats.skim_breakpoints_injected, 0,
+            "second pass must not re-inject"
+        );
+        assert_eq!(
+            out2.stats.client_breakpoint_count, 1,
+            "second pass sees 1 client marker (skim's marker)"
+        );
     }
 
     // ── AC10 — Fail-open on malformed/ambiguous input ─────────────────────────
@@ -769,8 +802,14 @@ mod tests {
         // AC13: fail-open inputs are SHA-256-equal to stage input (no byte change)
         let dup_body = br#"{"tools":[],"tools":[{"name":"a"}],"messages":[]}"#;
         let out = align(dup_body, Provider::Anthropic, "req-ac13b");
-        assert_eq!(&out.bytes, dup_body, "fail-open must return exact input bytes");
-        assert_eq!(out.stats.input_sha256, out.stats.output_sha256, "fail-open SHA-256s must be equal");
+        assert_eq!(
+            &out.bytes, dup_body,
+            "fail-open must return exact input bytes"
+        );
+        assert_eq!(
+            out.stats.input_sha256, out.stats.output_sha256,
+            "fail-open SHA-256s must be equal"
+        );
     }
 
     // ── AC14 — Client sovereignty (>4 markers) ───────────────────────────────
@@ -780,7 +819,10 @@ mod tests {
         // AC14: client has 4 markers → 0 skim markers injected, all client markers preserved
         let body = br#"{"messages":[{"role":"user","content":[{"cache_control":{"type":"ephemeral"},"text":"a","type":"text"},{"cache_control":{"type":"ephemeral"},"text":"b","type":"text"}]}],"system":[{"cache_control":{"type":"ephemeral"},"text":"sys","type":"text"}],"tools":[{"cache_control":{"type":"ephemeral"},"name":"t"}]}"#;
         let out = align(body, Provider::Anthropic, "req-ac14");
-        assert_eq!(out.stats.skim_breakpoints_injected, 0, "AC14: 4 client markers → 0 skim");
+        assert_eq!(
+            out.stats.skim_breakpoints_injected, 0,
+            "AC14: 4 client markers → 0 skim"
+        );
         // All 4 client markers preserved
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
         assert_eq!(count_cache_control_occurrences(out_str), 4);
@@ -791,7 +833,10 @@ mod tests {
         // AC14: 5 client markers → 0 skim markers
         let body = br#"{"messages":[{"role":"user","content":[{"cache_control":{"type":"ephemeral"},"text":"a","type":"text"},{"cache_control":{"type":"ephemeral"},"text":"b","type":"text"},{"cache_control":{"type":"ephemeral"},"text":"c","type":"text"}]}],"system":[{"cache_control":{"type":"ephemeral"},"text":"sys","type":"text"}],"tools":[{"cache_control":{"type":"ephemeral"},"name":"t"}]}"#;
         let out = align(body, Provider::Anthropic, "req-ac14b");
-        assert_eq!(out.stats.skim_breakpoints_injected, 0, "AC14: 5 client markers → 0 skim");
+        assert_eq!(
+            out.stats.skim_breakpoints_injected, 0,
+            "AC14: 5 client markers → 0 skim"
+        );
     }
 
     // ── AC15 — Provider isolation (OpenAI: no cache_control) ─────────────────

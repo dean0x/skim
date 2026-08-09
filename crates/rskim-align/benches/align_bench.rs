@@ -14,7 +14,7 @@
 //! internally. This file lives in `benches/` and is excluded from the CI
 //! source-level grep (`grep -rnE ... crates/rskim-align/src`).
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rskim_align::align;
 use rskim_llm::Provider;
 
@@ -62,9 +62,7 @@ fn build_anthropic_512kb_body() -> Vec<u8> {
     let large_content = "B".repeat(8192);
     let mut msgs: Vec<String> = Vec::new();
     for _ in 0..32 {
-        msgs.push(format!(
-            r#"{{"content":"{large_content}","role":"user"}}"#,
-        ));
+        msgs.push(format!(r#"{{"content":"{large_content}","role":"user"}}"#,));
         msgs.push(format!(
             r#"{{"content":"{large_content}","role":"assistant"}}"#,
         ));

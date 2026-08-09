@@ -310,7 +310,11 @@ pub(crate) fn sort_tools_array(raw: &str, kind: ToolArrayKind) -> Option<Vec<u8>
 
     // Sort: primary by name (decoded UTF-8 bytes), tie-break by canonical bytes
     // This is a total order — no element can be "incomparable".
-    keyed.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.canonical.cmp(&b.canonical)));
+    keyed.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.canonical.cmp(&b.canonical))
+    });
 
     // Emit sorted elements
     let mut out = Vec::new();
@@ -398,7 +402,8 @@ pub fn canonical_envelope(
             }
             "functions" => {
                 // OpenAI legacy functions array: top-level "name" sort key
-                let canonicalized = sort_tools_array(raw_val, ToolArrayKind::OpenAiLegacyFunctions)?;
+                let canonicalized =
+                    sort_tools_array(raw_val, ToolArrayKind::OpenAiLegacyFunctions)?;
                 out.extend_from_slice(&canonicalized);
             }
             "system" => match provider {
@@ -431,9 +436,11 @@ pub fn canonical_envelope(
 
     // AD-CA-7 envelope self-verify: assert messages span byte-identical
     // (should always pass since we copy verbatim; guards against future bugs)
-    if let (Some(input_msgs), Some(output_start), Some(output_len)) =
-        (messages_input_bytes, messages_output_start, messages_output_len)
-    {
+    if let (Some(input_msgs), Some(output_start), Some(output_len)) = (
+        messages_input_bytes,
+        messages_output_start,
+        messages_output_len,
+    ) {
         let output_end = output_start.checked_add(output_len)?;
         match out.get(output_start..output_end) {
             Some(out_slice) if out_slice == input_msgs.as_bytes() => {}
@@ -595,7 +602,11 @@ mod tests {
             "AD-CA-7: set-equality must hold after element reorder"
         );
         // Non-tautology: the sorted output is NOT byte-equal to the input (reorder happened)
-        assert_ne!(raw.as_bytes(), out.as_slice(), "reorder must produce a different byte sequence");
+        assert_ne!(
+            raw.as_bytes(),
+            out.as_slice(),
+            "reorder must produce a different byte sequence"
+        );
     }
 
     #[test]
@@ -634,10 +645,9 @@ mod tests {
     #[test]
     fn envelope_messages_span_verbatim_ad_ca_13() {
         // AC31: messages value must be byte-identical after envelope reorder
-        let messages_val = r#"[{"role":"user","content":"hello world"},{"role":"assistant","content":"hi"}]"#;
-        let input = format!(
-            r#"{{"model":"claude-3","messages":{messages_val},"max_tokens":100}}"#
-        );
+        let messages_val =
+            r#"[{"role":"user","content":"hello world"},{"role":"assistant","content":"hi"}]"#;
+        let input = format!(r#"{{"model":"claude-3","messages":{messages_val},"max_tokens":100}}"#);
         let spans = locate_top_level_spans(&input).unwrap();
         let out = canonical_envelope(&input, &spans, Provider::Anthropic).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
@@ -692,7 +702,10 @@ mod tests {
         let spans = locate_top_level_spans(input).unwrap();
         let out = canonical_envelope(input, &spans, Provider::Anthropic).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
-        assert!(out_str.contains("1e3"), "number token 1e3 must be preserved verbatim");
+        assert!(
+            out_str.contains("1e3"),
+            "number token 1e3 must be preserved verbatim"
+        );
     }
 
     #[test]
@@ -713,7 +726,10 @@ mod tests {
         let spans = locate_top_level_spans(input).unwrap();
         let out = canonical_envelope(input, &spans, Provider::OpenAi).unwrap();
         let out_str = std::str::from_utf8(&out).unwrap();
-        assert!(!out_str.contains("cache_control"), "OpenAI output must not contain cache_control");
+        assert!(
+            !out_str.contains("cache_control"),
+            "OpenAI output must not contain cache_control"
+        );
     }
 
     // ── Proptest: idempotence ─────────────────────────────────────────────────
@@ -752,9 +768,7 @@ mod tests {
             .prop_map(|(tools, model_val)| {
                 let tools_json = format!("[{}]", tools.join(","));
                 // Vary the top-level key order to test convergence
-                format!(
-                    r#"{{"model":{model_val},"messages":[],"tools":{tools_json}}}"#
-                )
+                format!(r#"{{"model":{model_val},"messages":[],"tools":{tools_json}}}"#)
             })
     }
 

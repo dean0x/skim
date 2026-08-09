@@ -443,9 +443,10 @@ pub fn tools_arrays_set_equal(raw_a: &str, raw_b: &str) -> bool {
 
     for a_elem in &a_elems {
         // Find the first unused b element that is canonically equal to a_elem.
-        let matched = b_elems.iter().enumerate().find(|(j, b_elem)| {
-            !used[*j] && raw_nodes_equal(a_elem, b_elem)
-        });
+        let matched = b_elems
+            .iter()
+            .enumerate()
+            .find(|(j, b_elem)| !used[*j] && raw_nodes_equal(a_elem, b_elem));
         match matched {
             Some((j, _)) => used[j] = true,
             None => return false, // no unused match → set mismatch
@@ -910,7 +911,10 @@ mod tests {
     #[test]
     fn tools_arrays_set_equal_same_order_is_true() {
         let a = r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#;
-        assert!(tools_arrays_set_equal(a, a), "identical arrays must be set-equal");
+        assert!(
+            tools_arrays_set_equal(a, a),
+            "identical arrays must be set-equal"
+        );
     }
 
     /// Drop one element → false (length mismatch catches it).
@@ -972,7 +976,10 @@ mod tests {
     /// Empty arrays → set-equal (vacuous).
     #[test]
     fn tools_arrays_set_equal_empty_is_true() {
-        assert!(tools_arrays_set_equal("[]", "[]"), "empty arrays are set-equal");
+        assert!(
+            tools_arrays_set_equal("[]", "[]"),
+            "empty arrays are set-equal"
+        );
     }
 
     /// Non-array inputs → false.
@@ -991,10 +998,8 @@ mod tests {
     /// and the mutation would be invisible.
     #[test]
     fn tools_arrays_set_equal_raw_number_mutation_is_false() {
-        let original =
-            r#"[{"name":"t","parameters":{"default":1e3}},{"name":"u"}]"#;
-        let mutated =
-            r#"[{"name":"u"},{"name":"t","parameters":{"default":1000}}]"#;
+        let original = r#"[{"name":"t","parameters":{"default":1e3}},{"name":"u"}]"#;
+        let mutated = r#"[{"name":"u"},{"name":"t","parameters":{"default":1000}}]"#;
         assert!(
             !tools_arrays_set_equal(original, mutated),
             "1e3 vs 1000 raw-token mutation must fail set-equality (AC11)"
