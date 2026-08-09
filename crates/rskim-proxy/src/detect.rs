@@ -197,48 +197,157 @@ fn detect_by_shape(body: &[u8]) -> Option<ProxyProvider> {
 // Model extraction (AD-PXY-22)
 // ============================================================================
 
+/// Upper bound on top-level keys scanned while looking for `"model"`.
+///
+/// ## Honest rationale (ADR-003 / PF-005)
+///
+/// **Not a measured threshold — it is derived from the sniff window.** The scan
+/// already cannot see past [`SHAPE_SNIFF_LIMIT`] bytes, and the shortest
+/// possible top-level entry (`"a":0,`) costs 6 bytes, so no valid document can
+/// present more than `SHAPE_SNIFF_LIMIT / 6` keys inside the window. The counter
+/// is the explicit loop bound the reliability rule requires; it can never be the
+/// binding constraint for well-formed input.
+const MAX_SNIFF_KEYS: usize = SHAPE_SNIFF_LIMIT / 6;
+
+/// Sentinel message for the early-exit `Err` raised once `"model"` is captured.
+///
+/// Not a failure: [`detect_model`] discards the error and reads the captured
+/// value. See the `ModelSeed` doc comment for why `Err` (not `Ok`) is the
+/// early-exit signal.
+const STOP_AFTER_MODEL: &str = "model key found — scan complete";
+
+/// Largest prefix of `sniff` that is valid UTF-8.
+///
+/// [`sniff_window`] cuts at a byte offset, which can land in the middle of a
+/// multi-byte character. Truncating to `valid_up_to()` keeps the scan working on
+/// such bodies instead of discarding the whole window.
+fn valid_utf8_prefix(sniff: &[u8]) -> &str {
+    match std::str::from_utf8(sniff) {
+        Ok(s) => s,
+        Err(e) => {
+            // SAFETY-equivalent: `valid_up_to()` is by definition a valid boundary.
+            std::str::from_utf8(&sniff[..e.valid_up_to()]).unwrap_or("")
+        }
+    }
+}
+
 /// Extract the model string from a request body, verbatim.
 ///
 /// ## AD-PXY-22 — verbatim model extraction
 ///
-/// Reuses the bounded shallow-JSON sniff infrastructure (`SHAPE_SNIFF_LIMIT`)
-/// to read only the top-level `"model"` key. The string is stored exactly as
-/// supplied — no casing, alias, or version normalization. Grouping in analytics
-/// is exact-string.
+/// Reuses the bounded shallow-JSON sniff budget (`SHAPE_SNIFF_LIMIT`) to read
+/// only the top-level `"model"` key. The string is stored exactly as supplied —
+/// no casing, alias, or version normalization. Grouping in analytics is
+/// exact-string.
+///
+/// ## Why an early-stopping visitor, not `serde_json::from_str::<Struct>`
+///
+/// A derived struct forces serde to consume the **whole** document to look for
+/// further fields, so a body larger than `SHAPE_SNIFF_LIMIT` — which is every
+/// real L3 transcript — parses as truncated JSON and yields `None`. That would
+/// leave `token_savings.model` NULL for essentially all production traffic and
+/// silently empty the per-model breakdown (AC5/AC10/AC11).
+///
+/// The seed below stops at the `"model"` key and never inspects the rest of the
+/// document, so trailing/truncated bytes after that key are tolerated. The
+/// honest bound is therefore "detected iff `model` appears within the first
+/// [`SHAPE_SNIFF_LIMIT`] bytes" rather than "iff the whole body fits in the
+/// sniff window".
 ///
 /// Returns `None` when:
-/// - The body is non-UTF-8
-/// - JSON parse fails (truncated or malformed)
-/// - No top-level `"model"` key is present
+/// - The sniff window holds no valid UTF-8 prefix
+/// - JSON parsing fails before reaching `"model"` (malformed, or truncated
+///   mid-way through an earlier value)
+/// - `"model"` is absent, `null`, or not a string
+/// - `"model"` sits beyond the sniff window
 ///
 /// The function MUST NOT delay or reject the request — it is infallible and
 /// always fails to `None`.
 pub(crate) fn detect_model(body: &[u8]) -> Option<String> {
     use serde::Deserialize;
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
 
     // Bound the sniff to SHAPE_SNIFF_LIMIT — same budget as provider detection.
-    let sniff = sniff_window(body);
-
-    let Ok(text) = std::str::from_utf8(sniff) else {
+    let text = valid_utf8_prefix(sniff_window(body));
+    if text.is_empty() {
         return None;
-    };
-
-    // Minimal struct: only materialise the `model` key. Serde skips unknown
-    // fields without allocating for them, so no catch-all field is needed —
-    // adding a `#[serde(flatten)]` map would force serde's intermediate
-    // content-buffering and allocate a String key for every top-level field.
-    // This mirrors the `ShallowBody` technique in `detect_by_shape` (AD-PXY-22).
-    #[derive(Deserialize)]
-    struct ModelOnly {
-        #[serde(default)]
-        model: Option<String>,
     }
 
-    let Ok(parsed) = serde_json::from_str::<ModelOnly>(text) else {
-        return None;
-    };
+    /// Top-level key discriminator — matched without allocating a `String`.
+    enum Key {
+        Model,
+        Other,
+    }
 
-    parsed.model
+    impl<'de> Deserialize<'de> for Key {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct KeyVisitor;
+            impl Visitor<'_> for KeyVisitor {
+                type Value = Key;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object key")
+                }
+                fn visit_str<E>(self, v: &str) -> Result<Key, E> {
+                    Ok(if v == "model" { Key::Model } else { Key::Other })
+                }
+            }
+            d.deserialize_str(KeyVisitor)
+        }
+    }
+
+    /// Seed that writes the model into the caller's slot and then aborts.
+    ///
+    /// The abort is why this is a `DeserializeSeed` writing through `&mut`
+    /// rather than a plain `Deserialize` returning the value: `serde_json`'s
+    /// `deserialize_map` calls `end_map()` after `visit_map` returns `Ok`, which
+    /// requires the map to have been drained to its closing `}`. Returning early
+    /// with `Ok` therefore fails on **every** document, truncated or not. Signalling
+    /// completion with `Err` skips that check; the value is already in the slot,
+    /// and the caller discards the error.
+    struct ModelSeed<'a>(&'a mut Option<String>);
+
+    impl<'de> serde::de::DeserializeSeed<'de> for ModelSeed<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for ModelSeed<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object with an optional top-level \"model\" key")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            // Explicit loop bound (reliability rule); see MAX_SNIFF_KEYS.
+            for _ in 0..MAX_SNIFF_KEYS {
+                let Some(key) = map.next_key::<Key>()? else {
+                    // Map drained without a `model` key — a clean, complete parse.
+                    return Ok(());
+                };
+                match key {
+                    // AD-PXY-22: verbatim. A non-string value (number, object,
+                    // `null`) leaves the slot `None` rather than fabricating a
+                    // stand-in; either way the scan is finished.
+                    Key::Model => {
+                        *self.0 = map.next_value::<String>().ok();
+                        return Err(serde::de::Error::custom(STOP_AFTER_MODEL));
+                    }
+                    Key::Other => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut model = None;
+    let mut de = serde_json::Deserializer::from_str(text);
+    // The result is deliberately discarded: `Err` is either a real parse failure
+    // (slot stays `None`) or the STOP_AFTER_MODEL early-exit (slot already set).
+    let _ = serde::de::DeserializeSeed::deserialize(ModelSeed(&mut model), &mut de);
+    model
 }
 
 // ============================================================================
@@ -510,6 +619,103 @@ mod tests {
     #[test]
     fn test_detect_model_empty_body() {
         assert_eq!(detect_model(b""), None, "empty body → None");
+    }
+
+    // AD-PXY-22 / regression: a realistic L3 request body is far larger than
+    // SHAPE_SNIFF_LIMIT (8 KiB).  The `model` key sits at the top of the object,
+    // well inside the sniff window, so it MUST still be extracted — the sniff
+    // bound truncates the JSON, and a whole-document parse of a truncated
+    // document fails.  Deleting the early-stop map visitor makes this fail
+    // (model would be None for essentially all real traffic).
+    #[test]
+    fn test_detect_model_body_larger_than_sniff_limit() {
+        let filler = "x".repeat(SHAPE_SNIFF_LIMIT * 4);
+        let body = format!(
+            r#"{{"model": "claude-3-5-sonnet-20241022", "messages": [{{"role": "user", "content": "{filler}"}}]}}"#
+        );
+        assert!(body.len() > SHAPE_SNIFF_LIMIT * 4);
+        assert_eq!(
+            detect_model(body.as_bytes()),
+            Some("claude-3-5-sonnet-20241022".to_owned()),
+            "model must be extracted from a body larger than SHAPE_SNIFF_LIMIT"
+        );
+    }
+
+    // AD-PXY-22: `model` need not be the first key — anything inside the sniff
+    // window is reachable even when the body is far larger.
+    #[test]
+    fn test_detect_model_not_first_key_in_large_body() {
+        let filler = "y".repeat(SHAPE_SNIFF_LIMIT * 4);
+        let body = format!(
+            r#"{{"max_tokens": 1024, "stream": true, "model": "gpt-4o", "messages": [{{"role": "user", "content": "{filler}"}}]}}"#
+        );
+        assert_eq!(
+            detect_model(body.as_bytes()),
+            Some("gpt-4o".to_owned()),
+            "model after other top-level keys must still be extracted"
+        );
+    }
+
+    // The sniff window cuts at a byte offset that may split a multi-byte
+    // character; the valid-UTF-8 prefix must still be scanned.
+    #[test]
+    fn test_detect_model_multibyte_boundary_in_large_body() {
+        // "€" is 3 bytes, so repeating it guarantees the 8 KiB cut lands
+        // mid-character for at least one of the two lengths below.
+        for pad in [SHAPE_SNIFF_LIMIT, SHAPE_SNIFF_LIMIT + 1] {
+            let filler = "€".repeat(pad);
+            let body = format!(r#"{{"model": "claude-opus-4", "system": "{filler}"}}"#);
+            assert_eq!(
+                detect_model(body.as_bytes()),
+                Some("claude-opus-4".to_owned()),
+                "multi-byte truncation boundary must not discard the sniff window"
+            );
+        }
+    }
+
+    // AD-PXY-22: when `model` sits beyond the sniff window it is genuinely
+    // unavailable — the bound is honest, not silently widened.
+    #[test]
+    fn test_detect_model_beyond_sniff_window_is_none() {
+        let filler = "x".repeat(SHAPE_SNIFF_LIMIT * 2);
+        let body = format!(r#"{{"system": "{filler}", "model": "gpt-4o"}}"#);
+        assert_eq!(
+            detect_model(body.as_bytes()),
+            None,
+            "a model key past SHAPE_SNIFF_LIMIT is out of budget → None"
+        );
+    }
+
+    // AD-PXY-22: a non-object top-level JSON value yields None, not a panic.
+    #[test]
+    fn test_detect_model_non_object_json() {
+        assert_eq!(detect_model(b"[1,2,3]"), None, "JSON array → None");
+        assert_eq!(
+            detect_model(b"\"just a string\""),
+            None,
+            "JSON string → None"
+        );
+    }
+
+    // AD-PXY-22: an explicit JSON null model yields None.
+    #[test]
+    fn test_detect_model_null_value() {
+        assert_eq!(
+            detect_model(br#"{"model": null}"#),
+            None,
+            "null model → None"
+        );
+    }
+
+    // AD-PXY-22: a non-string model value must not abort extraction with a
+    // fabricated value — it yields None.
+    #[test]
+    fn test_detect_model_non_string_value() {
+        assert_eq!(
+            detect_model(br#"{"model": 42}"#),
+            None,
+            "numeric model → None"
+        );
     }
 
     // AD-PXY-22: OpenAI model string verbatim.

@@ -1062,16 +1062,30 @@ impl AnalyticsDb {
             return Ok(0);
         }
 
+        // AD-AN-6: scope the cleanup to CLI rows.  This DELETE repairs a
+        // pre-#305 CLI recording bug that failed to clamp at record time.  A
+        // proxy row with `compressed_tokens > raw_tokens` is NOT corrupt — it is
+        // a measured expansion (the transform grew the body), which AD-AN-7
+        // requires be recorded honestly.  Without this predicate the one-time
+        // sweep would silently destroy those legitimate measurements, biasing
+        // reported savings upward by deleting exactly the worst outcomes.
+        //
         // AD-AN-13: delete the child detail rows in the same transaction (the
-        // declared FK does not cascade — `PRAGMA foreign_keys` is off).
+        // declared FK does not cascade — `PRAGMA foreign_keys` is off).  Today
+        // only proxy parents carry detail rows, so with the CLI scope above this
+        // statement matches nothing; it is kept so the child DELETE can never
+        // drift out of step with the parent predicate should a later migration
+        // attach detail rows to other command types.
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM proxy_block_decisions WHERE savings_id IN \
-             (SELECT id FROM token_savings WHERE compressed_tokens > raw_tokens)",
+             (SELECT id FROM token_savings \
+              WHERE command_type != 'proxy' AND compressed_tokens > raw_tokens)",
             [],
         )?;
         let count = tx.execute(
-            "DELETE FROM token_savings WHERE compressed_tokens > raw_tokens",
+            "DELETE FROM token_savings \
+             WHERE command_type != 'proxy' AND compressed_tokens > raw_tokens",
             [],
         )?;
         tx.commit()?;
@@ -1430,20 +1444,28 @@ impl AnalyticsDb {
             } else if counted_rows > 0 {
                 let raw: u64 = rows.iter().filter_map(|r| r.raw_tokens).sum();
                 let comp: u64 = rows.iter().filter_map(|r| r.compressed_tokens).sum();
-                // Weighted average savings_pct over counted model rows.
-                let counted_models: Vec<&ProxyModelStats> = rows
+                // Row-weighted mean savings_pct over counted model rows.
+                //
+                // Each `ProxyModelStats::avg_savings_pct` is itself an average
+                // over that model's `counted_rows` requests, so the model
+                // averages must be weighted by `counted_rows` to reproduce the
+                // provider-level mean.  An unweighted mean of the model averages
+                // would let a single-request model outweigh a thousand-request
+                // one (e.g. gpt-4 @ 90% over 1 request + gpt-4o @ 0% over 999
+                // reporting 45% instead of ~0.09%).
+                let weight_total: u64 = rows
                     .iter()
                     .filter(|r| r.avg_savings_pct.is_some())
-                    .copied()
-                    .collect();
-                let avg_pct: Option<f64> = if counted_models.is_empty() {
+                    .map(|r| r.counted_rows)
+                    .sum();
+                let avg_pct: Option<f64> = if weight_total == 0 {
                     None
                 } else {
-                    let s: f64 = counted_models
+                    let weighted: f64 = rows
                         .iter()
-                        .filter_map(|r| r.avg_savings_pct)
+                        .filter_map(|r| r.avg_savings_pct.map(|p| p * r.counted_rows as f64))
                         .sum();
-                    Some(s / counted_models.len() as f64)
+                    Some(weighted / weight_total as f64)
                 };
                 (first_basis.to_string(), Some(raw), Some(comp), avg_pct)
             } else {
@@ -4029,11 +4051,16 @@ mod tests {
     /// `token_savings` row also deletes its `proxy_block_decisions` children.
     ///
     /// `PRAGMA foreign_keys` is off (SQLite default), so the declared FK does
-    /// NOT cascade.  Dropping the explicit child DELETE from `clear`,
-    /// `prune_older_than`, or `clean_invalid_records` leaves detail rows with no
-    /// deletion path at all — they would survive both `skim stats --clear` and
-    /// the 90-day retention prune forever.  Removing any of the three child
-    /// DELETEs fails this test.
+    /// NOT cascade.  Dropping the explicit child DELETE from `clear` or
+    /// `prune_older_than` leaves detail rows with no deletion path at all — they
+    /// would survive both `skim stats --clear` and the 90-day retention prune
+    /// forever.  Removing either child DELETE fails this test.
+    ///
+    /// `clean_invalid_records` is the third arm, and it is CLI-scoped (AD-AN-6):
+    /// it must delete *nothing* here, because an expanded proxy row is a valid
+    /// measurement rather than corruption.  See
+    /// `test_clean_invalid_records_preserves_expanded_proxy_rows` for the
+    /// dedicated coverage.
     #[test]
     fn test_deleting_parent_rows_also_deletes_block_decision_rows() {
         // --- clear() ---
@@ -4084,18 +4111,22 @@ mod tests {
         );
 
         // --- clean_invalid_records() ---
+        // AD-AN-6: the sweep repairs a pre-#305 CLI recording bug and is scoped
+        // to `command_type != 'proxy'`.  `compressed > raw` on a proxy row is a
+        // measured expansion, not corruption (AD-AN-7), so nothing is deleted
+        // and no detail row can be stranded.
         let (mut db, _tmp) = test_db();
         let mut expanded = sample_proxy_input();
         expanded.raw_tokens = Some(100);
-        expanded.compressed_tokens = Some(500); // compressed > raw ⇒ "invalid"
+        expanded.compressed_tokens = Some(500); // measured expansion
         db.record_proxy(&expanded).unwrap();
         assert_eq!(detail_row_count(&db), 2);
         let cleaned = db.clean_invalid_records().unwrap();
-        assert_eq!(cleaned, 1);
+        assert_eq!(cleaned, 0, "the CLI-scoped sweep must skip proxy rows");
         assert_eq!(
             detail_row_count(&db),
-            0,
-            "clean_invalid_records must not strand orphaned detail rows"
+            2,
+            "a surviving parent keeps its detail rows — nothing stranded, nothing lost"
         );
     }
 
@@ -4902,6 +4933,142 @@ mod tests {
             .unwrap();
         assert_eq!(gpt4.basis, "exact", "gpt-4 (Cl100k) must have basis=exact");
         assert_eq!(gpt4.raw_tokens, Some(2000));
+    }
+
+    /// AD-AN-9 — the per-provider `avg_savings_pct` rollup is weighted by each
+    /// model's counted-row count, not an unweighted mean of model averages.
+    ///
+    /// PF-007 discriminator: one `claude-3-opus` request at 90% plus nine
+    /// `claude-3-haiku` requests at 0% must roll up to 9%, the true per-request
+    /// mean. An unweighted mean of the two model averages yields 45% — five
+    /// times the real figure — so reverting the weighting fails this test.
+    /// Both models resolve to `AnthropicOffline`, keeping the group single-basis
+    /// so the token rollup (and therefore `avg_savings_pct`) is emitted at all.
+    #[test]
+    fn test_query_by_provider_avg_savings_is_row_weighted() {
+        let (db, _tmp) = test_db();
+
+        // One high-savings request.
+        insert_proxy_row(
+            &db,
+            Some("anthropic"),
+            Some("claude-3-opus"),
+            Some(1000),
+            Some(100),
+            Some(90.0),
+            None,
+            "full",
+            1_711_400_001,
+        );
+        // Nine zero-savings requests on a different model in the same family.
+        for i in 0..9 {
+            insert_proxy_row(
+                &db,
+                Some("anthropic"),
+                Some("claude-3-haiku"),
+                Some(1000),
+                Some(1000),
+                Some(0.0),
+                None,
+                "passthrough",
+                1_711_400_010 + i,
+            );
+        }
+
+        let providers = db.query_by_provider(None).unwrap();
+        assert_eq!(providers.len(), 1, "must be 1 provider group (anthropic)");
+        let prov = &providers[0];
+        assert_eq!(prov.requests, 10);
+        assert_eq!(prov.counted_rows, 10);
+        assert_ne!(
+            prov.basis, "mixed",
+            "both models share AnthropicOffline — the rollup must be emitted"
+        );
+
+        let avg = prov
+            .avg_savings_pct
+            .expect("single-basis provider must carry a combined savings figure");
+        assert!(
+            (avg - 9.0).abs() < 1e-9,
+            "AD-AN-9: provider rollup must be row-weighted (expected 9.0, got {avg}); \
+             45.0 indicates an unweighted mean of per-model averages"
+        );
+    }
+
+    /// AD-AN-6 — `clean_invalid_records` is a pre-#305 CLI repair sweep and must
+    /// never touch proxy rows.
+    ///
+    /// PF-007 discriminator: a proxy row whose transform genuinely expanded the
+    /// body (`compressed_tokens > raw_tokens`) is a valid measurement that
+    /// AD-AN-7 requires be kept. Dropping the `command_type != 'proxy'` predicate
+    /// deletes it — and its detail rows — biasing reported savings upward by
+    /// removing precisely the worst outcomes. The CLI row in the same table
+    /// proves the sweep still does its original job.
+    #[test]
+    fn test_clean_invalid_records_preserves_expanded_proxy_rows() {
+        let (mut db, _tmp) = test_db();
+
+        // A genuinely expanded proxy row (compressed > raw) plus detail rows.
+        let mut input = sample_proxy_input();
+        input.raw_tokens = Some(100);
+        input.compressed_tokens = Some(140);
+        input.savings_pct = Some(-40.0);
+        input.blocks = vec![ProxyBlockDecision {
+            block_index: 0,
+            component: "block-router".to_string(),
+            outcome: "full".to_string(),
+            bytes_in: 400,
+            bytes_out: 560,
+        }];
+        db.record_proxy(&input).unwrap();
+
+        // A CLI row with the pre-#305 corruption the sweep exists to remove.
+        db.conn
+            .execute(
+                "INSERT INTO token_savings \
+                 (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, \
+                  savings_pct, duration_ms, project_path) \
+                 VALUES (1711500000, 'file', 'cat x.ts', 100, 400, -300.0, 5, '/tmp')",
+                [],
+            )
+            .unwrap();
+
+        let deleted = db.clean_invalid_records().unwrap();
+        assert_eq!(deleted, 1, "only the corrupt CLI row may be deleted");
+
+        let proxy_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM token_savings WHERE command_type = 'proxy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            proxy_rows, 1,
+            "AD-AN-6: an expanded proxy row is a valid measurement and must survive"
+        );
+
+        let detail_rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM proxy_block_decisions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            detail_rows, 1,
+            "the surviving parent must keep its detail rows"
+        );
+
+        let cli_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM token_savings WHERE command_type != 'proxy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cli_rows, 0, "the corrupt CLI row must still be swept");
     }
 
     /// query_by_upstream_error — counts only rows with upstream_error_status IS NOT NULL.

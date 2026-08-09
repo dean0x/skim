@@ -229,17 +229,29 @@ pub(crate) fn event_payload_bytes(event: &ProxyEvent) -> u64 {
 /// bounded lifecycle established here — one `recv_timeout(FLUSH_BOUND)`
 /// gate per proxy startup in `proxy.rs` (Cross-Plan Amendment #4 / ADR-003).
 /// Do NOT add a second divergent `flush_pending()` drain for #306.
+///
+/// `db_path` is the injected database location: `None` resolves through
+/// `AnalyticsDb::open_default()` (the production path, honouring
+/// `SKIM_ANALYTICS_DB` / `SKIM_CACHE_DIR`), `Some(p)` opens `p` directly. The
+/// parameter exists so tests can drive **this** function against a temp DB
+/// instead of re-implementing the drain loop — a duplicated loop silently drifts
+/// from production and would leave the real consumer untested — and without
+/// racing on `std::env::set_var` between parallel tests.
 pub(crate) fn spawn_consumer(
     rx: crossbeam_channel::Receiver<ProxyEvent>,
     drop_count: Arc<AtomicU64>,
     queued_bytes: Arc<AtomicU64>,
     session_id: Option<String>,
     done_tx: crossbeam_channel::Sender<()>,
+    db_path: Option<std::path::PathBuf>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         // Attempt to open the analytics DB once. Failure → all events are
         // dropped-and-counted (fail-open, AC15).
-        let mut db = AnalyticsDb::open_default().ok();
+        let mut db = match db_path {
+            Some(ref p) => AnalyticsDb::open(p).ok(),
+            None => AnalyticsDb::open_default().ok(),
+        };
 
         // Drain until the sender side closes (returns Err when channel is
         // empty and all senders have been dropped).
@@ -476,12 +488,16 @@ mod tests {
         )
     }
 
-    /// Run an inline consumer against a real DB at `db_path`.
+    /// Drive the **production** [`spawn_consumer`] against a test-scoped DB path.
     ///
-    /// Drains `rx` until the channel closes, writes each event to the DB,
-    /// persists drops, and signals `done_tx` on completion. Used in tests that
-    /// need a real DB without touching the process-global `SKIM_ANALYTICS_DB`
-    /// env var (thread-unsafe).
+    /// Drains `rx` until the channel closes, writes each event to the DB at
+    /// `db_path`, persists drops, and signals `done_tx` on completion.
+    ///
+    /// This is deliberately a thin delegation rather than a re-implementation of
+    /// the drain loop: a copied loop would let the tests keep passing while
+    /// `spawn_consumer` regressed. The injected path also avoids the
+    /// thread-unsafe `std::env::set_var` races that `open_default()` would
+    /// otherwise force between parallel tests.
     fn run_inline_consumer(
         db_path: &Path,
         rx: crossbeam_channel::Receiver<ProxyEvent>,
@@ -490,35 +506,14 @@ mod tests {
         session_id: Option<String>,
         done_tx: crossbeam_channel::Sender<()>,
     ) -> std::thread::JoinHandle<()> {
-        let db_path = db_path.to_path_buf();
-        std::thread::spawn(move || {
-            let mut db = AnalyticsDb::open(&db_path).ok();
-            for event in &rx {
-                let payload = event_payload_bytes(&event);
-                let _ = queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(payload))
-                });
-                match db {
-                    Some(ref mut db) => {
-                        let input = build_proxy_record_input(&event, &session_id);
-                        if db.record_proxy(&input).is_err() {
-                            drop_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    None => {
-                        drop_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            let total = drop_count.load(Ordering::Relaxed);
-            // if-let chain (Rust 2024): mirror the production spawn_consumer form.
-            if total > 0
-                && let Some(ref db) = db
-            {
-                let _ = db.analytics_meta_add_drop_count(total);
-            }
-            let _ = done_tx.send(());
-        })
+        spawn_consumer(
+            rx,
+            drop_count,
+            queued_bytes,
+            session_id,
+            done_tx,
+            Some(db_path.to_path_buf()),
+        )
     }
 
     // -------------------------------------------------------------------------

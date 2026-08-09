@@ -247,6 +247,9 @@ pub(crate) fn run(
             queued_bytes,
             analytics.session_id.clone(),
             done_tx,
+            // None → AnalyticsDb::open_default(), honouring SKIM_ANALYTICS_DB /
+            // SKIM_CACHE_DIR. Only tests inject an explicit path.
+            None,
         );
         analytics_arc = Arc::new(hook);
         consumer_handle = Some(handle);
