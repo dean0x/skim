@@ -721,7 +721,7 @@ mod tests {
             ) -> Outcome {
                 let mut out = body.to_vec();
                 // Append exactly GROWTH bytes to simulate marker injection.
-                out.extend(std::iter::repeat(b'M').take(GROWTH));
+                out.extend(std::iter::repeat_n(b'M', GROWTH));
                 Outcome::modified(out, body.len(), ctx.request_id, self.name())
             }
             fn max_growth(&self, _input_len: usize) -> usize {
@@ -771,7 +771,7 @@ mod tests {
                 _sink: &dyn DecisionSink,
             ) -> Outcome {
                 let mut out = body.to_vec();
-                out.extend(std::iter::repeat(b'M').take(GROWTH));
+                out.extend(std::iter::repeat_n(b'M', GROWTH));
                 Outcome::modified(out, body.len(), ctx.request_id, self.name())
             }
             fn max_growth(&self, _input_len: usize) -> usize {
@@ -823,7 +823,7 @@ mod tests {
             ) -> Outcome {
                 let mut out = body.to_vec();
                 // Inflate by 50 bytes — well beyond the declared growth of 10.
-                out.extend(std::iter::repeat(b'X').take(50));
+                out.extend(std::iter::repeat_n(b'X', 50));
                 Outcome::modified(out, body.len(), ctx.request_id, self.name())
             }
             fn max_growth(&self, _input_len: usize) -> usize {

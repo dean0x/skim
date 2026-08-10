@@ -1145,7 +1145,10 @@ mod tests {
             &out.bytes, body,
             "AC26: depth-exceeded body must fail-open to byte-identical passthrough"
         );
-        assert!(out.stats.fail_open, "AC26: depth-exceeded must set fail_open=true");
+        assert!(
+            out.stats.fail_open,
+            "AC26: depth-exceeded must set fail_open=true"
+        );
         // SHA-256 equality (passthrough assertion)
         assert_eq!(
             out.stats.input_sha256, out.stats.output_sha256,
@@ -1169,8 +1172,8 @@ mod tests {
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
 
         // Extract the messages value from the output using span-location
-        let out_spans = crate::span::locate_top_level_spans(out_str)
-            .expect("AC11: output must be valid JSON");
+        let out_spans =
+            crate::span::locate_top_level_spans(out_str).expect("AC11: output must be valid JSON");
         let out_messages = out_spans
             .get("messages")
             .and_then(|s| s.extract(out_str))
@@ -1217,7 +1220,10 @@ mod tests {
             "AC24: empty tools array must not get a marker"
         );
         assert_eq!(out.stats.skim_breakpoints_injected, 0);
-        assert!(!out.stats.fail_open, "AC24: empty tools array is not an error");
+        assert!(
+            !out.stats.fail_open,
+            "AC24: empty tools array is not an error"
+        );
     }
 
     #[test]
@@ -1229,7 +1235,10 @@ mod tests {
             &out.bytes, body,
             "AC24: non-array tools must fail-open to byte-identical passthrough"
         );
-        assert!(out.stats.fail_open, "AC24: non-array tools must set fail_open");
+        assert!(
+            out.stats.fail_open,
+            "AC24: non-array tools must set fail_open"
+        );
     }
 
     #[test]
@@ -1305,9 +1314,9 @@ mod tests {
     fn ac29_set_equal_gate_passes_correct_sort() {
         // AC29 POSITIVE companion: gate passes for a correctly sorted output.
         // Non-tautology: the sorted output is NOT byte-equal to the input (reorder happened).
-        use rskim_contract::canonical::tools_arrays_set_equal;
-        use crate::canonical_emit::sort_tools_array;
         use crate::canonical_emit::ToolArrayKind;
+        use crate::canonical_emit::sort_tools_array;
+        use rskim_contract::canonical::tools_arrays_set_equal;
         let original = r#"[{"name":"beta","x":1},{"name":"alpha","x":2}]"#;
         let sorted = sort_tools_array(original, ToolArrayKind::AnthropicTools).unwrap();
         let sorted_str = std::str::from_utf8(&sorted).unwrap();
@@ -1316,7 +1325,8 @@ mod tests {
             "AC29: correct sort must pass the set-equal gate"
         );
         assert_ne!(
-            original.as_bytes(), sorted.as_slice(),
+            original.as_bytes(),
+            sorted.as_slice(),
             "AC29: sort must have actually reordered elements (non-tautology)"
         );
     }

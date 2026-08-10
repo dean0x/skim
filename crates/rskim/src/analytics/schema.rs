@@ -120,7 +120,11 @@ mod tests {
     fn schema_fresh_migration_advances_to_v4() {
         let conn = open_mem();
         run_migrations(&conn).expect("migrations must succeed on fresh db");
-        assert_eq!(user_version(&conn), 4, "fresh db must reach user_version = 4");
+        assert_eq!(
+            user_version(&conn),
+            4,
+            "fresh db must reach user_version = 4"
+        );
         assert!(
             table_exists(&conn, "token_savings"),
             "v1: token_savings table must exist"
@@ -160,7 +164,11 @@ mod tests {
 
         // Now re-run migrations — only the v4 block should fire.
         run_migrations(&conn).expect("v3→v4 migration must succeed");
-        assert_eq!(user_version(&conn), 4, "v3 db must advance to user_version = 4");
+        assert_eq!(
+            user_version(&conn),
+            4,
+            "v3 db must advance to user_version = 4"
+        );
         assert!(
             table_exists(&conn, "alignment_decisions"),
             "v4: alignment_decisions table must be created by v3→v4 migration"
@@ -175,7 +183,11 @@ mod tests {
         let conn = open_mem();
         run_migrations(&conn).expect("first migration run must succeed");
         run_migrations(&conn).expect("second migration run must succeed (idempotent)");
-        assert_eq!(user_version(&conn), 4, "double migration must keep user_version = 4");
+        assert_eq!(
+            user_version(&conn),
+            4,
+            "double migration must keep user_version = 4"
+        );
     }
 
     // AC19 / POSITIVE: the alignment_decisions table has the correct column schema.

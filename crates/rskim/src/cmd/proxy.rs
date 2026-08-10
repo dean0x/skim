@@ -1227,9 +1227,8 @@ mod tests {
 
         // Pipeline WITHOUT CacheAlignStage (--no-cache-align path)
         let router_only = BlockRouter::new(Arc::new(BinarySinkStub));
-        let pipeline_no_align = TransformPipeline::from_stages(vec![Box::new(
-            BlockRouterStage::new(router_only),
-        )]);
+        let pipeline_no_align =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router_only))]);
         let ctx_no = TransformContext::new(
             ProxyProvider::Anthropic,
             AuthMode::ApiKey,
@@ -1242,7 +1241,9 @@ mod tests {
         let router_full = BlockRouter::new(Arc::new(BinarySinkStub));
         let pipeline_full = TransformPipeline::from_stages(vec![
             Box::new(BlockRouterStage::new(router_full)),
-            Box::new(CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder))),
+            Box::new(CacheAlignStage::new(Box::new(
+                crate::analytics::NoopRecorder,
+            ))),
         ]);
         let ctx_full = TransformContext::new(
             ProxyProvider::Anthropic,
