@@ -1213,8 +1213,14 @@ impl ChannelAlignmentRecorder {
     /// # AC18 — Observable drop counter
     ///
     /// Drop-on-overflow is the correct failure mode for a fire-and-forget analytics
-    /// path, but a silent drop is not observable. This accessor makes the counter
-    /// readable so overflow is diagnosable (and testable) rather than invisible.
+    /// path, but a silent drop is not observable. Observability has two halves, and
+    /// this accessor is only the second one:
+    /// - **In production builds**, each drop emits a `SKIM_DEBUG`-gated stderr notice
+    ///   from [`AlignmentRecorder::record`] carrying the running total. That notice —
+    ///   not this accessor — is what an operator reads.
+    /// - **In test builds**, this accessor exposes the same counter so the overflow
+    ///   path is assertable. It is `#[cfg(test)]` because no production call site
+    ///   reads it, and an unused `pub(crate)` method would trip the zero-warnings gate.
     #[cfg(test)]
     pub(crate) fn drop_count(&self) -> usize {
         self.drop_count.load(Ordering::Relaxed)

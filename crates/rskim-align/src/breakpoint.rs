@@ -136,19 +136,41 @@ pub fn count_client_markers(input_str: &str, spans: &HashMap<String, Span>) -> u
 
 /// Count `"cache_control"` key occurrences in a JSON span string.
 ///
-/// Counts occurrences of the byte sequence `"cache_control":` in `s`.
+/// Matches the key token `"cache_control"` followed by **optional insignificant
+/// whitespace** and a `:`.
+///
+/// # Why the whitespace tolerance is load-bearing
+///
+/// A literal `"cache_control":` needle silently misses a client marker written as
+/// `"cache_control" : {…}` — legal JSON that any pretty-printer emits. Under-counting
+/// is the one dangerous direction: it inflates skim's budget
+/// (`MAX_MARKERS − client_count`), which can push the total marker count past
+/// `MAX_MARKERS` and make the provider reject the request. Over-counting (a literal
+/// `"cache_control":` appearing inside a string *value*) only shrinks skim's budget,
+/// so it fails safe.
+///
+/// The `messages` span is copied byte-verbatim, so client markers there keep whatever
+/// spacing the client used — this scan is the only thing standing between that
+/// spacing and a marker-cap overrun.
 fn count_cc_in_span(s: &str) -> usize {
-    let needle = b"\"cache_control\":";
+    const KEY: &[u8] = b"\"cache_control\"";
     let haystack = s.as_bytes();
     let mut count = 0;
     let mut i = 0;
-    while i + needle.len() <= haystack.len() {
-        if haystack[i..i + needle.len()] == *needle {
-            count += 1;
-            i += needle.len();
-        } else {
-            i += 1;
+    // Bounded: `i` strictly increases on every iteration, so this is O(len).
+    while i + KEY.len() <= haystack.len() {
+        if &haystack[i..i + KEY.len()] == KEY {
+            let mut j = i + KEY.len();
+            while j < haystack.len() && haystack[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if haystack.get(j) == Some(&b':') {
+                count += 1;
+                i = j + 1;
+                continue;
+            }
         }
+        i += 1;
     }
     count
 }
@@ -279,11 +301,14 @@ fn rebuild_array_with(
     out
 }
 
-/// Check whether the system value contains an eligible last text block.
+/// Check whether the system value's v1 injection position is eligible.
 ///
 /// Eligible means:
 /// - The system value is a JSON array (block form).
-/// - At least one element has `"type":"text"` without `"cache_control"`.
+/// - Its **last** `"type":"text"` element does not already carry `cache_control`.
+///
+/// Delegates to [`last_injectable_text_block_index`], which fixes the position before
+/// testing eligibility — see that function for why the order matters (AC5/AC8).
 fn system_position_eligible(canonical_system: &[u8]) -> bool {
     let s = match std::str::from_utf8(canonical_system) {
         Ok(s) => s.trim(),
@@ -292,8 +317,7 @@ fn system_position_eligible(canonical_system: &[u8]) -> bool {
     if !s.starts_with('[') {
         return false; // string-form system, not block-form
     }
-    // Check for at least one eligible text block
-    find_last_eligible_text_block_idx(s).is_some()
+    last_injectable_text_block_index(s).is_some()
 }
 
 // ============================================================================
@@ -341,8 +365,8 @@ pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
     ))
 }
 
-/// Inject a `cache_control` marker into the last eligible text block of a
-/// canonical block-form system array.
+/// Inject a `cache_control` marker into the **last** text block of a canonical
+/// block-form system array.
 ///
 /// # AD-CA-4
 ///
@@ -368,7 +392,7 @@ pub fn inject_system_marker(canonical_system: &[u8]) -> Option<(Vec<u8>, usize)>
     }
 
     let elements: Vec<Box<RawValue>> = serde_json::from_str(trimmed).ok()?;
-    let target_idx = find_last_eligible_text_block_idx(trimmed)?;
+    let target_idx = last_injectable_text_block_index(trimmed)?;
 
     // Rebuild the target text block with cache_control at its canonical sorted
     // position (idempotence: the rebuilt element is already key-sorted).
@@ -556,32 +580,48 @@ fn strip_injected_marker(array_str: &str, target_idx: usize) -> Option<Vec<u8>> 
 // Internal helpers
 // ============================================================================
 
-/// Find the index of the last eligible text block in a canonical block-form system string.
+/// Index of the **last** `"type":"text"` block in a canonical block-form system array,
+/// when that one block does not already carry a top-level `cache_control` member.
 ///
-/// An element is eligible when it is a JSON object that has a top-level `"type"` member
-/// equal to `"text"` and **no** top-level `cache_control` member.
+/// Returns `None` when the value is not an array, contains no text block, or the last
+/// text block already carries `cache_control`.
+///
+/// # Position is structural; `cache_control` only gates eligibility
+///
+/// The position is chosen **first** (always the last text block, a pure function of
+/// request structure per AC4), and `cache_control` presence is then checked on that one
+/// position. Scanning backwards for the last text block *without* `cache_control` would
+/// make placement depend on marker presence, with two concrete failures:
+///
+/// - **AC8 (idempotence):** `align(align(x))` on a two-text-block system injected into
+///   block 1 on the first pass and then into block 0 on the second, accumulating markers
+///   up to the cap instead of converging.
+/// - **AC5 (cross-turn placement stability):** a client that marks the last system block
+///   itself would push skim's marker onto a different block, moving the static-zone
+///   marker between turns and defeating the stable prefix.
+///
+/// This mirrors [`last_injectable_object_index`], which has always taken the last
+/// element and then checked it for `cache_control`.
 ///
 /// The membership tests are structural (`parse_object_pairs`), not substring scans: a
-/// substring scan would match `"type":"text"` nested inside another value and would miss
-/// nothing but could also mis-classify a block whose `cache_control` sits at a nested
-/// level. Structural checks keep eligibility a pure function of the top-level shape.
-fn find_last_eligible_text_block_idx(trimmed_sys: &str) -> Option<usize> {
+/// substring scan could mis-classify a block whose `"type":"text"` or `cache_control`
+/// sits at a nested level. Structural checks keep eligibility a pure function of the
+/// top-level shape.
+fn last_injectable_text_block_index(trimmed_sys: &str) -> Option<usize> {
     let elements: Vec<Box<RawValue>> = serde_json::from_str(trimmed_sys).ok()?;
-    elements
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, e)| {
-            let Some(pairs) = parse_object_pairs(e.get().trim()) else {
-                return false; // not an object
-            };
-            let is_text = pairs
-                .iter()
-                .any(|(k, v)| k == "type" && v.get().trim() == "\"text\"");
-            let has_cc = pairs.iter().any(|(k, _)| k == CC_KEY);
-            is_text && !has_cc
-        })
-        .map(|(i, _)| i)
+    // Step 1 — locate the position: the last element that is a text block.
+    let (idx, pairs) = elements.iter().enumerate().rev().find_map(|(i, e)| {
+        let pairs = parse_object_pairs(e.get().trim())?; // not an object → keep scanning
+        let is_text = pairs
+            .iter()
+            .any(|(k, v)| k == "type" && v.get().trim() == "\"text\"");
+        is_text.then_some((i, pairs))
+    })?;
+    // Step 2 — eligibility of that one position: it must not already carry a marker.
+    if pairs.iter().any(|(k, _)| k == CC_KEY) {
+        return None;
+    }
+    Some(idx)
 }
 
 // ============================================================================
@@ -611,6 +651,67 @@ mod tests {
         let s =
             r#"[{"cache_control":{"type":"ephemeral"}},{"cache_control":{"type":"ephemeral"}}]"#;
         assert_eq!(count_cc_in_span(s), 2);
+    }
+
+    /// AC14: whitespace between the key token and `:` is insignificant JSON but was
+    /// hiding client markers from the budget calculation.
+    ///
+    /// DISCRIMINATING (PF-007): with a literal `"cache_control":` needle this returns 0,
+    /// skim's budget is over-stated, and the total marker count can exceed MAX_MARKERS.
+    #[test]
+    fn count_cc_tolerates_whitespace_before_colon_ac14() {
+        assert_eq!(
+            count_cc_in_span(r#"[{"cache_control" : {"type":"ephemeral"}}]"#),
+            1,
+            "a space before the colon must not hide a client marker"
+        );
+        assert_eq!(
+            count_cc_in_span("[{\"cache_control\"\n\t: {\"type\":\"ephemeral\"}}]"),
+            1,
+            "newline/tab before the colon must not hide a client marker"
+        );
+    }
+
+    /// The key token without a following `:` is a string VALUE, not a marker.
+    #[test]
+    fn count_cc_ignores_key_token_that_is_not_a_key() {
+        assert_eq!(
+            count_cc_in_span(r#"[{"text":"cache_control"}]"#),
+            0,
+            "a bare string value must not be counted"
+        );
+    }
+
+    // ── system position: structural, not marker-dependent (AC5/AC8) ──────────
+
+    /// AC5/AC8 regression: the injection position is the LAST text block, always.
+    /// A client marker on that block makes the position ineligible — it must NOT
+    /// shift skim's marker onto an earlier block.
+    ///
+    /// DISCRIMINATING (PF-007): the previous "last block lacking cc" scan returned
+    /// `Some(0)` here, which made `align()` non-idempotent and moved the static-zone
+    /// marker between turns.
+    #[test]
+    fn system_position_ineligible_when_last_text_block_is_marked_ac5() {
+        let sys = br#"[{"text":"one","type":"text"},{"cache_control":{"type":"ephemeral"},"text":"two","type":"text"}]"#;
+        assert!(
+            !system_position_eligible(sys),
+            "a marked LAST text block makes the position ineligible, not relocatable"
+        );
+        assert!(
+            inject_system_marker(sys).is_none(),
+            "no injection when the structural position is already marked"
+        );
+    }
+
+    /// The unmarked last text block of a multi-block system is the target.
+    #[test]
+    fn system_position_targets_last_text_block_of_many() {
+        let sys = br#"[{"text":"one","type":"text"},{"text":"two","type":"text"}]"#;
+        assert!(system_position_eligible(sys));
+        let (injected, idx) = inject_system_marker(sys).unwrap();
+        assert_eq!(idx, 1, "the LAST text block is the target");
+        assert!(verify_injection(sys, &injected, idx));
     }
 
     // ── count_client_markers ─────────────────────────────────────────────────

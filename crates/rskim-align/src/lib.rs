@@ -27,8 +27,9 @@
 //! # AD-CA-7 — Triple self-verify
 //!
 //! The pipeline applies three independent self-verify checks:
-//! 1. **Reorder path**: `tools_arrays_set_equal(original_tools, canonical_tools)` — proves
-//!    the tools element sort dropped, duplicated, or mutated nothing.
+//! 1. **Reorder path**: `tools_arrays_set_equal(original, canonical)` over BOTH the
+//!    `tools` and the OpenAI legacy `functions` spans — proves the element sort dropped,
+//!    duplicated, or mutated nothing in either array.
 //! 2. **Envelope path**: output `messages` value span byte-identical to input `messages`
 //!    span (done in `canonical_envelope`), plus unchanged top-level key set.
 //! 3. **Injection path**: after injecting markers, verify each injected span against the
@@ -222,17 +223,25 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
         }
     }
 
-    // ── AD-CA-7 reorder path: tools arrays set-equal ─────────────────────────
-    // tools_arrays_set_equal(original_tools_span, canonicalized_reordered_tools_span)
-    // Proves the element sort dropped, duplicated, or mutated nothing.
-    let orig_tools_str = input_spans.get("tools").and_then(|s| s.extract(input_str));
-    let canon_tools_str = canonical_spans
-        .get("tools")
-        .and_then(|s| s.extract(canonical_str));
-    if let (Some(orig), Some(canon)) = (orig_tools_str, canon_tools_str)
-        && !tools_arrays_set_equal(orig, canon)
-    {
-        return None; // AD-CA-7 reorder self-verify failed → fail-open
+    // ── AD-CA-7 reorder path: element-reordered arrays set-equal ─────────────
+    // `canonical_envelope` element-reorders BOTH `tools` and the OpenAI legacy
+    // `functions` array (AD-CA-12), so both need the multiset gate — AC29 names both.
+    // Gating only `tools` would leave a legacy-`functions` body's reorder unverified,
+    // i.e. an ungated egress mutation (ADR-007).
+    //
+    // tools_arrays_set_equal(original_span, canonicalized_reordered_span) proves the
+    // element sort dropped, duplicated, and mutated nothing while permitting the
+    // deliberate order change.
+    for key in ["tools", "functions"] {
+        let before = input_spans.get(key).and_then(|s| s.extract(input_str));
+        let after = canonical_spans
+            .get(key)
+            .and_then(|s| s.extract(canonical_str));
+        if let (Some(before), Some(after)) = (before, after)
+            && !tools_arrays_set_equal(before, after)
+        {
+            return None; // AD-CA-7 reorder self-verify failed → fail-open
+        }
     }
 
     // ── Stats bookkeeping ────────────────────────────────────────────────────
@@ -244,7 +253,9 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
     let tools_key_sorted = ["tools", "functions"].into_iter().any(|key| {
         match (
             input_spans.get(key).and_then(|s| s.extract(input_str)),
-            canonical_spans.get(key).and_then(|s| s.extract(canonical_str)),
+            canonical_spans
+                .get(key)
+                .and_then(|s| s.extract(canonical_str)),
         ) {
             (Some(before), Some(after)) => before != after,
             _ => false,
@@ -1326,6 +1337,112 @@ mod tests {
             original.as_bytes(),
             sorted.as_slice(),
             "AC29: sort must have actually reordered elements (non-tautology)"
+        );
+    }
+
+    // ── AC8 / AC5 — placement is structural, not marker-dependent ─────────────
+
+    /// AC8 (idempotence) + AC5 (placement stability) for a MULTI-block system.
+    ///
+    /// Regression: `system_position_eligible` used to scan backwards for the last text
+    /// block *without* `cache_control`, so pass 1 marked block 1 and pass 2 marked
+    /// block 0 as well — markers accumulated instead of converging, and the static-zone
+    /// marker moved between turns.
+    ///
+    /// DISCRIMINATING (PF-007): reverting `last_injectable_text_block_index` to a
+    /// "last block lacking cc" scan makes pass 2 emit a second marker and this fails.
+    #[test]
+    fn align_idempotent_multi_block_system_ac8() {
+        let body = br#"{"messages":[],"model":"claude-3","system":[{"text":"one","type":"text"},{"text":"two","type":"text"}]}"#;
+        let out1 = align(body, Provider::Anthropic, "req-ac8-multi-1");
+        let out2 = align(&out1.bytes, Provider::Anthropic, "req-ac8-multi-2");
+        assert_eq!(
+            out1.bytes, out2.bytes,
+            "AC8: multi-block system must be idempotent (no second marker on an earlier block)"
+        );
+        let out1_str = std::str::from_utf8(&out1.bytes).unwrap();
+        assert_eq!(
+            count_cache_control_occurrences(out1_str),
+            1,
+            "exactly one marker, on the LAST system text block"
+        );
+        assert_eq!(out2.stats.skim_breakpoints_injected, 0, "no re-injection");
+    }
+
+    /// AC5: a client marker on the LAST system block must not push skim's marker onto
+    /// an earlier block — the position is structural, so the position is simply
+    /// ineligible and skim injects nothing there.
+    ///
+    /// DISCRIMINATING (PF-007): with the old "last block lacking cc" scan, skim injected
+    /// into block 0 here, moving the static-zone marker.
+    #[test]
+    fn align_client_marked_last_system_block_blocks_injection_ac5() {
+        let body = br#"{"messages":[],"model":"claude-3","system":[{"text":"one","type":"text"},{"cache_control":{"type":"ephemeral"},"text":"two","type":"text"}]}"#;
+        let out = align(body, Provider::Anthropic, "req-ac5-sys");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+        assert_eq!(
+            count_cache_control_occurrences(out_str),
+            1,
+            "the client's marker is the only one; skim must not mark an earlier block"
+        );
+        assert_eq!(out.stats.skim_breakpoints_injected, 0);
+        assert_eq!(out.stats.client_breakpoint_count, 1);
+    }
+
+    // ── AC14 — client marker counting tolerates JSON whitespace ───────────────
+
+    /// AC14: client markers written as `"cache_control" : {…}` (space before the colon —
+    /// legal JSON) MUST be counted, or skim's budget is inflated and the total marker
+    /// count can exceed `MAX_MARKERS`, which the provider rejects.
+    ///
+    /// DISCRIMINATING (PF-007): with the literal `"cache_control":` needle this body
+    /// counted 0 client markers and skim injected 2, for a total of 6 > MAX_MARKERS.
+    #[test]
+    fn align_counts_whitespaced_client_markers_ac14() {
+        let body = br#"{"messages":[{"content":[{"cache_control" : {"type":"ephemeral"},"text":"a","type":"text"},{"cache_control" : {"type":"ephemeral"},"text":"b","type":"text"},{"cache_control" : {"type":"ephemeral"},"text":"c","type":"text"},{"cache_control" : {"type":"ephemeral"},"text":"d","type":"text"}],"role":"user"}],"system":[{"text":"s","type":"text"}],"tools":[{"name":"a"}]}"#;
+        let out = align(body, Provider::Anthropic, "req-ac14-ws");
+        assert_eq!(
+            out.stats.client_breakpoint_count, 4,
+            "AC14: whitespace between the key and `:` must not hide a client marker"
+        );
+        assert_eq!(
+            out.stats.skim_breakpoints_injected, 0,
+            "AC14: budget is exhausted by 4 client markers — skim must inject none"
+        );
+    }
+
+    // ── AC29 — reorder gate covers the OpenAI legacy `functions` array ────────
+
+    /// AC29: the legacy `functions` array is element-reordered exactly like `tools`,
+    /// so it must satisfy the same multiset gate.
+    ///
+    /// Non-tautology: the companion assert proves the reorder actually happened, so a
+    /// passing set-equality check is not vacuous.
+    #[test]
+    fn align_openai_functions_reorder_is_set_equal_ac29() {
+        let body = br#"{"functions":[{"name":"b","description":"B"},{"name":"a","description":"A"}],"messages":[],"model":"gpt-4o"}"#;
+        let out = align(body, Provider::OpenAi, "req-ac29-fns");
+        assert!(!out.stats.fail_open, "a well-formed body must align");
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+
+        let orig_spans = locate_top_level_spans(std::str::from_utf8(body).unwrap()).unwrap();
+        let out_spans = locate_top_level_spans(out_str).unwrap();
+        let before = orig_spans["functions"]
+            .extract(std::str::from_utf8(body).unwrap())
+            .unwrap();
+        let after = out_spans["functions"].extract(out_str).unwrap();
+
+        assert!(
+            tools_arrays_set_equal(before, after),
+            "AC29: the `functions` reorder must be multiset-equal to its input"
+        );
+        assert_ne!(
+            before, after,
+            "AC29 non-tautology: the `functions` array must actually have been reordered"
+        );
+        assert!(
+            !out_str.contains("cache_control"),
+            "AC15: no Anthropic marker on an OpenAI body"
         );
     }
 
