@@ -169,16 +169,13 @@ pub fn canonicalize_value(raw: &str, depth: u32) -> Option<Vec<u8>> {
 /// This is the within-object key-sort that makes two semantically-equal objects
 /// with different key orders produce identical bytes.
 fn canonicalize_object(raw: &str, depth: u32) -> Option<Vec<u8>> {
-    let pairs = parse_object_pairs(raw)?;
-
-    // Sort by key string lexicographically
-    let mut sorted = pairs;
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut pairs = parse_object_pairs(raw)?;
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = Vec::new();
     out.push(b'{');
 
-    for (i, (key, val)) in sorted.iter().enumerate() {
+    for (i, (key, val)) in pairs.iter().enumerate() {
         if i > 0 {
             out.push(b',');
         }

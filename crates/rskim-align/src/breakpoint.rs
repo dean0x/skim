@@ -109,8 +109,8 @@ pub fn count_client_markers(input_str: &str, spans: &HashMap<String, Span>) -> u
     let mut count = 0;
 
     // Count in tools/functions span
-    for key in &["tools", "functions"] {
-        if let Some(span) = spans.get(*key)
+    for key in ["tools", "functions"] {
+        if let Some(span) = spans.get(key)
             && let Some(s) = span.extract(input_str)
         {
             count += count_cc_in_span(s);

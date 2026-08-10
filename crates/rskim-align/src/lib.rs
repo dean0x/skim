@@ -241,12 +241,10 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
     // canonicalization actually did. `tools_key_sorted` is true only when a tools or
     // functions span was genuinely rewritten; `spans_compacted` only when the canonical
     // body is strictly smaller than the input.
-    let tools_key_sorted = ["tools", "functions"].iter().any(|key| {
+    let tools_key_sorted = ["tools", "functions"].into_iter().any(|key| {
         match (
-            input_spans.get(*key).and_then(|s| s.extract(input_str)),
-            canonical_spans
-                .get(*key)
-                .and_then(|s| s.extract(canonical_str)),
+            input_spans.get(key).and_then(|s| s.extract(input_str)),
+            canonical_spans.get(key).and_then(|s| s.extract(canonical_str)),
         ) {
             (Some(before), Some(after)) => before != after,
             _ => false,
