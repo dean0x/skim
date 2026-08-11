@@ -44,6 +44,19 @@ test-utils = []
 [dev-dependencies]
 # Enable test-utils so integration tests in tests/ can import cochange::test_utils.
 rskim-bench = { path = ".", features = ["test-utils"] }
+# Criterion for the AC18-perf proxy analytics overhead bench (informational only,
+# non-gating — see crates/rskim-bench/benches/proxy_analytics_overhead.rs).
+criterion = { workspace = true }
+# rskim-proxy provides ChannelAnalyticsHook / NoopAnalyticsHook / ProxyEvent for
+# the analytics overhead bench. Dev-dep only — rskim-bench is publish=false and
+# bench targets are never part of the production rskim binary tree (ADR-008 safe).
+rskim-proxy = { path = "../rskim-proxy" }
+bytes = { workspace = true }
+
+[[bench]]
+name = "proxy_analytics_overhead"
+path = "benches/proxy_analytics_overhead.rs"
+harness = false
 
 [lints.clippy]
 unwrap_used = "deny"

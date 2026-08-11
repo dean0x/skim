@@ -2586,10 +2586,13 @@ name = "rskim-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "criterion",
  "rayon",
  "rskim-bench",
  "rskim-core",
+ "rskim-proxy",
  "rskim-research",
  "rskim-search",
  "serde",
