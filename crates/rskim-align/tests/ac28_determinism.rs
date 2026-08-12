@@ -371,6 +371,68 @@ fn ac28_non_object_element_no_panic() {
 }
 
 // ============================================================================
+// AC30 — 100-run envelope key ordering stability
+// ============================================================================
+
+/// Body with top-level keys in non-canonical order (model, tools, max_tokens, messages).
+/// The canonical order is: max_tokens < messages < model < tools.
+/// All 100 runs of this body through `align()` must produce byte-identical output.
+static ENVELOPE_SCRAMBLED_BODY: &[u8] = br#"{"model":"claude-3-5-sonnet-20241022","tools":[{"name":"foxtrot","description":"Foxtrot tool","input_schema":{"type":"object"}},{"name":"alpha","description":"Alpha tool","input_schema":{"type":"object"}},{"name":"delta","description":"Delta tool","input_schema":{"type":"object"}}],"max_tokens":1024,"messages":[{"role":"user","content":"List all tools"}]}"#;
+
+/// AC30 / POSITIVE — 100 repeated runs of a body with scrambled envelope key order
+/// all produce byte-identical output.
+///
+/// Distinct from AC28(b) (which verifies tool ELEMENT ordering): AC30 verifies that
+/// the canonical envelope key sort (AD-CA-13) is pure and stateless — no ambient
+/// state (HashMap iteration order, wall-clock, or RNG) can affect the top-level
+/// key ordering.
+///
+/// DISCRIMINATING (PF-007): if `canonical_envelope` used a HashMap to collect
+/// top-level keys before emitting them, the iteration order would be non-deterministic
+/// across runs (even in the same process), causing different byte outputs.
+/// Deleting the key-sort step would cause all non-canonically-ordered bodies to
+/// produce outputs that differ from the canonical-order body — but within 100 runs
+/// of the same scrambled body they would still be identical. The discriminator here
+/// is the combination of (a) non-canonical input + (b) byte-identity assertion,
+/// which together prove that the sort is deterministic AND correct across runs.
+#[test]
+fn ac30_hundred_runs_envelope_key_order_stability() {
+    // Establish a reference output from the scrambled-envelope body.
+    let reference = align(ENVELOPE_SCRAMBLED_BODY, Provider::Anthropic, "ac30-ref");
+    assert!(
+        !reference.stats.fail_open,
+        "AC30: reference body must not fail-open"
+    );
+
+    // The reference output must have the canonical key order (max_tokens < messages < model < tools).
+    let ref_str = std::str::from_utf8(&reference.bytes).expect("AC30: output must be UTF-8");
+    let max_pos = ref_str.find("\"max_tokens\"").expect("AC30: max_tokens must be present");
+    let msg_pos = ref_str.find("\"messages\"").expect("AC30: messages must be present");
+    let mdl_pos = ref_str.find("\"model\"").expect("AC30: model must be present");
+    let tls_pos = ref_str.find("\"tools\"").expect("AC30: tools must be present");
+    assert!(
+        max_pos < msg_pos && msg_pos < mdl_pos && mdl_pos < tls_pos,
+        "AC30: reference output must have canonical key order: \
+         max_tokens={max_pos} < messages={msg_pos} < model={mdl_pos} < tools={tls_pos}"
+    );
+
+    // Run 99 more times; every output must be byte-identical to the reference.
+    for i in 1..=99u32 {
+        let out = align(
+            ENVELOPE_SCRAMBLED_BODY,
+            Provider::Anthropic,
+            &format!("ac30-run-{i:03}"),
+        );
+        assert!(!out.stats.fail_open, "AC30: run {i} must not fail-open");
+        assert_eq!(
+            out.bytes, reference.bytes,
+            "AC30: envelope key ordering run {i} produced different bytes than the reference \
+             (envelope key sort must be purely deterministic)"
+        );
+    }
+}
+
+// ============================================================================
 // AC28 — Platform determinism cross-check (in-process multi-call)
 // ============================================================================
 

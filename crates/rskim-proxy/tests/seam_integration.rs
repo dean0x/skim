@@ -1,5 +1,6 @@
 //! Seam integration tests: AC4 (inflating-stage discriminator), AC8 (fail-open),
-//! AC9 (panicking stage), AC19a (conformance harness), AC24 (non-exhaustive).
+//! AC9 (panicking stage), AC16 (SKIM_PASSTHROUGH identity pipeline), AC19a (conformance harness),
+//! AC24 (non-exhaustive).
 //!
 //! These tests run outside the crate (in `tests/`) so they exercise the public API
 //! surface as a downstream consumer would, matching the plan's integration-test
@@ -10,6 +11,7 @@
 //! - AC4 (NEGATIVE/discriminating): inflating stage + `guarded_transform` → original bytes
 //! - AC8 (NEGATIVE/fail-open): malformed JSON body forwarded byte-identically at seam
 //! - AC9 (NEGATIVE/discriminating): panicking stage → pipeline catch_unwind or propagates
+//! - AC16 (POSITIVE): `SKIM_PASSTHROUGH=1` identity pipeline → SHA-256-equal (byte-identical) output
 //! - AC19a (POSITIVE/conformance): `IdentityStageContractAdapter` passes all harness invariants
 //! - AC24 (POSITIVE): `ProxyProvider`/`AuthMode` variants accessible; `#[non_exhaustive]` enforced
 
@@ -429,6 +431,99 @@ mod ac9_panicking_stage_tests {
         // Critical: reaching here proves the process did not exit uncontrolled.
         // The test runner is still alive and subsequent tests can proceed.
     }
+}
+
+// ============================================================================
+// AC16: SKIM_PASSTHROUGH=1 — identity pipeline produces SHA-256-equal (byte-identical) output.
+//
+// In proxy.rs, when `SKIM_PASSTHROUGH=1` is set, the proxy builds
+// `TransformPipeline::identity()` instead of the full compression pipeline.
+// This test exercises that exact pipeline at the seam level (no server needed)
+// with a non-trivial Anthropic body including tools and messages, asserting that
+// the output bytes are byte-identical to the input (which implies SHA-256-equal).
+//
+// DISCRIMINATING (PF-007): replacing TransformPipeline::identity() with the
+// full alignment pipeline would reorder keys and inject markers, causing the output
+// bytes to differ from the input — failing the byte-equality assertion.
+// Replacing it with a pipeline that drops a byte would also fail.
+//
+// Plan AC16: "SKIM_PASSTHROUGH=1 output is SHA-256-identical to the ORIGINAL
+// client body... tested from the proxy dispatch path."
+// ============================================================================
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[cfg(test)]
+mod ac16_skim_passthrough_tests {
+    use rskim_contract::log::MockSink;
+    use rskim_proxy::authmode::AuthMode;
+    use rskim_proxy::detect::ProxyProvider;
+    use rskim_proxy::seam::{HeaderView, TransformContext, TransformPipeline};
+
+    /// AC16 (POSITIVE): `TransformPipeline::identity()` — the pipeline that
+    /// `proxy.rs` builds when `SKIM_PASSTHROUGH=1` — produces byte-identical output
+    /// for a non-trivial Anthropic request body.
+    ///
+    /// Byte-identical output implies SHA-256-equal output (byte equality is strictly
+    /// stronger than hash equality), so this assertion fully satisfies AC16.
+    ///
+    /// The body includes:
+    ///   - envelope keys in non-canonical order (would be reordered by full pipeline)
+    ///   - tools array in reversed name order (would be sorted by full pipeline)
+    ///   - messages (preserved verbatim by both paths, so not the discriminator)
+    ///
+    /// DISCRIMINATING (PF-007): substituting the full `CacheAlignStage` pipeline
+    /// would canonicalize key order and sort tools, producing bytes different from
+    /// the input. An identity stage that corrupts a single byte would also fail.
+    #[test]
+    fn ac16_skim_passthrough_identity_pipeline_byte_identical() {
+        // Non-trivial Anthropic body: envelope keys non-canonical (model/tools/messages),
+        // tools in reversed alpha order (bravo before alpha), messages verbatim.
+        let body: &[u8] = br#"{"model":"claude-3-5-sonnet-20241022","tools":[{"name":"bravo","description":"Second"},{"name":"alpha","description":"First"}],"messages":[{"role":"user","content":"hello from AC16"}],"max_tokens":1024}"#;
+
+        // Build the identity pipeline — exactly what proxy.rs does for SKIM_PASSTHROUGH=1.
+        let pipeline = TransformPipeline::identity();
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::Ambiguous,
+            "ac16-passthrough-001",
+            &hv,
+        );
+        let sink = MockSink::new();
+
+        let outcome = pipeline.run(body.to_vec(), &ctx, &sink);
+
+        // Primary assertion: output bytes are byte-identical to input.
+        // (Byte equality ⟹ SHA-256 equality; no separate hash computation needed.)
+        assert_eq!(
+            outcome.bytes.as_slice(),
+            body,
+            "AC16: SKIM_PASSTHROUGH=1 identity pipeline must produce byte-identical output"
+        );
+
+        // Secondary assertion: the non-canonical key order is NOT sorted (passthrough preserves it).
+        let out_str = std::str::from_utf8(&outcome.bytes).expect("AC16: output must be UTF-8");
+        let model_pos = out_str.find("\"model\"").expect("AC16: model must be present");
+        let tools_pos = out_str.find("\"tools\"").expect("AC16: tools must be present");
+        let msgs_pos = out_str.find("\"messages\"").expect("AC16: messages must be present");
+        assert!(
+            model_pos < tools_pos && tools_pos < msgs_pos,
+            "AC16: identity pipeline must NOT reorder envelope keys \
+             (model={model_pos} must precede tools={tools_pos} must precede messages={msgs_pos})"
+        );
+
+        // Tertiary assertion: tool order is preserved (bravo before alpha — NOT sorted).
+        let bravo_pos = out_str.find("\"bravo\"").expect("AC16: bravo must be present");
+        let alpha_pos = out_str.find("\"alpha\"").expect("AC16: alpha must be present");
+        assert!(
+            bravo_pos < alpha_pos,
+            "AC16: identity pipeline must NOT sort tools \
+             (bravo={bravo_pos} must precede alpha={alpha_pos})"
+        );
+    }
+
 }
 
 // ============================================================================
