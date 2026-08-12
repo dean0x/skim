@@ -505,9 +505,15 @@ mod ac16_skim_passthrough_tests {
 
         // Secondary assertion: the non-canonical key order is NOT sorted (passthrough preserves it).
         let out_str = std::str::from_utf8(&outcome.bytes).expect("AC16: output must be UTF-8");
-        let model_pos = out_str.find("\"model\"").expect("AC16: model must be present");
-        let tools_pos = out_str.find("\"tools\"").expect("AC16: tools must be present");
-        let msgs_pos = out_str.find("\"messages\"").expect("AC16: messages must be present");
+        let model_pos = out_str
+            .find("\"model\"")
+            .expect("AC16: model must be present");
+        let tools_pos = out_str
+            .find("\"tools\"")
+            .expect("AC16: tools must be present");
+        let msgs_pos = out_str
+            .find("\"messages\"")
+            .expect("AC16: messages must be present");
         assert!(
             model_pos < tools_pos && tools_pos < msgs_pos,
             "AC16: identity pipeline must NOT reorder envelope keys \
@@ -515,15 +521,18 @@ mod ac16_skim_passthrough_tests {
         );
 
         // Tertiary assertion: tool order is preserved (bravo before alpha — NOT sorted).
-        let bravo_pos = out_str.find("\"bravo\"").expect("AC16: bravo must be present");
-        let alpha_pos = out_str.find("\"alpha\"").expect("AC16: alpha must be present");
+        let bravo_pos = out_str
+            .find("\"bravo\"")
+            .expect("AC16: bravo must be present");
+        let alpha_pos = out_str
+            .find("\"alpha\"")
+            .expect("AC16: alpha must be present");
         assert!(
             bravo_pos < alpha_pos,
             "AC16: identity pipeline must NOT sort tools \
              (bravo={bravo_pos} must precede alpha={alpha_pos})"
         );
     }
-
 }
 
 // ============================================================================

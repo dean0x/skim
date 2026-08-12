@@ -252,7 +252,10 @@ fn canonicalize_array(raw: &str, depth: u32) -> Option<Vec<u8>> {
 ///
 /// Returns `None` if the name cannot be extracted. The caller uses `""` as the
 /// fallback name — non-named elements sort to the front, which is deterministic.
-fn extract_name_from_pairs(pairs: &[(String, Box<RawValue>)], kind: ToolArrayKind) -> Option<String> {
+fn extract_name_from_pairs(
+    pairs: &[(String, Box<RawValue>)],
+    kind: ToolArrayKind,
+) -> Option<String> {
     match kind {
         ToolArrayKind::AnthropicTools | ToolArrayKind::OpenAiLegacyFunctions => {
             // Top-level "name" field — no additional parse

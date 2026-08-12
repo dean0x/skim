@@ -406,10 +406,18 @@ fn ac30_hundred_runs_envelope_key_order_stability() {
 
     // The reference output must have the canonical key order (max_tokens < messages < model < tools).
     let ref_str = std::str::from_utf8(&reference.bytes).expect("AC30: output must be UTF-8");
-    let max_pos = ref_str.find("\"max_tokens\"").expect("AC30: max_tokens must be present");
-    let msg_pos = ref_str.find("\"messages\"").expect("AC30: messages must be present");
-    let mdl_pos = ref_str.find("\"model\"").expect("AC30: model must be present");
-    let tls_pos = ref_str.find("\"tools\"").expect("AC30: tools must be present");
+    let max_pos = ref_str
+        .find("\"max_tokens\"")
+        .expect("AC30: max_tokens must be present");
+    let msg_pos = ref_str
+        .find("\"messages\"")
+        .expect("AC30: messages must be present");
+    let mdl_pos = ref_str
+        .find("\"model\"")
+        .expect("AC30: model must be present");
+    let tls_pos = ref_str
+        .find("\"tools\"")
+        .expect("AC30: tools must be present");
     assert!(
         max_pos < msg_pos && msg_pos < mdl_pos && mdl_pos < tls_pos,
         "AC30: reference output must have canonical key order: \

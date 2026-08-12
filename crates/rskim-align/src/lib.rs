@@ -1200,10 +1200,22 @@ mod tests {
         assert!(!out_e.stats.fail_open, "AC1 variant-e must not fail-open");
 
         // All five must produce byte-identical output (every pair).
-        assert_eq!(out_a.bytes, out_b.bytes, "AC1: envelope key order variant must converge to same bytes as canonical");
-        assert_eq!(out_a.bytes, out_c.bytes, "AC1: tools element order variant must converge to same bytes as canonical");
-        assert_eq!(out_a.bytes, out_d.bytes, "AC1: within-tool key order variant must converge to same bytes as canonical");
-        assert_eq!(out_a.bytes, out_e.bytes, "AC1: whitespace + scramble variant must converge to same bytes as canonical");
+        assert_eq!(
+            out_a.bytes, out_b.bytes,
+            "AC1: envelope key order variant must converge to same bytes as canonical"
+        );
+        assert_eq!(
+            out_a.bytes, out_c.bytes,
+            "AC1: tools element order variant must converge to same bytes as canonical"
+        );
+        assert_eq!(
+            out_a.bytes, out_d.bytes,
+            "AC1: within-tool key order variant must converge to same bytes as canonical"
+        );
+        assert_eq!(
+            out_a.bytes, out_e.bytes,
+            "AC1: whitespace + scramble variant must converge to same bytes as canonical"
+        );
     }
 
     // ── AC2 — OpenAI convergence + legacy functions ───────────────────────────
@@ -1533,13 +1545,11 @@ mod tests {
 
         // (c) Construct the drop fault and prove the gate detects it.
         // Build the canonical tools using the same function try_align_full calls.
-        let canon_bytes =
-            canonical_envelope(body_str, &input_spans, Provider::Anthropic).unwrap();
+        let canon_bytes = canonical_envelope(body_str, &input_spans, Provider::Anthropic).unwrap();
         let canon_str = std::str::from_utf8(&canon_bytes).unwrap();
         let canon_spans = locate_top_level_spans(canon_str).unwrap();
         let canon_tools_str = canon_spans["tools"].extract(canon_str).unwrap();
-        let canon_parsed: Vec<serde_json::Value> =
-            serde_json::from_str(canon_tools_str).unwrap();
+        let canon_parsed: Vec<serde_json::Value> = serde_json::from_str(canon_tools_str).unwrap();
         // Drop fault: canonical array minus one element.
         let drop_mutant = serde_json::to_string(&canon_parsed[..1]).unwrap();
         assert!(
@@ -1559,8 +1569,7 @@ mod tests {
             "AC29 wiring/drop: gate-fire path must produce SHA-256(output)==SHA-256(input)"
         );
         assert_eq!(
-            fo_out.stats.input_sha256,
-            fo_out.stats.output_sha256,
+            fo_out.stats.input_sha256, fo_out.stats.output_sha256,
             "AC29 wiring/drop: passthrough produces SHA-256-equal output"
         );
     }
@@ -1583,7 +1592,10 @@ mod tests {
 
         // (a) Correct sort — align() succeeds.
         let out = align(body, Provider::Anthropic, "ac29-dup-wire");
-        assert!(!out.stats.fail_open, "AC29 wiring/dup: correct sort must not fail-open");
+        assert!(
+            !out.stats.fail_open,
+            "AC29 wiring/dup: correct sort must not fail-open"
+        );
 
         // (b) No tool name appears more than once in the output.
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
@@ -1603,13 +1615,11 @@ mod tests {
         // (c) Construct the duplication fault and prove the gate detects it.
         let input_spans = locate_top_level_spans(body_str).unwrap();
         let orig_tools = input_spans["tools"].extract(body_str).unwrap();
-        let canon_bytes =
-            canonical_envelope(body_str, &input_spans, Provider::Anthropic).unwrap();
+        let canon_bytes = canonical_envelope(body_str, &input_spans, Provider::Anthropic).unwrap();
         let canon_str = std::str::from_utf8(&canon_bytes).unwrap();
         let canon_spans = locate_top_level_spans(canon_str).unwrap();
         let canon_tools_str = canon_spans["tools"].extract(canon_str).unwrap();
-        let canon_parsed: Vec<serde_json::Value> =
-            serde_json::from_str(canon_tools_str).unwrap();
+        let canon_parsed: Vec<serde_json::Value> = serde_json::from_str(canon_tools_str).unwrap();
         // Duplication fault: first element appears twice.
         let mut dup_parsed = canon_parsed.clone();
         dup_parsed.push(canon_parsed[0].clone());
@@ -1629,8 +1639,7 @@ mod tests {
             "AC29 wiring/dup: gate-fire produces SHA-256(output)==SHA-256(input)"
         );
         assert_eq!(
-            fo_out.stats.input_sha256,
-            fo_out.stats.output_sha256,
+            fo_out.stats.input_sha256, fo_out.stats.output_sha256,
             "AC29 wiring/dup: passthrough is SHA-256-equal"
         );
     }
@@ -1654,7 +1663,10 @@ mod tests {
 
         // (a) Correct sort — align() succeeds.
         let out = align(body, Provider::Anthropic, "ac29-mut-wire");
-        assert!(!out.stats.fail_open, "AC29 wiring/mut: correct sort must not fail-open");
+        assert!(
+            !out.stats.fail_open,
+            "AC29 wiring/mut: correct sort must not fail-open"
+        );
 
         // (b) All original tool names and descriptions are present unmodified in the output.
         let out_str = std::str::from_utf8(&out.bytes).unwrap();
@@ -1683,17 +1695,14 @@ mod tests {
         }
 
         // (c) Construct the mutation fault and prove the gate detects it.
-        let canon_bytes =
-            canonical_envelope(body_str, &input_spans, Provider::Anthropic).unwrap();
+        let canon_bytes = canonical_envelope(body_str, &input_spans, Provider::Anthropic).unwrap();
         let canon_str = std::str::from_utf8(&canon_bytes).unwrap();
         let canon_spans = locate_top_level_spans(canon_str).unwrap();
         let canon_tools_str = canon_spans["tools"].extract(canon_str).unwrap();
-        let mut mut_parsed: Vec<serde_json::Value> =
-            serde_json::from_str(canon_tools_str).unwrap();
+        let mut mut_parsed: Vec<serde_json::Value> = serde_json::from_str(canon_tools_str).unwrap();
         // Mutation fault: corrupt the first element's name.
         if let Some(first) = mut_parsed.first_mut() {
-            *first.get_mut("name").unwrap() =
-                serde_json::Value::String("MUTATED_NAME".to_owned());
+            *first.get_mut("name").unwrap() = serde_json::Value::String("MUTATED_NAME".to_owned());
         }
         let mut_mutant = serde_json::to_string(&mut_parsed).unwrap();
         assert!(
@@ -1711,8 +1720,7 @@ mod tests {
             "AC29 wiring/mut: gate-fire produces SHA-256(output)==SHA-256(input)"
         );
         assert_eq!(
-            fo_out.stats.input_sha256,
-            fo_out.stats.output_sha256,
+            fo_out.stats.input_sha256, fo_out.stats.output_sha256,
             "AC29 wiring/mut: passthrough is SHA-256-equal"
         );
     }
