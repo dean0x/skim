@@ -695,6 +695,11 @@ mod tests {
     /// consumer's internal `busy_timeout` is set in `AnalyticsDb::open`;
     /// in practice the consumer will fail quickly on the WAL path. The test
     /// only asserts "no panic/hang", not the drop count, since timing varies.
+    ///
+    /// Wall-clock discrimination of `set_busy_timeout(100ms)` is in the
+    /// companion test `test_consumer_busy_timeout_cap_discriminates_set_busy_timeout`,
+    /// which holds the lock until after the drain completes so that each BUSY wait
+    /// runs to the full cap.
     #[test]
     fn test_consumer_db_locked_by_exclusive_connection() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -744,6 +749,98 @@ mod tests {
         assert!(
             consumer_finished,
             "AC15 arm (b): consumer must finish despite DB lock — no panic or hang"
+        );
+    }
+
+    /// PF-007 discriminating: `spawn_consumer` calls `db.set_busy_timeout(100ms)`
+    /// (proxy_analytics.rs line 262) to cap each blocked write to at most 100ms.
+    /// Without that call, `AnalyticsDb::open` leaves the timeout at 5000ms, and
+    /// draining N events under an exclusive lock takes N × 5000ms ≈ 15s for N=3.
+    /// With the cap, it takes N × 100ms ≈ 300ms. The wall-clock assertion below
+    /// (< 2s) passes with the cap and fails without it.
+    ///
+    /// SQLite / WAL notes that apply to this code path:
+    /// - `Connection::transaction()` issues `BEGIN DEFERRED` — no lock is acquired
+    ///   until the first operation.
+    /// - The first `INSERT` in `record_proxy` attempts to acquire the WAL WRITER
+    ///   lock from scratch. This is NOT a "read-to-write promotion" (where the busy
+    ///   handler is sometimes skipped), so the busy handler IS invoked and
+    ///   `busy_timeout` controls the wait duration.
+    ///
+    /// Setup contract: a small sleep after spawning the consumer ensures its
+    /// `AnalyticsDb::open()` completes before the exclusive lock is acquired.
+    /// Without that sleep, `open()` races the lock acquisition; if it loses,
+    /// `db = None` (a different code path) and the test becomes vacuous.
+    #[test]
+    fn test_consumer_busy_timeout_cap_discriminates_set_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("busycap.db");
+
+        // Pre-create the DB so the consumer can open it successfully.
+        {
+            let _db = AnalyticsDb::open(&db_path).expect("pre-create db");
+        }
+
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+
+        // Spawn the production consumer — it will open the DB and call
+        // set_busy_timeout(100ms).  The sleep below lets AnalyticsDb::open()
+        // finish before we acquire the exclusive lock.
+        let handle = run_inline_consumer(
+            &db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Hold an exclusive lock for the entire duration of the drain so that
+        // every record_proxy call blocks for the full busy_timeout window before
+        // failing open.
+        let lock_conn = rusqlite::Connection::open(&db_path).expect("lock conn");
+        let _ = lock_conn.execute_batch("BEGIN EXCLUSIVE");
+
+        const N_EVENTS: u64 = 3;
+        for _ in 0..N_EVENTS {
+            hook.on_request(&make_small_event());
+        }
+        drop(hook); // close sender so consumer exits after draining all events
+
+        // Measure wall-clock time from channel-close to consumer exit.
+        let started = std::time::Instant::now();
+        let consumer_finished = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok();
+        let elapsed = started.elapsed();
+
+        // Release the exclusive lock now that the consumer is done.
+        let _ = lock_conn.execute_batch("ROLLBACK");
+        drop(lock_conn);
+        let _ = handle.join();
+
+        assert!(consumer_finished, "consumer must finish — no panic or hang");
+
+        // PF-007 discriminating: with set_busy_timeout(100ms) each BUSY wait is
+        // capped at ~100ms → 3 × 100ms ≈ 300ms total.  Without the cap the
+        // fallback from AnalyticsDb::open is 5000ms/event → ~15s total.
+        // Deleting proxy_analytics.rs line 262 must fail this assertion.
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_000),
+            "AC15 busy_timeout cap: drained {N_EVENTS} events under exclusive lock in \
+             {elapsed:?}; expected < 2s (each BUSY capped at 100ms). Without \
+             set_busy_timeout(100ms) the fallback is 5000ms/event (~15s total)."
+        );
+
+        // All events must have been fail-open dropped (lock never released).
+        assert_eq!(
+            drop_count.load(Ordering::Relaxed),
+            N_EVENTS,
+            "all {N_EVENTS} events must be fail-open dropped when DB is exclusively locked"
         );
     }
 
@@ -880,8 +977,16 @@ mod tests {
         proxy_hostile_db_assert(&db_path, "garbage DB file");
     }
 
-    /// AC15 proxy-side arm (c): DB locked by an exclusive connection. The consumer's
-    /// `busy_timeout` expires → fail-open drop. Proxy must still forward.
+    /// AC15 proxy-side arm (c): DB locked by an exclusive connection before the
+    /// consumer starts. `AnalyticsDb::open()` fails (the `PRAGMA user_version`
+    /// read needs a SHARED lock, denied by the EXCLUSIVE), so `db = None` and
+    /// all events are fail-open dropped without any BUSY wait. The proxy must
+    /// still forward — that is the assertion here.
+    ///
+    /// Note: because `AnalyticsDb::open()` fails before `set_busy_timeout(100ms)`
+    /// is reached, this test does **not** discriminate the busy_timeout cap; wall-
+    /// clock discrimination lives in
+    /// `test_consumer_busy_timeout_cap_discriminates_set_busy_timeout`.
     #[test]
     fn test_proxy_forwards_with_locked_db() {
         let dir = tempfile::tempdir().expect("tempdir");
