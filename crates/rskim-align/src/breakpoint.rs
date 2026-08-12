@@ -276,6 +276,48 @@ fn last_injectable_object_index(canonical_array: &[u8]) -> Option<usize> {
     Some(last_idx)
 }
 
+/// Eligible index within an already-parsed tools array (R6 variant).
+///
+/// Same eligibility rules as [`last_injectable_object_index`] but operates on
+/// already-parsed `elements` so the caller can reuse a single parse for both
+/// finding the index and rebuilding the array (R6 — single-borrowed-parse).
+///
+/// Returns `None` when:
+/// - Array is empty.
+/// - Last element is not an object, is `{}`, or already has `cache_control`.
+fn last_injectable_object_index_from_elements(elements: &[Box<RawValue>]) -> Option<usize> {
+    let last_idx = elements.len().checked_sub(1)?;
+    let pairs = parse_object_pairs(elements[last_idx].get().trim())?;
+    if pairs.is_empty() {
+        return None;
+    }
+    if pairs.iter().any(|(k, _)| k == CC_KEY) {
+        return None;
+    }
+    Some(last_idx)
+}
+
+/// Eligible text-block index within an already-parsed system array (R6 variant).
+///
+/// Same eligibility rules as [`last_injectable_text_block_index`] but operates on
+/// already-parsed `elements` so the caller can reuse a single parse for both
+/// finding the index and rebuilding the array (R6 — single-borrowed-parse).
+///
+/// Returns `None` when no eligible text block exists.
+fn last_injectable_text_block_index_from_elements(elements: &[Box<RawValue>]) -> Option<usize> {
+    let (idx, pairs) = elements.iter().enumerate().rev().find_map(|(i, e)| {
+        let pairs = parse_object_pairs(e.get().trim())?; // not an object → keep scanning
+        let is_text = pairs
+            .iter()
+            .any(|(k, v)| k == "type" && v.get().trim() == "\"text\"");
+        is_text.then_some((i, pairs))
+    })?;
+    if pairs.iter().any(|(k, _)| k == CC_KEY) {
+        return None;
+    }
+    Some(idx)
+}
+
 /// Rebuild a canonical JSON array with `elements[target_idx]` replaced by `replacement`.
 ///
 /// Every other element is copied verbatim from its trimmed source bytes, so the only
@@ -352,9 +394,13 @@ pub fn inject_tools_marker(canonical_tools: &[u8]) -> Option<(Vec<u8>, usize)> {
         "AD-CA-4: MARKER must equal MARKER_BYTES"
     );
 
+    // R6 — single-borrowed-parse: parse the tools array exactly once, then
+    // derive both the eligible index and the elements for rebuild from that
+    // single parse. Previously called `last_injectable_object_index` (which
+    // parsed the array) then `serde_json::from_str` again — two parses total.
     let s = std::str::from_utf8(canonical_tools).ok()?;
-    let target_idx = last_injectable_object_index(canonical_tools)?;
     let elements: Vec<Box<RawValue>> = serde_json::from_str(s.trim()).ok()?;
+    let target_idx = last_injectable_object_index_from_elements(&elements)?;
 
     // Rebuild the target element with cache_control at its canonical sorted position.
     let new_elem = build_element_with_cc(elements.get(target_idx)?.get().trim())?;
@@ -391,8 +437,12 @@ pub fn inject_system_marker(canonical_system: &[u8]) -> Option<(Vec<u8>, usize)>
         return None; // string-form system
     }
 
+    // R6 — single-borrowed-parse: parse the system array exactly once, then
+    // derive both the eligible index and the elements for rebuild from that
+    // single parse. Previously called `serde_json::from_str` then
+    // `last_injectable_text_block_index` (which also parses) — two parses total.
     let elements: Vec<Box<RawValue>> = serde_json::from_str(trimmed).ok()?;
-    let target_idx = last_injectable_text_block_index(trimmed)?;
+    let target_idx = last_injectable_text_block_index_from_elements(&elements)?;
 
     // Rebuild the target text block with cache_control at its canonical sorted
     // position (idempotence: the rebuilt element is already key-sorted).

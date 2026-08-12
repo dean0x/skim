@@ -51,7 +51,7 @@ pub mod stats;
 pub mod volatile;
 
 use crate::breakpoint::{BreakpointPlan, plan_injection};
-use crate::canonical_emit::canonical_envelope;
+use crate::canonical_emit::canonical_envelope_with_spans;
 use crate::span::locate_top_level_spans;
 use crate::stats::AlignStats;
 use rskim_contract::canonical::tools_arrays_set_equal;
@@ -206,10 +206,13 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
 
     // ── Step 2: Build canonical form (no markers yet) ────────────────────────
     // AD-CA-2/12/13: canonical ordering, element sort, envelope key order
-    let canonical_bytes = canonical_envelope(input_str, &input_spans, provider)?;
+    //
+    // R6 — single-borrowed-parse: `canonical_envelope_with_spans` returns both
+    // the canonical bytes AND a span-map over those bytes in one pass, eliminating
+    // the second `locate_top_level_spans` call that was previously needed here.
+    let (canonical_bytes, canonical_spans) =
+        canonical_envelope_with_spans(input_str, &input_spans, provider)?;
     let canonical_str = std::str::from_utf8(&canonical_bytes).ok()?;
-    // Second span-locate on canonical output (needed for span extraction below)
-    let canonical_spans = locate_top_level_spans(canonical_str)?;
 
     // ── AD-CA-7 envelope path: top-level key set unchanged ───────────────────
     // (The messages-span byte-identity is verified inside canonical_envelope.)

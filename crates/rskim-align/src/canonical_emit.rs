@@ -169,7 +169,25 @@ pub fn canonicalize_value(raw: &str, depth: u32) -> Option<Vec<u8>> {
 /// This is the within-object key-sort that makes two semantically-equal objects
 /// with different key orders produce identical bytes.
 fn canonicalize_object(raw: &str, depth: u32) -> Option<Vec<u8>> {
-    let mut pairs = parse_object_pairs(raw)?;
+    let pairs = parse_object_pairs(raw)?;
+    canonicalize_object_from_pairs(pairs, depth)
+}
+
+/// Emit a canonical compact key-sorted JSON object from already-parsed pairs.
+///
+/// Accepts pairs that were already parsed via [`parse_object_pairs`], avoiding a
+/// second parse when the caller already has the pairs in hand. This is the hot-path
+/// variant used by [`sort_tools_array`] to merge name-extraction with canonicalization
+/// into a single parse per element (R6 — single-borrowed-parse optimization).
+///
+/// # AD-CA-2
+///
+/// Same invariants as [`canonicalize_object`]: sorts keys, recursively canonicalizes
+/// values, returns compact framing.
+pub(crate) fn canonicalize_object_from_pairs(
+    mut pairs: Vec<(String, Box<RawValue>)>,
+    depth: u32,
+) -> Option<Vec<u8>> {
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = Vec::new();
@@ -218,46 +236,41 @@ fn canonicalize_array(raw: &str, depth: u32) -> Option<Vec<u8>> {
 // Tool name extraction for element sort key
 // ============================================================================
 
-/// Extract the tool name from a single tools/functions array element.
+/// Extract the tool name from already-parsed object pairs.
+///
+/// This is the hot-path variant of name extraction, accepting pairs that were
+/// already parsed via [`parse_object_pairs`], so the caller can reuse the same
+/// parse for both canonicalization and name extraction (R6 — single-borrowed-parse).
 ///
 /// # AD-CA-12 — Provider-shape-aware sort key extraction
 ///
 /// - `AnthropicTools`: top-level `"name"` field (decoded UTF-8).
-/// - `OpenAiTools`: nested `"function"."name"` field.
+/// - `OpenAiTools`: nested `"function"."name"` field — still requires one
+///   additional parse of the nested `"function"` sub-object, but does not
+///   re-parse the top-level element.
 /// - `OpenAiLegacyFunctions`: top-level `"name"` field (same path as Anthropic).
 ///
-/// Returns `None` if the name cannot be extracted (non-object element, missing
-/// name field, non-string name value). The caller uses an empty string as the
-/// fallback name — such elements sort to the front of the array, which is
-/// deterministic (consistent for the same input).
-fn extract_tool_name(element: &RawValue, kind: ToolArrayKind) -> Option<String> {
-    let s = element.get().trim();
-    if !s.starts_with('{') {
-        return None; // non-object element — no name to extract
-    }
-
-    let pairs = parse_object_pairs(s)?;
-
+/// Returns `None` if the name cannot be extracted. The caller uses `""` as the
+/// fallback name — non-named elements sort to the front, which is deterministic.
+fn extract_name_from_pairs(pairs: &[(String, Box<RawValue>)], kind: ToolArrayKind) -> Option<String> {
     match kind {
         ToolArrayKind::AnthropicTools | ToolArrayKind::OpenAiLegacyFunctions => {
-            // Top-level "name" field
-            for (k, v) in &pairs {
+            // Top-level "name" field — no additional parse
+            for (k, v) in pairs {
                 if k == "name" {
-                    let name: String = serde_json::from_str(v.get().trim()).ok()?;
-                    return Some(name);
+                    return serde_json::from_str(v.get().trim()).ok();
                 }
             }
             None
         }
         ToolArrayKind::OpenAiTools => {
-            // Nested "function"."name"
-            for (k, v) in &pairs {
+            // Nested "function"."name" — one additional parse of the "function" sub-object
+            for (k, v) in pairs {
                 if k == "function" {
                     let func_pairs = parse_object_pairs(v.get().trim())?;
                     for (fk, fv) in &func_pairs {
                         if fk == "name" {
-                            let name: String = serde_json::from_str(fv.get().trim()).ok()?;
-                            return Some(name);
+                            return serde_json::from_str(fv.get().trim()).ok();
                         }
                     }
                 }
@@ -298,10 +311,24 @@ pub(crate) fn sort_tools_array(raw: &str, kind: ToolArrayKind) -> Option<Vec<u8>
         name: String, // primary sort key (empty when not extractable)
     }
 
+    // R6 — single-borrowed-parse: for object elements, parse once via
+    // `parse_object_pairs`, extract the name from the parsed pairs, then
+    // canonicalize from those same pairs — eliminating the per-element
+    // redundant `parse_object_pairs` call that `extract_tool_name` used to make.
     let mut keyed: Vec<ElemWithKey> = Vec::with_capacity(elements.len());
     for elem in &elements {
-        let canonical = canonicalize_value(elem.get().trim(), 0)?;
-        let name = extract_tool_name(elem, kind).unwrap_or_default();
+        let s = elem.get().trim();
+        let (canonical, name) = if s.starts_with('{') {
+            // Object element: parse once, canonicalize + extract name from same pairs
+            let pairs = parse_object_pairs(s)?;
+            let name = extract_name_from_pairs(&pairs, kind).unwrap_or_default();
+            let canonical = canonicalize_object_from_pairs(pairs, 0)?;
+            (canonical, name)
+        } else {
+            // Non-object element: no name, canonicalize as plain value
+            let canonical = canonicalize_value(s, 0)?;
+            (canonical, String::new())
+        };
         keyed.push(ElemWithKey { canonical, name });
     }
 
@@ -449,6 +476,125 @@ pub fn canonical_envelope(
     }
 
     Some(out)
+}
+
+/// Restructure a JSON request body into canonical key order and return both
+/// the canonical bytes **and** a span-map over the canonical output.
+///
+/// This is the R6 single-borrowed-parse variant of [`canonical_envelope`].
+/// It eliminates the second `locate_top_level_spans` call that `try_align_full`
+/// previously made on the canonical output: instead of emitting bytes and then
+/// re-parsing to find each value's position, we record each value's start and
+/// length while emitting.
+///
+/// # Semantics
+///
+/// Identical to [`canonical_envelope`] for the output bytes. The returned
+/// `HashMap<String, Span>` maps each top-level key to its value's byte position
+/// within the returned `Vec<u8>`. Spans are always in-bounds for the returned
+/// bytes by construction.
+///
+/// # AD-CA-7 — Envelope path self-verify
+///
+/// Same self-verify as [`canonical_envelope`]: messages bytes must be identical
+/// between input and canonical output. Returns `None` on any self-verify failure.
+pub fn canonical_envelope_with_spans(
+    input: &str,
+    spans: &HashMap<String, Span>,
+    provider: Provider,
+) -> Option<(Vec<u8>, HashMap<String, Span>)> {
+    // Sort keys lexicographically for deterministic envelope order (AD-CA-13)
+    let mut keys: Vec<&str> = spans.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    let mut out: Vec<u8> = Vec::with_capacity(input.len() + 16);
+    out.push(b'{');
+
+    let mut canonical_spans: HashMap<String, Span> = HashMap::with_capacity(spans.len());
+
+    // Track the messages value bytes for the AD-CA-7 self-verify
+    let mut messages_input_bytes: Option<&str> = None;
+    let mut messages_output_start: Option<usize> = None;
+    let mut messages_output_len: Option<usize> = None;
+
+    for (i, key) in keys.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+
+        // Emit key as JSON string
+        let key_json = serde_json::to_string(*key).ok()?;
+        out.extend_from_slice(key_json.as_bytes());
+        out.push(b':');
+
+        let span = spans.get(*key)?;
+        let raw_val = span.extract(input)?;
+
+        // Record where this value starts in the output
+        let value_start = out.len();
+
+        match *key {
+            "tools" => {
+                let kind = match provider {
+                    Provider::Anthropic => ToolArrayKind::AnthropicTools,
+                    Provider::OpenAi => ToolArrayKind::OpenAiTools,
+                    _ => return None,
+                };
+                let canonicalized = sort_tools_array(raw_val, kind)?;
+                out.extend_from_slice(&canonicalized);
+            }
+            "functions" => {
+                let canonicalized =
+                    sort_tools_array(raw_val, ToolArrayKind::OpenAiLegacyFunctions)?;
+                out.extend_from_slice(&canonicalized);
+            }
+            "system" => match provider {
+                Provider::Anthropic => {
+                    let canonicalized = canonicalize_value(raw_val.trim(), 0)?;
+                    out.extend_from_slice(&canonicalized);
+                }
+                _ => {
+                    out.extend_from_slice(raw_val.as_bytes());
+                }
+            },
+            "messages" => {
+                messages_input_bytes = Some(raw_val);
+                messages_output_start = Some(value_start);
+                out.extend_from_slice(raw_val.as_bytes());
+                messages_output_len = Some(raw_val.len());
+            }
+            _ => {
+                out.extend_from_slice(raw_val.as_bytes());
+            }
+        }
+
+        // Record the span of this key's value in the canonical output
+        let value_len = out.len() - value_start;
+        canonical_spans.insert(
+            (*key).to_owned(),
+            Span {
+                start: value_start,
+                len: value_len,
+            },
+        );
+    }
+
+    out.push(b'}');
+
+    // AD-CA-7 envelope self-verify
+    if let (Some(input_msgs), Some(output_start), Some(output_len)) = (
+        messages_input_bytes,
+        messages_output_start,
+        messages_output_len,
+    ) {
+        let output_end = output_start.checked_add(output_len)?;
+        match out.get(output_start..output_end) {
+            Some(out_slice) if out_slice == input_msgs.as_bytes() => {}
+            _ => return None,
+        }
+    }
+
+    Some((out, canonical_spans))
 }
 
 // ============================================================================
