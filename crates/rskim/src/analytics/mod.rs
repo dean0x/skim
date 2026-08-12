@@ -2661,10 +2661,10 @@ pub(crate) mod tests {
     }
 
     // ========================================================================
-    // Schema migration v4 tests — alignment_decisions table (AD-CA-9)
+    // Schema migration v5 tests — alignment_decisions table (AD-CA-9)
     // ========================================================================
 
-    /// POSITIVE: v4 migration creates the alignment_decisions table.
+    /// POSITIVE: v5 migration creates the alignment_decisions table.
     /// DISCRIMINATING (PF-007): if the migration were removed, this test fails.
     #[test]
     fn test_alignment_decisions_table_created_by_migration() {
@@ -2679,20 +2679,20 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             count, 1,
-            "alignment_decisions table must be created by migration v4"
+            "alignment_decisions table must be created by migration v5"
         );
     }
 
-    /// POSITIVE: schema version is 4 after migration.
-    /// DISCRIMINATING: if PRAGMA user_version = 4 were not the last statement, version would be wrong.
+    /// POSITIVE: schema version is 5 after migration.
+    /// DISCRIMINATING: if PRAGMA user_version = 5 were not the last statement, version would be wrong.
     #[test]
-    fn test_schema_version_is_4_after_migration() {
+    fn test_schema_version_is_5_after_migration() {
         let (db, _tmp) = test_db();
         let version: i64 = db
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4, "schema version must be 4 after all migrations");
+        assert_eq!(version, 5, "schema version must be 5 after all migrations");
     }
 
     /// POSITIVE: record_alignment inserts a row into alignment_decisions.
