@@ -7,6 +7,27 @@
 //! - `align_anthropic_512kb` — 512 KB multi-turn body
 //! - `align_openai_64tools` — same 64 tools, OpenAI format
 //!
+//! # Stage micro-benchmarks (TEMPORARY INSTRUMENTATION — not wired into CI)
+//!
+//! Groups `stage_64tools` and `stage_2tools` break the `align()` pipeline into
+//! isolated stages so each stage's share of the total ~7.5 ms can be attributed
+//! independently. These benchmarks are NOT part of the CI gate — they exist only
+//! to identify the dominant hotspot and answer whether the O(n log n)
+//! `tools_arrays_set_equal` implementation warrants keeping, reverting, or bounding.
+//!
+//! Pipeline stages measured:
+//!   A  — `locate_top_level_spans` on raw input (serde_json flat map walk)
+//!   B  — `sort_tools_array` on the extracted tools value span
+//!         (64 × per-element: parse_object_pairs + recursive canonicalize_value ×8 depth)
+//!   C  — `canonical_envelope_with_spans` end-to-end (includes B + system + envelope)
+//!   D  — `locate_top_level_spans` on canonical output (AD-CA-7 independent re-parse gate)
+//!   E  — `tools_arrays_set_equal(original, canonical)` (O(n log n) reorder gate)
+//!         (parse_raw_node ×2 arrays + canonical_bytes_of_node ×128 + sort ×2)
+//!   F  — Two SHA-256 digests (input + canonical output)
+//!   G  — `detect_volatile` (regex scan over input)
+//!   H  — `count_client_markers` (cache_control string scan)
+//!   I  — `plan_injection` + `inject_tools_marker` (breakpoint planning + splice)
+//!
 //! # No direct `Instant::now`
 //!
 //! Bench user code must NOT call `Instant::now` directly (enforced by the
@@ -16,10 +37,18 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rskim_align::align;
+use rskim_align::breakpoint::{count_client_markers, inject_tools_marker, plan_injection};
+use rskim_align::canonical_emit::{
+    ToolArrayKind, canonical_envelope_with_spans, sort_tools_array,
+};
+use rskim_align::span::locate_top_level_spans;
+use rskim_align::stats::sha256;
+use rskim_align::volatile::detect_volatile;
+use rskim_contract::canonical::tools_arrays_set_equal;
 use rskim_llm::Provider;
 
 // ============================================================================
-// Fixture helpers
+// Fixture helpers (shared with AC17 benches)
 // ============================================================================
 
 /// Build a single tool definition with a nested schema at a given depth.
@@ -110,7 +139,7 @@ fn build_openai_n_tools(n: usize, depth: usize) -> Vec<u8> {
 }
 
 // ============================================================================
-// Benchmark: 64 tools with nested schema depth 8
+// Benchmark: 64 tools with nested schema depth 8 (AC17 primary gate)
 // ============================================================================
 
 /// AC17 — Worst-case fixture: 64 tools × nested depth 8 (Anthropic).
@@ -215,6 +244,270 @@ fn bench_align_anthropic_2tools_baseline(c: &mut Criterion) {
     });
 }
 
+// ============================================================================
+// TEMPORARY INSTRUMENTATION: per-stage benchmarks (NOT wired into CI)
+//
+// These benchmarks decompose the align() pipeline into isolated stages to
+// attribute the ~7.5 ms total across specific operations. See module-level
+// docs for the stage labelling scheme.
+//
+// To run only these: `cargo bench -p rskim-align -- stage_`
+// ============================================================================
+
+/// Run all pipeline-stage sub-benchmarks for the 64-tool fixture.
+///
+/// Each sub-benchmark isolates one stage of `try_align_full` and measures it
+/// independently. The sum of stages A–I will be less than the full `align()`
+/// call because `align()` also includes overhead not covered by individual
+/// stages (e.g. match arms, intermediate &str checks, Vec::with_capacity
+/// decision points).
+fn bench_stages_anthropic_64tools(c: &mut Criterion) {
+    // ── Pre-compute shared state (not part of any measurement) ──────────────
+
+    let body = build_anthropic_n_tools(64, 8);
+    let body_str: &str = std::str::from_utf8(&body).unwrap();
+
+    // Parsed input spans (used by Stage C and Stage H)
+    let input_spans = locate_top_level_spans(body_str)
+        .expect("64-tool fixture must have valid top-level spans");
+
+    // Extract the raw tools value span (used by Stage B and Stage E)
+    let tools_raw: String = input_spans["tools"]
+        .extract(body_str)
+        .expect("64-tool fixture must have a tools key")
+        .to_owned();
+
+    // Canonical form of the body (used by Stage D, Stage E, Stage F)
+    let (canonical_bytes, canonical_spans) =
+        canonical_envelope_with_spans(body_str, &input_spans, Provider::Anthropic)
+            .expect("64-tool fixture must canonicalize without error");
+    let canonical_str: String =
+        String::from_utf8(canonical_bytes.clone()).expect("canonical bytes must be valid UTF-8");
+
+    // Extract the canonical tools value span (used by Stage E)
+    let canonical_tools_raw: String = canonical_spans["tools"]
+        .extract(&canonical_str)
+        .expect("canonical output must have a tools key")
+        .to_owned();
+
+    // Client marker count for the injection stages
+    let client_count = count_client_markers(body_str, &input_spans);
+
+    // ── Stage benchmarks ─────────────────────────────────────────────────────
+
+    let mut group = c.benchmark_group("stage_64tools");
+
+    // Stage A: locate_top_level_spans on raw input
+    // What: serde_json flat-map parse of the top-level object; records byte spans
+    // for each top-level key (5 keys in the 64-tool fixture).
+    group.bench_function("A_locate_input_spans", |b| {
+        b.iter(|| locate_top_level_spans(criterion::black_box(body_str)))
+    });
+
+    // Stage B: sort_tools_array on the extracted tools value span
+    // What: parse_array_elements (64 elements) + for each element:
+    //   parse_object_pairs + recursive canonicalize_value at depth 8
+    //   (9 serde_json parse calls per element × 64 = ~576 total).
+    // This is the primary canonicalization hot path.
+    group.bench_function("B_sort_tools_array", |b| {
+        b.iter(|| {
+            sort_tools_array(
+                criterion::black_box(tools_raw.as_str()),
+                ToolArrayKind::AnthropicTools,
+            )
+        })
+    });
+
+    // Stage C: canonical_envelope_with_spans (full canonicalization including Stage B)
+    // What: sorts envelope keys + dispatches to sort_tools_array (tools),
+    // canonicalize_value (system), verbatim copy (messages, others). Includes
+    // the AD-CA-7 messages self-verify. Stage C - Stage B ≈ envelope overhead.
+    group.bench_function("C_canonical_envelope", |b| {
+        b.iter(|| {
+            canonical_envelope_with_spans(
+                criterion::black_box(body_str),
+                &input_spans,
+                Provider::Anthropic,
+            )
+        })
+    });
+
+    // Stage D: locate_top_level_spans on canonical output (AD-CA-7 independent re-parse gate)
+    // What: same as Stage A but on the canonical (post-sort, post-compaction) body.
+    // This is the "independent re-parse" envelope path check from AD-CA-7.
+    group.bench_function("D_locate_canonical_spans", |b| {
+        b.iter(|| locate_top_level_spans(criterion::black_box(canonical_str.as_str())))
+    });
+
+    // Stage E: tools_arrays_set_equal(original, canonical) — the O(n log n) reorder gate
+    // What: parse_raw_node on BOTH arrays (original 64-tool + canonical 64-tool),
+    // building full RawNode trees; canonical_bytes_of_node for 128 elements;
+    // sort of 64 Vec<u8> keys × 2; pairwise comparison.
+    // This is the AC29 ADR-007 multiset gate for the element reorder.
+    group.bench_function("E_tools_set_equal", |b| {
+        b.iter(|| {
+            tools_arrays_set_equal(
+                criterion::black_box(tools_raw.as_str()),
+                criterion::black_box(canonical_tools_raw.as_str()),
+            )
+        })
+    });
+
+    // Stage F: two SHA-256 digests (AlignStats::success calls sha256 twice)
+    // What: SHA-256(input ~42KB) + SHA-256(canonical ~42KB).
+    group.bench_function("F_sha256_both", |b| {
+        b.iter(|| {
+            let h1 = sha256(criterion::black_box(&body));
+            let h2 = sha256(criterion::black_box(&canonical_bytes));
+            criterion::black_box((h1, h2))
+        })
+    });
+
+    // Stage G: volatile detection (warn/stats only; does not steer placement)
+    // What: regex pattern scan over the entire input string.
+    group.bench_function("G_volatile_detect", |b| {
+        b.iter(|| detect_volatile(criterion::black_box(body_str)))
+    });
+
+    // Stage H: count_client_markers (pre-injection budget accounting)
+    // What: counts "cache_control" occurrences within the tools/system/messages spans.
+    group.bench_function("H_count_client_markers", |b| {
+        b.iter(|| count_client_markers(criterion::black_box(body_str), &input_spans))
+    });
+
+    // Stage I: plan_injection + inject_tools_marker (breakpoint planning + splice)
+    // What: determines eligible positions (V1: last tool object + last system block),
+    // then injects the marker into the canonical tools array. Excludes the
+    // verify_injection call (that is part of apply_injection in lib.rs).
+    group.bench_function("I_plan_and_inject_tools", |b| {
+        let canonical_tools_bytes = canonical_tools_raw.as_bytes();
+        let canonical_system_bytes: Option<Vec<u8>> = canonical_spans
+            .get("system")
+            .and_then(|s| s.extract(&canonical_str))
+            .map(|v| v.as_bytes().to_vec());
+        b.iter(|| {
+            let plan = plan_injection(
+                criterion::black_box(Some(canonical_tools_bytes)),
+                criterion::black_box(canonical_system_bytes.as_deref()),
+                client_count,
+            );
+            if plan.skim_count > 0 {
+                let _ = inject_tools_marker(criterion::black_box(canonical_tools_bytes));
+            }
+        })
+    });
+
+    group.finish();
+}
+
+/// Run all pipeline-stage sub-benchmarks for the 2-tool baseline fixture.
+///
+/// Used alongside `stage_64tools` to quantify the per-tool scaling factor
+/// for each stage independently.
+fn bench_stages_anthropic_2tools(c: &mut Criterion) {
+    // ── Pre-compute shared state ──────────────────────────────────────────────
+
+    let body_str: &str = std::str::from_utf8(ANTHROPIC_BODY_2TOOLS).unwrap();
+    let body_bytes: &[u8] = ANTHROPIC_BODY_2TOOLS;
+
+    let input_spans = locate_top_level_spans(body_str)
+        .expect("2-tool fixture must have valid top-level spans");
+
+    let tools_raw: String = input_spans["tools"]
+        .extract(body_str)
+        .expect("2-tool fixture must have a tools key")
+        .to_owned();
+
+    let (canonical_bytes, canonical_spans) =
+        canonical_envelope_with_spans(body_str, &input_spans, Provider::Anthropic)
+            .expect("2-tool fixture must canonicalize without error");
+    let canonical_str: String =
+        String::from_utf8(canonical_bytes.clone()).expect("canonical bytes must be valid UTF-8");
+
+    let canonical_tools_raw: String = canonical_spans["tools"]
+        .extract(&canonical_str)
+        .expect("canonical output must have a tools key")
+        .to_owned();
+
+    let client_count = count_client_markers(body_str, &input_spans);
+
+    // ── Stage benchmarks ─────────────────────────────────────────────────────
+
+    let mut group = c.benchmark_group("stage_2tools");
+
+    group.bench_function("A_locate_input_spans", |b| {
+        b.iter(|| locate_top_level_spans(criterion::black_box(body_str)))
+    });
+
+    group.bench_function("B_sort_tools_array", |b| {
+        b.iter(|| {
+            sort_tools_array(
+                criterion::black_box(tools_raw.as_str()),
+                ToolArrayKind::AnthropicTools,
+            )
+        })
+    });
+
+    group.bench_function("C_canonical_envelope", |b| {
+        b.iter(|| {
+            canonical_envelope_with_spans(
+                criterion::black_box(body_str),
+                &input_spans,
+                Provider::Anthropic,
+            )
+        })
+    });
+
+    group.bench_function("D_locate_canonical_spans", |b| {
+        b.iter(|| locate_top_level_spans(criterion::black_box(canonical_str.as_str())))
+    });
+
+    group.bench_function("E_tools_set_equal", |b| {
+        b.iter(|| {
+            tools_arrays_set_equal(
+                criterion::black_box(tools_raw.as_str()),
+                criterion::black_box(canonical_tools_raw.as_str()),
+            )
+        })
+    });
+
+    group.bench_function("F_sha256_both", |b| {
+        b.iter(|| {
+            let h1 = sha256(criterion::black_box(body_bytes));
+            let h2 = sha256(criterion::black_box(&canonical_bytes));
+            criterion::black_box((h1, h2))
+        })
+    });
+
+    group.bench_function("G_volatile_detect", |b| {
+        b.iter(|| detect_volatile(criterion::black_box(body_str)))
+    });
+
+    group.bench_function("H_count_client_markers", |b| {
+        b.iter(|| count_client_markers(criterion::black_box(body_str), &input_spans))
+    });
+
+    group.bench_function("I_plan_and_inject_tools", |b| {
+        let canonical_tools_bytes = canonical_tools_raw.as_bytes();
+        let canonical_system_bytes: Option<Vec<u8>> = canonical_spans
+            .get("system")
+            .and_then(|s| s.extract(&canonical_str))
+            .map(|v| v.as_bytes().to_vec());
+        b.iter(|| {
+            let plan = plan_injection(
+                criterion::black_box(Some(canonical_tools_bytes)),
+                criterion::black_box(canonical_system_bytes.as_deref()),
+                client_count,
+            );
+            if plan.skim_count > 0 {
+                let _ = inject_tools_marker(criterion::black_box(canonical_tools_bytes));
+            }
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_align_anthropic_64tools,
@@ -222,4 +515,13 @@ criterion_group!(
     bench_align_openai_64tools,
     bench_align_anthropic_2tools_baseline,
 );
-criterion_main!(benches);
+
+// TEMPORARY INSTRUMENTATION: stage benchmarks for hotspot attribution.
+// Not part of the CI gate. Run with: cargo bench -p rskim-align -- stage_
+criterion_group!(
+    stages,
+    bench_stages_anthropic_64tools,
+    bench_stages_anthropic_2tools,
+);
+
+criterion_main!(benches, stages);
