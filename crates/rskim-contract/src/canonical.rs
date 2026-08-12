@@ -138,6 +138,12 @@ fn parse_raw_node(raw_src: &str, depth: usize) -> Option<RawNode> {
 /// can only receive trees whose depth is ≤ `MAX_CANONICAL_DEPTH`.
 /// This satisfies AC17's "all recursion explicitly bounded" requirement,
 /// though the bound is at the parse site rather than the comparison site.
+///
+/// # Relationship to `canonical_bytes_of_node`
+///
+/// `raw_nodes_equal(a, b)` iff `canonical_bytes_of_node(a) == canonical_bytes_of_node(b)`.
+/// This is the property exploited by [`tools_arrays_set_equal`] to replace the O(n²)
+/// greedy scan with an O(n log n) sort-and-compare.
 fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
     match (a, b) {
         (RawNode::Null, RawNode::Null) => true,
@@ -167,6 +173,100 @@ fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
             })
         }
         _ => false, // type mismatch
+    }
+}
+
+/// Serialize a `RawNode` tree to its canonical compact bytes.
+///
+/// # Canonical form
+///
+/// - `Null` → `b"null"`
+/// - `Bool` → `b"true"` / `b"false"`
+/// - `Number(raw)` → verbatim raw token bytes (preserves `1e3`, `1.0`, etc.)
+/// - `JsonString(s)` → the decoded string re-serialized as compact JSON
+///   (normalises `"A"` → `"A"`, matching the decoded-value comparison in
+///   [`raw_nodes_equal`])
+/// - `Array(elems)` → compact JSON array, elements in source order
+/// - `Object(pairs)` → compact JSON object with keys in BTreeMap-sorted order
+///   (guaranteed by [`parse_raw_node`], which builds objects via `BTreeMap`)
+///
+/// # Semantic equivalence with `raw_nodes_equal`
+///
+/// `raw_nodes_equal(a, b)` iff `canonical_bytes_of_node(a) == canonical_bytes_of_node(b)`.
+///
+/// Proof sketch:
+/// - **Object**: `raw_nodes_equal` is key-order-insensitive; `canonical_bytes_of_node`
+///   iterates in BTreeMap order (both `a` and `b` were parsed via BTreeMap, so same
+///   sorted key order). Equal objects → same key-value pairs → same sorted-key bytes.
+/// - **Number**: both compare raw token bytes directly.
+/// - **String**: both compare decoded values; re-serialization produces identical
+///   compact bytes for the same decoded string.
+/// - **Array/null/bool**: direct structural equality → identical serialization.
+///
+/// # Depth bound (AC17)
+///
+/// The `RawNode` tree depth is bounded to [`MAX_CANONICAL_DEPTH`] by [`parse_raw_node`].
+/// `canonical_bytes_of_node` recurses only into children of already-parsed nodes,
+/// so its recursion depth is also ≤ `MAX_CANONICAL_DEPTH`.
+fn canonical_bytes_of_node(node: &RawNode) -> Vec<u8> {
+    match node {
+        RawNode::Null => b"null".to_vec(),
+        RawNode::Bool(true) => b"true".to_vec(),
+        RawNode::Bool(false) => b"false".to_vec(),
+        RawNode::Number(raw) => raw.as_bytes().to_vec(),
+        RawNode::JsonString(s) => {
+            // Re-serialise the decoded string to canonical compact JSON.
+            // `serde_json::to_vec` for a `&str` is infallible: Rust strings
+            // are always valid UTF-8 and always representable as JSON strings.
+            serde_json::to_vec(s.as_str()).unwrap_or_else(|_| {
+                // Unreachable: String is always a valid JSON string value.
+                // Emit a quoted copy as a last-resort defensive fallback so that
+                // the serialization is at worst pessimistic (two inputs that
+                // differ only in this unreachable case will produce differing bytes
+                // and be treated as non-equal — the conservative outcome).
+                let mut out = Vec::with_capacity(s.len() + 2);
+                out.push(b'"');
+                out.extend_from_slice(s.as_bytes());
+                out.push(b'"');
+                out
+            })
+        }
+        RawNode::Array(elems) => {
+            let mut out = vec![b'['];
+            for (i, elem) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&canonical_bytes_of_node(elem));
+            }
+            out.push(b']');
+            out
+        }
+        RawNode::Object(pairs) => {
+            // Pairs are already in BTreeMap-sorted order (guaranteed at parse time
+            // by `parse_raw_node`, which builds objects via a `BTreeMap` that
+            // iterates in lexicographic key order).
+            let mut out = vec![b'{'];
+            for (i, (key, val)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                // Serialise the key as a JSON string.  Infallible for &str.
+                let key_bytes = serde_json::to_vec(key.as_str()).unwrap_or_else(|_| {
+                    // Unreachable: String key is always a valid JSON string.
+                    let mut b = Vec::with_capacity(key.len() + 2);
+                    b.push(b'"');
+                    b.extend_from_slice(key.as_bytes());
+                    b.push(b'"');
+                    b
+                });
+                out.extend_from_slice(&key_bytes);
+                out.push(b':');
+                out.extend_from_slice(&canonical_bytes_of_node(val));
+            }
+            out.push(b'}');
+            out
+        }
     }
 }
 
@@ -429,33 +529,38 @@ pub fn tools_arrays_set_equal(raw_a: &str, raw_b: &str) -> bool {
         return false;
     }
 
-    // Greedy multiset match: for each element in `a`, find the first unused
-    // canonically-equal element in `b`. Use a boolean "used" mask to prevent
-    // the same `b` element from being matched twice (handles duplicate elements
-    // in `a` correctly — each must consume a distinct `b` slot).
-    //
-    // O(n²) in the number of tools; safe in practice (real requests have at
-    // most ~64 tools, and this function runs at most once per request per
-    // transform invocation). A HashMap-based O(n) alternative would require
-    // a stable serialization step to key the map; the O(n²) scan is cheaper
-    // for this cardinality range.
-    let mut used = vec![false; b_elems.len()];
-
-    for a_elem in &a_elems {
-        // Find the first unused b element that is canonically equal to a_elem.
-        let matched = b_elems
-            .iter()
-            .enumerate()
-            .find(|(j, b_elem)| !used[*j] && raw_nodes_equal(a_elem, b_elem));
-        match matched {
-            Some((j, _)) => used[j] = true,
-            None => return false, // no unused match → set mismatch
-        }
+    // Fast path: empty arrays are trivially equal.
+    if a_elems.is_empty() {
+        return true;
     }
 
-    // All elements in `a` matched; since lengths are equal, all `b` slots
-    // are also used (pigeon-hole: n elements consumed n of n slots).
-    true
+    // O(n log n) multiset equality via canonical-bytes sort-and-compare.
+    //
+    // `canonical_bytes_of_node` produces a deterministic compact JSON byte string
+    // for each element, with the property:
+    //
+    //   raw_nodes_equal(a, b)  iff  canonical_bytes_of_node(a) == canonical_bytes_of_node(b)
+    //
+    // Sorting both sides' byte-string vectors and comparing pairwise is therefore
+    // equivalent to multiset equality:
+    //  - Any element drop or duplication changes the sorted-byte multiset → mismatch.
+    //  - Any content mutation changes at least one element's canonical bytes → mismatch.
+    //  - A pure permutation changes neither the multiset nor any element's bytes → equal.
+    //
+    // Complexity: O(n log n) sort + O(n · |elem|) comparison, versus the former
+    // O(n²) greedy scan with O(k²) raw_nodes_equal calls per element pair (where k
+    // is the number of object keys per element). At 64 tools the old code made ~4096
+    // deep tree comparisons; the new code sorts 64 compact byte strings.
+    //
+    // Semantics unchanged: the AC11 raw-token number invariant is preserved because
+    // `canonical_bytes_of_node` copies number tokens verbatim (see its implementation).
+    let mut a_keys: Vec<Vec<u8>> = a_elems.iter().map(canonical_bytes_of_node).collect();
+    let mut b_keys: Vec<Vec<u8>> = b_elems.iter().map(canonical_bytes_of_node).collect();
+
+    a_keys.sort_unstable();
+    b_keys.sort_unstable();
+
+    a_keys == b_keys
 }
 
 // ============================================================================
@@ -1018,6 +1123,164 @@ mod tests {
             tools_arrays_set_equal(a, b),
             "identical arrays with genuine duplicates must be set-equal"
         );
+    }
+
+    // ========================================================================
+    // proptest cross-check: new O(n log n) implementation vs O(n²) reference
+    //
+    // The new sort-and-compare implementation must agree with the original
+    // greedy multiset matcher on every input reachable by the strategy below.
+    // ========================================================================
+
+    /// O(n²) reference implementation preserved for proptest cross-checking.
+    ///
+    /// This is the original greedy multiset matcher. It is intentionally kept
+    /// here (rather than deleted) so the proptest can verify the new O(n log n)
+    /// `tools_arrays_set_equal` produces identical results on all generated inputs.
+    fn tools_arrays_set_equal_reference(raw_a: &str, raw_b: &str) -> bool {
+        let (a_node, b_node) = match (parse_raw_node(raw_a, 0), parse_raw_node(raw_b, 0)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return false,
+        };
+        let (a_elems, b_elems) = match (a_node, b_node) {
+            (RawNode::Array(a), RawNode::Array(b)) => (a, b),
+            _ => return false,
+        };
+        if a_elems.len() != b_elems.len() {
+            return false;
+        }
+        let mut used = vec![false; b_elems.len()];
+        for a_elem in &a_elems {
+            let matched = b_elems
+                .iter()
+                .enumerate()
+                .find(|(j, b_elem)| !used[*j] && raw_nodes_equal(a_elem, b_elem));
+            match matched {
+                Some((j, _)) => used[j] = true,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    use proptest::prelude::*;
+
+    /// Strategy: generate a compact JSON representation of one tool element.
+    ///
+    /// Elements are simple objects to keep proptest shrinking fast while still
+    /// covering the key shape space: name, optional description, optional integer,
+    /// optional raw-number token (for AC11 coverage), optional nested object.
+    ///
+    /// Integer values are drawn from a fixed small set (not filtered arbitrary
+    /// i32) to avoid prop_filter local-reject exhaustion at high rejection rates.
+    fn arb_tool_element() -> impl Strategy<Value = String> {
+        // Fixed-shape tools so keys are stable; proptest varies only values.
+        prop_oneof![
+            // Simple name-only tool
+            prop_oneof![
+                Just("alpha"),
+                Just("beta"),
+                Just("gamma"),
+                Just("delta"),
+            ]
+            .prop_map(|name| format!(r#"{{"name":"{name}"}}"#)),
+            // Tool with name + description
+            (
+                prop_oneof![Just("search"), Just("read"), Just("write"), Just("exec")],
+                prop_oneof![Just("do it"), Just("do something else"), Just("run")],
+            )
+                .prop_map(|(name, desc)| format!(r#"{{"name":"{name}","description":"{desc}"}}"#)),
+            // Tool with name + integer parameter.
+            // Use a small fixed set instead of filtered i32::ANY: a filter
+            // that passes only 2M out of 4B values causes >65k local rejects
+            // and proptest aborts the run.
+            (
+                prop_oneof![Just("compute"), Just("fetch"), Just("store")],
+                prop_oneof![
+                    Just(0i32),
+                    Just(1),
+                    Just(-1),
+                    Just(42),
+                    Just(-100),
+                    Just(1000),
+                ],
+            )
+                .prop_map(|(name, n)| {
+                    format!(r#"{{"name":"{name}","parameters":{{"limit":{n}}}}}"#)
+                }),
+            // Tool with raw-number token (AC11 coverage: 1e3 vs 1000 are distinct)
+            prop_oneof![Just("raw_num_1e3"), Just("raw_num_42")]
+                .prop_map(|name| format!(r#"{{"name":"{name}","default":1e3}}"#)),
+        ]
+    }
+
+    /// Strategy: generate a tools JSON array with 0–5 elements.
+    fn arb_tools_array() -> impl Strategy<Value = String> {
+        prop::collection::vec(arb_tool_element(), 0..=5)
+            .prop_map(|elems| format!("[{}]", elems.join(",")))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 300,
+            max_shrink_iters: 500,
+            ..ProptestConfig::default()
+        })]
+
+        /// Cross-check: new O(n log n) implementation must agree with the O(n²)
+        /// reference greedy matcher on all generated (a, b) array pairs.
+        ///
+        /// This is the primary regression guard for the algorithmic refactor.
+        /// Any input on which the two implementations disagree is a bug.
+        #[test]
+        fn prop_tools_arrays_set_equal_agrees_with_reference(
+            a in arb_tools_array(),
+            b in arb_tools_array(),
+        ) {
+            let new_result = tools_arrays_set_equal(&a, &b);
+            let ref_result = tools_arrays_set_equal_reference(&a, &b);
+            prop_assert_eq!(
+                new_result, ref_result,
+                "new O(n log n) impl disagrees with O(n²) reference for a={:?} b={:?}",
+                a,
+                b
+            );
+        }
+
+        /// Cross-check: permuted array is always set-equal to original (both impls agree).
+        #[test]
+        fn prop_permuted_array_is_set_equal(
+            elems in prop::collection::vec(arb_tool_element(), 0..=4),
+            // Use a simple rotation as the permutation
+            rotation in 0usize..=4,
+        ) {
+            if elems.is_empty() {
+                return Ok(());
+            }
+            let rotation = rotation % elems.len();
+            let a_str = format!("[{}]", elems.join(","));
+            let mut rotated = elems.clone();
+            rotated.rotate_right(rotation);
+            let b_str = format!("[{}]", rotated.join(","));
+
+            let new_result = tools_arrays_set_equal(&a_str, &b_str);
+            let ref_result = tools_arrays_set_equal_reference(&a_str, &b_str);
+
+            // Both must agree
+            prop_assert_eq!(
+                new_result, ref_result,
+                "impls disagree on permuted array: a={:?} b={:?}",
+                a_str,
+                b_str
+            );
+            // And both must say true (permutation is always set-equal)
+            prop_assert!(
+                new_result,
+                "permuted array must be set-equal: a={:?} b={:?}",
+                a_str,
+                b_str
+            );
+        }
     }
 
     // ========================================================================
