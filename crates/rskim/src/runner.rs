@@ -131,7 +131,14 @@ impl CommandRunner {
         let start = Instant::now();
 
         let mut cmd = Command::new(program);
-        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Null stdin: child must not inherit the caller's stdin, which in test
+        // environments is often a blocking pipe.  Without this, a shell script
+        // that runs as the child (`#!/bin/sh`) can block on read-ahead after
+        // its own commands complete, hanging the test indefinitely.
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         for (key, value) in env_vars {
             cmd.env(key, value);

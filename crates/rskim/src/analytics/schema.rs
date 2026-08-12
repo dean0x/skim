@@ -2,6 +2,12 @@
 
 use rusqlite::Connection;
 
+/// Current schema version of this skim release.
+///
+/// AD-AN-5: `AnalyticsDb::open()` rejects databases whose `user_version` exceeds
+/// this constant before any schema mutation, WAL flip, or chmod (AC3).
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 5;
+
 /// Run all database migrations.
 pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -157,6 +163,7 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
             COMMIT;",
         )?;
     }
+
 
     Ok(())
 }

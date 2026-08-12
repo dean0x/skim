@@ -35,11 +35,13 @@
 //! pipeline is a PF-007 tautology (`out_len == in_len` always). #304 owns the
 //! post-assembly `whole_request_check` call; #307 owns the zone-assembly path.
 //!
-//! ## AD-PXY-09 — `turn_id` reserved
+//! ## AD-PXY-09 — `turn_id` lives on `ProxyEvent`, not `TransformContext`
 //!
-//! `turn_id` is intentionally absent from [`TransformContext`]. The derivation
-//! spec is tracked in #344 (filed per ADR-004; see DECISIONS-NEEDED.md). It will
-//! be added to `TransformContext` by #305 before turn-level tests land.
+//! `turn_id` is intentionally absent from [`TransformContext`]. No transform
+//! stage consumes it, and adding a dead field would be scaffolding for a
+//! now-impossible state (quality rule). `turn_id` is carried on
+//! [`crate::analytics::ProxyEvent`] as a nullable field (`None` until #344
+//! lands) — derivation spec is tracked in #344 (filed per ADR-004).
 
 use rskim_contract::contract::{Contract, Outcome};
 use rskim_contract::log::DecisionSink;
@@ -96,9 +98,12 @@ impl<'a> HeaderView<'a> {
 /// logging, stored in decision records, or exposed to stages. The redaction
 /// contract is enforced in `logging.rs` using `rskim_contract::log::is_sensitive_value`.
 ///
-/// ## AD-PXY-09 — turn_id is intentionally absent
+/// ## AD-PXY-09 — turn_id lives on ProxyEvent, not TransformContext
 ///
-/// `turn_id` derivation spec is tracked in #344. It will be added here by #305.
+/// `turn_id` is absent from `TransformContext` (no stage consumes it; adding
+/// a dead field violates the quality rule against scaffolding for now-impossible
+/// states). `turn_id` is carried as a nullable field on
+/// [`crate::analytics::ProxyEvent`]. Derivation spec is tracked in #344.
 #[non_exhaustive]
 pub struct TransformContext<'a> {
     /// Provider classified by the self-contained detection pipeline.
@@ -140,8 +145,8 @@ impl<'a> TransformContext<'a> {
     ///
     /// # AD-PXY-09
     ///
-    /// `turn_id` is intentionally absent (spec in #344). The constructor signature
-    /// will be extended non-breakingly when #305 adds `turn_id`.
+    /// `turn_id` is absent from `TransformContext` (see module-level AD-PXY-09
+    /// note). It lives on [`crate::analytics::ProxyEvent`] as a nullable field.
     pub fn new(
         provider: ProxyProvider,
         auth_mode: AuthMode,

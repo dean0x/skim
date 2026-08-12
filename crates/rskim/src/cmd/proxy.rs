@@ -324,17 +324,9 @@ pub(crate) fn run(
     // SKIM_PASSTHROUGH=1 → identity pipeline (no compression). Consistent with
     // skim's global passthrough convention for debugging (#304 escape hatch).
     //
-    // --no-cache-align → BlockRouterStage only (no CacheAlignStage); same as
-    //   the previous phase before #306 was merged. Alignment is skipped while
-    //   the block-router compression still runs. AD-CA-8 / PF-006.
-    //
-    // Default → BlockRouterStage (#304) + CacheAlignStage (#306, LAST — AD-CA-8).
-    // AD-PXY-06 canonical order: #307 → #304 → #306 LAST.
-    //
-    // `proxy_analytics_hook`: the proxy's own NoopAnalyticsHook (distinct from the
-    // skim AnalyticsConfig `analytics_cfg`). Named explicitly to resolve the
-    // name shadow that existed when both were called `analytics` (AD-CA-9).
-    let proxy_analytics_hook = Arc::new(rskim_proxy::analytics::NoopAnalyticsHook);
+    // Default → inject BlockRouterStage wrapping BlockRouter (Phase 4a / D1 / AC19).
+    // The router holds a BinarySinkStub for its Contract bridge; the per-call
+    // apply() path receives the real sink via TransformStage::apply.
     let pipeline = if std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1") {
         TransformPipeline::identity()
     } else if parsed.no_cache_align {
@@ -365,16 +357,84 @@ pub(crate) fn run(
         TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
     };
 
+    // Build the analytics hook.
+    //
+    // AD-AN-10: when analytics.enabled, build the BridgeAnalyticsHook and spawn
+    // the background consumer thread. When disabled (SKIM_DISABLE_ANALYTICS=1
+    // or analytics.enabled = false), fall back to NoopAnalyticsHook.
+    //
+    // AD-AN-12: `analytics_arc` is MOVED into `serve_with_stage` — no clone is
+    // retained here. When serve_with_stage returns all request-level Arc clones
+    // have been released, so the sender inside BridgeAnalyticsHook closes and
+    // the consumer's `for event in &rx` loop terminates naturally.
+    //
+    // Separate `let` bindings (not a tuple) to satisfy clippy::type_complexity.
+    let analytics_arc: Arc<dyn rskim_proxy::analytics::AnalyticsHook>;
+    let consumer_handle: Option<std::thread::JoinHandle<()>>;
+    let done_rx: Option<crossbeam_channel::Receiver<()>>;
+
+    if analytics_cfg.enabled {
+        let (hook, rx) = super::proxy_analytics::BridgeAnalyticsHook::new(
+            super::proxy_analytics::PROXY_QUEUE_RECORD_CAPACITY,
+        );
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, drx) = crossbeam_channel::bounded(1);
+        let handle = super::proxy_analytics::spawn_consumer(
+            rx,
+            drop_count,
+            queued_bytes,
+            analytics_cfg.session_id.clone(),
+            done_tx,
+            // None → AnalyticsDb::open_default(), honouring SKIM_ANALYTICS_DB /
+            // SKIM_CACHE_DIR. Only tests inject an explicit path.
+            None,
+        );
+        analytics_arc = Arc::new(hook);
+        consumer_handle = Some(handle);
+        done_rx = Some(drx);
+    } else {
+        analytics_arc = Arc::new(rskim_proxy::analytics::NoopAnalyticsHook);
+        consumer_handle = None;
+        done_rx = None;
+    }
+
     // Call serve_with_stage() — blocks until SIGINT/SIGTERM and drain completes (AC23).
-    // After it returns, the pipeline is dropped (the alignment recorder's sender closes),
-    // allowing the consumer thread to drain and exit (joined by flush_pending in main).
-    match rskim_proxy::serve_with_stage(config, pipeline, proxy_analytics_hook) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
+    // AD-AN-12: analytics_arc is moved in; the sender closes on return.
+    // The exit code is captured rather than returned immediately so the bounded
+    // consumer flush below still runs on the failure path; a serve error must
+    // still surface as a non-zero exit (fail loud).
+    let exit = match rskim_proxy::serve_with_stage(config, pipeline, analytics_arc) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("skim proxy: error: {e}");
-            Ok(ExitCode::FAILURE)
+            ExitCode::FAILURE
+        }
+    };
+
+    // AD-AN-12: bounded shutdown flush — wait up to FLUSH_BOUND for the
+    // consumer to drain and persist drop counts. If the bound elapses
+    // (pathological wedge), return without blocking; OS reclaims the thread.
+    //
+    // Cross-Plan Amendment #4 (bounded-consumer ownership): this
+    // `recv_timeout(FLUSH_BOUND)` is THE ONE bounded-consumer shutdown mechanism
+    // for the resident proxy (ADR-003 / PF-005). When #306's AlignmentRecorder
+    // consumer lands, it must reuse this same registered/bounded lifecycle
+    // (extend this block) rather than adding a second divergent flush_pending()
+    // drain. One shutdown mechanism → one flush gate → one exit path.
+    if let (Some(done_rx), Some(handle)) = (done_rx, consumer_handle) {
+        match done_rx.recv_timeout(super::proxy_analytics::FLUSH_BOUND) {
+            Ok(()) => {
+                let _ = handle.join();
+            }
+            Err(_) => {
+                // FLUSH_BOUND elapsed → consumer did not finish in time.
+                // Drop the JoinHandle; OS reclaims the thread.
+            }
         }
     }
+
+    Ok(exit)
 }
 
 // ============================================================================
