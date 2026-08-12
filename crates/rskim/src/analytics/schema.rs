@@ -12,6 +12,22 @@ pub(super) const CURRENT_SCHEMA_VERSION: i64 = 5;
 pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
+    // AD-AN-5 / ADR-006: reject databases written by a newer skim build.
+    // This is the same guard as `AnalyticsDb::open()` in mod.rs, replicated here
+    // so that `run_migrations` is safe to call directly (e.g. from tests or from
+    // a future non-`open()` entry point) without going through the open guard.
+    // A DB advanced to a version we don't know about might have schema changes
+    // that the migrations below would corrupt; bail fast rather than silently
+    // clobber a future schema.
+    if version > CURRENT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "analytics database schema version {} is newer than this skim build \
+             (supports up to v{}); upgrade skim to open this database",
+            version,
+            CURRENT_SCHEMA_VERSION,
+        );
+    }
+
     if version < 1 {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS token_savings (
@@ -163,7 +179,6 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
             COMMIT;",
         )?;
     }
-
 
     Ok(())
 }
@@ -514,15 +529,31 @@ mod tests {
                          savings_pct, session_id
                   FROM token_savings WHERE timestamp = 1000",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .expect("first row must be readable after migration");
         assert_eq!(ts, 1000, "timestamp must survive migration");
         assert_eq!(cmd, "cat", "command_type must survive migration");
         assert_eq!(raw, 100, "raw_tokens must survive migration");
         assert_eq!(comp, 60, "compressed_tokens must survive migration");
-        assert!((pct - 40.0).abs() < 1e-9, "savings_pct must survive migration");
-        assert_eq!(sid.as_deref(), Some("sess-a"), "session_id must survive migration");
+        assert!(
+            (pct - 40.0).abs() < 1e-9,
+            "savings_pct must survive migration"
+        );
+        assert_eq!(
+            sid.as_deref(),
+            Some("sess-a"),
+            "session_id must survive migration"
+        );
 
         // AC5/AC6: after v4, NULL-token inserts must succeed (nullable columns).
         // A proxy row records timing/provider without token counts.
@@ -547,6 +578,54 @@ mod tests {
         assert_eq!(
             null_count, 1,
             "one NULL-raw_tokens row: the proxy row inserted after v4 migration"
+        );
+    }
+
+    // AD-AN-5 / ADR-006 / NEGATIVE: run_migrations must reject a database whose
+    // user_version is greater than CURRENT_SCHEMA_VERSION.
+    //
+    // This mirrors the guard in `AnalyticsDb::open()` (mod.rs) but exercises it
+    // at the `run_migrations` level so that callers which bypass `open()` (e.g.
+    // direct test helpers or future entry points) are also protected.
+    //
+    // DISCRIMINATING (PF-007): removing the `if version > CURRENT_SCHEMA_VERSION`
+    // guard from `run_migrations` causes this test to expect an error but receive
+    // `Ok(())`, failing the `is_err()` assertion.
+    #[test]
+    fn schema_future_version_is_rejected_by_run_migrations() {
+        let conn = open_mem();
+        // Bootstrap to current version first, then force it one step ahead.
+        run_migrations(&conn).expect("initial migration must succeed");
+        assert_eq!(user_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // Advance user_version beyond what this build knows about.
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            CURRENT_SCHEMA_VERSION + 1
+        ))
+        .expect("force future user_version must succeed");
+
+        // run_migrations must now return an error (forward-version guard).
+        let result = run_migrations(&conn);
+        assert!(
+            result.is_err(),
+            "AD-AN-5: run_migrations must return Err for a database whose \
+             user_version ({}) exceeds CURRENT_SCHEMA_VERSION ({}); \
+             the forward-version guard in run_migrations is absent or bypassed",
+            CURRENT_SCHEMA_VERSION + 1,
+            CURRENT_SCHEMA_VERSION
+        );
+
+        // The error message must name the schema version numbers so operators
+        // know which skim version wrote the database.
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&(CURRENT_SCHEMA_VERSION + 1).to_string()),
+            "AD-AN-5: error message must include the database's schema version; got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains(&CURRENT_SCHEMA_VERSION.to_string()),
+            "AD-AN-5: error message must include CURRENT_SCHEMA_VERSION; got: {err_msg}"
         );
     }
 }

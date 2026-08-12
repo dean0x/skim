@@ -56,17 +56,25 @@ use crate::MAX_ALIGN_SCHEMA_DEPTH;
 ///
 /// # Purpose
 ///
-/// Exercises the independent `locate_top_level_spans` re-parse gate in
-/// `try_align_full` (lib.rs:236-244). When [`POISON_CANONICAL_OUTPUT`] is set
-/// on the current thread, [`canonical_envelope_with_spans`] appends a trailing
-/// `X` byte to its output **after** the messages self-verify passes — simulating
-/// a hypothetical framing bug in the emit loop. `locate_top_level_spans` then
-/// calls `de.end()` (span.rs:83) which rejects the trailing content, causing the
-/// gate to return `None` → whole-request fail-open.
+/// Two seams are provided, each exercising a different gate in `try_align_full`:
 ///
-/// This module is compiled only under `#[cfg(test)]` and has zero production
-/// footprint. See the discriminating test
-/// `ad_ca_7_envelope_self_verify_rejects_corrupt_canonical_bytes` in `lib.rs`.
+/// 1. **`POISON_CANONICAL_OUTPUT`** (`set_corrupt_emit` / `PoisonGuard`):
+///    Exercises the independent `locate_top_level_spans` re-parse gate
+///    (lib.rs:236-244). Appends a trailing `X` byte to the canonical output
+///    after the messages self-verify, so `locate_top_level_spans` rejects the
+///    trailing content via `de.end()` (span.rs:83) → `None` → fail-open.
+///    See `ad_ca_7_envelope_self_verify_rejects_corrupt_canonical_bytes`.
+///
+/// 2. **`POISON_TOOLS_SORT_DROP`** (`set_drop_tools_sort` / `DropGuard`):
+///    Exercises the AD-CA-7 reorder gate (lib.rs:255-265). When armed,
+///    [`super::sort_tools_array`] truncates its sorted result to at most one
+///    element before emitting, simulating a hypothetical element-drop bug.
+///    `tools_arrays_set_equal(original, canonical)` then returns `false` →
+///    the gate returns `None` → whole-request fail-open.
+///    See `ac29_reorder_gate_fires_on_element_drop_fault` in lib.rs.
+///
+/// Both seams are compiled only under `#[cfg(test)]` and have zero production
+/// footprint.
 #[cfg(test)]
 pub(crate) mod fault_injection {
     use std::cell::Cell;
@@ -76,6 +84,13 @@ pub(crate) mod fault_injection {
         /// this thread appends a trailing `X` byte to its output, after the messages
         /// self-verify, so the independent re-parse gate in `try_align_full` rejects it.
         pub(crate) static POISON_CANONICAL_OUTPUT: Cell<bool> = const { Cell::new(false) };
+
+        /// When `true`, the next [`super::sort_tools_array`] call on this thread
+        /// truncates its sorted result to at most one element before emitting —
+        /// simulating a hypothetical element-drop bug in the sort. The AC29 gate
+        /// (`tools_arrays_set_equal(original, canonical)`) then returns `false` →
+        /// `try_align_full` returns `None` → whole-request fail-open.
+        pub(crate) static POISON_TOOLS_SORT_DROP: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Arm (`true`) or disarm (`false`) the emit-corruption fault for this thread.
@@ -83,13 +98,31 @@ pub(crate) mod fault_injection {
         POISON_CANONICAL_OUTPUT.with(|c| c.set(enabled));
     }
 
-    /// RAII guard: disarms the poison on drop, ensuring it is cleared even if a
-    /// test assertion panics.
+    /// Arm (`true`) or disarm (`false`) the tools-sort element-drop fault.
+    ///
+    /// When armed, the next `sort_tools_array` call truncates its sorted output
+    /// to at most one element, causing the AC29 set-equal gate to fire.
+    pub(crate) fn set_drop_tools_sort(enabled: bool) {
+        POISON_TOOLS_SORT_DROP.with(|c| c.set(enabled));
+    }
+
+    /// RAII guard: disarms the emit-corruption poison on drop, ensuring it is
+    /// cleared even if a test assertion panics.
     pub(crate) struct PoisonGuard;
 
     impl Drop for PoisonGuard {
         fn drop(&mut self) {
             set_corrupt_emit(false);
+        }
+    }
+
+    /// RAII guard: disarms the tools-sort drop poison on drop, ensuring it is
+    /// cleared even if a test assertion panics.
+    pub(crate) struct DropGuard;
+
+    impl Drop for DropGuard {
+        fn drop(&mut self) {
+            set_drop_tools_sort(false);
         }
     }
 }
@@ -388,6 +421,15 @@ pub(crate) fn sort_tools_array(raw: &str, kind: ToolArrayKind) -> Option<Vec<u8>
             .cmp(&b.name)
             .then_with(|| a.canonical.cmp(&b.canonical))
     });
+
+    // Test-only fault injection: truncate the sorted array to 1 element to simulate
+    // an element-drop bug. When POISON_TOOLS_SORT_DROP is set, `tools_arrays_set_equal`
+    // (called in the AD-CA-7 reorder gate) returns false → try_align_full returns None
+    // → whole-request fail-open. This seam has zero production footprint.
+    #[cfg(test)]
+    if fault_injection::POISON_TOOLS_SORT_DROP.with(|c| c.get()) && keyed.len() > 1 {
+        keyed.truncate(1);
+    }
 
     // Emit sorted elements
     let mut out = Vec::new();

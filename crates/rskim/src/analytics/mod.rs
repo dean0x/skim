@@ -4144,7 +4144,10 @@ pub(crate) mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5, "AC2: version must be 5 after full migration (v4+v5)");
+        assert_eq!(
+            version, 5,
+            "AC2: version must be 5 after full migration (v4+v5)"
+        );
 
         // All 2 original rows are still there.
         let count: i64 = db

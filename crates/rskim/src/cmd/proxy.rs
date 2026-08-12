@@ -245,6 +245,50 @@ impl TransformStage for CacheAlignStage {
     }
 }
 
+// ============================================================================
+// Pipeline selection (AC16)
+// ============================================================================
+
+/// Which pipeline variant `run()` builds given the runtime flags.
+///
+/// Extracted into a pure enum so that the selection logic can be unit-tested
+/// without constructing actual stages, I/O, or environment side-effects.
+///
+/// # AC16 — testable selection
+///
+/// `select_pipeline(passthrough_env, no_cache_align)` maps two boolean inputs
+/// to one of three variants. Tests assert that all three variants are reachable
+/// and that they are pairwise distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineSelection {
+    /// `SKIM_PASSTHROUGH=1` — forward bytes unmodified; no stages.
+    Identity,
+    /// `--no-cache-align` — compression only; CacheAlignStage omitted.
+    BlockRouterOnly,
+    /// Default — full pipeline: compression then cache-key alignment.
+    Full,
+}
+
+/// Map runtime flags to a pipeline variant.
+///
+/// This is a pure function so that tests can assert the selection logic
+/// without constructing stages, spawning threads, or reading env vars.
+///
+/// `passthrough_env` is `true` when `SKIM_PASSTHROUGH == "1"`.
+/// `no_cache_align` is `true` when `--no-cache-align` was passed.
+///
+/// `passthrough_env` takes priority: if it is `true`, the result is always
+/// `Identity` regardless of `no_cache_align`.
+fn select_pipeline(passthrough_env: bool, no_cache_align: bool) -> PipelineSelection {
+    if passthrough_env {
+        PipelineSelection::Identity
+    } else if no_cache_align {
+        PipelineSelection::BlockRouterOnly
+    } else {
+        PipelineSelection::Full
+    }
+}
+
 /// Cleartext-exposure warning emitted to stderr when `--bind` is a non-loopback address.
 ///
 /// AC1 / AD-PXY-03: this exact string is the contract; tests assert it appears on stderr.
@@ -321,40 +365,47 @@ pub(crate) fn run(
 
     // Build the transform pipeline.
     //
-    // SKIM_PASSTHROUGH=1 → identity pipeline (no compression). Consistent with
-    // skim's global passthrough convention for debugging (#304 escape hatch).
-    //
-    // Default → inject BlockRouterStage wrapping BlockRouter (Phase 4a / D1 / AC19).
-    // The router holds a BinarySinkStub for its Contract bridge; the per-call
-    // apply() path receives the real sink via TransformStage::apply.
-    let pipeline = if std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1") {
-        TransformPipeline::identity()
-    } else if parsed.no_cache_align {
-        // --no-cache-align: run BlockRouterStage only; omit CacheAlignStage.
-        // No AlignmentRecorder is constructed on this path, so no consumer thread
-        // is spawned and analytics.db is never opened by the proxy.
-        let router = BlockRouter::new(Arc::new(BinarySinkStub));
-        let block_stage = BlockRouterStage::new(router);
-        TransformPipeline::from_stages(vec![Box::new(block_stage)])
-    } else {
-        // Full pipeline: BlockRouterStage (#304) then CacheAlignStage (#306).
-        // AD-CA-8: CacheAlignStage appended LAST per AD-PXY-06.
-        let router = BlockRouter::new(Arc::new(BinarySinkStub));
-        let block_stage = BlockRouterStage::new(router);
-        // AD-CA-9 / AD-AN-5: build the AlignmentRecorder from the analytics config
-        // ONLY on the path that uses it — `new_boxed` spawns a consumer thread and
-        // opens analytics.db, which must not happen under --no-cache-align or
-        // SKIM_PASSTHROUGH. It returns a NoopRecorder (no thread) when analytics
-        // are disabled, so the stage is always safe to construct.
-        //
-        // AD-CA-9: CacheAlignStage takes ownership of the recorder. When
-        // serve_with_stage() returns, the pipeline is dropped, which drops
-        // CacheAlignStage, which drops the recorder, which drops the Sender.
-        // The consumer thread drains remaining records and exits.
-        // flush_pending() in main() joins the thread before process exit.
-        let align_recorder = crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
-        let align_stage = CacheAlignStage::new(align_recorder);
-        TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
+    // AC16: the variant is selected by the pure `select_pipeline` function so that
+    // tests can assert on the selection logic without constructing actual stages.
+    let selection = select_pipeline(
+        std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1"),
+        parsed.no_cache_align,
+    );
+    let pipeline = match selection {
+        PipelineSelection::Identity => {
+            // SKIM_PASSTHROUGH=1 → identity pipeline (no compression).
+            // Consistent with skim's global passthrough convention (#304 escape hatch).
+            TransformPipeline::identity()
+        }
+        PipelineSelection::BlockRouterOnly => {
+            // --no-cache-align: run BlockRouterStage only; omit CacheAlignStage.
+            // No AlignmentRecorder is constructed on this path, so no consumer thread
+            // is spawned and analytics.db is never opened by the proxy.
+            let router = BlockRouter::new(Arc::new(BinarySinkStub));
+            let block_stage = BlockRouterStage::new(router);
+            TransformPipeline::from_stages(vec![Box::new(block_stage)])
+        }
+        PipelineSelection::Full => {
+            // Full pipeline: BlockRouterStage (#304) then CacheAlignStage (#306).
+            // AD-CA-8: CacheAlignStage appended LAST per AD-PXY-06.
+            let router = BlockRouter::new(Arc::new(BinarySinkStub));
+            let block_stage = BlockRouterStage::new(router);
+            // AD-CA-9 / AD-AN-5: build the AlignmentRecorder from the analytics config
+            // ONLY on the path that uses it — `new_boxed` spawns a consumer thread and
+            // opens analytics.db, which must not happen under --no-cache-align or
+            // SKIM_PASSTHROUGH. It returns a NoopRecorder (no thread) when analytics
+            // are disabled, so the stage is always safe to construct.
+            //
+            // AD-CA-9: CacheAlignStage takes ownership of the recorder. When
+            // serve_with_stage() returns, the pipeline is dropped, which drops
+            // CacheAlignStage, which drops the recorder, which drops the Sender.
+            // The consumer thread drains remaining records and exits.
+            // flush_pending() in main() joins the thread before process exit.
+            let align_recorder =
+                crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
+            let align_stage = CacheAlignStage::new(align_recorder);
+            TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
+        }
     };
 
     // Build the analytics hook.
@@ -1416,6 +1467,91 @@ mod tests {
         assert_eq!(
             out_noop.bytes, out_blocking.bytes,
             "AC18: NoopRecorder vs BlockingMockRecorder must produce identical forwarded bytes"
+        );
+    }
+
+    // =========================================================================
+    // AC16 — select_pipeline: pure selection logic is directly testable
+    // =========================================================================
+    //
+    // These tests target `select_pipeline(passthrough_env, no_cache_align)` —
+    // the pure function extracted from the pipeline-building block in `run()`.
+    // Because the function takes explicit booleans, it is testable without
+    // setting env-vars, constructing stages, or spawning threads.
+    //
+    // DISCRIMINATING (PF-007): each test fails when the corresponding branch is
+    // deleted from `select_pipeline`:
+    //   - Deleting `else if no_cache_align` makes `select_pipeline(false, true)`
+    //     return `Full` instead of `BlockRouterOnly` →
+    //     `test_select_pipeline_no_cache_align_maps_to_block_router_only` fails.
+    //   - Deleting the `passthrough_env` branch makes both `true` inputs return
+    //     `BlockRouterOnly` or `Full` →
+    //     `test_select_pipeline_passthrough_wins` fails.
+    //   - Removing any variant makes `test_select_pipeline_all_three_are_distinct`
+    //     fail (two selections would collapse to the same variant).
+
+    // AC16 / POSITIVE: SKIM_PASSTHROUGH=1 always selects the identity pipeline,
+    // regardless of --no-cache-align.
+    // DISCRIMINATING: deleting the passthrough_env branch causes both cases to
+    // return BlockRouterOnly or Full, failing the assertion.
+    #[test]
+    fn test_select_pipeline_passthrough_wins() {
+        assert_eq!(
+            select_pipeline(true, false),
+            PipelineSelection::Identity,
+            "SKIM_PASSTHROUGH=1 without --no-cache-align must select Identity"
+        );
+        assert_eq!(
+            select_pipeline(true, true),
+            PipelineSelection::Identity,
+            "SKIM_PASSTHROUGH=1 with --no-cache-align must still select Identity \
+             (passthrough takes priority)"
+        );
+    }
+
+    // AC16 / POSITIVE: --no-cache-align (without SKIM_PASSTHROUGH) selects BlockRouterOnly.
+    // DISCRIMINATING: deleting `else if no_cache_align` makes this return Full.
+    #[test]
+    fn test_select_pipeline_no_cache_align_maps_to_block_router_only() {
+        assert_eq!(
+            select_pipeline(false, true),
+            PipelineSelection::BlockRouterOnly,
+            "--no-cache-align without SKIM_PASSTHROUGH must select BlockRouterOnly \
+             (CacheAlignStage omitted)"
+        );
+    }
+
+    // AC16 / POSITIVE: neither flag selects the Full pipeline.
+    // DISCRIMINATING: any branch misfire would change this to Identity or BlockRouterOnly.
+    #[test]
+    fn test_select_pipeline_default_maps_to_full() {
+        assert_eq!(
+            select_pipeline(false, false),
+            PipelineSelection::Full,
+            "default (no SKIM_PASSTHROUGH, no --no-cache-align) must select Full \
+             (both BlockRouterStage and CacheAlignStage)"
+        );
+    }
+
+    // AC16 / POSITIVE: all three selections are pairwise distinct.
+    // DISCRIMINATING: if two branches collapse to the same variant, this fails.
+    // Also validates that `select_pipeline` has three meaningful, non-degenerate branches.
+    #[test]
+    fn test_select_pipeline_all_three_are_distinct() {
+        let identity = select_pipeline(true, false);
+        let block_only = select_pipeline(false, true);
+        let full = select_pipeline(false, false);
+        assert_ne!(
+            identity, block_only,
+            "AC16: Identity and BlockRouterOnly must be distinct pipeline selections"
+        );
+        assert_ne!(
+            identity, full,
+            "AC16: Identity and Full must be distinct pipeline selections"
+        );
+        assert_ne!(
+            block_only, full,
+            "AC16: BlockRouterOnly and Full must be distinct pipeline selections"
         );
     }
 }

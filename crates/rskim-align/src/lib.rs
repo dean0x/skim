@@ -1911,6 +1911,75 @@ mod tests {
         );
     }
 
+    // ── AC29 — discriminating test: production gate is load-bearing ───────────
+
+    /// AC29 DISCRIMINATING: the `tools_arrays_set_equal` gate at `try_align_full`
+    /// lib.rs:255-265 must fire when the canonical tools array has a dropped element,
+    /// causing whole-request fail-open with the original bytes returned unmodified.
+    ///
+    /// # Mechanism
+    ///
+    /// `canonical_emit::fault_injection::set_drop_tools_sort(true)` makes
+    /// `sort_tools_array` truncate its sorted output to at most one element
+    /// (simulating a hypothetical element-drop bug in the sort path). With two
+    /// input tools, the canonical span is `[one-element]` while the original span
+    /// is `[two-elements]`. `tools_arrays_set_equal(original, canonical)` returns
+    /// `false` (different lengths) → the gate returns `None` → whole-request
+    /// fail-open.
+    ///
+    /// # Discriminating property (PF-007)
+    ///
+    /// Deleting the gate block at lib.rs:255-265 causes `try_align_full` to
+    /// return `Some(AlignResult)` with the corrupt (one-element) tools span.
+    /// `align()` then returns `out.stats.fail_open == false` and
+    /// `out.bytes != body`, failing both assertions below.
+    ///
+    /// # ADR-007 egress losslessness
+    ///
+    /// On gate failure the egress bytes must be byte-identical to the original
+    /// input — asserted directly on `out.bytes` (not via the tautological
+    /// `input_sha256 == output_sha256` comparison on `AlignStats::fail_open_from_input`,
+    /// which is always true for fail-open because both hashes are set from the same
+    /// input digest).
+    #[test]
+    fn ac29_reorder_gate_fires_on_element_drop_fault() {
+        use crate::canonical_emit::fault_injection::{DropGuard, set_drop_tools_sort};
+
+        // Body with two tools in NON-canonical element order (bravo before alpha).
+        // Keys within each element are already canonical (description < name) so
+        // sort_tools_array only reorders elements — not keys — making the gate
+        // comparison clean: before = original element bytes, after = sorted + truncated.
+        let body = br#"{"messages":[],"tools":[{"description":"z","name":"bravo"},{"description":"a","name":"alpha"}]}"#;
+
+        // Arm the element-drop fault: the next sort_tools_array call truncates
+        // the sorted output from [alpha, bravo] to [alpha] (drops bravo).
+        set_drop_tools_sort(true);
+        let _guard = DropGuard; // disarms on drop, even if an assertion panics
+
+        let out = align(body, Provider::Anthropic, "ac29-gate-drop-fault");
+
+        // The gate at lib.rs:255-265 must detect the drop (set-equal returns false)
+        // and cause whole-request fail-open.
+        assert!(
+            out.stats.fail_open,
+            "AC29: element-drop fault must trigger fail-open via the \
+             tools_arrays_set_equal gate at try_align_full lib.rs:255-265. \
+             If this fails, deleting that gate block still passes the suite — \
+             the gate is absent or bypassed."
+        );
+
+        // ADR-007 egress losslessness: the bytes returned by align() must be
+        // byte-identical to the original input (not the corrupt canonical form).
+        // Asserting on out.bytes directly — not on the tautological sha256 fields
+        // of AlignStats::fail_open_from_input (which are always equal for fail-open).
+        assert_eq!(
+            out.bytes.as_slice(),
+            body.as_slice(),
+            "AC29: fail-open must return the ORIGINAL input bytes byte-for-byte \
+             (ADR-007 egress losslessness — no corrupt output must escape the gate)"
+        );
+    }
+
     // ── Helper ────────────────────────────────────────────────────────────────
 
     /// Count `"cache_control"` key occurrences in a JSON string (for test assertions).
