@@ -30,8 +30,13 @@
 //! 1. **Reorder path**: `tools_arrays_set_equal(original, canonical)` over BOTH the
 //!    `tools` and the OpenAI legacy `functions` spans — proves the element sort dropped,
 //!    duplicated, or mutated nothing in either array.
-//! 2. **Envelope path**: output `messages` value span byte-identical to input `messages`
-//!    span (done in `canonical_envelope`), plus unchanged top-level key set.
+//! 2. **Envelope path**: (a) output `messages` value bytes are byte-identical to the
+//!    input `messages` bytes (verified inside `canonical_envelope_with_spans`); and
+//!    (b) the emitted canonical bytes are independently re-parsed by
+//!    `locate_top_level_spans` to validate well-formedness and confirm the top-level
+//!    key set is unchanged (done in `try_align_full` after `canonical_envelope_with_spans`
+//!    returns — an independent parse that catches emit bugs the constructed span map
+//!    cannot detect).
 //! 3. **Injection path**: after injecting markers, verify each injected span against the
 //!    pre-injection canonical bytes (byte-exact equality after stripping the known marker).
 //!
@@ -214,14 +219,26 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
         canonical_envelope_with_spans(input_str, &input_spans, provider)?;
     let canonical_str = std::str::from_utf8(&canonical_bytes).ok()?;
 
-    // ── AD-CA-7 envelope path: top-level key set unchanged ───────────────────
-    // (The messages-span byte-identity is verified inside canonical_envelope.)
-    // Verify: same number of top-level keys, all input keys present in canonical.
-    if input_spans.len() != canonical_spans.len() {
+    // ── AD-CA-7 envelope path: independent re-parse of canonical output ──────
+    //
+    // `canonical_spans` is built inside `canonical_envelope_with_spans` by
+    // iterating `input_spans.keys()`, so comparing `canonical_spans` against
+    // `input_spans` would be a tautology — both maps are identical by
+    // construction on every non-None path.
+    //
+    // Instead, re-parse `canonical_str` independently.  `locate_top_level_spans`
+    // performs a full serde_json parse of the emitted bytes; it rejects duplicate
+    // keys and trailing content (span.rs:74-83) and returns `None` for any
+    // malformed input.  Comparing the resulting `reparsed` map against
+    // `input_spans` is the real key-set equality and well-formedness check
+    // (AD-CA-7 envelope path, plan §2.2.3).  `canonical_spans` is kept for the
+    // hot path in Step 3 (marker injection uses it to locate value offsets).
+    let reparsed = locate_top_level_spans(canonical_str)?;
+    if reparsed.len() != input_spans.len() {
         return None;
     }
     for key in input_spans.keys() {
-        if !canonical_spans.contains_key(key) {
+        if !reparsed.contains_key(key) {
             return None;
         }
     }
@@ -1467,43 +1484,45 @@ mod tests {
         );
     }
 
-    // ── AC29 WIRING — fault-injection through align() ─────────────────────────
+    // ── AC29 — Component + consequence tests ──────────────────────────────────
     //
     // The three component-level tests above prove the gate FUNCTION detects each
-    // fault. These three tests prove the WIRING: a fault that the gate detects at
-    // the component level would cause align() to return SHA-256-equal passthrough
-    // (via the try_align_full → None → passthrough path at lib.rs:238-248).
+    // fault kind (drop, duplication, mutation).  The three tests below cover the
+    // complementary aspects:
+    //   (a) the happy path through align() — correct sort does not fail-open;
+    //   (b) the end-to-end structural invariant — no element was dropped or added;
+    //   (c) component-level proof that the gate function WOULD detect the fault;
+    //   (d) the fail-open consequence — a body that causes try_align_full to return
+    //       None produces the original bytes unchanged (ADR-007 losslessness).
     //
-    // Pattern for each test:
-    //   (a) Drive the correct sort through align() — assert gate passes (not fail-open).
-    //   (b) Verify the output preserves the tool set end-to-end (no fault occurred).
-    //   (c) Construct the fault variant of the canonical tools and assert the gate
-    //       WOULD fire for it (tools_arrays_set_equal returns false).
-    //   (d) Prove the gate-fire CONSEQUENCE: a body that genuinely causes try_align_full
-    //       to return None (dup-key fail-open) produces SHA-256-equal passthrough bytes,
-    //       proving the None → passthrough path is wired correctly.
-    //
-    // Together (a)+(b) prove the gate passes for the correct sort; (c) proves the
-    // gate detects the fault at the component level; (d) proves the consequence.
-    // If sort_tools_array had the fault, (c) would fire → None → same passthrough
-    // path demonstrated in (d).
+    // COVERAGE NOTE: the gate block at lib.rs:238-248 is NOT directly exercised by
+    // these tests.  Step (d) uses a duplicate-top-level-key body that causes
+    // locate_top_level_spans (AD-CA-11) to return None BEFORE reaching the gate,
+    // so deleting the gate block would not change these test results.  Exercising
+    // the gate block itself requires a fault-injection seam inside sort_tools_array.
 
-    /// AC29 WIRING — DROP fault: verify align() does not drop tools and that the
-    /// gate would detect a drop and route to SHA-256-equal passthrough.
+    /// AC29 — DROP fault: verify align() does not drop tools and that the gate
+    /// function detects a drop; plus verify the fail-open consequence path.
     ///
-    /// DISCRIMINATING (PF-007): deleting the gate check at lib.rs:240-247 would
-    /// NOT cause this test to fail for the correct sort (it only asserts gate-pass
-    /// behavior), but the gate-detection assertion in step (c) would fail if the
-    /// gate function itself were replaced with an always-true stub.
+    /// SCOPE (PF-007): this test covers:
+    ///   (a) the happy path — correct sort does not fail-open;
+    ///   (b) the end-to-end tool count — no element dropped by align();
+    ///   (c) component-level: `tools_arrays_set_equal` detects the drop fault;
+    ///   (d) the fail-open consequence — a None-returning body produces the
+    ///       original bytes unchanged (ADR-007 losslessness).
+    ///
+    /// NOT COVERED: the actual gate block at lib.rs:238-248 is not exercised —
+    /// deleting it would not fail any assertion here (step (d) uses a dup-key
+    /// body that returns None before reaching the gate).  Testing the gate
+    /// block directly requires a fault-injection seam in sort_tools_array.
     ///
     /// Note: tool element keys are in canonical order (description before name) so that
     /// `align()` only reorders elements (not keys within elements). `tools_arrays_set_equal`
     /// compares element bytes; if within-element key order changed, the same semantic
     /// element would appear with different bytes and the set-equal check would return false.
     #[test]
-    fn ac29_drop_fault_wires_to_passthrough_consequence() {
+    fn ac29_drop_fault_component_and_passthrough_consequence() {
         use crate::canonical_emit::canonical_envelope;
-        use crate::stats::sha256;
         use rskim_contract::canonical::tools_arrays_set_equal;
 
         // Two tools in reversed element order; keys within each element are already in
@@ -1558,32 +1577,31 @@ mod tests {
              (would fire at lib.rs:240-247 → try_align_full returns None)"
         );
 
-        // (d) Prove the None → passthrough consequence: a body that genuinely causes
-        // try_align_full to return None produces SHA-256-equal passthrough bytes.
-        // (Duplicate top-level key → locate_top_level_spans returns None → same path.)
+        // (d) Fail-open consequence: a body that causes try_align_full to return
+        // None must produce the original bytes unchanged (ADR-007 losslessness).
+        // (Duplicate top-level key → locate_top_level_spans returns None → fail-open.)
         let fo_body = br#"{"tools":[],"tools":[{"name":"a"}],"messages":[]}"#;
         let fo_out = align(fo_body, Provider::Anthropic, "ac29-drop-wire-fo");
-        assert_eq!(
-            fo_out.stats.input_sha256,
-            sha256(fo_body),
-            "AC29 wiring/drop: gate-fire path must produce SHA-256(output)==SHA-256(input)"
+        assert!(
+            fo_out.stats.fail_open,
+            "AC29/drop: fail-open path must set the fail_open flag"
         );
         assert_eq!(
-            fo_out.stats.input_sha256, fo_out.stats.output_sha256,
-            "AC29 wiring/drop: passthrough produces SHA-256-equal output"
+            fo_out.bytes.as_slice(),
+            fo_body.as_slice(),
+            "AC29/drop: fail-open must return the original bytes unchanged (ADR-007)"
         );
     }
 
-    /// AC29 WIRING — DUPLICATION fault: verify align() does not duplicate tools and
-    /// that the gate would detect a duplication and route to SHA-256-equal passthrough.
+    /// AC29 — DUPLICATION fault: verify align() does not duplicate tools and that
+    /// the gate function detects a duplication; plus verify the fail-open consequence.
     ///
-    /// DISCRIMINATING (PF-007): a sort with a duplication bug would produce a canonical
-    /// where one element appears twice; tools_arrays_set_equal would return false, firing
-    /// the gate at lib.rs:240-247 and causing align() to return the ORIGINAL bytes unchanged.
+    /// SCOPE (PF-007): covers happy path, no-dup end-to-end, component gate detection,
+    /// and the fail-open consequence.  Does NOT exercise the gate block at lib.rs:238-248
+    /// directly (step (d) uses a dup-key body that returns None before the gate).
     #[test]
-    fn ac29_duplication_fault_wires_to_passthrough_consequence() {
+    fn ac29_duplication_fault_component_and_passthrough_consequence() {
         use crate::canonical_emit::canonical_envelope;
-        use crate::stats::sha256;
         use rskim_contract::canonical::tools_arrays_set_equal;
 
         let body =
@@ -1630,31 +1648,30 @@ mod tests {
              (would fire at lib.rs:240-247 → try_align_full returns None)"
         );
 
-        // (d) Gate-fire consequence: None → SHA-256-equal passthrough.
+        // (d) Fail-open consequence: None → original bytes unchanged (ADR-007).
         let fo_body = br#"{"tools":[],"tools":[{"name":"a"}],"messages":[]}"#;
         let fo_out = align(fo_body, Provider::Anthropic, "ac29-dup-wire-fo");
-        assert_eq!(
-            fo_out.stats.input_sha256,
-            sha256(fo_body),
-            "AC29 wiring/dup: gate-fire produces SHA-256(output)==SHA-256(input)"
+        assert!(
+            fo_out.stats.fail_open,
+            "AC29/dup: fail-open path must set the fail_open flag"
         );
         assert_eq!(
-            fo_out.stats.input_sha256, fo_out.stats.output_sha256,
-            "AC29 wiring/dup: passthrough is SHA-256-equal"
+            fo_out.bytes.as_slice(),
+            fo_body.as_slice(),
+            "AC29/dup: fail-open must return the original bytes unchanged (ADR-007)"
         );
     }
 
-    /// AC29 WIRING — MUTATION fault: verify align() does not mutate tool content and
-    /// that the gate would detect a mutation and route to SHA-256-equal passthrough.
+    /// AC29 — MUTATION fault: verify align() does not mutate tool content and that
+    /// the gate function detects a mutation; plus verify the fail-open consequence.
     ///
-    /// DISCRIMINATING (PF-007): a sort with a mutation bug (e.g., corrupting a tool name
-    /// during the canonical key-sort emit) would produce a canonical where one element
-    /// differs from the original; tools_arrays_set_equal would return false, firing
-    /// the gate at lib.rs:240-247 and causing align() to return the ORIGINAL bytes unchanged.
+    /// SCOPE (PF-007): covers happy path, no-mutation end-to-end, component gate
+    /// detection, and the fail-open consequence.  Does NOT exercise the gate block at
+    /// lib.rs:238-248 directly (step (d) uses a dup-key body that returns None before
+    /// the gate).
     #[test]
-    fn ac29_mutation_fault_wires_to_passthrough_consequence() {
+    fn ac29_mutation_fault_component_and_passthrough_consequence() {
         use crate::canonical_emit::canonical_envelope;
-        use crate::stats::sha256;
         use rskim_contract::canonical::tools_arrays_set_equal;
 
         let body =
@@ -1711,17 +1728,17 @@ mod tests {
              (would fire at lib.rs:240-247 → try_align_full returns None)"
         );
 
-        // (d) Gate-fire consequence: None → SHA-256-equal passthrough.
+        // (d) Fail-open consequence: None → original bytes unchanged (ADR-007).
         let fo_body = br#"{"tools":[],"tools":[{"name":"a"}],"messages":[]}"#;
         let fo_out = align(fo_body, Provider::Anthropic, "ac29-mut-wire-fo");
-        assert_eq!(
-            fo_out.stats.input_sha256,
-            sha256(fo_body),
-            "AC29 wiring/mut: gate-fire produces SHA-256(output)==SHA-256(input)"
+        assert!(
+            fo_out.stats.fail_open,
+            "AC29/mut: fail-open path must set the fail_open flag"
         );
         assert_eq!(
-            fo_out.stats.input_sha256, fo_out.stats.output_sha256,
-            "AC29 wiring/mut: passthrough is SHA-256-equal"
+            fo_out.bytes.as_slice(),
+            fo_body.as_slice(),
+            "AC29/mut: fail-open must return the original bytes unchanged (ADR-007)"
         );
     }
 

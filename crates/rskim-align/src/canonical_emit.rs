@@ -383,102 +383,20 @@ pub(crate) fn sort_tools_array(raw: &str, kind: ToolArrayKind) -> Option<Vec<u8>
 ///
 /// If any value within `tools` or `system` nests deeper than
 /// `MAX_ALIGN_SCHEMA_DEPTH`, returns `None` → whole-request fail-open.
+///
+/// # Implementation note
+///
+/// This is a thin wrapper over [`canonical_envelope_with_spans`] that discards
+/// the span map. The full logic (key sort, value dispatch, AD-CA-7 messages
+/// self-verify) lives in `canonical_envelope_with_spans`; this function exists
+/// so callers that only need bytes (e.g. tests) do not have to destructure the
+/// pair. Both functions exercise identical production logic.
 pub fn canonical_envelope(
     input: &str,
     spans: &HashMap<String, Span>,
     provider: Provider,
 ) -> Option<Vec<u8>> {
-    // Sort keys lexicographically for deterministic envelope order (AD-CA-13)
-    let mut keys: Vec<&str> = spans.keys().map(String::as_str).collect();
-    keys.sort_unstable();
-
-    let mut out: Vec<u8> = Vec::with_capacity(input.len() + 16);
-    out.push(b'{');
-
-    // Track the messages value bytes for the AD-CA-7 self-verify
-    let mut messages_input_bytes: Option<&str> = None;
-    let mut messages_output_start: Option<usize> = None;
-    let mut messages_output_len: Option<usize> = None;
-
-    for (i, key) in keys.iter().enumerate() {
-        if i > 0 {
-            out.push(b',');
-        }
-
-        // Emit key as JSON string
-        let key_json = serde_json::to_string(*key).ok()?;
-        out.extend_from_slice(key_json.as_bytes());
-        out.push(b':');
-
-        let span = spans.get(*key)?;
-        let raw_val = span.extract(input)?;
-
-        // Determine how to emit this value
-        let value_start = out.len();
-        match *key {
-            "tools" => {
-                // AD-CA-12: canonicalize + deterministically sort elements
-                let kind = match provider {
-                    Provider::Anthropic => ToolArrayKind::AnthropicTools,
-                    Provider::OpenAi => ToolArrayKind::OpenAiTools,
-                    // AD-CA-10: unknown provider → fail-open
-                    _ => return None,
-                };
-                let canonicalized = sort_tools_array(raw_val, kind)?;
-                out.extend_from_slice(&canonicalized);
-            }
-            "functions" => {
-                // OpenAI legacy functions array: top-level "name" sort key
-                let canonicalized =
-                    sort_tools_array(raw_val, ToolArrayKind::OpenAiLegacyFunctions)?;
-                out.extend_from_slice(&canonicalized);
-            }
-            "system" => match provider {
-                Provider::Anthropic => {
-                    // System canonicalization: key-sort within blocks, block ORDER unchanged.
-                    // canonicalize_value on an array preserves element order (by design).
-                    let canonicalized = canonicalize_value(raw_val.trim(), 0)?;
-                    out.extend_from_slice(&canonicalized);
-                }
-                _ => {
-                    // Non-Anthropic: copy system verbatim (unknown semantics)
-                    out.extend_from_slice(raw_val.as_bytes());
-                }
-            },
-            "messages" => {
-                // AD-CA-13: messages value is byte-verbatim
-                messages_input_bytes = Some(raw_val);
-                messages_output_start = Some(value_start);
-                out.extend_from_slice(raw_val.as_bytes());
-                messages_output_len = Some(raw_val.len());
-            }
-            _ => {
-                // All other keys: copy value verbatim
-                out.extend_from_slice(raw_val.as_bytes());
-            }
-        }
-    }
-
-    out.push(b'}');
-
-    // AD-CA-7 envelope self-verify: assert messages span byte-identical
-    // (should always pass since we copy verbatim; guards against future bugs)
-    if let (Some(input_msgs), Some(output_start), Some(output_len)) = (
-        messages_input_bytes,
-        messages_output_start,
-        messages_output_len,
-    ) {
-        let output_end = output_start.checked_add(output_len)?;
-        match out.get(output_start..output_end) {
-            Some(out_slice) if out_slice == input_msgs.as_bytes() => {}
-            _ => {
-                // AD-CA-7 self-verify failed → fail-open
-                return None;
-            }
-        }
-    }
-
-    Some(out)
+    canonical_envelope_with_spans(input, spans, provider).map(|(bytes, _)| bytes)
 }
 
 /// Restructure a JSON request body into canonical key order and return both

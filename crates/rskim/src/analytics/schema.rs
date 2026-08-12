@@ -126,9 +126,17 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         // cache-alignment outcomes (tools sorted, markers injected, fail-open flag,
         // SHA-256 pair for losslessness audit). Migration is UNCONDITIONAL (not
         // proxy-gated) so DB versions never fork across build variants (finding 19).
-        // ADR-006: PRAGMA user_version = 5 is the FINAL statement in this batch.
+        //
+        // ADR-006: wrapped in a single BEGIN..COMMIT transaction so any mid-batch
+        // failure (e.g. a pre-existing alignment_decisions with an incompatible
+        // schema causing the CREATE INDEX to fail) rolls back the entire batch and
+        // leaves user_version at 4, allowing a safe retry — identical structure to
+        // the v4 batch above.  PRAGMA user_version = 5 is the FINAL statement so a
+        // partial abort at any earlier statement rolls back before the version is
+        // advanced.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS alignment_decisions (
+            "BEGIN;
+            CREATE TABLE IF NOT EXISTS alignment_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 request_id TEXT NOT NULL,
@@ -145,7 +153,8 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
                 output_sha256 BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ad_timestamp ON alignment_decisions(timestamp);
-            PRAGMA user_version = 5;",
+            PRAGMA user_version = 5;
+            COMMIT;",
         )?;
     }
 
@@ -298,18 +307,24 @@ mod tests {
     // PRAGMA user_version = N is the FINAL statement in its batch, ensuring that any
     // abort before that point rolls back the entire batch.
     //
-    // Strategy: place the DB at v4, open an explicit transaction, partially execute
-    // the v5 DDL (creating alignment_decisions with a wrong schema), then ROLLBACK
-    // before the PRAGMA user_version = 5 would run.  Verify user_version stays at 4
-    // and alignment_decisions is absent.  Then call run_migrations and confirm it
-    // advances to v5 cleanly — proving the DB is re-migratable.
+    // Strategy: place the DB at v4, pre-create alignment_decisions with a wrong
+    // schema (no `timestamp` column).  Call run_migrations: the v5 batch's
+    // `CREATE TABLE IF NOT EXISTS` is a no-op (table exists), but `CREATE INDEX
+    // ... ON alignment_decisions(timestamp)` fails (no such column).  With
+    // BEGIN..COMMIT wrapping the v5 batch (ADR-006), the whole batch rolls back
+    // and user_version stays at 4.  Drop the conflicting table, re-run migrations
+    // and confirm v5 completes.
     //
     // DISCRIMINATING (PF-007): if PRAGMA user_version = 5 were placed BEFORE the
-    // CREATE TABLE statement in the v5 batch, user_version would be 5 after the
-    // rollback — the test would correctly catch that violation.
+    // CREATE INDEX in the v5 batch, it would autocommit before the index fails,
+    // leaving user_version = 5 after the error — this test catches that violation.
+    // Unlike the previous version of this test (which hand-wrote its own BEGIN and
+    // never called run_migrations), Phase 2 here drives the production migration
+    // code path — the statement ORDER of schema.rs:130-149 is what determines the
+    // outcome.
     #[test]
     fn schema_mid_migration_failure_leaves_prior_version_intact() {
-        // Phase 1: advance to v4 by running full migrations then stepping back.
+        // Phase 1: advance to v4.
         let conn = open_mem();
         run_migrations(&conn).expect("full migration must succeed");
         conn.execute_batch(
@@ -323,44 +338,57 @@ mod tests {
             "alignment_decisions must be absent at v4"
         );
 
-        // Phase 2: simulate an aborted v5 migration.  We open an explicit
-        // transaction, create the table with a deliberately incomplete schema
-        // (wrong columns — as if DDL was partially applied), then ROLLBACK before
-        // `PRAGMA user_version = 5` executes.  This is the reliable, portable
-        // way to model a crash/abort mid-batch with SQLite: ROLLBACK is the
-        // explicit analogue of the implicit rollback on a connection close.
-        conn.execute_batch("BEGIN;")
-            .expect("begin transaction must succeed");
+        // Phase 2: inject a conflicting alignment_decisions table (wrong schema —
+        // no `timestamp` column).  The v5 CREATE INDEX will fail at the column
+        // reference; with the BEGIN..COMMIT wrapper the whole batch rolls back and
+        // user_version stays at 4.
         conn.execute_batch(
-            "CREATE TABLE alignment_decisions (id INTEGER PRIMARY KEY, dummy TEXT);",
+            "CREATE TABLE alignment_decisions (id INTEGER PRIMARY KEY, wrong_col TEXT);",
         )
-        .expect("partial DDL within open transaction must succeed");
-        // Explicitly abort — PRAGMA user_version = 5 was never reached.
-        conn.execute_batch("ROLLBACK;")
-            .expect("rollback must succeed");
+        .expect("pre-create alignment_decisions with wrong schema");
 
-        // user_version must still be 4 — ROLLBACK undid the CREATE TABLE.
+        // Call the production migration — it must fail due to the index error.
+        let result = run_migrations(&conn);
+        assert!(
+            result.is_err(),
+            "run_migrations must return Err when mid-batch DDL fails (index on missing column)"
+        );
+
+        // ADR-006 check: user_version must still be 4 (batch rolled back before
+        // PRAGMA user_version = 5 was reached).
         assert_eq!(
             user_version(&conn),
             4,
-            "mid-migration abort must leave user_version at 4 (prior version)"
+            "mid-migration failure must leave user_version at 4 (prior version)"
         );
+        // The table exists but has the wrong schema — proving the batch did not
+        // atomically commit the CREATE TABLE either.  (SQLite IF NOT EXISTS is a
+        // no-op here, so the pre-created wrong-schema table survived; it was never
+        // part of the failed transaction.)
         assert!(
-            !table_exists(&conn, "alignment_decisions"),
-            "alignment_decisions must be absent after rollback"
+            table_exists(&conn, "alignment_decisions"),
+            "setup check: conflicting alignment_decisions must still be present"
         );
 
-        // Phase 3: re-run migrations — v5 must now complete successfully and
-        // produce the correct schema.
-        run_migrations(&conn).expect("retry migration after abort must succeed");
+        // SQLite does not auto-rollback when execute_batch fails mid-batch: the
+        // BEGIN; opened a transaction and the index-creation failure left it open.
+        // Explicitly roll it back so the connection is in a clean state before
+        // Phase 3 tries to start a new transaction.
+        conn.execute_batch("ROLLBACK;")
+            .expect("rollback the failed v5 transaction before retry");
+
+        // Phase 3: remove the conflicting table, then re-run — v5 must complete.
+        conn.execute_batch("DROP TABLE alignment_decisions;")
+            .expect("remove conflicting table before retry");
+        run_migrations(&conn).expect("retry migration after clearing conflict must succeed");
         assert_eq!(
             user_version(&conn),
             5,
-            "re-migration after abort must reach user_version = 5"
+            "re-migration after conflict removal must reach user_version = 5"
         );
         assert!(
             table_exists(&conn, "alignment_decisions"),
-            "alignment_decisions must exist after successful re-migration"
+            "alignment_decisions must exist with correct schema after successful re-migration"
         );
     }
 
@@ -405,5 +433,113 @@ mod tests {
                 "AC19: alignment_decisions table must have column '{col}'"
             );
         }
+    }
+
+    // AC5 / AC6 / AC19: the v4 destructive migration (INSERT+DROP+RENAME) preserves
+    // all pre-existing rows and their column values.  The v4 batch touches every row
+    // in token_savings; without a seeded, migrated, then read-back test the data-copy
+    // SQL cannot be verified (empty tables pass silently).
+    //
+    // Also verifies that after the full migration NULL-token inserts succeed (the
+    // nullable-column change that the v4 rebuild exists for — AC5/AC6 proxy rows).
+    //
+    // DISCRIMINATING (PF-007): dropping or reordering a column in either the INSERT
+    // list or the SELECT list of the v4 copy causes an error on a non-empty table or
+    // produces NULL values in the wrong columns — both are caught here.  Reverting
+    // the nullable constraint on raw_tokens/compressed_tokens/savings_pct is caught
+    // by the NULL-insert assertion at the end.
+    #[test]
+    fn schema_v4_migration_preserves_rows_and_allows_null_tokens() {
+        // Create a v3-era token_savings with the original NOT NULL schema and seed
+        // two rows with known values before running the v4 migration.
+        let conn = open_mem();
+        run_migrations(&conn).expect("bootstrap must succeed");
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS proxy_block_decisions;
+             DROP TABLE IF EXISTS alignment_decisions;
+             DROP TABLE IF EXISTS token_savings;
+             CREATE TABLE token_savings (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 timestamp INTEGER NOT NULL,
+                 command_type TEXT NOT NULL,
+                 original_cmd TEXT NOT NULL,
+                 raw_tokens INTEGER NOT NULL,
+                 compressed_tokens INTEGER NOT NULL,
+                 savings_pct REAL NOT NULL,
+                 duration_ms INTEGER NOT NULL,
+                 project_path TEXT NOT NULL,
+                 mode TEXT,
+                 language TEXT,
+                 parse_tier TEXT,
+                 session_id TEXT
+             );
+             INSERT INTO token_savings
+                 (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens,
+                  savings_pct, duration_ms, project_path, mode, language, parse_tier, session_id)
+             VALUES
+                 (1000, 'cat', 'cat file.ts', 100, 60, 40.0, 5, '/tmp',
+                  'structure', 'typescript', 'tree-sitter', 'sess-a');
+             INSERT INTO token_savings
+                 (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens,
+                  savings_pct, duration_ms, project_path, mode, language, parse_tier, session_id)
+             VALUES
+                 (2000, 'ls', 'ls -la', 50, 30, 40.0, 2, '/home',
+                  NULL, NULL, NULL, NULL);",
+        )
+        .expect("recreate v3 schema and seed rows");
+        conn.execute_batch("PRAGMA user_version = 3")
+            .expect("force user_version = 3");
+
+        // Run migrations v3 → v4 → v5.
+        run_migrations(&conn).expect("v3→v4→v5 migration must succeed");
+        assert_eq!(user_version(&conn), 5, "must reach v5 after migration");
+
+        // Row count must be preserved — the INSERT+DROP+RENAME must not lose rows.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
+            .expect("COUNT must succeed");
+        assert_eq!(count, 2, "v4 migration must preserve both seeded rows");
+
+        // Verify the first row's column values are byte-identical after the rebuild.
+        let (ts, cmd, raw, comp, pct, sid): (i64, String, i64, i64, f64, Option<String>) = conn
+            .query_row(
+                "SELECT timestamp, command_type, raw_tokens, compressed_tokens,
+                         savings_pct, session_id
+                  FROM token_savings WHERE timestamp = 1000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .expect("first row must be readable after migration");
+        assert_eq!(ts, 1000, "timestamp must survive migration");
+        assert_eq!(cmd, "cat", "command_type must survive migration");
+        assert_eq!(raw, 100, "raw_tokens must survive migration");
+        assert_eq!(comp, 60, "compressed_tokens must survive migration");
+        assert!((pct - 40.0).abs() < 1e-9, "savings_pct must survive migration");
+        assert_eq!(sid.as_deref(), Some("sess-a"), "session_id must survive migration");
+
+        // AC5/AC6: after v4, NULL-token inserts must succeed (nullable columns).
+        // A proxy row records timing/provider without token counts.
+        conn.execute(
+            "INSERT INTO token_savings
+                 (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens,
+                  savings_pct, duration_ms, project_path)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, ?5)",
+            rusqlite::params![3000_i64, "proxy", "proxy-req", 10_i64, "/proxy"],
+        )
+        .expect("AC5/AC6: NULL-token proxy row insert must succeed after v4 migration");
+
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM token_savings WHERE raw_tokens IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("COUNT must succeed");
+        // The v3-seeded rows had NOT NULL raw_tokens (the v3 schema required it).
+        // Only the new proxy row has NULL raw_tokens.
+        assert_eq!(
+            null_count, 1,
+            "one NULL-raw_tokens row: the proxy row inserted after v4 migration"
+        );
     }
 }
