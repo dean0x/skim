@@ -1974,26 +1974,45 @@ impl AlignmentRecorder for NoopRecorder {
 #[cfg(feature = "proxy")]
 const ALIGN_CHANNEL_CAP: usize = 256;
 
+/// Bundle returned by [`ChannelAlignmentRecorder::new_boxed`].
+///
+/// The `handle` and `done_rx` are `Some` when analytics are enabled (i.e. a
+/// consumer thread was spawned) and `None` when disabled.  The proxy's bounded
+/// shutdown block (Cross-Plan Amendment #4) uses them directly — the alignment
+/// consumer is **not** registered via `register_thread` / `flush_pending()`.
+/// Both consumers (#305 proxy-analytics and #306 alignment) drain concurrently
+/// under a single `FLUSH_BOUND` window each.
+#[cfg(feature = "proxy")]
+pub(crate) struct AlignmentRecorderBundle {
+    pub(crate) recorder: Box<dyn AlignmentRecorder>,
+    /// Consumer thread handle.  `None` when analytics are disabled.
+    pub(crate) handle: Option<std::thread::JoinHandle<()>>,
+    /// Fires once when the consumer has drained all queued records and exited.
+    /// `None` when analytics are disabled.
+    pub(crate) done_rx: Option<crossbeam_channel::Receiver<()>>,
+}
+
 /// Production [`AlignmentRecorder`] backed by a bounded crossbeam channel.
 ///
 /// # Design (AD-CA-9 / AD-AN-5)
 ///
 /// - **Bounded channel + `try_send`**: a blocked/full channel causes drop-on-overflow,
 ///   never a stall. The drop counter is observable for diagnostics.
-/// - **One registered consumer thread**: opens `AnalyticsDb::open_default()` once
-///   (WAL + `busy_timeout(5000)`, honouring `SKIM_ANALYTICS_DB` > `SKIM_CACHE_DIR`)
-///   and drains the channel until the sender is dropped.
-/// - **`register_thread` registration**: the consumer handle is registered so
-///   `flush_pending()` joins it before process exit, ensuring all queued records
-///   reach the DB when the proxy shuts down.
+/// - **One consumer thread**: opens `AnalyticsDb::open_default()` once, caps
+///   `busy_timeout` to 100 ms (matching the #305 proxy-analytics consumer — see
+///   Cross-Plan Amendment #4), and drains the channel until the sender is dropped.
+/// - **Proxy-owned lifecycle**: `new_boxed` returns the thread handle and done
+///   channel in [`AlignmentRecorderBundle`] so `proxy.rs` can join the thread
+///   within the same bounded `FLUSH_BOUND` gate it uses for the #305 consumer.
+///   The consumer is **not** registered via `register_thread` / `flush_pending()`.
 ///
 /// # Drain sequence (proxy shutdown)
 ///
 /// When `serve_with_stage()` returns (SIGINT / SIGTERM), the
 /// `TransformPipeline` drops, which drops `CacheAlignStage`, which drops this
 /// recorder, which drops the `Sender`. The channel is then closed; the consumer
-/// thread drains remaining records and exits. `flush_pending()` in `main()` joins
-/// it before the process exits.
+/// drains remaining records, fires `done_tx`, and exits. `proxy.rs` joins the
+/// thread within `FLUSH_BOUND` before process exit (Cross-Plan Amendment #4).
 #[cfg(feature = "proxy")]
 pub(crate) struct ChannelAlignmentRecorder {
     sender: crossbeam_channel::Sender<AlignmentDecisionRecord>,
@@ -2006,32 +2025,58 @@ pub(crate) struct ChannelAlignmentRecorder {
 impl ChannelAlignmentRecorder {
     /// Construct a recorder and spawn its consumer thread.
     ///
-    /// Returns a [`NoopRecorder`] (boxed) when `analytics.enabled` is false.
-    /// Otherwise constructs a bounded channel, registers the consumer thread
-    /// via [`register_thread`], and returns the recorder (boxed).
-    pub(crate) fn new_boxed(analytics: &AnalyticsConfig) -> Box<dyn AlignmentRecorder> {
+    /// Returns an [`AlignmentRecorderBundle`] with a [`NoopRecorder`] and
+    /// `handle`/`done_rx` both `None` when `analytics.enabled` is false.
+    /// Otherwise constructs a bounded channel, spawns the consumer, and
+    /// returns the bundle. The caller (proxy.rs) owns the lifecycle — the
+    /// consumer is not registered via `register_thread` (Cross-Plan Amendment #4).
+    pub(crate) fn new_boxed(analytics: &AnalyticsConfig) -> AlignmentRecorderBundle {
         if !analytics.enabled {
-            return Box::new(NoopRecorder);
+            return AlignmentRecorderBundle {
+                recorder: Box::new(NoopRecorder),
+                handle: None,
+                done_rx: None,
+            };
         }
         let (tx, rx) = crossbeam_channel::bounded::<AlignmentDecisionRecord>(ALIGN_CHANNEL_CAP);
         let drop_count = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
         let handle = std::thread::spawn(move || {
             // Open once — WAL + busy_timeout(5000) inherited from open_default.
             // Honouring SKIM_ANALYTICS_DB > SKIM_CACHE_DIR (mod.rs:414).
             let db = match AnalyticsDb::open_default() {
                 Ok(d) => d,
-                Err(_) => return, // Fail-open: silently skip all records.
+                Err(_) => {
+                    // Fail-open: silently skip all records and still signal done
+                    // so the bounded shutdown block in proxy.rs is not orphaned.
+                    let _ = done_tx.send(());
+                    return;
+                }
             };
+            // Cap per-write SQLITE_BUSY wait to 100 ms (Cross-Plan Amendment #4):
+            // both the #305 proxy-analytics consumer and this consumer write to
+            // analytics.db from the same process, so contention is routine.
+            // Without this cap the full 5 s open_default() busy_timeout applies
+            // per write; with ALIGN_CHANNEL_CAP=256 queued records that bounds
+            // proxy exit at up to 1280 s — longer than any operator would wait.
+            let _ = db.set_busy_timeout(Duration::from_millis(100));
             while let Ok(rec) = rx.recv() {
                 let _ = db.record_alignment(&rec);
             }
-            // Channel closed (sender dropped) → drain complete.
+            // Channel closed (sender dropped) → drain complete.  Signal proxy.rs.
+            let _ = done_tx.send(());
         });
-        register_thread(handle);
-        Box::new(Self {
-            sender: tx,
-            drop_count,
-        })
+        // Do NOT call register_thread — proxy.rs owns this handle via the bounded
+        // block (Cross-Plan Amendment #4).  A flush_pending() join here would be
+        // the second divergent drain the amendment explicitly forbids.
+        AlignmentRecorderBundle {
+            recorder: Box::new(Self {
+                sender: tx,
+                drop_count,
+            }),
+            handle: Some(handle),
+            done_rx: Some(done_rx),
+        }
     }
 
     /// Number of records dropped because the bounded channel was full or disconnected.
@@ -3775,7 +3820,15 @@ pub(crate) mod tests {
             input_cost_per_mtok: None,
             session_id: None,
         };
-        let recorder = ChannelAlignmentRecorder::new_boxed(&cfg);
+        // new_boxed now returns an AlignmentRecorderBundle; destructure the recorder.
+        let AlignmentRecorderBundle {
+            recorder,
+            handle,
+            done_rx,
+        } = ChannelAlignmentRecorder::new_boxed(&cfg);
+        // Disabled path: no thread is spawned.
+        assert!(handle.is_none());
+        assert!(done_rx.is_none());
         // Must not panic — NoopRecorder::record is a no-op.
         recorder.record(AlignmentDecisionRecord {
             timestamp: 0,
@@ -3792,6 +3845,69 @@ pub(crate) mod tests {
             input_sha256: [0u8; 32],
             output_sha256: [0u8; 32],
         });
+    }
+
+    // Cross-Plan Amendment #4 regression: AlignmentRecorderBundle lifecycle.
+    //
+    // new_boxed must:
+    //   (a) return Some(handle) + Some(done_rx) when analytics are enabled;
+    //   (b) NOT register the thread via register_thread (PENDING_THREADS stays
+    //       empty — the caller owns the lifecycle);
+    //   (c) fire done_rx after the sender is dropped (channel closes).
+    //
+    // Uses REGISTRY_TEST_LOCK + drain_registry() for PENDING_THREADS isolation.
+    // Points SKIM_ANALYTICS_DB at a non-existent path so the consumer takes the
+    // fail-open branch (done_tx.send fires on open error); this avoids touching
+    // the real analytics.db and still exercises the critical lifecycle guarantee.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_alignment_recorder_bundle_done_rx_fires_not_registered() {
+        use std::time::Duration;
+
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_registry(); // clean slate
+
+        // Non-existent path → AnalyticsDb::open_default() fails → fail-open path
+        // → consumer fires done_tx immediately without opening the real DB.
+        let bad_path = std::path::PathBuf::from("/nonexistent-skim-align-test-dir-xyz/align.db");
+        // SAFETY: single-threaded under REGISTRY_TEST_LOCK; no other thread
+        // reads SKIM_ANALYTICS_DB concurrently.
+        unsafe { std::env::set_var("SKIM_ANALYTICS_DB", &bad_path) };
+
+        let cfg = AnalyticsConfig {
+            enabled: true,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+        let AlignmentRecorderBundle {
+            recorder,
+            handle,
+            done_rx,
+        } = ChannelAlignmentRecorder::new_boxed(&cfg);
+
+        // Reset env var before any assertion that could panic.
+        // SAFETY: single-threaded under REGISTRY_TEST_LOCK.
+        unsafe { std::env::remove_var("SKIM_ANALYTICS_DB") };
+
+        let handle = handle.expect("enabled path must return Some(handle)");
+        let done_rx = done_rx.expect("enabled path must return Some(done_rx)");
+
+        // (b) PENDING_THREADS must be empty — consumer is NOT registered.
+        let registry_len = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            registry_len, 0,
+            "Cross-Plan Amendment #4: new_boxed must NOT call register_thread"
+        );
+
+        // (c) Drop the sender; done_rx must fire within FLUSH_BOUND.
+        drop(recorder);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("done_rx must fire after sender drop");
+        let _ = handle.join();
     }
 
     // Schema v4 migration tests (AC1–AC4, #305)

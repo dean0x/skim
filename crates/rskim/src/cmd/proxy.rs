@@ -367,6 +367,14 @@ pub(crate) fn run(
     //
     // AC16: the variant is selected by the pure `select_pipeline` function so that
     // tests can assert on the selection logic without constructing actual stages.
+    //
+    // Separate `let` bindings for align_handle / align_done_rx so they are
+    // visible after the match block (same pattern as consumer_handle / done_rx
+    // for the proxy-analytics consumer). Both are `None` on the Identity and
+    // BlockRouterOnly paths; `Some` on the Full path when analytics are enabled.
+    let align_handle: Option<std::thread::JoinHandle<()>>;
+    let align_done_rx: Option<crossbeam_channel::Receiver<()>>;
+
     let selection = select_pipeline(
         std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1"),
         parsed.no_cache_align,
@@ -375,12 +383,16 @@ pub(crate) fn run(
         PipelineSelection::Identity => {
             // SKIM_PASSTHROUGH=1 → identity pipeline (no compression).
             // Consistent with skim's global passthrough convention (#304 escape hatch).
+            align_handle = None;
+            align_done_rx = None;
             TransformPipeline::identity()
         }
         PipelineSelection::BlockRouterOnly => {
             // --no-cache-align: run BlockRouterStage only; omit CacheAlignStage.
             // No AlignmentRecorder is constructed on this path, so no consumer thread
             // is spawned and analytics.db is never opened by the proxy.
+            align_handle = None;
+            align_done_rx = None;
             let router = BlockRouter::new(Arc::new(BinarySinkStub));
             let block_stage = BlockRouterStage::new(router);
             TransformPipeline::from_stages(vec![Box::new(block_stage)])
@@ -396,13 +408,17 @@ pub(crate) fn run(
             // SKIM_PASSTHROUGH. It returns a NoopRecorder (no thread) when analytics
             // are disabled, so the stage is always safe to construct.
             //
-            // AD-CA-9: CacheAlignStage takes ownership of the recorder. When
-            // serve_with_stage() returns, the pipeline is dropped, which drops
-            // CacheAlignStage, which drops the recorder, which drops the Sender.
-            // The consumer thread drains remaining records and exits.
-            // flush_pending() in main() joins the thread before process exit.
-            let align_recorder =
-                crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
+            // Cross-Plan Amendment #4 (fulfilled): new_boxed returns the thread
+            // handle and done channel in AlignmentRecorderBundle so the bounded
+            // shutdown block below owns the lifecycle — not register_thread /
+            // flush_pending().
+            let crate::analytics::AlignmentRecorderBundle {
+                recorder: align_recorder,
+                handle,
+                done_rx,
+            } = crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
+            align_handle = handle;
+            align_done_rx = done_rx;
             let align_stage = CacheAlignStage::new(align_recorder);
             TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
         }
@@ -463,17 +479,32 @@ pub(crate) fn run(
         }
     };
 
-    // AD-AN-12: bounded shutdown flush — wait up to FLUSH_BOUND for the
-    // consumer to drain and persist drop counts. If the bound elapses
-    // (pathological wedge), return without blocking; OS reclaims the thread.
+    // AD-AN-12 / Cross-Plan Amendment #4 (fulfilled): bounded shutdown flush.
     //
-    // Cross-Plan Amendment #4 (bounded-consumer ownership): this
-    // `recv_timeout(FLUSH_BOUND)` is THE ONE bounded-consumer shutdown mechanism
-    // for the resident proxy (ADR-003 / PF-005). When #306's AlignmentRecorder
-    // consumer lands, it must reuse this same registered/bounded lifecycle
-    // (extend this block) rather than adding a second divergent flush_pending()
-    // drain. One shutdown mechanism → one flush gate → one exit path.
+    // Both the #305 proxy-analytics consumer and the #306 alignment consumer
+    // are joined here with `recv_timeout(FLUSH_BOUND)` — one bounded gate per
+    // consumer (ADR-003 / PF-005). Neither is registered via register_thread /
+    // flush_pending(). The two consumers drain concurrently, so in the common
+    // case the alignment wait returns immediately after the analytics wait.
+    //
+    // If a bound elapses (pathological wedge), the JoinHandle is dropped and
+    // the OS reclaims the thread — the proxy never hangs indefinitely.
+
+    // Proxy-analytics consumer (#305).
     if let (Some(done_rx), Some(handle)) = (done_rx, consumer_handle) {
+        match done_rx.recv_timeout(super::proxy_analytics::FLUSH_BOUND) {
+            Ok(()) => {
+                let _ = handle.join();
+            }
+            Err(_) => {
+                // FLUSH_BOUND elapsed → consumer did not finish in time.
+                // Drop the JoinHandle; OS reclaims the thread.
+            }
+        }
+    }
+
+    // Alignment consumer (#306) — same bounded gate, same pattern.
+    if let (Some(done_rx), Some(handle)) = (align_done_rx, align_handle) {
         match done_rx.recv_timeout(super::proxy_analytics::FLUSH_BOUND) {
             Ok(()) => {
                 let _ = handle.join();

@@ -221,14 +221,14 @@ pub(crate) fn event_payload_bytes(event: &ProxyEvent) -> u64 {
 /// Token counting happens HERE on the consumer thread, never on the request
 /// path (AC14 / AD-AN-8).
 ///
-/// Cross-Plan Amendment #5 (#306 forward annotation): #305 swaps:
+/// Cross-Plan Amendment #4 (fulfilled): #305 swaps:
 /// - `NullSink` → `ChannelDecisionSink` (collector) in `server.rs:422`
 /// - `NoopAnalyticsHook` → real `BridgeAnalyticsHook` here in `proxy.rs:238`
 ///
-/// When #306's `AlignmentRecorder` consumer lands, it must adopt the same
-/// bounded lifecycle established here — one `recv_timeout(FLUSH_BOUND)`
-/// gate per proxy startup in `proxy.rs` (Cross-Plan Amendment #4 / ADR-003).
-/// Do NOT add a second divergent `flush_pending()` drain for #306.
+/// #306's `AlignmentRecorder` consumer adopts the same bounded lifecycle:
+/// `ChannelAlignmentRecorder::new_boxed` returns the thread handle and done
+/// channel in `AlignmentRecorderBundle` so `proxy.rs` joins it under the
+/// same `recv_timeout(FLUSH_BOUND)` pattern (ADR-003 / Cross-Plan Amendment #4).
 ///
 /// `db_path` is the injected database location: `None` resolves through
 /// `AnalyticsDb::open_default()` (the production path, honouring
