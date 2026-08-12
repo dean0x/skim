@@ -49,6 +49,52 @@ use std::fmt;
 use crate::MAX_ALIGN_SCHEMA_DEPTH;
 
 // ============================================================================
+// Test-only fault injection seam
+// ============================================================================
+
+/// Test-only fault injection seam for the canonical emit path.
+///
+/// # Purpose
+///
+/// Exercises the independent `locate_top_level_spans` re-parse gate in
+/// `try_align_full` (lib.rs:236-244). When [`POISON_CANONICAL_OUTPUT`] is set
+/// on the current thread, [`canonical_envelope_with_spans`] appends a trailing
+/// `X` byte to its output **after** the messages self-verify passes — simulating
+/// a hypothetical framing bug in the emit loop. `locate_top_level_spans` then
+/// calls `de.end()` (span.rs:83) which rejects the trailing content, causing the
+/// gate to return `None` → whole-request fail-open.
+///
+/// This module is compiled only under `#[cfg(test)]` and has zero production
+/// footprint. See the discriminating test
+/// `ad_ca_7_envelope_self_verify_rejects_corrupt_canonical_bytes` in `lib.rs`.
+#[cfg(test)]
+pub(crate) mod fault_injection {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// When `true`, the next [`super::canonical_envelope_with_spans`] call on
+        /// this thread appends a trailing `X` byte to its output, after the messages
+        /// self-verify, so the independent re-parse gate in `try_align_full` rejects it.
+        pub(crate) static POISON_CANONICAL_OUTPUT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm (`true`) or disarm (`false`) the emit-corruption fault for this thread.
+    pub(crate) fn set_corrupt_emit(enabled: bool) {
+        POISON_CANONICAL_OUTPUT.with(|c| c.set(enabled));
+    }
+
+    /// RAII guard: disarms the poison on drop, ensuring it is cleared even if a
+    /// test assertion panics.
+    pub(crate) struct PoisonGuard;
+
+    impl Drop for PoisonGuard {
+        fn drop(&mut self) {
+            set_corrupt_emit(false);
+        }
+    }
+}
+
+// ============================================================================
 // Internal: tool array kind
 // ============================================================================
 
@@ -513,6 +559,17 @@ pub fn canonical_envelope_with_spans(
             Some(out_slice) if out_slice == input_msgs.as_bytes() => {}
             _ => return None,
         }
+    }
+
+    // Test-only fault injection: append trailing content to simulate a framing bug
+    // in the emit loop.  The messages self-verify above has already passed (it checks
+    // only the messages value span, not the whole-body framing).  The trailing byte
+    // is caught by the independent locate_top_level_spans re-parse gate in
+    // try_align_full, which calls de.end() (span.rs:83) to reject trailing content.
+    // This seam has no production effect — compiled only under #[cfg(test)].
+    #[cfg(test)]
+    if fault_injection::POISON_CANONICAL_OUTPUT.with(|c| c.get()) {
+        out.push(b'X'); // trailing non-JSON byte — de.end() in span.rs rejects this
     }
 
     Some((out, canonical_spans))

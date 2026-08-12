@@ -1495,11 +1495,12 @@ mod tests {
     //   (d) the fail-open consequence — a body that causes try_align_full to return
     //       None produces the original bytes unchanged (ADR-007 losslessness).
     //
-    // COVERAGE NOTE: the gate block at lib.rs:238-248 is NOT directly exercised by
-    // these tests.  Step (d) uses a duplicate-top-level-key body that causes
-    // locate_top_level_spans (AD-CA-11) to return None BEFORE reaching the gate,
-    // so deleting the gate block would not change these test results.  Exercising
-    // the gate block itself requires a fault-injection seam inside sort_tools_array.
+    // The AD-CA-7 independent re-parse gate in try_align_full (locate_top_level_spans
+    // called on canonical_str) is NOT exercised by steps (a)-(d) in these tests: step
+    // (d) uses a duplicate-top-level-key body that causes the FIRST locate_top_level_spans
+    // call (AD-CA-11, on the raw input) to return None before the gate is reached.
+    // The gate IS exercised by the dedicated fault-injection test below:
+    // `ad_ca_7_envelope_self_verify_rejects_corrupt_canonical_bytes`.
 
     /// AC29 — DROP fault: verify align() does not drop tools and that the gate
     /// function detects a drop; plus verify the fail-open consequence path.
@@ -1739,6 +1740,68 @@ mod tests {
             fo_out.bytes.as_slice(),
             fo_body.as_slice(),
             "AC29/mut: fail-open must return the original bytes unchanged (ADR-007)"
+        );
+    }
+
+    // ── AD-CA-7 — Re-parse gate discriminating test ───────────────────────────
+
+    /// AD-CA-7 discriminating test (PF-007): the independent `locate_top_level_spans`
+    /// re-parse gate in `try_align_full` must detect a structural emit bug and cause
+    /// whole-request fail-open.
+    ///
+    /// # Mechanism
+    ///
+    /// `canonical_emit::fault_injection::set_corrupt_emit(true)` makes
+    /// `canonical_envelope_with_spans` append a trailing `X` byte to its output
+    /// **after** the messages self-verify passes (that check verifies only the
+    /// `messages` value span and is always-pass-by-construction; it is not what this
+    /// test targets).  The gate in `try_align_full` then calls
+    /// `locate_top_level_spans(canonical_str)` on the poisoned bytes — `de.end()`
+    /// (span.rs:83) rejects the trailing `X` as non-JSON content, returning `None`,
+    /// so `try_align_full` returns `None` → whole-request fail-open.
+    ///
+    /// # Discriminating property (PF-007)
+    ///
+    /// Deleting the re-parse gate block at `try_align_full` lines 236-244 causes
+    /// the corrupt bytes to propagate to `AlignOutcome::bytes`, `out.stats.fail_open`
+    /// is `false`, and BOTH assertions below fail.  The test is therefore
+    /// non-tautological: it passes iff the gate is present.
+    ///
+    /// # Why the messages self-verify alone is not enough
+    ///
+    /// The messages bytes check inside `canonical_envelope_with_spans` only verifies
+    /// the `messages` value span; it cannot catch framing bugs elsewhere in the emit
+    /// loop (unclosed objects, misplaced delimiters, trailing bytes).  The independent
+    /// re-parse gate is the only guard that validates the whole-body well-formedness
+    /// of the canonical bytes before they leave `try_align_full`.
+    #[test]
+    fn ad_ca_7_envelope_self_verify_rejects_corrupt_canonical_bytes() {
+        use crate::canonical_emit::fault_injection::{PoisonGuard, set_corrupt_emit};
+
+        let body = br#"{"model":"claude-3","messages":[{"role":"user","content":"hello"}]}"#;
+
+        // Arm the fault: the next canonical_envelope_with_spans call on this thread
+        // will append a trailing 'X' byte after its output JSON, making it structurally
+        // invalid (trailing content after the closing '}').
+        set_corrupt_emit(true);
+        let _guard = PoisonGuard; // disarms the fault on drop, even if an assertion panics
+
+        let out = align(body, Provider::Anthropic, "ad-ca-7-corrupt-emit");
+
+        // The independent locate_top_level_spans re-parse gate must detect the
+        // trailing 'X' and cause whole-request fail-open.
+        assert!(
+            out.stats.fail_open,
+            "AD-CA-7: corrupt canonical bytes (trailing non-JSON 'X') must trigger \
+             fail-open; if this assertion fails, the locate_top_level_spans gate in \
+             try_align_full is absent or bypassed"
+        );
+        // ADR-007 egress losslessness: fail-open returns the ORIGINAL input bytes.
+        assert_eq!(
+            out.bytes.as_slice(),
+            body.as_slice(),
+            "AD-CA-7: fail-open must return the ORIGINAL input bytes byte-for-byte \
+             (ADR-007 egress losslessness — no corrupt output must reach the provider)"
         );
     }
 
