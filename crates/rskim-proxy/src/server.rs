@@ -75,6 +75,17 @@ use tokio::sync::Semaphore;
 use tokio::time::{Sleep, timeout};
 use tracing::{info, warn};
 
+use rskim_contract::log::{DecisionRecord, DecisionSink, OutcomeReason, SinkFull};
+
+use crate::analytics::{AnalyticsHook, BlockDecisionProjection, ProxyEvent, RequestTier};
+use crate::authmode::classify_auth;
+use crate::config::ProxyConfig;
+use crate::detect::{ProxyProvider, detect_model, detect_provider};
+use crate::errors::ProxyError;
+use crate::forward::{ForwardError, UpstreamClient, forward_request, is_hop_by_hop};
+use crate::health::{ReadinessState, is_health_path, livez_response, readyz_response};
+use crate::seam::{HeaderView, TransformContext, TransformPipeline};
+
 /// Unified response body type: either a buffered error body (Full<Bytes>) or a
 /// streaming upstream body (Incoming). Using BoxBody allows `handle_request` to
 /// return streaming responses without buffering (AC5 / AC7).
@@ -202,40 +213,305 @@ fn streaming_body_with_idle_timeout(b: Incoming, idle_timeout: Duration) -> Prox
     IdleTimedBody::new(b, idle_timeout).boxed()
 }
 
-use rskim_contract::log::DecisionSink;
-
-use crate::analytics::{AnalyticsHook, ProxyEvent};
-use crate::authmode::classify_auth;
-use crate::config::ProxyConfig;
-use crate::detect::{ProxyProvider, detect_provider};
-use crate::errors::ProxyError;
-use crate::forward::{ForwardError, UpstreamClient, forward_request, is_hop_by_hop};
-use crate::health::{ReadinessState, is_health_path, livez_response, readyz_response};
-use crate::seam::{HeaderView, TransformContext, TransformPipeline};
-
 // ============================================================================
-// NullSink — production decision sink for the identity pipeline
+// AnalyticsCompletionBody — observe-only stream-end wrapper (AD-PXY-23)
 // ============================================================================
 
-/// A no-op [`DecisionSink`] for the production forwarding path.
+/// Observe-only response-completion body wrapper.
 ///
-/// In #303 the transform pipeline is identity-only and no decision records are
-/// persisted. This sink discards all records with zero allocation — unlike
-/// [`rskim_contract::log::MockSink`] which accumulates records into a `Mutex<Vec>`,
-/// this type is the correct production sink.
+/// ## AD-PXY-23 — fire analytics at stream end, not at header time
 ///
-/// #305 will wire a real persistent `ChannelDecisionSink` into `serve()` once
-/// the decision-record ledger lands.
-struct NullSink;
+/// The prior approach fired `analytics.on_request()` inside `handle_request`
+/// at response-header time (`start.elapsed()` measured time-to-headers, not
+/// time-to-stream-end). This wrapper replaces that fire site.
+///
+/// `AnalyticsCompletionBody` composes around the existing relay body (the
+/// [`IdleTimedBody`]-wrapped `Incoming` produced by
+/// `streaming_body_with_idle_timeout`). It:
+/// - Delegates every `poll_frame` unchanged (ADR-007 egress losslessness — the
+///   wrapper never reads or mutates forwarded bytes).
+/// - Fires `analytics.on_request(&event)` exactly once at the first of:
+///   - Clean EOF: `poll_frame` returns `Poll::Ready(None)`.
+///   - Drop: called when the body is dropped (mid-stream client disconnect or
+///     body error surfaced by the idle-timeout wrapper), via `Drop::drop`.
+/// - A boolean guard (`fired`) prevents double-fire if EOF is followed by Drop.
+/// - Computes `duration = start.elapsed()` at fire time, making `duration_ms`
+///   measure request receipt → final relayed frame / stream end (AC4/AC20).
+///
+/// The wrapper never reads or mutates forwarded bytes. The non-blocking
+/// `analytics.on_request()` call is wrapped in `catch_unwind` (AC9).
+///
+/// ## ADR-007 losslessness
+///
+/// This wrapper adds only observe-only structure to the egress relay path.
+/// Frame bytes are forwarded byte-identical to the upstream response. The
+/// `round-trip decompress(compress(x))==x` guarantee mandated by ADR-007 lives
+/// in the compression engines (#304/#427), which this ticket does not modify.
+struct AnalyticsCompletionBody {
+    inner: ProxyBody,
+    /// The partially-built event (duration == Duration::ZERO; set at fire time).
+    event: ProxyEvent,
+    analytics: Arc<dyn AnalyticsHook>,
+    start: Instant,
+    /// Prevents double-fire when EOF `poll_frame` is followed by `Drop`.
+    fired: bool,
+}
 
-impl DecisionSink for NullSink {
-    fn try_send(
-        &self,
-        _record: rskim_contract::log::DecisionRecord,
-    ) -> Result<(), rskim_contract::log::SinkFull> {
-        // Intentional no-op. Zero allocation, zero blocking.
+impl AnalyticsCompletionBody {
+    fn new(
+        inner: ProxyBody,
+        event: ProxyEvent,
+        analytics: Arc<dyn AnalyticsHook>,
+        start: Instant,
+    ) -> Self {
+        Self {
+            inner,
+            event,
+            analytics,
+            start,
+            fired: false,
+        }
+    }
+
+    /// Fire the analytics event exactly once, computing duration at call time.
+    ///
+    /// AD-PXY-23: `duration = start.elapsed()` is evaluated here so it measures
+    /// the full request → stream-end wall time. The boolean guard prevents
+    /// double-fire. `catch_unwind` satisfies AC9 (panicking hook cannot fail
+    /// the relay).
+    fn fire(&mut self) {
+        if !self.fired {
+            self.fired = true;
+            let mut event = self.event.clone();
+            event.duration = self.start.elapsed();
+            let analytics = Arc::clone(&self.analytics);
+            // AC9: catch_unwind ensures a panicking hook does not propagate.
+            // AD-PXY-17: on_request must not block (ChannelAnalyticsHook is
+            // the non-blocking implementation; NoopAnalyticsHook is zero-cost).
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                analytics.on_request(&event);
+            }));
+        }
+    }
+}
+
+/// Drop-based fire: covers mid-stream client disconnect or body error.
+///
+/// AD-PXY-23: fires on the first of {clean EOF, Drop}. The `fired` guard
+/// prevents double-fire when the clean-EOF path already fired.
+impl Drop for AnalyticsCompletionBody {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
+impl http_body::Body for AnalyticsCompletionBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        // Safety: AnalyticsCompletionBody is Unpin (all fields are Unpin).
+        // get_mut() is safe here.
+        let this = self.as_mut().get_mut();
+        // BoxBody is Unpin — Pin::new is safe.
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            // AD-PXY-23: clean EOF — fire analytics at stream end.
+            Poll::Ready(None) => {
+                this.fire();
+                Poll::Ready(None)
+            }
+            // Pass through all other outcomes unchanged (ADR-007 losslessness).
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+// ============================================================================
+// CollectingSink — production request-scoped decision sink (AD-PXY-21)
+// ============================================================================
+
+/// Upper bound on `DecisionRecord`s collected for a single request.
+///
+/// ## Honest rationale (ADR-003 / PF-005)
+///
+/// **This is a safety bound, not a measured threshold.** It exists because the
+/// reliability rule requires every accumulating resource to carry an explicit
+/// bound: without it a stage emitting one record per block could grow the
+/// per-request vector in proportion to attacker-influenced body structure. A
+/// request that exceeds it degrades to passthrough (the `SinkFull` contract),
+/// never to unbounded memory.
+const MAX_COLLECTED_RECORDS: usize = 4096;
+
+/// Request-scoped [`DecisionSink`] that collects per-block decision records.
+///
+/// ## AD-PXY-21 — the production collecting sink
+///
+/// Replaces the #303 `NullSink` now that the request tier and the
+/// `proxy_block_decisions` detail table are derived from per-block records.
+///
+/// This is deliberately **not** [`rskim_contract::log::MockSink`]: that type is
+/// a test double (it carries a `set_full` failure-injection toggle and an
+/// unbounded `Vec`) and must not run on the request path.
+///
+/// Bounded per [`MAX_COLLECTED_RECORDS`]. Past the cap `try_send` returns
+/// `Err(SinkFull)`, which the `DecisionSink` contract defines as "the caller
+/// MUST fall back to passthrough" — the correct fail-open outcome.
+struct CollectingSink {
+    records: std::sync::Mutex<Vec<DecisionRecord>>,
+}
+
+impl CollectingSink {
+    fn new() -> Self {
+        Self {
+            records: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Take the collected records, leaving the sink empty.
+    ///
+    /// Poison-tolerant: a stage that panicked while holding the lock must not
+    /// turn into a panic on the request path (AC9 fail-open).
+    fn drain(&self) -> Vec<DecisionRecord> {
+        std::mem::take(&mut *self.records.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl DecisionSink for CollectingSink {
+    fn try_send(&self, record: DecisionRecord) -> Result<(), SinkFull> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= MAX_COLLECTED_RECORDS {
+            return Err(SinkFull);
+        }
+        guard.push(record);
         Ok(())
     }
+}
+
+// ============================================================================
+// Tier derivation helpers (AD-PXY-21)
+// ============================================================================
+
+/// Derive the request-level compression tier from collected `DecisionRecord`s.
+///
+/// ## AD-PXY-21 / Cross-Plan Amendment #3
+///
+/// Filters to the `"block-router"` component only, excluding any
+/// `CacheAlignStage` records (#306) that share the same collector sink. Rule:
+/// - any `Degraded` → `RequestTier::Degraded`
+/// - else any `Full` → `RequestTier::Full`
+/// - else `RequestTier::Passthrough`
+///
+/// This is pure in-memory aggregation of a small `Vec` — no I/O, no token
+/// counting on the request path (constraint 1).
+fn derive_tier(records: &[DecisionRecord]) -> RequestTier {
+    let mut has_degraded = false;
+    let mut has_full = false;
+
+    for record in records {
+        // Cross-Plan Amendment #3: filter to block-router component only.
+        // A discriminating test (in proxy_analytics_tier_tests.rs) asserts that
+        // a non-"block-router" component emitting Full does NOT affect the tier.
+        if record.component != "block-router" {
+            continue;
+        }
+        #[allow(unreachable_patterns)] // OutcomeReason is #[non_exhaustive]
+        match record.reason {
+            OutcomeReason::Degraded => has_degraded = true,
+            OutcomeReason::Full => has_full = true,
+            _ => {}
+        }
+    }
+
+    if has_degraded {
+        RequestTier::Degraded
+    } else if has_full {
+        RequestTier::Full
+    } else {
+        RequestTier::Passthrough
+    }
+}
+
+/// Project one `DecisionRecord` into a compact `BlockDecisionProjection`.
+///
+/// ## AD-AN-13 / AD-PXY-21
+///
+/// The outcome string is derived from `OutcomeReason` to a stable static str.
+/// `bytes_in` / `bytes_out` are copied directly (always present, exact, and
+/// additive across blocks — the byte-reconciliation invariant).
+fn project_decision(record: &DecisionRecord) -> BlockDecisionProjection {
+    #[allow(unreachable_patterns)] // OutcomeReason is #[non_exhaustive]
+    let outcome = match record.reason {
+        OutcomeReason::Full => "full",
+        OutcomeReason::Degraded => "degraded",
+        OutcomeReason::Passthrough => "passthrough",
+        OutcomeReason::FailedOpen => "failed_open",
+        OutcomeReason::PolicyPassthrough => "policy_passthrough",
+        OutcomeReason::LossyRejected => "lossy_rejected",
+        _ => "unknown",
+    };
+    BlockDecisionProjection {
+        component: record.component,
+        outcome,
+        bytes_in: record.bytes_in,
+        bytes_out: record.bytes_out,
+    }
+}
+
+/// Fire a distinct analytics event for a request that passed the transform
+/// but failed upstream (AD-PXY-25).
+///
+/// ## AD-PXY-24 / AD-PXY-25 — three-outcome recording predicate
+///
+/// Called at the post-transform 502/504 return sites:
+/// - 502 no-upstream (empty `upstream_url`)
+/// - 504 upstream timeout
+/// - 502 bad-URL / connection-error
+///
+/// The event carries `upstream_error_status = Some(status)` and NULL token
+/// columns (token counting is not performed for these rows). Its per-block
+/// `block_decisions` are still recorded (the transform ran), so the
+/// byte-reconciliation invariant (AD-AN-13) holds.
+///
+/// This function uses a bounded non-blocking `on_request` call (AC14) wrapped
+/// in `catch_unwind` (AC9). It must NEVER block the request path.
+#[allow(clippy::too_many_arguments)]
+fn fire_upstream_error_event(
+    analytics: &Arc<dyn AnalyticsHook>,
+    provider: &ProxyProvider,
+    model: &Option<String>,
+    tier: RequestTier,
+    raw_body: &Bytes,
+    final_body: &Bytes,
+    block_decisions: &[BlockDecisionProjection],
+    status: u16,
+    start: Instant,
+) {
+    let event = ProxyEvent::new(
+        provider.clone(),
+        model.clone(),
+        None, // turn_id — always None until #344
+        tier,
+        raw_body.clone(),
+        final_body.clone(),
+        block_decisions.to_vec(),
+        Some(status), // upstream_error_status (AD-PXY-25)
+        start.elapsed(),
+    );
+    // AC9 / AD-PXY-17: catch_unwind + non-blocking.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        analytics.on_request(&event);
+    }));
 }
 
 // ============================================================================
@@ -397,13 +673,17 @@ async fn handle_request(
             ));
         }
     };
-    let request_bytes = body_bytes.len() as u64;
 
     // ---- Provider detection ----
     let sniff_limit = std::cmp::min(body_bytes.len(), crate::detect::SHAPE_SNIFF_LIMIT);
     let provider = detect_provider(&path, &body_bytes[..sniff_limit]);
 
+    // AD-PXY-22: extract model string verbatim from the same bounded sniff window.
+    // Returns None when undetected (non-UTF-8, no "model" key, or parse failure).
+    let model = detect_model(&body_bytes[..sniff_limit]);
+
     // ---- 502 for Unknown provider with no default upstream (D8 / AC3) ----
+    // AD-PXY-24: pre-transform failure → NO analytics event (transform never ran).
     if provider == ProxyProvider::Unknown && config.upstream_default.is_none() {
         warn!(
             request_id = %request_id,
@@ -415,11 +695,15 @@ async fn handle_request(
         ));
     }
 
-    // ---- Transform pipeline ----
+    // ---- Transform pipeline (with collecting sink for tier derivation) ----
+    //
+    // AD-PXY-21: replace NullSink with a request-scoped CollectingSink so
+    // per-block DecisionRecords are captured for tier derivation and the
+    // proxy_block_decisions detail table.
     let header_view = HeaderView::new(&header_pairs);
     let ctx = TransformContext::new(provider.clone(), auth_mode, &request_id, &header_view);
 
-    let null_sink = NullSink;
+    let collecting_sink = CollectingSink::new();
 
     // AC9: per-transform panic containment — catch_unwind around pipeline.run.
     // A panicking stage falls back to the original body bytes (fail-open).
@@ -427,7 +711,7 @@ async fn handle_request(
     let transformed_body = {
         let body_vec = body_bytes.to_vec();
         let pipeline_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pipeline.run(body_vec, &ctx, &null_sink)
+            pipeline.run(body_vec, &ctx, &collecting_sink)
         }));
         match pipeline_result {
             Ok(outcome) => Bytes::from(outcome.bytes),
@@ -437,6 +721,24 @@ async fn handle_request(
             }
         }
     };
+
+    // Cross-Plan Amendment #2 (measurement-point scope): `transformed_body` here
+    // reflects the post-#304 BlockRouter output — the CONTENT-compression stage.
+    // When #306's CacheAlignStage lands, its byte delta must NOT be attributed to
+    // compressed_tokens here; instead, update this measurement point to capture the
+    // post-BlockRouter / pre-CacheAlign body (the seam between content-compression
+    // and cache-alignment is at the stage boundary). Record #306's alignment deltas
+    // only in its own alignment_decisions table (AD-AN-13 / Cross-Plan Amendment #2).
+    //
+    // AD-PXY-21: drain the collecting sink and derive the request tier.
+    // Cross-Plan Amendment #3: derive_tier filters to "block-router" component
+    // to exclude future CacheAlignStage (#306) records.
+    let collected_records = collecting_sink.drain();
+    let tier = derive_tier(&collected_records);
+    // Project each record to the compact per-block representation for the
+    // proxy_block_decisions detail table (AD-AN-13).
+    let block_decisions: Vec<BlockDecisionProjection> =
+        collected_records.iter().map(project_decision).collect();
 
     // ---- Determine upstream URL ----
     // Map provider to the key used in ProxyConfig::upstream_for.
@@ -454,6 +756,20 @@ async fn handle_request(
     let upstream_url = config.upstream_for(provider_key).unwrap_or("").to_owned();
 
     if upstream_url.is_empty() {
+        // AD-PXY-25: post-transform 502 (no upstream configured) — fire distinct
+        // transformed-but-upstream-errored event. The transform ran (line above),
+        // so we have tier and block_decisions.
+        fire_upstream_error_event(
+            &analytics,
+            &provider,
+            &model,
+            tier,
+            &body_bytes,
+            &transformed_body,
+            &block_decisions,
+            502,
+            start,
+        );
         return Ok(json_response(
             StatusCode::BAD_GATEWAY,
             r#"{"error":"no upstream configured"}"#,
@@ -464,7 +780,12 @@ async fn handle_request(
     // AD-PXY-14: upstream_timeout = 60s (evidence-cited in config.rs).
     let forward_result = timeout(
         config.upstream_timeout,
-        forward_request(parts, transformed_body, &upstream_url, &upstream_client),
+        forward_request(
+            parts,
+            transformed_body.clone(),
+            &upstream_url,
+            &upstream_client,
+        ),
     )
     .await;
 
@@ -479,6 +800,18 @@ async fn handle_request(
                 timeout_secs = %config.upstream_timeout.as_secs(),
                 "upstream timeout (AC20)"
             );
+            // AD-PXY-25: post-transform 504 — fire distinct upstream-errored event.
+            fire_upstream_error_event(
+                &analytics,
+                &provider,
+                &model,
+                tier,
+                &body_bytes,
+                &transformed_body,
+                &block_decisions,
+                504,
+                start,
+            );
             return Ok(json_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 r#"{"error":"upstream timeout","code":"504"}"#,
@@ -487,6 +820,18 @@ async fn handle_request(
         Ok(Err(ForwardError::BadUpstreamUrl(u))) => {
             readiness.record_failure();
             warn!(request_id = %request_id, upstream = %u, "bad upstream URL");
+            // AD-PXY-25: post-transform 502 (bad upstream URL) — fire distinct event.
+            fire_upstream_error_event(
+                &analytics,
+                &provider,
+                &model,
+                tier,
+                &body_bytes,
+                &transformed_body,
+                &block_decisions,
+                502,
+                start,
+            );
             return Ok(json_response(
                 StatusCode::BAD_GATEWAY,
                 r#"{"error":"bad upstream URL"}"#,
@@ -499,6 +844,18 @@ async fn handle_request(
             // control characters (A03 — escape output for its context).
             readiness.record_failure();
             warn!(request_id = %request_id, error = %e, "upstream connection error (AC10)");
+            // AD-PXY-25: post-transform 502 (connection error) — fire distinct event.
+            fire_upstream_error_event(
+                &analytics,
+                &provider,
+                &model,
+                tier,
+                &body_bytes,
+                &transformed_body,
+                &block_decisions,
+                502,
+                start,
+            );
             let body = serde_json::json!({"error": "upstream error", "detail": e}).to_string();
             return Ok(json_response(StatusCode::BAD_GATEWAY, body));
         }
@@ -523,11 +880,6 @@ async fn handle_request(
 
     // Record readiness success (upstream responded, even if 5xx).
     readiness.record_success();
-
-    // We do not know the response_bytes at relay time for streaming responses.
-    // Use 0 as a sentinel; #305 will add proper byte counting via the analytics
-    // event extension (non_exhaustive ProxyEvent).
-    let response_bytes: u64 = 0;
 
     // ---- Build relay response with streaming body ----
     //
@@ -567,16 +919,34 @@ async fn handle_request(
             )
         });
 
-    // ---- Fire analytics (AC15 / AD-PXY-17) ----
-    // The call is synchronous — use ChannelAnalyticsHook (or similar non-blocking
-    // implementation) to avoid blocking the request path (AC15 / AD-PXY-17).
-    // catch_unwind ensures a panicking hook cannot fail the request (AC9).
-    let event = ProxyEvent::new(provider, request_bytes, response_bytes, start.elapsed());
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        analytics.on_request(&event);
-    }));
-
-    Ok(relay_response)
+    // ---- Wrap relay body with AnalyticsCompletionBody (AD-PXY-23) ----
+    //
+    // AD-PXY-23: fire the analytics event at clean EOF or Drop (not at header
+    // time), so duration captures the full stream-to-client time. Every
+    // poll_frame is delegated unchanged — ADR-007 egress losslessness.
+    //
+    // AD-PXY-24: three-outcome recording predicate — success path records a
+    // normal relay row here. Pre-transform failures (400 paths above) fire NO
+    // event. Post-transform 502/504 sites fire a distinct upstream-errored
+    // event (AD-PXY-25) before returning.
+    //
+    // Build the ProxyEvent with duration=ZERO; AnalyticsCompletionBody fills
+    // in the real elapsed time at fire() time (AC15 / AD-PXY-17).
+    let (relay_parts, relay_inner_body) = relay_response.into_parts();
+    let event = ProxyEvent::new(
+        provider,
+        model,
+        None, // turn_id — always None until #344 derives it
+        tier,
+        body_bytes,
+        transformed_body,
+        block_decisions,
+        None, // upstream_error_status: None for the success path
+        Duration::ZERO,
+    );
+    let instrumented_body =
+        AnalyticsCompletionBody::new(relay_inner_body, event, analytics, start).boxed();
+    Ok(Response::from_parts(relay_parts, instrumented_body))
 }
 
 // ============================================================================
@@ -959,7 +1329,17 @@ mod tests {
         }
 
         let hook = Arc::new(PanicHook);
-        let event = ProxyEvent::new(ProxyProvider::Anthropic, 0, 0, Duration::ZERO);
+        let event = ProxyEvent::new(
+            ProxyProvider::Anthropic,
+            None,
+            None,
+            crate::analytics::RequestTier::Passthrough,
+            Bytes::new(),
+            Bytes::new(),
+            vec![],
+            None,
+            Duration::ZERO,
+        );
 
         // This simulates the catch_unwind used in handle_request.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -968,5 +1348,111 @@ mod tests {
         // Should not propagate — either Ok or caught.
         drop(result);
         // If we reach here, the test passes (no uncaught panic).
+    }
+
+    // ========================================================================
+    // derive_tier unit tests (AD-PXY-21 / Cross-Plan Amendment #3)
+    // ========================================================================
+
+    /// AD-PXY-21: empty record set → Passthrough.
+    #[test]
+    fn test_derive_tier_empty_records_passthrough() {
+        assert_eq!(derive_tier(&[]), RequestTier::Passthrough);
+    }
+
+    /// AD-PXY-21: one Full record from "block-router" → Full.
+    #[test]
+    fn test_derive_tier_block_router_full_returns_full() {
+        let records = vec![DecisionRecord::modified("req-1", "block-router", 100, 80)];
+        assert_eq!(derive_tier(&records), RequestTier::Full);
+    }
+
+    /// AD-PXY-21: one Degraded record from "block-router" → Degraded.
+    #[test]
+    fn test_derive_tier_block_router_degraded_returns_degraded() {
+        let records = vec![DecisionRecord::modified_with_reason(
+            "req-1",
+            "block-router",
+            100,
+            90,
+            OutcomeReason::Degraded,
+        )];
+        assert_eq!(derive_tier(&records), RequestTier::Degraded);
+    }
+
+    /// AD-PXY-21: Degraded trumps Full when both are present.
+    #[test]
+    fn test_derive_tier_degraded_trumps_full() {
+        let records = vec![
+            DecisionRecord::modified("req-1", "block-router", 100, 80), // Full
+            DecisionRecord::modified_with_reason(
+                "req-1",
+                "block-router",
+                80,
+                80,
+                OutcomeReason::Degraded,
+            ),
+        ];
+        assert_eq!(derive_tier(&records), RequestTier::Degraded);
+    }
+
+    /// Cross-Plan Amendment #3: "cache-align" Full records are excluded.
+    #[test]
+    fn test_derive_tier_filters_non_block_router_components() {
+        let records = vec![
+            DecisionRecord::modified("req-1", "cache-align", 100, 80), // Full but wrong component
+        ];
+        // "cache-align" is not "block-router" — must remain Passthrough.
+        assert_eq!(derive_tier(&records), RequestTier::Passthrough);
+    }
+
+    /// Cross-Plan Amendment #3: mixed components — only block-router records count.
+    #[test]
+    fn test_derive_tier_mixed_components_only_block_router_counts() {
+        let records = vec![
+            DecisionRecord::modified("req-1", "cache-align", 100, 80), // Full, excluded
+            DecisionRecord::passthrough("req-1", "block-router", 80),  // Passthrough, included
+        ];
+        // Only the block-router Passthrough record counts — result: Passthrough.
+        assert_eq!(derive_tier(&records), RequestTier::Passthrough);
+    }
+
+    // ========================================================================
+    // project_decision unit tests (AD-AN-13 / AD-PXY-21)
+    // ========================================================================
+
+    /// AD-AN-13: project_decision maps Full → "full".
+    #[test]
+    fn test_project_decision_full_outcome() {
+        let record = DecisionRecord::modified("req-1", "block-router", 200, 150);
+        let proj = project_decision(&record);
+        assert_eq!(proj.outcome, "full");
+        assert_eq!(proj.component, "block-router");
+        assert_eq!(proj.bytes_in, 200);
+        assert_eq!(proj.bytes_out, 150);
+    }
+
+    /// AD-AN-13: project_decision maps Passthrough → "passthrough".
+    #[test]
+    fn test_project_decision_passthrough_outcome() {
+        let record = DecisionRecord::passthrough("req-1", "block-router", 200);
+        let proj = project_decision(&record);
+        assert_eq!(proj.outcome, "passthrough");
+        assert_eq!(proj.bytes_in, 200);
+        assert_eq!(proj.bytes_out, 200); // passthrough preserves size
+    }
+
+    /// AD-AN-13: project_decision maps Degraded → "degraded".
+    #[test]
+    fn test_project_decision_degraded_outcome() {
+        let record = DecisionRecord::modified_with_reason(
+            "req-1",
+            "block-router",
+            200,
+            190,
+            OutcomeReason::Degraded,
+        );
+        let proj = project_decision(&record);
+        assert_eq!(proj.outcome, "degraded");
     }
 }

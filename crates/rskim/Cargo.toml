@@ -70,3 +70,10 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 filetime = { workspace = true }
 rskim-contract = { path = "../rskim-contract" }
+# proxy_analytics tests construct Bytes values for ProxyEvent::new (feature = "proxy" only).
+bytes = { workspace = true }
+# AC23 / AC15 proxy server E2E tests: rskim_proxy::testing::run_server_with_listener
+# (feature = "proxy" only — the test module is gated by #[cfg(feature = "proxy")]).
+rskim-proxy = { path = "../rskim-proxy", features = ["testing"] }
+# Tokio runtime + TcpListener/TcpStream for async proxy server tests.
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "io-util"] }

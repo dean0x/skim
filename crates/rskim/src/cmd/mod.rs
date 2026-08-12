@@ -43,6 +43,8 @@ mod permissions;
 mod pkg;
 #[cfg(feature = "proxy")]
 mod proxy;
+#[cfg(feature = "proxy")]
+mod proxy_analytics;
 mod rewrite;
 mod search;
 mod session;
