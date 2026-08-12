@@ -1512,10 +1512,8 @@ mod tests {
     ///   (d) the fail-open consequence — a None-returning body produces the
     ///       original bytes unchanged (ADR-007 losslessness).
     ///
-    /// NOT COVERED: the actual gate block at lib.rs:238-248 is not exercised —
-    /// deleting it would not fail any assertion here (step (d) uses a dup-key
-    /// body that returns None before reaching the gate).  Testing the gate
-    /// block directly requires a fault-injection seam in sort_tools_array.
+    /// The gate block in `try_align_full` is additionally exercised by
+    /// `ac29_reorder_gate_fires_on_element_drop_fault` (fault-injection seam).
     ///
     /// Note: tool element keys are in canonical order (description before name) so that
     /// `align()` only reorders elements (not keys within elements). `tools_arrays_set_equal`
@@ -1575,7 +1573,7 @@ mod tests {
         assert!(
             !tools_arrays_set_equal(orig_tools, &drop_mutant),
             "AC29 wiring/drop: gate MUST detect the drop fault \
-             (would fire at lib.rs:240-247 → try_align_full returns None)"
+             (tools_arrays_set_equal returns false → try_align_full returns None)"
         );
 
         // (d) Fail-open consequence: a body that causes try_align_full to return
@@ -1598,8 +1596,8 @@ mod tests {
     /// the gate function detects a duplication; plus verify the fail-open consequence.
     ///
     /// SCOPE (PF-007): covers happy path, no-dup end-to-end, component gate detection,
-    /// and the fail-open consequence.  Does NOT exercise the gate block at lib.rs:238-248
-    /// directly (step (d) uses a dup-key body that returns None before the gate).
+    /// and the fail-open consequence.  The gate block in `try_align_full` is additionally
+    /// exercised by `ac29_reorder_gate_fires_on_element_drop_fault` (fault-injection seam).
     #[test]
     fn ac29_duplication_fault_component_and_passthrough_consequence() {
         use crate::canonical_emit::canonical_envelope;
@@ -1646,7 +1644,7 @@ mod tests {
         assert!(
             !tools_arrays_set_equal(orig_tools, &dup_mutant),
             "AC29 wiring/dup: gate MUST detect the duplication fault \
-             (would fire at lib.rs:240-247 → try_align_full returns None)"
+             (tools_arrays_set_equal returns false → try_align_full returns None)"
         );
 
         // (d) Fail-open consequence: None → original bytes unchanged (ADR-007).
@@ -1667,9 +1665,9 @@ mod tests {
     /// the gate function detects a mutation; plus verify the fail-open consequence.
     ///
     /// SCOPE (PF-007): covers happy path, no-mutation end-to-end, component gate
-    /// detection, and the fail-open consequence.  Does NOT exercise the gate block at
-    /// lib.rs:238-248 directly (step (d) uses a dup-key body that returns None before
-    /// the gate).
+    /// detection, and the fail-open consequence.  The gate block in `try_align_full`
+    /// is additionally exercised by `ac29_reorder_gate_fires_on_element_drop_fault`
+    /// (fault-injection seam).
     #[test]
     fn ac29_mutation_fault_component_and_passthrough_consequence() {
         use crate::canonical_emit::canonical_envelope;
@@ -1726,7 +1724,7 @@ mod tests {
         assert!(
             !tools_arrays_set_equal(orig_tools, &mut_mutant),
             "AC29 wiring/mut: gate MUST detect the mutation fault \
-             (would fire at lib.rs:240-247 → try_align_full returns None)"
+             (tools_arrays_set_equal returns false → try_align_full returns None)"
         );
 
         // (d) Fail-open consequence: None → original bytes unchanged (ADR-007).
@@ -1913,9 +1911,9 @@ mod tests {
 
     // ── AC29 — discriminating test: production gate is load-bearing ───────────
 
-    /// AC29 DISCRIMINATING: the `tools_arrays_set_equal` gate at `try_align_full`
-    /// lib.rs:255-265 must fire when the canonical tools array has a dropped element,
-    /// causing whole-request fail-open with the original bytes returned unmodified.
+    /// AC29 DISCRIMINATING: the `tools_arrays_set_equal` gate in `try_align_full`
+    /// must fire when the canonical tools array has a dropped element, causing
+    /// whole-request fail-open with the original bytes returned unmodified.
     ///
     /// # Mechanism
     ///
@@ -1929,8 +1927,8 @@ mod tests {
     ///
     /// # Discriminating property (PF-007)
     ///
-    /// Deleting the gate block at lib.rs:255-265 causes `try_align_full` to
-    /// return `Some(AlignResult)` with the corrupt (one-element) tools span.
+    /// Deleting the gate block in `try_align_full` causes it to return
+    /// `Some(AlignResult)` with the corrupt (one-element) tools span.
     /// `align()` then returns `out.stats.fail_open == false` and
     /// `out.bytes != body`, failing both assertions below.
     ///
@@ -1958,12 +1956,12 @@ mod tests {
 
         let out = align(body, Provider::Anthropic, "ac29-gate-drop-fault");
 
-        // The gate at lib.rs:255-265 must detect the drop (set-equal returns false)
+        // The gate in try_align_full must detect the drop (set-equal returns false)
         // and cause whole-request fail-open.
         assert!(
             out.stats.fail_open,
             "AC29: element-drop fault must trigger fail-open via the \
-             tools_arrays_set_equal gate at try_align_full lib.rs:255-265. \
+             tools_arrays_set_equal gate in try_align_full. \
              If this fails, deleting that gate block still passes the suite — \
              the gate is absent or bypassed."
         );

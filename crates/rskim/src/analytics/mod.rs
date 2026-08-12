@@ -795,6 +795,9 @@ impl AnalyticsDb {
     }
 
     /// Query aggregate summary.
+    ///
+    /// **AD-AN-6:** excludes `command_type = 'proxy'` rows via
+    /// [`cli_scope_clause`] so proxy savings never inflate the CLI headline.
     pub(crate) fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
         let (where_clause, params) = cli_scope_clause(since);
         // Fifth column: per-row floored tokens_saved — consistent with
@@ -829,6 +832,8 @@ impl AnalyticsDb {
     }
 
     /// Query daily breakdown.
+    ///
+    /// **AD-AN-6:** excludes proxy rows so CLI daily figures stay unaffected.
     pub(crate) fn query_daily(&self, since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
         let (where_clause, params) = cli_scope_clause(since);
         // CASE WHEN flooring is consistent with query_by_command/lang/mode/session.
@@ -852,6 +857,8 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by command type.
+    ///
+    /// **AD-AN-6:** excludes proxy rows from all CLI aggregates.
     pub(crate) fn query_by_command(&self, since: Option<i64>) -> anyhow::Result<Vec<CommandStats>> {
         let (where_clause, params) = cli_scope_clause(since);
         let sql = format!(
@@ -876,6 +883,8 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by language (file operations only).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI language aggregates.
     pub(crate) fn query_by_language(
         &self,
         since: Option<i64>,
@@ -902,6 +911,8 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by mode (file operations only).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI mode aggregates.
     pub(crate) fn query_by_mode(&self, since: Option<i64>) -> anyhow::Result<Vec<ModeStats>> {
         let (clause, params) = cli_scope_clause_with_extra(since, "mode IS NOT NULL");
         let sql = format!(
@@ -924,7 +935,10 @@ impl AnalyticsDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Query parse tier distribution (command operations only).
+    /// Query parse tier distribution (CLI command operations only).
+    ///
+    /// **AD-AN-6:** excludes proxy rows.  The proxy tier distribution uses
+    /// `query_by_model` / `query_by_provider` (success-scope only, per AD-PXY-25).
     pub(crate) fn query_tier_distribution(
         &self,
         since: Option<i64>,
@@ -953,6 +967,8 @@ impl AnalyticsDb {
     }
 
     /// Query breakdown by original command string (top 15 by tokens saved).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI command breakdown.
     pub(crate) fn query_by_original_cmd(
         &self,
         since: Option<i64>,
@@ -981,6 +997,13 @@ impl AnalyticsDb {
     }
 
     /// Prune records older than N days.
+    ///
+    /// **AD-AN-13:** the child `proxy_block_decisions` rows are deleted in the
+    /// same transaction as their parents.  `PRAGMA foreign_keys` is off (SQLite
+    /// default), so the declared FK does not cascade — without the explicit
+    /// child DELETE the detail rows would have no deletion path at all and would
+    /// accumulate past the retention window (ADR-006: never persist a partial
+    /// state — children first, then parents, committed together).
     pub(crate) fn prune_older_than(&self, days: u64) -> anyhow::Result<usize> {
         let cutoff = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -988,12 +1011,20 @@ impl AnalyticsDb {
             .as_secs() as i64
             - (days as i64 * SECONDS_PER_DAY as i64);
         let tx = self.conn.unchecked_transaction()?;
+        // Children before parents (FK ordering): proxy_block_decisions references
+        // token_savings, so detail rows must be deleted before parent rows.
         tx.execute(
             "DELETE FROM proxy_block_decisions WHERE savings_id IN \
              (SELECT id FROM token_savings WHERE timestamp < ?1)",
             [cutoff],
         )?;
         let count = tx.execute("DELETE FROM token_savings WHERE timestamp < ?1", [cutoff])?;
+        // alignment_decisions is a standalone table (no FK children); delete in
+        // the same transaction so the retention window is applied atomically.
+        tx.execute(
+            "DELETE FROM alignment_decisions WHERE timestamp < ?1",
+            [cutoff],
+        )?;
         tx.commit()?;
         Ok(count)
     }
@@ -1045,6 +1076,20 @@ impl AnalyticsDb {
             return Ok(0);
         }
 
+        // AD-AN-6: scope the cleanup to CLI rows.  This DELETE repairs a
+        // pre-#305 CLI recording bug that failed to clamp at record time.  A
+        // proxy row with `compressed_tokens > raw_tokens` is NOT corrupt — it is
+        // a measured expansion (the transform grew the body), which AD-AN-7
+        // requires be recorded honestly.  Without this predicate the one-time
+        // sweep would silently destroy those legitimate measurements, biasing
+        // reported savings upward by deleting exactly the worst outcomes.
+        //
+        // AD-AN-13: delete the child detail rows in the same transaction (the
+        // declared FK does not cascade — `PRAGMA foreign_keys` is off).  Today
+        // only proxy parents carry detail rows, so with the CLI scope above this
+        // statement matches nothing; it is kept so the child DELETE can never
+        // drift out of step with the parent predicate should a later migration
+        // attach detail rows to other command types.
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM proxy_block_decisions WHERE savings_id IN \
@@ -1116,6 +1161,8 @@ impl AnalyticsDb {
     ///
     /// Division by zero is guarded: when `distinct_sessions == 0`,
     /// `avg_tokens_per_session` is 0.0 (computed in Rust after the query).
+    ///
+    /// **AD-AN-6:** excludes proxy rows from CLI session stats.
     pub(crate) fn query_session_stats(&self, since: Option<i64>) -> anyhow::Result<SessionStats> {
         // F2: Single query using conditional aggregation — eliminates the two-query pattern.
         let (where_clause, params) = cli_scope_clause(since);
@@ -1619,8 +1666,15 @@ fn since_clause(since: Option<i64>) -> (String, Vec<i64>) {
 
 /// Build WHERE clause for CLI-scope queries — excludes proxy rows.
 ///
-/// **AD-AN-6:** all eight CLI-scope aggregates exclude `command_type = 'proxy'`
-/// rows so proxy analytics never inflate CLI figures.
+/// **AD-AN-6:** all eight CLI-scope aggregates (`query_summary`, `query_daily`,
+/// `query_by_command`, `query_by_language`, `query_by_mode`,
+/// `query_by_original_cmd`, `query_session_stats`, `query_tier_distribution`)
+/// exclude `command_type = 'proxy'` rows so proxy analytics never inflate
+/// CLI figures.  The constraint comes from the PRISM #83 lesson (constraint 12).
+///
+/// **Discriminating guard (PF-007):** removing this predicate from any CLI
+/// query allows proxy savings to inflate the CLI headline, breaking the
+/// AC8 equality assertion.
 fn cli_scope_clause(since: Option<i64>) -> (String, Vec<i64>) {
     match since {
         Some(ts) => (

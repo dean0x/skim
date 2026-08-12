@@ -38,9 +38,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rskim_align::align;
 use rskim_align::breakpoint::{count_client_markers, inject_tools_marker, plan_injection};
-use rskim_align::canonical_emit::{
-    ToolArrayKind, canonical_envelope_with_spans, sort_tools_array,
-};
+use rskim_align::canonical_emit::{ToolArrayKind, canonical_envelope_with_spans, sort_tools_array};
 use rskim_align::span::locate_top_level_spans;
 use rskim_align::stats::sha256;
 use rskim_align::volatile::detect_volatile;
@@ -268,8 +266,8 @@ fn bench_stages_anthropic_64tools(c: &mut Criterion) {
     let body_str: &str = std::str::from_utf8(&body).unwrap();
 
     // Parsed input spans (used by Stage C and Stage H)
-    let input_spans = locate_top_level_spans(body_str)
-        .expect("64-tool fixture must have valid top-level spans");
+    let input_spans =
+        locate_top_level_spans(body_str).expect("64-tool fixture must have valid top-level spans");
 
     // Extract the raw tools value span (used by Stage B and Stage E)
     let tools_raw: String = input_spans["tools"]
@@ -410,8 +408,8 @@ fn bench_stages_anthropic_2tools(c: &mut Criterion) {
     let body_str: &str = std::str::from_utf8(ANTHROPIC_BODY_2TOOLS).unwrap();
     let body_bytes: &[u8] = ANTHROPIC_BODY_2TOOLS;
 
-    let input_spans = locate_top_level_spans(body_str)
-        .expect("2-tool fixture must have valid top-level spans");
+    let input_spans =
+        locate_top_level_spans(body_str).expect("2-tool fixture must have valid top-level spans");
 
     let tools_raw: String = input_spans["tools"]
         .extract(body_str)

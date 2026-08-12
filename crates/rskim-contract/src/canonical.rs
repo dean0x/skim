@@ -462,16 +462,13 @@ pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
 ///
 /// # Algorithm
 ///
-/// Parse both `raw_a` and `raw_b` as JSON arrays. Require equal length. For each element
-/// of `raw_a`, find one as-yet-unused element in `raw_b` that is canonically equal under
-/// raw-token element equality ([`raw_nodes_equal`]). Return `true` iff every element in
-/// `raw_a` matches exactly one element in `raw_b`.
+/// Parse both `raw_a` and `raw_b` as JSON arrays. Require equal length (a length mismatch
+/// immediately returns `false`). Convert each element to a canonical byte string via
+/// [`canonical_bytes_of_node`], sort both vectors, and compare them pairwise. Two arrays
+/// are set-equal iff their sorted canonical-byte vectors are identical.
 ///
-/// The matching is **greedy**: elements are matched left-to-right in `raw_a` against the
-/// first unused canonical-equal element in `raw_b`. This produces a correct multiset
-/// equality check because duplicate elements are handled by the "as-yet-unused" invariant:
-/// a `raw_b` with a duplicated element requires two matching requests from `raw_a`, so the
-/// presence of a genuine duplicate in `raw_a` is correctly verified.
+/// Complexity: O(n log n) sort + O(n · |elem|) comparison, where `n` is the element count
+/// and `|elem|` is the average canonical byte length per element.
 ///
 /// # Number comparison
 ///
@@ -481,9 +478,10 @@ pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
 ///
 /// # Returns
 ///
-/// - `true` — both arrays have the same elements under canonical equality (any order)
-/// - `false` — either array fails to parse, arrays differ in length, or any element in
-///   `raw_a` has no matching unused canonical-equal element in `raw_b`
+/// - `true` — both arrays parse successfully, have equal length, and their sorted
+///   canonical-byte vectors are identical
+/// - `false` — either array fails to parse, arrays differ in length, or any element's
+///   canonical bytes differ after sorting
 ///
 /// # Examples
 ///
@@ -1024,9 +1022,11 @@ mod tests {
 
     /// Drop one element → false (length mismatch catches it).
     ///
-    /// Discriminating: if the length check is removed, the greedy matcher would
-    /// still pass (all elements of the shorter array find a match), returning true
-    /// for a dropped element.
+    /// Discriminating: the length check at the top of `tools_arrays_set_equal` returns
+    /// `false` immediately on a length mismatch. If that check were removed, the
+    /// subsequent sorted-vector comparison (`a_keys == b_keys`) would still return
+    /// `false` for different-length inputs (Rust's `Vec` equality is length-sensitive),
+    /// but the early-exit optimisation would be absent.
     #[test]
     fn tools_arrays_set_equal_drop_is_false() {
         let a = r#"[{"name":"a"},{"name":"b"}]"#;
@@ -1044,12 +1044,11 @@ mod tests {
     /// Duplicate one element → false.
     ///
     /// `b` has two copies of `{"name":"a"}` and zero copies of `{"name":"b"}`.
-    /// The greedy matcher assigns the first `{"name":"a"}` in `a` to the first
-    /// `{"name":"a"}` in `b`, and then cannot find an unused match for `{"name":"b"}`.
+    /// After sorting, `a`'s canonical keys are `[b"a", b"b"]` and `b`'s are
+    /// `[b"a", b"a"]`; the pairwise comparison fails at the second element.
     ///
-    /// Discriminating: if the `used` mask is removed, the second element of `a`
-    /// (`{"name":"b"}`) could incorrectly match the second `{"name":"a"}` in `b`
-    /// via a buggy implementation. The `used` mask prevents this.
+    /// Discriminating: the sort-and-compare correctly distinguishes a duplicated
+    /// element from the original because the sorted multisets differ.
     #[test]
     fn tools_arrays_set_equal_duplicate_is_false() {
         let a = r#"[{"name":"a"},{"name":"b"}]"#;
@@ -1177,13 +1176,8 @@ mod tests {
         // Fixed-shape tools so keys are stable; proptest varies only values.
         prop_oneof![
             // Simple name-only tool
-            prop_oneof![
-                Just("alpha"),
-                Just("beta"),
-                Just("gamma"),
-                Just("delta"),
-            ]
-            .prop_map(|name| format!(r#"{{"name":"{name}"}}"#)),
+            prop_oneof![Just("alpha"), Just("beta"), Just("gamma"), Just("delta"),]
+                .prop_map(|name| format!(r#"{{"name":"{name}"}}"#)),
             // Tool with name + description
             (
                 prop_oneof![Just("search"), Just("read"), Just("write"), Just("exec")],

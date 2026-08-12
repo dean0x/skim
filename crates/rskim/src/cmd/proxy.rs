@@ -1585,4 +1585,54 @@ mod tests {
             "AC16: BlockRouterOnly and Full must be distinct pipeline selections"
         );
     }
+
+    /// Build a [`TransformPipeline`] for `selection` using [`crate::analytics::NoopRecorder`]
+    /// so tests can assert on the constructed stage count without spawning threads.
+    ///
+    /// Mirrors the `match selection { … }` block in [`run()`] exactly, using `NoopRecorder`
+    /// in place of `ChannelAlignmentRecorder` so no consumer thread is spawned.  Any change
+    /// to the Full arm's stage list here (or in `run()`) is caught by
+    /// `test_select_pipeline_stage_count`.
+    fn build_test_pipeline(selection: PipelineSelection) -> TransformPipeline {
+        match selection {
+            PipelineSelection::Identity => TransformPipeline::identity(),
+            PipelineSelection::BlockRouterOnly => {
+                let router = BlockRouter::new(Arc::new(BinarySinkStub));
+                TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router))])
+            }
+            PipelineSelection::Full => {
+                let router = BlockRouter::new(Arc::new(BinarySinkStub));
+                let block_stage = BlockRouterStage::new(router);
+                let align_stage = CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder));
+                TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
+            }
+        }
+    }
+
+    // AC16 / DISCRIMINATING: Full pipeline must contain CacheAlignStage (stage_count == 2).
+    //
+    // The four `test_select_pipeline_*` tests above cover only the enum value returned by
+    // `select_pipeline()` — they pass even if CacheAlignStage is deleted from the `Full`
+    // arm of the `match selection` block in `run()`.  This test bridges the gap: it calls
+    // `build_test_pipeline()` (which mirrors the production `match` block) and asserts on
+    // `stage_count()`, so removing CacheAlignStage reduces the count from 2 to 1 and fails.
+    #[test]
+    fn test_select_pipeline_stage_count() {
+        assert_eq!(
+            build_test_pipeline(PipelineSelection::Identity).stage_count(),
+            1,
+            "AC16: Identity pipeline must have exactly 1 stage (IdentityStage)"
+        );
+        assert_eq!(
+            build_test_pipeline(PipelineSelection::BlockRouterOnly).stage_count(),
+            1,
+            "AC16: BlockRouterOnly pipeline must have exactly 1 stage (BlockRouterStage only)"
+        );
+        assert_eq!(
+            build_test_pipeline(PipelineSelection::Full).stage_count(),
+            2,
+            "AC16: Full pipeline must have exactly 2 stages (BlockRouterStage + CacheAlignStage); \
+             removing CacheAlignStage from the Full arm reduces this to 1 and fails this test"
+        );
+    }
 }
