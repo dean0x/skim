@@ -2577,6 +2577,7 @@ dependencies = [
  "strip-ansi-escapes",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml 0.8.23",
  "tree-sitter",
 ]

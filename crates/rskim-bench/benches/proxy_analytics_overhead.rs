@@ -75,12 +75,12 @@ fn make_event() -> ProxyEvent {
     ProxyEvent::new(
         ProxyProvider::Anthropic,
         Some("claude-3-5-sonnet-20241022".to_owned()),
-        None,                    // turn_id — always None until #344
+        None, // turn_id — always None until #344
         RequestTier::Passthrough,
         body.clone(),
         body,
-        vec![],  // block_decisions — empty for a passthrough request
-        None,    // upstream_error_status — None for a normal relayed row
+        vec![], // block_decisions — empty for a passthrough request
+        None,   // upstream_error_status — None for a normal relayed row
         Duration::from_millis(10),
     )
 }

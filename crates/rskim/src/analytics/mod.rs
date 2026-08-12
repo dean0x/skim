@@ -1529,6 +1529,50 @@ impl AnalyticsDb {
             .unwrap_or(0);
         Ok(count.max(0) as u64)
     }
+
+    /// Adjust the SQLite busy-wait timeout on the underlying connection.
+    ///
+    /// Used by [`spawn_consumer`] to cap per-call SQLITE_BUSY waits at a short
+    /// bound so a locked DB does not stall the consumer drain loop for the full
+    /// `open()` default (5 s). The consumer is a fail-open background thread
+    /// (AC15 / AD-AN-8): it must not delay forwarding even when the DB is locked.
+    ///
+    /// Gated to `cfg(feature = "proxy")` because the only caller is `spawn_consumer`
+    /// in `proxy_analytics.rs`, which is itself proxy-gated. Without this gate,
+    /// clippy reports `dead_code` in the default build (PF-009 / CMD-5 analogue).
+    #[cfg(feature = "proxy")]
+    pub(crate) fn set_busy_timeout(&self, d: Duration) -> anyhow::Result<()> {
+        self.conn.busy_timeout(d).map_err(Into::into)
+    }
+
+    /// Return ALL rows from `proxy_block_decisions` (test helper for byte-reconciliation checks).
+    ///
+    /// **AD-AN-13:** exercises the full block table — used by proxy_analytics.rs tests to
+    /// assert the byte-reconciliation invariant without needing the parent `savings_id` in
+    /// advance. Not available in production builds (`#[cfg(all(test, feature = "proxy"))]`).
+    ///
+    /// The `feature = "proxy"` gate matches the caller: `proxy_analytics.rs` is compiled
+    /// only under `#[cfg(feature = "proxy")]` (see `cmd/mod.rs`). Without this gate, clippy
+    /// reports `dead_code` when compiling `--all-targets` without `--features proxy` (CMD-5).
+    #[cfg(all(test, feature = "proxy"))]
+    pub(crate) fn all_block_decisions(&self) -> anyhow::Result<Vec<ProxyBlockDecisionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, savings_id, block_index, component, outcome, bytes_in, bytes_out \
+             FROM proxy_block_decisions ORDER BY savings_id, block_index",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ProxyBlockDecisionRow {
+                id: row.get(0)?,
+                savings_id: row.get(1)?,
+                block_index: row.get::<_, i64>(2)? as u64,
+                component: row.get(3)?,
+                outcome: row.get(4)?,
+                bytes_in: row.get::<_, i64>(5)?.max(0) as u64,
+                bytes_out: row.get::<_, i64>(6)?.max(0) as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
 }
 
 impl AnalyticsStore for AnalyticsDb {
@@ -3667,25 +3711,145 @@ mod tests {
         }
 
         // Pre-existing CLI aggregates are numerically identical after migration.
-        // (The v4 migration preserves raw_tokens, compressed_tokens, savings_pct.)
+        // The v4 migration adds command_type != 'proxy' scope predicates, which are
+        // no-ops on v3 data (no proxy rows), so all eight aggregates survive verbatim.
+        // Snapshot all EIGHT (AC2 — plan criterion explicitly lists every aggregate).
+
+        // (1) query_summary
+        // Row 1: raw=1000, compressed=200 → saved=800
+        // Row 2: raw=500, compressed=100 → saved=400
         let summary = db.query_summary(None).unwrap();
         assert_eq!(
             summary.invocations, 2,
-            "AC2: invocation count must equal pre-migration value"
+            "AC2: summary.invocations must equal pre-migration value"
         );
-        // Row 1: raw=1000, compressed=200 → saved=800
-        // Row 2: raw=500, compressed=100 → saved=400
         assert_eq!(
             summary.raw_tokens, 1500,
-            "AC2: raw_tokens aggregate must be unchanged after migration"
+            "AC2: summary.raw_tokens aggregate must be unchanged after migration"
         );
         assert_eq!(
             summary.compressed_tokens, 300,
-            "AC2: compressed_tokens aggregate must be unchanged after migration"
+            "AC2: summary.compressed_tokens aggregate must be unchanged after migration"
         );
         assert_eq!(
             summary.tokens_saved, 1200,
-            "AC2: tokens_saved aggregate must be unchanged after migration"
+            "AC2: summary.tokens_saved aggregate must be unchanged after migration"
+        );
+
+        // (2) query_daily — both timestamps are on the same UTC day (2024-03-24).
+        let daily = db.query_daily(None).unwrap();
+        assert_eq!(
+            daily.len(),
+            1,
+            "AC2: query_daily must return exactly 1 day entry"
+        );
+        assert_eq!(
+            daily[0].invocations, 2,
+            "AC2: daily.invocations must equal pre-migration value"
+        );
+        assert_eq!(
+            daily[0].tokens_saved, 1200,
+            "AC2: daily.tokens_saved must equal pre-migration value"
+        );
+
+        // (3) query_by_command — ordered by tokens_saved DESC: file(800) then test(400).
+        let by_cmd = db.query_by_command(None).unwrap();
+        assert_eq!(by_cmd.len(), 2, "AC2: query_by_command must return 2 rows");
+        assert_eq!(
+            by_cmd[0].command_type, "file",
+            "AC2: first by_command row must be 'file'"
+        );
+        assert_eq!(by_cmd[0].invocations, 1, "AC2: file invocations must be 1");
+        assert_eq!(
+            by_cmd[0].tokens_saved, 800,
+            "AC2: file tokens_saved must be 800"
+        );
+        assert_eq!(
+            by_cmd[1].command_type, "test",
+            "AC2: second by_command row must be 'test'"
+        );
+        assert_eq!(by_cmd[1].invocations, 1, "AC2: test invocations must be 1");
+        assert_eq!(
+            by_cmd[1].tokens_saved, 400,
+            "AC2: test tokens_saved must be 400"
+        );
+
+        // (4) query_by_language — only Row 1 has language IS NOT NULL (rust).
+        let by_lang = db.query_by_language(None).unwrap();
+        assert_eq!(by_lang.len(), 1, "AC2: query_by_language must return 1 row");
+        assert_eq!(by_lang[0].language, "rust", "AC2: language must be 'rust'");
+        assert_eq!(by_lang[0].files, 1, "AC2: rust files must be 1");
+        assert_eq!(
+            by_lang[0].tokens_saved, 800,
+            "AC2: rust tokens_saved must be 800"
+        );
+
+        // (5) query_by_mode — only Row 1 has mode IS NOT NULL (structure).
+        let by_mode = db.query_by_mode(None).unwrap();
+        assert_eq!(by_mode.len(), 1, "AC2: query_by_mode must return 1 row");
+        assert_eq!(
+            by_mode[0].mode, "structure",
+            "AC2: mode must be 'structure'"
+        );
+        assert_eq!(by_mode[0].files, 1, "AC2: structure files must be 1");
+        assert_eq!(
+            by_mode[0].tokens_saved, 800,
+            "AC2: structure tokens_saved must be 800"
+        );
+
+        // (6) query_by_original_cmd — ordered by tokens_saved DESC.
+        let by_orig = db.query_by_original_cmd(None).unwrap();
+        assert_eq!(
+            by_orig.len(),
+            2,
+            "AC2: query_by_original_cmd must return 2 rows"
+        );
+        assert_eq!(
+            by_orig[0].original_cmd, "skim test.rs",
+            "AC2: first by_original_cmd must be 'skim test.rs'"
+        );
+        assert_eq!(
+            by_orig[0].tokens_saved, 800,
+            "AC2: skim test.rs tokens_saved must be 800"
+        );
+        assert_eq!(
+            by_orig[1].original_cmd, "cargo test",
+            "AC2: second by_original_cmd must be 'cargo test'"
+        );
+        assert_eq!(
+            by_orig[1].tokens_saved, 400,
+            "AC2: cargo test tokens_saved must be 400"
+        );
+
+        // (7) query_session_stats — Row 1 has session_id='sess-abc' (saved=800).
+        //                           Row 2 has session_id=NULL (untagged).
+        let sess = db.query_session_stats(None).unwrap();
+        assert_eq!(
+            sess.distinct_sessions, 1,
+            "AC2: distinct_sessions must be 1"
+        );
+        assert_eq!(
+            sess.total_tokens_saved, 800,
+            "AC2: session total_tokens_saved must be 800 (only sessioned row)"
+        );
+        assert_eq!(
+            sess.untagged_invocations, 1,
+            "AC2: untagged_invocations must be 1"
+        );
+
+        // (8) query_tier_distribution — only Row 2 has parse_tier IS NOT NULL (full).
+        let tier = db.query_tier_distribution(None).unwrap();
+        assert!(
+            (tier.full_pct - 100.0).abs() < 1e-9,
+            "AC2: full_pct must be 100.0 (only row with parse_tier IS NOT NULL is 'full')"
+        );
+        assert!(
+            tier.degraded_pct.abs() < 1e-9,
+            "AC2: degraded_pct must be 0.0"
+        );
+        assert!(
+            tier.passthrough_pct.abs() < 1e-9,
+            "AC2: passthrough_pct must be 0.0"
         );
 
         // proxy_block_decisions table exists (but is empty — no proxy rows yet).

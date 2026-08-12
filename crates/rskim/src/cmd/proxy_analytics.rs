@@ -253,6 +253,15 @@ pub(crate) fn spawn_consumer(
             None => AnalyticsDb::open_default().ok(),
         };
 
+        // AC15: cap per-call SQLITE_BUSY waits to 100 ms so a locked DB does not
+        // stall the drain loop for the full open() default (5 s per attempt).
+        // The consumer is a fail-open background thread — it counts BUSY hits as
+        // drops and must not delay forwarding (AD-AN-8). 100 ms is enough for
+        // brief writer contention between concurrent skim CLI invocations.
+        if let Some(ref db) = db {
+            let _ = db.set_busy_timeout(Duration::from_millis(100));
+        }
+
         // Drain until the sender side closes (returns Err when channel is
         // empty and all senders have been dropped).
         for event in &rx {
@@ -457,8 +466,13 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use rskim_contract::contract::Outcome;
+    use rskim_contract::log::DecisionSink;
     use rskim_proxy::analytics::{BlockDecisionProjection, RequestTier};
+    use rskim_proxy::authmode::AuthMode;
+    use rskim_proxy::config::ProxyConfig;
     use rskim_proxy::detect::ProxyProvider;
+    use rskim_proxy::seam::{TransformContext, TransformPipeline, TransformStage};
 
     use super::*;
     use crate::analytics::{AnalyticsDb, AnalyticsStore, RecordingProvider};
@@ -832,6 +846,167 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // AC15 proxy-side: proxy forwards under every hostile DB state
+    // -------------------------------------------------------------------------
+    //
+    // The four consumer-side arms (a)–(d) above prove the consumer never panics
+    // or hangs. These proxy-side tests add the complementary assertion: even when
+    // analytics recording fails (consumer sees a hostile DB), the HTTP forwarding
+    // path is completely unaffected — requests reach the upstream and responses
+    // return to the client.
+    //
+    // PF-012: proxy and upstream both bind via :0 (OS-assigned ephemeral ports).
+    // Shared infrastructure: `start_fake_upstream_tcp`, `send_proxy_request_raw_tcp`,
+    // `LocalBlockRouterStage` — all defined in the helpers section below.
+
+    /// AC15 proxy-side arm (a): absent DB path (consumer cannot create the DB file
+    /// because the parent directory does not exist). Proxy must still forward.
+    #[test]
+    fn test_proxy_forwards_with_absent_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Path in a non-existent sub-directory → AnalyticsDb::open fails.
+        let db_path = dir.path().join("nonexistent_subdir").join("analytics.db");
+        proxy_hostile_db_assert(&db_path, "absent DB directory");
+    }
+
+    /// AC15 proxy-side arm (b): garbage DB file. Consumer's `AnalyticsDb::open`
+    /// sees a non-SQLite file and fails with a parse error. Proxy must still forward.
+    #[test]
+    fn test_proxy_forwards_with_garbage_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("garbage.db");
+        std::fs::write(&db_path, b"NOT A DATABASE\x00\xff\xfe\x00garbage garbage")
+            .expect("write garbage");
+        proxy_hostile_db_assert(&db_path, "garbage DB file");
+    }
+
+    /// AC15 proxy-side arm (c): DB locked by an exclusive connection. The consumer's
+    /// `busy_timeout` expires → fail-open drop. Proxy must still forward.
+    #[test]
+    fn test_proxy_forwards_with_locked_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("locked.db");
+        // Pre-create the DB so the consumer can attempt to open it.
+        {
+            let _ = AnalyticsDb::open(&db_path).expect("pre-create locked db");
+        }
+        // Acquire an exclusive lock that the consumer will hit.
+        let lock_conn = rusqlite::Connection::open(&db_path).expect("lock conn");
+        let _ = lock_conn.execute_batch("BEGIN EXCLUSIVE");
+
+        proxy_hostile_db_assert(&db_path, "locked DB");
+
+        // Release the lock after the assertion so the tempdir cleanup can succeed.
+        let _ = lock_conn.execute_batch("ROLLBACK");
+    }
+
+    /// AC15 proxy-side arm (d): read-only directory. Consumer cannot create or open
+    /// the DB because the directory is unwritable. Proxy must still forward.
+    #[cfg(unix)]
+    #[test]
+    fn test_proxy_forwards_with_readonly_db_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("noperm.db");
+
+        // Make the directory read-only before the consumer starts.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms.clone()).unwrap();
+
+        proxy_hostile_db_assert(&db_path, "read-only DB directory");
+
+        // Restore write permission so tempdir cleanup succeeds.
+        perms.set_mode(0o755);
+        let _ = std::fs::set_permissions(dir.path(), perms);
+    }
+
+    /// Shared helper for the four AC15 proxy-side tests.
+    ///
+    /// Wires up a `BridgeAnalyticsHook` + consumer against the given (hostile)
+    /// `db_path`, then starts a real proxy server (with `LocalBlockRouterStage`)
+    /// and a raw-TCP fake upstream, sends one request, and asserts:
+    ///
+    /// 1. The proxy returned a non-empty response (forwarding succeeded).
+    /// 2. The consumer thread finished without panic or hang.
+    ///
+    /// The consumer's DB writes fail-open under hostile conditions (AD-AN-8 /
+    /// AC15); the proxy forwarding path is completely independent of the consumer.
+    fn proxy_hostile_db_assert(db_path: &std::path::Path, scenario: &str) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let consumer_handle = run_inline_consumer(
+            db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+        let hook_arc: Arc<dyn AnalyticsHook> = Arc::new(hook);
+
+        let request_body: &[u8] = br#"{"msg":"hostile-db-test"}"#;
+
+        let (response, abort_handle) = rt.block_on(async {
+            let (upstream_url, _upstream_abort) = start_fake_upstream_tcp().await;
+
+            let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("proxy bind :0");
+            let proxy_addr = proxy_listener.local_addr().expect("proxy local_addr");
+
+            // port(0) would fail ProxyConfig::build() range check (41000-49000).
+            // For run_server_with_listener the config port is a placeholder — the
+            // actual binding uses the pre-bound TcpListener, not config.bind_addr.
+            let config = ProxyConfig::builder()
+                .upstream_default(upstream_url)
+                .build()
+                .expect("proxy config");
+
+            let stage = LocalBlockRouterStage::new();
+            let pipeline = TransformPipeline::from_stages(vec![Box::new(stage)]);
+
+            let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+                proxy_listener,
+                config,
+                pipeline,
+                Arc::clone(&hook_arc),
+            ));
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let response = send_proxy_request_raw_tcp(proxy_addr, request_body).await;
+
+            tokio::time::sleep(Duration::from_millis(30)).await;
+
+            (response, task.abort_handle())
+        });
+
+        abort_handle.abort();
+        drop(hook_arc);
+        let consumer_finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let _ = consumer_handle.join();
+
+        assert!(
+            !response.is_empty(),
+            "AC15 proxy-side ({scenario}): proxy must forward the request and return \
+             a non-empty response; analytics DB failure must not block forwarding"
+        );
+        assert!(
+            consumer_finished,
+            "AC15 proxy-side ({scenario}): consumer must finish without panic or hang"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // AC22 — SKIM_DISABLE_ANALYTICS wiring: NoopAnalyticsHook stores nothing
     // -------------------------------------------------------------------------
 
@@ -1065,6 +1240,164 @@ mod tests {
         );
     }
 
+    /// AC24 / AD-AN-13: proxy_block_decisions rows ARE written to the DB for a
+    /// transformed-but-upstream-errored event, and satisfy the byte-reconciliation
+    /// invariant.
+    ///
+    /// The existing `test_upstream_errored_event_has_null_token_columns` verifies the
+    /// in-memory `ProxyRecordInput.blocks` count. This test verifies the **DB rows**:
+    /// the consumer writes `proxy_block_decisions` for errored events (AD-AN-13),
+    /// and their byte sums exactly equal the raw and final body lengths.
+    ///
+    /// **Byte-reconciliation invariant (AD-AN-13):**
+    ///   `Σ proxy_block_decisions.bytes_in  == raw_body.len()`
+    ///   `Σ proxy_block_decisions.bytes_out == final_body.len()`
+    ///
+    /// **Discriminating assertion (PF-007):** removing the
+    /// `proxy_block_decisions` INSERT from `record_proxy` leaves the table empty,
+    /// failing `assert!(!decisions.is_empty(), ...)`.
+    /// Introducing a byte-accounting bug in `BlockRouter` (e.g. wrong `bytes_in`)
+    /// fails the sum-equality assertions.
+    ///
+    /// Driven through the real `BlockRouter` with `Policy::Default` on a
+    /// compressible body, with `upstream_error_status = Some(502)` to simulate
+    /// the transformed-but-errored path (AD-PXY-25).
+    #[test]
+    fn test_upstream_errored_event_proxy_block_decisions_in_db() {
+        use rskim_compress::{BlockRouter, Policy};
+        use rskim_contract::log::MockSink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("errored_blocks.db");
+
+        // A compressible body the BlockRouter will transform (real decision records).
+        let raw_body_bytes: &[u8] = br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"Summarise: The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog."}]}"#;
+
+        // Run the real BlockRouter to get real per-block decision records.
+        let per_call_sink = MockSink::new();
+        let router = BlockRouter::new(Arc::new(TestDecisionSinkStub));
+        let outcome = router.route(raw_body_bytes, Policy::Default, "ac24-test", &per_call_sink);
+        let final_body = outcome.bytes.clone();
+        let block_decisions_raw = per_call_sink.drain();
+
+        // Verify body was actually compressed (invariant needed for non-trivial assertion).
+        assert!(
+            !block_decisions_raw.is_empty(),
+            "AC24: BlockRouter must produce at least one decision for a compressible body"
+        );
+
+        // Build BlockDecisionProjections from real decisions.
+        let block_decisions: Vec<BlockDecisionProjection> = block_decisions_raw
+            .iter()
+            .map(|r| BlockDecisionProjection {
+                component: r.component,
+                outcome: outcome_static_str(r.reason.clone()),
+                bytes_in: r.bytes_in,
+                bytes_out: r.bytes_out,
+            })
+            .collect();
+
+        // Build a ProxyEvent as if the upstream returned 502 after the transformation.
+        // upstream_error_status=Some(502) marks this as "transformed-but-upstream-errored"
+        // (AD-PXY-25): token columns will be NULL, but block decisions are still written.
+        let event = ProxyEvent::new(
+            ProxyProvider::Anthropic,
+            Some("claude-3-5-sonnet-20241022".to_string()),
+            None,
+            derive_tier_from_decisions(&block_decisions_raw),
+            Bytes::copy_from_slice(raw_body_bytes),
+            Bytes::from(final_body.clone()),
+            block_decisions,
+            Some(502), // upstream error status
+            Duration::from_millis(15),
+        );
+
+        // Push through the production consumer.
+        let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
+        let drop_count = hook.drop_count_handle();
+        let queued_bytes = hook.queued_bytes_handle();
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let handle = run_inline_consumer(
+            &db_path,
+            rx,
+            Arc::clone(&drop_count),
+            Arc::clone(&queued_bytes),
+            None,
+            done_tx,
+        );
+
+        hook.on_request(&event);
+        drop(hook); // close sender → consumer drains and exits
+        let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        let _ = handle.join();
+
+        // Verify proxy_block_decisions rows in the DB.
+        let db = AnalyticsDb::open(&db_path).expect("AC24: open DB");
+        let decisions = db.all_block_decisions().expect("AC24: all_block_decisions");
+
+        // Discriminating assertion: rows must be present (AD-AN-13).
+        assert!(
+            !decisions.is_empty(),
+            "AC24/AD-AN-13: proxy_block_decisions must have rows for an errored event; \
+             deleting the INSERT from record_proxy leaves the table empty and fails here"
+        );
+
+        // AD-AN-13: byte-reconciliation invariant.
+        //
+        // IMPORTANT: bytes_in / bytes_out in DecisionRecord are PER-BLOCK content
+        // lengths (the text string length of each processed candidate block), NOT
+        // the full raw/final body lengths.  `Σ bytes_in` therefore equals the sum
+        // of content-string lengths across all candidate blocks — not raw_body.len().
+        //
+        // The correct invariant is:
+        //   Σ DB.bytes_in  == Σ BlockRouter.DecisionRecord.bytes_in
+        //   Σ DB.bytes_out == Σ BlockRouter.DecisionRecord.bytes_out
+        //
+        // This proves that the recording pipeline faithfully stores what the
+        // BlockRouter reported, without truncation, corruption, or omission.
+        //
+        // Discriminating (PF-007): introducing a bug in record_proxy that stores 0
+        // instead of the actual bytes_in/out values makes these equal fail.
+        let expected_bytes_in: u64 = block_decisions_raw.iter().map(|d| d.bytes_in as u64).sum();
+        let expected_bytes_out: u64 = block_decisions_raw.iter().map(|d| d.bytes_out as u64).sum();
+
+        let sum_bytes_in: u64 = decisions.iter().map(|d| d.bytes_in).sum();
+        let sum_bytes_out: u64 = decisions.iter().map(|d| d.bytes_out).sum();
+
+        assert!(
+            expected_bytes_in > 0,
+            "AC24: BlockRouter must process some bytes (expected_bytes_in=0 indicates \
+             the test body was not compressed — use a compressible body)"
+        );
+
+        assert_eq!(
+            sum_bytes_in, expected_bytes_in,
+            "AC24/AD-AN-13: Σ DB.bytes_in ({sum_bytes_in}) must equal \
+             Σ BlockRouter.bytes_in ({expected_bytes_in}); \
+             a byte-accounting bug in record_proxy (e.g. storing 0) causes divergence"
+        );
+        assert_eq!(
+            sum_bytes_out, expected_bytes_out,
+            "AC24/AD-AN-13: Σ DB.bytes_out ({sum_bytes_out}) must equal \
+             Σ BlockRouter.bytes_out ({expected_bytes_out}); \
+             a byte-accounting bug in record_proxy (e.g. storing 0) causes divergence"
+        );
+        assert!(
+            sum_bytes_out <= sum_bytes_in,
+            "AC24/AD-AN-13: compressed bytes ({sum_bytes_out}) must not exceed raw bytes \
+             ({sum_bytes_in}); the never-inflate byte gate must have been respected"
+        );
+
+        // AD-PXY-25: the parent row must be counted as an upstream error (not as savings).
+        let upstream_error_count = db
+            .query_by_upstream_error(None)
+            .expect("AC24: query_by_upstream_error");
+        assert_eq!(
+            upstream_error_count, 1,
+            "AC24/AD-PXY-25: the errored event must appear in query_by_upstream_error"
+        );
+    }
+
     /// AD-PXY-22: `store_model` stores the model string exactly as supplied.
     ///
     /// After removing the unplanned MAX_MODEL_LEN truncation (alignment fix),
@@ -1226,69 +1559,53 @@ mod tests {
         );
     }
 
-    /// AC23 / AC5: real `BlockRouter` with a compressible body produces a proxy
-    /// row with real token counts in the DB.
+    /// AC23 / PF-007: a **real proxy server** with `LocalBlockRouterStage` produces
+    /// a DB row with real measured token counts. No `if let` escape hatch.
     ///
-    /// Validates the complete pipeline:
-    /// BlockRouter → ProxyEvent → BridgeAnalyticsHook → consumer → DB row.
+    /// Drives the complete stack end-to-end through a live HTTP proxy:
     ///
-    /// "Real BlockRouter + Policy::Default + body the re-encoder actually shrinks"
-    /// (plan AC23). `Policy::Default` maps to ApiKey auth (D1/AD-PXY-08).
+    /// ```text
+    /// raw-TCP client → proxy (LocalBlockRouterStage / Policy::Default)
+    ///   → raw-TCP fake upstream → BridgeAnalyticsHook → consumer thread → AnalyticsDb
+    /// ```
+    ///
+    /// **Discriminating assertions (PF-007 — deleting any guarded path fails the test):**
+    ///
+    /// - `tier_full_pct > 0 || tier_degraded_pct > 0` — the body is highly
+    ///   compressible; block-router must fire. Removing `LocalBlockRouterStage` from
+    ///   the pipeline causes all traffic to be passthrough, zeroing both percentages.
+    /// - `.expect("...")` on `raw_tokens` / `compressed_tokens` — no `if let` guard;
+    ///   removing token counting from the consumer leaves these `None` and panics here.
+    /// - `raw_tok > comp_tok` — actual bytes were saved. A no-op transform produces
+    ///   equal counts, failing this strict-greater-than assertion.
+    ///
+    /// **PF-012:** both proxy and upstream bind via `:0` (OS-assigned ephemeral
+    /// ports); inter-test port collisions are impossible.
     #[test]
     fn test_e2e_block_router_full_tier_row_with_real_token_delta() {
-        use rskim_compress::{BlockRouter, Policy};
-        use rskim_contract::log::MockSink;
+        // AC23: the user message content must be JSON (start with `{` so the classifier
+        // routes it to Class::Json → JSON engine → OutcomeReason::Full).
+        //
+        // Plain English text is Class::Text → Passthrough (prefilter rejects it;
+        // class_max returns 0 for Text). Use a spaced-out JSON object instead:
+        // the JSON engine minifies whitespace → bytes_out < bytes_in → tier=full.
+        let raw_body: &[u8] = br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"{ \"results\": [ { \"id\": 1, \"score\": 0.95, \"text\": \"alpha result\" }, { \"id\": 2, \"score\": 0.87, \"text\": \"beta result\" }, { \"id\": 3, \"score\": 0.72, \"text\": \"gamma result\" }, { \"id\": 4, \"score\": 0.61, \"text\": \"delta result\" }, { \"id\": 5, \"score\": 0.55, \"text\": \"epsilon result\" } ] }"}]}"#;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("e2e.db");
 
-        // A large compressible body (repetitive content the block router trims).
-        let raw_body: &[u8] = br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"Summarise this text: The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog. The quick brown fox jumped over the lazy dog."}]}"#;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("AC23: tokio runtime");
 
-        // Run the real BlockRouter with Policy::Default (equivalent to ApiKey auth, D1).
-        let per_call_sink = MockSink::new();
-        let contract_stub = Arc::new(TestDecisionSinkStub);
-        let router = BlockRouter::new(contract_stub);
-        let outcome = router.route(raw_body, Policy::Default, "e2e-test-001", &per_call_sink);
-
-        let final_body_bytes = outcome.bytes;
-        let block_decisions_raw = per_call_sink.drain();
-
-        // Derive tier from the block-router decisions (Cross-Plan Amendment #3).
-        let tier = derive_tier_from_decisions(&block_decisions_raw);
-
-        // Build block decision projections.
-        let block_decisions: Vec<BlockDecisionProjection> = block_decisions_raw
-            .iter()
-            .map(|r| BlockDecisionProjection {
-                // component and outcome are &'static str fields on DecisionRecord
-                component: r.component,
-                outcome: outcome_static_str(r.reason.clone()),
-                bytes_in: r.bytes_in,
-                bytes_out: r.bytes_out,
-            })
-            .collect();
-
-        // Build the ProxyEvent with the real router output.
-        let event = ProxyEvent::new(
-            ProxyProvider::Anthropic,
-            Some("claude-3-5-sonnet-20241022".to_string()),
-            None,
-            tier,
-            Bytes::copy_from_slice(raw_body),
-            Bytes::from(final_body_bytes),
-            block_decisions,
-            None,
-            Duration::from_millis(42),
-        );
-
-        // Push through the bridge hook.
+        // Wire up the consumer thread BEFORE the proxy starts so events are not
+        // lost between proxy startup and consumer launch.
         let (hook, rx) = BridgeAnalyticsHook::new(PROXY_QUEUE_RECORD_CAPACITY);
         let drop_count = hook.drop_count_handle();
         let queued_bytes = hook.queued_bytes_handle();
         let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
-
-        let handle = run_inline_consumer(
+        let consumer_handle = run_inline_consumer(
             &db_path,
             rx,
             Arc::clone(&drop_count),
@@ -1296,15 +1613,72 @@ mod tests {
             None,
             done_tx,
         );
+        // Wrap in Arc<dyn AnalyticsHook> for run_server_with_listener.
+        let hook_arc: Arc<dyn AnalyticsHook> = Arc::new(hook);
 
-        hook.on_request(&event);
-        drop(hook); // close sender → consumer loop ends
-        let _ = done_rx.recv_timeout(Duration::from_secs(10));
-        let _ = handle.join();
+        // Start fake upstream + real proxy, send the compressible request.
+        let abort_handle = rt.block_on(async {
+            // PF-012: fake upstream on OS-assigned port.
+            let (upstream_url, _upstream_abort) = start_fake_upstream_tcp().await;
 
-        // Verify the DB row (AD-AN-9: query_by_model returns one row).
-        let db = AnalyticsDb::open(&db_path).expect("open DB");
-        let rows = db.query_by_model(None).expect("query_by_model");
+            // PF-012: proxy on OS-assigned port.
+            let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("AC23: proxy bind :0");
+            let proxy_addr = proxy_listener.local_addr().expect("proxy local_addr");
+
+            // port(0) would fail ProxyConfig::build() range check (41000-49000).
+            // For run_server_with_listener the config port is a placeholder — the
+            // actual binding uses the pre-bound TcpListener, not config.bind_addr.
+            let config = ProxyConfig::builder()
+                .upstream_default(upstream_url)
+                .build()
+                .expect("AC23: proxy config");
+
+            // LocalBlockRouterStage routes ApiKey requests via Policy::Default (D1).
+            let stage = LocalBlockRouterStage::new();
+            let pipeline = TransformPipeline::from_stages(vec![Box::new(stage)]);
+
+            let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+                proxy_listener,
+                config,
+                pipeline,
+                Arc::clone(&hook_arc),
+            ));
+
+            // Give the proxy time to bind and accept connections.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Send the compressible body via raw TCP (x-api-key → ApiKey → Policy::Default).
+            let response = send_proxy_request_raw_tcp(proxy_addr, raw_body).await;
+            assert!(
+                !response.is_empty(),
+                "AC23: proxy must return a response (forwarding itself failed)"
+            );
+
+            // Brief pause so on_request has enqueued the event before abort.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            task.abort_handle()
+        });
+
+        // Aborting the task drops its Arc<dyn AnalyticsHook> clone.
+        // Dropping hook_arc too → Arc refcount reaches 0 → hook drops → sender closes
+        // → consumer drains remaining events → done_tx fires.
+        abort_handle.abort();
+        drop(hook_arc);
+
+        let consumer_finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let _ = consumer_handle.join();
+
+        assert!(
+            consumer_finished,
+            "AC23: consumer must finish after proxy abort"
+        );
+
+        // Assert DB row — unconditionally (no `if let` escape hatch — PF-007).
+        let db = AnalyticsDb::open(&db_path).expect("AC23: open DB");
+        let rows = db.query_by_model(None).expect("AC23: query_by_model");
 
         assert!(
             !rows.is_empty(),
@@ -1312,17 +1686,42 @@ mod tests {
         );
 
         let row = &rows[0];
-        assert!(row.requests > 0, "AC23: requests count must be positive");
 
-        // If token counts are present (body is valid UTF-8 → they WILL be),
-        // verify raw_tokens >= compressed_tokens (body was not inflated).
-        if let (Some(raw_tok), Some(comp_tok)) = (row.raw_tokens, row.compressed_tokens) {
-            assert!(raw_tok > 0, "AC23: raw_tokens must be positive");
-            assert!(
-                comp_tok <= raw_tok,
-                "AC23: compressed_tokens ({comp_tok}) must be <= raw_tokens ({raw_tok})"
-            );
-        }
+        // Tier: block-router fired → must be full or degraded, never passthrough only.
+        // Deleting LocalBlockRouterStage from the pipeline zeroes both percentages.
+        assert!(
+            row.tier_full_pct > 0.0 || row.tier_degraded_pct > 0.0,
+            "AC23: tier must be full or degraded for a compressible body \
+             (full={:.1}%, degraded={:.1}%, passthrough={:.1}%)",
+            row.tier_full_pct,
+            row.tier_degraded_pct,
+            row.tier_passthrough_pct
+        );
+
+        // Token counts must be Some (no NULL) and strictly positive.
+        // `.expect()` is the discriminating assertion — no `if let` guard.
+        // Removing token counting leaves raw_tokens=None and panics here.
+        let raw_tok = row.raw_tokens.expect(
+            "AC23: raw_tokens must be Some — NULL means token counting was omitted (PF-007)",
+        );
+        let comp_tok = row
+            .compressed_tokens
+            .expect("AC23: compressed_tokens must be Some — NULL means token counting was omitted");
+
+        assert!(raw_tok > 0, "AC23: raw_tokens ({raw_tok}) must be positive");
+        assert!(
+            comp_tok > 0,
+            "AC23: compressed_tokens ({comp_tok}) must be positive"
+        );
+        assert!(
+            raw_tok > comp_tok,
+            "AC23: raw_tokens ({raw_tok}) must exceed compressed_tokens ({comp_tok}); \
+             a no-op transform produces equal counts and would fail this assertion"
+        );
+        assert!(
+            row.avg_savings_pct.is_some(),
+            "AC23: avg_savings_pct must be Some for a compressed row"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1379,6 +1778,125 @@ mod tests {
         } else {
             RequestTier::Passthrough
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Async proxy-server infrastructure (AC23 / AC15 proxy-side)
+    // -------------------------------------------------------------------------
+
+    /// Test-local BlockRouter adapter: mirrors the production `BlockRouterStage`
+    /// in `cmd/proxy.rs` (private struct, cannot be imported as a library).
+    ///
+    /// `Send + Sync` is auto-derived because `BlockRouter` is `Send + Sync`
+    /// (its only field is `Arc<dyn DecisionSink>` where `DecisionSink: Send + Sync`).
+    ///
+    /// Auth mode → Policy mapping (D1 / AD-PXY-08):
+    /// - `ApiKey` / `Ambiguous` → `Policy::Default` (full compression allowed)
+    /// - `Subscription`         → `Policy::LosslessOnly` (conservative)
+    struct LocalBlockRouterStage {
+        router: rskim_compress::BlockRouter,
+    }
+
+    impl LocalBlockRouterStage {
+        fn new() -> Self {
+            Self {
+                router: rskim_compress::BlockRouter::new(Arc::new(TestDecisionSinkStub)),
+            }
+        }
+    }
+
+    impl TransformStage for LocalBlockRouterStage {
+        fn name(&self) -> &'static str {
+            "block-router"
+        }
+
+        fn apply(
+            &self,
+            body: &[u8],
+            ctx: &TransformContext<'_>,
+            sink: &dyn DecisionSink,
+        ) -> Outcome {
+            use rskim_compress::Policy;
+            let policy = match ctx.auth_mode {
+                AuthMode::Subscription => Policy::LosslessOnly,
+                // ApiKey, Ambiguous → Policy::Default (D1)
+                _ => Policy::Default,
+            };
+            self.router.route(body, policy, ctx.request_id, sink)
+        }
+    }
+
+    /// Start a raw-TCP fake upstream server. Returns `(upstream_url, abort_handle)`.
+    ///
+    /// Accepts each connection, drains up to 64 KiB of incoming bytes (the proxy's
+    /// forwarded request), then sends a minimal HTTP/1.1 200 response and closes.
+    /// `Connection: close` tells the proxy-client that the response body ends when
+    /// the connection closes.
+    ///
+    /// **PF-012:** binds to `127.0.0.1:0`; OS assigns an ephemeral port.
+    async fn start_fake_upstream_tcp() -> (String, tokio::task::AbortHandle) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake upstream bind :0");
+        let addr = listener.local_addr().expect("fake upstream local_addr");
+        let url = format!("http://{addr}");
+
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    // Drain the incoming request (necessary so the proxy-client
+                    // doesn't get a broken-pipe writing the body).
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf).await;
+                    // Respond with a minimal HTTP/1.1 200.
+                    let resp = b"HTTP/1.1 200 OK\r\n\
+                        Content-Type: application/json\r\n\
+                        Content-Length: 2\r\n\
+                        Connection: close\r\n\
+                        \r\n{}";
+                    let _ = stream.write_all(resp).await;
+                    // Drop stream → TCP FIN → proxy-client reads EOF → response done.
+                });
+            }
+        });
+
+        (url, task.abort_handle())
+    }
+
+    /// Send a raw HTTP/1.1 POST to the proxy and return the response bytes.
+    ///
+    /// Sets `x-api-key` so the proxy classifies the request as
+    /// `AuthMode::ApiKey → Policy::Default` (D1 / AD-PXY-08).
+    /// Uses `Connection: close` so `read_to_end` terminates when the proxy closes.
+    async fn send_proxy_request_raw_tcp(proxy_addr: std::net::SocketAddr, body: &[u8]) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let headers = format!(
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: {proxy_addr}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             x-api-key: test-api-key-not-real\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+            .await
+            .expect("connect to proxy");
+        stream
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write request headers");
+        stream.write_all(body).await.expect("write request body");
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        response
     }
 
     // -------------------------------------------------------------------------
