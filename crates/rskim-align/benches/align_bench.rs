@@ -11,13 +11,13 @@
 //! - `align_anthropic_512kb` — 512 KB multi-turn body
 //! - `align_openai_64tools` — same 64 tools, OpenAI format
 //!
-//! # Stage micro-benchmarks (TEMPORARY INSTRUMENTATION — not wired into CI)
+//! # Stage micro-benchmarks (not wired into CI)
 //!
 //! Groups `stage_64tools` and `stage_2tools` break the `align()` pipeline into
-//! isolated stages so each stage's share of the total ~7.5 ms can be attributed
-//! independently. These benchmarks are NOT part of the CI gate — they exist only
-//! to identify the dominant hotspot and answer whether the O(n log n)
-//! `tools_arrays_set_equal` implementation warrants keeping, reverting, or bounding.
+//! isolated stages so each stage's share of the total latency can be attributed
+//! independently. These benchmarks are NOT part of the CI gate — they provide
+//! per-stage attribution of the pipeline for future optimisation work. Run them
+//! with: `cargo bench -p rskim-align -- stage_`
 //!
 //! Pipeline stages measured:
 //!   A  — `locate_top_level_spans` on raw input (serde_json flat map walk)
@@ -247,11 +247,11 @@ fn bench_align_anthropic_2tools_baseline(c: &mut Criterion) {
 }
 
 // ============================================================================
-// TEMPORARY INSTRUMENTATION: per-stage benchmarks (NOT wired into CI)
+// Stage micro-benchmarks (NOT wired into CI)
 //
 // These benchmarks decompose the align() pipeline into isolated stages to
-// attribute the ~7.5 ms total across specific operations. See module-level
-// docs for the stage labelling scheme.
+// attribute the total latency across specific operations. See module-level
+// docs for the stage labelling scheme (Stages A–I).
 //
 // To run only these: `cargo bench -p rskim-align -- stage_`
 // ============================================================================
@@ -518,8 +518,8 @@ criterion_group!(
     bench_align_anthropic_2tools_baseline,
 );
 
-// TEMPORARY INSTRUMENTATION: stage benchmarks for hotspot attribution.
-// Not part of the CI gate. Run with: cargo bench -p rskim-align -- stage_
+// Stage benchmarks: pipeline-stage attribution (not CI-gated).
+// Run with: cargo bench -p rskim-align -- stage_
 criterion_group!(
     stages,
     bench_stages_anthropic_64tools,

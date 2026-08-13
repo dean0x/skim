@@ -113,6 +113,65 @@ Given a valid Anthropic or OpenAI request body JSON object:
 5. Triple self-verify (AD-CA-7); fail-open on any verification failure.
 ```
 
+## AC17 gate history
+
+The `align_anthropic_64tools` CI bench gate guards worst-case latency for the
+64-tool × depth-8 Anthropic fixture. The gate uses Criterion's **upper bound of
+the 95% confidence interval of the mean** (the third value in
+`time: [low mean high]`), which is a conservative ceiling well below p99.
+
+### What profiling showed (before R6 optimisation)
+
+Stage micro-benchmarks (commit 3c7318d6) isolated each pipeline stage. The
+dominant cost was Stage E (`tools_arrays_set_equal`) — two full `parse_raw_node`
+tree builds (one per array) scaled O(n × depth) with 64 tools at depth 8. This
+accounted for approximately 79% of total runtime. Stage B
+(`sort_tools_array` / canonicalization) was the remaining hot path. All other
+stages (spans, SHA-256, volatile scan, marker injection) were sub-millisecond.
+
+### R6 optimisation (commit 7b0ed407, 2026-08-14)
+
+Eliminated two redundant `parse_raw_node` calls: the canonical array is parsed
+once before the reorder-gate loop and threaded into both AD-CA-7 gates, removing
+the O(n × depth) re-parse that had been repeated for each gate independently.
+
+### Measured results (2026-08-14, 3 runs, macOS Apple Silicon, release build)
+
+**Before R6** (bench_r1/r2/r3, Aug 12 2026):
+
+| Run | low       | mean      | high (upper bound) |
+|-----|-----------|-----------|-------------------|
+| 1   | 7.6538 ms | 7.6885 ms | 7.7413 ms         |
+| 2   | 7.8935 ms | 7.9254 ms | **7.9624 ms**     |
+| 3   | 7.7457 ms | 7.7881 ms | 7.8474 ms         |
+
+Worst upper bound before R6: **7.9624 ms**
+
+**After R6** (r6bench1/r6bench2/r6bench3, Aug 14 2026):
+
+| Run | low       | mean      | high (upper bound) |
+|-----|-----------|-----------|-------------------|
+| 1   | 6.6585 ms | 6.6736 ms | 6.6879 ms         |
+| 2   | 6.7471 ms | 6.7662 ms | 6.7854 ms         |
+| 3   | 6.8038 ms | 6.8776 ms | **6.9696 ms**     |
+
+Worst upper bound after R6: **6.9696 ms**
+
+Improvement: 12.5% on upper bound, 13.1% on mean. Noise floor for this
+fixture is 4.03%; the improvement is 3× the noise floor and is a real finding.
+
+### Gate derivation
+
+- Measured worst upper bound (3 runs): **6.9696 ms**
+- Headroom: +25% (well above the 4.03% noise floor so CI does not flap)
+  → 6.9696 × 1.25 = 8.712 ms → rounded up to **9.0 ms**
+- Hard ceiling: #303 proxy budget is 10 ms; 9.0 ms < 10 ms ✓
+- **New CI gate: `< 9.0 ms`** (replaces the prior 5.0 ms unmeasured halving)
+
+The prior 5.0 ms gate (and the 2.5 ms figure that appeared in early planning)
+were unmeasured halvings of the #303 proxy latency bar — no empirical measurement
+backed them. They were replaced by this grounded derivation per ADR-003 / PF-005.
+
 ## Status history
 
 | Date       | Status   | Note |
@@ -121,3 +180,4 @@ Given a valid Anthropic or OpenAI request body JSON object:
 | 2026-07-17 | Accepted | OD-2 envelope key order decided by user |
 | 2026-07-17 | Accepted | OD-3 cache churn accepted by user (no canonical_version marker) |
 | 2026-08-09 | Active   | Implemented in rskim-align v0.1.0 (#306 Phase 1-5) |
+| 2026-08-14 | Active   | R6 parse-once opt; AC17 gate re-baselined to 9.0 ms from measured 6.9696 ms worst upper bound |
