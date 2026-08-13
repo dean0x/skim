@@ -125,6 +125,36 @@ pub(crate) mod fault_injection {
             set_drop_tools_sort(false);
         }
     }
+
+    thread_local! {
+        /// When `true`, the next [`super::canonical_envelope_with_spans`] call on
+        /// this thread records the messages output span length as **zero** rather than
+        /// the real emitted length.
+        ///
+        /// This causes the AD-CA-7 messages self-verify comparison to evaluate
+        /// `out.get(output_start..output_start) == Some(&[])`, which differs from the
+        /// non-empty input messages bytes and therefore returns `None` → whole-request
+        /// fail-open.  The emitted bytes in `out` are unchanged — the JSON is still
+        /// structurally valid — so the independent `locate_top_level_spans` re-parse
+        /// gate in `try_align_full` does NOT catch this.  Only the messages self-verify
+        /// detects it, making this seam a precise discriminating fault for that check.
+        pub(crate) static POISON_MESSAGES_SPAN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm (`true`) or disarm (`false`) the messages-span fault for this thread.
+    pub(crate) fn set_messages_span_poison(enabled: bool) {
+        POISON_MESSAGES_SPAN.with(|c| c.set(enabled));
+    }
+
+    /// RAII guard: disarms the messages-span poison on drop, ensuring it is
+    /// cleared even if a test assertion panics.
+    pub(crate) struct MessagesSpanPoisonGuard;
+
+    impl Drop for MessagesSpanPoisonGuard {
+        fn drop(&mut self) {
+            set_messages_span_poison(false);
+        }
+    }
 }
 
 // ============================================================================
@@ -582,7 +612,22 @@ pub fn canonical_envelope_with_spans(
                 messages_input_bytes = Some(raw_val);
                 messages_output_start = Some(value_start);
                 out.extend_from_slice(raw_val.as_bytes());
-                messages_output_len = Some(raw_val.len());
+                // Test-only fault: record zero length so the self-verify comparison
+                // sees `out.get(output_start..output_start) == Some(&[])`, which
+                // differs from any non-empty input messages value and returns None.
+                // The emitted bytes are NOT mutated — the JSON stays structurally
+                // valid — so the re-parse gate in try_align_full does not catch this.
+                // Only the messages self-verify detects it.
+                // See `ad_ca_7_messages_self_verify_rejects_span_mismatch`.
+                #[cfg(test)]
+                let messages_len = if fault_injection::POISON_MESSAGES_SPAN.with(|c| c.get()) {
+                    0
+                } else {
+                    raw_val.len()
+                };
+                #[cfg(not(test))]
+                let messages_len = raw_val.len();
+                messages_output_len = Some(messages_len);
             }
             _ => {
                 out.extend_from_slice(raw_val.as_bytes());

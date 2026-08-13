@@ -1,4 +1,8 @@
 //! Criterion benchmarks for rskim-align — worst-case fixture (AC17).
+// Benchmark setup code may panic on invalid fixtures — that is the intended
+// behavior.  Suppress the crate-level `expect_used` / `unwrap_used` denies here
+// since they are not appropriate for criterion harness code.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //!
 //! # AC17 — Worst-case latency gate
 //!

@@ -298,6 +298,39 @@ const CLEARTEXT_WARNING: &str = "WARNING: skim proxy is bound to a non-loopback 
      network environments. Omit --bind (or pass --bind 127.0.0.1) to restrict \
      to loopback.";
 
+/// Build a [`TransformPipeline`] for the given [`PipelineSelection`].
+///
+/// `recorder` is consumed by the [`PipelineSelection::Full`] arm only; callers on
+/// Identity or BlockRouterOnly paths should pass [`crate::analytics::NoopRecorder`].
+///
+/// This is the **single canonical definition** of the stage composition.  Both
+/// [`run()`] and tests call this function — there is no separate test mirror.  A
+/// change to the Full arm's stage list is immediately visible to both paths, so
+/// deleting a stage from the Full arm is caught by `test_select_pipeline_stage_count`.
+///
+/// # AD-CA-8
+///
+/// [`CacheAlignStage`] is appended LAST per AD-PXY-06.
+fn build_pipeline(
+    selection: PipelineSelection,
+    recorder: Box<dyn crate::analytics::AlignmentRecorder>,
+) -> TransformPipeline {
+    match selection {
+        PipelineSelection::Identity => TransformPipeline::identity(),
+        PipelineSelection::BlockRouterOnly => {
+            let router = BlockRouter::new(Arc::new(BinarySinkStub));
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router))])
+        }
+        PipelineSelection::Full => {
+            // AD-CA-8: CacheAlignStage appended LAST per AD-PXY-06.
+            let router = BlockRouter::new(Arc::new(BinarySinkStub));
+            let block_stage = BlockRouterStage::new(router);
+            let align_stage = CacheAlignStage::new(recorder);
+            TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
+        }
+    }
+}
+
 /// Run the `skim proxy` subcommand.
 ///
 /// Parses flags from `args`, builds a validated [`ProxyConfig`], emits the
@@ -380,38 +413,24 @@ pub(crate) fn run(
         parsed.no_cache_align,
     );
     let pipeline = match selection {
-        PipelineSelection::Identity => {
-            // SKIM_PASSTHROUGH=1 → identity pipeline (no compression).
-            // Consistent with skim's global passthrough convention (#304 escape hatch).
+        PipelineSelection::Identity | PipelineSelection::BlockRouterOnly => {
+            // Identity: SKIM_PASSTHROUGH=1 → no compression.
+            // BlockRouterOnly: --no-cache-align → compression only; CacheAlignStage omitted.
+            // No AlignmentRecorder on these paths — no consumer thread is spawned and
+            // analytics.db is never opened by the proxy on these paths.
             align_handle = None;
             align_done_rx = None;
-            TransformPipeline::identity()
-        }
-        PipelineSelection::BlockRouterOnly => {
-            // --no-cache-align: run BlockRouterStage only; omit CacheAlignStage.
-            // No AlignmentRecorder is constructed on this path, so no consumer thread
-            // is spawned and analytics.db is never opened by the proxy.
-            align_handle = None;
-            align_done_rx = None;
-            let router = BlockRouter::new(Arc::new(BinarySinkStub));
-            let block_stage = BlockRouterStage::new(router);
-            TransformPipeline::from_stages(vec![Box::new(block_stage)])
+            build_pipeline(selection, Box::new(crate::analytics::NoopRecorder))
         }
         PipelineSelection::Full => {
-            // Full pipeline: BlockRouterStage (#304) then CacheAlignStage (#306).
-            // AD-CA-8: CacheAlignStage appended LAST per AD-PXY-06.
-            let router = BlockRouter::new(Arc::new(BinarySinkStub));
-            let block_stage = BlockRouterStage::new(router);
-            // AD-CA-9 / AD-AN-5: build the AlignmentRecorder from the analytics config
-            // ONLY on the path that uses it — `new_boxed` spawns a consumer thread and
-            // opens analytics.db, which must not happen under --no-cache-align or
-            // SKIM_PASSTHROUGH. It returns a NoopRecorder (no thread) when analytics
-            // are disabled, so the stage is always safe to construct.
+            // AD-CA-9 / AD-AN-5: build the AlignmentRecorder ONLY on the Full path —
+            // `new_boxed` spawns a consumer thread and opens analytics.db, which must
+            // not happen under --no-cache-align or SKIM_PASSTHROUGH. Returns a
+            // NoopRecorder (no thread) when analytics are disabled.
             //
-            // Cross-Plan Amendment #4 (fulfilled): new_boxed returns the thread
-            // handle and done channel in AlignmentRecorderBundle so the bounded
-            // shutdown block below owns the lifecycle — not register_thread /
-            // flush_pending().
+            // Cross-Plan Amendment #4 (fulfilled): new_boxed returns the thread handle
+            // and done channel in AlignmentRecorderBundle so the bounded shutdown block
+            // below owns the lifecycle — not register_thread / flush_pending().
             let crate::analytics::AlignmentRecorderBundle {
                 recorder: align_recorder,
                 handle,
@@ -419,8 +438,7 @@ pub(crate) fn run(
             } = crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
             align_handle = handle;
             align_done_rx = done_rx;
-            let align_stage = CacheAlignStage::new(align_recorder);
-            TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
+            build_pipeline(selection, align_recorder)
         }
     };
 
@@ -1586,50 +1604,43 @@ mod tests {
         );
     }
 
-    /// Build a [`TransformPipeline`] for `selection` using [`crate::analytics::NoopRecorder`]
-    /// so tests can assert on the constructed stage count without spawning threads.
-    ///
-    /// Mirrors the `match selection { … }` block in [`run()`] exactly, using `NoopRecorder`
-    /// in place of `ChannelAlignmentRecorder` so no consumer thread is spawned.  Any change
-    /// to the Full arm's stage list here (or in `run()`) is caught by
-    /// `test_select_pipeline_stage_count`.
-    fn build_test_pipeline(selection: PipelineSelection) -> TransformPipeline {
-        match selection {
-            PipelineSelection::Identity => TransformPipeline::identity(),
-            PipelineSelection::BlockRouterOnly => {
-                let router = BlockRouter::new(Arc::new(BinarySinkStub));
-                TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router))])
-            }
-            PipelineSelection::Full => {
-                let router = BlockRouter::new(Arc::new(BinarySinkStub));
-                let block_stage = BlockRouterStage::new(router);
-                let align_stage = CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder));
-                TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
-            }
-        }
-    }
-
     // AC16 / DISCRIMINATING: Full pipeline must contain CacheAlignStage (stage_count == 2).
     //
     // The four `test_select_pipeline_*` tests above cover only the enum value returned by
     // `select_pipeline()` — they pass even if CacheAlignStage is deleted from the `Full`
-    // arm of the `match selection` block in `run()`.  This test bridges the gap: it calls
-    // `build_test_pipeline()` (which mirrors the production `match` block) and asserts on
-    // `stage_count()`, so removing CacheAlignStage reduces the count from 2 to 1 and fails.
+    // arm of `build_pipeline()`.  This test calls `build_pipeline()` directly (the same
+    // function used by `run()`) and asserts on `stage_count()`, so removing CacheAlignStage
+    // from the Full arm reduces the count from 2 to 1 and fails this test.
+    //
+    // Note: there is no separate `build_test_pipeline` helper — that would be a hand-copy
+    // of the production stage list that could diverge silently.  Calling the real
+    // `build_pipeline()` from tests is the single-definition guarantee.
     #[test]
     fn test_select_pipeline_stage_count() {
         assert_eq!(
-            build_test_pipeline(PipelineSelection::Identity).stage_count(),
+            build_pipeline(
+                PipelineSelection::Identity,
+                Box::new(crate::analytics::NoopRecorder)
+            )
+            .stage_count(),
             1,
             "AC16: Identity pipeline must have exactly 1 stage (IdentityStage)"
         );
         assert_eq!(
-            build_test_pipeline(PipelineSelection::BlockRouterOnly).stage_count(),
+            build_pipeline(
+                PipelineSelection::BlockRouterOnly,
+                Box::new(crate::analytics::NoopRecorder)
+            )
+            .stage_count(),
             1,
             "AC16: BlockRouterOnly pipeline must have exactly 1 stage (BlockRouterStage only)"
         );
         assert_eq!(
-            build_test_pipeline(PipelineSelection::Full).stage_count(),
+            build_pipeline(
+                PipelineSelection::Full,
+                Box::new(crate::analytics::NoopRecorder)
+            )
+            .stage_count(),
             2,
             "AC16: Full pipeline must have exactly 2 stages (BlockRouterStage + CacheAlignStage); \
              removing CacheAlignStage from the Full arm reduces this to 1 and fails this test"

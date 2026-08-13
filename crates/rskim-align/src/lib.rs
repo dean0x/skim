@@ -1803,6 +1803,76 @@ mod tests {
         );
     }
 
+    /// AD-CA-7 — messages self-verify: detects a span mismatch while JSON stays valid.
+    ///
+    /// # What this tests
+    ///
+    /// The AD-CA-7 check inside `canonical_envelope_with_spans` (canonical_emit.rs)
+    /// compares the bytes of the `messages` value span in the emitted output against
+    /// the bytes of the `messages` value span extracted from the input.  A mismatch
+    /// returns `None` → whole-request fail-open.
+    ///
+    /// The existing `ad_ca_7_envelope_self_verify_rejects_corrupt_canonical_bytes`
+    /// test exercises the *re-parse gate* (`locate_top_level_spans` in `try_align_full`),
+    /// NOT the messages self-verify: its `POISON_CANONICAL_OUTPUT` fault appends a
+    /// trailing `'X'` byte **after** the messages check has already passed, so the
+    /// comparison code on lines 606-615 of canonical_emit.rs never sees a mismatch
+    /// there.  Replacing `_ => return None,` with `_ => {}` in that match arm leaves
+    /// all existing tests passing — the guard is untested.
+    ///
+    /// This test uses a separate `POISON_MESSAGES_SPAN` fault that zeroes the recorded
+    /// output span length *before* the self-verify runs.  The emitted JSON bytes are
+    /// unchanged (structurally valid), so the re-parse gate in `try_align_full` would
+    /// not catch the fault if the `_ => return None,` arm were bypassed.  Only the
+    /// messages self-verify can detect it.
+    ///
+    /// # Discriminating property
+    ///
+    /// Replacing `_ => return None,` with `_ => {}` in the messages self-verify match
+    /// (canonical_emit.rs lines 612-615) causes:
+    /// - The self-verify to silently pass despite the zeroed span.
+    /// - The emitted JSON to be structurally valid → re-parse gate passes.
+    /// - `align()` to return `fail_open = false`.
+    /// - The `assert!(out.stats.fail_open, …)` assertion below to FAIL.
+    ///
+    /// Restoring `_ => return None,` causes:
+    /// - The zeroed-span comparison to evaluate `Some(&[]) != input_msgs.as_bytes()`.
+    /// - `canonical_envelope_with_spans` to return `None` → `try_align_full` returns `None`.
+    /// - `align()` to set `fail_open = true` and return the original input bytes.
+    /// - Both assertions below to PASS.
+    #[test]
+    fn ad_ca_7_messages_self_verify_rejects_span_mismatch() {
+        use crate::canonical_emit::fault_injection::{
+            MessagesSpanPoisonGuard, set_messages_span_poison,
+        };
+
+        let body = br#"{"messages":[{"role":"user","content":"hello"}],"model":"claude-3"}"#;
+
+        // Arm the fault: the next canonical_envelope_with_spans call on this thread
+        // will record messages_output_len = 0, making the self-verify comparison see
+        // `out.get(start..start) == Some(&[])`, which differs from the non-empty
+        // input messages bytes → the `_ => return None` arm fires → fail-open.
+        set_messages_span_poison(true);
+        let _guard = MessagesSpanPoisonGuard; // disarms on drop, even if an assertion panics
+
+        let out = align(body, Provider::Anthropic, "ad-ca-7-messages-span-mismatch");
+
+        // The messages self-verify must detect the span mismatch and trigger fail-open.
+        assert!(
+            out.stats.fail_open,
+            "AD-CA-7: messages self-verify must detect a span mismatch and trigger \
+             fail-open; if this fails, the `_ => return None` arm in the messages \
+             self-verify match (canonical_emit.rs) is absent or bypassed"
+        );
+        // ADR-007 egress losslessness: fail-open returns the ORIGINAL input bytes.
+        assert_eq!(
+            out.bytes.as_slice(),
+            body.as_slice(),
+            "AD-CA-7: fail-open must return the ORIGINAL input bytes byte-for-byte \
+             (ADR-007 egress losslessness — no corrupt output must reach the provider)"
+        );
+    }
+
     // ── AC8 / AC5 — placement is structural, not marker-dependent ─────────────
 
     /// AC8 (idempotence) + AC5 (placement stability) for a MULTI-block system.
