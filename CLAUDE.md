@@ -111,7 +111,9 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
   in a sandbox it is sufficient to set `SKIM_CACHE_DIR` alone (the default analytics.db
   moves with it).
 - `SKIM_DISABLE_ANALYTICS=1` — disable recording. `SKIM_INPUT_COST_PER_MTOK` — $/MTok for cost estimates (default 3.0).
+- `SKIM_WRAPPERS_DIR` — overrides the `~/.skim/bin/` wrapper symlink directory used by `skim init --wrappers` and `skim init --uninstall`. Primarily used in tests via `skim_sandboxed()` to redirect wrapper installation into a TempDir sandbox so real `~/.skim/bin/` is not touched. An empty value is treated as unset (falls back to `~/.skim/bin`).
 - Session-provider overrides for `discover`/`learn`/`agents`: `SKIM_PROJECTS_DIR`, `SKIM_CODEX_SESSIONS_DIR`, `SKIM_COPILOT_DIR`, `SKIM_CURSOR_DB_PATH`, `SKIM_GEMINI_DIR`, `SKIM_CRUSH_DIR`.
+- **Agent config-dir overrides** (read by `skim init` / `init --uninstall` / `doctor` — these are the agents' *own* variable names, not `SKIM_`-prefixed): `CLAUDE_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, `CODEX_HOME`, `CRUSH_CONFIG_DIR`. Each redirects that agent's hook script, settings file, permissions sidecar, **and guidance file** (`GEMINI.md`, `copilot-instructions.md`, …) away from the `~/.<agent>/` default. Do not confuse them with the `SKIM_GEMINI_DIR` / `SKIM_COPILOT_DIR` session-provider overrides above, which point at transcript directories and have no effect on install/uninstall. Any test that shells out to `skim init`/`--uninstall`/`doctor` must set them (use `common::skim_sandboxed`) or it will mutate the developer's real home directory.
 
 ## Design Constraints
 

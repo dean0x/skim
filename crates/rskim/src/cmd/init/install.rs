@@ -471,7 +471,20 @@ fn run_install_single(
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
-    if state.hook_installed && state.hook_is_current() && guidance_current && !permissions_blocked {
+    // Include manifest presence in the fast path: if the manifest is absent,
+    // fall through to execute_install → create_hook_script, which will write
+    // (or re-write) the manifest.  This makes `skim init` self-heal a missing
+    // sidecar so that `skim doctor`'s advice ("run `skim init`") actually works
+    // (Group 4 fix / #471).
+    let manifest_present =
+        crate::cmd::integrity::read_hash_manifest(&state.hook_config_dir, state.agent_cli_name)
+            .is_some();
+    if state.hook_installed
+        && state.hook_is_current()
+        && guidance_current
+        && !permissions_blocked
+        && manifest_present
+    {
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -840,6 +853,16 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     // Check if existing script has same version (idempotent)
     if script_path.exists() {
         if is_hook_script_current(&script_path, &state.skim_version) {
+            // Script is current — write (or re-write) the manifest so `skim init`
+            // self-heals a missing or stale sidecar.  This makes doctor's advice
+            // ("run `skim init --agent {agent}`") actually work (Group 4 fix / #471).
+            let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
+            crate::cmd::integrity::write_hash_manifest(
+                &state.hook_config_dir,
+                state.agent_cli_name,
+                HOOK_SCRIPT_NAME,
+                &hash,
+            )?;
             println!(
                 "  {} Skipped: {} (already v{})",
                 check_mark(true),
@@ -893,15 +916,16 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
 
     atomic_write_executable(&hooks_dir, &script_path, &script_content)?;
 
-    // Compute and store SHA-256 hash for integrity verification (#57)
-    if let Ok(hash) = crate::cmd::integrity::compute_file_hash(&script_path) {
-        let _ = crate::cmd::integrity::write_hash_manifest(
-            &state.hook_config_dir,
-            state.agent_cli_name,
-            HOOK_SCRIPT_NAME,
-            &hash,
-        );
-    }
+    // Compute and store SHA-256 hash for integrity verification (#57).
+    // Errors are propagated with `?` — silently installing without tamper
+    // detection (e.g. on a read-only hooks dir) is worse than a hard error.
+    let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
+    crate::cmd::integrity::write_hash_manifest(
+        &state.hook_config_dir,
+        state.agent_cli_name,
+        HOOK_SCRIPT_NAME,
+        &hash,
+    )?;
 
     Ok(())
 }

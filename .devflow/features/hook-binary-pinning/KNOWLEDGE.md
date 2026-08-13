@@ -1,11 +1,11 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem, or modifying the proxy feature gate / cfg-gated registry entries, or touching the rewrite transparency marker (SKIM_REWRITTEN_FROM / rewrite_origin / rewrite_transparency_marker / view_differs). Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, proxy feature gate, cfg-gated registry, routing guard, cli_proxy_gating, KNOWN_SUBCOMMANDS, META_SUBCOMMANDS, wrapper_targets, uses_dedicated_hook_file, hook_event_key, print_install_summary, print_dry_run_actions, print_dry_run_permissions, SKIM_JSON_NAME, SKIM_REWRITTEN_FROM, rewrite_origin, rewrite_transparency_marker, view_differs, transparency marker, origin tag, ADR-004, ADR-005, ADR-006, ADR-008."
+description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem, or modifying the proxy feature gate / cfg-gated registry entries, or touching the rewrite transparency marker (SKIM_REWRITTEN_FROM / rewrite_origin / rewrite_transparency_marker / view_differs), or working on doctor integrity checks / ScriptIntegrity / hook_status_line, or adding test harness sandboxing (skim_sandboxed / hermetic_path). Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, proxy feature gate, cfg-gated registry, routing guard, cli_proxy_gating, KNOWN_SUBCOMMANDS, META_SUBCOMMANDS, wrapper_targets, uses_dedicated_hook_file, hook_event_key, print_install_summary, print_dry_run_actions, print_dry_run_permissions, SKIM_JSON_NAME, SKIM_REWRITTEN_FROM, rewrite_origin, rewrite_transparency_marker, view_differs, transparency marker, origin tag, ScriptIntegrity, classify_script_integrity, verify_script_integrity, hook_status_line, HookFacts, NoManifest, Tampered, Verified, Unreadable, skim_sandboxed, hermetic_path, ADR-004, ADR-005, ADR-006, ADR-008."
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
 created: 2026-07-04
-updated: 2026-07-16
+updated: 2026-08-12
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -14,7 +14,7 @@ updated: 2026-07-16
 
 This feature area covers how skim installs itself as a PreToolUse hook into AI agent runtimes (Claude Code, Cursor, Gemini CLI, Copilot CLI, Crush) and as awareness-only files into Codex CLI. The central problem it solves is the **wrong-clone hazard**: multiple skim clones on different branches can report identical semver strings. Without binary pinning, the installed hook might silently exec the wrong clone — one that was built from a different branch — and produce subtly broken rewriting behavior.
 
-The solution is a pinned-binary hook script format (introduced in F6 / PR #421) that embeds the canonicalized absolute path of the generating binary at install time, along with a git short SHA for same-version divergent-build detection. The running hook can then detect mismatches and log warnings daily without ever touching stderr.
+The solution is a pinned-binary hook script format (introduced in F6 / PR #421) that embeds the canonicalized absolute path of the generating binary at install time, along with a git short SHA for same-version divergent-build detection. A SHA-256 manifest sidecar (`.sha256` file alongside the hook script) enables tamper detection independent of the script's own content — `skim doctor` derives its verdict from the manifest, not from the hook bytes that a tamper would edit.
 
 v2.11.0 added the **permissions seeding subsystem** (`skim init --permissions`): a TTY-gated, human-consent-only channel for seeding agent-native allowlist entries for skim's read-only tool wrappers. This is entirely separate from runtime hook behavior — hooks never write permissions.
 
@@ -26,161 +26,103 @@ v2.11.0 added the **permissions seeding subsystem** (`skim init --permissions`):
 - Hard zero-stderr invariant in hook mode (#361 Bug 3): mismatch warnings go to `hook.log` ONLY
 - Hooks must never fail (passthrough on any error, timeout, or AwarenessOnly agent)
 - Script content must be shell-safe for any file path, including paths with spaces and embedded single quotes
-- Reinstall idempotence: a script that is already current must not be regenerated
+- Reinstall idempotence: a script that is already current must not be regenerated (but the manifest IS always rewritten — see self-heal below)
 - Permissions seeding is user-scope only (`--project` is mutually exclusive); consent is TTY-gated with no bypass flag
 
 ## Core Business Rules
 
 ### The Generated Hook Script Format
 
-`generate_hook_script` in `hooks/mod.rs` is the single source of truth for script content. All RealHook agents must produce scripts via this shared function. The format (F6) is:
-
-```bash
-#!/usr/bin/env bash
-# skim-hook v{version}
-# Generated by: skim init --agent {agent_cli_name} -- do not edit manually
-export SKIM_HOOK_VERSION="{version}"
-export SKIM_HOOK_BINARY='{canonicalized/absolute/path/to/skim}'   # single-quoted
-export SKIM_HOOK_COMMIT={git_short_sha}                           # unquoted; "unknown" for tarball
-_SKIM_BIN='{canonicalized/absolute/path/to/skim}'                 # single-quoted, same path
-if [ -x "$_SKIM_BIN" ]; then
-  exec "$_SKIM_BIN" rewrite --hook --agent {agent_cli_name}
-fi
-exec skim rewrite --hook --agent {agent_cli_name}                 # PATH fallback
-```
-
-Critical details: `SKIM_HOOK_BINARY` is exported; `_SKIM_BIN` is single-quoted via `shell_single_quote()`; `SKIM_HOOK_COMMIT` has no quotes (ascii-alphanumeric assertion guards this); the script does NOT export/prepend PATH; the PATH fallback is a safety net only.
+`generate_hook_script` in `hooks/mod.rs` is the single source of truth for script content. All RealHook agents must produce scripts via this shared function. The format (F6) embeds `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY`, `SKIM_HOOK_COMMIT`, and `_SKIM_BIN` — single-quoted via `shell_single_quote()`. The PATH fallback (`exec skim rewrite --hook`) is a safety net only.
 
 ### The Two Currency Predicates — One Shared Pinned-Marker Helper
 
 Two separate predicates determine whether an existing hook script is stale, sharing a single source of truth: `script_has_pinned_marker` in `init/mod.rs`.
 
-**`uses_pinned_binary` (`init/state.rs`)** delegates to the shared helper for state detection (`DetectedState::hook_uses_pinned_binary`). **`is_hook_script_current` (`init/install.rs`)** ANDs its own version-line check with the shared marker scan. `DetectedState::hook_is_current()` combines both: `version matches && hook_uses_pinned_binary`.
+**`uses_pinned_binary` (`init/state.rs`)** delegates to the shared helper for state detection. **`is_hook_script_current` (`init/install.rs`)** ANDs its own version-line check with the shared marker scan. `DetectedState::hook_is_current()` combines both: `version matches && hook_uses_pinned_binary`.
 
 The shared helper **structurally prevents** drift: changing the `SKIM_HOOK_BINARY` marker updates both predicates at once. A new **required line** added to the script format and gated in only one predicate re-introduces the lockstep hazard — fold any new required-line check into the shared helper.
+
+### ScriptIntegrity: Doctor Derives Verdict from Manifest, Not Hook Text
+
+`cmd/integrity.rs` provides a four-state enum and the classifier that `skim doctor` uses to determine tamper status:
+
+```rust
+pub(crate) enum ScriptIntegrity {
+    Verified,    // hash matches stored manifest — script is unmodified
+    NoManifest,  // no .sha256 manifest present — pre-manifest install (backward compat)
+    Tampered,    // script contents differ from stored hash
+    Unreadable,  // script file cannot be read (missing, permission denied)
+}
+
+pub(crate) fn classify_script_integrity(
+    config_dir: &Path,
+    agent_cli_name: &str,
+    script_path: &Path,
+) -> ScriptIntegrity { ... }
+```
+
+`verify_script_integrity` is a **thin bool wrapper** over `classify_script_integrity` that maps `Verified|NoManifest → Ok(true)`, `Tampered → Ok(false)`, `Unreadable → Err(...)`. It preserves the existing call contract for the two legacy callers (`cmd/rewrite/hook.rs` and `cmd/init/uninstall.rs`) that predate the full enum.
+
+**Why the manifest, not the script text:** the hook script bytes are exactly what a tamper modifies. A doctor that reads the `SKIM_HOOK_VERSION` comment out of the script and trusts it would be fooled by any modification that preserves the comment. The SHA-256 manifest is an independent artefact written at install time and stored alongside the script — a tamper that also updates the manifest would need to know the expected hash.
+
+**`HookFacts.script_integrity`:** `hook_facts()` in `init/mod.rs` calls `classify_script_integrity` for every agent (not just ClaudeCode) and stores the result in `HookFacts`. Doctor reads `HookFacts.script_integrity` and passes it to `hook_status_line()`.
+
+**`hook_status_line()` in `doctor/mod.rs`:** a pure, testable function that produces `(bool, String)` — drift verdict and the display line. It checks `ScriptIntegrity` **before** pin/currency checks so the verdict always comes from the manifest. Behavior by state:
+- `Tampered` → drift (`✗`), names the suppression coupling (#479)
+- `Unreadable` → drift (`✗`), names the suppression coupling (#479)
+- `NoManifest` → advisory only (`⚠`), **not** drift — falls through to pin/currency checks (Group 3 fix: no early return that suppresses drift detection for the pin state)
+- `Verified` → falls through to pin/currency checks
+
+### Two Fail-Opens Fixed (issue #471)
+
+**Fail-open 1 — `NoManifest` early return suppressed all drift detection:**
+Previously `NoManifest` returned early from the hook-status logic, silently bypassing pin/currency drift checks for pre-manifest installs. Now `NoManifest` falls through with an advisory note (`⚠ no integrity manifest...`) appended to whatever the pin/currency check produces. Pre-manifest hooks can still be reported as unpinned or stale.
+
+**Fail-open 2 — `skim init` never regenerated a missing manifest:**
+The idempotent early-return path (when `is_hook_script_current()` returns true) previously exited immediately without writing the manifest. Doctor's advice — "run `skim init --agent X`" — was therefore a dead end: running init again would hit the same early return and skip the manifest write again. Now the early-return path explicitly computes and writes/rewrites the manifest before printing "Skipped":
+
+```rust
+// install.rs — self-heal: always write manifest on the idempotent path
+if script_path.exists() && is_hook_script_current(&script_path, &state.skim_version) {
+    let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;  // ? propagates errors
+    crate::cmd::integrity::write_hash_manifest(...)?;                     // ? propagates errors
+    println!("  {} Skipped: ...", ...);
+    return Ok(());
+}
+```
+
+Write errors are propagated with `?` — the previous code used `let _ = write_hash_manifest(...)` which silently swallowed failures.
 
 ### `check_hook_binary_mismatch` — Same-Version Divergent Build Detection
 
 This function in `rewrite/hook.rs` fires only when versions match. It compares (1) `SKIM_HOOK_BINARY` vs `canonicalize(current_exe())` and (2) `SKIM_HOOK_COMMIT` vs `option_env!("SKIM_GIT_COMMIT")`. Both comparisons skip if the env var is unset (backward compat) and skip the commit comparison if either side is `"unknown"`. Warnings go to `hook.log` via `warn_once_daily()` — never stderr.
 
+**Still-open decision (#479):** At hook-exec time (`rewrite/hook.rs:359`), drift detection is suppressed when integrity fails — an integrity failure subsumes drift detection deliberately. This is the correct behavior but is tracked as an issue to reconsider after the self-heal ships in a release (a user who installs with the self-heal can no longer reach the `NoManifest` state, at which point promoting it to drift would be safe).
+
+**`parse_version_from_script` reads the comment first:** `parse_version_from_script` in `state.rs` scans lines and checks `# skim-hook v{version}` (the legacy comment line) **before** `export SKIM_HOOK_VERSION="..."`. Since the comment appears first in the generated script, it wins. This means an attacker who edits the script can change the comment and change what version `detect_state` sees. This function must **never** be used as a security input — it is a convenience parser for display and reinstall-skip decisions only, not for integrity classification (which uses the manifest).
+
 ### Codex Is HookSupport::AwarenessOnly
 
 `CodexCliHook` returns `HookSupport::AwarenessOnly`: `generate_script()` returns `""`, `parse_input()` returns `None`, `format_response()` returns `Null`. In `run_hook_mode`, the awareness check fires before any stdin read. Tests for Codex assert NO script and NO handshake.
 
+### Doctor-vs-Hook Asymmetry
+
+**Hook-time integrity checking is claude-code-only.** In `run_hook_mode` (`rewrite/hook.rs`), `check_hook_integrity` is called only inside the `if agent_kind == AgentKind::ClaudeCode` branch (line ~353). Other agents do not get hook-time integrity checking.
+
+**Doctor checks all agents.** `print_hook_section` in `doctor/mod.rs` iterates `AgentKind::all_supported()` and calls `hook_status_line(&facts, ...)` for every agent. `hook_facts(agent)` calls `classify_script_integrity` for any agent with a hook script path. This means hand-edited gemini/codex/cursor/copilot scripts now report `✗` in `skim doctor` even though no integrity check fires at hook-exec time for those agents.
+
 ### Proxy Feature Gate (#352)
 
-The `proxy` subcommand is compiled out of default builds (ADR-008). This is enforced in three coordinated places:
-
-**Registry pair-gate (`registry.rs`)**: `"proxy"` appears in BOTH `KNOWN_SUBCOMMANDS` (line ~72) AND `META_SUBCOMMANDS` (line ~127), each under `#[cfg(feature = "proxy")]`. Because `wrapper_targets() = KNOWN − META`, the cfg-gate must always be applied as a **pair**: if proxy is in KNOWN it must also be in META (and vice versa). A META-only mis-gate would add proxy to `wrapper_targets()` and cause `skim init --wrappers` to create a bogus `~/.skim/bin/proxy` → skim symlink at runtime.
-
-The invariant test `test_proxy_registry_entries_gated_as_a_pair` in `registry.rs` asserts `is_known_subcommand("proxy") == is_meta_subcommand("proxy")` and `!wrapper_targets().contains(&"proxy")`. This assertion is meaningful in **both** feature configs: with proxy ON both return true (equal); with proxy OFF both return false (equal). A mis-gate makes one true and one false, which fails immediately.
-
-**Routing guard (`main.rs`)**: After the known-subcommand check fails (proxy not in KNOWN in default builds), the pre-parse router hits an explicit `#[cfg(not(feature = "proxy"))]` guard that intercepts the bare positional `"proxy"` before falling through to the file-op path. It calls `anyhow::bail!("'proxy' requires a build with --features proxy")`, producing exit 1 with an actionable error on stderr. Without this guard, a file named `proxy` in cwd would be silently skimmed — or the user would get a confusing "No such file or directory" error.
-
-**Cargo optional deps (`Cargo.toml`)**: `rskim-proxy` and `rskim-contract` are `optional = true` in `[dependencies]` and are gated behind the non-default `proxy` feature (`proxy = ["dep:rskim-proxy", "dep:rskim-contract"]`). The rskim-contract **dev-dependency** stays unconditional (needed by contract tests in default builds). rskim-contract also reaches default builds transitively through rskim-compress — this is accepted because rskim-contract carries no HTTP/TLS/async code.
-
-**E2E coverage**: `tests/cli_proxy_gating.rs` is file-gated `#![cfg(not(feature = "proxy"))]` and pins three behaviors: bare `skim proxy` exits 1 with the actionable error, a file named `proxy` in cwd does not defeat the routing guard, and `skim completions bash` does not list `proxy` when the feature is off.
-
-**CI**: the Build Check step builds `--release -p rskim --features proxy` plus a proxy smoke test; separate default-features clippy and gating-test steps run without the feature; `release.yml` passes `--features proxy` on all native and cross builds.
+The `proxy` subcommand is compiled out of default builds (ADR-008). Enforced in three coordinated places: the registry pair-gate (`"proxy"` appears in both `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the same `#[cfg(feature = "proxy")]`), the routing guard in `main.rs` (`#[cfg(not(feature = "proxy"))]` fires before file-op fallthrough), and optional Cargo deps (`proxy = ["dep:rskim-proxy", "dep:rskim-contract"]`). The invariant test `test_proxy_registry_entries_gated_as_a_pair` asserts the cfg-pair in both feature configs.
 
 ### Transparency Marker for Hook-Rewritten File Reads (SKIM_REWRITTEN_FROM)
 
-When the rewrite engine rewrites a `cat`/`head`/`tail` command into a skim file read, it injects an env-prefix token `SKIM_REWRITTEN_FROM=<cat|head|tail>` at the front of the rewritten token list (after caller env vars — caller envs stay first, matching the session-id out-of-band ordering precedent from ADR-004). This tag travels to the skim binary when the agent exec-s the rewritten command.
-
-`output/mod.rs` provides three pieces:
-- `REWRITE_ORIGIN_ENV` constant (`"SKIM_REWRITTEN_FROM"`) — single source of truth for the env var name
-- `rewrite_origin()` — reads `SKIM_REWRITTEN_FROM` from the environment; returns `Some(val)` only for the closed vocabulary `cat|head|tail`; any other value returns `None` to prevent stderr text injection via arbitrary env vars
-- `rewrite_transparency_marker(origin, mode_str, differing, total)` — builds the marker string; returns `None` when `differing == 0` (byte-identical output)
-
-Marker format:
-- Single file: `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`
-- Multi-file: `[skim] transformed view (cat → skim --mode=pseudo): 2/3 files not raw bytes — SKIM_PASSTHROUGH=1 for raw output`
-
-**Emission points:**
-- Single-file/stdin: `write_result_and_stats` in `process.rs` (called from both single-file paths in `main.rs`)
-- Multi-file aggregate: once per run in `multi.rs process_files` after counting `view_differs_count`
-- Cache hits: `try_cached_result` in `process.rs` — `view_differs` is recomputed by re-reading raw bytes against the cached output. When that re-read fails, `view_differs` defaults to `true` (fail-open — a false positive is the safe direction; the incident class to avoid is silently serving stale data without a marker)
-
-**Gate (both conditions required):** (1) origin tag present in env (`rewrite_origin()` returns `Some`) AND (2) `view_differs` is true (final output after guardrail differs from raw file bytes).
-
-**Silent cases:** no origin tag (direct `skim file.rs` invocations), byte-identical transforms (e.g. `--mode=full`), guardrail raw fallback (guardrail serves raw bytes → `view_differs=false`).
-
-**Why env var, not a CLI flag:** a new `--skim-origin=cat` flag on the rewritten command would trigger "unexpected argument" on old skim binaries with stale hooks (the version-skew hazard ADR-004 already documents). Unknown env vars are silently ignored by old binaries, making the env approach version-skew safe.
-
-**Stderr and the zero-stderr invariant:** the marker goes to stderr only (stdout unchanged, applying #317). The zero-stderr invariant applies to HOOK MODE (`skim rewrite --hook`) only. The transparency marker is emitted by the file-read execution surface, which is a different code path and is permitted to use stderr.
-
-**PF-004 nuance:** `SKIM_REWRITTEN_FROM` exists ONLY on the rewrite-engine surface. The PATH-wrapper surface (`~/.skim/bin/<tool>` symlinks) never calls `try_rewrite`, so wrapper-mediated file reads are intentionally unmarked. This is by design: there is no rewrite step on the wrapper surface to tag.
-
-**`would_rewrite` includes the origin tag:** because `try_custom_handlers` inserts `SKIM_REWRITTEN_FROM=cat` into the token list before `tokens.join(" ")`, `would_rewrite("cat file.rs")` now returns a string that includes the tag prefix. `skim discover` output reflects this.
+When the rewrite engine rewrites a `cat`/`head`/`tail` command into a skim file read, it injects `SKIM_REWRITTEN_FROM=<cat|head|tail>` at the front of the rewritten token list. `rewrite_origin()` reads this from the environment with a closed vocabulary (any other value returns `None`). `rewrite_transparency_marker()` builds the marker string; returns `None` when `differing == 0` (byte-identical output). This tag is rewrite-engine-only — PATH-wrapper-mediated reads are intentionally unmarked (PF-004).
 
 ### Permissions Seeding Subsystem (`cmd/permissions/`)
 
-`PermissionsProtocol` is a format-agnostic trait with four methods: `agent_label`, `render_entry`, `seed`, and `remove_seeded`. Each per-agent writer implements it. The factory `permissions_protocol_for_agent` returns `Some` for ClaudeCode, GeminiCli, CodexCli, and CopilotCli; returns `None` permanently for Cursor (IDE-only, no CLI hook) and Crush (WS2B decision). These two permanent `None` returns are pinned by contract tests.
-
-**Seed derivation**: the seeded tool list is always `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()` — exactly 8 tools: `df`, `diff`, `du`, `grep`, `ls`, `rg`, `tree`, `wc`. Per-agent render formats: Claude → `"Bash(skim <tool>:*)"`, Gemini → `"skim <tool>"`, Codex → raw tool name, Copilot → `"Bash(skim <tool>:*)"` (same as Claude). Entries are sorted before writing so the sidecar and config diff are stable.
-
-**`READ_ONLY_SUBCOMMANDS` invariant**: defined in `cmd/registry.rs`, referenced ONLY from install-time (`cmd/permissions/`). It must never be imported from rewrite/dispatch code paths. This is contract-tested: a `PF-004`-style test verifies the constant is not reachable from dispatch. The 8-tool exact set is pinned by `test_read_only_subcommands_exact_contents`.
-
-**Exclusions-for-cause**: `find` (recursive filesystem walk, path disclosure), `env`/`printenv` (env var enumeration), `dig`/`nslookup` (network DNS), `ps` (process enumeration). `Bash(skim <tool>:*)` entries do NOT bound the wrapped tool's arguments — only arg-safe read-only tools may be seeded.
-
-**Mirror tier does NOT enforce seed-tier exclusions**: `is_valid_mirror_source` in `claude.rs` documents this explicitly. The mirror tier only copies a `Bash(<tool>:*)` entry the user has already granted — it never expands the trust envelope beyond the pre-existing base-tool grant. Enforcing exclusions on the mirror path would silently drop valid user grants with no security benefit.
-
-**`confirm_grant` TTY-gating doctrine**: `confirm_grant()` in `init/helpers.rs` is the primary defense against prompt-injected agent self-grant. Non-TTY stdin → immediate `false` (no output). The `--yes` flag is for hook uninstall confirmation only; it does **not** bypass `confirm_grant`. No test bypass exists by design: consent-yes is unit-tested only (TTY behavior is verified in unit tests, not bypassed). The default-deny choice (empty input → false) is intentional.
-
-**Consent-path hardening in `resolve_permissions_consent`**: `resolve_permissions_consent` in `install.rs` no longer returns a fabricated `Ok(true)` for empty mirror proposals — when `propose_mirrors` returns an empty list it prints "No existing allow-list entries eligible to mirror; nothing to seed." and returns `Ok(false)`, so `confirm_grant` is only ever called when a seed is actually feasible. Additionally, Copilot permissions undergo a cwd git-root pre-check **before** prompting (line `I-25` guard): if `find_git_root_from_cwd()` returns `None`, install prints a notice and returns `Ok(false)` immediately, so `execute_install` never aborts mid-run after hook install with guidance skipped.
-
-**`remove_seeded` ownership contract (documented in trait doc)**: the trait doc in `mod.rs` codifies the ownership split:
-- **Skim-owned writers** (Gemini `policies/skim.toml`, Codex `rules/skim.rules`): if the config file is already gone, the sidecar is also deleted and `NothingToRemove` is returned.
-- **User-owned writers** (Claude `settings.json`, Copilot `permissions-config.json`): if the config file is absent the sidecar is left in place and `NothingToRemove` is returned — the sidecar still records what was seeded and may inform future operations.
-
-**Sidecar manifest semantics**: each agent that receives permissions gets a `skim-permissions.json` sidecar at `{config_dir}/`. The sidecar is **authoritative for claims** (which entries skim wrote, config hash at write time) and **advisory for removal** (removal uses the sidecar to identify entries to remove but verifies byte-equality in the live config). A missing sidecar is `SidecarError::NotFound` — distinguished from `Corrupt` so callers can treat "never written" differently. The sidecar is never silently ignored.
-
-**`hash_if_bounded` byte-cap rule**: all `compute_file_hash` calls in `cmd/permissions/` route through `hash_if_bounded(path)`, which guards on `MAX_SETTINGS_SIZE` before hashing. Returns `Ok(None)` for oversized files (caller applies context-specific semantics) and `Err` on I/O failure. This single helper enforces the size-cap uniformly across all permission writers.
-
-**Three tiers**: `Seed` (default, narrowest — 8 read-only tools), `Mirror` (copies existing allow-list), `Blanket` (requires double-confirmation). Set via `--permissions-tier seed|mirror|blanket`. Default is `Seed`.
-
-### Copilot-Specific Architecture
-
-**`hook_config_dir` seam**: `HookProtocol` has a `hook_config_dir(resolved_config_dir, project_scope, has_override)` method. The default implementation is a passthrough (all non-Copilot agents). `CopilotCliHook` overrides it: when `project_scope=false` AND `has_override=false`, it redirects to `~/.copilot/` (not `~/.github/`). The `dot_dir_name()` stays `.github` — Copilot's settings live there — but hook artifacts (script, sidecar, `skim.json`) live under `~/.copilot/hooks/`. `uses_dedicated_hook_file()` returns `true` for Copilot; all other agents return `false`.
-
-**Why `dot_dir_name` stays `.github`**: Copilot settings (`settings.json`, project instructions) live in `~/.github/`, which is the value returned by `dot_dir_name()`. The hook file is a separate artifact that Copilot reads from `~/.copilot/hooks/`. Conflating the two would write hook artifacts into the settings directory, which Copilot does not check.
-
-**`detect_copilot_cli` keys off `~/.copilot`**: `detect_copilot_cli` in `cmd/agents/detection.rs` detects the agent by checking whether `~/.copilot/` exists. Earlier code checked `~/.github/hooks/` — this is a v2.11.0 behavioral change. The hook detection itself checks for `~/.copilot/hooks/skim.json`.
-
-**`write_copilot_skim_json` is atomic**: uses the same tmp-sibling + rename idiom as `atomic_write_settings` and `write_sidecar`: writes to `hooks/skim.json.tmp`, sets mode `0o600` on Unix, then renames. Any pre-existing file is replaced atomically and the tmp is never left behind on a permissions error.
-
-**`SKIM_JSON_NAME` is `pub(crate)`**: the constant `SKIM_JSON_NAME = "skim.json"` in `hooks/copilot.rs` is `pub(crate)` so `install.rs` can import it for summary/dry-run path construction. There is one canonical string for the dedicated hook filename — do not add a second literal in `install.rs` or elsewhere.
-
-**Protocol-driven install summary and dry-run output**: `print_install_summary` and `print_dry_run_actions` in `install.rs` both take an explicit `agent: AgentKind` parameter and call `protocol_for_agent(agent).uses_dedicated_hook_file()` to branch output:
-- Copilot (`uses_dedicated_hook_file() == true`): prints "Register hook: `<hook_config_dir>/hooks/skim.json` (`<hook_event_key()>` entry)" / dry-run "Would write: … (register `<hook_event_key()>` hook)". No backup/patch lines.
-- Settings-based agents (`uses_dedicated_hook_file() == false`): prints "Patch settings: `<settings_path>` (add `<hook_event_key()>` hook)" using the protocol's event key (Gemini → `BeforeTool`, Cursor → `preToolUse`, Claude → `PreToolUse`). This means new agents get correct wording for free without code changes.
-
-`print_dry_run_actions` takes 5 params `(state, no_guidance, global, env, agent)` — the `#[allow(clippy::too_many_arguments)]` pragma is absent; the permissions-enumeration block was extracted into a private companion `print_dry_run_permissions(agent, permissions, tier, perm_dir)` (4 params). The call site in `run_install_single` calls `print_dry_run_actions(...)` then `print_dry_run_permissions(...)` in sequence (same visual output order as before). On the Mirror tier, `print_dry_run_permissions` uses a `match` on `propose_mirrors` — on read/parse error it falls back to seed entries and emits a `SKIM_DEBUG=1`-gated stderr notice (`std::env::var("SKIM_DEBUG").as_deref() == Ok("1")` idiom) before the fallback; control flow is unchanged.
-
-**Copilot hook scan bounds**: `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` in `hooks/copilot.rs` both enforce `MAX_HOOK_FILES = 50` (via `.take(MAX_HOOK_FILES)`) and per-file `MAX_SETTINGS_SIZE` guards, matching the `scan_other_hooks` behavior on other agents. The v2.11.0 rewrite had initially dropped these guards; they were restored and regression tests pin both (oversized file tests use sparse-write to avoid allocating 10 MiB in CI).
-
-**Copilot permissions writer keys by git root**: `CopilotPermissions` in `permissions/copilot.rs` writes per-project entries into `permissions-config.json` keyed by the absolute project root (found via `find_git_root_from_cwd()`). Seeding project A cannot clobber project B entries. Full happy-path + per-project-key isolation tests exist in the unit test module.
-
-**Copilot response doctrine (ADR-006 matrix)**: `CopilotCliHook::format_response` returns `{"modifiedArgs": {"command": "<rewritten>"}}` with **no `permissionDecision` field**. Copilot joins Claude Code in the no-verb column: skim only emits a permission verb where the host protocol forces a decision field (Gemini, Crush use `decision:allow`; Cursor uses `permission:allow` — both are protocol-forced). No-rewrite = empty stdout; the `modifiedArgs` object is echoed only when a rewrite actually happened. Requires Copilot CLI >= 1.0.24 (2026-04-10); older CLIs silently ignore `modifiedArgs`.
-
-### Guidance Template (guidance_content)
-
-`guidance_content(version)` in `init/helpers.rs` is the single source of truth. `guidance_content_mdc(version)` wraps the same body in Cursor `.mdc` YAML frontmatter.
-
-**"Command wrapping" section — current wording (unreleased — post-#446)**: the section now explicitly names `cat`/`head`/`tail` file-read rewrites with a concrete example (`cat file.ts` becomes `skim file.ts --mode=pseudo`). It describes that skim emits a one-line stderr notice whenever the served view differs from raw file bytes. The earlier false claim "Compression condenses how results are presented — it does not change what the command did." was removed. The "flag it to the user" sentence remained byte-identical (ADR-005).
-
-**Pinned test asserts in `test_guidance_content_has_version_markers`:**
-- Positive: `content.contains("`cat`, `head`, `tail`")` — cat/head/tail rewrites must be named
-- Positive: `content.contains("stderr notice")` — the one-line marker must be described
-- Positive: `content.contains("flag it to the user")` — escalation path (ADR-005, byte-identical)
-- Positive: `content.contains("### Command wrapping")` — section header must exist
-- Negative: `!content.contains("SKIM_PASSTHROUGH")` — agents that learn about it bypass compression (ADR-005)
-- Negative: `!content.contains("rskim")` — corollary to ADR-005 negative assert
-- Negative: `!content.contains("does not change what the command did")` — removed false claim
-
-**Brace-free body constraint**: `{` or `}` in the body string inside `format!(r#"…"#)` causes a compile error. All guidance prose must stay brace-free.
-
-**New in v2.11.0**: the "### Command wrapping" section gained a user-approved permissions paragraph: "At install time the user may have approved a small allowlist of these skim-wrapped commands..." and "Do not change permission or allowlist settings yourself to avoid a prompt." The **positive assert** `content.contains("Do not change permission or allowlist settings")` is enforced alongside other asserts. The paragraph is user-approved verbatim — do not paraphrase without explicit approval.
+`PermissionsProtocol` is a format-agnostic trait for seeding agent-native allowlist entries. The seeded tool list is always `READ_ONLY_SUBCOMMANDS ∩ wrapper_targets()` — exactly 8 tools. `confirm_grant()` is the primary TTY-gated consent gate; non-TTY stdin → immediate `false`. The `--yes` flag is for hook uninstall confirmation only; it does NOT bypass `confirm_grant`. Three tiers: `Seed`, `Mirror`, `Blanket` — set via `--permissions-tier`.
 
 ## State Transitions
 
@@ -189,12 +131,12 @@ The `detect_state` → `run_install_single` flow:
 ```
 detect_state()
   └─ reads hook script once → uses_pinned_binary + parse_version_from_script
-  └─ sets hook_uses_pinned_binary, hook_version, hook_installed
   └─ DetectedState::hook_is_current() = version matches && pinned format
         │
-        ├─ true → print "Already up to date", exit
-        └─ false → create_hook_script() → is_hook_script_current() [redundant check, idempotent]
-                  → atomic_write_executable() → write_hash_manifest()
+        ├─ true → compute hash → write_hash_manifest (self-heal, ? propagated)
+        │          → print "Already up to date", return
+        └─ false → create_hook_script()
+                  → atomic_write_executable() → write_hash_manifest (? propagated)
                   → patch_settings() [or install_hook_registration() for Copilot]
                   → inject_guidance()
                   → [if --permissions] resolve_permissions_consent() → confirm_grant() → seed()
@@ -202,121 +144,113 @@ detect_state()
 
 ## Technical Implementation Patterns
 
-### Shell-Safe Embedding
-
-Binary paths use `shell_single_quote()`. `generate_hook_script` asserts three parameters before embedding: `version` (alphanumeric + `.`/`-`), `agent_cli_name` (alphanumeric + `-`), `git_commit` (ascii-alphanumeric only, accepts hex SHAs and `"unknown"`). All `assert!` calls fire at `skim init` time.
-
 ### SHA-256 Sidecar Regeneration Order
 
-In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_file_hash()` + `write_hash_manifest()`. A crash between steps leaves a stale sidecar; the integrity check reports "tampered" — conservatively safe. Write order is intentional.
+In `create_hook_script()`: (1) `atomic_write_executable()` then (2) `compute_file_hash()` + `write_hash_manifest()`. A crash between steps leaves a stale sidecar; the integrity check reports "tampered" — conservatively safe. Write order is intentional. Errors from `write_hash_manifest` propagate with `?` — silently installing without tamper detection is worse than a hard error.
+
+### Shell-Safe Embedding
+
+Binary paths use `shell_single_quote()`. `generate_hook_script` asserts three parameters before embedding: `version` (alphanumeric + `.`/`-`), `agent_cli_name` (alphanumeric + `-`), `git_commit` (ascii-alphanumeric only). All `assert!` calls fire at `skim init` time.
 
 ### Wrapper Symlink Stem Rule
 
 `uninstall_wrappers_in` uses `file_stem()` (not `file_name()`) — strips extensions, exact match on `"skim"` or `"rskim"`. `install_wrappers_in` never overwrites non-symlink files (PF-003 safety invariant).
 
-### Settings File Security Bounds
+### Test Hermeticity — `skim_sandboxed` and `hermetic_path`
 
-`MAX_SETTINGS_SIZE` (10 MiB) caps settings.json reads. Files larger are treated as non-existent. `hash_if_bounded` in `cmd/permissions/mod.rs` applies the same cap to all permissions-module hash calls uniformly.
+Before this branch, `cli_init*` and `cli_doctor` tests ran global `skim init --uninstall` against the developer's real `$HOME`, deleting `~/.skim/bin` wrappers and `~/.gemini/GEMINI.md`.
+
+`tests/common/mod.rs` now provides `skim_sandboxed(home)` which redirects:
+- `HOME` — redirects all `dirs::home_dir()` lookups
+- `CLAUDE_CONFIG_DIR` → `home/.claude`
+- `SKIM_CACHE_DIR` → `home/.cache/skim`
+- `SKIM_WRAPPERS_DIR` → `home/.skim/bin`
+- `GEMINI_CONFIG_DIR` → `home/.gemini`
+- `COPILOT_CONFIG_DIR` → `home/.copilot`
+
+Also removes `SKIM_PASSTHROUGH`, `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY` to start clean.
+
+**Two traps worth recording:**
+
+1. **`detect_installed_agents()` in override-mode requires the config dir to already exist.** Tests must call `std::fs::create_dir_all(home.join(".claude"))` before calling `skim_sandboxed(home)` for init tests — otherwise `detect_installed_agents` returns empty (agent appears not installed).
+
+2. **`skim doctor` scans `$PATH`, so a sibling clone's binary can win and produce spurious drift.** `cli_doctor.rs` has a `hermetic_path()` helper that prepends the test binary's directory to `$PATH`, ensuring the built binary under test is the one that wins. Tests that assert on drift must use `hermetic_path()` or they may see false drift from an unrelated release build on the developer's PATH.
 
 ## Anti-Patterns
 
-**Adding a new required script line but wiring it into only one currency predicate**: the shared `script_has_pinned_marker` updates both predicates. A new required line gated in only one predicate (e.g. only `is_hook_script_current`, not `uses_pinned_binary`) silently desync state detection from reinstall. Fold any new required-line check into the shared helper.
+**Adding a new required script line but wiring it into only one currency predicate**: the shared `script_has_pinned_marker` updates both predicates. A new required line gated in only one predicate silently desync state detection from reinstall.
 
-**Emitting anything to stderr in hook mode**: all hook-mode diagnostics go to `hook.log` via `log_hook_warning` only. Zero-stderr invariant (GRANITE #361 Bug 3). Note: the transparency marker is NOT emitted in hook mode — it fires on the file-read execution path, which is a separate code surface.
+**Emitting anything to stderr in hook mode**: all hook-mode diagnostics go to `hook.log` via `log_hook_warning` only. Zero-stderr invariant (GRANITE #361 Bug 3).
 
-**Treating both dispatch surfaces as equivalent for rewrite tests**: the rewrite engine (stdin JSON → `try_rewrite()` → JSON response) and the wrapper surface (argv0 dispatch) share per-tool handlers but have completely different front-ends. Flag preservation, corruption-bail, and pipe-source passthrough are rewrite-engine-only. The `SKIM_REWRITTEN_FROM` origin tag is also rewrite-engine-only — wrapper-mediated reads are intentionally unmarked. Output-fidelity (`stdout_is_regular_file`) exists on both surfaces via distinct mechanisms.
+**Deriving doctor's verdict from the hook script text**: the hook bytes are exactly what a tamper modifies. Doctor must use `classify_script_integrity` (which reads the SHA-256 manifest) and the `HookFacts.script_integrity` field — not `parse_version_from_script` or any other scan of the script body.
 
-**Adding `--yes` bypass to `confirm_grant`**: the `--yes` flag is uninstall-only. `confirm_grant` must be called unconditionally whenever permissions are requested. Adding a skip parameter violates the consent-gate design.
+**Treating both dispatch surfaces as equivalent for rewrite tests**: the rewrite engine (stdin JSON → `try_rewrite()` → JSON response) and the wrapper surface (argv0 dispatch) share per-tool handlers but have completely different front-ends. `SKIM_REWRITTEN_FROM` is rewrite-engine-only.
 
-**Adding `find`, `env`, `ps`, `dig`, or `nslookup` to `READ_ONLY_SUBCOMMANDS`**: these tools are excluded for cause (path disclosure, env enumeration, network DNS, process enumeration). `Bash(skim <tool>:*)` entries do NOT bound tool arguments — a "read-only" classification alone is insufficient; arg-safety must be reviewed explicitly before seeding. The mirror tier is exempt from this check because it only mirrors pre-existing user grants.
+**Adding `--yes` bypass to `confirm_grant`**: the `--yes` flag is uninstall-only. `confirm_grant` must be called unconditionally whenever permissions are requested.
 
-**Adding `SKIM_PASSTHROUGH` to the guidance template**: enforced by `!content.contains("SKIM_PASSTHROUGH")` negative test assert. Agents that learn about it use it as a default bypass, defeating compression.
+**Adding `find`, `env`, `ps`, `dig`, or `nslookup` to `READ_ONLY_SUBCOMMANDS`**: these tools are excluded for cause. `Bash(skim <tool>:*)` entries do NOT bound tool arguments.
 
-**Mis-gating the proxy registry entries**: `"proxy"` must appear in `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the **same** `#[cfg(feature = "proxy")]` attribute. Gating only META (not KNOWN) would make `wrapper_targets()` include `"proxy"` in default builds, causing `skim init --wrappers` to create a bogus `~/.skim/bin/proxy` symlink. Gating only KNOWN (not META) is impossible in practice but would break `is_known_subcommand` consistency. The `test_proxy_registry_entries_gated_as_a_pair` test pins this invariant in both feature configs.
+**Adding `SKIM_PASSTHROUGH` to the guidance template**: enforced by `!content.contains("SKIM_PASSTHROUGH")` negative test assert.
 
-**Hardcoding agent event names or dedicated hook filenames in user-facing init output**: `print_install_summary` and `print_dry_run_actions` must call `protocol_for_agent(agent).hook_event_key()` and `uses_dedicated_hook_file()` for all output labels. Hardcoding strings like `"PreToolUse"` or `"skim.json"` in those functions means new agents silently show incorrect wording.
+**Mis-gating the proxy registry entries**: `"proxy"` must appear in `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the **same** `#[cfg(feature = "proxy")]` attribute.
 
-**Leaking `SKIM_REWRITTEN_FROM` into test invocations**: if the developer's shell carries `SKIM_REWRITTEN_FROM` from a prior session, test helpers that don't strip it will inject a spurious marker into stderr, breaking any test that asserts zero stderr. All test helper functions that construct a skim command — `common::skim()`, local helpers in `cli_guardrail.rs`, `cli_e2e_rewrite.rs` — must call `.env_remove("SKIM_REWRITTEN_FROM")`.
+**Using `let _ = write_hash_manifest(...)` to swallow write errors**: the manifest write must use `?` — silently installing without tamper detection is worse than a hard error. The self-heal path in `create_hook_script` demonstrates the correct pattern.
 
-**Restoring the "does not change what the command did" wording in guidance**: this sentence was removed as a false claim (file-read rewrites DO change what the agent sees). The negative assert `!content.contains("does not change what the command did")` pins this. Do not reintroduce it.
+**Running `skim init` or `skim doctor` tests without `skim_sandboxed`**: tests that run init, uninstall, or doctor without sandboxing will mutate the developer's real `~/.claude/`, `~/.gemini/`, etc., and `skim init --uninstall` (which defaults to all agents) will delete real wrappers and guidance files.
 
 ## Gotchas
 
-**`check_hook_binary_mismatch` fires only on same-version**: when versions differ, `check_hook_version_mismatch` logs the version mismatch and returns without calling the binary/commit check. A binary path change coinciding with a version bump is silently skipped until versions re-synchronize.
+**`check_hook_binary_mismatch` fires only on same-version**: when versions differ, `check_hook_version_mismatch` logs the version mismatch and returns without calling the binary/commit check.
 
-**The integrity check skips non-ClaudeCode agents**: `check_hook_integrity` is called only for `AgentKind::ClaudeCode` (TODO: extend to Cursor/Gemini/Copilot once their install paths are validated).
+**`NoManifest` is not drift — but it no longer suppresses drift detection**: pre-manifest installs are advisory only (`⚠`), not drift. However, they now fall through to pin/currency checks so an unpinned pre-manifest hook is still reported as drift. The still-open question is whether `NoManifest` should become drift after the self-heal ships in a release (#471 follow-on, tracked).
 
-**`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — safe because hex SHAs and `"unknown"` contain no shell-special chars. `generate_hook_script` enforces ascii-alphanumeric only via `assert!`. Future `SKIM_GIT_COMMIT` format changes (e.g., prefix like `commit-`) must widen the predicate first.
+**`rewrite/hook.rs:359` suppresses drift on integrity failure deliberately — tracked as #479**: when `check_hook_integrity` returns `true` (integrity failed), `detect_drift` is not called. This is intentional — an integrity failure subsumes drift — but it means drift is invisible on a tampered script at hook-exec time.
 
-**`hook_config_dir` for Copilot env-override installs**: when `COPILOT_CONFIG_DIR` is set, the `hook_config_dir` override is suppressed and the env-supplied path is used verbatim. This means test sandboxing works correctly; production global install correctly redirects to `~/.copilot/`. The `dot_dir_name` stays `.github` for settings, but `detect_copilot_cli` now checks `~/.copilot/` not `~/.github/`.
+**`parse_version_from_script` reads the `# skim-hook v{version}` comment first**: because the comment appears before `export SKIM_HOOK_VERSION=` in the script, the scanner finds the comment first. This makes the version marker attacker-editable: anyone who modifies the script can change what `detect_state` reads as the installed version. Never use this function for security decisions.
 
-**`print_detected_state` still shows "Config: …/settings.json (will be created)" for Copilot**: this is a known residual cosmetic gap (out of scope, unfixed as of PR #446). `print_detected_state` uses `state.settings_path` and `state.settings_exists` directly — it does not branch on `uses_dedicated_hook_file()`. For Copilot, `settings_path` resolves to `~/.github/settings.json`, which may not exist. The misleading "(will be created)" label appears but no settings.json is actually written (Copilot uses `skim.json` instead). The actual install path is correct; only the detection-phase printout is cosmetically wrong.
+**Doctor-vs-hook asymmetry for non-ClaudeCode agents**: `skim doctor` now reports `✗` for tampered codex/gemini/cursor/copilot scripts (via `hook_facts` + `classify_script_integrity`), but `skim rewrite --hook` only runs `check_hook_integrity` for ClaudeCode. So a tampered Gemini script shows up in doctor but produces no warning at hook-exec time.
 
-**Borrow conflict in seed() — use `HashSet<String>`, not `HashSet<&str>`**: in writers whose `seed()` mutates the live allow array (Claude and Copilot), the existing-entries membership set must be `HashSet<String>` — a `HashSet<&str>` borrowed from the allow array conflicts with the subsequent `.push()` (E0502). The `remove_seeded` and `retain` paths (no push during scan) correctly use `HashSet<&str>`. This split is intentional and visible in both `permissions/claude.rs` and `permissions/copilot.rs`.
+**`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — safe because hex SHAs and `"unknown"` contain no shell-special chars. `generate_hook_script` enforces ascii-alphanumeric only via `assert!`.
 
-**`find_git_root_from_cwd` has a duplicate in `install.rs`**: `permissions/copilot.rs` exposes `find_git_root_from(start: &Path)` as a testable inner helper (0..64 bound) with `find_git_root_from_cwd()` as a thin wrapper. `install.rs` has its own inlined copy of `find_git_root_from_cwd` (pre-existing, different caller contract: returns `None` meaning "not a git repo" rather than falling back to cwd). Consolidation is deferred. Do not accidentally call the wrong version across modules.
+**`detect_installed_agents()` in override-mode requires config dir to exist**: when `CLAUDE_CONFIG_DIR` (or any agent's config dir env var) is set, `detect_installed_agents` checks whether that directory exists. Tests using `skim_sandboxed` must `create_dir_all(home.join(".claude"))` before calling init or the agent appears uninstalled.
 
-**`nextest --all-targets` does not build `target/debug/skim`**: the E2E test harness (integration tests in `tests/`) invokes the `skim` binary from `target/debug/skim`. `cargo nextest run -p rskim --all-targets` runs the tests but does NOT build the binary first. Always run `cargo build -p rskim` before running `--all-targets` integration tests.
+**`skim doctor` scans `$PATH` — use `hermetic_path()` in tests**: the test binary and the release build may both appear on `$PATH`. Without restricting PATH to the test binary's directory, `skim doctor` may detect PATH drift from the unrelated release build and exit 1, making the test assertion wrong.
 
-**CI runs `--all-features` lint; local stays scoped**: CI's `cargo clippy` runs `--all-features` which may surface lints that a local `-p rskim` run misses. After editing registry or permission files, run `cargo clippy -p rskim --all-features -- -D warnings` locally before assuming CI will pass.
+**`nextest --all-targets` does not build `target/debug/skim`**: the E2E test harness invokes the `skim` binary from `target/debug/skim`. Always run `cargo build -p rskim` before running `--all-targets` integration tests.
 
-**`InstructionEnv` lacks `GEMINI`/`COPILOT_CONFIG_DIR` guidance routing**: `InstructionEnv` (session/instruction file resolution) does not have per-agent config-dir overrides for Gemini and Copilot. Tests that need to avoid writing real guidance files use `--no-guidance`. `DetectionEnv` (which does have all overrides) is the correct struct for config-dir resolution; `InstructionEnv` is for instruction-file path resolution only.
-
-**`--permissions` and `--project` are mutually exclusive**: permissions seeding writes to user-scope config files. Project-scoped settings are repository-controlled and must not receive auto-generated allowlist entries. The parser enforces this conflict explicitly.
-
-**Proxy routing guard fires before file-op fallthrough**: in default builds, `skim proxy` with a file named `proxy` in cwd does NOT silently skim that file. The `#[cfg(not(feature = "proxy"))]` guard in `resolve_invocation()` fires after the known-subcommand check fails but before the FileOperation fallthrough. This is intentional — "proxy" as a positional arg always means the subcommand, not a file. Use `skim ./proxy` to skim a file with that name.
-
-**`cli_proxy_gating.rs` is invisible to `--all-features` runs**: the `#![cfg(not(feature = "proxy"))]` file-level gate means the entire test file is excluded when building with `--features proxy`. A CI step that only runs `cargo test --all-features` will not exercise the gating tests. The default-features CI step is the one that provides coverage for the routing guard and completions exclusion.
-
-**Fileops dispatcher intercepts `--help` only, not `-h`**: `cmd/file/mod.rs` checks `args.iter().any(|a| a == "--help")` and deliberately skips `-h`. This mirrors `db/mod.rs` hostname-precedent and reflects real tool-level semantics: `grep -h` means "suppress filename prefix", `ls -h`/`du -h`/`df -h`/`tree -h` mean "human-readable". If the dispatcher also intercepted `-h`, those tool-level flags would be swallowed. Use `skim <tool> --help` explicitly to see skim's fileops usage text.
-
-**rg skips `-h` and `--help` in its rewrite rule; grep does not**: the `rg` rewrite rule in `cmd/rewrite/rules.rs` has `skip_if_flag_prefix: &["-h", "--help", ...]` because for `rg` both are help flags. The `grep` catch-all rule has `skip_if_flag_prefix: &["--help", "--version", "-V"]` — `grep -h` is intentionally NOT skipped because it is a tool-level flag (suppress filenames). Do not add `-h` to the grep or ls skip lists. Pinned by `test_grep_h_still_rewrites_and_preserves_flag` in `rules.rs`.
-
-**Transparency fixture language choice**: `cli_transparency.rs` uses TypeScript fixtures (not Rust) because the pseudo mode for trivial single-function Rust files may produce output byte-identical to raw, giving `view_differs=false` and silently skipping the marker. TypeScript pseudo mode strips `: string`/`: number` type annotations — structurally guaranteed to differ — making fixture behavior deterministic.
-
-**Transparency cache-hit fail-open**: when `try_cached_result` re-reads raw bytes to compute `view_differs` and that read fails (e.g. file deleted between cache population and marker check), `view_differs` defaults to `true`. This is a false positive (marker fires even though the agent gets a cache hit that may be correct), but the alternative — silently serving stale data without a marker — is the more dangerous class of failure.
+**`print_detected_state` still shows "Config: …/settings.json (will be created)" for Copilot**: known residual cosmetic gap. `print_detected_state` uses `state.settings_path` directly without branching on `uses_dedicated_hook_file()`. The actual install path is correct; only the detection-phase printout is cosmetically wrong.
 
 ## Key Files
 
-- `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch, `command()` clap definition, `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan)
-- `crates/rskim/src/cmd/init/helpers.rs` — `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `load_or_create_settings()`, `confirm_proceed()`, `confirm_grant()` (TTY-gated consent gate), `backup_settings_file()`
+- `crates/rskim/src/cmd/integrity.rs` — `ScriptIntegrity` enum; `classify_script_integrity()`; `verify_script_integrity` (thin bool wrapper); `compute_file_hash()`; `write_hash_manifest()`; `read_hash_manifest()`
+- `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch; `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan); `HookFacts` DTO; `hook_facts()` (calls `classify_script_integrity` for every agent)
+- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (pure, testable; checks `ScriptIntegrity` before pin/currency; verdict from manifest not script text); `print_hook_section()` (iterates `AgentKind::all_supported()`)
+- `crates/rskim/src/cmd/init/helpers.rs` — `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `load_or_create_settings()`, `confirm_proceed()`, `confirm_grant()` (TTY-gated consent gate)
 - `crates/rskim/src/cmd/init/flags.rs` — `PermissionsTier`, `InitFlags`, `DetectionEnv`, `detect_installed_agents()`, `resolve_agent()`
-- `crates/rskim/src/cmd/init/install.rs` — `print_install_summary(state, agent)` and `print_dry_run_actions(state, no_guidance, global, env, agent)` (5 params, no `#[allow(clippy::too_many_arguments)]`, protocol-driven, branch on `uses_dedicated_hook_file()`); `print_dry_run_permissions(agent, permissions, tier, perm_dir)` (companion dry-run helper, SKIM_DEBUG-gated mirror-read diagnostic); `resolve_permissions_consent()` (consent orchestration, Copilot pre-check, mirror empty-proposal guard); `is_hook_script_current()`, `create_hook_script()`, `atomic_write_executable()`; own copy of `find_git_root_from_cwd`
-- `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait (including `hook_config_dir` seam, `uses_dedicated_hook_file()`, `hook_event_key()`), `HookSupport` enum
-- `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect to `~/.copilot`, `uses_dedicated_hook_file`, `hook_event_key`, `format_response` (modifiedArgs, no-verb doctrine), `write_copilot_skim_json` (atomic, 0o600), `scan_copilot_foreign_hooks` and `copilot_skim_json_has_entry` (both bounded by `MAX_HOOK_FILES=50` and `MAX_SETTINGS_SIZE`); `SKIM_JSON_NAME` constant (`pub(crate)`, single source for "skim.json")
-- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`
-- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`, `check_hook_binary_mismatch()`, `check_hook_version_mismatch()`, `check_hook_integrity()`, `warn_once_daily()`
-- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite()`, `try_custom_handlers()` (injects `SKIM_REWRITTEN_FROM=<tool>` origin tag into rewritten file-read tokens)
-- `crates/rskim/src/cmd/rewrite/rules.rs` — rewrite rule table; rg rule skips `-h`/`--help`; grep catch-all does NOT skip `-h`
-- `crates/rskim/src/output/mod.rs` — `REWRITE_ORIGIN_ENV` (`"SKIM_REWRITTEN_FROM"`), `rewrite_origin()` (closed-vocabulary reader), `rewrite_transparency_marker()` (builds marker string); also `elision_marker`, `FilterTransparencyHeader`
-- `crates/rskim/src/process.rs` — `write_result_and_stats()` (single-file marker emission), `try_cached_result()` (cache-hit `view_differs` recomputation), `view_differs` field on `ProcessResult`
-- `crates/rskim/src/multi.rs` — `process_files()` (multi-file aggregate marker emission, `view_differs_count`)
-- `crates/rskim/src/cmd/file/mod.rs` — fileops dispatcher; intercepts `--help` only (not `-h`) to preserve tool-level `-h` semantics
-- `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait (with `remove_seeded` ownership contract in doc), `permissions_protocol_for_agent` factory, `hash_if_bounded`, `seeded_entries`
-- `crates/rskim/src/cmd/permissions/claude.rs` — Claude writer; `propose_mirrors()` and `is_valid_mirror_source()` (mirror tier logic)
-- `crates/rskim/src/cmd/permissions/copilot.rs` — Copilot writer; per-project-key JSON map, `find_git_root_from(start)` injectable helper, `find_git_root_from_cwd()` thin wrapper
-- `crates/rskim/src/cmd/permissions/sidecar.rs` — `PermissionSidecar`, `load_sidecar`, `write_sidecar`, `SidecarError`
-- `crates/rskim/src/cmd/registry.rs` — `READ_ONLY_SUBCOMMANDS` (8-tool seed set, install-time-only invariant), `KNOWN_SUBCOMMANDS`, `META_SUBCOMMANDS`, `wrapper_targets()`; `"proxy"` cfg-gated as a pair; `test_proxy_registry_entries_gated_as_a_pair` invariant test
-- `crates/rskim/src/main.rs` — pre-parse routing (`resolve_invocation()`), `#[cfg(not(feature = "proxy"))]` proxy routing guard (actionable exit 1 before file-op fallthrough)
-- `crates/rskim/Cargo.toml` — `proxy = ["dep:rskim-proxy", "dep:rskim-contract"]` feature definition; rskim-contract unconditional dev-dep
-- `crates/rskim/tests/cli_proxy_gating.rs` — E2E integration tests for default-build proxy gating; file-gated `#![cfg(not(feature = "proxy"))]`
-- `crates/rskim/src/cmd/hooks/codex.rs` — `CodexCliHook` (AwarenessOnly reference implementation)
+- `crates/rskim/src/cmd/init/install.rs` — `create_hook_script()` (self-heals manifest on idempotent path); `is_hook_script_current()`; `atomic_write_executable()`; `resolve_permissions_consent()`
+- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`; `parse_version_from_script` (reads comment-first; attacker-editable, advisory only)
+- `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait, `HookSupport` enum
+- `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect, `uses_dedicated_hook_file`, `write_copilot_skim_json` (atomic); `SKIM_JSON_NAME` constant
+- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`; `check_hook_binary_mismatch()`; `check_hook_integrity()` (ClaudeCode-only at hook time); `detect_drift()`; line ~359: drift suppressed when integrity fails (#479)
+- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite()`, `try_custom_handlers()` (injects `SKIM_REWRITTEN_FROM=<tool>` origin tag)
+- `crates/rskim/src/output/mod.rs` — `REWRITE_ORIGIN_ENV`, `rewrite_origin()` (closed-vocabulary reader), `rewrite_transparency_marker()`
+- `crates/rskim/src/cmd/registry.rs` — `READ_ONLY_SUBCOMMANDS`, `KNOWN_SUBCOMMANDS`, `META_SUBCOMMANDS`, `wrapper_targets()`; `"proxy"` cfg-gated as a pair
+- `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait, `permissions_protocol_for_agent` factory, `hash_if_bounded`, `seeded_entries`
 - `crates/rskim/build.rs` — `SKIM_GIT_COMMIT` build-time injection
-- `crates/rskim/src/cmd/agents/detection.rs` — `detect_copilot_cli` (keys off `~/.copilot`)
+- `crates/rskim/tests/common/mod.rs` — `skim_sandboxed(home)` (6-env-var sandbox helper); `skim()` (`SKIM_REWRITTEN_FROM` removed)
+- `crates/rskim/tests/cli_doctor.rs` — `hermetic_path()` helper; `do_sandboxed_init()`; E2E tests for tamper detection via manifest
 
 ## Related
 
-- ADR-004 (hook install pins absolute binary path + handshake): mandated the pinned-binary format, daily-rate-limited warn-only signaling, and guidance rollout via version-bump re-pin; also provides the ordering precedent (`SKIM_SESSION_ID` out-of-band approach) that informed placing `SKIM_REWRITTEN_FROM` before the skim binary token but after caller env vars
-- ADR-005 (guidance framed as calibrated trust): prohibits `SKIM_PASSTHROUGH` in the guidance template; enforced by `!content.contains("SKIM_PASSTHROUGH")` negative assert; `!content.contains("rskim")` is a corollary in the same test; the "flag it to the user" sentence (byte-identical since v2.11.0) and the stderr notice description both apply ADR-005
-- ADR-006 (hook responses never self-approve — permissions seeding is consent-gated): defines the per-host response matrix (Claude/Copilot = no-verb; Gemini/Crush/Cursor = protocol-forced allow verb); permissions seeding is a separate, install-time, TTY-gated channel; `--yes` never grants; `resolve_permissions_consent` enforces the pre-checks that keep the gate robust
-- ADR-007 (pseudo preserves return types): context for why TypeScript is the correct fixture language for transparency marker tests — Rust pseudo is more conservative and may be byte-identical for trivial functions
-- ADR-008 (default builds never link async/TLS/HTTP; `proxy` cargo feature is the opt-in, enforced by AC9 CI dep-gate; release builds pass `--features proxy`): the cfg-pair registry gating and main.rs routing guard are the runtime enforcement; the `proxy = ["dep:rskim-proxy", "dep:rskim-contract"]` optional-dep definition is the compile-time enforcement
-- PF-004 (two interception surfaces: rewrite engine vs PATH wrappers): `SKIM_REWRITTEN_FROM` exists only on the rewrite-engine surface; the wrapper surface is intentionally unmarked; applies PF-004 — do not conflate the two surfaces when verifying transparency behavior
-- PF-006 (strip_ansi destroys tabs — gh/diff skip_ansi_strip fix): covers wrapper configs that live outside this KB's directories; relevant because `guidance_content` explains command wrapping behavior those wrappers implement
+- ADR-004 (hook install pins absolute binary path + handshake): mandated the pinned-binary format, daily-rate-limited warn-only signaling; also provides ordering precedent for `SKIM_REWRITTEN_FROM`
+- ADR-005 (guidance framed as calibrated trust): prohibits `SKIM_PASSTHROUGH` in guidance template; "flag it to the user" sentence byte-identical since v2.11.0
+- ADR-006 (hook responses never self-approve — permissions seeding is consent-gated): per-host response matrix; `confirm_grant` enforces pre-checks
+- ADR-007 (pseudo preserves return types): context for why TypeScript is the correct fixture language for transparency marker tests
+- ADR-008 (default builds never link async/TLS/HTTP; `proxy` cargo feature is the opt-in): the cfg-pair registry gating and main.rs routing guard are the runtime enforcement
+- PF-004 (two interception surfaces: rewrite engine vs PATH wrappers): `SKIM_REWRITTEN_FROM` exists only on the rewrite-engine surface; the wrapper surface is intentionally unmarked
+- PF-006 (strip_ansi destroys tabs — gh/diff skip_ansi_strip fix): covers wrapper configs that live outside this KB's directories
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags
-- Source: `crates/rskim/src/cmd/integrity/` — `compute_file_hash()` and `write_hash_manifest()` used in SHA-256 sidecar generation
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (the only permitted diagnostic channel in hook mode)
-- Tests: `crates/rskim/tests/cli_transparency.rs` — 8 E2E cases covering: marker fires on tagged pseudo read, silent without origin tag, silent when full-mode byte-identical, guardrail-silence (guardrail serves raw → view_differs=false), structure-mode naming, head-tag, multi-file aggregate, cache-hit persistence
-- Tests: `crates/rskim/tests/cli_init.rs` — `test_gemini_dry_run_shows_before_tool_hook_key` (verifies protocol-driven event key in dry-run output)
-- Tests: `crates/rskim/tests/cli_init_copilot_migrate.rs` — `test_copilot_dry_run_shows_register_hook_not_patch_settings` (verifies Copilot dry-run shows "Would write skim.json", not "Would patch"/"Would back up")
-- Tests: `crates/rskim/tests/cli_e2e_file_h_flag.rs` — fileops `-h` passthrough behavior
+- Tests: `crates/rskim/tests/cli_integrity.rs` — E2E tests for `classify_script_integrity` and `hook_status_line` behaviors
+- Tests: `crates/rskim/tests/cli_doctor.rs` — E2E tests for tamper detection, healthy exit-0, hermetic PATH
+- Tests: `crates/rskim/tests/cli_init.rs` — init isolation using `skim_sandboxed`; `create_dir_all` traps

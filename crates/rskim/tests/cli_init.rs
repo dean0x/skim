@@ -477,14 +477,25 @@ fn test_init_dry_run() {
 
 #[test]
 fn test_init_uninstall() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    // Sandboxed: HOME is a TempDir so uninstall cannot touch real ~/.gemini,
+    // ~/.copilot, ~/.skim/bin, or ~/.claude/hooks/ (avoids PF-009 / PF-015).
+    let home = TempDir::new().unwrap();
+    let config = home.path().join(".claude"); // CLAUDE_CONFIG_DIR set by skim_sandboxed
+
+    // Pre-create the config dir: detect_installed_agents() in override-mode
+    // requires the override path to be an existing directory (p.is_dir()).
+    fs::create_dir_all(&config).unwrap();
 
     // First install
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    common::skim_sandboxed(home.path())
+        .arg("init")
+        .args(["--yes"])
+        .assert()
+        .success();
 
     // Then uninstall
-    skim_init_cmd(config)
+    common::skim_sandboxed(home.path())
+        .arg("init")
         .args(["--uninstall", "--yes"])
         .assert()
         .success()
@@ -506,11 +517,21 @@ fn test_init_uninstall() {
 
 #[test]
 fn test_init_uninstall_preserves_other_hooks() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
+    // Sandboxed: HOME is a TempDir so uninstall cannot touch real home directory
+    // artifacts (avoids PF-009 / PF-015).
+    let home = TempDir::new().unwrap();
+    let config = home.path().join(".claude"); // CLAUDE_CONFIG_DIR set by skim_sandboxed
+
+    // Pre-create the config dir: detect_installed_agents() in override-mode
+    // requires the override path to be an existing directory (p.is_dir()).
+    fs::create_dir_all(&config).unwrap();
 
     // Install skim
-    skim_init_cmd(config).args(["--yes"]).assert().success();
+    common::skim_sandboxed(home.path())
+        .arg("init")
+        .args(["--yes"])
+        .assert()
+        .success();
 
     // Manually add another hook
     let contents = fs::read_to_string(config.join("settings.json")).unwrap();
@@ -527,7 +548,8 @@ fn test_init_uninstall_preserves_other_hooks() {
     .unwrap();
 
     // Uninstall skim
-    skim_init_cmd(config)
+    common::skim_sandboxed(home.path())
+        .arg("init")
         .args(["--uninstall", "--yes"])
         .assert()
         .success();
@@ -550,6 +572,73 @@ fn test_init_uninstall_when_not_installed() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Nothing to uninstall"));
+}
+
+// ============================================================================
+// Hermeticity regression guard (PF-009 / PF-015)
+// ============================================================================
+
+/// Regression guard: `skim init` artifacts (hooks, wrappers, guidance) must land
+/// inside the TempDir home provided to `skim_sandboxed`, not in the developer's
+/// real home directory.
+///
+/// Covers the three env-var override surfaces introduced in issue #472:
+/// - `CLAUDE_CONFIG_DIR` → hook script + settings.json
+/// - `SKIM_WRAPPERS_DIR` → wrapper symlinks (none expected without --wrappers)
+/// - `GEMINI_CONFIG_DIR` / `COPILOT_CONFIG_DIR` → guidance files (if written)
+#[test]
+fn test_init_sandbox_artifacts_stay_inside_tempdir() {
+    let home = TempDir::new().unwrap();
+
+    // Pre-create the Claude config dir: detect_installed_agents() in override-mode
+    // requires the override path to be an existing directory (p.is_dir()).
+    let claude_config = home.path().join(".claude");
+    fs::create_dir_all(&claude_config).unwrap();
+
+    // Global install via the sandboxed helper (sets HOME + all per-agent config dirs).
+    common::skim_sandboxed(home.path())
+        .arg("init")
+        .args(["--yes"])
+        .assert()
+        .success();
+
+    // Claude Code hook artifacts must be inside home.path()/.claude/, not real ~/.claude/.
+    assert!(
+        claude_config.join("hooks/skim-rewrite.sh").exists(),
+        "Hook script must land inside sandboxed Claude config (PF-009): \
+         real ~/.claude/hooks/ must not be touched"
+    );
+    assert!(
+        claude_config.join("settings.json").exists(),
+        "settings.json must land inside sandboxed Claude config"
+    );
+
+    // Wrapper dir — only created by `--wrappers`; this is a bare install.
+    // If anything was written to the wrapper dir, it must be inside the sandbox.
+    let sandbox_wrappers = home.path().join(".skim").join("bin");
+    if sandbox_wrappers.exists() {
+        for entry in fs::read_dir(&sandbox_wrappers).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(
+                path.starts_with(home.path()),
+                "Wrapper symlink must be inside TempDir, found outside: {:?}",
+                path
+            );
+        }
+    }
+
+    // Uninstall via the same sandbox — cleanup must also stay inside TempDir.
+    common::skim_sandboxed(home.path())
+        .arg("init")
+        .args(["--uninstall", "--yes"])
+        .assert()
+        .success();
+
+    // Hook script must be gone from the sandbox (not from real ~/.claude/).
+    assert!(
+        !claude_config.join("hooks/skim-rewrite.sh").exists(),
+        "Hook script must be removed from sandboxed Claude config after uninstall"
+    );
 }
 
 // ============================================================================

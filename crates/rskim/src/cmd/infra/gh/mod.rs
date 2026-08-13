@@ -69,9 +69,10 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     env_overrides: &[],
     install_hint: "Install gh: https://cli.github.com/",
     family: "infra",
-    // `gh pr checks` emits TAB-separated output and no ANSI when piped;
-    // `strip_ansi_escapes` drops `\t`, destroying the `RE_GH_CHECK_TAB`
-    // separators before the parser can see them. Mirror the DB/DNS precedent.
+    // `gh pr checks` emits TAB-separated output; setting this flag prevents
+    // `strip_escape_sequences` from running at all, guaranteeing the `\t`
+    // separators required by `RE_GH_CHECK_TAB` survive to the parser
+    // (PF-006).  Mirror the DB/DNS precedent.
     skip_ansi_strip: true,
     command_type: CommandType::Infra,
     // gh exits 8 for pending/failing checks — a result the parser compresses,
@@ -283,9 +284,10 @@ mod tests {
     //
     // These pin CONFIG fields that are easy to accidentally regress.
     //
-    // skip_ansi_strip MUST be true: `gh pr checks` emits TAB-separated output
-    // and `strip_ansi_escapes` drops `\t`, destroying the `RE_GH_CHECK_TAB`
-    // separators before the parser can see them.
+    // skip_ansi_strip MUST be true: `gh pr checks` emits TAB-separated output;
+    // setting this flag prevents `strip_escape_sequences` from running at all,
+    // guaranteeing the `\t` separators required by `RE_GH_CHECK_TAB` survive
+    // to the parser (PF-006).
     //
     // expected_exit_codes MUST include 8: gh exits 8 for pending/failing checks
     // — a result the parser compresses, not an error. Without &[8], exit 8 is
@@ -297,7 +299,8 @@ mod tests {
         assert!(
             CONFIG.skip_ansi_strip,
             "gh CONFIG.skip_ansi_strip must be true — \
-             strip_ansi_escapes drops \\t, destroying RE_GH_CHECK_TAB separators"
+             flag prevents strip_escape_sequences from running, guaranteeing \\t \
+             separators survive to RE_GH_CHECK_TAB (PF-006)"
         );
     }
 

@@ -127,6 +127,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim doctor` now detects tampered hook scripts (#471)** — Previously, doctor
+  derived its hook-health verdict entirely from `SKIM_HOOK_*` markers parsed out of the
+  hook script text, so a tampered or manually edited script could still pass as healthy
+  (the verdict came from the very bytes under test). Doctor now consults the SHA-256
+  manifest written at install time — an independent artefact the hook script cannot
+  influence — before checking pin/currency state. A mismatched hash exits 1 and names
+  the suppression coupling ("a failed integrity check also silences drift detection on
+  this agent's hook channel") so users know both output channels are untrusted.
+  **Intended behaviour change:** `skim doctor` now iterates all supported agents
+  (`AgentKind::all_supported()`) for integrity checks, while hook-time integrity
+  verification remains ClaudeCode-only (`rewrite/hook.rs`). Machines with hand-edited
+  codex, gemini, cursor, copilot, or crush hook scripts will **newly report ✗ on
+  `skim doctor`**; run `skim init --agent <name>` to reinstall and clear the flag.
+  Pre-manifest installs (no `.sha256` sidecar) remain advisory (`⚠`) and do not drive
+  exit 1 — backward compatibility is preserved for installs predating the manifest feature.
+  **Widened (#471 follow-up):** the `NoManifest` path now falls through to the pin/currency
+  checks rather than returning early, so drift in the hook version or binary pin is still
+  reported even when the manifest is absent.  The advisory message is appended to the
+  pin/currency verdict; drift=false is preserved.
+
+- **`strip_ansi` no longer destroys TABs and other C0 controls when an ESC byte is
+  present (#465)** — `strip_ansi()` previously delegated to `strip_ansi_escapes::strip_str`,
+  which drives a `vte` state machine that emits only printables + `\n`, silently discarding
+  ALL C0 control bytes including TABs whenever a single ESC byte appeared anywhere in the
+  buffer. A single colour code on line 2 would destroy the `\t` column separators on lines 1
+  and 3. The function now uses `strip_escape_sequences` — the same ESC-scoped scanner already
+  used by `strip_ansi_cow` — which removes only ESC-rooted sequences and leaves every other
+  byte unchanged. **Scope:** both `strip_ansi()` and `strip_ansi_cow()` were affected —
+  `strip_ansi_cow`'s no-ESC fast path only skipped the *allocation*, and once any ESC byte
+  was present it fell through to the same vte stripper. Both now route to the new scanner,
+  which covers every caller of
+  `strip_ansi()`: cargo/make/gradle/maven/tsc build output, pytest/jest/vitest combined output,
+  `gh` streaming lines, `git status` raw baseline, and vitest regex parsing. TABs, BEL, BS,
+  VT, FF, and CR bytes in build/test/VCS output now survive ANSI stripping in all paths.
+  The `strip-ansi-escapes` crate dependency is removed from the workspace (no remaining callers).
+
+- **`strip_escape_sequences` unterminated-sequence safety (#317 / #465 follow-up)** —
+  Previously, an unterminated CSI (`ESC [` with no final byte before end-of-input) or OSC
+  (`ESC ]` with no BEL or ST before end-of-input) silently discarded all remaining content
+  in the buffer — a "compress, never truncate" violation. Both loops now cap at 2 KiB and
+  emit the consumed bytes **literally** rather than dropping them when the cap is exceeded or
+  the input ends mid-sequence.  Additionally, the bare-ESC arm no longer consumes the
+  following byte unconditionally: only bytes in `0x20..=0x7e` (valid 2-byte-sequence second
+  bytes) are consumed, so a lone ESC before `\n` no longer merges two lines.  The same
+  guarantee now covers bytes that cannot legally appear *inside* a sequence body: a CSI byte
+  outside `0x20..=0x3f`, or a C0 control other than BEL/ESC inside an OSC body, ends the scan
+  and emits the consumed bytes literally.  Without this, a malformed `ESC [ 3 2` kept scanning
+  past the line break to the first byte in `0x40..=0x7e` — the next line's first letter —
+  swallowing the newline and that letter, merging two lines.
+
+- **`skim git show` reads AST breadcrumb source from the commit, not the working tree
+  (#467)** — `git show <ref>` rendered its AST breadcrumbs from whatever the file looks like
+  on disk *now*, so any uncommitted edit produced breadcrumbs describing symbols that do not
+  exist in the commit being shown. The rendering path now takes an explicit `is_show` intent
+  parameter (rather than re-sniffing argv) and resolves the blob at the shown ref; `git diff
+  A B` likewise resolves the new-side ref. Independently, a `source_matches_diff` backstop
+  verifies every context and added line against the resolved source before any breadcrumb is
+  emitted — on mismatch the file falls back to raw hunks. This catches what the ADR-001
+  net-savings guard cannot: a wrong-revision render can be *smaller* than raw and so passes a
+  size check while showing wrong content. The fallback is a no-loss raw fallback and is
+  therefore `SKIM_DEBUG`-gated per ADR-011. `git diff <ref> <path>` written without `--`
+  (e.g. `git diff HEAD src/foo.ts`) still resolves to the working tree.
+
+- **`SKIM_WRAPPERS_DIR`** — new override for the `~/.skim/bin/` wrapper symlink directory
+  used by `skim init --wrappers` and `skim init --uninstall`; an empty value is treated as
+  unset. Added so the test suite can confine wrapper installation to a sandbox instead of
+  mutating the developer's real home directory (#472). `InstructionEnv` now also honours
+  `GEMINI_CONFIG_DIR` and `COPILOT_CONFIG_DIR` when resolving guidance files, matching the
+  `DetectionEnv` behaviour those variables already had — previously `skim init --uninstall`
+  could remove the real `~/.gemini/GEMINI.md` even under a redirected config dir.
+
+- **`skim init` self-heals a missing SHA-256 manifest (#471 follow-up)** — Previously, if
+  the `.sha256` sidecar was absent (e.g. due to a transient write failure at install time,
+  a backup tool removing it, or a read-only filesystem edge case), re-running `skim init`
+  on an already-current install would hit the "already up to date" fast path and return
+  without restoring the manifest — making `skim doctor`'s advice ("run `skim init --agent
+  {agent}`") a no-op.  Fixed by: (1) adding a manifest-presence check to the fast path so
+  a missing manifest bypasses it; (2) writing the manifest on the "already current" script
+  path in `create_hook_script` before printing "Skipped"; (3) propagating manifest write
+  errors with `?` instead of swallowing them silently (the error names the manifest path and
+  says the hook directory must be writable).  Manifest removal during uninstall now also runs
+  outside the `if script_exists` guard, so a sidecar left behind by a hook whose script file
+  was deleted out from under it is cleaned up along with the registration.  (An uninstall
+  still short-circuits when neither the registration nor the script exists, so a fully
+  orphaned sidecar is left in place — harmless, since re-installing always rewrites it.)
+
 - **`skim init --yes` now re-pins the hook script after an in-place rebuild at the same
   version (#466)** — `hook_is_current()` previously compared only the binary path and
   version string, so a `cargo build` that incremented the commit SHA while keeping the

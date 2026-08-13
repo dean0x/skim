@@ -202,7 +202,11 @@ impl AgentKind {
                 base.map(|d| d.join("CLAUDE.md"))
             }
             (AgentKind::GeminiCli, true) => {
-                env.home_dir.as_ref().map(|h| h.join(".gemini/GEMINI.md"))
+                let base = env
+                    .gemini_config_dir
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".gemini")));
+                base.map(|d| d.join("GEMINI.md"))
             }
             (AgentKind::CodexCli, true) => {
                 let base = env
@@ -211,10 +215,13 @@ impl AgentKind {
                     .or_else(|| env.home_dir.as_ref().map(|h| h.join(".codex")));
                 base.map(|d| d.join("AGENTS.md"))
             }
-            (AgentKind::CopilotCli, true) => env
-                .home_dir
-                .as_ref()
-                .map(|h| h.join(".copilot/copilot-instructions.md")),
+            (AgentKind::CopilotCli, true) => {
+                let base = env
+                    .copilot_config_dir
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".copilot")));
+                base.map(|d| d.join("copilot-instructions.md"))
+            }
             (AgentKind::Crush, true) => {
                 let base = env
                     .crush_config_dir
@@ -271,17 +278,24 @@ pub(crate) struct InstructionEnv {
     pub codex_home: Option<PathBuf>,
     /// `CRUSH_CONFIG_DIR` override
     pub crush_config_dir: Option<PathBuf>,
+    /// `GEMINI_CONFIG_DIR` override (defence-in-depth: mirrors `DetectionEnv`)
+    pub gemini_config_dir: Option<PathBuf>,
+    /// `COPILOT_CONFIG_DIR` override (defence-in-depth: mirrors `DetectionEnv`)
+    pub copilot_config_dir: Option<PathBuf>,
 }
 
 impl InstructionEnv {
     /// Read env once at the system boundary. Call this in `main`-adjacent code,
     /// then thread the struct down to callers — never call from within library functions.
     pub fn from_process() -> Self {
+        let read = |name: &str| std::env::var_os(name).map(PathBuf::from);
         Self {
             home_dir: dirs::home_dir(),
-            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-            codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
-            crush_config_dir: std::env::var_os("CRUSH_CONFIG_DIR").map(PathBuf::from),
+            claude_config_dir: read("CLAUDE_CONFIG_DIR"),
+            codex_home: read("CODEX_HOME"),
+            crush_config_dir: read("CRUSH_CONFIG_DIR"),
+            gemini_config_dir: read("GEMINI_CONFIG_DIR"),
+            copilot_config_dir: read("COPILOT_CONFIG_DIR"),
         }
     }
 }
@@ -784,6 +798,37 @@ mod tests {
         };
         let path = AgentKind::Crush.instruction_file(true, &env).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-crush/AGENTS.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_gemini_env_override() {
+        // GEMINI_CONFIG_DIR overrides home-dir-based resolution for Gemini guidance.
+        // This is the defence-in-depth path: tests that set GEMINI_CONFIG_DIR will
+        // have InstructionEnv populated, so guidance removal cannot touch the real
+        // ~/.gemini/GEMINI.md (avoids PF-009 / PF-015).
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            gemini_config_dir: Some(PathBuf::from("/tmp/test-gemini")),
+            ..Default::default()
+        };
+        let path = AgentKind::GeminiCli.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test-gemini/GEMINI.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_copilot_env_override() {
+        // COPILOT_CONFIG_DIR overrides home-dir-based resolution for Copilot guidance.
+        // Mirrors the GEMINI_CONFIG_DIR pattern — see test above for rationale.
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            copilot_config_dir: Some(PathBuf::from("/tmp/test-copilot")),
+            ..Default::default()
+        };
+        let path = AgentKind::CopilotCli.instruction_file(true, &env).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/test-copilot/copilot-instructions.md")
+        );
     }
 
     #[test]

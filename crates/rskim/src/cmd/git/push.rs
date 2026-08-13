@@ -169,8 +169,8 @@ fn extract_flag_and_rest(line: &str) -> Option<(&str, &str)> {
         let flag_char = line.chars().next().unwrap_or(' ');
         if matches!(flag_char, '=' | '*' | '+' | '!' | '-') {
             let after_flag = &line[1..];
-            // Strip optional tab (strip_ansi_escapes removes tab bytes, so the tab
-            // may already be absent after preprocessing).
+            // Strip optional tab — git push porcelain output may include a tab
+            // after the flag character; trim it defensively before validating.
             let rest = after_flag.trim_start_matches('\t');
             // Require that the ref content starts with `refs/` or contains `:`
             // (src:dst ref notation).  Lines like `! [remote rejected]` start with

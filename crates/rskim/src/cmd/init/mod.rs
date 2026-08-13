@@ -62,6 +62,11 @@ pub(crate) struct HookFacts {
     pub(crate) hook_is_current: bool,
     /// Path to the hook script file (`hook_config_dir/hooks/skim-rewrite.sh`).
     pub(crate) hook_script_path: PathBuf,
+    /// Integrity classification of the hook script against its SHA-256 manifest.
+    ///
+    /// Derived from the manifest (an independent artefact), NOT from the hook
+    /// script bytes — which is exactly what a tamper modifies (PF-016).
+    pub(crate) script_integrity: crate::cmd::integrity::ScriptIntegrity,
 }
 
 /// Gather hook installation facts for a given agent — used by `skim doctor`.
@@ -93,6 +98,20 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         .join("hooks")
         .join(helpers::HOOK_SCRIPT_NAME);
 
+    // Integrity is derived from the SHA-256 manifest (independent of the script
+    // bytes), so a tampered script cannot influence this verdict (PF-016).
+    //
+    // Verification: `detected.hook_config_dir` is the same directory that
+    // `create_hook_script` in `install.rs` passes to `write_hash_manifest`
+    // (`write_hash_manifest(&state.hook_config_dir, state.agent_cli_name, ...)`).
+    // This alignment holds for every agent — including Copilot, whose
+    // `hook_config_dir` redirects to `~/.copilot/` via `HookProtocol::hook_config_dir`.
+    let script_integrity = crate::cmd::integrity::classify_script_integrity(
+        &detected.hook_config_dir,
+        agent.cli_name(),
+        &hook_script_path,
+    );
+
     Ok(HookFacts {
         hook_installed: detected.hook_installed,
         hook_version: detected.hook_version,
@@ -101,6 +120,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
         hook_is_current: is_current,
         hook_script_path,
+        script_integrity,
     })
 }
 

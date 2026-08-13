@@ -205,10 +205,11 @@ fn test_diff_tab_header_path_not_glued() {
 
 /// Stub grep emits output with a literal TAB in the match content (Makefile recipe).
 ///
-/// With `skip_ansi_strip: true` on grep's CONFIG, the TAB byte (0x09) survives
-/// execution.rs's ANSI-strip step and appears in skim's stdout byte-faithfully.
-/// Without the flag, strip_ansi_escapes::strip_str destroys 0x09 before
-/// parse_impl clones stdout — a #317 fidelity violation (ADR-009 / PF-006).
+/// With `skip_ansi_strip: true` on grep's CONFIG, the ANSI-strip step in
+/// execution.rs is skipped entirely and the TAB byte (0x09) appears in skim's
+/// stdout byte-faithfully.  Without the flag, `strip_escape_sequences`
+/// (via `strip_ansi_cow`) would run on the buffer — a #317 fidelity risk for
+/// content-bearing bytes (ADR-012 / PF-006).
 #[test]
 fn test_grep_tab_content_preserved() {
     // Makefile recipe lines begin with a mandatory literal TAB.
@@ -295,9 +296,9 @@ fn test_diff_esc_in_body_content_survives_adr012() {
         String::from_utf8_lossy(&out.stderr)
     );
     // The ESC byte (0x1b) from the file CONTENT body line must appear in
-    // skim's stdout.  With skip_ansi_strip: true, the byte is never removed
-    // by the strip_ansi_escapes step in run_tool (the same flag that also
-    // preserves the \t delimiter in --- path\t<mtime> headers).
+    // skim's stdout.  With skip_ansi_strip: true, the ANSI-strip step is
+    // skipped entirely in run_tool — the same flag that also guarantees the
+    // \t delimiter survives in --- path\t<mtime> headers (PF-006 / ADR-012).
     assert!(
         stdout_bytes.contains(&0x1b_u8),
         "ADR-012: ESC byte (0x1b) from file CONTENT must survive byte-faithfully \
@@ -314,10 +315,11 @@ fn test_diff_esc_in_body_content_survives_adr012() {
 
 /// Stub rg emits output with a literal TAB in the match content (Makefile recipe).
 ///
-/// With `skip_ansi_strip: true` on rg's CONFIG, the TAB byte (0x09) survives
-/// execution.rs's ANSI-strip step and appears in skim's stdout byte-faithfully.
-/// Without the flag, strip_ansi_escapes::strip_str destroys 0x09 before
-/// parse_impl clones stdout — a #317 fidelity violation (ADR-009 / PF-006).
+/// With `skip_ansi_strip: true` on rg's CONFIG, the ANSI-strip step in
+/// execution.rs is skipped entirely and the TAB byte (0x09) appears in skim's
+/// stdout byte-faithfully.  Without the flag, `strip_escape_sequences`
+/// (via `strip_ansi_cow`) would run on the buffer — a #317 fidelity risk for
+/// content-bearing bytes (ADR-012 / PF-006).
 #[test]
 fn test_rg_tab_content_preserved() {
     // Makefile recipe lines begin with a mandatory literal TAB.
@@ -358,9 +360,9 @@ fn test_rg_tab_content_preserved() {
 // reader receives are exactly what execution.rs holds in `output.stdout` AFTER
 // the ANSI-strip step runs.  With skip_ansi_strip: false the strip runs first,
 // shadows the output binding, and RawPassthrough then serves the ALREADY-STRIPPED
-// bytes.  strip_ansi_escapes treats \t (0x09) as a C0 control and drops it along
-// with every ESC sequence, so one ESC byte anywhere in the buffer destroys every
-// tab on every line.
+// bytes.  `strip_escape_sequences` (via `strip_ansi_cow`) removes ESC-rooted
+// sequences; any content-level ESC bytes in the buffer are lost, and the
+// stripping step itself could affect bytes the reader expects intact (PF-006).
 //
 // Fix: skip_ansi_strip must be true for every wrapper whose bytes reach the reader
 // unparsed (RawPassthrough).  The strip runs upstream of parsing and shadows
@@ -424,8 +426,8 @@ fn assert_byte_faithful_passthrough(tool: &str, args: &[&str], fixture: &str) {
 /// wc: passthrough must preserve TAB and ESC byte-faithfully.
 ///
 /// wc returns RawPassthrough; without skip_ansi_strip: true the ESC byte in the
-/// fixture triggers strip_ansi_cow → Cow::Owned, and strip_ansi_escapes removes
-/// BOTH ESC sequences AND tabs from the entire buffer.
+/// fixture triggers `strip_ansi_cow` → `Cow::Owned`, and `strip_escape_sequences`
+/// removes ESC sequences from the buffer — any content-level ESC bytes are lost.
 #[test]
 fn test_wc_passthrough_preserves_tabs_and_esc() {
     // Simulates colored wc output: ESC bytes for bold + TAB between columns.
@@ -481,26 +483,22 @@ fn test_ps_passthrough_preserves_tabs_and_esc() {
 }
 
 /// TAB preservation across lines is all-or-nothing: `strip_ansi_cow` returns
-/// `Cow::Owned` when ANY ESC byte appears anywhere in the buffer, and
-/// `strip_ansi_escapes` then drops ALL C0 controls (including 0x09 tab) from the
-/// WHOLE buffer.  An ESC byte in line 2's filename therefore destroys tabs on
-/// lines 1 AND 3 — even though those lines contain no ANSI at all.
+/// `Cow::Owned` when ANY ESC byte appears anywhere in the buffer, and the
+/// `strip_escape_sequences` scanner then processes the whole buffer — content-level
+/// ESC bytes on any line are in scope for removal.  An ESC byte in line 2's
+/// filename is therefore a risk for every other line in the buffer too.
 ///
 /// This is the highest-value test in the set: it is the only one that would fail
 /// if someone later "optimised" strip_ansi_cow to operate per-line.  It also
-/// asserts that the ESC-bearing filename survives byte-for-byte (`./esc\x1bname`,
-/// not the corrupted `./escame` that strip_ansi_escapes produces by consuming
-/// the byte following ESC as part of a 2-byte sequence — the filename corruption
-/// measured at HEAD).
+/// asserts that the ESC-bearing filename survives byte-for-byte (`./esc\x1bname`)
+/// rather than being corrupted by sequence-scanning that consumes the byte after ESC.
 #[test]
 fn test_du_esc_in_one_filename_strips_tabs_on_every_line() {
     // Three `size\tpath` lines; only line 2 contains an ESC byte in the path.
     // With skip_ansi_strip: false: strip_ansi_cow sees the ESC on line 2,
-    // returns Cow::Owned, and strip_ansi_escapes drops ALL 0x09 bytes from the
-    // entire buffer — killing the tabs on lines 1 AND 3 too.
-    // strip_ansi_escapes also consumes the byte following ESC as part of a
-    // 2-byte sequence: `\x1bn` → consumed entirely, turning `esc\x1bname`
-    // into `escame` (the `n` vanishes with the ESC byte).
+    // returns Cow::Owned, and strip_escape_sequences processes the entire buffer —
+    // the ESC byte on line 2 and any bytes consumed as part of its sequence are
+    // lost, and the whole-buffer scan means every line is in scope.
     let fixture = "4\t./file1.txt\n8\t./esc\x1bname\n16\t.\n";
     let stub_dir = make_stub("du", fixture, 0);
     let path = prepend_path(stub_dir.path());
@@ -560,5 +558,56 @@ fn test_du_esc_in_one_filename_strips_tabs_on_every_line() {
         *stdout,
         fixture.as_bytes().to_vec(),
         "du: stdout must be byte-identical to fixture — any byte mutation is a #317 violation"
+    );
+}
+
+// ============================================================================
+// Issue #465 — strip_ansi_cow preserves TABs when ESC byte present
+// ============================================================================
+
+/// E2E regression test for #465: `strip_ansi_cow` (invoked by `run_tool` when
+/// `skip_ansi_strip: false`) formerly used `strip_ansi_escapes::strip_str` (a
+/// `vte` state machine that emitted only printables + `\n`, discarding ALL C0
+/// controls including TABs whenever any ESC byte appeared).  The replacement,
+/// `strip_escape_sequences`, preserves all bytes that are not part of an
+/// ESC-rooted sequence — TABs and other C0 controls survive.
+///
+/// Uses an `eslint` stub (`skip_ansi_strip: false`) so the live `strip_ansi_cow`
+/// path fires before parsing.  The fixture is not valid eslint output → the parser
+/// falls through to Tier 3 (Passthrough) and the bytes reach the reader directly.
+///
+/// Before the fix: all 3 TABs destroyed.
+/// After the fix: only the two CSI sequences are stripped; all 3 TABs survive.
+#[test]
+fn test_465_strip_ansi_cow_preserves_tabs_in_eslint_passthrough() {
+    // Three lines: line 1 — TAB only; line 2 — CSI colour sequences + TAB;
+    // line 3 — TAB only.
+    let fixture = "a\tb\n\x1b[32mc\x1b[0m\td\n e\tf\n";
+
+    // eslint has skip_ansi_strip: false → strip_ansi_cow runs on this fixture.
+    // The fixture is neither valid JSON nor the eslint text format → Passthrough.
+    let stub_dir = make_stub("eslint", fixture, 1);
+    let path = prepend_path(stub_dir.path());
+    let skim = common::skim_bin();
+
+    let out = std::process::Command::new(&skim)
+        .args(["eslint", "."])
+        .env("PATH", &path)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .output()
+        .expect("skim eslint must be spawnable");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let tab_count = stdout.matches('\t').count();
+    assert_eq!(
+        tab_count, 3,
+        "all 3 TABs must survive the strip_ansi_cow step — \
+         strip_escape_sequences removes only ESC-rooted sequences, not C0 controls \
+         (#465); stdout: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains('\x1b'),
+        "ESC sequences must be removed from the Passthrough payload; stdout: {stdout:?}"
     );
 }

@@ -1,10 +1,11 @@
 //! Three-tier parse degradation output (#41)
 //!
 //! Provides ParseResult enum (Full/Degraded/Passthrough), output cleaning
-//! (ANSI stripping, progress line collapsing, deduplication), token-aware
-//! truncation, and filter transparency headers.
+//! (ANSI stripping, token-aware truncation, and filter transparency headers.
 
-// Infrastructure module — consumers arrive in later Phase B tickets.
+// Infrastructure module — canonical, tee, and several items here (OutputMode,
+// PassthroughTruncator, FilterTransparencyHeader) have consumers arriving in
+// Phase B tickets; suppress dead_code until those callers land.
 #![allow(dead_code)]
 
 pub(crate) mod canonical;
@@ -212,9 +213,161 @@ impl OutputMode {
 
 /// Strip ANSI escape sequences from the input string.
 ///
-/// Delegates to `strip_ansi_escapes::strip_str()`.
+/// Delegates to [`strip_escape_sequences`], which removes only ESC-rooted
+/// sequences (CSI, OSC, 2-byte) while leaving every other byte — including
+/// TABs and C0 controls — unchanged.  Unterminated or overlong sequences are
+/// emitted literally rather than silently dropped (#317 / PF-006 / #465).
 pub(crate) fn strip_ansi(input: &str) -> String {
-    strip_ansi_escapes::strip_str(input)
+    strip_escape_sequences(input)
+}
+
+/// Remove only ANSI/VT escape sequences from `input`, leaving every other byte
+/// (including TABs and C0 controls) unchanged.
+///
+/// Handled sequence types:
+/// - CSI: `ESC [ <parameter bytes> <final byte 0x40..=0x7e>`
+/// - OSC: `ESC ] <text> BEL`  or  `ESC ] <text> ESC \` (ST)
+/// - 2-byte: `ESC x` where `x` is in `0x20..=0x7e` — both bytes discarded
+///
+/// **Bounded scanning (#317 / "compress, never truncate"):**
+/// Both CSI and OSC loops are capped at [`MAX_SEQ_SCAN`] bytes.  If that bound
+/// is exceeded, if the input ends before a sequence terminator is found, or if a
+/// byte that cannot legally appear in the sequence body is encountered (a CSI
+/// byte outside `0x20..=0x3f`, or a C0 control other than BEL/ESC inside an OSC
+/// body — e.g. a newline), the consumed bytes (including the leading `ESC` and
+/// type byte) are emitted **literally** rather than silently dropped.  This
+/// body-validity bail is what stops a malformed `ESC [ 3 2` from scanning across
+/// a newline and swallowing it plus the next letter.  Losing content is the failure
+/// mode we are eliminating; the safe direction is "if this doesn't look like a
+/// real sequence, keep it".
+///
+/// **Bare-ESC safety:** the byte after `ESC` is peeked before consuming.  Only
+/// bytes in `0x20..=0x7e` (valid 2-byte-sequence second bytes) are consumed.
+/// A control character following `ESC` (e.g. `\n`, `\t`) is left in the stream
+/// and the lone `ESC` is emitted literally, preventing two lines from merging.
+///
+/// # Why not `strip_ansi_escapes::strip_str`?
+///
+/// That crate drives a `vte` state machine that emits only printables + `\n`,
+/// silently discarding ALL C0 control bytes — including TABs (`0x09`).  When one
+/// ESC byte is present anywhere in the buffer the entire buffer is re-encoded,
+/// destroying tabs on every line.  This is a #317 violation (PF-006 / issue #465).
+fn strip_escape_sequences(input: &str) -> String {
+    /// Maximum bytes to scan inside a single escape-sequence body.
+    ///
+    /// No valid ANSI/VT sequence exceeds a few hundred bytes.  Sequences that
+    /// go beyond this bound are not real escape sequences; emit them literally
+    /// so the reader sees the content rather than losing it silently (#317).
+    const MAX_SEQ_SCAN: usize = 2048;
+
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    loop {
+        let c = match chars.next() {
+            None => break,
+            Some(c) => c,
+        };
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // ESC byte — peek at the next character to determine sequence type.
+        // Peekable lets us inspect without consuming, so control characters
+        // (e.g. `\n`) are never eaten by the bare-ESC arm.
+        match chars.peek().copied() {
+            // CSI: ESC [ <params> <final byte in 0x40..=0x7e>
+            Some('[') => {
+                chars.next(); // consume `[`
+                let mut seq_buf = String::new();
+                let mut terminated = false;
+                for b in chars.by_ref() {
+                    seq_buf.push(b);
+                    if ('\x40'..='\x7e').contains(&b) {
+                        terminated = true;
+                        break; // final byte consumed; sequence complete
+                    }
+                    if !('\x20'..='\x3f').contains(&b) {
+                        // Not a valid CSI parameter (0x30..=0x3f) or intermediate
+                        // (0x20..=0x2f) byte — e.g. a newline, TAB, or non-ASCII
+                        // char.  This is not a real CSI sequence, so stop scanning
+                        // and emit what we consumed literally.  Without this bail a
+                        // malformed `ESC [ 3 2` would keep scanning across the
+                        // newline and swallow it plus the next letter (the first
+                        // byte in 0x40..=0x7e), merging two lines and losing
+                        // content (#317).
+                        break;
+                    }
+                    if seq_buf.len() >= MAX_SEQ_SCAN {
+                        break; // safety bound exceeded
+                    }
+                }
+                if !terminated {
+                    // Unterminated or overlong — emit literally to preserve content.
+                    out.push('\x1b');
+                    out.push('[');
+                    out.push_str(&seq_buf);
+                }
+                // terminated == true: sequence fully consumed and stripped
+            }
+            // OSC: ESC ] <text> BEL  |  ESC ] <text> ESC \(ST)
+            //
+            // Track whether the previous char was ESC so ST (ESC \) can be
+            // detected without calling `chars.next()` inside a `by_ref()` loop
+            // (which would require a second mutable borrow of `chars`).
+            Some(']') => {
+                chars.next(); // consume `]`
+                let mut seq_buf = String::new();
+                let mut prev_esc = false;
+                let mut terminated = false;
+                for b in chars.by_ref() {
+                    if b == '\x07' {
+                        terminated = true;
+                        break; // BEL terminates OSC
+                    }
+                    if prev_esc && b == '\\' {
+                        terminated = true;
+                        break; // ST = ESC \ terminates OSC
+                    }
+                    if b < '\x20' && b != '\x1b' {
+                        // A C0 control other than BEL (handled above) or ESC (the
+                        // first byte of ST) cannot appear in an OSC string body.
+                        // Bail and emit literally rather than scanning across a
+                        // newline and swallowing subsequent lines up to the next
+                        // stray BEL/ST (#317).
+                        seq_buf.push(b);
+                        break;
+                    }
+                    seq_buf.push(b);
+                    prev_esc = b == '\x1b';
+                    if seq_buf.len() >= MAX_SEQ_SCAN {
+                        break; // safety bound exceeded
+                    }
+                }
+                if !terminated {
+                    // Unterminated or overlong — emit literally to preserve content.
+                    out.push('\x1b');
+                    out.push(']');
+                    out.push_str(&seq_buf);
+                }
+                // terminated == true: sequence fully consumed and stripped
+            }
+            // 2-byte sequence: only consume the second byte if it is in the
+            // valid ESC-Fe / ESC-Fp / ESC-Fs range (0x20..=0x7e — covers both
+            // finals and intermediates).  Control characters (< 0x20) are NOT
+            // valid second bytes; leave them in the stream and emit `ESC`
+            // literally so a lone ESC before `\n` does not merge two lines.
+            Some(c2) if ('\x20'..='\x7e').contains(&c2) => {
+                chars.next(); // consume valid 2-byte sequence second byte
+                // ESC + c2 stripped (standard 2-byte VT sequence)
+            }
+            // ESC followed by a control character or end-of-input:
+            // emit `ESC` literally and leave the following character in stream.
+            _ => {
+                out.push('\x1b');
+            }
+        }
+    }
+    out
 }
 
 /// Strip ANSI escape sequences with a fast-path borrow.
@@ -222,83 +375,19 @@ pub(crate) fn strip_ansi(input: &str) -> String {
 /// When no ESC byte (`0x1b`) is present in `input`, returns `Cow::Borrowed(input)`
 /// without any allocation. Only allocates when ANSI escapes are actually present.
 ///
+/// The underlying scanner ([`strip_escape_sequences`]) removes only ESC-rooted
+/// sequences (CSI, OSC, 2-byte), leaving every other byte — including TABs and
+/// other C0 controls — unchanged.  This avoids the PF-006 / #465 regression where
+/// `strip_ansi_escapes::strip_str` discarded ALL C0 controls including TABs.
+///
 /// Use this in hot paths where the input may already be clean (e.g. when the
 /// spawn path has already stripped ANSI before passing the string to a parser).
 #[inline]
 pub(crate) fn strip_ansi_cow(input: &str) -> std::borrow::Cow<'_, str> {
     if input.as_bytes().contains(&0x1b) {
-        std::borrow::Cow::Owned(strip_ansi_escapes::strip_str(input))
+        std::borrow::Cow::Owned(strip_escape_sequences(input))
     } else {
         std::borrow::Cow::Borrowed(input)
-    }
-}
-
-/// Collapse progress lines that use carriage return (`\r`) overwriting.
-///
-/// Terminal progress bars use `\r` (without `\n`) to overwrite the current line.
-/// This function keeps only the last segment of each `\r`-separated group.
-///
-/// 1. Normalizes `\r\n` to `\n` first (Windows line endings are real newlines)
-/// 2. Splits on `\n`
-/// 3. For each line containing bare `\r`: splits on `\r`, keeps last non-empty segment
-/// 4. Rejoins with `\n`
-pub(crate) fn collapse_progress_lines(input: &str) -> String {
-    // Normalize \r\n to \n so Windows line endings are not treated as progress
-    let normalized = input.replace("\r\n", "\n");
-
-    normalized
-        .split('\n')
-        .map(|line| {
-            if line.contains('\r') {
-                line.split('\r').rfind(|s| !s.is_empty()).unwrap_or("")
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Deduplicate consecutive identical lines, preserving blank lines between
-/// different content blocks.
-pub(crate) fn deduplicate_consecutive_lines(input: &str) -> String {
-    let mut result = Vec::new();
-    let mut prev: Option<&str> = None;
-
-    for line in input.split('\n') {
-        match prev {
-            Some(previous) if previous == line && !line.is_empty() => {
-                // Skip consecutive duplicate (non-blank) line
-            }
-            _ => {
-                result.push(line);
-            }
-        }
-        prev = Some(line);
-    }
-
-    result.join("\n")
-}
-
-/// Full cleaning pipeline: collapse progress → strip ANSI → deduplicate.
-///
-/// The order matters: progress line collapsing must happen before ANSI stripping
-/// because `strip_ansi_escapes` drops `\r` bytes (they are C0 control codes).
-/// If ANSI were stripped first, there would be no `\r` for progress collapsing.
-pub(crate) fn clean(input: &str) -> String {
-    let collapsed = collapse_progress_lines(input);
-    let stripped = strip_ansi(&collapsed);
-    deduplicate_consecutive_lines(&stripped)
-}
-
-/// Clean with mode-dependent behavior.
-///
-/// - `Compact`: full pipeline (collapse progress → strip ANSI → deduplicate)
-/// - `Verbose`: ANSI strip only (preserves progress lines and duplicates for debugging)
-pub(crate) fn clean_with_mode(input: &str, mode: OutputMode) -> String {
-    match mode {
-        OutputMode::Compact => clean(input),
-        OutputMode::Verbose => strip_ansi(input),
     }
 }
 
@@ -884,6 +973,228 @@ mod tests {
         assert_eq!(result, "");
     }
 
+    /// Issue #465 regression: `strip_ansi_cow` must preserve TABs when ESC bytes
+    /// are present.  Before the fix, `strip_ansi_escapes::strip_str` (vte-based)
+    /// discarded ALL C0 control bytes — including TABs — whenever a single ESC byte
+    /// appeared anywhere in the buffer, even on completely different lines.
+    #[test]
+    fn test_strip_ansi_cow_preserves_tabs_when_esc_present() {
+        // Three lines: line 1 has a TAB only, line 2 has both CSI sequences and a
+        // TAB, line 3 has a TAB only.  One ESC byte was enough to destroy all three
+        // tabs under the old implementation.
+        let input = "a\tb\n\x1b[32mc\x1b[0m\td\n e\tf\n";
+        let result = strip_ansi_cow(input);
+        assert!(
+            matches!(result, std::borrow::Cow::Owned(_)),
+            "ESC byte present — must allocate (Cow::Owned)"
+        );
+        assert_eq!(
+            &*result, "a\tb\nc\td\n e\tf\n",
+            "CSI sequences stripped; all 3 TABs preserved (#465)"
+        );
+        assert_eq!(
+            result.matches('\t').count(),
+            3,
+            "exactly 3 TABs must survive"
+        );
+        assert!(
+            !result.contains('\x1b'),
+            "no ESC bytes must remain after stripping"
+        );
+    }
+
+    /// Negative / pinning test for #465: C0 controls other than ESC-sequence bytes
+    /// themselves (BEL, BS, VT, FF, CR) must survive the strip.
+    ///
+    /// `strip_ansi_escapes::strip_str` would have destroyed every one of these (it
+    /// emits only printables + `\n`); `strip_escape_sequences` must not.
+    #[test]
+    fn test_strip_ansi_cow_preserves_other_c0_controls_when_esc_present() {
+        // A CSI sequence at the start + every problematic C0 control after it.
+        let input = "\x1b[31mstart\x1b[0m\x07\x08\x0b\x0c\x0d";
+        let result = strip_ansi_cow(input);
+        assert!(
+            matches!(result, std::borrow::Cow::Owned(_)),
+            "ESC byte present — Cow::Owned"
+        );
+        assert_eq!(
+            &*result, "start\x07\x08\x0b\x0c\x0d",
+            "BEL(\\x07), BS(\\x08), VT(\\x0b), FF(\\x0c), CR(\\x0d) must survive — \
+             the old strip_ansi_escapes::strip_str destroyed them (issue #465)"
+        );
+    }
+
+    /// OSC termination variants and truncated-sequence robustness.
+    #[test]
+    fn test_strip_ansi_cow_osc_and_truncated_sequences() {
+        // BEL-terminated OSC (e.g. terminal title set).
+        let result = strip_ansi_cow("before\x1b]0;title\x07after");
+        assert_eq!(
+            &*result, "beforeafter",
+            "OSC terminated by BEL must be fully stripped"
+        );
+
+        // ST-terminated OSC (ESC \).
+        let result = strip_ansi_cow("before\x1b]0;title\x1b\\after");
+        assert_eq!(
+            &*result, "beforeafter",
+            "OSC terminated by ST (ESC \\) must be fully stripped"
+        );
+
+        // Unterminated CSI: input ends before final byte — must emit literally,
+        // not silently drop content (#317 / Group 1b).
+        let result = strip_ansi_cow("ok\x1b[32");
+        assert_eq!(
+            &*result, "ok\x1b[32",
+            "unterminated CSI: consumed bytes must be emitted literally, not dropped"
+        );
+
+        // Unterminated OSC: input ends without BEL or ST — must emit literally,
+        // not silently drop content (#317 / Group 1a).
+        let result = strip_ansi_cow("ok\x1b]0;title");
+        assert_eq!(
+            &*result, "ok\x1b]0;title",
+            "unterminated OSC: consumed bytes must be emitted literally, not dropped"
+        );
+
+        // Content after a complete sequence (including a TAB) must be preserved.
+        let result = strip_ansi_cow("\x1b[32mcolored\x1b[0m extra\ttext");
+        assert_eq!(
+            &*result, "colored extra\ttext",
+            "content after sequence including TAB must be preserved"
+        );
+    }
+
+    /// Group 1a: unterminated OSC with a non-empty body — the body MUST survive.
+    ///
+    /// Before the fix: the OSC body was silently consumed, violating #317.
+    /// After the fix: the consumed bytes are emitted literally.
+    #[test]
+    fn test_strip_escape_sequences_unterminated_osc_emits_literally() {
+        // OSC with a long body and no BEL/ST terminator.
+        let input = "preamble\x1b]osc-body-must-survive";
+        let result = strip_escape_sequences(input);
+        assert_eq!(
+            result, "preamble\x1b]osc-body-must-survive",
+            "unterminated OSC body must not be silently discarded (#317 / Group 1a)"
+        );
+    }
+
+    /// Group 1b: unterminated CSI with a non-empty body — the body MUST survive.
+    ///
+    /// Before the fix: the CSI body was silently consumed, violating #317.
+    /// After the fix: the consumed bytes are emitted literally.
+    #[test]
+    fn test_strip_escape_sequences_unterminated_csi_emits_literally() {
+        // CSI with parameter bytes (digits, all in 0x30..=0x3F) and no final byte.
+        let input = "preamble\x1b[9999;9999";
+        let result = strip_escape_sequences(input);
+        assert_eq!(
+            result, "preamble\x1b[9999;9999",
+            "unterminated CSI body must not be silently discarded (#317 / Group 1b)"
+        );
+    }
+
+    /// Group 1c: bare ESC immediately before `\n` must NOT consume the newline.
+    ///
+    /// Before the fix: the `_ => {}` arm consumed the next byte unconditionally,
+    /// so ESC before `\n` caused two lines to merge.
+    /// After the fix: control characters are not consumed by the bare-ESC arm.
+    #[test]
+    fn test_strip_escape_sequences_bare_esc_before_newline_preserves_newline() {
+        let input = "line1\x1b\nline2";
+        let result = strip_escape_sequences(input);
+        // `\n` must survive; the bare ESC is emitted literally (safe direction).
+        assert!(
+            result.contains('\n'),
+            "newline after bare ESC must survive — two lines must not merge (Group 1c); \
+             got: {result:?}"
+        );
+        assert_eq!(
+            result, "line1\x1b\nline2",
+            "bare ESC emitted literally and newline preserved (Group 1c)"
+        );
+    }
+
+    /// #317: a malformed CSI must not scan across a newline and swallow it.
+    ///
+    /// `ESC [ 3 2` with no final byte before the line break used to keep scanning
+    /// until it hit the first byte in `0x40..=0x7e` — the `H` of the *next* line —
+    /// consuming the `\n` and the `H` with it.  Two lines merged and two content
+    /// bytes vanished.  The body-validity bail stops the scan at the newline and
+    /// emits the consumed bytes literally.
+    #[test]
+    fn test_strip_escape_sequences_malformed_csi_does_not_swallow_newline() {
+        let input = "line1 \x1b[32\nHello world\tkeep\n";
+        let result = strip_escape_sequences(input);
+        assert_eq!(
+            result, input,
+            "a malformed CSI is not a real sequence — every byte must survive (#317)"
+        );
+        assert_eq!(
+            result.matches('\n').count(),
+            2,
+            "both newlines must survive — lines must not merge"
+        );
+    }
+
+    /// #317: an unterminated OSC must not scan across a newline to a later BEL.
+    ///
+    /// Without the C0 bail, `ESC ]` would consume everything up to the next stray
+    /// BEL anywhere downstream, silently deleting whole lines of real content.
+    #[test]
+    fn test_strip_escape_sequences_malformed_osc_does_not_swallow_lines() {
+        let input = "one\x1b]notice\ntwo\tthree\x07four\n";
+        let result = strip_escape_sequences(input);
+        assert_eq!(
+            result, input,
+            "an OSC body cannot contain a newline — bail and emit literally (#317)"
+        );
+    }
+
+    /// Byte-conservation property: output length equals input length minus the
+    /// bytes of genuinely well-formed escape sequences, and never less.
+    #[test]
+    fn test_strip_escape_sequences_never_loses_content_bytes() {
+        // (input, expected) — expected is input minus only well-formed sequences.
+        let cases: &[(&str, &str)] = &[
+            ("\x1b[1;31mred\x1b[0m", "red"),
+            ("\x1b]0;title\x07body", "body"),
+            ("\x1b]0;title\x1b\\body", "body"),
+            // Malformed / non-sequence ESC usage — nothing may be dropped.
+            ("a\x1b[32\nb", "a\x1b[32\nb"),
+            ("a\x1b[9999;9999", "a\x1b[9999;9999"),
+            ("a\x1b]unterminated", "a\x1b]unterminated"),
+            ("a\x1b\nb", "a\x1b\nb"),
+            ("a\x1b[\tb", "a\x1b[\tb"),
+            ("a\x1b]x\ny\x07z", "a\x1b]x\ny\x07z"),
+        ];
+        for (input, expected) in cases {
+            let result = strip_escape_sequences(input);
+            assert_eq!(
+                &result, expected,
+                "byte conservation violated for input {input:?}"
+            );
+        }
+    }
+
+    /// Group 2 regression: `strip_ansi` must preserve TABs when an ESC is present.
+    ///
+    /// The old `strip_ansi_escapes::strip_str` destroyed ALL C0 controls including
+    /// TABs when any ESC byte appeared anywhere in the buffer (issue #465 / PF-006).
+    #[test]
+    fn test_strip_ansi_preserves_tabs_when_esc_present() {
+        // ESC sequence on line 2; TABs on all three lines.
+        let input = "a\tb\n\x1b[32mc\x1b[0m\td\ne\tf\n";
+        let result = strip_ansi(input);
+        assert_eq!(
+            result, "a\tb\nc\td\ne\tf\n",
+            "CSI sequences stripped; all TABs must survive — \
+             old strip_ansi_escapes::strip_str destroyed them (#465 / Group 2)"
+        );
+        assert!(!result.contains('\x1b'), "no ESC bytes must remain");
+    }
+
     #[test]
     fn test_strip_ansi_removes_color_codes() {
         let input = "\x1b[31mred\x1b[0m";
@@ -904,76 +1215,6 @@ mod tests {
         let input = "\x1b[31m\x1b[1m\x1b[0m";
         let result = strip_ansi(input);
         assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_collapse_progress_single_cr_line() {
-        // "a\rb\rc" → "c" (last segment wins)
-        let input = "a\rb\rc";
-        let result = collapse_progress_lines(input);
-        assert_eq!(result, "c");
-    }
-
-    #[test]
-    fn test_collapse_progress_multiline_mixed() {
-        // Lines with \r get collapsed, lines without are preserved
-        let input = "normal line\nfoo\rbar\rbaz\nanother normal";
-        let result = collapse_progress_lines(input);
-        assert_eq!(result, "normal line\nbaz\nanother normal");
-    }
-
-    #[test]
-    fn test_collapse_handles_windows_line_endings() {
-        // \r\n should be normalized to \n, not treated as progress overwrite
-        let input = "line1\r\nline2\r\nline3";
-        let result = collapse_progress_lines(input);
-        assert_eq!(result, "line1\nline2\nline3");
-    }
-
-    #[test]
-    fn test_deduplicate_consecutive_identical() {
-        let input = "a\na\na\nb\nb\nc";
-        let result = deduplicate_consecutive_lines(input);
-        assert_eq!(result, "a\nb\nc");
-    }
-
-    #[test]
-    fn test_deduplicate_preserves_non_consecutive() {
-        let input = "a\nb\na";
-        let result = deduplicate_consecutive_lines(input);
-        assert_eq!(result, "a\nb\na");
-    }
-
-    #[test]
-    fn test_clean_full_pipeline() {
-        // Input has ANSI codes, progress lines with \r, and duplicate lines
-        let input = "\x1b[32mhello\x1b[0m\nfoo\rbar\rbaz\nbaz\nbaz\nend";
-        let result = clean(input);
-        // After collapse: "hello\nbaz\nbaz\nbaz\nend" (after ANSI strip)
-        // After dedup: "hello\nbaz\nend"
-        assert_eq!(result, "hello\nbaz\nend");
-    }
-
-    #[test]
-    fn test_clean_with_mode_compact() {
-        let input = "\x1b[31mred\x1b[0m\nred\nred";
-        let result = clean_with_mode(input, OutputMode::Compact);
-        // Strip ANSI → "red\nred\nred", dedup → "red"
-        assert_eq!(result, "red");
-    }
-
-    #[test]
-    fn test_clean_with_mode_verbose() {
-        // Verbose: only ANSI stripped, progress and duplicates preserved
-        let input = "\x1b[31mred\x1b[0m\nred\nred";
-        let result = clean_with_mode(input, OutputMode::Verbose);
-        // ANSI stripped only, duplicates preserved
-        assert_eq!(result, "red\nred\nred");
-    }
-
-    #[test]
-    fn test_clean_empty_input() {
-        assert_eq!(clean(""), "");
     }
 
     // ========================================================================
@@ -1173,53 +1414,6 @@ mod tests {
         assert!(
             !result.contains("line one"),
             "expected no original content in zero-budget output, got: {result}"
-        );
-    }
-
-    // ========================================================================
-    // Adversarial PassthroughCleaner tests
-    // ========================================================================
-
-    #[test]
-    fn test_collapse_trailing_cr() {
-        // "hello\r" → last segment after \r is empty, rfind non-empty → "hello"
-        assert_eq!(collapse_progress_lines("hello\r"), "hello");
-    }
-
-    #[test]
-    fn test_collapse_only_cr_no_newline() {
-        // "foo\rbar\rbaz" (no \n) → single line, split on \r, last non-empty → "baz"
-        assert_eq!(collapse_progress_lines("foo\rbar\rbaz"), "baz");
-    }
-
-    #[test]
-    fn test_collapse_mixed_cr_crlf() {
-        // "foo\rbar\r\nbaz" → normalize \r\n to \n → "foo\rbar\nbaz"
-        // First line "foo\rbar" → collapsed to "bar"
-        // Second line "baz" → unchanged
-        assert_eq!(collapse_progress_lines("foo\rbar\r\nbaz"), "bar\nbaz");
-    }
-
-    #[test]
-    fn test_collapse_reversed_line_ending() {
-        // "\n\r" is NOT a Windows line ending — the \r is on the next line
-        // "line1\n\rline2" → normalize (no \r\n found) → split on \n → ["line1", "\rline2"]
-        // Second line has \r: split → ["", "line2"], rfind non-empty → "line2"
-        assert_eq!(collapse_progress_lines("line1\n\rline2"), "line1\nline2");
-    }
-
-    #[test]
-    fn test_deduplicate_preserves_blank_lines() {
-        // Blank lines should never be deduplicated (they separate content blocks)
-        assert_eq!(deduplicate_consecutive_lines("a\n\n\nb"), "a\n\n\nb");
-    }
-
-    #[test]
-    fn test_deduplicate_trailing_whitespace_differs() {
-        // "hello" and "hello " are different strings — both should be kept
-        assert_eq!(
-            deduplicate_consecutive_lines("hello\nhello \nhello"),
-            "hello\nhello \nhello"
         );
     }
 

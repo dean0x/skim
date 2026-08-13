@@ -37,17 +37,18 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     //
     // 1. PF-006 tab-preservation: standalone `diff -u` emits
     //    `--- path\t<mtime>` headers; the parser splits on `\t`
-    //    (see `try_parse_standalone_unified`).  `strip_ansi_escapes::strip_str`
-    //    drops `\t`, fusing path and mtime before the delimiter can be parsed.
+    //    (see `try_parse_standalone_unified`).  Setting this flag prevents
+    //    `strip_escape_sequences` from running at all, guaranteeing the `\t`
+    //    delimiter survives regardless of buffer contents.
     //
     // 2. ADR-012 content-byte fidelity: hunk body lines (`+`/`-`/` `) carry
-    //    file CONTENT that may contain ESC/CSI bytes.  Stripping them would
-    //    diverge from the raw `diff` output without a loss marker — a #317
-    //    compress-never-truncate violation.  The tool's OWN colorization is
-    //    neutralized at the child-invocation boundary via `--no-color` (on
-    //    `git diff`/`git show`; standalone `diff` never emits ANSI itself).
-    //    Content bytes must reach the reader byte-faithfully on both passthrough
-    //    and skim-synthesized renders.
+    //    file CONTENT that may contain ESC/CSI bytes.  Stripping them with
+    //    `strip_escape_sequences` would diverge from the raw `diff` output
+    //    without a loss marker — a #317 compress-never-truncate violation.
+    //    The tool's OWN colorization is neutralized at the child-invocation
+    //    boundary via `--no-color` (on `git diff`/`git show`; standalone
+    //    `diff` never emits ANSI itself).  Content bytes must reach the reader
+    //    byte-faithfully on both passthrough and skim-synthesized renders.
     //
     // Corollary: per-field `strip_ansi` on the already-split PATH field (lines
     // ~303/313) remains correct — the `\t` delimiter has been consumed by
@@ -439,14 +440,14 @@ mod tests {
     // --- config-lock tests ---
     //
     // skip_ansi_strip MUST be true for two independent reasons (ADR-012):
-    // (1) PF-006: `strip_ansi_escapes::strip_str` drops `\t`, gluing path to
-    //     mtime in `--- path\t<mtime>` headers before `split('\t')` can separate
-    //     them (see `try_parse_standalone_unified` — the `---`/`+++` handlers).
-    // (2) ADR-012: hunk body lines are file CONTENT; stripping ESC/CSI bytes
-    //     from them would diverge from the raw tool without a loss marker (#317).
-    //     See `test_adr012_esc_in_diff_body_line_survives` for the content half,
-    //     which pairs with `test_ansi_in_diff_path_is_stripped` to document the
-    //     metadata-vs-content split ADR-012 draws.
+    // (1) PF-006: prevents `strip_escape_sequences` from running at all, so the
+    //     `\t` delimiter in `--- path\t<mtime>` headers is guaranteed to survive
+    //     before `split('\t')` can separate them (see `try_parse_standalone_unified`).
+    // (2) ADR-012: hunk body lines are file CONTENT; stripping ESC/CSI bytes with
+    //     `strip_escape_sequences` would diverge from the raw tool without a loss
+    //     marker (#317).  See `test_adr012_esc_in_diff_body_line_survives` for the
+    //     content half, which pairs with `test_ansi_in_diff_path_is_stripped` to
+    //     document the metadata-vs-content split ADR-012 draws.
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
@@ -454,7 +455,8 @@ mod tests {
         assert!(
             CONFIG.skip_ansi_strip,
             "diff CONFIG.skip_ansi_strip must be true — \
-             (1) PF-006: strip_ansi_escapes drops \\t, gluing path to mtime in --- headers; \
+             (1) PF-006: flag prevents strip_escape_sequences from running, guaranteeing \
+             \\t in --- headers survives; \
              (2) ADR-012: ESC/CSI bytes in diff body CONTENT must survive byte-faithfully"
         );
     }
