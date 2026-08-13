@@ -59,7 +59,9 @@ use crate::breakpoint::{BreakpointPlan, plan_injection};
 use crate::canonical_emit::canonical_envelope_with_spans;
 use crate::span::locate_top_level_spans;
 use crate::stats::AlignStats;
-use rskim_contract::canonical::tools_arrays_set_equal;
+use rskim_contract::canonical::{
+    RawNode, parse_array_nodes, tools_arrays_set_equal, tools_arrays_set_equal_nodes,
+};
 use rskim_contract::contract::{Contract, Outcome};
 use rskim_contract::waiver::MetadataReorderWithMarkers;
 use rskim_llm::ParsedBody;
@@ -243,6 +245,34 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
         }
     }
 
+    // ── R6 parse-once: canonical tools/functions nodes ────────────────────────
+    //
+    // Parse each canonical array ONCE here, then thread the nodes into BOTH
+    // AD-CA-7 self-verify gates: the reorder gate below and the injection-path
+    // self-verify in `apply_injection`.  This eliminates the redundant
+    // `parse_raw_node` calls that `tools_arrays_set_equal` and
+    // `verify_injection → tools_arrays_equal` would otherwise make on the same
+    // canonical bytes (2 of the 4 total `parse_raw_node` calls on the
+    // benchmark's 64-element depth-8 arrays).
+    //
+    // Correspondence guarantee (safety, plan §NON-NEGOTIABLE-CONSTRAINTS): the
+    // nodes are parsed from the SAME `canonical_str` span that produces the
+    // `after` bytes used in the reorder gate, and from the SAME bytes that
+    // `apply_injection` receives as `canonical_tools_bytes`.  Parsing from
+    // DIFFERENT bytes than the ones being checked would turn the gate into a
+    // tautology — the exact class of bug that caused an earlier AD-CA-7 rewrite.
+    //
+    // The `before` (original input) side is always parsed fresh inside the
+    // node-accepting variants, so there is no risk of a reuse mismatch there.
+    let canonical_tools_nodes: Option<Vec<RawNode>> = canonical_spans
+        .get("tools")
+        .and_then(|s| s.extract(canonical_str))
+        .and_then(parse_array_nodes);
+    let canonical_functions_nodes: Option<Vec<RawNode>> = canonical_spans
+        .get("functions")
+        .and_then(|s| s.extract(canonical_str))
+        .and_then(parse_array_nodes);
+
     // ── AD-CA-7 reorder path: element-reordered arrays set-equal ─────────────
     // `canonical_envelope` element-reorders BOTH `tools` and the OpenAI legacy
     // `functions` array (AD-CA-12), so both need the multiset gate — AC29 names both.
@@ -252,15 +282,32 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
     // tools_arrays_set_equal(original_span, canonicalized_reordered_span) proves the
     // element sort dropped, duplicated, and mutated nothing while permitting the
     // deliberate order change.
+    //
+    // R6: use the pre-parsed canonical nodes when available to avoid a second
+    // `parse_raw_node` call on the canonical array.  Falls back to the &str
+    // variant when nodes are absent (no-tools/functions body) or when
+    // `parse_array_nodes` returned `None` (defensive; should not occur on a
+    // well-formed canonical emit, but fail-safe rather than fail-open).
     for key in ["tools", "functions"] {
         let before = input_spans.get(key).and_then(|s| s.extract(input_str));
         let after = canonical_spans
             .get(key)
             .and_then(|s| s.extract(canonical_str));
-        if let (Some(before), Some(after)) = (before, after)
-            && !tools_arrays_set_equal(before, after)
-        {
-            return None; // AD-CA-7 reorder self-verify failed → fail-open
+        if let (Some(before), Some(after)) = (before, after) {
+            let ok = match key {
+                "tools" => canonical_tools_nodes.as_deref().map_or_else(
+                    || tools_arrays_set_equal(before, after),
+                    |nodes| tools_arrays_set_equal_nodes(before, nodes),
+                ),
+                "functions" => canonical_functions_nodes.as_deref().map_or_else(
+                    || tools_arrays_set_equal(before, after),
+                    |nodes| tools_arrays_set_equal_nodes(before, nodes),
+                ),
+                _ => true,
+            };
+            if !ok {
+                return None; // AD-CA-7 reorder self-verify failed → fail-open
+            }
         }
     }
 
@@ -309,12 +356,15 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
             // No markers to inject — canonical output is final
             (canonical_bytes, 0)
         } else {
-            // Apply marker injection with AD-CA-7 injection path self-verify
+            // Apply marker injection with AD-CA-7 injection path self-verify.
+            // Thread canonical_tools_nodes so verify_injection_with_nodes can
+            // skip the re-parse of the canonical tools array (R6 parse-once).
             let result = apply_injection(
                 &canonical_bytes,
                 &canonical_spans,
                 canonical_tools_bytes.as_deref(),
                 canonical_system_bytes.as_deref(),
+                canonical_tools_nodes.as_deref(),
                 &plan,
             );
             // Any injection failure → whole-request fail-open
@@ -358,11 +408,24 @@ fn try_align_full(body: &[u8], provider: Provider) -> Option<AlignResult> {
 /// # Returns
 ///
 /// `Some((final_bytes, skim_count))` on success, `None` on any failure.
+/// Apply marker injection into the canonical output at the positions specified by `plan`.
+///
+/// # R6 — canonical tools nodes
+///
+/// `canonical_tools_nodes` carries pre-parsed element nodes for the canonical tools
+/// array (from the R6 parse-once in `try_align_full`).  When `Some`, the injection-path
+/// self-verify uses [`breakpoint::verify_injection_with_nodes`], which skips one
+/// `parse_raw_node` call on the canonical tools bytes.  When `None` (no tools, or nodes
+/// failed to parse), falls back to [`breakpoint::verify_injection`].
+///
+/// The nodes must correspond to the bytes in `canonical_tools_bytes` — they are parsed
+/// from the same span of `canonical_str` that produced those bytes.
 fn apply_injection(
     canonical_bytes: &[u8],
     canonical_spans: &HashMap<String, crate::span::Span>,
     canonical_tools_bytes: Option<&[u8]>,
     canonical_system_bytes: Option<&[u8]>,
+    canonical_tools_nodes: Option<&[RawNode]>,
     plan: &BreakpointPlan,
 ) -> Option<(Vec<u8>, usize)> {
     let mut result = canonical_bytes.to_vec();
@@ -387,8 +450,22 @@ fn apply_injection(
     {
         let (injected_tools, tools_elem_idx) = breakpoint::inject_tools_marker(tools_bytes)?;
 
-        // AD-CA-7 injection path self-verify for tools
-        if !breakpoint::verify_injection(tools_bytes, &injected_tools, tools_elem_idx) {
+        // AD-CA-7 injection path self-verify for tools.
+        // R6: use pre-parsed canonical nodes when available to skip one parse_raw_node
+        // call on the canonical tools bytes.  Falls back to the &[u8] variant when nodes
+        // are absent (defensive path; canonical_tools_nodes is None only if tools are
+        // absent or parse_array_nodes failed, in which case plan.inject_tools would also
+        // be false — so this branch would not be reached — but we guard defensively).
+        let tools_verify_ok = match canonical_tools_nodes {
+            Some(nodes) => breakpoint::verify_injection_with_nodes(
+                tools_bytes,
+                nodes,
+                &injected_tools,
+                tools_elem_idx,
+            ),
+            None => breakpoint::verify_injection(tools_bytes, &injected_tools, tools_elem_idx),
+        };
+        if !tools_verify_ok {
             return None;
         }
 

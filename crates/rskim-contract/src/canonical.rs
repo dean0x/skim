@@ -52,14 +52,30 @@ use serde_json::Value;
 
 /// Node parsed from a raw JSON string, keeping numbers as their raw token bytes.
 ///
-/// This is the internal representation used by [`tools_arrays_equal`] to ensure
-/// number tokens are compared byte-for-byte rather than as parsed f64 values.
-enum RawNode {
+/// This is the canonical representation used by [`tools_arrays_equal`] and related
+/// functions to ensure number tokens are compared byte-for-byte rather than as parsed
+/// f64 values.
+///
+/// # Visibility (R6 — parse-once optimization)
+///
+/// `RawNode` is `pub` so that callers (e.g. `rskim-align`) can receive
+/// pre-parsed node vectors from [`parse_array_nodes`] and pass them to
+/// [`tools_arrays_set_equal_nodes`] / [`tools_arrays_equal_nodes`], eliminating
+/// redundant `parse_raw_node` calls on the same canonical bytes.  Callers never
+/// construct `RawNode` variants directly — they receive them from the `parse_*`
+/// helpers in this module.
+pub enum RawNode {
+    /// JSON `null`.
     Null,
+    /// JSON boolean (`true` or `false`).
     Bool(bool),
-    Number(String), // raw token bytes, owned
+    /// JSON number, kept as the raw source-token bytes (never re-serialized).
+    Number(String),
+    /// JSON string, stored as the decoded UTF-8 value.
     JsonString(String),
+    /// JSON array, elements in source order.
     Array(Vec<RawNode>),
+    /// JSON object.  Keys are in BTreeMap-sorted order (guaranteed at parse time).
     Object(Vec<(String, RawNode)>),
 }
 
@@ -562,6 +578,117 @@ pub fn tools_arrays_set_equal(raw_a: &str, raw_b: &str) -> bool {
 }
 
 // ============================================================================
+// R6 — parse-once optimization variants
+// ============================================================================
+
+/// Parse a JSON array string into its element nodes.
+///
+/// This is the entry point for the **R6 parse-once optimization**: callers that
+/// need to verify the same canonical array in multiple gates (e.g. reorder gate
+/// and injection-path self-verify in AD-CA-7) call this once, cache the result,
+/// and pass it to [`tools_arrays_set_equal_nodes`] /
+/// [`tools_arrays_equal_nodes`] — eliminating the redundant `parse_raw_node`
+/// calls that those functions would otherwise make on the same bytes.
+///
+/// Returns `None` if `raw` fails to parse as a JSON array (fail-open: the caller
+/// must fall back to the `&str`-based variants).
+/// Returns `Some(Vec<RawNode>)` with one `RawNode` per array element.
+pub fn parse_array_nodes(raw: &str) -> Option<Vec<RawNode>> {
+    match parse_raw_node(raw, 0)? {
+        RawNode::Array(elems) => Some(elems),
+        _ => None,
+    }
+}
+
+/// Multiset (bag) equality between a tools array `raw_a` and pre-parsed nodes for `b`.
+///
+/// This is the **R6 parse-once optimization** variant of [`tools_arrays_set_equal`].
+/// It accepts pre-parsed nodes for the `b` (canonical) side, eliminating one
+/// `parse_raw_node` call when the caller has already built `b`'s nodes via
+/// [`parse_array_nodes`].
+///
+/// # Safety
+///
+/// **`b_elems` must correspond exactly to the bytes of the `b` array being
+/// compared.**  Passing nodes parsed from *different* bytes than the actual `b`
+/// string would make this check a tautology (comparing `b` against itself), which
+/// is exactly the class of bug that caused the AD-CA-7 rewrite (plan §R11).  The
+/// caller (AD-CA-7 reorder gate in `rskim-align`) guarantees correspondence by
+/// parsing `b_elems` from the same `canonical_str` span that produced `b`'s bytes.
+///
+/// `raw_a` is always parsed **fresh** from the original input bytes — no risk of
+/// reuse mismatch on the `a` side.
+///
+/// # Semantics
+///
+/// Identical to [`tools_arrays_set_equal`]: O(n log n) sort-and-compare of canonical
+/// element bytes, raw-token number invariant (AC11), fail-open (false) on any parse
+/// error or length mismatch.
+pub fn tools_arrays_set_equal_nodes(raw_a: &str, b_elems: &[RawNode]) -> bool {
+    let a_node = match parse_raw_node(raw_a, 0) {
+        Some(n) => n,
+        None => return false,
+    };
+    let a_elems = match a_node {
+        RawNode::Array(elems) => elems,
+        _ => return false,
+    };
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+    if a_elems.is_empty() {
+        return true;
+    }
+    let mut a_keys: Vec<Vec<u8>> = a_elems.iter().map(canonical_bytes_of_node).collect();
+    let mut b_keys: Vec<Vec<u8>> = b_elems.iter().map(canonical_bytes_of_node).collect();
+    a_keys.sort_unstable();
+    b_keys.sort_unstable();
+    a_keys == b_keys
+}
+
+/// Order-sensitive equality between pre-parsed nodes for `a` and a tools array string `raw_b`.
+///
+/// This is the **R6 parse-once optimization** variant of [`tools_arrays_equal`].
+/// It accepts pre-parsed nodes for the `a` (canonical, pre-injection) side,
+/// eliminating one `parse_raw_node` call when the caller has already built `a`'s
+/// nodes via [`parse_array_nodes`].
+///
+/// # Safety
+///
+/// **`a_elems` must correspond exactly to the bytes of the `a` (canonical,
+/// pre-injection) array.**  Passing nodes from *different* bytes than the actual
+/// `a` value would make this check a tautology.  The caller (AD-CA-7 injection-path
+/// self-verify via `verify_injection_with_nodes` in `rskim-align`) guarantees
+/// correspondence by using nodes parsed from the same canonical tools span that
+/// `verify_injection_with_nodes` received as `canonical`.
+///
+/// `raw_b` is always parsed **fresh** from the stripped (post-injection, marker-removed)
+/// bytes — no risk of reuse mismatch on the `b` side.
+///
+/// # Semantics
+///
+/// Identical to [`tools_arrays_equal`]: order-sensitive comparison, raw-token number
+/// invariant (AC11), fail-open (false) on any parse error or length mismatch.
+pub fn tools_arrays_equal_nodes(a_elems: &[RawNode], raw_b: &str) -> bool {
+    let b_node = match parse_raw_node(raw_b, 0) {
+        Some(n) => n,
+        None => return false,
+    };
+    let b_elems = match b_node {
+        RawNode::Array(elems) => elems,
+        _ => return false,
+    };
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+    // Order-sensitive: zip pairwise and compare with raw-node equality (AC11)
+    a_elems
+        .iter()
+        .zip(b_elems.iter())
+        .all(|(a, b)| raw_nodes_equal(a, b))
+}
+
+// ============================================================================
 // value_equivalent_raw — O(n) value-equivalence comparator (#427 Pass 2)
 // ============================================================================
 
@@ -818,6 +945,7 @@ fn value_equiv_inner(raw_a: &str, raw_b: &str, depth: usize, budget: &mut usize)
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -1639,5 +1767,128 @@ mod tests {
         let mut b = 100usize;
         assert_eq!(value_equivalent_raw("{invalid}", "{}", &mut b), None);
         assert_eq!(value_equivalent_raw("{}", "{invalid}", &mut b), None);
+    }
+
+    // ── R6 parse-once variants ────────────────────────────────────────────────
+
+    /// `parse_array_nodes` returns elements for a valid array.
+    #[test]
+    fn parse_array_nodes_returns_elements() {
+        let arr = r#"[{"name":"a"},{"name":"b"}]"#;
+        let nodes = parse_array_nodes(arr);
+        assert!(nodes.is_some());
+        assert_eq!(nodes.expect("valid array JSON").len(), 2);
+    }
+
+    /// `parse_array_nodes` returns `None` for non-array JSON.
+    #[test]
+    fn parse_array_nodes_non_array_is_none() {
+        assert!(parse_array_nodes(r#"{"x":1}"#).is_none());
+        assert!(parse_array_nodes("{invalid}").is_none());
+    }
+
+    /// `parse_array_nodes` returns empty vec for `[]`.
+    #[test]
+    fn parse_array_nodes_empty_array() {
+        let nodes = parse_array_nodes("[]").expect("empty array is valid");
+        assert!(nodes.is_empty());
+    }
+
+    /// `tools_arrays_set_equal_nodes` matches `tools_arrays_set_equal` for a permutation.
+    #[test]
+    fn tools_arrays_set_equal_nodes_permutation_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"b"},{"name":"a"}]"#;
+        let b_nodes = parse_array_nodes(b).expect("valid array JSON");
+        // Both variants must agree: permutation → true
+        assert_eq!(
+            tools_arrays_set_equal(a, b),
+            tools_arrays_set_equal_nodes(a, &b_nodes),
+        );
+        assert!(tools_arrays_set_equal_nodes(a, &b_nodes));
+    }
+
+    /// `tools_arrays_set_equal_nodes` matches `tools_arrays_set_equal` for a drop.
+    #[test]
+    fn tools_arrays_set_equal_nodes_drop_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"a"}]"#;
+        let b_nodes = parse_array_nodes(b).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_set_equal(a, b),
+            tools_arrays_set_equal_nodes(a, &b_nodes),
+        );
+        assert!(!tools_arrays_set_equal_nodes(a, &b_nodes));
+    }
+
+    /// `tools_arrays_set_equal_nodes` matches `tools_arrays_set_equal` for a mutation.
+    #[test]
+    fn tools_arrays_set_equal_nodes_mutation_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"CHANGED"},{"name":"b"}]"#;
+        let b_nodes = parse_array_nodes(b).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_set_equal(a, b),
+            tools_arrays_set_equal_nodes(a, &b_nodes),
+        );
+        assert!(!tools_arrays_set_equal_nodes(a, &b_nodes));
+    }
+
+    /// `tools_arrays_set_equal_nodes` returns false when `raw_a` is not an array.
+    #[test]
+    fn tools_arrays_set_equal_nodes_non_array_a_is_false() {
+        let b_nodes: Vec<RawNode> = vec![];
+        assert!(!tools_arrays_set_equal_nodes(r#"{"x":1}"#, &b_nodes));
+        assert!(!tools_arrays_set_equal_nodes("{invalid}", &b_nodes));
+    }
+
+    /// `tools_arrays_equal_nodes` matches `tools_arrays_equal` for equal arrays.
+    #[test]
+    fn tools_arrays_equal_nodes_equal_matches_str_variant() {
+        // Element 0 in `a` has keys in one order; element 0 in `b` reverses them.
+        // `tools_arrays_equal` compares objects order-insensitively, so both must agree
+        // this is equal.
+        let a = r#"[{"description":"x","name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"a","description":"x"},{"name":"b"}]"#; // key reorder in elem 0
+        let a_nodes = parse_array_nodes(a).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_equal(a, b),
+            tools_arrays_equal_nodes(&a_nodes, b),
+        );
+        assert!(tools_arrays_equal_nodes(&a_nodes, b));
+    }
+
+    /// `tools_arrays_equal_nodes` is order-sensitive (matches `tools_arrays_equal`).
+    #[test]
+    fn tools_arrays_equal_nodes_order_sensitive_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"b"},{"name":"a"}]"#;
+        let a_nodes = parse_array_nodes(a).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_equal(a, b),
+            tools_arrays_equal_nodes(&a_nodes, b),
+        );
+        assert!(!tools_arrays_equal_nodes(&a_nodes, b));
+    }
+
+    /// `tools_arrays_equal_nodes` returns false for a mutation.
+    #[test]
+    fn tools_arrays_equal_nodes_mutation_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"a"},{"name":"CHANGED"}]"#;
+        let a_nodes = parse_array_nodes(a).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_equal(a, b),
+            tools_arrays_equal_nodes(&a_nodes, b),
+        );
+        assert!(!tools_arrays_equal_nodes(&a_nodes, b));
+    }
+
+    /// `tools_arrays_equal_nodes` returns false when `raw_b` is not an array.
+    #[test]
+    fn tools_arrays_equal_nodes_non_array_b_is_false() {
+        let a_nodes = parse_array_nodes(r#"[{"name":"a"}]"#).expect("valid array JSON");
+        assert!(!tools_arrays_equal_nodes(&a_nodes, r#"{"x":1}"#));
+        assert!(!tools_arrays_equal_nodes(&a_nodes, "{invalid}"));
     }
 }

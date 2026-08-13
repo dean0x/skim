@@ -28,7 +28,7 @@
 //! count). The volatile detector's output is used only for logging/stats.
 
 // AD-CA-4: MARKER_BYTES and MAX_MARKERS IMPORTED from rskim_contract::waiver, NEVER redefined here.
-use rskim_contract::canonical::tools_arrays_equal;
+use rskim_contract::canonical::{RawNode, tools_arrays_equal, tools_arrays_equal_nodes};
 use rskim_contract::waiver::{MARKER_BYTES, MAX_MARKERS};
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -580,6 +580,54 @@ pub fn verify_injection(canonical: &[u8], injected: &[u8], injected_idx: usize) 
     };
     // Condition 3: order-sensitive value equality with the pre-injection bytes.
     tools_arrays_equal(canonical_str, &stripped_str)
+}
+
+/// Verify a marker injection using pre-parsed nodes for the canonical (pre-injection) side.
+///
+/// This is the **R6 parse-once optimization** variant of [`verify_injection`].  It accepts
+/// pre-parsed element nodes for the canonical array, eliminating one `parse_raw_node` call
+/// on the `canonical` bytes.  The three conditions are identical to those in
+/// [`verify_injection`]; only the implementation of condition 3 differs.
+///
+/// # Safety
+///
+/// **`canonical_nodes` must correspond exactly to the bytes in `canonical`.**  Passing
+/// nodes from DIFFERENT bytes than the actual pre-injection array would make condition 3
+/// a tautology (comparing `canonical` against itself).  The caller (`apply_injection` in
+/// `lib.rs`) guarantees correspondence: `canonical_nodes` are parsed from the same
+/// `canonical_str` span that produced `canonical_tools_bytes` (the `canonical` argument).
+///
+/// # Arguments
+///
+/// - `canonical`: the canonical (pre-injection) array bytes — used for the **length check**
+///   (condition 1) only.
+/// - `canonical_nodes`: pre-parsed element nodes for `canonical` — used for the
+///   **value equality check** (condition 3), skipping one `parse_raw_node` call.
+/// - `injected`: the post-injection array bytes (with the marker inserted).
+/// - `injected_idx`: index of the element that received the `cache_control` marker.
+pub fn verify_injection_with_nodes(
+    canonical: &[u8],
+    canonical_nodes: &[RawNode],
+    injected: &[u8],
+    injected_idx: usize,
+) -> bool {
+    // Condition 1: exactly one marker's worth of growth.
+    if injected.len() != canonical.len() + MARKER_BYTES {
+        return false;
+    }
+    let Ok(injected_str) = std::str::from_utf8(injected) else {
+        return false;
+    };
+    // Condition 2: strip the one skim-injected marker back out.
+    let Some(stripped) = strip_injected_marker(injected_str, injected_idx) else {
+        return false;
+    };
+    let Ok(stripped_str) = String::from_utf8(stripped) else {
+        return false;
+    };
+    // Condition 3: order-sensitive value equality with the pre-injection bytes,
+    // using pre-parsed canonical nodes (R6: skips parse_raw_node on `canonical`).
+    tools_arrays_equal_nodes(canonical_nodes, &stripped_str)
 }
 
 /// Remove the skim-injected `cache_control` member from element `target_idx` of a
