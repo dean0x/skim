@@ -151,7 +151,8 @@ pub(crate) fn is_removable_comment(node: Node, source: &str, language: Language)
     }
     let should_preserve = is_shebang(node, source)
         || is_inside_function_body(node, language)
-        || is_doc_comment(node, source, language);
+        || is_doc_comment(node, source, language)
+        || is_module_header_comment(node, source, language);
     !should_preserve
 }
 
@@ -269,6 +270,64 @@ fn is_go_declaration(kind: &str) -> bool {
             | "const_declaration"
             | "type_spec"
     )
+}
+
+/// Check if a comment is part of the module-level header comment block.
+///
+/// A module header is a contiguous run of comment nodes at the very top of the
+/// file (direct children of the root node) with no blank-line break between them
+/// and no preceding non-comment sibling.
+///
+/// Languages where this applies: Python, Ruby, SQL, and Bash — all use `#` or
+/// `--` comments at the module level for shebangs, copyright, SPDX,
+/// `frozen_string_literal: true`, provenance markers, and FIXTURE/TESTS headers.
+/// No doc-comment convention exists for these languages (`is_doc_comment` returns
+/// `false`), so without this guard minimal/pseudo would strip them.
+///
+/// # Blank-line break
+///
+/// A single newline between two consecutive comment lines means no blank line
+/// (adjacent). Two or more newlines means at least one blank line exists between
+/// them, which ends the header block — comments after the break are strippable.
+fn is_module_header_comment(node: Node, source: &str, language: Language) -> bool {
+    match language {
+        Language::Python | Language::Ruby | Language::Sql | Language::Bash => {}
+        _ => return false,
+    }
+    // Must be a direct child of the root node.
+    // A comment inside a class/function body has a deeper ancestor chain and
+    // must NOT be preserved as a header (the existing body-comment rule or
+    // `is_inside_function_body` already handles those correctly).
+    let is_root_child = node.parent().map(|p| p.parent().is_none()).unwrap_or(false);
+    if !is_root_child {
+        return false;
+    }
+    // Walk backwards through named siblings.  If every preceding named sibling
+    // is also a comment node with no blank-line break in the gap, we are part of
+    // the contiguous header block that starts at byte 0.
+    let mut current = node;
+    loop {
+        match current.prev_named_sibling() {
+            None => return true, // reached the start of the file — this IS a header
+            Some(prev) => {
+                // A blank line (> 1 newline in the gap) between two comments ends
+                // the header block.
+                let gap_start = prev.end_byte();
+                let gap_end = current.start_byte();
+                if gap_start < gap_end
+                    && let Some(gap) = source.get(gap_start..gap_end)
+                    && gap.bytes().filter(|&b| b == b'\n').count() > 1
+                {
+                    return false;
+                }
+                if is_comment_node(prev.kind(), language) {
+                    current = prev;
+                } else {
+                    return false; // non-comment precedes us — not a file header
+                }
+            }
+        }
+    }
 }
 
 /// Adjust a range to remove the entire line if the range is the only
@@ -411,9 +470,132 @@ pub(crate) fn trim_and_normalize(source: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // acceptable in tests
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // is_module_header_comment — five direct unit tests (Fix 3e)
+    // ========================================================================
+    //
+    // These tests exercise the helper through tree-sitter node queries so we
+    // do not rely solely on higher-level integration tests.  All five cases
+    // use Python (the simplest grammar for comment positioning); the function
+    // itself is language-dispatched and the grammar rules are identical for
+    // Python, Ruby, SQL, and Bash at the root-child / gap-bytes level.
+
+    // Helper: parse Python source into a tree-sitter Tree.
+    fn parse_python(source: &str) -> Tree {
+        let mut parser = crate::Parser::new(Language::Python).unwrap();
+        parser.parse(source).unwrap()
+    }
+
+    // Helper: find the Nth root-level comment node (0-indexed) in a parsed tree.
+    fn nth_root_comment<'a>(tree: &'a Tree, _source: &str, n: usize) -> Node<'a> {
+        let root = tree.root_node();
+        let mut found = 0usize;
+        for i in 0..root.named_child_count() {
+            let child = root.named_child(i).expect("named child must exist");
+            if child.kind() == "comment" {
+                if found == n {
+                    return child;
+                }
+                found += 1;
+            }
+        }
+        panic!("could not find comment #{n} in root named children");
+    }
+
+    #[test]
+    fn test_is_module_header_comment_at_byte_0() {
+        // A single comment at byte 0 with no preceding siblings → header.
+        let source = "# Copyright 2024 Acme Corp.\nx = 1\n";
+        let tree = parse_python(source);
+        let comment = nth_root_comment(&tree, source, 0);
+        assert_eq!(
+            comment.start_byte(),
+            0,
+            "test fixture: comment must be at byte 0"
+        );
+        assert!(
+            is_module_header_comment(comment, source, Language::Python),
+            "comment at byte 0 with no preceding siblings must be a module header"
+        );
+    }
+
+    #[test]
+    fn test_is_module_header_comment_after_shebang() {
+        // A comment immediately following the shebang (no blank line) → header.
+        // Backward walk: prev sibling is the shebang (also a comment node, gap < 2 newlines) → continue;
+        // prev of shebang is None → return true.
+        let source = "#!/usr/bin/env python3\n# SPDX-License-Identifier: MIT\nx = 1\n";
+        let tree = parse_python(source);
+        let spdx = nth_root_comment(&tree, source, 1); // index 0 is shebang, 1 is SPDX
+        assert!(
+            is_module_header_comment(spdx, source, Language::Python),
+            "comment contiguous with shebang must be identified as a module header"
+        );
+    }
+
+    #[test]
+    fn test_is_module_header_comment_after_blank_line_break_is_stripped() {
+        // A comment separated from the preceding comment by a blank line → NOT a header.
+        // The blank line produces > 1 newline in the gap, ending the header block.
+        let source = "# Copyright 2024\n\n# helper used by the CLI\nx = 1\n";
+        let tree = parse_python(source);
+        let non_header = nth_root_comment(&tree, source, 1);
+        assert!(
+            !is_module_header_comment(non_header, source, Language::Python),
+            "comment after a blank-line break must NOT be a module header (should be stripped)"
+        );
+    }
+
+    #[test]
+    fn test_is_module_header_comment_after_code_is_stripped() {
+        // A comment that has a code node as its preceding named sibling → NOT a header.
+        let source = "x = 1\n# standalone comment after code\n";
+        let tree = parse_python(source);
+        let comment = nth_root_comment(&tree, source, 0);
+        assert!(
+            !is_module_header_comment(comment, source, Language::Python),
+            "comment following a code statement must NOT be a module header"
+        );
+    }
+
+    #[test]
+    fn test_is_module_header_comment_inline_in_body_is_unchanged() {
+        // A comment inside a function body is NOT a direct root child → returns false
+        // immediately without evaluating sibling history.  This guards against the
+        // "adjacent to declaration" false-positive from Go-style is_go_doc_comment.
+        let source = "def f():\n    # body comment — never a header\n    pass\n";
+        let tree = parse_python(source);
+        let root = tree.root_node();
+        // Walk into the function body to find the comment node.
+        let func = root.named_child(0).expect("function_definition expected");
+        // The block is a field on the function; find the comment inside it.
+        let body_comment = {
+            let mut found = None;
+            'outer: for i in 0..func.named_child_count() {
+                let child = func.named_child(i).unwrap();
+                for j in 0..child.named_child_count() {
+                    let grandchild = child.named_child(j).unwrap();
+                    if grandchild.kind() == "comment" {
+                        found = Some(grandchild);
+                        break 'outer;
+                    }
+                }
+                if child.kind() == "comment" {
+                    found = Some(child);
+                    break;
+                }
+            }
+            found.expect("expected a comment node inside the function body")
+        };
+        assert!(
+            !is_module_header_comment(body_comment, source, Language::Python),
+            "inline body comment must NOT be a module header (is_root_child guard fires)"
+        );
+    }
 
     #[test]
     fn test_trim_and_normalize_preserves_two_blanks() {

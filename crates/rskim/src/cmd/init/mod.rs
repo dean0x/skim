@@ -60,6 +60,13 @@ pub(crate) struct HookFacts {
     pub(crate) hook_uses_pinned_binary: bool,
     /// Whether the hook is fully current (version + pinned binary + commit all match).
     pub(crate) hook_is_current: bool,
+    /// Whether the hook's recorded binary pin points to the same canonical path
+    /// as the running binary.  `false` when the pin is absent.
+    ///
+    /// Separate from `hook_is_current` so `skim doctor` can display a specific
+    /// pin-mismatch cause when two clones share the same version and commit but
+    /// the hook still points to the wrong one (PF-015 display-without-gate).
+    pub(crate) pin_is_current: bool,
     /// Path to the hook script file (`hook_config_dir/hooks/skim-rewrite.sh`).
     pub(crate) hook_script_path: PathBuf,
     /// Integrity classification of the hook script against its SHA-256 manifest.
@@ -91,8 +98,11 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
     let env = DetectionEnv::from_process();
     let detected = state::detect_state(&init_flags, agent, &env)?;
 
-    // Evaluate hook_is_current() before partially moving out of `detected`.
+    // Evaluate hook_is_current() and pin_is_current() before partially moving
+    // out of `detected`. Both queries read struct fields, so they must be called
+    // before any field is moved.
     let is_current = detected.hook_is_current();
+    let pin_current = detected.pin_is_current();
     let hook_script_path = detected
         .hook_config_dir
         .join("hooks")
@@ -119,6 +129,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         hook_binary_pin: detected.hook_binary_pin,
         hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
         hook_is_current: is_current,
+        pin_is_current: pin_current,
         hook_script_path,
         script_integrity,
     })

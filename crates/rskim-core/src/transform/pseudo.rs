@@ -279,9 +279,15 @@ pub(crate) fn transform_pseudo_with_spans(
 /// each output byte can be traced back to its source byte, and therefore to its
 /// source line number. The post-processing steps (`collapse_whitespace`,
 /// `trim_and_normalize`) operate within lines without changing line-to-source
-/// correspondence — except that `trim_and_normalize` drops lines when there are
-/// 3+ consecutive blank lines. `normalize_line_map_blanks` mirrors that step on
-/// the line map.
+/// correspondence — with two exceptions where `trim_and_normalize` drops lines:
+///
+/// 1. **Leading blank lines** — blank lines before the first non-blank content
+///    are silently dropped (`result.push_str("")` is a no-op on an empty accumulator).
+/// 2. **3+ consecutive blank lines** — runs longer than 2 are capped; the third
+///    and subsequent blank lines in a run are skipped.
+///
+/// `normalize_line_map_blanks` mirrors both rules on the line map so the map stays
+/// in sync with the final output text.
 pub(crate) fn transform_pseudo_with_spans_and_line_map(
     source: &str,
     tree: &Tree,

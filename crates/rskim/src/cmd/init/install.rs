@@ -11,7 +11,8 @@ use super::helpers::{
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
 use super::state::{
-    DetectedState, detect_state, has_skim_hook_entry, parse_commit_from_script, read_settings_json,
+    DetectedState, detect_state, has_skim_hook_entry, parse_binary_pin_from_script,
+    parse_commit_from_script, read_settings_json,
 };
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
@@ -152,6 +153,26 @@ fn print_completion_message(agent_name: &str) {
 // ============================================================================
 // Permissions install helpers
 // ============================================================================
+
+/// Returns `true` when the "already up to date" fast path must be bypassed
+/// because wrapper installation was explicitly requested.
+///
+/// Rule (mirrors `permissions_blocks_fast_path`):
+/// - `Some(true)`  → always block (explicit `--wrappers` flag).
+/// - `Some(false)` → never block (explicit `--no-wrappers` flag).
+/// - `None`        → never block — this is load-bearing.  When no wrapper flag is
+///   given, `maybe_install_wrappers` prompts the user interactively (on a TTY) or
+///   skips silently (non-TTY).  If `None` were to block the fast path, every
+///   non-TTY `skim init` invocation (CI, test harness) would fall through and
+///   reinstall the hook on each run, breaking idempotence tests such as
+///   `test_init_skips_when_version_and_commit_are_current`.
+fn wrappers_blocks_fast_path(flags: &InitFlags) -> bool {
+    match flags.wrappers {
+        Some(true) => true, // explicit --wrappers: bypass fast path so wrappers are installed
+        Some(false) => false, // explicit --no-wrappers: fast path safe
+        None => false,      // no flag: interactive prompt fires after hook; don't block
+    }
+}
 
 /// Returns `true` when the "already up to date" fast path must be bypassed
 /// because permissions work may be needed.
@@ -479,10 +500,13 @@ fn run_install_single(
     let manifest_present =
         crate::cmd::integrity::read_hash_manifest(&state.hook_config_dir, state.agent_cli_name)
             .is_some();
+    let wrappers_blocked = wrappers_blocks_fast_path(flags);
     if state.hook_installed
         && state.hook_is_current()
+        && state.pin_is_current()
         && guidance_current
         && !permissions_blocked
+        && !wrappers_blocked
         && manifest_present
     {
         print_already_up_to_date();
@@ -720,8 +744,7 @@ fn maybe_install_wrappers(wrappers: Option<bool>, dry_run: bool) -> anyhow::Resu
         return Ok(());
     }
 
-    let skim_binary = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("cannot determine skim binary path: {e}"))?;
+    let skim_binary = super::helpers::resolve_skim_binary()?;
 
     let result = super::wrappers::install_wrappers(&skim_binary, dry_run)?;
 
@@ -755,12 +778,17 @@ fn print_wrapper_install_result(result: &super::wrappers::InstallResult, dry_run
                 result.skipped_non_symlink
             );
         }
-        println!();
-        println!("  To enable wrappers, add to ~/.zshrc or ~/.bashrc:");
-        println!("    export PATH=\"$HOME/.skim/bin:$PATH\"");
-        println!();
-        println!("  Set SKIM_SESSION_ID in your shell profile for analytics attribution:");
-        println!("    export SKIM_SESSION_ID=\"<your-session-id>\"");
+        // Only print the PATH setup instructions when wrappers were actually
+        // created or updated. When all are already correct (re-run of `init
+        // --wrappers` on an up-to-date install) the blurb is noise.
+        if result.created + result.updated > 0 {
+            println!();
+            println!("  To enable wrappers, add to ~/.zshrc or ~/.bashrc:");
+            println!("    export PATH=\"$HOME/.skim/bin:$PATH\"");
+            println!();
+            println!("  Set SKIM_SESSION_ID in your shell profile for analytics attribution:");
+            println!("    export SKIM_SESSION_ID=\"<your-session-id>\"");
+        }
     }
 }
 
@@ -833,6 +861,19 @@ fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool 
             _ => return false,
         }
     }
+    // #477: also require the binary pin to match the running binary.
+    // When two clones share the same version and commit the version+commit checks
+    // above both pass, but the hook still pins the wrong clone. Comparing the
+    // canonical paths catches this case and triggers a rewrite.
+    if let Some(pin) = parse_binary_pin_from_script(&contents)
+        && let Ok(running) = super::helpers::resolve_skim_binary()
+    {
+        let pin_path = std::path::Path::new(pin.as_str());
+        let canon_pin = std::fs::canonicalize(pin_path).unwrap_or_else(|_| pin_path.to_owned());
+        if running != canon_pin {
+            return false;
+        }
+    }
     true
 }
 
@@ -887,23 +928,14 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         println!("  {} Created: {}", check_mark(true), script_path.display());
     }
 
-    // Canonicalize the current binary path for embedding in the hook script.
+    // Resolve the canonical binary path for embedding in the hook script.
     // B5b: failure here must be loud — a silent empty path produces an
     // unpinned hook script, which is exactly the state this whole change
     // exists to eliminate. `create_hook_script` returns `Result`, so we
     // thread the error instead of falling back to an empty string.
-    let binary_path = std::env::current_exe()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot determine the skim binary path: {e}\n\
-                 hint: re-run `skim init` from the skim binary directly"
-            )
-        })
-        .map(|p| {
-            // Prefer the canonical path (resolves symlinks); fall back to the
-            // original path when canonicalize fails (rare: e.g. deleted-while-open).
-            std::fs::canonicalize(&p).unwrap_or(p)
-        })?;
+    // Uses the shared `resolve_skim_binary()` helper so this site and
+    // `maybe_install_wrappers` always produce the same canonical path.
+    let binary_path = super::helpers::resolve_skim_binary()?;
     let binary_path_str = binary_path.to_string_lossy();
 
     // Delegate to the shared generator in hooks/mod.rs so install.rs and per-agent
@@ -1499,14 +1531,21 @@ mod tests {
             compiled_commit.to_string()
         };
 
+        // #477: pin-path check compares SKIM_HOOK_BINARY against current_exe().
+        // Use the actual running binary so the check passes in all build environments.
+        let running_binary = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("skim-rewrite.sh");
         // New F6 pinned format: version comment + SKIM_HOOK_BINARY export + current commit.
         let content = format!(
             "#!/bin/sh\n# skim-hook v1.2.3\n\
-             export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
+             export SKIM_HOOK_BINARY='{running_binary}'\n\
              export SKIM_HOOK_COMMIT={hook_commit}\n\
-             _SKIM_BIN='/usr/local/bin/skim'\n\
+             _SKIM_BIN='{running_binary}'\n\
              if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
              exec skim rewrite --hook --agent claude-code\n"
         );
@@ -1514,7 +1553,7 @@ mod tests {
 
         assert!(
             is_hook_script_current(&path, "1.2.3"),
-            "matching version + SKIM_HOOK_BINARY export + matching commit must return true"
+            "matching version + SKIM_HOOK_BINARY export + matching commit + matching binary path must return true"
         );
     }
 
@@ -2386,6 +2425,52 @@ mod tests {
         assert!(
             !super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
             "None with no sidecar must not block the fast path"
+        );
+    }
+
+    // ---- wrappers_blocks_fast_path ----
+
+    fn make_flags_with_wrappers(wrappers: Option<bool>) -> super::super::flags::InitFlags {
+        super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            agent: None,
+            wrappers,
+            permissions: None,
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        }
+    }
+
+    #[test]
+    fn test_wrappers_blocks_fast_path_some_true_blocks() {
+        let flags = make_flags_with_wrappers(Some(true));
+        assert!(
+            super::wrappers_blocks_fast_path(&flags),
+            "Some(true) (--wrappers) must block the fast path"
+        );
+    }
+
+    #[test]
+    fn test_wrappers_blocks_fast_path_some_false_does_not_block() {
+        let flags = make_flags_with_wrappers(Some(false));
+        assert!(
+            !super::wrappers_blocks_fast_path(&flags),
+            "Some(false) (--no-wrappers) must not block the fast path"
+        );
+    }
+
+    #[test]
+    fn test_wrappers_blocks_fast_path_none_does_not_block() {
+        // Load-bearing: None must NOT block. If it blocked, every non-TTY skim init
+        // would reinstall on every run and break test_init_skips_when_version_and_commit_are_current.
+        let flags = make_flags_with_wrappers(None);
+        assert!(
+            !super::wrappers_blocks_fast_path(&flags),
+            "None (no --wrappers flag) must NOT block the fast path (load-bearing)"
         );
     }
 }

@@ -412,8 +412,7 @@ fn hook_status_line(
                 true,
                 format!(
                     "  ✗ {agent_cli_name}  installed — hook script unreadable (cannot hash); \
-                     note: an unreadable script also silences drift detection on this \
-                     agent's hook channel — run `skim init --agent {agent_cli_name}` to reinstall"
+                     run `skim init --agent {agent_cli_name}` to reinstall"
                 ),
             );
         }
@@ -457,7 +456,7 @@ fn hook_status_line(
         );
     }
 
-    if !facts.hook_is_current {
+    if !facts.hook_is_current || !facts.pin_is_current {
         let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
         let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
         let commit_ok = facts.hook_commit.as_deref() == Some(compiled_commit);
@@ -466,6 +465,16 @@ fn hook_status_line(
             format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
         } else if !version_ok {
             format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
+        } else if !facts.pin_is_current {
+            // Version and commit match but the pin path differs: two clones at
+            // the same commit.  Show both paths so the user can identify which
+            // binary is running and which the hook points to.
+            let running = std::env::current_exe()
+                .ok()
+                .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "?".to_string());
+            format!("binary pin mismatch (hook: {pin}, running: {running})")
         } else {
             "stale".to_string()
         };
@@ -942,6 +951,7 @@ mod tests {
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
             hook_is_current: true,
+            pin_is_current: true,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: integrity,
         }
@@ -979,8 +989,14 @@ mod tests {
 
         assert!(drift, "Unreadable must report drift");
         assert!(
-            line.contains("silences drift detection"),
-            "message must name the drift-detection suppression coupling: {line}"
+            line.contains("unreadable"),
+            "message must name the unreadable state: {line}"
+        );
+        // Fix 4b: Unreadable does NOT silence drift detection (only Tampered does).
+        // The message must NOT claim this.
+        assert!(
+            !line.contains("silences drift detection"),
+            "Unreadable message must NOT claim drift detection is silenced (only Tampered does): {line}"
         );
         assert!(
             line.contains("skim init"),
@@ -1069,6 +1085,7 @@ mod tests {
             hook_binary_pin: None,
             hook_uses_pinned_binary: false,
             hook_is_current: false,
+            pin_is_current: false,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
         };

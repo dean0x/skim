@@ -400,8 +400,8 @@ fn test_cli_minimal_mode_python_shebang() {
         .stdout(predicate::str::contains("#!/usr/bin/env python3"))
         // Code preserved
         .stdout(predicate::str::contains("def hello()"))
-        // Regular comment stripped
-        .stdout(predicate::str::contains("# regular comment").not());
+        // Module-header comment immediately after shebang (no blank line) preserved (#476)
+        .stdout(predicate::str::contains("# regular comment"));
 }
 
 #[test]

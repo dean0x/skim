@@ -1606,12 +1606,14 @@ fn test_minimal_token_reduction() {
 
 #[test]
 fn test_python_minimal_nested_function_body_comments() {
-    let source = "# top-level comment\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
+    // Source starts with a code statement so the mid-file comment is NOT a module
+    // header and must be stripped. Comments inside function bodies are preserved.
+    let source = "x = 1\n# mid-file comment to strip\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
     let result = transform(source, Language::Python, Mode::Minimal).unwrap();
 
     assert!(
-        !result.contains("top-level comment"),
-        "top-level should be stripped"
+        !result.contains("mid-file comment"),
+        "mid-file comment should be stripped"
     );
     assert!(
         result.contains("comment in outer body"),
@@ -2371,8 +2373,11 @@ fn test_ruby_structure_reduces_tokens() {
 #[test]
 fn test_sql_minimal_reduces_tokens() {
     // SQL structure mode preserves all statements (no function bodies to strip).
-    // Minimal mode strips comments, verifying actual token reduction.
-    let source = include_str!("../../../tests/fixtures/sql/simple.sql");
+    // Minimal mode strips non-header comments, verifying actual token reduction.
+    // Uses comments.sql which has strippable standalone -- comments beyond the
+    // two-line module header (simple.sql only has header comments → no reduction
+    // after the module-header fix in #476).
+    let source = include_str!("../../../tests/fixtures/sql/comments.sql");
     let result = transform(source, Language::Sql, Mode::Minimal).unwrap();
     assert!(
         result.len() < source.len(),
