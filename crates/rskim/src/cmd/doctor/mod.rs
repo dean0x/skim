@@ -459,13 +459,24 @@ fn hook_status_line(
     if !facts.hook_is_current || !facts.pin_is_current {
         let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
         let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
-        let commit_ok = facts.hook_commit.as_deref() == Some(compiled_commit);
-        // Report the most specific cause first.
+        // Mirror hook_is_current()'s treatment of tarball/non-git builds: when
+        // the compiled commit is "unknown" the comparison is not determinable and
+        // must not be reported as a mismatch — doing so would misattribute a
+        // genuine pin mismatch as a "commit mismatch" (Defect 3).
+        let commit_ok = if compiled_commit == "unknown" {
+            true
+        } else {
+            facts.hook_commit.as_deref() == Some(compiled_commit)
+        };
+        // Report the most specific cause first.  The final `else` is the only
+        // reachable terminal: commit_ok ∧ version_ok ⇒ the mismatch is in the
+        // pin path (two clones at the same commit).  The former "stale" fallback
+        // that followed was dead code and has been removed.
         let reason = if !commit_ok {
             format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
         } else if !version_ok {
             format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
-        } else if !facts.pin_is_current {
+        } else {
             // Version and commit match but the pin path differs: two clones at
             // the same commit.  Show both paths so the user can identify which
             // binary is running and which the hook points to.
@@ -475,8 +486,6 @@ fn hook_status_line(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "?".to_string());
             format!("binary pin mismatch (hook: {pin}, running: {running})")
-        } else {
-            "stale".to_string()
         };
         return (
             true,
@@ -1226,6 +1235,95 @@ mod tests {
         assert!(
             info.commit.is_none(),
             "non-skim binary must yield commit: None (--version has no 'skim ' prefix, --commit rejected)"
+        );
+    }
+
+    // ---- Defect 1 + 3: binary pin mismatch coverage (PF-015) ----
+    //
+    // The "binary pin mismatch" path at line ~477 was previously unreachable
+    // from any test: make_installed_facts hardcodes pin_is_current: true, and
+    // the only HookFacts with pin_is_current: false had hook_installed: false
+    // (early return at L385 before any pin logic).  These tests close that gap
+    // at the unit tier (PF-015: display-without-gate — the fix must be covered
+    // at the surface that displays it).
+
+    /// Verified integrity + pin_is_current: false → drift, "binary pin mismatch"
+    /// reason with both the hook pin and the running path in the message.
+    #[test]
+    fn test_hook_status_line_pin_mismatch_verified_is_drift() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.pin_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(drift, "pin mismatch must report drift: {line}");
+        assert!(
+            line.contains("binary pin mismatch"),
+            "message must name the pin mismatch: {line}"
+        );
+        assert!(
+            line.contains("hook: /usr/local/bin/skim"),
+            "message must include the hook pin path: {line}"
+        );
+        assert!(
+            line.contains("running:"),
+            "message must include the running binary path: {line}"
+        );
+        // Must NOT misattribute the cause as a commit or version problem.
+        assert!(
+            !line.contains("commit mismatch"),
+            "must not report commit mismatch when version and commit match: {line}"
+        );
+        assert!(
+            !line.contains("version mismatch"),
+            "must not report version mismatch when version and commit match: {line}"
+        );
+    }
+
+    /// NoManifest integrity + pin_is_current: false → drift, pin-mismatch
+    /// verdict AND the advisory both appear (advisory appended, not substituted).
+    #[test]
+    fn test_hook_status_line_pin_mismatch_no_manifest_appends_advisory() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::NoManifest);
+        facts.pin_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(
+            drift,
+            "pin mismatch is drift regardless of manifest state: {line}"
+        );
+        assert!(
+            line.contains("binary pin mismatch"),
+            "pin-mismatch verdict must survive the advisory composition: {line}"
+        );
+        assert!(
+            line.contains("no integrity manifest"),
+            "advisory must be appended to pin-mismatch verdict, not substituted: {line}"
+        );
+    }
+
+    /// Defect 3: when the compiled commit is "unknown" (tarball/non-git build),
+    /// a genuine pin mismatch must be reported as "binary pin mismatch", NOT as
+    /// "commit mismatch".  Mirrors hook_is_current()'s treatment: when the
+    /// compiled commit is not determinable, the comparison is skipped.
+    #[test]
+    fn test_hook_status_line_unknown_compiled_commit_reports_pin_mismatch_not_commit_mismatch() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        // hook_commit is a real git SHA; the running binary is a tarball build.
+        // hook_is_current: true (version matches; hook_is_current() skips commit
+        // check for "unknown" compiled commit).
+        facts.pin_is_current = false;
+        // Pass "unknown" as compiled_commit to simulate a tarball build.
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "unknown");
+
+        assert!(drift, "pin mismatch must report drift: {line}");
+        assert!(
+            !line.contains("commit mismatch"),
+            "must NOT report commit mismatch for a tarball-build pin mismatch \
+             (the compiled commit is indeterminate): {line}"
+        );
+        assert!(
+            line.contains("binary pin mismatch"),
+            "must report binary pin mismatch, not commit mismatch: {line}"
         );
     }
 }
