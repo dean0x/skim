@@ -157,7 +157,8 @@ fn test_doctor_exits_1_and_names_tamper_after_hook_modification() {
 /// display path had no test that reached it through the real wiring.
 /// Editing the hook script would trip `Tampered` (which early-returns before
 /// any pin logic), so copying the binary is the only correct approach.
-/// All sandbox env vars mirror `skim_sandboxed` to satisfy PF-017.
+/// Both invocations route through `skim_sandboxed_with_bin` (the single
+/// authoritative sandbox env-var block) to satisfy PF-017.
 #[cfg(unix)]
 #[test]
 fn test_doctor_exits_1_on_binary_pin_mismatch() {
@@ -179,10 +180,9 @@ fn test_doctor_exits_1_on_binary_pin_mismatch() {
     }
 
     // Run `init` using the copy so the hook pins to copy_path (via
-    // current_exe() inside the copy).  Mirror every env var that
-    // skim_sandboxed() sets so no state escapes into the developer's real
-    // home directory (PF-017).
-    let status = std::process::Command::new(&copy_path)
+    // current_exe() inside the copy).  Routes through skim_sandboxed_with_bin
+    // so the sandbox env-var block stays in one authoritative place (PF-017).
+    common::skim_sandboxed_with_bin(home, &copy_path)
         .args([
             "init",
             "--agent",
@@ -190,21 +190,9 @@ fn test_doctor_exits_1_on_binary_pin_mismatch() {
             "--no-guidance",
             "--no-wrappers",
         ])
-        .env("HOME", home)
-        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
-        .env("SKIM_CACHE_DIR", home.join(".cache/skim"))
-        .env("SKIM_WRAPPERS_DIR", home.join(".skim").join("bin"))
-        .env("GEMINI_CONFIG_DIR", home.join(".gemini"))
-        .env("COPILOT_CONFIG_DIR", home.join(".copilot"))
-        .env("SKIM_DISABLE_ANALYTICS", "1")
-        .env("NO_COLOR", "1")
-        .env_remove("SKIM_PASSTHROUGH")
-        .env_remove("SKIM_HOOK_VERSION")
-        .env_remove("SKIM_HOOK_BINARY")
         .env("PATH", hermetic_path())
-        .status()
-        .expect("init via copy binary must execute");
-    assert!(status.success(), "init via copy binary must succeed");
+        .assert()
+        .success();
 
     // Run doctor from the original binary: same version/commit, different path
     // → Verified integrity, pin_is_current == false → exit 1 + "binary pin mismatch".
