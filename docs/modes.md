@@ -7,7 +7,7 @@ Skim offers six transformation modes, each with different levels of aggressivene
 | Mode       | Token Reduction | What's Kept                              | What's Removed              |
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
-| Minimal    | 15-30%          | All code, doc comments, Python/Ruby/SQL/Bash module header comments | Non-doc comments (except headers) |
+| Minimal    | 15-30%          | All code, doc comments, Python/Ruby/SQL/Bash module header comments | Non-doc comments; module headers stripped in Rust, C, TypeScript, Go, and all other languages |
 | Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types | Parameter type annotations (Python, TypeScript), generics (except inside preserved return types), decorators, semicolons |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |

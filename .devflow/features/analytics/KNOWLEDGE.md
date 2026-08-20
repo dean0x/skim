@@ -21,13 +21,15 @@ updated: 2026-06-25
 
 ## Overview
 
-This subsystem records per-invocation token-savings data to a local SQLite database (`~/.cache/skim/analytics.db`) so `skim stats` can show dashboards. The core challenge — which produced PF-001 — is that recording must happen AFTER stdout is flushed (streaming contract), token counting is expensive, and short-lived processes exit before background threads finish writing. The subsystem also resolves where all cache state lives; a prior drift (PF-002) caused `SKIM_CACHE_DIR` to relocate only the parser cache but not analytics.db.
+This subsystem records per-invocation token-savings data to a local SQLite database (`~/.cache/skim/analytics.db`) so `skim stats` can show dashboards. The core challenge — which produced PF-001 — is that recording must happen AFTER stdout is flushed (streaming contract), token counting is expensive, and short-lived processes exit before background threads finish writing. The subsystem also resolves where all cache state lives; a prior drift caused `SKIM_CACHE_DIR` to relocate only the parser cache but not `analytics.db`.
 
 Two recording paths exist and must not be conflated: the **file-op path** (`record_file_ops`) for `skim <file>` invocations, and the **subcommand path** (`record_fire_and_forget` / `try_record_command` / `try_record_command_with_counts`) for wrapped tool output (cargo, git, etc.).
 
 ## Business Context
 
 Analytics are purely local and best-effort. They answer "how many tokens did skim save this week across all my projects?" No data leaves the machine. The recording model accepts that occasional rows are silently dropped (e.g. file deleted between main-thread run and background re-read) rather than blocking the primary output path.
+
+Each persisted row also contains `original_cmd` (the invoked skim command, truncated to 500 bytes at a UTF-8 boundary) and `project_path`. To prevent credential leakage, git handlers call `build_analytics_label` (`cmd/git/mod.rs`) which uses `scrub_credential_url` to redact credential-bearing URLs before the label is stored; db and infra handlers use `scrub_db_args`/`scrub_infra_args` for the same purpose.
 
 ## Core Business Rules
 
@@ -66,7 +68,7 @@ The mutex is poison-recovered (`into_inner()`) so a prior thread panic does not 
 
 ### Rule 5: Parallel tokenization, serial persist
 
-Inside `record_file_ops`'s background thread: `rows.into_par_iter().filter_map(...)` resolves all counts in parallel (rayon), then `for rec in records { persist_record(&rec); }` writes serially. This is intentional: rayon is safe for read-only BPE tokenization; SQLite's WAL mode allows concurrent readers but a single writer is simpler and avoids contention errors.
+Inside `record_file_ops`'s background thread: `rows.into_par_iter().filter_map(...)` resolves all counts in parallel (rayon), then opens ONE `AnalyticsDb` connection via `AnalyticsDb::open_default()` and writes all records serially via `db.record(rec)`, followed by a single `db.maybe_prune()`. This is intentional: rayon is safe for read-only BPE tokenization; a single shared connection per batch (not one connection per record) is simpler and avoids SQLite contention. Note: `persist_record` is the OTHER recording path (used by the subcommand path via `record_fire_and_forget`/`record_with_counts`) — do not conflate (Rule 3).
 
 ### Rule 6: Cache-dir single source of truth
 
@@ -123,9 +125,10 @@ Migrations in `schema::run_migrations` are guarded by `PRAGMA user_version` and 
 
 - **Spawning an analytics thread without calling `register_thread`** — the thread handle is dropped immediately, `flush_pending()` never joins it, and short-lived processes exit before the write completes. This was PF-001.
 - **Calling `AnalyticsDb::open_default()` directly from integration tests** — it writes to the real developer `~/.cache/skim/analytics.db`. Always use the test harness helpers.
-- **Adding a second `cache_root` resolver** — any new subsystem needing the cache dir must call `cache::cache_root` / `get_cache_dir`, not re-read `SKIM_CACHE_DIR` directly. Divergence re-introduces PF-002.
+- **Adding a second `cache_root` resolver** — any new subsystem needing the cache dir must call `cache::cache_root` / `get_cache_dir`, not re-read `SKIM_CACHE_DIR` directly. Divergence breaks the cache-dir single-source-of-truth contract: `SKIM_CACHE_DIR` overrides affect some subsystems but not others, silently splitting state across directories.
 - **Mixing the two recording paths** — do not call `try_record_command` for file operations or `record_file_ops` for subcommand output. They set different `command_type` values and have different tokenization semantics.
 - **Running token counting on the main thread before stdout flush** — any BPE tokenization must happen in the background thread, after output is written.
+- **Adding a new wrapper that passes unscrubbed credentials via `original_cmd`** — any wrapper handling git URLs, database connection strings, or API tokens must scrub those values before passing the label to the analytics layer. Use `shared::scrub_credential_url` for URL-form credentials or a handler-specific scrub function (see `scrub_db_args`, `scrub_infra_args`). An unredacted credential is written verbatim to `~/.cache/skim/analytics.db` and retained for 90 days.
 
 ## Gotchas
 
@@ -141,7 +144,7 @@ Migrations in `schema::run_migrations` are guarded by `PRAGMA user_version` and 
 - `crates/rskim/src/analytics/mod.rs` — all recording logic: `record_file_ops`, `record_fire_and_forget`, `register_thread`, `flush_pending`, `AnalyticsDb`, `AnalyticsConfig`, `FileCounts`, `FileOpRow`, `FileOpCommon`, `RawSource`
 - `crates/rskim/src/analytics/schema.rs` — forward-only SQLite migrations (v1–v3)
 - `crates/rskim/src/cache.rs` — `cache_root`, `cache_root_from`, `get_cache_dir` (single source of truth for cache-dir resolution)
-- `crates/rskim/src/cmd/hook_log.rs` — `CacheEnv` delegates to `cache_root_from`; hook.log rotation; proves the PF-002 fix is consistent across subsystems
+- `crates/rskim/src/cmd/hook_log.rs` — `CacheEnv` delegates to `cache_root_from`; hook.log rotation; demonstrates that the cache-dir fix is consistent across subsystems
 - `crates/rskim/src/main.rs` — `flush_pending()` call site; `AnalyticsConfig::from_process`; `record_file_analytics` helper; `parse_session_id`; `THREADS_SPAWNED` guard
 - `crates/rskim/src/multi.rs` — `MultiFileOptions.analytics_enabled`; bulk `FileOpRow` construction for glob/dir paths; calls `record_file_ops`
 - `crates/rskim/src/process.rs` — `ProcessResult.stdin_raw` (buffer for stdin analytics); `ProcessResult.language` / `parse_tier` fields consumed by recording layer
@@ -151,4 +154,4 @@ Migrations in `schema::run_migrations` are guarded by `PRAGMA user_version` and 
 
 - ADR-001: net-savings compression guard caps tokenization INPUT at 256 KiB in the output/compression-decision guard — NOT in analytics. Analytics tokenization is bounded instead by the 50 MB `read_source` guard in `process.rs`.
 - PF-001 (resolved): plain `skim <file>` analytics was gated on parser-cache-carried token counts; fixed by the `record_file_ops` background recorder with `register_thread`.
-- PF-002 (resolved): `SKIM_CACHE_DIR` only relocated parser cache, not analytics.db; fixed by routing all subsystems through `cache::cache_root` / `cache_root_from`.
+- Cache-dir drift (resolved): `SKIM_CACHE_DIR` previously relocated only the parser cache but not `analytics.db`; fixed by routing all subsystems through `cache::cache_root` / `cache_root_from`.
