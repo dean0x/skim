@@ -549,9 +549,8 @@ mod tests {
              export SKIM_HOOK_VERSION=\"2.5.1\"\n\
              export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
              export SKIM_HOOK_COMMIT=abc1234\n\
-             _SKIM_BIN='/usr/local/bin/skim'\n\
-             if [ -x \"$_SKIM_BIN\" ]; then\n\
-               exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code\n\
+             if [ -x \"$SKIM_HOOK_BINARY\" ]; then\n\
+               exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent claude-code\n\
              fi\n\
              exec skim rewrite --hook --agent claude-code\n",
         )

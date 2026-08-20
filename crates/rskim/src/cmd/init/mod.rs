@@ -36,6 +36,7 @@ pub(crate) use flags::PermissionsTier;
 pub(crate) use helpers::atomic_write_settings;
 pub(crate) use helpers::backup_settings_file;
 pub(crate) use helpers::load_or_create_settings;
+pub(crate) use helpers::resolve_skim_binary;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;
 
@@ -167,9 +168,9 @@ pub(crate) fn run(
 /// Returns `true` when hook script `contents` exports `SKIM_HOOK_BINARY`,
 /// indicating the F6 pinned-binary format.
 ///
-/// This is the single source of truth for the "has pinned binary marker" scan,
-/// shared by `uses_pinned_binary` (state detection) and `is_hook_script_current`
-/// (reinstall idempotence check) so that a format change updates both in lockstep.
+/// This is the single source of truth for the "has pinned binary marker" scan
+/// used by `uses_pinned_binary` in state detection, so a format change
+/// updates all detection sites in lockstep.
 pub(super) fn script_has_pinned_marker(contents: &str) -> bool {
     contents
         .lines()

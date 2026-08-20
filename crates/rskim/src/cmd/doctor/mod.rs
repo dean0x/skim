@@ -369,7 +369,7 @@ fn print_path_section(entries: &[PathEntry]) -> bool {
 ///
 /// Design decisions:
 /// - `Tampered`   → drift (`✗`), names the suppression coupling.
-/// - `Unreadable` → drift (`✗`), names the suppression coupling.
+/// - `Unreadable` → drift (`✗`).
 /// - `NoManifest` → advisory only (`⚠`), **not** drift — users who installed
 ///   before manifests existed have done nothing wrong and must not have their
 ///   `skim doctor` exit-0 broken (applies ADR-004 backward-compat intent).
@@ -456,41 +456,40 @@ fn hook_status_line(
         );
     }
 
-    if !facts.hook_is_current || !facts.pin_is_current {
+    // Hook script is stale (version or commit mismatch) → drift.
+    if !facts.hook_is_current {
         let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
         let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
-        // Mirror hook_is_current()'s treatment of tarball/non-git builds: when
-        // the compiled commit is "unknown" the comparison is not determinable and
-        // must not be reported as a mismatch — doing so would misattribute a
-        // genuine pin mismatch as a "commit mismatch" (Defect 3).
-        let commit_ok = if compiled_commit == "unknown" {
-            true
-        } else {
-            facts.hook_commit.as_deref() == Some(compiled_commit)
-        };
-        // Report the most specific cause first.  The final `else` is the only
-        // reachable terminal: commit_ok ∧ version_ok ⇒ the mismatch is in the
-        // pin path (two clones at the same commit).  The former "stale" fallback
-        // that followed was dead code and has been removed.
-        let reason = if !commit_ok {
-            format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
-        } else if !version_ok {
+        // With hook_uses_pinned_binary confirmed above, !hook_is_current means
+        // either version or commit mismatches.  `version_ok` distinguishes them;
+        // no separate commit_ok derivation needed (D4: derived from hook_is_current).
+        let reason = if !version_ok {
             format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
         } else {
-            // Version and commit match but the pin path differs: two clones at
-            // the same commit.  Show both paths so the user can identify which
-            // binary is running and which the hook points to.
-            let running = std::env::current_exe()
-                .ok()
-                .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "?".to_string());
-            format!("binary pin mismatch (hook: {pin}, running: {running})")
+            // Pinned format confirmed + version matches → commit must differ.
+            format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
         };
         return (
             true,
             append_advisory(format!(
                 "  ✗ {agent_cli_name}  installed  pin: {pin}  [{reason}]  — \
+                 run `./target/release/skim init --yes` to update"
+            )),
+        );
+    }
+
+    // Pin path differs from running binary — advisory only, not drift (C-1 fix: two-clone
+    // scenario where version and commit match but the hook still points to the wrong clone).
+    if !facts.pin_is_current {
+        let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
+        let running = crate::cmd::init::resolve_skim_binary()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "?".to_string());
+        return (
+            false,
+            append_advisory(format!(
+                "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}  \
+                 [binary pin mismatch (hook: {pin}, running: {running})] — \
                  run `./target/release/skim init --yes` to update"
             )),
         );
@@ -703,10 +702,10 @@ fn print_staleness_section(compiled_commit: &str) -> bool {
 
     if !commit_exists {
         println!(
-            "  ✗  SHA {compiled_commit} not found in this repo — \
-             built from a different repository"
+            "  –  SHA {compiled_commit} not in this repo — \
+             binary built from a different repository (not a staleness error)"
         );
-        return true;
+        return false;
     }
 
     // Count commits between compiled SHA and HEAD.
@@ -1238,35 +1237,36 @@ mod tests {
         );
     }
 
-    // ---- Defect 1 + 3: binary pin mismatch coverage (PF-015) ----
+    // ---- C-1: binary pin mismatch is advisory, not drift (PF-015) ----
     //
-    // The "binary pin mismatch" path at line ~477 was previously unreachable
-    // from any test: make_installed_facts hardcodes pin_is_current: true, and
-    // the only HookFacts with pin_is_current: false had hook_installed: false
-    // (early return at L385 before any pin logic).  These tests close that gap
-    // at the unit tier (PF-015: display-without-gate — the fix must be covered
-    // at the surface that displays it).
+    // After C-1, `pin_is_current: false` (two-clone scenario: version and commit
+    // match but binary paths differ) is an advisory (⚠), not drift (✗).  These
+    // tests verify that `hook_status_line` returns `is_drift == false` for all
+    // pin-mismatch states and that the advisory message is correctly composed.
 
-    /// Verified integrity + pin_is_current: false → drift, "binary pin mismatch"
-    /// reason with both the hook pin and the running path in the message.
+    /// Verified integrity + pin_is_current: false → advisory (⚠), NOT drift.
+    /// The "binary pin mismatch" message must appear with both paths.
     #[test]
-    fn test_hook_status_line_pin_mismatch_verified_is_drift() {
+    fn test_hook_status_line_pin_mismatch_verified_is_advisory() {
         let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
         facts.pin_is_current = false;
         let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
 
-        assert!(drift, "pin mismatch must report drift: {line}");
+        assert!(
+            !drift,
+            "pin mismatch must NOT report drift (C-1 fix): {line}"
+        );
         assert!(
             line.contains("binary pin mismatch"),
-            "message must name the pin mismatch: {line}"
+            "advisory must name the pin mismatch: {line}"
         );
         assert!(
             line.contains("hook: /usr/local/bin/skim"),
-            "message must include the hook pin path: {line}"
+            "advisory must include the hook pin path: {line}"
         );
         assert!(
             line.contains("running:"),
-            "message must include the running binary path: {line}"
+            "advisory must include the running binary path: {line}"
         );
         // Must NOT misattribute the cause as a commit or version problem.
         assert!(
@@ -1279,8 +1279,8 @@ mod tests {
         );
     }
 
-    /// NoManifest integrity + pin_is_current: false → drift, pin-mismatch
-    /// verdict AND the advisory both appear (advisory appended, not substituted).
+    /// NoManifest integrity + pin_is_current: false → advisory (NOT drift).
+    /// Both the pin-mismatch advisory and the no-manifest note must appear.
     #[test]
     fn test_hook_status_line_pin_mismatch_no_manifest_appends_advisory() {
         let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::NoManifest);
@@ -1288,23 +1288,22 @@ mod tests {
         let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
 
         assert!(
-            drift,
-            "pin mismatch is drift regardless of manifest state: {line}"
+            !drift,
+            "pin mismatch is advisory regardless of manifest state (C-1 fix): {line}"
         );
         assert!(
             line.contains("binary pin mismatch"),
-            "pin-mismatch verdict must survive the advisory composition: {line}"
+            "pin-mismatch advisory must survive the no-manifest composition: {line}"
         );
         assert!(
             line.contains("no integrity manifest"),
-            "advisory must be appended to pin-mismatch verdict, not substituted: {line}"
+            "no-manifest note must be appended to pin-mismatch advisory: {line}"
         );
     }
 
-    /// Defect 3: when the compiled commit is "unknown" (tarball/non-git build),
-    /// a genuine pin mismatch must be reported as "binary pin mismatch", NOT as
-    /// "commit mismatch".  Mirrors hook_is_current()'s treatment: when the
-    /// compiled commit is not determinable, the comparison is skipped.
+    /// When the compiled commit is "unknown" (tarball/non-git build),
+    /// a genuine pin mismatch must be reported as "binary pin mismatch" (advisory),
+    /// NOT as "commit mismatch".  Mirrors hook_is_current()'s treatment.
     #[test]
     fn test_hook_status_line_unknown_compiled_commit_reports_pin_mismatch_not_commit_mismatch() {
         let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
@@ -1315,7 +1314,10 @@ mod tests {
         // Pass "unknown" as compiled_commit to simulate a tarball build.
         let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "unknown");
 
-        assert!(drift, "pin mismatch must report drift: {line}");
+        assert!(
+            !drift,
+            "pin mismatch is advisory, not drift (C-1 fix): {line}"
+        );
         assert!(
             !line.contains("commit mismatch"),
             "must NOT report commit mismatch for a tarball-build pin mismatch \
@@ -1323,7 +1325,7 @@ mod tests {
         );
         assert!(
             line.contains("binary pin mismatch"),
-            "must report binary pin mismatch, not commit mismatch: {line}"
+            "must report binary pin mismatch advisory, not commit mismatch: {line}"
         );
     }
 }

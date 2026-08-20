@@ -83,7 +83,7 @@ impl DriftEnv {
             hook_commit: std::env::var("SKIM_HOOK_COMMIT")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            current_exe: std::env::current_exe().and_then(std::fs::canonicalize).ok(),
+            current_exe: crate::cmd::init::resolve_skim_binary().ok(),
             compiled_version: env!("CARGO_PKG_VERSION").to_string(),
             compiled_commit: option_env!("SKIM_GIT_COMMIT")
                 .unwrap_or("unknown")

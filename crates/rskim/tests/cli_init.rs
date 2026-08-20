@@ -67,22 +67,22 @@ fn test_init_creates_hook_script() {
         content.contains("rewrite --hook"),
         "Should exec rewrite --hook"
     );
-    // F6: pinned binary format — SKIM_HOOK_BINARY and _SKIM_BIN must be present.
+    // Pinned binary format (D5): SKIM_HOOK_BINARY exec directly (no _SKIM_BIN indirection).
     assert!(
         content.contains("export SKIM_HOOK_BINARY="),
-        "Hook script must export SKIM_HOOK_BINARY (F6 pinned binary format), got:\n{content}"
+        "Hook script must export SKIM_HOOK_BINARY (pinned binary format), got:\n{content}"
     );
     assert!(
         content.contains("export SKIM_HOOK_COMMIT="),
-        "Hook script must export SKIM_HOOK_COMMIT (F6 pinned binary format), got:\n{content}"
+        "Hook script must export SKIM_HOOK_COMMIT (pinned binary format), got:\n{content}"
     );
     assert!(
-        content.contains("_SKIM_BIN="),
-        "Hook script must set _SKIM_BIN variable, got:\n{content}"
+        !content.contains("_SKIM_BIN="),
+        "Hook script must NOT set the redundant _SKIM_BIN variable (D5 removed it), got:\n{content}"
     );
     assert!(
-        content.contains("exec \"$_SKIM_BIN\" rewrite --hook"),
-        "Hook script must exec via pinned binary, got:\n{content}"
+        content.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook"),
+        "Hook script must exec via $SKIM_HOOK_BINARY directly, got:\n{content}"
     );
     // PATH fallback must be present as a safety net.
     assert!(
@@ -220,8 +220,12 @@ fn test_init_migrates_bare_command_format_to_pinned() {
         "Migrated script must export SKIM_HOOK_BINARY, got:\n{content}"
     );
     assert!(
-        content.contains("exec \"$_SKIM_BIN\" rewrite --hook"),
-        "Migrated script must exec via pinned binary variable, got:\n{content}"
+        content.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook"),
+        "Migrated script must exec via $SKIM_HOOK_BINARY directly (D5), got:\n{content}"
+    );
+    assert!(
+        !content.contains("_SKIM_BIN="),
+        "Migrated script must not set _SKIM_BIN (D5 removed it), got:\n{content}"
     );
     // PATH fallback must still be present.
     assert!(
@@ -1620,24 +1624,16 @@ fn test_gemini_dry_run_shows_before_tool_hook_key() {
 }
 
 // ============================================================================
-// B5c-CLI follow-up: commit drift triggers rewrite (#466 second gate)
+// B5c-CLI: commit drift triggers rewrite
 // ============================================================================
-//
-// The unit test `test_hook_is_current_commit_mismatch_returns_false` in
-// state.rs called `hook_is_current()` directly, so it passed — but the CLI
-// path that drives `create_hook_script()` used a separate, version-only gate
-// (`is_hook_script_current`) that was NOT updated by PR #468.  These tests
-// drive the actual `skim init` binary to close that gap.
 
 /// B5c-CLI: `skim init --yes` must rewrite the hook script when the installed
 /// script records a stale git commit but the version is current.
 ///
-/// Why the old unit tests missed this: they called `hook_is_current()` and
-/// `is_hook_script_current()` in isolation.  The CLI path that decides whether
-/// to call `create_hook_script()` uses `hook_is_current()` (correct); but
-/// inside `create_hook_script()` there was a second, independent version-only
-/// check that short-circuited before any write, printing "Skipped: … (already
-/// v…)" even when the commit had drifted.
+/// This drives the actual `skim init` binary to cover the full detection path:
+/// `detect_state` reads the script, `hook_is_current()` returns false (stale
+/// commit), the fast path is skipped, and `create_hook_script` rewrites the
+/// script with the current commit.
 #[test]
 fn test_init_rewrites_hook_on_stale_commit_same_version() {
     let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
@@ -1667,8 +1663,7 @@ fn test_init_rewrites_hook_on_stale_commit_same_version() {
          export SKIM_HOOK_VERSION=\"{version}\"\n\
          export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
          export SKIM_HOOK_COMMIT={stale}\n\
-         _SKIM_BIN='/usr/local/bin/skim'\n\
-         if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
+         if [ -x \"$SKIM_HOOK_BINARY\" ]; then exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent claude-code; fi\n\
          exec skim rewrite --hook --agent claude-code\n",
         version = current_version,
         stale = stale_commit,
@@ -1721,66 +1716,16 @@ fn test_init_skips_when_version_and_commit_are_current() {
 }
 
 // ============================================================================
-// Fix 1: pin-path mismatch triggers reinstall (#477)
+// Fix 1: `init --wrappers` on a current install runs wrappers (C-3)
 // ============================================================================
 
-/// When the hook script's `SKIM_HOOK_BINARY` pin points to a different path
-/// than the running binary (same version, same commit — two-clone scenario),
-/// `skim init --yes` must NOT report "Already up to date" and must rewrite
-/// the script so the pin points to the correct binary.
-#[test]
-fn test_init_rewrites_hook_when_pin_path_differs() {
-    let dir = TempDir::new().unwrap();
-    let config = dir.path();
-
-    // Step 1: Fresh install — hook script records the real binary path.
-    skim_init_cmd(config).args(["--yes"]).assert().success();
-
-    // Step 2: Overwrite the hook script with the same version + commit but a
-    // WRONG binary path (simulates the sibling-clone scenario).
-    let hook_path = config.join("hooks/skim-rewrite.sh");
-    let current_version = env!("CARGO_PKG_VERSION");
-    let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-    let wrong_binary = "/some/other/clone/target/release/skim";
-    let patched_script = format!(
-        "#!/usr/bin/env bash\n\
-         # skim-hook v{version}\n\
-         # Generated by: skim init -- do not edit manually\n\
-         export SKIM_HOOK_VERSION=\"{version}\"\n\
-         export SKIM_HOOK_BINARY='{wrong}'\n\
-         export SKIM_HOOK_COMMIT={commit}\n\
-         _SKIM_BIN='{wrong}'\n\
-         if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
-         exec skim rewrite --hook --agent claude-code\n",
-        version = current_version,
-        commit = compiled_commit,
-        wrong = wrong_binary,
-    );
-    fs::write(&hook_path, &patched_script).unwrap();
-
-    // Step 3: Re-run init — must detect the pin-path mismatch and rewrite.
-    skim_init_cmd(config)
-        .args(["--yes"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Already up to date").not());
-
-    // Step 4: The rewritten script must no longer reference the wrong path.
-    let updated = fs::read_to_string(&hook_path).unwrap();
-    assert!(
-        !updated.contains(wrong_binary),
-        "Rewritten script must not contain the wrong binary path, got:\n{updated}"
-    );
-}
-
-// ============================================================================
-// Fix 2: `init --wrappers` on a current install runs wrappers (#478)
-// ============================================================================
-
-/// `skim init --wrappers` on a fully-current hook install must NOT exit via
-/// the "Already up to date" fast path.  Before the fix, `wrappers_blocks_fast_path`
-/// was absent, so `--wrappers` on a current install silently skipped 55 lines
-/// before reaching `maybe_install_wrappers`.
+/// `skim init --wrappers` on a fully-current hook install must install wrappers
+/// even though the fast path fires (C-3 fix: `maybe_install_wrappers` now runs
+/// inside the fast path before `print_already_up_to_date`).
+///
+/// Previously `--wrappers` bypassed the fast path entirely; after C-3 the fast
+/// path IS hit and "Already up to date" IS printed, but wrappers ARE still
+/// installed because they run first inside the fast-path block.
 #[test]
 fn test_init_wrappers_bypasses_fast_path() {
     let home = TempDir::new().unwrap();
@@ -1797,7 +1742,7 @@ fn test_init_wrappers_bypasses_fast_path() {
         .assert()
         .success();
 
-    // Step 2: Re-run with --wrappers — must NOT print "Already up to date".
+    // Step 2: Re-run with --wrappers — fast path fires AND wrappers are installed.
     let out = common::skim_sandboxed(home_path)
         .arg("init")
         .args(["--yes", "--wrappers"])
@@ -1806,13 +1751,206 @@ fn test_init_wrappers_bypasses_fast_path() {
 
     assert!(out.status.success(), "init --wrappers must succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // After C-3: fast path fires (wrappers run inside it), so "Already up to date"
+    // IS printed at the end.
     assert!(
-        !stdout.contains("Already up to date"),
-        "init --wrappers on a current install must NOT hit the fast path, got:\n{stdout}"
+        stdout.contains("Already up to date"),
+        "init --wrappers on a current install must print the fast-path message after installing wrappers, got:\n{stdout}"
     );
     // The wrappers line must appear (created or already-correct).
     assert!(
         stdout.contains("Wrappers:"),
         "init --wrappers on a current install must run wrapper installation, got:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// Fix 2: `init --force` bypasses fast path (A-1)
+// ============================================================================
+
+/// `skim init --force` on a fully-current install must NOT exit via the fast
+/// path — it must run the full install path even when everything is up to date.
+///
+/// Before A-1, `flags.force` was never read in `install.rs` so `--force` was
+/// silently a no-op (empirically confirmed; see empirical-doctor-init-verification.md).
+#[test]
+fn test_init_force_bypasses_fast_path() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path();
+
+    fs::create_dir_all(home_path.join(".claude")).unwrap();
+
+    // Step 1: Fresh install — hook becomes current.
+    common::skim_sandboxed(home_path)
+        .arg("init")
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+
+    // Step 2: Re-run with --force — must NOT print "Already up to date".
+    let out = common::skim_sandboxed(home_path)
+        .arg("init")
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+            "--force",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "init --force must succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("Already up to date"),
+        "init --force must NOT hit the fast path on a current install, got:\n{stdout}"
+    );
+}
+
+/// `skim init --force` on an install whose hook lacks `SKIM_HOOK_BINARY` (absent
+/// pin, repairable) must rewrite the hook script and add the pin.
+///
+/// This exercises the repair path: even though the hook's format is stale
+/// (`hook_is_current() == false`), `--force` ensures we always run through the
+/// full install path.  Without `--force`, the same result is reached via the
+/// slow path (hook is already detected as stale), so the test mainly demonstrates
+/// that `--force` does not interfere with the repair.
+#[test]
+fn test_init_force_repairs_unpinned_hook() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path();
+
+    fs::create_dir_all(home_path.join(".claude")).unwrap();
+
+    // Step 1: Write a pre-pin hook script directly (simulates a legacy install
+    // without SKIM_HOOK_BINARY).
+    let hooks_dir = home_path.join(".claude/hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook_path = hooks_dir.join("skim-rewrite.sh");
+    let version = env!("CARGO_PKG_VERSION");
+    let unpinned_script = format!(
+        "#!/usr/bin/env bash\n\
+         # skim-hook v{version}\n\
+         export SKIM_HOOK_VERSION=\"{version}\"\n\
+         exec skim rewrite --hook --agent claude-code\n"
+    );
+    fs::write(&hook_path, &unpinned_script).unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    // Also create a minimal settings.json so init can find the hook entry.
+    let settings_path = home_path.join(".claude/settings.json");
+    fs::write(
+        &settings_path,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"","hooks":[{"type":"command","command":"skim-rewrite.sh rewrite --hook --agent claude-code"}]}]}}"#,
+    )
+    .unwrap();
+
+    // Step 2: Run init with --force — must detect the missing pin and rewrite.
+    common::skim_sandboxed(home_path)
+        .arg("init")
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+            "--force",
+        ])
+        .assert()
+        .success();
+
+    // Step 3: Rewritten script must export SKIM_HOOK_BINARY.
+    let updated = fs::read_to_string(&hook_path).unwrap();
+    assert!(
+        updated.contains("export SKIM_HOOK_BINARY="),
+        "repaired script must export SKIM_HOOK_BINARY, got:\n{updated}"
+    );
+    // And must NOT use the old _SKIM_BIN local variable (D5 cleanup).
+    assert!(
+        !updated.contains("_SKIM_BIN="),
+        "repaired script must not set _SKIM_BIN (D5 removed it), got:\n{updated}"
+    );
+}
+
+// ============================================================================
+// Fix 3: repeat `init --wrappers` does not clobber settings.json.bak (C-3)
+// ============================================================================
+
+/// Running `skim init --wrappers` twice on a current install must NOT clobber
+/// `settings.json.bak`.  Before C-3, `--wrappers` bypassed the fast path and
+/// re-ran `execute_install`, which re-invoked `patch_settings` which created a
+/// new `.bak` that overwrote the user's original backup.
+#[test]
+fn test_init_repeat_wrappers_does_not_clobber_bak() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path();
+
+    fs::create_dir_all(home_path.join(".claude")).unwrap();
+
+    // Write a sentinel settings.json so patch_settings has something to back up.
+    let settings_path = home_path.join(".claude/settings.json");
+    let original_content = r#"{"custom":"user setting"}"#;
+    fs::write(&settings_path, original_content).unwrap();
+
+    let bak_path = home_path.join(".claude/settings.json.bak");
+
+    // Step 1: First install with --wrappers — creates bak from the original file.
+    common::skim_sandboxed(home_path)
+        .arg("init")
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--wrappers",
+        ])
+        .assert()
+        .success();
+
+    // The bak must exist and preserve the original content.
+    assert!(
+        bak_path.exists(),
+        "settings.json.bak must be created on first install"
+    );
+    let bak_after_first = fs::read_to_string(&bak_path).unwrap();
+    assert!(
+        bak_after_first.contains("user setting"),
+        "bak must preserve original content, got:\n{bak_after_first}"
+    );
+
+    // Step 2: Second install with --wrappers on a now-current hook.
+    // After C-3: fast path fires (wrappers run inside it, hook is NOT reinstalled),
+    // so settings.json is NOT re-read and bak is NOT overwritten.
+    common::skim_sandboxed(home_path)
+        .arg("init")
+        .args([
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--wrappers",
+        ])
+        .assert()
+        .success();
+
+    // The bak must still contain the original content — NOT the post-install
+    // settings.json (which has the skim hook entry added).
+    let bak_after_second = fs::read_to_string(&bak_path).unwrap();
+    assert_eq!(
+        bak_after_first, bak_after_second,
+        "settings.json.bak must not be clobbered by a second --wrappers run"
     );
 }

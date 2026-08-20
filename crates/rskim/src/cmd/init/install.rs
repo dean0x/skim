@@ -10,10 +10,7 @@ use super::helpers::{
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
-use super::state::{
-    DetectedState, detect_state, has_skim_hook_entry, parse_binary_pin_from_script,
-    parse_commit_from_script, read_settings_json,
-};
+use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
@@ -153,26 +150,6 @@ fn print_completion_message(agent_name: &str) {
 // ============================================================================
 // Permissions install helpers
 // ============================================================================
-
-/// Returns `true` when the "already up to date" fast path must be bypassed
-/// because wrapper installation was explicitly requested.
-///
-/// Rule (mirrors `permissions_blocks_fast_path`):
-/// - `Some(true)`  → always block (explicit `--wrappers` flag).
-/// - `Some(false)` → never block (explicit `--no-wrappers` flag).
-/// - `None`        → never block — this is load-bearing.  When no wrapper flag is
-///   given, `maybe_install_wrappers` prompts the user interactively (on a TTY) or
-///   skips silently (non-TTY).  If `None` were to block the fast path, every
-///   non-TTY `skim init` invocation (CI, test harness) would fall through and
-///   reinstall the hook on each run, breaking idempotence tests such as
-///   `test_init_skips_when_version_and_commit_are_current`.
-fn wrappers_blocks_fast_path(flags: &InitFlags) -> bool {
-    match flags.wrappers {
-        Some(true) => true, // explicit --wrappers: bypass fast path so wrappers are installed
-        Some(false) => false, // explicit --no-wrappers: fast path safe
-        None => false,      // no flag: interactive prompt fires after hook; don't block
-    }
-}
 
 /// Returns `true` when the "already up to date" fast path must be bypassed
 /// because permissions work may be needed.
@@ -500,15 +477,22 @@ fn run_install_single(
     let manifest_present =
         crate::cmd::integrity::read_hash_manifest(&state.hook_config_dir, state.agent_cli_name)
             .is_some();
-    let wrappers_blocked = wrappers_blocks_fast_path(flags);
     if state.hook_installed
         && state.hook_is_current()
-        && state.pin_is_current()
         && guidance_current
         && !permissions_blocked
-        && !wrappers_blocked
+        && !flags.force
         && manifest_present
     {
+        // Wrappers run inside the fast path so that `skim init --wrappers` on a
+        // current hook install still installs wrappers without falling through to
+        // a full reinstall (C-3 fix: repeat `--wrappers` no longer clobbers
+        // settings.json.bak).  `flags.dry_run` is forwarded so `--dry-run
+        // --wrappers` on a current install shows dry-run output rather than
+        // actually creating symlinks.
+        if !flags.project {
+            maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
+        }
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -824,59 +808,6 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
 // Hook script generation (B7)
 // ============================================================================
 
-/// Return `true` when the script at `script_path` is fully current: correct
-/// version marker, pinned-binary format (F6), **and** the same git commit as
-/// the running binary.
-///
-/// Three conditions must all hold:
-/// 1. The `# skim-hook v{version}` marker matches the current semver.
-/// 2. The script exports `SKIM_HOOK_BINARY` (F6 pinned-binary format; old
-///    bare-exec scripts lack it and must be regenerated).
-/// 3. The `export SKIM_HOOK_COMMIT=` line matches the compiled-in
-///    `SKIM_GIT_COMMIT`. When the compiled commit is `"unknown"` (tarball /
-///    crates.io builds have no git SHA) the commit check is **skipped** so
-///    these builds do not rewrite on every invocation.
-///
-/// # #466 follow-up — the second gate
-///
-/// `hook_is_current()` on `DetectedState` (state.rs) was fixed by PR #468 to
-/// include the commit comparison, but `create_hook_script` had its own
-/// independent version-only gate here that was not updated. This function is
-/// the fix: it mirrors the same commit logic so both gates agree.
-fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string(script_path) else {
-        return false;
-    };
-    let version_line = format!("# skim-hook v{version}");
-    if !(contents.contains(&version_line) && super::script_has_pinned_marker(&contents)) {
-        return false;
-    }
-    // B5c follow-up: also require the recorded commit to match the compiled one.
-    // Skip when the compiled commit is "unknown" (tarball builds have no git SHA).
-    let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-    if compiled_commit != "unknown" {
-        match parse_commit_from_script(&contents) {
-            Some(ref hook_commit) if hook_commit == compiled_commit => {}
-            // Absent commit (pre-commit-pinning script) or mismatched commit → stale.
-            _ => return false,
-        }
-    }
-    // #477: also require the binary pin to match the running binary.
-    // When two clones share the same version and commit the version+commit checks
-    // above both pass, but the hook still pins the wrong clone. Comparing the
-    // canonical paths catches this case and triggers a rewrite.
-    if let Some(pin) = parse_binary_pin_from_script(&contents)
-        && let Ok(running) = super::helpers::resolve_skim_binary()
-    {
-        let pin_path = std::path::Path::new(pin.as_str());
-        let canon_pin = std::fs::canonicalize(pin_path).unwrap_or_else(|_| pin_path.to_owned());
-        if running != canon_pin {
-            return false;
-        }
-    }
-    true
-}
-
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     let hooks_dir = state.hook_config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
@@ -891,9 +822,10 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         }
     }
 
-    // Check if existing script has same version (idempotent)
+    // Check if existing script is current (idempotent).
+    // Uses the already-detected hook state rather than re-reading the script.
     if script_path.exists() {
-        if is_hook_script_current(&script_path, &state.skim_version) {
+        if state.hook_is_current() {
             // Script is current — write (or re-write) the manifest so `skim init`
             // self-heals a missing or stale sidecar.  This makes doctor's advice
             // ("run `skim init --agent {agent}`") actually work (Group 4 fix / #471).
@@ -1514,157 +1446,6 @@ mod tests {
             entries.len(),
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
-        );
-    }
-
-    // ---- is_hook_script_current ----
-
-    #[test]
-    fn test_is_hook_script_current_pinned_format_returns_true() {
-        // B5c follow-up: the commit in the script must match the compiled commit.
-        // Use the actual compiled commit so the check passes, or any placeholder
-        // when the compiled commit is "unknown" (tarball build, check skipped).
-        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        let hook_commit = if compiled_commit == "unknown" {
-            "abc1234".to_string()
-        } else {
-            compiled_commit.to_string()
-        };
-
-        // #477: pin-path check compares SKIM_HOOK_BINARY against current_exe().
-        // Use the actual running binary so the check passes in all build environments.
-        let running_binary = std::env::current_exe()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // New F6 pinned format: version comment + SKIM_HOOK_BINARY export + current commit.
-        let content = format!(
-            "#!/bin/sh\n# skim-hook v1.2.3\n\
-             export SKIM_HOOK_BINARY='{running_binary}'\n\
-             export SKIM_HOOK_COMMIT={hook_commit}\n\
-             _SKIM_BIN='{running_binary}'\n\
-             if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
-             exec skim rewrite --hook --agent claude-code\n"
-        );
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            is_hook_script_current(&path, "1.2.3"),
-            "matching version + SKIM_HOOK_BINARY export + matching commit + matching binary path must return true"
-        );
-    }
-
-    /// B5c follow-up (#466 second gate): `is_hook_script_current` must return
-    /// `false` when the version matches but the recorded commit differs from the
-    /// compiled binary's commit.
-    ///
-    /// This is the unit-level companion to the CLI regression test in
-    /// `cli_init.rs::test_init_rewrites_hook_on_stale_commit_same_version`.
-    #[test]
-    fn test_is_hook_script_current_stale_commit_returns_false() {
-        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        if compiled_commit == "unknown" {
-            // Tarball build: commit check is skipped; nothing to assert.
-            return;
-        }
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Script has the right version and pinned-binary marker, but a STALE commit.
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
-                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       export SKIM_HOOK_COMMIT=000000000stale\n\
-                       _SKIM_BIN='/usr/local/bin/skim'\n\
-                       if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
-                       exec skim rewrite --hook --agent claude-code\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "stale commit must cause is_hook_script_current to return false even when version matches"
-        );
-    }
-
-    /// B5c follow-up: a script that has the right version and pinned binary but
-    /// NO commit line (predates commit pinning) must be treated as stale.
-    #[test]
-    fn test_is_hook_script_current_missing_commit_returns_false() {
-        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        if compiled_commit == "unknown" {
-            // Tarball build: commit check is skipped; nothing to assert.
-            return;
-        }
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Script has correct version + pinned-binary marker but NO SKIM_HOOK_COMMIT.
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
-                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       _SKIM_BIN='/usr/local/bin/skim'\n\
-                       exec skim rewrite --hook --agent claude-code\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "script without SKIM_HOOK_COMMIT must be treated as stale (predates commit pinning)"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_old_bare_exec_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Pre-F6 bare-exec format is stale — no SKIM_HOOK_BINARY export.
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\nexec skim rewrite --hook \"$@\"\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "old bare-exec format (no SKIM_HOOK_BINARY) must return false even when version matches"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_wrong_version_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Script has v1.0.0 with new pinned format but we check for v2.0.0
-        let content = "#!/bin/sh\n# skim-hook v1.0.0\n\
-                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       exec skim rewrite --hook\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "2.0.0"),
-            "mismatched version must return false"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_missing_file_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.sh");
-
-        assert!(
-            !is_hook_script_current(&path, "1.0.0"),
-            "unreadable/missing file must return false"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_missing_pinned_binary_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Version matches but no SKIM_HOOK_BINARY export at all
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\nskim rewrite --hook \"$@\"\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "missing SKIM_HOOK_BINARY export must return false even when version matches"
         );
     }
 
@@ -2425,52 +2206,6 @@ mod tests {
         assert!(
             !super::permissions_blocks_fast_path(&flags, AgentKind::ClaudeCode, tmp.path()),
             "None with no sidecar must not block the fast path"
-        );
-    }
-
-    // ---- wrappers_blocks_fast_path ----
-
-    fn make_flags_with_wrappers(wrappers: Option<bool>) -> super::super::flags::InitFlags {
-        super::super::flags::InitFlags {
-            project: false,
-            yes: false,
-            dry_run: false,
-            uninstall: false,
-            force: false,
-            no_guidance: false,
-            agent: None,
-            wrappers,
-            permissions: None,
-            permissions_tier: super::super::flags::PermissionsTier::Seed,
-        }
-    }
-
-    #[test]
-    fn test_wrappers_blocks_fast_path_some_true_blocks() {
-        let flags = make_flags_with_wrappers(Some(true));
-        assert!(
-            super::wrappers_blocks_fast_path(&flags),
-            "Some(true) (--wrappers) must block the fast path"
-        );
-    }
-
-    #[test]
-    fn test_wrappers_blocks_fast_path_some_false_does_not_block() {
-        let flags = make_flags_with_wrappers(Some(false));
-        assert!(
-            !super::wrappers_blocks_fast_path(&flags),
-            "Some(false) (--no-wrappers) must not block the fast path"
-        );
-    }
-
-    #[test]
-    fn test_wrappers_blocks_fast_path_none_does_not_block() {
-        // Load-bearing: None must NOT block. If it blocked, every non-TTY skim init
-        // would reinstall on every run and break test_init_skips_when_version_and_commit_are_current.
-        let flags = make_flags_with_wrappers(None);
-        assert!(
-            !super::wrappers_blocks_fast_path(&flags),
-            "None (no --wrappers flag) must NOT block the fast path (load-bearing)"
         );
     }
 }

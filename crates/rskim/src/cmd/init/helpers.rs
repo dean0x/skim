@@ -21,9 +21,8 @@ pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 /// different binaries.
 ///
 /// Canonicalize failure (e.g., binary deleted while running) falls back to the
-/// raw path from `current_exe()` rather than failing, preserving the behaviour
-/// of the pre-unification code at `install.rs:895-906`.
-pub(super) fn resolve_skim_binary() -> anyhow::Result<PathBuf> {
+/// raw path from `current_exe()` rather than failing.
+pub(crate) fn resolve_skim_binary() -> anyhow::Result<PathBuf> {
     let p = std::env::current_exe().map_err(|e| {
         anyhow::anyhow!(
             "cannot determine the skim binary path: {e}\n\

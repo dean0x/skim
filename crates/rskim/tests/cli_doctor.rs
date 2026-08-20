@@ -153,15 +153,21 @@ fn test_doctor_exits_1_and_names_tamper_after_hook_modification() {
 /// stays `Verified` (no script bytes were changed); different canonical path →
 /// `pin_is_current == false` → exit 1 with "binary pin mismatch".
 ///
-/// This is the closed coverage gap from PF-015: the "binary pin mismatch"
-/// display path had no test that reached it through the real wiring.
-/// Editing the hook script would trip `Tampered` (which early-returns before
-/// any pin logic), so copying the binary is the only correct approach.
+/// This test verifies C-1: binary pin mismatch is advisory (⚠), NOT drift.
+///
+/// Two-clone scenario: init with a copied binary (so hook pins copy_path), then
+/// run doctor with the original binary (same version + commit, different path).
+/// After C-1, `pin_is_current == false` produces a `⚠` advisory line but does
+/// NOT contribute to exit 1 — doctor exits 0.
+///
+/// The "binary pin mismatch" message must still appear so the user can see it,
+/// just with `⚠` (advisory) instead of `✗` (drift) status.
+///
 /// Both invocations route through `skim_sandboxed_with_bin` (the single
 /// authoritative sandbox env-var block) to satisfy PF-017.
 #[cfg(unix)]
 #[test]
-fn test_doctor_exits_1_on_binary_pin_mismatch() {
+fn test_doctor_exits_0_on_binary_pin_mismatch() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
 
@@ -195,13 +201,13 @@ fn test_doctor_exits_1_on_binary_pin_mismatch() {
         .success();
 
     // Run doctor from the original binary: same version/commit, different path
-    // → Verified integrity, pin_is_current == false → exit 1 + "binary pin mismatch".
+    // → Verified integrity, pin_is_current == false → exit 0 (advisory ⚠, not drift).
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
         .env("PATH", hermetic_path())
         .assert()
-        .failure() // exit 1 (pin drift)
+        .success() // exit 0 — pin mismatch is advisory only (C-1 fix)
         .stdout(predicates::prelude::predicate::str::contains(
             "binary pin mismatch",
         ));
@@ -233,4 +239,68 @@ fn test_doctor_exits_0_when_no_manifest() {
         .env("PATH", hermetic_path())
         .assert()
         .success();
+}
+
+/// `skim doctor` must exit 0 when the compiled SHA is not found in the current
+/// git repo — the end-user scenario (running doctor inside their own project,
+/// which is not the skim source repo).
+///
+/// This is the C-2 regression test: before the fix, `print_staleness_section`
+/// returned `true` (drift) when `git cat-file -e <sha>^{commit}` failed in the
+/// cwd repo, causing exit 1 for every end user not running doctor from the skim
+/// source directory.  After C-2, the "SHA not in this repo" case returns `false`
+/// (neutral `–` line, no drift).
+///
+/// If `compiled_commit == "unknown"` (tarball build) or git is unavailable, the
+/// staleness check is already skipped and the test trivially passes — that is
+/// correct behaviour for those environments.
+#[test]
+fn test_doctor_does_not_exit_1_for_absent_sha() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path();
+
+    std::fs::create_dir_all(home_path.join(".claude")).unwrap();
+    do_sandboxed_init(home_path);
+
+    // Create a throwaway git repo that does NOT contain the skim binary's SHA.
+    let git_dir = TempDir::new().unwrap();
+    let git_path = git_dir.path();
+
+    let git_init_ok = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(git_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !git_init_ok {
+        // git not available in this environment — the staleness check is
+        // skipped inside doctor (no drift possible), so exit 0 is guaranteed.
+        return;
+    }
+
+    // Create one dummy commit so the repo has a HEAD (needed for `in_repo` check).
+    let _ = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "throwaway",
+        ])
+        .current_dir(git_path)
+        .output();
+
+    // Run doctor from inside the throwaway repo (which lacks the skim SHA).
+    // After C-2: exits 0 (neutral `–` line for absent SHA, not drift).
+    // Before C-2: would exit 1 ("SHA not found" → return true → exit 1).
+    common::skim_sandboxed(home_path)
+        .arg("doctor")
+        .current_dir(git_path)
+        .env("PATH", hermetic_path())
+        .assert()
+        .success(); // must exit 0 regardless of compiled_commit value
 }
