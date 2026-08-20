@@ -832,22 +832,26 @@ mod tests {
 
     #[test]
     fn test_large_header_block_linear_time() {
-        // REGRESSION GUARD for the O(N³) defect in the old backward-walk
+        // CUBIC SMOKE TEST for the O(N³) defect in the old backward-walk
         // implementation of is_module_header_comment.
         //
+        // WHAT THIS TEST PROVES: that N=500 comments complete within 200 ms.
+        // The old O(N³) code took ~3 s at N=500 in a DEBUG build — well beyond
+        // 200 ms. The fixed O(N) code completes in < 10 ms.
+        //
+        // WHAT THIS TEST DOES NOT PROVE: linear vs quadratic scaling. An O(N²)
+        // regression at N=500 would complete in ~31 ms and pass this test. For
+        // the doubling-ratio guard that discriminates O(N) from O(N²), see
+        // test_quadratic_scaling_guard.
+        //
         // Empirical measurement (fix/init-pin-wrappers-header-comments, DEBUG build):
-        //   N=200  → 213 ms   N=400  → 1736 ms   N=1000 → 23920 ms
-        //   fitted alpha ≈ 2.9 (cubic)
+        //   O(N³) unfixed: N=200 → 213ms, N=400 → 1736ms, N=1000 → 23920ms
+        //   O(N)  fixed:   N=500 → < 10ms
         //
-        // With the O(N) forward-pass fix, N=500 comments complete in < 5 ms.
-        // The 2000 ms deadline is 400× below the old asymptote at N=500
-        // (extrapolated ~3 s in DEBUG, ~200 ms in release), giving generous
-        // headroom for CI scheduling noise while remaining a strict guard against
-        // any regression back toward O(N²) or worse.
-        //
-        // Wall-clock is inherently non-deterministic; we use generous headroom
-        // (2 s) so that even a heavily loaded CI agent won't produce false
-        // positives, while the old cubic code would reliably exceed the limit.
+        // Budget tightened from 2000ms to 200ms: the O(N³) code reliably exceeds
+        // 200ms (extrapolated ~3 s at N=500), while the fixed code runs in < 10ms,
+        // leaving ~20× CI headroom. 2000ms gave a 222× margin and asserted almost
+        // nothing about scaling.
         let n = 500usize;
         let mut source = String::with_capacity(n * 25);
         for i in 0..n {
@@ -876,9 +880,10 @@ mod tests {
         );
 
         assert!(
-            elapsed < std::time::Duration::from_millis(2000),
-            "{n} leading comments must process in < 2 s (got {elapsed:?}); \
-             old O(N³) code took ~3 s at N={n} in DEBUG — this indicates a regression"
+            elapsed < std::time::Duration::from_millis(200),
+            "{n} leading comments must process in < 200ms (got {elapsed:?}); \
+             old O(N³) code took ~3 s at N={n} in DEBUG — this indicates a cubic regression. \
+             For quadratic regressions, see test_quadratic_scaling_guard."
         );
     }
 
@@ -1168,12 +1173,27 @@ mod tests {
     //
     // Empirical basis (debug build, fix/init-pin-wrappers-header-comments):
     //   O(N²) unfixed: N=1000 → 125.5ms, N=2000 → 508.0ms, ratio = 4.05
-    //   O(N) fixed:    N=1000 → ~9.5ms,  N=2000 → ~12.7ms, ratio = 1.34
-    // Threshold 2.5 sits midway: margin ≥ 0.9 from O(N) upper (1.6×), ≥ 1.3 from O(N²) (3.8×).
+    //   O(N)  fixed:   N=2000 → ~12.7ms,  N=8000 → ~30.4ms
+    //                  N=4000 → ~18.6ms (linear interpolation from the two points above)
+    //   N=4000 vs N=8000 ratio on fixed code:         ~30.4 / ~18.6 ≈ 1.63×
+    //   N=4000 vs N=8000 ratio on O(N²) unfixed code: ~8032ms / ~2008ms ≈ 4.0×
+    //   Threshold 2.5× sits midway: ≥ 0.9 margin from linear upper (1.6×),
+    //                               ≥ 1.3 margin below quadratic lower (3.8×).
+    //
+    // N sizes chosen so that t1 (N=4000) reliably exceeds 2 ms even on fast debug
+    // hardware (~18 ms measured), keeping the noise floor assertion below the expected
+    // measurement by ~9×.
 
     #[test]
     fn test_quadratic_scaling_guard() {
-        // Build N=1000 and N=2000 contiguous-leading-comment Python files.
+        // WHAT THIS TEST PROVES: that the doubling ratio (N=4000 → N=8000) stays
+        // below 2.5×. An O(N) implementation produces ~1.3–1.6×; O(N²) produces
+        // ~4.0×. The 2.5 threshold sits midway between them.
+        //
+        // WHAT THIS TEST DOES NOT PROVE: absolute throughput or strict O(N) vs
+        // O(N log N). It discriminates linear from quadratic, no finer.
+        //
+        // Build N=4000 and N=8000 contiguous-leading-comment Python files.
         // (The same "gap-then-body-function" fixture as the other timing tests.)
         let make_source = |n: usize| {
             let mut s = String::with_capacity(n * 25 + 16);
@@ -1183,59 +1203,70 @@ mod tests {
             s.push_str("def f(x): return x\n");
             s
         };
-        let source_1k = make_source(1000);
-        let source_2k = make_source(2000);
+        let source_4k = make_source(4000);
+        let source_8k = make_source(8000);
 
         let mut parser = crate::Parser::new(Language::Python).unwrap();
         let config = TransformConfig::default();
 
         // Warm up (parse once before measuring; avoids one-time tree-sitter
-        // initialisation costs skewing the N=1000 sample).
+        // initialisation costs skewing the N=4000 sample).
         {
-            let tree = parser.parse(&source_1k).unwrap();
-            let _ = transform_minimal(&source_1k, &tree, Language::Python, &config);
+            let tree = parser.parse(&source_4k).unwrap();
+            let _ = transform_minimal(&source_4k, &tree, Language::Python, &config);
         }
 
-        // Measure N=1000
+        // Measure N=4000
         let t1 = {
-            let tree = parser.parse(&source_1k).unwrap();
+            let tree = parser.parse(&source_4k).unwrap();
             let start = std::time::Instant::now();
-            let r = transform_minimal(&source_1k, &tree, Language::Python, &config);
+            let r = transform_minimal(&source_4k, &tree, Language::Python, &config);
             let elapsed = start.elapsed();
-            assert!(r.is_ok(), "N=1000 transform must succeed: {:?}", r.err());
+            assert!(r.is_ok(), "N=4000 transform must succeed: {:?}", r.err());
             elapsed
         };
 
-        // Measure N=2000
+        // Measure N=8000
         let t2 = {
-            let tree = parser.parse(&source_2k).unwrap();
+            let tree = parser.parse(&source_8k).unwrap();
             let start = std::time::Instant::now();
-            let r = transform_minimal(&source_2k, &tree, Language::Python, &config);
+            let r = transform_minimal(&source_8k, &tree, Language::Python, &config);
             let elapsed = start.elapsed();
-            assert!(r.is_ok(), "N=2000 transform must succeed: {:?}", r.err());
+            assert!(r.is_ok(), "N=8000 transform must succeed: {:?}", r.err());
             elapsed
         };
 
-        // The doubling ratio must stay below 2.5 (O(N²) produces ~4.0×, O(N) ~1.3-1.6×).
-        // Threshold 2.5 is midway: ≥ 0.9 margin from linear upper bound, ≥ 1.3 below quadratic.
-        // If t1 is extremely fast (< 5ms), skip the ratio test: at such small absolute
-        // values the measurement is dominated by OS scheduling noise and the ratio is
-        // unreliable. The single-point timing guard above still catches severe regressions.
         let t1_ms = t1.as_secs_f64() * 1000.0;
         let t2_ms = t2.as_secs_f64() * 1000.0;
-        if t1_ms >= 5.0 {
-            let ratio = t2_ms / t1_ms;
-            assert!(
-                ratio < 2.5,
-                "Doubling N from 1000 to 2000 must produce a ratio below 2.5 (got {ratio:.2}×). \
-                 O(N) → ~1.3-1.6×; O(N²) → ~4.0× (empirically measured). \
-                 This indicates a regression to super-linear scaling. Check that \
-                 compute_header_end_byte uses a TreeCursor (not next_named_sibling), \
-                 is_module_header_comment uses depth (not parent() calls), and \
-                 collect_removable_comments threads in_function_body (not is_inside_function_body). \
-                 N=1000 took {t1_ms:.1}ms, N=2000 took {t2_ms:.1}ms."
-            );
-        }
+
+        // N=4000 must produce a measurable result above the OS noise floor.
+        // In debug builds this is ~18 ms; 2 ms is the floor — if it completes
+        // faster than that, either the transform is being cached/skipped or N
+        // needs to be raised further.
+        //
+        // We FAIL rather than skip: a silently-passing ratio guard is worse than
+        // no guard at all. This assertion is the tripwire against that failure mode.
+        assert!(
+            t1_ms >= 2.0,
+            "N=4000 transform completed in {t1_ms:.3}ms — too fast to measure reliably \
+             (expected ≥ 2ms; ~18ms measured on debug builds). Either the transform is \
+             being cached/skipped or N should be raised further. \
+             DO NOT convert this to a skip — a silently-passing guard provides no protection."
+        );
+
+        // The doubling ratio must stay below 2.5 (O(N²) produces ~4.0×, O(N) ~1.3–1.6×).
+        // Threshold 2.5 is midway: ≥ 0.9 margin from linear upper bound, ≥ 1.3 below quadratic.
+        let ratio = t2_ms / t1_ms;
+        assert!(
+            ratio < 2.5,
+            "Doubling N from 4000 to 8000 must produce a ratio below 2.5 (got {ratio:.2}×). \
+             O(N) → ~1.3–1.6×; O(N²) → ~4.0× (empirically measured). \
+             This indicates a regression to super-linear scaling. Check that \
+             compute_header_end_byte uses a TreeCursor (not next_named_sibling), \
+             is_module_header_comment uses depth (not parent() calls), and \
+             collect_removable_comments threads in_function_body (not is_inside_function_body). \
+             N=4000 took {t1_ms:.1}ms, N=8000 took {t2_ms:.1}ms."
+        );
     }
 
     // ── build_newline_table correctness ─────────────────────────────────────

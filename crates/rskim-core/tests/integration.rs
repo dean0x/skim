@@ -1704,20 +1704,31 @@ fn test_python_pseudo_large_header_preserves_all_header_comments() {
 
 #[test]
 fn test_python_minimal_large_header_linear_time() {
-    // Performance guard: 500 leading comments must process well within 3 s.
-    // Old O(N³) code: ~3–10 s at N=500 (empirically measured at N=100..1000).
-    // Fixed O(N) code: < 5 ms.  3000 ms deadline is 600× below the old
-    // asymptote while being 600× above the new ceiling — CI noise cannot close
-    // that gap.
+    // CUBIC SMOKE TEST: 500 leading comments must process within 500 ms.
+    //
+    // WHAT THIS TEST PROVES: that N=500 comments complete within 500 ms through
+    // the full transform stack. The old O(N³) code took ~3–10 s at N=500; the
+    // fixed O(N) code completes in < 10 ms. The 500 ms budget gives ~50× CI
+    // headroom while being 6× below the O(N³) lower bound.
+    //
+    // WHAT THIS TEST DOES NOT PROVE: linear vs quadratic scaling. An O(N²)
+    // regression at N=500 would complete in ~31 ms and pass this test. For the
+    // doubling-ratio guard that discriminates O(N) from O(N²), see
+    // test_quadratic_scaling_guard in crates/rskim-core/src/transform/minimal.rs.
+    //
+    // Budget tightened from 3000 ms to 500 ms: the O(N³) code reliably exceeds
+    // 500 ms, while the fixed code runs in < 10 ms. 3000 ms gave a 333× margin
+    // and asserted almost nothing about scaling.
     let start = std::time::Instant::now();
     let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal);
     let elapsed = start.elapsed();
 
     assert!(result.is_ok(), "transform must succeed: {:?}", result.err());
     assert!(
-        elapsed < std::time::Duration::from_millis(3000),
-        "500-comment file must process in < 3 s (got {elapsed:?}); \
-         old O(N³) code reliably exceeded this — regression detected"
+        elapsed < std::time::Duration::from_millis(500),
+        "500-comment file must process in < 500ms (got {elapsed:?}); \
+         old O(N³) code reliably exceeded this — cubic regression detected. \
+         For quadratic regressions, see test_quadratic_scaling_guard."
     );
 }
 
