@@ -304,3 +304,193 @@ fn test_doctor_does_not_exit_1_for_absent_sha() {
         .assert()
         .success(); // must exit 0 regardless of compiled_commit value
 }
+
+// ============================================================================
+// Wrapper drift detection — Item 2 (#488)
+// ============================================================================
+
+/// When a wrapper symlink points at a DIFFERENT binary than the one running,
+/// `skim doctor` must exit 1 and name the mismatch.
+///
+/// Setup:
+///  1. Copy the test binary to `<tmp>/old-install/skim` — filename stays `skim`
+///     so the stem check (`stem == "skim"`) passes, but the directory differs,
+///     so the canonical path comparison detects a mismatch.
+///  2. Install wrappers using the COPY (so the symlinks point to copy_path).
+///  3. Run doctor from the ORIGINAL binary: same version/commit, different
+///     canonical path → wrapper target mismatch → exit 1.
+///
+/// Both init and doctor invocations route through `skim_sandboxed_with_bin`
+/// (the single authoritative sandbox env-var block) to satisfy PF-017.
+#[cfg(unix)]
+#[test]
+fn test_doctor_exits_1_on_wrapper_target_mismatch() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+    let original_bin = common::skim_bin();
+    // Place the copy in a subdirectory named `old-install` so the filename stays
+    // `skim` (stem == "skim" passes the doctor stem check) but the canonical path
+    // differs from the running binary → triggers "wrapper target mismatch".
+    let old_install_dir = home.join("old-install");
+    std::fs::create_dir_all(&old_install_dir).unwrap();
+    let copy_path = old_install_dir.join("skim");
+    std::fs::copy(&original_bin, &copy_path).expect("copying the test binary must succeed");
+    {
+        let mut perms = std::fs::metadata(&copy_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&copy_path, perms).unwrap();
+    }
+
+    // Install hook AND wrappers using the copy — symlinks will point to copy_path.
+    common::skim_sandboxed_with_bin(home, &copy_path)
+        .args([
+            "init",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--wrappers",
+        ])
+        .env("PATH", hermetic_path())
+        .assert()
+        .success();
+
+    // Verify at least one wrapper symlink was created.
+    let wrappers_dir = home.join(".skim").join("bin");
+    assert!(
+        wrappers_dir.exists(),
+        "wrapper directory must exist after init --wrappers"
+    );
+
+    // Run doctor from the ORIGINAL binary: wrapper targets point to copy_path,
+    // but we are running original_bin → mismatch → exit 1.
+    common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", hermetic_path())
+        .assert()
+        .failure() // exit 1 — wrapper target mismatch is drift
+        .stdout(predicates::prelude::predicate::str::contains(
+            "wrapper target mismatch",
+        ));
+}
+
+/// When all wrapper symlinks point at the SAME binary that is running, `skim
+/// doctor` must exit 0 and not report any wrapper drift.
+///
+/// This is the "wrapper section clean" regression: the new read_link-based
+/// check must not produce false positives on a correct install.
+#[cfg(unix)]
+#[test]
+fn test_doctor_exits_0_with_correct_wrappers() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+    // Install hook AND wrappers using the same binary that will run doctor.
+    common::skim_sandboxed(home)
+        .args([
+            "init",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--wrappers",
+        ])
+        .env("PATH", hermetic_path())
+        .assert()
+        .success();
+
+    // Doctor from the same binary: wrappers point to this binary → no mismatch.
+    common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", hermetic_path())
+        .assert()
+        .success(); // exit 0 — correct wrappers do not produce drift
+}
+
+/// A foreign symlink in the wrappers directory (target stem != "skim"/"rskim")
+/// must be reported as an advisory "foreign symlink — not installed by skim"
+/// and must NOT cause `skim doctor` to exit 1.
+///
+/// Invariant being tested: wrapper install/uninstall only ever touches symlinks
+/// whose target stem is "skim" or "rskim". A foreign symlink is reported but
+/// never modified or removed. `skim doctor` reports it as advisory (warning),
+/// not as drift (does not increment the mismatch counter → exit 0).
+///
+/// This behaviour was discovered when `test_doctor_exits_1_on_wrapper_target_mismatch`
+/// used `skim-copy` as the target name: doctor correctly left it alone and exited 0.
+#[cfg(unix)]
+#[test]
+fn test_doctor_foreign_symlink_is_advisory_not_exit_1() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+    // Install hook AND wrappers so the wrappers directory is created.
+    common::skim_sandboxed(home)
+        .args([
+            "init",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--wrappers",
+        ])
+        .env("PATH", hermetic_path())
+        .assert()
+        .success();
+
+    let wrappers_dir = home.join(".skim").join("bin");
+    assert!(
+        wrappers_dir.exists(),
+        "wrapper directory must exist after init --wrappers"
+    );
+
+    // Place a foreign symlink in the wrappers dir whose target stem is NOT
+    // "skim" or "rskim". Points at a well-known binary that is guaranteed to
+    // exist on Unix (/bin/sh) so the target exists, but it is not a skim binary.
+    let foreign_link = wrappers_dir.join("not-a-skim-tool");
+    symlink("/bin/sh", &foreign_link).expect("creating foreign symlink must succeed");
+    assert!(
+        foreign_link.exists() || std::fs::symlink_metadata(&foreign_link).is_ok(),
+        "foreign symlink must be present before doctor runs"
+    );
+
+    // Run doctor: the foreign symlink must be flagged as advisory but must NOT
+    // produce a mismatch count → exit 0.
+    let out = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", hermetic_path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        out.status.success(),
+        "skim doctor must exit 0 when only foreign symlinks are present, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("foreign symlink — not installed by skim"),
+        "doctor must report the foreign symlink as advisory, got:\n{stdout}"
+    );
+
+    // The foreign symlink must NOT have been removed or modified.
+    assert!(
+        std::fs::symlink_metadata(&foreign_link).is_ok(),
+        "doctor must not remove the foreign symlink"
+    );
+    let target = std::fs::read_link(&foreign_link).expect("foreign symlink must still be readable");
+    assert_eq!(
+        target,
+        std::path::Path::new("/bin/sh"),
+        "doctor must not modify the foreign symlink target"
+    );
+}

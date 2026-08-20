@@ -469,20 +469,36 @@ fn run_install_single(
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
-    // Include manifest presence in the fast path: if the manifest is absent,
-    // fall through to execute_install → create_hook_script, which will write
-    // (or re-write) the manifest.  This makes `skim init` self-heal a missing
-    // sidecar so that `skim doctor`'s advice ("run `skim init`") actually works
-    // (Group 4 fix / #471).
-    let manifest_present =
-        crate::cmd::integrity::read_hash_manifest(&state.hook_config_dir, state.agent_cli_name)
-            .is_some();
+    // Gate the fast path on integrity, not just manifest presence.
+    //
+    // Variant decisions:
+    // - Verified   → fast path ALLOWED: hash matches the stored manifest.
+    // - Tampered   → fast path BLOCKED: must reach create_hook_script, which
+    //                regenerates from source and prints "Repaired". Allowing the
+    //                fast path here would launder the divergence and produce a
+    //                non-converging repair loop (same shape as the binary-pin bug
+    //                this branch already fixed once).
+    // - NoManifest → fast path BLOCKED: fall through so execute_install →
+    //                create_hook_script writes the manifest for the first time
+    //                (Group 4 fix / #471; matches the old manifest_present = false
+    //                behaviour that was intentional).
+    // - Unreadable → fast path BLOCKED (fail-closed): cannot verify the script,
+    //                so fall through. create_hook_script also bails on Unreadable
+    //                with an actionable error, so both gates agree — no stuck state.
+    let integrity_verified = {
+        use crate::cmd::integrity::{ScriptIntegrity, classify_script_integrity};
+        let script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+        matches!(
+            classify_script_integrity(&state.hook_config_dir, state.agent_cli_name, &script_path),
+            ScriptIntegrity::Verified
+        )
+    };
     if state.hook_installed
         && state.hook_is_current()
         && guidance_current
         && !permissions_blocked
         && !flags.force
-        && manifest_present
+        && integrity_verified
     {
         // Wrappers run inside the fast path so that `skim init --wrappers` on a
         // current hook install still installs wrappers without falling through to
@@ -826,35 +842,73 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     // Uses the already-detected hook state rather than re-reading the script.
     if script_path.exists() {
         if state.hook_is_current() {
-            // Script is current — write (or re-write) the manifest so `skim init`
-            // self-heals a missing or stale sidecar.  This makes doctor's advice
-            // ("run `skim init --agent {agent}`") actually work (Group 4 fix / #471).
-            let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
-            crate::cmd::integrity::write_hash_manifest(
+            // Script is current — but only self-heal the manifest when integrity
+            // passes. A Tampered verdict means the on-disk bytes are unknown;
+            // hashing and writing them would launder the divergence, making a
+            // subsequent `skim doctor` report Verified for the wrong reason.
+            // Instead, fall through to the write path so the script is restored
+            // from the known-good generator (applies PF-016 / ADR-004 repair).
+            use crate::cmd::integrity::{ScriptIntegrity, classify_script_integrity};
+            match classify_script_integrity(
                 &state.hook_config_dir,
                 state.agent_cli_name,
-                HOOK_SCRIPT_NAME,
-                &hash,
-            )?;
-            println!(
-                "  {} Skipped: {} (already v{})",
-                check_mark(true),
-                script_path.display(),
-                state.skim_version
-            );
-            return Ok(());
-        }
-        // Different version — will overwrite
-        if let Some(old_ver) = &state.hook_version {
-            println!(
-                "  {} Updated: {} (v{} -> v{})",
-                check_mark(true),
-                script_path.display(),
-                old_ver,
-                state.skim_version
-            );
+                &script_path,
+            ) {
+                ScriptIntegrity::Verified | ScriptIntegrity::NoManifest => {
+                    // Verified: hash matches the stored manifest → re-write to
+                    // refresh a stale sidecar (Group 4 fix / #471).
+                    // NoManifest: no manifest yet → write it for the first time
+                    // (self-heal for pre-manifest installs).
+                    // In both cases we hash the CONFIRMED-GOOD on-disk bytes.
+                    let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
+                    crate::cmd::integrity::write_hash_manifest(
+                        &state.hook_config_dir,
+                        state.agent_cli_name,
+                        HOOK_SCRIPT_NAME,
+                        &hash,
+                    )?;
+                    println!(
+                        "  {} Skipped: {} (already v{})",
+                        check_mark(true),
+                        script_path.display(),
+                        state.skim_version
+                    );
+                    return Ok(());
+                }
+                ScriptIntegrity::Tampered => {
+                    // Script content was modified after install. Do NOT hash the
+                    // tampered bytes — that would launder the divergence. Fall
+                    // through to the regeneration path below so the known-good
+                    // content is written and the manifest is recomputed from it.
+                    println!(
+                        "  {} Repaired: {} (content tampered; regenerating from source v{})",
+                        check_mark(true),
+                        script_path.display(),
+                        state.skim_version,
+                    );
+                }
+                ScriptIntegrity::Unreadable => {
+                    anyhow::bail!(
+                        "cannot read hook script {} to verify its integrity: check permissions\n\
+                         hint: run `skim init --force --agent {}` to overwrite",
+                        script_path.display(),
+                        state.agent_cli_name,
+                    );
+                }
+            }
         } else {
-            println!("  {} Updated: {}", check_mark(true), script_path.display());
+            // Different version — will overwrite
+            if let Some(old_ver) = &state.hook_version {
+                println!(
+                    "  {} Updated: {} (v{} -> v{})",
+                    check_mark(true),
+                    script_path.display(),
+                    old_ver,
+                    state.skim_version
+                );
+            } else {
+                println!("  {} Updated: {}", check_mark(true), script_path.display());
+            }
         }
     } else {
         println!("  {} Created: {}", check_mark(true), script_path.display());

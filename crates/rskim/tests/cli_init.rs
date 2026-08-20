@@ -1954,3 +1954,174 @@ fn test_init_repeat_wrappers_does_not_clobber_bak() {
         "settings.json.bak must not be clobbered by a second --wrappers run"
     );
 }
+
+// ============================================================================
+// Fix: integrity-aware self-heal — tampered hooks are REPAIRED, not laundered
+// ============================================================================
+
+/// After tampering with a hook script (appending one byte) that still passes
+/// `hook_is_current()` (version/commit markers unchanged), `skim init` must
+/// REPAIR the script by regenerating from source — NOT launder the tampered
+/// bytes into the manifest.
+///
+/// Before this fix, the self-heal path inside `create_hook_script` would
+/// re-hash the on-disk tampered bytes and write them into the manifest
+/// when `hook_is_current() == true`, so `skim doctor` subsequently reported
+/// `Verified` for the wrong content.
+///
+/// After this fix:
+/// - `skim init` prints "Repaired" and regenerates the script.
+/// - The script content matches freshly generated content (not the tampered bytes).
+/// - `skim doctor` reports `Verified` (for the now-correct content).
+#[test]
+fn test_init_repairs_tampered_hook_not_launders() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path();
+
+    std::fs::create_dir_all(home_path.join(".claude")).unwrap();
+
+    // Step 1: Fresh install.
+    common::skim_sandboxed(home_path)
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+
+    let script_path = home_path.join(".claude/hooks/skim-rewrite.sh");
+    let manifest_path = home_path.join(".claude/hooks/skim-claude-code.sha256");
+    assert!(script_path.exists(), "hook script must exist after init");
+    assert!(manifest_path.exists(), "manifest must exist after init");
+
+    // Capture the known-good content produced by the initial install.
+    let good_content = fs::read(&script_path).expect("must be able to read hook script");
+
+    // Step 2: Tamper — append one byte to the script while leaving the
+    // version/commit markers unchanged, so hook_is_current() still returns true.
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script_path)
+            .expect("must be able to open hook script for appending");
+        f.write_all(b"X").unwrap();
+    }
+
+    // Confirm the tamper is detectable: the script now differs from good_content.
+    let tampered_content = fs::read(&script_path).unwrap();
+    assert_ne!(
+        good_content, tampered_content,
+        "tampered script must differ from the original"
+    );
+
+    // Step 3: Re-run `skim init`. The self-heal path must REPAIR the script
+    // (regenerate from source), NOT launder (hash-and-bless the tampered bytes).
+    let out = common::skim_sandboxed(home_path)
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "init after tamper must succeed, got:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Repaired"),
+        "init must report 'Repaired' for a tampered script, got:\n{stdout}"
+    );
+
+    // Step 4: The on-disk script must now match the known-good content —
+    // NOT the tampered bytes.
+    let repaired_content = fs::read(&script_path).unwrap();
+    assert_eq!(
+        good_content, repaired_content,
+        "repaired script content must match the freshly generated known-good content, \
+         not the tampered bytes"
+    );
+
+    // Step 5: `skim doctor` must now report Verified (not Tampered).
+    // This confirms that the manifest was recomputed from the repaired content.
+    //
+    // We run doctor from the sandbox home (not a git repo) and prepend the
+    // test binary's directory to PATH so the PATH scan does not spuriously
+    // report drift from an unrelated release build.
+    let bin = common::skim_bin();
+    let bin_dir = bin.parent().expect("skim binary has a parent directory");
+    let hermetic_path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let doctor_out = common::skim_sandboxed(home_path)
+        .arg("doctor")
+        .current_dir(home_path)
+        .env("PATH", hermetic_path)
+        .output()
+        .unwrap();
+
+    let doctor_stdout = String::from_utf8_lossy(&doctor_out.stdout);
+    assert!(
+        doctor_out.status.success(),
+        "skim doctor must exit 0 after repair, got:\n{doctor_stdout}"
+    );
+    assert!(
+        !doctor_stdout.contains("tampered"),
+        "skim doctor must NOT report tampered after repair, got:\n{doctor_stdout}"
+    );
+}
+
+// ============================================================================
+// Fix: --project --wrappers mutual exclusion
+// ============================================================================
+
+/// `skim init --project --wrappers` must be rejected at parse time with an
+/// actionable error message — not silently accepted while installing zero
+/// wrappers.
+///
+/// Before this fix, `--project` silently suppressed wrapper installation
+/// (`if !flags.project { maybe_install_wrappers(...) }`) with no diagnostic,
+/// matching the shape of the existing `--permissions + --project` guard.
+#[test]
+fn test_init_project_and_wrappers_is_rejected() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path();
+
+    std::fs::create_dir_all(home_path.join(".claude")).unwrap();
+
+    let out = common::skim_sandboxed(home_path)
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--project",
+            "--wrappers",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "--project --wrappers must fail, but it succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stderr}{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        combined.contains("mutually exclusive"),
+        "--project --wrappers must report a mutual-exclusion error, got:\n{combined}"
+    );
+}

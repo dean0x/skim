@@ -127,6 +127,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`skim doctor` exit-code contract changes (#488)** — Two user-visible changes
+  to which conditions drive `skim doctor`'s exit 1:
+
+  - **Binary pin mismatch is now advisory (⚠), not drift (✗)** — Previously, when the
+    hook script pinned a different binary path than the one currently running (same
+    version and commit, different absolute path — the two-clone scenario), `skim doctor`
+    exited 1. It now exits 0 and prints a `⚠` advisory line, because the running binary
+    is identical in every meaningful way. **If you use `skim doctor` as a CI pre-flight
+    to catch wrong-clone issues, note that this signal has been demoted.** The wrapper
+    surface (below) now contributes to exit 1 instead, providing an equivalent signal
+    via a different mechanism.
+
+  - **Compiled SHA absent from the current repo no longer exits 1 (fix)** — When a user
+    ran `skim doctor` inside their own project (not the skim source repository),
+    `git cat-file -e <sha>^{commit}` failed in their repo (the sha has never been there)
+    and doctor incorrectly exited 1. The staleness section now returns neutral (`–`) for
+    an absent SHA rather than treating absence as drift.
+
+  - **Wrapper target drift now exits 1 (new signal)** — `skim doctor` now resolves each
+    wrapper symlink in `~/.skim/bin/` with `read_link` and compares the canonical target
+    against the running binary. A wrapper pointing at a stale or foreign skim binary now
+    reports `✗` and exits 1, partially restoring the wrong-clone detection signal removed
+    by the pin-mismatch demotion above. Foreign symlinks (target stem ≠ `skim`/`rskim`)
+    are reported as `⚠` and do not affect the exit code.
+
+- **`skim init` now REPAIRS tampered hook scripts instead of laundering them** — When
+  `skim init` ran on an install where the hook script had been manually edited (tampered)
+  but the version/commit markers were unchanged, the previous self-heal path would
+  re-hash the on-disk tampered bytes and write them into the integrity manifest, so a
+  subsequent `skim doctor` would report Verified — for the wrong content. The installer
+  now classifies script integrity before deciding whether to return early: a `Tampered`
+  verdict falls through to the full regeneration path (restoring the known-good script
+  content), while `Verified`/`NoManifest` continue to return early as before (applies
+  PF-016, ADR-004).
+
 - **`skim doctor` now detects tampered hook scripts (#471)** — Previously, doctor
   derived its hook-health verdict entirely from `SKIM_HOOK_*` markers parsed out of the
   hook script text, so a tampered or manually edited script could still pass as healthy

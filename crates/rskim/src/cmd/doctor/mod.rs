@@ -34,7 +34,7 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
 
     // 1. Running binary
-    let running_path = current_exe_canonical();
+    let running_path = crate::cmd::init::resolve_skim_binary().ok();
     println!("Running binary");
     match &running_path {
         Some(p) => println!(
@@ -61,7 +61,10 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     println!();
 
     // 4. Wrappers
-    print_wrapper_section();
+    let wrapper_drift = print_wrapper_section();
+    if wrapper_drift {
+        drift = true;
+    }
     println!();
 
     // 5. Cache & Analytics
@@ -92,12 +95,9 @@ pub(super) fn command() -> clap::Command {
 // ============================================================================
 // Running binary
 // ============================================================================
-
-fn current_exe_canonical() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-}
+// Canonical path of the running binary comes from `crate::cmd::init::resolve_skim_binary()`,
+// the single shared derivation used by install, wrappers, hook pinning, and doctor.
+// A local helper was previously duplicated here; it is now deleted (applies architecture-02).
 
 // ============================================================================
 // $PATH scan
@@ -540,32 +540,136 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
 // Wrappers
 // ============================================================================
 
-fn print_wrapper_section() {
+/// Print the wrappers section and return `true` if any wrapper points at a
+/// different binary than the one currently running (drift).
+///
+/// Each wrapper symlink's target is resolved with `read_link` and compared
+/// against `resolve_skim_binary()` — the same canonical derivation the
+/// installer uses, so the comparison is on equal footing.
+///
+/// Wrapper install/uninstall only ever touches symlinks whose target stem is
+/// `"skim"` or `"rskim"`. This function reports but never modifies any file
+/// (including foreign symlinks), preserving that invariant.
+fn print_wrapper_section() -> bool {
     println!("Wrappers  (~/.skim/bin)");
 
     let wrappers_dir = match crate::cmd::skim_wrappers_dir() {
         Some(d) => d,
         None => {
             println!("  (cannot determine home directory)");
-            return;
+            return false;
         }
     };
 
     if !wrappers_dir.exists() {
         println!("  –  not installed  (run `skim init --wrappers` to install)");
-        return;
+        return false;
     }
 
-    let count = std::fs::read_dir(wrappers_dir)
-        .ok()
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.file_type().ok().is_some_and(|ft| ft.is_symlink()))
-                .count()
-        })
-        .unwrap_or(0);
+    // Resolve the running binary once for comparison — reuses the shared
+    // derivation so this and all install/doctor sites stay in sync.
+    let running = crate::cmd::init::resolve_skim_binary().ok();
 
-    println!("  ✓  {}  ({count} symlinks)", wrappers_dir.display());
+    let entries = match std::fs::read_dir(wrappers_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            println!("  (cannot read wrappers directory: {e})");
+            return false;
+        }
+    };
+
+    let mut symlink_count: usize = 0;
+    let mut mismatch_count: usize = 0;
+
+    // Circuit breaker: wrapper dir should never exceed ~2× the number of
+    // wrapper targets (~59). An absurdly large directory is not our concern.
+    const MAX_ENTRIES: usize = 256;
+    let mut checked: usize = 0;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        checked += 1;
+        if checked > MAX_ENTRIES {
+            println!("  (wrapper directory has more than {MAX_ENTRIES} entries — truncating scan)");
+            break;
+        }
+
+        // Use file_type() from the DirEntry directly — it reports the type of
+        // the directory entry itself (i.e. "symlink"), not its target.
+        // entry.metadata() would follow the symlink and return target metadata,
+        // making is_symlink() always false for a one-level-deep symlink.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        // Only inspect symlinks — plain files or directories are left alone.
+        if !file_type.is_symlink() {
+            continue;
+        }
+
+        symlink_count += 1;
+
+        let link_path = entry.path();
+        let target = match std::fs::read_link(&link_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("  ⚠  {}  (cannot read symlink: {e})", link_path.display());
+                continue;
+            }
+        };
+
+        // Classify the symlink target stem: only "skim"/"rskim" targets are
+        // ours to care about. Foreign symlinks are reported but not penalised.
+        let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let is_skim_target = stem == "skim" || stem == "rskim";
+
+        if !is_skim_target {
+            println!(
+                "  ⚠  {}  → {} (foreign symlink — not installed by skim)",
+                link_path.display(),
+                target.display()
+            );
+            continue;
+        }
+
+        // Compare the symlink's target against the running binary. Use the
+        // canonical form of both sides so that Homebrew cellar symlinks,
+        // cargo-install links, and /tmp → /private/tmp mappings all resolve
+        // consistently. The comparison is advisory for path-only mismatches
+        // (same binary, different path) but still contributes to drift so the
+        // CI pre-flight (`skim doctor`) can catch wrong-clone scenarios via this
+        // surface when pin mismatch was demoted to advisory.
+        let target_canonical = std::fs::canonicalize(&target).unwrap_or(target.clone());
+        let mismatch = match &running {
+            Some(run) => target_canonical != *run,
+            None => false, // cannot determine running binary — skip comparison
+        };
+
+        if mismatch {
+            mismatch_count += 1;
+            let run_display = running
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "  ✗  {}  → {}  [wrapper target mismatch (wrapper: {}, running: {})] — \
+                 run `skim init --wrappers` to update",
+                link_path.display(),
+                target.display(),
+                target_canonical.display(),
+                run_display,
+            );
+        }
+    }
+
+    if mismatch_count == 0 {
+        println!(
+            "  ✓  {}  ({symlink_count} symlinks)",
+            wrappers_dir.display()
+        );
+    }
+
+    mismatch_count > 0
 }
 
 // ============================================================================
