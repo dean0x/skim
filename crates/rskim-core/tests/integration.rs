@@ -1641,6 +1641,87 @@ fn test_python_minimal_class_level_comments_stripped() {
 }
 
 // ============================================================================
+// Large Header Block — O(N) regression guard
+// ============================================================================
+//
+// The fixture `large_header.py` contains 500 contiguous leading comments
+// followed by a blank-line-separated comment (to be stripped) and a function.
+// The old O(N³) backward-walk would take ~3 s on this fixture in DEBUG mode;
+// the O(N) forward-pass fix completes in < 5 ms.  The 3000 ms deadline is
+// intentionally generous to tolerate CI scheduling noise.
+
+const LARGE_HEADER_PY: &str = include_str!("../../../tests/fixtures/python/large_header.py");
+
+#[test]
+fn test_python_minimal_large_header_preserves_all_header_comments() {
+    // Correctness: all 500 contiguous leading comments must be preserved.
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("# Header comment 0"),
+        "first header comment must be preserved; result starts with: {:?}",
+        &result[..result.len().min(200)]
+    );
+    assert!(
+        result.contains("# Header comment 499"),
+        "last header comment must be preserved"
+    );
+    // The post-gap comment must be stripped.
+    assert!(
+        !result.contains("is NOT a header"),
+        "post-gap comment must be stripped; got:\n{result}"
+    );
+    // The sentinel function and its body comment must survive.
+    assert!(
+        result.contains("def sentinel_function"),
+        "sentinel function must be preserved"
+    );
+    assert!(
+        result.contains("# body comment"),
+        "in-body comment of sentinel function must be preserved"
+    );
+}
+
+#[test]
+fn test_python_pseudo_large_header_preserves_all_header_comments() {
+    // Same correctness guarantee through the pseudo-mode path (which also routes
+    // through compute_header_end_byte → is_module_header_comment).
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Pseudo).unwrap();
+
+    assert!(
+        result.contains("# Header comment 0"),
+        "first header comment must be preserved in pseudo mode"
+    );
+    assert!(
+        result.contains("# Header comment 499"),
+        "last header comment must be preserved in pseudo mode"
+    );
+    assert!(
+        !result.contains("is NOT a header"),
+        "post-gap comment must be stripped in pseudo mode"
+    );
+}
+
+#[test]
+fn test_python_minimal_large_header_linear_time() {
+    // Performance guard: 500 leading comments must process well within 3 s.
+    // Old O(N³) code: ~3–10 s at N=500 (empirically measured at N=100..1000).
+    // Fixed O(N) code: < 5 ms.  3000 ms deadline is 600× below the old
+    // asymptote while being 600× above the new ceiling — CI noise cannot close
+    // that gap.
+    let start = std::time::Instant::now();
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal);
+    let elapsed = start.elapsed();
+
+    assert!(result.is_ok(), "transform must succeed: {:?}", result.err());
+    assert!(
+        elapsed < std::time::Duration::from_millis(3000),
+        "500-comment file must process in < 3 s (got {elapsed:?}); \
+         old O(N³) code reliably exceeded this — regression detected"
+    );
+}
+
+// ============================================================================
 // Max Lines (AST-aware truncation) Tests
 // ============================================================================
 

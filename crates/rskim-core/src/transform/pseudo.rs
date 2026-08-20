@@ -20,10 +20,11 @@ use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 
 use super::minimal::{
-    MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal, is_removable_comment,
-    remove_ranges, trim_and_normalize,
+    MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal, build_newline_table,
+    compute_header_end_byte, is_removable_comment, remove_ranges, trim_and_normalize,
 };
 use super::{compute_line_map_from_removed_ranges, normalize_line_map_blanks};
+use crate::transform::utils::is_function_scope_kind;
 
 /// Bundled parameters for the recursive noise walker to avoid parameter explosion
 struct NoiseWalkContext<'a> {
@@ -32,6 +33,9 @@ struct NoiseWalkContext<'a> {
     language: Language,
     ranges: &'a mut Vec<(usize, usize)>,
     node_count: &'a mut usize,
+    /// End byte of the last header comment, precomputed by `compute_header_end_byte`.
+    /// 0 when there are no header comments or the language has no header-comment convention.
+    header_end_byte: usize,
 }
 
 /// Extend a byte position forward to consume trailing spaces (not past newline).
@@ -296,6 +300,10 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
 ) -> Result<(String, Vec<NodeSpan>, Vec<usize>)> {
     let rules = get_pseudo_rules(language);
 
+    // Precompute the module-header boundary in a single O(N) forward pass.
+    // This prevents the O(N³) per-node backward walk inside is_module_header_comment.
+    let header_end_byte = compute_header_end_byte(tree.root_node(), source, language);
+
     // Single-pass collection: comments AND noise ranges in one AST walk
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut node_count: usize = 0;
@@ -305,17 +313,23 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
         language,
         ranges: &mut ranges,
         node_count: &mut node_count,
+        header_end_byte,
     };
-    collect_noise_ranges(tree.root_node(), &mut ctx, &rules, 0)?;
+    collect_noise_ranges(tree.root_node(), &mut ctx, &rules, 0, false)?;
 
     // Sort, dedup, and adjust ranges for full line removal
     ctx.ranges.sort_unstable_by_key(|&(start, _)| start);
     ctx.ranges.dedup();
 
+    // Precompute the newline offset table so adjust_range_for_line_removal
+    // resolves line boundaries in O(log N) (binary search) instead of O(start)
+    // (rfind scan), reducing the total from O(N²) to O(N log N) across N ranges.
+    let newlines = build_newline_table(source);
+
     let mut final_ranges: Vec<(usize, usize)> = ctx
         .ranges
         .iter()
-        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end))
+        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
         .collect();
 
     // Re-sort after adjustment (line-level adjustments can change ordering)
@@ -418,6 +432,7 @@ fn collect_noise_ranges(
     ctx: &mut NoiseWalkContext<'_>,
     rules: &PseudoRules,
     depth: usize,
+    in_function_body: bool,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST
     if depth > MAX_AST_DEPTH {
@@ -443,7 +458,15 @@ fn collect_noise_ranges(
 
     // Check for removable comments (merged from former separate pass).
     // Uses the same doc-comment/shebang/function-body filtering as minimal mode.
-    if is_removable_comment(node, ctx.source, ctx.language) {
+    // Pass the threaded depth and in_function_body to avoid O(depth) parent() calls.
+    if is_removable_comment(
+        node,
+        ctx.source,
+        ctx.language,
+        ctx.header_end_byte,
+        depth,
+        in_function_body,
+    ) {
         ctx.ranges.push((node.start_byte(), node.end_byte()));
         return Ok(()); // Comments have no children to recurse into
     }
@@ -511,10 +534,14 @@ fn collect_noise_ranges(
         return result;
     }
 
-    // Recurse into children
+    // Recurse into children. Thread child_in_body so is_removable_comment never
+    // calls parent() in the hot path — a TSNode has no parent pointer, so every
+    // parent() call re-walks the tree from the root (O(depth)), making the walker
+    // O(N²) across N root-level nodes.
+    let child_in_body = in_function_body || is_function_scope_kind(node.kind(), ctx.language);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_noise_ranges(child, ctx, rules, depth + 1)?;
+        collect_noise_ranges(child, ctx, rules, depth + 1, child_in_body)?;
     }
 
     Ok(())
