@@ -124,3 +124,65 @@ pub fn skim_with_analytics(db: &std::path::Path) -> assert_cmd::Command {
         .env("NO_COLOR", "1");
     c
 }
+
+// ============================================================================
+// Stub tools on a prepended PATH
+// ============================================================================
+
+/// Write `script` to `dir/name` and make it executable.
+///
+/// The caller owns the whole script body, which is what tests that need timing
+/// control (`sleep`) or loops require.  Prefer [`make_stub`] /
+/// [`make_stub_bytes`] for the common fixed-output case.
+///
+/// Unix-only: the executable bit requires `std::os::unix::fs::PermissionsExt`.
+#[cfg(unix)]
+pub fn write_stub_script(dir: &std::path::Path, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script_path = dir.join(name);
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Create a stub tool script that prints fixed stdout/stderr and exits `code`.
+///
+/// The payloads are written to sidecar files and `cat`-ed by the script, so no
+/// shell escaping of the content is needed — and, because `cat` is an external
+/// process, the bytes reach the pipe without depending on the shell's own
+/// stdout buffering.
+///
+/// Unix-only: the script uses `#!/bin/sh`.
+#[cfg(unix)]
+pub fn make_stub(dir: &std::path::Path, name: &str, stdout: &str, stderr: &str, code: i32) {
+    make_stub_bytes(dir, name, stdout.as_bytes(), stderr.as_bytes(), code);
+}
+
+/// Byte-payload variant of [`make_stub`].
+///
+/// Required for fidelity tests whose payload is deliberately not valid UTF-8 —
+/// a `&str` parameter cannot express those bytes at all.
+#[cfg(unix)]
+pub fn make_stub_bytes(dir: &std::path::Path, name: &str, stdout: &[u8], stderr: &[u8], code: i32) {
+    let out_path = dir.join(format!("{name}.out"));
+    let err_path = dir.join(format!("{name}.err"));
+    std::fs::write(&out_path, stdout).unwrap();
+    std::fs::write(&err_path, stderr).unwrap();
+    let script = format!(
+        "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit {code}\n",
+        out_path.display(),
+        err_path.display()
+    );
+    write_stub_script(dir, name, &script);
+}
+
+/// PATH with `dir` prepended so skim's spawned child resolves to the stub.
+///
+/// Unix-only: uses `:` as the PATH separator.
+#[cfg(unix)]
+pub fn stub_path(dir: &std::path::Path) -> String {
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}

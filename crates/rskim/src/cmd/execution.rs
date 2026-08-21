@@ -437,8 +437,13 @@ pub(crate) struct ParsedCommandConfig<'a> {
 }
 
 /// How a child process's exit status should steer output handling. (#317)
+///
+/// `pub(crate)` so the streamed raw-passthrough sink
+/// (`cmd::file::passthrough_stream`) applies the *same* matrix as the buffered
+/// sink rather than re-deriving it — the two paths serve identical bytes for the
+/// same command and must not drift on the notice/tier decisions that follow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExitDisposition {
+pub(crate) enum ExitDisposition {
     /// Exit 0 — compress normally.
     Success,
     /// A non-zero code the tool's parser meaningfully compresses
@@ -453,7 +458,7 @@ enum ExitDisposition {
 ///
 /// Must be called on the raw `Option<i32>` BEFORE any `unwrap_or` default:
 /// a signal kill (`None`) is always an [`ExitDisposition::UnexpectedFailure`].
-fn classify_exit(code: Option<i32>, expected: &[i32]) -> ExitDisposition {
+pub(crate) fn classify_exit(code: Option<i32>, expected: &[i32]) -> ExitDisposition {
     match code {
         Some(0) => ExitDisposition::Success,
         Some(c) if expected.contains(&c) => ExitDisposition::ExpectedFailure,

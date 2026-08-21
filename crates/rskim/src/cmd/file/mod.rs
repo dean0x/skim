@@ -13,6 +13,17 @@
 //! [`passthrough_config`] is the SINGLE write-point for `skip_ansi_strip: true`
 //! across the whole passthrough family; [`run_passthrough_tool`] combines it with
 //! [`super::run_tool`] so each handler's `run` function reduces to one call.
+//!
+//! ## Two sinks, one entry point
+//!
+//! [`run_passthrough_tool`] is the single entry point for the family, and it is
+//! also where the buffered-vs-streamed decision lives.  It knows *statically*
+//! that the tool is pure passthrough — `parse_impl` always returns
+//! `ParseResult::RawPassthrough` — without needing `parse()` to have run, which
+//! is exactly what lets the default path stream (`passthrough_stream`, #495)
+//! instead of buffering the child's whole stdout.  See
+//! [`choose_passthrough_sink`] for the four cases that still need the complete
+//! string.
 
 use super::{RunContext, ToolRunConfig, run_tool};
 use crate::output::ParseResult;
@@ -26,6 +37,7 @@ pub(crate) mod env;
 pub(crate) mod find;
 pub(crate) mod grep;
 pub(crate) mod ls;
+mod passthrough_stream;
 pub(crate) mod ps;
 pub(crate) mod rg;
 pub(crate) mod wc;
@@ -115,10 +127,75 @@ pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRun
     }
 }
 
+/// Which sink serves a pure-passthrough run.
+///
+/// The two sinks emit identical bytes; they differ in *when*.  See
+/// [`choose_passthrough_sink`] for why the buffered one still exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(super) enum PassthroughSink {
+    /// Stream the child's stdout as it arrives (`passthrough_stream`).
+    Streamed,
+    /// Buffer the child's whole output, then emit (`execution::run_tool`).
+    Buffered,
+}
+
+/// Inputs to the buffered-vs-streamed decision.
+///
+/// A struct rather than four positional `bool`s so a transposed argument at the
+/// call site is a compile error rather than a silent routing bug.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SinkInputs {
+    /// `--json` was requested.
+    pub json_output: bool,
+    /// `--show-stats` was requested.
+    pub show_stats: bool,
+    /// The tool's input comes from stdin, not from a spawned child.
+    pub reads_stdin: bool,
+    /// `SKIM_PASSTHROUGH=1` is set.
+    pub passthrough_mode: bool,
+}
+
+/// Decide which sink a pure-passthrough run uses.
+///
+/// Streaming is the default for this family: `parse_impl` always returns
+/// `ParseResult::RawPassthrough`, so there is no compressed view and therefore
+/// nothing the ADR-001 net-savings guard could compare.  Four cases still need
+/// the complete string and stay buffered:
+///
+/// - **`json_output`** — the `{"tier":"passthrough","raw":…}` envelope has to
+///   embed the whole body as a JSON string; it cannot be emitted incrementally.
+/// - **`show_stats`** — `record_and_report` tokenizes the raw and compressed
+///   strings to display a token count.  The streamed sink never holds either, so
+///   approximating would silently change a user-visible number.  This exclusion
+///   exists specifically to keep that number identical.
+/// - **`reads_stdin`** — there is no child process to stream from.
+/// - **`passthrough_mode`** — `SKIM_PASSTHROUGH=1` routes through
+///   `execution::passthrough_raw`, which has its own byte contract (no
+///   trailing-newline guard on either stream).  Streaming that sink is a
+///   separate change; conflating it here would silently alter the escape
+///   hatch's output.
+///
+/// Pure and `const` so the routing rule is unit-testable without spawning
+/// anything.
+pub(super) const fn choose_passthrough_sink(inputs: SinkInputs) -> PassthroughSink {
+    if inputs.json_output || inputs.show_stats || inputs.reads_stdin || inputs.passthrough_mode {
+        PassthroughSink::Buffered
+    } else {
+        PassthroughSink::Streamed
+    }
+}
+
 /// Execute a pure-passthrough file tool.
 ///
-/// Combines [`passthrough_config`] and [`run_tool`] so each handler's `run`
-/// function is a single call.  `parse_fn` is kept as a parameter — the 16
+/// Routes to the streaming sink ([`passthrough_stream::run_passthrough_streamed`])
+/// or the buffered one ([`passthrough_config`] + [`run_tool`]) per
+/// [`choose_passthrough_sink`].  Branching *here* rather than inside
+/// `execution.rs` is what makes streaming safe: this is the single entry point
+/// for the family, and it knows *statically* that the tool is pure passthrough
+/// without needing `parse()` to have run.
+///
+/// `parse_fn` is kept as a parameter — the buffered sink needs it, and the 16
 /// existing `test_parse_impl_is_passthrough` unit tests call each module's
 /// `parse_impl` directly, keeping that symbol reachable and dead-code-lint-clean.
 pub(super) fn run_passthrough_tool(
@@ -127,7 +204,19 @@ pub(super) fn run_passthrough_tool(
     ctx: &RunContext,
     parse_fn: impl FnOnce(&CommandOutput) -> ParseResult<FileResult>,
 ) -> anyhow::Result<std::process::ExitCode> {
-    run_tool(passthrough_config(spec), args, ctx, |_| {}, parse_fn)
+    let sink = choose_passthrough_sink(SinkInputs {
+        json_output: ctx.json_output,
+        show_stats: ctx.show_stats,
+        reads_stdin: super::should_read_stdin(args),
+        passthrough_mode: super::is_passthrough_mode(),
+    });
+
+    match sink {
+        PassthroughSink::Streamed => passthrough_stream::run_passthrough_streamed(&spec, args, ctx),
+        PassthroughSink::Buffered => {
+            run_tool(passthrough_config(spec), args, ctx, |_| {}, parse_fn)
+        }
+    }
 }
 
 /// Maximum path/match entries shown in output (truncation cap).
@@ -302,5 +391,81 @@ mod tests {
             config.expected_exit_codes.is_empty(),
             "wc config must not carry any expected_exit_codes"
         );
+    }
+
+    // ========================================================================
+    // choose_passthrough_sink: the buffered-vs-streamed routing rule
+    //
+    // SCOPE — pure-function tests over the routing decision.  They exercise
+    // NEITHER the rewrite engine NOR the PATH-wrapper dispatch front-end; the
+    // e2e coverage of the two sinks lives in tests/cli_e2e_pipe_fidelity.rs.
+    // ========================================================================
+
+    /// The plain case — no flags, a real child process — streams.
+    #[test]
+    fn test_plain_invocation_streams() {
+        assert_eq!(
+            choose_passthrough_sink(SinkInputs {
+                json_output: false,
+                show_stats: false,
+                reads_stdin: false,
+                passthrough_mode: false,
+            }),
+            PassthroughSink::Streamed,
+            "streaming is the default for a family that has no compressed view"
+        );
+    }
+
+    /// Each exclusion independently forces the buffered sink.
+    ///
+    /// Table-driven so a newly added exclusion cannot be half-wired: the
+    /// assertion names the reason it exists, and every field is exercised on its
+    /// own rather than only in combination.
+    #[test]
+    fn test_each_exclusion_forces_the_buffered_sink() {
+        let base = SinkInputs {
+            json_output: false,
+            show_stats: false,
+            reads_stdin: false,
+            passthrough_mode: false,
+        };
+        let cases: [(&str, SinkInputs); 4] = [
+            (
+                "--json needs the whole body inside a JSON string",
+                SinkInputs {
+                    json_output: true,
+                    ..base
+                },
+            ),
+            (
+                "--show-stats tokenizes both strings to display a count",
+                SinkInputs {
+                    show_stats: true,
+                    ..base
+                },
+            ),
+            (
+                "stdin input has no child process to stream from",
+                SinkInputs {
+                    reads_stdin: true,
+                    ..base
+                },
+            ),
+            (
+                "SKIM_PASSTHROUGH=1 uses passthrough_raw's own byte contract",
+                SinkInputs {
+                    passthrough_mode: true,
+                    ..base
+                },
+            ),
+        ];
+
+        for (reason, inputs) in cases {
+            assert_eq!(
+                choose_passthrough_sink(inputs),
+                PassthroughSink::Buffered,
+                "must stay buffered: {reason}"
+            );
+        }
     }
 }
