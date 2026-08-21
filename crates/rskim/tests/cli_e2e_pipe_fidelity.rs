@@ -73,6 +73,19 @@ fn skim_with_stubs(stub_dir: &Path, args: &[&str]) -> Command {
     c
 }
 
+/// [`skim_with_stubs`] with the `SKIM_PASSTHROUGH=1` escape hatch enabled.
+///
+/// The escape hatch is a *different sink* from the family streaming sink: it is
+/// `execution::run_parsed_command_with_exit`'s own pre-`obtain_output` branch,
+/// and it carries a stricter byte contract (no trailing-newline guard on either
+/// stream, no notices, no analytics).  Tests that assert escape-hatch behaviour
+/// must go through here, not through [`skim_with_stubs`].
+fn skim_escape_hatch(stub_dir: &Path, args: &[&str]) -> Command {
+    let mut c = skim_with_stubs(stub_dir, args);
+    c.env("SKIM_PASSTHROUGH", "1");
+    c
+}
+
 /// A grep-shaped fixture of `n` lines, sized well past the pipe buffer.
 ///
 /// The pipe-buffer threshold matters: below it the whole write lands before the
@@ -541,5 +554,272 @@ fn t8_stdin_input_still_routes_to_the_buffered_path() {
     assert!(
         body.contains("piped stdin body"),
         "stdin must still be served by the buffered path; got: {body:?}"
+    );
+}
+
+// ============================================================================
+// T9–T14 — the SKIM_PASSTHROUGH=1 escape hatch (A2)
+//
+// The escape hatch is the surface a user reaches for *because* compressed
+// output hid something.  Before A2 it was the least faithful sink skim had: it
+// buffered the child's whole stdout through `runner::read_pipe`, which
+// hard-errors at MAX_OUTPUT_BYTES and **discards the entire buffer** — so the
+// documented remedy for "skim hid my output" returned nothing at all.
+//
+// Surface: every test below drives the **explicit subcommand** path
+// (`skim grep …` / `skim find …`), i.e. the same `cmd::dispatch` front-end the
+// PATH-wrapper surface reaches via `detect_argv0_dispatch`.  None of them
+// exercises the rewrite engine.
+// ============================================================================
+
+/// How long the T9 stub stalls between its two output lines.
+const T9_STALL: Duration = Duration::from_secs(3);
+
+/// The escape hatch reproduces the producer's timeline instead of replaying it.
+///
+/// Same construction as [`t2_reader_observes_the_producers_stall`], and for the
+/// same reason: the assertion is on the **gap between two emitted lines**, never
+/// on an absolute deadline from `spawn()`.  A debug binary under 4-way parallel
+/// `nextest` on macOS can take ~1.5 s just to reach `main`, which flakes any
+/// absolute deadline tight enough to discriminate.  The gap cancels start-up
+/// cost entirely: ~0 s buffered versus [`T9_STALL`] streamed.
+#[test]
+fn t9_escape_hatch_reader_observes_the_producers_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("first.txt"), "a.rs:1:first\n").unwrap();
+    std::fs::write(dir.path().join("second.txt"), "a.rs:2:second\n").unwrap();
+    // `cat` rather than the shell's `echo` builtin: otherwise the *shell's* own
+    // stdout buffering, not skim's, decides when bytes reach the pipe.
+    write_stub_script(
+        dir.path(),
+        "grep",
+        &format!(
+            "#!/bin/sh\ncat '{}'\nsleep {}\ncat '{}'\n",
+            dir.path().join("first.txt").display(),
+            T9_STALL.as_secs(),
+            dir.path().join("second.txt").display()
+        ),
+    );
+
+    let mut child = skim_escape_hatch(dir.path(), &["grep", "-rn", "first", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(l) = line else { return };
+            if tx.send((l, Instant::now())).is_err() {
+                return;
+            }
+        }
+    });
+
+    let (first, t_first) = rx
+        .recv_timeout(HANG_TIMEOUT)
+        .expect("the first line never arrived through the escape hatch");
+    let (second, t_second) = rx
+        .recv_timeout(HANG_TIMEOUT)
+        .expect("the second line never arrived through the escape hatch");
+    wait_bounded(&mut child, "t9");
+
+    assert_eq!(first, "a.rs:1:first");
+    assert_eq!(second, "a.rs:2:second");
+
+    let gap = t_second.duration_since(t_first);
+    assert!(
+        gap >= T9_STALL / 2,
+        "the two lines arrived {gap:?} apart but the producer stalled {T9_STALL:?} between \
+         them — SKIM_PASSTHROUGH=1 buffered the whole stream instead of streaming it"
+    );
+}
+
+/// The escape hatch delivers raw's own first 20 lines and exits 141.
+///
+/// `head` is deliberately not used: `assert_cmd` buffers the whole child and
+/// cannot close a pipe early, so this drops a `BufReader` after N lines instead.
+#[test]
+fn t10_escape_hatch_first_n_parity_and_exit_is_pipe_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = grep_fixture(5_000);
+    make_stub(dir.path(), "grep", &fixture, "", 0);
+
+    let mut child = skim_escape_hatch(dir.path(), &["grep", "-rn", "some_function", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let got = read_n_lines_then_close(&mut child, 20);
+    let status = wait_bounded(&mut child, "t10");
+
+    let expected: Vec<String> = fixture.lines().take(20).map(|l| format!("{l}\n")).collect();
+    assert_eq!(
+        got, expected,
+        "the escape hatch must deliver raw's own first 20 lines before the reader closed"
+    );
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "a closed downstream reader must exit 141 (128 + SIGPIPE), never 1"
+    );
+}
+
+/// The escape hatch delivers output far past the buffered 64 MiB ceiling.
+///
+/// **This is the headline fix.**  `runner::read_pipe` hard-errors at
+/// `MAX_OUTPUT_BYTES` and throws the accumulated buffer away, so before A2 this
+/// exact invocation produced `Error: output exceeded 67108864 byte limit`, exit
+/// 1, and **zero bytes of stdout** — measured, not theorised.  A byte pump has
+/// no ceiling at all: memory is O(chunk) because each chunk is written out
+/// before the next is read.
+///
+/// `#[ignore]` because it moves 70 MiB through a pipe; the always-run guard is
+/// the pure-function `pump` test in `cmd::stream_pump`
+/// (`test_pump_delivers_everything_past_a_buffered_style_ceiling`), which uses
+/// an injectable limit in the `read_pipe_degrade_impl(reader, limit)` style.
+/// Run with `cargo nextest run -p rskim --all-targets --run-ignored all`.
+#[test]
+#[ignore = "moves 70 MiB through a pipe; the pump unit test is the always-run guard"]
+fn t11_escape_hatch_delivers_past_the_buffered_ceiling() {
+    const MIB: usize = 1024 * 1024;
+    const EMITTED_MIB: usize = 70;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_stub_script(
+        dir.path(),
+        "grep",
+        &format!(
+            "#!/bin/sh\ndd if=/dev/zero bs={MIB} count={EMITTED_MIB} 2>/dev/null | tr '\\0' 'x'\n"
+        ),
+    );
+
+    let (out_path, out_sink) = stderr_file(dir.path(), "huge.out");
+    let (err_path, err_sink) = stderr_file(dir.path(), "huge.err");
+    let mut child = skim_escape_hatch(dir.path(), &["grep", "-rn", "x", "."])
+        .stdout(out_sink)
+        .stderr(err_sink)
+        .spawn()
+        .unwrap();
+    let status = wait_bounded(&mut child, "t11");
+
+    let delivered = std::fs::metadata(&out_path).unwrap().len() as usize;
+    let errs = std::fs::read_to_string(&err_path).unwrap();
+    assert_eq!(
+        delivered,
+        EMITTED_MIB * MIB,
+        "every byte must be DELIVERED past the old 64 MiB ceiling — the buffered \
+         path discarded the whole buffer here and emitted nothing; stderr was: {errs:?}"
+    );
+    assert_eq!(status.code(), Some(0), "the stub exits 0");
+    assert!(
+        !errs.contains("byte limit"),
+        "the escape hatch must not hard-error at a byte ceiling; got: {errs:?}"
+    );
+}
+
+/// Non-UTF-8 bytes survive the escape hatch verbatim.
+///
+/// `runner::read_pipe` decodes with `String::from_utf8(..).unwrap_or_else(lossy)`,
+/// so `0xFF 0xFE` reached the reader as two U+FFFD sequences — skim showing
+/// something *different* from raw, with no marker (#317).  The byte pump has no
+/// decode step.
+#[test]
+fn t12_escape_hatch_passes_non_utf8_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: &[u8] = b"a.rs:1:caf\xc3\xa9\ta.rs:2:\xff\xfe raw\x80bytes\n";
+    make_stub_bytes(dir.path(), "grep", payload, b"", 0);
+
+    let out = skim_escape_hatch(dir.path(), &["grep", "-rn", "raw", "."])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.stdout, payload,
+        "the escape hatch must forward non-UTF-8 tool bytes verbatim, not as U+FFFD"
+    );
+}
+
+/// ~1 MiB interleaved on stdout AND stderr completes without deadlocking.
+///
+/// Streaming stdout on the calling thread reintroduces the pipe-full deadlock
+/// that the two-reader-thread buffered runner made structurally impossible: with
+/// nobody draining stderr the child blocks once that pipe fills, stops writing
+/// stdout, and the stdout pump blocks forever (PF-023 / AD-STR-8).
+///
+/// [`wait_bounded`] is the explicit timeout: it polls `try_wait` against
+/// [`HANG_TIMEOUT`] and **kills the child and panics** rather than blocking, so a
+/// regression fails CI instead of hanging it.
+#[test]
+fn t13_escape_hatch_interleaved_stdout_and_stderr_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunk_out: String = std::iter::repeat_n("o".repeat(63), 1024)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let chunk_err: String = std::iter::repeat_n("e".repeat(63), 1024)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(dir.path().join("chunk.out"), &chunk_out).unwrap();
+    std::fs::write(dir.path().join("chunk.err"), &chunk_err).unwrap();
+    write_stub_script(
+        dir.path(),
+        "grep",
+        &format!(
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 16 ]; do\n  cat '{}'\n  cat '{}' >&2\n  i=$((i+1))\ndone\n",
+            dir.path().join("chunk.out").display(),
+            dir.path().join("chunk.err").display()
+        ),
+    );
+
+    let (out_path, out_sink) = stderr_file(dir.path(), "eh.out");
+    let (err_path, err_sink) = stderr_file(dir.path(), "eh.err");
+    let mut child = skim_escape_hatch(dir.path(), &["grep", "-rn", "o", "."])
+        .stdout(out_sink)
+        .stderr(err_sink)
+        .spawn()
+        .unwrap();
+    let status = wait_bounded(&mut child, "t13");
+
+    assert_eq!(status.code(), Some(0), "stub exits 0");
+    assert_eq!(
+        std::fs::metadata(&out_path).unwrap().len() as usize,
+        chunk_out.len() * 16,
+        "every stdout byte must reach the reader (#317: compress, never truncate)"
+    );
+    assert!(
+        std::fs::metadata(&err_path).unwrap().len() as usize >= chunk_err.len() * 16,
+        "the escape hatch forwards child stderr verbatim"
+    );
+}
+
+/// The escape hatch stays byte-exact: it must NOT append a trailing newline.
+///
+/// This is the regression guard for the `choose_passthrough_sink` routing
+/// decision.  The family streaming sink (`run_passthrough_streamed`) reproduces
+/// `emit_raw_passthrough`'s trailing-newline guard and appends one — see
+/// [`t7b_missing_trailing_newline_is_added_exactly_once`].  The escape hatch
+/// reproduces `passthrough_raw`'s contract instead and appends nothing, because
+/// a newline the raw tool never emitted is exactly the divergence
+/// `SKIM_PASSTHROUGH=1` exists to escape.  If this test starts failing, the
+/// `passthrough_mode` field was dropped from `choose_passthrough_sink` and the
+/// escape hatch is being served by the wrong sink.
+#[test]
+fn t14_escape_hatch_does_not_append_a_trailing_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: &[u8] = b"a.rs:1:no trailing newline";
+    make_stub_bytes(dir.path(), "grep", payload, b"", 0);
+
+    let out = skim_escape_hatch(dir.path(), &["grep", "-rn", "no", "."])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.stdout, payload,
+        "SKIM_PASSTHROUGH=1 is byte-exact — it must not add a newline the tool never emitted"
     );
 }

@@ -129,14 +129,19 @@ pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRun
 
 /// Which sink serves a pure-passthrough run.
 ///
-/// The two sinks emit identical bytes; they differ in *when*.  See
-/// [`choose_passthrough_sink`] for why the buffered one still exists.
+/// See [`choose_passthrough_sink`] for why the second one still exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub(super) enum PassthroughSink {
-    /// Stream the child's stdout as it arrives (`passthrough_stream`).
+    /// This family's own streaming sink
+    /// ([`passthrough_stream::run_passthrough_streamed`]).
     Streamed,
-    /// Buffer the child's whole output, then emit (`execution::run_tool`).
+    /// Hand the run to the shared `execution::run_tool` pipeline.
+    ///
+    /// Named for what it does in three of its four cases.  The fourth,
+    /// `SKIM_PASSTHROUGH=1`, is *not* buffered: `execution.rs` has its own
+    /// streamed escape hatch with a stricter byte contract, and routing here is
+    /// how the family defers to it.  See [`choose_passthrough_sink`].
     Buffered,
 }
 
@@ -160,8 +165,8 @@ pub(super) struct SinkInputs {
 ///
 /// Streaming is the default for this family: `parse_impl` always returns
 /// `ParseResult::RawPassthrough`, so there is no compressed view and therefore
-/// nothing the ADR-001 net-savings guard could compare.  Four cases still need
-/// the complete string and stay buffered:
+/// nothing the ADR-001 net-savings guard could compare.  Four cases route to
+/// `execution::run_tool` instead:
 ///
 /// - **`json_output`** — the `{"tier":"passthrough","raw":…}` envelope has to
 ///   embed the whole body as a JSON string; it cannot be emitted incrementally.
@@ -170,11 +175,25 @@ pub(super) struct SinkInputs {
 ///   approximating would silently change a user-visible number.  This exclusion
 ///   exists specifically to keep that number identical.
 /// - **`reads_stdin`** — there is no child process to stream from.
-/// - **`passthrough_mode`** — `SKIM_PASSTHROUGH=1` routes through
-///   `execution::passthrough_raw`, which has its own byte contract (no
-///   trailing-newline guard on either stream).  Streaming that sink is a
-///   separate change; conflating it here would silently alter the escape
-///   hatch's output.
+/// - **`passthrough_mode`** — a *byte-contract* exclusion, not a buffering one.
+///
+/// # Why `passthrough_mode` stays in the condition
+///
+/// `SKIM_PASSTHROUGH=1` now streams too — `execution::stream_passthrough_raw`
+/// drives the same shared pump this family does — so "streaming is a separate
+/// change" is no longer the reason.  The reason is that the two sinks have
+/// **different byte contracts**, and the escape hatch needs the stricter one:
+///
+/// | | family sink | escape hatch |
+/// |---|---|---|
+/// | trailing-newline guard | on (parity with `emit_raw_passthrough`) | **off — byte-exact** |
+/// | notices | tier + exit-disposition notices | none |
+/// | analytics | records a `passthrough`/`raw` row | records nothing |
+///
+/// Dropping the field would serve `SKIM_PASSTHROUGH=1 skim grep …` from the
+/// family sink, which appends a newline the raw tool never emitted — precisely
+/// the divergence the escape hatch exists to escape.
+/// `t14_escape_hatch_does_not_append_a_trailing_newline` pins this.
 ///
 /// Pure and `const` so the routing rule is unit-testable without spawning
 /// anything.
@@ -416,7 +435,7 @@ mod tests {
         );
     }
 
-    /// Each exclusion independently forces the buffered sink.
+    /// Each exclusion independently routes away from the family sink.
     ///
     /// Table-driven so a newly added exclusion cannot be half-wired: the
     /// assertion names the reason it exists, and every field is exercised on its
@@ -452,7 +471,9 @@ mod tests {
                 },
             ),
             (
-                "SKIM_PASSTHROUGH=1 uses passthrough_raw's own byte contract",
+                "SKIM_PASSTHROUGH=1 needs the escape hatch's byte-exact contract \
+                 (no trailing-newline guard, no notices, no analytics) — it streams \
+                 too, but from execution::stream_passthrough_raw, not from here",
                 SinkInputs {
                     passthrough_mode: true,
                     ..base
@@ -464,7 +485,7 @@ mod tests {
             assert_eq!(
                 choose_passthrough_sink(inputs),
                 PassthroughSink::Buffered,
-                "must stay buffered: {reason}"
+                "must not use the family streaming sink: {reason}"
             );
         }
     }

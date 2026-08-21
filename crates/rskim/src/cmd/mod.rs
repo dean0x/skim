@@ -75,6 +75,8 @@ pub(crate) use registry::{
 mod security;
 pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
 
+pub(crate) mod stream_pump;
+
 #[cfg(test)]
 pub(crate) mod test_utils;
 

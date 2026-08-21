@@ -8,6 +8,9 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use crate::cmd::stream_pump::{
+    PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child, write_tail,
+};
 use crate::output::ParseResult;
 use crate::runner::{CommandOutput, CommandRunner};
 
@@ -575,13 +578,33 @@ where
     Ok((s, status))
 }
 
-/// Write raw command output to stdout/stderr and return the process exit code.
+/// Write already-captured raw command output to stdout/stderr and return the
+/// process exit code.
 ///
-/// Used by the passthrough fast-path in [`run_parsed_command_with_mode`] when
-/// `SKIM_PASSTHROUGH=1` is set. Forwards stdout/stderr verbatim without any
-/// compression or parsing.
-/// A closed downstream pipe on either stream short-circuits to
-/// [`pipe_closed_exit`] instead of propagating `Error: Broken pipe`.
+/// Forwards stdout/stderr verbatim without any compression or parsing, with no
+/// trailing-newline guard on either stream.  A closed downstream pipe on either
+/// stream short-circuits to [`pipe_closed_exit`] instead of propagating
+/// `Error: Broken pipe`.
+///
+/// # Call sites — and why only one of them streams
+///
+/// This is the **buffered** form: it renders a [`CommandOutput`] the caller
+/// already holds.  Two paths reach it, and they are structurally different:
+///
+/// - **Unexpected-exit-code raw forwarding** ([`ExitDisposition::UnexpectedFailure`])
+///   — cannot stream, by construction.  The disposition is a *function of the
+///   exit code*, which is only knowable once the child has exited, and it
+///   selects between two different byte streams (raw vs compressed).  Streaming
+///   would mean committing raw bytes to stdout before the branch that decides
+///   whether raw is even the right answer, and those bytes cannot be un-written.
+///   By the time this branch runs the child has also already been reaped, so
+///   there is no live producer left to stream from and no latency to recover.
+/// - **Stdin-fed passthrough** — `obtain_output` may have taken its bytes from
+///   stdin rather than a child, so there is nothing to spawn or stream.
+///
+/// The `SKIM_PASSTHROUGH=1` escape hatch over a *spawned* child uses
+/// [`stream_passthrough_raw`] instead, which reproduces this byte contract
+/// exactly while streaming.
 fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     let code = output.exit_code.unwrap_or(1);
     {
@@ -601,6 +624,106 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
         }
     }
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
+}
+
+/// Streaming form of [`passthrough_raw`] — the `SKIM_PASSTHROUGH=1` escape hatch.
+///
+/// Spawns `program` and pumps its stdout straight through, byte for byte, with
+/// the same contract [`passthrough_raw`] renders: no trailing-newline guard on
+/// either stream, no notices, no analytics, and the child's own exit code.
+///
+/// # Why the escape hatch is the sink that most needed this
+///
+/// The buffered form is downstream of `obtain_output` → `CommandRunner::run_with_env`
+/// → `runner::read_pipe`, which past [`crate::runner::MAX_OUTPUT_BYTES`] returns
+/// `Err("output exceeded … byte limit")` and **discards the entire accumulated
+/// buffer** — a genuine zero-output path.  `SKIM_PASSTHROUGH=1` shared it, so the
+/// documented remedy for "skim hid my output" returned *nothing at all* past
+/// 64 MiB.  That is the worst possible failure mode for an escape hatch: it is
+/// what a user runs precisely *because* compressed output hid something.
+/// Measured before this change on a 70 MiB producer: 0 bytes delivered, exit 1,
+/// `Error: output exceeded 67108864 byte limit`.
+///
+/// The pump has no ceiling at all (memory is O(chunk)), so the escape hatch is
+/// now lossless by construction rather than by an ADR-002-style degrade branch.
+/// It also fixes the lossy UTF-8 decode in `read_pipe`, which turned non-UTF-8
+/// tool bytes into U+FFFD, and the buffered latency that made
+/// `SKIM_PASSTHROUGH=1 skim find … | head` wait for the whole scan.
+///
+/// # Exit contract
+///
+/// Child's own code on clean EOF; [`pipe_closed_exit`] (`141` on unix) when the
+/// reader closes the pipe. **Never `1` on pipe closure** — for `grep`/`rg`/`diff`
+/// exit 1 is the wire protocol for "no matches found".
+fn stream_passthrough_raw(
+    program: &str,
+    args: &[String],
+    env_overrides: &[(&str, &str)],
+    install_hint: &str,
+) -> anyhow::Result<ExitCode> {
+    let mut sink = io::BufWriter::with_capacity(PUMP_BUF_BYTES, io::stdout().lock());
+    let outcome = stream_child(
+        &StreamSpec {
+            program,
+            args,
+            env_overrides,
+        },
+        &mut sink,
+    )?;
+
+    let done = match outcome {
+        // Same message and hint as `obtain_output`'s `is_spawn_error` branch.
+        StreamOutcome::SpawnFailed => {
+            eprintln!("error: '{program}' not found");
+            eprintln!("hint: {install_hint}");
+            return Ok(ExitCode::FAILURE);
+        }
+        StreamOutcome::PipeClosed => {
+            // ADR-011 class 2: nothing was lost — the *reader* stopped reading,
+            // and the raw tool is silent in exactly this situation.
+            crate::debug_log!(
+                "[skim] downstream reader closed the pipe; stopped streaming {program} output."
+            );
+            return Ok(pipe_closed_exit());
+        }
+        StreamOutcome::Completed(done) => done,
+    };
+
+    // Release the stdout lock (the pump flushes per chunk, so nothing is
+    // pending) before touching stderr, preserving stream ordering.
+    drop(sink);
+
+    if !done.stderr.is_empty() {
+        let mut err = io::stderr().lock();
+        // `false`: byte-exact, matching `passthrough_raw`'s stderr write.
+        match write_tail(&mut err, &done.stderr, false) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if done.stderr_discarded {
+        // ADR-011 class 1: the reader is seeing LESS child stderr than raw, so
+        // the marker is unconditional — a debug-gated banner here would hide a
+        // real divergence.  The remedy is NOT the usual `SKIM_PASSTHROUGH=1`
+        // hint: passthrough mode is already on, so that advice is circular and
+        // unactionable.  Point at the raw tool instead, which is the only way to
+        // see more.  The buffered path hard-errors here (`read_pipe` fails past
+        // the ceiling and emits nothing at all), so a marked partial is strictly
+        // more faithful.
+        eprintln!(
+            "{}",
+            crate::output::elision_marker_unbounded_with_remedy(
+                "the 64 MiB stderr capture ceiling",
+                "child stderr",
+                &format!("run '{program}' directly for the full stream"),
+            )
+        );
+    }
+
+    Ok(ExitCode::from(
+        done.exit_code.unwrap_or(1).clamp(0, 255) as u8
+    ))
 }
 
 /// Tools for which exit code 1 means "no match" / "differs" — a benign
@@ -778,12 +901,27 @@ where
         synthesize_success_line,
     } = config;
 
+    // Passthrough mode: bypass all compression and forward raw output.
+    //
+    // ORDERING: this branch is deliberately placed BEFORE `obtain_output`.  That
+    // call is where the child's whole stdout is accumulated by `runner::read_pipe`
+    // — which hard-errors past 64 MiB and throws the buffer away, decodes
+    // non-UTF-8 bytes to U+FFFD, and cannot deliver anything until the child
+    // exits.  Branching after it would inherit all three defects no matter how
+    // the bytes were subsequently written.  Streaming here is what removes them.
+    let passthrough = is_passthrough_mode();
+    if passthrough && !use_stdin {
+        return stream_passthrough_raw(program, args, env_overrides, install_hint);
+    }
+
     let Some(output) = obtain_output(program, args, env_overrides, install_hint, use_stdin)? else {
         return Ok(ExitCode::FAILURE);
     };
 
-    // Passthrough mode: bypass all compression and forward raw output.
-    if is_passthrough_mode() {
+    // Stdin-fed passthrough: `obtain_output` may have taken its bytes from stdin
+    // rather than from a child, so there is nothing to spawn and nothing to
+    // stream.  Unchanged from before.
+    if passthrough {
         return passthrough_raw(&output);
     }
 
