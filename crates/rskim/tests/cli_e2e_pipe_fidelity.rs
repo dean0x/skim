@@ -1027,3 +1027,306 @@ fn t15_pipe_close_costs_zero_stderr_bytes() {
         "a closed reader must cost zero stderr bytes by default (ADR-011 class 2); got:\n{err}"
     );
 }
+
+// ============================================================================
+// T16 — `dispatch::run_raw_passthrough`, the missed sibling surface (PF-006)
+//
+// A *third* buffered passthrough, serving the unknown-subcommand fallback plus
+// `gh` (output-steering gate) and `yarn`.  It is NOT the `SKIM_PASSTHROUGH=1`
+// escape hatch, which is why A2 correctly left it — and it carried both defects
+// A2 fixed elsewhere: the 64 MiB TOTAL-LOSS hard error and the lossy UTF-8
+// decode.  It is a pure byte passthrough (it returns only an `ExitCode`; no
+// caller inspects the text), so nothing needed the complete buffer.
+//
+// `skim yarn build` is the probe: `build` is not one of yarn's compressed
+// subcommands, so it takes the raw-passthrough arm.
+//
+// Surface: explicit subcommand path (`cmd::dispatch`), the same front-end the
+// PATH-wrapper surface reaches via `detect_argv0_dispatch`.  Not the rewrite
+// engine.
+// ============================================================================
+
+/// How long the T16 stub stalls between its two output lines.
+const T16_STALL: Duration = Duration::from_secs(3);
+
+/// First-N parity and exit 141 when the reader leaves mid-stream.
+///
+/// Exit 141 was already correct before this change — the `write!` propagated its
+/// `BrokenPipe` to the `main.rs` boundary — so this is a regression guard for the
+/// exit contract while the sink underneath it changes.  What is new is that the
+/// bytes now arrive incrementally (see [`t16_raw_passthrough_reader_observes_the_producers_stall`])
+/// and the child is killed rather than run to completion.
+#[test]
+fn t16_raw_passthrough_first_n_parity_and_exit_is_pipe_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = grep_fixture(5_000);
+    make_stub(dir.path(), "yarn", &fixture, "", 0);
+
+    let (err_path, err_sink) = stderr_file(dir.path(), "t16-parity.err");
+    let mut child = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(err_sink)
+        .spawn()
+        .unwrap();
+
+    let got = read_n_lines_then_close(&mut child, 20);
+    let status = wait_bounded(&mut child, "t16-parity");
+    let err = std::fs::read_to_string(&err_path).unwrap();
+
+    let expected: Vec<String> = fixture.lines().take(20).map(|l| format!("{l}\n")).collect();
+    assert_eq!(
+        got, expected,
+        "the lines delivered before the reader closed must be raw's own first 20 lines"
+    );
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "a closed downstream reader must exit 141 (128 + SIGPIPE), never 1"
+    );
+    assert!(
+        !err.contains("Broken pipe"),
+        "`Error: Broken pipe` must never reach stderr; got:\n{err}"
+    );
+}
+
+/// The reader observes the producer's own stall — proof that this sink streams.
+///
+/// Same construction and the same reason as `t2` / `t9`: the assertion is on the
+/// **gap between two emitted lines**, never on an absolute deadline from
+/// `spawn()`.  A debug binary under 4-way parallel `nextest` on macOS can take
+/// ~1.5 s just to reach `main`, which flakes any absolute deadline tight enough
+/// to discriminate.  The gap cancels start-up cost entirely: ~0 s buffered
+/// versus [`T16_STALL`] streamed.
+#[test]
+fn t16_raw_passthrough_reader_observes_the_producers_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("first.txt"), "yarn:1:first\n").unwrap();
+    std::fs::write(dir.path().join("second.txt"), "yarn:2:second\n").unwrap();
+    // `cat` rather than the shell's `echo` builtin: otherwise the *shell's* own
+    // stdout buffering, not skim's, decides when bytes reach the pipe.
+    write_stub_script(
+        dir.path(),
+        "yarn",
+        &format!(
+            "#!/bin/sh\ncat '{}'\nsleep {}\ncat '{}'\n",
+            dir.path().join("first.txt").display(),
+            T16_STALL.as_secs(),
+            dir.path().join("second.txt").display()
+        ),
+    );
+
+    let mut child = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(l) = line else { return };
+            if tx.send((l, Instant::now())).is_err() {
+                return;
+            }
+        }
+    });
+
+    let (first, t_first) = rx
+        .recv_timeout(HANG_TIMEOUT)
+        .expect("the first line never arrived through run_raw_passthrough");
+    let (second, t_second) = rx
+        .recv_timeout(HANG_TIMEOUT)
+        .expect("the second line never arrived through run_raw_passthrough");
+    wait_bounded(&mut child, "t16-ttfb");
+
+    assert_eq!(first, "yarn:1:first");
+    assert_eq!(second, "yarn:2:second");
+
+    let gap = t_second.duration_since(t_first);
+    assert!(
+        gap >= T16_STALL / 2,
+        "the two lines arrived {gap:?} apart but the producer stalled {T16_STALL:?} between \
+         them — run_raw_passthrough buffered the whole stream instead of streaming it"
+    );
+}
+
+/// Non-UTF-8 bytes survive `run_raw_passthrough` verbatim.
+///
+/// `runner::read_pipe` decodes with `String::from_utf8(..).unwrap_or_else(lossy)`,
+/// so `0xFF 0xFE 0x80` reached the reader as U+FFFD sequences — skim showing
+/// something *different* from raw with no marker (#317).  Measured pre-fix on
+/// this exact payload: 39 bytes out for 33 bytes in.  The byte pump never
+/// decodes.
+#[test]
+fn t16_raw_passthrough_passes_non_utf8_verbatim() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: &[u8] = b"a.rs:1:caf\xc3\xa9\ta.rs:2:\xff\xfe raw\x80bytes\n";
+    make_stub_bytes(dir.path(), "yarn", payload, b"", 0);
+
+    let out = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.stdout, payload,
+        "run_raw_passthrough must forward non-UTF-8 tool bytes verbatim, not as U+FFFD"
+    );
+}
+
+/// The byte contract is exact: no trailing newline is invented.
+///
+/// The buffered form wrote `write!(out, "{}", output.stdout)` with no
+/// trailing-newline guard; the streamed form must not acquire one (that is the
+/// family sink's contract, not this one).
+#[test]
+fn t16_raw_passthrough_does_not_append_a_trailing_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload: &[u8] = b"yarn:1:no trailing newline";
+    make_stub_bytes(dir.path(), "yarn", payload, b"", 0);
+
+    let out = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.stdout, payload,
+        "run_raw_passthrough is byte-exact — it must not add a newline the tool never emitted"
+    );
+}
+
+/// The child's exit code is forwarded unchanged.
+///
+/// `run_raw_passthrough` has its own disposition — the child's code,
+/// `unwrap_or(1)` on a signal kill, clamped to `[0, 255]` — which is *not* the
+/// file family's exit matrix.  Migrating the sink must not import a different one.
+#[test]
+fn t16_raw_passthrough_forwards_the_child_exit_code() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "yarn", "built\n", "", 7);
+
+    let out = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.stdout, b"built\n");
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "the child's own exit code must be forwarded unchanged"
+    );
+}
+
+/// ~1 MiB interleaved on stdout AND stderr completes without deadlocking.
+///
+/// Streaming stdout on the calling thread reintroduces the pipe-full deadlock
+/// that the two-reader-thread buffered runner made structurally impossible: with
+/// nobody draining stderr the child blocks once that pipe fills, stops writing
+/// stdout, and the stdout pump blocks forever (PF-023 / AD-STR-8).
+///
+/// [`wait_bounded`] is the explicit timeout: it polls `try_wait` against
+/// [`HANG_TIMEOUT`] and **kills the child and panics** rather than blocking, so a
+/// regression fails CI instead of hanging it.
+#[test]
+fn t16_raw_passthrough_interleaved_stdout_and_stderr_does_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let chunk_out: String = std::iter::repeat_n("o".repeat(63), 1024)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let chunk_err: String = std::iter::repeat_n("e".repeat(63), 1024)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(dir.path().join("chunk.out"), &chunk_out).unwrap();
+    std::fs::write(dir.path().join("chunk.err"), &chunk_err).unwrap();
+    write_stub_script(
+        dir.path(),
+        "yarn",
+        &format!(
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 16 ]; do\n  cat '{}'\n  cat '{}' >&2\n  i=$((i+1))\ndone\n",
+            dir.path().join("chunk.out").display(),
+            dir.path().join("chunk.err").display()
+        ),
+    );
+
+    let (out_path, out_sink) = stderr_file(dir.path(), "t16.out");
+    let (err_path, err_sink) = stderr_file(dir.path(), "t16.err");
+    let mut child = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .stdout(out_sink)
+        .stderr(err_sink)
+        .spawn()
+        .unwrap();
+    let status = wait_bounded(&mut child, "t16-deadlock");
+
+    assert_eq!(status.code(), Some(0), "stub exits 0");
+    assert_eq!(
+        std::fs::metadata(&out_path).unwrap().len() as usize,
+        chunk_out.len() * 16,
+        "every stdout byte must reach the reader (#317: compress, never truncate)"
+    );
+    assert!(
+        std::fs::metadata(&err_path).unwrap().len() as usize >= chunk_err.len() * 16,
+        "child stderr is forwarded verbatim"
+    );
+}
+
+/// `run_raw_passthrough` delivers output far past the buffered 64 MiB ceiling.
+///
+/// **The headline defect-2 fix.**  `runner::read_pipe` hard-errors at
+/// `MAX_OUTPUT_BYTES` and throws the accumulated buffer away, so before this
+/// change `skim yarn build` on a 70 MiB log produced
+/// `Error: output exceeded 67108864 byte limit`, exit 1, and **zero bytes of
+/// stdout** — measured on this exact stub, not theorised.  A byte pump has no
+/// ceiling at all.
+///
+/// `#[ignore]` because it moves 70 MiB through a pipe; the always-run guard is
+/// the pure-function `pump` test in `cmd::stream_pump`
+/// (`test_pump_delivers_everything_past_a_buffered_style_ceiling`), which now
+/// covers this call site too because both share `stream_child`.
+/// Run with `cargo nextest run -p rskim --all-targets --run-ignored all`.
+#[test]
+#[ignore = "moves 70 MiB through a pipe; the pump unit test is the always-run guard"]
+fn t16_raw_passthrough_delivers_past_the_buffered_ceiling() {
+    const MIB: usize = 1024 * 1024;
+    const EMITTED_MIB: usize = 70;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_stub_script(
+        dir.path(),
+        "yarn",
+        &format!(
+            "#!/bin/sh\ndd if=/dev/zero bs={MIB} count={EMITTED_MIB} 2>/dev/null | tr '\\0' 'x'\n"
+        ),
+    );
+
+    let (out_path, out_sink) = stderr_file(dir.path(), "t16-huge.out");
+    let (err_path, err_sink) = stderr_file(dir.path(), "t16-huge.err");
+    let mut child = skim_with_stubs(dir.path(), &["yarn", "build"])
+        .stdin(Stdio::null())
+        .stdout(out_sink)
+        .stderr(err_sink)
+        .spawn()
+        .unwrap();
+    let status = wait_bounded(&mut child, "t16-huge");
+
+    let delivered = std::fs::metadata(&out_path).unwrap().len() as usize;
+    let errs = std::fs::read_to_string(&err_path).unwrap();
+    assert_eq!(
+        delivered,
+        EMITTED_MIB * MIB,
+        "every byte must be DELIVERED past the old 64 MiB ceiling — the buffered \
+         path discarded the whole buffer here and emitted nothing; stderr was: {errs:?}"
+    );
+    assert_eq!(status.code(), Some(0), "the stub exits 0");
+    assert!(
+        !errs.contains("byte limit"),
+        "run_raw_passthrough must not hard-error at a byte ceiling; got: {errs:?}"
+    );
+}

@@ -232,9 +232,12 @@ pub(crate) struct StreamCompleted {
 /// How a streamed run ended.
 #[must_use]
 pub(crate) enum StreamOutcome {
-    /// The child could not be spawned.  The caller owns the "not found" message
-    /// and install hint, which differ per family.
-    SpawnFailed,
+    /// The child could not be spawned.  The caller owns the diagnostic, which
+    /// differs per family: the passthrough sinks print their own "not found"
+    /// message plus an install hint and ignore the payload, while
+    /// `dispatch::run_raw_passthrough` rebuilds `RunnerError::SpawnFailed` from
+    /// it so its error text stays byte-identical to the buffered runner's.
+    SpawnFailed(io::Error),
     /// The downstream reader closed the pipe mid-stream.  The child has already
     /// been killed and the drain thread joined; the caller must stop producing
     /// output and return `pipe_closed_exit()`.
@@ -273,7 +276,7 @@ pub(crate) fn stream_child(
     // gone.
     let mut child = match cmd.spawn() {
         Ok(c) => ChildGuard(c),
-        Err(_) => return Ok(StreamOutcome::SpawnFailed),
+        Err(e) => return Ok(StreamOutcome::SpawnFailed(e)),
     };
 
     // Started BEFORE the first stdout read — see the PF-023 design note above.

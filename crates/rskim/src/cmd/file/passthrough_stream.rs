@@ -77,7 +77,7 @@ pub(super) fn run_passthrough_streamed(
 
     let done = match outcome {
         // Matches `execution::obtain_output`'s `is_spawn_error` branch.
-        StreamOutcome::SpawnFailed => {
+        StreamOutcome::SpawnFailed(_) => {
             eprintln!("error: '{}' not found", spec.program);
             eprintln!("hint: {}", spec.install_hint);
             return Ok(ExitCode::FAILURE);

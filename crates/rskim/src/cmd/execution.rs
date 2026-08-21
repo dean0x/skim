@@ -754,7 +754,7 @@ fn stream_passthrough_raw(
 
     let done = match outcome {
         // Same message and hint as `obtain_output`'s `is_spawn_error` branch.
-        StreamOutcome::SpawnFailed => {
+        StreamOutcome::SpawnFailed(_) => {
             eprintln!("error: '{program}' not found");
             eprintln!("hint: {install_hint}");
             return Ok(ExitCode::FAILURE);
