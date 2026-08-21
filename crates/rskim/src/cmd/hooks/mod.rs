@@ -577,9 +577,8 @@ pub(crate) fn generate_hook_script(
          export SKIM_HOOK_VERSION=\"{version}\"\n\
          export SKIM_HOOK_BINARY={quoted}\n\
          export SKIM_HOOK_COMMIT={git_commit}\n\
-         _SKIM_BIN={quoted}\n\
-         if [ -x \"$_SKIM_BIN\" ]; then\n\
-           exec \"$_SKIM_BIN\" rewrite --hook --agent {agent_cli_name}\n\
+         if [ -x \"$SKIM_HOOK_BINARY\" ]; then\n\
+           exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent {agent_cli_name}\n\
          fi\n\
          exec skim rewrite --hook --agent {agent_cli_name}\n"
     )
@@ -650,7 +649,7 @@ mod tests {
         assert!(script.contains("# skim-hook v1.2.3"));
         assert!(script.contains("skim init --agent test-agent"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.3\""));
-        // New pinned format: SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, _SKIM_BIN, and PATH fallback.
+        // Pinned format: SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, and PATH fallback.
         assert!(
             script.contains("export SKIM_HOOK_BINARY="),
             "script must export SKIM_HOOK_BINARY"
@@ -660,12 +659,12 @@ mod tests {
             "script must export SKIM_HOOK_COMMIT"
         );
         assert!(
-            script.contains("_SKIM_BIN="),
-            "script must set _SKIM_BIN variable"
+            !script.contains("_SKIM_BIN="),
+            "script must not set the redundant _SKIM_BIN local variable (D5)"
         );
         assert!(
-            script.contains("exec \"$_SKIM_BIN\" rewrite --hook --agent test-agent"),
-            "script must exec via pinned binary"
+            script.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent test-agent"),
+            "script must exec via $SKIM_HOOK_BINARY directly"
         );
         // PATH fallback for when pinned binary is unavailable.
         assert!(

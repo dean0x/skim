@@ -564,7 +564,8 @@ pub enum Mode {
     /// Useful for testing and comparing with other modes.
     Full,
 
-    /// Minimal cleanup - strip non-doc comments, normalize blank lines
+    /// Minimal cleanup - strip non-doc comments, normalize blank lines;
+    /// module header comments preserved in Python, Ruby, SQL, and Bash
     ///
     /// Token reduction: ~15-30%
     ///
@@ -573,9 +574,12 @@ pub enum Mode {
     /// - Doc comments (JSDoc `/** */`, Python docstrings, Rust `///`/`//!`, Go doc, Javadoc)
     /// - Comments inside function bodies
     /// - Shebangs (`#!/usr/bin/env python3`)
+    /// - Module header comments (SPDX, `# frozen_string_literal:`, provenance lines) in
+    ///   Python, Ruby, SQL, and Bash only — stripped in all other languages
     ///
     /// Removes:
     /// - Regular single-line comments (`//`, `#`) at module/class level
+    ///   (except module header comments in Python, Ruby, SQL, and Bash)
     /// - Regular block comments (`/* */`) at module/class level
     /// - Trailing whitespace left by comment removal
     /// - Excessive blank lines (3+ consecutive -> 2)
@@ -639,7 +643,7 @@ impl Mode {
     ///
     /// Higher values mean more aggressive token reduction:
     /// - Full(0): No transformation, 0% reduction
-    /// - Minimal(1): Strip non-doc comments, ~15-30% reduction
+    /// - Minimal(1): Strip non-doc comments (module header comments preserved in Python, Ruby, SQL, Bash), ~15-30% reduction
     /// - Pseudo(2): Strip syntactic noise, ~30-50% reduction
     /// - Structure(3): Strip bodies, ~70-80% reduction
     /// - Signatures(4): Signatures only, ~85-92% reduction

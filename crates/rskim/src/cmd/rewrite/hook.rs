@@ -83,7 +83,7 @@ impl DriftEnv {
             hook_commit: std::env::var("SKIM_HOOK_COMMIT")
                 .ok()
                 .filter(|v| !v.is_empty()),
-            current_exe: std::env::current_exe().and_then(std::fs::canonicalize).ok(),
+            current_exe: crate::cmd::init::resolve_skim_binary().ok(),
             compiled_version: env!("CARGO_PKG_VERSION").to_string(),
             compiled_commit: option_env!("SKIM_GIT_COMMIT")
                 .unwrap_or("unknown")
@@ -355,7 +355,12 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         let integrity_failed = check_hook_integrity(agent_kind);
 
         let de = DriftEnv::from_process();
-        // Only detect drift if integrity is intact; integrity failure subsumes drift.
+        // Drift detection reads env vars that the hook script itself exports
+        // (SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).  When the
+        // hook is Tampered those exports come from the tampered script and
+        // cannot be trusted — so drift results would be unreliable.  Skip
+        // drift detection only on Tampered; an unreadable hook (which returns
+        // integrity_failed=false) still allows drift detection to run.
         let drifts = if !integrity_failed {
             detect_drift(&de)
         } else {
@@ -593,7 +598,14 @@ fn check_hook_integrity(agent: AgentKind) -> bool {
             }
             true
         }
-        Err(_) => false, // Script unreadable — don't block the hook
+        Err(_) => {
+            // Script unreadable: cannot compute hash, so cannot detect tampering.
+            // Return false (integrity check does NOT signal failure) so drift
+            // detection continues to run — the unreadable-script state will be
+            // visible via `skim doctor` without silencing drift on this channel.
+            // Only `Tampered` (above) returns true and suppresses drift.
+            false
+        }
     }
 }
 

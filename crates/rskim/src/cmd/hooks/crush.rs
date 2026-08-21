@@ -131,7 +131,7 @@ mod tests {
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.0.0\""));
         assert!(script.contains("export SKIM_HOOK_BINARY="));
         assert!(script.contains("export SKIM_HOOK_COMMIT="));
-        assert!(script.contains("exec \"$_SKIM_BIN\" rewrite --hook --agent crush"));
+        assert!(script.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent crush"));
         // PATH fallback must still be present.
         assert!(script.contains("exec skim rewrite --hook --agent crush"));
     }

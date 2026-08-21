@@ -139,11 +139,14 @@ fn test_ruby_full_mode_passthrough() {
 // ============================================================================
 
 #[test]
-fn test_ruby_minimal_strips_comments() {
+fn test_ruby_minimal_preserves_module_header_comments() {
+    // Module-level header comments (contiguous from file start) must be preserved
+    // in minimal mode (#476). Shebangs, copyright, SPDX, frozen_string_literal,
+    // and FIXTURE/TESTS markers all live here.
     let result = transform(SIMPLE_RB, Language::Ruby, Mode::Minimal).unwrap();
     assert!(
-        !result.contains("# FIXTURE:"),
-        "file-level comments should be stripped, got:\n{result}"
+        result.contains("# FIXTURE:"),
+        "module-level header comments should be preserved, got:\n{result}"
     );
     assert!(
         result.contains("class UserService"),
@@ -153,11 +156,15 @@ fn test_ruby_minimal_strips_comments() {
 
 #[test]
 fn test_ruby_minimal_preserves_body_comments() {
-    let source = "# Top-level comment to strip\nclass Foo\n  def bar\n    # inside body comment\n    42\n  end\nend\n";
+    // Class-level comment (inside class body, not a root child) must be stripped.
+    // Body comment inside a method must be preserved.
+    // Source deliberately starts with a class definition so the comment inside
+    // the class is NOT at the root level and does not qualify as a module header.
+    let source = "class Foo\n  # class-level comment to strip\n  def bar\n    # inside body comment\n    42\n  end\nend\n";
     let result = transform(source, Language::Ruby, Mode::Minimal).unwrap();
     assert!(
-        !result.contains("Top-level comment"),
-        "top-level comments should be stripped, got:\n{result}"
+        !result.contains("class-level comment"),
+        "class-level comments should be stripped, got:\n{result}"
     );
     assert!(
         result.contains("inside body comment"),

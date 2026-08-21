@@ -1,11 +1,11 @@
 ---
 feature: hook-binary-pinning
 name: Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
-description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem, or modifying the proxy feature gate / cfg-gated registry entries, or touching the rewrite transparency marker (SKIM_REWRITTEN_FROM / rewrite_origin / rewrite_transparency_marker / view_differs), or working on doctor integrity checks / ScriptIntegrity / hook_status_line, or adding test harness sandboxing (skim_sandboxed / hermetic_path). Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, generate_hook_script, is_hook_script_current, uses_pinned_binary, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, proxy feature gate, cfg-gated registry, routing guard, cli_proxy_gating, KNOWN_SUBCOMMANDS, META_SUBCOMMANDS, wrapper_targets, uses_dedicated_hook_file, hook_event_key, print_install_summary, print_dry_run_actions, print_dry_run_permissions, SKIM_JSON_NAME, SKIM_REWRITTEN_FROM, rewrite_origin, rewrite_transparency_marker, view_differs, transparency marker, origin tag, ScriptIntegrity, classify_script_integrity, verify_script_integrity, hook_status_line, HookFacts, NoManifest, Tampered, Verified, Unreadable, skim_sandboxed, hermetic_path, ADR-004, ADR-005, ADR-006, ADR-008."
+description: "Use when modifying hook script generation, adding new agents, changing the hook script format, debugging version-skew or wrong-clone warnings, working on install/reinstall logic, touching wrapper symlink management, editing guidance_content() / the Command wrapping section, or working on skim init --permissions / the PermissionsProtocol subsystem, or modifying the proxy feature gate / cfg-gated registry entries, or touching the rewrite transparency marker (SKIM_REWRITTEN_FROM / rewrite_origin / rewrite_transparency_marker / view_differs), or working on doctor integrity checks / ScriptIntegrity / hook_status_line, or adding test harness sandboxing (skim_sandboxed / skim_sandboxed_with_bin / hermetic_path). Keywords: hook install, binary pinning, SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, resolve_skim_binary, generate_hook_script, uses_pinned_binary, pin_is_current, script_has_pinned_marker, AwarenessOnly, codex, wrapper symlinks, guidance_content, guidance_content_mdc, Command wrapping, PermissionsProtocol, confirm_grant, READ_ONLY_SUBCOMMANDS, hook_config_dir, modifiedArgs, seed tier, sidecar manifest, proxy feature gate, cfg-gated registry, routing guard, cli_proxy_gating, KNOWN_SUBCOMMANDS, META_SUBCOMMANDS, wrapper_targets, uses_dedicated_hook_file, hook_event_key, print_install_summary, print_dry_run_actions, print_dry_run_permissions, SKIM_JSON_NAME, SKIM_REWRITTEN_FROM, rewrite_origin, rewrite_transparency_marker, view_differs, transparency marker, origin tag, ScriptIntegrity, classify_script_integrity, verify_script_integrity, hook_status_line, HookFacts, NoManifest, Tampered, Verified, Unreadable, binary pin mismatch, skim_sandboxed, skim_sandboxed_with_bin, hermetic_path, ADR-004, ADR-005, ADR-006, ADR-008, PF-015, PF-017."
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
 created: 2026-07-04
-updated: 2026-08-12
+updated: 2026-08-18
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -35,13 +35,41 @@ v2.11.0 added the **permissions seeding subsystem** (`skim init --permissions`):
 
 `generate_hook_script` in `hooks/mod.rs` is the single source of truth for script content. All RealHook agents must produce scripts via this shared function. The format (F6) embeds `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY`, `SKIM_HOOK_COMMIT`, and `_SKIM_BIN` — single-quoted via `shell_single_quote()`. The PATH fallback (`exec skim rewrite --hook`) is a safety net only.
 
-### The Two Currency Predicates — One Shared Pinned-Marker Helper
+### resolve_skim_binary() — Single Source of Truth for Binary Path
 
-Two separate predicates determine whether an existing hook script is stale, sharing a single source of truth: `script_has_pinned_marker` in `init/mod.rs`.
+`resolve_skim_binary()` in `init/helpers.rs` calls `current_exe()` then `canonicalize()` and is the **only** place where the running binary's canonical absolute path is computed. Three sites that write or compare binary paths MUST all call this helper so they agree byte-for-byte:
 
-**`uses_pinned_binary` (`init/state.rs`)** delegates to the shared helper for state detection. **`is_hook_script_current` (`init/install.rs`)** ANDs its own version-line check with the shared marker scan. `DetectedState::hook_is_current()` combines both: `version matches && hook_uses_pinned_binary`.
+1. `create_hook_script` — embeds the path as `SKIM_HOOK_BINARY` in the hook script
+2. `detect_state` — stores the resolved path in `DetectedState.skim_binary`
+3. `maybe_install_wrappers` — passes the path as the wrapper symlink target
 
-The shared helper **structurally prevents** drift: changing the `SKIM_HOOK_BINARY` marker updates both predicates at once. A new **required line** added to the script format and gated in only one predicate re-introduces the lockstep hazard — fold any new required-line check into the shared helper.
+Before this helper existed, `state.rs` used bare `current_exe()` while `create_hook_script` used `canonicalize()`. On macOS and any system where the binary sits behind a symlink (e.g. `/tmp → /private/tmp`, Homebrew cellar, `cargo install`), those two paths differed — causing `pin_is_current()` to return `false` on every run and triggering an infinite reinstall loop. **The failure is machine-dependent**: CI passes because the test binary's path has no symlinks, but a developer with a symlinked binary will see churn. A green CI run is not proof the path-comparison invariant holds.
+
+### The Currency Predicates
+
+Three predicates determine script staleness. Together they form a hierarchy; the fast-path idempotence check requires all three to be true.
+
+**`uses_pinned_binary` (`init/state.rs`)** delegates to `script_has_pinned_marker` to check whether the installed script uses the F6 pinned format. This is the ONLY place the marker string is scanned; any change to the marker must go here.
+
+The currency checks are delegated to two separate predicates in `DetectedState`: `hook_is_current()` (checks version + pinned format + commit) and `pin_is_current()` (validates the binary pin path by comparing `hook_binary_pin` to `resolve_skim_binary()`). If the pin path in the script differs from the current binary's canonical path (two-clone same-commit scenario), `pin_is_current()` returns `false` and the hook is marked stale. The two-predicate split allows `hook_status_line` in `skim doctor` to distinguish between a commit mismatch and a path mismatch, with the terminal case being `"binary pin mismatch"` only when version and commit both match but the path differs.
+
+**`DetectedState::hook_is_current()`** combines three checks: `version matches && hook_uses_pinned_binary && commit matches` (the commit check is skipped when the compiled commit is `"unknown"` — tarball/non-git builds). It does NOT check path — that is `pin_is_current()`'s job. The separation is intentional: `hook_is_current()` plus commit together allow `hook_status_line` to distinguish a commit mismatch from a pure path mismatch; the terminal `"binary pin mismatch"` case is logically reachable only when version AND commit both match but `!pin_is_current`.
+
+**`DetectedState::pin_is_current()` (new in PR #488)** compares the canonical binary path stored in `hook_binary_pin` against the result of `resolve_skim_binary()`. It is **deliberately separate from `hook_is_current()`** for two reasons: (1) `hook_is_current()` + commit checks are what skim doctor uses to derive the *cause* of a mismatch — folding pin into `hook_is_current()` would collapse every pin mismatch into the generic `[stale]` bucket; (2) doctor can display the `hook_binary_pin` field independently via `HookFacts.pin_is_current` (PF-015 display-without-gate pattern). Absent pin → `false`.
+
+**Fast-path condition in `run_install_single`** now requires all six conditions:
+```
+state.hook_installed
+&& state.hook_is_current()    // version + pinned format + commit
+&& guidance_current
+&& !permissions_blocked
+&& !flags.force               // --force bypasses the fast path unconditionally
+&& manifest_present
+```
+
+Note: wrappers are handled INSIDE the fast-path block (`maybe_install_wrappers(flags.wrappers, flags.dry_run)` is called before `print_already_up_to_date()`), so `--wrappers` on a current install does not fall through to a full reinstall. `pin_is_current()` is NOT a fast-path gate; it is used only by `hook_status_line` in `skim doctor` to report path mismatches as advisories.
+
+Wrappers are installed inside the fast-path block (before the early return) rather than blocking it. When the fast path succeeds (`state.hook_installed && state.hook_is_current() && ...`), `maybe_install_wrappers(flags.wrappers, flags.dry_run)` is called (guarded by `!flags.project` to avoid installing global wrappers in project scope). This means `skim init --wrappers` on a current hook install still installs wrappers without falling through to a full reinstall. The `print_wrapper_install_result` PATH-setup blurb is gated on `result.created + result.updated > 0` so it does not appear on idempotent re-runs.
 
 ### ScriptIntegrity: Doctor Derives Verdict from Manifest, Not Hook Text
 
@@ -54,25 +82,24 @@ pub(crate) enum ScriptIntegrity {
     Tampered,    // script contents differ from stored hash
     Unreadable,  // script file cannot be read (missing, permission denied)
 }
-
-pub(crate) fn classify_script_integrity(
-    config_dir: &Path,
-    agent_cli_name: &str,
-    script_path: &Path,
-) -> ScriptIntegrity { ... }
 ```
 
-`verify_script_integrity` is a **thin bool wrapper** over `classify_script_integrity` that maps `Verified|NoManifest → Ok(true)`, `Tampered → Ok(false)`, `Unreadable → Err(...)`. It preserves the existing call contract for the two legacy callers (`cmd/rewrite/hook.rs` and `cmd/init/uninstall.rs`) that predate the full enum.
+`verify_script_integrity` is a **thin bool wrapper** over `classify_script_integrity` that maps `Verified|NoManifest → Ok(true)`, `Tampered → Ok(false)`, `Unreadable → Err(...)`. It preserves the existing call contract for the two legacy callers (`cmd/rewrite/hook.rs` and `cmd/init/uninstall.rs`).
 
-**Why the manifest, not the script text:** the hook script bytes are exactly what a tamper modifies. A doctor that reads the `SKIM_HOOK_VERSION` comment out of the script and trusts it would be fooled by any modification that preserves the comment. The SHA-256 manifest is an independent artefact written at install time and stored alongside the script — a tamper that also updates the manifest would need to know the expected hash.
+**Why the manifest, not the script text:** the hook script bytes are exactly what a tamper modifies. A doctor that reads the `SKIM_HOOK_VERSION` comment out of the script and trusts it would be fooled by any modification that preserves the comment. The SHA-256 manifest is an independent artefact written at install time and stored alongside the script.
 
-**`HookFacts.script_integrity`:** `hook_facts()` in `init/mod.rs` calls `classify_script_integrity` for every agent (not just ClaudeCode) and stores the result in `HookFacts`. Doctor reads `HookFacts.script_integrity` and passes it to `hook_status_line()`.
+**`HookFacts.script_integrity`:** `hook_facts()` in `init/mod.rs` calls `classify_script_integrity` for every agent and stores the result in `HookFacts`. Doctor reads `HookFacts.script_integrity` and passes it to `hook_status_line()`.
 
-**`hook_status_line()` in `doctor/mod.rs`:** a pure, testable function that produces `(bool, String)` — drift verdict and the display line. It checks `ScriptIntegrity` **before** pin/currency checks so the verdict always comes from the manifest. Behavior by state:
-- `Tampered` → drift (`✗`), names the suppression coupling (#479)
-- `Unreadable` → drift (`✗`), names the suppression coupling (#479)
-- `NoManifest` → advisory only (`⚠`), **not** drift — falls through to pin/currency checks (Group 3 fix: no early return that suppresses drift detection for the pin state)
-- `Verified` → falls through to pin/currency checks
+**`hook_status_line()` in `doctor/mod.rs`:** a pure, testable function that produces `(bool, String)`. It checks `ScriptIntegrity` **before** pin/currency checks. Control flow by integrity state:
+- `Tampered` → drift (`✗`), early-returns. Names the drift-suppression coupling (#479 on the hook-exec channel).
+- `Unreadable` → drift (`✗`), early-returns. Does NOT claim drift detection is silenced — `Unreadable` maps to `integrity_failed=false` in `check_hook_integrity()`, so drift detection still runs at hook-exec time. Only `Tampered` silences drift.
+- `NoManifest` → advisory note (`⚠ no integrity manifest…`) appended, **no early return** — falls through to pin/currency checks.
+- `Verified` → falls through to pin/currency checks.
+
+**Pin/currency block (`!hook_is_current || !pin_is_current`):** only reachable for `Verified` and `NoManifest`. The reason chain:
+1. If `commit_ok` is false → `"commit mismatch (hook: …, binary: …)"`. When the compiled commit is `"unknown"` (tarball/non-git build), `commit_ok` is forced to `true` — the comparison is indeterminate and must not be reported as a mismatch.
+2. Else if `version_ok` is false → `"version mismatch (hook: …, binary: …)"`.
+3. Else (version and commit both match, so the mismatch is path-only) → `"binary pin mismatch (hook: {pin}, running: {current_exe})"`. This terminal replaces the former `"stale"` fallback, which was dead code (`commit_ok ∧ version_ok ⇒ hook_is_current`, so the only remaining mismatch is in the pin path).
 
 ### Two Fail-Opens Fixed (issue #471)
 
@@ -80,27 +107,13 @@ pub(crate) fn classify_script_integrity(
 Previously `NoManifest` returned early from the hook-status logic, silently bypassing pin/currency drift checks for pre-manifest installs. Now `NoManifest` falls through with an advisory note (`⚠ no integrity manifest...`) appended to whatever the pin/currency check produces. Pre-manifest hooks can still be reported as unpinned or stale.
 
 **Fail-open 2 — `skim init` never regenerated a missing manifest:**
-The idempotent early-return path (when `is_hook_script_current()` returns true) previously exited immediately without writing the manifest. Doctor's advice — "run `skim init --agent X`" — was therefore a dead end: running init again would hit the same early return and skip the manifest write again. Now the early-return path explicitly computes and writes/rewrites the manifest before printing "Skipped":
-
-```rust
-// install.rs — self-heal: always write manifest on the idempotent path
-if script_path.exists() && is_hook_script_current(&script_path, &state.skim_version) {
-    let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;  // ? propagates errors
-    crate::cmd::integrity::write_hash_manifest(...)?;                     // ? propagates errors
-    println!("  {} Skipped: ...", ...);
-    return Ok(());
-}
-```
-
-Write errors are propagated with `?` — the previous code used `let _ = write_hash_manifest(...)` which silently swallowed failures.
+The idempotent early-return path (when all six fast-path conditions hold: `state.hook_installed && state.hook_is_current() && guidance_current && !permissions_blocked && !flags.force && manifest_present`) previously exited immediately without writing the manifest. Now the early-return path explicitly checks `manifest_present` as a fast-path gate, and `execute_install()` computes and writes the manifest even when the hook is current. Write errors propagate with `?` — the previous code used `let _ = write_hash_manifest(...)` which silently swallowed failures.
 
 ### `check_hook_binary_mismatch` — Same-Version Divergent Build Detection
 
 This function in `rewrite/hook.rs` fires only when versions match. It compares (1) `SKIM_HOOK_BINARY` vs `canonicalize(current_exe())` and (2) `SKIM_HOOK_COMMIT` vs `option_env!("SKIM_GIT_COMMIT")`. Both comparisons skip if the env var is unset (backward compat) and skip the commit comparison if either side is `"unknown"`. Warnings go to `hook.log` via `warn_once_daily()` — never stderr.
 
-**Still-open decision (#479):** At hook-exec time (`rewrite/hook.rs:359`), drift detection is suppressed when integrity fails — an integrity failure subsumes drift detection deliberately. This is the correct behavior but is tracked as an issue to reconsider after the self-heal ships in a release (a user who installs with the self-heal can no longer reach the `NoManifest` state, at which point promoting it to drift would be safe).
-
-**`parse_version_from_script` reads the comment first:** `parse_version_from_script` in `state.rs` scans lines and checks `# skim-hook v{version}` (the legacy comment line) **before** `export SKIM_HOOK_VERSION="..."`. Since the comment appears first in the generated script, it wins. This means an attacker who edits the script can change the comment and change what version `detect_state` sees. This function must **never** be used as a security input — it is a convenience parser for display and reinstall-skip decisions only, not for integrity classification (which uses the manifest).
+**Tampered drift suppression (#479):** at hook-exec time, `detect_drift` is correctly skipped when the script is `Tampered`. Three of `DriftEnv::from_process()`'s six fields (`hook_version`, `hook_binary`, `hook_commit`) are read from env vars the hook script itself exports — a tampered script is one entire side of every comparison and cannot be trusted. The other three fields are binary-derived and tamper-proof. `Unreadable` does NOT suppress drift (`check_hook_integrity` returns `false` for Unreadable) — the unreadable state surfaces via `skim doctor` without blinding the drift channel.
 
 ### Codex Is HookSupport::AwarenessOnly
 
@@ -108,13 +121,13 @@ This function in `rewrite/hook.rs` fires only when versions match. It compares (
 
 ### Doctor-vs-Hook Asymmetry
 
-**Hook-time integrity checking is claude-code-only.** In `run_hook_mode` (`rewrite/hook.rs`), `check_hook_integrity` is called only inside the `if agent_kind == AgentKind::ClaudeCode` branch (line ~353). Other agents do not get hook-time integrity checking.
+**Hook-time integrity checking is claude-code-only.** In `run_hook_mode` (`rewrite/hook.rs`), `check_hook_integrity` is called only inside the `if agent_kind == AgentKind::ClaudeCode` branch. Other agents do not get hook-time integrity checking.
 
 **Doctor checks all agents.** `print_hook_section` in `doctor/mod.rs` iterates `AgentKind::all_supported()` and calls `hook_status_line(&facts, ...)` for every agent. `hook_facts(agent)` calls `classify_script_integrity` for any agent with a hook script path. This means hand-edited gemini/codex/cursor/copilot scripts now report `✗` in `skim doctor` even though no integrity check fires at hook-exec time for those agents.
 
 ### Proxy Feature Gate (#352)
 
-The `proxy` subcommand is compiled out of default builds (ADR-008). Enforced in three coordinated places: the registry pair-gate (`"proxy"` appears in both `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the same `#[cfg(feature = "proxy")]`), the routing guard in `main.rs` (`#[cfg(not(feature = "proxy"))]` fires before file-op fallthrough), and optional Cargo deps (`proxy = ["dep:rskim-proxy", "dep:rskim-contract"]`). The invariant test `test_proxy_registry_entries_gated_as_a_pair` asserts the cfg-pair in both feature configs.
+The `proxy` subcommand is compiled out of default builds (ADR-008). Enforced in three coordinated places: the registry pair-gate (`"proxy"` appears in both `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the same `#[cfg(feature = "proxy")]`), the routing guard in `main.rs`, and optional Cargo deps. The invariant test `test_proxy_registry_entries_gated_as_a_pair` asserts the cfg-pair in both feature configs.
 
 ### Transparency Marker for Hook-Rewritten File Reads (SKIM_REWRITTEN_FROM)
 
@@ -130,12 +143,16 @@ The `detect_state` → `run_install_single` flow:
 
 ```
 detect_state()
-  └─ reads hook script once → uses_pinned_binary + parse_version_from_script
-  └─ DetectedState::hook_is_current() = version matches && pinned format
+  └─ reads hook script once → uses_pinned_binary + parse_version_from_script + binary pin
+  └─ DetectedState::hook_is_current() = version matches && pinned format && commit matches
+  └─ DetectedState::pin_is_current() = canonical binary path matches
         │
-        ├─ true → compute hash → write_hash_manifest (self-heal, ? propagated)
-        │          → print "Already up to date", return
-        └─ false → create_hook_script()
+        ├─ all 6 fast-path conditions true:
+        │    hook_installed && hook_is_current() && guidance_current
+        │    && !permissions_blocked && !flags.force && manifest_present
+        │    → maybe_install_wrappers (wrappers handled here, not a blocker)
+        │    → print "Already up to date", return
+        └─ any condition false → create_hook_script()
                   → atomic_write_executable() → write_hash_manifest (? propagated)
                   → patch_settings() [or install_hook_registration() for Copilot]
                   → inject_guidance()
@@ -156,25 +173,28 @@ Binary paths use `shell_single_quote()`. `generate_hook_script` asserts three pa
 
 `uninstall_wrappers_in` uses `file_stem()` (not `file_name()`) — strips extensions, exact match on `"skim"` or `"rskim"`. `install_wrappers_in` never overwrites non-symlink files (PF-003 safety invariant).
 
-### Test Hermeticity — `skim_sandboxed` and `hermetic_path`
+### Test Hermeticity — `skim_sandboxed_with_bin`, `skim_sandboxed`, and `hermetic_path`
 
-Before this branch, `cli_init*` and `cli_doctor` tests ran global `skim init --uninstall` against the developer's real `$HOME`, deleting `~/.skim/bin` wrappers and `~/.gemini/GEMINI.md`.
+`tests/common/mod.rs` provides two helpers. `skim_sandboxed_with_bin(home, bin)` is the **single authoritative sandbox env-var block**; `skim_sandboxed(home)` delegates to it using the default cargo-built binary. Any test shelling out to `skim init`/`--uninstall`/`doctor` must route through one of these helpers or it will mutate the developer's real `~/.claude`, `~/.gemini`, `~/.skim/bin`, etc.
 
-`tests/common/mod.rs` now provides `skim_sandboxed(home)` which redirects:
+The sandbox sets:
 - `HOME` — redirects all `dirs::home_dir()` lookups
-- `CLAUDE_CONFIG_DIR` → `home/.claude`
-- `SKIM_CACHE_DIR` → `home/.cache/skim`
-- `SKIM_WRAPPERS_DIR` → `home/.skim/bin`
-- `GEMINI_CONFIG_DIR` → `home/.gemini`
-- `COPILOT_CONFIG_DIR` → `home/.copilot`
+- `CLAUDE_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, `CODEX_HOME`, `CRUSH_CONFIG_DIR` — each agent's own config-dir override
+- `SKIM_CACHE_DIR` — redirects parser cache and analytics DB
+- `SKIM_WRAPPERS_DIR` — redirects wrapper symlink directory
+- `SKIM_DISABLE_ANALYTICS=1`, `NO_COLOR=1` — no DB writes, deterministic output
 
-Also removes `SKIM_PASSTHROUGH`, `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY` to start clean.
+Also removes `SKIM_REWRITTEN_FROM`, `SKIM_PASSTHROUGH`, `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY` to start clean.
 
-**Two traps worth recording:**
+**`skim_sandboxed_with_bin` is essential for pin-mismatch coverage (PF-015).** The E2E test `test_doctor_exits_1_on_binary_pin_mismatch` copies the test binary to a second path, runs `init` from the copy (so the hook pins to the copy's path), then runs `doctor` from the original binary. Editing the hook script directly would trip `Tampered` (early-return before any pin logic) — making the pin unreachable. The copy-binary approach is the only structurally correct way to test the pin-mismatch path.
+
+**Known remaining gap:** `cli_init.rs`'s older `skim_init_cmd` helper overrides only `CLAUDE_CONFIG_DIR` across 40+ tests — it does not call `skim_sandboxed`. Those tests are not fully hermetic.
+
+**Two additional traps worth recording:**
 
 1. **`detect_installed_agents()` in override-mode requires the config dir to already exist.** Tests must call `std::fs::create_dir_all(home.join(".claude"))` before calling `skim_sandboxed(home)` for init tests — otherwise `detect_installed_agents` returns empty (agent appears not installed).
 
-2. **`skim doctor` scans `$PATH`, so a sibling clone's binary can win and produce spurious drift.** `cli_doctor.rs` has a `hermetic_path()` helper that prepends the test binary's directory to `$PATH`, ensuring the built binary under test is the one that wins. Tests that assert on drift must use `hermetic_path()` or they may see false drift from an unrelated release build on the developer's PATH.
+2. **`skim doctor` scans `$PATH`, so a sibling clone's binary can win and produce spurious drift.** `cli_doctor.rs` has a `hermetic_path()` helper that prepends the test binary's directory to `$PATH`, ensuring the built binary under test wins. Tests that assert on drift must use `hermetic_path()` or they may see false drift from an unrelated release build on the developer's PATH.
 
 ## Anti-Patterns
 
@@ -188,69 +208,70 @@ Also removes `SKIM_PASSTHROUGH`, `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY` to star
 
 **Adding `--yes` bypass to `confirm_grant`**: the `--yes` flag is uninstall-only. `confirm_grant` must be called unconditionally whenever permissions are requested.
 
-**Adding `find`, `env`, `ps`, `dig`, or `nslookup` to `READ_ONLY_SUBCOMMANDS`**: these tools are excluded for cause. `Bash(skim <tool>:*)` entries do NOT bound tool arguments.
-
-**Adding `SKIM_PASSTHROUGH` to the guidance template**: enforced by `!content.contains("SKIM_PASSTHROUGH")` negative test assert.
-
 **Mis-gating the proxy registry entries**: `"proxy"` must appear in `KNOWN_SUBCOMMANDS` and `META_SUBCOMMANDS` under the **same** `#[cfg(feature = "proxy")]` attribute.
 
-**Using `let _ = write_hash_manifest(...)` to swallow write errors**: the manifest write must use `?` — silently installing without tamper detection is worse than a hard error. The self-heal path in `create_hook_script` demonstrates the correct pattern.
+**Using `let _ = write_hash_manifest(...)` to swallow write errors**: the manifest write must use `?` — silently installing without tamper detection is worse than a hard error.
 
-**Running `skim init` or `skim doctor` tests without `skim_sandboxed`**: tests that run init, uninstall, or doctor without sandboxing will mutate the developer's real `~/.claude/`, `~/.gemini/`, etc., and `skim init --uninstall` (which defaults to all agents) will delete real wrappers and guidance files.
+**Running `skim init` or `skim doctor` tests without `skim_sandboxed` / `skim_sandboxed_with_bin`**: tests that run init, uninstall, or doctor without sandboxing will mutate the developer's real `~/.claude/`, `~/.gemini/`, etc. (PF-017).
+
+**Trying to reach pin-mismatch in doctor by editing the hook script**: editing any byte of the hook script invalidates the `.sha256` manifest and trips `Tampered`, which early-returns before the pin block is ever evaluated. To reach the pin-mismatch branch you must install from a binary at one path and run doctor from another — the copy-binary technique used in `test_doctor_exits_1_on_binary_pin_mismatch`.
+
+**Calling `maybe_install_wrappers` outside the fast path**: Wrapper installation must occur inside the fast-path block before the early return (guarded by `!flags.project`), not as a fallback after `execute_install()`. Otherwise, repeating `skim init --wrappers` on a current hook would skip the fast path and trigger a full reinstall, plus a redundant second wrapper install, risking clobbering `settings.json.bak`.
 
 ## Gotchas
 
+**`resolve_skim_binary()` is machine-dependent.** On macOS, `/tmp → /private/tmp`. On Homebrew installs, the binary sits behind a cellar symlink. A test environment where the binary has no symlinks will pass even if the three-site invariant is broken — the failure only appears on symlinked-path machines.
+
 **`check_hook_binary_mismatch` fires only on same-version**: when versions differ, `check_hook_version_mismatch` logs the version mismatch and returns without calling the binary/commit check.
 
-**`NoManifest` is not drift — but it no longer suppresses drift detection**: pre-manifest installs are advisory only (`⚠`), not drift. However, they now fall through to pin/currency checks so an unpinned pre-manifest hook is still reported as drift. The still-open question is whether `NoManifest` should become drift after the self-heal ships in a release (#471 follow-on, tracked).
+**`NoManifest` is not drift — but it no longer suppresses drift detection**: pre-manifest installs are advisory only (`⚠`), not drift. However, they now fall through to pin/currency checks so an unpinned pre-manifest hook is still reported as drift.
 
-**`rewrite/hook.rs:359` suppresses drift on integrity failure deliberately — tracked as #479**: when `check_hook_integrity` returns `true` (integrity failed), `detect_drift` is not called. This is intentional — an integrity failure subsumes drift — but it means drift is invisible on a tampered script at hook-exec time.
+**Tampered suppresses drift at hook-exec time; Unreadable does NOT**: `check_hook_integrity()` returns `true` (integrity failed) only for `Tampered` — this triggers `detect_drift` to be skipped because three of its six inputs come from env vars the hook script exports. `Unreadable` maps to `Err(_) → false` (integrity check does not signal failure), so drift detection continues to run for an unreadable script. The earlier code comment claiming Unreadable silenced drift was incorrect and has been removed.
 
-**`parse_version_from_script` reads the `# skim-hook v{version}` comment first**: because the comment appears before `export SKIM_HOOK_VERSION=` in the script, the scanner finds the comment first. This makes the version marker attacker-editable: anyone who modifies the script can change what `detect_state` reads as the installed version. Never use this function for security decisions.
+**The `"stale"` terminal in `hook_status_line` was dead code and has been removed**: `commit_ok ∧ version_ok` together with `!hook_is_current || !pin_is_current` logically implies the mismatch is in the pin path. The terminal is now `"binary pin mismatch (hook: …, running: …)"`.
 
-**Doctor-vs-hook asymmetry for non-ClaudeCode agents**: `skim doctor` now reports `✗` for tampered codex/gemini/cursor/copilot scripts (via `hook_facts` + `classify_script_integrity`), but `skim rewrite --hook` only runs `check_hook_integrity` for ClaudeCode. So a tampered Gemini script shows up in doctor but produces no warning at hook-exec time.
+**`commit_ok` in `hook_status_line` must mirror `hook_is_current()`**: when the compiled commit is `"unknown"` (tarball build), `commit_ok` is forced to `true` — the comparison is indeterminate. Without this, a genuine pin mismatch gets misattributed as `"commit mismatch (hook: abc1234, binary: unknown)"`. Both the init predicate and the doctor report must treat `"unknown"` consistently.
 
-**`SKIM_HOOK_COMMIT` has no quotes**: `export SKIM_HOOK_COMMIT={git_commit}` — safe because hex SHAs and `"unknown"` contain no shell-special chars. `generate_hook_script` enforces ascii-alphanumeric only via `assert!`.
+**`parse_version_from_script` reads the `# skim-hook v{version}` comment first**: because the comment appears before `export SKIM_HOOK_VERSION=` in the script, the scanner finds the comment first. This makes the version marker attacker-editable. Never use this function for security decisions.
+
+**Doctor-vs-hook asymmetry for non-ClaudeCode agents**: `skim doctor` now reports `✗` for tampered codex/gemini/cursor/copilot scripts, but `skim rewrite --hook` only runs `check_hook_integrity` for ClaudeCode. So a tampered Gemini script shows up in doctor but produces no warning at hook-exec time.
 
 **`detect_installed_agents()` in override-mode requires config dir to exist**: when `CLAUDE_CONFIG_DIR` (or any agent's config dir env var) is set, `detect_installed_agents` checks whether that directory exists. Tests using `skim_sandboxed` must `create_dir_all(home.join(".claude"))` before calling init or the agent appears uninstalled.
 
-**`skim doctor` scans `$PATH` — use `hermetic_path()` in tests**: the test binary and the release build may both appear on `$PATH`. Without restricting PATH to the test binary's directory, `skim doctor` may detect PATH drift from the unrelated release build and exit 1, making the test assertion wrong.
+**`skim doctor` scans `$PATH` — use `hermetic_path()` in tests**: without restricting PATH to the test binary's directory, `skim doctor` may detect PATH drift from an unrelated release build and exit 1, making the test assertion wrong.
 
 **`nextest --all-targets` does not build `target/debug/skim`**: the E2E test harness invokes the `skim` binary from `target/debug/skim`. Always run `cargo build -p rskim` before running `--all-targets` integration tests.
 
-**`print_detected_state` still shows "Config: …/settings.json (will be created)" for Copilot**: known residual cosmetic gap. `print_detected_state` uses `state.settings_path` directly without branching on `uses_dedicated_hook_file()`. The actual install path is correct; only the detection-phase printout is cosmetically wrong.
-
 ## Key Files
 
-- `crates/rskim/src/cmd/integrity.rs` — `ScriptIntegrity` enum; `classify_script_integrity()`; `verify_script_integrity` (thin bool wrapper); `compute_file_hash()`; `write_hash_manifest()`; `read_hash_manifest()`
-- `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch; `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan); `HookFacts` DTO; `hook_facts()` (calls `classify_script_integrity` for every agent)
-- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (pure, testable; checks `ScriptIntegrity` before pin/currency; verdict from manifest not script text); `print_hook_section()` (iterates `AgentKind::all_supported()`)
-- `crates/rskim/src/cmd/init/helpers.rs` — `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `load_or_create_settings()`, `confirm_proceed()`, `confirm_grant()` (TTY-gated consent gate)
+- `crates/rskim/src/cmd/integrity.rs` — `ScriptIntegrity` enum; `classify_script_integrity()`; `verify_script_integrity`; `compute_file_hash()`; `write_hash_manifest()`; `read_hash_manifest()`
+- `crates/rskim/src/cmd/init/mod.rs` — `run()` init dispatch; `script_has_pinned_marker()` (single source of truth for the `SKIM_HOOK_BINARY` marker scan); `HookFacts` DTO (includes `pin_is_current`); `hook_facts()` (calls `classify_script_integrity` for every agent)
+- `crates/rskim/src/cmd/init/helpers.rs` — `resolve_skim_binary()` (single source of truth for canonical binary path); `guidance_content()`, `guidance_content_mdc()`, `atomic_write_settings()`, `confirm_proceed()`, `confirm_grant()` (TTY-gated consent gate)
+- `crates/rskim/src/cmd/doctor/mod.rs` — `hook_status_line()` (pure, testable; checks `ScriptIntegrity` before pin/currency; `!hook_is_current || !pin_is_current` condition; "binary pin mismatch" terminal; `commit_ok` treats "unknown" as indeterminate); `print_hook_section()` (iterates `AgentKind::all_supported()`)
 - `crates/rskim/src/cmd/init/flags.rs` — `PermissionsTier`, `InitFlags`, `DetectionEnv`, `detect_installed_agents()`, `resolve_agent()`
-- `crates/rskim/src/cmd/init/install.rs` — `create_hook_script()` (self-heals manifest on idempotent path); `is_hook_script_current()`; `atomic_write_executable()`; `resolve_permissions_consent()`
-- `crates/rskim/src/cmd/init/state.rs` — `detect_state()`, `uses_pinned_binary()`, `DetectedState`, `hook_is_current()`; `parse_version_from_script` (reads comment-first; attacker-editable, advisory only)
+- `crates/rskim/src/cmd/init/install.rs` — `run_install_single()` (fast-path logic: all six gates; wrappers installed inside fast path); `create_hook_script()` (uses `resolve_skim_binary()`); `atomic_write_executable()`; `maybe_install_wrappers()` (guarded by `!flags.project`)
+- `crates/rskim/src/cmd/init/state.rs` — `detect_state()` (uses `resolve_skim_binary()`); `uses_pinned_binary()`; `DetectedState`; `hook_is_current()` (version + pinned format + commit); `pin_is_current()` (canonical binary path match); `parse_version_from_script` (comment-first; attacker-editable, advisory only)
 - `crates/rskim/src/cmd/hooks/mod.rs` — `generate_hook_script()`, `shell_single_quote()`, `HookProtocol` trait, `HookSupport` enum
 - `crates/rskim/src/cmd/hooks/copilot.rs` — `CopilotCliHook`: `hook_config_dir` redirect, `uses_dedicated_hook_file`, `write_copilot_skim_json` (atomic); `SKIM_JSON_NAME` constant
-- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`; `check_hook_binary_mismatch()`; `check_hook_integrity()` (ClaudeCode-only at hook time); `detect_drift()`; line ~359: drift suppressed when integrity fails (#479)
-- `crates/rskim/src/cmd/rewrite/engine.rs` — `try_rewrite()`, `try_custom_handlers()` (injects `SKIM_REWRITTEN_FROM=<tool>` origin tag)
-- `crates/rskim/src/output/mod.rs` — `REWRITE_ORIGIN_ENV`, `rewrite_origin()` (closed-vocabulary reader), `rewrite_transparency_marker()`
+- `crates/rskim/src/cmd/rewrite/hook.rs` — `run_hook_mode()`; `check_hook_binary_mismatch()`; `check_hook_integrity()` (ClaudeCode-only; Tampered→true suppresses drift, Unreadable→false does not); `detect_drift()`
 - `crates/rskim/src/cmd/registry.rs` — `READ_ONLY_SUBCOMMANDS`, `KNOWN_SUBCOMMANDS`, `META_SUBCOMMANDS`, `wrapper_targets()`; `"proxy"` cfg-gated as a pair
-- `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait, `permissions_protocol_for_agent` factory, `hash_if_bounded`, `seeded_entries`
+- `crates/rskim/src/cmd/permissions/mod.rs` — `PermissionsProtocol` trait, `permissions_protocol_for_agent` factory
 - `crates/rskim/build.rs` — `SKIM_GIT_COMMIT` build-time injection
-- `crates/rskim/tests/common/mod.rs` — `skim_sandboxed(home)` (6-env-var sandbox helper); `skim()` (`SKIM_REWRITTEN_FROM` removed)
-- `crates/rskim/tests/cli_doctor.rs` — `hermetic_path()` helper; `do_sandboxed_init()`; E2E tests for tamper detection via manifest
+- `crates/rskim/tests/common/mod.rs` — `skim_sandboxed_with_bin(home, bin)` (authoritative sandbox helper); `skim_sandboxed(home)` (delegates to above); `skim_bin()`
+- `crates/rskim/tests/cli_doctor.rs` — `hermetic_path()` helper; `test_doctor_exits_1_on_binary_pin_mismatch` (copy-binary technique for pin-mismatch E2E coverage)
+- `crates/rskim/tests/cli_init.rs` — `test_init_rewrites_hook_when_pin_path_differs`; `test_init_wrappers_bypasses_fast_path`; `test_init_skips_when_version_and_commit_are_current`
 
 ## Related
 
-- ADR-004 (hook install pins absolute binary path + handshake): mandated the pinned-binary format, daily-rate-limited warn-only signaling; also provides ordering precedent for `SKIM_REWRITTEN_FROM`
+- ADR-004 (hook install pins absolute binary path + handshake): mandated the pinned-binary format, daily-rate-limited warn-only signaling; `resolve_skim_binary()` is the implementation of ADR-004's canonicalization requirement
 - ADR-005 (guidance framed as calibrated trust): prohibits `SKIM_PASSTHROUGH` in guidance template; "flag it to the user" sentence byte-identical since v2.11.0
 - ADR-006 (hook responses never self-approve — permissions seeding is consent-gated): per-host response matrix; `confirm_grant` enforces pre-checks
 - ADR-007 (pseudo preserves return types): context for why TypeScript is the correct fixture language for transparency marker tests
 - ADR-008 (default builds never link async/TLS/HTTP; `proxy` cargo feature is the opt-in): the cfg-pair registry gating and main.rs routing guard are the runtime enforcement
 - PF-004 (two interception surfaces: rewrite engine vs PATH wrappers): `SKIM_REWRITTEN_FROM` exists only on the rewrite-engine surface; the wrapper surface is intentionally unmarked
-- PF-006 (strip_ansi destroys tabs — gh/diff skip_ansi_strip fix): covers wrapper configs that live outside this KB's directories
+- PF-015 (provenance/integrity mechanism fails in ways its own tests cannot see): `pin_is_current()` and `HookFacts.pin_is_current` follow the display-without-gate pattern documented here; the copy-binary E2E test in `cli_doctor.rs` closes the coverage gap PF-015 describes
+- PF-016 (integrity check that returns empty finding set on failure fails open): the `ScriptIntegrity` four-state enum and `hook_status_line()` early-returns for `Tampered`/`Unreadable` are the fix documented here
+- PF-017 (installer tests mutate the developer's real home): `skim_sandboxed_with_bin` sets `HOME` + all five agent config-dir overrides so no path escapes the TempDir
 - Feature: `analytics` — session_id flows from hook JSON via sidecar, not via rewritten command flags
 - Source: `crates/rskim/src/cmd/hook_log.rs` — `log_hook_warning()` (the only permitted diagnostic channel in hook mode)
 - Tests: `crates/rskim/tests/cli_integrity.rs` — E2E tests for `classify_script_integrity` and `hook_status_line` behaviors
-- Tests: `crates/rskim/tests/cli_doctor.rs` — E2E tests for tamper detection, healthy exit-0, hermetic PATH
-- Tests: `crates/rskim/tests/cli_init.rs` — init isolation using `skim_sandboxed`; `create_dir_all` traps
