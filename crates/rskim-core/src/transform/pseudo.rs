@@ -20,8 +20,9 @@ use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
 
 use super::minimal::{
-    MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal, build_newline_table,
-    compute_header_end_byte, is_removable_comment, remove_ranges, trim_and_normalize,
+    CommentClassification, MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal,
+    build_newline_table, compute_go_doc_comment_starts, compute_header_end_byte,
+    is_removable_comment, remove_ranges, trim_and_normalize,
 };
 use super::{compute_line_map_from_removed_ranges, normalize_line_map_blanks};
 use crate::transform::utils::is_function_scope_kind;
@@ -33,9 +34,8 @@ struct NoiseWalkContext<'a> {
     language: Language,
     ranges: &'a mut Vec<(usize, usize)>,
     node_count: &'a mut usize,
-    /// End byte of the last header comment, precomputed by `compute_header_end_byte`.
-    /// 0 when there are no header comments or the language has no header-comment convention.
-    header_end_byte: usize,
+    /// Per-file comment-classification tables, precomputed before the walk.
+    classification: CommentClassification<'a>,
 }
 
 /// Extend a byte position forward to consume trailing spaces (not past newline).
@@ -303,6 +303,9 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     // Precompute the module-header boundary in a single O(N) forward pass.
     // This prevents the O(N³) per-node backward walk inside is_module_header_comment.
     let header_end_byte = compute_header_end_byte(tree.root_node(), source, language);
+    // Precompute Go doc-comment starts in a single O(N) TreeCursor pass. This
+    // prevents the Θ(M³/3) per-node forward sibling walk inside is_go_doc_comment.
+    let go_doc_comment_starts = compute_go_doc_comment_starts(tree.root_node(), source, language);
 
     // Single-pass collection: comments AND noise ranges in one AST walk
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -313,7 +316,10 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
         language,
         ranges: &mut ranges,
         node_count: &mut node_count,
-        header_end_byte,
+        classification: CommentClassification {
+            header_end_byte,
+            go_doc_comment_starts: &go_doc_comment_starts,
+        },
     };
     collect_noise_ranges(tree.root_node(), &mut ctx, &rules, 0, false)?;
 
@@ -463,7 +469,7 @@ fn collect_noise_ranges(
         node,
         ctx.source,
         ctx.language,
-        ctx.header_end_byte,
+        ctx.classification,
         depth,
         in_function_body,
     ) {

@@ -15,13 +15,30 @@ pub(crate) const MAX_AST_DEPTH: usize = 500;
 /// Maximum number of AST nodes to prevent memory exhaustion
 pub(crate) const MAX_AST_NODES: usize = 100_000;
 
+/// Per-file comment-classification tables, precomputed once before the walk.
+///
+/// Bundled into one `Copy` struct rather than passed as separate scalars so
+/// `is_removable_comment` stays at 6 parameters — a 7th would sit on clippy's
+/// `too_many_arguments` threshold. This follows the in-repo precedent of a
+/// params struct over an `#[allow]` (see `cmd/heatmap/insights.rs`).
+///
+/// Both fields are *per-file* tables that replace per-node sibling walks; see
+/// PF-020 for why a `TSNode` walk is never O(1).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CommentClassification<'a> {
+    /// End byte of the last header comment, precomputed by `compute_header_end_byte`.
+    /// 0 when there are no header comments or the language has no header-comment convention.
+    pub(crate) header_end_byte: usize,
+    /// Sorted start bytes of every Go doc comment, precomputed by
+    /// `compute_go_doc_comment_starts`. Empty for every non-Go language.
+    pub(crate) go_doc_comment_starts: &'a [usize],
+}
+
 /// Bundled parameters for the recursive comment walker to avoid parameter explosion
 pub(crate) struct CommentWalkContext<'a> {
     pub(crate) ranges: &'a mut Vec<(usize, usize)>,
     pub(crate) node_count: &'a mut usize,
-    /// End byte of the last header comment, precomputed by `compute_header_end_byte`.
-    /// 0 when there are no header comments or the language has no header-comment convention.
-    pub(crate) header_end_byte: usize,
+    pub(crate) classification: CommentClassification<'a>,
 }
 
 /// Transform source by stripping non-doc comments and normalizing blank lines
@@ -41,13 +58,20 @@ pub(crate) fn transform_minimal(
     // Precompute the module-header boundary in a single O(N) forward pass.
     // This replaces the per-node O(N) backward walk that produced an overall O(N³).
     let header_end_byte = compute_header_end_byte(root, source, language);
+    // Precompute Go doc-comment starts in a single O(N) TreeCursor pass. This
+    // replaces the per-node forward sibling walk that was Θ(M³/3) for a run of
+    // M contiguous comments in one sibling group.
+    let go_doc_comment_starts = compute_go_doc_comment_starts(root, source, language);
 
     let mut ranges_to_remove: Vec<(usize, usize)> = Vec::new();
     let mut node_count: usize = 0;
     let mut ctx = CommentWalkContext {
         ranges: &mut ranges_to_remove,
         node_count: &mut node_count,
-        header_end_byte,
+        classification: CommentClassification {
+            header_end_byte,
+            go_doc_comment_starts: &go_doc_comment_starts,
+        },
     };
     collect_removable_comments(root, source, language, &mut ctx, 0, false)?;
 
@@ -112,7 +136,7 @@ pub(crate) fn collect_removable_comments(
         node,
         source,
         language,
-        ctx.header_end_byte,
+        ctx.classification,
         depth,
         in_function_body,
     ) {
@@ -172,8 +196,10 @@ pub(crate) fn is_comment_node(kind: &str, language: Language) -> bool {
 /// Combines `is_comment_node` with doc-comment filtering, shebang detection, and
 /// function-body detection. Returns true if the node is a comment that should be stripped.
 ///
-/// `header_end_byte` is the precomputed module-header boundary from
-/// `compute_header_end_byte`; pass 0 to disable header-comment preservation.
+/// `classification` carries the per-file precomputed tables — the module-header
+/// boundary from `compute_header_end_byte` and the sorted Go doc-comment start
+/// bytes from `compute_go_doc_comment_starts`. `CommentClassification::default()`
+/// disables both.
 ///
 /// `depth` is the recursion depth from the root (root = 0, root children = 1, …).
 /// `in_function_body` is a threaded flag — true when any strict ancestor of this
@@ -186,7 +212,7 @@ pub(crate) fn is_removable_comment(
     node: Node,
     source: &str,
     language: Language,
-    header_end_byte: usize,
+    classification: CommentClassification<'_>,
     depth: usize,
     in_function_body: bool,
 ) -> bool {
@@ -195,8 +221,8 @@ pub(crate) fn is_removable_comment(
     }
     let should_preserve = is_shebang(node, source)
         || in_function_body
-        || is_doc_comment(node, source, language)
-        || is_module_header_comment(node, language, header_end_byte, depth);
+        || is_doc_comment(node, source, language, classification.go_doc_comment_starts)
+        || is_module_header_comment(node, language, classification.header_end_byte, depth);
     !should_preserve
 }
 
@@ -204,7 +230,12 @@ pub(crate) fn is_removable_comment(
 ///
 /// Language-specific doc comment detection. See match arms below for
 /// per-language rules covering all supported tree-sitter languages.
-fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
+fn is_doc_comment(
+    node: Node,
+    source: &str,
+    language: Language,
+    go_doc_comment_starts: &[usize],
+) -> bool {
     let text = match node.utf8_text(source.as_bytes()) {
         Ok(t) => t,
         Err(_) => return false,
@@ -228,9 +259,9 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
                 || text.starts_with("/*!")
         }
         Language::Go => {
-            // Go doc comments are comments that are adjacent to a declaration.
-            // Walk forward through siblings to find next non-comment named sibling.
-            is_go_doc_comment(node, source)
+            // Go doc comments are comments adjacent to a declaration. Resolved
+            // once per file into a sorted start-byte table; O(log D) here.
+            is_go_doc_comment(node, go_doc_comment_starts)
         }
         Language::Java => {
             // Javadoc comments start with /**
@@ -270,37 +301,186 @@ fn is_doc_comment(node: Node, source: &str, language: Language) -> bool {
     }
 }
 
-/// Check if a Go comment is a doc comment (adjacent to a declaration)
+/// Check if a Go comment is a doc comment (adjacent to a declaration).
 ///
-/// Go doc comments are comments that immediately precede a declaration
-/// (function, type, var, const) with no blank lines between them.
-/// Walks forward through siblings to find the end of the contiguous comment
-/// block and checks whether a declaration immediately follows.
-fn is_go_doc_comment(node: Node, source: &str) -> bool {
-    let mut current_end = node.end_byte();
-    let mut sibling = node.next_named_sibling();
+/// **O(log D) lookup** — the set of Go doc-comment start bytes is precomputed
+/// once per file by `compute_go_doc_comment_starts` and passed in as a sorted
+/// slice. Classification is a single binary search.
+///
+/// Replaces a per-node forward `next_named_sibling()` walk that was
+/// **Θ(M³/3)** for a run of M contiguous comments in one sibling group: a
+/// `TSNode` has no parent pointer, so every `next_named_sibling()` re-derives
+/// the parent by descending from the tree root (PF-020). Measured on this
+/// branch (DEBUG build, Go leading-comment run before `package main`):
+/// N=250 → 665 ms, N=500 → 5231 ms, N=1000 → 41616 ms (α = 2.98).
+fn is_go_doc_comment(node: Node, go_doc_comment_starts: &[usize]) -> bool {
+    go_doc_comment_starts
+        .binary_search(&node.start_byte())
+        .is_ok()
+}
 
-    while let Some(sib) = sibling {
-        let sib_start = sib.start_byte();
+/// Does the byte gap between `current_end` and `sib_start` contain a blank line?
+///
+/// Replicates the guard from the original per-node walk **exactly**: when
+/// `current_end <= sib_start && sib_start <= source.len()` does not hold, the
+/// blank-line test is *skipped* (treated as "no blank line") rather than
+/// terminating the run. `source.get()` returning `None` — only reachable if a
+/// bound is not a UTF-8 char boundary — is likewise treated as "no blank line";
+/// the original indexed `&source[..]` directly and would have panicked there.
+///
+/// Counting `b'\n'` over bytes is equivalent to counting `'\n'` over chars:
+/// 0x0A never occurs inside a multi-byte UTF-8 sequence.
+fn go_gap_breaks_run(source: &str, current_end: usize, sib_start: usize) -> bool {
+    if current_end <= sib_start
+        && sib_start <= source.len()
+        && let Some(between) = source.get(current_end..sib_start)
+    {
+        return between.bytes().filter(|&b| b == b'\n').count() > 1;
+    }
+    false
+}
 
-        if current_end <= sib_start && sib_start <= source.len() {
-            let between = &source[current_end..sib_start];
-            let newline_count = between.chars().filter(|&c| c == '\n').count();
-            if newline_count > 1 {
-                return false;
-            }
+/// Precompute the start bytes of every Go doc comment in the file.
+///
+/// Returns a **sorted** `Vec<usize>` of `start_byte()` values, produced by a
+/// single `TreeCursor` pass. `is_go_doc_comment` then answers in O(log D) via
+/// `binary_search`.
+///
+/// A sorted `Vec` rather than a `HashSet`: at realistic D, ~log₂(D) integer
+/// comparisons beat one SipHash, and it avoids a hash table allocation
+/// (minimise-allocation-after-initialisation). Sortedness comes free from
+/// pre-order emission and is locked by a `debug_assert!` at the end.
+///
+/// **Every sibling group is covered, not just the root's children.**
+/// `is_function_scope_kind` maps Go to `["block"]`, so comments inside
+/// `field_declaration_list`, `interface_type`, and grouped `type (…)` /
+/// `const (…)` / `var (…)` / import blocks are *not* treated as in-body and do
+/// reach this predicate. In particular a comment inside a grouped `type (…)`
+/// precedes a `type_spec` — an `is_go_declaration` kind — so it is a KEEP that a
+/// root-children-only precompute would silently misclassify as STRIP.
+///
+/// **Complexity:** O(N) — each named node is visited exactly once. `TreeCursor`
+/// is the only genuinely O(1)-per-step traversal API in tree-sitter (PF-020).
+///
+/// Non-Go languages return `Vec::new()`, which does not allocate.
+pub(crate) fn compute_go_doc_comment_starts(
+    root: Node,
+    source: &str,
+    language: Language,
+) -> Vec<usize> {
+    if language != Language::Go {
+        return Vec::new();
+    }
+    let mut starts = Vec::new();
+    let mut run_starts = Vec::new();
+    scan_go_sibling_group(root, source, &mut starts, &mut run_starts, 0);
+    debug_assert!(
+        starts.windows(2).all(|w| w[0] < w[1]),
+        "compute_go_doc_comment_starts must emit strictly ascending start bytes \
+         (binary_search depends on it); got {starts:?}"
+    );
+    starts
+}
+
+/// Advance `cursor` to the next *named* sibling at the current level.
+///
+/// Anonymous siblings are invisible to `next_named_sibling()` and must never
+/// terminate a comment run or update the run's `current_end`; skipping them here
+/// reproduces that exactly.
+fn goto_next_named_sibling(cursor: &mut tree_sitter::TreeCursor<'_>) -> bool {
+    while cursor.goto_next_sibling() {
+        if cursor.node().is_named() {
+            return true;
         }
+    }
+    false
+}
 
-        if is_comment_node(sib.kind(), Language::Go) {
-            current_end = sib.end_byte();
-            sibling = sib.next_named_sibling();
+/// Walk one sibling group in pre-order, recording Go doc-comment start bytes.
+///
+/// Comment nodes are leaves, so a whole comment run can be resolved in place
+/// before descending into the node that terminates it — which keeps emission in
+/// ascending byte order across the entire file.
+fn scan_go_sibling_group(
+    parent: Node,
+    source: &str,
+    starts: &mut Vec<usize>,
+    run_starts: &mut Vec<usize>,
+    depth: usize,
+) {
+    // Mirrors the walkers' MAX_AST_DEPTH bound. A tree deeper than this makes
+    // `collect_removable_comments` / `collect_noise_ranges` return a ParseError
+    // before any of these classifications can be observed.
+    if depth > MAX_AST_DEPTH {
+        return;
+    }
+
+    let mut cursor = parent.walk();
+    if !cursor.goto_first_child() {
+        return;
+    }
+    if !cursor.node().is_named() && !goto_next_named_sibling(&mut cursor) {
+        return;
+    }
+
+    loop {
+        if !is_comment_node(cursor.node().kind(), Language::Go) {
+            let node = cursor.node();
+            scan_go_sibling_group(node, source, starts, run_starts, depth + 1);
+            if !goto_next_named_sibling(&mut cursor) {
+                return;
+            }
             continue;
         }
 
-        return is_go_declaration(sib.kind());
-    }
+        // Resolve the whole contiguous comment run in one forward pass.
+        //
+        // For a run c₀..c₍ₘ₋₁₎ terminated by named non-comment X, the original
+        // walk starting at cᵢ returned `is_go_declaration(X)` unless some gap in
+        // gᵢ..g₍ₘ₋₁₎ contained a blank line. Since a break disqualifies every
+        // earlier comment too, the doc comments form a contiguous SUFFIX of the
+        // run, starting just past the LAST break.
+        run_starts.clear();
+        run_starts.push(cursor.node().start_byte());
+        let mut prev_end = cursor.node().end_byte();
+        let mut last_break: Option<usize> = None;
+        let mut terminator_is_declaration = false;
+        let mut have_sibling = true;
 
-    false
+        loop {
+            if !goto_next_named_sibling(&mut cursor) {
+                // Run ends at the end of the sibling list → every cᵢ is false.
+                have_sibling = false;
+                break;
+            }
+            let sib = cursor.node();
+            if go_gap_breaks_run(source, prev_end, sib.start_byte()) {
+                last_break = Some(run_starts.len() - 1);
+            }
+            if is_comment_node(sib.kind(), Language::Go) {
+                run_starts.push(sib.start_byte());
+                prev_end = sib.end_byte();
+                continue;
+            }
+            terminator_is_declaration = is_go_declaration(sib.kind());
+            break;
+        }
+
+        if terminator_is_declaration {
+            let first_doc = last_break.map_or(0, |i| i + 1);
+            starts.extend_from_slice(&run_starts[first_doc..]);
+        }
+
+        if !have_sibling {
+            return;
+        }
+        // The cursor now sits on the terminator; descend into it, then continue.
+        let terminator = cursor.node();
+        scan_go_sibling_group(terminator, source, starts, run_starts, depth + 1);
+        if !goto_next_named_sibling(&mut cursor) {
+            return;
+        }
+    }
 }
 
 /// Check if a Go node kind is a declaration type
@@ -615,11 +795,17 @@ mod tests {
     }
 
     // Helper: find the Nth root-level comment node (0-indexed) in a parsed tree.
-    fn nth_root_comment<'a>(tree: &'a Tree, _source: &str, n: usize) -> Node<'a> {
+    //
+    // Uses a TreeCursor, not `named_child(i)` in a loop: `ts_node_named_child`
+    // re-scans the child list from position 0 on every call, so the indexed form
+    // is O(i) per step and O(N²) overall — the exact pattern the module docblock
+    // above forbids (PF-020). Test-only code is not exempt from being a worked
+    // example.
+    fn nth_root_comment<'a>(tree: &'a Tree, n: usize) -> Node<'a> {
         let root = tree.root_node();
+        let mut cursor = root.walk();
         let mut found = 0usize;
-        for i in 0..root.named_child_count() {
-            let child = root.named_child(i).expect("named child must exist");
+        for child in root.named_children(&mut cursor) {
             if child.kind() == "comment" {
                 if found == n {
                     return child;
@@ -646,7 +832,7 @@ mod tests {
         // Single leading comment → header_end = end_byte of that comment.
         let source = "# Copyright 2024 Acme Corp.\nx = 1\n";
         let tree = parse_python(source);
-        let comment = nth_root_comment(&tree, source, 0);
+        let comment = nth_root_comment(&tree, 0);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         assert_eq!(
             heb,
@@ -661,7 +847,7 @@ mod tests {
         let source =
             "#!/usr/bin/env python3\n# SPDX-License-Identifier: MIT\n# Copyright 2024\nx = 1\n";
         let tree = parse_python(source);
-        let third = nth_root_comment(&tree, source, 2);
+        let third = nth_root_comment(&tree, 2);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         assert_eq!(
             heb,
@@ -675,7 +861,7 @@ mod tests {
         // Blank line between first and second comment → only first is the header.
         let source = "# Copyright 2024\n\n# helper used by the CLI\nx = 1\n";
         let tree = parse_python(source);
-        let first = nth_root_comment(&tree, source, 0);
+        let first = nth_root_comment(&tree, 0);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         assert_eq!(
             heb,
@@ -689,7 +875,7 @@ mod tests {
         // File consisting entirely of comments → all are in the header.
         let source = "# Line 1\n# Line 2\n# Line 3\n";
         let tree = parse_python(source);
-        let last = nth_root_comment(&tree, source, 2);
+        let last = nth_root_comment(&tree, 2);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         assert_eq!(
             heb,
@@ -704,7 +890,7 @@ mod tests {
         // not a char index. The comparison must not panic on non-char boundaries.
         let source = "# 版权所有 2024 公司名\nx = 1\n";
         let tree = parse_python(source);
-        let comment = nth_root_comment(&tree, source, 0);
+        let comment = nth_root_comment(&tree, 0);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         assert_eq!(
             heb,
@@ -735,7 +921,7 @@ mod tests {
         // A single comment at byte 0 with no preceding siblings → header.
         let source = "# Copyright 2024 Acme Corp.\nx = 1\n";
         let tree = parse_python(source);
-        let comment = nth_root_comment(&tree, source, 0);
+        let comment = nth_root_comment(&tree, 0);
         assert_eq!(
             comment.start_byte(),
             0,
@@ -754,7 +940,7 @@ mod tests {
         // A comment immediately following the shebang (no blank line) → header.
         let source = "#!/usr/bin/env python3\n# SPDX-License-Identifier: MIT\nx = 1\n";
         let tree = parse_python(source);
-        let spdx = nth_root_comment(&tree, source, 1); // index 0 is shebang, 1 is SPDX
+        let spdx = nth_root_comment(&tree, 1); // index 0 is shebang, 1 is SPDX
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1 in the walker.
         assert!(
@@ -768,7 +954,7 @@ mod tests {
         // A comment separated from the preceding comment by a blank line → NOT a header.
         let source = "# Copyright 2024\n\n# helper used by the CLI\nx = 1\n";
         let tree = parse_python(source);
-        let non_header = nth_root_comment(&tree, source, 1);
+        let non_header = nth_root_comment(&tree, 1);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1; the byte comparison gates this (not depth).
         assert!(
@@ -782,7 +968,7 @@ mod tests {
         // A comment that has a code node as its preceding named sibling → NOT a header.
         let source = "x = 1\n# standalone comment after code\n";
         let tree = parse_python(source);
-        let comment = nth_root_comment(&tree, source, 0);
+        let comment = nth_root_comment(&tree, 0);
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1; heb=0 means no header (byte comparison fails).
         assert!(
@@ -1305,6 +1491,582 @@ mod tests {
             table,
             vec![3, 9],
             "CJK multibyte source, newlines at bytes 3 and 9"
+        );
+    }
+
+    // ========================================================================
+    // Go doc-comment precompute — differential equivalence against the original
+    // ========================================================================
+    //
+    // `reference_is_go_doc_comment` below is a BYTE-FOR-BYTE copy of the
+    // per-node forward sibling walk that `compute_go_doc_comment_starts`
+    // replaced. Keeping it here converts the one-shot byte-identity check done
+    // at the time of the change into a PERMANENT invariant: the precompute must
+    // agree with the original walk for every comment node in every snippet and
+    // fixture below.
+    //
+    // If this test ever fails, the two traps to re-read are:
+    //   1. the `current_end <= sib_start` guard SKIPS the blank-line test when
+    //      it fails — it does not terminate the run; and
+    //   2. anonymous siblings are invisible to `next_named_sibling()` and must
+    //      neither terminate a run nor update `current_end`.
+
+    /// VERBATIM copy of the original O(M³) walk. Do not "clean up" — its value
+    /// is that it is textually the pre-change implementation.
+    fn reference_is_go_doc_comment(node: Node, source: &str) -> bool {
+        let mut current_end = node.end_byte();
+        let mut sibling = node.next_named_sibling();
+
+        while let Some(sib) = sibling {
+            let sib_start = sib.start_byte();
+
+            if current_end <= sib_start && sib_start <= source.len() {
+                let between = &source[current_end..sib_start];
+                let newline_count = between.chars().filter(|&c| c == '\n').count();
+                if newline_count > 1 {
+                    return false;
+                }
+            }
+
+            if is_comment_node(sib.kind(), Language::Go) {
+                current_end = sib.end_byte();
+                sibling = sib.next_named_sibling();
+                continue;
+            }
+
+            return is_go_declaration(sib.kind());
+        }
+
+        false
+    }
+
+    fn collect_go_comment_nodes<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+        if is_comment_node(node.kind(), Language::Go) {
+            out.push(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            collect_go_comment_nodes(child, out);
+        }
+    }
+
+    /// Assert the precompute agrees with the reference walk on every comment
+    /// node in `source`. Returns the number of comment nodes compared.
+    fn assert_precompute_matches_reference(label: &str, source: &str) -> usize {
+        let mut parser = crate::Parser::new(Language::Go).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let root = tree.root_node();
+
+        let starts = compute_go_doc_comment_starts(root, source, Language::Go);
+        assert!(
+            starts.windows(2).all(|w| w[0] < w[1]),
+            "[{label}] precomputed starts must be strictly ascending: {starts:?}"
+        );
+
+        let mut comments = Vec::new();
+        collect_go_comment_nodes(root, &mut comments);
+
+        for c in &comments {
+            let expected = reference_is_go_doc_comment(*c, source);
+            let actual = is_go_doc_comment(*c, &starts);
+            assert_eq!(
+                actual,
+                expected,
+                "[{label}] classification diverged for comment at byte {} ({:?}); \
+                 reference walk said {expected}, precompute said {actual}",
+                c.start_byte(),
+                c.utf8_text(source.as_bytes()).unwrap_or("<invalid utf8>"),
+            );
+        }
+        comments.len()
+    }
+
+    /// Degenerate Go snippets. Each exercises a shape that the run-linearisation
+    /// could plausibly get wrong.
+    const GO_DIFFERENTIAL_SNIPPETS: &[(&str, &str)] = &[
+        (
+            "comment-at-eof",
+            "package main\n\nfunc f() {}\n\n// trailing comment at EOF\n",
+        ),
+        (
+            "comment-before-package",
+            "// leading one\n// leading two\npackage main\n",
+        ),
+        ("decl-function", "package main\n\n// doc\nfunc f() {}\n"),
+        (
+            "decl-method",
+            "package main\n\ntype T struct{}\n\n// doc\nfunc (t T) M() {}\n",
+        ),
+        ("decl-type", "package main\n\n// doc\ntype T struct{}\n"),
+        ("decl-var", "package main\n\n// doc\nvar X = 1\n"),
+        ("decl-const", "package main\n\n// doc\nconst C = 1\n"),
+        (
+            "decl-type-spec-in-group",
+            "package main\n\ntype (\n\t// doc for the spec\n\tW struct{ x int }\n)\n",
+        ),
+        (
+            "field-declaration-list",
+            "package main\n\ntype T struct {\n\t// field comment\n\tx int\n}\n",
+        ),
+        (
+            "interface-type",
+            "package main\n\ntype I interface {\n\t// method comment\n\tM() int\n}\n",
+        ),
+        (
+            "const-group",
+            "package main\n\nconst (\n\t// const comment\n\tA = 1\n\tB = 2\n)\n",
+        ),
+        (
+            "block-comments",
+            "package main\n\n/* block doc */\nfunc f() {}\n\n/* orphan block */\n\n/* another */\nvar V = 1\n",
+        ),
+        (
+            "blank-line-inside-run",
+            "package main\n\n// run a1\n// run a2\n\n// run b1\n// run b2\nfunc f() {}\n",
+        ),
+        (
+            "crlf",
+            "package main\r\n\r\n// doc line one\r\n// doc line two\r\nfunc f() {}\r\n\r\n// orphan\r\n\r\nvar V = 1\r\n",
+        ),
+        (
+            "cjk",
+            "package main\n\n// 版权所有 2024 公司名\n// これはドキュメントコメントです\nfunc f() {}\n",
+        ),
+        (
+            "malformed-error-nodes",
+            "package main\n\n// doc before broken code\nfunc f( { ] ) unclosed\n\n// another comment\ntype T struct{\n",
+        ),
+        (
+            "comments-inside-function-body",
+            "package main\n\nfunc f() {\n\t// body comment\n\tx := 1\n\t// another body comment\n\treturn\n}\n",
+        ),
+        ("only-comments", "// one\n// two\n// three\n"),
+        ("empty", ""),
+        (
+            "import-block",
+            "package main\n\nimport (\n\t// import comment\n\t\"fmt\"\n)\n",
+        ),
+    ];
+
+    #[test]
+    fn test_go_doc_comment_precompute_matches_reference_walk_on_snippets() {
+        let mut total = 0usize;
+        for (label, source) in GO_DIFFERENTIAL_SNIPPETS {
+            total += assert_precompute_matches_reference(label, source);
+        }
+        // Tripwire against a snippet being silently dropped from the table.
+        assert!(
+            GO_DIFFERENTIAL_SNIPPETS.len() >= 20,
+            "the degenerate-snippet table must keep its coverage; got {} entries",
+            GO_DIFFERENTIAL_SNIPPETS.len()
+        );
+        // 32 comment nodes across the 20 snippets as of this commit.
+        assert!(
+            total >= 30,
+            "expected the degenerate snippets to contribute a meaningful number of \
+             comment nodes to the differential comparison; got {total}"
+        );
+    }
+
+    #[test]
+    fn test_go_doc_comment_precompute_matches_reference_walk_on_fixtures() {
+        const GO_FIXTURES: &[(&str, &str)] = &[
+            (
+                "simple.go",
+                include_str!("../../../../tests/fixtures/go/simple.go"),
+            ),
+            (
+                "comments.go",
+                include_str!("../../../../tests/fixtures/go/comments.go"),
+            ),
+            (
+                "large_doc_blocks.go",
+                include_str!("../../../../tests/fixtures/go/large_doc_blocks.go"),
+            ),
+        ];
+        let mut total = 0usize;
+        for (label, source) in GO_FIXTURES {
+            total += assert_precompute_matches_reference(label, source);
+        }
+        // 869 comment nodes as of this commit (849 of them in large_doc_blocks.go).
+        // A floor rather than an exact count so editing a fixture does not fail here.
+        assert!(
+            total >= 500,
+            "expected the Go fixtures to contribute >= 500 comment nodes to the \
+             differential comparison; got {total}"
+        );
+    }
+
+    // ── large_doc_blocks.go section behaviour ────────────────────────────────
+    //
+    // Each section of the fixture uses a DISTINCT marker so `contains()` is
+    // unambiguous. See the section table at the top of the fixture.
+
+    const LARGE_DOC_BLOCKS: &str =
+        include_str!("../../../../tests/fixtures/go/large_doc_blocks.go");
+
+    fn transform_go(source: &str, mode_minimal: bool) -> String {
+        let mut parser = crate::Parser::new(Language::Go).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::default();
+        if mode_minimal {
+            transform_minimal(source, &tree, Language::Go, &config).unwrap()
+        } else {
+            crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
+                source,
+                &tree,
+                Language::Go,
+                &config,
+            )
+            .unwrap()
+            .0
+        }
+    }
+
+    #[test]
+    fn test_large_doc_blocks_sections_minimal() {
+        let out = transform_go(LARGE_DOC_BLOCKS, true);
+
+        // Section A: leading run before `package main` — terminator is
+        // package_clause, not a declaration → every line STRIPPED.
+        assert!(
+            !out.contains("SECTIONA_HEADERRUN"),
+            "Section A (run before `package main`) must be stripped entirely"
+        );
+
+        // Section B: alternating doc blocks.
+        assert!(
+            out.contains("SECTIONB_KEEP_0") && out.contains("SECTIONB_KEEP_124"),
+            "Section B KEEP blocks (adjacent to a declaration) must be preserved"
+        );
+        assert!(
+            !out.contains("SECTIONB_STRIP_0") && !out.contains("SECTIONB_STRIP_124"),
+            "Section B STRIP blocks (blank line before the declaration) must be stripped"
+        );
+
+        // Section C: 100-line run with a blank line before the declaration.
+        assert!(
+            !out.contains("SECTIONC_BLANKBROKEN"),
+            "Section C (blank line between run and declaration) must be stripped entirely"
+        );
+
+        // Section D: 100-line run immediately followed by a declaration. This is
+        // the case a naive scalar-boundary fix gets wrong — the run is long and
+        // every one of its 100 lines is a doc comment.
+        assert!(
+            out.contains("SECTIOND_ADJACENT line 0") && out.contains("SECTIOND_ADJACENT line 99"),
+            "Section D (run immediately followed by a declaration) must be preserved in full"
+        );
+
+        // Section E: nested sibling groups. The grouped `type (…)` comment
+        // precedes a type_spec — an is_go_declaration kind — so it is a KEEP
+        // that a ROOT-CHILDREN-ONLY precompute would silently misclassify.
+        assert!(
+            out.contains("SECTIONE_TYPESPEC"),
+            "Section E grouped-type-spec doc comment must be preserved — a \
+             root-children-only precompute would wrongly strip it"
+        );
+        assert!(
+            !out.contains("SECTIONE_FIELD"),
+            "Section E field_declaration_list comment must be stripped"
+        );
+        assert!(
+            !out.contains("SECTIONE_IFACE"),
+            "Section E interface_type comment must be stripped"
+        );
+        assert!(
+            !out.contains("SECTIONE_CONST"),
+            "Section E const-group comment must be stripped"
+        );
+    }
+
+    #[test]
+    fn test_large_doc_blocks_sections_pseudo() {
+        // Go's pseudo rules strip no node kinds and no keywords, so pseudo mode
+        // exercises the same comment classification as minimal. pseudo is the
+        // mode the cat/head/tail rewrite selects for regular code files
+        // (ADR-008), which makes it the production path for this predicate.
+        let out = transform_go(LARGE_DOC_BLOCKS, false);
+        assert!(!out.contains("SECTIONA_HEADERRUN"));
+        assert!(out.contains("SECTIONB_KEEP_0"));
+        assert!(!out.contains("SECTIONB_STRIP_0"));
+        assert!(!out.contains("SECTIONC_BLANKBROKEN"));
+        assert!(
+            out.contains("SECTIOND_ADJACENT line 0") && out.contains("SECTIOND_ADJACENT line 99"),
+            "Section D must survive pseudo mode in full"
+        );
+        assert!(
+            out.contains("SECTIONE_TYPESPEC"),
+            "nested grouped-type-spec doc comment must survive pseudo mode"
+        );
+        assert!(!out.contains("SECTIONE_FIELD"));
+    }
+
+    // ── Go pseudo-mode comment coverage (previously untested) ────────────────
+    //
+    // Before this test the only Go pseudo test used a fixture with zero
+    // comments, so Go's pseudo comment path had NO coverage at all.
+
+    #[test]
+    fn test_go_pseudo_preserves_doc_comments_and_strips_orphans() {
+        const COMMENTS_GO: &str = include_str!("../../../../tests/fixtures/go/comments.go");
+        let out = transform_go(COMMENTS_GO, false);
+
+        // Doc comments adjacent to a declaration — KEEP.
+        assert!(
+            out.contains("// Add adds two numbers together."),
+            "Go doc comment adjacent to func must survive pseudo; got:\n{out}"
+        );
+        assert!(
+            out.contains("// Calculator is a simple calculator."),
+            "Go doc comment adjacent to type must survive pseudo; got:\n{out}"
+        );
+        assert!(
+            out.contains("// NewCalculator creates a new Calculator."),
+            "Go doc comment on constructor must survive pseudo; got:\n{out}"
+        );
+
+        // Comments inside a function body — KEEP (in_function_body flag).
+        assert!(
+            out.contains("// This comment is inside a function body (KEEP)"),
+            "in-body comment must survive pseudo; got:\n{out}"
+        );
+
+        // Orphan comments separated from any declaration — STRIP.
+        assert!(
+            !out.contains("// This is a standalone comment not adjacent"),
+            "orphan comment must be stripped by pseudo; got:\n{out}"
+        );
+        assert!(
+            !out.contains("/* This is a standalone block comment (STRIP) */"),
+            "orphan block comment must be stripped by pseudo; got:\n{out}"
+        );
+        // Struct field comment — not a function body, terminator is a
+        // field_declaration (not an is_go_declaration kind) — STRIP.
+        assert!(
+            !out.contains("// Value field comment inside struct"),
+            "struct field comment must be stripped by pseudo; got:\n{out}"
+        );
+    }
+
+    // ========================================================================
+    // Go comment-classification scaling guards
+    // ========================================================================
+    //
+    // All three pre-existing perf guards in this file are PYTHON-only, so a Go
+    // regression had no coverage whatsoever: an O(N²) Go regression at N=500
+    // finishes in ~31 ms and passes silently.
+    //
+    // MEASURED SERIES (DEBUG build, this branch, best-of-1 pre-fix / best-of-3
+    // post-fix; `transform_minimal` / `transform_pseudo_*` called directly, so
+    // the skim file-level disk cache is NOT involved — a warm parser cache
+    // hides exactly this defect class, PF-020).
+    //
+    //   Go leading comment run before `package main`, minimal:
+    //     BEFORE (Θ(M³/3)):  N=250 → 665.43 ms | N=500 → 5231.39 ms | N=1000 → 41615.57 ms
+    //                        ratios 7.86×, 7.95×   →   α = 2.98
+    //     AFTER  (linear):   N=250 →   0.38 ms | N=500 →    0.77 ms | N=1000 →     1.48 ms
+    //                        ratios 2.00×, 1.94×   →   α = 0.98        (28118× at N=1000)
+    //
+    //   Go leading comment run before `package main`, pseudo:
+    //     BEFORE:            N=250 → 656.58 ms | N=500 → 5212.06 ms | N=1000 → 41571.69 ms
+    //                        ratios 7.94×, 7.98×   →   α = 2.99
+    //     AFTER:             N=250 →   0.44 ms | N=500 →    0.85 ms | N=1000 →     1.66 ms
+    //                        ratios 1.93×, 1.95×   →   α = 0.96        (25043× at N=1000)
+    //
+    //   Go 3-line doc blocks each followed by a declaration, minimal:
+    //     BEFORE:            n=500 →  21.42 ms | n=1000 →   45.29 ms | n=2000 →   96.01 ms
+    //                        ratios 2.11×, 2.12×   →   α = 1.08
+    //     AFTER:             n=500 →  12.92 ms | n=1000 →   25.28 ms | n=2000 →   50.32 ms
+    //                        ratios 1.96×, 1.99×   →   α = 0.98
+    //
+    // NOTE, recorded deliberately: the doc-block shape was ALREADY LINEAR
+    // before the fix (α = 1.08, not the α ≈ 2 that was predicted). Short runs
+    // bound the forward walk to ~3 sibling steps, so the cubic term never
+    // develops. Its guard below is therefore a REGRESSION guard, not evidence
+    // of the fix. The leading-run shape is the one that demonstrates the defect.
+    //
+    // AFTER, at the guard sizes used below (best-of-3):
+    //   leading-run/minimal: N=2000 → 4.62 ms | N=4000 → 6.48 ms | N=8000 → 11.91 ms
+    //   leading-run/pseudo : N=2000 → 3.26 ms | N=4000 → 6.58 ms | N=8000 → 13.27 ms
+    //
+    // THRESHOLD RATIONALE — the ratio guards use 2.8, not the 2.5 used by the
+    // Python `test_quadratic_scaling_guard`. A doubling ratio of 2.8 ≈ 2^1.5 is
+    // the exponent-space midpoint between linear (2.0×) and quadratic (4.0×).
+    // The Python guard can afford 2.5 because its measured ratio is ~1.63 —
+    // fixed overhead pulls it well below 2.0. The Go guards measure ~1.84–2.02,
+    // so 2.5 would leave only ~25 % headroom and flake on a loaded machine.
+
+    /// N contiguous comments at the very top, then `package main`.
+    /// Worst case for the old walk: every comment walked the whole remaining run.
+    fn go_leading_run_source(n: usize) -> String {
+        let mut s = String::with_capacity(n * 26 + 64);
+        for i in 0..n {
+            s.push_str(&format!("// leading run line {i}\n"));
+        }
+        s.push_str("package main\n\nfunc f() int { return 1 }\n");
+        s
+    }
+
+    /// `n` doc blocks of 3 comment lines, each immediately followed by a func.
+    fn go_doc_blocks_source(n: usize) -> String {
+        let mut s = String::with_capacity(n * 120 + 64);
+        s.push_str("package main\n\n");
+        for i in 0..n {
+            s.push_str(&format!("// Fn{i} does a thing.\n"));
+            s.push_str(&format!("// More detail about Fn{i}.\n"));
+            s.push_str(&format!("// Even more detail about Fn{i}.\n"));
+            s.push_str(&format!(
+                "func Fn{i}(a int, b int) int {{\n\treturn a + b\n}}\n\n"
+            ));
+        }
+        s
+    }
+
+    fn time_go_minimal(source: &str) -> f64 {
+        let mut parser = crate::Parser::new(Language::Go).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::default();
+        let start = std::time::Instant::now();
+        let r = transform_minimal(source, &tree, Language::Go, &config);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(r.is_ok(), "minimal transform must succeed: {:?}", r.err());
+        ms
+    }
+
+    fn time_go_pseudo(source: &str) -> f64 {
+        let mut parser = crate::Parser::new(Language::Go).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::default();
+        let start = std::time::Instant::now();
+        let r = crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
+            source,
+            &tree,
+            Language::Go,
+            &config,
+        );
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
+        ms
+    }
+
+    /// Cheap cubic tripwire. Runs FIRST inside each ratio guard so that a
+    /// reintroduced Θ(M³) implementation fails in ~40 s at N=1000 instead of
+    /// letting the N=8000 measurement grind for hours.
+    fn assert_no_cubic_regression(timer: fn(&str) -> f64, mode: &str) {
+        let probe = timer(&go_leading_run_source(1000));
+        assert!(
+            probe < 200.0,
+            "[{mode}] N=1000 Go leading comment run took {probe:.1}ms (budget 200ms). \
+             The Θ(M³/3) per-node next_named_sibling() walk took 41616ms here; the \
+             linear precompute takes ~1.5ms. This is a CUBIC regression — check that \
+             is_go_doc_comment does a binary_search over compute_go_doc_comment_starts \
+             and does NOT walk siblings (PF-020)."
+        );
+    }
+
+    #[test]
+    fn test_go_leading_comment_run_linear_time() {
+        // CUBIC SMOKE TEST. Pre-fix: 41616 ms at N=1000. Post-fix: 1.48 ms.
+        // Budget 200 ms leaves ~135× headroom over the fixed code while the
+        // cubic code exceeds it by ~208×.
+        let n = 1000usize;
+        let source = go_leading_run_source(n);
+        let elapsed = time_go_minimal(&source);
+
+        // Behaviour assertion alongside the timing: the whole run precedes
+        // `package main`, which is NOT an is_go_declaration kind, so every one
+        // of the N comments must be stripped.
+        let out = transform_go(&source, true);
+        assert!(
+            !out.contains("// leading run line"),
+            "a leading comment run terminated by package_clause must be stripped entirely"
+        );
+
+        assert!(
+            elapsed < 200.0,
+            "{n} leading Go comments must process in < 200ms (got {elapsed:.1}ms); \
+             the old Θ(M³/3) walk took 41616ms at N={n}."
+        );
+    }
+
+    #[test]
+    fn test_go_leading_comment_run_scaling_guard() {
+        assert_no_cubic_regression(time_go_minimal, "minimal");
+
+        let t1 = time_go_minimal(&go_leading_run_source(4000));
+        let t2 = time_go_minimal(&go_leading_run_source(8000));
+
+        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
+        // in this work went vacuous when a fix made it too fast to measure, and
+        // a silently-passing scaling guard provides no protection at all.
+        assert!(
+            t1 >= 1.5,
+            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
+             (expected ≥ 1.5ms; ~6.5ms measured on debug builds). Either the \
+             transform is being cached/skipped or N must be raised. \
+             DO NOT convert this to a skip."
+        );
+
+        let ratio = t2 / t1;
+        assert!(
+            ratio < 2.8,
+            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
+             (got {ratio:.2}×; measured 1.84× on the linear implementation). \
+             O(N) → ~2.0×; O(N²) → ~4.0×; 2.8 ≈ 2^1.5 is the exponent-space \
+             midpoint. N=4000 took {t1:.2}ms, N=8000 took {t2:.2}ms."
+        );
+    }
+
+    #[test]
+    fn test_go_doc_block_scaling_guard() {
+        // n is capped at 2000: each block is ~17 AST nodes, so n=4000 would
+        // approach MAX_AST_NODES (100_000) and silently turn this guard into an
+        // Err(ComplexityLimit) assertion instead of a timing assertion.
+        //
+        // This shape was already linear before the fix (α = 1.08) — it is a
+        // REGRESSION guard, not evidence of the fix. See the series above.
+        let t1 = time_go_minimal(&go_doc_blocks_source(1000));
+        let t2 = time_go_minimal(&go_doc_blocks_source(2000));
+
+        assert!(
+            t1 >= 3.0,
+            "n=1000 doc blocks completed in {t1:.3}ms — too fast to measure \
+             reliably (expected ≥ 3ms; ~25ms measured). DO NOT convert to a skip."
+        );
+
+        let ratio = t2 / t1;
+        assert!(
+            ratio < 2.8,
+            "Doubling doc-block count from 1000 to 2000 must produce a ratio \
+             below 2.8 (got {ratio:.2}×; measured 1.99×). \
+             n=1000 took {t1:.2}ms, n=2000 took {t2:.2}ms."
+        );
+    }
+
+    #[test]
+    fn test_go_pseudo_leading_comment_run_scaling_guard() {
+        // pseudo is the PRODUCTION path: the cat/head/tail rewrite selects
+        // --mode=pseudo for regular code files (ADR-008), so this is the mode an
+        // agent actually reads Go through. Go's pseudo rules strip no node kinds
+        // and no keywords, so this measures the comment walk almost in isolation.
+        assert_no_cubic_regression(time_go_pseudo, "pseudo");
+
+        let t1 = time_go_pseudo(&go_leading_run_source(4000));
+        let t2 = time_go_pseudo(&go_leading_run_source(8000));
+
+        assert!(
+            t1 >= 1.5,
+            "N=4000 pseudo completed in {t1:.3}ms — too fast to measure reliably \
+             (expected ≥ 1.5ms; ~6.6ms measured). DO NOT convert this to a skip."
+        );
+
+        let ratio = t2 / t1;
+        assert!(
+            ratio < 2.8,
+            "Doubling N from 4000 to 8000 in pseudo mode must produce a ratio \
+             below 2.8 (got {ratio:.2}×; measured 2.02×). \
+             N=4000 took {t1:.2}ms, N=8000 took {t2:.2}ms."
         );
     }
 
