@@ -823,3 +823,207 @@ fn t14_escape_hatch_does_not_append_a_trailing_newline() {
         "SKIM_PASSTHROUGH=1 is byte-exact — it must not add a newline the tool never emitted"
     );
 }
+
+// ============================================================================
+// T15 — `println!` must never panic on a closed pipe (exit 101)
+//
+// `println!`/`print!` PANIC when the downstream reader is gone:
+//
+//     thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+//     failed printing to stdout: Broken pipe (os error 32)
+//
+// A panic is not an `Err`, so neither the `StdoutStatus` sinks nor the
+// `is_broken_pipe_chain` boundary in `main.rs` can catch it: the process exits
+// **101** with a panic message on stderr where the raw tool exits **141** in
+// silence.  Measured against the pre-fix binary, every command below reproduced
+// exit 101 with one `panicked at` line.
+//
+// Surface: these drive the **explicit subcommand** path (`skim git log …`,
+// `skim make`, `skim vitest run`), i.e. the same `cmd::dispatch` front-end the
+// PATH-wrapper surface reaches via `detect_argv0_dispatch`.  None of them
+// exercises the rewrite engine, and none may be cited as coverage of it.
+// ============================================================================
+
+/// A `git log --format=%h %s (%cr) <%an>`-shaped fixture of `n` commits.
+///
+/// Shape matters here in a way it does not for [`grep_fixture`]: `git log`'s
+/// parser only produces a large rendering (JSON or text) when it actually
+/// recognises commit lines.  Fed grep-shaped bytes it parses zero commits, the
+/// rendering is a few hundred bytes, the whole write fits the pipe buffer, and
+/// the defect does not reproduce at all — the same size-dependence that made the
+/// original bug look flaky.
+fn git_log_fixture(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("a1b2c{i:04} refactor module {i} for clarity and speed ({i} days ago) <Dean Sharon>\n"))
+        .collect()
+}
+
+/// `n` lines that no build/test-runner parser recognises.
+///
+/// The build and test-runner probes need the **passthrough** tier, where the
+/// handler forwards the whole raw body.  Shape matters for the opposite reason
+/// it does in [`git_log_fixture`]: fed [`grep_fixture`]'s `path:line:content`
+/// lines, the vitest parser produces a `pass: 0 fail: 0 skip: 0` summary — a
+/// 24-byte write that fits the pipe buffer, so the reader never closes on it and
+/// the defect does not reproduce.  Deliberately anodyne prose keeps every parser
+/// on its passthrough arm.
+fn unparseable_fixture(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("some arbitrary unparseable output line number {i} with padding text here\n"))
+        .collect()
+}
+
+/// Run `skim <args>` with `stub_dir` first on PATH, let a reader take `lines`
+/// lines and then vanish, and report `(exit code, stderr text)`.
+///
+/// `stdin` is `/dev/null` deliberately: several handlers call
+/// `should_read_stdin`, and an inherited terminal stdin makes them block instead
+/// of spawning the stub.
+fn exit_and_stderr_after_early_close(
+    stub_dir: &Path,
+    args: &[&str],
+    lines: usize,
+    tag: &str,
+) -> (Option<i32>, String) {
+    let (err_path, err_sink) = stderr_file(stub_dir, &format!("{tag}.err"));
+    let mut child = skim_with_stubs(stub_dir, args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(err_sink)
+        .spawn()
+        .unwrap();
+    let got = read_n_lines_then_close(&mut child, lines);
+    assert!(
+        !got.is_empty(),
+        "{tag}: skim produced no output at all, so this invocation never reached \
+         the write under test — fix the fixture, not the assertion"
+    );
+    let status = wait_bounded(&mut child, tag);
+    (
+        status.code(),
+        std::fs::read_to_string(&err_path).unwrap_or_default(),
+    )
+}
+
+/// Assert the pipe-closed contract: exit 141, and **no panic** on stderr.
+fn assert_panic_free_pipe_close(code: Option<i32>, stderr: &str, what: &str) {
+    assert!(
+        !stderr.contains("panicked at"),
+        "{what}: `println!` panicked on the closed pipe — stderr was:\n{stderr}"
+    );
+    assert_ne!(
+        code,
+        Some(101),
+        "{what}: exit 101 is the panic-abort code; raw exits 141 silently"
+    );
+    assert_eq!(
+        code,
+        Some(141),
+        "{what}: a closed downstream reader must exit 141 (128 + SIGPIPE); stderr was:\n{stderr}"
+    );
+}
+
+/// `cmd/git/mod.rs` — `run_passthrough`'s `print!("{}", output.stdout)`.
+///
+/// `--format` routes `git log` to the flag-aware passthrough, which forwards the
+/// tool's stdout verbatim.  Pre-fix: exit 101 + panic.
+#[test]
+fn t15_git_mod_passthrough_does_not_panic_on_closed_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "git", &grep_fixture(5_000), "", 0);
+
+    let (code, err) = exit_and_stderr_after_early_close(
+        dir.path(),
+        &["git", "log", "--format=%H"],
+        3,
+        "t15-git-mod",
+    );
+    assert_panic_free_pipe_close(code, &err, "git/mod.rs run_passthrough");
+}
+
+/// `cmd/git/mod.rs` — `run_parsed_command`'s compressed-result `println!("{s}")`.
+///
+/// `git status` over a large porcelain-v2 fixture keeps the compressed body
+/// (the net-savings guard says Keep), which is the arm that used `println!`.
+#[test]
+fn t15_git_mod_parsed_command_does_not_panic_on_closed_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixture = String::from(
+        "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n",
+    );
+    for i in 1..=5_000 {
+        fixture.push_str(&format!(
+            "1 .M N... 100644 100644 100644 aaa bbb src/module/file{i}.rs\n"
+        ));
+    }
+    make_stub(dir.path(), "git", &fixture, "", 0);
+
+    let (code, err) =
+        exit_and_stderr_after_early_close(dir.path(), &["git", "status"], 3, "t15-git-status");
+    assert_panic_free_pipe_close(code, &err, "git/mod.rs run_parsed_command");
+}
+
+/// `cmd/git/log.rs` — the `--json` arm's `println!("{json}")`.
+#[test]
+fn t15_git_log_json_does_not_panic_on_closed_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "git", &git_log_fixture(5_000), "", 0);
+
+    let (code, err) =
+        exit_and_stderr_after_early_close(dir.path(), &["git", "log", "--json"], 3, "t15-git-log");
+    assert_panic_free_pipe_close(code, &err, "git/log.rs --json");
+}
+
+/// `cmd/build/mod.rs` — the passthrough-tier `println!("{content}")`.
+#[test]
+fn t15_build_does_not_panic_on_closed_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "make", &unparseable_fixture(5_000), "", 0);
+
+    let (code, err) = exit_and_stderr_after_early_close(dir.path(), &["make"], 3, "t15-build");
+    assert_panic_free_pipe_close(code, &err, "build/mod.rs");
+}
+
+/// `cmd/test/shared.rs` — the `ParseResult::Passthrough` arm's `println!("{raw}")`.
+#[test]
+fn t15_test_runner_does_not_panic_on_closed_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "vitest", &unparseable_fixture(5_000), "", 0);
+
+    let (code, err) =
+        exit_and_stderr_after_early_close(dir.path(), &["vitest", "run"], 3, "t15-test");
+    assert_panic_free_pipe_close(code, &err, "test/shared.rs");
+}
+
+/// `cmd/git/show.rs` — the file-content / non-commit `print!("{raw}")` sinks.
+///
+/// Not in the originally reported set; found by the sweep and reproduced at
+/// exit 101 the same way.
+#[test]
+fn t15_git_show_does_not_panic_on_closed_pipe() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "git", &grep_fixture(5_000), "", 0);
+
+    let (code, err) =
+        exit_and_stderr_after_early_close(dir.path(), &["git", "show", "HEAD"], 3, "t15-git-show");
+    assert_panic_free_pipe_close(code, &err, "git/show.rs");
+}
+
+/// stderr stays clean on the pipe-closed path for a `println!`-family handler.
+///
+/// ADR-011 class 2: nothing is lost (the *reader* stopped reading) and the raw
+/// tool is silent here, so the pipe-closed notice is a debug-gated banner and
+/// the default run must cost **zero** stderr bytes.  The panic message this
+/// replaces was 254 bytes of unconditional noise into every agent's transcript.
+#[test]
+fn t15_pipe_close_costs_zero_stderr_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    make_stub(dir.path(), "make", &unparseable_fixture(5_000), "", 0);
+
+    let (code, err) = exit_and_stderr_after_early_close(dir.path(), &["make"], 3, "t15-silent");
+    assert_eq!(code, Some(141));
+    assert!(
+        err.is_empty(),
+        "a closed reader must cost zero stderr bytes by default (ADR-011 class 2); got:\n{err}"
+    );
+}

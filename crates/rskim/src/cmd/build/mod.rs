@@ -203,8 +203,11 @@ pub(super) fn run_parsed_command(
     let effective_tier = if tier_name != "passthrough" {
         match crate::cmd::execution::savings_decision(raw_cow.as_ref(), content) {
             crate::cmd::execution::SavingsDecision::Keep => {
-                if !content.is_empty() {
-                    println!("{content}");
+                if !content.is_empty()
+                    && crate::cmd::execution::write_line_to_stdout(content)?
+                        == crate::cmd::execution::StdoutStatus::PipeClosed
+                {
+                    return Ok(crate::cmd::execution::pipe_closed_exit());
                 }
                 tier_name
             }
@@ -219,8 +222,11 @@ pub(super) fn run_parsed_command(
         }
     } else {
         // Already passthrough — print as-is and skip guard.
-        if !content.is_empty() {
-            println!("{content}");
+        if !content.is_empty()
+            && crate::cmd::execution::write_line_to_stdout(content)?
+                == crate::cmd::execution::StdoutStatus::PipeClosed
+        {
+            return Ok(crate::cmd::execution::pipe_closed_exit());
         }
         tier_name
     };

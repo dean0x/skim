@@ -261,12 +261,18 @@ pub(crate) fn pipe_closed_exit() -> ExitCode {
     ExitCode::from(pipe_closed_code())
 }
 
-/// Outcome of writing to stdout.
+/// Outcome of writing to a standard stream.
 ///
 /// A closed downstream pipe (`skim grep … | head -20`) is a normal
 /// end-of-consumption event, not a failure, so it is modelled as a value the
 /// caller must handle rather than an `Err` that would surface as
 /// `Error: Broken pipe (os error 32)` and exit `1`.
+///
+/// The name reflects the dominant sink, not a file-descriptor restriction: the
+/// tool-stderr forwarding helpers ([`write_to_stderr`], [`write_line_to_stderr`])
+/// return the same value, because under `skim … 2>&1 | head` both descriptors
+/// are the *same pipe* and a departed reader is the identical disposition on
+/// either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub(crate) enum StdoutStatus {
@@ -274,6 +280,20 @@ pub(crate) enum StdoutStatus {
     Written,
     /// The reader closed the pipe; no further output can be delivered.
     PipeClosed,
+}
+
+/// Map a completed write into a [`StdoutStatus`], keeping `BrokenPipe` out of
+/// the error channel.
+///
+/// This is the single place the EPIPE-is-a-value rule is expressed, so no sink
+/// can drift into returning `Err` (which becomes `Error: Broken pipe` + exit 1)
+/// or into panicking (which `println!` does, and which is exit 101).
+fn classify_write(result: io::Result<()>) -> io::Result<StdoutStatus> {
+    match result {
+        Ok(()) => Ok(StdoutStatus::Written),
+        Err(e) if is_broken_pipe(&e) => Ok(StdoutStatus::PipeClosed),
+        Err(e) => Err(e),
+    }
 }
 
 /// Write `s` to `out` and flush, optionally appending a trailing newline when
@@ -286,6 +306,18 @@ fn write_and_flush(out: &mut impl Write, s: &str, ensure_trailing_newline: bool)
     if ensure_trailing_newline && !s.is_empty() && !s.ends_with('\n') {
         writeln!(out)?;
     }
+    out.flush()
+}
+
+/// Write `s` followed by **exactly one unconditional newline**, then flush.
+///
+/// This is `println!("{s}")`'s byte contract, deliberately *not*
+/// [`write_and_flush`]'s conditional trailing-newline guard: `println!` appends
+/// a newline even when `s` already ends with one, and the call sites this
+/// replaces are load-bearing on that (a body that ends in `\n` renders a blank
+/// terminating line today). Reusing the guard would silently change their bytes.
+fn write_line_and_flush(out: &mut impl Write, s: &str) -> io::Result<()> {
+    writeln!(out, "{s}")?;
     out.flush()
 }
 
@@ -306,11 +338,74 @@ fn write_and_flush(out: &mut impl Write, s: &str, ensure_trailing_newline: bool)
 /// reports as exit `1`.
 pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, StdoutStatus)> {
     let mut out = io::stdout().lock();
-    match write_and_flush(&mut out, raw, true) {
-        Ok(()) => Ok(("passthrough", StdoutStatus::Written)),
-        Err(e) if is_broken_pipe(&e) => Ok(("passthrough", StdoutStatus::PipeClosed)),
-        Err(e) => Err(e),
-    }
+    let status = classify_write(write_and_flush(&mut out, raw, true))?;
+    Ok(("passthrough", status))
+}
+
+// ----------------------------------------------------------------------------
+// Panic-free replacements for `print!` / `println!` / `eprint!` / `eprintln!`
+// ----------------------------------------------------------------------------
+//
+// `println!` and friends **panic** on a closed pipe:
+//
+// ```text
+// thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+// failed printing to stdout: Broken pipe (os error 32)
+// ```
+//
+// A panic is not an `Err`, so neither the sinks above nor the `is_broken_pipe_chain`
+// boundary in `main.rs` can catch it: the process exits **101** with a panic
+// message on stderr, where raw `git diff … | head -2` exits 141 in silence.  That
+// is a *louder* divergence from raw than the exit-1 defect A0 fixed.
+//
+// Every handler that emits **tool output** — the wrapped tool's own bytes, or a
+// compressed rendering of them, both unbounded in size — must route through
+// these helpers instead.  Short skim-authored notices (help text, usage errors,
+// the `[skim]` banners) deliberately keep `println!`/`eprintln!`: see the module
+// note in `mod.rs` for the boundary and its rationale.
+//
+// ADR-011: these helpers *remove* output on a closed pipe rather than adding
+// any, so they never emit an elision marker.  The only diagnostic is the
+// caller's existing class-2 `debug_log!` banner.
+
+/// Write a pre-serialized string to stdout verbatim — `print!("{s}")` without
+/// the panic.
+///
+/// A closed downstream pipe returns [`StdoutStatus::PipeClosed`] rather than an
+/// error — see [`pipe_closed_code`] for why a broken pipe must never become
+/// exit `1`.
+pub(crate) fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
+    let mut handle = io::stdout().lock();
+    Ok(classify_write(write_and_flush(&mut handle, s, false))?)
+}
+
+/// Write a string plus one unconditional newline to stdout — `println!("{s}")`
+/// without the panic.
+///
+/// Byte-identical to `println!`, including the newline it appends to a body that
+/// already ends in one; see [`write_line_and_flush`].
+pub(crate) fn write_line_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
+    let mut handle = io::stdout().lock();
+    Ok(classify_write(write_line_and_flush(&mut handle, s))?)
+}
+
+/// Forward tool stderr verbatim — `eprint!("{s}")` without the panic.
+///
+/// stderr is a distinct descriptor but not a distinct hazard: `skim … 2>&1 | head`
+/// merges both streams into one pipe, so a departed reader breaks fd 2 exactly as
+/// it breaks fd 1, and `eprint!`/`eprintln!` panic identically
+/// (`failed printing to stderr`).  Forwarded tool stderr is unbounded, so it is
+/// held to the same rule as forwarded tool stdout.
+pub(crate) fn write_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
+    let mut handle = io::stderr().lock();
+    Ok(classify_write(write_and_flush(&mut handle, s, false))?)
+}
+
+/// Forward tool stderr plus one unconditional newline — `eprintln!("{s}")`
+/// without the panic.  See [`write_to_stderr`] for why stderr needs this too.
+pub(crate) fn write_line_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
+    let mut handle = io::stderr().lock();
+    Ok(classify_write(write_line_and_flush(&mut handle, s))?)
 }
 
 use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
@@ -547,20 +642,6 @@ where
                 Ok(format!("{content}\n"))
             }
         }
-    }
-}
-
-/// Write a pre-serialized string to stdout.
-///
-/// A closed downstream pipe returns [`StdoutStatus::PipeClosed`] rather than an
-/// error — see [`pipe_closed_code`] for why a broken pipe must never become
-/// exit `1`.
-fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
-    let mut handle = io::stdout().lock();
-    match write_and_flush(&mut handle, s, false) {
-        Ok(()) => Ok(StdoutStatus::Written),
-        Err(e) if is_broken_pipe(&e) => Ok(StdoutStatus::PipeClosed),
-        Err(e) => Err(e.into()),
     }
 }
 

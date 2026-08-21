@@ -48,6 +48,7 @@ use std::process::ExitCode;
 
 use rskim_core::{Language, Mode, TransformConfig};
 
+use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
 use crate::runner::CommandRunner;
@@ -412,6 +413,10 @@ enum ShowRawOutcome {
         exit_code: ExitCode,
         duration: std::time::Duration,
     },
+    /// The downstream reader closed the pipe while the failure streams were
+    /// being forwarded.  The caller must stop and return `pipe_closed_exit()`
+    /// without recording analytics, matching every other pipe-closed path.
+    PipeClosed,
 }
 
 /// Execute `git show` and return a structured outcome.
@@ -431,11 +436,15 @@ fn run_git_show_raw(
     let output = runner.run("git", &as_str_slice(&full_args))?;
 
     if output.exit_code != Some(0) {
-        if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
+        if !output.stderr.is_empty()
+            && exec::write_to_stderr(&output.stderr)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(ShowRawOutcome::PipeClosed);
         }
-        if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
+        if !output.stdout.is_empty()
+            && exec::write_to_stdout(&output.stdout)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(ShowRawOutcome::PipeClosed);
         }
         return Ok(ShowRawOutcome::Failure {
             stdout: output.stdout,
@@ -546,7 +555,7 @@ fn emit_show_commit(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<exec::StdoutStatus> {
     let rec_full = rec.with_tier("full");
     match output_format {
         OutputFormat::Json => {
@@ -556,7 +565,9 @@ fn emit_show_commit(
             // could spuriously emit `[skim:guardrail]` to stderr.
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
-            println!("{json}");
+            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed {
+                return Ok(exec::StdoutStatus::PipeClosed);
+            }
             finalize_git_output_owned(raw, json, label, show_stats, rec_full, duration);
         }
         OutputFormat::Text => {
@@ -576,7 +587,9 @@ fn emit_show_commit(
             };
             let guardrail = crate::output::guardrail::apply_to_stderr(raw, result_str)?;
             let final_output = guardrail.into_output();
-            print!("{final_output}");
+            if exec::write_to_stdout(&final_output)? == exec::StdoutStatus::PipeClosed {
+                return Ok(exec::StdoutStatus::PipeClosed);
+            }
             finalize_git_output_owned(
                 raw_for_record,
                 final_output,
@@ -587,7 +600,7 @@ fn emit_show_commit(
             );
         }
     }
-    Ok(())
+    Ok(exec::StdoutStatus::Written)
 }
 
 /// Run `git show` in commit mode: parse header + AST-aware diff.
@@ -606,6 +619,7 @@ fn run_show_commit(
 ) -> anyhow::Result<ExitCode> {
     let (raw, duration) = match run_git_show_raw(global_flags, git_args)? {
         ShowRawOutcome::Success { stdout, duration } => (stdout, duration),
+        ShowRawOutcome::PipeClosed => return Ok(exec::pipe_closed_exit()),
         ShowRawOutcome::Failure {
             stdout,
             exit_code,
@@ -638,7 +652,9 @@ fn run_show_commit(
         // entry instead of silently dropping the invocation (HIGH-3).
         // raw == output; move raw into the passthrough variant: 1 allocation
         // (clone) on the analytics path, 0 when disabled (PF-018 resolution).
-        print!("{raw}");
+        if exec::write_to_stdout(&raw)? == exec::StdoutStatus::PipeClosed {
+            return Ok(exec::pipe_closed_exit());
+        }
         super::finalize_git_output_passthrough(
             raw,
             label,
@@ -649,7 +665,11 @@ fn run_show_commit(
         return Ok(ExitCode::SUCCESS);
     };
 
-    emit_show_commit(result, raw, label, output_format, show_stats, rec, duration)?;
+    if emit_show_commit(result, raw, label, output_format, show_stats, rec, duration)?
+        == exec::StdoutStatus::PipeClosed
+    {
+        return Ok(exec::pipe_closed_exit());
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -686,9 +706,11 @@ fn passthrough_file_content(
     rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
     tier: u8,
-) {
+) -> anyhow::Result<exec::StdoutStatus> {
     crate::debug_log!("[skim] git show: falling back to raw (tier {tier})");
-    print!("{raw}");
+    if exec::write_to_stdout(&raw)? == exec::StdoutStatus::PipeClosed {
+        return Ok(exec::StdoutStatus::PipeClosed);
+    }
     // raw == output (passthrough); move raw into finalize_git_output_passthrough
     // so the analytics path clones once and moves once — 1 allocation total
     // instead of 2 (PF-018 resolution).
@@ -706,6 +728,7 @@ fn passthrough_file_content(
         rec.with_tier_opt(tier_name),
         duration,
     );
+    Ok(exec::StdoutStatus::Written)
 }
 
 /// Run `git show <ref>:<path>` in file-content mode.
@@ -750,11 +773,15 @@ fn run_show_file_content(
     let output = runner.run("git", &as_str_slice(&full_args))?;
 
     if output.exit_code != Some(0) {
-        if !output.stderr.is_empty() {
-            eprint!("{}", output.stderr);
+        if !output.stderr.is_empty()
+            && exec::write_to_stderr(&output.stderr)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
         }
-        if !output.stdout.is_empty() {
-            print!("{}", output.stdout);
+        if !output.stdout.is_empty()
+            && exec::write_to_stdout(&output.stdout)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
         }
         let exit_code = output.exit_code;
         // Record analytics on the error path so the DB reflects failed
@@ -782,7 +809,11 @@ fn run_show_file_content(
         // Tier 2: unsupported or serde-based language — passthrough.
         // Move raw: the else branch always returns, so Rust knows raw is
         // available after the let-else for the Tier 1 path.
-        passthrough_file_content(raw, label, show_stats, rec, duration, 2);
+        if passthrough_file_content(raw, label, show_stats, rec, duration, 2)?
+            == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
+        }
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -809,7 +840,11 @@ fn run_show_file_content(
                     "[skim:debug] git show file-content transform failed for {path_str}: {e}"
                 );
             }
-            passthrough_file_content(raw, label, show_stats, rec, duration, 3);
+            if passthrough_file_content(raw, label, show_stats, rec, duration, 3)?
+                == exec::StdoutStatus::PipeClosed
+            {
+                return Ok(exec::pipe_closed_exit());
+            }
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -826,7 +861,9 @@ fn run_show_file_content(
     let guardrail = crate::output::guardrail::apply_to_stderr(raw, transformed)?;
     let final_output = guardrail.into_output();
 
-    print!("{final_output}");
+    if exec::write_to_stdout(&final_output)? == exec::StdoutStatus::PipeClosed {
+        return Ok(exec::pipe_closed_exit());
+    }
     // Both raw_for_record and final_output are owned Strings; use the owned
     // variant to move them directly into analytics, avoiding two extra .to_string()
     // clones that the borrowed finalize_git_output would incur (HIGH-3, PF-018).

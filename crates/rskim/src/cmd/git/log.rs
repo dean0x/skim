@@ -2,6 +2,7 @@
 
 use std::process::ExitCode;
 
+use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::GitResult;
 use crate::runner::CommandRunner;
@@ -59,12 +60,16 @@ pub(super) fn run_log(
     if !stdout_truncated && output.exit_code != Some(0) {
         // Scrub credential URLs before forwarding (PF-024).
         let scrubbed_stderr = super::shared::scrub_lines(&output.stderr);
-        if !scrubbed_stderr.is_empty() {
-            eprintln!("{scrubbed_stderr}");
+        if !scrubbed_stderr.is_empty()
+            && exec::write_line_to_stderr(&scrubbed_stderr)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
         }
         let scrubbed_stdout = super::shared::scrub_lines(&output.stdout);
-        if !scrubbed_stdout.is_empty() {
-            println!("{scrubbed_stdout}");
+        if !scrubbed_stdout.is_empty()
+            && exec::write_line_to_stdout(&scrubbed_stdout)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
         }
         let exit_code = output.exit_code;
         super::finalize_git_output_passthrough(
@@ -97,13 +102,25 @@ pub(super) fn run_log(
         None
     };
 
+    // Emit the elision marker (when one is due) on stdout, exactly where the
+    // former `println!("{marker}")` sat.  It is ADR-010 / ADR-011 class 1 —
+    // loss-bearing and unconditional — but it is still stdout, so a departed
+    // reader must stop the run rather than panic the process.
+    let emit_elision = |elision: Option<&String>| -> anyhow::Result<exec::StdoutStatus> {
+        match elision {
+            Some(marker) => exec::write_line_to_stdout(marker),
+            None => Ok(exec::StdoutStatus::Written),
+        }
+    };
+
     let (result_str, effective_tier) = match output_format {
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            println!("{json}");
-            if let Some(ref marker) = elision {
-                println!("{marker}");
+            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed
+                || emit_elision(elision.as_ref())? == exec::StdoutStatus::PipeClosed
+            {
+                return Ok(exec::pipe_closed_exit());
             }
             (json, parse_tier)
         }
@@ -111,30 +128,31 @@ pub(super) fn run_log(
             let s = result.to_string();
             let tier_str: Option<&'static str> = if parse_tier.is_some_and(|t| t == "passthrough") {
                 // Already passthrough tier — skip guard, print as-is.
-                println!("{s}");
-                if let Some(ref marker) = elision {
-                    println!("{marker}");
+                if exec::write_line_to_stdout(&s)? == exec::StdoutStatus::PipeClosed
+                    || emit_elision(elision.as_ref())? == exec::StdoutStatus::PipeClosed
+                {
+                    return Ok(exec::pipe_closed_exit());
                 }
                 parse_tier
             } else {
-                match crate::cmd::execution::savings_decision(&raw, &s) {
-                    crate::cmd::execution::SavingsDecision::Keep => {
-                        println!("{s}");
-                        if let Some(ref marker) = elision {
-                            println!("{marker}");
+                match exec::savings_decision(&raw, &s) {
+                    exec::SavingsDecision::Keep => {
+                        if exec::write_line_to_stdout(&s)? == exec::StdoutStatus::PipeClosed
+                            || emit_elision(elision.as_ref())? == exec::StdoutStatus::PipeClosed
+                        {
+                            return Ok(exec::pipe_closed_exit());
                         }
                         parse_tier
                     }
-                    crate::cmd::execution::SavingsDecision::Passthrough => {
+                    exec::SavingsDecision::Passthrough => {
                         // Even when passthrough wins, if we truncated stdout
                         // then the raw itself is incomplete — still emit the
                         // elision marker so the caller knows.
-                        let (tier, status) = crate::cmd::execution::emit_raw_passthrough(&raw)?;
-                        if status == crate::cmd::execution::StdoutStatus::PipeClosed {
-                            return Ok(crate::cmd::execution::pipe_closed_exit());
-                        }
-                        if let Some(ref marker) = elision {
-                            println!("{marker}");
+                        let (tier, status) = exec::emit_raw_passthrough(&raw)?;
+                        if status == exec::StdoutStatus::PipeClosed
+                            || emit_elision(elision.as_ref())? == exec::StdoutStatus::PipeClosed
+                        {
+                            return Ok(exec::pipe_closed_exit());
                         }
                         Some(tier)
                     }
