@@ -129,7 +129,10 @@ pub(super) fn run_log(
                         // Even when passthrough wins, if we truncated stdout
                         // then the raw itself is incomplete — still emit the
                         // elision marker so the caller knows.
-                        let tier = crate::cmd::execution::emit_raw_passthrough(&raw)?;
+                        let (tier, status) = crate::cmd::execution::emit_raw_passthrough(&raw)?;
+                        if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                            return Ok(crate::cmd::execution::pipe_closed_exit());
+                        }
                         if let Some(ref marker) = elision {
                             println!("{marker}");
                         }

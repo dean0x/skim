@@ -204,9 +204,91 @@ pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
     }
 }
 
+// ============================================================================
+// Closed-downstream-pipe handling
+// ============================================================================
+
+/// True when `e` is a closed-downstream-pipe error (`EPIPE`).
+///
+/// Rust's std installs `SIG_IGN` for `SIGPIPE` before `main()` runs, so skim is
+/// never signal-killed when a reader goes away — the write simply returns
+/// [`io::ErrorKind::BrokenPipe`]. A closed pipe is therefore an ordinary
+/// error-handling case, not a signal-handling one.
+pub(crate) fn is_broken_pipe(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::BrokenPipe
+}
+
+/// True when any layer of an `anyhow` chain is a broken-pipe [`io::Error`].
+///
+/// The buffered sinks propagate `io::Error` through `?` (and sometimes under a
+/// `.context(…)` layer), so the top-level boundary in `main.rs` must walk the
+/// whole chain rather than downcast only the head.
+pub(crate) fn is_broken_pipe_chain(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<io::Error>().is_some_and(is_broken_pipe))
+}
+
+/// Numeric exit code for "the reader closed the pipe before we finished writing".
+///
+/// # Contract
+///
+/// **This is never `1`.** For `grep`, `rg`, and `diff` (see
+/// [`BENIGN_EXIT1_PROGRAMS`]) exit 1 is the wire protocol for *"no matches
+/// found"*, so exiting 1 because the reader went away reports a false negative
+/// to any caller that inspects `$?` — `skim grep … | head -20` would tell the
+/// caller the pattern is absent when it is not.
+///
+/// - **unix** → `141` (`128 + SIGPIPE`). This is what a shell reports for a
+///   process killed by `SIGPIPE`, so `skim grep … | head` matches raw
+///   `grep … | head` in `${PIPESTATUS[0]}`, including under `set -o pipefail`.
+///   The value is a deliberate *approximation*: skim exits normally with 141
+///   rather than restoring `SIG_DFL` and re-raising `SIGPIPE`, which would
+///   require `unsafe`.
+/// - **non-unix** → `0`, equivalent to [`ExitCode::SUCCESS`]. There is no
+///   SIGPIPE convention to mirror.
+pub(crate) const fn pipe_closed_code() -> u8 {
+    if cfg!(unix) { 141 } else { 0 }
+}
+
+/// [`ExitCode`] form of [`pipe_closed_code`]. Never `ExitCode::from(1)`.
+///
+/// Every path that observes a closed downstream pipe must funnel through this
+/// one helper so the call sites cannot drift apart.
+pub(crate) fn pipe_closed_exit() -> ExitCode {
+    ExitCode::from(pipe_closed_code())
+}
+
+/// Outcome of writing to stdout.
+///
+/// A closed downstream pipe (`skim grep … | head -20`) is a normal
+/// end-of-consumption event, not a failure, so it is modelled as a value the
+/// caller must handle rather than an `Err` that would surface as
+/// `Error: Broken pipe (os error 32)` and exit `1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum StdoutStatus {
+    /// All bytes were written and flushed.
+    Written,
+    /// The reader closed the pipe; no further output can be delivered.
+    PipeClosed,
+}
+
+/// Write `s` to `out` and flush, optionally appending a trailing newline when
+/// `s` is non-empty and does not already end with one.
+///
+/// Shared by [`emit_raw_passthrough`] and [`write_to_stdout`] so the
+/// trailing-newline guard cannot drift between the two sinks.
+fn write_and_flush(out: &mut impl Write, s: &str, ensure_trailing_newline: bool) -> io::Result<()> {
+    write!(out, "{s}")?;
+    if ensure_trailing_newline && !s.is_empty() && !s.ends_with('\n') {
+        writeln!(out)?;
+    }
+    out.flush()
+}
+
 /// Emit `raw` to stdout verbatim and ensure a trailing newline if the string is
 /// non-empty and does not already end with one. Returns the `"passthrough"`
-/// analytics tier string.
+/// analytics tier string plus the [`StdoutStatus`].
 ///
 /// This is the single shared raw-passthrough emission used by every
 /// command-handler sink (execution, build, git, test, log). Centralising here
@@ -215,14 +297,17 @@ pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
 ///
 /// The helper owns **stdout raw emission only**. Each call site retains its own
 /// stderr forwarding and exit-code handling — those are not moved here.
-pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<&'static str> {
+///
+/// A [`StdoutStatus::PipeClosed`] result is *not* an error: callers must stop
+/// producing output and return [`pipe_closed_exit`] so the closed pipe never
+/// reports as exit `1`.
+pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, StdoutStatus)> {
     let mut out = io::stdout().lock();
-    write!(out, "{raw}")?;
-    if !raw.is_empty() && !raw.ends_with('\n') {
-        writeln!(out)?;
+    match write_and_flush(&mut out, raw, true) {
+        Ok(()) => Ok(("passthrough", StdoutStatus::Written)),
+        Err(e) if is_broken_pipe(&e) => Ok(("passthrough", StdoutStatus::PipeClosed)),
+        Err(e) => Err(e),
     }
-    out.flush()?;
-    Ok("passthrough")
 }
 
 use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
@@ -458,21 +543,31 @@ where
 }
 
 /// Write a pre-serialized string to stdout.
-fn write_to_stdout(s: &str) -> anyhow::Result<()> {
+///
+/// A closed downstream pipe returns [`StdoutStatus::PipeClosed`] rather than an
+/// error — see [`pipe_closed_code`] for why a broken pipe must never become
+/// exit `1`.
+fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stdout().lock();
-    write!(handle, "{s}")?;
-    handle.flush()?;
-    Ok(())
+    match write_and_flush(&mut handle, s, false) {
+        Ok(()) => Ok(StdoutStatus::Written),
+        Err(e) if is_broken_pipe(&e) => Ok(StdoutStatus::PipeClosed),
+        Err(e) => Err(e.into()),
+    }
 }
 
-/// Render parsed result to stdout, returning the output string for analytics.
-fn render_output<T>(result: &ParseResult<T>, output_format: OutputFormat) -> anyhow::Result<String>
+/// Render parsed result to stdout, returning the output string for analytics
+/// and whether the reader was still attached.
+fn render_output<T>(
+    result: &ParseResult<T>,
+    output_format: OutputFormat,
+) -> anyhow::Result<(String, StdoutStatus)>
 where
     T: AsRef<str> + serde::Serialize,
 {
     let s = serialize_output(result, output_format)?;
-    write_to_stdout(&s)?;
-    Ok(s)
+    let status = write_to_stdout(&s)?;
+    Ok((s, status))
 }
 
 /// Write raw command output to stdout/stderr and return the process exit code.
@@ -480,15 +575,25 @@ where
 /// Used by the passthrough fast-path in [`run_parsed_command_with_mode`] when
 /// `SKIM_PASSTHROUGH=1` is set. Forwards stdout/stderr verbatim without any
 /// compression or parsing.
+/// A closed downstream pipe on either stream short-circuits to
+/// [`pipe_closed_exit`] instead of propagating `Error: Broken pipe`.
 fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     let code = output.exit_code.unwrap_or(1);
-    let mut out = io::stdout().lock();
-    write!(out, "{}", output.stdout)?;
-    out.flush()?;
+    {
+        let mut out = io::stdout().lock();
+        match write_and_flush(&mut out, &output.stdout, false) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
+            Err(e) => return Err(e.into()),
+        }
+    }
     if !output.stderr.is_empty() {
         let mut err = io::stderr().lock();
-        write!(err, "{}", output.stderr)?;
-        err.flush()?;
+        match write_and_flush(&mut err, &output.stderr, false) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
@@ -816,10 +921,15 @@ where
             if !json_str.ends_with('\n') {
                 json_str.push('\n');
             }
-            write_to_stdout(&json_str)?;
+            if write_to_stdout(&json_str)? == StdoutStatus::PipeClosed {
+                return Ok(pipe_closed_exit());
+            }
             (json_str, tier_name)
         } else {
-            let tier = emit_raw_passthrough(&output.stdout)?;
+            let (tier, status) = emit_raw_passthrough(&output.stdout)?;
+            if status == StdoutStatus::PipeClosed {
+                return Ok(pipe_closed_exit());
+            }
             (output.stdout.clone(), tier)
         }
     } else if output_format == OutputFormat::Text
@@ -829,7 +939,9 @@ where
         let compressed_str = serialize_output(&result, output_format)?;
         match savings_decision(&output.stdout, &compressed_str) {
             SavingsDecision::Keep => {
-                write_to_stdout(&compressed_str)?;
+                if write_to_stdout(&compressed_str)? == StdoutStatus::PipeClosed {
+                    return Ok(pipe_closed_exit());
+                }
                 (compressed_str, tier_name)
             }
             SavingsDecision::Passthrough => {
@@ -837,13 +949,19 @@ where
                 // so `should_emit_compressed_hint` stays silent (passthrough tier
                 // never gets the hint — the body is already verbatim raw).
                 let raw = &output.stdout;
-                let tier = emit_raw_passthrough(raw)?;
+                let (tier, status) = emit_raw_passthrough(raw)?;
+                if status == StdoutStatus::PipeClosed {
+                    return Ok(pipe_closed_exit());
+                }
                 (raw.clone(), tier)
             }
         }
     } else {
         // JSON or Passthrough(String): write normally, no guard needed.
-        let s = render_output(&result, output_format)?;
+        let (s, status) = render_output(&result, output_format)?;
+        if status == StdoutStatus::PipeClosed {
+            return Ok(pipe_closed_exit());
+        }
         (s, tier_name)
     };
 
@@ -863,17 +981,19 @@ where
         should_synthesize_success(code, compressed.trim().is_empty(), synthesize_success_line)
     {
         let synthesized = format!("{line}\n");
-        write_to_stdout(&synthesized)?;
+        if write_to_stdout(&synthesized)? == StdoutStatus::PipeClosed {
+            return Ok(pipe_closed_exit());
+        }
         compressed = synthesized;
     }
 
     if let Some(err_text) = stderr_to_forward {
         let mut err = io::stderr().lock();
-        write!(err, "{err_text}")?;
-        if !err_text.ends_with('\n') {
-            writeln!(err)?;
+        match write_and_flush(&mut err, &err_text, true) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
+            Err(e) => return Err(e.into()),
         }
-        err.flush()?;
     }
 
     record_and_report(RecordReport {
@@ -1079,6 +1199,109 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // Closed-downstream-pipe contract (A0)
+    //
+    // Surface: these are pure-function unit tests over the shared helpers.
+    // They exercise NEITHER the rewrite engine NOR the PATH-wrapper dispatch
+    // front-end — both surfaces share these helpers via the per-tool handlers,
+    // but a test here is not a test of either dispatch path.
+    // ========================================================================
+
+    /// `is_broken_pipe` recognises EPIPE.
+    #[test]
+    fn test_is_broken_pipe_true_for_broken_pipe_kind() {
+        let e = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert!(is_broken_pipe(&e), "BrokenPipe must be recognised");
+    }
+
+    /// `is_broken_pipe` does not over-match other I/O failures.
+    #[test]
+    fn test_is_broken_pipe_false_for_other_kinds() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::WriteZero,
+            io::ErrorKind::Interrupted,
+        ] {
+            let e = io::Error::from(kind);
+            assert!(
+                !is_broken_pipe(&e),
+                "{kind:?} must NOT be classified as a broken pipe"
+            );
+        }
+    }
+
+    /// THE contract: a closed downstream pipe is 128 + SIGPIPE(13) = 141 on unix.
+    ///
+    /// 141 is what a shell reports for a SIGPIPE death, so `skim grep … | head`
+    /// matches raw `grep … | head` in `${PIPESTATUS[0]}`.
+    #[cfg(unix)]
+    #[test]
+    fn test_pipe_closed_code_is_141_on_unix() {
+        assert_eq!(
+            pipe_closed_code(),
+            141,
+            "unix pipe-closed exit must be 128 + SIGPIPE(13)"
+        );
+    }
+
+    /// Non-unix has no SIGPIPE convention → clean success.
+    #[cfg(not(unix))]
+    #[test]
+    fn test_pipe_closed_code_is_success_on_non_unix() {
+        assert_eq!(pipe_closed_code(), 0, "non-unix pipe-closed exit must be 0");
+    }
+
+    /// HARD MUST: the pipe-closed exit is NEVER 1.
+    ///
+    /// This is the whole point of the fix.  For `grep`/`rg`/`diff`, exit 1 is
+    /// the wire protocol for "no matches found" ([`BENIGN_EXIT1_PROGRAMS`]), so
+    /// exiting 1 because the *reader* went away reports a false negative to any
+    /// caller that reads `$?`.
+    #[test]
+    fn test_pipe_closed_code_is_never_one() {
+        assert_ne!(
+            pipe_closed_code(),
+            1,
+            "exit 1 means 'no matches' for grep/rg/diff — a closed pipe must never report it"
+        );
+    }
+
+    /// The `ExitCode` wrapper agrees with the pure code and is never `1`.
+    #[test]
+    fn test_pipe_closed_exit_matches_code_and_is_never_one() {
+        assert_eq!(pipe_closed_exit(), ExitCode::from(pipe_closed_code()));
+        assert_ne!(
+            pipe_closed_exit(),
+            ExitCode::from(1),
+            "pipe_closed_exit() must never be ExitCode::from(1)"
+        );
+    }
+
+    /// A `BrokenPipe` surfaced through an `anyhow` chain is still classified.
+    ///
+    /// The buffered call sites propagate `io::Error` via `?`, which anyhow wraps
+    /// (and may nest under `.context(…)`), so the top-level boundary in
+    /// `main.rs` must walk the chain rather than downcast only the head.
+    #[test]
+    fn test_is_broken_pipe_chain_walks_context_layers() {
+        let e = anyhow::Error::from(io::Error::from(io::ErrorKind::BrokenPipe))
+            .context("writing raw passthrough")
+            .context("skim grep");
+        assert!(
+            is_broken_pipe_chain(&e),
+            "a nested BrokenPipe must be found through context layers"
+        );
+
+        let other = anyhow::Error::from(io::Error::from(io::ErrorKind::PermissionDenied))
+            .context("writing raw passthrough");
+        assert!(
+            !is_broken_pipe_chain(&other),
+            "non-BrokenPipe errors must not be swallowed as pipe closure"
+        );
+    }
 
     // ========================================================================
     // should_synthesize_success tests (R3)

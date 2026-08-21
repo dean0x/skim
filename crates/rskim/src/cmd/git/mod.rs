@@ -479,7 +479,10 @@ where
                         // Emit the user's raw output if available (C-7), otherwise
                         // emit the internal command raw; record under "passthrough" tier.
                         let emit_raw = raw_override.as_deref().unwrap_or(&raw);
-                        let tier = crate::cmd::execution::emit_raw_passthrough(emit_raw)?;
+                        let (tier, status) = crate::cmd::execution::emit_raw_passthrough(emit_raw)?;
+                        if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                            return Ok(crate::cmd::execution::pipe_closed_exit());
+                        }
                         Some(tier)
                     }
                 }

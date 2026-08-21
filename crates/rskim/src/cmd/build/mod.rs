@@ -210,7 +210,11 @@ pub(super) fn run_parsed_command(
             }
             crate::cmd::execution::SavingsDecision::Passthrough => {
                 // Emit raw verbatim (stdout+stderr combined, same as raw_cow).
-                crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?
+                let (tier, status) = crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?;
+                if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                    return Ok(crate::cmd::execution::pipe_closed_exit());
+                }
+                tier
             }
         }
     } else {

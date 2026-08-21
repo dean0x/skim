@@ -177,7 +177,11 @@ where
                 crate::cmd::execution::SavingsDecision::Passthrough => {
                     // Emit raw verbatim; drop the compressed summary.
                     // Record analytics under "passthrough" so the hint stays silent.
-                    effective_tier = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+                    let (tier, status) = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+                    if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                        return Ok(crate::cmd::execution::pipe_closed_exit());
+                    }
+                    effective_tier = tier;
                 }
             }
 
@@ -213,7 +217,10 @@ where
             // Shared plumbing, behavior-preserving: mirrors execution.rs text-mode arm.
             // effective_tier is already "passthrough" from result.tier_name() above.
             let _ = result.emit_markers(&mut io::stderr().lock());
-            crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+            let (_, status) = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+            if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                return Ok(crate::cmd::execution::pipe_closed_exit());
+            }
             resolve_exit_code(0, exit_source)
         }
     };
