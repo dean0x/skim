@@ -14,6 +14,26 @@
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
 //! Token reduction target: 30-50%
+//!
+//! # Traversal rule (PF-020)
+//!
+//! > The parent's own child loop already holds every relational fact tree-sitter
+//! > would otherwise re-derive from the root — thread it down instead of asking
+//! > for it back.
+//!
+//! A `TSNode` carries no parent pointer. `parent()`, `prev_sibling()` and
+//! `next_sibling()` all re-derive their answer by descending from the tree root,
+//! and the sibling variants then scan the parent's child list from the start —
+//! so `prev_sibling()`/`next_sibling()` are O(index-in-parent) and a per-node
+//! backward walk is O(N³) (that is the defect B1 fixed in `minimal.rs`).
+//! `collect_noise_ranges` therefore threads a [`WalkPosition`] down from each
+//! parent's child loop, where the parent kind, the previous sibling and the
+//! `return_type` field membership are all already in hand at O(1).
+//!
+//! Note the asymmetry that makes this worth writing down: the fix is to stop
+//! asking for the *parent*, not to stop using field lookups. `child_by_field_name`
+//! called on a node you already hold descends *into* that node and is cheap; it is
+//! `parent()` in front of it that pays the root descent.
 
 use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError, TransformConfig};
@@ -36,6 +56,129 @@ struct NoiseWalkContext<'a> {
     node_count: &'a mut usize,
     /// Per-file comment-classification tables, precomputed before the walk.
     classification: CommentClassification<'a>,
+}
+
+/// A node's position within its parent's child list, captured by the parent's own
+/// child loop and threaded down instead of re-derived from the tree root.
+///
+/// Every field is exactly what the corresponding parent-derived `Node` accessor
+/// would return, so a site that used to call `parent()` / `prev_sibling()` /
+/// `child_by_field_name` reads the same fact here at O(1) (PF-020). The kinds are
+/// `&'static str` because tree-sitter interns node kinds in the language table.
+///
+/// `Default` is the root node's position: no parent, no previous sibling, no field.
+#[derive(Clone, Copy, Default)]
+struct WalkPosition {
+    /// Equivalent to `node.parent().map(Node::kind)`.
+    parent_kind: Option<&'static str>,
+    /// Equivalent to `node.prev_sibling().map(|s| s.kind())`. Anonymous siblings
+    /// are included, matching `Node::children`'s iteration order (and therefore
+    /// `prev_sibling`, which is also anonymous-inclusive).
+    prev_sibling_kind: Option<&'static str>,
+    /// Equivalent to `node.prev_sibling().map(|s| s.start_byte())`.
+    prev_sibling_start: Option<usize>,
+    /// Equivalent to `is_return_type_candidate(node.kind(), language)` **and**
+    /// `node.parent().child_by_field_name("return_type")` resolving back to
+    /// `node` — the exact predicate that guards return-type preservation
+    /// (ADR-007). The parent resolves the field on itself, so the `parent()`
+    /// call disappears while `child_by_field_name`'s semantics are unchanged.
+    ///
+    /// Deliberately NOT derived from `TreeCursor::field_name()`: in
+    /// tree-sitter-swift 0.7 the cursor reports field `name` for the very node
+    /// `child_by_field_name("return_type")` resolves to, so the two are not
+    /// interchangeable across grammars. `pseudo_walk_position_matches_node_apis_*`
+    /// pins this.
+    is_return_type_field: bool,
+}
+
+/// Yields each child of a node paired with the [`WalkPosition`] the parent can
+/// supply at O(1).
+///
+/// This is the SINGLE source of truth for walk-position derivation: both
+/// `collect_noise_ranges` and its differential test drive it, so the test compares
+/// production output against the `Node` APIs rather than against a second copy of
+/// the derivation that could drift from it independently.
+///
+/// Iteration order is identical to `Node::children` — all children, anonymous
+/// included — and is bounded by `child_count`.
+struct ChildPositions<'tree> {
+    parent: Node<'tree>,
+    parent_kind: &'static str,
+    language: Language,
+    cursor: tree_sitter::TreeCursor<'tree>,
+    /// Remaining children to yield. Hard upper bound on the iteration.
+    remaining: usize,
+    /// `false` until `goto_first_child` has run.
+    descended: bool,
+    prev_sibling_kind: Option<&'static str>,
+    prev_sibling_start: Option<usize>,
+    /// Memoized `parent.child_by_field_name("return_type").map(Node::id)`. Resolved
+    /// at most once per parent, and only once a child turns out to be a candidate
+    /// kind, so grammars without return-type annotations never pay the lookup.
+    ///
+    /// `child_by_field_name` on the parent we are already holding descends INTO it;
+    /// it is `parent()` in front of it that pays the root descent (PF-020).
+    return_type_child_id: Option<Option<usize>>,
+}
+
+impl<'tree> ChildPositions<'tree> {
+    fn new(parent: Node<'tree>, language: Language) -> Self {
+        Self {
+            parent,
+            parent_kind: parent.kind(),
+            language,
+            cursor: parent.walk(),
+            remaining: parent.child_count(),
+            descended: false,
+            prev_sibling_kind: None,
+            prev_sibling_start: None,
+            return_type_child_id: None,
+        }
+    }
+}
+
+impl<'tree> Iterator for ChildPositions<'tree> {
+    type Item = (Node<'tree>, WalkPosition);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let advanced = if self.descended {
+            self.cursor.goto_next_sibling()
+        } else {
+            self.descended = true;
+            self.cursor.goto_first_child()
+        };
+        if !advanced {
+            self.remaining = 0;
+            return None;
+        }
+        self.remaining -= 1;
+
+        let child = self.cursor.node();
+        let parent = self.parent;
+        let is_return_type_field = is_return_type_candidate(child.kind(), self.language)
+            && *self
+                .return_type_child_id
+                .get_or_insert_with(|| parent.child_by_field_name("return_type").map(|n| n.id()))
+                == Some(child.id());
+
+        let pos = WalkPosition {
+            parent_kind: Some(self.parent_kind),
+            prev_sibling_kind: self.prev_sibling_kind,
+            prev_sibling_start: self.prev_sibling_start,
+            is_return_type_field,
+        };
+
+        self.prev_sibling_kind = Some(child.kind());
+        self.prev_sibling_start = Some(child.start_byte());
+        Some((child, pos))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.remaining))
+    }
 }
 
 /// Extend a byte position forward to consume trailing spaces (not past newline).
@@ -321,7 +464,17 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
             go_doc_comment_starts: &go_doc_comment_starts,
         },
     };
-    collect_noise_ranges(tree.root_node(), &mut ctx, &rules, 0, false)?;
+    // The root has no parent, no previous sibling and no field name — exactly
+    // `WalkPosition::default()`. Every deeper position is supplied by the caller's
+    // child loop.
+    collect_noise_ranges(
+        tree.root_node(),
+        &mut ctx,
+        &rules,
+        0,
+        false,
+        WalkPosition::default(),
+    )?;
 
     // Sort, dedup, and adjust ranges for full line removal
     ctx.ranges.sort_unstable_by_key(|&(start, _)| start);
@@ -409,7 +562,11 @@ fn collapse_whitespace(source: &str) -> String {
 ///
 /// Returns `Some(Ok(()))` to skip recursion (C++ cases — stripped nodes are leaf-like),
 /// `Some(Err(...))` to propagate errors, or `None` to continue normal recursion.
-fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> Option<Result<()>> {
+fn handle_language_special_cases(
+    node: Node,
+    ctx: &mut NoiseWalkContext<'_>,
+    pos: WalkPosition,
+) -> Option<Result<()>> {
     let kind = node.kind();
     match ctx.language {
         Language::Cpp if kind == "access_specifier" => {
@@ -420,11 +577,14 @@ fn handle_language_special_cases(node: Node, ctx: &mut NoiseWalkContext<'_>) -> 
             None
         }
         Language::Cpp if kind == "template_parameter_list" => {
-            // `template<typename T>` is two siblings: `template` keyword + parameter list
-            let template_start = node
-                .prev_sibling()
-                .filter(|s| s.kind() == "template")
-                .map_or(node.start_byte(), |s| s.start_byte());
+            // `template<typename T>` is two siblings: `template` keyword + parameter list.
+            // The previous sibling is threaded from the parent's child loop rather than
+            // read back via `prev_sibling()`, which is O(index-in-parent) (PF-020).
+            let template_start = if pos.prev_sibling_kind == Some("template") {
+                pos.prev_sibling_start.unwrap_or_else(|| node.start_byte())
+            } else {
+                node.start_byte()
+            };
             let end = consume_trailing_whitespace(ctx.source_bytes, node.end_byte());
             ctx.ranges.push((template_start, end));
             Some(Ok(())) // Skip recursion
@@ -439,6 +599,7 @@ fn collect_noise_ranges(
     rules: &PseudoRules,
     depth: usize,
     in_function_body: bool,
+    pos: WalkPosition,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST
     if depth > MAX_AST_DEPTH {
@@ -479,11 +640,15 @@ fn collect_noise_ranges(
 
     // Check if this node kind should be stripped
     if rules.strip_kinds.contains(&kind) {
-        // Return type annotations are API surface — preserved wholesale (A4 contract).
-        // Stopping recursion here means nested type args (Promise<User>, tuple[int, str])
-        // survive intact.  Param/variable/property annotations under other field names
-        // still fall through to be stripped.
-        if is_return_type_annotation(node, kind, ctx.language) {
+        // Return type annotations are API surface — preserved wholesale (A4 contract,
+        // ADR-007). Stopping recursion here means nested type args (Promise<User>,
+        // tuple[int, str]) survive intact.  Param/variable/property annotations under
+        // other field names still fall through to be stripped.
+        //
+        // `is_return_type_field` is `is_return_type_candidate(kind, language)` AND the
+        // `child_by_field_name("return_type")` identity test, both resolved by the
+        // parent's child loop — see `WalkPosition` (PF-020).
+        if pos.is_return_type_field {
             return Ok(());
         }
 
@@ -513,17 +678,16 @@ fn collect_noise_ranges(
         }
     }
 
-    // Check for semicolon stripping (statement-terminating only, not for-loop headers)
+    // Check for semicolon stripping (statement-terminating only, not for-loop headers).
+    // The parent kind is threaded from the parent's child loop rather than read back
+    // via `parent()`, which re-descends from the tree root (PF-020).
     if rules.strip_semicolons && kind == ";" {
-        let is_for_loop = node
-            .parent()
-            .map(|p| {
-                matches!(
-                    p.kind(),
-                    "for_statement" | "for_in_statement" | "for_of_statement"
-                )
-            })
-            .unwrap_or(false);
+        let is_for_loop = pos.parent_kind.is_some_and(|parent_kind| {
+            matches!(
+                parent_kind,
+                "for_statement" | "for_in_statement" | "for_of_statement"
+            )
+        });
         if !is_for_loop {
             ctx.ranges.push((node.start_byte(), node.end_byte()));
             return Ok(());
@@ -536,18 +700,20 @@ fn collect_noise_ranges(
     }
 
     // Handle language-specific multi-node patterns (C++ siblings)
-    if let Some(result) = handle_language_special_cases(node, ctx) {
+    if let Some(result) = handle_language_special_cases(node, ctx, pos) {
         return result;
     }
 
-    // Recurse into children. Thread child_in_body so is_removable_comment never
-    // calls parent() in the hot path — a TSNode has no parent pointer, so every
-    // parent() call re-walks the tree from the root (O(depth)), making the walker
-    // O(N²) across N root-level nodes.
-    let child_in_body = in_function_body || is_function_scope_kind(node.kind(), ctx.language);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_noise_ranges(child, ctx, rules, depth + 1, child_in_body)?;
+    // Recurse into children through `ChildPositions`, which walks with a TreeCursor
+    // — the only O(1)-per-step traversal API tree-sitter offers (PF-020) — and hands
+    // each child the relational facts its parent already holds, instead of letting the
+    // child ask for them back via a root-descending `parent()` / `prev_sibling()`.
+    // `child_in_body` is threaded on the same principle, so `is_removable_comment`
+    // never calls `parent()` either.
+    let child_in_body = in_function_body || is_function_scope_kind(kind, ctx.language);
+    let language = ctx.language;
+    for (child, child_pos) in ChildPositions::new(node, language) {
+        collect_noise_ranges(child, ctx, rules, depth + 1, child_in_body, child_pos)?;
     }
 
     Ok(())
@@ -591,22 +757,17 @@ fn adjust_type_start(language: Language, kind: &str, source: &[u8], start: usize
 ///
 /// Stopping recursion at this point means nested type arguments
 /// (`Promise<User>`, `tuple[int, str]`) survive intact inside the return annotation.
-fn is_return_type_annotation(node: Node, kind: &str, language: Language) -> bool {
+///
+/// Only Python `"type"` and TypeScript `"type_annotation"` nodes are candidates; all
+/// other languages either do not use these kinds or already preserve return types
+/// through normal recursion. A candidate still has to BE the parent's `return_type`
+/// field child — that half of the test is resolved by the parent's child loop and
+/// arrives as [`WalkPosition::is_return_type_field`].
+fn is_return_type_candidate(kind: &str, language: Language) -> bool {
     matches!(
         (language, kind),
         (Language::Python, "type") | (Language::TypeScript, "type_annotation")
-    ) && is_return_field_child(node)
-}
-
-/// Returns `true` when `node` is the `return_type` field child of its parent.
-fn is_return_field_child(node: Node) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    let Some(return_type_node) = parent.child_by_field_name("return_type") else {
-        return false;
-    };
-    return_type_node.id() == node.id()
+    )
 }
 
 /// Strip `self` or `cls` first parameter from Python method definitions
@@ -1667,6 +1828,636 @@ mod tests {
         assert!(
             result.contains("): string"),
             "return type must be preserved for optional-param function, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // WalkPosition differential equivalence  (B2 / #494 / PF-020)
+    // ========================================================================
+    //
+    // `collect_noise_ranges` used to ask tree-sitter three relational questions
+    // its own child loop already knew the answers to:
+    //
+    //   1. `node.parent()`        — once per `;` (TS/JS/Rust/Java/C/C++/C#/SQL)
+    //   2. `is_return_field_child`— once per Python `type` / TS `type_annotation`
+    //      (`node.parent()` + `child_by_field_name("return_type")`)
+    //   3. `node.prev_sibling()`  — once per C++ `template_parameter_list`
+    //
+    // All three now read `WalkPosition`. The tests below pin the two forms
+    // together node-for-node so the threading can never silently diverge from
+    // the `Node` APIs it replaced — the sweep becomes a permanent invariant
+    // rather than a one-shot check.
+
+    /// Verbatim copy of the `parent()`-based predicate that
+    /// `is_return_type_annotation` used before the field name was threaded down.
+    ///
+    /// Reference implementation for the differential tests ONLY — production code
+    /// must never call it. Deleting it would turn those tests into self-comparisons.
+    fn reference_is_return_field_child(node: Node) -> bool {
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        let Some(return_type_node) = parent.child_by_field_name("return_type") else {
+            return false;
+        };
+        return_type_node.id() == node.id()
+    }
+
+    /// Walk `node`'s subtree exactly as `collect_noise_ranges` does, asserting at
+    /// every node that the threaded `WalkPosition` equals what the parent-derived
+    /// `Node` APIs return. Returns the number of nodes compared.
+    ///
+    /// The child loop here MUST mirror `collect_noise_ranges`'s child loop; if that
+    /// loop changes shape, change this one with it.
+    fn assert_position_matches_node_apis(
+        node: Node,
+        pos: WalkPosition,
+        label: &str,
+        language: Language,
+        depth: usize,
+        compared: &mut usize,
+    ) {
+        assert!(
+            depth <= MAX_AST_DEPTH,
+            "[{label}] differential walk exceeded MAX_AST_DEPTH"
+        );
+        *compared += 1;
+
+        let at = format!("[{label}] node {:?} @{}", node.kind(), node.start_byte());
+
+        assert_eq!(
+            pos.parent_kind,
+            node.parent().map(|p| p.kind()),
+            "{at}: threaded parent_kind must equal node.parent().kind()"
+        );
+
+        let prev = node.prev_sibling();
+        assert_eq!(
+            pos.prev_sibling_kind,
+            prev.map(|s| s.kind()),
+            "{at}: threaded prev_sibling_kind must equal node.prev_sibling().kind()"
+        );
+        assert_eq!(
+            pos.prev_sibling_start,
+            prev.map(|s| s.start_byte()),
+            "{at}: threaded prev_sibling_start must equal node.prev_sibling().start_byte()"
+        );
+
+        // The exact predicate site 2 replaced, asserted on EVERY node of every
+        // language — not just the reachable candidates — so a future widening of
+        // `is_return_type_candidate` cannot quietly change meaning.
+        assert_eq!(
+            pos.is_return_type_field,
+            is_return_type_candidate(node.kind(), language)
+                && reference_is_return_field_child(node),
+            "{at}: threaded is_return_type_field must equal \
+             is_return_type_candidate(kind, language) && \
+             parent.child_by_field_name(\"return_type\") == node"
+        );
+
+        // Drive the PRODUCTION iterator — not a copy of it — so this test fails if
+        // `ChildPositions` ever stops agreeing with the `Node` APIs it replaced.
+        let mut yielded = 0usize;
+        for (child, child_pos) in ChildPositions::new(node, language) {
+            yielded += 1;
+            assert_position_matches_node_apis(
+                child,
+                child_pos,
+                label,
+                language,
+                depth + 1,
+                compared,
+            );
+        }
+        assert_eq!(
+            yielded,
+            node.child_count(),
+            "{at}: ChildPositions must yield exactly child_count() children, \
+             matching Node::children"
+        );
+    }
+
+    fn compare_positions(label: &str, source: &str, language: Language) -> usize {
+        let mut parser = Parser::new(language).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let mut compared = 0usize;
+        assert_position_matches_node_apis(
+            tree.root_node(),
+            WalkPosition::default(),
+            label,
+            language,
+            0,
+            &mut compared,
+        );
+        compared
+    }
+
+    /// The Swift finding that ruled out a `TreeCursor::field_name()` design, pinned
+    /// so it cannot silently change under a grammar bump.
+    ///
+    /// In tree-sitter-swift 0.7 a `function_declaration` reports field `name` from
+    /// the cursor for BOTH the `simple_identifier` and the return-type node, while
+    /// `child_by_field_name("return_type")` resolves to the return-type node. The two
+    /// APIs disagree, so a threaded field NAME is not a faithful substitute for
+    /// `child_by_field_name` — which is why `WalkPosition` carries the resolved
+    /// identity test instead. This test is the evidence, not a behaviour requirement.
+    #[test]
+    fn cursor_field_name_is_not_interchangeable_with_child_by_field_name() {
+        let source =
+            "func first<T: Equatable>(in a: [T], matching v: T) -> Int? {\n    return nil\n}\n";
+        let mut parser = Parser::new(Language::Swift).unwrap();
+        let tree = parser.parse(source).unwrap();
+
+        let mut checked = false;
+        // Bounded: the tree is finite and this fixture is a single declaration.
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "function_declaration" {
+                let return_type = node
+                    .child_by_field_name("return_type")
+                    .expect("Swift function_declaration must expose a return_type field");
+                assert!(
+                    reference_is_return_field_child(return_type),
+                    "child_by_field_name must round-trip through parent()"
+                );
+
+                let mut cursor = node.walk();
+                let mut cursor_field: Option<Option<&str>> = None;
+                if cursor.goto_first_child() {
+                    for _ in 0..node.child_count() {
+                        if cursor.node().id() == return_type.id() {
+                            cursor_field = Some(cursor.field_name());
+                            break;
+                        }
+                        if !cursor.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(
+                    cursor_field,
+                    Some(Some("name")),
+                    "tree-sitter-swift 0.7 reports `name` from the cursor for the \
+                     return-type child. If this changes, re-evaluate whether \
+                     WalkPosition can carry a field name instead of a resolved \
+                     identity test — but do NOT assume the two APIs agree."
+                );
+                checked = true;
+            }
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                stack.push(ch);
+            }
+        }
+        assert!(
+            checked,
+            "expected a Swift function_declaration in the snippet"
+        );
+    }
+
+    /// Degenerate shapes: empty input, ERROR nodes, for-loop headers (the one
+    /// place a `;` must NOT be stripped), repeated/absent return types, C++
+    /// templates with and without a preceding `template` keyword, CRLF and
+    /// non-ASCII bytes.
+    const POSITION_DIFFERENTIAL_SNIPPETS: &[(&str, Language, &str)] = &[
+        ("ts-empty", Language::TypeScript, ""),
+        ("ts-lone-semicolon", Language::TypeScript, ";"),
+        ("ts-only-semicolons", Language::TypeScript, ";;;;\n"),
+        (
+            "ts-for-header",
+            Language::TypeScript,
+            "for (let i = 0; i < 10; i++) { doIt(); }\n",
+        ),
+        (
+            "ts-for-in-of",
+            Language::TypeScript,
+            "for (const k in o) { f(k); }\nfor (const v of a) { g(v); }\n",
+        ),
+        (
+            "ts-return-types",
+            Language::TypeScript,
+            "function a(x: number): Promise<User> { return get(x); }\nconst b = (y: string): void => {};\n",
+        ),
+        (
+            "ts-nested-return-type",
+            Language::TypeScript,
+            "function f(): Map<string, Array<number>> { return new Map(); }\n",
+        ),
+        (
+            "ts-malformed",
+            Language::TypeScript,
+            "function broken(a: { ] ) : number {\n  return ;\n",
+        ),
+        (
+            "ts-crlf",
+            Language::TypeScript,
+            "const a: number = 1;\r\nfunction f(): void {}\r\n",
+        ),
+        (
+            "ts-cjk",
+            Language::TypeScript,
+            "const 名前: string = \"値\";\nfunction 関数(): string { return 名前; }\n",
+        ),
+        (
+            "js-semicolons",
+            Language::JavaScript,
+            "const a = 1;\nfor (let i = 0; i < 3; i++) { a++; }\n",
+        ),
+        (
+            "py-return-types",
+            Language::Python,
+            "def f(a: int, b: str) -> tuple[int, str]:\n    return a, b\n\ndef g(c):\n    return c\n",
+        ),
+        (
+            "py-annotated-var",
+            Language::Python,
+            "x: int = 1\n\nclass C:\n    y: str = 'a'\n\n    def m(self) -> None:\n        pass\n",
+        ),
+        (
+            "py-malformed",
+            Language::Python,
+            "def broken(a: int -> int:\n    return (\n",
+        ),
+        (
+            "cpp-template",
+            Language::Cpp,
+            "template<typename T> T add(T a, T b) { return a + b; }\n",
+        ),
+        (
+            "cpp-template-class-member",
+            Language::Cpp,
+            "class C {\npublic:\n  template<typename T> void m(T v) { use(v); }\n};\n",
+        ),
+        (
+            "cpp-nested-template",
+            Language::Cpp,
+            "template<typename T>\nstruct S {\n  template<typename U> U conv(T t) { return (U)t; }\n};\n",
+        ),
+        (
+            "cpp-malformed-template",
+            Language::Cpp,
+            "template<typename T T broken( { return; }\n",
+        ),
+        (
+            "rust-semicolons",
+            Language::Rust,
+            "pub fn f(a: i32) -> i32 {\n    let b = a;\n    b\n}\n",
+        ),
+        (
+            "java-semicolons",
+            Language::Java,
+            "class A {\n  public int f(int a) {\n    int b = a;\n    for (int i = 0; i < 3; i++) { b++; }\n    return b;\n  }\n}\n",
+        ),
+        (
+            "c-semicolons",
+            Language::C,
+            "int f(int a) {\n  int b = a;\n  for (int i = 0; i < 3; i++) { b++; }\n  return b;\n}\n",
+        ),
+        (
+            "csharp-semicolons",
+            Language::CSharp,
+            "class A {\n  public int F(int a) {\n    var b = a;\n    for (int i = 0; i < 3; i++) { b++; }\n    return b;\n  }\n}\n",
+        ),
+        (
+            "sql-semicolons",
+            Language::Sql,
+            "SELECT 1;\nSELECT id FROM t WHERE x = 2;\n",
+        ),
+    ];
+
+    #[test]
+    fn pseudo_walk_position_matches_node_apis_on_snippets() {
+        let mut total = 0usize;
+        for (label, language, source) in POSITION_DIFFERENTIAL_SNIPPETS {
+            total += compare_positions(label, source, *language);
+        }
+        // Tripwire against a snippet being silently dropped from the table.
+        assert!(
+            POSITION_DIFFERENTIAL_SNIPPETS.len() >= 23,
+            "the degenerate-snippet table must keep its coverage; got {} entries",
+            POSITION_DIFFERENTIAL_SNIPPETS.len()
+        );
+        // 763 nodes across the 23 snippets as of this commit. A floor, not an
+        // exact count, so editing a snippet does not fail here.
+        assert!(
+            total >= 700,
+            "expected the degenerate snippets to contribute a meaningful number of \
+             nodes to the differential comparison; got {total}"
+        );
+    }
+
+    #[test]
+    fn pseudo_walk_position_matches_node_apis_on_fixtures() {
+        const FIXTURES: &[(&str, Language, &str)] = &[
+            (
+                "typescript/simple.ts",
+                Language::TypeScript,
+                include_str!("../../../../tests/fixtures/typescript/simple.ts"),
+            ),
+            (
+                "typescript/types.ts",
+                Language::TypeScript,
+                include_str!("../../../../tests/fixtures/typescript/types.ts"),
+            ),
+            (
+                "typescript/mixed_priority.ts",
+                Language::TypeScript,
+                include_str!("../../../../tests/fixtures/typescript/mixed_priority.ts"),
+            ),
+            (
+                "javascript/comments.js",
+                Language::JavaScript,
+                include_str!("../../../../tests/fixtures/javascript/comments.js"),
+            ),
+            (
+                "python/simple.py",
+                Language::Python,
+                include_str!("../../../../tests/fixtures/python/simple.py"),
+            ),
+            (
+                "python/mixed_priority.py",
+                Language::Python,
+                include_str!("../../../../tests/fixtures/python/mixed_priority.py"),
+            ),
+            (
+                "rust/mixed_priority.rs",
+                Language::Rust,
+                include_str!("../../../../tests/fixtures/rust/mixed_priority.rs"),
+            ),
+            (
+                "java/Simple.java",
+                Language::Java,
+                include_str!("../../../../tests/fixtures/java/Simple.java"),
+            ),
+            (
+                "c/types.c",
+                Language::C,
+                include_str!("../../../../tests/fixtures/c/types.c"),
+            ),
+            (
+                "cpp/types.cpp",
+                Language::Cpp,
+                include_str!("../../../../tests/fixtures/cpp/types.cpp"),
+            ),
+            (
+                "cpp/mixed_priority.cpp",
+                Language::Cpp,
+                include_str!("../../../../tests/fixtures/cpp/mixed_priority.cpp"),
+            ),
+            (
+                "csharp/generics.cs",
+                Language::CSharp,
+                include_str!("../../../../tests/fixtures/csharp/generics.cs"),
+            ),
+            (
+                "go/simple.go",
+                Language::Go,
+                include_str!("../../../../tests/fixtures/go/simple.go"),
+            ),
+            (
+                "sql/joins.sql",
+                Language::Sql,
+                include_str!("../../../../tests/fixtures/sql/joins.sql"),
+            ),
+            (
+                "kotlin/Simple.kt",
+                Language::Kotlin,
+                include_str!("../../../../tests/fixtures/kotlin/Simple.kt"),
+            ),
+            (
+                "swift/Generics.swift",
+                Language::Swift,
+                include_str!("../../../../tests/fixtures/swift/Generics.swift"),
+            ),
+            (
+                "ruby/class.rb",
+                Language::Ruby,
+                include_str!("../../../../tests/fixtures/ruby/class.rb"),
+            ),
+            (
+                "bash/functions.sh",
+                Language::Bash,
+                include_str!("../../../../tests/fixtures/bash/functions.sh"),
+            ),
+        ];
+        let mut total = 0usize;
+        for (label, language, source) in FIXTURES {
+            total += compare_positions(label, source, *language);
+        }
+        // 4740 nodes across the 18 fixtures as of this commit. A floor, not an
+        // exact count, so editing a fixture does not fail here.
+        assert!(
+            total >= 4000,
+            "expected the fixtures to contribute >= 4000 nodes to the differential \
+             comparison; got {total}"
+        );
+    }
+
+    // ========================================================================
+    // pseudo-walker scaling guards  (B2 / #494)
+    // ========================================================================
+    //
+    // pseudo is the PRODUCTION path: the cat/head/tail rewrite selects
+    // --mode=pseudo for regular code files (ADR-008), so this walker is the
+    // hottest agent-facing transform in the product. Every pre-existing perf
+    // guard in this workspace is PYTHON-minimal-only or GO-only, so a
+    // TypeScript / C++ / Java / C# pseudo regression had no coverage at all.
+    //
+    // MEASURED SERIES (DEBUG build, this branch, best-of-3; the transform is
+    // called directly so the skim file-level disk cache is NOT involved — a warm
+    // parser cache hides exactly this defect class, PF-020).
+    //
+    //   TS, N top-level `const vI = I;` statements — one `;` site per statement:
+    //     BEFORE: N=1000 → 10.42 ms | N=2000 → 21.46 ms | N=4000 → 43.30 ms
+    //             ratios 2.06×, 2.02×   →   α = 1.03
+    //     AFTER:  N=1000 →  8.72 ms | N=2000 → 18.13 ms | N=4000 → 37.66 ms
+    //             ratios 2.08×, 2.08×   →   α = 1.06        (1.15× faster at 4N)
+    //     BEFORE (XL): N=3000 → 32.40 ms | N=6000 → 66.43 ms | N=12000 → 143.47 ms  α = 1.07
+    //     AFTER  (XL): N=3000 → 26.92 ms | N=6000 → 57.78 ms | N=12000 → 117.62 ms  α = 1.06  (1.22×)
+    //
+    //   Python, N `def fI(a: int, b: int) -> int` — two return-type-field tests each:
+    //     BEFORE: N=500 → 15.74 ms | N=1000 → 32.65 ms | N=2000 → 68.33 ms   α = 1.06
+    //     AFTER:  N=500 → 13.55 ms | N=1000 → 28.43 ms | N=2000 → 57.78 ms   α = 1.05  (1.18×)
+    //
+    //   TypeScript, same shape via `type_annotation`:
+    //     BEFORE: N=500 → 14.72 ms | N=1000 → 30.34 ms | N=2000 → 60.80 ms   α = 1.02
+    //     AFTER:  N=500 → 12.21 ms | N=1000 → 24.95 ms | N=2000 → 51.11 ms   α = 1.03  (1.19×)
+    //
+    //   C++, N `template<typename T> T fI(T a, T b)` — one `prev_sibling()` site each:
+    //     BEFORE: N=500 → 13.28 ms | N=1000 → 27.26 ms | N=2000 → 55.24 ms   α = 1.03
+    //     AFTER:  N=500 → 12.20 ms | N=1000 → 24.83 ms | N=2000 → 50.09 ms   α = 1.02  (1.10×)
+    //
+    // ⚠ CORRECTION TO THE PLAN — these sites were NEVER Θ(N²), and the guards
+    // below are REGRESSION guards, not evidence of the fix. α is ~1.02–1.07 both
+    // before and after; the win is a constant factor of 1.10×–1.22×.
+    //
+    // Why the Θ(N²) prediction failed, measured rather than reasoned. Isolating
+    // the primitive on the exact `;` population (debug build, per call):
+    //
+    //     n=2000  parent() 1.655 µs   prev_sibling() 1.910 µs
+    //     n=4000  parent() 1.752 µs   prev_sibling() 2.009 µs
+    //     n=8000  parent() 1.885 µs   prev_sibling() 2.152 µs
+    //
+    // Per-call cost grows ~14 % while n quadruples — that is O(log N), not
+    // O(index). `ts_parser__balance_subtree` (tree-sitter 0.25.10 parser.c)
+    // rotates `repeat` subtrees so their depth stays logarithmic, and
+    // `ts_node_parent` descends that balanced structure.
+    //
+    // So PF-020's cost model needs splitting, not discarding. The O(index) half
+    // is the SIBLING scan — `ts_node__prev_sibling` / `ts_node__next_sibling`
+    // iterate the parent's child list from the start looking for `self` — and
+    // B1 measured that half directly (α = 2.98 for a per-node forward sibling
+    // walk over one large sibling group, 41 616 ms at N=1000). The `parent()`
+    // half does NOT scale that way, which is why the same pitfall produced a
+    // 28118× win in `minimal.rs` and a ~1.2× win here.
+    //
+    // Consequence for these guards, stated plainly: a ratio guard CANNOT detect
+    // re-introduction of `parent()` here, because `parent()` is O(log N). What
+    // they do cover is the gap B1 identified — a future super-linear regression
+    // in this walker (e.g. someone adding a per-node sibling walk, the Go bug's
+    // shape) would otherwise pass silently on every language except Python.
+    //
+    // THRESHOLD RATIONALE — 2.8 ≈ 2^1.5 is the exponent-space midpoint between
+    // linear (2.0×) and quadratic (4.0×), matching the Go guards in minimal.rs.
+    // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
+
+    fn time_pseudo(source: &str, language: Language) -> f64 {
+        let mut parser = Parser::new(language).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::with_mode(Mode::Pseudo);
+        let start = std::time::Instant::now();
+        let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
+        ms
+    }
+
+    /// N top-level statements, each terminated by a `;` — the site-1 population.
+    fn ts_semicolon_source(n: usize) -> String {
+        let mut s = String::with_capacity(n * 20 + 32);
+        for i in 0..n {
+            s.push_str(&format!("const v{i} = {i};\n"));
+        }
+        s
+    }
+
+    /// N annotated defs — two `is_return_field_child` calls each (both params and
+    /// the return annotation are `type` nodes reaching the site-2 guard).
+    fn python_return_type_source(n: usize) -> String {
+        let mut s = String::with_capacity(n * 48 + 32);
+        for i in 0..n {
+            s.push_str(&format!(
+                "def f{i}(a: int, b: int) -> int:\n    return a + b\n\n"
+            ));
+        }
+        s
+    }
+
+    /// N template functions — the site-3 `prev_sibling()` population.
+    fn cpp_template_source(n: usize) -> String {
+        let mut s = String::with_capacity(n * 64 + 32);
+        for i in 0..n {
+            s.push_str(&format!(
+                "template<typename T> T f{i}(T a, T b) {{ return a + b; }}\n"
+            ));
+        }
+        s
+    }
+
+    #[test]
+    fn test_typescript_pseudo_semicolon_walk_scaling_guard() {
+        // Behaviour alongside the timing: these `;` are statement terminators,
+        // not for-loop separators, so all of them must be stripped.
+        let out = transform(&ts_semicolon_source(4), Language::TypeScript);
+        assert!(
+            !out.contains(';'),
+            "top-level statement semicolons must be stripped, got: {out}"
+        );
+
+        // N=8000 is ~56 k AST nodes, comfortably under MAX_AST_NODES (100 k);
+        // above it this would silently become an Err(ComplexityLimit) assertion.
+        let t1 = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
+        let t2 = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
+
+        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
+        // in this work went vacuous when a fix made it too fast to measure, and
+        // a silently-passing scaling guard provides no protection at all.
+        assert!(
+            t1 >= 8.0,
+            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
+             (expected ≥ 8ms; ~36.0ms measured on debug builds). Either the \
+             transform is being cached/skipped or N must be raised. \
+             DO NOT convert this to a skip."
+        );
+
+        let ratio = t2 / t1;
+        assert!(
+            ratio < 2.8,
+            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
+             (got {ratio:.2}×; measured 2.07×). O(N) → ~2.0×; O(N²) → ~4.0×; \
+             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 took {t1:.2}ms, \
+             N=8000 took {t2:.2}ms. Check that the walker threads WalkPosition \
+             and does not walk siblings per node (PF-020)."
+        );
+    }
+
+    #[test]
+    fn test_python_pseudo_return_type_walk_scaling_guard() {
+        // ADR-007: pseudo PRESERVES function return types. Pin it here so the
+        // guard cannot pass on a walker that stopped classifying return types.
+        let out = transform(&python_return_type_source(2), Language::Python);
+        assert!(
+            out.contains("-> int"),
+            "pseudo must preserve Python return types (ADR-007), got: {out}"
+        );
+        assert!(
+            !out.contains("a: int"),
+            "pseudo must still strip Python parameter annotations, got: {out}"
+        );
+
+        let t1 = time_pseudo(&python_return_type_source(1000), Language::Python);
+        let t2 = time_pseudo(&python_return_type_source(2000), Language::Python);
+
+        assert!(
+            t1 >= 6.0,
+            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
+             (expected ≥ 6ms; ~27.3ms measured). DO NOT convert this to a skip."
+        );
+
+        let ratio = t2 / t1;
+        assert!(
+            ratio < 2.8,
+            "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
+             (got {ratio:.2}×; measured 2.04×). N=1000 took {t1:.2}ms, \
+             N=2000 took {t2:.2}ms."
+        );
+    }
+
+    #[test]
+    fn test_cpp_pseudo_template_walk_scaling_guard() {
+        // Behaviour alongside the timing: the `template` keyword must be
+        // consumed along with its parameter list, leaving no orphan.
+        let out = transform(&cpp_template_source(2), Language::Cpp);
+        assert!(
+            !out.contains("template"),
+            "the `template` keyword must be consumed with its parameter list, got: {out}"
+        );
+
+        let t1 = time_pseudo(&cpp_template_source(1000), Language::Cpp);
+        let t2 = time_pseudo(&cpp_template_source(2000), Language::Cpp);
+
+        assert!(
+            t1 >= 5.0,
+            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
+             (expected ≥ 5ms; ~24.2ms measured). DO NOT convert this to a skip."
+        );
+
+        let ratio = t2 / t1;
+        assert!(
+            ratio < 2.8,
+            "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
+             (got {ratio:.2}×; measured 2.01×). N=1000 took {t1:.2}ms, \
+             N=2000 took {t2:.2}ms."
         );
     }
 }
