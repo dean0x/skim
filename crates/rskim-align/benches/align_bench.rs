@@ -6,10 +6,19 @@
 //!
 //! # AC17 — Worst-case latency gate
 //!
-//! CI asserts p99 < 9.0 ms on three groups:
-//! - `align_anthropic_64tools` — 64 tools, nested schema depth ≥8
-//! - `align_anthropic_512kb` — 512 KB multi-turn body
-//! - `align_openai_64tools` — same 64 tools, OpenAI format
+//! The CI gate (`.github/workflows/ci.yml`, step "AC17/rskim-align latency
+//! gate") asserts exactly ONE number: the upper bound of Criterion's 95%
+//! confidence interval of the **mean** for `align_anthropic_64tools` must be
+//! < 9.0 ms. That is not a p99 — it is a conservative ceiling that sits below
+//! p99 for this workload (see the "NOTE on AC17 metric" comment in the same
+//! CI step).
+//!
+//! CI invokes the Criterion filter `align_anthropic_(64tools|512kb)`, so the
+//! three AC17 groups are covered to different degrees:
+//! - `align_anthropic_64tools` — 64 tools, nested schema depth ≥8 — **gated**
+//! - `align_anthropic_512kb` — 512 KB multi-turn body — run and logged, not asserted
+//! - `align_openai_64tools` — same 64 tools, OpenAI format — not matched by the
+//!   CI filter; local/manual measurement only
 //!
 //! # Stage micro-benchmarks (not wired into CI)
 //!
@@ -146,7 +155,8 @@ fn build_openai_n_tools(n: usize, depth: usize) -> Vec<u8> {
 
 /// AC17 — Worst-case fixture: 64 tools × nested depth 8 (Anthropic).
 ///
-/// This is the primary p99 measurement for the CI gate (< 9.0 ms).
+/// This is the one measurement the CI gate asserts: the upper bound of the 95%
+/// confidence interval of the mean must be < 9.0 ms (not a p99 — see module docs).
 fn bench_align_anthropic_64tools(c: &mut Criterion) {
     let body = build_anthropic_n_tools(64, 8);
     let body_len = body.len();

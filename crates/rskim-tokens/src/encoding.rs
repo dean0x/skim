@@ -150,10 +150,16 @@ fn family_prefix_fallback(model_id: &str) -> Encoding {
 ///
 /// This enum is LOCAL to `rskim-tokens` and intentionally distinct from
 /// `rskim_proxy::detect::ProxyProvider` (proxy detection pipeline) and any
-/// `rskim_llm::Provider` (LLM transcript parser). The CI dependency-isolation
-/// gates (`.github/workflows/ci.yml`, the `dependency-isolation` job) forbid
-/// `rskim-tokens` from depending on `rskim-proxy`, `rskim-contract`, or
-/// `rskim-llm`, so their provider enums are unreachable from here.
+/// `rskim_llm::Provider` (LLM transcript parser). `rskim-tokens` declares no
+/// workspace-crate dependency at all — `crates/rskim-tokens/Cargo.toml` lists
+/// only `tiktoken-rs`, `thiserror`, `anyhow` (plus the optional
+/// `net-anthropic` HTTP deps) — so those provider enums are unreachable from
+/// here. CI reinforces this from one side: the "Dependency-tree isolation
+/// check" step of the `lint` job in `.github/workflows/ci.yml` fails the build
+/// if any HTTP/TLS crate enters the default `rskim-tokens` tree, which is what
+/// a dependency on `rskim-proxy` would drag in. It does NOT independently
+/// forbid `rskim-contract` or `rskim-llm`; the `[dependencies]` table is the
+/// binding constraint for those.
 ///
 /// The same isolation rationale applies to `rskim-proxy`'s `ProxyProvider`
 /// (documented in `crates/rskim-proxy/src/detect.rs`: "This enum is LOCAL to
