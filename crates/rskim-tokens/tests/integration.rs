@@ -426,6 +426,68 @@ fn ac7_encoding_for_model_is_public() {
     assert_eq!(enc, Encoding::Cl100k);
 }
 
+/// AC21 / #306 — nine-cell truth table for `encoding_for_provider_model`.
+///
+/// This test lives in `rskim-tokens` because a `-p rskim-tokens` run never
+/// sees `rskim`'s tests; coverage must exist on both sides (PF-007).
+///
+/// Discriminating case: `(OpenAI, Some("gpt-4"))` → `Cl100k` (not `O200k`),
+/// proving the function delegates to `encoding_for_model` for recognised models
+/// rather than always returning the family default. A naive "return family
+/// default always" regression would return `O200k` here instead of `Cl100k`.
+#[test]
+fn ac21_encoding_for_provider_model_nine_cells() {
+    use rskim_tokens::Encoding::*;
+    use rskim_tokens::Provider::*;
+
+    let cases: &[(
+        &str,
+        rskim_tokens::Provider,
+        Option<&str>,
+        rskim_tokens::Encoding,
+    )] = &[
+        // Unknown provider → always Heuristic regardless of model (AD-AN-11 #5b)
+        ("Unknown+None", Unknown, None, Heuristic),
+        ("Unknown+recognized", Unknown, Some("gpt-4o"), Heuristic),
+        (
+            "Unknown+unrecognized",
+            Unknown,
+            Some("mystery-llm"),
+            Heuristic,
+        ),
+        // Anthropic + None → AnthropicOffline family default
+        ("Anthropic+None", Anthropic, None, AnthropicOffline),
+        // Anthropic + recognized model → keeps its encoding
+        (
+            "Anthropic+recognized",
+            Anthropic,
+            Some("claude-3-opus-20240229"),
+            AnthropicOffline,
+        ),
+        // Anthropic + unrecognized → falls back to AnthropicOffline family default
+        (
+            "Anthropic+unrecognized",
+            Anthropic,
+            Some("mystery-llm"),
+            AnthropicOffline,
+        ),
+        // OpenAI + None → O200k family default
+        ("OpenAI+None", OpenAI, None, O200k),
+        // OpenAI + "gpt-4" → Cl100k (discriminating: different from O200k family default)
+        ("OpenAI+gpt-4(Cl100k)", OpenAI, Some("gpt-4"), Cl100k),
+        // OpenAI + unrecognized → O200k family default
+        ("OpenAI+unrecognized", OpenAI, Some("mystery-llm"), O200k),
+    ];
+
+    for &(label, provider, model, expected) in cases {
+        let got = rskim_tokens::encoding_for_provider_model(provider, model);
+        assert_eq!(
+            got, expected,
+            "encoding_for_provider_model case '{label}': expected {expected:?} got {got:?}"
+        );
+    }
+}
+
 /// Detect whether `src` declares any `fn` that takes a borrowed-str parameter
 /// and returns a type whose final path segment is `Encoding` — i.e. a model→
 /// encoding lookup/table. Tolerates qualified return paths (`-> crate::Encoding`,

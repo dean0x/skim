@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::tokens;
-use rskim_tokens::{Encoding, encoding_for_model};
+use rskim_tokens::{Encoding, encoding_for_provider_model};
 
 // ============================================================================
 // Shared time constant
@@ -364,7 +364,7 @@ pub(crate) struct ProxyModelStats {
     /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
     pub tier_passthrough_pct: f64,
     /// Counting basis: one of `"exact"`, `"approximation"`, or `"heuristic"`.
-    /// Derived from `select_encoding(provider, model)` (AD-AN-9).
+    /// Derived from `encoding_for_provider_model(provider, model)` (AD-AN-9).
     pub basis: String,
     /// Success-scope rows with non-NULL token columns (countable).
     pub counted_rows: u64,
@@ -452,6 +452,16 @@ pub(crate) enum RecordingProvider {
     OpenAI,
 }
 
+impl From<RecordingProvider> for rskim_tokens::Provider {
+    fn from(p: RecordingProvider) -> Self {
+        match p {
+            RecordingProvider::Anthropic => rskim_tokens::Provider::Anthropic,
+            RecordingProvider::OpenAI => rskim_tokens::Provider::OpenAI,
+            RecordingProvider::Unknown => rskim_tokens::Provider::Unknown,
+        }
+    }
+}
+
 /// Per-block decision record from the proxy's BlockRouter.
 ///
 /// AD-AN-13: the unit is bytes (not tokens); `bytes_in`/`bytes_out` are exact
@@ -491,7 +501,7 @@ pub(crate) struct ProxyBlockDecision {
 /// value.
 ///
 /// The consumer thread in `proxy_analytics.rs` populates the three token fields
-/// after calling [`select_encoding`] and constructing a
+/// after calling `rskim_tokens::encoding_for_provider_model` and constructing a
 /// [`rskim_tokens::Counter`] for the resolved encoding.
 // Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
 #[allow(dead_code)]
@@ -533,55 +543,6 @@ pub(crate) struct ProxyRecordInput {
     pub upstream_error_status: Option<i64>,
     /// Per-block decision log (AD-AN-13).
     pub blocks: Vec<ProxyBlockDecision>,
-}
-
-// ============================================================================
-// select_encoding — provider + model → token counting basis (AD-AN-11)
-// ============================================================================
-
-/// Select the token encoding for a proxy request based on provider and model.
-///
-/// **AD-AN-11:** reconciles `#300`'s model-string API with the provider-enum
-/// fallback.  `encoding_for_model` (rskim-tokens) is model-string-only and
-/// returns `Heuristic` for unknown strings (verified encoding.rs:138), so this
-/// function adds provider-level family defaults so an unrecognized model within
-/// a known family uses the family encoding rather than the conservative
-/// `Heuristic`.
-///
-/// ## Fallback table (AC21)
-///
-/// | Provider  | `model = None`     | recognized model   | unrecognized model |
-/// |-----------|--------------------|--------------------|---------------------|
-/// | `Unknown` | `Heuristic`        | `Heuristic`        | `Heuristic`         |
-/// | `Anthropic` | `AnthropicOffline` | family encoding | `AnthropicOffline`  |
-/// | `OpenAI`  | `O200k`            | family encoding    | `O200k`             |
-///
-/// All 9 cases are pinned by a table-driven unit test (AC21).
-// Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
-#[allow(dead_code)]
-pub(crate) fn select_encoding(provider: &RecordingProvider, model: Option<&str>) -> Encoding {
-    match provider {
-        // AD-AN-11 challenge #5b: unknown provider → Heuristic even when a model
-        // string is present (the model may belong to an unclassifiable provider).
-        RecordingProvider::Unknown => Encoding::Heuristic,
-        RecordingProvider::Anthropic => match model {
-            // AD-AN-11 challenge #5a: family default when model absent.
-            None => Encoding::AnthropicOffline,
-            // AD-AN-11: unrecognized-within-family → family default;
-            // recognized model keeps its own encoding.
-            Some(m) => match encoding_for_model(m) {
-                Encoding::Heuristic => Encoding::AnthropicOffline,
-                e => e,
-            },
-        },
-        RecordingProvider::OpenAI => match model {
-            None => Encoding::O200k,
-            Some(m) => match encoding_for_model(m) {
-                Encoding::Heuristic => Encoding::O200k,
-                e => e,
-            },
-        },
-    }
 }
 
 // ============================================================================
@@ -1443,7 +1404,7 @@ impl AnalyticsDb {
                 .iter()
                 .map(|r| {
                     let prov = recording_provider_from_str(r.provider.as_deref());
-                    select_encoding(&prov, r.model.as_deref())
+                    encoding_for_provider_model(prov.into(), r.model.as_deref())
                 })
                 .collect();
             let first_encoding = encodings.first().copied().unwrap_or(Encoding::Heuristic);
@@ -1741,7 +1702,7 @@ fn recording_provider_from_str(s: Option<&str>) -> RecordingProvider {
 /// or `"heuristic"` (Heuristic).
 fn counting_basis_label(provider: Option<&str>, model: Option<&str>) -> &'static str {
     let rp = recording_provider_from_str(provider);
-    match select_encoding(&rp, model) {
+    match encoding_for_provider_model(rp.into(), model) {
         Encoding::Cl100k | Encoding::O200k => "exact",
         Encoding::AnthropicOffline => "approximation",
         Encoding::Heuristic => "heuristic",
@@ -4946,14 +4907,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// AC21 — `select_encoding` covers all 9 cells of the
-    /// {Unknown, Anthropic, OpenAI} × {None, recognized, unrecognized} matrix.
+    /// AC21 — `encoding_for_provider_model` covers all 9 cells of the
+    /// {Unknown, Anthropic, OpenAI} × {None, recognized, unrecognized} matrix,
+    /// routed through the `RecordingProvider → rskim_tokens::Provider` conversion.
     ///
     /// The OpenAI + "gpt-4" cell is the **discriminating case**: gpt-4 maps to
     /// `Cl100k` (not `O200k`), so a regression that always returns the family
-    /// default would produce the wrong answer here.
+    /// default would produce the wrong answer here. The `.into()` conversion is
+    /// exercised on every row, so a mismap in `From<RecordingProvider>` would
+    /// also be caught.
     #[test]
-    fn test_select_encoding_table_driven() {
+    fn test_encoding_for_provider_model_table_driven() {
         use Encoding::*;
         use RecordingProvider::*;
 
@@ -4994,13 +4958,40 @@ pub(crate) mod tests {
             ("OpenAI+unrecognized", OpenAI, Some("mystery-llm"), O200k),
         ];
 
-        for &(label, ref provider, model, expected) in cases {
-            let got = select_encoding(provider, model);
+        for &(label, provider, model, expected) in cases {
+            let got = encoding_for_provider_model(provider.into(), model);
             assert_eq!(
                 got, expected,
-                "select_encoding case '{label}': expected {expected:?} got {got:?}"
+                "encoding_for_provider_model case '{label}': expected {expected:?} got {got:?}"
             );
         }
+    }
+
+    /// Pins the `RecordingProvider → rskim_tokens::Provider` variant correspondence.
+    ///
+    /// A future variant pair that happens to share an encoding cannot mismap
+    /// undetected: if a new `RecordingProvider::X` maps to the wrong
+    /// `rskim_tokens::Provider::Y`, this test catches it directly (not through
+    /// encoding equality alone, which could mask a wrong provider mapping that
+    /// happens to produce the same encoding).
+    #[test]
+    fn test_recording_provider_maps_to_tokens_provider() {
+        use rskim_tokens::Provider as TP;
+        assert_eq!(
+            TP::from(RecordingProvider::Anthropic),
+            TP::Anthropic,
+            "RecordingProvider::Anthropic must map to rskim_tokens::Provider::Anthropic"
+        );
+        assert_eq!(
+            TP::from(RecordingProvider::OpenAI),
+            TP::OpenAI,
+            "RecordingProvider::OpenAI must map to rskim_tokens::Provider::OpenAI"
+        );
+        assert_eq!(
+            TP::from(RecordingProvider::Unknown),
+            TP::Unknown,
+            "RecordingProvider::Unknown must map to rskim_tokens::Provider::Unknown"
+        );
     }
 
     /// AD-AN-13 + AD-PXY-21 — record_proxy writes a correctly-populated parent

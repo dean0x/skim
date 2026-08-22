@@ -4,11 +4,11 @@
 //! ## AD-AN-10 — feature-gated bridge, ungated core
 //!
 //! Only this module and the `run()` wiring in `cmd/proxy.rs` are
-//! `#[cfg(feature = "proxy")]`. Schema v4, `record_proxy`, `select_encoding`,
-//! and the stats breakdowns compile and are reachable in the default build
-//! (they use `rusqlite` + `rskim-tokens`, both default deps — no `rskim-proxy`
-//! type). A default-build compile + reachability check is an AC (AC22 /
-//! challenge #14). Applies ADR-008.
+//! `#[cfg(feature = "proxy")]`. Schema v4, `record_proxy`,
+//! `encoding_for_provider_model`, and the stats breakdowns compile and are
+//! reachable in the default build (they use `rusqlite` + `rskim-tokens`, both
+//! default deps — no `rskim-proxy` type). A default-build compile +
+//! reachability check is an AC (AC22 / challenge #14). Applies ADR-008.
 //!
 //! ## AD-AN-8 — bounded proxy recording queue (records AND bytes)
 //!
@@ -39,9 +39,7 @@ use rskim_proxy::analytics::{AnalyticsHook, ProxyEvent};
 use rskim_proxy::config::DEFAULT_GRACEFUL_DRAIN_SECS;
 use rskim_proxy::detect::ProxyProvider;
 
-use crate::analytics::{
-    AnalyticsDb, ProxyBlockDecision, ProxyRecordInput, RecordingProvider, select_encoding,
-};
+use crate::analytics::{AnalyticsDb, ProxyBlockDecision, ProxyRecordInput, RecordingProvider};
 
 // ============================================================================
 // Bounded-queue constants (AD-AN-8 / ADR-003 / PF-005)
@@ -338,9 +336,10 @@ fn to_recording_provider(provider: &ProxyProvider) -> RecordingProvider {
 ///
 /// ## AD-AN-11 — one encoding source of truth
 ///
-/// `select_encoding(recording_provider, model)` is called once; the returned
-/// `Encoding` is used to build a single `Counter` that counts **both** the raw
-/// and the final body, so both sides use the same tokeniser instance.
+/// `rskim_tokens::encoding_for_provider_model(recording_provider, model)` is
+/// called once; the returned `Encoding` is used to build a single `Counter`
+/// that counts **both** the raw and the final body, so both sides use the same
+/// tokeniser instance.
 pub(crate) fn compute_token_counts(
     event: &ProxyEvent,
     recording_provider: &RecordingProvider,
@@ -356,7 +355,10 @@ pub(crate) fn compute_token_counts(
     };
 
     // AD-AN-11: single encoding derived from provider + model.
-    let encoding = select_encoding(recording_provider, event.model.as_deref());
+    let encoding = rskim_tokens::encoding_for_provider_model(
+        (*recording_provider).into(),
+        event.model.as_deref(),
+    );
 
     // AD-AN-7: one Counter instance for both sides (same encoding — never mix).
     let counter = match rskim_tokens::Counter::new(encoding) {

@@ -137,3 +137,131 @@ fn family_prefix_fallback(model_id: &str) -> Encoding {
     // Unknown provider → safe conservative ceiling
     Encoding::Heuristic
 }
+
+// ============================================================================
+// Provider enum
+// ============================================================================
+
+/// Identifies the API provider responsible for a request, used by
+/// [`encoding_for_provider_model`] to supply family-level encoding defaults
+/// when the model string is absent or unrecognised.
+///
+/// ## Separation from other `Provider` enums in the workspace
+///
+/// This enum is LOCAL to `rskim-tokens` and intentionally distinct from
+/// `rskim_proxy::detect::ProxyProvider` (proxy detection pipeline) and any
+/// `rskim_llm::Provider` (LLM transcript parser). The CI dependency-isolation
+/// gates (`.github/workflows/ci.yml`, the `dependency-isolation` job) forbid
+/// `rskim-tokens` from depending on `rskim-proxy`, `rskim-contract`, or
+/// `rskim-llm`, so their provider enums are unreachable from here.
+///
+/// The same isolation rationale applies to `rskim-proxy`'s `ProxyProvider`
+/// (documented in `crates/rskim-proxy/src/detect.rs`: "This enum is LOCAL to
+/// the proxy and distinct from `rskim_llm::Provider`"). Each layer defines
+/// its own provider vocabulary, converts at the boundary, and holds no
+/// cross-layer dependency.
+///
+/// ## `#[non_exhaustive]` within this crate
+///
+/// The attribute prevents external crates from exhaustive matching, but match
+/// arms within this crate MUST remain exhaustive. A new variant is therefore a
+/// compile error at [`encoding_for_provider_model`]'s `match provider` arm —
+/// forcing the author to decide the family default for the new provider rather
+/// than silently inheriting `Unknown` (which would return `Heuristic` and mask
+/// the new family).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provider {
+    /// Anthropic API (Claude family).
+    Anthropic,
+    /// OpenAI API (GPT / o-series family).
+    OpenAI,
+    /// Provider could not be determined from the request.
+    Unknown,
+}
+
+// ============================================================================
+// encoding_for_provider_model — provider + model → token counting basis
+// ============================================================================
+
+/// Select the token encoding for a provider + model pair.
+///
+/// This is the **authoritative multi-provider encoding selector** — it
+/// bridges `rskim-tokens`' model-string API ([`encoding_for_model`]) with
+/// provider-level family defaults so an unrecognised model within a known
+/// family uses the family encoding rather than the conservative `Heuristic`.
+///
+/// ## Rationale (AD-AN-11 / AC21 / #305 / #306)
+///
+/// ### Why this function exists
+///
+/// [`encoding_for_model`] is model-string–only: it returns `Heuristic` for
+/// any model string it does not recognise (documented in the module header
+/// above). A proxy recording that captures a valid Anthropic request but does
+/// not recognise the specific Claude model string would therefore record
+/// `Heuristic` instead of `AnthropicOffline`, silently under-counting Anthropic
+/// tokens. This function adds the provider-level family default so the recorded
+/// encoding is appropriate for the known provider even when the exact model is
+/// new or unlisted.
+///
+/// ### Provenance
+///
+/// - **AD-AN-11**: the design decision that mandates reconciling the
+///   model-string API with provider-level family defaults.
+/// - **AC21**: the nine-cell truth table that pins every case.
+/// - **#305**: the analytics-v4 ticket that introduced a delegating wrapper in
+///   `crates/rskim/src/analytics/mod.rs` to supply provider-level defaults.
+/// - **#306**: this ticket — collapses the duplication into this function;
+///   the prior `rskim::analytics` wrapper is deleted and all callers are
+///   repointed here.
+///
+/// ### Equivalence proof
+///
+/// All nine cells of the table below are equivalent to the prior delegating
+/// wrapper that lived in `crates/rskim/src/analytics/mod.rs` and was removed
+/// in #306:
+///
+/// | Provider    | `model = None`     | recognized model  | unrecognized model  |
+/// |-------------|--------------------|-------------------|---------------------|
+/// | `Unknown`   | `Heuristic`        | `Heuristic`       | `Heuristic`         |
+/// | `Anthropic` | `AnthropicOffline` | family encoding   | `AnthropicOffline`  |
+/// | `OpenAI`    | `O200k`            | family encoding   | `O200k`             |
+///
+/// Cell `(OpenAI, recognized "gpt-4")` → `Cl100k` (not `O200k`) is the
+/// **discriminating case**: a naive "always return family default" would return
+/// `O200k` here, which this function's inner [`encoding_for_model`] call
+/// correctly overrides to `Cl100k`.
+///
+/// ## Control flow
+///
+/// **`Unknown` exits before the model string is ever read.** This is a hard
+/// invariant (AD-AN-11 challenge #5b): an `Unknown` provider means the request
+/// is unclassifiable, so consulting the model string to get a more specific
+/// encoding would be wrong — `(Unknown, Some("gpt-4"))` must return `Heuristic`,
+/// not `Cl100k`. A refactor that computes `family_default` before the early
+/// return would silently break this invariant by letting the `Some(m)` arm run.
+///
+/// # Examples
+///
+/// ```
+/// use rskim_tokens::{Provider, Encoding, encoding_for_provider_model};
+///
+/// assert_eq!(encoding_for_provider_model(Provider::Anthropic, None), Encoding::AnthropicOffline);
+/// assert_eq!(encoding_for_provider_model(Provider::OpenAI, Some("gpt-4")), Encoding::Cl100k);
+/// assert_eq!(encoding_for_provider_model(Provider::Unknown, Some("gpt-4")), Encoding::Heuristic);
+/// ```
+#[must_use]
+pub fn encoding_for_provider_model(provider: Provider, model: Option<&str>) -> Encoding {
+    let family_default = match provider {
+        Provider::Anthropic => Encoding::AnthropicOffline,
+        Provider::OpenAI => Encoding::O200k,
+        Provider::Unknown => return Encoding::Heuristic, // AD-AN-11 #5b — model never consulted
+    };
+    match model {
+        None => family_default,
+        Some(m) => match encoding_for_model(m) {
+            Encoding::Heuristic => family_default,
+            recognized => recognized, // (OpenAI, "gpt-4") stays Cl100k
+        },
+    }
+}
