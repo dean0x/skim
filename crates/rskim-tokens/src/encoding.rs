@@ -170,11 +170,22 @@ fn family_prefix_fallback(model_id: &str) -> Encoding {
 /// ## `#[non_exhaustive]` within this crate
 ///
 /// The attribute prevents external crates from exhaustive matching, but match
-/// arms within this crate MUST remain exhaustive. A new variant is therefore a
-/// compile error at [`encoding_for_provider_model`]'s `match provider` arm —
-/// forcing the author to decide the family default for the new provider rather
-/// than silently inheriting `Unknown` (which would return `Heuristic` and mask
-/// the new family).
+/// arms within this crate MUST remain exhaustive. A new `Provider` variant is
+/// therefore a compile error at [`encoding_for_provider_model`]'s `match
+/// provider` arm — forcing the author to decide the family default for the new
+/// provider rather than silently inheriting `Unknown`.
+///
+/// **Boundary of this guarantee**: it holds within `rskim-tokens` and at the
+/// `From<RecordingProvider>` impl. It does NOT extend one hop upstream.
+/// `rskim_proxy::detect::ProxyProvider` is itself `#[non_exhaustive]`, so
+/// `to_recording_provider` in `rskim/src/cmd/proxy_analytics.rs` is
+/// compiler-required to carry a wildcard arm (`_ => RecordingProvider::Unknown`).
+/// A future `ProxyProvider::Google` therefore flows silently:
+/// `Google → Unknown → Provider::Unknown → Encoding::Heuristic`, recorded as
+/// `basis = "heuristic"`, with no compile error anywhere in the chain.
+/// The wildcard arm carries a comment pointing back here; closing the gap would
+/// require `ProxyProvider` to be exhaustively matched, which is not possible
+/// across a foreign `#[non_exhaustive]` enum.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Provider {

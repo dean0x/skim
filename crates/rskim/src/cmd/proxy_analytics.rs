@@ -309,8 +309,12 @@ fn to_recording_provider(provider: &ProxyProvider) -> RecordingProvider {
     match provider {
         ProxyProvider::Anthropic => RecordingProvider::Anthropic,
         ProxyProvider::OpenAI => RecordingProvider::OpenAI,
-        // `#[non_exhaustive]` wildcard — any future ProxyProvider variant falls
-        // back to Unknown, which stores NULL in the provider column.
+        // `#[non_exhaustive]` wildcard: `ProxyProvider` is a foreign
+        // `#[non_exhaustive]` enum, so exhaustive matching is impossible here.
+        // A future `ProxyProvider::Google` therefore silently maps to Unknown
+        // (→ `Provider::Unknown` → `Encoding::Heuristic`, basis = "heuristic").
+        // See the `Provider` rustdoc in `rskim-tokens/src/encoding.rs` for the
+        // full gap analysis and why this cannot be made a compile error.
         _ => RecordingProvider::Unknown,
     }
 }

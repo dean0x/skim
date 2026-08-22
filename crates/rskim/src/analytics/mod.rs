@@ -4967,13 +4967,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// Pins the `RecordingProvider → rskim_tokens::Provider` variant correspondence.
+    /// Pins the `RecordingProvider → rskim_tokens::Provider` variant correspondence
+    /// for the three current variants.
     ///
-    /// A future variant pair that happens to share an encoding cannot mismap
-    /// undetected: if a new `RecordingProvider::X` maps to the wrong
-    /// `rskim_tokens::Provider::Y`, this test catches it directly (not through
-    /// encoding equality alone, which could mask a wrong provider mapping that
-    /// happens to produce the same encoding).
+    /// What this test actually proves:
+    /// 1. The three current `RecordingProvider` variants (`Anthropic`, `OpenAI`,
+    ///    `Unknown`) each map to the correct `rskim_tokens::Provider` counterpart.
+    /// 2. The exhaustive `match` in `From<RecordingProvider>` forces any future
+    ///    `RecordingProvider` variant to get an explicit arm — a compile error at
+    ///    add-time, not a silent mismatch.
+    ///
+    /// What this test does NOT prove: a wrongly-coded fourth arm (e.g.
+    /// `RecordingProvider::Google => TP::Unknown` when `TP::Google` is correct)
+    /// would compile and these three assertions would still pass. The exhaustive
+    /// match enforces the presence of an arm, not its correctness.
     #[test]
     fn test_recording_provider_maps_to_tokens_provider() {
         use rskim_tokens::Provider as TP;

@@ -11,6 +11,7 @@
 //! - AC8: Unknown IDs resolve via two-tier rule without panic.
 //! - AC11: Counter is Send + Sync (compile-time static assertion).
 //! - AC12: 100KB counting latency < 25ms.
+//! - AC21: encoding_for_provider_model provider×model → Encoding truth table.
 
 use rskim_tokens::{Counter, Encoding, TokenError, counter_for_model, encoding_for_model};
 use std::sync::Arc;
@@ -520,8 +521,10 @@ fn ac21_encoding_for_provider_model_nine_cells() {
 // Residual, deliberately accepted gaps (documented so the next reader does not
 // have to rediscover them): macro-generated tables (`include!`, `macro_rules!`
 // expansion), tables built by runtime `insert()` calls with non-literal keys,
-// prefix classifiers keyed on raw-string literals (`r"gpt-"`), and prefix
-// classifiers living in a module-level closure with no enclosing `fn`.
+// prefix classifiers keyed on raw-string literals (`r"gpt-"`), prefix
+// classifiers living in a module-level closure with no enclosing `fn`, and
+// `&[(Cow<'static, str>, Encoding)]` pair slices (the Cow key type does not
+// match the (&str / String) opener patterns in signal (b)).
 // ============================================================================
 
 /// Which construct fired. Carried into the failure message so the engineer who
@@ -568,11 +571,21 @@ struct MappingHit {
     offset: usize,
 }
 
-/// Literal text tests that indicate a family-prefix classifier. Only the
-/// literal-argument forms are listed: `x.starts_with(prefix)` with a variable
-/// argument is not a table, and `x.starts_with(&"a".repeat(n))` (a real idiom
-/// in `rskim-tokens/src/net.rs`) does not match `".starts_with(\""` either.
-const LITERAL_TEXT_TESTS: [&str; 3] = [".starts_with(\"", ".ends_with(\"", ".contains(\""];
+/// Literal text tests that indicate a string-keyed mapping in a function body.
+///
+/// Three method-call forms cover `.starts_with("…")`, `.ends_with("…")`, and
+/// `.contains("…")`; only literal-argument forms are listed (a variable argument
+/// is not a table). Two equality forms cover `m == "gpt-4"` and `"gpt-4" == m`
+/// (gap 2 of the false-negative analysis): after blanking string literal
+/// *contents*, the respective substrings `== "` and `" ==` still appear and can
+/// be scanned without matching non-string code.
+const LITERAL_TEXT_TESTS: [&str; 5] = [
+    ".starts_with(\"",
+    ".ends_with(\"",
+    ".contains(\"",
+    "== \"", // m == "gpt-4"
+    "\" ==", // "gpt-4" == m (reversed, less common)
+];
 
 /// Is `b` a byte that can occur inside a Rust identifier? Non-ASCII bytes count
 /// (Rust permits non-ASCII identifiers) so word-boundary checks never split a
@@ -838,18 +851,202 @@ fn fn_body_open(code: &str, start: usize) -> Option<usize> {
     None
 }
 
+// ============================================================================
+// Gap-closing context (gaps 1–4 of the false-negative analysis)
+// ============================================================================
+
+/// Exhaustive list of `Encoding` variant names used by the glob-import
+/// normalizer (gap 1). When `use Encoding::*` is in scope, a bare
+/// `Cl100k` is indistinguishable from `Encoding::Cl100k` at the use site.
+///
+/// The anti-rot test `ac7_encoding_variant_list_is_complete` fails if a new
+/// variant is added to `Encoding` without updating this constant, so the list
+/// cannot silently fall out of sync.
+const ENCODING_VARIANTS: [&str; 4] = ["Cl100k", "O200k", "AnthropicOffline", "Heuristic"];
+
+/// Scanning context derived from the sanitized source before the three
+/// signals run. Captures the three kinds of non-qualified `Encoding`
+/// reference so the signals can be extended without restructuring each.
+struct ScanCtx<'a> {
+    /// `true` when the source contains `Encoding::*` (glob import).
+    /// Bare variant names — `Cl100k`, `O200k`, etc. — are then equivalent
+    /// to `Encoding::Cl100k` etc. at every use site.
+    has_glob: bool,
+    /// Names that are aliases of `Encoding` via:
+    /// - `use … Encoding as Name;`
+    /// - `type Name = Encoding;`
+    aliases: Vec<&'a str>,
+    /// `(open_brace, close_brace)` byte ranges of `impl Encoding { … }` blocks.
+    /// Inside these ranges `Self::` is equivalent to `Encoding::`.
+    impl_enc_ranges: Vec<(usize, usize)>,
+}
+
+impl<'a> ScanCtx<'a> {
+    fn from_sanitized(code: &'a str) -> Self {
+        Self {
+            has_glob: code.contains("Encoding::*"),
+            aliases: collect_encoding_aliases(code),
+            impl_enc_ranges: impl_encoding_body_ranges(code),
+        }
+    }
+
+    /// Is `offset` inside an `impl Encoding { … }` block?
+    fn in_impl_enc(&self, offset: usize) -> bool {
+        self.impl_enc_ranges
+            .iter()
+            .any(|&(s, e)| offset >= s && offset <= e)
+    }
+
+    /// Does `qualifier` name the `Encoding` type for the purposes of signals (a)
+    /// and (c)? Accepts `Encoding`, each collected alias, and `Self` when
+    /// `offset` is inside an `impl Encoding` block (gap 4).
+    fn is_encoding_qualifier(&self, qualifier: &str, offset: usize) -> bool {
+        qualifier == "Encoding"
+            || self.aliases.contains(&qualifier)
+            || (qualifier == "Self" && self.in_impl_enc(offset))
+    }
+}
+
+/// Collect names that are aliases of `Encoding` in the sanitized source.
+///
+/// Handles:
+/// - `use … Encoding as Name;` (gap 3a)
+/// - `type Name = Encoding;`   (gap 3b)
+fn collect_encoding_aliases(code: &str) -> Vec<&str> {
+    let mut aliases: Vec<&str> = Vec::new();
+    let bytes = code.as_bytes();
+
+    // Pattern 3a: `Encoding as Name` — in use statements or re-exports.
+    for (idx, _) in code.match_indices("Encoding as ") {
+        // Reject `MyEncoding as`
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            continue;
+        }
+        let rest = &code[idx + "Encoding as ".len()..];
+        let end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if end > 0 {
+            aliases.push(&rest[..end]);
+        }
+    }
+
+    // Pattern 3b: `type Name = Encoding` — type alias declaration.
+    // After sanitizing, string-literal contents are blanked but keyword
+    // sequences like `type Enc = Encoding;` are unchanged.
+    for (idx, _) in code.match_indices("type ") {
+        // Reject `retype ` etc.
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            continue;
+        }
+        let rest = &code[idx + "type ".len()..];
+        let name_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(0);
+        if name_end == 0 {
+            continue;
+        }
+        // After the name, look for `= Encoding` (possibly with intervening
+        // generic params like `<T>`; handled by scanning for `= Encoding`).
+        let after_name = &rest[name_end..];
+        // Find `= Encoding` in the next 128 bytes (ample for `<T, U> = Encoding`).
+        let window = &after_name[..after_name.len().min(128)];
+        let Some(eq_rel) = window.find("= Encoding") else {
+            continue;
+        };
+        // `= Encoding` must not be followed by `::` (that would be `= Encoding::Variant`).
+        let after_enc = eq_rel + "= Encoding".len();
+        if let Some(&b) = window.as_bytes().get(after_enc)
+            && (is_ident_byte(b) || b == b':')
+        {
+            continue; // `= EncodingFoo` or `= Encoding::Variant`
+        }
+        aliases.push(&rest[..name_end]);
+    }
+
+    aliases
+}
+
+/// Return the `(open_brace, close_brace)` byte ranges of every
+/// `impl Encoding { … }` block (including `impl Trait for Encoding { … }`)
+/// in the sanitized source.
+///
+/// Within these ranges `Self::` is equivalent to `Encoding::` (gap 4).
+fn impl_encoding_body_ranges(code: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let bytes = code.as_bytes();
+
+    for (idx, _) in code.match_indices("impl ") {
+        // Reject `reimpl ` etc.
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            continue;
+        }
+        // Search for `Encoding` within the next 128 bytes (covers `impl<T>`,
+        // `impl Trait for Encoding`, whitespace, generic bounds).
+        let search_end = (idx + 5 + 128).min(code.len());
+        let search = &code[idx + 5..search_end];
+        let Some(enc_rel) = search.find("Encoding") else {
+            continue;
+        };
+        let abs_enc = idx + 5 + enc_rel;
+        // Reject `MyEncoding`
+        if abs_enc > 0 && is_ident_byte(bytes[abs_enc - 1]) {
+            continue;
+        }
+        // Reject `EncodingFoo`
+        let after_enc = abs_enc + "Encoding".len();
+        if after_enc < bytes.len() && is_ident_byte(bytes[after_enc]) {
+            continue;
+        }
+        // Find the opening brace of the impl block.
+        let Some(open_rel) = code[after_enc..].find('{') else {
+            continue;
+        };
+        let open = after_enc + open_rel;
+        let Some(close) = matching_brace(code, open) else {
+            continue;
+        };
+        ranges.push((open, close));
+    }
+    ranges
+}
+
+// ============================================================================
+// Signal helpers
+// ============================================================================
+
 /// Does `rhs` begin with a path whose final-but-one segment is `Encoding` and
 /// which names a variant? Accepts `Encoding::Cl100k`, `crate::Encoding::O200k`,
 /// `rskim_tokens::Encoding::Heuristic`. Rejects `RecordingProvider::OpenAI`,
 /// `MyEncoding::X`, `"exact"`, `{`, and a bare `Encoding::`.
-fn rhs_is_encoding_variant(rhs: &str) -> bool {
+///
+/// Extended (gaps 1, 3, 4): also accepts alias-qualified paths (`Enc::Cl100k`),
+/// bare variant names when a glob import is in scope (`Cl100k`), and
+/// `Self::Variant` when `at` is inside an `impl Encoding` block.
+fn rhs_is_encoding_variant(rhs: &str, at: usize, ctx: &ScanCtx) -> bool {
     let end = rhs
         .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
         .unwrap_or(rhs.len());
-    let Some((head, variant)) = rhs[..end].rsplit_once("::") else {
+    let token = &rhs[..end];
+
+    // Case 1: qualified path — `Encoding::Variant`, `crate::Encoding::Variant`,
+    // `Alias::Variant` (gap 3), or `Self::Variant` inside `impl Encoding` (gap 4).
+    if let Some((head, variant)) = token.rsplit_once("::") {
+        if !variant.is_empty() {
+            let qualifier = head.rsplit("::").next().unwrap_or("");
+            if ctx.is_encoding_qualifier(qualifier, at) {
+                return true;
+            }
+        }
         return false;
-    };
-    !variant.is_empty() && head.rsplit("::").next() == Some("Encoding")
+    }
+
+    // Case 2: bare variant name when a glob import is in scope (gap 1).
+    if ctx.has_glob && ENCODING_VARIANTS.contains(&token) {
+        return true;
+    }
+
+    false
 }
 
 /// Does this body *yield* an `Encoding` variant (return it, produce it from a
@@ -861,41 +1058,111 @@ fn rhs_is_encoding_variant(rhs: &str) -> bool {
 /// position is what makes it safe to include `.contains("…")` in
 /// [`LITERAL_TEXT_TESTS`] without false-positiving on
 /// `assert!(s.contains("…"))` in a test that also builds a `Counter`.
-fn body_yields_encoding_variant(body: &str) -> bool {
+///
+/// Extended (gaps 1, 3, 4): also checks alias-qualified paths, `Self::` inside
+/// `impl Encoding` blocks, and bare variant names under a glob import.
+fn body_yields_encoding_variant(body: &str, ctx: &ScanCtx, self_enc: bool) -> bool {
     let bytes = body.as_bytes();
-    for (idx, _) in body.match_indices("Encoding::") {
-        // Final path segment must be exactly `Encoding` (rejects `MyEncoding::`).
-        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
-            continue;
-        }
-        let rest = &body[idx + "Encoding::".len()..];
-        let vlen = rest
-            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .unwrap_or(rest.len());
-        if vlen == 0 {
-            continue;
-        }
-        // Tail-expression position: `… Encoding::Heuristic }`
-        if rest[vlen..].trim_start().starts_with('}') {
+
+    /// Returns `true` when the variant occurrence at `path_start..path_start+path_len`
+    /// (beginning of the full qualifier path, e.g. `crate::Encoding::`) followed by a
+    /// variant name of `vlen` bytes is in a yielding position.
+    fn is_yielding(
+        body: &str,
+        bytes: &[u8],
+        path_start: usize,
+        path_len: usize,
+        vlen: usize,
+    ) -> bool {
+        let var_end = path_start + path_len + vlen;
+        let after = &body[var_end..];
+        // Tail-expression: `… Variant }`
+        if after.trim_start().starts_with('}') {
             return true;
         }
-        // Walk back over any `crate::` / `rskim_tokens::` qualification.
-        let mut path_start = idx;
-        while path_start > 0
-            && (is_ident_byte(bytes[path_start - 1]) || bytes[path_start - 1] == b':')
-        {
-            path_start -= 1;
+        // Walk back over any leading path qualification (`crate::`, `rskim_tokens::`)
+        // to find what precedes the whole path expression.
+        let mut ps = path_start;
+        while ps > 0 && (is_ident_byte(bytes[ps - 1]) || bytes[ps - 1] == b':') {
+            ps -= 1;
         }
-        let head = body[..path_start].trim_end();
+        let head = body[..ps].trim_end();
+        // Match-arm RHS: `"…" => Variant`
         if head.ends_with("=>") {
             return true;
         }
+        // Return statement: `return Variant`
         if let Some(pre) = head.strip_suffix("return")
             && pre.as_bytes().last().is_none_or(|&b| !is_ident_byte(b))
         {
             return true;
         }
+        false
     }
+
+    // --- Original: `Encoding::Variant` (and qualified forms) ---
+    for (idx, _) in body.match_indices("Encoding::") {
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            continue; // `MyEncoding::`
+        }
+        let rest = &body[idx + "Encoding::".len()..];
+        let vlen = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if vlen > 0 && is_yielding(body, bytes, idx, "Encoding::".len(), vlen) {
+            return true;
+        }
+    }
+
+    // --- Gap 3: alias-qualified paths (`Enc::Variant`) ---
+    for alias in &ctx.aliases {
+        let prefix = format!("{}::", alias);
+        for (idx, _) in body.match_indices(prefix.as_str()) {
+            if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+                continue;
+            }
+            let rest = &body[idx + prefix.len()..];
+            let vlen = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if vlen > 0 && is_yielding(body, bytes, idx, prefix.len(), vlen) {
+                return true;
+            }
+        }
+    }
+
+    // --- Gap 4: `Self::Variant` inside `impl Encoding { … }` ---
+    if self_enc {
+        for (idx, _) in body.match_indices("Self::") {
+            let rest = &body[idx + "Self::".len()..];
+            let vlen = rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            if vlen > 0 && is_yielding(body, bytes, idx, "Self::".len(), vlen) {
+                return true;
+            }
+        }
+    }
+
+    // --- Gap 1: bare variant names under a glob import ---
+    if ctx.has_glob {
+        for &variant in ENCODING_VARIANTS.iter() {
+            for (idx, _) in body.match_indices(variant) {
+                if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+                    continue;
+                }
+                let after_pos = idx + variant.len();
+                if after_pos < bytes.len() && is_ident_byte(bytes[after_pos]) {
+                    continue;
+                }
+                // For bare variants there is no qualifier prefix; walk back from idx.
+                if is_yielding(body, bytes, idx, 0, variant.len()) {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
 }
 
@@ -903,15 +1170,18 @@ fn body_yields_encoding_variant(body: &str) -> bool {
 /// body is an `Encoding` variant.
 ///
 /// Direction is load-bearing. `Encoding::Cl100k | Encoding::O200k => "exact"`
-/// (`analytics::counting_basis_label`) is an Encoding→label projection, not a
+/// (the label projection in `analytics`) is an Encoding→label direction, not a
 /// mapping, and fails the right-hand test. `Encoding::Heuristic =>
 /// Encoding::AnthropicOffline` (`analytics::select_encoding`, the delegating
 /// wrapper that caused the false positive this detector replaces) passes the
 /// right-hand test but fails the left-hand one: its pattern is a variant, not a
 /// string literal.
-fn scan_literal_match_arms(code: &str, hits: &mut Vec<MappingHit>) {
+///
+/// Extended (gaps 1, 3, 4): `rhs_is_encoding_variant` now also accepts
+/// alias-qualified paths, bare variant names, and `Self::` in `impl Encoding`.
+fn scan_literal_match_arms(code: &str, hits: &mut Vec<MappingHit>, ctx: &ScanCtx) {
     for (idx, _) in code.match_indices("=>") {
-        if !rhs_is_encoding_variant(code[idx + 2..].trim_start()) {
+        if !rhs_is_encoding_variant(code[idx + 2..].trim_start(), idx, ctx) {
             continue;
         }
         // Pattern text: back to the previous arm boundary.
@@ -938,33 +1208,44 @@ fn scan_literal_match_arms(code: &str, hits: &mut Vec<MappingHit>) {
 ///
 /// `)` and `>` are the only accepted closers. `}` is deliberately excluded so
 /// `use rskim_tokens::{Counter, Encoding};` (a use-tree, not a type) is not a hit.
-fn scan_str_keyed_table_types(code: &str, hits: &mut Vec<MappingHit>) {
+///
+/// Extended (gap 3): also scans for alias names in the value position of a
+/// two-element table type (e.g. `HashMap<&str, Enc>` where `Enc` aliases
+/// `Encoding`).
+fn scan_str_keyed_table_types(code: &str, hits: &mut Vec<MappingHit>, ctx: &ScanCtx) {
     const KEY_OPENERS: [&str; 4] = ["(&str", "<&str", "(String", "<String"];
     let bytes = code.as_bytes();
-    for (idx, _) in code.match_indices("Encoding") {
-        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
-            continue; // `MyEncoding`
-        }
-        let after = code[idx + "Encoding".len()..].trim_start();
-        if !(after.starts_with(')') || after.starts_with('>')) {
-            continue; // not in value position of a 2-element table type
-        }
-        let Some(before) = code[..idx].trim_end().strip_suffix(',') else {
-            continue; // not the second element of anything
-        };
-        let before = before.trim_end();
-        // Last 48 chars are ample for `&[(&'static str` / `HashMap<&str`.
-        let window = before
-            .char_indices()
-            .rev()
-            .nth(47)
-            .map_or(before, |(p, _)| &before[p..]);
-        let norm = normalize_type_text(window);
-        if KEY_OPENERS.iter().any(|k| norm.ends_with(k)) {
-            hits.push(MappingHit {
-                signal: MappingSignal::StrKeyedTableType,
-                offset: idx,
-            });
+
+    // Build list of type names to scan: the real name plus any aliases (gap 3).
+    let mut terms: Vec<&str> = vec!["Encoding"];
+    terms.extend(ctx.aliases.iter().copied());
+
+    for term in &terms {
+        for (idx, _) in code.match_indices(*term) {
+            if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+                continue; // `MyEncoding`
+            }
+            let after = code[idx + term.len()..].trim_start();
+            if !(after.starts_with(')') || after.starts_with('>')) {
+                continue; // not in value position of a 2-element table type
+            }
+            let Some(before) = code[..idx].trim_end().strip_suffix(',') else {
+                continue; // not the second element of anything
+            };
+            let before = before.trim_end();
+            // Last 48 chars are ample for `&[(&'static str` / `HashMap<&str`.
+            let window = before
+                .char_indices()
+                .rev()
+                .nth(47)
+                .map_or(before, |(p, _)| &before[p..]);
+            let norm = normalize_type_text(window);
+            if KEY_OPENERS.iter().any(|k| norm.ends_with(k)) {
+                hits.push(MappingHit {
+                    signal: MappingSignal::StrKeyedTableType,
+                    offset: idx,
+                });
+            }
         }
     }
 }
@@ -977,7 +1258,12 @@ fn scan_str_keyed_table_types(code: &str, hits: &mut Vec<MappingHit>) {
 /// Scoping to a single `fn` body — enabled by brace matching over sanitized
 /// text — is what prevents a `.starts_with("…")` in one function from combining
 /// with an `Encoding::` in an unrelated sibling function.
-fn scan_prefix_family_fns(code: &str, hits: &mut Vec<MappingHit>) {
+///
+/// Extended (gaps 1–4): the body check now also recognises equality comparisons
+/// (`== "…"`), alias-qualified variants, `Self::` inside `impl Encoding`, and
+/// bare variant names under a glob import (all delegated to
+/// `body_yields_encoding_variant`).
+fn scan_prefix_family_fns(code: &str, hits: &mut Vec<MappingHit>, ctx: &ScanCtx) {
     let bytes = code.as_bytes();
     for (start, _) in code.match_indices("fn ") {
         if start > 0 && is_ident_byte(bytes[start - 1]) {
@@ -990,7 +1276,10 @@ fn scan_prefix_family_fns(code: &str, hits: &mut Vec<MappingHit>) {
             continue;
         };
         let body = &code[open..=close];
-        if LITERAL_TEXT_TESTS.iter().any(|n| body.contains(n)) && body_yields_encoding_variant(body)
+        // `self_enc`: true when this `fn` lives inside an `impl Encoding` block.
+        let self_enc = ctx.in_impl_enc(start);
+        if LITERAL_TEXT_TESTS.iter().any(|n| body.contains(n))
+            && body_yields_encoding_variant(body, ctx, self_enc)
         {
             hits.push(MappingHit {
                 signal: MappingSignal::PrefixFamilyFn,
@@ -1016,9 +1305,10 @@ fn find_parallel_encoding_mappings(src: &str) -> Vec<MappingHit> {
         return hits;
     }
     let code = blank_comments_and_literals(src);
-    scan_literal_match_arms(&code, &mut hits);
-    scan_str_keyed_table_types(&code, &mut hits);
-    scan_prefix_family_fns(&code, &mut hits);
+    let ctx = ScanCtx::from_sanitized(&code);
+    scan_literal_match_arms(&code, &mut hits, &ctx);
+    scan_str_keyed_table_types(&code, &mut hits, &ctx);
+    scan_prefix_family_fns(&code, &mut hits, &ctx);
     hits.sort_by_key(|h| h.offset);
     hits
 }
@@ -1338,6 +1628,85 @@ fn ac7_detector_catches_parallel_mappings_and_ignores_getters() {
         "Some(\"literal\") pattern must be flagged"
     );
 
+    // === POSITIVES: gap-closing fixtures (gaps 1–4 of the false-negative analysis) ===
+
+    // (12) Gap 1 — glob-import bare variants in a literal match arm.
+    // `use Encoding::*;` brings bare `Cl100k`, `O200k` etc. into scope; a
+    // future table written as `match m { "gpt-4" => Cl100k, … }` was invisible.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"use rskim_tokens::Encoding;
+               use Encoding::*;
+               pub fn enc(m: &str) -> Encoding {
+                   match m { "gpt-4" => Cl100k, _ => Heuristic }
+               }"#
+        ),
+        "glob-import bare variant in match arm must be flagged (gap 1)"
+    );
+
+    // (13) Gap 1b — glob-import bare variants in a prefix-family classifier.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"use Encoding::*;
+               pub fn fam(m: &str) -> Encoding {
+                   if m.starts_with("gpt-") { return O200k; }
+                   Heuristic
+               }"#
+        ),
+        "glob-import bare variant in prefix classifier must be flagged (gap 1)"
+    );
+
+    // (14) Gap 2 — equality-ladder table (`m == "literal"` instead of starts_with).
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"use rskim_tokens::Encoding;
+               pub fn enc(m: &str) -> Encoding {
+                   if m == "gpt-4" { return Encoding::Cl100k; }
+                   if m == "gpt-4o" { return Encoding::O200k; }
+                   Encoding::Heuristic
+               }"#
+        ),
+        "equality-ladder `m == \"…\"` classifier must be flagged (gap 2)"
+    );
+
+    // (15) Gap 3a — `use Encoding as Enc;` alias in match arms.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"use rskim_tokens::Encoding as Enc;
+               pub fn enc(m: &str) -> Enc {
+                   match m { "gpt-4" => Enc::Cl100k, _ => Enc::Heuristic }
+               }"#
+        ),
+        "`use Encoding as Enc` alias must be flagged (gap 3a)"
+    );
+
+    // (16) Gap 3b — `type Enc = Encoding;` type alias in match arms.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"use rskim_tokens::Encoding;
+               type Enc = Encoding;
+               pub fn enc(m: &str) -> Enc {
+                   match m { "gpt-4" => Enc::Cl100k, _ => Enc::Heuristic }
+               }"#
+        ),
+        "`type Enc = Encoding` alias must be flagged (gap 3b)"
+    );
+
+    // (17) Gap 4 — `Self::Variant` inside an `impl Encoding` block.
+    // The orphan rule confines `impl Encoding { … }` to `rskim-tokens` itself,
+    // but any file within that crate is a valid host (e.g. `counter.rs`).
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"use rskim_tokens::Encoding;
+               impl Encoding {
+                   pub fn for_model(m: &str) -> Self {
+                       match m { "gpt-4" => Self::Cl100k, _ => Self::Heuristic }
+                   }
+               }"#
+        ),
+        "`Self::Variant` inside `impl Encoding` must be flagged (gap 4)"
+    );
+
     // === NEGATIVES — these MUST NOT be flagged =============================
 
     // Hazard 1: the delegating wrapper that caused the predecessor's false positive.
@@ -1523,6 +1892,78 @@ fn ac7_gate_needs_no_self_exclusion() {
             .map(|h| (h.signal, line_and_snippet(&src, h.offset)))
             .collect::<Vec<_>>()
     );
+}
+
+/// Anti-rot guard for `ENCODING_VARIANTS`: verifies the constant lists EXACTLY
+/// the variants declared in `Encoding`, no more and no less.
+///
+/// Without this test, a new variant added to `Encoding` (e.g. `O1`) would be
+/// silently invisible to the glob-import normalizer (gap 1), allowing a file
+/// with `use Encoding::*;` to map `"o1-mini" => O1` without triggering the
+/// AC7 gate. This test MUST fail before that regression ships.
+#[test]
+fn ac7_encoding_variant_list_is_complete() {
+    use std::path::Path;
+
+    let enc_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("encoding.rs");
+    let src =
+        std::fs::read_to_string(&enc_path).unwrap_or_else(|e| panic!("must read encoding.rs: {e}"));
+
+    // Locate the `pub enum Encoding {` block and extract variant names.
+    // This is a simple line-scanner; it handles attributes (`#[…]`) and
+    // doc comments (`///`) that precede individual variants.
+    let mut in_enum = false;
+    let mut found: Vec<String> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        if !in_enum {
+            // Match the enum declaration line
+            if t.starts_with("pub enum Encoding") && (t.ends_with('{') || t.contains('{')) {
+                in_enum = true;
+            }
+            continue;
+        }
+        // The closing brace ends the enum
+        if t == "}" {
+            break;
+        }
+        // Skip attributes and comments
+        if t.starts_with('#') || t.starts_with("//") || t.is_empty() {
+            continue;
+        }
+        // The variant name is the trimmed line with a trailing comma stripped.
+        let name = t.trim_end_matches(',').trim();
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            found.push(name.to_owned());
+        }
+    }
+
+    assert!(
+        !found.is_empty(),
+        "failed to extract any variant names from Encoding — check the parser \
+         if the enum layout changed"
+    );
+
+    // Every found variant must be in ENCODING_VARIANTS.
+    for v in &found {
+        assert!(
+            ENCODING_VARIANTS.contains(&v.as_str()),
+            "Encoding variant `{v}` is not listed in ENCODING_VARIANTS — add it \
+             and update the glob-import normalizer so the AC7 gate catches bare \
+             uses of the new variant"
+        );
+    }
+
+    // Every ENCODING_VARIANTS entry must be an actual variant.
+    for &listed in ENCODING_VARIANTS.iter() {
+        assert!(
+            found.iter().any(|f| f == listed),
+            "ENCODING_VARIANTS lists `{listed}` but it is not a variant of \
+             Encoding — remove the stale entry"
+        );
+    }
 }
 
 // ============================================================================
