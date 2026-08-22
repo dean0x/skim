@@ -1646,6 +1646,24 @@ mod tests {
             "import-block",
             "package main\n\nimport (\n\t// import comment\n\t\"fmt\"\n)\n",
         ),
+        // ANONYMOUS SIBLING between a comment and its next NAMED sibling.
+        //
+        // The old walk used `next_named_sibling()`, which skips anonymous nodes
+        // entirely; `scan_go_sibling_group` must reproduce that by filtering on
+        // `is_named()`.  Here `source_file`'s children are
+        // `package_clause, var_declaration, comment, ";"(anonymous), var_declaration`
+        // — so the run terminator is the second `var_declaration` (an
+        // `is_go_declaration` kind → KEEP).  Without the `is_named()` filter the
+        // terminator would be the anonymous `";"` → STRIP, a silent
+        // classification flip.
+        //
+        // Added because the rest of this table has ZERO comments with an
+        // anonymous sibling before their next named one: deleting the
+        // `is_named()` filter passed the entire suite before this entry existed.
+        (
+            "anon-semi-between-comment-and-next-named-sibling",
+            "package main\n\nvar A = 1 /* doc */ ; var B = 2\n",
+        ),
     ];
 
     #[test]
@@ -1660,7 +1678,7 @@ mod tests {
             "the degenerate-snippet table must keep its coverage; got {} entries",
             GO_DIFFERENTIAL_SNIPPETS.len()
         );
-        // 32 comment nodes across the 20 snippets as of this commit.
+        // 33 comment nodes across the 21 snippets as of this commit.
         assert!(
             total >= 30,
             "expected the degenerate snippets to contribute a meaningful number of \
