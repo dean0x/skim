@@ -488,55 +488,590 @@ fn ac21_encoding_for_provider_model_nine_cells() {
     }
 }
 
-/// Detect whether `src` declares any `fn` that takes a borrowed-str parameter
-/// and returns a type whose final path segment is `Encoding` — i.e. a model→
-/// encoding lookup/table. Tolerates qualified return paths (`-> crate::Encoding`,
-/// `-> rskim_tokens::Encoding`), surrounding whitespace, and a `Result<Encoding>`
-/// wrapper. Excludes `&self` getters because they take no `&str` parameter.
-fn file_has_str_to_encoding_fn(src: &str) -> bool {
-    // Walk each `fn ` declaration and inspect its signature header (up to the
-    // opening brace or `;`).
-    for (start, _) in src.match_indices("fn ") {
-        let after = &src[start..];
-        let header_end = after.find('{').unwrap_or(after.len());
-        let header = &after[..header_end];
+// ============================================================================
+// AC7 sole-mapping gate — source-text detector
+//
+// # Design decision: detect the mapping *construct*, not the function shape
+//
+// The predecessor of this detector matched a signature shape (`fn(&str) ->
+// Encoding`) and never read a body. That is the wrong question. The invariant
+// `encoding.rs` declares (module docs, lines 3-5) is that no *parallel
+// model-string → Encoding mapping* may exist outside it — a property of a
+// construct, not of a signature. The mismatch made the old detector
+// simultaneously:
+//
+//   * over-inclusive — `rskim::analytics::select_encoding` is a delegating
+//     wrapper that calls `encoding_for_model` and only supplies provider-level
+//     family defaults. It holds no model table, yet matched the shape and
+//     blocked a merge.
+//   * under-inclusive — `fn f(model: String) -> Encoding` (owned parameter),
+//     a module-level `const TABLE: &[(&str, Encoding)]`, and a
+//     `HashMap<&str, Encoding>` with no enclosing function all carry real
+//     mappings and were all invisible.
+//   * self-triggering — the *prose* describing the shape matched the shape,
+//     which forced a blanket "skip any file named integration.rs" exclusion
+//     that silently exempted four other crates from a workspace-wide gate.
+//
+// The replacement scans a *sanitized* copy of the source (comment bodies and
+// string/char-literal contents blanked; see `blank_comments_and_literals`) for
+// three constructs. Prose and fixture snippets are therefore invisible by
+// construction, and function bodies can be brace-matched safely.
+//
+// Residual, deliberately accepted gaps (documented so the next reader does not
+// have to rediscover them): macro-generated tables (`include!`, `macro_rules!`
+// expansion), tables built by runtime `insert()` calls with non-literal keys,
+// prefix classifiers keyed on raw-string literals (`r"gpt-"`), and prefix
+// classifiers living in a module-level closure with no enclosing `fn`.
+// ============================================================================
 
-        // Must take a borrowed str parameter (the model id).
-        if !header.contains("&str") {
+/// Which construct fired. Carried into the failure message so the engineer who
+/// trips this gate is told *what* was detected, not merely that something was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MappingSignal {
+    /// `"gpt-4" | "gpt-4-turbo" => Encoding::Cl100k` — a match arm whose
+    /// pattern contains a string literal and whose body is an `Encoding`
+    /// variant. This is the canonical exact-match table (`encoding.rs` tier 1).
+    LiteralMatchArm,
+    /// `&[(&str, Encoding)]`, `[(&str, Encoding); N]`, `HashMap<&str, Encoding>`,
+    /// `phf::Map<&'static str, Encoding>`, `Vec<(String, Encoding)>` — a
+    /// two-element, string-keyed table *type*. Catches tables that exist as
+    /// data with no enclosing function of any particular shape.
+    StrKeyedTableType,
+    /// A `fn` whose body combines a string-literal text test
+    /// (`.starts_with("…")` / `.ends_with("…")` / `.contains("…")`) with an
+    /// `Encoding` variant in a yielding position, scoped to a single function
+    /// body by brace-matching. This is the family-prefix fallback shape
+    /// (`encoding.rs::family_prefix_fallback`), which has neither literal arms
+    /// nor a table type and would otherwise be missed.
+    PrefixFamilyFn,
+}
+
+impl MappingSignal {
+    /// Human-readable description used in the assertion message.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::LiteralMatchArm => "match arm mapping a string literal to an Encoding variant",
+            Self::StrKeyedTableType => "string-keyed 2-element table type with Encoding values",
+            Self::PrefixFamilyFn => {
+                "fn body combining a string-literal text test with a returned Encoding variant"
+            }
+        }
+    }
+}
+
+/// One detected mapping construct. `offset` is a byte offset valid in the
+/// ORIGINAL source (`blank_comments_and_literals` preserves byte length), so
+/// the reporter can quote the real, unblanked line.
+#[derive(Debug, Clone, Copy)]
+struct MappingHit {
+    signal: MappingSignal,
+    offset: usize,
+}
+
+/// Literal text tests that indicate a family-prefix classifier. Only the
+/// literal-argument forms are listed: `x.starts_with(prefix)` with a variable
+/// argument is not a table, and `x.starts_with(&"a".repeat(n))` (a real idiom
+/// in `rskim-tokens/src/net.rs`) does not match `".starts_with(\""` either.
+const LITERAL_TEXT_TESTS: [&str; 3] = [".starts_with(\"", ".ends_with(\"", ".contains(\""];
+
+/// Is `b` a byte that can occur inside a Rust identifier? Non-ASCII bytes count
+/// (Rust permits non-ASCII identifiers) so word-boundary checks never split a
+/// multi-byte identifier.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Byte width of the UTF-8 char starting with `first`.
+fn utf8_width(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+/// Push one blanked byte, preserving `\n` so line numbers survive.
+fn push_blank(out: &mut Vec<u8>, byte: u8) {
+    out.push(if byte == b'\n' { b'\n' } else { b' ' });
+}
+
+/// Blank comment bodies and string/char-literal *contents*, preserving the
+/// source's exact byte length, its newlines, and its literal delimiters.
+///
+/// # Why this exists
+///
+/// Every signal below is a *code* pattern. Without this pass, three things go
+/// wrong:
+///
+/// 1. Rustdoc that names a banned construct trips the gate on its own
+///    documentation — which is exactly why the predecessor gate had to exempt
+///    every file named `integration.rs` in the workspace.
+/// 2. The meta-test's fixture snippets (Rust source stored as string literals)
+///    trip the gate when this very file is walked from disk. Blanking literal
+///    *contents* while keeping the delimiters resolves this asymmetrically and
+///    correctly: on disk a fixture is a literal (invisible); passed as a value
+///    to the detector it is code (visible).
+/// 3. Brace matching desyncs on a `'}'` inside a literal, so `fn` bodies could
+///    not be delimited — and body scoping is what stops a `.starts_with("…")`
+///    in function A from combining with an `Encoding::` in unrelated function B.
+///
+/// # Preserved properties
+///
+/// * `out.len() == src.len()` — byte offsets index the original source.
+/// * Newline count and positions are unchanged — line numbers are exact.
+/// * A `"` in the output is always a literal delimiter, never literal content.
+///   Signal (a) relies on this: "does this pattern contain a string literal?"
+///   reduces to `lhs.contains('"')`.
+///
+/// Handles `//`, `///`, `//!`, nested `/* */`, `"…"`, `b"…"`, `r"…"`,
+/// `r#"…"#`, `br##"…"##`, `'c'`, `'\n'`, and disambiguates a char literal from
+/// a lifetime (`&'static str`, `'a`, `'_`, `'outer:`) by the standard rule:
+/// `'` begins a char literal only when followed by `\` or by exactly one char
+/// then `'`.
+fn blank_comments_and_literals(src: &str) -> String {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut out: Vec<u8> = Vec::with_capacity(n);
+    let mut i = 0usize;
+
+    while i < n {
+        let c = b[i];
+
+        // ---- line comment (covers `//`, `///`, `//!`) ----
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < n && b[i] != b'\n' {
+                push_blank(&mut out, b[i]);
+                i += 1;
+            }
             continue;
         }
-        // Must return something ending in `Encoding`. Find the return arrow and
-        // check the returned type path ends in the `Encoding` identifier.
-        if let Some(arrow) = header.find("->") {
-            let ret = header[arrow + 2..].trim();
-            // Strip a `Result<...>` / `Option<...>` wrapper if present.
-            let inner = ret
-                .strip_prefix("Result<")
-                .or_else(|| ret.strip_prefix("Option<"))
-                .map_or(ret, |r| r.split([',', '>']).next().unwrap_or(r).trim());
-            // Last path segment of the returned type.
-            let last_seg = inner
-                .trim_start_matches('&')
-                .rsplit("::")
-                .next()
-                .unwrap_or("")
-                .trim();
-            if last_seg == "Encoding" {
-                return true;
+
+        // ---- block comment, nesting-aware (covers `/*`, `/**`, `/*!`) ----
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 1usize;
+            push_blank(&mut out, b'/');
+            push_blank(&mut out, b'*');
+            i += 2;
+            while i < n && depth > 0 {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    push_blank(&mut out, b' ');
+                    push_blank(&mut out, b' ');
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    push_blank(&mut out, b' ');
+                    push_blank(&mut out, b' ');
+                    i += 2;
+                } else {
+                    push_blank(&mut out, b[i]);
+                    i += 1;
+                }
             }
+            continue;
+        }
+
+        // ---- raw string: r"…" / r#"…"# / br"…" / br##"…"## ----
+        if (c == b'r' || (c == b'b' && b.get(i + 1) == Some(&b'r')))
+            && (i == 0 || !is_ident_byte(b[i - 1]))
+        {
+            let mut k = if c == b'b' { i + 2 } else { i + 1 };
+            let hash_start = k;
+            while k < n && b[k] == b'#' {
+                k += 1;
+            }
+            if b.get(k) == Some(&b'"') {
+                let hashes = k - hash_start;
+                out.extend_from_slice(&b[i..=k]); // keep `r#"` verbatim
+                i = k + 1;
+                while i < n {
+                    if b[i] == b'"'
+                        && i + hashes < n
+                        && b[i + 1..=i + hashes].iter().all(|&h| h == b'#')
+                    {
+                        out.extend_from_slice(&b[i..=i + hashes]);
+                        i += hashes + 1;
+                        break;
+                    }
+                    push_blank(&mut out, b[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // ---- char literal vs lifetime ----
+        if c == b'\'' {
+            let is_char_lit = match b.get(i + 1) {
+                Some(&b'\\') => true,
+                Some(&first) => b.get(i + 1 + utf8_width(first)) == Some(&b'\''),
+                None => false,
+            };
+            if !is_char_lit {
+                out.push(c); // lifetime tick — harmless, keep it
+                i += 1;
+                continue;
+            }
+            out.push(b'\'');
+            i += 1;
+            while i < n {
+                if b[i] == b'\\' {
+                    push_blank(&mut out, b[i]);
+                    i += 1;
+                    if i < n {
+                        push_blank(&mut out, b[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b[i] == b'\'' {
+                    out.push(b'\'');
+                    i += 1;
+                    break;
+                }
+                push_blank(&mut out, b[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // ---- normal / byte string literal ----
+        if c == b'"' {
+            out.push(b'"');
+            i += 1;
+            while i < n {
+                if b[i] == b'\\' {
+                    push_blank(&mut out, b[i]);
+                    i += 1;
+                    if i < n {
+                        push_blank(&mut out, b[i]);
+                        i += 1;
+                    }
+                    continue;
+                }
+                if b[i] == b'"' {
+                    out.push(b'"');
+                    i += 1;
+                    break;
+                }
+                push_blank(&mut out, b[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(c);
+        i += 1;
+    }
+
+    // Every byte written is either copied verbatim from a UTF-8 boundary run or
+    // an ASCII blank, so this is always valid UTF-8; `lossy` avoids an unwrap.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Strip whitespace and lifetime tokens from a short type fragment, so
+/// `&[( &'static str ,` and `&[(&str,` compare equal.
+fn normalize_type_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c == '\'' {
+            // Drop a lifetime token (`'static`, `'a`, `'_`).
+            while chars
+                .peek()
+                .is_some_and(|n| n.is_alphanumeric() || *n == '_')
+            {
+                chars.next();
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Index of the `}` closing the `{` at `open`. Sound only on sanitized text
+/// (literals cannot contribute stray braces) — that is the whole reason
+/// `blank_comments_and_literals` runs first.
+fn matching_brace(code: &str, open: usize) -> Option<usize> {
+    let b = code.as_bytes();
+    if b.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (off, &byte) in b[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + off);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Index of the `{` opening the body of the `fn` item beginning at `start`.
+/// `None` for a bodiless declaration (`fn f();` in a trait). Paren/bracket
+/// depth tracking keeps `fn f(buf: [u8; 4]) { … }` from being mistaken for a
+/// bodiless declaration because of the `;` inside the array type.
+fn fn_body_open(code: &str, start: usize) -> Option<usize> {
+    let (mut paren, mut bracket) = (0usize, 0usize);
+    for (off, &byte) in code.as_bytes()[start..].iter().enumerate() {
+        match byte {
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b'[' => bracket += 1,
+            b']' => bracket = bracket.saturating_sub(1),
+            b';' if paren == 0 && bracket == 0 => return None,
+            b'{' if paren == 0 && bracket == 0 => return Some(start + off),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Does `rhs` begin with a path whose final-but-one segment is `Encoding` and
+/// which names a variant? Accepts `Encoding::Cl100k`, `crate::Encoding::O200k`,
+/// `rskim_tokens::Encoding::Heuristic`. Rejects `RecordingProvider::OpenAI`,
+/// `MyEncoding::X`, `"exact"`, `{`, and a bare `Encoding::`.
+fn rhs_is_encoding_variant(rhs: &str) -> bool {
+    let end = rhs
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
+        .unwrap_or(rhs.len());
+    let Some((head, variant)) = rhs[..end].rsplit_once("::") else {
+        return false;
+    };
+    !variant.is_empty() && head.rsplit("::").next() == Some("Encoding")
+}
+
+/// Does this body *yield* an `Encoding` variant (return it, produce it from a
+/// match arm, or leave it as a tail expression)?
+///
+/// The distinction matters: `let e = Encoding::Cl100k;` and
+/// `Counter::new(Encoding::Cl100k)` merely *mention* a variant and are
+/// pervasive in ordinary construction and test code. Requiring a yielding
+/// position is what makes it safe to include `.contains("…")` in
+/// [`LITERAL_TEXT_TESTS`] without false-positiving on
+/// `assert!(s.contains("…"))` in a test that also builds a `Counter`.
+fn body_yields_encoding_variant(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    for (idx, _) in body.match_indices("Encoding::") {
+        // Final path segment must be exactly `Encoding` (rejects `MyEncoding::`).
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            continue;
+        }
+        let rest = &body[idx + "Encoding::".len()..];
+        let vlen = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if vlen == 0 {
+            continue;
+        }
+        // Tail-expression position: `… Encoding::Heuristic }`
+        if rest[vlen..].trim_start().starts_with('}') {
+            return true;
+        }
+        // Walk back over any `crate::` / `rskim_tokens::` qualification.
+        let mut path_start = idx;
+        while path_start > 0
+            && (is_ident_byte(bytes[path_start - 1]) || bytes[path_start - 1] == b':')
+        {
+            path_start -= 1;
+        }
+        let head = body[..path_start].trim_end();
+        if head.ends_with("=>") {
+            return true;
+        }
+        if let Some(pre) = head.strip_suffix("return")
+            && pre.as_bytes().last().is_none_or(|&b| !is_ident_byte(b))
+        {
+            return true;
         }
     }
     false
 }
 
+/// Signal (a): a match arm whose pattern contains a string literal and whose
+/// body is an `Encoding` variant.
+///
+/// Direction is load-bearing. `Encoding::Cl100k | Encoding::O200k => "exact"`
+/// (`analytics::counting_basis_label`) is an Encoding→label projection, not a
+/// mapping, and fails the right-hand test. `Encoding::Heuristic =>
+/// Encoding::AnthropicOffline` (`analytics::select_encoding`, the delegating
+/// wrapper that caused the false positive this detector replaces) passes the
+/// right-hand test but fails the left-hand one: its pattern is a variant, not a
+/// string literal.
+fn scan_literal_match_arms(code: &str, hits: &mut Vec<MappingHit>) {
+    for (idx, _) in code.match_indices("=>") {
+        if !rhs_is_encoding_variant(code[idx + 2..].trim_start()) {
+            continue;
+        }
+        // Pattern text: back to the previous arm boundary.
+        let lhs_start = code[..idx].rfind([',', '{', '}', ';']).map_or(0, |p| p + 1);
+        // After sanitizing, every `"` in `code` is a literal delimiter.
+        if code[lhs_start..idx].contains('"') {
+            hits.push(MappingHit {
+                signal: MappingSignal::LiteralMatchArm,
+                offset: idx,
+            });
+        }
+    }
+}
+
+/// Signal (b): a string-keyed two-element table *type* with `Encoding` values —
+/// `&[(&str, Encoding)]`, `[(&str, Encoding); N]`, `HashMap<&str, Encoding>`,
+/// `phf::Map<&'static str, Encoding>`, `Vec<(String, Encoding)>`.
+///
+/// The shape is matched *exactly*, which is what excludes the AC21 fixture
+/// table `&[(&str, RecordingProvider, Option<&str>, Encoding)]`: the text
+/// preceding its `Encoding` normalizes to `…Option<&str>`, which ends in `>`
+/// rather than opening the tuple with `(&str`. A looser "an array mentioning
+/// both `&str` and `Encoding`" test would flag it.
+///
+/// `)` and `>` are the only accepted closers. `}` is deliberately excluded so
+/// `use rskim_tokens::{Counter, Encoding};` (a use-tree, not a type) is not a hit.
+fn scan_str_keyed_table_types(code: &str, hits: &mut Vec<MappingHit>) {
+    const KEY_OPENERS: [&str; 4] = ["(&str", "<&str", "(String", "<String"];
+    let bytes = code.as_bytes();
+    for (idx, _) in code.match_indices("Encoding") {
+        if idx > 0 && is_ident_byte(bytes[idx - 1]) {
+            continue; // `MyEncoding`
+        }
+        let after = code[idx + "Encoding".len()..].trim_start();
+        if !(after.starts_with(')') || after.starts_with('>')) {
+            continue; // not in value position of a 2-element table type
+        }
+        let Some(before) = code[..idx].trim_end().strip_suffix(',') else {
+            continue; // not the second element of anything
+        };
+        let before = before.trim_end();
+        // Last 48 chars are ample for `&[(&'static str` / `HashMap<&str`.
+        let window = before
+            .char_indices()
+            .rev()
+            .nth(47)
+            .map_or(before, |(p, _)| &before[p..]);
+        let norm = normalize_type_text(window);
+        if KEY_OPENERS.iter().any(|k| norm.ends_with(k)) {
+            hits.push(MappingHit {
+                signal: MappingSignal::StrKeyedTableType,
+                offset: idx,
+            });
+        }
+    }
+}
+
+/// Signal (c): a `fn` whose body combines a string-literal text test with an
+/// `Encoding` variant in a yielding position — the family-prefix fallback
+/// shape (`encoding.rs::family_prefix_fallback`), which has neither literal
+/// arms nor a table type.
+///
+/// Scoping to a single `fn` body — enabled by brace matching over sanitized
+/// text — is what prevents a `.starts_with("…")` in one function from combining
+/// with an `Encoding::` in an unrelated sibling function.
+fn scan_prefix_family_fns(code: &str, hits: &mut Vec<MappingHit>) {
+    let bytes = code.as_bytes();
+    for (start, _) in code.match_indices("fn ") {
+        if start > 0 && is_ident_byte(bytes[start - 1]) {
+            continue;
+        }
+        let Some(open) = fn_body_open(code, start) else {
+            continue;
+        };
+        let Some(close) = matching_brace(code, open) else {
+            continue;
+        };
+        let body = &code[open..=close];
+        if LITERAL_TEXT_TESTS.iter().any(|n| body.contains(n)) && body_yields_encoding_variant(body)
+        {
+            hits.push(MappingHit {
+                signal: MappingSignal::PrefixFamilyFn,
+                offset: start,
+            });
+        }
+    }
+}
+
+/// Find every parallel model-string → `Encoding` mapping construct in `src`.
+///
+/// Returns hits in source order, each naming the construct that fired and
+/// carrying a byte offset into the ORIGINAL `src`.
+fn find_parallel_encoding_mappings(src: &str) -> Vec<MappingHit> {
+    let mut hits = Vec::new();
+    // Cheap superset pre-filter. Every signal requires the identifier
+    // `Encoding` in the sanitized text, and sanitizing only ever *blanks*
+    // bytes — it never introduces new ones. So "sanitized contains Encoding"
+    // implies "raw contains Encoding", and skipping here cannot miss a hit.
+    // This is what keeps the gate cheap: of ~504 `.rs` files / ~20 MB under
+    // `crates/`, only 14 files (~250 KB) are sanitized.
+    if !src.contains("Encoding") {
+        return hits;
+    }
+    let code = blank_comments_and_literals(src);
+    scan_literal_match_arms(&code, &mut hits);
+    scan_str_keyed_table_types(&code, &mut hits);
+    scan_prefix_family_fns(&code, &mut hits);
+    hits.sort_by_key(|h| h.offset);
+    hits
+}
+
+/// Boolean convenience wrapper used by the meta-tests.
+fn has_parallel_encoding_mapping(src: &str) -> bool {
+    !find_parallel_encoding_mappings(src).is_empty()
+}
+
+/// 1-based line number and trimmed text of the line containing `offset`,
+/// read from the ORIGINAL (unblanked) source so the message quotes real code.
+fn line_and_snippet(src: &str, offset: usize) -> (usize, String) {
+    let Some(head) = src.get(..offset) else {
+        return (0, String::new());
+    };
+    let line_no = head.bytes().filter(|&b| b == b'\n').count() + 1;
+    let start = head.rfind('\n').map_or(0, |p| p + 1);
+    let end = src[start..].find('\n').map_or(src.len(), |p| start + p);
+    let line = src[start..end].trim();
+    let snippet = if line.chars().count() > 100 {
+        line.chars().take(97).collect::<String>() + "..."
+    } else {
+        line.to_string()
+    };
+    (line_no, snippet)
+}
+
 /// AC7 (sole-mapping gate): assert that `encoding.rs` is the ONLY workspace
-/// source file declaring a `&str -> Encoding` model→encoding mapping. This is
-/// the repository assertion AC7 mandates ("a test MUST assert this table is the
-/// sole mapping in the workspace") — it fails the moment a second ticket (#301,
-/// #302, …) reintroduces a parallel table instead of calling `encoding_for_model`.
+/// source file containing a model-string → `Encoding` mapping construct. This
+/// is the repository assertion AC7 mandates ("a test MUST assert this table is
+/// the sole mapping in the workspace") — it fails the moment a ticket
+/// reintroduces a parallel table instead of calling `encoding_for_model`.
+///
+/// # Exclusions
+///
+/// Exactly one: `crates/rskim-tokens/src/encoding.rs`, by **full path**.
+///
+/// The predecessor also excluded *any file named* `integration.rs`, which
+/// blanket-exempted all five `integration.rs` files in the workspace
+/// (rskim-bench, rskim-compress, rskim-core, rskim-llm, rskim-tokens) from a
+/// workspace-wide invariant. That exclusion existed only because the gate's own
+/// explanatory prose matched its own detector. Blanking comments and literal
+/// contents (`blank_comments_and_literals`) removes the cause, so the exclusion
+/// is gone — and its removal is pinned by `ac7_gate_needs_no_self_exclusion`,
+/// so a future edit that reintroduces the problem fails a test named for the
+/// reason rather than this gate.
 #[test]
 fn ac7_model_encoding_mapping_is_sole_in_workspace() {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    /// Cap on reported hits so a systemic regression produces a readable
+    /// message rather than a wall of text.
+    const MAX_REPORTED: usize = 12;
 
     // Resolve the workspace `crates/` root relative to this crate's manifest.
     let crates_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -549,76 +1084,444 @@ fn ac7_model_encoding_mapping_is_sole_in_workspace() {
     );
 
     // The single authorised location for the model→encoding table.
-    let authorised = crates_root.join("rskim-tokens/src/encoding.rs");
+    let authorised = crates_root
+        .join("rskim-tokens")
+        .join("src")
+        .join("encoding.rs");
+    assert!(
+        authorised.is_file(),
+        "the authorised mapping must exist at {authorised:?} — if this file \
+         moved, update the exclusion rather than deleting it"
+    );
 
-    // Recursively collect all .rs files under crates/.
-    let mut offenders: Vec<String> = Vec::new();
+    let mut offenders: Vec<(PathBuf, Vec<MappingHit>, String)> = Vec::new();
     let mut stack = vec![crates_root.clone()];
-    // Bounded directory walk (no symlink following; finite tree).
+    // Bounded directory walk (finite tree; symlinks are not followed).
     while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                // Skip build artefacts.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue; // no symlink following — the walk stays a finite tree
+            }
+            if file_type.is_dir() {
+                // Skip build artefacts (including crates/rskim-llm/fuzz/target).
                 if path.file_name().is_some_and(|n| n == "target") {
                     continue;
                 }
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && path != authorised
-                // Exclude THIS test file: its explanatory comment names the
-                // detected signature shape and would otherwise self-trigger.
-                && path.file_name().is_none_or(|n| n != "integration.rs")
-            {
-                let src = std::fs::read_to_string(&path).unwrap_or_default();
-                if file_has_str_to_encoding_fn(&src) {
-                    offenders.push(path.display().to_string());
-                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") || path == authorised {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let hits = find_parallel_encoding_mappings(&src);
+            if !hits.is_empty() {
+                offenders.push((path, hits, src));
             }
         }
     }
 
-    assert!(
-        offenders.is_empty(),
-        "AC7 violation: a second `&str -> Encoding` mapping exists outside \
-         encoding.rs (call `encoding_for_model` instead). Offending files: {offenders:?}"
+    if offenders.is_empty() {
+        return;
+    }
+
+    // Fail loud, and name *which construct* fired (CLAUDE.md: "fail loud with
+    // actionable messages, never silently"). The predecessor named only the
+    // file, which is what made its one false positive expensive to diagnose.
+    offenders.sort_by(|a, b| a.0.cmp(&b.0));
+    let total: usize = offenders.iter().map(|(_, h, _)| h.len()).sum();
+    let mut report = String::new();
+    let mut shown = 0usize;
+    for (path, hits, src) in &offenders {
+        for hit in hits {
+            if shown == MAX_REPORTED {
+                break;
+            }
+            let (line, snippet) = line_and_snippet(src, hit.offset);
+            let rel = path.strip_prefix(&crates_root).unwrap_or(path);
+            report.push_str(&format!(
+                "\n  crates/{}:{line}\n      signal: {}\n      {snippet}\n",
+                rel.display(),
+                hit.signal.describe()
+            ));
+            shown += 1;
+        }
+    }
+    if total > shown {
+        report.push_str(&format!("\n  ... and {} more\n", total - shown));
+    }
+
+    panic!(
+        "AC7 violation: {total} parallel model→encoding mapping construct(s) found \
+         outside the single source of truth (crates/rskim-tokens/src/encoding.rs, \
+         module docs lines 3-5).\n{report}\n\
+         Fix: call `rskim_tokens::encoding_for_model(model_id)` instead of \
+         re-deriving the mapping.\n\
+         Note: a thin *delegating wrapper* that calls `encoding_for_model` and only \
+         adds provider-level defaults is NOT a violation and is NOT flagged — this \
+         detector reads bodies and table types, not signatures. If you believe this \
+         hit is spurious, the fix is to sharpen the named signal in \
+         crates/rskim-tokens/tests/integration.rs, not to add a path exclusion."
     );
 }
 
+// ---------------------------------------------------------------------------
+// Fixtures for the meta-test below. Raw strings so the embedded Rust reads
+// naturally.
+//
+// NOTE on non-vacuity of the *negative* fixtures: `find_parallel_encoding_mappings`
+// short-circuits on sources that never mention `Encoding`. A negative fixture
+// without the identifier would pass on the pre-filter alone and prove nothing
+// about the signals, so every negative below mentions `Encoding` in code.
+// ---------------------------------------------------------------------------
+
+/// The `analytics::select_encoding` shape verbatim: a delegating wrapper whose
+/// only match arms are Encoding→Encoding. The predecessor detector flagged this
+/// and blocked a merge. It MUST NOT be flagged.
+const FIXTURE_DELEGATING_WRAPPER: &str = r#"
+use rskim_tokens::{Encoding, encoding_for_model};
+pub(crate) fn select_encoding(provider: &RecordingProvider, model: Option<&str>) -> Encoding {
+    match provider {
+        RecordingProvider::Unknown => Encoding::Heuristic,
+        RecordingProvider::Anthropic => match model {
+            None => Encoding::AnthropicOffline,
+            Some(m) => match encoding_for_model(m) {
+                Encoding::Heuristic => Encoding::AnthropicOffline,
+                e => e,
+            },
+        },
+        RecordingProvider::OpenAI => match model {
+            None => Encoding::O200k,
+            Some(m) => match encoding_for_model(m) {
+                Encoding::Heuristic => Encoding::O200k,
+                e => e,
+            },
+        },
+    }
+}
+"#;
+
+/// The AC21 table-driven test fixture from `analytics/mod.rs`: a 4-tuple
+/// table whose elements happen to include both `&str` and `Encoding`. A loose
+/// "array mentioning &str and Encoding" check would flag it. It MUST NOT be.
+const FIXTURE_AC21_FOUR_TUPLE_TABLE: &str = r#"
+fn test_select_encoding_table_driven() {
+    let cases: &[(&str, RecordingProvider, Option<&str>, Encoding)] = &[
+        ("Unknown+None", RecordingProvider::Unknown, None, Encoding::Heuristic),
+        ("OpenAI+gpt-4(Cl100k)", RecordingProvider::OpenAI, Some("gpt-4"), Encoding::Cl100k),
+    ];
+    for &(label, ref provider, model, expected) in cases {
+        assert_eq!(select_encoding(provider, model), expected, "case {label}");
+    }
+}
+"#;
+
 /// Guard against a vacuous AC7 gate (PF-007): the detector must FIRE on every
-/// realistic parallel-mapping shape and stay SILENT on non-mappings.
+/// realistic parallel-mapping construct and stay SILENT on everything else.
+///
+/// DELIBERATE BEHAVIOUR CHANGE vs. predecessor: the four original positive
+/// fixtures were bare signatures with `{ todo!() }` bodies. Under body-based
+/// detection an empty body is not a mapping and no longer fires — correctly,
+/// because a bare `-> Encoding` signature is precisely the delegating-wrapper
+/// shape that caused the false positive. Each fixture now carries a realistic
+/// table body while preserving the return-path coverage the originals were
+/// written for.
 #[test]
 fn ac7_detector_catches_parallel_mappings_and_ignores_getters() {
-    // Positive cases — these MUST be flagged.
-    assert!(file_has_str_to_encoding_fn(
-        "pub fn t(model: &str) -> Encoding { todo!() }"
+    // === POSITIVES — these MUST be flagged =================================
+
+    // (1) bare `Encoding::` variants
+    assert!(has_parallel_encoding_mapping(
+        r#"pub fn t(model: &str) -> Encoding {
+               match model { "gpt-4" => Encoding::Cl100k, _ => Encoding::Heuristic }
+           }"#
     ));
-    assert!(file_has_str_to_encoding_fn(
-        "fn t(m: &str) -> crate::Encoding { todo!() }"
+    // (2) `crate::`-qualified variants
+    assert!(has_parallel_encoding_mapping(
+        r#"fn t(m: &str) -> crate::Encoding {
+               match m { "gpt-4o" => crate::Encoding::O200k, _ => crate::Encoding::Heuristic }
+           }"#
     ));
-    assert!(file_has_str_to_encoding_fn(
-        "fn t(m: &str) -> rskim_tokens::Encoding {\n}"
+    // (3) `rskim_tokens::`-qualified variants
+    assert!(has_parallel_encoding_mapping(
+        r#"fn t(m: &str) -> rskim_tokens::Encoding {
+               match m {
+                   "claude-opus-4-5" => rskim_tokens::Encoding::AnthropicOffline,
+                   _ => rskim_tokens::Encoding::Heuristic,
+               }
+           }"#
     ));
-    assert!(file_has_str_to_encoding_fn(
-        "pub fn t(m: &str)\n    -> Result<Encoding, Error> { todo!() }"
+    // (4) multi-line signature + `Result<Encoding, Error>` wrapper
+    assert!(has_parallel_encoding_mapping(
+        r#"pub fn t(m: &str)
+               -> Result<Encoding, Error> {
+               Ok(match m { "gpt-4" => Encoding::Cl100k, _ => Encoding::Heuristic })
+           }"#
     ));
 
-    // Negative cases — these MUST NOT be flagged.
+    // (5) OWNED parameter — invisible to the predecessor (closes under-inclusiveness).
     assert!(
-        !file_has_str_to_encoding_fn("pub fn encoding(&self) -> Encoding { self.enc }"),
-        "&self getter (no &str param) must not be flagged"
+        has_parallel_encoding_mapping(
+            r#"fn t(model: String) -> Encoding {
+                   match model.as_str() { "gpt-4" => Encoding::Cl100k, _ => Encoding::Heuristic }
+               }"#
+        ),
+        "owned `model: String` parameter must not hide a table"
+    );
+
+    // (6) module-level const table, NO enclosing fn at all.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"const TABLE: &[(&str, Encoding)] = &[("gpt-4", Encoding::Cl100k)];"#
+        ),
+        "module-level &[(&str, Encoding)] table must be flagged"
+    );
+
+    // (7) HashMap keyed by &'static str.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"fn table() -> HashMap<&'static str, Encoding> { HashMap::new() }"#
+        ),
+        "HashMap<&str, Encoding> must be flagged (lifetime must not hide it)"
+    );
+
+    // (8) fixed-size array table.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"static T: [(&str, Encoding); 2] =
+                   [("gpt-4", Encoding::Cl100k), ("gpt-4o", Encoding::O200k)];"#
+        ),
+        "[(&str, Encoding); N] table must be flagged"
+    );
+
+    // (9) prefix-family classifier — no arms, no table type.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"fn fam(m: &str) -> Encoding {
+                   if m.starts_with("gpt-") { return Encoding::O200k; }
+                   if m.starts_with("claude-") { return Encoding::AnthropicOffline; }
+                   Encoding::Heuristic
+               }"#
+        ),
+        "family-prefix fallback must be flagged (this is encoding.rs tier 2)"
+    );
+
+    // (10) multi-line `|`-separated pattern list (the real encoding.rs shape).
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"fn t(m: &str) -> Encoding {
+                   match m {
+                       "gpt-3.5-turbo"
+                       | "gpt-4"
+                       | "gpt-4-turbo" => Encoding::Cl100k,
+                       _ => Encoding::Heuristic,
+                   }
+               }"#
+        ),
+        "multi-line |-separated pattern list must be flagged"
+    );
+
+    // (11) `Option`-wrapped literal pattern.
+    assert!(
+        has_parallel_encoding_mapping(
+            r#"fn t(m: Option<&str>) -> Encoding {
+                   match m { Some("gpt-4") => Encoding::Cl100k, _ => Encoding::Heuristic }
+               }"#
+        ),
+        "Some(\"literal\") pattern must be flagged"
+    );
+
+    // === NEGATIVES — these MUST NOT be flagged =============================
+
+    // Hazard 1: the delegating wrapper that caused the predecessor's false positive.
+    assert!(
+        !has_parallel_encoding_mapping(FIXTURE_DELEGATING_WRAPPER),
+        "a delegating wrapper that calls encoding_for_model and only adds \
+         provider-level defaults is NOT a parallel table — this is the exact \
+         false positive that blocked a merge under the signature-based detector"
+    );
+
+    // Hazard 2: the AC21 4-tuple test table.
+    assert!(
+        !has_parallel_encoding_mapping(FIXTURE_AC21_FOUR_TUPLE_TABLE),
+        "a 4-tuple test-case table is not a (&str, Encoding) mapping"
+    );
+
+    // Hazard 3: prose. Doc, line, and block comments describing banned shapes.
+    assert!(
+        !has_parallel_encoding_mapping(
+            "/// Maps \"gpt-4\" => Encoding::Cl100k via a HashMap<&str, Encoding>.\n\
+             //! Module doc: `const T: &[(&str, Encoding)]` is banned.\n\
+             // static TABLE: &[(&str, Encoding)] = &[(\"gpt-4\", Encoding::Cl100k)];\n\
+             /* Encoding::Cl100k, /* nested */ &[(&str, Encoding)] */\n\
+             fn nothing() {}"
+        ),
+        "comment text must never trip the gate — this is why the blanket \
+         integration.rs exclusion could be removed"
+    );
+
+    // Hazard 4: fixture source stored as a string literal (this file's own shape).
+    assert!(
+        !has_parallel_encoding_mapping(
+            "const FIXTURE: &str = \"match m { \\\"gpt-4\\\" => Encoding::Cl100k }\";\n\
+             const RAW: &str = r#\"static T: &[(&str, Encoding)] = &[];\"#;"
+        ),
+        "Rust source held in a string literal is data, not code — this is what \
+         lets the meta-test fixtures coexist with the workspace walk"
+    );
+
+    // Predecessor negatives, retained.
+    assert!(
+        !has_parallel_encoding_mapping("pub fn encoding(&self) -> Encoding { self.enc }"),
+        "&self getter must not be flagged"
     );
     assert!(
-        !file_has_str_to_encoding_fn("fn name(&self) -> &str { self.name }"),
+        !has_parallel_encoding_mapping(
+            "use rskim_tokens::Encoding;\nfn name(&self) -> &str { self.name }"
+        ),
         "&str return (not Encoding) must not be flagged"
     );
     assert!(
-        !file_has_str_to_encoding_fn("fn count(text: &str) -> usize { text.len() }"),
+        !has_parallel_encoding_mapping(
+            "use rskim_tokens::Encoding;\nfn count(text: &str) -> usize { text.len() }"
+        ),
         "unrelated &str fn must not be flagged"
+    );
+
+    // Reverse direction: Encoding → label (analytics::counting_basis_label).
+    assert!(
+        !has_parallel_encoding_mapping(
+            r#"fn basis(e: Encoding) -> &'static str {
+                   match e {
+                       Encoding::Cl100k | Encoding::O200k => "exact",
+                       Encoding::AnthropicOffline => "approximation",
+                       Encoding::Heuristic => "heuristic",
+                   }
+               }"#
+        ),
+        "Encoding -> label projection is not a model -> Encoding mapping"
+    );
+
+    // String literals mapping to a NON-Encoding enum.
+    assert!(
+        !has_parallel_encoding_mapping(
+            r#"use rskim_tokens::Encoding;
+               fn provider(s: Option<&str>) -> RecordingProvider {
+                   match s {
+                       Some("anthropic") => RecordingProvider::Anthropic,
+                       Some("openai") => RecordingProvider::OpenAI,
+                       _ => RecordingProvider::Unknown,
+                   }
+               }"#
+        ),
+        "string arms producing a non-Encoding type are not a mapping"
+    );
+
+    // Ordinary construction + assertion — the most common shape in this crate.
+    assert!(
+        !has_parallel_encoding_mapping(
+            r#"#[test]
+               fn t() {
+                   let e = Encoding::Cl100k;
+                   let c = Counter::new(Encoding::Cl100k).unwrap();
+                   assert_eq!(encoding_for_model("gpt-4"), Encoding::Cl100k);
+                   assert!(c.label().contains("exact"));
+                   let _ = e;
+               }"#
+        ),
+        "constructing a Counter and asserting on a model id is not a mapping; \
+         `.contains(\"…\")` must not fire without a yielded Encoding variant"
+    );
+
+    // Sanitizer invariant: byte length is preserved, so hit offsets index the
+    // original source and reported line numbers are exact.
+    let tricky = "let a: &'static str = \"}{\"; /* } */ let c = '}'; let r = r#\"}\"#;\n";
+    assert_eq!(
+        blank_comments_and_literals(tricky).len(),
+        tricky.len(),
+        "sanitizer must preserve byte length (offsets index the original source)"
+    );
+    assert_eq!(
+        blank_comments_and_literals(tricky).matches('\n').count(),
+        tricky.matches('\n').count(),
+        "sanitizer must preserve newlines (line numbers must stay exact)"
+    );
+}
+
+/// PF-007 anti-vacuity: the detector MUST fire on the real, authorised table.
+///
+/// This is the strongest guard in the file. A hardened detector that quietly
+/// stopped matching `encoding.rs` would make
+/// `ac7_model_encoding_mapping_is_sole_in_workspace` pass unconditionally —
+/// worse than the detector it replaced. This test proves the gate is saved by
+/// the *exclusion*, not by a detector miss, and pins BOTH tiers of the real
+/// table independently.
+#[test]
+fn ac7_detector_fires_on_the_authorised_table() {
+    use std::path::Path;
+
+    let authorised = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("encoding.rs");
+    let src = std::fs::read_to_string(&authorised)
+        .unwrap_or_else(|e| panic!("must read {authorised:?}: {e}"));
+
+    let hits = find_parallel_encoding_mappings(&src);
+    assert!(
+        !hits.is_empty(),
+        "PF-007: the detector must fire on the authorised table itself — a \
+         detector that misses encoding.rs makes the AC7 gate vacuous"
+    );
+    assert!(
+        hits.iter()
+            .any(|h| h.signal == MappingSignal::LiteralMatchArm),
+        "tier 1 (exact-match literal arms, encoding.rs:71-108) must be detected; \
+         got {:?}",
+        hits.iter().map(|h| h.signal).collect::<Vec<_>>()
+    );
+    assert!(
+        hits.iter()
+            .any(|h| h.signal == MappingSignal::PrefixFamilyFn),
+        "tier 2 (family_prefix_fallback, encoding.rs:118-139) must be detected; \
+         got {:?}",
+        hits.iter().map(|h| h.signal).collect::<Vec<_>>()
+    );
+}
+
+/// Pins the removal of the predecessor's blanket `integration.rs` exclusion.
+///
+/// That exclusion exempted all five `integration.rs` files in the workspace
+/// from a workspace-wide invariant, purely because this file's own prose
+/// matched its own detector. Comment/literal blanking removed the cause. If a
+/// future edit reintroduces a self-trip (e.g. by writing a fixture as real code
+/// instead of a string literal), this test fails with an explanation rather
+/// than the AC7 gate failing mysteriously.
+#[test]
+fn ac7_gate_needs_no_self_exclusion() {
+    use std::path::Path;
+
+    let this_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("integration.rs");
+    let src = std::fs::read_to_string(&this_file)
+        .unwrap_or_else(|e| panic!("must read {this_file:?}: {e}"));
+
+    let hits = find_parallel_encoding_mappings(&src);
+    assert!(
+        hits.is_empty(),
+        "this test file must not trip its own detector (that is why the blanket \
+         `integration.rs` exclusion could be deleted). Keep detector fixtures as \
+         string literals, and needle constants as string literals. Hits: {:?}",
+        hits.iter()
+            .map(|h| (h.signal, line_and_snippet(&src, h.offset)))
+            .collect::<Vec<_>>()
     );
 }
 
