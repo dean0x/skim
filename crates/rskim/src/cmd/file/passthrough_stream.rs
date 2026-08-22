@@ -48,11 +48,20 @@ use crate::cmd::stream_pump::{
 ///
 /// A run cut short by a closed reader records **nothing** — a truncated run
 /// would record misleading savings.  A completed run records byte counts where
-/// the buffered path records BPE token counts.  Savings are exactly `0` on both
-/// paths (raw *is* the body for this family), so the load-bearing number is
-/// unchanged; only the raw/compressed magnitudes differ.  `--show-stats` is
-/// deliberately routed to the buffered sink so the number skim *displays* stays
-/// byte-for-byte what it was.
+/// the buffered path records BPE token counts.  Per-row *savings* are exactly
+/// `0` on both paths (raw *is* the body for this family), so no row ever claims
+/// a compression it did not achieve.
+///
+/// KNOWN DIVERGENCE, not a wash: the recorded magnitudes are ~4× larger than the
+/// token counts they replace, and `raw_tokens` is not inert — `cmd/stats.rs`
+/// divides `tokens_saved` by it for the dashboard's overall-reduction
+/// percentage.  Passthrough-family runs therefore dilute that percentage more
+/// than they used to.  The direction is conservative (it understates skim's
+/// savings, never overstates them), but it is a real change to a displayed
+/// number and should be closed by recording a token count rather than a byte
+/// count.  `--show-stats` is unaffected: it is deliberately routed to the
+/// buffered sink, so the number skim *displays inline* is byte-for-byte what it
+/// was.
 pub(super) fn run_passthrough_streamed(
     spec: &PassthroughSpec<'_>,
     args: &[String],
