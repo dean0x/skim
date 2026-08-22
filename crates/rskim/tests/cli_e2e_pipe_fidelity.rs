@@ -15,18 +15,29 @@
 //!
 //! CLAUDE.md documents two independent interception surfaces that share the
 //! per-tool handlers but NOT the dispatch front-end.  Every test in this file
-//! drives the **explicit subcommand** path (`skim grep …`).  That is the same
-//! `cmd::dispatch` front-end the **PATH-wrapper** surface reaches via
-//! `detect_argv0_dispatch`, so wrapper coverage follows for the handler body —
-//! but it is **not** the rewrite engine.  No test here exercises
-//! `skim rewrite` / the PreToolUse hook text transformation, and none should be
-//! cited as coverage of it.
+//! drives the **explicit subcommand** path (`skim grep …`), so what is covered
+//! here is the **handler body**, reached via `cmd::dispatch` — and *neither*
+//! front-end:
+//!
+//! - **Not the rewrite engine.**  No test exercises `skim rewrite` / the
+//!   PreToolUse hook text transformation, and none may be cited as coverage of
+//!   it.
+//! - **Not the PATH-wrapper front-end.**  No test sets `argv[0]`, so
+//!   `detect_argv0_dispatch` never runs and neither does the wrapper-only
+//!   fidelity gate above it (`main.rs`: `stdout_is_regular_file()` →
+//!   `cmd::run_inherited_passthrough`, #370).  The wrapper eventually calls the
+//!   same `cmd::dispatch`, so the handler behaviour asserted here does apply
+//!   there — but that is an inference about the shared body, not coverage of the
+//!   wrapper path.  `crates/rskim/tests/cli_both_surfaces_paired.rs` is where
+//!   `argv[0]` dispatch is actually driven.
 //!
 //! ## Anti-flake rules observed here
 //!
-//! - **Never race a live `grep`.**  Every test uses a stub on a prepended PATH
-//!   that emits a fixture, so timing is a property of skim, not of the host
-//!   filesystem.
+//! - **Never race a live `grep`.**  Every test that spawns a child tool uses a
+//!   stub on a prepended PATH that emits a fixture, so timing is a property of
+//!   skim, not of the host filesystem.  (`t8_stdin_input_still_routes_to_the_buffered_path`
+//!   is the one exception, and deliberately so: proving the stdin route did NOT
+//!   spawn anything is the assertion.)
 //! - **Never shell out to `head`.**  `assert_cmd` buffers the whole child and
 //!   cannot close a pipe early, so early-close tests use
 //!   `std::process::Command` + `Stdio::piped()` and drop the handle after N
@@ -34,6 +45,16 @@
 //! - **Assert on wide margins and ordering, never on exact byte counts past the
 //!   cut.**  How much skim managed to write before the reader vanished is a
 //!   kernel-scheduling detail.
+//! - **Every blocking wait is bounded.**  Both `read_n_lines_then_close` and
+//!   `wait_bounded` time out, because the regressions this file guards (a
+//!   stalled pump, the PF-023 stderr-drain deadlock) present as a block, and
+//!   there is no `.config/nextest.toml` `slow-timeout` or workflow
+//!   `timeout-minutes` to catch one.
+//! - **An absence is never the only assertion.**  Tests whose subject is "no
+//!   stderr", "no sentinel", or "exited fast" first assert that skim actually
+//!   produced output and took the pipe-closed path, via
+//!   `read_n_lines_then_close_checked`; otherwise a run that emitted nothing
+//!   passes them all for the wrong reason.
 
 #![cfg(unix)]
 
@@ -105,19 +126,86 @@ fn grep_fixture(n: usize) -> String {
 /// Returns the lines read.  Dropping the `BufReader` (which owns the
 /// `ChildStdout`) is what makes skim's next write fail with `EPIPE` — the exact
 /// thing `| head -N` does.
+///
+/// # Why the read is bounded
+///
+/// The read itself must have a timeout, not just the [`wait_bounded`] that
+/// follows it.  `read_line` on a live pipe blocks forever, and "skim delivered
+/// fewer than `count` lines and then stopped" is *precisely* the regression this
+/// file guards (a stalled pump, or the PF-023 / AD-STR-8 stderr-drain deadlock).
+/// On that regression the read blocks first, so `wait_bounded` is never reached
+/// and the bound it advertises does not exist.  There is no `.config/nextest.toml`
+/// `slow-timeout` and no `timeout-minutes` in any workflow, so an unbounded read
+/// burns GitHub's 360-minute default instead of failing in seconds.
+///
+/// The reading is therefore done on a worker thread and collected with
+/// `recv_timeout`; the main thread keeps `&mut Child`, so on timeout it can kill
+/// skim and fail the test with a diagnosis.
 fn read_n_lines_then_close(child: &mut Child, count: usize) -> Vec<String> {
     let stdout = child.stdout.take().expect("stdout must be piped");
-    let mut reader = BufReader::new(stdout);
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+
+    let reader_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        for _ in 0..count {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(None);
+                    return;
+                }
+                Ok(_) => {
+                    if tx.send(Some(line)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        // Returning drops `reader` and with it the pipe's read end — the
+        // `| head -N` moment.  Joining below is what makes that ordering
+        // observable to the caller.
+    });
+
     let mut lines = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut line = String::new();
-        if reader.read_line(&mut line).expect("read_line") == 0 {
-            break;
+        match rx.recv_timeout(HANG_TIMEOUT) {
+            Ok(Some(line)) => lines.push(line),
+            Ok(None) => break,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "skim delivered only {} of {count} lines and then blocked for \
+                     {HANG_TIMEOUT:?}. A stalled pump or the stderr-drain deadlock \
+                     (PF-023 / AD-STR-8) looks exactly like this — failing here \
+                     instead of hanging CI is the whole point of the bound.",
+                    lines.len()
+                );
+            }
         }
-        lines.push(line);
     }
-    drop(reader);
+    let _ = reader_thread.join();
     lines
+}
+
+/// [`read_n_lines_then_close`] plus the precondition that skim actually wrote.
+///
+/// Every early-close assertion downstream is about what happens *after* the
+/// reader leaves, so a run that produced nothing never reached the code under
+/// test.  Without this check a test whose only assertions are absences — no
+/// stderr, no sentinel — passes for the wrong reason.  Mirrors the guard
+/// [`exit_and_stderr_after_early_close`] already applies.
+fn read_n_lines_then_close_checked(child: &mut Child, count: usize, tag: &str) -> Vec<String> {
+    let got = read_n_lines_then_close(child, count);
+    assert_eq!(
+        got.len(),
+        count,
+        "{tag}: skim delivered {} of {count} lines before the reader closed, so this \
+         invocation never reached the behaviour under test — fix the fixture, not \
+         the assertion",
+        got.len()
+    );
+    got
 }
 
 /// Wait for `child`, failing the test rather than hanging CI if it never exits.
@@ -299,8 +387,16 @@ fn t3_pipe_close_is_silent_by_default_and_bannered_under_debug() {
         .stderr(quiet_sink)
         .spawn()
         .unwrap();
-    read_n_lines_then_close(&mut child, 20);
-    wait_bounded(&mut child, "t3-quiet");
+    read_n_lines_then_close_checked(&mut child, 20, "t3-quiet");
+    let quiet_status = wait_bounded(&mut child, "t3-quiet");
+    // Both assertions below are ABSENCES, which a run that emitted nothing and
+    // exited would satisfy for the wrong reason.  Pin the pipe-closed exit first
+    // so "silent" can only mean "silent on the path under test".
+    assert_eq!(
+        quiet_status.code(),
+        Some(141),
+        "t3-quiet: the run must actually have taken the pipe-closed path"
+    );
     let quiet = std::fs::read_to_string(&quiet_path).unwrap();
     assert!(
         quiet.is_empty(),
@@ -418,15 +514,92 @@ fn t6_child_is_killed_when_the_reader_closes_early() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    read_n_lines_then_close(&mut child, 20);
-    wait_bounded(&mut child, "t6");
+    read_n_lines_then_close_checked(&mut child, 20, "t6");
+    let status = wait_bounded(&mut child, "t6");
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "t6: the run must actually have taken the pipe-closed path — otherwise \
+         the sentinel assertion below proves nothing about ChildGuard"
+    );
 
-    // Well past the stub's 1 s stall: if the child survived, the sentinel exists.
-    std::thread::sleep(Duration::from_millis(2_000));
+    // The stub's path to the sentinel is `cat` (dies on EPIPE) -> `sleep 1` ->
+    // `touch`, so a surviving child creates it ~1 s after skim exits.  Poll to a
+    // deadline rather than sleeping a fixed 2 s: with only ~1 s of margin, a
+    // loaded 4-way test runner could let the sentinel land *after* a fixed
+    // check, and that failure mode is a silent PASS, not a flake.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        assert!(
+            !sentinel.exists(),
+            "the child kept running after the reader left — ChildGuard must kill it, \
+             exactly as raw grep dies on SIGPIPE"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// An early close returns promptly even when a GRANDCHILD still holds stderr.
+///
+/// Killing the child closes only *its* copy of the stderr write end.  A
+/// grandchild that inherited fd 2 keeps the pipe open, so `drain_capped` never
+/// reaches EOF — and `stream_child` must therefore **abandon** the drain thread
+/// on the early-close path rather than join it.  Joining blocks skim for the
+/// grandchild's entire lifetime while the raw tool returns at once, which is the
+/// exact latency defect this tier exists to fix.
+///
+/// Real shape: `SKIM_PASSTHROUGH=1 skim cargo build | head` and
+/// `skim yarn <sub> | head` — cargo/yarn/npm all spawn tool processes that
+/// inherit stderr.  Measured before the fix: 26.5 s for a 25 s grandchild,
+/// against 0.33 s for the raw tool.
+///
+/// The assertion is a *gap*, not an absolute deadline from `spawn()`: it starts
+/// counting only after the reader has closed the pipe, so process startup under
+/// a parallel test runner is not part of the budget.
+#[test]
+fn t6b_early_close_does_not_wait_for_a_grandchild_holding_stderr() {
+    /// Grandchild lifetime.  Long enough that joining the drain is unmistakable.
+    const GRANDCHILD_SECS: u64 = 20;
+    /// Budget for skim to exit after the reader leaves.  Far below
+    /// `GRANDCHILD_SECS`, far above a prompt teardown.
+    const EXIT_BUDGET: Duration = Duration::from_secs(5);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("big.out"), grep_fixture(5_000)).unwrap();
+    // `( sleep N ) &` inherits fd 2 from the stub and outlives a kill of it.
+    write_stub_script(
+        dir.path(),
+        "grep",
+        &format!(
+            "#!/bin/sh\n( sleep {GRANDCHILD_SECS} ) &\ncat '{}'\n",
+            dir.path().join("big.out").display()
+        ),
+    );
+
+    let mut child = skim_with_stubs(dir.path(), &["grep", "-rn", "some_function", "."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    read_n_lines_then_close_checked(&mut child, 20, "t6b");
+
+    let closed_at = Instant::now();
+    let status = wait_bounded(&mut child, "t6b");
+    let exit_gap = closed_at.elapsed();
+
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "t6b: the run must actually have taken the pipe-closed path — a run that \
+         emitted nothing would also exit fast and pass the budget below"
+    );
     assert!(
-        !sentinel.exists(),
-        "the child kept running after the reader left — ChildGuard must kill it, \
-         exactly as raw grep dies on SIGPIPE"
+        exit_gap < EXIT_BUDGET,
+        "skim took {exit_gap:?} to exit after the reader closed the pipe, \
+         budget {EXIT_BUDGET:?}. A grandchild is holding the child's stderr \
+         write end open, so the drain thread never reaches EOF — the \
+         early-close path must ABANDON that thread, not join it (ADR-008 \
+         forbids an internal timeout, so not waiting is the only bound)."
     );
 }
 
@@ -567,9 +740,10 @@ fn t8_stdin_input_still_routes_to_the_buffered_path() {
 // documented remedy for "skim hid my output" returned nothing at all.
 //
 // Surface: every test below drives the **explicit subcommand** path
-// (`skim grep …` / `skim find …`), i.e. the same `cmd::dispatch` front-end the
-// PATH-wrapper surface reaches via `detect_argv0_dispatch`.  None of them
-// exercises the rewrite engine.
+// (`skim grep …`), reaching the handler through `cmd::dispatch`.  None of them
+// exercises the rewrite engine, and none sets `argv[0]`, so the PATH-wrapper
+// front-end (`detect_argv0_dispatch` and the `stdout_is_regular_file` gate) is
+// not covered either — see the module header.
 // ============================================================================
 
 /// How long the T9 stub stalls between its two output lines.
@@ -839,9 +1013,9 @@ fn t14_escape_hatch_does_not_append_a_trailing_newline() {
 // exit 101 with one `panicked at` line.
 //
 // Surface: these drive the **explicit subcommand** path (`skim git log …`,
-// `skim make`, `skim vitest run`), i.e. the same `cmd::dispatch` front-end the
-// PATH-wrapper surface reaches via `detect_argv0_dispatch`.  None of them
-// exercises the rewrite engine, and none may be cited as coverage of it.
+// `skim make`, `skim vitest run`), reaching the handler through `cmd::dispatch`.
+// Neither front-end is covered: not the rewrite engine, and not the PATH-wrapper
+// dispatch (no test sets `argv[0]`) — see the module header.
 // ============================================================================
 
 /// A `git log --format=%h %s (%cr) <%an>`-shaped fixture of `n` commits.
@@ -1043,9 +1217,9 @@ fn t15_pipe_close_costs_zero_stderr_bytes() {
 // `skim yarn build` is the probe: `build` is not one of yarn's compressed
 // subcommands, so it takes the raw-passthrough arm.
 //
-// Surface: explicit subcommand path (`cmd::dispatch`), the same front-end the
-// PATH-wrapper surface reaches via `detect_argv0_dispatch`.  Not the rewrite
-// engine.
+// Surface: explicit subcommand path, reaching the handler through
+// `cmd::dispatch`.  Neither front-end is covered: not the rewrite engine, and
+// not the PATH-wrapper dispatch (no test sets `argv[0]`) — see the module header.
 // ============================================================================
 
 /// How long the T16 stub stalls between its two output lines.
