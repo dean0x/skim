@@ -53,9 +53,24 @@
 //! timeout, so kill-on-drop is the *only* thing that stops a child once the
 //! reader has left.  Without it `skim grep -rn x / | head -20` would keep
 //! scanning the filesystem after `head` exited, where raw `grep` dies at once.
-//! On the early-close path the child is killed **before** the drain thread is
-//! joined: the child may be blocked writing to a stdout pipe nobody is reading,
-//! so its stderr would never reach EOF and the join would hang.
+//!
+//! # DESIGN NOTE — the early-close path DETACHES the drain, never joins it
+//!
+//! On the early-close path the child is killed and the drain thread is then
+//! **abandoned, not joined**.  Joining there is unbounded: killing the child
+//! closes only *its* copy of the stderr write end, and any grandchild that
+//! inherited fd 2 keeps the pipe open, so `drain_capped` never reaches EOF.
+//! `SKIM_PASSTHROUGH=1 skim cargo build | head` and `skim yarn <sub> | head`
+//! are exactly that shape — cargo/yarn/npm spawn tool processes that inherit
+//! stderr — and a join would block skim for the grandchild's whole lifetime
+//! while raw `cargo build | head` returns at once.  ADR-008 forbids an internal
+//! timeout, so the bound has to come from not waiting at all.
+//!
+//! Abandoning costs nothing: [`StreamOutcome::PipeClosed`] carries no payload,
+//! so the drain's result was already discarded.  The detached thread holds at
+//! most [`MAX_OUTPUT_BYTES`] and dies with the process.  This matches the
+//! pre-existing precedent in `cmd::infra::gh::streaming`, whose early-return
+//! write-failure paths also drop their stderr `JoinHandle` rather than join it.
 
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
@@ -253,7 +268,9 @@ pub(crate) enum StreamOutcome {
 ///
 /// 1. [`ChildGuard`] wraps the child **at spawn**, so every early return kills it.
 /// 2. The stderr drain thread starts **before the first stdout read**.
-/// 3. On a closed reader the child is killed **before** the drain thread is joined.
+/// 3. On a closed reader the child is killed and the drain thread is **abandoned,
+///    never joined** — a surviving grandchild that inherited fd 2 keeps the
+///    stderr pipe open, so a join there has no bound.
 ///
 /// `sink` is borrowed rather than owned so the caller can keep writing to the
 /// same buffered stdout handle afterwards (the trailing-newline guard).  The pump
@@ -296,13 +313,16 @@ pub(crate) fn stream_child(
     };
 
     if report.stop == PumpStop::PipeClosed {
-        // Kill BEFORE joining: the child may be blocked writing to a stdout pipe
-        // nobody is reading, so its stderr would never reach EOF and the join
-        // would hang.
+        // Kill the child, then ABANDON the drain thread — see the design note
+        // above.  Killing closes only the child's own copy of the stderr write
+        // end; a grandchild that inherited fd 2 (cargo -> rustc, yarn -> node)
+        // keeps the pipe open, so `drain_capped` may never reach EOF and a join
+        // here would block for the grandchild's whole lifetime while the raw
+        // tool returns at once.  `StreamOutcome::PipeClosed` carries no payload,
+        // so the drain's result was already discarded; dropping the handle
+        // detaches the thread, which dies with the process.
         let _ = child.0.kill();
-        if let Some(handle) = stderr_drain {
-            let _ = handle.join();
-        }
+        drop(stderr_drain);
         return Ok(StreamOutcome::PipeClosed);
     }
 
