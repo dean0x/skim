@@ -869,7 +869,9 @@ fn git_log_fixture(n: usize) -> String {
 /// on its passthrough arm.
 fn unparseable_fixture(n: usize) -> String {
     (1..=n)
-        .map(|i| format!("some arbitrary unparseable output line number {i} with padding text here\n"))
+        .map(|i| {
+            format!("some arbitrary unparseable output line number {i} with padding text here\n")
+        })
         .collect()
 }
 
