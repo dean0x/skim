@@ -168,10 +168,10 @@ pub(crate) mod fault_injection {
 /// The sort key is provider-shape-aware: different providers use different
 /// field paths to carry the tool name.
 ///
-/// # TEMPORARY INSTRUMENTATION NOTE
+/// # Bench visibility
 ///
-/// This enum is `pub` only to allow direct measurement in `benches/align_bench.rs`.
-/// It is NOT part of the stable public API of this crate.
+/// This enum is `pub` with `#[doc(hidden)]` to allow direct measurement in
+/// `benches/align_bench.rs`. It is NOT part of the stable public API of this crate.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolArrayKind {
@@ -417,10 +417,10 @@ fn extract_name_from_pairs(
 /// Returns `None` if any element fails canonicalization (depth exceeded or parse
 /// error) → whole-request fail-open.
 ///
-/// # TEMPORARY INSTRUMENTATION NOTE
+/// # Bench visibility
 ///
-/// This function is `pub` only to allow direct measurement in `benches/align_bench.rs`.
-/// It is NOT part of the stable public API of this crate.
+/// This function is `pub` with `#[doc(hidden)]` to allow direct measurement in
+/// `benches/align_bench.rs`. It is NOT part of the stable public API of this crate.
 #[doc(hidden)]
 pub fn sort_tools_array(raw: &str, kind: ToolArrayKind) -> Option<Vec<u8>> {
     let elements = parse_array_elements(raw)?;

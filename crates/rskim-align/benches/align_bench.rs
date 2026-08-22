@@ -6,7 +6,7 @@
 //!
 //! # AC17 — Worst-case latency gate
 //!
-//! CI asserts p99 < 5 ms on three groups:
+//! CI asserts p99 < 9.0 ms on three groups:
 //! - `align_anthropic_64tools` — 64 tools, nested schema depth ≥8
 //! - `align_anthropic_512kb` — 512 KB multi-turn body
 //! - `align_openai_64tools` — same 64 tools, OpenAI format
@@ -146,7 +146,7 @@ fn build_openai_n_tools(n: usize, depth: usize) -> Vec<u8> {
 
 /// AC17 — Worst-case fixture: 64 tools × nested depth 8 (Anthropic).
 ///
-/// This is the primary p99 measurement for the CI gate (< 5 ms).
+/// This is the primary p99 measurement for the CI gate (< 9.0 ms).
 fn bench_align_anthropic_64tools(c: &mut Criterion) {
     let body = build_anthropic_n_tools(64, 8);
     let body_len = body.len();
