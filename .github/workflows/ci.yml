@@ -2,16 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [ main, 'feature/*', 'wave/**', 'ticket/**' ]
+    branches: [ main, 'feature/*', 'wave/**' ]
   pull_request:
 
-# Cancel any in-progress run for the same workflow + ref so a push to an open
-# PR branch does not trigger two concurrent runs (one from push:branches, one
-# from pull_request). The group key is stable per-ref for both event types:
-# `github.ref` is `refs/heads/<branch>` on push and `refs/pull/<n>/merge` on
-# pull_request, so runs for different PRs or branches never share a group.
+# Cancel any in-progress run for the same workflow + branch so a push to an
+# open PR does not run alongside the pull_request event for the same commit.
+#
+# Why not `github.ref`: on push it is `refs/heads/<branch>`; on pull_request
+# it is `refs/pull/<n>/merge` — different strings for the same branch, so the
+# old group key never matched and nothing was cancelled.  `github.head_ref` is
+# the bare branch name on pull_request and empty on push; `github.ref_name` is
+# the bare branch name on push.  Together they form a stable per-branch key
+# that deduplicates across both event types.
+#
+# Ticket branches (ticket/**) are intentionally absent from push:branches so
+# the authoritative gate is always the pull_request run (which tests the merge
+# commit against the base), not an earlier push run against the tip alone.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:

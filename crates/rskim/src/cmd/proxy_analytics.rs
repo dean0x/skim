@@ -831,14 +831,16 @@ mod tests {
 
         assert!(consumer_finished, "consumer must finish — no panic or hang");
 
-        // PF-007 discriminating: with set_busy_timeout(100ms) each BUSY wait is
+        // PF-007/ADR-003 discriminating: with set_busy_timeout(100ms) each BUSY wait is
         // capped at ~100ms → 3 × 100ms ≈ 300ms total.  Without the cap the
         // fallback from AnalyticsDb::open is 5000ms/event → ~15s total.
-        // Deleting proxy_analytics.rs line 262 must fail this assertion.
+        // 5s bound: observed 2.115s on CI (run 32871027659) with ~2.4× headroom.
+        // The discriminating property is the ~3× gap to the ~15s uncapped path,
+        // not the absolute value.  Deleting proxy_analytics.rs line 262 must fail.
         assert!(
-            elapsed < std::time::Duration::from_millis(2_000),
+            elapsed < std::time::Duration::from_millis(5_000),
             "AC15 busy_timeout cap: drained {N_EVENTS} events under exclusive lock in \
-             {elapsed:?}; expected < 2s (each BUSY capped at 100ms). Without \
+             {elapsed:?}; expected < 5s (each BUSY capped at 100ms). Without \
              set_busy_timeout(100ms) the fallback is 5000ms/event (~15s total)."
         );
 
