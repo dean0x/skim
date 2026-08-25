@@ -142,9 +142,8 @@ pub(super) fn detect_state(
 
     let mut hook_installed = false;
     let mut hook_version = None;
-    let existing_hooks;
 
-    if protocol.uses_dedicated_hook_file() {
+    let existing_hooks = if protocol.uses_dedicated_hook_file() {
         // Copilot-style: detect from hooks/skim.json, not settings.json.
         hook_installed = protocol.detect_hook_registration(&hook_config_dir);
         if hook_installed {
@@ -153,7 +152,7 @@ pub(super) fn detect_state(
                 .as_deref()
                 .and_then(parse_version_from_script);
         }
-        existing_hooks = protocol.scan_foreign_hooks(&hook_config_dir);
+        protocol.scan_foreign_hooks(&hook_config_dir)
     } else {
         // settings.json-style: existing detection code (behaviorally unchanged).
         let parsed_settings = read_settings_json(&settings_path);
@@ -187,13 +186,13 @@ pub(super) fn detect_state(
                 }
             }
         }
-        existing_hooks = scan_existing_hooks(
+        scan_existing_hooks(
             parsed_settings.as_ref(),
             protocol.hook_event_key(),
             protocol.tool_matcher(),
             protocol.as_ref(),
-        );
-    }
+        )
+    };
 
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags, agent, env)?;
