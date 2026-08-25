@@ -10,9 +10,7 @@ use super::helpers::{
     HOOK_SCRIPT_NAME, SETTINGS_BACKUP, atomic_write_settings, check_mark, confirm_grant,
     confirm_proceed, load_or_create_settings, resolve_real_settings_path,
 };
-use super::state::{
-    DetectedState, detect_state, has_skim_hook_entry, parse_commit_from_script, read_settings_json,
-};
+use super::state::{DetectedState, detect_state, has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
@@ -471,20 +469,46 @@ fn run_install_single(
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
-    // Include manifest presence in the fast path: if the manifest is absent,
-    // fall through to execute_install → create_hook_script, which will write
-    // (or re-write) the manifest.  This makes `skim init` self-heal a missing
-    // sidecar so that `skim doctor`'s advice ("run `skim init`") actually works
-    // (Group 4 fix / #471).
-    let manifest_present =
-        crate::cmd::integrity::read_hash_manifest(&state.hook_config_dir, state.agent_cli_name)
-            .is_some();
+    // Gate the fast path on integrity, not just manifest presence.
+    //
+    // Variant decisions:
+    // - Verified   → fast path ALLOWED: hash matches the stored manifest.
+    // - Tampered   → fast path BLOCKED: must reach create_hook_script, which
+    //                regenerates from source and prints "Repaired". Allowing the
+    //                fast path here would launder the divergence and produce a
+    //                non-converging repair loop (same shape as the binary-pin bug
+    //                this branch already fixed once).
+    // - NoManifest → fast path BLOCKED: fall through so execute_install →
+    //                create_hook_script writes the manifest for the first time
+    //                (Group 4 fix / #471; matches the old manifest_present = false
+    //                behaviour that was intentional).
+    // - Unreadable → fast path BLOCKED (fail-closed): cannot verify the script,
+    //                so fall through. create_hook_script also bails on Unreadable
+    //                with an actionable error, so both gates agree — no stuck state.
+    let integrity_verified = {
+        use crate::cmd::integrity::{ScriptIntegrity, classify_script_integrity};
+        let script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+        matches!(
+            classify_script_integrity(&state.hook_config_dir, state.agent_cli_name, &script_path),
+            ScriptIntegrity::Verified
+        )
+    };
     if state.hook_installed
         && state.hook_is_current()
         && guidance_current
         && !permissions_blocked
-        && manifest_present
+        && !flags.force
+        && integrity_verified
     {
+        // Wrappers run inside the fast path so that `skim init --wrappers` on a
+        // current hook install still installs wrappers without falling through to
+        // a full reinstall (C-3 fix: repeat `--wrappers` no longer clobbers
+        // settings.json.bak).  `flags.dry_run` is forwarded so `--dry-run
+        // --wrappers` on a current install shows dry-run output rather than
+        // actually creating symlinks.
+        if !flags.project {
+            maybe_install_wrappers(flags.wrappers, flags.dry_run)?;
+        }
         print_already_up_to_date();
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -720,8 +744,7 @@ fn maybe_install_wrappers(wrappers: Option<bool>, dry_run: bool) -> anyhow::Resu
         return Ok(());
     }
 
-    let skim_binary = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("cannot determine skim binary path: {e}"))?;
+    let skim_binary = super::helpers::resolve_skim_binary()?;
 
     let result = super::wrappers::install_wrappers(&skim_binary, dry_run)?;
 
@@ -755,12 +778,17 @@ fn print_wrapper_install_result(result: &super::wrappers::InstallResult, dry_run
                 result.skipped_non_symlink
             );
         }
-        println!();
-        println!("  To enable wrappers, add to ~/.zshrc or ~/.bashrc:");
-        println!("    export PATH=\"$HOME/.skim/bin:$PATH\"");
-        println!();
-        println!("  Set SKIM_SESSION_ID in your shell profile for analytics attribution:");
-        println!("    export SKIM_SESSION_ID=\"<your-session-id>\"");
+        // Only print the PATH setup instructions when wrappers were actually
+        // created or updated. When all are already correct (re-run of `init
+        // --wrappers` on an up-to-date install) the blurb is noise.
+        if result.created + result.updated > 0 {
+            println!();
+            println!("  To enable wrappers, add to ~/.zshrc or ~/.bashrc:");
+            println!("    export PATH=\"$HOME/.skim/bin:$PATH\"");
+            println!();
+            println!("  Set SKIM_SESSION_ID in your shell profile for analytics attribution:");
+            println!("    export SKIM_SESSION_ID=\"<your-session-id>\"");
+        }
     }
 }
 
@@ -796,46 +824,6 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
 // Hook script generation (B7)
 // ============================================================================
 
-/// Return `true` when the script at `script_path` is fully current: correct
-/// version marker, pinned-binary format (F6), **and** the same git commit as
-/// the running binary.
-///
-/// Three conditions must all hold:
-/// 1. The `# skim-hook v{version}` marker matches the current semver.
-/// 2. The script exports `SKIM_HOOK_BINARY` (F6 pinned-binary format; old
-///    bare-exec scripts lack it and must be regenerated).
-/// 3. The `export SKIM_HOOK_COMMIT=` line matches the compiled-in
-///    `SKIM_GIT_COMMIT`. When the compiled commit is `"unknown"` (tarball /
-///    crates.io builds have no git SHA) the commit check is **skipped** so
-///    these builds do not rewrite on every invocation.
-///
-/// # #466 follow-up — the second gate
-///
-/// `hook_is_current()` on `DetectedState` (state.rs) was fixed by PR #468 to
-/// include the commit comparison, but `create_hook_script` had its own
-/// independent version-only gate here that was not updated. This function is
-/// the fix: it mirrors the same commit logic so both gates agree.
-fn is_hook_script_current(script_path: &std::path::Path, version: &str) -> bool {
-    let Ok(contents) = std::fs::read_to_string(script_path) else {
-        return false;
-    };
-    let version_line = format!("# skim-hook v{version}");
-    if !(contents.contains(&version_line) && super::script_has_pinned_marker(&contents)) {
-        return false;
-    }
-    // B5c follow-up: also require the recorded commit to match the compiled one.
-    // Skip when the compiled commit is "unknown" (tarball builds have no git SHA).
-    let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-    if compiled_commit != "unknown" {
-        match parse_commit_from_script(&contents) {
-            Some(ref hook_commit) if hook_commit == compiled_commit => {}
-            // Absent commit (pre-commit-pinning script) or mismatched commit → stale.
-            _ => return false,
-        }
-    }
-    true
-}
-
 fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     let hooks_dir = state.hook_config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
@@ -850,60 +838,90 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
         }
     }
 
-    // Check if existing script has same version (idempotent)
+    // Check if existing script is current (idempotent).
+    // Uses the already-detected hook state rather than re-reading the script.
     if script_path.exists() {
-        if is_hook_script_current(&script_path, &state.skim_version) {
-            // Script is current — write (or re-write) the manifest so `skim init`
-            // self-heals a missing or stale sidecar.  This makes doctor's advice
-            // ("run `skim init --agent {agent}`") actually work (Group 4 fix / #471).
-            let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
-            crate::cmd::integrity::write_hash_manifest(
+        if state.hook_is_current() {
+            // Script is current — but only self-heal the manifest when integrity
+            // passes. A Tampered verdict means the on-disk bytes are unknown;
+            // hashing and writing them would launder the divergence, making a
+            // subsequent `skim doctor` report Verified for the wrong reason.
+            // Instead, fall through to the write path so the script is restored
+            // from the known-good generator (applies PF-016 / ADR-004 repair).
+            use crate::cmd::integrity::{ScriptIntegrity, classify_script_integrity};
+            match classify_script_integrity(
                 &state.hook_config_dir,
                 state.agent_cli_name,
-                HOOK_SCRIPT_NAME,
-                &hash,
-            )?;
-            println!(
-                "  {} Skipped: {} (already v{})",
-                check_mark(true),
-                script_path.display(),
-                state.skim_version
-            );
-            return Ok(());
-        }
-        // Different version — will overwrite
-        if let Some(old_ver) = &state.hook_version {
-            println!(
-                "  {} Updated: {} (v{} -> v{})",
-                check_mark(true),
-                script_path.display(),
-                old_ver,
-                state.skim_version
-            );
+                &script_path,
+            ) {
+                ScriptIntegrity::Verified | ScriptIntegrity::NoManifest => {
+                    // Verified: hash matches the stored manifest → re-write to
+                    // refresh a stale sidecar (Group 4 fix / #471).
+                    // NoManifest: no manifest yet → write it for the first time
+                    // (self-heal for pre-manifest installs).
+                    // In both cases we hash the CONFIRMED-GOOD on-disk bytes.
+                    let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
+                    crate::cmd::integrity::write_hash_manifest(
+                        &state.hook_config_dir,
+                        state.agent_cli_name,
+                        HOOK_SCRIPT_NAME,
+                        &hash,
+                    )?;
+                    println!(
+                        "  {} Skipped: {} (already v{})",
+                        check_mark(true),
+                        script_path.display(),
+                        state.skim_version
+                    );
+                    return Ok(());
+                }
+                ScriptIntegrity::Tampered => {
+                    // Script content was modified after install. Do NOT hash the
+                    // tampered bytes — that would launder the divergence. Fall
+                    // through to the regeneration path below so the known-good
+                    // content is written and the manifest is recomputed from it.
+                    println!(
+                        "  {} Repaired: {} (content tampered; regenerating from source v{})",
+                        check_mark(true),
+                        script_path.display(),
+                        state.skim_version,
+                    );
+                }
+                ScriptIntegrity::Unreadable => {
+                    anyhow::bail!(
+                        "cannot read hook script {} to verify its integrity: check permissions\n\
+                         hint: run `skim init --force --agent {}` to overwrite",
+                        script_path.display(),
+                        state.agent_cli_name,
+                    );
+                }
+            }
         } else {
-            println!("  {} Updated: {}", check_mark(true), script_path.display());
+            // Different version — will overwrite
+            if let Some(old_ver) = &state.hook_version {
+                println!(
+                    "  {} Updated: {} (v{} -> v{})",
+                    check_mark(true),
+                    script_path.display(),
+                    old_ver,
+                    state.skim_version
+                );
+            } else {
+                println!("  {} Updated: {}", check_mark(true), script_path.display());
+            }
         }
     } else {
         println!("  {} Created: {}", check_mark(true), script_path.display());
     }
 
-    // Canonicalize the current binary path for embedding in the hook script.
+    // Resolve the canonical binary path for embedding in the hook script.
     // B5b: failure here must be loud — a silent empty path produces an
     // unpinned hook script, which is exactly the state this whole change
     // exists to eliminate. `create_hook_script` returns `Result`, so we
     // thread the error instead of falling back to an empty string.
-    let binary_path = std::env::current_exe()
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "cannot determine the skim binary path: {e}\n\
-                 hint: re-run `skim init` from the skim binary directly"
-            )
-        })
-        .map(|p| {
-            // Prefer the canonical path (resolves symlinks); fall back to the
-            // original path when canonicalize fails (rare: e.g. deleted-while-open).
-            std::fs::canonicalize(&p).unwrap_or(p)
-        })?;
+    // Uses the shared `resolve_skim_binary()` helper so this site and
+    // `maybe_install_wrappers` always produce the same canonical path.
+    let binary_path = super::helpers::resolve_skim_binary()?;
     let binary_path_str = binary_path.to_string_lossy();
 
     // Delegate to the shared generator in hooks/mod.rs so install.rs and per-agent
@@ -1482,150 +1500,6 @@ mod tests {
             entries.len(),
             1,
             "running upsert twice should produce exactly one entry, not a duplicate"
-        );
-    }
-
-    // ---- is_hook_script_current ----
-
-    #[test]
-    fn test_is_hook_script_current_pinned_format_returns_true() {
-        // B5c follow-up: the commit in the script must match the compiled commit.
-        // Use the actual compiled commit so the check passes, or any placeholder
-        // when the compiled commit is "unknown" (tarball build, check skipped).
-        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        let hook_commit = if compiled_commit == "unknown" {
-            "abc1234".to_string()
-        } else {
-            compiled_commit.to_string()
-        };
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // New F6 pinned format: version comment + SKIM_HOOK_BINARY export + current commit.
-        let content = format!(
-            "#!/bin/sh\n# skim-hook v1.2.3\n\
-             export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-             export SKIM_HOOK_COMMIT={hook_commit}\n\
-             _SKIM_BIN='/usr/local/bin/skim'\n\
-             if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
-             exec skim rewrite --hook --agent claude-code\n"
-        );
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            is_hook_script_current(&path, "1.2.3"),
-            "matching version + SKIM_HOOK_BINARY export + matching commit must return true"
-        );
-    }
-
-    /// B5c follow-up (#466 second gate): `is_hook_script_current` must return
-    /// `false` when the version matches but the recorded commit differs from the
-    /// compiled binary's commit.
-    ///
-    /// This is the unit-level companion to the CLI regression test in
-    /// `cli_init.rs::test_init_rewrites_hook_on_stale_commit_same_version`.
-    #[test]
-    fn test_is_hook_script_current_stale_commit_returns_false() {
-        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        if compiled_commit == "unknown" {
-            // Tarball build: commit check is skipped; nothing to assert.
-            return;
-        }
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Script has the right version and pinned-binary marker, but a STALE commit.
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
-                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       export SKIM_HOOK_COMMIT=000000000stale\n\
-                       _SKIM_BIN='/usr/local/bin/skim'\n\
-                       if [ -x \"$_SKIM_BIN\" ]; then exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code; fi\n\
-                       exec skim rewrite --hook --agent claude-code\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "stale commit must cause is_hook_script_current to return false even when version matches"
-        );
-    }
-
-    /// B5c follow-up: a script that has the right version and pinned binary but
-    /// NO commit line (predates commit pinning) must be treated as stale.
-    #[test]
-    fn test_is_hook_script_current_missing_commit_returns_false() {
-        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        if compiled_commit == "unknown" {
-            // Tarball build: commit check is skipped; nothing to assert.
-            return;
-        }
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Script has correct version + pinned-binary marker but NO SKIM_HOOK_COMMIT.
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\n\
-                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       _SKIM_BIN='/usr/local/bin/skim'\n\
-                       exec skim rewrite --hook --agent claude-code\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "script without SKIM_HOOK_COMMIT must be treated as stale (predates commit pinning)"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_old_bare_exec_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Pre-F6 bare-exec format is stale — no SKIM_HOOK_BINARY export.
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\nexec skim rewrite --hook \"$@\"\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "old bare-exec format (no SKIM_HOOK_BINARY) must return false even when version matches"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_wrong_version_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Script has v1.0.0 with new pinned format but we check for v2.0.0
-        let content = "#!/bin/sh\n# skim-hook v1.0.0\n\
-                       export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
-                       exec skim rewrite --hook\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "2.0.0"),
-            "mismatched version must return false"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_missing_file_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("nonexistent.sh");
-
-        assert!(
-            !is_hook_script_current(&path, "1.0.0"),
-            "unreadable/missing file must return false"
-        );
-    }
-
-    #[test]
-    fn test_is_hook_script_current_missing_pinned_binary_returns_false() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("skim-rewrite.sh");
-        // Version matches but no SKIM_HOOK_BINARY export at all
-        let content = "#!/bin/sh\n# skim-hook v1.2.3\nskim rewrite --hook \"$@\"\n";
-        std::fs::write(&path, content).unwrap();
-
-        assert!(
-            !is_hook_script_current(&path, "1.2.3"),
-            "missing SKIM_HOOK_BINARY export must return false even when version matches"
         );
     }
 

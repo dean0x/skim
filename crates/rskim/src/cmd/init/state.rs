@@ -40,6 +40,41 @@ pub(super) struct DetectedState {
 }
 
 impl DetectedState {
+    /// Returns `true` when the hook's recorded binary pin points to the same
+    /// canonical path as the currently-running binary.
+    ///
+    /// # Why this is separate from `hook_is_current`
+    ///
+    /// `hook_is_current` checks version + pinned format + commit. When two skim
+    /// clones sit on the same commit (e.g., `main` vs a worktree at the same
+    /// SHA), all three of those fields match — yet the hook still points to the
+    /// wrong binary. `pin_is_current` catches that remaining case by comparing
+    /// the actual file-system path, not just the version/commit metadata.
+    ///
+    /// `skim doctor` can display the `hook_binary_pin` field independently
+    /// (PF-015: display-without-gate pattern), which is why this predicate is
+    /// separate: it lets the doctor report a pin-mismatch cause with
+    /// `hook_is_current=true, pin_is_current=false` before the fix would have
+    /// been taken by the former fast-path check.
+    pub(super) fn pin_is_current(&self) -> bool {
+        let Some(ref pinned) = self.hook_binary_pin else {
+            return false; // no pin recorded → treat as stale
+        };
+        // Resolve the running binary to its canonical path so symlinked
+        // installations are compared correctly (ADR-004).
+        match super::helpers::resolve_skim_binary() {
+            Ok(running) => {
+                let pinned_path = std::path::Path::new(pinned.as_str());
+                // Canonicalize the pinned path too, in case it was recorded as
+                // a symlink target that has since been re-targeted.
+                let canon_pinned =
+                    std::fs::canonicalize(pinned_path).unwrap_or_else(|_| pinned_path.to_owned());
+                running == canon_pinned
+            }
+            Err(_) => false, // cannot resolve running binary — treat as mismatch
+        }
+    }
+
     /// Returns `true` when the installed hook is at the current version, uses
     /// the pinned binary format, AND pins the same git commit as this binary.
     ///
@@ -83,7 +118,7 @@ pub(super) fn detect_state(
     agent: crate::cmd::session::AgentKind,
     env: &DetectionEnv,
 ) -> anyhow::Result<DetectedState> {
-    let skim_binary = std::env::current_exe()?;
+    let skim_binary = super::helpers::resolve_skim_binary()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
     let config_dir = env.resolve(agent, flags.project)?;
     let protocol = protocol_for_agent(agent);
@@ -107,9 +142,8 @@ pub(super) fn detect_state(
 
     let mut hook_installed = false;
     let mut hook_version = None;
-    let existing_hooks;
 
-    if protocol.uses_dedicated_hook_file() {
+    let existing_hooks = if protocol.uses_dedicated_hook_file() {
         // Copilot-style: detect from hooks/skim.json, not settings.json.
         hook_installed = protocol.detect_hook_registration(&hook_config_dir);
         if hook_installed {
@@ -118,7 +152,7 @@ pub(super) fn detect_state(
                 .as_deref()
                 .and_then(parse_version_from_script);
         }
-        existing_hooks = protocol.scan_foreign_hooks(&hook_config_dir);
+        protocol.scan_foreign_hooks(&hook_config_dir)
     } else {
         // settings.json-style: existing detection code (behaviorally unchanged).
         let parsed_settings = read_settings_json(&settings_path);
@@ -152,13 +186,13 @@ pub(super) fn detect_state(
                 }
             }
         }
-        existing_hooks = scan_existing_hooks(
+        scan_existing_hooks(
             parsed_settings.as_ref(),
             protocol.hook_event_key(),
             protocol.tool_matcher(),
             protocol.as_ref(),
-        );
-    }
+        )
+    };
 
     // Dual-scope check (B5)
     let dual_scope_warning = check_dual_scope(flags, agent, env)?;
@@ -514,9 +548,8 @@ mod tests {
              export SKIM_HOOK_VERSION=\"2.5.1\"\n\
              export SKIM_HOOK_BINARY='/usr/local/bin/skim'\n\
              export SKIM_HOOK_COMMIT=abc1234\n\
-             _SKIM_BIN='/usr/local/bin/skim'\n\
-             if [ -x \"$_SKIM_BIN\" ]; then\n\
-               exec \"$_SKIM_BIN\" rewrite --hook --agent claude-code\n\
+             if [ -x \"$SKIM_HOOK_BINARY\" ]; then\n\
+               exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent claude-code\n\
              fi\n\
              exec skim rewrite --hook --agent claude-code\n",
         )
@@ -973,5 +1006,61 @@ mod tests {
     #[test]
     fn test_parse_version_from_script_empty() {
         assert_eq!(parse_version_from_script(""), None);
+    }
+
+    // ---- pin_is_current ----
+
+    fn make_state_with_pin(pin: Option<String>) -> DetectedState {
+        DetectedState {
+            skim_binary: std::path::PathBuf::from("/usr/local/bin/skim"),
+            skim_version: env!("CARGO_PKG_VERSION").to_string(),
+            config_dir: std::path::PathBuf::from("/tmp/test"),
+            hook_config_dir: std::path::PathBuf::from("/tmp/test"),
+            settings_path: std::path::PathBuf::from("/tmp/test/settings.json"),
+            settings_exists: false,
+            hook_installed: true,
+            hook_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            hook_commit: None,
+            hook_binary_pin: pin,
+            hook_uses_pinned_binary: true,
+            dual_scope_warning: None,
+            existing_hooks: vec![],
+            agent_cli_name: "claude-code",
+        }
+    }
+
+    #[test]
+    fn test_pin_is_current_no_pin_returns_false() {
+        let state = make_state_with_pin(None);
+        assert!(
+            !state.pin_is_current(),
+            "absent pin must return false (treat as stale)"
+        );
+    }
+
+    #[test]
+    fn test_pin_is_current_wrong_path_returns_false() {
+        // A path that doesn't match the running binary must return false.
+        let state = make_state_with_pin(Some("/definitely/not/the/running/binary".to_string()));
+        assert!(
+            !state.pin_is_current(),
+            "a non-matching pin must return false"
+        );
+    }
+
+    #[test]
+    fn test_pin_is_current_matching_path_returns_true() {
+        // Use the actual running binary path so the comparison succeeds.
+        let running = std::env::current_exe()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
+        let Some(running_path) = running else {
+            return; // cannot determine running binary in this environment — skip
+        };
+        let state = make_state_with_pin(Some(running_path.to_string_lossy().to_string()));
+        assert!(
+            state.pin_is_current(),
+            "pin matching the running binary must return true"
+        );
     }
 }

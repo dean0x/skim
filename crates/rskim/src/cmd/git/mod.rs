@@ -23,6 +23,7 @@ mod status;
 use std::process::ExitCode;
 
 use crate::cmd::OutputFormat;
+use crate::cmd::execution as exec;
 use crate::output::canonical::GitResult;
 use crate::runner::CommandRunner;
 
@@ -316,9 +317,13 @@ pub(super) fn run_passthrough(
     let arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
     let output = runner.run("git", &arg_refs)?;
 
-    print!("{}", output.stdout);
-    if !output.stderr.is_empty() {
-        eprint!("{}", output.stderr);
+    if exec::write_to_stdout(&output.stdout)? == exec::StdoutStatus::PipeClosed {
+        return Ok(exec::pipe_closed_exit());
+    }
+    if !output.stderr.is_empty()
+        && exec::write_to_stderr(&output.stderr)? == exec::StdoutStatus::PipeClosed
+    {
+        return Ok(exec::pipe_closed_exit());
     }
 
     let exit_code = output.exit_code;
@@ -413,13 +418,17 @@ where
         // applies to all git subcommands going through run_parsed_command, not
         // just push — generic protection is safer than a subcmd-specific gate.
         let scrubbed_stderr = shared::scrub_lines(&output.stderr);
-        if !scrubbed_stderr.is_empty() {
-            eprintln!("{scrubbed_stderr}");
+        if !scrubbed_stderr.is_empty()
+            && exec::write_line_to_stderr(&scrubbed_stderr)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
         }
         // Scrub stdout once; reuse for both terminal output and analytics (PF-024).
         let scrubbed_stdout = shared::scrub_lines(&output.stdout);
-        if !scrubbed_stdout.is_empty() {
-            println!("{scrubbed_stdout}");
+        if !scrubbed_stdout.is_empty()
+            && exec::write_line_to_stdout(&scrubbed_stdout)? == exec::StdoutStatus::PipeClosed
+        {
+            return Ok(exec::pipe_closed_exit());
         }
         let exit_code = output.exit_code;
         // Record analytics even on non-zero exit so the DB reflects failed
@@ -459,27 +468,36 @@ where
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            println!("{json}");
+            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed {
+                return Ok(exec::pipe_closed_exit());
+            }
             (json, parse_tier)
         }
         OutputFormat::Text => {
             let s = result.to_string();
             let tier_str: Option<&'static str> = if parse_tier.is_some_and(|t| t == "passthrough") {
                 // Already passthrough — skip guard, print as-is.
-                println!("{s}");
+                if exec::write_line_to_stdout(&s)? == exec::StdoutStatus::PipeClosed {
+                    return Ok(exec::pipe_closed_exit());
+                }
                 parse_tier
             } else {
                 // Apply net-savings guard.
-                match crate::cmd::execution::savings_decision(guard_raw, &s) {
-                    crate::cmd::execution::SavingsDecision::Keep => {
-                        println!("{s}");
+                match exec::savings_decision(guard_raw, &s) {
+                    exec::SavingsDecision::Keep => {
+                        if exec::write_line_to_stdout(&s)? == exec::StdoutStatus::PipeClosed {
+                            return Ok(exec::pipe_closed_exit());
+                        }
                         parse_tier
                     }
-                    crate::cmd::execution::SavingsDecision::Passthrough => {
+                    exec::SavingsDecision::Passthrough => {
                         // Emit the user's raw output if available (C-7), otherwise
                         // emit the internal command raw; record under "passthrough" tier.
                         let emit_raw = raw_override.as_deref().unwrap_or(&raw);
-                        let tier = crate::cmd::execution::emit_raw_passthrough(emit_raw)?;
+                        let (tier, status) = exec::emit_raw_passthrough(emit_raw)?;
+                        if status == exec::StdoutStatus::PipeClosed {
+                            return Ok(exec::pipe_closed_exit());
+                        }
                         Some(tier)
                     }
                 }

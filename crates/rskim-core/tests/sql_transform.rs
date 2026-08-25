@@ -123,11 +123,13 @@ fn test_sql_full_mode_passthrough() {
 // ============================================================================
 
 #[test]
-fn test_sql_minimal_strips_comments() {
+fn test_sql_minimal_preserves_module_header_comments() {
+    // Module-level header comments (contiguous from file start) must be preserved
+    // in minimal mode (#476).
     let result = transform(SIMPLE_SQL, Language::Sql, Mode::Minimal).unwrap();
     assert!(
-        !result.contains("-- FIXTURE:"),
-        "comments should be stripped in minimal mode, got:\n{result}"
+        result.contains("-- FIXTURE:"),
+        "module-level header comments should be preserved, got:\n{result}"
     );
     assert!(
         result.contains("CREATE TABLE"),

@@ -36,6 +36,7 @@ pub(crate) use flags::PermissionsTier;
 pub(crate) use helpers::atomic_write_settings;
 pub(crate) use helpers::backup_settings_file;
 pub(crate) use helpers::load_or_create_settings;
+pub(crate) use helpers::resolve_skim_binary;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;
 
@@ -60,6 +61,13 @@ pub(crate) struct HookFacts {
     pub(crate) hook_uses_pinned_binary: bool,
     /// Whether the hook is fully current (version + pinned binary + commit all match).
     pub(crate) hook_is_current: bool,
+    /// Whether the hook's recorded binary pin points to the same canonical path
+    /// as the running binary.  `false` when the pin is absent.
+    ///
+    /// Separate from `hook_is_current` so `skim doctor` can display a specific
+    /// pin-mismatch cause when two clones share the same version and commit but
+    /// the hook still points to the wrong one (PF-015 display-without-gate).
+    pub(crate) pin_is_current: bool,
     /// Path to the hook script file (`hook_config_dir/hooks/skim-rewrite.sh`).
     pub(crate) hook_script_path: PathBuf,
     /// Integrity classification of the hook script against its SHA-256 manifest.
@@ -91,8 +99,11 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
     let env = DetectionEnv::from_process();
     let detected = state::detect_state(&init_flags, agent, &env)?;
 
-    // Evaluate hook_is_current() before partially moving out of `detected`.
+    // Evaluate hook_is_current() and pin_is_current() before partially moving
+    // out of `detected`. Both queries read struct fields, so they must be called
+    // before any field is moved.
     let is_current = detected.hook_is_current();
+    let pin_current = detected.pin_is_current();
     let hook_script_path = detected
         .hook_config_dir
         .join("hooks")
@@ -119,6 +130,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         hook_binary_pin: detected.hook_binary_pin,
         hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
         hook_is_current: is_current,
+        pin_is_current: pin_current,
         hook_script_path,
         script_integrity,
     })
@@ -156,9 +168,9 @@ pub(crate) fn run(
 /// Returns `true` when hook script `contents` exports `SKIM_HOOK_BINARY`,
 /// indicating the F6 pinned-binary format.
 ///
-/// This is the single source of truth for the "has pinned binary marker" scan,
-/// shared by `uses_pinned_binary` (state detection) and `is_hook_script_current`
-/// (reinstall idempotence check) so that a format change updates both in lockstep.
+/// This is the single source of truth for the "has pinned binary marker" scan
+/// used by `uses_pinned_binary` in state detection, so a format change
+/// updates all detection sites in lockstep.
 pub(super) fn script_has_pinned_marker(contents: &str) -> bool {
     contents
         .lines()

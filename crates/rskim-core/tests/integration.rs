@@ -1606,12 +1606,14 @@ fn test_minimal_token_reduction() {
 
 #[test]
 fn test_python_minimal_nested_function_body_comments() {
-    let source = "# top-level comment\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
+    // Source starts with a code statement so the mid-file comment is NOT a module
+    // header and must be stripped. Comments inside function bodies are preserved.
+    let source = "x = 1\n# mid-file comment to strip\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
     let result = transform(source, Language::Python, Mode::Minimal).unwrap();
 
     assert!(
-        !result.contains("top-level comment"),
-        "top-level should be stripped"
+        !result.contains("mid-file comment"),
+        "mid-file comment should be stripped"
     );
     assert!(
         result.contains("comment in outer body"),
@@ -1635,6 +1637,98 @@ fn test_python_minimal_class_level_comments_stripped() {
     assert!(
         result.contains("body comment"),
         "method body comment should be preserved"
+    );
+}
+
+// ============================================================================
+// Large Header Block — O(N) regression guard
+// ============================================================================
+//
+// The fixture `large_header.py` contains 500 contiguous leading comments
+// followed by a blank-line-separated comment (to be stripped) and a function.
+// The old O(N³) backward-walk would take ~3 s on this fixture in DEBUG mode;
+// the O(N) forward-pass fix completes in < 5 ms.  The 3000 ms deadline is
+// intentionally generous to tolerate CI scheduling noise.
+
+const LARGE_HEADER_PY: &str = include_str!("../../../tests/fixtures/python/large_header.py");
+
+#[test]
+fn test_python_minimal_large_header_preserves_all_header_comments() {
+    // Correctness: all 500 contiguous leading comments must be preserved.
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("# Header comment 0"),
+        "first header comment must be preserved; result starts with: {:?}",
+        &result[..result.len().min(200)]
+    );
+    assert!(
+        result.contains("# Header comment 499"),
+        "last header comment must be preserved"
+    );
+    // The post-gap comment must be stripped.
+    assert!(
+        !result.contains("is NOT a header"),
+        "post-gap comment must be stripped; got:\n{result}"
+    );
+    // The sentinel function and its body comment must survive.
+    assert!(
+        result.contains("def sentinel_function"),
+        "sentinel function must be preserved"
+    );
+    assert!(
+        result.contains("# body comment"),
+        "in-body comment of sentinel function must be preserved"
+    );
+}
+
+#[test]
+fn test_python_pseudo_large_header_preserves_all_header_comments() {
+    // Same correctness guarantee through the pseudo-mode path (which also routes
+    // through compute_header_end_byte → is_module_header_comment).
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Pseudo).unwrap();
+
+    assert!(
+        result.contains("# Header comment 0"),
+        "first header comment must be preserved in pseudo mode"
+    );
+    assert!(
+        result.contains("# Header comment 499"),
+        "last header comment must be preserved in pseudo mode"
+    );
+    assert!(
+        !result.contains("is NOT a header"),
+        "post-gap comment must be stripped in pseudo mode"
+    );
+}
+
+#[test]
+fn test_python_minimal_large_header_linear_time() {
+    // CUBIC SMOKE TEST: 500 leading comments must process within 500 ms.
+    //
+    // WHAT THIS TEST PROVES: that N=500 comments complete within 500 ms through
+    // the full transform stack. The old O(N³) code took ~3–10 s at N=500; the
+    // fixed O(N) code completes in < 10 ms. The 500 ms budget gives ~50× CI
+    // headroom while being 6× below the O(N³) lower bound.
+    //
+    // WHAT THIS TEST DOES NOT PROVE: linear vs quadratic scaling. An O(N²)
+    // regression at N=500 would complete in ~31 ms and pass this test. For the
+    // doubling-ratio guard that discriminates O(N) from O(N²), see
+    // test_quadratic_scaling_guard in crates/rskim-core/src/transform/minimal.rs.
+    //
+    // Budget tightened from 3000 ms to 500 ms: the O(N³) code reliably exceeds
+    // 500 ms, while the fixed code runs in < 10 ms. 3000 ms gave a 333× margin
+    // and asserted almost nothing about scaling.
+    let start = std::time::Instant::now();
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal);
+    let elapsed = start.elapsed();
+
+    assert!(result.is_ok(), "transform must succeed: {:?}", result.err());
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "500-comment file must process in < 500ms (got {elapsed:?}); \
+         old O(N³) code reliably exceeded this — cubic regression detected. \
+         For quadratic regressions, see test_quadratic_scaling_guard."
     );
 }
 
@@ -2371,8 +2465,11 @@ fn test_ruby_structure_reduces_tokens() {
 #[test]
 fn test_sql_minimal_reduces_tokens() {
     // SQL structure mode preserves all statements (no function bodies to strip).
-    // Minimal mode strips comments, verifying actual token reduction.
-    let source = include_str!("../../../tests/fixtures/sql/simple.sql");
+    // Minimal mode strips non-header comments, verifying actual token reduction.
+    // Uses comments.sql which has strippable standalone -- comments beyond the
+    // two-line module header (simple.sql only has header comments → no reduction
+    // after the module-header fix in #476).
+    let source = include_str!("../../../tests/fixtures/sql/comments.sql");
     let result = transform(source, Language::Sql, Mode::Minimal).unwrap();
     assert!(
         result.len() < source.len(),

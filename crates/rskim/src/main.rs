@@ -876,6 +876,27 @@ fn main() -> ExitCode {
 
     let exit_code = match result {
         Ok(code) => code,
+        // A closed downstream pipe (`skim … | head -20`) is a normal
+        // end-of-consumption event, not a failure.  Three sinks in
+        // `cmd/execution.rs` return `StdoutStatus::PipeClosed` directly; this
+        // boundary catches every *other* buffered write site so no
+        // `Error: Broken pipe (os error 32)` can reach a user and, critically,
+        // so the process never exits `1` — for grep/rg/diff exit 1 means "no
+        // matches found", which would be a false negative.
+        //
+        // ADR-011 classification: nothing is lost here (the reader chose to stop
+        // reading), so any diagnostic is a class-(2) no-loss raw-fallback
+        // banner and is debug-gated.  It is emphatically NOT an elision marker:
+        // no `output::elision_marker`, no unconditional stderr line.  Raw grep
+        // is silent in this exact situation, so an unconditional notice would
+        // itself be a divergence from raw.
+        Err(e) if cmd::execution::is_broken_pipe_chain(&e) => {
+            crate::debug_log!(
+                "[skim] downstream pipe closed; exiting {}.",
+                cmd::execution::pipe_closed_code()
+            );
+            cmd::execution::pipe_closed_exit()
+        }
         Err(e) => {
             eprintln!("Error: {e:#}");
             // Map known SkimError variants to documented exit codes:

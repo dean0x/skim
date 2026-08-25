@@ -12,56 +12,21 @@
 //! stdout/stderr/exit without depending on real infra binaries.
 
 use std::fs;
-use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
+
+// `make_stub` / `stub_path` live in `common` so `cli_e2e_pipe_fidelity.rs` can
+// reuse the exact same stub shape rather than keeping a second copy.
+#[cfg(unix)]
+use common::{make_stub, stub_path};
 
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
-}
-
-/// Create a stub tool script that prints fixed stdout/stderr and exits `code`.
-///
-/// The payloads are written to sidecar files and `cat`-ed by the script, so no
-/// shell escaping of the content is needed.
-///
-/// Unix-only: the script uses `#!/bin/sh` and the executable bit requires
-/// `std::os::unix::fs::PermissionsExt`.
-#[cfg(unix)]
-fn make_stub(dir: &Path, name: &str, stdout: &str, stderr: &str, code: i32) {
-    let out_path = dir.join(format!("{name}.out"));
-    let err_path = dir.join(format!("{name}.err"));
-    fs::write(&out_path, stdout).unwrap();
-    fs::write(&err_path, stderr).unwrap();
-    let script = format!(
-        "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit {code}\n",
-        out_path.display(),
-        err_path.display()
-    );
-    let script_path = dir.join(name);
-    fs::write(&script_path, script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
-/// PATH with the stub dir prepended so skim's spawned child resolves to it.
-///
-/// Unix-only: uses `:` as the PATH separator.
-#[cfg(unix)]
-fn stub_path(dir: &Path) -> String {
-    format!(
-        "{}:{}",
-        dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
 }
 
 // ============================================================================

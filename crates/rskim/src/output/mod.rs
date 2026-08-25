@@ -547,11 +547,30 @@ pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<S
     ))
 }
 
+/// [`elision_marker_unbounded`] with a caller-supplied remedy clause.
+///
+/// The standard remedy — `SKIM_PASSTHROUGH=1 for full output` — is only useful
+/// when passthrough mode is *not* already active.  Inside the escape hatch it is
+/// circular advice: the reader has already taken it, and repeating it tells them
+/// nothing they can act on.  Loss-bearing markers are unconditional by ADR-011
+/// class 1, so the marker must still fire there; this constructor is how such a
+/// site keeps the marker while making its remedy actionable.
+///
+/// `remedy` is an imperative clause without leading punctuation, e.g.
+/// `"run 'grep' directly for the full stream"`.
+pub(crate) fn elision_marker_unbounded_with_remedy(
+    shown_desc: &str,
+    unit: &str,
+    remedy: &str,
+) -> String {
+    format!("[skim] {unit} elided beyond {shown_desc} — {remedy}")
+}
+
 /// Streaming variant of [`elision_marker`] for sites where the total is
 /// unknowable (the input is consumed incrementally and elision happens
 /// mid-stream). `shown_desc` describes what WAS kept (e.g. `"first 64 KiB"`).
 pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
-    format!("[skim] {unit} elided beyond {shown_desc} — SKIM_PASSTHROUGH=1 for full output")
+    elision_marker_unbounded_with_remedy(shown_desc, unit, "SKIM_PASSTHROUGH=1 for full output")
 }
 
 /// Canonical compressed-output hint emitted to stderr after a non-zero exit

@@ -34,7 +34,7 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
 
     // 1. Running binary
-    let running_path = current_exe_canonical();
+    let running_path = crate::cmd::init::resolve_skim_binary().ok();
     println!("Running binary");
     match &running_path {
         Some(p) => println!(
@@ -61,7 +61,10 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     println!();
 
     // 4. Wrappers
-    print_wrapper_section();
+    let wrapper_drift = print_wrapper_section();
+    if wrapper_drift {
+        drift = true;
+    }
     println!();
 
     // 5. Cache & Analytics
@@ -92,12 +95,9 @@ pub(super) fn command() -> clap::Command {
 // ============================================================================
 // Running binary
 // ============================================================================
-
-fn current_exe_canonical() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-}
+// Canonical path of the running binary comes from `crate::cmd::init::resolve_skim_binary()`,
+// the single shared derivation used by install, wrappers, hook pinning, and doctor.
+// A local helper was previously duplicated here; it is now deleted (applies architecture-02).
 
 // ============================================================================
 // $PATH scan
@@ -369,7 +369,7 @@ fn print_path_section(entries: &[PathEntry]) -> bool {
 ///
 /// Design decisions:
 /// - `Tampered`   → drift (`✗`), names the suppression coupling.
-/// - `Unreadable` → drift (`✗`), names the suppression coupling.
+/// - `Unreadable` → drift (`✗`).
 /// - `NoManifest` → advisory only (`⚠`), **not** drift — users who installed
 ///   before manifests existed have done nothing wrong and must not have their
 ///   `skim doctor` exit-0 broken (applies ADR-004 backward-compat intent).
@@ -412,8 +412,7 @@ fn hook_status_line(
                 true,
                 format!(
                     "  ✗ {agent_cli_name}  installed — hook script unreadable (cannot hash); \
-                     note: an unreadable script also silences drift detection on this \
-                     agent's hook channel — run `skim init --agent {agent_cli_name}` to reinstall"
+                     run `skim init --agent {agent_cli_name}` to reinstall"
                 ),
             );
         }
@@ -457,22 +456,40 @@ fn hook_status_line(
         );
     }
 
+    // Hook script is stale (version or commit mismatch) → drift.
     if !facts.hook_is_current {
         let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
         let version_ok = facts.hook_version.as_deref() == Some(compiled_version);
-        let commit_ok = facts.hook_commit.as_deref() == Some(compiled_commit);
-        // Report the most specific cause first.
-        let reason = if !commit_ok {
-            format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
-        } else if !version_ok {
+        // With hook_uses_pinned_binary confirmed above, !hook_is_current means
+        // either version or commit mismatches.  `version_ok` distinguishes them;
+        // no separate commit_ok derivation needed (D4: derived from hook_is_current).
+        let reason = if !version_ok {
             format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
         } else {
-            "stale".to_string()
+            // Pinned format confirmed + version matches → commit must differ.
+            format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
         };
         return (
             true,
             append_advisory(format!(
                 "  ✗ {agent_cli_name}  installed  pin: {pin}  [{reason}]  — \
+                 run `./target/release/skim init --yes` to update"
+            )),
+        );
+    }
+
+    // Pin path differs from running binary — advisory only, not drift (C-1 fix: two-clone
+    // scenario where version and commit match but the hook still points to the wrong clone).
+    if !facts.pin_is_current {
+        let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
+        let running = crate::cmd::init::resolve_skim_binary()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "?".to_string());
+        return (
+            false,
+            append_advisory(format!(
+                "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}  \
+                 [binary pin mismatch (hook: {pin}, running: {running})] — \
                  run `./target/release/skim init --yes` to update"
             )),
         );
@@ -523,32 +540,136 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
 // Wrappers
 // ============================================================================
 
-fn print_wrapper_section() {
+/// Print the wrappers section and return `true` if any wrapper points at a
+/// different binary than the one currently running (drift).
+///
+/// Each wrapper symlink's target is resolved with `read_link` and compared
+/// against `resolve_skim_binary()` — the same canonical derivation the
+/// installer uses, so the comparison is on equal footing.
+///
+/// Wrapper install/uninstall only ever touches symlinks whose target stem is
+/// `"skim"` or `"rskim"`. This function reports but never modifies any file
+/// (including foreign symlinks), preserving that invariant.
+fn print_wrapper_section() -> bool {
     println!("Wrappers  (~/.skim/bin)");
 
     let wrappers_dir = match crate::cmd::skim_wrappers_dir() {
         Some(d) => d,
         None => {
             println!("  (cannot determine home directory)");
-            return;
+            return false;
         }
     };
 
     if !wrappers_dir.exists() {
         println!("  –  not installed  (run `skim init --wrappers` to install)");
-        return;
+        return false;
     }
 
-    let count = std::fs::read_dir(wrappers_dir)
-        .ok()
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .filter(|e| e.file_type().ok().is_some_and(|ft| ft.is_symlink()))
-                .count()
-        })
-        .unwrap_or(0);
+    // Resolve the running binary once for comparison — reuses the shared
+    // derivation so this and all install/doctor sites stay in sync.
+    let running = crate::cmd::init::resolve_skim_binary().ok();
 
-    println!("  ✓  {}  ({count} symlinks)", wrappers_dir.display());
+    let entries = match std::fs::read_dir(wrappers_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            println!("  (cannot read wrappers directory: {e})");
+            return false;
+        }
+    };
+
+    let mut symlink_count: usize = 0;
+    let mut mismatch_count: usize = 0;
+
+    // Circuit breaker: wrapper dir should never exceed ~2× the number of
+    // wrapper targets (~59). An absurdly large directory is not our concern.
+    const MAX_ENTRIES: usize = 256;
+    let mut checked: usize = 0;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        checked += 1;
+        if checked > MAX_ENTRIES {
+            println!("  (wrapper directory has more than {MAX_ENTRIES} entries — truncating scan)");
+            break;
+        }
+
+        // Use file_type() from the DirEntry directly — it reports the type of
+        // the directory entry itself (i.e. "symlink"), not its target.
+        // entry.metadata() would follow the symlink and return target metadata,
+        // making is_symlink() always false for a one-level-deep symlink.
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        // Only inspect symlinks — plain files or directories are left alone.
+        if !file_type.is_symlink() {
+            continue;
+        }
+
+        symlink_count += 1;
+
+        let link_path = entry.path();
+        let target = match std::fs::read_link(&link_path) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("  ⚠  {}  (cannot read symlink: {e})", link_path.display());
+                continue;
+            }
+        };
+
+        // Classify the symlink target stem: only "skim"/"rskim" targets are
+        // ours to care about. Foreign symlinks are reported but not penalised.
+        let stem = target.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let is_skim_target = stem == "skim" || stem == "rskim";
+
+        if !is_skim_target {
+            println!(
+                "  ⚠  {}  → {} (foreign symlink — not installed by skim)",
+                link_path.display(),
+                target.display()
+            );
+            continue;
+        }
+
+        // Compare the symlink's target against the running binary. Use the
+        // canonical form of both sides so that Homebrew cellar symlinks,
+        // cargo-install links, and /tmp → /private/tmp mappings all resolve
+        // consistently. The comparison is advisory for path-only mismatches
+        // (same binary, different path) but still contributes to drift so the
+        // CI pre-flight (`skim doctor`) can catch wrong-clone scenarios via this
+        // surface when pin mismatch was demoted to advisory.
+        let target_canonical = std::fs::canonicalize(&target).unwrap_or(target.clone());
+        let mismatch = match &running {
+            Some(run) => target_canonical != *run,
+            None => false, // cannot determine running binary — skip comparison
+        };
+
+        if mismatch {
+            mismatch_count += 1;
+            let run_display = running
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            println!(
+                "  ✗  {}  → {}  [wrapper target mismatch (wrapper: {}, running: {})] — \
+                 run `skim init --wrappers` to update",
+                link_path.display(),
+                target.display(),
+                target_canonical.display(),
+                run_display,
+            );
+        }
+    }
+
+    if mismatch_count == 0 {
+        println!(
+            "  ✓  {}  ({symlink_count} symlinks)",
+            wrappers_dir.display()
+        );
+    }
+
+    mismatch_count > 0
 }
 
 // ============================================================================
@@ -685,10 +806,10 @@ fn print_staleness_section(compiled_commit: &str) -> bool {
 
     if !commit_exists {
         println!(
-            "  ✗  SHA {compiled_commit} not found in this repo — \
-             built from a different repository"
+            "  –  SHA {compiled_commit} not in this repo — \
+             binary built from a different repository (not a staleness error)"
         );
-        return true;
+        return false;
     }
 
     // Count commits between compiled SHA and HEAD.
@@ -942,6 +1063,7 @@ mod tests {
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
             hook_is_current: true,
+            pin_is_current: true,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: integrity,
         }
@@ -979,8 +1101,14 @@ mod tests {
 
         assert!(drift, "Unreadable must report drift");
         assert!(
-            line.contains("silences drift detection"),
-            "message must name the drift-detection suppression coupling: {line}"
+            line.contains("unreadable"),
+            "message must name the unreadable state: {line}"
+        );
+        // Fix 4b: Unreadable does NOT silence drift detection (only Tampered does).
+        // The message must NOT claim this.
+        assert!(
+            !line.contains("silences drift detection"),
+            "Unreadable message must NOT claim drift detection is silenced (only Tampered does): {line}"
         );
         assert!(
             line.contains("skim init"),
@@ -1069,6 +1197,7 @@ mod tests {
             hook_binary_pin: None,
             hook_uses_pinned_binary: false,
             hook_is_current: false,
+            pin_is_current: false,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
             script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
         };
@@ -1209,6 +1338,98 @@ mod tests {
         assert!(
             info.commit.is_none(),
             "non-skim binary must yield commit: None (--version has no 'skim ' prefix, --commit rejected)"
+        );
+    }
+
+    // ---- C-1: binary pin mismatch is advisory, not drift (PF-015) ----
+    //
+    // After C-1, `pin_is_current: false` (two-clone scenario: version and commit
+    // match but binary paths differ) is an advisory (⚠), not drift (✗).  These
+    // tests verify that `hook_status_line` returns `is_drift == false` for all
+    // pin-mismatch states and that the advisory message is correctly composed.
+
+    /// Verified integrity + pin_is_current: false → advisory (⚠), NOT drift.
+    /// The "binary pin mismatch" message must appear with both paths.
+    #[test]
+    fn test_hook_status_line_pin_mismatch_verified_is_advisory() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.pin_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(
+            !drift,
+            "pin mismatch must NOT report drift (C-1 fix): {line}"
+        );
+        assert!(
+            line.contains("binary pin mismatch"),
+            "advisory must name the pin mismatch: {line}"
+        );
+        assert!(
+            line.contains("hook: /usr/local/bin/skim"),
+            "advisory must include the hook pin path: {line}"
+        );
+        assert!(
+            line.contains("running:"),
+            "advisory must include the running binary path: {line}"
+        );
+        // Must NOT misattribute the cause as a commit or version problem.
+        assert!(
+            !line.contains("commit mismatch"),
+            "must not report commit mismatch when version and commit match: {line}"
+        );
+        assert!(
+            !line.contains("version mismatch"),
+            "must not report version mismatch when version and commit match: {line}"
+        );
+    }
+
+    /// NoManifest integrity + pin_is_current: false → advisory (NOT drift).
+    /// Both the pin-mismatch advisory and the no-manifest note must appear.
+    #[test]
+    fn test_hook_status_line_pin_mismatch_no_manifest_appends_advisory() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::NoManifest);
+        facts.pin_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "abc1234");
+
+        assert!(
+            !drift,
+            "pin mismatch is advisory regardless of manifest state (C-1 fix): {line}"
+        );
+        assert!(
+            line.contains("binary pin mismatch"),
+            "pin-mismatch advisory must survive the no-manifest composition: {line}"
+        );
+        assert!(
+            line.contains("no integrity manifest"),
+            "no-manifest note must be appended to pin-mismatch advisory: {line}"
+        );
+    }
+
+    /// When the compiled commit is "unknown" (tarball/non-git build),
+    /// a genuine pin mismatch must be reported as "binary pin mismatch" (advisory),
+    /// NOT as "commit mismatch".  Mirrors hook_is_current()'s treatment.
+    #[test]
+    fn test_hook_status_line_unknown_compiled_commit_reports_pin_mismatch_not_commit_mismatch() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        // hook_commit is a real git SHA; the running binary is a tarball build.
+        // hook_is_current: true (version matches; hook_is_current() skips commit
+        // check for "unknown" compiled commit).
+        facts.pin_is_current = false;
+        // Pass "unknown" as compiled_commit to simulate a tarball build.
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "unknown");
+
+        assert!(
+            !drift,
+            "pin mismatch is advisory, not drift (C-1 fix): {line}"
+        );
+        assert!(
+            !line.contains("commit mismatch"),
+            "must NOT report commit mismatch for a tarball-build pin mismatch \
+             (the compiled commit is indeterminate): {line}"
+        );
+        assert!(
+            line.contains("binary pin mismatch"),
+            "must report binary pin mismatch advisory, not commit mismatch: {line}"
         );
     }
 }

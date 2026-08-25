@@ -20,6 +20,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 
+use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
 use crate::runner::CommandRunner;
@@ -153,12 +154,12 @@ fn handle_error_exit(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
     duration: std::time::Duration,
-) -> ExitCode {
-    if !stderr.is_empty() {
-        eprint!("{stderr}");
+) -> anyhow::Result<ExitCode> {
+    if !stderr.is_empty() && exec::write_to_stderr(&stderr)? == exec::StdoutStatus::PipeClosed {
+        return Ok(exec::pipe_closed_exit());
     }
-    if !stdout.is_empty() {
-        print!("{stdout}");
+    if !stdout.is_empty() && exec::write_to_stdout(&stdout)? == exec::StdoutStatus::PipeClosed {
+        return Ok(exec::pipe_closed_exit());
     }
     // Record analytics even on non-zero exit so the DB reflects failed
     // invocations (PF-018 resolution: move stdout instead of cloning).
@@ -169,13 +170,15 @@ fn handle_error_exit(
         rec.with_tier("passthrough"),
         duration,
     );
-    map_exit_code(exit_code)
+    Ok(map_exit_code(exit_code))
 }
 
 /// Render a non-empty list of parsed file diffs into the requested output format.
 ///
 /// Handles parallel vs. sequential dispatch, JSON vs. text output, and prints
-/// the result to stdout.  Returns the rendered string for analytics recording.
+/// the result to stdout.  Returns the rendered string for analytics recording,
+/// plus whether the reader was still attached — only the JSON arm writes here,
+/// and a departed reader must stop the run rather than panic the process.
 ///
 /// Extracted from `run_diff` to keep the happy-path readable.
 fn render_and_format<'a>(
@@ -184,7 +187,7 @@ fn render_and_format<'a>(
     git_args: &[String],
     diff_mode: DiffMode,
     output_format: OutputFormat,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, exec::StdoutStatus)> {
     let render_one = |i: usize, file_diff: &types::FileDiff<'_>| {
         let skip_ast = i >= MAX_AST_FILE_COUNT;
         let rendered = render_diff_file(
@@ -230,8 +233,8 @@ fn render_and_format<'a>(
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-            println!("{json}");
-            json
+            let status = exec::write_line_to_stdout(&json)?;
+            return Ok((json, status));
         }
         OutputFormat::Text => {
             // Text: return without printing here.
@@ -242,7 +245,7 @@ fn render_and_format<'a>(
         }
     };
 
-    Ok(out)
+    Ok((out, exec::StdoutStatus::Written))
 }
 
 /// Run `git diff` with AST-aware pipeline (#103).
@@ -296,7 +299,7 @@ pub(super) fn run_diff(
 
     if output.exit_code != Some(0) {
         let label = super::build_analytics_label("diff", args, show_stats, rec.enabled);
-        return Ok(handle_error_exit(
+        return handle_error_exit(
             output.stdout,
             output.stderr,
             output.exit_code,
@@ -304,14 +307,20 @@ pub(super) fn run_diff(
             show_stats,
             rec,
             output.duration,
-        ));
+        );
     }
 
     // Surface git diff stderr warnings (e.g., "warning: LF will be replaced by CRLF")
     // on successful runs. These are informational notices from git, not failures,
     // so they should be visible even when diff output is otherwise compressed.
     if !output.stderr.is_empty() {
-        eprint!("[skim] git diff notice: {}", output.stderr.trim());
+        // Forwarded tool stderr (one `warning: LF will be replaced by CRLF` per
+        // file on a large checkout), so it takes the panic-free sink even though
+        // it carries a skim prefix.
+        let notice = format!("[skim] git diff notice: {}", output.stderr.trim());
+        if exec::write_to_stderr(&notice)? == exec::StdoutStatus::PipeClosed {
+            return Ok(exec::pipe_closed_exit());
+        }
     }
 
     let duration = output.duration;
@@ -337,7 +346,7 @@ pub(super) fn run_diff(
     // Parse unified diff, then render. The inner block ensures `file_diffs`
     // (which borrows `raw_diff`) is dropped before `raw_diff` is moved into
     // analytics below.
-    let result_str = {
+    let (result_str, render_status) = {
         let file_diffs = parse_unified_diff(&raw_diff);
 
         if file_diffs.is_empty() {
@@ -367,6 +376,12 @@ pub(super) fn run_diff(
         )?
     }; // file_diffs dropped here, raw_diff is free to move
 
+    // The JSON arm writes inside `render_and_format`; a closed reader there must
+    // stop the run before the guardrail / analytics tail below.
+    if render_status == exec::StdoutStatus::PipeClosed {
+        return Ok(exec::pipe_closed_exit());
+    }
+
     // ADR-001 guardrail (applies ADR-001: compress, never truncate).
     // Clone raw only when telemetry is needed (--show-stats or analytics enabled).
     // For JSON output, render_and_format already printed; guardrail is skipped.
@@ -384,7 +399,9 @@ pub(super) fn run_diff(
             let outcome = crate::output::guardrail::apply_to_stderr(raw_diff, result_str)?;
             let triggered = outcome.was_triggered();
             let s = outcome.into_output();
-            print!("{s}");
+            if exec::write_to_stdout(&s)? == exec::StdoutStatus::PipeClosed {
+                return Ok(exec::pipe_closed_exit());
+            }
             (
                 s,
                 if triggered {

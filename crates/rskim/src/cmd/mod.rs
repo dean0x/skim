@@ -22,6 +22,43 @@
 //! unknown subcommands would make skim unusable in normal project workflows;
 //! passthrough lets skim compress only what it understands while staying
 //! transparent for everything else.
+//!
+//! # `println!` is banned for TOOL OUTPUT (and only for tool output)
+//!
+//! `println!`/`print!`/`eprintln!`/`eprint!` **panic** when the downstream
+//! reader has gone away:
+//!
+//! ```text
+//! $ skim git diff HEAD~40 | head -2
+//! exit=101
+//! thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+//! failed printing to stdout: Broken pipe (os error 32)
+//! ```
+//!
+//! A panic is not an `Err`, so neither the `StdoutStatus` sinks nor the
+//! `is_broken_pipe_chain` boundary in `main.rs` can catch it — the process exits
+//! **101** with a panic message on stderr where raw `git diff … | head -2` exits
+//! **141** in silence.  That is a louder divergence from raw than the exit-1
+//! defect it replaced.
+//!
+//! **The rule, and its exact boundary:**
+//!
+//! - **Tool output** — the wrapped tool's own bytes, or a compressed rendering
+//!   of them — is unbounded in size, is what a reader pipes into `head`, and
+//!   therefore MUST go through
+//!   [`execution::write_to_stdout`] / [`execution::write_line_to_stdout`] /
+//!   [`execution::write_to_stderr`] / [`execution::write_line_to_stderr`], or
+//!   through a `write!`-family macro on a locked handle whose `io::Error`
+//!   propagates.  On [`execution::StdoutStatus::PipeClosed`] the handler stops
+//!   producing output and returns [`execution::pipe_closed_exit`].
+//! - **Skim's own short notices** — help text, usage errors, `[skim]` banners,
+//!   the token-stats line — keep `println!`/`eprintln!`.  They are bounded (a
+//!   handful of lines), they are the *first* thing a `--help` invocation writes
+//!   so a pipe buffer always absorbs them, and converting ~900 of them would
+//!   bury the fidelity-relevant change in noise.
+//!
+//! Reviewers: a new `println!` carrying a tool-derived variable is a defect;
+//! a new `println!` carrying a literal is not.
 
 mod agents;
 pub(crate) mod build;
@@ -74,6 +111,8 @@ pub(crate) use registry::{
 
 mod security;
 pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
+
+pub(crate) mod stream_pump;
 
 #[cfg(test)]
 pub(crate) mod test_utils;

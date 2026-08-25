@@ -384,6 +384,19 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         i += 1;
     }
 
+    // Cross-flag conflict: --wrappers + --project is an error.
+    // Wrappers are per-user PATH entries; they cannot be scoped to a project.
+    // Without this guard, `skim init --project --wrappers` is accepted but
+    // installs zero wrappers, silently doing nothing (mirrors the guard below
+    // for --permissions + --project).
+    if wrappers == Some(true) && project {
+        anyhow::bail!(
+            "--wrappers and --project are mutually exclusive: \
+             wrappers are per-user PATH entries and cannot be scoped to a project; \
+             run `skim init --wrappers` without --project to install wrappers"
+        );
+    }
+
     // Cross-flag conflict: --permissions + --project is an error.
     // Permissions seeding is user-scope only; project settings are repository-controlled.
     if permissions == Some(true) && project {
