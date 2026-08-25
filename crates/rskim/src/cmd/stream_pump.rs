@@ -37,7 +37,7 @@
 //! This module is a **raw byte pump**, not a line splitter: there is no parser to
 //! feed, so decoding would only reintroduce defect 3.
 //!
-//! # DESIGN NOTE — stderr is drained concurrently (PF-023 / AD-STR-8)
+//! # DESIGN NOTE — stderr is drained concurrently (PF-021 / AD-STR-8)
 //!
 //! [`crate::runner::CommandRunner::run_with_env`] uses two reader threads, which
 //! makes the pipe-full deadlock *structurally impossible*.  Streaming stdout on
@@ -167,7 +167,7 @@ fn pump(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<PumpRepor
 ///
 /// **Never stops draining.**  Past `limit` the loop keeps reading and throwing
 /// bytes away so the child's stderr pipe cannot fill — a collector that stopped
-/// reading would deadlock the stdout pump (PF-023 / AD-STR-8).  Discarding is
+/// reading would deadlock the stdout pump (PF-021 / AD-STR-8).  Discarding is
 /// loss-bearing and the caller must emit an unconditional elision marker for it
 /// (ADR-011 class 1).
 ///
@@ -296,7 +296,7 @@ pub(crate) fn stream_child(
         Err(e) => return Ok(StreamOutcome::SpawnFailed(e)),
     };
 
-    // Started BEFORE the first stdout read — see the PF-023 design note above.
+    // Started BEFORE the first stdout read — see the PF-021 design note above.
     let stderr_drain = child
         .0
         .stderr
@@ -445,7 +445,7 @@ mod tests {
     /// The collector must consume the pipe to EOF even after its ceiling is
     /// reached.  A collector that stopped reading would leave the child's stderr
     /// pipe full, blocking the child and deadlocking the stdout pump
-    /// (PF-023 / AD-STR-8).
+    /// (PF-021 / AD-STR-8).
     #[test]
     fn test_drain_capped_keeps_reading_past_the_limit() {
         let mut reader = CountingReader::new(300_000, b'e');
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(
             reader.read_total, 300_000,
             "the collector must drain the whole pipe, not stop at its ceiling — \
-             stopping is the PF-023 deadlock"
+             stopping is the PF-021 deadlock"
         );
         assert_eq!(reader.remaining, 0);
     }

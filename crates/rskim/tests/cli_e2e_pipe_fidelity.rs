@@ -47,7 +47,7 @@
 //!   kernel-scheduling detail.
 //! - **Every blocking wait is bounded.**  Both `read_n_lines_then_close` and
 //!   `wait_bounded` time out, because the regressions this file guards (a
-//!   stalled pump, the PF-023 stderr-drain deadlock) present as a block, and
+//!   stalled pump, the PF-021 stderr-drain deadlock) present as a block, and
 //!   there is no `.config/nextest.toml` `slow-timeout` or workflow
 //!   `timeout-minutes` to catch one.
 //! - **An absence is never the only assertion.**  Tests whose subject is "no
@@ -132,7 +132,7 @@ fn grep_fixture(n: usize) -> String {
 /// The read itself must have a timeout, not just the [`wait_bounded`] that
 /// follows it.  `read_line` on a live pipe blocks forever, and "skim delivered
 /// fewer than `count` lines and then stopped" is *precisely* the regression this
-/// file guards (a stalled pump, or the PF-023 / AD-STR-8 stderr-drain deadlock).
+/// file guards (a stalled pump, or the PF-021 / AD-STR-8 stderr-drain deadlock).
 /// On that regression the read blocks first, so `wait_bounded` is never reached
 /// and the bound it advertises does not exist.  There is no `.config/nextest.toml`
 /// `slow-timeout` and no `timeout-minutes` in any workflow, so an unbounded read
@@ -177,7 +177,7 @@ fn read_n_lines_then_close(child: &mut Child, count: usize) -> Vec<String> {
                 panic!(
                     "skim delivered only {} of {count} lines and then blocked for \
                      {HANG_TIMEOUT:?}. A stalled pump or the stderr-drain deadlock \
-                     (PF-023 / AD-STR-8) looks exactly like this — failing here \
+                     (PF-021 / AD-STR-8) looks exactly like this — failing here \
                      instead of hanging CI is the whole point of the bound.",
                     lines.len()
                 );
@@ -211,7 +211,7 @@ fn read_n_lines_then_close_checked(child: &mut Child, count: usize, tag: &str) -
 /// Wait for `child`, failing the test rather than hanging CI if it never exits.
 ///
 /// Without this bound a regression that reintroduces the stderr-drain deadlock
-/// (PF-023 / AD-STR-8) would hang the test binary instead of failing it.
+/// (PF-021 / AD-STR-8) would hang the test binary instead of failing it.
 fn wait_bounded(child: &mut Child, what: &str) -> std::process::ExitStatus {
     let deadline = Instant::now() + HANG_TIMEOUT;
     loop {
@@ -223,7 +223,7 @@ fn wait_bounded(child: &mut Child, what: &str) -> std::process::ExitStatus {
                 panic!(
                     "{what}: skim did not exit within {HANG_TIMEOUT:?} — \
                      the stderr drain thread is the only thing preventing this \
-                     deadlock (PF-023 / AD-STR-8)"
+                     deadlock (PF-021 / AD-STR-8)"
                 );
             }
             None => std::thread::sleep(POLL_INTERVAL),
@@ -425,7 +425,7 @@ fn t3_pipe_close_is_silent_by_default_and_bannered_under_debug() {
 }
 
 // ============================================================================
-// T4 — deadlock guard: concurrent stderr drain (PF-023 / AD-STR-8)
+// T4 — deadlock guard: concurrent stderr drain (PF-021 / AD-STR-8)
 // ============================================================================
 
 /// ~1 MiB interleaved on stdout AND stderr completes without deadlocking.
@@ -922,7 +922,7 @@ fn t12_escape_hatch_passes_non_utf8_verbatim() {
 /// Streaming stdout on the calling thread reintroduces the pipe-full deadlock
 /// that the two-reader-thread buffered runner made structurally impossible: with
 /// nobody draining stderr the child blocks once that pipe fills, stops writing
-/// stdout, and the stdout pump blocks forever (PF-023 / AD-STR-8).
+/// stdout, and the stdout pump blocks forever (PF-021 / AD-STR-8).
 ///
 /// [`wait_bounded`] is the explicit timeout: it polls `try_wait` against
 /// [`HANG_TIMEOUT`] and **kills the child and panics** rather than blocking, so a
@@ -1403,7 +1403,7 @@ fn t16_raw_passthrough_forwards_the_child_exit_code() {
 /// Streaming stdout on the calling thread reintroduces the pipe-full deadlock
 /// that the two-reader-thread buffered runner made structurally impossible: with
 /// nobody draining stderr the child blocks once that pipe fills, stops writing
-/// stdout, and the stdout pump blocks forever (PF-023 / AD-STR-8).
+/// stdout, and the stdout pump blocks forever (PF-021 / AD-STR-8).
 ///
 /// [`wait_bounded`] is the explicit timeout: it polls `try_wait` against
 /// [`HANG_TIMEOUT`] and **kills the child and panics** rather than blocking, so a

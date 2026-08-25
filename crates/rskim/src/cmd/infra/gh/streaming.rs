@@ -70,7 +70,7 @@
 //! After the stdout loop completes, the background thread is joined and the
 //! collected stderr lines are fed through the parser.  This prevents the pipe
 //! deadlock that would occur if the child writes more than 64 KiB to stderr
-//! while the main thread is blocked on stdout (PF-023).
+//! while the main thread is blocked on stdout (PF-021).
 //!
 //! # DESIGN NOTE (AD-STR-9) — ChildGuard kills and reaps on drop
 //!
@@ -400,7 +400,7 @@ pub(super) fn run_streamed_stdin(
 ///
 /// Spawns `cmd` with `args`, pipes both stdout and stderr, and feeds each line
 /// to `parser.on_line()`.  Stderr is drained concurrently in a background
-/// thread to prevent the pipe-full deadlock described in PF-023.  After stdout
+/// thread to prevent the pipe-full deadlock described in PF-021.  After stdout
 /// reaches EOF the background thread is joined and the collected stderr lines
 /// are fed through the parser in order.  Calls `parser.finalize()` at EOF.
 ///
@@ -458,7 +458,7 @@ pub(super) fn run_streamed_spawned(
     let mut stdout = BufWriter::new(io::stdout());
     let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled, cfg.session_id);
 
-    // Spawn a background thread to drain stderr concurrently (AD-STR-8, PF-023).
+    // Spawn a background thread to drain stderr concurrently (AD-STR-8, PF-021).
     // The thread collects all stderr lines into a Vec so we can feed them through
     // the parser after stdout is exhausted -- without risking a pipe deadlock when
     // the child writes > 64 KiB to stderr while the main thread is blocked on
