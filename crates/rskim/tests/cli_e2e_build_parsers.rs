@@ -99,7 +99,9 @@ fn test_cargo_unknown_subcmd_exit_code() {
         .failure()
         // D2: cargo's own error surfaces; "no such command" or "unknown" covers
         // both older and newer cargo versions.
-        .stderr(predicate::str::contains("no such command").or(predicate::str::contains("unknown")));
+        .stderr(
+            predicate::str::contains("no such command").or(predicate::str::contains("unknown")),
+        );
 }
 
 #[test]

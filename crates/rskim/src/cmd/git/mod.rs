@@ -82,9 +82,7 @@ pub(crate) fn run(
             // The banner is debug-gated per ADR-011 (no-loss path — the reader sees
             // exactly what git would produce).
             let safe = crate::cmd::sanitize_for_display(other);
-            crate::debug_log!(
-                "skim git: unknown subcommand '{safe}' — passing through to git"
-            );
+            crate::debug_log!("skim git: unknown subcommand '{safe}' — passing through to git");
             // Reconstruct full args: subcommand + remaining subcmd_args, then
             // re-prepend any global git flags so they reach the real binary.
             let mut all_args: Vec<String> = global_flags.to_vec();

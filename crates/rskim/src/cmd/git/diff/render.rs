@@ -51,6 +51,20 @@ struct EmittedCursor {
     last_old: usize,
 }
 
+/// Line-emission axis for the post-render verifier (C1b / PF-025).
+///
+/// The verifier (`verify_ast_render`) tracks every rendered line as
+/// `(Axis, file_line_number)` to enforce three invariants the ADR-001
+/// net-savings size guard cannot catch — it fires only on OVER-emission,
+/// never on silent UNDER-emission or content substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    /// New-file axis: `+` (added) and ` ` (context) lines, plus breadcrumbs.
+    New,
+    /// Old-file axis: `-` (removed) lines.
+    Old,
+}
+
 /// Compute the minimum column width needed to display any line number in `hunks`.
 ///
 /// Returns at least 1 so empty diffs still produce a consistent format.
@@ -299,13 +313,33 @@ fn try_ast_render(
         // This replaces the old render_changed_only → render_node_with_hunks path
         // that emitted the ENTIRE enclosing node body, producing 2-5x bloat vs raw
         // for small changes inside large functions (ADR-001).
+        //
+        // C1b: collect emissions for the post-render verifier so we can detect
+        // content-substitution corruption that the ADR-001 net-savings guard
+        // cannot catch (it fires only on OVER-emission, never on silent omission).
+        let mut emissions: Vec<(Axis, usize)> =
+            Vec::with_capacity(file_diff.hunks.iter().map(|h| h.patch_lines.len()).sum());
         render_default_scoped(
             &mut output,
             &changed_ranges,
             &file_diff.hunks,
             &source_lines,
             ln_width,
+            &mut emissions,
         );
+
+        // ADR-011 class-2: no-loss raw fallback — banner is debug-gated
+        // (`crate::debug_log!` → zero stderr bytes without `SKIM_DEBUG`).
+        // The verifier checks three invariants the ADR-001 size guard misses:
+        // per-axis uniqueness, new-axis monotonicity, and `+`/`-` coverage.
+        if !verify_ast_render(&emissions, &file_diff.hunks) {
+            crate::debug_log!(
+                "[skim] git diff AST verifier: render integrity check failed for {}; \
+                 falling back to raw hunks (ADR-011 class-2: no-loss)",
+                file_diff.path
+            );
+            return None;
+        }
     }
 
     Some(output)
@@ -401,143 +435,136 @@ fn render_changed_only(
 
 /// Render default mode with hunk-scoped output (ADR-001 compliance, #R2).
 ///
-/// For each changed AST node, emits:
-///   1. A breadcrumb — the container's header line only (one line per unique container).
-///   2. The overlapping hunk patch lines, clipped to the node's boundary via
-///      `emit_hunk_patch_lines_clipped` (which already includes git's ±3 context).
+/// Implements a **single positional walk** over all hunks (C1a fix):
+///   1. Pre-computes a breadcrumb schedule: for each changed AST range, the
+///      first hunk where `breadcrumb_line < hunk.new_start` gets a scheduled
+///      breadcrumb.  This constraint ensures the breadcrumb's line is always
+///      OUTSIDE the hunk window — the hunk never re-emits it.
+///   2. Walks hunks in document order.  Before each hunk, emits any scheduled
+///      breadcrumbs.  Then walks ALL hunk patch lines (in-node AND orphan) in
+///      one pass.
 ///
-/// Orphan content — patch lines that fall outside ALL changed AST node ranges
-/// (EOF deletions, additions between functions, trailing/inter-node blanks) — is
-/// rendered by a second pass so no content is silently dropped (#317, ADR-003).
-/// Attribution is tracked at LINE granularity, not per-hunk: a single hunk that
-/// both edits inside a node AND deletes lines just past that node's closing brace
-/// has the in-node lines emitted by the range loop and the out-of-node lines
-/// emitted by the orphan pass. A per-hunk "attributed" boolean would mark such a
-/// hunk done after clipping and drop its trailing deletions — a silent OMISSION
-/// the ADR-001 net-savings guardrail cannot catch, because that guard fires only
-/// on OVER-emission (skim larger than raw), never on UNDER-emission.
+/// **Three bugs eliminated by this design:**
+///   - Bug 1 (duplicate context): breadcrumb no longer emitted mid-hunk (only
+///     strictly before), so the hunk cannot re-emit the same line as context.
+///   - Bug 2 (out-of-order orphan): orphan lines appear during the single walk,
+///     in document order, not after all range processing.
+///   - Bug 3 (`+` as context): `+` lines at the function header position are
+///     now emitted by the hunk itself (not the breadcrumb), preserving the
+///     correct `+` prefix.
 ///
-/// Output size is bounded to ≈ raw because we emit ONLY the hunk lines (which ARE
-/// the raw content for those regions) plus one breadcrumb per changed container.
-/// This prevents the 2-5× bloat of the old `render_changed_only` path that emitted
-/// the entire enclosing node body via `render_node_with_hunks`.
+/// **Coverage guarantee (#317, ADR-003):** every patch line in every hunk is
+/// visited exactly once during the single walk — no clipping, no skip pass.
+/// In-node and orphan lines are treated identically.
 ///
-/// De-duplication within the range loop is handled by the per-file `EmittedCursor`
-/// — two adjacent ranges sharing one hunk still emit each changed line exactly
-/// once. The orphan pass de-duplicates against the range loop by new-file line
-/// membership in the recorded clip windows (see below), not the cursor.
+/// **Emissions tracking (C1b):** every emitted line is pushed to `emissions`
+/// for the post-render verifier (`verify_ast_render`): `+` and context lines
+/// on the New axis, `-` lines on the Old axis.  The `\` marker contributes
+/// no delta and is not tracked.
 fn render_default_scoped(
     output: &mut String,
     changed_ranges: &[ChangedNodeRange],
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
     ln_width: usize,
+    emissions: &mut Vec<(Axis, usize)>,
 ) {
-    // Per-hunk record of the node-range clip windows applied during the range
-    // loop. An EMPTY entry means the hunk overlapped no changed node (a fully
-    // orphan hunk). A NON-empty entry means the hunk was clipped to one or more
-    // node ranges — but any lines OUTSIDE those windows (EOF/trailing deletions,
-    // blanks between nodes) were NOT emitted and must still be rendered below.
+    // -------------------------------------------------------------------------
+    // Phase 1 — breadcrumb schedule
     //
-    // This is LINE-granular attribution. A single per-hunk boolean (the prior
-    // design) marked the whole hunk "done" once any node clipped it, silently
-    // dropping its out-of-node changed lines — a #317 compress-never-truncate
-    // violation the ADR-001 size guardrail cannot catch (it fires only on
-    // OVER-emission, never UNDER-emission; see ADR-003).
-    let mut hunk_clips: Vec<Vec<(usize, usize)>> = vec![Vec::new(); hunks.len()];
-
-    // Per-unique-container deduplication for breadcrumbs.
-    let mut emitted_breadcrumbs: HashSet<usize> = HashSet::new();
-
-    // Per-file monotonic cursor — prevents duplicate changed lines when two
-    // adjacent ranges share one hunk (same semantics as render_changed_only).
-    let mut cursor = EmittedCursor::default();
+    // For each changed range, find the first overlapping hunk H where
+    // `breadcrumb_line < H.new_start`.  That constraint guarantees the
+    // breadcrumb's line is strictly before the hunk's window, so the hunk can
+    // never visit it and we never need cursor-based de-duplication.
+    //
+    // breadcrumb_line → earliest hunk_idx at which to emit it.
+    // -------------------------------------------------------------------------
+    let mut schedule: HashMap<usize, usize> = HashMap::new();
 
     for range in changed_ranges {
-        // Locate the window of hunks that overlap this node range using the
-        // same partition_point logic as render_node_with_hunks.
-        let first = hunks.partition_point(|h| {
-            h.new_start.saturating_add(h.new_count.saturating_sub(1)) < range.start
-        });
-        let relevant_indices: Vec<usize> = hunks[first..]
-            .iter()
-            .enumerate()
-            .take_while(|(_, h)| h.new_start <= range.end)
-            .map(|(i, _)| first + i)
-            .collect();
-
-        if relevant_indices.is_empty() {
-            continue; // No overlapping hunk — nothing to emit for this range
-        }
-
-        // Breadcrumb: container header line only.
-        // For nested nodes (methods inside a class/struct/impl) use the
-        // parent's header line; for top-level nodes use the node's own
-        // first line.  Emitted at most once per unique header line.
-        //
-        // `breadcrumb_line` is always >= 1: it comes from
-        // `child.start_position().row + 1` (tree-sitter rows are 0-indexed)
-        // so `checked_sub(1)` returning None is unreachable on any real AST.
-        // Guard with checked_sub rather than a bare `- 1` so a synthetic or
-        // zero value skips the breadcrumb silently instead of panicking in
-        // debug builds.
+        // `breadcrumb_line` is always >= 1 (tree-sitter row + 1, see comments
+        // in `render_changed_only`).  Use `checked_sub` defensively.
         let breadcrumb_line = range
             .parent_context
             .as_ref()
             .map_or(range.start, |p| p.header_line);
-        if emitted_breadcrumbs.insert(breadcrumb_line)
-            && let Some(idx) = breadcrumb_line.checked_sub(1)
-            && let Some(line) = source_lines.get(idx)
-        {
-            let _ = writeln!(output, " {:>ln_width$} {line}", breadcrumb_line);
-        }
 
-        // Emit hunk patch lines clipped to this node's boundary, recording the
-        // clip window so the orphan pass can tell in-node lines (already emitted
-        // here) from out-of-node lines (still to render).
-        for &hunk_idx in &relevant_indices {
-            hunk_clips[hunk_idx].push((range.start, range.end));
-            emit_hunk_patch_lines_clipped(
-                output,
-                &hunks[hunk_idx],
-                range.start,
-                range.end,
-                ln_width,
-                &mut cursor,
-            );
+        // Skip to the first hunk whose new-range ends at/after range.start.
+        let first = hunks.partition_point(|h| {
+            h.new_start.saturating_add(h.new_count.saturating_sub(1)) < range.start
+        });
+
+        // Walk overlapping hunks to find the first one where
+        // `breadcrumb_line < hunk.new_start`.
+        let emit_before = hunks[first..]
+            .iter()
+            .enumerate()
+            .take_while(|(_, h)| h.new_start <= range.end)
+            .find(|(_, h)| breadcrumb_line < h.new_start)
+            .map(|(i, _)| first + i);
+
+        if let Some(hunk_idx) = emit_before {
+            // Keep the earliest hunk index for this breadcrumb line so that two
+            // ranges with the same breadcrumb schedule it before the first one.
+            schedule
+                .entry(breadcrumb_line)
+                .and_modify(|v| *v = (*v).min(hunk_idx))
+                .or_insert(hunk_idx);
         }
     }
 
-    // Line-granular orphan pass: emit every patch line NOT covered by any node
-    // clip window for its hunk, so no changed line is silently dropped (#317,
-    // ADR-003). Two cases collapse into one walk:
-    //   * fully orphan hunk (clips empty)     → every line emitted (raw), as the
-    //     old orphan-hunk loop did (EOF deletions, additions between functions).
-    //   * partially clipped hunk (clips set)  → only the OUT-of-node lines
-    //     (trailing/EOF deletions, inter-node blanks) are emitted; the in-node
-    //     lines were already written by the range loop above and are skipped.
+    // Build a per-hunk list of breadcrumb lines, sorted for deterministic output.
+    // hunk_crumbs[i] = breadcrumb lines to emit before hunk i, in source order.
+    let mut hunk_crumbs: Vec<Vec<usize>> = vec![Vec::new(); hunks.len()];
+    for (&bl, &hi) in &schedule {
+        hunk_crumbs[hi].push(bl);
+    }
+    for crumbs in &mut hunk_crumbs {
+        crumbs.sort_unstable();
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2 — single positional walk (C1a fix)
     //
-    // A line is "in node" iff its new-file line position falls within any clip
-    // window for this hunk, mirroring `emit_hunk_patch_lines_clipped`'s
-    // `[node_start, node_end]` clip (which skips `patch_new_line < node_start`
-    // and breaks at `patch_new_line > node_end`). This new-file-membership test
-    // is provably equivalent to "was emitted by the range loop" and — unlike a
-    // shared monotonic cursor — is immune to cross-hunk false-skips when a
-    // partially-clipped hunk precedes a later attributed hunk in the same file.
+    // Walk hunks in document order. Before each hunk, emit any scheduled
+    // breadcrumbs (guaranteed breadcrumb_line < hunk.new_start, so no
+    // overlap with the hunk's patch lines). Then walk ALL patch lines.
+    // -------------------------------------------------------------------------
+    let mut emitted_breadcrumbs: HashSet<usize> = HashSet::new();
+
     for (hunk_idx, hunk) in hunks.iter().enumerate() {
-        let clips = &hunk_clips[hunk_idx];
+        // --- Breadcrumbs ---
+        for &breadcrumb_line in &hunk_crumbs[hunk_idx] {
+            if emitted_breadcrumbs.insert(breadcrumb_line)
+                && let Some(idx) = breadcrumb_line.checked_sub(1)
+                && let Some(line) = source_lines.get(idx)
+            {
+                let _ = writeln!(output, " {:>ln_width$} {line}", breadcrumb_line);
+                // Track on New axis for verifier monotonicity.
+                // breadcrumb_line < hunk.new_start by construction — strictly
+                // before the hunk window, so no conflict with hunk emissions.
+                emissions.push((Axis::New, breadcrumb_line));
+            }
+        }
+
+        // --- Hunk patch lines (single pass, no clipping) ---
+        //
+        // Every line — in-node and orphan alike — is emitted here.
+        // The old design split these across a range loop (in-node) and a
+        // trailing orphan pass (out-of-node), causing Bug 2 (out-of-order).
         let mut cur_new = hunk.new_start;
         let mut cur_old = hunk.old_start;
-        for line in &hunk.patch_lines {
-            let in_node = clips
-                .iter()
-                .any(|&(start, end)| (start..=end).contains(&cur_new));
-            let (nd, od) = if in_node {
-                // Already emitted by the range loop — advance counters only.
-                patch_line_deltas(line)
-            } else {
-                emit_patch_line(output, line, cur_new, cur_old, ln_width)
-            };
+        for patch_line in &hunk.patch_lines {
+            let (nd, od) = emit_patch_line(output, patch_line, cur_new, cur_old, ln_width);
+            // Track emissions for the post-render verifier (C1b):
+            //   `+` / context ` `: nd > 0 → New axis.
+            //   `-`: nd == 0, od > 0 → Old axis.
+            //   `\` marker: nd == 0, od == 0 → no tracking (no line number).
+            if nd > 0 {
+                emissions.push((Axis::New, cur_new));
+            } else if od > 0 {
+                emissions.push((Axis::Old, cur_old));
+            }
             cur_new += nd;
             cur_old += od;
         }
@@ -915,21 +942,6 @@ fn render_node_with_hunks(
     }
 }
 
-/// Line-number deltas for a patch line WITHOUT emitting it.
-///
-/// Mirrors `emit_patch_line`'s counter advancement exactly: `+` → (1, 0),
-/// `-` → (0, 1), ` ` (context) → (1, 1), and `\` (no-newline marker) or any
-/// other prefix → (0, 0). Used by `render_default_scoped`'s orphan pass to
-/// advance past lines already emitted by the range loop without re-emitting them.
-fn patch_line_deltas(patch_line: &str) -> (usize, usize) {
-    match patch_line.as_bytes().first() {
-        Some(b'+') => (1, 0),
-        Some(b'-') => (0, 1),
-        Some(b' ') => (1, 1),
-        _ => (0, 0),
-    }
-}
-
 /// Emit a single patch line with its line number, updating the line counters.
 ///
 /// Returns `(new_line_delta, old_line_delta)` — the amount each counter should
@@ -968,6 +980,88 @@ fn emit_patch_line(
             (0, 0)
         }
     }
+}
+
+/// Post-render correctness verifier (C1b).
+///
+/// Checks three invariants that the ADR-001 net-savings size guard cannot catch
+/// (it fires only on OVER-emission, never on silent UNDER-emission or content
+/// substitution — see ADR-003):
+///
+/// 1. **Per-axis uniqueness** — no line number appears twice on the same axis.
+/// 2. **New-axis monotonicity** — new-side numbers never jump backward.
+/// 3. **Coverage** — every `+` hunk line appears in the New-axis trace; every
+///    `-` hunk line appears in the Old-axis trace.
+///
+/// Returns `true` when all invariants hold (render is correct).
+/// Returns `false` on any violation — the caller falls back to `render_raw_hunks`,
+/// which is always safe (ADR-011 class-2 no-loss fallback; banner is
+/// `crate::debug_log!`-gated → zero stderr bytes without `SKIM_DEBUG`).
+///
+/// **PF-025 lesson:** this verifier was verified against known-corrupt inputs
+/// (duplicate line, backward jump, dropped `+` line) before adoption. Do not
+/// adopt candidate guards that pass on known-corrupt data.
+fn verify_ast_render(emissions: &[(Axis, usize)], hunks: &[DiffHunk<'_>]) -> bool {
+    // Pre-populate seen sets (used for both uniqueness and coverage checks).
+    let mut new_seen: HashSet<usize> = HashSet::with_capacity(emissions.len());
+    let mut old_seen: HashSet<usize> = HashSet::with_capacity(emissions.len() / 4 + 1);
+
+    // (1) Per-axis uniqueness — reject the first duplicate.
+    for &(axis, line) in emissions {
+        match axis {
+            Axis::New => {
+                if !new_seen.insert(line) {
+                    return false; // duplicate New-axis line number
+                }
+            }
+            Axis::Old => {
+                if !old_seen.insert(line) {
+                    return false; // duplicate Old-axis line number
+                }
+            }
+        }
+    }
+
+    // (2) New-axis monotonicity — reject any backward jump.
+    let mut prev_new: usize = 0;
+    for &(axis, line) in emissions {
+        if axis == Axis::New {
+            if line < prev_new {
+                return false; // backward jump on New axis
+            }
+            prev_new = line;
+        }
+    }
+
+    // (3) Coverage — every `+` and `-` hunk line must appear in the trace.
+    // Context ` ` lines are not checked (they aren't tracked on the Old axis).
+    for hunk in hunks {
+        let mut cur_new = hunk.new_start;
+        let mut cur_old = hunk.old_start;
+        for patch_line in &hunk.patch_lines {
+            match patch_line.as_bytes().first() {
+                Some(b'+') => {
+                    if !new_seen.contains(&cur_new) {
+                        return false; // `+` line at cur_new is absent from trace
+                    }
+                    cur_new += 1;
+                }
+                Some(b'-') => {
+                    if !old_seen.contains(&cur_old) {
+                        return false; // `-` line at cur_old is absent from trace
+                    }
+                    cur_old += 1;
+                }
+                Some(b' ') => {
+                    cur_new += 1;
+                    cur_old += 1;
+                }
+                _ => {} // `\` no-newline marker — no advance, no check
+            }
+        }
+    }
+
+    true
 }
 
 /// Render raw diff hunks as fallback (no AST awareness), with line numbers.
@@ -1768,7 +1862,14 @@ mod tests {
         }];
 
         let mut output = String::new();
-        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 2);
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            2,
+            &mut vec![],
+        );
 
         // Breadcrumb must appear.
         assert!(
@@ -1825,7 +1926,14 @@ mod tests {
         let changed_ranges: Vec<super::super::types::ChangedNodeRange> = vec![];
 
         let mut output = String::new();
-        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut vec![],
+        );
 
         // The orphan deletion line must appear in the output.
         assert!(
@@ -1884,7 +1992,14 @@ mod tests {
         }];
 
         let mut output = String::new();
-        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut vec![],
+        );
 
         // The edited in-node line must appear (attributed emission).
         assert!(
@@ -1964,7 +2079,14 @@ mod tests {
         ];
 
         let mut output = String::new();
-        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut vec![],
+        );
 
         // Breadcrumb must appear exactly once.
         let breadcrumb_count = output.lines().filter(|l| l.contains("MyClass {")).count();
@@ -2010,7 +2132,14 @@ mod tests {
         }];
 
         let mut output = String::new();
-        render_default_scoped(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut vec![],
+        );
 
         // The no-newline markers must appear verbatim.
         assert!(
@@ -2186,6 +2315,486 @@ mod tests {
         assert!(
             source_matches_diff(&source_lines, &[hunk]),
             r"'\ No newline at end of file' marker must be skipped"
+        );
+    }
+
+    // =========================================================================
+    // C1a — render_default_scoped single-positional-walk tests (TDD: failing first)
+    //
+    // These tests document the THREE bugs in the old two-pass design:
+    //   Bug 1 (Duplicate context line): breadcrumb didn't update EmittedCursor,
+    //     so the hunk's context line at `breadcrumb_line` was emitted twice.
+    //   Bug 2 (Out-of-order orphan): the trailing orphan pass ran AFTER the
+    //     range loop, placing orphan hunk lines AFTER later range hunk lines.
+    //   Bug 3 (+ line as context): a `+` line at `breadcrumb_line` was emitted
+    //     as context (` ` format) by the breadcrumb before the hunk could emit
+    //     it correctly as `+`.
+    //
+    // All three are fixed by the single positional walk: breadcrumbs are only
+    // emitted when `breadcrumb_line < hunk.new_start`, so the hunk never revisits
+    // the breadcrumb position, and orphan hunks are emitted in document order.
+    // =========================================================================
+
+    /// Canonical C1a reproducer — doc-comment insertion above a function.
+    ///
+    /// When a doc comment is inserted at line 1 and fn compute() is at line 2,
+    /// the hunk covers lines 1-4 (new_start=1). The range for fn compute is [2,4]
+    /// giving breadcrumb_line=2.
+    ///
+    /// OLD code: breadcrumb emits " 2 fn compute() {" (cursor NOT updated), then
+    /// `emit_hunk_patch_lines_clipped` clips to [2,4] and re-emits " 2 fn compute()"
+    /// because cursor.last_new==0. Result: fn compute() appears TWICE.
+    ///
+    /// NEW code: breadcrumb_line=2, hunk.new_start=1 → 2 < 1 is false → no
+    /// separate breadcrumb; hunk emits line 2 as context exactly once.
+    #[test]
+    fn test_c1a_doc_comment_insertion_no_duplicate_context_line() {
+        let source_lines: Vec<&str> = vec![
+            "/// New doc comment", // line 1 (added by hunk)
+            "fn compute() {",      // line 2 — the AST range starts here
+            "    42",              // line 3
+            "}",                   // line 4
+        ];
+
+        // Hunk: insert doc comment at line 1; fn compute context starts at 1.
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 4,
+            patch_lines: vec!["+/// New doc comment", " fn compute() {", "     42", " }"],
+        }];
+
+        // Range covers fn compute (line 2 through 4); breadcrumb_line = 2.
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 2,
+            end: 4,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        let mut emissions: Vec<(Axis, usize)> = Vec::new();
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut emissions,
+        );
+
+        // fn compute must appear exactly once (Bug 1: old code emits it twice).
+        let fn_count = output.lines().filter(|l| l.contains("fn compute")).count();
+        assert_eq!(
+            fn_count, 1,
+            "fn compute() must appear exactly once (Bug 1 — breadcrumb duplicate);\
+             \ngot {fn_count} occurrences in:\n{output}"
+        );
+
+        // Doc comment must appear as ADDED (`+` prefix), not duplicated.
+        let added_doc = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("doc comment"))
+            .count();
+        assert_eq!(
+            added_doc, 1,
+            "doc comment must appear exactly once as added (+):\n{output}"
+        );
+
+        // Verifier must accept the new render.
+        assert!(
+            verify_ast_render(&emissions, &hunks),
+            "render must pass verifier:\n{output}"
+        );
+    }
+
+    /// C1a Bug 2 — orphan hunk out-of-order (the trailing orphan pass ran AFTER
+    /// the range loop, reversing document order between an orphan and a range hunk).
+    ///
+    /// Orphan hunk: comment update at lines 2-3 (no AST node).
+    /// Range hunk: function body change at lines 8-10.
+    ///
+    /// OLD code: range loop emits lines 8-10 first; orphan pass appends lines 2-3
+    /// AFTER → output is backward (lines 8-10 before lines 2-3).
+    ///
+    /// NEW code: single hunk walk → H0 (lines 2-3) emitted first, H1 (lines 8-10)
+    /// emitted second → correct document order.
+    #[test]
+    fn test_c1a_orphan_hunk_before_range_emitted_in_document_order() {
+        // Ten-line file; only lines 8-10 are in the AST range.
+        let source_lines: Vec<&str> = vec![
+            "// file header", // line 1
+            "// comment A",   // line 2
+            "// comment B",   // line 3
+            "",               // line 4
+            "",               // line 5
+            "",               // line 6
+            "",               // line 7
+            "fn foo() {",     // line 8
+            "    let x = 0;", // line 9
+            "}",              // line 10
+        ];
+
+        let hunks = vec![
+            // H0: orphan edit of comment, lines 2-3 (no AST range covers this).
+            DiffHunk {
+                old_start: 2,
+                old_count: 2,
+                new_start: 2,
+                new_count: 2,
+                patch_lines: vec!["-// comment A", "+// comment A (updated)"],
+            },
+            // H1: edit inside fn foo, lines 8-10.
+            DiffHunk {
+                old_start: 8,
+                old_count: 3,
+                new_start: 8,
+                new_count: 3,
+                patch_lines: vec![" fn foo() {", "-    let x = 0;", "+    let x = 1;"],
+            },
+        ];
+
+        // Only fn foo (lines 8-10) is in the changed AST range.
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 8,
+            end: 10,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        let mut emissions: Vec<(Axis, usize)> = Vec::new();
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            2,
+            &mut emissions,
+        );
+
+        // The orphan comment update must appear BEFORE fn foo (Bug 2 check).
+        let comment_pos = output
+            .find("comment A (updated)")
+            .expect("updated comment must appear in output");
+        let fn_pos = output
+            .find("fn foo()")
+            .expect("fn foo must appear in output");
+        assert!(
+            comment_pos < fn_pos,
+            "Bug 2: orphan hunk (lines 2-3) must precede range hunk (lines 8-10)\
+             \nin output:\n{output}"
+        );
+
+        // Both changes must be present.
+        assert!(
+            output.contains("let x = 1;"),
+            "fn foo body change must appear:\n{output}"
+        );
+
+        // Verifier must accept the render.
+        assert!(
+            verify_ast_render(&emissions, &hunks),
+            "render must pass verifier:\n{output}"
+        );
+    }
+
+    /// C1a Bug 3 — a `+` (added) line at `breadcrumb_line` was emitted in
+    /// CONTEXT format (` ` prefix) by the breadcrumb, then the hunk tried to
+    /// emit it again as `+` — resulting in the wrong prefix surviving.
+    ///
+    /// Scenario: a new function `fn inserted()` is added at line 1.  The AST
+    /// range is [1,3].  breadcrumb_line = 1 = hunk.new_start.
+    ///
+    /// OLD code: breadcrumb emits " 1 fn inserted()" (context, WRONG); cursor NOT
+    /// updated; hunk clips to [1,3] and re-emits "+1 fn inserted()" (added, right)
+    /// — so the function appears as BOTH context and added.
+    ///
+    /// NEW code: breadcrumb_line=1, hunk.new_start=1 → 1 < 1 is false → no separate
+    /// breadcrumb; hunk emits "+1 fn inserted()" exactly once (correct).
+    #[test]
+    fn test_c1a_added_line_at_range_start_emitted_as_added_not_context() {
+        let source_lines: Vec<&str> = vec![
+            "fn inserted() {", // line 1 — newly added
+            "    42",          // line 2
+            "}",               // line 3
+        ];
+
+        // All lines are `+` (newly added function).
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 3,
+            patch_lines: vec!["+fn inserted() {", "+    42", "+}"],
+        }];
+
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 3,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        let mut emissions: Vec<(Axis, usize)> = Vec::new();
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut emissions,
+        );
+
+        // fn inserted must appear exactly once (no breadcrumb + hunk double-emission).
+        let count = output.lines().filter(|l| l.contains("fn inserted")).count();
+        assert_eq!(
+            count, 1,
+            "fn inserted() must appear exactly once (Bug 3 — + line as context):\n{output}"
+        );
+
+        // It must appear as ADDED (`+` prefix), NOT as context (` ` prefix).
+        let as_added = output
+            .lines()
+            .filter(|l| l.starts_with('+') && l.contains("fn inserted"))
+            .count();
+        assert_eq!(
+            as_added, 1,
+            "fn inserted() must appear with `+` prefix, not as context:\n{output}"
+        );
+
+        let as_context = output
+            .lines()
+            .filter(|l| l.starts_with(' ') && l.contains("fn inserted"))
+            .count();
+        assert_eq!(
+            as_context, 0,
+            "fn inserted() must NOT appear as context (` ` prefix):\n{output}"
+        );
+
+        // Verifier must accept the render.
+        assert!(
+            verify_ast_render(&emissions, &hunks),
+            "render must pass verifier:\n{output}"
+        );
+    }
+
+    // =========================================================================
+    // C1b — verify_ast_render unit tests (PF-025: test against known-corrupt input)
+    //
+    // PF-025 lesson: "Any guard you write must be tested against known-corrupt
+    // input before it is trusted." Each test below constructs a deliberately
+    // corrupt emission trace and proves the verifier rejects it.
+    // =========================================================================
+
+    /// Verifier rejects a trace with a duplicate New-axis line number.
+    #[test]
+    fn test_c1b_verifier_rejects_duplicate_new_axis_line() {
+        // Deliberately corrupt: line 5 appears twice on the New axis.
+        let emissions: Vec<(Axis, usize)> = vec![
+            (Axis::New, 3),
+            (Axis::New, 4),
+            (Axis::New, 5), // first occurrence
+            (Axis::New, 5), // DUPLICATE — corrupt
+            (Axis::New, 6),
+        ];
+        assert!(
+            !verify_ast_render(&emissions, &[]),
+            "duplicate New-axis line must be rejected (per-axis uniqueness invariant)"
+        );
+    }
+
+    /// Verifier rejects a trace with a duplicate Old-axis line number.
+    #[test]
+    fn test_c1b_verifier_rejects_duplicate_old_axis_line() {
+        let emissions: Vec<(Axis, usize)> = vec![
+            (Axis::Old, 10),
+            (Axis::Old, 10), // DUPLICATE — corrupt
+        ];
+        assert!(
+            !verify_ast_render(&emissions, &[]),
+            "duplicate Old-axis line must be rejected"
+        );
+    }
+
+    /// Verifier rejects a trace where New-axis numbers jump backward.
+    #[test]
+    fn test_c1b_verifier_rejects_backward_jump_on_new_axis() {
+        // Deliberately corrupt: line 7 appears after line 15 → backward jump.
+        let emissions: Vec<(Axis, usize)> = vec![
+            (Axis::New, 5),
+            (Axis::New, 15),
+            (Axis::New, 7), // BACKWARD JUMP — corrupt
+        ];
+        assert!(
+            !verify_ast_render(&emissions, &[]),
+            "backward jump on New axis must be rejected (monotonicity invariant)"
+        );
+    }
+
+    /// Verifier rejects a trace where a `+` hunk line is absent.
+    ///
+    /// This is the PF-025 scenario: a verifier that only checks subsequence
+    /// order passes while a `+` line is silently missing from the render. This
+    /// verifier catches it via the coverage check.
+    #[test]
+    fn test_c1b_verifier_rejects_dropped_added_line() {
+        let hunks = vec![DiffHunk {
+            old_start: 4,
+            old_count: 1,
+            new_start: 4,
+            new_count: 2,
+            patch_lines: vec![" context4", "+added5", " context6"],
+        }];
+        // Trace: context4 and context6 emitted; `+added5` at new_line=5 is MISSING.
+        let emissions: Vec<(Axis, usize)> = vec![
+            (Axis::New, 4), // context4
+            // Missing: (Axis::New, 5) for +added5 — deliberately corrupt
+            (Axis::New, 6), // context6
+        ];
+        assert!(
+            !verify_ast_render(&emissions, &hunks),
+            "missing `+` line must be detected by coverage invariant (PF-025)"
+        );
+    }
+
+    /// Verifier rejects a trace where a `-` hunk line is absent.
+    #[test]
+    fn test_c1b_verifier_rejects_dropped_removed_line() {
+        let hunks = vec![DiffHunk {
+            old_start: 4,
+            old_count: 2,
+            new_start: 4,
+            new_count: 1,
+            patch_lines: vec!["-removed_a", "-removed_b", "+added"],
+        }];
+        // Trace: only the added line; both `-` lines missing — deliberately corrupt.
+        let emissions: Vec<(Axis, usize)> = vec![(Axis::New, 4)];
+        assert!(
+            !verify_ast_render(&emissions, &hunks),
+            "missing `-` line must be detected by coverage invariant"
+        );
+    }
+
+    /// Verifier accepts a valid render (positive control — PF-025 requires
+    /// proving the guard does not false-positive on good data).
+    #[test]
+    fn test_c1b_verifier_accepts_correct_render() {
+        let hunks = vec![DiffHunk {
+            old_start: 4,
+            old_count: 2,
+            new_start: 4,
+            new_count: 2,
+            patch_lines: vec![" context4", "-removed5", "+added5", " context6"],
+        }];
+        // Correct trace: context4 (New,4), removed5 (Old,5), added5 (New,5), context6 (New,6).
+        let emissions: Vec<(Axis, usize)> = vec![
+            (Axis::New, 4),
+            (Axis::Old, 5),
+            (Axis::New, 5),
+            (Axis::New, 6),
+        ];
+        assert!(
+            verify_ast_render(&emissions, &hunks),
+            "correct render must be accepted by verifier"
+        );
+    }
+
+    /// Verifier trivially accepts empty emissions with no hunks.
+    #[test]
+    fn test_c1b_verifier_accepts_empty_trace_no_hunks() {
+        assert!(
+            verify_ast_render(&[], &[]),
+            "empty trace with no hunks must pass all invariants vacuously"
+        );
+    }
+
+    /// ADR-011 class-2 pin: the verifier fallback is a no-loss raw-fallback and
+    /// must be gated behind `SKIM_DEBUG`. This test verifies the three verifier
+    /// invariants independently, proving each alone can trigger rejection —
+    /// which is what would cause `try_ast_render` to call `crate::debug_log!`
+    /// (the class-2 gated banner) and return `None` for the raw-fallback.
+    ///
+    /// The `crate::debug_log!` macro writes zero bytes to stderr without
+    /// `SKIM_DEBUG=1`, satisfying ADR-011 class-2 for no-loss raw fallbacks.
+    #[test]
+    fn test_c1b_each_invariant_triggers_rejection_independently() {
+        // Invariant 1: uniqueness — duplicate triggers rejection.
+        let dup = vec![(Axis::New, 1), (Axis::New, 1)];
+        assert!(
+            !verify_ast_render(&dup, &[]),
+            "uniqueness invariant must reject duplicate"
+        );
+
+        // Invariant 2: monotonicity — backward jump triggers rejection.
+        let backward = vec![(Axis::New, 10), (Axis::New, 5)];
+        assert!(
+            !verify_ast_render(&backward, &[]),
+            "monotonicity invariant must reject backward jump"
+        );
+
+        // Invariant 3: coverage — missing `+` triggers rejection.
+        let hunk = DiffHunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            patch_lines: vec!["+added"],
+        };
+        let missing_plus: Vec<(Axis, usize)> = vec![]; // +added at new_line=1 missing
+        assert!(
+            !verify_ast_render(&missing_plus, &[hunk]),
+            "coverage invariant must reject missing `+` line"
+        );
+    }
+
+    /// C1a + C1b integration: render_default_scoped single walk produces a trace
+    /// that passes the verifier for a mixed hunk (orphan + in-node lines).
+    ///
+    /// Validates that the new code path threads emissions correctly and the
+    /// verifier accepts the output (regression guard against accidentally
+    /// breaking the emission tracking in the new single-walk implementation).
+    #[test]
+    fn test_c1a_c1b_integration_single_walk_passes_verifier() {
+        // Simple function change: one context + one removed + one added + one context.
+        let source_lines: Vec<&str> = vec!["fn foo() {", "    new_val", "}"];
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 3,
+            patch_lines: vec![" fn foo() {", "-    old_val", "+    new_val", " }"],
+        }];
+        let changed_ranges = vec![super::super::types::ChangedNodeRange {
+            start: 1,
+            end: 3,
+            parent_context: None,
+        }];
+
+        let mut output = String::new();
+        let mut emissions: Vec<(Axis, usize)> = Vec::new();
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            &mut emissions,
+        );
+
+        assert!(
+            verify_ast_render(&emissions, &hunks),
+            "single-walk render must pass all three verifier invariants;\
+             \nemissions: {emissions:?}\noutput:\n{output}"
+        );
+
+        // Sanity check on content.
+        assert!(
+            output.contains("new_val"),
+            "changed content must appear:\n{output}"
+        );
+        assert!(
+            output.contains("old_val"),
+            "removed content must appear:\n{output}"
         );
     }
 }

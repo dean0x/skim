@@ -94,7 +94,9 @@ pub(crate) mod ux;
 // ============================================================================
 
 mod dispatch;
-pub(crate) use dispatch::{dispatch, dispatch_for_wrapper, run_inherited_passthrough, run_raw_passthrough};
+pub(crate) use dispatch::{
+    dispatch, dispatch_for_wrapper, run_inherited_passthrough, run_raw_passthrough,
+};
 
 pub(crate) mod execution;
 pub(crate) use execution::{
@@ -461,7 +463,10 @@ mod tests {
         let args: Vec<String> = vec!["--json=title,number".into(), "--limit=10".into()];
         let (filtered, is_json) = extract_json_flag(&args);
         // Tool-owned --json=value must survive — skim only strips bare --json.
-        assert!(!is_json, "--json=value must not set skim's json_output flag");
+        assert!(
+            !is_json,
+            "--json=value must not set skim's json_output flag"
+        );
         assert_eq!(
             filtered,
             vec!["--json=title,number", "--limit=10"],
@@ -475,7 +480,10 @@ mod tests {
         let args: Vec<String> = vec!["--cached".into(), "--".into(), "--json".into()];
         let (filtered, is_json) = extract_json_flag(&args);
         // --json after -- is a positional arg passed to the tool, not skim's flag.
-        assert!(!is_json, "--json after -- must not set skim's json_output flag");
+        assert!(
+            !is_json,
+            "--json after -- must not set skim's json_output flag"
+        );
         assert_eq!(
             filtered,
             vec!["--cached", "--", "--json"],

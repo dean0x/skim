@@ -651,7 +651,9 @@ fn test_skim_git_unknown_subcommand() {
         .failure()
         // D2: git's native error surfaces; "not a git command" covers both old
         // and new git versions. Skim no longer emits "unknown git subcommand".
-        .stderr(predicate::str::contains("not a git command").or(predicate::str::contains("unknown")));
+        .stderr(
+            predicate::str::contains("not a git command").or(predicate::str::contains("unknown")),
+        );
 }
 
 #[test]
@@ -939,7 +941,9 @@ fn test_skim_git_show_unknown_subcommand_message() {
         .failure()
         // D2: git's native error surfaces; "not a git command" covers both old and
         // new git versions. Skim no longer emits a list of supported subcommands.
-        .stderr(predicate::str::contains("not a git command").or(predicate::str::contains("unknown")));
+        .stderr(
+            predicate::str::contains("not a git command").or(predicate::str::contains("unknown")),
+        );
 }
 
 #[test]
@@ -1055,14 +1059,17 @@ fn test_skim_git_show_head_commit_mode_json() {
 /// path (show.rs Tier-1) is a safety net that cannot be triggered in practice.
 /// This test targets commit mode (`skim git show HEAD`, no colon-path), which
 /// calls `apply_to_stderr` in `emit_show_commit` (show.rs) and CAN inflate when
-/// the AST-aware hunk renderer adds breadcrumbs and per-line numbers that exceed
-/// the raw diff metadata saved.
+/// per-line numbers added by `render_raw_hunks` exceed the metadata savings from
+/// the compact skim commit header.
 ///
-/// Inflation scenario: two-commit hermetic repo where the second commit modifies
-/// an existing TypeScript file by appending 20 functions (f20..f39, two-digit
-/// names).  The skim commit render adds line numbers and AST breadcrumbs to each
-/// diff line; the overhead exceeds the diff-metadata savings, so compressed >
-/// raw (verified empirically: raw ~745 bytes, compressed inflates past that).
+/// Inflation scenario: two-commit hermetic repo where the second commit ADDS a
+/// new TypeScript file (inflate.ts) with 100 functions (f000..f099).
+/// Status = Added → `render_raw_hunks` path in `render_diff_file` (skips AST
+/// overlay entirely).  `render_raw_hunks` prepends a 3-digit line number column
+/// (`ln_width = 3` for 100 lines), adding 4 chars per line × 100 lines = 400
+/// chars of inflation.  The skim compact commit header saves ~90 chars vs raw
+/// (strips the 40-char hash, Author/Date headers, and indent).  Net: render
+/// inflates by ~310 chars → `compressed.len() > raw.len()` → guardrail fires.
 ///
 /// Paired assertions (avoids PF-009 by using a hermetic repo):
 ///   SKIM_DEBUG=1        → banner PRESENT  (catches a revert of Fix 5 that makes
@@ -1078,27 +1085,29 @@ fn test_skim_git_show_commit_guardrail_is_debug_gated() {
     git_in(&repo, &["config", "user.email", "test@example.com"]);
     git_in(&repo, &["config", "user.name", "Test"]);
 
-    // First commit: establish inflate.ts with f0..f19 (single/double-digit names).
-    let mut ts_src_v1 = String::new();
-    for i in 0..20 {
-        ts_src_v1.push_str(&format!("function f{i}() {{ }}\n"));
+    // First commit: a minimal anchor so HEAD~1 exists.
+    std::fs::write(repo.join("README.md"), "# test\n").expect("write README.md");
+    git_in(&repo, &["add", "README.md"]);
+    git_in(&repo, &["commit", "-m", "initial"]);
+
+    // Second commit: ADD inflate.ts with 100 zero-padded functions (f000..f099).
+    //
+    // Choosing status=Added is deliberate: `render_diff_file` returns
+    // `render_raw_hunks` immediately for Added files (no AST overlay), so this
+    // test is independent of the C1a breadcrumb-walk fix and will keep working
+    // even if the AST default-mode render compresses further.
+    //
+    // With 100 lines, `line_number_width` returns 3 (max new-file line = 101).
+    // Each added line grows from `+function fNNN() { }\n` (22 chars in raw) to
+    // `+NNN function fNNN() { }\n` (26 chars in render) → +4 chars × 100 = 400
+    // chars inflation, which exceeds the ~90-char commit-header saving.
+    let mut ts_src = String::new();
+    for i in 0..100usize {
+        ts_src.push_str(&format!("function f{i:0>3}() {{ }}\n"));
     }
-    std::fs::write(repo.join("inflate.ts"), &ts_src_v1).expect("write inflate.ts v1");
+    std::fs::write(repo.join("inflate.ts"), &ts_src).expect("write inflate.ts");
     git_in(&repo, &["add", "inflate.ts"]);
     git_in(&repo, &["commit", "-m", "add inflate fixture"]);
-
-    // Second commit: append f20..f39 (all two-digit names).
-    // The commit diff shows the f17..f19 context lines plus the 20 additions.
-    // skim commit render adds per-line numbers (+20, +21, …) and AST breadcrumbs
-    // to each hunk line, inflating past the raw diff size (≥ 256 bytes) so the
-    // guardrail at apply_to_stderr in emit_show_commit fires.
-    let mut ts_src_v2 = ts_src_v1.clone();
-    for i in 20..40 {
-        ts_src_v2.push_str(&format!("function f{i}() {{ }}\n"));
-    }
-    std::fs::write(repo.join("inflate.ts"), &ts_src_v2).expect("write inflate.ts v2");
-    git_in(&repo, &["add", "inflate.ts"]);
-    git_in(&repo, &["commit", "-m", "extend inflate fixture"]);
 
     // With SKIM_DEBUG=1: guardrail fires AND banner is visible → PRESENT.
     let debug_out = common::skim()

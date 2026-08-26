@@ -13,8 +13,8 @@ use super::stream_pump::{PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child
 #[cfg(feature = "proxy")]
 use super::proxy;
 use super::{
-    agents, build, completions, db, discover, doctor, file, git, heatmap, infra, init, learn,
-    lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
+    agents, build, completions, db, discover, doctor, file, git, heatmap, infra, init, learn, lint,
+    log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
 
 // ============================================================================
@@ -533,9 +533,7 @@ fn dispatch_cargo(
             // it understands; everything else passes through byte-faithfully.
             // Banner is debug-gated per ADR-011 (lossless path).
             let safe = sanitize_for_display(unknown);
-            crate::debug_log!(
-                "skim cargo: unknown subcommand '{safe}' — passing through to cargo"
-            );
+            crate::debug_log!("skim cargo: unknown subcommand '{safe}' — passing through to cargo");
             run_raw_passthrough("cargo", args, &[])
         }
     }
@@ -562,9 +560,7 @@ fn dispatch_go(
             // D2: unknown go subcommands (build, fmt, get, mod, vet, …) are forwarded
             // to the real go binary. Banner is debug-gated per ADR-011 (lossless path).
             let safe = sanitize_for_display(unknown);
-            crate::debug_log!(
-                "skim go: unknown subcommand '{safe}' — passing through to go"
-            );
+            crate::debug_log!("skim go: unknown subcommand '{safe}' — passing through to go");
             run_raw_passthrough("go", args, &[])
         }
     }

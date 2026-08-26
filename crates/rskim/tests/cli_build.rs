@@ -51,7 +51,9 @@ fn test_skim_cargo_unknown_subcmd_exits_nonzero() {
         .assert()
         .failure()
         // D2: skim passes through to cargo; cargo's own error surfaces here.
-        .stderr(predicate::str::contains("no such command").or(predicate::str::contains("unknown")));
+        .stderr(
+            predicate::str::contains("no such command").or(predicate::str::contains("unknown")),
+        );
 }
 
 // ============================================================================
