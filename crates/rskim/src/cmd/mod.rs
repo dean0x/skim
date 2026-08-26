@@ -94,7 +94,7 @@ pub(crate) mod ux;
 // ============================================================================
 
 mod dispatch;
-pub(crate) use dispatch::{dispatch, run_inherited_passthrough, run_raw_passthrough};
+pub(crate) use dispatch::{dispatch, dispatch_for_wrapper, run_inherited_passthrough, run_raw_passthrough};
 
 pub(crate) mod execution;
 pub(crate) use execution::{
@@ -325,13 +325,43 @@ pub(crate) fn extract_show_stats(args: &[String]) -> (Vec<String>, bool) {
 ///
 /// This centralises the pattern that was previously copy-pasted across git,
 /// lint, and pkg subcommand entry points.
+/// Extract skim's `--json` output flag from args.
+///
+/// Returns `(filtered_args, is_json)` where `filtered_args` has skim's `--json`
+/// removed and `is_json` is true when the flag was present.
+///
+/// D4 improvements over the original implementation:
+/// - **Position-aware**: only strips bare `--json`; never strips `--json=value`
+///   (e.g. `gh pr list --json title,number` — the gh field-selector must survive).
+/// - **Separator-aware**: never strips `--json` after the POSIX `--` separator
+///   (args after `--` are positional arguments, not skim flags).
+///
+/// Note: tools with their own `--json` flag (rg, tree) should be handled by the
+/// caller's passthrough logic (D3/D4: the rewrite surface's `skip_if_flag_prefix`
+/// equivalent). On the wrapper surface, `dispatch_for_wrapper` handles `--version`
+/// and `--help`; tool-owned `--json` is handled by checking `skip_if_flag_prefix`
+/// in `dispatch_for_wrapper` (see D4 extension in dispatch.rs).
 pub(crate) fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let is_json = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
+    let mut is_json = false;
+    let mut past_separator = false;
+    let mut filtered = Vec::with_capacity(args.len());
+
+    for arg in args {
+        if arg == "--" {
+            past_separator = true;
+            filtered.push(arg.clone());
+            continue;
+        }
+        // Only strip bare `--json` (skim's output-format flag), and only before `--`.
+        // `--json=value` is a tool-owned flag (e.g. gh's field-selector) — keep it.
+        if !past_separator && arg.as_str() == "--json" {
+            is_json = true;
+            // Strip from filtered — caller uses json_output=true for JSON formatting.
+        } else {
+            filtered.push(arg.clone());
+        }
+    }
+
     (filtered, is_json)
 }
 
@@ -421,6 +451,49 @@ mod tests {
         let (filtered, is_json) = extract_json_flag(&args);
         assert!(!is_json);
         assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    // D4 additions: value-aware and separator-aware extract_json_flag tests.
+
+    /// `--json=value` is a tool-owned flag (e.g. gh field-selector); must NOT be stripped.
+    #[test]
+    fn test_extract_json_flag_with_value_not_stripped() {
+        let args: Vec<String> = vec!["--json=title,number".into(), "--limit=10".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        // Tool-owned --json=value must survive — skim only strips bare --json.
+        assert!(!is_json, "--json=value must not set skim's json_output flag");
+        assert_eq!(
+            filtered,
+            vec!["--json=title,number", "--limit=10"],
+            "--json=value must not be stripped from tool args"
+        );
+    }
+
+    /// `--json` after `--` is a positional argument; must NOT be stripped.
+    #[test]
+    fn test_extract_json_flag_after_separator_not_stripped() {
+        let args: Vec<String> = vec!["--cached".into(), "--".into(), "--json".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        // --json after -- is a positional arg passed to the tool, not skim's flag.
+        assert!(!is_json, "--json after -- must not set skim's json_output flag");
+        assert_eq!(
+            filtered,
+            vec!["--cached", "--", "--json"],
+            "--json after -- must survive in filtered args"
+        );
+    }
+
+    /// Bare `--json` before `--` is still stripped (skim's output-format flag).
+    #[test]
+    fn test_extract_json_flag_before_separator_is_stripped() {
+        let args: Vec<String> = vec!["--json".into(), "--".into(), "positional".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(is_json, "bare --json before -- must set json_output=true");
+        assert_eq!(
+            filtered,
+            vec!["--", "positional"],
+            "bare --json before -- must be stripped; positional args must survive"
+        );
     }
 
     // ========================================================================

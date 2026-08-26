@@ -76,12 +76,21 @@ pub(crate) fn run(
         "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, rec),
         "push" => push::run_push(&global_flags, subcmd_args, show_stats, rec),
         other => {
-            let safe_other = crate::cmd::sanitize_for_display(other);
-            anyhow::bail!(
-                "unknown git subcommand: '{safe_other}'\n\n\
-                 Supported: status, diff, fetch, log, show, commit, push\n\
-                 Run 'skim git --help' for usage"
+            // D2: unknown git subcommands (branch, checkout, rev-parse, stash, …) are
+            // forwarded to the real git binary unchanged. skim only compresses the
+            // subcommands it understands; everything else passes through byte-faithfully.
+            // The banner is debug-gated per ADR-011 (no-loss path — the reader sees
+            // exactly what git would produce).
+            let safe = crate::cmd::sanitize_for_display(other);
+            crate::debug_log!(
+                "skim git: unknown subcommand '{safe}' — passing through to git"
             );
+            // Reconstruct full args: subcommand + remaining subcmd_args, then
+            // re-prepend any global git flags so they reach the real binary.
+            let mut all_args: Vec<String> = global_flags.to_vec();
+            all_args.push(other.to_string());
+            all_args.extend_from_slice(subcmd_args);
+            super::run_raw_passthrough("git", &all_args, &[])
         }
     }
 }

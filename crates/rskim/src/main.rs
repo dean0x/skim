@@ -632,23 +632,46 @@ where
         .filter(|s| analytics::is_safe_session_id(s))
 }
 
-/// Pure PATH filter: removes all entries that match `~/.skim/bin` from `path`.
+/// Pure PATH filter: removes all entries that match the wrappers directory from `path`.
 ///
 /// Returns `Some(filtered)` when at least one entry was removed, `None` when
-/// the wrappers directory cannot be determined or the path is unchanged.
+/// the wrappers directory is absent from `path` or nothing was removed.
 ///
 /// Extracted as a pure function (no `set_var`) so it can be unit-tested
 /// directly without touching the process environment.
-fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
-    // Fast-path: if the raw PATH string contains no ".skim" substring, the
-    // wrappers directory cannot be present.  Skip the expensive
-    // split-normalize-filter-join entirely — this is the common case when
+///
+/// The `wrappers_dir` parameter is the resolved wrappers directory (from
+/// `cmd::skim_wrappers_dir()`).  Accepting it explicitly rather than calling
+/// `skim_wrappers_dir()` internally keeps the function testable with arbitrary
+/// paths — including paths that do NOT contain `.skim` (D6 fix: the old
+/// hardcoded `b".skim"` fast-path check would silently skip filtering when
+/// `SKIM_WRAPPERS_DIR` pointed outside `~/.skim/`, leaving the wrapper dir in
+/// PATH and causing infinite recursion in the tool handler).
+fn filter_wrappers_from_path(
+    path: &std::ffi::OsStr,
+    wrappers_dir: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    let wrappers_dir = wrappers_dir?;
+
+    // Fast-path: if the raw PATH bytes contain no substring matching the
+    // wrappers directory, the directory cannot be present. Skip the expensive
+    // split-normalize-filter-join — this is the common case when
     // `skim init --wrappers` has not been run.
-    if !path.as_encoded_bytes().windows(5).any(|w| w == b".skim") {
+    //
+    // D6: the needle is derived from the ACTUAL resolved wrappers_dir rather
+    // than a hardcoded b".skim" substring. This ensures that
+    // SKIM_WRAPPERS_DIR=/custom/skim-wrappers (a path without ".skim") is
+    // still correctly stripped from PATH.
+    let dir_bytes = wrappers_dir.as_os_str().as_encoded_bytes();
+    if !dir_bytes.is_empty()
+        && !path
+            .as_encoded_bytes()
+            .windows(dir_bytes.len())
+            .any(|w| w == dir_bytes)
+    {
         return None;
     }
 
-    let wrappers_dir = cmd::skim_wrappers_dir()?;
     // Syntactic normalization only: collapses trailing slashes and `..`
     // segments so they don't defeat the equality check.  Filesystem symlinks
     // in *parent* directories are NOT resolved — use std::fs::canonicalize
@@ -704,7 +727,7 @@ fn strip_skim_wrappers_from_path() {
         Some(p) => p,
         None => return,
     };
-    if let Some(new_path) = filter_wrappers_from_path(&path) {
+    if let Some(new_path) = filter_wrappers_from_path(&path, cmd::skim_wrappers_dir()) {
         // SAFETY: THREADS_SPAWNED is false (asserted above), so no other
         // thread can be reading the environment concurrently.
         unsafe {
@@ -714,25 +737,55 @@ fn strip_skim_wrappers_from_path() {
 }
 
 // ============================================================================
-// D2b (#370): stdout-is-regular-file predicate for wrapper passthrough
+// D2b (#370) / D5: stdout gate — serve raw when stdout is not a TTY or pipe
 // ============================================================================
 
-/// Testable seam: return `true` when the `io::Result<Metadata>` describes a
-/// regular file. Used by [`stdout_is_regular_file`] so the check can be unit-
-/// tested with synthetic metadata without touching real file descriptors.
+/// Testable seam: return `true` when stdout should serve raw bytes
+/// (i.e., fd 1 is not a TTY/char-device and not a pipe/FIFO).
+///
+/// Kept separate from [`stdout_should_serve_raw`] so tests can construct
+/// synthetic `Metadata` via a mock filesystem without touching real fds.
+///
+/// D5 widens the original `is_file` check to also catch sockets and other
+/// non-compressible sink types — anything that is neither a TTY nor a pipe
+/// receives raw bytes. Regular files (the D2b case) still trigger; the only
+/// new cases under D5 are AF_UNIX sockets (rare for fd 1) and block devices.
+///
+/// **Accepted pinned divergence:** `$(skim grep …)` (command substitution) sets
+/// fd 1 to a pipe → compress path → compressed output captured by the shell.
+/// On the rewrite surface, `grep …` inside `$(…)` is not intercepted (the
+/// compound-expression handler detects the pipe). This is an accepted
+/// divergence documented here rather than silently surprising the user.
 #[cfg(unix)]
+fn stdout_should_serve_raw_impl(meta: std::io::Result<std::fs::Metadata>) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    match meta {
+        Err(_) => false, // Cannot determine — compress (safe default)
+        Ok(m) => {
+            let ft = m.file_type();
+            // Compress on TTY (char device) or pipe (FIFO).
+            // Serve raw for everything else: regular files, sockets, …
+            !ft.is_char_device() && !ft.is_fifo()
+        }
+    }
+}
+
+/// Backward-compat alias for tests that drive the D2b `is_file` predicate.
+///
+/// The underlying logic moved to [`stdout_should_serve_raw_impl`] (D5).
+/// This wrapper is kept so the D2b test coverage remains exercisable.
+#[cfg(unix)]
+#[cfg(test)]
 fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
     meta.map(|m| m.is_file()).unwrap_or(false)
 }
 
-/// Return `true` when the process's stdout (fd 1) is a regular file.
+/// Return `true` when the process's stdout (fd 1) should receive raw bytes.
 ///
-/// When a PATH-wrapper invocation is `~/.skim/bin/gh api … > out.json`, the
-/// shell sets fd 1 → the file BEFORE exec-ing the wrapper. No `>` appears in
-/// argv, so the rewrite-engine guard (D2-A) cannot catch it. Detecting the fd
-/// directly and running the real tool with inherited stdio ensures raw bytes
-/// reach the file unmodified (#370, #317). Pipes/ttys are not regular files
-/// and fall through to normal compression (skim's core use case).
+/// D5 widens the original D2b `is_regular_file` check: serve raw when stdout
+/// is not a TTY (char device) and not a pipe (FIFO). This covers regular
+/// files (the common case for `> file` redirection), sockets, and other
+/// non-compressible sink types.
 ///
 /// **Shared invariant (cross-surface):** "stdout redirected to a regular file
 /// must receive the tool's raw bytes, never a skim summary." This invariant is
@@ -743,10 +796,6 @@ fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
 /// - **Rewrite surface (static):** `stdout_redirected_to_file` in
 ///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
 ///
-/// Keep the two detectors in lockstep. If you widen or narrow the detection
-/// semantics here, audit `stdout_redirected_to_file` for the same forms
-/// (`>f`, `>>f`, `1>f`, `&>f`, `&>>f`).
-///
 /// Non-Unix: always returns `false` (compression proceeds normally).
 #[cfg(unix)]
 fn stdout_is_regular_file() -> bool {
@@ -755,10 +804,9 @@ fn stdout_is_regular_file() -> bool {
     // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
     // SAFETY: ManuallyDrop suppresses File's Drop, so fd 1 is never closed
     // (no double-close). If fd 1 is invalid (e.g. the process was started with
-    // stdout closed), f.metadata() returns Err; is_regular_file_stdout falls
-    // back to false and normal compression proceeds.
+    // stdout closed), metadata() returns Err; we fall back to false (compress).
     let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-    is_regular_file_stdout(f.metadata())
+    stdout_should_serve_raw_impl(f.metadata())
 }
 
 #[cfg(not(unix))]
@@ -862,7 +910,10 @@ fn main() -> ExitCode {
         if stdout_is_regular_file() {
             Ok(cmd::run_inherited_passthrough(&name, &args))
         } else {
-            cmd::dispatch(&name, &args, &analytics)
+            // D3: use dispatch_for_wrapper on the wrapper surface so that
+            // `grep --help`, `git --help`, etc. forward to the real tool
+            // rather than printing skim's internal handler help.
+            cmd::dispatch_for_wrapper(&name, &args, &analytics)
         }
     } else {
         match resolve_invocation() {
@@ -1185,6 +1236,50 @@ mod tests {
         assert!(
             !is_regular_file_stdout(meta),
             "Err metadata must return false (defensive)"
+        );
+    }
+
+    // ========================================================================
+    // D5: stdout_should_serve_raw_impl — wider gate (not-TTY, not-pipe)
+    // ========================================================================
+
+    /// D5: regular file → serve raw (D2b behaviour preserved).
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_regular_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let meta = tmp.as_file().metadata();
+        assert!(
+            stdout_should_serve_raw_impl(meta),
+            "regular file must trigger raw-serve (D5)"
+        );
+    }
+
+    /// D5: error result → compress (defensive default unchanged).
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_false_for_err() {
+        let meta: std::io::Result<std::fs::Metadata> =
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            !stdout_should_serve_raw_impl(meta),
+            "Err metadata must fall through to compress (defensive)"
+        );
+    }
+
+    /// D5: directory → serve raw (not a TTY or FIFO; edge case, but widened gate handles it).
+    ///
+    /// This is an accepted deviation from D2b which only served raw for regular files.
+    /// A directory as fd 1 is vanishingly rare in practice, so any behaviour is fine;
+    /// pinning it here makes the widened gate explicit.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(tmp.path());
+        assert!(
+            stdout_should_serve_raw_impl(meta),
+            "directory metadata (not TTY, not FIFO) must trigger raw-serve (D5)"
         );
     }
 
@@ -1602,8 +1697,9 @@ mod tests {
         let input_paths = vec![wrappers.clone(), other.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        // Call the real extracted function — no manual replication.
-        let result = filter_wrappers_from_path(&path_str)
+        // D6: pass wrappers_dir explicitly — the function no longer reads it
+        // from the LazyLock cache internally.
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers))
             .expect("wrappers dir present — filter must return Some");
 
         let result_paths: Vec<_> = std::env::split_paths(&result).collect();
@@ -1620,14 +1716,16 @@ mod tests {
     /// PATH without ~/.skim/bin returns None (no change needed).
     #[test]
     fn test_strip_skim_wrappers_no_change_when_absent() {
+        let home = dirs::home_dir().unwrap();
+        let wrappers = home.join(".skim").join("bin");
         let other = std::path::PathBuf::from("/usr/local/bin");
         let other2 = std::path::PathBuf::from("/usr/bin");
 
         let input_paths = vec![other.clone(), other2.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        // filter_wrappers_from_path returns None when nothing was removed.
-        let result = filter_wrappers_from_path(&path_str);
+        // D6: pass wrappers_dir explicitly.
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers));
         assert!(
             result.is_none(),
             "path without wrappers dir must return None (no change)"
@@ -1645,7 +1743,7 @@ mod tests {
         let input_paths = vec![before.clone(), wrappers.clone(), after.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        let result = filter_wrappers_from_path(&path_str)
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers))
             .expect("wrappers dir present — filter must return Some");
         let filtered: Vec<_> = std::env::split_paths(&result).collect();
 
@@ -1668,7 +1766,7 @@ mod tests {
         let input_paths = vec![wrappers.clone(), other.clone(), wrappers.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        let result = filter_wrappers_from_path(&path_str)
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers))
             .expect("wrappers dir present — filter must return Some");
         let filtered: Vec<_> = std::env::split_paths(&result).collect();
 
@@ -1678,6 +1776,40 @@ mod tests {
             "both duplicate wrappers entries must be removed"
         );
         assert_eq!(filtered[0], other, "only /usr/bin must remain");
+    }
+
+    /// D6 regression: when SKIM_WRAPPERS_DIR points to a path without ".skim",
+    /// filter_wrappers_from_path must still correctly remove it from PATH.
+    ///
+    /// The old code fast-pathed on `b".skim"` — a path like
+    /// `/custom/skim-wrappers/bin` would pass the fast-path check (no ".skim"
+    /// substring) and return None, leaving the wrapper dir in PATH and causing
+    /// infinite recursion. The D6 fix derives the fast-path needle from the
+    /// actual resolved wrappers_dir.
+    #[test]
+    fn test_strip_skim_wrappers_custom_dir_without_skim_substring() {
+        // A custom wrappers dir whose path does NOT contain ".skim".
+        let custom_wrappers = std::path::PathBuf::from("/opt/custom-wrappers/bin");
+        let other = std::path::PathBuf::from("/usr/bin");
+
+        let input_paths = vec![custom_wrappers.clone(), other.clone()];
+        let path_str = std::env::join_paths(&input_paths).unwrap();
+
+        // The old code (windows(5).any(|w| w == b".skim")) would return None here
+        // because "/opt/custom-wrappers/bin" contains no ".skim" substring.
+        // The D6 fix correctly detects and removes the custom wrappers dir.
+        let result = filter_wrappers_from_path(&path_str, Some(&custom_wrappers))
+            .expect("custom wrappers dir in PATH — filter must return Some (D6 regression)");
+
+        let result_paths: Vec<_> = std::env::split_paths(&result).collect();
+        assert!(
+            !result_paths.contains(&custom_wrappers),
+            "custom wrappers dir without '.skim' in path must be removed (D6)"
+        );
+        assert!(
+            result_paths.contains(&other),
+            "non-wrapper dirs must be preserved"
+        );
     }
 
     // ========================================================================
@@ -1866,28 +1998,33 @@ mod tests {
     // filter_wrappers_from_path tests
     // ========================================================================
 
-    /// Fast-path: PATH with no ".skim" substring returns None without allocation.
+    /// Fast-path: PATH with no wrappers_dir substring returns None without allocation.
     #[test]
     fn test_filter_wrappers_fast_path_no_skim() {
+        let wrappers = std::path::Path::new("/home/user/.skim/bin");
         let path = std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin");
-        let result = filter_wrappers_from_path(&path);
+        let result = filter_wrappers_from_path(&path, Some(wrappers));
         assert!(
             result.is_none(),
-            "PATH with no '.skim' must return None immediately (fast-path)"
+            "PATH without the wrappers_dir must return None (no filtering needed)"
         );
     }
 
-    /// Fast-path passes through to full filter when ".skim" is present but
-    /// does not match the wrappers directory — result may be None (unchanged).
+    /// Fast-path passes through to full filter when a similar-looking path is
+    /// present but does not match the exact wrappers directory — result is None.
     #[test]
     fn test_filter_wrappers_fast_path_skim_present_but_no_match() {
-        // A path containing ".skim" in a different position should not cause
-        // a panic; it falls through to the full filter which returns None
-        // when nothing was removed.
+        // D6: the needle is derived from wrappers_dir, not a hardcoded ".skim".
+        // A path containing a similar-looking segment is NOT filtered unless it
+        // matches the exact wrappers_dir bytes.
+        let wrappers = std::path::Path::new("/home/user/.skim/bin");
         let path = std::ffi::OsString::from("/usr/local/bin:/some/.skim-other/bin:/usr/bin");
-        // We can't assert the exact value because it depends on skim_wrappers_dir(),
-        // but we can assert no panic occurs and the function is callable.
-        let _ = filter_wrappers_from_path(&path);
+        let result = filter_wrappers_from_path(&path, Some(wrappers));
+        // The path does not contain "/home/user/.skim/bin", so nothing is filtered.
+        assert!(
+            result.is_none(),
+            "PATH without exact wrappers_dir match must return None"
+        );
     }
 
     /// KNOWN LIMITATION: filter_wrappers_from_path uses syntactic normalization

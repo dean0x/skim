@@ -88,13 +88,18 @@ fn test_build_clippy_success_exit_code() {
 // Build error handling
 // ============================================================================
 
+/// D2: unknown cargo subcommands are passed through to cargo itself via
+/// run_raw_passthrough. Cargo exits non-zero and emits its own error message
+/// ("no such command") rather than skim's old "unknown subcommand" message.
 #[test]
 fn test_cargo_unknown_subcmd_exit_code() {
     skim_cmd()
         .args(["cargo", "webpack"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        // D2: cargo's own error surfaces; "no such command" or "unknown" covers
+        // both older and newer cargo versions.
+        .stderr(predicate::str::contains("no such command").or(predicate::str::contains("unknown")));
 }
 
 #[test]

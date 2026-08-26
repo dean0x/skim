@@ -13,8 +13,8 @@ use super::stream_pump::{PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child
 #[cfg(feature = "proxy")]
 use super::proxy;
 use super::{
-    KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, doctor, file, git, heatmap, infra,
-    init, learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
+    agents, build, completions, db, discover, doctor, file, git, heatmap, infra, init, learn,
+    lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
 
 // ============================================================================
@@ -363,10 +363,11 @@ fn passthrough_subcmd(
     supported: &str,
     env: &[(&str, &str)],
 ) -> anyhow::Result<ExitCode> {
+    // D2/ADR-011: banner is debug-gated — this is a no-loss raw-fallback path;
+    // the reader sees exactly what the native tool would produce.
     let safe = sanitize_for_display(unknown);
-    eprintln!(
-        "skim {tool}: unknown subcommand '{safe}' — passing through\n\
-         Supported subcommands: {supported}"
+    crate::debug_log!(
+        "skim {tool}: unknown subcommand '{safe}' — passing through (supported: {supported})"
     );
     run_raw_passthrough(tool, &prepend_without(unknown, args, subcmd_idx), env)
 }
@@ -527,13 +528,15 @@ fn dispatch_cargo(
         // audit: keep "audit" in args — pkg::run uses it to select the audit parser.
         "audit" => pkg::run(&prepend("cargo", args), analytics),
         unknown => {
+            // D2: unknown cargo subcommands (run, install, update, publish, …) are
+            // forwarded to the real cargo binary. skim only compresses the subcommands
+            // it understands; everything else passes through byte-faithfully.
+            // Banner is debug-gated per ADR-011 (lossless path).
             let safe = sanitize_for_display(unknown);
-            eprintln!(
-                "skim cargo: unknown subcommand '{safe}'\n\n\
-                 Usage: skim cargo <test|build|check|fmt|clippy|audit|nextest> [args...]\n\n\
-                 Supported subcommands: test, nextest, build, check, fmt, clippy, audit"
+            crate::debug_log!(
+                "skim cargo: unknown subcommand '{safe}' — passing through to cargo"
             );
-            Ok(ExitCode::FAILURE)
+            run_raw_passthrough("cargo", args, &[])
         }
     }
 }
@@ -556,13 +559,13 @@ fn dispatch_go(
     match subcmd {
         "test" => test::run(&prepend_without("go", args, idx), analytics),
         unknown => {
+            // D2: unknown go subcommands (build, fmt, get, mod, vet, …) are forwarded
+            // to the real go binary. Banner is debug-gated per ADR-011 (lossless path).
             let safe = sanitize_for_display(unknown);
-            eprintln!(
-                "skim go: unknown subcommand '{safe}'\n\n\
-                 Usage: skim go <test> [args...]\n\n\
-                 Supported subcommands: test"
+            crate::debug_log!(
+                "skim go: unknown subcommand '{safe}' — passing through to go"
             );
-            Ok(ExitCode::FAILURE)
+            run_raw_passthrough("go", args, &[])
         }
     }
 }
@@ -714,6 +717,62 @@ fn handler_visible_args<'a>(subcommand: &str, args: &'a [String]) -> &'a [String
     args
 }
 
+/// Dispatch for the PATH-wrapper surface (D3).
+///
+/// When skim is invoked via a symlink (`~/.skim/bin/grep`), informational flags
+/// such as `--help`, `-h`, `--version`, and `-V` must be forwarded to the real
+/// tool — not intercepted by skim's internal help for that handler. This mirrors
+/// the behaviour of `skip_if_flag_prefix` on the rewrite surface (where `grep
+/// --help` is not rewritten, so the user sees grep's real help output).
+///
+/// Meta/management subcommands (`doctor`, `stats`, `init`, …) are excluded: they
+/// have no external binary counterpart, so their `--help` is always skim's own.
+///
+/// For all other flags and subcommands, delegates to [`dispatch`].
+pub(crate) fn dispatch_for_wrapper(
+    name: &str,
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    use crate::cmd::registry::is_meta_subcommand;
+    use crate::cmd::rewrite::skip_flags_for_tool;
+
+    // D3: universal help/version passthrough for non-meta tool wrappers.
+    // Equivalent to skip_if_flag_prefix on the rewrite surface: when `grep --help`
+    // is not rewritten (rewrite surface), it also must not be compressed (wrapper
+    // surface). The reader should see the real tool's output in both cases.
+    if !is_meta_subcommand(name)
+        && args
+            .iter()
+            .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return run_raw_passthrough(name, args, &[]);
+    }
+
+    // D4: tool-owned skip flags from rewrite rules.
+    // Some tools have flags that skim must never intercept — e.g., `rg --json` and
+    // `tree --json` enable the tool's own JSON output; they are distinct from skim's
+    // `--json` output-format flag. The rewrite surface handles this via
+    // `skip_if_flag_prefix`; the wrapper surface must honour the same set.
+    //
+    // `skip_flags_for_tool` returns the non-help/version skip flags for `name`'s
+    // rewrite rules. If any arg matches a skip flag, passthrough to the real tool.
+    if !is_meta_subcommand(name) {
+        let skip_flags = skip_flags_for_tool(name);
+        if !skip_flags.is_empty()
+            && args.iter().any(|arg| {
+                skip_flags
+                    .iter()
+                    .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+            })
+        {
+            return run_raw_passthrough(name, args, &[]);
+        }
+    }
+
+    dispatch(name, args, analytics)
+}
+
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
 /// v2.8.0: Flat dispatch — tool names are top-level subcommands.
@@ -848,8 +907,11 @@ pub(crate) fn dispatch(
         "gradle" | "gradlew" | "make" | "mvn" | "mvnw" | "tsc" => {
             build::run(&prepend(subcommand, args), analytics)
         }
-        "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "mypy" | "oxlint"
-        | "prettier" | "rubocop" | "ruff" | "rustfmt" | "swiftlint" => {
+        // "golangci" kept for backward compat with old wrapper installs; canonical name is now
+        // "golangci-lint" (matches the real binary). The rewrite surface rewrites to
+        // `skim golangci-lint` after the D1 fix; old wrappers still dispatch "golangci".
+        "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "golangci-lint"
+        | "mypy" | "oxlint" | "prettier" | "rubocop" | "ruff" | "rustfmt" | "swiftlint" => {
             lint::run(&prepend(subcommand, args), analytics)
         }
         "npm" | "pip" | "pnpm" | "yarn" => pkg::run(&prepend(subcommand, args), analytics),
@@ -860,13 +922,16 @@ pub(crate) fn dispatch(
         | "tree" | "wc" => file::run(&prepend(subcommand, args), analytics),
 
         _ => {
+            // D2: unknown top-level commands (npx, pip3, gmake, bundle, …) are
+            // forwarded to the system binary of the same name. skim only wraps tools
+            // in KNOWN_SUBCOMMANDS; everything else passes through byte-faithfully.
+            // Banner is debug-gated per ADR-011 (lossless path — reader sees exactly
+            // what the native tool would produce).
             let safe = sanitize_for_display(subcommand);
-            anyhow::bail!(
-                "Unknown subcommand: '{safe}'\n\
-                 Available subcommands: {}\n\
-                 Run 'skim --help' for usage information",
-                KNOWN_SUBCOMMANDS.join(", ")
+            crate::debug_log!(
+                "skim: unrecognized command '{safe}' — passing through to system binary"
             );
+            run_raw_passthrough(subcommand, args, &[])
         }
     }
 }
@@ -1080,6 +1145,7 @@ mod tests {
     /// panic here means a match arm is missing for a registered subcommand.
     #[test]
     fn test_dispatch_covers_all_known_subcommands() {
+        use crate::cmd::KNOWN_SUBCOMMANDS;
         use std::panic;
 
         for &subcommand in KNOWN_SUBCOMMANDS {
@@ -1115,7 +1181,12 @@ mod tests {
             );
         }
 
-        // Also verify that an unknown name correctly returns an Err from dispatch().
+        // D2: unknown subcommands are passed through to the system binary via
+        // run_raw_passthrough. The binary "__unknown_xyz__" does not exist on any
+        // real system, so the spawn fails and dispatch() returns Err(SpawnFailed).
+        // The important invariant is: dispatch() never panics — the error message
+        // no longer contains "Unknown subcommand" because D2 replaced the bail!
+        // with a raw-passthrough that fails at spawn time.
         let analytics = crate::analytics::AnalyticsConfig {
             enabled: false,
             session_id: None,
@@ -1124,12 +1195,7 @@ mod tests {
         let unknown_result = dispatch("__unknown_xyz__", &[], &analytics);
         assert!(
             unknown_result.is_err(),
-            "dispatch() should return Err for unknown subcommand"
-        );
-        let err_msg = unknown_result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Unknown subcommand"),
-            "error message should mention 'Unknown subcommand', got: {err_msg}"
+            "dispatch() should return Err for non-existent binary (SpawnFailed)"
         );
     }
 

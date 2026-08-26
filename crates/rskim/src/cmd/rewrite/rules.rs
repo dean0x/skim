@@ -551,10 +551,11 @@ const LINT_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
-    // golangci-lint
+    // golangci-lint (D1: rewrite_to uses canonical "golangci-lint" to match the new
+    // KNOWN_SUBCOMMANDS entry and wrapper symlink name)
     RewriteRule {
         prefix: &["golangci-lint", "run"],
-        rewrite_to: &["skim", "golangci"],
+        rewrite_to: &["skim", "golangci-lint"],
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -563,7 +564,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["golangci-lint"],
-        rewrite_to: &["skim", "golangci"],
+        rewrite_to: &["skim", "golangci-lint"],
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -1797,23 +1798,14 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
-    // diff
+    // diff — rewrite rule intentionally absent (D1/PF-011 decision, 2026-08-26).
     //
-    // `skim diff` is a pure passthrough (RawPassthrough for every input), so
-    // any flag form the user passes is forwarded unchanged.  No format-specific
-    // flags need to be excluded from the rewrite — the handler no longer injects
-    // `-u` and therefore cannot conflict with the user's chosen format.
-    // `prepare_args` in `cmd/file/diff.rs` is a no-op; this skip list is kept
-    // consistent with it (PF-024: remove dead conflict-detection).
-    RewriteRule {
-        prefix: &["diff"],
-        rewrite_to: &["skim", "diff"],
-        skip_if_flag_prefix: &["--help", "--version"],
-        category: RewriteCategory::FileOps,
-        skip_if_middle_contains_eq: false,
-        global_value_flags: &[],
-        require_flag: &[],
-    },
+    // `skim diff` is a pure passthrough (RawPassthrough for every input after the
+    // Phase 1 fix). Rewriting `diff a b` → `skim diff a b` spawns an extra process
+    // with zero compression benefit — skim forwards the bytes unchanged regardless.
+    // PF-011 says: if skim would cost more than not using skim, run the native command.
+    // The wrapper symlink (~/.skim/bin/diff) is kept for backward-compat; the
+    // RawPassthrough path is still byte-identical to native diff on the wrapper surface.
     // ls catch-all (B.1) — DESIGN NOTE (AD-RW-2)
     //
     // Fires for any `ls` invocation not matched by a more-specific earlier rule
@@ -1893,8 +1885,9 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 26 + 28 + 16 + 3;
+    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(15) + DB(3)
+    /// FILE_OPS was 16; diff rewrite rule removed (D1/PF-011: pure passthrough, zero savings).
+    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 26 + 28 + 15 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {
@@ -2414,5 +2407,60 @@ mod tests {
             try_rewrite(&["rg", "-h"]).is_none(),
             "rg -h should pass through (not rewritten to skim rg)"
         );
+    }
+
+    // ========================================================================
+    // D1: Registry ≡ rewrite-head cross-check
+    //
+    // Every rewrite rule's leading token (prefix[0]) must be in
+    // wrapper_targets() or be a documented alias for a tool that IS wrapped.
+    // This test catches drift like the golangci/golangci-lint mismatch where
+    // the rewrite intercepted `golangci-lint` but the wrapper symlink was named
+    // `golangci` — agents on the wrapper surface got different behaviour.
+    // ========================================================================
+
+    /// Every rewrite rule head must be a wrapper target OR a documented alias.
+    ///
+    /// Aliases are secondary invocation names for tools that skim handles
+    /// under a canonical name. They do not need their own wrapper symlink.
+    /// Any new alias must be deliberate — add it here with a comment.
+    #[test]
+    fn test_rewrite_heads_are_wrapper_targets_or_documented_aliases() {
+        use crate::cmd::registry::wrapper_targets;
+        use std::collections::BTreeSet;
+
+        // Known aliases: rewrite heads that are NOT their own wrapper symlink
+        // targets because they are secondary spellings of a canonical tool name.
+        const KNOWN_ALIASES: &[&str] = &[
+            "./gradlew", // path-prefixed gradlew — aliased to gradlew handler
+            "./mvnw",    // path-prefixed mvnw — aliased to mvnw handler
+            "bundle",    // Bundler CLI — aliased to npm/pkg handler
+            "gmake",     // GNU make alias — aliased to make handler
+            "npx",       // npm exec — aliased to npm handler
+            "pip3",      // pip for Python 3 — aliased to pip handler
+            "python",    // python interpreter — aliased to pip handler
+            "python3",   // python 3 interpreter — aliased to pip handler
+        ];
+
+        let wrapper_set: BTreeSet<&str> = wrapper_targets().iter().copied().collect();
+
+        for rule in all_rules() {
+            let Some(&head) = rule.prefix.first() else {
+                continue;
+            };
+            if KNOWN_ALIASES.contains(&head) {
+                continue;
+            }
+            assert!(
+                wrapper_set.contains(head),
+                "Rewrite rule head '{head}' (prefix {:?}) is not in wrapper_targets() \
+                 and not in KNOWN_ALIASES — registry drift detected.\n\
+                 Fix: either correct the spelling in KNOWN_SUBCOMMANDS to match '{head}', \
+                 or add '{head}' to KNOWN_ALIASES if it is an alias for a canonical tool.\n\
+                 Example of drift this test catches: 'golangci' in KNOWN_SUBCOMMANDS \
+                 while rewrite rules intercepted 'golangci-lint' (the real binary name).",
+                rule.prefix,
+            );
+        }
     }
 }

@@ -180,64 +180,71 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
 }
 
 // ============================================================================
-// Unknown cargo subcommand — error path coverage
+// Unknown subcommand — error path coverage (D2 passthrough semantics)
 // ============================================================================
 
-/// `skim cargo unknownthing` must fail with an "unknown subcommand" error
-/// on stderr. This covers the `unknown` arm in `dispatch_cargo`.
+// D2: unknown subcommands in these dispatchers are now forwarded to the native
+// binary via run_raw_passthrough instead of returning a skim-generated "unknown
+// subcommand" error. These tests verify:
+//   (a) skim exits non-zero (native tool fails or binary not found)
+//   (b) skim's own "unknown subcommand" message is absent (native tool drives stderr)
+
+/// `skim cargo unknownthing` must exit non-zero with cargo's native error.
+/// D2: skim forwards to cargo via run_raw_passthrough; cargo's "no such command"
+/// error surfaces directly — skim no longer wraps it in its own message.
 #[test]
 fn test_skim_cargo_unknown_subcommand_errors() {
     common::skim()
         .args(["cargo", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        // D2: cargo's native error, not skim's. Content varies by cargo version.
+        .stderr(predicate::str::contains("skim: unknown subcommand").not());
 }
 
-// ============================================================================
-// Error-path E2E coverage — go, npm, pnpm, pip unknown/missing subcommands
-// ============================================================================
-
-/// `skim go unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `unknown` arm in `dispatch_go`.
+/// `skim go unknownthing` must exit non-zero.
+/// D2: skim forwards to go via run_raw_passthrough. If go is not installed,
+/// skim exits with a SpawnFailed error instead of "unknown subcommand".
 #[test]
 fn test_skim_go_unknown_subcommand_errors() {
     common::skim()
         .args(["go", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        // D2: no skim-generated "unknown subcommand" — either go's native error
+        // (if go is installed) or a spawn-failure from skim (if go is absent).
+        .stderr(predicate::str::contains("skim: unknown subcommand").not());
 }
 
-/// `skim npm unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `other` arm in `pkg::npm::run`.
+/// `skim npm unknownthing` must exit non-zero with npm's native error.
+/// D2: skim forwards to npm; npm's "Unknown command" error surfaces directly.
 #[test]
 fn test_skim_npm_unknown_subcommand_errors() {
     common::skim()
         .args(["npm", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stderr(predicate::str::contains("skim: unknown subcommand").not());
 }
 
-/// `skim pnpm unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `other` arm in `pkg::pnpm::run`.
+/// `skim pnpm unknownthing` must exit non-zero.
+/// D2: skim forwards to pnpm; pnpm's native error surfaces directly.
 #[test]
 fn test_skim_pnpm_unknown_subcommand_errors() {
     common::skim()
         .args(["pnpm", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stderr(predicate::str::contains("skim: unknown subcommand").not());
 }
 
-/// `skim pip unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `other` arm in `pkg::pip::run`.
+/// `skim pip unknownthing` must exit non-zero with pip's native error.
+/// D2: skim forwards to pip; pip's "ERROR: unknown command" surfaces directly.
 #[test]
 fn test_skim_pip_unknown_subcommand_errors() {
     common::skim()
         .args(["pip", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stderr(predicate::str::contains("skim: unknown subcommand").not());
 }

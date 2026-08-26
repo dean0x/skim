@@ -640,13 +640,18 @@ fn test_skim_git_fetch_with_new_origin_commit_reports_update() {
 // Error cases
 // ============================================================================
 
+/// D2: unknown git subcommands are forwarded to git itself via run_raw_passthrough.
+/// Git exits non-zero and emits its own "is not a git command" error rather than
+/// skim's old "unknown git subcommand" message.
 #[test]
 fn test_skim_git_unknown_subcommand() {
     common::skim()
         .args(["git", "unknown_subcmd"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown git subcommand"));
+        // D2: git's native error surfaces; "not a git command" covers both old
+        // and new git versions. Skim no longer emits "unknown git subcommand".
+        .stderr(predicate::str::contains("not a git command").or(predicate::str::contains("unknown")));
 }
 
 #[test]
@@ -923,14 +928,18 @@ fn test_skim_git_show_stat_passthrough() {
         .success();
 }
 
+/// D2: unknown git subcommands are forwarded to git itself via run_raw_passthrough.
+/// Git exits non-zero and emits its own "is not a git command" error rather than
+/// skim's old list of supported subcommands (which included "show").
 #[test]
 fn test_skim_git_show_unknown_subcommand_message() {
-    // The "unknown git subcommand" error should now list "show" in the supported list.
     common::skim()
         .args(["git", "totally_unknown_cmd_xyz"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("show"));
+        // D2: git's native error surfaces; "not a git command" covers both old and
+        // new git versions. Skim no longer emits a list of supported subcommands.
+        .stderr(predicate::str::contains("not a git command").or(predicate::str::contains("unknown")));
 }
 
 #[test]

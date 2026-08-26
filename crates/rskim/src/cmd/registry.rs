@@ -45,8 +45,8 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "gh",          // infrastructure
     "git",         // multi-category dispatcher
     "go",          // multi-category dispatcher
-    "gofmt",       // linter
-    "golangci",    // linter
+    "gofmt",        // linter
+    "golangci-lint", // linter (binary name is `golangci-lint`, not `golangci`)
     "gradle",      // build tool
     "gradlew",     // build tool
     "grep",        // file operations

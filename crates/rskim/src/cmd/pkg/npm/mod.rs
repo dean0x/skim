@@ -46,13 +46,14 @@ pub(crate) fn run(
         "test" | "t" => run::run_script("test", subcmd_args, show_stats, json_output, rec),
         "run" | "run-script" => run::run_script("run", subcmd_args, show_stats, json_output, rec),
         other => {
+            // D2: unknown npm subcommands (publish, pack, unlink, link, …) are
+            // forwarded to the real npm binary. Banner is debug-gated per ADR-011
+            // (lossless path — reader sees exactly what npm would produce).
             let safe = crate::cmd::sanitize_for_display(other);
-            eprintln!(
-                "skim npm: unknown subcommand '{safe}'\n\
-                 Available: install, audit, outdated, ls, test, run\n\
-                 Run 'skim npm --help' for usage"
-            );
-            Ok(ExitCode::FAILURE)
+            crate::debug_log!("skim npm: unknown subcommand '{safe}' — passing through to npm");
+            let mut all_args: Vec<String> = vec![other.to_string()];
+            all_args.extend_from_slice(subcmd_args);
+            crate::cmd::run_raw_passthrough("npm", &all_args, &[])
         }
     }
 }

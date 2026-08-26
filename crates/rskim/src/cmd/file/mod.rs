@@ -285,7 +285,19 @@ pub(crate) fn run(
         "df" => df::run(tool_args, &ctx),
         "diff" => diff::run(tool_args, &ctx),
         "du" => du::run(tool_args, &ctx),
-        "env" | "printenv" => env::run(tool_args, &ctx),
+        "env" | "printenv" => {
+            // D2: when any arg contains '=' this is a VAR=value assignment invocation:
+            //   env FOO=1 printenv FOO  →  should print "1", not run printenv
+            // The env handler (CONFIG.program = "printenv") cannot understand VAR=val
+            // syntax — it would forward the tokens as file arguments to printenv.
+            // Pass through to the real `env` binary, which handles VAR=val natively.
+            // (Consistent with skip_if_middle_contains_eq on the rewrite surface.)
+            if tool_name.as_str() == "env" && tool_args.iter().any(|a| a.contains('=')) {
+                super::run_raw_passthrough("env", tool_args, &[])
+            } else {
+                env::run(tool_args, &ctx)
+            }
+        }
         "find" => find::run(tool_args, &ctx),
         "grep" => grep::run(tool_args, &ctx),
         "ls" => ls::run(tool_args, &ctx, "ls"),

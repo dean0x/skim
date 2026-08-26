@@ -242,7 +242,9 @@ fn test_mypy_json_flag_full() {
 fn test_golangci_tier1_json_fail() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
     skim_cmd()
-        .args(["golangci"])
+        // D1: canonical binary name is "golangci-lint" (matches real binary on PATH).
+        // "golangci" was the old alias; use "golangci-lint" for all new tests.
+        .args(["golangci-lint"])
         .write_stdin(fixture)
         .assert()
         .code(0)
@@ -259,7 +261,7 @@ fn test_golangci_tier1_json_fail() {
 fn test_golangci_tier2_regex_degraded() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_text.txt");
     skim_cmd()
-        .args(["--debug", "golangci"])
+        .args(["--debug", "golangci-lint"])
         .write_stdin(fixture)
         .assert()
         .success()
@@ -274,7 +276,7 @@ fn test_golangci_tier2_regex_degraded() {
 #[test]
 fn test_golangci_tier3_passthrough_garbage() {
     skim_cmd()
-        .args(["--debug", "golangci"])
+        .args(["--debug", "golangci-lint"])
         .write_stdin("random garbage not golangci output\n")
         .assert()
         .success()
@@ -290,7 +292,7 @@ fn test_golangci_tier3_passthrough_garbage() {
 fn test_golangci_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
     skim_cmd()
-        .args(["golangci", "--json"])
+        .args(["golangci-lint", "--json"])
         .write_stdin(fixture)
         .assert()
         .success()

@@ -127,6 +127,24 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
 /// - `"git worktree list && cargo test"` → `Some(...)` (AlreadyCompact + Rewritten)
 ///
 /// If you need the full tri-state result, call `classify_command` directly.
+/// Return the `skip_if_flag_prefix` entries for a tool from its rewrite rules.
+///
+/// Used by `dispatch_for_wrapper` (D4) to enforce tool-specific passthrough flags
+/// on the wrapper surface — mirroring `skip_if_flag_prefix` on the rewrite surface.
+/// For example, `rg --json` and `tree --json` set these tools' own JSON output mode
+/// and must not be intercepted by skim's `--json` output-format handler.
+///
+/// Returns an owned `Vec` so the caller does not need to hold a borrow on the rules
+/// iterator. The `--help`, `-h`, `--version`, and `-V` flags are excluded because
+/// `dispatch_for_wrapper` handles them separately (D3) before this is consulted.
+pub(crate) fn skip_flags_for_tool(tool_name: &str) -> Vec<&'static str> {
+    rules::all_rules()
+        .filter(|r| r.prefix.first().copied() == Some(tool_name))
+        .flat_map(|r| r.skip_if_flag_prefix.iter().copied())
+        .filter(|&f| !matches!(f, "--help" | "-h" | "--version" | "-V"))
+        .collect()
+}
+
 // Kept for backward-compatibility; primary callers are tests in discover.rs.
 #[allow(dead_code)]
 pub(crate) fn would_rewrite(command: &str) -> Option<String> {

@@ -40,14 +40,18 @@ fn test_skim_cargo_no_subcmd_shows_help() {
         .stdout(predicate::str::contains("skim cargo"));
 }
 
+/// D2: unknown cargo subcommands are now passed through to cargo itself via
+/// run_raw_passthrough. Cargo exits non-zero and emits its own "no such command"
+/// error — skim no longer wraps it in a custom "unknown subcommand" message.
 #[test]
-fn test_skim_cargo_unknown_subcmd_shows_error() {
+fn test_skim_cargo_unknown_subcmd_exits_nonzero() {
     common::skim()
         .arg("cargo")
         .arg("webpack")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        // D2: skim passes through to cargo; cargo's own error surfaces here.
+        .stderr(predicate::str::contains("no such command").or(predicate::str::contains("unknown")));
 }
 
 // ============================================================================

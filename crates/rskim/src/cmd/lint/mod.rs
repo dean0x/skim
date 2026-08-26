@@ -31,7 +31,8 @@ const KNOWN_LINTERS: &[&str] = &[
     "dprint",
     "eslint",
     "gofmt",
-    "golangci",
+    "golangci",      // backward-compat alias for old wrapper installs
+    "golangci-lint", // canonical name (D1: matches real binary and KNOWN_SUBCOMMANDS)
     "mypy",
     "oxlint",
     "prettier",
@@ -76,7 +77,9 @@ pub(crate) fn run(
         "dprint" => dprint::run(linter_args, &ctx),
         "eslint" => eslint::run(linter_args, &ctx),
         "gofmt" => gofmt::run(linter_args, &ctx),
-        "golangci" => golangci::run(linter_args, &ctx),
+        // "golangci" kept for backward compat with old `~/.skim/bin/golangci` installs.
+        // New installations use "golangci-lint" (canonical binary name; D1 fix).
+        "golangci" | "golangci-lint" => golangci::run(linter_args, &ctx),
         "mypy" => mypy::run(linter_args, &ctx),
         "oxlint" => oxlint::run(linter_args, &ctx),
         "prettier" => prettier::run(linter_args, &ctx),

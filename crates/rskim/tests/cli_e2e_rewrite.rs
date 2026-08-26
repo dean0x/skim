@@ -920,22 +920,25 @@ fn test_rewrite_python3_m_mypy() {
         .stdout(predicate::str::contains("skim mypy src/"));
 }
 
+/// D1: rewrite target updated from "golangci" to "golangci-lint" to match
+/// the real binary name (`golangci-lint`, not `golangci`).
 #[test]
 fn test_rewrite_golangci_lint_run() {
     skim_cmd()
         .args(["rewrite", "golangci-lint", "run", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim golangci ./..."));
+        .stdout(predicate::str::contains("skim golangci-lint ./..."));
 }
 
+/// D1: rewrite target updated from "golangci" to "golangci-lint".
 #[test]
 fn test_rewrite_golangci_lint_bare() {
     skim_cmd()
         .args(["rewrite", "golangci-lint", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim golangci ./..."));
+        .stdout(predicate::str::contains("skim golangci-lint ./..."));
 }
 
 // ============================================================================
