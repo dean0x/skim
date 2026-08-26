@@ -360,6 +360,9 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 /// * `known_token_count` - Pre-computed token count of `text`, if available.
 ///   When `Some(count)`, skips the initial full-text tokenization.
 ///   Pass `None` when the count is unknown.
+/// * `elision_hint` - Optional remedy clause appended to the omission marker
+///   (B5 / ADR-011 class 1). Pass `None` for CLI-agnostic library use.
+///   The CLI passes `Some("SKIM_PASSTHROUGH=1 for full output")`.
 ///
 /// # Returns
 /// Text fitting within the token budget, with omission marker if truncated.
@@ -375,7 +378,7 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// let output = "line 1\nline 2\nline 3\nline 4\nline 5";
 /// let word_count = |s: &str| -> usize { s.split_whitespace().count() };
-/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None)?;
+/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None, None)?;
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn truncate_to_token_budget<F>(
@@ -384,6 +387,7 @@ pub fn truncate_to_token_budget<F>(
     token_budget: usize,
     count_tokens: F,
     known_token_count: Option<usize>,
+    elision_hint: Option<&str>,
 ) -> Result<String>
 where
     F: Fn(&str) -> usize,
@@ -394,6 +398,7 @@ where
         token_budget,
         count_tokens,
         known_token_count,
+        elision_hint,
     )
 }
 

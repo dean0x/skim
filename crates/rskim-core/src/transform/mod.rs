@@ -49,9 +49,9 @@ pub(crate) fn transform_tree(
 ) -> Result<String> {
     let (text, spans) = transform_tree_with_spans(source, tree, language, config)?;
 
-    // Apply truncation if max_lines is set
+    // Apply truncation if max_lines is set (B5: thread elision_hint for remedy clause).
     if let Some(max_lines) = config.max_lines {
-        truncate::truncate_to_lines(&text, &spans, language, max_lines)
+        truncate::truncate_to_lines(&text, &spans, language, max_lines, config.elision_hint.as_deref())
     } else {
         Ok(text)
     }
@@ -156,9 +156,9 @@ pub(crate) fn transform_tree_with_line_map(
         }
     };
 
-    // Apply max_lines truncation (adjusting the line map)
+    // Apply max_lines truncation (adjusting the line map) (B5: thread elision_hint).
     let (final_text, final_line_map) = if let Some(max_lines) = config.max_lines {
-        let truncated_text = truncate::truncate_to_lines(&text, &spans, language, max_lines)?;
+        let truncated_text = truncate::truncate_to_lines(&text, &spans, language, max_lines, config.elision_hint.as_deref())?;
         // After truncation, the output has a subset of lines plus omission markers.
         // Rebuild the line map: match output lines back to pre-truncation line map.
         let final_line_map = reconcile_line_map_after_truncation(&text, &truncated_text, &line_map);
