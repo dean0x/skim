@@ -9,7 +9,10 @@
 //!   The L2 guardrail has a token slow-path for the case where bytes grow
 //!   but tokens shrink; L3 has no such path.
 //! - **No tiny-payload exemption** (invariant 2 / AC4).
-//!   The L2 guardrail skips files < 256 bytes; L3 applies to all sizes.
+//!   The L2 guardrail previously skipped files < 256 bytes; that floor was
+//!   removed in A4 (omnibus fidelity overhaul) — L2 now applies to all sizes,
+//!   matching L3.  The #325 scope assumption ("L3 is stricter") is now stale;
+//!   the migration tracked there should be re-scoped.
 //! - **Per-transform-unit** (one content block in one message), with a
 //!   whole-request defense-in-depth check.
 //!

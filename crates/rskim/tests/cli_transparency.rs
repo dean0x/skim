@@ -110,7 +110,7 @@ fn test_no_marker_when_guardrail_fires() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("inflating.ts");
 
-    // 20 functions × ~18 bytes = ~360 bytes raw (above MIN_RAW_SIZE_FOR_GUARDRAIL of 256).
+    // 20 functions × ~18 bytes = ~360 bytes raw (well above guardrail activation size).
     // Each empty body `{ }` (3 bytes) → ` {...}` (6 bytes) = +3 bytes per function,
     // so the compressed output exceeds the raw size and the guardrail fires.
     let mut source = String::new();

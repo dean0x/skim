@@ -45,165 +45,16 @@ pub(crate) enum SavingsDecision {
     Passthrough,
 }
 
-/// Byte length of the longest run containing no ASCII whitespace.
-///
-/// cl100k BPE splits on whitespace, so a long no-split run is the pathological
-/// (~O(n²) per-word merge) dimension; this bounds it.  Runs through the input
-/// once (O(n)) with no allocation.
-fn longest_nonwhitespace_run(s: &str) -> usize {
-    let mut longest = 0usize;
-    let mut current = 0usize;
-    for &b in s.as_bytes() {
-        if b.is_ascii_whitespace() {
-            current = 0;
-        } else {
-            current += 1;
-            longest = longest.max(current);
-        }
-    }
-    longest
-}
-
 /// Decide whether to emit `compressed` or fall back to `raw`.
 ///
-/// **Conservative rule:** keep compressed IFF `compressed_tokens < raw_tokens`
-/// (strictly less).  Tie (equal) or larger → `Passthrough`.
-/// This is the verbatim user decision: *"conservative — keep compressed ONLY IF
-/// strictly smaller than raw, measured in tokens, always."*
-/// Boundary: saving exactly 0 tokens → Passthrough; saving 1 token → Keep.
-///
-/// **Tokenizer-unavailable fallback:** if `count_token_pair` returns `(None, None)`
-/// (counter init failed), fall back to a **byte** comparison:
-/// keep iff `compressed.len() < raw.len()` (strictly less).
-/// Never panics, never expands.
-///
-/// **Comparison normalization:** trailing whitespace is trimmed from both sides
-/// before comparison so a single trailing newline does not flip the decision
-/// arbitrarily (e.g. `println!` always appends `\n`; the raw command may or may
-/// not end with `\n`).  This keeps boundary cases stable.
-///
-/// **Empty-raw behaviour:** if raw is empty/whitespace-only, compressed output is
-/// NOT strictly smaller (0 < 0 fails) → Passthrough (emit raw, i.e. nothing).
-/// A silent command stays silent, matching the raw tool exactly.
-///
-/// **JSON exempt:** callers are responsible for not calling this function when
-/// `output_format == OutputFormat::Json`.  JSON responses must never be rewritten
-/// to non-JSON; the guard only applies to `OutputFormat::Text` paths.
-///
-/// **Already-passthrough exempt:** if the parse tier is already `"passthrough"`,
-/// `compressed` IS the raw body (no re-encoding occurred); skip the guard.
-///
-/// **#317 invariant:** this guard only ever moves output toward *more-complete
-/// raw*.  It can never show LESS than raw.
-///
-/// **Size cap (performance):** tokenizing costs ~0.3 s/MB in release builds
-/// (~10× that unoptimized/debug), so for inputs above 256 KiB the function falls
-/// back to byte comparison — keeping the guard's added latency to roughly
-/// 100–150 ms worst case at the cap in release, comfortably within budget —
-/// consistent with the "never expand" promise.  Below the cap the exact token
-/// decision is used; above it, byte length is a safe proxy (a large output that
-/// compresses wins on both axes; only near-ties differ, and those are rare at
-/// scale).  Token accuracy matters most for small outputs (tight expansion
-/// margins); those are well below the cap and always tokenized.
-///
-/// **Longest-run guard (degenerate inputs):** cl100k BPE splits on whitespace,
-/// so a single long run of non-whitespace characters is the pathological
-/// dimension — the tokenizer's per-word merge loop becomes O(n²) in the run
-/// length.  When either string has a non-whitespace run > 4 KiB (and both are
-/// below the size cap), the function falls back to the same byte-comparison path.
-/// Real line-oriented shell output never produces runs this long; the guard only
-/// fires on minified JS, base64 blobs, or similar single-line data — exactly the
-/// cases where byte comparison is already safe (the "never expand" invariant still
-/// holds: a compressed blob that is byte-shorter is also cheaper to transmit).
+/// Thin wrapper over [`crate::output::fidelity::decide`] — the canonical
+/// unified gate (A2).  Keep compressed IFF strictly smaller in BOTH bytes AND
+/// tokens; tie → Passthrough.  See `output/fidelity.rs` for full semantics.
 pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
-    /// 256 KiB — above this threshold skip tokenization (performance cap).
-    /// Tokenization costs ~0.3 s/MB in release (~10× in debug), so this bounds
-    /// the guard's added latency to roughly 100–150 ms at the cap in release;
-    /// larger outputs fall back to byte comparison.
-    const TOKEN_SIZE_CAP: usize = 256 * 1024;
-    /// 4 KiB — longest non-whitespace run above which we fall back to byte
-    /// comparison.  cl100k BPE's per-word merge is O(n²) in run length; 4 KiB
-    /// bounds the per-word merge cost to a safe constant.  Real line-oriented
-    /// output never reaches this; minified JS / base64 single-line blobs do —
-    /// they safely fall back to byte comparison (never-expand invariant holds).
-    const TOKEN_RUN_CAP: usize = 4 * 1024;
-    // Compile-time invariant: TOKEN_SIZE_CAP must be strictly greater than
-    // TOKEN_RUN_CAP so the run-scan is always bounded to ≤TOKEN_SIZE_CAP bytes.
-    // If these constants are ever changed, this assertion catches the violation.
-    const { assert!(TOKEN_SIZE_CAP > TOKEN_RUN_CAP) };
-
-    // Normalize whitespace from both ends so leading/trailing formatting
-    // (e.g., a `println!` trailing newline, or a leading space before "OK")
-    // does not flip a tie.  We compare trimmed lengths; the actual emitted
-    // bytes are unchanged.
-    let raw_t = raw.trim();
-    let comp_t = compressed.trim();
-
-    // Conservative rule: keep compressed IFF strictly smaller than raw.
-    //
-    // Tie (equal tokens/bytes) or larger → Passthrough.  This is intentionally
-    // conservative: the guard only ever moves output toward more-complete raw, so
-    // it cannot show LESS than the raw tool.  A tie means no savings; the raw form
-    // is equally complete and always safe to emit.
-    //
-    // Empty-raw case: if raw is empty/whitespace-only, comp_t.len() > 0 means
-    // compressed is NOT strictly smaller (0 < n fails "comp < raw").  The uniform
-    // rule therefore emits raw (nothing) — which is the faithful "never expand"
-    // behaviour: a silent command stays silent, matching the raw tool exactly.
-    //
-    // Oversized inputs (> 256 KiB): tokenization is skipped for performance;
-    // byte comparison is used instead — consistent with the "never expand" promise.
-    //
-    // Degenerate-run inputs (longest non-ws run > 4 KiB, only checked when below
-    // the size cap): tokenization is skipped to avoid O(n²) BPE merge cost; byte
-    // comparison is used instead.  The scan is bounded to ≤256 KiB each.
-
-    // Determine whether to take the fast byte-comparison path.
-    let over_size_cap = raw.len() > TOKEN_SIZE_CAP || compressed.len() > TOKEN_SIZE_CAP;
-
-    // Byte early-exit: if bytes already say compressed is not strictly shorter,
-    // the decision is Passthrough regardless of tokens or run length — skip all
-    // further scanning.  This covers the empty-raw case (raw_t.len() == 0 means
-    // comp_t.len() >= 0 is always true → Passthrough) and the common "compression
-    // doesn't win" path where up to ~512 KiB of run-scan would otherwise run
-    // needlessly.  Must come before the run guard so the scan is never paid when
-    // the byte gate already settles the decision.
-    if comp_t.len() >= raw_t.len() {
-        return SavingsDecision::Passthrough;
-    }
-
-    // comp_t.len() < raw_t.len() here — bytes say compressed is strictly shorter.
-    // Run guard: only scan when below the size cap (bounds the scan to ≤256 KiB
-    // each).  A single-char repeated string has a non-whitespace run equal to its
-    // own length; short human-readable output has runs ≤ line length (~80–200 b).
-    // Scanning here is safe: the byte early-exit above means we only reach this
-    // point when compressed is already byte-shorter, so the scan is only paid on
-    // the minority path where a token comparison could change the decision.
-    let over_run_cap = !over_size_cap
-        && (longest_nonwhitespace_run(raw) > TOKEN_RUN_CAP
-            || longest_nonwhitespace_run(compressed) > TOKEN_RUN_CAP);
-
-    if over_size_cap || over_run_cap {
-        // Above size cap or run cap: byte comparison only (no tokenisation).
-        // comp_t.len() < raw_t.len() was already verified above → Keep.
-        return SavingsDecision::Keep;
-    }
-
-    // comp_t.len() < raw_t.len() here — bytes say compressed is strictly shorter.
-    // Confirm with token counts; if the tokenizer says compressed uses MORE tokens
-    // than raw (byte-compression but token-expansion), passthrough.
-    match crate::process::count_token_pair(raw_t, comp_t) {
-        (Some(raw_tok), Some(comp_tok)) => {
-            if comp_tok < raw_tok {
-                // Strictly fewer tokens — keep compressed.
-                SavingsDecision::Keep
-            } else {
-                // Token tie or token-expansion even though bytes were shorter → Passthrough.
-                SavingsDecision::Passthrough
-            }
-        }
-        // Tokenizer unavailable: byte comparison says comp_t.len() < raw_t.len() → Keep.
-        _ => SavingsDecision::Keep,
+    use crate::output::fidelity::{decide, FidelityDecision};
+    match decide(raw, compressed) {
+        FidelityDecision::Keep => SavingsDecision::Keep,
+        FidelityDecision::Passthrough => SavingsDecision::Passthrough,
     }
 }
 
@@ -2209,7 +2060,7 @@ mod tests {
         );
         // Sanity: all non-ws runs are 1 byte (run guard must NOT fire).
         assert!(
-            longest_nonwhitespace_run(&compressed) < 4 * 1024,
+            crate::output::fidelity::longest_nonwhitespace_run(&compressed) < 4 * 1024,
             "compressed non-ws run must be < 4 KiB to keep token path"
         );
         // Both below the size cap.

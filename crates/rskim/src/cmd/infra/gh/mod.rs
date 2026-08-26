@@ -79,7 +79,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // not an error. Without this, exit 8 is raw-forwarded before parsing.
     expected_exit_codes: &[8],
     forward_stderr: false,
-    skip_net_savings_guard: true,
+    skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,

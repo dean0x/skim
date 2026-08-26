@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod canonical;
+pub(crate) mod fidelity;
 pub(crate) mod guardrail;
 pub(crate) mod tee;
 
