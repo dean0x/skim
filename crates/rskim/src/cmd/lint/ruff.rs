@@ -41,6 +41,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // passthrough preserves it — consistent with ruff's native behaviour.
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
 };
 
 // Static regex patterns compiled once via LazyLock.

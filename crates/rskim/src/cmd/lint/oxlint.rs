@@ -33,6 +33,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // oxlint prints a "Found 0 warnings and 0 errors" summary on clean runs — not silent.
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
 };
 
 /// Matches Rust-style location markers in oxlint fancy output.

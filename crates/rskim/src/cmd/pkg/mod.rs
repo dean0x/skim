@@ -135,6 +135,7 @@ where
             skip_net_savings_guard: false,
             // pkg commands (audit, install, etc.) always produce structured output on success.
             synthesize_success_line: None,
+            raw_override: None,
         },
         |output| parse_fn(output),
     )

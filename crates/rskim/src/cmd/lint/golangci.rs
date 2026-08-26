@@ -33,6 +33,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // golangci-lint exits 0 silently on a clean codebase; passthrough preserves raw output.
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
 };
 
 // Static regex pattern compiled once via LazyLock.

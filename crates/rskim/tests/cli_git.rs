@@ -303,6 +303,67 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
     );
 }
 
+/// A1: `skim git status` (NO flags) on a small hermetic dirty repo must NEVER
+/// emit MORE bytes than the raw `git status` output.
+///
+/// Before A1, `raw_override` was only populated when the user supplied a
+/// conflicting format flag (e.g. `-s`, `--short`).  For a bare `git status`
+/// invocation, `raw_override = None` and the guard compared compressed output
+/// against the injected `--porcelain=v2 --branch` bytes (machine-readable with
+/// branch header lines).  The porcelain form is typically LARGER than the default
+/// `git status` output — so the guard could fire KEEP even when compressed
+/// output was larger than what the user typed, violating the "never expand vs
+/// user intent" guarantee (ADR-001).
+///
+/// After A1, `raw_override` is always populated.  This test pins the correct
+/// behavior end-to-end.
+#[test]
+fn test_skim_git_status_no_flags_never_expands_vs_raw() {
+    let (_dir, repo) = make_hermetic_dirty_repo();
+
+    // Capture raw `git status` output for the baseline.
+    let raw_output = std::process::Command::new("git")
+        .arg("status")
+        .current_dir(&repo)
+        .output()
+        .expect("git must be available");
+    let raw_len = raw_output.stdout.len();
+
+    // Run `skim git status` (no flags) against the same repo.
+    let skim_output = common::skim()
+        .args(["git", "status"])
+        .current_dir(&repo)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git status must not fail to spawn");
+
+    assert!(
+        skim_output.status.success(),
+        "skim git status must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let skim_len = skim_output.stdout.len();
+
+    // ADR-001 / A1 invariant: skim must NEVER emit more bytes than the raw
+    // `git status` baseline — the command the user actually typed.  Prior to A1
+    // the guard used the injected `--porcelain=v2 --branch` output as baseline,
+    // which could allow compressed output that is larger than native `git status`.
+    assert!(
+        skim_len <= raw_len,
+        "A1: skim git status (no flags) expanded vs raw git status\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}\n  \
+         raw_override must be set unconditionally (A1) so the guard compares \
+         against the user's literal command output, not the injected porcelain form.",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout)
+    );
+}
+
 /// Create a hermetic git repo where the worker clone is 1 commit ahead of origin.
 ///
 /// Layout: bare repo (remote) ← seed (initial push) ← worker (1 unpushed commit).

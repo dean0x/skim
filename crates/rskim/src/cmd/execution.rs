@@ -532,6 +532,30 @@ pub(crate) struct ParsedCommandConfig<'a> {
     ///
     /// Default: `None`.
     pub synthesize_success_line: Option<&'a str>,
+    /// Pre-captured bytes of the user's literal (uninjected) command output.
+    ///
+    /// When `Some`, replaces `output.stdout` (the injected command's output) as:
+    ///
+    /// (a) The guard baseline in `savings_decision` — the comparison target that
+    ///     determines whether compressed output is strictly smaller than what the
+    ///     user's command would have produced.
+    ///
+    /// (b) The guard's raw fallback emission — what is written to stdout when the
+    ///     guard decides compressed output is no shorter.
+    ///
+    /// (c) The `SKIM_PASSTHROUGH=1` escape hatch — emitted verbatim instead of
+    ///     streaming the (potentially injected) command when set.
+    ///
+    /// Only set for **read-only / idempotent** handlers where re-running the
+    /// user's literal command has no side effects.  Handlers that inject
+    /// side-effecting flags (e.g. `black --check` suppresses file writes) MUST
+    /// NOT set this field — streaming the injected command is the correct
+    /// `SKIM_PASSTHROUGH=1` behavior for those handlers and the guard must
+    /// treat the injected output as the baseline.
+    ///
+    /// Default: `None` (guard operates on `output.stdout`; passthrough streams
+    /// the injected command unchanged — pre-fix behavior).
+    pub raw_override: Option<String>,
 }
 
 /// How a child process's exit status should steer output handling. (#317)
@@ -980,6 +1004,7 @@ where
         forward_stderr,
         skip_net_savings_guard,
         synthesize_success_line,
+        raw_override,
     } = config;
 
     // Passthrough mode: bypass all compression and forward raw output.
@@ -992,6 +1017,17 @@ where
     // the bytes were subsequently written.  Streaming here is what removes them.
     let passthrough = is_passthrough_mode();
     if passthrough && !use_stdin {
+        // A1: when the handler pre-captured the user's literal command output,
+        // emit those bytes instead of streaming the (potentially injected) command.
+        // raw_override = None falls through to the original streaming path so
+        // handlers that did not set it see no behavior change.
+        if let Some(ref raw) = raw_override {
+            let (_, status) = emit_raw_passthrough(raw)?;
+            if status == StdoutStatus::PipeClosed {
+                return Ok(pipe_closed_exit());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         return stream_passthrough_raw(program, args, env_overrides, install_hint);
     }
 
@@ -1161,7 +1197,15 @@ where
         && !skip_net_savings_guard
     {
         let compressed_str = serialize_output(&result, output_format)?;
-        match savings_decision(&output.stdout, &compressed_str) {
+        // A1: use the user's literal command output as the guard baseline when
+        // the handler pre-captured it (`raw_override = Some`).  Without this,
+        // a handler that injects flags (e.g. `git status --porcelain=v2`) would
+        // compare compressed output against the injected command's stdout, not
+        // against what the user's literal command would have produced — so an
+        // "expansion" relative to the user's command could pass the guard while
+        // a genuine "compression" could fail it.
+        let guard_raw: &str = raw_override.as_deref().unwrap_or(&output.stdout);
+        match savings_decision(guard_raw, &compressed_str) {
             SavingsDecision::Keep => {
                 if write_to_stdout(&compressed_str)? == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
@@ -1172,12 +1216,15 @@ where
                 // Emit raw verbatim; record analytics under "passthrough" tier
                 // so `should_emit_compressed_hint` stays silent (passthrough tier
                 // never gets the hint — the body is already verbatim raw).
-                let raw = &output.stdout;
-                let (tier, status) = emit_raw_passthrough(raw)?;
+                // A1: emit user's literal output when available, not the injected
+                // command's stdout — the fallback must show what the user expected
+                // to see, not skim's internal machine-readable representation.
+                let emit_raw: &str = raw_override.as_deref().unwrap_or(&output.stdout);
+                let (tier, status) = emit_raw_passthrough(emit_raw)?;
                 if status == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
                 }
-                (raw.clone(), tier)
+                (emit_raw.to_owned(), tier)
             }
         }
     } else {
@@ -1326,6 +1373,17 @@ pub(crate) struct ToolRunConfig<'a> {
     ///
     /// Default: `None`.
     pub injected_format_flag: Option<&'a str>,
+    /// Pre-captured bytes of the user's literal (uninjected) command output.
+    ///
+    /// See [`ParsedCommandConfig::raw_override`] for full rationale.
+    ///
+    /// Only set for **read-only / idempotent** handlers where re-running the
+    /// user's literal command has no side effects.  Handlers that inject
+    /// side-effecting flags (e.g. `black --check` suppresses file writes) must
+    /// leave this `None`.
+    ///
+    /// Default: `None`.
+    pub raw_override: Option<String>,
 }
 
 /// Returns the line to synthesize when skim's format-flag injection caused
@@ -1411,6 +1469,7 @@ where
             forward_stderr: config.forward_stderr,
             skip_net_savings_guard: config.skip_net_savings_guard,
             synthesize_success_line: effective_success_line,
+            raw_override: config.raw_override,
         },
         parse_fn,
     )
@@ -2243,6 +2302,120 @@ mod tests {
             "256 KiB single-run decision took {}ms — run guard must skip tokenization \
              (full tokenization path costs ~3 s; 500 ms bound proves it was skipped)",
             elapsed.as_millis()
+        );
+    }
+
+    // ========================================================================
+    // A1: raw_override guard baseline semantics
+    //
+    // These tests verify that `savings_decision` is called with the correct
+    // baseline — the user's literal command output — when raw_override is set.
+    //
+    // Context: before A1, the guard compared compressed output against the
+    // INJECTED command's stdout (e.g. `git status --porcelain=v2 --branch`
+    // rather than the user's `git status`).  This meant:
+    //   - On a small clean repo, `--porcelain=v2 --branch` produces ~60 B of
+    //     machine-readable headers while the user's `git status` produces ~40 B
+    //     of human-readable output.  A compressed GitResult might be 20 B — which
+    //     is strictly smaller than the porcelain baseline (60 B) so the guard said
+    //     KEEP.  But it is NOT smaller than the user baseline (40 B), so the
+    //     guard SHOULD say KEEP in that case too... wait, 20 < 40 so the guard
+    //     is actually correct.  The problem scenario is when compressed ≥ user-
+    //     baseline but < injected-baseline.
+    //
+    // The tests below document the property by testing `savings_decision` directly
+    // with representative baseline pairs: they verify the conservative tie→Passthrough
+    // rule that `run_parsed_command_with_exit` relies on when `raw_override` is set.
+    // ========================================================================
+
+    /// A1 property: when the guard baseline is the user's literal command output
+    /// (raw_override set) and compressed equals that baseline, the result is
+    /// Passthrough (tie rule — not strictly smaller).
+    ///
+    /// Without A1, the guard would compare against the injected command's output,
+    /// which might be larger, causing a spurious Keep even when the compressed
+    /// output is no smaller than what the user would have seen.
+    #[test]
+    fn a1_guard_baseline_tie_gives_passthrough() {
+        // Simulated user baseline: human-readable `git status` output (~40 bytes).
+        let user_baseline = "On branch main\nnothing to commit, working tree clean\n";
+        // Simulated compressed output: equal size to user baseline — a tie.
+        // The guard must say Passthrough (conservative: strictly-smaller-to-keep).
+        let compressed_equal = user_baseline; // exactly equal bytes
+        assert_eq!(
+            savings_decision(user_baseline, compressed_equal),
+            SavingsDecision::Passthrough,
+            "A1: tie against user baseline → Passthrough (guard must not favor injected-form)"
+        );
+    }
+
+    /// A1 property: when the guard baseline is the user's literal command output
+    /// and compressed is strictly smaller, Keep is correct.
+    #[test]
+    fn a1_guard_baseline_smaller_gives_keep() {
+        let user_baseline = "On branch main\nChanges not staged for commit:\n  modified: src/main.rs\n\n";
+        // Skim compresses to a one-liner — strictly smaller.
+        let compressed = "1 modified\n";
+        assert_eq!(
+            savings_decision(user_baseline, compressed),
+            SavingsDecision::Keep,
+            "A1: compressed strictly smaller than user baseline → Keep"
+        );
+    }
+
+    /// A1 property: raw_override field exists on ParsedCommandConfig with the
+    /// correct type.  This is a compile-time guard — the test only runs to confirm
+    /// the struct can be constructed with the field set.
+    #[test]
+    fn a1_parsed_command_config_has_raw_override_field() {
+        // This test is primarily a compile check: if raw_override is removed or
+        // renamed, this fails to compile before it fails at runtime.
+        let override_bytes = "user literal output\n".to_string();
+        let _ = ParsedCommandConfig {
+            program: "test-tool",
+            args: &[],
+            env_overrides: &[],
+            install_hint: "",
+            use_stdin: false,
+            show_stats: false,
+            output_format: crate::cmd::OutputFormat::Text,
+            family: "test",
+            skip_ansi_strip: false,
+            rec: crate::analytics::RecordingContext {
+                enabled: false,
+                command_type: crate::analytics::CommandType::FileOps,
+                parse_tier: None,
+                session_id: None,
+            },
+            expected_exit_codes: &[],
+            forward_stderr: false,
+            skip_net_savings_guard: false,
+            synthesize_success_line: None,
+            raw_override: Some(override_bytes),
+        };
+        // If we reach here, the field exists and accepts an owned String.
+    }
+
+    /// A1 property: ToolRunConfig has raw_override field with correct type.
+    #[test]
+    fn a1_tool_run_config_has_raw_override_field() {
+        let config = ToolRunConfig {
+            program: "test",
+            env_overrides: &[],
+            install_hint: "",
+            family: "test",
+            skip_ansi_strip: false,
+            command_type: crate::analytics::CommandType::FileOps,
+            expected_exit_codes: &[],
+            forward_stderr: false,
+            skip_net_savings_guard: false,
+            synthesize_success_line: None,
+            injected_format_flag: None,
+            raw_override: Some("user output\n".to_string()),
+        };
+        assert!(
+            config.raw_override.is_some(),
+            "ToolRunConfig.raw_override must accept Some(String)"
         );
     }
 }

@@ -64,6 +64,7 @@ const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
 };
 
 /// Matches tree summary line: `N directories, M files`

@@ -34,6 +34,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // passthrough is consistent with swiftlint's native no-output-on-clean behaviour.
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
 };
 
 /// `file.swift:line:col: warning: message (rule_id)`

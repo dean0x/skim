@@ -82,6 +82,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     skip_net_savings_guard: true,
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
 };
 
 // ============================================================================

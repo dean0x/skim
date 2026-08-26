@@ -124,6 +124,7 @@ pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRun
         skip_net_savings_guard: false,
         synthesize_success_line: None,
         injected_format_flag: None,
+        raw_override: None,
     }
 }
 
