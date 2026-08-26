@@ -234,22 +234,29 @@ fn test_diff_differing_files_exit1_full_tier_hint_suppressed() {
         // FileResult::render produces "diff 1" header when shown == total.
         .stdout(predicate::str::contains("diff"))
         .stdout(predicate::str::contains("changed"))
+        // Fix 2 (#317): the actual changed lines must survive to stdout, not
+        // just a diffstat header/footer. "beta" (deletion) and "gamma"
+        // (insertion) come from the patch body; a diffstat-only regression
+        // would drop them. These hold whether the net-savings guard emits the
+        // compressed FileResult (`-beta`/`+gamma`) or falls back to raw diff.
+        .stdout(predicate::str::contains("beta"))
+        .stdout(predicate::str::contains("gamma"))
         // The hint must NOT appear: diff exit 1 is benign ("files differ"),
         // not an error. Printing the hint would mislead agents.
         .stderr(predicate::str::contains("[skim] compressed output").not());
 }
 
-/// diff exit >=2 = read error — hint DOES fire (not benign, real error).
+/// diff exit >=2 = read error — diff's own stderr is forwarded by skim.
 ///
 /// Proves the suppression is exit-code-aware, not blanket: only exit 1 is
-/// benign for diff. A missing-file error exits 2 and SHOULD get the hint so
-/// agents know skim re-encoded the (forwarded-raw) diagnostic output.
+/// benign for diff. A missing-file error exits 2 and is an unexpected failure
+/// (not in expected_exit_codes=[1]), so skim raw-forwards the child's stderr
+/// unchanged via `passthrough_raw`.
 ///
-/// Because exit 2 is an unexpected failure (not in expected_exit_codes=[1]),
-/// skim actually raw-forwards the output with the "raw output (not compressed)"
-/// notice, not the "compressed output" hint. Either notice signals the agent
-/// to investigate — the key property is that diff exit 2 does NOT produce a
-/// silent suppression identical to the benign exit-1 path.
+/// After Fix 5, skim's own diagnostic notice is debug-gated (SKIM_DEBUG=1 only).
+/// The stderr visible here is diff's native "No such file or directory" message
+/// forwarded via `forward_stderr: true` — not a skim banner. The contract is
+/// that exit 2 does NOT produce silence identical to the benign exit-1 path.
 #[test]
 fn test_diff_missing_file_exit2_not_silent() {
     skim_cmd()
@@ -260,8 +267,8 @@ fn test_diff_missing_file_exit2_not_silent() {
         ])
         .assert()
         .code(2)
-        // skim must emit SOME diagnostic to stderr for exit 2 — either the
-        // raw-forward notice or (if the parser somehow reaches record_and_report)
-        // the compressed-output hint. Either way it must not be silent.
-        .stderr(predicate::str::is_empty().not());
+        // diff's own "No such file or directory" message is forwarded via
+        // forward_stderr: true — not a skim-generated banner (which is
+        // debug-gated after Fix 5 / ADR-011).
+        .stderr(predicate::str::contains("No such file or directory"));
 }

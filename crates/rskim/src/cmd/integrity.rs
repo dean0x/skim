@@ -13,12 +13,18 @@
 //! - Uninstall: stderr warning, require `--force` if tampered
 //! - Install/upgrade: always recompute hash
 
+use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Compute SHA-256 hash of file contents, returning the hex-encoded digest.
+///
+/// The error carries the path: `create_hook_script` propagates this failure to
+/// the user with `?`, and a bare "Permission denied (os error 13)" would not be
+/// actionable.
 pub(crate) fn compute_file_hash(path: &Path) -> anyhow::Result<String> {
-    let contents = std::fs::read(path)?;
+    let contents = std::fs::read(path)
+        .with_context(|| format!("cannot read {} to compute its hash", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&contents);
     let result = hasher.finalize();
@@ -29,6 +35,11 @@ pub(crate) fn compute_file_hash(path: &Path) -> anyhow::Result<String> {
 ///
 /// Creates the manifest at `{config_dir}/hooks/skim-{agent_cli_name}.sha256`.
 /// The manifest contains a single line: `sha256:<hash>  <script_name>\n`.
+///
+/// Errors carry the manifest path and a remediation hint: `create_hook_script`
+/// propagates this failure to the user with `?` (installing without tamper
+/// detection is worse than a hard error), so the message must say which file
+/// could not be written and what to do about it.
 pub(crate) fn write_hash_manifest(
     config_dir: &Path,
     agent_cli_name: &str,
@@ -40,9 +51,17 @@ pub(crate) fn write_hash_manifest(
     // Ensure the hooks directory exists (caller may have already created it,
     // but this is idempotent).
     if let Some(parent) = manifest_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create hook directory {}", parent.display()))?;
     }
-    std::fs::write(&manifest_path, content)?;
+    std::fs::write(&manifest_path, content).with_context(|| {
+        format!(
+            "cannot write integrity manifest {}\n\
+             hint: the hook directory must be writable — skim refuses to install a hook \
+             it cannot later verify",
+            manifest_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -57,7 +76,55 @@ pub(crate) fn read_hash_manifest(config_dir: &Path, agent_cli_name: &str) -> Opt
         .map(|s| s.to_string())
 }
 
+/// Four-state integrity classification for a hook script.
+///
+/// Used by `skim doctor` to derive its verdict from the SHA-256 manifest
+/// (an independent artefact) rather than from the hook script bytes
+/// themselves — which are exactly what a tamper modifies (PF-016).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScriptIntegrity {
+    /// Hash matches the stored manifest — script is unmodified.
+    Verified,
+    /// No manifest present — pre-manifest install (backward compat).
+    /// Treat as advisory, not failure.
+    NoManifest,
+    /// Script contents differ from the stored hash — tampered.
+    Tampered,
+    /// Script file cannot be read (missing, permission denied, etc.).
+    Unreadable,
+}
+
+/// Classify the integrity of a hook script against its stored SHA-256 manifest.
+///
+/// Returns:
+/// - `Verified`   — hash matches.
+/// - `NoManifest` — no manifest file (pre-manifest install; backward compat).
+/// - `Tampered`   — stored hash differs from current file hash.
+/// - `Unreadable` — script file cannot be read (I/O error).
+///
+/// The real signatures of the helpers this calls:
+/// - `read_hash_manifest(config_dir, agent_cli_name) -> Option<String>` — `None` when absent.
+/// - `compute_file_hash(path) -> anyhow::Result<String>` — `Err` on I/O failure.
+pub(crate) fn classify_script_integrity(
+    config_dir: &Path,
+    agent_cli_name: &str,
+    script_path: &Path,
+) -> ScriptIntegrity {
+    let Some(stored) = read_hash_manifest(config_dir, agent_cli_name) else {
+        return ScriptIntegrity::NoManifest;
+    };
+    match compute_file_hash(script_path) {
+        Ok(cur) if cur == stored => ScriptIntegrity::Verified,
+        Ok(_) => ScriptIntegrity::Tampered,
+        Err(_) => ScriptIntegrity::Unreadable,
+    }
+}
+
 /// Verify script integrity against stored hash.
+///
+/// Thin bool wrapper over [`classify_script_integrity`] — preserves the
+/// existing call contract so the two existing callers
+/// (`cmd/rewrite/hook.rs` and `cmd/init/uninstall.rs`) are unaffected.
 ///
 /// Returns:
 /// - `Ok(true)` if the hash matches OR if no manifest exists (backward compat)
@@ -68,12 +135,13 @@ pub(crate) fn verify_script_integrity(
     agent_cli_name: &str,
     script_path: &Path,
 ) -> anyhow::Result<bool> {
-    let stored_hash = match read_hash_manifest(config_dir, agent_cli_name) {
-        Some(h) => h,
-        None => return Ok(true), // Missing hash = backward compat, treat as valid
-    };
-    let current_hash = compute_file_hash(script_path)?;
-    Ok(stored_hash == current_hash)
+    match classify_script_integrity(config_dir, agent_cli_name, script_path) {
+        ScriptIntegrity::Verified | ScriptIntegrity::NoManifest => Ok(true),
+        ScriptIntegrity::Tampered => Ok(false),
+        ScriptIntegrity::Unreadable => {
+            anyhow::bail!("cannot read hook script: {}", script_path.display())
+        }
+    }
 }
 
 /// Delete hash manifest for an agent. No-op if the file does not exist.
@@ -358,6 +426,108 @@ mod tests {
         // Verify — should be tampered
         let valid = verify_awareness_integrity(config_dir, "crush", &awareness_path).unwrap();
         assert!(!valid, "modified awareness file should fail verification");
+    }
+
+    // ---- classify_script_integrity ----
+
+    #[test]
+    fn test_classify_verified_when_hash_matches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        std::fs::create_dir_all(config_dir.join("hooks")).unwrap();
+
+        let script_path = config_dir.join("hooks/skim-rewrite.sh");
+        std::fs::write(&script_path, "#!/bin/bash\nexec skim rewrite --hook\n").unwrap();
+        let hash = compute_file_hash(&script_path).unwrap();
+        write_hash_manifest(config_dir, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+
+        let result = classify_script_integrity(config_dir, "claude-code", &script_path);
+        assert_eq!(result, ScriptIntegrity::Verified);
+    }
+
+    #[test]
+    fn test_classify_no_manifest_when_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        std::fs::create_dir_all(config_dir.join("hooks")).unwrap();
+
+        let script_path = config_dir.join("hooks/skim-rewrite.sh");
+        std::fs::write(&script_path, "#!/bin/bash\nexec skim rewrite --hook\n").unwrap();
+        // No manifest written.
+
+        let result = classify_script_integrity(config_dir, "claude-code", &script_path);
+        assert_eq!(result, ScriptIntegrity::NoManifest);
+    }
+
+    #[test]
+    fn test_classify_tampered_when_hash_differs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        std::fs::create_dir_all(config_dir.join("hooks")).unwrap();
+
+        let script_path = config_dir.join("hooks/skim-rewrite.sh");
+        std::fs::write(&script_path, "#!/bin/bash\nexec skim rewrite --hook\n").unwrap();
+        let hash = compute_file_hash(&script_path).unwrap();
+        write_hash_manifest(config_dir, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+
+        // Tamper: append one byte.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&script_path)
+            .unwrap();
+        f.write_all(b"X").unwrap();
+
+        let result = classify_script_integrity(config_dir, "claude-code", &script_path);
+        assert_eq!(result, ScriptIntegrity::Tampered);
+    }
+
+    #[test]
+    fn test_classify_unreadable_when_file_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        std::fs::create_dir_all(config_dir.join("hooks")).unwrap();
+
+        // Write manifest but no script file.
+        write_hash_manifest(
+            config_dir,
+            "claude-code",
+            "skim-rewrite.sh",
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        )
+        .unwrap();
+        let missing = config_dir.join("hooks/skim-rewrite.sh");
+
+        let result = classify_script_integrity(config_dir, "claude-code", &missing);
+        assert_eq!(result, ScriptIntegrity::Unreadable);
+    }
+
+    #[test]
+    fn test_verify_script_integrity_is_thin_wrapper_over_classifier() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path();
+        std::fs::create_dir_all(config_dir.join("hooks")).unwrap();
+
+        let script_path = config_dir.join("hooks/skim-rewrite.sh");
+        std::fs::write(&script_path, "#!/bin/bash\nexec skim rewrite --hook\n").unwrap();
+        let hash = compute_file_hash(&script_path).unwrap();
+        write_hash_manifest(config_dir, "claude-code", "skim-rewrite.sh", &hash).unwrap();
+
+        // Verified → Ok(true)
+        assert!(verify_script_integrity(config_dir, "claude-code", &script_path).unwrap());
+
+        // NoManifest → Ok(true) (backward compat)
+        let no_manifest_dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(no_manifest_dir.path().join("hooks")).unwrap();
+        std::fs::write(no_manifest_dir.path().join("hooks/skim-rewrite.sh"), "x").unwrap();
+        assert!(
+            verify_script_integrity(
+                no_manifest_dir.path(),
+                "claude-code",
+                &no_manifest_dir.path().join("hooks/skim-rewrite.sh")
+            )
+            .unwrap()
+        );
     }
 
     #[test]

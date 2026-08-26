@@ -6,6 +6,14 @@
 //! - **F3**: `ls -la d1 d2` output is sectioned on both surfaces.
 //! - **F5**: grep leading-indent lines are preserved on both surfaces.
 //! - **F2**: mypy synthesized success line appears on both surfaces.
+//! - **`du` byte-faithful passthrough** (ADR-014 / PF-006): TAB and ESC bytes must
+//!   survive on both surfaces.  ONE paired test discharges the two-surface
+//!   discipline *here specifically* because the defect lives in the shared
+//!   execution.rs `skip_ansi_strip` gate, which runs downstream of dispatch.
+//!   Both surfaces route to the same `run_tool` path; fixing the shared flag
+//!   fixes both surfaces simultaneously, so they CANNOT diverge for this
+//!   behaviour.  This is not general dual-surface coverage for all wrapper
+//!   behaviours.
 //!
 //! ## Surfaces under test
 //!
@@ -296,6 +304,118 @@ src/app.py:12:        return self.value\n";
         assert!(
             stdout.contains("mypy OK"),
             "argv0 surface: synthesized success line must appear; got: {stdout}"
+        );
+    }
+
+    // ========================================================================
+    // du — byte-faithful passthrough: TAB and ESC must survive on both surfaces
+    // (ADR-014 / PF-006)
+    //
+    // ONE paired test discharges the two-surface discipline here specifically
+    // because the defect (skip_ansi_strip: false) lives in the shared execution.rs
+    // ANSI-strip gate, which runs downstream of dispatch after both surfaces have
+    // routed to the same run_tool path.  Fixing the shared flag fixes both surfaces
+    // simultaneously — they cannot diverge for this behaviour — so a single paired
+    // test is sufficient and exhaustive for this defect.  Do not cite this as general
+    // dual-surface coverage for all wrapper behaviours; it is scoped to the shared
+    // handler layer only.
+    // ========================================================================
+
+    /// `du` TAB and ESC byte-faithful passthrough on both interception surfaces.
+    ///
+    /// du's POSIX format is `size<TAB>path`; with `skip_ansi_strip: false` an
+    /// ESC byte anywhere triggers `strip_ansi_cow` → `Cow::Owned`, and
+    /// `strip_escape_sequences` then scans the entire buffer — content-level
+    /// ESC bytes are removed and any bytes the reader expects intact are at risk.
+    ///
+    /// Both the hook surface (`skim du -a`) and the argv0/wrapper surface
+    /// (`argv[0]="du"`) must produce byte-identical output matching the fixture,
+    /// and must agree with each other.
+    #[test]
+    fn du_passthrough_tab_and_esc_both_surfaces() {
+        // `size\tpath` with a colorized path — both bytes must survive on both surfaces.
+        // Fixture ends with `\n` to match emit_raw_passthrough (which appends one
+        // if the output lacks a trailing newline).
+        let fixture = "4\t\x1b[32m./file.txt\x1b[0m\n8\t.\n";
+        let stub_dir = make_stub("du", fixture, 0);
+        let path = prepend_path(stub_dir.path());
+        let skim = skim_bin();
+
+        // Surface 1: hook / direct-invocation surface (`skim du -a`)
+        let hook_out = std::process::Command::new(&skim)
+            .args(["du", "-a"])
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("hook surface: skim du must be spawnable");
+
+        // Surface 2: argv0/wrapper surface (`du -a` with argv[0]="du")
+        let argv0_out = std::process::Command::new(&skim)
+            .arg0("du")
+            .args(["-a"])
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("argv0 surface: skim-as-du must be spawnable");
+
+        // Both must exit 0.
+        assert_eq!(
+            hook_out.status.code(),
+            Some(0),
+            "hook surface: exit must be 0; stderr={}",
+            String::from_utf8_lossy(&hook_out.stderr)
+        );
+        assert_eq!(
+            argv0_out.status.code(),
+            Some(0),
+            "argv0 surface: exit must be 0; stderr={}",
+            String::from_utf8_lossy(&argv0_out.stderr)
+        );
+
+        // Both must contain TAB (0x09).
+        assert!(
+            hook_out.stdout.contains(&0x09_u8),
+            "hook surface: TAB must survive (skip_ansi_strip: true); got: {:?}",
+            hook_out.stdout
+        );
+        assert!(
+            argv0_out.stdout.contains(&0x09_u8),
+            "argv0 surface: TAB must survive (skip_ansi_strip: true); got: {:?}",
+            argv0_out.stdout
+        );
+
+        // Both must contain ESC (0x1b).
+        assert!(
+            hook_out.stdout.contains(&0x1b_u8),
+            "hook surface: ESC must survive (ADR-012); got: {:?}",
+            hook_out.stdout
+        );
+        assert!(
+            argv0_out.stdout.contains(&0x1b_u8),
+            "argv0 surface: ESC must survive (ADR-012); got: {:?}",
+            argv0_out.stdout
+        );
+
+        // Both must match the fixture exactly.
+        assert_eq!(
+            hook_out.stdout,
+            fixture.as_bytes(),
+            "hook surface: stdout must be byte-identical to fixture — any stripping is #317"
+        );
+        assert_eq!(
+            argv0_out.stdout,
+            fixture.as_bytes(),
+            "argv0 surface: stdout must be byte-identical to fixture — any stripping is #317"
+        );
+
+        // The two surfaces must agree with each other.
+        assert_eq!(
+            hook_out.stdout, argv0_out.stdout,
+            "hook and argv0 surfaces must produce identical output for du passthrough"
         );
     }
 }

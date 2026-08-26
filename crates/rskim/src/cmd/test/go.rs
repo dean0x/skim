@@ -73,7 +73,13 @@ pub(crate) fn run(
     // Emit the result
     let exit_code = match &parsed {
         ParseResult::Full(result) | ParseResult::Degraded(result, _) => {
-            println!("{result}");
+            // `AsRef<str>` and `Display` both yield `TestResult::rendered`
+            // verbatim, so this is byte-identical to the former `println!`.
+            if crate::cmd::execution::write_line_to_stdout(result.as_ref())?
+                == crate::cmd::execution::StdoutStatus::PipeClosed
+            {
+                return Ok(crate::cmd::execution::pipe_closed_exit());
+            }
             // Emit degradation markers to stderr
             let mut stderr = std::io::stderr().lock();
             let _ = parsed.emit_markers(&mut stderr);
@@ -84,14 +90,22 @@ pub(crate) fn run(
                 // Pass the actual exit code (e.g. 2 for compilation errors) so
                 // the hint reflects the real status rather than a hardcoded 1.
                 let actual_exit = output.exit_code.unwrap_or(1);
-                super::shared::emit_failure_context(&combined, actual_exit);
+                if super::shared::emit_failure_context(&combined, actual_exit)?
+                    == crate::cmd::execution::StdoutStatus::PipeClosed
+                {
+                    return Ok(crate::cmd::execution::pipe_closed_exit());
+                }
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
             }
         }
         ParseResult::Passthrough(raw) => {
-            println!("{raw}");
+            if crate::cmd::execution::write_line_to_stdout(raw)?
+                == crate::cmd::execution::StdoutStatus::PipeClosed
+            {
+                return Ok(crate::cmd::execution::pipe_closed_exit());
+            }
             let mut stderr = std::io::stderr().lock();
             let _ = parsed.emit_markers(&mut stderr);
             // Mirror the original process exit code
@@ -99,6 +113,9 @@ pub(crate) fn run(
                 Some(0) => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
             }
+        }
+        ParseResult::RawPassthrough => {
+            unreachable!("go test local parser never returns RawPassthrough")
         }
     };
 

@@ -308,11 +308,18 @@ pub(crate) fn compute_line_map_from_removed_ranges(
 
 /// Normalize a line map to match `trim_and_normalize`'s blank-line dropping.
 ///
-/// `trim_and_normalize` drops output lines when there are 3+ consecutive blank
-/// lines (keeping at most 2). The line map computed from byte ranges has one
-/// entry per line in the intermediate output (after `remove_ranges` and
-/// `collapse_whitespace`, before `trim_and_normalize`). This function replays
-/// the same blank-line dropping logic over the line map to keep it in sync.
+/// `trim_and_normalize` has two blank-line rules that reduce output lines:
+///
+/// 1. **Leading blanks dropped** — blank lines before the first non-blank line
+///    are silently discarded. `trim_and_normalize` calls `result.push_str("")`
+///    for each such line, but `result` remains empty (an empty push is a no-op),
+///    so the blank never appears in the output.
+/// 2. **3+ consecutive blanks capped to 2** — blank runs longer than 2 are
+///    truncated. The third (and any subsequent) blank in a run is skipped via
+///    `continue`.
+///
+/// Both rules must be mirrored here so the line map stays in sync with the
+/// output text that `trim_and_normalize` produces.
 ///
 /// `pre_normalized_text` is the intermediate text (after `collapse_whitespace`,
 /// before `trim_and_normalize`). `line_map` has the same length as the number
@@ -328,6 +335,15 @@ pub(crate) fn normalize_line_map_blanks(
     for (line, &src_line) in pre_normalized_text.lines().zip(line_map.iter()) {
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
+            // Rule 1: mirror trim_and_normalize's leading-blank drop.
+            // trim_and_normalize calls result.push_str("") for every blank line,
+            // but since `result` stays empty until the first non-blank content is
+            // pushed, those blanks never appear in the output. Skip the map entry
+            // for the same leading blank lines.
+            if result.is_empty() {
+                continue;
+            }
+            // Rule 2: cap consecutive blanks at 2.
             consecutive_blanks += 1;
             if consecutive_blanks > 2 {
                 // trim_and_normalize drops this line — skip it in the map too.
@@ -399,6 +415,7 @@ pub(crate) fn reconcile_line_map_after_truncation(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
 mod tests {
     use super::*;
+    use crate::transform::minimal::trim_and_normalize;
 
     // ========================================================================
     // compute_line_map_by_text_matching
@@ -643,6 +660,85 @@ mod tests {
     fn test_normalize_line_map_empty() {
         let result = normalize_line_map_blanks("", vec![]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_line_map_leading_blank_dropped() {
+        // Regression test for #476 / Fix 5: trim_and_normalize discards blank lines
+        // before the first non-blank content (an empty push to an empty result is a
+        // no-op). normalize_line_map_blanks must mirror that behaviour.
+        // pre_normalized_text: blank(line 1), blank(line 2), "code"(line 3)
+        let text = "\n\ncode\n";
+        // Three entries in the intermediate map: src lines 1, 2, 3
+        let line_map = vec![1, 2, 3];
+        let result = normalize_line_map_blanks(text, line_map);
+        // Only "code" (src line 3) appears in the output.
+        assert_eq!(
+            result,
+            vec![3],
+            "leading blank entries must be dropped to match trim_and_normalize output"
+        );
+    }
+
+    #[test]
+    fn test_normalize_line_map_single_leading_blank_dropped() {
+        // K=1 leading blank: the single blank must be dropped.
+        let text = "\nfoo\nbar\n";
+        let line_map = vec![1, 2, 3];
+        let result = normalize_line_map_blanks(text, line_map);
+        assert_eq!(result, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_normalize_line_map_five_leading_blanks_all_dropped() {
+        // K=5 leading blanks.  Before the leading-blank fix the 3+ consecutive
+        // rule would keep 2 entries (shift of 2), producing vec![24, 25, 26].
+        // After the fix all 5 leading blanks are dropped, shift is 0 not 2.
+        let text = "\n\n\n\n\nimport os\n";
+        // Pre-normalized line map: 5 blank lines (src 21-25) + import (src 26)
+        let line_map = vec![21, 22, 23, 24, 25, 26];
+        let result = normalize_line_map_blanks(text, line_map);
+        assert_eq!(
+            result,
+            vec![26],
+            "all 5 leading blanks must be dropped (shift is 0, not 2)"
+        );
+    }
+
+    #[test]
+    fn test_normalize_line_map_invariant_matches_trim_and_normalize() {
+        // Fix 5c invariant: for any input with at least one non-blank line, the
+        // map length must equal the line count of trim_and_normalize's output.
+        // This is the durable regression guard for the class of defect where the
+        // text and the map diverge because of an unmirrored transformation rule.
+        let cases: &[(&str, Vec<usize>)] = &[
+            // K=1 leading blank
+            ("\nimport os\n", vec![21, 22]),
+            // K=5 leading blanks
+            ("\n\n\n\n\nimport os\n", vec![21, 22, 23, 24, 25, 26]),
+            // 3+ consecutive interior blanks (the pre-existing rule)
+            ("a\n\n\n\nb\n", vec![1, 2, 3, 4, 5]),
+            // Mixed: leading blank + interior 3+ run
+            ("\na\n\n\n\nb\n", vec![1, 2, 3, 4, 5, 6]),
+        ];
+        for (text, line_map) in cases {
+            let normalized_map = normalize_line_map_blanks(text, line_map.clone());
+            let normalized_text = trim_and_normalize(text);
+            assert_eq!(
+                normalized_map.len(),
+                normalized_text.lines().count(),
+                "map length ({}) must match trim_and_normalize line count ({}) for input {:?}",
+                normalized_map.len(),
+                normalized_text.lines().count(),
+                text,
+            );
+        }
+        // Known divergence: all-blank input → text gets 1 line (trailing-newline
+        // restore at minimal.rs:406-408) but map returns [].  Harmless: format.rs
+        // degrades via `.get(i).unwrap_or(0)` and renders a blank line with no
+        // prefix, which is correct output for a blank line.
+        let blank_map = normalize_line_map_blanks("\n\n", vec![1, 2]);
+        assert!(blank_map.is_empty(), "all-blank input returns empty map");
     }
 
     // ========================================================================

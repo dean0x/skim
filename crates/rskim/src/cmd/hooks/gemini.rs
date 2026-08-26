@@ -129,8 +129,8 @@ mod tests {
         let script = hook().generate_script("1.2.3", "/usr/local/bin/skim");
         // Pinned exec via variable.
         assert!(
-            script.contains("exec \"$_SKIM_BIN\" rewrite --hook"),
-            "script must exec via pinned binary, got: {script}"
+            script.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook"),
+            "script must exec via $SKIM_HOOK_BINARY directly, got: {script}"
         );
         // PATH fallback present.
         assert!(

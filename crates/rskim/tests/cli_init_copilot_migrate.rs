@@ -51,25 +51,32 @@ fn test_copilot_permissions_non_tty_writes_nothing() {
 /// must print a loud notice to stderr but still exit 0 (non-fatal).
 ///
 /// This exercises the non-fatal sidecar error path in `run_uninstall_for_agent`.
+///
+/// Sandboxed: HOME is a TempDir so uninstall cannot touch real ~/.copilot,
+/// ~/.skim/bin, or any other home-directory artifact (avoids PF-009 / PF-015).
 #[test]
 fn test_copilot_uninstall_corrupt_sidecar_loud_notice_non_fatal() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    // skim_sandboxed sets COPILOT_CONFIG_DIR=home/.copilot; use that as config_dir.
+    let config_dir = home.path().join(".copilot");
+
+    // Pre-create the config dir: single-agent install verifies config dir exists
+    // before proceeding (guards against "agent not installed" false installs).
+    std::fs::create_dir_all(&config_dir).unwrap();
 
     // First, do a full install to create real hook artifacts.
-    common::skim()
+    common::skim_sandboxed(home.path())
         .args(["init", "--agent", "copilot", "--no-guidance"])
-        .env("COPILOT_CONFIG_DIR", tmp.path())
         .assert()
         .success();
 
     // Now write a corrupt sidecar where permissions would live.
-    let sidecar_path = tmp.path().join("skim-permissions.json");
+    let sidecar_path = config_dir.join("skim-permissions.json");
     std::fs::write(&sidecar_path, b"{ INVALID JSON !!!").unwrap();
 
     // Uninstall must not fail hard; it emits a notice and continues.
-    let out = common::skim()
+    let out = common::skim_sandboxed(home.path())
         .args(["init", "--agent", "copilot", "--uninstall", "--yes"])
-        .env("COPILOT_CONFIG_DIR", tmp.path())
         .output()
         .expect("skim must run");
 

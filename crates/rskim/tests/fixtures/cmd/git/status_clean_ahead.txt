@@ -1,0 +1,4 @@
+# branch.oid abc123def456789
+# branch.head feature/my-branch
+# branch.upstream origin/feature/my-branch
+# branch.ab +3 -0

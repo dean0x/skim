@@ -6,18 +6,76 @@ use crate::cmd::extract_output_format;
 use crate::output::canonical::GitResult;
 use crate::runner::CommandRunner;
 
+/// Short option characters that, when present in a single-dash cluster, change
+/// `git status` output format and conflict with the `--porcelain=v2` the handler
+/// injects:
+///
+/// - `s` — selects short format (overrides porcelain)
+/// - `z` — NUL-terminates records (breaks `output.lines()` line-based parse)
+const CONFLICTING_SHORT_OPTS: &[char] = &['s', 'z'];
+
 /// Returns `true` for flags that conflict with the `--porcelain=v2` flag the
-/// handler injects.  These are `-s`, `--short`, `--porcelain`, and any
-/// `--porcelain=*` variant.
+/// handler injects.
+///
+/// Conflicting flags are those that change the output format to something other
+/// than porcelain v2:
+/// - `--short` / `--porcelain` / `--porcelain=*` / `--null` / `--long` (long forms)
+/// - Short clusters containing any char in [`CONFLICTING_SHORT_OPTS`] (`s` or `z`)
+///
+/// `-b` alone is NOT conflicting — it enables branch display, same as the
+/// `--branch` flag the handler already injects.
+///
+/// Callers must exclude pathspecs (tokens after `--`) before invoking this
+/// predicate; see [`strip_conflicting_short_chars`] and [`run_status`].
 fn is_conflicting_status_flag(s: &str) -> bool {
-    s == "-s" || s == "--short" || s == "--porcelain" || s.starts_with("--porcelain=")
+    // Long-form format flags
+    if matches!(s, "--short" | "--porcelain" | "--null" | "--long") || s.starts_with("--porcelain=")
+    {
+        return true;
+    }
+    // Short flag clusters: single-dash only; check against the closed set {s, z}.
+    if s.starts_with('-') && !s.starts_with("--") {
+        return s[1..].chars().any(|c| CONFLICTING_SHORT_OPTS.contains(&c));
+    }
+    false
+}
+
+/// Transform a single arg token by removing conflicting short option chars.
+///
+/// - Long-form conflicting flags (`--short`, `--null`, `--long`, etc.) → `None`
+///   (drop entirely).
+/// - Short clusters: strip chars in [`CONFLICTING_SHORT_OPTS`], re-emit remainder.
+///   - `-suno` → `Some("-uno")` (strip `s`, keep `uno`)
+///   - `-sb`   → `Some("-b")`  (strip `s`, keep `b`)
+///   - `-z`    → `None`        (nothing remains — drop entirely)
+/// - Non-conflicting tokens are returned unchanged (`Some(token)`).
+fn strip_conflicting_short_chars(token: &str) -> Option<String> {
+    if !is_conflicting_status_flag(token) {
+        return Some(token.to_string());
+    }
+    // Long flags: always drop entirely.
+    if token.starts_with("--") {
+        return None;
+    }
+    // Short cluster: strip only the conflicting chars, preserve the rest.
+    let remainder: String = token[1..]
+        .chars()
+        .filter(|c| !CONFLICTING_SHORT_OPTS.contains(c))
+        .collect();
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(format!("-{remainder}"))
+    }
 }
 
 /// Run `git status` with compression.
 ///
-/// Strips user-supplied format flags (`-s`, `--short`, `--porcelain`,
-/// `--porcelain=*`) before forwarding to git so they cannot conflict with the
-/// `--porcelain=v2` flag that the handler injects for structured parsing.
+/// Strips user-supplied format flags (see [`is_conflicting_status_flag`]) before
+/// forwarding to git so they cannot conflict with the `--porcelain=v2` flag that
+/// the handler injects for structured parsing. Short-flag clusters have only their
+/// conflicting chars stripped — non-conflicting chars in the same cluster are
+/// preserved (e.g., `-suno` → `-uno`). Pathspecs after `--` are never modified.
 ///
 /// # C-7 / net-savings guard baseline
 ///
@@ -40,13 +98,28 @@ pub(super) fn run_status(
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
     // Detect whether the user supplied any format-substituting flags.
-    let has_conflicting = args.iter().any(|a| is_conflicting_status_flag(a.as_str()));
+    // Stop scanning at `--` — pathspecs after the terminator are not flags.
+    let has_conflicting = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| is_conflicting_status_flag(a.as_str()));
 
-    // Strip conflicting format flags — handler injects --porcelain=v2 itself.
+    // Transform conflicting format flags:
+    // - Before `--`: strip only the conflicting chars; drop token if nothing remains.
+    // - At `--` and after: pass through verbatim (pathspecs, not flags).
+    let mut past_terminator = false;
     let stripped_args: Vec<String> = args
         .iter()
-        .filter(|a| !is_conflicting_status_flag(a.as_str()))
-        .cloned()
+        .filter_map(|a| {
+            if past_terminator {
+                return Some(a.clone());
+            }
+            if a.as_str() == "--" {
+                past_terminator = true;
+                return Some(a.clone());
+            }
+            strip_conflicting_short_chars(a.as_str())
+        })
         .collect();
 
     let (filtered_args, output_format) = extract_output_format(&stripped_args);
@@ -99,10 +172,41 @@ pub(super) fn run_status(
     )
 }
 
+/// State of the `# branch.ab` line from porcelain v2 output.
+///
+/// Tracking absence separately from zero counts is essential: when a remote
+/// tracking branch exists but the remote ref is gone, git omits the
+/// `# branch.ab` line entirely.  Treating that as `(0, 0)` would render the
+/// branch as "in sync", masking the deletion.
+///
+/// Parsed at [`StatusCategories::classify_line`] time (parse-at-boundaries
+/// rule) — not deferred to render time.
+#[derive(Default)]
+enum AheadBehind {
+    /// No `# branch.ab` line was seen.  When an upstream is configured this
+    /// indicates the remote ref is gone; the render path shows `[gone]` to
+    /// mirror native `git status -sb`.
+    #[default]
+    Absent,
+    /// Line was seen and both counts parsed successfully.
+    Counts { ahead: u64, behind: u64 },
+    /// Line was seen but could not be parsed — the raw payload is surfaced
+    /// verbatim rather than silently claiming in-sync (PF-008 / fail-loud).
+    Malformed(String),
+}
+
 /// Accumulated per-category file lists from a porcelain v2 status parse.
 #[derive(Default)]
 struct StatusCategories {
     branch: String,
+    /// Upstream tracking branch from `# branch.upstream <name>`.
+    upstream: String,
+    /// Ahead/behind counts parsed from `# branch.ab +<ahead> -<behind>`.
+    ///
+    /// [`AheadBehind::Absent`] when no `# branch.ab` line was emitted by git
+    /// (the remote ref is gone).  Parsed eagerly in [`classify_line`] so the
+    /// render path never needs to re-parse a raw string.
+    ahead_behind: AheadBehind,
     staged: Vec<String>,
     modified: Vec<String>,
     untracked: Vec<String>,
@@ -115,6 +219,16 @@ impl StatusCategories {
     fn classify_line(&mut self, line: &str) {
         if let Some(head) = line.strip_prefix("# branch.head ") {
             self.branch = head.to_string();
+            return;
+        }
+
+        if let Some(upstream) = line.strip_prefix("# branch.upstream ") {
+            self.upstream = upstream.to_string();
+            return;
+        }
+
+        if let Some(ab) = line.strip_prefix("# branch.ab ") {
+            self.ahead_behind = parse_ahead_behind(ab);
             return;
         }
 
@@ -167,7 +281,31 @@ impl StatusCategories {
         let mut details: Vec<String> = Vec::new();
 
         if !self.branch.is_empty() {
-            details.push(format!("branch: {}", self.branch));
+            let branch_line = if self.upstream.is_empty() {
+                // No upstream configured: just show the head name.
+                format!("branch: {}", self.branch)
+            } else {
+                // Upstream present: mirror native `git status -sb` header format
+                // "## main...origin/main [ahead 1]" exactly.
+                //
+                // The three-state model:
+                //   Absent         → upstream ref is gone  → "[gone]"
+                //   Counts(0, 0)   → in sync with upstream → no bracket
+                //   Counts(a, b)   → diverged              → "[ahead A]" / "[behind B]" / both
+                //   Malformed(raw) → parse failed          → "[{raw}]" (fail loud, PF-008)
+                let suffix = match self.ahead_behind {
+                    AheadBehind::Absent => " [gone]".to_string(),
+                    AheadBehind::Counts { ahead, behind } => match (ahead, behind) {
+                        (0, 0) => String::new(),
+                        (a, 0) => format!(" [ahead {a}]"),
+                        (0, b) => format!(" [behind {b}]"),
+                        (a, b) => format!(" [ahead {a}, behind {b}]"),
+                    },
+                    AheadBehind::Malformed(raw) => format!(" [{raw}]"),
+                };
+                format!("branch: {}...{}{}", self.branch, self.upstream, suffix)
+            };
+            details.push(branch_line);
         }
         for f in &self.staged {
             details.push(format!("staged: {f}"));
@@ -288,6 +426,25 @@ fn worktree_prefix(c: char) -> &'static str {
     }
 }
 
+/// Parse a `# branch.ab` value (format: `+<ahead> -<behind>`) into an
+/// [`AheadBehind`] state.
+///
+/// Returns [`AheadBehind::Malformed`] with the raw payload when either field
+/// cannot be parsed, surfacing it verbatim rather than silently claiming
+/// in-sync (fail-loud principle, PF-008 class).
+fn parse_ahead_behind(ab: &str) -> AheadBehind {
+    let mut parts = ab.split_whitespace();
+    let ahead_str = parts.next().unwrap_or("");
+    let behind_str = parts.next().unwrap_or("");
+    match (
+        ahead_str.trim_start_matches('+').parse::<u64>(),
+        behind_str.trim_start_matches('-').parse::<u64>(),
+    ) {
+        (Ok(ahead), Ok(behind)) => AheadBehind::Counts { ahead, behind },
+        _ => AheadBehind::Malformed(ab.to_string()),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -359,8 +516,164 @@ mod tests {
         let output = "# branch.oid abc123\n# branch.head main\n";
         let result = parse_status(output);
         assert_eq!(result.summary, "clean");
-        // Details should contain branch info only
+        // Details should contain branch info only (no upstream on this fixture)
         assert!(result.details.iter().any(|d| d.contains("branch: main")));
+    }
+
+    /// Fix 1: `# branch.upstream` and `# branch.ab` lines must appear in the
+    /// branch detail, not be silently discarded.  This catches the root cause of
+    /// the `git status -sb` branch-header info-loss on clean trees.
+    ///
+    /// Full-string assert pins the exact format declared by the "mirror native
+    /// `git status -sb` header format exactly" comment (testing-04).
+    #[test]
+    fn test_parse_status_upstream_and_ahead_behind() {
+        let output = include_str!("../../../tests/fixtures/cmd/git/status_clean_ahead.txt");
+        let result = parse_status(output);
+        assert_eq!(result.summary, "clean", "clean tree with upstream");
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        // Full-string assert — field-order swaps or separator changes must fail.
+        assert_eq!(
+            branch_detail, "branch: feature/my-branch...origin/feature/my-branch [ahead 3]",
+            "branch detail must mirror native git status -sb format exactly"
+        );
+    }
+
+    /// Branch-detail render (in-sync case): when both ahead and behind are 0,
+    /// the bracket is omitted entirely — matching native `git status -sb`
+    /// `## main...origin/main` with no `[...]` suffix.
+    ///
+    /// Full-string assert pins the exact format (testing-04).
+    #[test]
+    fn test_parse_status_upstream_both_zero_no_bracket() {
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -0\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        // Both counts zero → no bracket; exact format match.
+        assert_eq!(
+            branch_detail, "branch: main...origin/main",
+            "in-sync case must omit bracket entirely"
+        );
+    }
+
+    /// Branch-detail render (diverged case): when ahead > 0 AND behind > 0,
+    /// both components must appear in the bracket — `[ahead A, behind B]`.
+    ///
+    /// Full-string assert pins the exact format (testing-04).
+    #[test]
+    fn test_parse_status_upstream_both_nonzero_bracket() {
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert_eq!(
+            branch_detail, "branch: main...origin/main [ahead 2, behind 3]",
+            "diverged case must show both components"
+        );
+    }
+
+    /// Branch-detail render (behind-only case): when only behind > 0, only the
+    /// `[behind B]` bracket must appear — no `ahead` component.
+    ///
+    /// Full-string assert pins the exact format (testing-04).
+    #[test]
+    fn test_parse_status_upstream_behind_only_bracket() {
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +0 -5\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert_eq!(
+            branch_detail, "branch: main...origin/main [behind 5]",
+            "behind-only case must show only [behind N]"
+        );
+    }
+
+    /// Branch-detail render (gone-upstream case, architecture-02): when an
+    /// upstream is configured but git emits no `# branch.ab` line — which
+    /// happens when the remote ref has been deleted — the render must show
+    /// `[gone]`, exactly matching native `git status -sb` output.
+    ///
+    /// With the old `ahead_behind: String` model, absent ab defaulted to `""`
+    /// which `build_ahead_behind_bracket` treated as `(0, 0)` → no bracket,
+    /// falsely implying "in sync with upstream".
+    #[test]
+    fn test_parse_status_gone_upstream() {
+        // Upstream present, no # branch.ab line (upstream ref deleted on remote).
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert_eq!(
+            branch_detail, "branch: main...origin/main [gone]",
+            "gone-upstream case must render [gone] to match native git status -sb"
+        );
+    }
+
+    /// Branch-detail render (malformed-ab case, security-07 / reliability-02):
+    /// when `# branch.ab` is present but has an unexpected shape, the raw
+    /// payload must be surfaced in brackets rather than silently claiming
+    /// in-sync.  Silent zero default violates PF-008 fail-loud.
+    #[test]
+    fn test_parse_status_malformed_ab_surfaces_raw_payload() {
+        // A hypothetical future porcelain format change or corrupted output.
+        let output = "# branch.oid abc123\n# branch.head main\n# branch.upstream origin/main\n# branch.ab unexpected-format\n";
+        let result = parse_status(output);
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        // The raw payload must be surfaced — NOT silently rendered as in-sync.
+        assert_eq!(
+            branch_detail, "branch: main...origin/main [unexpected-format]",
+            "malformed ab must surface raw payload, never silently claim in-sync"
+        );
+        // Explicit negative: no silent in-sync render (the PF-008 failure mode).
+        assert!(
+            !branch_detail.ends_with("origin/main"),
+            "malformed ab must NOT render as bare in-sync (no bracket)"
+        );
+    }
+
+    /// Fix 1: `git status -sb` — the `-sb` cluster must be detected as
+    /// conflicting (contains `s` = short format) so it is stripped before
+    /// forwarding to git, preventing the short-format `##` branch line from
+    /// overriding the porcelain v2 output and causing info-loss.
+    #[test]
+    fn test_short_cluster_with_s_is_conflicting() {
+        for flag in &["-s", "-sb", "-bs", "-sbu", "-us"] {
+            assert!(
+                is_conflicting_status_flag(flag),
+                "{flag:?} contains 's' (short format) — must be conflicting"
+            );
+        }
+        // `-b` alone: NOT conflicting — branch flag, same as our --branch injection.
+        assert!(
+            !is_conflicting_status_flag("-b"),
+            "-b alone must NOT be conflicting"
+        );
+        // `-u` alone: NOT conflicting — untracked-files flag.
+        assert!(
+            !is_conflicting_status_flag("-u"),
+            "-u alone must NOT be conflicting"
+        );
     }
 
     #[test]
@@ -388,6 +701,18 @@ mod tests {
             result.summary.contains("renamed"),
             "expected 'renamed' in summary, got: {}",
             result.summary
+        );
+
+        // Fix 1: branch detail must mirror native git -sb format exactly.
+        // Full-string assert — field-order swaps or separator changes must fail (testing-04).
+        let branch_detail = result
+            .details
+            .iter()
+            .find(|d| d.starts_with("branch:"))
+            .expect("must have a branch detail line");
+        assert_eq!(
+            branch_detail, "branch: main...origin/main [ahead 1]",
+            "branch detail must mirror native git status -sb format exactly"
         );
     }
 
@@ -525,36 +850,60 @@ mod tests {
     // Flag-stripping predicate
     // ========================================================================
 
-    /// Thin test wrapper around the module-scope predicate.
+    /// Test helper that mirrors `run_status`'s flag-stripping logic: partial-strip
+    /// of conflicting short-cluster chars with `--` terminator support.
     fn strip_conflicting_flags(args: &[&str]) -> Vec<String> {
+        let mut past_terminator = false;
         args.iter()
-            .filter(|a| !is_conflicting_status_flag(a))
-            .map(|s| s.to_string())
+            .filter_map(|&a| {
+                if past_terminator {
+                    return Some(a.to_string());
+                }
+                if a == "--" {
+                    past_terminator = true;
+                    return Some(a.to_string());
+                }
+                strip_conflicting_short_chars(a)
+            })
             .collect()
     }
 
     #[test]
     fn test_flag_stripping_removes_conflicting_flags() {
-        // Each of these must be stripped individually.
+        // Tokens whose only content is conflicting chars are dropped entirely.
         assert!(
             strip_conflicting_flags(&["-s"]).is_empty(),
-            "-s must be stripped"
+            "-s alone must be dropped entirely"
         );
         assert!(
             strip_conflicting_flags(&["--short"]).is_empty(),
-            "--short must be stripped"
+            "--short must be dropped entirely"
         );
         assert!(
             strip_conflicting_flags(&["--porcelain"]).is_empty(),
-            "--porcelain must be stripped"
+            "--porcelain must be dropped entirely"
         );
         assert!(
             strip_conflicting_flags(&["--porcelain=v1"]).is_empty(),
-            "--porcelain=v1 must be stripped"
+            "--porcelain=v1 must be dropped entirely"
         );
         assert!(
             strip_conflicting_flags(&["--porcelain=v2"]).is_empty(),
-            "--porcelain=v2 must be stripped"
+            "--porcelain=v2 must be dropped entirely"
+        );
+        // Short clusters: only the conflicting char(s) are stripped; non-conflicting
+        // chars in the same cluster are preserved.
+        // Fix 1: `-sb` and `-bs` contain `s` (conflicting) but also `b` (branch flag,
+        // same semantic as our injected --branch) — only `s` is stripped.
+        assert_eq!(
+            strip_conflicting_flags(&["-sb"]),
+            vec!["-b"],
+            "-sb must strip only 's' and preserve '-b'"
+        );
+        assert_eq!(
+            strip_conflicting_flags(&["-bs"]),
+            vec!["-b"],
+            "-bs must strip only 's' and preserve '-b'"
         );
     }
 
@@ -571,20 +920,21 @@ mod tests {
 
     #[test]
     fn test_flag_stripping_mixed_input() {
-        // Conflicting flags are stripped; non-conflicting flags are preserved.
+        // Conflicting flags before `--` are stripped; args after `--` are pathspecs
+        // and must be preserved verbatim even when they look like format flags.
         let input = [
             "-s",
             "--branch",
             "--short",
             "--",
-            "--porcelain=v1",
+            "--porcelain=v1", // after `--` → pathspec, NOT a flag; must be preserved
             "path/to/file",
         ];
         let result = strip_conflicting_flags(&input);
         assert_eq!(
             result,
-            vec!["--branch", "--", "path/to/file"],
-            "only conflicting flags must be stripped from mixed input"
+            vec!["--branch", "--", "--porcelain=v1", "path/to/file"],
+            "args after `--` must pass through verbatim as pathspecs, never stripped"
         );
     }
 
@@ -600,10 +950,15 @@ mod tests {
         // All substitution-triggering flags must be detected.
         for flag in &[
             "-s",
+            "-sb", // short cluster with 's'
+            "-bs", // short cluster with 's'
+            "-z",  // NUL termination — new
             "--short",
             "--porcelain",
             "--porcelain=v1",
             "--porcelain=v2",
+            "--null", // alias for -z — new
+            "--long", // human long format — new
         ] {
             assert!(
                 is_conflicting_status_flag(flag),
@@ -611,7 +966,7 @@ mod tests {
             );
         }
         // Non-conflicting flags must NOT trigger the override.
-        for flag in &["--branch", "--untracked-files", "-u", "--", "HEAD"] {
+        for flag in &["--branch", "--untracked-files", "-u", "-b", "--", "HEAD"] {
             assert!(
                 !is_conflicting_status_flag(flag),
                 "{flag:?} must NOT trigger C-7 raw-override path"
@@ -642,6 +997,91 @@ mod tests {
                 .any(|d| d.contains("image.png") && d.contains("Bin")),
             "expected binary file entry, got: {:?}",
             result.details
+        );
+    }
+
+    // ========================================================================
+    // New flag-detection and cluster-rewriting tests
+    // (security-04..06 / architecture-09 / reliability-08 / regression-05)
+    // ========================================================================
+
+    /// `-z` alone: NUL-terminates records, corrupts `output.lines()` parse.
+    /// Must be detected as conflicting and dropped entirely when stripped.
+    #[test]
+    fn test_z_flag_detected_and_stripped() {
+        assert!(
+            is_conflicting_status_flag("-z"),
+            "-z must be detected as conflicting (NUL termination)"
+        );
+        assert!(
+            strip_conflicting_flags(&["-z"]).is_empty(),
+            "-z alone must be dropped entirely when stripped"
+        );
+    }
+
+    /// `-sb`: `s` is the conflicting char; `-b` (branch) is semantically valid
+    /// and must survive stripping so git still sees the branch flag.
+    #[test]
+    fn test_sb_cluster_detected_b_preserved() {
+        assert!(
+            is_conflicting_status_flag("-sb"),
+            "-sb must be detected as conflicting (contains 's')"
+        );
+        assert_eq!(
+            strip_conflicting_flags(&["-sb"]),
+            vec!["-b"],
+            "-sb must strip 's' and preserve '-b'"
+        );
+    }
+
+    /// `-suno`: 's' conflicts; 'u','n','o' carry untracked-files semantics that
+    /// must reach git unmodified.
+    #[test]
+    fn test_suno_cluster_strips_only_s() {
+        assert!(
+            is_conflicting_status_flag("-suno"),
+            "-suno must be detected as conflicting (contains 's')"
+        );
+        assert_eq!(
+            strip_conflicting_flags(&["-suno"]),
+            vec!["-uno"],
+            "-suno must strip only 's' and preserve '-uno'"
+        );
+    }
+
+    /// `--null` and `--long`: long-form flags that change output format — must be
+    /// detected as conflicting and dropped entirely (never partially stripped).
+    #[test]
+    fn test_null_and_long_flags_detected() {
+        assert!(
+            is_conflicting_status_flag("--null"),
+            "--null must be detected as conflicting"
+        );
+        assert!(
+            is_conflicting_status_flag("--long"),
+            "--long must be detected as conflicting"
+        );
+        assert!(
+            strip_conflicting_flags(&["--null"]).is_empty(),
+            "--null must be dropped entirely"
+        );
+        assert!(
+            strip_conflicting_flags(&["--long"]).is_empty(),
+            "--long must be dropped entirely"
+        );
+    }
+
+    /// A pathspec literally named `-s` (or any token that looks like a flag)
+    /// appearing after `--` must NOT be stripped — the `--` terminator ends the
+    /// flag region.  Stripping it would silently change which paths git reports.
+    #[test]
+    fn test_pathspec_after_terminator_untouched() {
+        let input = ["--", "-s", "path/to/file"];
+        let result = strip_conflicting_flags(&input);
+        assert_eq!(
+            result,
+            vec!["--", "-s", "path/to/file"],
+            "tokens after '--' must be preserved verbatim as pathspecs"
         );
     }
 }

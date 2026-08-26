@@ -62,7 +62,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 - Round-trip safe: commands with pipes, newlines, heredocs, or command substitution are never rewritten
-- Known limitation: PATH wrappers (`skim init --wrappers`) intercept each pipeline segment independently, so a piped consumer sees compressed producer output — use `SKIM_PASSTHROUGH=1` on pipelines (tracked in #319)
+- Known limitation: PATH wrappers (`skim init --wrappers`) intercept each pipeline segment independently, so a piped consumer may see compressed output from a compressing wrapper — use `SKIM_PASSTHROUGH=1` when that is undesirable (tracked in #319). Note: `grep` and `rg` now emit native byte-faithful passthrough and are not affected by this caveat
 
 ### Test Output Compression
 - `skim cargo test`, `skim pytest`, `skim vitest`, `skim jest`, `skim go test`
@@ -83,7 +83,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Extracts vulnerabilities, version conflicts, and dependency issues
 
 ### Git Output Compression (`skim git`)
-- **`skim git diff`** -- AST-aware: shows changed functions with full boundaries and `+`/`-` markers, strips diff noise
+- **`skim git diff`** -- AST-aware: renders hunk-scoped context (AST breadcrumb + changed lines), bounded by a guardrail so output never exceeds the raw diff size; strips diff noise
   - `--mode structure` adds unchanged functions as signatures for context
   - `--mode full` shows entire files with change markers
   - Supports `--staged`, commit ranges (`HEAD~3`, `main..feature`)
@@ -505,6 +505,7 @@ skim stats --clear               # Reset analytics data
 
 | Variable | Description |
 |----------|-------------|
+| `SKIM_DEBUG` | Set to `1` (or use `--debug`) to enable raw-fallback diagnostic banners on stderr; loss-bearing elision markers are always emitted regardless of this setting (ADR-011) |
 | `SKIM_DISABLE_ANALYTICS` | Set to `1`, `true`, or `yes` to disable recording |
 | `SKIM_INPUT_COST_PER_MTOK` | Override $/MTok for cost estimates (default: 3.0) |
 | `SKIM_ANALYTICS_DB` | Override analytics database path |

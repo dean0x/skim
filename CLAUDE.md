@@ -12,15 +12,17 @@ User-facing install/usage lives in `README.md`; release mechanics in `CHANGELOG.
 
 ## Workspace
 
-Cargo workspace, 8 crates:
+Cargo workspace, 10 crates:
 - `rskim-core` — pure transform library (parsing, modes; no I/O side effects)
 - `rskim` — CLI binary (`skim`): caching, analytics, command wrappers
+- `rskim-proxy` — HTTP reverse proxy foundation for Layer-3 LLM request routing (hyper + tokio; isolated from default builds)
 - `rskim-search` — code-search index (lexical n-gram, temporal, AST structural), stored in `<root>/.skim/search.db`
 - `rskim-research` — offline tooling that generates AST weight tables
 - `rskim-bench` — benchmarks
 - `rskim-tokens` — offline + optional-network token counting (multi-provider; `net-anthropic` feature gates HTTP)
 - `rskim-contract` — byte-faithful contract / guardrail layer for transcript mutation
 - `rskim-llm` — LLM transcript parsing (OpenAI/Anthropic) + classifier
+- `rskim-compress` — per-content-type block compression router for the Layer-3 proxy (BlockRouter, log compression)
 
 `crates/rskim-search/src/ast_weights.rs` is **auto-generated — do not edit**. Regenerate via `rskim-research ast-run` then `ast-codegen`.
 
@@ -64,7 +66,7 @@ cargo run --bin skim -- file.ts --mode=signatures   # run locally
 
 A machine-global `~/.cargo/config.toml` caps every cargo invocation at `jobs = 4` and `RUST_TEST_THREADS = 4`, and routes compilation through `sccache` (a compile cache shared across parallel clones). **That config file is the enforcement layer — it protects every branch and clone regardless of this doc; the guidance below exists because the cap alone can still be multiplied by parallelism.** Running unbounded parallel builds across two clones once exhausted 64 GB RAM (heavy tree-sitter/SQLite/rustls deps + release LTO/`codegen-units=1`) and hard-restarted the machine. The root multiplier was **two clones with separate `target/` dirs compiling identical heavy deps at once**. Rules for agents and workflows:
 
-- **Scope cargo per-crate** (`-p <crate>`). Never `--workspace` or `--all-features` *inside an agent* — those fan out across all 8 crates and their heavy deps simultaneously.
+- **Scope cargo per-crate** (`-p <crate>`). Never `--workspace` or `--all-features` *inside an agent* — those fan out across all 10 crates and their heavy deps simultaneously.
 - **Never `cargo test -p rskim` in an agent**: it spawns a *nested* cargo (daemon meta-tests) on top of subprocess-spawning E2E tests. Use `cargo test -p rskim --bins` / `--all-targets` (see the scoping note above).
 - **Prefer `cargo nextest run -p <crate> -j 4`** for unit/integration tests, **plus `cargo test -p <crate> --doc`** for doctests (nextest cannot run doctests).
 - **Never run two release/LTO builds concurrently**, and never kick off a heavy build in both clones at the same time.
@@ -80,6 +82,7 @@ Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql,
 - `heatmap` — git-history risk/coupling analysis: churn, co-change, stability, fix-after-touch (`--json`, `--since`, `--window`, `--path`, `--insights`).
 - `init` — install skim as an agent hook (Claude/Cursor/Codex/Gemini/Copilot/Crush); `--wrappers` adds PATH wrappers for sub-agent interception; `--permissions` seeds consent-gated allowlist entries (tiers: seed|mirror|blanket).
 - `stats` — token analytics dashboard (`--since`, `--format json`, `--verbose`, `--clear`).
+- `doctor` — provenance check: reports the running binary (path + commit), every `skim` on `$PATH` with its commit and which one wins, hook pin state per agent (pinned binary path vs running binary path; a path mismatch is advisory `⚠` and does not cause exit `1`), wrapper directory, and cache/analytics locations. Exit `0` healthy / `1` on version mismatch, commit mismatch, tampered script, or unreadable script — works as a CI pre-flight. Commit resolution reads `--version` output rather than a `--commit` flag, so it correctly identifies binaries that predate `skim doctor` itself.
 - `discover` / `learn` / `rewrite` — scan agent sessions for missed optimizations, learn error-retry correction rules, and rewrite commands into skim equivalents.
 
 ### Two interception surfaces (they work differently — don't conflate them)
@@ -95,7 +98,7 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 ## Environment Variables
 
 - `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
-- `SKIM_DEBUG=1` (or `--debug`) — warnings/notices on stderr.
+- `SKIM_DEBUG=1` (or `--debug`) — enables raw-fallback diagnostic banners on stderr for no-loss raw-fallback paths (see **Stderr notice taxonomy** in Design Constraints below; loss-bearing elision markers and the ADR-008 transparency marker are unconditional and not gated by this variable). In hook mode the startup provenance line goes to `hook.log`, never stderr (GRANITE #361 Bug 3); drift events are also logged to `hook.log` unconditionally — `skim doctor` is the primary on-demand diagnosis path.
 - `SKIM_SESSION_ID` — analytics session attribution; priority sidecar > env > `--session-id` flag (flag is a forward-compat fallback only — the hook no longer injects it). Set it alongside the PATH export so sub-agents inherit it.
 - `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
   tee output (`tee/`), and the **default** `analytics.db` location. An empty value is
@@ -110,11 +113,15 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
   in a sandbox it is sufficient to set `SKIM_CACHE_DIR` alone (the default analytics.db
   moves with it).
 - `SKIM_DISABLE_ANALYTICS=1` — disable recording. `SKIM_INPUT_COST_PER_MTOK` — $/MTok for cost estimates (default 3.0).
+- `SKIM_WRAPPERS_DIR` — overrides the `~/.skim/bin/` wrapper symlink directory used by `skim init --wrappers` and `skim init --uninstall`. Primarily used in tests via `skim_sandboxed()` to redirect wrapper installation into a TempDir sandbox so real `~/.skim/bin/` is not touched. An empty value is treated as unset (falls back to `~/.skim/bin`).
 - Session-provider overrides for `discover`/`learn`/`agents`: `SKIM_PROJECTS_DIR`, `SKIM_CODEX_SESSIONS_DIR`, `SKIM_COPILOT_DIR`, `SKIM_CURSOR_DB_PATH`, `SKIM_GEMINI_DIR`, `SKIM_CRUSH_DIR`.
+- **Agent config-dir overrides** (read by `skim init` / `init --uninstall` / `doctor` — these are the agents' *own* variable names, not `SKIM_`-prefixed): `CLAUDE_CONFIG_DIR`, `GEMINI_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, `CODEX_HOME`, `CRUSH_CONFIG_DIR`. Each redirects that agent's hook script, settings file, permissions sidecar, **and guidance file** (`GEMINI.md`, `copilot-instructions.md`, …) away from the `~/.<agent>/` default. Do not confuse them with the `SKIM_GEMINI_DIR` / `SKIM_COPILOT_DIR` session-provider overrides above, which point at transcript directories and have no effect on install/uninstall. Any test that shells out to `skim init`/`--uninstall`/`doctor` must set them (use `common::skim_sandboxed`) or it will mutate the developer's real home directory.
 
 ## Design Constraints
 
 **MUST:** stream to stdout (never write intermediate files) · prefer `&str` slices over allocation in the hot path · tolerate incomplete code (rely on tree-sitter error nodes) · stay under 50ms for 1000-line files (benchmark regressions block) · fail loud with actionable messages, never silently · modes via CLI flags only, no `.skimrc` · **compress, never truncate** (#317): wrappers may re-encode output but never show less than the raw tool; an unavoidable safety bound must use `output::elision_marker` (exact counts + `SKIM_PASSTHROUGH=1` hint); unexpected non-zero exits forward raw output instead of compressing; rewrites must reconstruct the command byte-faithfully or bail (never emit a command that errors or changes semantics). **git diff enhancement view must fit within the raw budget** — any enriched render (e.g. hunk-scoped AST breadcrumbs) is guarded by an ADR-001 net-savings check; if enrichment expands the output beyond the raw diff size, raw is emitted instead (git-diff raw-budget decision reversal: the unguarded enhancement view was replaced by a guardrail-protected one).
+
+**Stderr notice taxonomy (ADR-011):** Every new `stderr` notice must be classified before it is added — (1) **loss-bearing markers** (elision markers with exact counts + `SKIM_PASSTHROUGH=1` hint; ADR-008 lossy-view transparency marker) fire when the reader sees less/different from raw and are **unconditional**; (2) **no-loss raw-fallback banners** (guardrail chose raw, unexpected exit, tool killed) fire only on lossless paths and are **gated behind `SKIM_DEBUG`/`--debug`** (`crate::debug_log!` / `io::sink()`). If a notice can fire when the reader sees less/different from raw, it is a marker (always on); if it fires only on a lossless raw fallback, it is a banner (debug-gated). Do not re-conflate the two classes.
 
 **MUST NOT:** add syntax highlighting (use `bat`), linting (use linters), type checking (use `tsc`/`mypy`), or LSP features — all out of scope.
 

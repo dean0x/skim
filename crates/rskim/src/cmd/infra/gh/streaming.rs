@@ -10,11 +10,24 @@
 //! performed.  This keeps the parser state machine simple and avoids buffer
 //! accumulation for streams that may idle for minutes.
 //!
-//! # DESIGN NOTE (AD-STR-2) — Backpressure via flush
+//! # DESIGN NOTE (AD-STR-2) — Backpressure via flush; closed-pipe exit code
 //!
 //! [`run_streamed_stdin`] and [`run_streamed_spawned`] call
 //! `BufWriter::flush()` after each emitted line to prevent output from being
 //! held in the buffer while the stream is still active.
+//!
+//! **Corrected 2026-08-22 (closed-pipe exit code).**  Both loops previously
+//! returned `ExitCode::SUCCESS` when a write failed, citing this note.  That
+//! was an *unexamined default*, not a `gh`-specific decision: this note only
+//! ever documented flushing, the behaviour arrived inside a large multi-feature
+//! commit (`ad9c979`), no test pinned it, and no linked issue discussed it.  It
+//! is also not raw-parity — under `set -o pipefail`,
+//! `skim gh run watch --exit-status | head` reported success for a workflow
+//! that had failed.  Both loops now route a failed write through
+//! [`write_failure_exit`], so a closed reader exits
+//! [`crate::cmd::execution::pipe_closed_exit`] (141 on unix, matching a
+//! SIGPIPE death) and any other write failure exits `ExitCode::FAILURE`.  The
+//! blanket `Err(_) => SUCCESS` arm that swallowed genuine I/O failures is gone.
 //!
 //! # DESIGN NOTE (AD-STR-3) — Analytics at EOF; Drop guard for partials
 //!
@@ -57,7 +70,7 @@
 //! After the stdout loop completes, the background thread is joined and the
 //! collected stderr lines are fed through the parser.  This prevents the pipe
 //! deadlock that would occur if the child writes more than 64 KiB to stderr
-//! while the main thread is blocked on stdout (PF-023).
+//! while the main thread is blocked on stdout (PF-021).
 //!
 //! # DESIGN NOTE (AD-STR-9) — ChildGuard kills and reaps on drop
 //!
@@ -71,8 +84,24 @@ use std::io::{self, BufRead, BufWriter, Read, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use crate::cmd::execution::{is_broken_pipe, pipe_closed_exit};
 use crate::output::strip_ansi;
 use crate::runner::ChildGuard;
+
+/// Exit disposition for a failed stdout write in the streaming loops (AD-STR-2).
+///
+/// A closed downstream reader is a normal end-of-consumption event and exits
+/// [`pipe_closed_exit`] (141 on unix) so the streaming surface matches the
+/// buffered surface and raw tool behaviour under `set -o pipefail`.  Any other
+/// write failure means the output genuinely could not be delivered, which is a
+/// failure — not the success the previous blanket arm reported.
+fn write_failure_exit(e: &io::Error) -> ExitCode {
+    if is_broken_pipe(e) {
+        pipe_closed_exit()
+    } else {
+        ExitCode::FAILURE
+    }
+}
 
 // ============================================================================
 // Constants
@@ -304,12 +333,14 @@ impl Drop for DropGuard {
 ///
 /// # Exit code semantics
 ///
-/// Always returns `ExitCode::SUCCESS` (stdin sources don't have an exit code).
+/// Returns `ExitCode::SUCCESS` on normal EOF (stdin sources don't have an exit
+/// code), or [`write_failure_exit`] when a write to stdout fails.
 ///
 /// # Signal handling
 ///
-/// SIGPIPE is handled gracefully: a `BrokenPipe` write error causes a clean
-/// exit via `ExitCode::SUCCESS`.  The Drop guard records partial analytics.
+/// A closed downstream reader is handled gracefully: the `BrokenPipe` write
+/// error exits [`pipe_closed_exit`] (141 on unix) rather than `SUCCESS`
+/// (AD-STR-2, corrected).  The Drop guard records partial analytics.
 ///
 /// # Analytics
 ///
@@ -339,14 +370,15 @@ pub(super) fn run_streamed_stdin(
                     // Update compressed bytes only after a successful write to
                     // avoid over-reporting on SIGPIPE (PF-026 / AD-STR-3).
                     guard.update(0, output.len() + 1);
-                    if stdout.flush().is_err() {
-                        // SIGPIPE -- exit gracefully (AD-STR-2).
-                        break;
+                    if let Err(e) = stdout.flush() {
+                        // Reader gone (or a real write failure) -- AD-STR-2.
+                        // The Drop guard records partial analytics.
+                        return write_failure_exit(&e);
                     }
                 }
-                Err(_) => {
-                    // SIGPIPE -- exit gracefully (AD-STR-2).
-                    break;
+                Err(e) => {
+                    // Reader gone (or a real write failure) -- AD-STR-2.
+                    return write_failure_exit(&e);
                 }
             }
         }
@@ -368,7 +400,7 @@ pub(super) fn run_streamed_stdin(
 ///
 /// Spawns `cmd` with `args`, pipes both stdout and stderr, and feeds each line
 /// to `parser.on_line()`.  Stderr is drained concurrently in a background
-/// thread to prevent the pipe-full deadlock described in PF-023.  After stdout
+/// thread to prevent the pipe-full deadlock described in PF-021.  After stdout
 /// reaches EOF the background thread is joined and the collected stderr lines
 /// are fed through the parser in order.  Calls `parser.finalize()` at EOF.
 ///
@@ -382,7 +414,9 @@ pub(super) fn run_streamed_stdin(
 ///
 /// The child is wrapped in [`ChildGuard`]; when the parent exits for any
 /// reason (SIGPIPE, panic, clean exit) the child is killed and reaped
-/// automatically (AD-STR-9, PF-025).  SIGPIPE on writes causes a clean exit.
+/// automatically (AD-STR-9, PF-025).  A closed downstream reader exits
+/// [`pipe_closed_exit`] (141 on unix) via [`write_failure_exit`] — see the
+/// corrected AD-STR-2 note.
 ///
 /// # Analytics
 ///
@@ -424,7 +458,7 @@ pub(super) fn run_streamed_spawned(
     let mut stdout = BufWriter::new(io::stdout());
     let mut guard = DropGuard::new(cfg.label, cfg.analytics_enabled, cfg.session_id);
 
-    // Spawn a background thread to drain stderr concurrently (AD-STR-8, PF-023).
+    // Spawn a background thread to drain stderr concurrently (AD-STR-8, PF-021).
     // The thread collects all stderr lines into a Vec so we can feed them through
     // the parser after stdout is exhausted -- without risking a pipe deadlock when
     // the child writes > 64 KiB to stderr while the main thread is blocked on
@@ -458,14 +492,16 @@ pub(super) fn run_streamed_spawned(
                         // Update compressed bytes only after a successful write
                         // to avoid over-reporting on SIGPIPE (PF-026).
                         guard.update(0, output.len() + 1);
-                        if stdout.flush().is_err() {
-                            // SIGPIPE -- kill child and exit gracefully.
-                            return ExitCode::SUCCESS;
+                        if let Err(e) = stdout.flush() {
+                            // Reader gone (or a real write failure): ChildGuard
+                            // kills the child on drop (AD-STR-9).
+                            return write_failure_exit(&e);
                         }
                     }
-                    Err(_) => {
-                        // SIGPIPE -- kill child and exit gracefully.
-                        return ExitCode::SUCCESS;
+                    Err(e) => {
+                        // Reader gone (or a real write failure): ChildGuard
+                        // kills the child on drop (AD-STR-9).
+                        return write_failure_exit(&e);
                     }
                 }
             }
@@ -485,9 +521,11 @@ pub(super) fn run_streamed_spawned(
             match writeln!(stdout, "{output}") {
                 Ok(()) => {
                     guard.update(0, output.len() + 1);
-                    let _ = stdout.flush();
+                    if let Err(e) = stdout.flush() {
+                        return write_failure_exit(&e);
+                    }
                 }
-                Err(_) => break,
+                Err(e) => return write_failure_exit(&e),
             }
         }
     }
@@ -523,6 +561,33 @@ pub(super) fn run_streamed_spawned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- AD-STR-2 pipe-closed exit convention ----
+
+    /// A closed downstream reader exits `pipe_closed_exit()` (141 on unix), NOT
+    /// `ExitCode::SUCCESS`.
+    ///
+    /// The former SUCCESS return was an unexamined default: under
+    /// `set -o pipefail`, `skim gh run watch --exit-status | head` reported
+    /// success for a workflow that had actually failed.
+    #[test]
+    fn test_write_failure_exit_broken_pipe_is_pipe_closed_not_success() {
+        let e = io::Error::from(io::ErrorKind::BrokenPipe);
+        assert_eq!(write_failure_exit(&e), pipe_closed_exit());
+        assert_ne!(
+            write_failure_exit(&e),
+            ExitCode::SUCCESS,
+            "AD-STR-2 must no longer report a closed pipe as success"
+        );
+        assert_ne!(write_failure_exit(&e), ExitCode::from(1));
+    }
+
+    /// A genuine write failure (not pipe closure) is a failure, not success.
+    #[test]
+    fn test_write_failure_exit_other_io_error_is_failure() {
+        let e = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(write_failure_exit(&e), ExitCode::FAILURE);
+    }
 
     // ---- Minimal StreamingParser implementation for testing ----
 

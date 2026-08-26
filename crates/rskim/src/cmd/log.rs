@@ -105,7 +105,10 @@ pub(crate) fn run(
             }
             crate::cmd::execution::SavingsDecision::Passthrough => {
                 // Emit raw verbatim to stdout.
-                let tier = crate::cmd::execution::emit_raw_passthrough(raw_input)?;
+                let (tier, status) = crate::cmd::execution::emit_raw_passthrough(raw_input)?;
+                if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                    return Ok(crate::cmd::execution::pipe_closed_exit());
+                }
                 (raw_input.to_string(), tier)
             }
         }

@@ -11,6 +11,27 @@ use std::path::{Path, PathBuf};
 pub(super) const HOOK_SCRIPT_NAME: &str = "skim-rewrite.sh";
 pub(super) const SETTINGS_BACKUP: &str = "settings.json.bak";
 
+/// Resolve the running skim binary to its canonical absolute path.
+///
+/// Uses `std::env::current_exe()` and then `std::fs::canonicalize()` to follow
+/// any symlinks. This is the single source of truth for the binary path used
+/// in hook scripts (`SKIM_HOOK_BINARY`) and wrapper installation so that all
+/// three sites agree — avoiding the two-clone mismatch where both clones share
+/// the same version string but `hook_is_current()` cannot detect they are
+/// different binaries.
+///
+/// Canonicalize failure (e.g., binary deleted while running) falls back to the
+/// raw path from `current_exe()` rather than failing.
+pub(crate) fn resolve_skim_binary() -> anyhow::Result<PathBuf> {
+    let p = std::env::current_exe().map_err(|e| {
+        anyhow::anyhow!(
+            "cannot determine the skim binary path: {e}\n\
+             hint: re-run `skim init` from the skim binary directly"
+        )
+    })?;
+    Ok(std::fs::canonicalize(&p).unwrap_or(p))
+}
+
 /// Resolve a symlink to its absolute target path.
 ///
 /// `read_link()` can return relative paths. This helper joins the relative
@@ -138,11 +159,13 @@ Use `-n` / `--line-numbers` to enrich the output with original source line numbe
 
 ### Command wrapping
 
-The rewrite hook may also wrap supported shell commands (`ls`, `grep`,
+The rewrite hook may also wrap supported shell commands (`ls`, `wc`,
 `git diff`, `gh`, test runners, ...) as `skim <tool>`: the same command
 runs with the same arguments and exit code, and skim compresses its
 output. Seeing `skim ls` run in place of `ls` is expected behavior, not
-an error. File reads (`cat`, `head`, `tail` on code files) are rewritten
+an error. Search commands (`grep`, `rg`) are also wrapped but pass through
+output byte-for-byte identical to the raw tool, with no compression.
+File reads (`cat`, `head`, `tail` on code files) are rewritten
 into direct skim reads (example: `cat file.ts` becomes
 `skim file.ts --mode=pseudo`), so the output is a structured view, not
 raw file contents; seeing `skim` run in place of the original command

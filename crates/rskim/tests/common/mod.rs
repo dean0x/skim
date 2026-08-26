@@ -36,6 +36,67 @@ pub fn skim() -> assert_cmd::Command {
     c
 }
 
+/// Build a sandboxed command for the given skim binary path.
+///
+/// This is the **single authoritative source** for the sandbox env-var block
+/// used by `skim init`, `skim init --uninstall`, and `skim doctor` tests.
+/// Both `skim_sandboxed` and any test that must run a non-default binary
+/// (e.g. a copied binary for pin-mismatch coverage) must route through here
+/// rather than hand-rolling their own env block (PF-017).
+///
+/// Sets every agent config-dir override that the installer reads, so the
+/// invocation cannot escape the TempDir sandbox even if the developer has
+/// exported `CODEX_HOME` or `CRUSH_CONFIG_DIR` in their shell:
+///
+/// - `HOME` — redirects all `dirs::home_dir()` lookups in the child process.
+/// - `CLAUDE_CONFIG_DIR` — Claude Code hook / settings / guidance.
+/// - `SKIM_CACHE_DIR` — parser cache, analytics DB, and hook.log.
+/// - `SKIM_WRAPPERS_DIR` — `~/.skim/bin/` wrapper symlink directory.
+/// - `GEMINI_CONFIG_DIR` — Gemini CLI hook / settings / guidance.
+/// - `COPILOT_CONFIG_DIR` — Copilot CLI hook / settings / guidance.
+/// - `CODEX_HOME` — Codex CLI config directory.
+/// - `CRUSH_CONFIG_DIR` — Crush CLI config directory.
+/// - `SKIM_DISABLE_ANALYTICS=1` — no rows written to any analytics DB.
+/// - `NO_COLOR=1` — deterministic, color-free output for assertions.
+///
+/// Also removes env vars that carry real-session state (`SKIM_REWRITTEN_FROM`,
+/// `SKIM_PASSTHROUGH`, `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY`).
+///
+/// Tests may chain additional `.env(...)` calls to add or override vars.
+pub fn skim_sandboxed_with_bin(
+    home: &std::path::Path,
+    bin: &std::path::Path,
+) -> assert_cmd::Command {
+    let mut c = assert_cmd::Command::new(bin);
+    c.env("HOME", home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("SKIM_CACHE_DIR", home.join(".cache/skim"))
+        .env("SKIM_WRAPPERS_DIR", home.join(".skim").join("bin"))
+        .env("GEMINI_CONFIG_DIR", home.join(".gemini"))
+        .env("COPILOT_CONFIG_DIR", home.join(".copilot"))
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("CRUSH_CONFIG_DIR", home.join(".crush"))
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_REWRITTEN_FROM")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_HOOK_VERSION")
+        .env_remove("SKIM_HOOK_BINARY");
+    c
+}
+
+/// Build a `skim` command sandboxed against a temporary home directory.
+///
+/// Thin delegation to `skim_sandboxed_with_bin` using the default cargo-built
+/// binary. All sandbox env-var documentation lives on that function.
+///
+/// Use this for any `skim init`, `skim init --uninstall`, or `skim doctor`
+/// invocation.  Tests may chain additional `.env(...)` calls to add or
+/// override specific vars after calling this helper.
+pub fn skim_sandboxed(home: &std::path::Path) -> assert_cmd::Command {
+    skim_sandboxed_with_bin(home, &skim_bin())
+}
+
 /// Return the path to the skim binary built by cargo.
 ///
 /// Use this when you need a `std::process::Command` rather than an
@@ -62,4 +123,66 @@ pub fn skim_with_analytics(db: &std::path::Path) -> assert_cmd::Command {
         .env_remove("SKIM_DISABLE_ANALYTICS")
         .env("NO_COLOR", "1");
     c
+}
+
+// ============================================================================
+// Stub tools on a prepended PATH
+// ============================================================================
+
+/// Write `script` to `dir/name` and make it executable.
+///
+/// The caller owns the whole script body, which is what tests that need timing
+/// control (`sleep`) or loops require.  Prefer [`make_stub`] /
+/// [`make_stub_bytes`] for the common fixed-output case.
+///
+/// Unix-only: the executable bit requires `std::os::unix::fs::PermissionsExt`.
+#[cfg(unix)]
+pub fn write_stub_script(dir: &std::path::Path, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let script_path = dir.join(name);
+    std::fs::write(&script_path, script).unwrap();
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Create a stub tool script that prints fixed stdout/stderr and exits `code`.
+///
+/// The payloads are written to sidecar files and `cat`-ed by the script, so no
+/// shell escaping of the content is needed — and, because `cat` is an external
+/// process, the bytes reach the pipe without depending on the shell's own
+/// stdout buffering.
+///
+/// Unix-only: the script uses `#!/bin/sh`.
+#[cfg(unix)]
+pub fn make_stub(dir: &std::path::Path, name: &str, stdout: &str, stderr: &str, code: i32) {
+    make_stub_bytes(dir, name, stdout.as_bytes(), stderr.as_bytes(), code);
+}
+
+/// Byte-payload variant of [`make_stub`].
+///
+/// Required for fidelity tests whose payload is deliberately not valid UTF-8 —
+/// a `&str` parameter cannot express those bytes at all.
+#[cfg(unix)]
+pub fn make_stub_bytes(dir: &std::path::Path, name: &str, stdout: &[u8], stderr: &[u8], code: i32) {
+    let out_path = dir.join(format!("{name}.out"));
+    let err_path = dir.join(format!("{name}.err"));
+    std::fs::write(&out_path, stdout).unwrap();
+    std::fs::write(&err_path, stderr).unwrap();
+    let script = format!(
+        "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit {code}\n",
+        out_path.display(),
+        err_path.display()
+    );
+    write_stub_script(dir, name, &script);
+}
+
+/// PATH with `dir` prepended so skim's spawned child resolves to the stub.
+///
+/// Unix-only: uses `:` as the PATH separator.
+#[cfg(unix)]
+pub fn stub_path(dir: &std::path::Path) -> String {
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
 }

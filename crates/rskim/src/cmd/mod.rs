@@ -22,16 +22,54 @@
 //! unknown subcommands would make skim unusable in normal project workflows;
 //! passthrough lets skim compress only what it understands while staying
 //! transparent for everything else.
+//!
+//! # `println!` is banned for TOOL OUTPUT (and only for tool output)
+//!
+//! `println!`/`print!`/`eprintln!`/`eprint!` **panic** when the downstream
+//! reader has gone away:
+//!
+//! ```text
+//! $ skim git diff HEAD~40 | head -2
+//! exit=101
+//! thread 'main' panicked at library/std/src/io/stdio.rs:1165:9:
+//! failed printing to stdout: Broken pipe (os error 32)
+//! ```
+//!
+//! A panic is not an `Err`, so neither the `StdoutStatus` sinks nor the
+//! `is_broken_pipe_chain` boundary in `main.rs` can catch it — the process exits
+//! **101** with a panic message on stderr where raw `git diff … | head -2` exits
+//! **141** in silence.  That is a louder divergence from raw than the exit-1
+//! defect it replaced.
+//!
+//! **The rule, and its exact boundary:**
+//!
+//! - **Tool output** — the wrapped tool's own bytes, or a compressed rendering
+//!   of them — is unbounded in size, is what a reader pipes into `head`, and
+//!   therefore MUST go through
+//!   [`execution::write_to_stdout`] / [`execution::write_line_to_stdout`] /
+//!   [`execution::write_to_stderr`] / [`execution::write_line_to_stderr`], or
+//!   through a `write!`-family macro on a locked handle whose `io::Error`
+//!   propagates.  On [`execution::StdoutStatus::PipeClosed`] the handler stops
+//!   producing output and returns [`execution::pipe_closed_exit`].
+//! - **Skim's own short notices** — help text, usage errors, `[skim]` banners,
+//!   the token-stats line — keep `println!`/`eprintln!`.  They are bounded (a
+//!   handful of lines), they are the *first* thing a `--help` invocation writes
+//!   so a pipe buffer always absorbs them, and converting ~900 of them would
+//!   bury the fidelity-relevant change in noise.
+//!
+//! Reviewers: a new `println!` carrying a tool-derived variable is a defect;
+//! a new `println!` carrying a literal is not.
 
 mod agents;
 pub(crate) mod build;
 mod completions;
 mod db;
 mod discover;
+mod doctor;
 mod file;
 mod git;
 mod heatmap;
-mod hook_log;
+pub(crate) mod hook_log;
 mod hooks;
 mod infra;
 mod init;
@@ -67,12 +105,16 @@ pub(crate) use execution::{
 };
 
 mod registry;
+#[cfg(test)]
+pub(crate) use registry::META_SUBCOMMANDS;
 pub(crate) use registry::{
     KNOWN_SUBCOMMANDS, is_known_subcommand, is_meta_subcommand, wrapper_targets,
 };
 
 mod security;
 pub(crate) use security::{sanitize_for_display, scrub_db_args, scrub_infra_args};
+
+pub(crate) mod stream_pump;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -119,28 +161,41 @@ pub(crate) fn resolve_cache_dir() -> Option<std::path::PathBuf> {
     hook_log::CacheEnv::from_process().resolve_cache_dir()
 }
 
-/// Cached `~/.skim/bin/` path — computed once on first access via [`LazyLock`].
+/// Cached PATH-wrappers directory — computed once on first access via [`LazyLock`].
 ///
-/// `dirs::home_dir()` + two `.join()` calls allocate a fresh `PathBuf` on every
-/// invocation. Since the home directory never changes within a process, computing
-/// it once and caching it eliminates repeated allocation.  Returns `None` when
-/// the home directory cannot be determined.
+/// Resolution order (first non-empty value wins):
+/// 1. `SKIM_WRAPPERS_DIR` environment variable (test sandboxing / user override).
+///    An empty value is treated as unset — matches the `SKIM_CACHE_DIR` convention.
+/// 2. `dirs::home_dir()` + `/.skim/bin` (platform default).
+///
+/// Returns `None` when the home directory cannot be determined and no env override
+/// is set.  `dirs::home_dir()` + two `.join()` calls allocate a fresh `PathBuf`
+/// on every invocation; computing this once and caching it eliminates repeated
+/// allocation.
 ///
 /// Matches the same pattern used by [`wrapper_targets()`].
-static SKIM_WRAPPERS_DIR: LazyLock<Option<std::path::PathBuf>> =
-    LazyLock::new(|| dirs::home_dir().map(|h| h.join(".skim").join("bin")));
+static WRAPPERS_DIR_CACHE: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+    // SKIM_WRAPPERS_DIR env var: test sandboxing and user override.
+    // Treat empty as unset — matches the SKIM_CACHE_DIR convention.
+    if let Ok(v) = std::env::var("SKIM_WRAPPERS_DIR")
+        && !v.is_empty()
+    {
+        return Some(std::path::PathBuf::from(v));
+    }
+    dirs::home_dir().map(|h| h.join(".skim").join("bin"))
+});
 
 /// Single authoritative source for `~/.skim/bin/` — the PATH-wrappers directory.
 ///
-/// Returns `None` when the home directory cannot be determined. Both
-/// `main::strip_skim_wrappers_from_path` (recursion prevention) and
-/// `cmd::init::wrappers::wrappers_dir` (installer/uninstaller) delegate here so
-/// that a future directory change requires only one edit.
+/// Returns `None` when the home directory cannot be determined and `SKIM_WRAPPERS_DIR`
+/// is not set. Both `main::strip_skim_wrappers_from_path` (recursion prevention) and
+/// `cmd::init::wrappers::wrappers_dir` (installer/uninstaller) delegate here so that
+/// a future directory change requires only one edit.
 ///
-/// Backed by [`SKIM_WRAPPERS_DIR`] — zero allocation on every call. Callers that
+/// Backed by [`WRAPPERS_DIR_CACHE`] — zero allocation on every call. Callers that
 /// need an owned `PathBuf` can call `.to_path_buf()` on the returned `&'static Path`.
 pub(crate) fn skim_wrappers_dir() -> Option<&'static std::path::Path> {
-    SKIM_WRAPPERS_DIR.as_deref()
+    WRAPPERS_DIR_CACHE.as_deref()
 }
 
 /// Core bounded read loop, injectable for testing.

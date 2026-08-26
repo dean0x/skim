@@ -270,9 +270,10 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
 
     if guardrail_count > 0 {
         let total = success_count + error_count;
-        eprintln!(
+        crate::debug_log!(
             "[skim:guardrail] triggered on {}/{} files",
-            guardrail_count, total
+            guardrail_count,
+            total
         );
     }
 
