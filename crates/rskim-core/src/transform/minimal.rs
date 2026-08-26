@@ -5,6 +5,7 @@
 //!
 //! Token reduction target: 15-30%
 
+use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output};
 use crate::transform::utils::is_function_scope_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -90,8 +91,13 @@ pub(crate) fn transform_minimal(
     final_ranges.sort_unstable_by_key(|&(start, _)| start);
     final_ranges.dedup();
 
+    // Collect literal-fragment ranges from the source tree before removal so
+    // trim_and_normalize can skip trailing-space trimming inside literals.
+    let literal_ranges = collect_literal_ranges(tree, language);
+    let protected = map_ranges_to_output(&literal_ranges, &final_ranges);
+
     let after_removal = remove_ranges(source, &final_ranges)?;
-    let normalized = trim_and_normalize(&after_removal);
+    let normalized = trim_and_normalize(&after_removal, &protected);
 
     Ok(normalized)
 }
@@ -742,18 +748,62 @@ pub(crate) fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<S
     Ok(result)
 }
 
-/// Trim trailing whitespace from each line and normalize blank lines in a single pass
+/// Trim trailing whitespace and normalize blank lines in a single pass.
 ///
 /// Combines two operations to avoid an extra allocation:
-/// 1. Trims trailing whitespace from each line
+/// 1. Trims trailing whitespace from each line (unprotected bytes only)
 /// 2. Normalizes blank lines: 3+ consecutive blank lines become 2
-pub(crate) fn trim_and_normalize(source: &str) -> String {
+///
+/// **Literal-aware:** byte ranges in `protected` are never trimmed, and a line
+/// is only considered blank when the backward-scan reaches the line start —
+/// meaning every byte was unprotected whitespace.  A line whose trailing bytes
+/// are protected (e.g. a string literal with trailing spaces) is preserved
+/// verbatim.
+///
+/// Index-based iteration (not `.lines()`) so that byte offsets remain
+/// correlatable with `protected` range coordinates.  CRLF line endings are
+/// normalised to LF.
+pub(crate) fn trim_and_normalize(source: &str, protected: &[(usize, usize)]) -> String {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blanks: usize = 0;
+    let mut pos = 0usize;
 
-    for line in source.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
+    while pos < n {
+        let line_start = pos;
+
+        // Locate the newline that terminates this line.
+        let nl = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+        // CRLF: exclude the `\r` from trimmed content.
+        let has_cr = nl > line_start && bytes[nl - 1] == b'\r';
+        let content_end = if has_cr { nl - 1 } else { nl };
+        pos = if nl < n { nl + 1 } else { n };
+
+        // Compute trim_end: scan backward, skip trailing unprotected whitespace.
+        let mut trim_end = content_end;
+        while trim_end > line_start {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // A line is blank when every byte was unprotected whitespace.
+        // Exception: a truly-empty line (trim_end == line_start, no content bytes)
+        // whose START position falls inside a protected range is a blank line that
+        // lives inside a multi-line string literal and must NOT be capped.
+        // (`trim_end == line_start` implies no protected content bytes; but the
+        // position itself may be inside a protected range — e.g. the `\n` of a
+        // blank line that is part of a Python """…""" body.)
+        let is_blank = trim_end == line_start && !in_protected(line_start, protected);
+
+        if is_blank {
             consecutive_blanks += 1;
             if consecutive_blanks > 2 {
                 continue;
@@ -765,7 +815,7 @@ pub(crate) fn trim_and_normalize(source: &str) -> String {
         if !result.is_empty() {
             result.push('\n');
         }
-        result.push_str(trimmed);
+        result.push_str(&source[line_start..trim_end]);
     }
 
     if source.ends_with('\n') {
@@ -1147,28 +1197,28 @@ mod tests {
     #[test]
     fn test_trim_and_normalize_preserves_two_blanks() {
         let input = "a\n\n\nb\n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "a\n\n\nb\n");
     }
 
     #[test]
     fn test_trim_and_normalize_reduces_four_blanks_to_two() {
         let input = "a\n\n\n\n\nb\n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "a\n\n\nb\n");
     }
 
     #[test]
     fn test_trim_and_normalize_no_change_needed() {
         let input = "a\n\nb\n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "a\n\nb\n");
     }
 
     #[test]
     fn test_trim_and_normalize_trims_trailing_whitespace() {
         let input = "hello   \nworld  \n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "hello\nworld\n");
     }
 
@@ -1176,7 +1226,7 @@ mod tests {
     fn test_trim_and_normalize_combined() {
         // Verify both trimming and normalization happen in one pass
         let input = "hello   \n\n\n\n\nworld  \n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "hello\n\n\nworld\n");
     }
 
@@ -2105,6 +2155,198 @@ mod tests {
         assert_eq!(
             end, 23,
             "line end must be byte 23 (includes the trailing newline)"
+        );
+    }
+
+    // ========================================================================
+    // C2a — trim_and_normalize literal protection unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_trim_and_normalize_preserves_protected_trailing_spaces() {
+        // Protected range [7..9) covers the two spaces inside the string "  ".
+        // trim_and_normalize must NOT trim them.
+        // Input: `x = "  "\n` — the `  ` is protected
+        let input = "x = \"  \"\n";
+        // "x = \"" = 5 bytes, spaces at [5..7), closing " at 7
+        // Wait: x=0 ' '=1 '='=2 ' '=3 '"'=4 ' '=5 ' '=6 '"'=7 '\n'=8
+        // string_content = bytes [5..7)
+        let protected = vec![(5, 7)];
+        let result = trim_and_normalize(input, &protected);
+        // Trailing `"` is at byte 7 — not a space, so trim_end stops there.
+        // The two spaces inside the literal are not at the end of the line anyway.
+        assert_eq!(result, "x = \"  \"\n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_trailing_protected_spaces_preserved() {
+        // When a string literal with trailing spaces is the last thing on the line,
+        // the spaces must be preserved if they are in a protected range.
+        // Input line: `"  "  ` where the 2 spaces inside quotes are protected [1..3)
+        // and the 2 spaces outside the closing quote are NOT protected.
+        // Expected: the outside trailing spaces are trimmed, the inside ones preserved.
+        // Layout: '"'=0 ' '=1 ' '=2 '"'=3 ' '=4 ' '=5 '\n'=6
+        let input = "\"  \"  \n";
+        let protected = vec![(1, 3)]; // the two spaces inside the quotes
+        let result = trim_and_normalize(input, &protected);
+        // Outside trailing spaces [4..6) are trimmed; literal content [1..3) is kept.
+        assert_eq!(result, "\"  \"\n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_protected_spaces_only_line_not_blank() {
+        // A line consisting entirely of protected spaces should NOT be blank.
+        // Protected: bytes [0..5) = 5 spaces
+        let input = "     \n";
+        let protected = vec![(0, 5)];
+        let result = trim_and_normalize(input, &protected);
+        // Not blank → kept verbatim (no trailing space trim since they're all protected)
+        assert_eq!(result, "     \n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_five_blank_lines_inside_string_preserved() {
+        // 5 blank lines inside a string literal must NOT be capped to 2.
+        // Each blank line is a single '\n'; together they form string content.
+        // We mark all of them as protected.
+        let input = "a\n\n\n\n\n\nb\n";
+        // Bytes: a=0 \n=1 \n=2 \n=3 \n=4 \n=5 \n=6 b=7 \n=8
+        // Mark the 5 inner blank lines [2..7) as protected
+        // (representing multi-line string content)
+        let protected = vec![(2, 7)];
+        let result = trim_and_normalize(input, &protected);
+        // All 5 protected blank lines must survive
+        assert_eq!(result, "a\n\n\n\n\n\nb\n");
+    }
+
+    // ========================================================================
+    // C2a — transform_minimal literal-protection integration tests (14 langs)
+    // ========================================================================
+
+    fn transform_min(source: &str, language: Language) -> String {
+        let mut parser = crate::Parser::new(language).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = crate::TransformConfig::with_mode(crate::Mode::Minimal);
+        transform_minimal(source, &tree, language, &config).unwrap()
+    }
+
+    #[test]
+    fn test_minimal_ts_literal_double_space_preserved() {
+        let source = "const INDENT = \"  \";\n";
+        let result = transform_min(source, Language::TypeScript);
+        assert!(result.contains("\"  \""), "TS minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_js_literal_double_space_preserved() {
+        let source = "const INDENT = '  ';\n";
+        let result = transform_min(source, Language::JavaScript);
+        assert!(result.contains("'  '"), "JS minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_python_literal_double_space_preserved() {
+        let source = "INDENT = \"  \"\n";
+        let result = transform_min(source, Language::Python);
+        assert!(result.contains("\"  \""), "Python minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_rust_literal_double_space_preserved() {
+        let source = "const INDENT: &str = \"  \";\n";
+        let result = transform_min(source, Language::Rust);
+        assert!(result.contains("\"  \""), "Rust minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_go_literal_double_space_preserved() {
+        let source = "var INDENT = \"  \"\n";
+        let result = transform_min(source, Language::Go);
+        assert!(result.contains("\"  \""), "Go minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_java_literal_double_space_preserved() {
+        let source = "class A { String s = \"  \"; }\n";
+        let result = transform_min(source, Language::Java);
+        assert!(result.contains("\"  \""), "Java minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_c_literal_double_space_preserved() {
+        let source = "char *s = \"  \";\n";
+        let result = transform_min(source, Language::C);
+        assert!(result.contains("\"  \""), "C minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_cpp_literal_double_space_preserved() {
+        let source = "std::string s = \"  \";\n";
+        let result = transform_min(source, Language::Cpp);
+        assert!(result.contains("\"  \""), "C++ minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_csharp_literal_double_space_preserved() {
+        let source = "string s = \"  \";\n";
+        let result = transform_min(source, Language::CSharp);
+        assert!(result.contains("\"  \""), "C# minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_ruby_literal_double_space_preserved() {
+        let source = "s = \"  \"\n";
+        let result = transform_min(source, Language::Ruby);
+        assert!(result.contains("\"  \""), "Ruby minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_kotlin_literal_double_space_preserved() {
+        let source = "val s = \"  \"\n";
+        let result = transform_min(source, Language::Kotlin);
+        assert!(result.contains("\"  \""), "Kotlin minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_swift_literal_double_space_preserved() {
+        let source = "let s = \"  \"\n";
+        let result = transform_min(source, Language::Swift);
+        assert!(result.contains("\"  \""), "Swift minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_sql_literal_double_space_preserved() {
+        let source = "SELECT '  ' AS s;\n";
+        let result = transform_min(source, Language::Sql);
+        assert!(result.contains("'  '"), "SQL minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_bash_literal_double_space_preserved() {
+        let source = "s=\"  \"\n";
+        let result = transform_min(source, Language::Bash);
+        assert!(result.contains("\"  \""), "Bash minimal: got {result:?}");
+    }
+
+    // ========================================================================
+    // C2d — normalize_line_map_blanks literal-protection integration
+    // ========================================================================
+
+    #[test]
+    fn test_line_map_integrity_with_protected_space_line() {
+        use crate::transform::normalize_line_map_blanks;
+        // A line consisting entirely of protected spaces must NOT be dropped from
+        // the map (it would be treated as blank without literal awareness).
+        let text = "a\n     \nb\n";
+        // Bytes: a=0 \n=1 ' '=2 ' '=3 ' '=4 ' '=5 ' '=6 \n=7 b=8 \n=9
+        let protected = vec![(2, 7)]; // 5 spaces on line 2 are protected
+        let map = vec![1, 2, 3];
+        let result = normalize_line_map_blanks(text, map, &protected);
+        // Line 2 ("     ") is NOT blank (all spaces are protected) → kept
+        assert_eq!(
+            result,
+            vec![1, 2, 3],
+            "protected-space line must not be dropped from map"
         );
     }
 }

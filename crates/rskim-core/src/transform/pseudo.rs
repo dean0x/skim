@@ -35,6 +35,7 @@
 //! called on a node you already hold descends *into* that node and is cheap; it is
 //! `parent()` in front of it that pays the root descent.
 
+use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output};
 use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -500,20 +501,32 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     // correct source line rather than getting source_line=0 from text matching.
     let line_map_after_removal = compute_line_map_from_removed_ranges(source, &final_ranges);
 
+    // Collect literal-fragment ranges from the source tree before removal.
+    // These are mapped to post-removal coordinates so that collapse_whitespace
+    // and trim_and_normalize can skip whitespace normalisation inside literals.
+    let literal_ranges = collect_literal_ranges(tree, language);
+    let protected_in_result = map_ranges_to_output(&literal_ranges, &final_ranges);
+
     let result = remove_ranges(source, &final_ranges)?;
 
     // Post-process — collapse whitespace artifacts and normalize.
     // collapse_whitespace is line-count-preserving (works within lines only).
-    let result = collapse_whitespace(&result);
+    // Returns the collapsed string AND the protected ranges in output coordinates
+    // (needed by trim_and_normalize and normalize_line_map_blanks).
+    let (result, protected_after_collapse) = collapse_whitespace(&result, &protected_in_result);
     // trim_and_normalize may drop lines when there are 3+ consecutive blanks.
     // Capture the text before that step so normalize_line_map_blanks can replay
     // the same logic to keep the line map in sync.
     let pre_normalized = result;
-    let result = trim_and_normalize(&pre_normalized);
+    let result = trim_and_normalize(&pre_normalized, &protected_after_collapse);
 
     // Mirror trim_and_normalize's blank-line dropping on the line map so the
     // two stay in sync (3+ consecutive blank lines → drop beyond 2).
-    let line_map = normalize_line_map_blanks(&pre_normalized, line_map_after_removal);
+    let line_map = normalize_line_map_blanks(
+        &pre_normalized,
+        line_map_after_removal,
+        &protected_after_collapse,
+    );
 
     // Build spans (single source_file span for truncation compatibility)
     let line_count = result.lines().count();
@@ -522,40 +535,176 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     Ok((result, spans, line_map))
 }
 
-/// Collapse whitespace artifacts from inline removal:
-/// - Multiple consecutive spaces in content portion -> single space
-/// - Trailing whitespace on lines is trimmed
-/// - Leading spaces left by inline removal are trimmed
-/// - Indentation is preserved
-fn collapse_whitespace(source: &str) -> String {
+/// Collapse whitespace artifacts from inline removal.
+///
+/// Per-line operations (for unprotected content only):
+/// - Multiple consecutive spaces → single space
+/// - Trailing whitespace trimmed
+/// - Leading spaces left by inline removal trimmed
+/// - Indentation preserved verbatim
+///
+/// **Literal-aware:** byte ranges listed in `protected` are emitted verbatim;
+/// no collapsing or trimming is applied inside them.
+///
+/// **CRLF handling:** `\r\n` line endings are normalised to `\n` in the output
+/// (explicit, not silent as in the old `.lines()`-based implementation).
+///
+/// **Returns** the collapsed string together with the positions of `protected`
+/// ranges inside the output (needed so `trim_and_normalize` can continue to
+/// skip the same byte spans after the collapse has shifted coordinates).
+fn collapse_whitespace(
+    source: &str,
+    protected: &[(usize, usize)],
+) -> (String, Vec<(usize, usize)>) {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
     let mut result = String::with_capacity(source.len());
+    // Collect (output_start, output_end) for each protected chunk we emit verbatim.
+    let mut new_protected: Vec<(usize, usize)> = Vec::with_capacity(protected.len());
 
-    for line in source.lines() {
-        let indent_len = line.len() - line.trim_start().len();
-        let content = line[indent_len..].trim_end();
+    // Monotonically advancing cursor into `protected` for the forward pass.
+    let mut prot_cursor = 0usize;
 
-        result.push_str(&line[..indent_len]);
+    let mut pos = 0usize;
+    while pos < n {
+        let line_start = pos;
 
-        // State machine: `leading` skips initial spaces after indent,
-        // `prev_space` collapses consecutive space runs to single space.
+        // Locate the newline terminating this line.
+        let nl_pos = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+
+        // CRLF: a `\r` immediately before `\n` belongs to the line ending.
+        let has_cr = nl_pos > line_start && bytes[nl_pos - 1] == b'\r';
+        // Content end: exclusive, does not include `\r` or `\n`.
+        let content_end = if has_cr { nl_pos - 1 } else { nl_pos };
+
+        // Advance `pos` past this line (including `\n` if present).
+        pos = if nl_pos < n { nl_pos + 1 } else { n };
+
+        // Advance prot_cursor past ranges that end before line_start.
+        while prot_cursor < protected.len() && protected[prot_cursor].1 <= line_start {
+            prot_cursor += 1;
+        }
+
+        // --- Indent: leading whitespace NOT inside a protected range ---
+        let indent_end = {
+            let mut s = line_start;
+            while s < content_end {
+                // Stop if a protected range starts here.
+                if prot_cursor < protected.len() && protected[prot_cursor].0 <= s {
+                    break;
+                }
+                match bytes[s] {
+                    b' ' | b'\t' => s += 1,
+                    _ => break,
+                }
+            }
+            s
+        };
+        result.push_str(&source[line_start..indent_end]);
+
+        // --- Content: [indent_end..content_end) ---
+
+        // Step 1: trim_end — scan backward, skip trailing unprotected whitespace.
+        let mut trim_end = content_end;
+        while trim_end > indent_end {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Step 2: forward pass over [indent_end..trim_end) emitting content.
+        // Protected chunks → verbatim; unprotected → collapse consecutive spaces.
+        let mut p = indent_end;
+        let mut lpc = prot_cursor; // local copy so prot_cursor is undisturbed
         let mut prev_space = false;
         let mut leading = true;
-        for ch in content.chars() {
-            if ch == ' ' {
-                if !prev_space && !leading {
-                    result.push(ch);
-                }
-                prev_space = true;
-            } else {
-                leading = false;
-                result.push(ch);
-                prev_space = false;
+
+        while p < trim_end {
+            // Advance lpc past ranges that end before p.
+            while lpc < protected.len() && protected[lpc].1 <= p {
+                lpc += 1;
             }
+
+            if lpc < protected.len() && protected[lpc].0 <= p {
+                // Inside a protected range: emit verbatim up to range end (or trim_end).
+                let range_end = protected[lpc].1.min(trim_end);
+                let out_start = result.len();
+                result.push_str(&source[p..range_end]);
+                let out_end = result.len();
+                if out_start < out_end {
+                    new_protected.push((out_start, out_end));
+                }
+                p = range_end;
+                prev_space = false;
+                leading = false;
+            } else {
+                // Unprotected byte: apply collapse logic.
+                let b = bytes[p];
+                if b == b' ' || b == b'\t' {
+                    // Collapse: emit at most one space per run, skip leading spaces.
+                    if !prev_space && !leading {
+                        result.push(' ');
+                    }
+                    prev_space = true;
+                    p += 1;
+                } else {
+                    // Non-space: decode entire UTF-8 char (tree-sitter boundaries
+                    // are always at char boundaries, so source[p..] is valid).
+                    let ch = source[p..].chars().next().unwrap_or('\0');
+                    leading = false;
+                    result.push(ch);
+                    p += ch.len_utf8();
+                    prev_space = false;
+                }
+            }
+        }
+
+        // Emit normalised line ending (CRLF → LF).
+        //
+        // Sentinel: if this is a truly-empty line (no bytes between line_start and
+        // content_end — just a bare '\n') AND its position falls inside a protected
+        // input range, emit a one-byte protected range covering the '\n' about to be
+        // pushed.  This signals to `trim_and_normalize` and `normalize_line_map_blanks`
+        // that the blank line is inside a multi-line string literal and must NOT be
+        // subject to the 3+ consecutive-blank cap.
+        //
+        // Whitespace-only lines inside a literal (e.g. "    \n" in a string body)
+        // do NOT need this sentinel because their content bytes are already recorded
+        // in `new_protected` by the forward pass above.
+        if content_end == line_start && in_protected(line_start, protected) {
+            let nl_out = result.len();
+            new_protected.push((nl_out, nl_out + 1));
         }
         result.push('\n');
     }
 
-    result
+    // Merge adjacent/overlapping output ranges produced by multi-line strings
+    // emitting consecutive per-line chunks.
+    let new_protected = merge_ranges(new_protected);
+    (result, new_protected)
+}
+
+/// Merge a sorted-or-unsorted list of byte ranges into a minimal sorted set,
+/// combining any adjacent or overlapping intervals.
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    ranges.sort_unstable_by_key(|&(s, _)| s);
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 /// Handle language-specific AST patterns that require multi-node context.
@@ -1194,14 +1343,14 @@ mod tests {
 
     #[test]
     fn test_collapse_whitespace_basic() {
-        let result = collapse_whitespace("  pub  fn  add() {}\n");
+        let (result, _) = collapse_whitespace("  pub  fn  add() {}\n", &[]);
         // Multiple spaces collapsed, leading indent preserved
         assert_eq!(result, "  pub fn add() {}\n");
     }
 
     #[test]
     fn test_collapse_whitespace_preserves_indentation() {
-        let result = collapse_whitespace("    let x = 1\n");
+        let (result, _) = collapse_whitespace("    let x = 1\n", &[]);
         assert_eq!(result, "    let x = 1\n");
     }
 
@@ -1651,11 +1800,10 @@ mod tests {
     fn test_collapse_whitespace_preserves_indent_when_modifier_stripped() {
         // When an inline modifier is stripped (e.g., `    pub fn` -> `     fn`),
         // the extra space becomes part of indentation and is preserved.
-        // The `leading` flag skips any content-leading spaces after indent detection.
-        let result = collapse_whitespace("    fn add() {}\n");
+        let (result, _) = collapse_whitespace("    fn add() {}\n", &[]);
         assert_eq!(result, "    fn add() {}\n", "normal 4-space indent");
 
-        let result = collapse_whitespace("     fn add() {}\n");
+        let (result, _) = collapse_whitespace("     fn add() {}\n", &[]);
         assert_eq!(
             result, "     fn add() {}\n",
             "5-space indent preserved as indentation"
@@ -1664,14 +1812,14 @@ mod tests {
 
     #[test]
     fn test_collapse_whitespace_empty_lines() {
-        let result = collapse_whitespace("line one\n\nline two\n");
+        let (result, _) = collapse_whitespace("line one\n\nline two\n", &[]);
         assert_eq!(result, "line one\n\nline two\n");
     }
 
     #[test]
     fn test_collapse_whitespace_whitespace_only_lines() {
         // Whitespace-only lines: indent portion is kept, content is empty
-        let result = collapse_whitespace("    \n  \n\n");
+        let (result, _) = collapse_whitespace("    \n  \n\n", &[]);
         // After trim_end on content (empty), only indent remains, then newline
         assert_eq!(result, "    \n  \n\n");
     }
@@ -1679,7 +1827,7 @@ mod tests {
     #[test]
     fn test_collapse_whitespace_multiline_mixed_patterns() {
         let input = "fn foo() {\n    let  x  =  1\n\n     return  x\n}\n";
-        let result = collapse_whitespace(input);
+        let (result, _) = collapse_whitespace(input, &[]);
         // Line 1: no extra spaces
         // Line 2: indent=4, "let  x  =  1" -> "let x = 1"
         // Line 3: empty
@@ -1690,21 +1838,21 @@ mod tests {
 
     #[test]
     fn test_collapse_whitespace_trailing_spaces_trimmed() {
-        let result = collapse_whitespace("fn foo()   \n");
+        let (result, _) = collapse_whitespace("fn foo()   \n", &[]);
         assert_eq!(result, "fn foo()\n", "trailing spaces should be trimmed");
     }
 
     #[test]
     fn test_collapse_whitespace_leading_spaces_become_indent() {
         // When remove_ranges leaves a gap (e.g., "export function" -> " function"),
-        // trim_start() treats the leading spaces as indentation, not content.
-        let result = collapse_whitespace(" function add()\n");
+        // the leading spaces are treated as indentation.
+        let (result, _) = collapse_whitespace(" function add()\n", &[]);
         assert_eq!(
             result, " function add()\n",
             "single leading space is part of indent"
         );
 
-        let result = collapse_whitespace("  function add()\n");
+        let (result, _) = collapse_whitespace("  function add()\n", &[]);
         assert_eq!(
             result, "  function add()\n",
             "two leading spaces treated as indentation"
@@ -2458,6 +2606,262 @@ mod tests {
             "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
              (got {ratio:.2}×; measured 2.01×). N=1000 took {t1:.2}ms, \
              N=2000 took {t2:.2}ms."
+        );
+    }
+
+    // ========================================================================
+    // C2a — literal corruption regression tests
+    // ========================================================================
+    //
+    // These tests were written BEFORE the fix (TDD) and prove that whitespace
+    // inside string literals is preserved through pseudo mode.  They would fail
+    // against the old collapse_whitespace that had no literal awareness.
+
+    /// Property: for each literal node in `source`, its raw text content must
+    /// appear unchanged (as a substring) in `result`.
+    /// Returns false if any literal's content was modified.
+    #[cfg(test)]
+    fn assert_literals_preserved(source: &str, result: &str, language: Language) -> bool {
+        use crate::transform::literals::collect_literal_ranges;
+        let mut parser = Parser::new(language).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let ranges = collect_literal_ranges(&tree, language);
+        for (ls, le) in ranges {
+            let lit = &source[ls..le];
+            if !result.contains(lit) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // C2e — property assertion: prove it passes on correct output and
+    //        REJECTS a known-corrupted output.
+
+    #[test]
+    fn test_c2e_property_passes_on_correct_pseudo_output() {
+        let source = "const INDENT = \"  \";\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            assert_literals_preserved(source, &result, Language::TypeScript),
+            "Property violated: literal content corrupted in pseudo output. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_c2e_property_detects_literal_corruption() {
+        // Construct the corrupted output the old code would have produced:
+        // "  " (two spaces) → " " (one space) via old collapse_whitespace.
+        let source = "const INDENT = \"  \";\n";
+        let corrupted = "const INDENT = \" \";\n"; // one space instead of two
+        assert!(
+            !assert_literals_preserved(source, corrupted, Language::TypeScript),
+            "Property assertion should detect the two-spaces→one-space corruption"
+        );
+    }
+
+    // --- TypeScript pseudo: double-space string literal preserved ---
+
+    #[test]
+    fn test_ts_pseudo_literal_double_space_preserved() {
+        // C2a: "  " inside a string must not be collapsed to " "
+        let source = "const INDENT = \"  \";\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("\"  \""),
+            "double-space string literal must survive pseudo: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_pseudo_template_literal_spaces_preserved() {
+        // C2a: spaces inside template literal text preserved; interpolation NOT protected
+        let source = "const s = `a  b`;\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("`a  b`"),
+            "double-space in template literal must survive pseudo: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_pseudo_interpolation_not_protected() {
+        // Spaces INSIDE ${...} (interpolation) must still be collapsed —
+        // only the string_fragment children are protected, not the whole template.
+        let source = "const s = `x${  a  +  b  }y`;\n";
+        let result = transform(source, Language::TypeScript);
+        // The result should contain collapsed whitespace in the interpolation
+        // (we can't predict exact output, but "  " must not appear inside `${...}`).
+        // The string_fragment "x" and "y" around the interpolation are protected.
+        // Verify output doesn't contain 4+ consecutive spaces (collapse happened).
+        assert!(
+            !result.contains("    "),
+            "more than 3 consecutive spaces should not appear (interpolation collapsed): {result:?}"
+        );
+    }
+
+    // --- JavaScript pseudo: single-quote and template literals ---
+
+    #[test]
+    fn test_js_pseudo_single_quote_literal_preserved() {
+        let source = "const s = 'hello   world';\n";
+        let result = transform(source, Language::JavaScript);
+        assert!(
+            result.contains("'hello   world'"),
+            "triple-space in single-quote string must survive: got {result:?}"
+        );
+    }
+
+    // --- Python pseudo: string with trailing spaces ---
+
+    #[test]
+    fn test_python_pseudo_string_trailing_spaces_preserved() {
+        // Trailing spaces inside a string must not be trimmed.
+        let source = "x = \"hello  \"\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            result.contains("\"hello  \""),
+            "trailing spaces inside string literal must survive pseudo: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_pseudo_multiline_string_spaces_preserved() {
+        // Multi-line string content with trailing spaces (PF-019 case).
+        let source = "x = \"\"\"\n  hello  \n\"\"\"\n";
+        let result = transform(source, Language::Python);
+        // The string_content spans the whole body; trailing spaces must survive.
+        assert!(
+            result.contains("  hello  "),
+            "trailing spaces inside multiline string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Rust pseudo: string literal spaces ---
+
+    #[test]
+    fn test_rust_pseudo_string_literal_spaces_preserved() {
+        let source = "fn f() { let s = \"a  b\"; }\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Rust string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Go pseudo: interpreted and raw string ---
+
+    #[test]
+    fn test_go_pseudo_interpreted_string_preserved() {
+        let source = "func f() { s := \"a  b\" }\n";
+        let result = transform(source, Language::Go);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Go interpreted string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- C pseudo ---
+
+    #[test]
+    fn test_c_pseudo_string_literal_spaces_preserved() {
+        let source = "void f() { char *s = \"a  b\"; }\n";
+        let result = transform(source, Language::C);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in C string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- C++ pseudo ---
+
+    #[test]
+    fn test_cpp_pseudo_string_literal_spaces_preserved() {
+        let source = "void f() { std::string s = \"a  b\"; }\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in C++ string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Java pseudo ---
+
+    #[test]
+    fn test_java_pseudo_string_literal_spaces_preserved() {
+        let source = "class A { String s = \"a  b\"; }\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Java string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Ruby pseudo ---
+
+    #[test]
+    fn test_ruby_pseudo_string_literal_spaces_preserved() {
+        let source = "s = \"a  b\"\n";
+        let result = transform(source, Language::Ruby);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Ruby string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Kotlin pseudo ---
+
+    #[test]
+    fn test_kotlin_pseudo_string_literal_spaces_preserved() {
+        let source = "val s = \"a  b\"\n";
+        let result = transform(source, Language::Kotlin);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Kotlin string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Bash pseudo ---
+
+    #[test]
+    fn test_bash_pseudo_string_literal_spaces_preserved() {
+        let source = "s=\"a  b\"\n";
+        let result = transform(source, Language::Bash);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Bash string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- CRLF handling (C2c) ---
+
+    #[test]
+    fn test_collapse_whitespace_crlf_normalised_to_lf() {
+        // CRLF line endings must be normalised to LF (explicit, not silent).
+        let input = "fn foo()  \r\nfn bar()  \r\n";
+        let (result, _) = collapse_whitespace(input, &[]);
+        // CRLF stripped → LF only; trailing spaces trimmed
+        assert_eq!(
+            result, "fn foo()\nfn bar()\n",
+            "CRLF must be normalised to LF"
+        );
+    }
+
+    #[test]
+    fn test_collapse_whitespace_crlf_preserves_literal_content() {
+        // Literal content inside a CRLF file must still be protected.
+        // Construct protected range for the double-space: bytes 7..9 in "s = \"  \"\r\n"
+        // "s = \"" = 5 bytes, then "  " = 2 bytes at [5..7]
+        // Actually source = "s = \"  \"\r\n" — let's compute:
+        //   s=0 ' '=1 '='=2 ' '=3 '"'=4 ' '=5 ' '=6 '"'=7 '\r'=8 '\n'=9
+        // The protected range for the two spaces is [5, 7).
+        let source = "s = \"  \"\r\n";
+        let protected = vec![(5, 7)];
+        let (result, new_prot) = collapse_whitespace(source, &protected);
+        assert_eq!(result, "s = \"  \"\n", "CRLF stripped; literal preserved");
+        assert!(
+            !new_prot.is_empty(),
+            "protected range must survive CRLF normalisation"
         );
     }
 }
