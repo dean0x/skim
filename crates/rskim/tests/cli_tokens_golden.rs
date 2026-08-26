@@ -24,7 +24,13 @@ fn golden_fixture() -> PathBuf {
 
 /// The exact stderr output captured before migration.
 /// Must match byte-for-byte after migration (AC13).
-const GOLDEN_STATS_LINE: &str = "[skim] 65 tokens → 45 tokens (30.8% reduction)";
+///
+/// Updated for B3 (ADR-011): the lossy-view marker now fires unconditionally
+/// when view differs from raw bytes (structure mode strips bodies → differs).
+/// The marker appears on the line after the token stats line.
+/// `--no-cache` ensures a cold-path read so view_differs is always computed
+/// from the actual transform (not the cache-path inference).
+const GOLDEN_STATS_LINE: &str = "[skim] 65 tokens \u{2192} 45 tokens (30.8% reduction)\n[skim] structure view: bodies removed \u{2014} SKIM_PASSTHROUGH=1 for raw output";
 
 #[test]
 fn ac13_show_stats_exact_golden() {
@@ -34,6 +40,7 @@ fn ac13_show_stats_exact_golden() {
     let output = common::skim()
         .arg(fixture.to_str().unwrap())
         .arg("--show-stats")
+        .arg("--no-cache")
         .env_remove("SKIM_PASSTHROUGH")
         .env_remove("SKIM_DEBUG")
         .output()

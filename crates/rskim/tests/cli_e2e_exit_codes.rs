@@ -222,8 +222,21 @@ fn test_diff_differing_files_exit1_full_tier_hint_suppressed() {
     let dir = tempfile::tempdir().unwrap();
     let file_a = dir.path().join("a.txt");
     let file_b = dir.path().join("b.txt");
-    fs::write(&file_a, "alpha\nbeta\n").unwrap();
-    fs::write(&file_b, "alpha\ngamma\n").unwrap();
+    // Files need enough shared context so the raw unified diff has enough
+    // lines that the compressed FileResult output is reliably smaller in
+    // tokens (guardrail net-savings check passes → structured output served).
+    // Two-line files produce a diff that is comparable in size to the
+    // compressed output, causing the guardrail to fall back to raw diff and
+    // losing the "changed" keyword the test asserts on.
+    let shared = "line1: context\nline2: context\nline3: context\nline4: context\n\
+                  line5: context\nline6: context\nline7: context\nline8: context\n\
+                  line9: context\n";
+    let file_a_content = format!("{shared}beta\nline11: context\nline12: context\n\
+                                  line13: context\nline14: context\nline15: context\n");
+    let file_b_content = format!("{shared}gamma\nline11: context\nline12: context\n\
+                                  line13: context\nline14: context\nline15: context\n");
+    fs::write(&file_a, &file_a_content).unwrap();
+    fs::write(&file_b, &file_b_content).unwrap();
 
     skim_cmd()
         .args(["diff", file_a.to_str().unwrap(), file_b.to_str().unwrap()])

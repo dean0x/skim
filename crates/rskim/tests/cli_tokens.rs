@@ -144,9 +144,12 @@ fn test_no_stats_by_default() {
         .clone();
 
     let stderr_str = String::from_utf8_lossy(&output);
+    // The lossy-view marker ([skim] structure view: ...) may appear when the
+    // mode strips content (ADR-011 class 1: unconditional loss-bearing marker).
+    // What must NOT appear is token-stats output, which requires --show-stats.
     assert!(
-        !stderr_str.contains("[skim]"),
-        "Stats should not appear without --show-stats flag"
+        !stderr_str.contains("tokens \u{2192}"),
+        "Token stats should not appear without --show-stats flag"
     );
 }
 

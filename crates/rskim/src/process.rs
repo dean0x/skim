@@ -220,6 +220,12 @@ fn try_cached_result(
     let origin_active = crate::output::rewrite_origin().is_some();
     let needs_raw_read = needs_recount || origin_active;
 
+    // A cache hit in a lossy mode means the served view differs from raw bytes
+    // (the original transform stripped bodies/comments/etc.).  When the
+    // origin tag is present we compare cached content against raw bytes to
+    // detect mid-flight changes; otherwise we infer view_differs from the mode.
+    let cache_hit_view_differs = options.mode != Mode::Full;
+
     let (orig_tokens, trans_tokens, view_differs) = if needs_raw_read {
         match read_and_validate(path) {
             Ok(contents) => {
@@ -228,7 +234,11 @@ fn try_cached_result(
                 } else {
                     (hit.original_tokens, hit.transformed_tokens)
                 };
-                let differs = origin_active && hit.content != contents;
+                let differs = if origin_active {
+                    hit.content != contents
+                } else {
+                    cache_hit_view_differs
+                };
                 (orig, trans, differs)
             }
             Err(e) => {
@@ -243,7 +253,7 @@ fn try_cached_result(
             }
         }
     } else {
-        (hit.original_tokens, hit.transformed_tokens, false)
+        (hit.original_tokens, hit.transformed_tokens, cache_hit_view_differs)
     };
 
     // Effective language for a cache hit: explicit override wins, else detect from path.

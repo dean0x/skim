@@ -138,25 +138,22 @@ fn prepare_args(args: &mut Vec<String>) {
     }
 }
 
-/// Route diff output to raw passthrough.
+/// Parse the diff output into a structured `FileResult`.
 ///
-/// # Why passthrough?
+/// Returns `Full(file_result)` when the output is a recognisable unified diff
+/// (exit code 1 = files differ).  The fidelity guard (`savings_decision`) in
+/// `run_tool` ensures the structured output is only emitted when it is strictly
+/// smaller in tokens than the raw diff — the guard baseline is `output.stdout`
+/// (the `-u`-injected unified diff), which is a correct baseline because skim
+/// always injects `-u` and users always see the unified form through skim.
 ///
-/// The fidelity baseline for `savings_decision` is `output.stdout`, which is
-/// the output of the **injected** command (`diff -u …`), not the user's literal
-/// `diff …` command.  Compressing the injected output and comparing it against
-/// itself as the baseline is unfair — it can claim savings that don't exist
-/// relative to what the user would see without skim.
-///
-/// Until `raw_override` is properly wired for `diff` (so the pre-injection
-/// user output is captured and used as the guard baseline), routing to
-/// `RawPassthrough` is the correct, safe default: output is never larger than
-/// the raw tool, and the #317 compress-never-truncate invariant is preserved.
-///
-/// The parser `try_parse_standalone_unified` remains available for future use
-/// once the baseline issue is resolved.
-fn parse_impl(_output: &CommandOutput) -> ParseResult<FileResult> {
-    ParseResult::RawPassthrough
+/// Returns `RawPassthrough` for empty stdout (exit 0 = identical files) or
+/// for unrecognised diff output (format unknown → lossless fallback per #317).
+fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
+    match try_parse_standalone_unified(&output.stdout) {
+        Some(result) => ParseResult::Full(result),
+        None => ParseResult::RawPassthrough,
+    }
 }
 
 // ============================================================================
@@ -164,15 +161,9 @@ fn parse_impl(_output: &CommandOutput) -> ParseResult<FileResult> {
 //
 // Handles `diff -u file1 file2` and `diff -ru dir1 dir2` output.
 // Does NOT handle `git diff` output (which has `diff --git a/path b/path` headers).
-//
-// CURRENTLY NOT WIRED IN `parse_impl` (A3 passthrough fix — see `parse_impl`).
-// Kept for future use when `raw_override` is properly set for the `diff` handler
-// so the guard baseline is the user's literal command, not the `-u`-injected form.
-// Tests call these functions directly to preserve the regression suite.
 // ============================================================================
 
 /// Per-file diff statistics and patch content.
-#[allow(dead_code)]
 struct FileStat {
     path: String,
     insertions: usize,
@@ -190,7 +181,6 @@ struct FileStat {
 }
 
 /// Mutable accumulator state for the standalone unified diff parser.
-#[allow(dead_code)]
 struct DiffParserState {
     file_stats: Vec<FileStat>,
     current_path: Option<String>,
@@ -213,7 +203,6 @@ struct DiffParserState {
     hunk_new_remaining: usize,
 }
 
-#[allow(dead_code)]
 impl DiffParserState {
     fn new() -> Self {
         Self {
@@ -263,7 +252,6 @@ impl DiffParserState {
 /// Per unified-diff convention the `,count` suffix is omitted when count == 1,
 /// so `@@ -5 +5 @@` is read as `(1, 1)`.  A `,0` suffix (e.g. `-0,0`) is
 /// explicit and means 0 lines — used for pure-insertion or pure-deletion hunks.
-#[allow(dead_code)]
 fn parse_hunk_counts(header: &str) -> (usize, usize) {
     let after_prefix = header.strip_prefix("@@ ").unwrap_or(header);
     let mut tokens = after_prefix.split_ascii_whitespace();
@@ -279,7 +267,6 @@ fn parse_hunk_counts(header: &str) -> (usize, usize) {
 ///
 /// Returns `b` / `d`.  When the comma-and-count suffix is absent, returns 1
 /// (the implicit count for single-line ranges per unified-diff convention).
-#[allow(dead_code)]
 fn parse_hunk_range_count(range: &str) -> usize {
     let digits = range.trim_start_matches(['-', '+']);
     if let Some(comma_pos) = digits.find(',') {
@@ -291,7 +278,6 @@ fn parse_hunk_range_count(range: &str) -> usize {
     }
 }
 
-#[allow(dead_code)]
 fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
     if stdout.trim().is_empty() {
         return None;
@@ -431,7 +417,6 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
 /// (which would violate the compress-never-truncate rule, #317).
 ///
 /// Returns `None` if no file stats were collected (unrecognised format).
-#[allow(dead_code)]
 fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
     if file_stats.is_empty() {
         return None;
@@ -702,33 +687,35 @@ mod tests {
         );
     }
 
-    // ---- A3: parse_impl always routes to RawPassthrough ----
+    // ---- parse_impl tier tests ----
     //
-    // Standalone `diff` is routed to passthrough because the current baseline
-    // is the `-u`-injected output (not the user's literal command), making the
-    // savings guard comparison unfair.  Passthrough is the safe, correct default
-    // until `raw_override` is properly wired for diff (#fidelity-parity-overhaul).
+    // parse_impl returns Full for recognisable unified diff output (exit 1 = files differ),
+    // and RawPassthrough for empty stdout (exit 0 = identical files) or unrecognised
+    // output (format unknown → lossless fallback per #317).
 
     #[test]
-    fn a3_parse_impl_exits_1_diff_output_is_passthrough() {
+    fn a3_parse_impl_exits_1_diff_output_is_full() {
+        // parse_impl returns Full for valid unified diff output; the fidelity guard
+        // in run_tool decides whether the structured form is served or raw falls back.
         let input = load_fixture("file", "diff_unified.txt");
         let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
-            result.is_passthrough(),
-            "A3: parse_impl must return Passthrough for exit-1 diff output; got {}",
+            !result.is_passthrough(),
+            "parse_impl must return Full for exit-1 unified diff output; got {}",
             result.tier_name()
         );
     }
 
     #[test]
     fn a3_parse_impl_identical_files_is_passthrough() {
-        // Exit code 0, empty stdout: files identical → was Full; A3 makes it Passthrough.
+        // Exit code 0, empty stdout: files identical → RawPassthrough (empty input
+        // makes try_parse_standalone_unified return None).
         let output = make_output_full("", "", Some(0));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "A3: identical-files (exit 0, empty stdout) must be Passthrough; got {}",
+            "identical-files (exit 0, empty stdout) must be Passthrough; got {}",
             result.tier_name()
         );
     }
@@ -799,15 +786,15 @@ mod tests {
         );
     }
 
-    /// A3: parse_impl always returns RawPassthrough (fidelity baseline fix).
+    /// parse_impl returns Full for valid unified diff output (exit 1 = files differ).
     #[test]
-    fn test_exit_code_1_is_passthrough() {
+    fn test_exit_code_1_is_full() {
         let input = load_fixture("file", "diff_unified.txt");
         let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
-            result.is_passthrough(),
-            "A3: exit code 1 (files differ) → RawPassthrough; got {}",
+            !result.is_passthrough(),
+            "exit code 1 (files differ) with valid unified diff → Full; got {}",
             result.tier_name()
         );
     }

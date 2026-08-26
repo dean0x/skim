@@ -1619,9 +1619,22 @@ fn write_fake_gh(bin_dir: &std::path::Path) -> std::path::PathBuf {
     // Valid issue-view JSON: has number + state + body (all required
     // discriminators for issue_view::try_parse_json). The body contains the
     // sentinel so we can distinguish raw passthrough from a structured summary.
+    //
+    // Body sizing constraints (fidelity gate must pass for BOTH handlers):
+    //
+    //  1. issue_view handler: body is never truncated (#317 "never truncate
+    //     prose") so any length works. The savings come from the labels /
+    //     comments array compaction.
+    //
+    //  2. api handler: compact_json_value truncates strings longer than
+    //     200 bytes and appends a ~120-byte elision note. With the old 211-char
+    //     body that note inflated the compact form past the raw JSON size
+    //     (482 vs 449 bytes) so the fidelity gate served raw. Keeping the body
+    //     under 200 chars avoids elision and the compact form (≈280 bytes) is
+    //     reliably smaller than the raw JSON wire bytes (≈380 bytes).
     fs::write(
         &gh_path,
-        "#!/bin/sh\nprintf '%s' '{\"number\":93,\"state\":\"OPEN\",\"title\":\"Test\",\"body\":\"__FAKE_GH_SENTINEL__\",\"labels\":[],\"assignees\":[],\"comments\":[]}'\n",
+        "#!/bin/sh\nprintf '%s' '{\"number\":93,\"state\":\"OPEN\",\"title\":\"Test PR: add feature\",\"body\":\"__FAKE_GH_SENTINEL__ Feature: structured output. Tasks: API design, tests, implementation, review. Acceptance: all tests pass, no regressions.\",\"labels\":[{\"name\":\"enhancement\"},{\"name\":\"needs-review\"}],\"assignees\":[{\"login\":\"octocat\"}],\"comments\":[{\"author\":{\"login\":\"reviewer\"},\"body\":\"LGTM, just fix the nits\"}]}'\n",
     )
     .unwrap();
     let perms = std::fs::Permissions::from_mode(0o755);
