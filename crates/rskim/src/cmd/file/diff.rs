@@ -69,41 +69,89 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
     run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
-/// Inject `-u` (unified diff) if not already present.
+/// Inject `-u` (unified diff) if no format-conflicting flag is present.
+///
+/// Format-conflicting flags select a diff output format that is mutually
+/// exclusive with `-u` (unified).  Injecting `-u` on top of them would
+/// change what the command does — overriding the user's chosen format.
+///
+/// Flags that suppress injection:
+/// - Already-unified: `-u`, `--unified`, `-UN`, `--unified=N`
+/// - Context format: `-c`, `-CN` (short), `-C N` (separate arg), `--context`
+/// - Side-by-side: `-y`, `--side-by-side`
+/// - Ed script: `-e`, `--ed`
+/// - RCS format: `-n`, `--rcs`
+/// - Summary only: `--brief`
+/// - Explicit default: `--normal`
 fn prepare_args(args: &mut Vec<String>) {
-    let already_has_unified = args.iter().any(|a| {
-        a == "-u" || a == "--unified" || a.starts_with("-U") || a.starts_with("--unified=")
+    let has_conflicting = args.iter().enumerate().any(|(i, a)| {
+        // Already-unified family
+        if a == "-u" || a == "--unified" || a.starts_with("-U") || a.starts_with("--unified=") {
+            return true;
+        }
+        // Context format: -c, -cN (no space), or "-C" with separate numeric arg
+        if a == "-c"
+            || (a.starts_with("-c")
+                && a.len() > 2
+                && a.chars().nth(2).is_some_and(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+        // -C N (context with separate N argument)
+        if a == "-C" && args.get(i + 1).is_some_and(|next| next.parse::<u32>().is_ok()) {
+            return true;
+        }
+        // Long-form context
+        if a == "--context" || a.starts_with("--context=") {
+            return true;
+        }
+        // Side-by-side
+        if a == "-y" || a == "--side-by-side" {
+            return true;
+        }
+        // Ed script format
+        if a == "-e" || a == "--ed" {
+            return true;
+        }
+        // RCS format
+        if a == "-n" || a == "--rcs" {
+            return true;
+        }
+        // Summary only
+        if a == "--brief" {
+            return true;
+        }
+        // Explicit default format
+        if a == "--normal" {
+            return true;
+        }
+        false
     });
-    if !already_has_unified {
+    if !has_conflicting {
         // Insert at the beginning so it precedes file arguments
         args.insert(0, "-u".to_string());
     }
 }
 
-/// Three-tier parse function for diff output.
-fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    // Exit code 2 means error (e.g., missing file) → passthrough
-    if output.exit_code == Some(2) {
-        return ParseResult::Passthrough(output.stdout.clone());
-    }
-
-    // Exit code 0 with empty stdout: files are identical
-    if output.exit_code == Some(0) && output.stdout.trim().is_empty() {
-        let result = FileResult::new(
-            "diff".to_string(),
-            0,
-            0,
-            vec!["files are identical".to_string()],
-            None,
-        );
-        return ParseResult::Full(result);
-    }
-
-    if let Some(result) = try_parse_standalone_unified(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
+/// Route diff output to raw passthrough.
+///
+/// # Why passthrough?
+///
+/// The fidelity baseline for `savings_decision` is `output.stdout`, which is
+/// the output of the **injected** command (`diff -u …`), not the user's literal
+/// `diff …` command.  Compressing the injected output and comparing it against
+/// itself as the baseline is unfair — it can claim savings that don't exist
+/// relative to what the user would see without skim.
+///
+/// Until `raw_override` is properly wired for `diff` (so the pre-injection
+/// user output is captured and used as the guard baseline), routing to
+/// `RawPassthrough` is the correct, safe default: output is never larger than
+/// the raw tool, and the #317 compress-never-truncate invariant is preserved.
+///
+/// The parser `try_parse_standalone_unified` remains available for future use
+/// once the baseline issue is resolved.
+fn parse_impl(_output: &CommandOutput) -> ParseResult<FileResult> {
+    ParseResult::RawPassthrough
 }
 
 // ============================================================================
@@ -111,9 +159,15 @@ fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
 //
 // Handles `diff -u file1 file2` and `diff -ru dir1 dir2` output.
 // Does NOT handle `git diff` output (which has `diff --git a/path b/path` headers).
+//
+// CURRENTLY NOT WIRED IN `parse_impl` (A3 passthrough fix — see `parse_impl`).
+// Kept for future use when `raw_override` is properly set for the `diff` handler
+// so the guard baseline is the user's literal command, not the `-u`-injected form.
+// Tests call these functions directly to preserve the regression suite.
 // ============================================================================
 
 /// Per-file diff statistics and patch content.
+#[allow(dead_code)]
 struct FileStat {
     path: String,
     insertions: usize,
@@ -131,6 +185,7 @@ struct FileStat {
 }
 
 /// Mutable accumulator state for the standalone unified diff parser.
+#[allow(dead_code)]
 struct DiffParserState {
     file_stats: Vec<FileStat>,
     current_path: Option<String>,
@@ -153,6 +208,7 @@ struct DiffParserState {
     hunk_new_remaining: usize,
 }
 
+#[allow(dead_code)]
 impl DiffParserState {
     fn new() -> Self {
         Self {
@@ -202,6 +258,7 @@ impl DiffParserState {
 /// Per unified-diff convention the `,count` suffix is omitted when count == 1,
 /// so `@@ -5 +5 @@` is read as `(1, 1)`.  A `,0` suffix (e.g. `-0,0`) is
 /// explicit and means 0 lines — used for pure-insertion or pure-deletion hunks.
+#[allow(dead_code)]
 fn parse_hunk_counts(header: &str) -> (usize, usize) {
     let after_prefix = header.strip_prefix("@@ ").unwrap_or(header);
     let mut tokens = after_prefix.split_ascii_whitespace();
@@ -217,6 +274,7 @@ fn parse_hunk_counts(header: &str) -> (usize, usize) {
 ///
 /// Returns `b` / `d`.  When the comma-and-count suffix is absent, returns 1
 /// (the implicit count for single-line ranges per unified-diff convention).
+#[allow(dead_code)]
 fn parse_hunk_range_count(range: &str) -> usize {
     let digits = range.trim_start_matches(['-', '+']);
     if let Some(comma_pos) = digits.find(',') {
@@ -228,6 +286,7 @@ fn parse_hunk_range_count(range: &str) -> usize {
     }
 }
 
+#[allow(dead_code)]
 fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
     if stdout.trim().is_empty() {
         return None;
@@ -367,6 +426,7 @@ fn try_parse_standalone_unified(stdout: &str) -> Option<FileResult> {
 /// (which would violate the compress-never-truncate rule, #317).
 ///
 /// Returns `None` if no file stats were collected (unrecognised format).
+#[allow(dead_code)]
 fn build_file_result(file_stats: Vec<FileStat>) -> Option<FileResult> {
     if file_stats.is_empty() {
         return None;
@@ -494,6 +554,143 @@ mod tests {
         assert!(!args.contains(&"-u".to_string()));
     }
 
+    // ---- A3: prepare_args conflict-detection for non-unified format flags ----
+    //
+    // These flags select a different diff output FORMAT — injecting `-u` on top
+    // would change what the command does (overrides the user's chosen format).
+    // A3 widens the existing "already has unified" guard to cover all format flags
+    // that are incompatible with `-u`.
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_c_context_format() {
+        // -c selects context diff format (incompatible with -u).
+        let mut args = vec!["-c".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: -c (context format) must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_C_N_context_format() {
+        // -C N (context with N lines) selects context diff format.
+        let mut args = vec!["-C".to_string(), "3".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: -C N (context N lines) must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_context_long() {
+        // --context selects context diff format.
+        let mut args = vec!["--context".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: --context must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_y_side_by_side_short() {
+        // -y selects side-by-side format (incompatible with -u).
+        let mut args = vec!["-y".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: -y (side-by-side) must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_side_by_side_long() {
+        // --side-by-side selects side-by-side format.
+        let mut args = vec!["--side-by-side".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: --side-by-side must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_e_ed_format() {
+        // -e selects ed script format (incompatible with -u).
+        let mut args = vec!["-e".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: -e (ed format) must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_n_rcs_format() {
+        // -n selects RCS format (incompatible with -u).
+        let mut args = vec!["-n".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: -n (RCS format) must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_brief_long() {
+        // --brief (report only whether files differ, no content) — incompatible with -u.
+        let mut args = vec!["--brief".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: --brief must suppress -u injection; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn a3_prepare_args_no_inject_when_normal() {
+        // --normal selects the default (normal) diff format — incompatible with -u.
+        let mut args = vec!["--normal".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        prepare_args(&mut args);
+        assert!(
+            !args.contains(&"-u".to_string()),
+            "A3: --normal must suppress -u injection; args={args:?}"
+        );
+    }
+
+    // ---- A3: parse_impl always routes to RawPassthrough ----
+    //
+    // Standalone `diff` is routed to passthrough because the current baseline
+    // is the `-u`-injected output (not the user's literal command), making the
+    // savings guard comparison unfair.  Passthrough is the safe, correct default
+    // until `raw_override` is properly wired for diff (#fidelity-parity-overhaul).
+
+    #[test]
+    fn a3_parse_impl_exits_1_diff_output_is_passthrough() {
+        let input = load_fixture("file", "diff_unified.txt");
+        let output = make_output_full(&input, "", Some(1));
+        let result = parse_impl(&output);
+        assert!(
+            result.is_passthrough(),
+            "A3: parse_impl must return Passthrough for exit-1 diff output; got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn a3_parse_impl_identical_files_is_passthrough() {
+        // Exit code 0, empty stdout: files identical → was Full; A3 makes it Passthrough.
+        let output = make_output_full("", "", Some(0));
+        let result = parse_impl(&output);
+        assert!(
+            result.is_passthrough(),
+            "A3: identical-files (exit 0, empty stdout) must be Passthrough; got {}",
+            result.tier_name()
+        );
+    }
+
     // ---- parse_impl tier tests ----
 
     #[test]
@@ -560,37 +757,38 @@ mod tests {
         );
     }
 
+    /// A3: parse_impl always returns RawPassthrough (fidelity baseline fix).
     #[test]
-    fn test_exit_code_1_is_success() {
+    fn test_exit_code_1_is_passthrough() {
         let input = load_fixture("file", "diff_unified.txt");
         let output = make_output_full(&input, "", Some(1));
         let result = parse_impl(&output);
         assert!(
-            result.is_full(),
-            "Exit code 1 means files differ — should produce Full, got {}",
+            result.is_passthrough(),
+            "A3: exit code 1 (files differ) → RawPassthrough; got {}",
             result.tier_name()
         );
     }
 
+    /// A3: error exit (code 2) is also passthrough.
     #[test]
-    fn test_exit_code_2_is_error() {
+    fn test_exit_code_2_is_passthrough() {
         let output = make_output_full("diff: file not found", "", Some(2));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "Exit code 2 is an error — should be Passthrough, got {}",
+            "Exit code 2 (error) must be Passthrough; got {}",
             result.tier_name()
         );
     }
 
     #[test]
     fn test_tier3_empty_passthrough() {
-        // Non-zero exit, empty output (not exit 0 which means identical)
         let output = make_output_full("", "", Some(2));
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "Empty output on error should be passthrough, got {}",
+            "Empty output on error must be passthrough; got {}",
             result.tier_name()
         );
     }
@@ -841,22 +1039,18 @@ mod tests {
         );
     }
 
+    /// A3: identical-files case (exit 0, empty stdout) → RawPassthrough.
+    /// Previously returned Full with "files are identical" message;
+    /// A3 routes all parse_impl outputs to RawPassthrough.
     #[test]
     fn test_identical_files() {
-        // Exit code 0, empty stdout: files are identical
         let output = make_output_full("", "", Some(0));
         let result = parse_impl(&output);
         assert!(
-            result.is_full(),
-            "Identical files should produce Full result, got {}",
+            result.is_passthrough(),
+            "A3: identical-files (exit 0, empty stdout) → RawPassthrough; got {}",
             result.tier_name()
         );
-        if let ParseResult::Full(fr) = result {
-            assert!(
-                fr.entries.iter().any(|e| e.contains("identical")),
-                "Should report files are identical"
-            );
-        }
     }
 
     // ---- regression tests for security-01 / rust-05: hunk-body-confusion ----
