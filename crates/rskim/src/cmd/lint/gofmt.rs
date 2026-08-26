@@ -37,6 +37,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 /// AD-LINT-21 (2026-04-15) — `.+` captures paths with spaces. Strips `.orig` suffix.

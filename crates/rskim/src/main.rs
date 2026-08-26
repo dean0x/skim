@@ -1010,6 +1010,31 @@ fn process_single_arg(
     process_options: process::ProcessOptions,
     multi_options: multi::MultiFileOptions,
 ) -> anyhow::Result<()> {
+    // B1 / ADR-011: structural passthrough gate for the read path.
+    //
+    // When SKIM_PASSTHROUGH=1, emit raw bytes without any transformation.
+    // This covers both file reads and stdin (the `-` argument).
+    if cmd::is_passthrough_mode() {
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        if file == "-" {
+            // Stdin passthrough: copy bounded stdin → stdout.
+            let buf = cmd::read_stdin_bounded()?;
+            out.write_all(buf.as_bytes())
+                .map_err(|e| anyhow::anyhow!("passthrough write: {e}"))?;
+        } else {
+            // File passthrough: read raw bytes and copy to stdout.
+            // Skip validation (size limits, UTF-8) — the point of passthrough
+            // is byte-faithful forwarding without skim's transform guards.
+            let contents = std::fs::read(file)
+                .map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
+            out.write_all(&contents)
+                .map_err(|e| anyhow::anyhow!("passthrough write: {e}"))?;
+        }
+        return Ok(());
+    }
+
     // Capture cwd on the main thread before any background threads are spawned.
     // (std::env::current_dir is not safe to call from background threads in general.)
     let cwd = std::env::current_dir()

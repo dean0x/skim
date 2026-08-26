@@ -651,6 +651,26 @@ pub(crate) fn dispatch(
         args
     };
 
+    // Structural passthrough convergence gate (B1 / ADR-011).
+    //
+    // `SKIM_PASSTHROUGH=1` bypasses all compression for tool wrappers — the user
+    // explicitly wants the raw OS command output forwarded without re-encoding.
+    //
+    // Excluded: meta subcommands (skim's own management commands — running them
+    // as OS binaries would fail or execute unrelated system programs) and "env"
+    // (PF-012: credential redaction is a security control that must hold
+    // regardless of byte arithmetic; see env.rs for the security invariant).
+    //
+    // This gate sits BEFORE the daemon guard so that `SKIM_PASSTHROUGH=1 skim
+    // vitest` skips the indefinite-command path and reaches the real tool, which
+    // is exactly the documented escape-hatch behavior.
+    if super::is_passthrough_mode()
+        && !super::registry::is_meta_subcommand(subcommand)
+        && subcommand != "env"
+    {
+        return Ok(run_inherited_passthrough(subcommand, args));
+    }
+
     // Daemon / streaming guard (ADR-008 Part C).
     //
     // Commands like `vite`, `npm run dev`, `jest --watch` run indefinitely;

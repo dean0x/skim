@@ -41,6 +41,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 /// Matches MySQL's "Empty set" output.

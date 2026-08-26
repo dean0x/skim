@@ -143,6 +143,7 @@ pub(crate) fn run(
             // cargo test success parses to Full with test counts in the summary — never empty.
             synthesize_success_line: None,
             raw_override: None,
+            never_passthrough: false,
         },
         move |output| parse_impl(output, is_nextest),
         // Stdin fabricates exit 0 (#317 Addendum 2): derive a failure exit

@@ -174,10 +174,17 @@ pub(crate) fn write_result_and_stats(
         report_token_stats(result.original_tokens, result.transformed_tokens, "");
     }
 
-    if result.view_differs
-        && let Some(origin) = crate::output::rewrite_origin()
-        && let Some(marker) = crate::output::rewrite_transparency_marker(&origin, mode_str, 1, 1)
-    {
+    // B3 / ADR-011 class 1: emit lossy-view marker unconditionally when the
+    // view differs from raw bytes.  Previously gated on `SKIM_REWRITTEN_FROM`;
+    // now fires for any lossy read (direct or hook-rewritten).  Not gated by
+    // `SKIM_DEBUG` — this is a loss-bearing marker (class 1), not a no-loss
+    // fallback banner (class 2).
+    if let Some(marker) = crate::output::lossy_view_marker(
+        crate::output::rewrite_origin().as_deref(),
+        mode_str,
+        if result.view_differs { 1 } else { 0 },
+        1,
+    ) {
         eprintln!("{marker}");
     }
 
@@ -641,7 +648,11 @@ pub(crate) fn process_stdin(
     // Transparency marker: did the transformation produce a different view?
     // Compare pre-line-numbers output against raw buffer. When guardrail fired,
     // final_output == buffer so view_differs will be false (correct — raw served).
-    let view_differs = crate::output::rewrite_origin().is_some() && final_output != buffer;
+    //
+    // B3 / ADR-011 class 1: view_differs is unconditional — does NOT require
+    // SKIM_REWRITTEN_FROM to be set. The lossy-view marker fires whenever the
+    // served bytes differ from raw, regardless of how skim was invoked.
+    let view_differs = final_output != buffer;
 
     // Apply line number formatting AFTER guardrail, BEFORE token stats.
     let final_output = apply_line_numbers(
@@ -746,7 +757,9 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // Transparency marker: did transformation produce a different view than raw bytes?
     // Compare pre-line-numbers output to raw contents. When guardrail fired,
     // final_output == contents so view_differs will be false (correct — raw was served).
-    let view_differs = crate::output::rewrite_origin().is_some() && final_output != contents;
+    //
+    // B3 / ADR-011 class 1: unconditional — does NOT require SKIM_REWRITTEN_FROM.
+    let view_differs = final_output != contents;
 
     // Apply line number formatting AFTER guardrail, BEFORE cache write and token stats.
     // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).

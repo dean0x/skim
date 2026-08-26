@@ -277,12 +277,12 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         );
     }
 
-    if view_differs_count > 0
-        && let Some(origin) = crate::output::rewrite_origin()
-    {
+    // B3 / ADR-011 class 1: emit lossy-view marker unconditionally when any
+    // file's view differs from raw bytes.  Previously gated on `SKIM_REWRITTEN_FROM`.
+    if view_differs_count > 0 {
         let mode_str = format!("{:?}", options.process.mode).to_lowercase();
-        if let Some(marker) = crate::output::rewrite_transparency_marker(
-            &origin,
+        if let Some(marker) = crate::output::lossy_view_marker(
+            crate::output::rewrite_origin().as_deref(),
             &mode_str,
             view_differs_count,
             total_paths,

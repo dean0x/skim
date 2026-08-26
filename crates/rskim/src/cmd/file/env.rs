@@ -52,6 +52,12 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    // SECURITY (PF-012): `never_passthrough = true` prevents SKIM_PASSTHROUGH=1
+    // from bypassing the `parse_impl` redaction pass.  Credential redaction is a
+    // non-negotiable safety property — it must hold on ALL paths, including the
+    // SKIM_PASSTHROUGH=1 escape hatch.  Without this flag, execution.rs would
+    // stream raw `printenv` output directly to stdout, leaking secrets.
+    never_passthrough: true,
 };
 
 /// Regex to detect and redact URL credentials: scheme://user:pass@host

@@ -407,6 +407,21 @@ pub(crate) struct ParsedCommandConfig<'a> {
     /// Default: `None` (guard operates on `output.stdout`; passthrough streams
     /// the injected command unchanged — pre-fix behavior).
     pub raw_override: Option<String>,
+    /// When `true`, SKIM_PASSTHROUGH=1 does NOT bypass this handler's parse_impl.
+    ///
+    /// Normally, `SKIM_PASSTHROUGH=1` bypasses all compression and streams the
+    /// raw tool output directly to stdout.  For handlers where the parse_impl
+    /// is a **security control** (not just a compression step), bypassing it would
+    /// violate a non-negotiable invariant.
+    ///
+    /// Currently set for: `env` / `printenv` — credential redaction (PF-012).
+    ///
+    /// PF-012 rationale: a security control that holds on only ONE branch of a
+    /// conditional is not a control.  `skim env` MUST redact credential values
+    /// regardless of byte arithmetic or passthrough mode.
+    ///
+    /// Default: `false` (passthrough bypasses parse_impl as normal).
+    pub never_passthrough: bool,
 }
 
 /// How a child process's exit status should steer output handling. (#317)
@@ -856,6 +871,7 @@ where
         skip_net_savings_guard,
         synthesize_success_line,
         raw_override,
+        never_passthrough,
     } = config;
 
     // Passthrough mode: bypass all compression and forward raw output.
@@ -866,7 +882,12 @@ where
     // non-UTF-8 bytes to U+FFFD, and cannot deliver anything until the child
     // exits.  Branching after it would inherit all three defects no matter how
     // the bytes were subsequently written.  Streaming here is what removes them.
-    let passthrough = is_passthrough_mode();
+    //
+    // `never_passthrough = true` (PF-012) permanently disables this shortcut for
+    // handlers where parse_impl is a security control (e.g. `env` / `printenv`
+    // credential redaction).  SKIM_PASSTHROUGH=1 bypasses compression, not
+    // non-negotiable safety properties.
+    let passthrough = is_passthrough_mode() && !never_passthrough;
     if passthrough && !use_stdin {
         // A1: when the handler pre-captured the user's literal command output,
         // emit those bytes instead of streaming the (potentially injected) command.
@@ -1235,6 +1256,14 @@ pub(crate) struct ToolRunConfig<'a> {
     ///
     /// Default: `None`.
     pub raw_override: Option<String>,
+    /// Prevent SKIM_PASSTHROUGH=1 from bypassing this handler's parse_impl.
+    ///
+    /// See [`ParsedCommandConfig::never_passthrough`] for full rationale.
+    /// Set to `true` only for handlers where parse_impl is a security control
+    /// (currently: `env` / `printenv` credential redaction — PF-012).
+    ///
+    /// Default: `false`.
+    pub never_passthrough: bool,
 }
 
 /// Returns the line to synthesize when skim's format-flag injection caused
@@ -1321,6 +1350,7 @@ where
             skip_net_savings_guard: config.skip_net_savings_guard,
             synthesize_success_line: effective_success_line,
             raw_override: config.raw_override,
+            never_passthrough: config.never_passthrough,
         },
         parse_fn,
     )
@@ -2243,6 +2273,7 @@ mod tests {
             skip_net_savings_guard: false,
             synthesize_success_line: None,
             raw_override: Some(override_bytes),
+            never_passthrough: false,
         };
         // If we reach here, the field exists and accepts an owned String.
     }
@@ -2263,6 +2294,7 @@ mod tests {
             synthesize_success_line: None,
             injected_format_flag: None,
             raw_override: Some("user output\n".to_string()),
+            never_passthrough: false,
         };
         assert!(
             config.raw_override.is_some(),

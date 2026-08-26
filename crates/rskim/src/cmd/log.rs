@@ -74,6 +74,19 @@ pub(crate) fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
+    // B1 / ADR-011: passthrough gate for the `log` meta-subcommand.
+    // `log` is META (not a PATH-wrapper target) so it is excluded from the
+    // dispatch-level convergence gate. We must add it here explicitly.
+    // When SKIM_PASSTHROUGH=1, copy stdin → stdout with no compression.
+    if super::is_passthrough_mode() {
+        let stdin_buf = super::read_stdin_bounded()?;
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        out.write_all(stdin_buf.as_bytes())
+            .map_err(|e| anyhow::anyhow!("skim log passthrough write: {e}"))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // Issue 1: check terminal BEFORE flag parsing, regardless of args.
     // Without this, `skim log --keep-debug` with no pipe hangs on stdin.
     if io::stdin().is_terminal() {

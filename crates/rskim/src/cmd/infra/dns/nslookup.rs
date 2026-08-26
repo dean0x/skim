@@ -54,6 +54,7 @@ const CONFIG_DIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
@@ -71,6 +72,7 @@ const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 // ============================================================================

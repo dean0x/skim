@@ -55,23 +55,40 @@ fn test_transparency_marker_fires_on_tagged_pseudo_read() {
 }
 
 // ============================================================================
-// Marker is silent without origin tag
+// Marker fires without origin tag when view differs (B3 behavior)
 // ============================================================================
 
-/// Explicit `skim file.rs --mode=pseudo` without the env tag must NOT emit a marker.
-/// This prevents false positives on direct skim invocations.
+/// After B3: `skim file.ts --mode=pseudo` without the env tag DOES emit a
+/// lossy-view marker when the pseudo view differs from raw bytes.
+///
+/// ADR-011 class 1: loss-bearing markers are unconditional — they do not
+/// require `SKIM_REWRITTEN_FROM` to be set.
+///
+/// Previously: "must NOT emit a marker" (pre-B3 behavior).
+/// Now: marker fires whenever view_differs (B3 generalization).
 #[test]
-fn test_no_marker_without_origin_tag() {
+fn test_lossy_marker_fires_without_origin_tag_b3() {
     let dir = TempDir::new().unwrap();
-    let file = dir.path().join("lib.rs");
-    fs::write(&file, "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+    let file = dir.path().join("lib.ts");
+    // TypeScript pseudo mode strips `: number` parameter type annotations →
+    // the transformed view differs from raw bytes → marker fires.
+    // (Rust pseudo mode on a trivially simple function may return the raw
+    // content unchanged, making view_differs=false and producing no marker.)
+    fs::write(
+        &file,
+        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+    )
+    .unwrap();
 
     skim_cmd()
         .arg(&file)
         .arg("--mode=pseudo")
+        .arg("--no-cache")
         .assert()
         .success()
-        .stderr(predicate::str::contains("[skim] transformed view").not());
+        // B3: marker fires even without SKIM_REWRITTEN_FROM.
+        .stderr(predicate::str::contains("[skim]"))
+        .stderr(predicate::str::contains("pseudo"));
 }
 
 // ============================================================================
@@ -91,7 +108,8 @@ fn test_no_marker_when_output_equals_raw_full_mode() {
         .arg("--mode=full")
         .assert()
         .success()
-        .stderr(predicate::str::contains("[skim] transformed view").not());
+        // B3: marker still silent when view_differs=false (output == raw bytes).
+        .stderr(predicate::str::is_empty());
 }
 
 // ============================================================================
@@ -174,9 +192,11 @@ fn test_transparency_marker_names_structure_mode() {
         .stderr;
     let stderr = String::from_utf8_lossy(&stderr_bytes);
 
+    // B3/B4: the marker fires unconditionally when view differs and names the mode.
+    // With SKIM_REWRITTEN_FROM=cat, the format is: "[skim] transformed view (cat → skim
+    // --mode=structure): structure view: bodies removed — SKIM_PASSTHROUGH=1 for raw output"
     // Either the view differs (marker fires naming "structure") or it doesn't (no marker).
-    // If it fires, the mode name must be "structure", not "pseudo".
-    if stderr.contains("[skim] transformed view") {
+    if !stderr.is_empty() {
         assert!(
             stderr.contains("structure"),
             "transparency marker must name 'structure' mode; got: {stderr}"
@@ -257,8 +277,10 @@ fn test_multi_file_aggregate_marker_emitted_once() {
         marker_count, 1,
         "multi-file transparency marker must appear exactly once; got {marker_count} occurrences in stderr:\n{stderr}"
     );
+    // B4 format: "... <class description>: 2/2 files — SKIM_PASSTHROUGH=1 for raw output"
+    // (old format was "2/2 files not raw bytes")
     assert!(
-        stderr.contains("2/2 files not raw bytes"),
+        stderr.contains("2/2 files"),
         "multi-file marker must show 2/2 count; got: {stderr}"
     );
 }

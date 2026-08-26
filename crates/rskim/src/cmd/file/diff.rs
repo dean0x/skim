@@ -62,6 +62,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 /// Run `skim diff [args...]`.
@@ -573,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn a3_prepare_args_no_inject_when_C_N_context_format() {
+    fn a3_prepare_args_no_inject_when_c_n_context_format() {
         // -C N (context with N lines) selects context diff format.
         let mut args = vec!["-C".to_string(), "3".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
         prepare_args(&mut args);

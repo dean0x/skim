@@ -46,6 +46,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 /// Global docker flags that accept a value in the following token.

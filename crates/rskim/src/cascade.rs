@@ -36,12 +36,18 @@ pub(crate) fn build_config(mode: Mode, trunc: &TruncationOptions) -> TransformCo
 }
 
 /// Build a `TransformConfig` with explicit line_numbers flag.
+///
+/// B5 / ADR-011: always wires `elision_hint` so that every truncation/elision
+/// marker produced by rskim-core carries the `SKIM_PASSTHROUGH=1 for full
+/// output` remedy clause when the CLI calls this builder.
 pub(crate) fn build_config_with_opts(
     mode: Mode,
     trunc: &TruncationOptions,
     line_numbers: bool,
 ) -> TransformConfig {
-    let mut config = TransformConfig::with_mode(mode).with_line_numbers(line_numbers);
+    let mut config = TransformConfig::with_mode(mode)
+        .with_line_numbers(line_numbers)
+        .with_elision_hint("SKIM_PASSTHROUGH=1 for full output");
     if let Some(n) = trunc.max_lines {
         config = config.with_max_lines(n);
     }
@@ -73,12 +79,15 @@ fn fallback_line_truncate(
         "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
         mode.name(),
     );
+    // B5: pass the CLI-level remedy hint so the token-budget truncation marker
+    // carries "SKIM_PASSTHROUGH=1 for full output" (ADR-011 class 1).
     let truncated = truncate_to_token_budget(
         output,
         language,
         token_budget,
         count_tokens_or_max,
         known_token_count,
+        Some("SKIM_PASSTHROUGH=1 for full output"),
     )?;
     Ok((truncated, mode))
 }

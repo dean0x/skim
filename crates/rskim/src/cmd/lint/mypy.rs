@@ -36,6 +36,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: Some("mypy OK 0 issues"),
     injected_format_flag: Some("--output"),
     raw_override: None,
+    never_passthrough: false,
 };
 
 // Static regex pattern compiled once via LazyLock.

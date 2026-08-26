@@ -40,6 +40,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,
+    never_passthrough: false,
 };
 
 /// Maximum byte length of JSON input accepted for Tier 1 parsing.

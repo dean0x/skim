@@ -608,14 +608,48 @@ pub(crate) fn rewrite_origin() -> Option<String> {
     }
 }
 
-/// Build a transparency marker for hook-rewritten file reads.
+/// Map a mode name to a human-readable class description (B4 / ADR-011 class 1).
 ///
-/// Returns `None` when `differing == 0` (view is byte-identical to raw bytes).
+/// The class label names what was elided so the reader knows what information
+/// they are missing without needing to know skim internals.
+fn mode_class_label(mode_str: &str) -> &'static str {
+    match mode_str {
+        "pseudo" => "pseudo view: bodies and syntactic detail removed",
+        "minimal" => "minimal view: comments and bodies removed",
+        "structure" => "structure view: bodies removed",
+        "signatures" => "signatures view: bodies removed",
+        "types" => "types view: non-type declarations removed",
+        _ => "transformed view",
+    }
+}
+
+/// Lossy-view marker for file reads (B3 / ADR-011 class 1 — unconditional).
 ///
-/// Single file: `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`
-/// Multi-file:  `[skim] transformed view (cat → skim --mode=pseudo): 2/3 files not raw bytes — SKIM_PASSTHROUGH=1 for raw output`
-pub(crate) fn rewrite_transparency_marker(
-    origin: &str,
+/// Fires whenever the served view differs from raw bytes, regardless of whether
+/// the read was triggered by a hook rewrite (`SKIM_REWRITTEN_FROM`) or an
+/// explicit `skim <file>` invocation.  This is an ADR-011 class 1 marker:
+/// it is unconditional and NOT gated by `SKIM_DEBUG`.
+///
+/// Returns `None` when `differing == 0` (view is byte-identical to raw).
+///
+/// # Marker format
+///
+/// With hook-rewrite origin (e.g. `SKIM_REWRITTEN_FROM=cat`):
+/// ```text
+/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// ```
+///
+/// Without origin (explicit `skim file.ts --mode=pseudo`):
+/// ```text
+/// [skim] pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// ```
+///
+/// Multi-file (with or without origin):
+/// ```text
+/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: 2/3 files — SKIM_PASSTHROUGH=1 for raw output
+/// ```
+pub(crate) fn lossy_view_marker(
+    origin: Option<&str>,
     mode_str: &str,
     differing: usize,
     total: usize,
@@ -623,67 +657,114 @@ pub(crate) fn rewrite_transparency_marker(
     if differing == 0 {
         return None;
     }
-    let inner = if total <= 1 {
-        "not raw file bytes".to_string()
-    } else {
-        format!("{differing}/{total} files not raw bytes")
+    let class = mode_class_label(mode_str);
+    let suffix = " \u{2014} SKIM_PASSTHROUGH=1 for raw output";
+
+    let marker = match (origin, total) {
+        // Hook-rewritten, single file
+        (Some(orig), n) if n <= 1 => format!(
+            "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}{suffix}"
+        ),
+        // Hook-rewritten, multi-file
+        (Some(orig), _) => format!(
+            "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}: {differing}/{total} files{suffix}"
+        ),
+        // Direct invocation, single file
+        (None, n) if n <= 1 => format!("[skim] {class}{suffix}"),
+        // Direct invocation, multi-file
+        (None, _) => format!("[skim] {class}: {differing}/{total} files{suffix}"),
     };
-    Some(format!(
-        "[skim] transformed view ({origin} \u{2192} skim --mode={mode_str}): {inner} — SKIM_PASSTHROUGH=1 for raw output"
-    ))
+    Some(marker)
+}
+
+/// Compatibility alias: `rewrite_transparency_marker` is superseded by
+/// `lossy_view_marker` (B3). Retained for any callers that have not been
+/// migrated yet; delegates with `origin = Some(origin_str)`.
+///
+/// DEPRECATED: use `lossy_view_marker(Some(origin), mode_str, differing, total)`.
+#[allow(dead_code)]
+pub(crate) fn rewrite_transparency_marker(
+    origin: &str,
+    mode_str: &str,
+    differing: usize,
+    total: usize,
+) -> Option<String> {
+    lossy_view_marker(Some(origin), mode_str, differing, total)
 }
 
 #[cfg(test)]
 mod rewrite_transparency_tests {
     use super::*;
 
+    // B3/B4: tests migrated to lossy_view_marker (the superseding function).
+    // The rewrite_transparency_marker compatibility alias delegates to it.
+
     #[test]
-    fn test_rewrite_transparency_marker_single_differing() {
-        let result = rewrite_transparency_marker("cat", "pseudo", 1, 1);
-        assert_eq!(
-            result,
-            Some(
-                "[skim] transformed view (cat \u{2192} skim --mode=pseudo): not raw file bytes \
-                 — SKIM_PASSTHROUGH=1 for raw output"
-                    .to_string()
-            )
-        );
+    fn test_lossy_view_marker_with_origin_single_file() {
+        // With origin: "transformed view" header + class description.
+        let result = lossy_view_marker(Some("cat"), "pseudo", 1, 1);
+        let marker = result.expect("differing=1 must produce a marker");
+        assert!(marker.contains("[skim] transformed view"), "must have header");
+        assert!(marker.contains("cat"), "must name origin");
+        assert!(marker.contains("pseudo"), "must name mode");
+        assert!(marker.contains("bodies"), "B4: must name elided class");
+        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "must carry remedy hint");
     }
 
     #[test]
-    fn test_rewrite_transparency_marker_multi_file() {
-        let result = rewrite_transparency_marker("cat", "pseudo", 2, 3);
-        assert_eq!(
-            result,
-            Some(
-                "[skim] transformed view (cat \u{2192} skim --mode=pseudo): 2/3 files not raw bytes \
-                 — SKIM_PASSTHROUGH=1 for raw output"
-                    .to_string()
-            )
-        );
+    fn test_lossy_view_marker_with_origin_multi_file() {
+        let result = lossy_view_marker(Some("cat"), "pseudo", 2, 3);
+        let marker = result.expect("differing=2 must produce a marker");
+        assert!(marker.contains("transformed view"), "must have header");
+        assert!(marker.contains("2/3"), "must have file counts");
+        assert!(marker.contains("pseudo"), "must name mode");
+        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "must carry remedy hint");
     }
 
     #[test]
-    fn test_rewrite_transparency_marker_zero_differing_returns_none() {
-        assert_eq!(rewrite_transparency_marker("cat", "pseudo", 0, 1), None);
-        assert_eq!(rewrite_transparency_marker("tail", "structure", 0, 5), None);
+    fn test_lossy_view_marker_without_origin_direct_invocation() {
+        // B3: fires without SKIM_REWRITTEN_FROM — no "transformed view" header.
+        let result = lossy_view_marker(None, "pseudo", 1, 1);
+        let marker = result.expect("differing=1 must produce a marker");
+        // B4: class label is the primary identifier for direct invocations.
+        assert!(marker.contains("pseudo"), "must name mode class");
+        assert!(marker.contains("bodies"), "B4: must name elided class");
+        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "must carry remedy hint");
     }
 
     #[test]
-    fn test_rewrite_transparency_marker_head_structure() {
-        let m = rewrite_transparency_marker("head", "structure", 1, 1)
+    fn test_lossy_view_marker_zero_differing_returns_none() {
+        assert_eq!(lossy_view_marker(Some("cat"), "pseudo", 0, 1), None);
+        assert_eq!(lossy_view_marker(None, "structure", 0, 5), None);
+    }
+
+    #[test]
+    fn test_lossy_view_marker_head_structure_b4() {
+        let m = lossy_view_marker(Some("head"), "structure", 1, 1)
             .expect("head + differing=1 must produce a marker");
         assert!(m.contains("head"), "marker must name the origin command");
         assert!(m.contains("structure"), "marker must name the mode");
-        assert!(
-            m.contains("SKIM_PASSTHROUGH=1"),
-            "marker must include passthrough hint"
-        );
+        assert!(m.contains("SKIM_PASSTHROUGH=1"), "marker must include passthrough hint");
+        // B4: structure class is named
+        assert!(m.contains("bodies removed"), "B4: structure marker must name 'bodies removed'");
     }
 
     #[test]
     fn test_rewrite_origin_env_constant() {
         assert_eq!(REWRITE_ORIGIN_ENV, "SKIM_REWRITTEN_FROM");
+    }
+
+    #[test]
+    fn test_mode_class_labels_cover_all_known_modes() {
+        // Ensure mode_class_label returns meaningful strings for all known modes.
+        for mode in &["pseudo", "minimal", "structure", "signatures", "types"] {
+            let label = super::mode_class_label(mode);
+            assert!(!label.is_empty(), "class label must be non-empty for mode {mode}");
+            assert!(
+                label.len() > "transformed view".len(),
+                "B4: class label must be more descriptive than 'transformed view' for mode {mode}"
+            );
+        }
     }
 }
 
