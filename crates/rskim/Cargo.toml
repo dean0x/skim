@@ -21,6 +21,13 @@ rskim-compress = { path = "../rskim-compress" }
 # Enabling pulls tokio/hyper/rustls into the tree; default builds are HTTP/TLS-free (AC9).
 rskim-contract = { path = "../rskim-contract", optional = true }
 rskim-proxy = { path = "../rskim-proxy", optional = true }
+# rskim-align: pure sync crate; optional under `proxy` feature so it is only
+# linked when the proxy subcommand is built. The crate itself has no hyper/tokio
+# deps (AC9 / AD-CA-1); pulling it in here does NOT break ADR-008. The binary
+# is the correct link point for both rskim-proxy (async) and rskim-align (sync).
+# AD-CA-9: record type + schema migration are unconditional; only the writer
+# wiring (ChannelAlignmentRecorder, CacheAlignStage) is proxy-gated.
+rskim-align = { path = "../rskim-align", optional = true }
 rskim-search = { path = "../rskim-search" }
 # Delegates token counting to the multi-provider library (AC13, AC15).
 # Do NOT enable "net-anthropic" here — default build must remain HTTP-free (AC9).
@@ -58,7 +65,7 @@ toml = { workspace = true }
 # Non-default gate for the `skim proxy` subcommand (#352). Enabling pulls
 # tokio/hyper/rustls into the tree. Default builds have no proxy subcommand
 # (AC9: HTTP/TLS-free default tree). Release binaries enable it (release.yml).
-proxy = ["dep:rskim-proxy", "dep:rskim-contract"]
+proxy = ["dep:rskim-proxy", "dep:rskim-contract", "dep:rskim-align"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

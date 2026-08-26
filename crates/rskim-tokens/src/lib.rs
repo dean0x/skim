@@ -75,7 +75,7 @@ pub mod heuristic;
 pub mod net;
 
 pub use counter::Counter;
-pub use encoding::{Encoding, encoding_for_model};
+pub use encoding::{Encoding, Provider, encoding_for_model, encoding_for_provider_model};
 pub use error::TokenError;
 
 /// Crate-level `Result` alias — mirrors the `rskim-core` / `rskim-search` workspace

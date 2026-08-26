@@ -4,11 +4,11 @@
 //! ## AD-AN-10 — feature-gated bridge, ungated core
 //!
 //! Only this module and the `run()` wiring in `cmd/proxy.rs` are
-//! `#[cfg(feature = "proxy")]`. Schema v4, `record_proxy`, `select_encoding`,
-//! and the stats breakdowns compile and are reachable in the default build
-//! (they use `rusqlite` + `rskim-tokens`, both default deps — no `rskim-proxy`
-//! type). A default-build compile + reachability check is an AC (AC22 /
-//! challenge #14). Applies ADR-008.
+//! `#[cfg(feature = "proxy")]`. Schema v4, `record_proxy`,
+//! `encoding_for_provider_model`, and the stats breakdowns compile and are
+//! reachable in the default build (they use `rusqlite` + `rskim-tokens`, both
+//! default deps — no `rskim-proxy` type). A default-build compile +
+//! reachability check is an AC (AC22 / challenge #14). Applies ADR-008.
 //!
 //! ## AD-AN-8 — bounded proxy recording queue (records AND bytes)
 //!
@@ -39,9 +39,7 @@ use rskim_proxy::analytics::{AnalyticsHook, ProxyEvent};
 use rskim_proxy::config::DEFAULT_GRACEFUL_DRAIN_SECS;
 use rskim_proxy::detect::ProxyProvider;
 
-use crate::analytics::{
-    AnalyticsDb, ProxyBlockDecision, ProxyRecordInput, RecordingProvider, select_encoding,
-};
+use crate::analytics::{AnalyticsDb, ProxyBlockDecision, ProxyRecordInput, RecordingProvider};
 
 // ============================================================================
 // Bounded-queue constants (AD-AN-8 / ADR-003 / PF-005)
@@ -221,14 +219,14 @@ pub(crate) fn event_payload_bytes(event: &ProxyEvent) -> u64 {
 /// Token counting happens HERE on the consumer thread, never on the request
 /// path (AC14 / AD-AN-8).
 ///
-/// Cross-Plan Amendment #5 (#306 forward annotation): #305 swaps:
+/// Cross-Plan Amendment #4 (fulfilled): #305 swaps:
 /// - `NullSink` → `ChannelDecisionSink` (collector) in `server.rs:422`
 /// - `NoopAnalyticsHook` → real `BridgeAnalyticsHook` here in `proxy.rs:238`
 ///
-/// When #306's `AlignmentRecorder` consumer lands, it must adopt the same
-/// bounded lifecycle established here — one `recv_timeout(FLUSH_BOUND)`
-/// gate per proxy startup in `proxy.rs` (Cross-Plan Amendment #4 / ADR-003).
-/// Do NOT add a second divergent `flush_pending()` drain for #306.
+/// #306's `AlignmentRecorder` consumer adopts the same bounded lifecycle:
+/// `ChannelAlignmentRecorder::new_boxed` returns the thread handle and done
+/// channel in `AlignmentRecorderBundle` so `proxy.rs` joins it under the
+/// same `recv_timeout(FLUSH_BOUND)` pattern (ADR-003 / Cross-Plan Amendment #4).
 ///
 /// `db_path` is the injected database location: `None` resolves through
 /// `AnalyticsDb::open_default()` (the production path, honouring
@@ -311,8 +309,12 @@ fn to_recording_provider(provider: &ProxyProvider) -> RecordingProvider {
     match provider {
         ProxyProvider::Anthropic => RecordingProvider::Anthropic,
         ProxyProvider::OpenAI => RecordingProvider::OpenAI,
-        // `#[non_exhaustive]` wildcard — any future ProxyProvider variant falls
-        // back to Unknown, which stores NULL in the provider column.
+        // `#[non_exhaustive]` wildcard: `ProxyProvider` is a foreign
+        // `#[non_exhaustive]` enum, so exhaustive matching is impossible here.
+        // A future `ProxyProvider::Google` therefore silently maps to Unknown
+        // (→ `Provider::Unknown` → `Encoding::Heuristic`, basis = "heuristic").
+        // See the `Provider` rustdoc in `rskim-tokens/src/encoding.rs` for the
+        // full gap analysis and why this cannot be made a compile error.
         _ => RecordingProvider::Unknown,
     }
 }
@@ -338,9 +340,10 @@ fn to_recording_provider(provider: &ProxyProvider) -> RecordingProvider {
 ///
 /// ## AD-AN-11 — one encoding source of truth
 ///
-/// `select_encoding(recording_provider, model)` is called once; the returned
-/// `Encoding` is used to build a single `Counter` that counts **both** the raw
-/// and the final body, so both sides use the same tokeniser instance.
+/// `rskim_tokens::encoding_for_provider_model(recording_provider, model)` is
+/// called once; the returned `Encoding` is used to build a single `Counter`
+/// that counts **both** the raw and the final body, so both sides use the same
+/// tokeniser instance.
 pub(crate) fn compute_token_counts(
     event: &ProxyEvent,
     recording_provider: &RecordingProvider,
@@ -356,7 +359,10 @@ pub(crate) fn compute_token_counts(
     };
 
     // AD-AN-11: single encoding derived from provider + model.
-    let encoding = select_encoding(recording_provider, event.model.as_deref());
+    let encoding = rskim_tokens::encoding_for_provider_model(
+        (*recording_provider).into(),
+        event.model.as_deref(),
+    );
 
     // AD-AN-7: one Counter instance for both sides (same encoding — never mix).
     let counter = match rskim_tokens::Counter::new(encoding) {
@@ -825,14 +831,16 @@ mod tests {
 
         assert!(consumer_finished, "consumer must finish — no panic or hang");
 
-        // PF-007 discriminating: with set_busy_timeout(100ms) each BUSY wait is
+        // PF-007/ADR-003 discriminating: with set_busy_timeout(100ms) each BUSY wait is
         // capped at ~100ms → 3 × 100ms ≈ 300ms total.  Without the cap the
         // fallback from AnalyticsDb::open is 5000ms/event → ~15s total.
-        // Deleting proxy_analytics.rs line 262 must fail this assertion.
+        // 5s bound: observed 2.115s on CI (run 32871027659) with ~2.4× headroom.
+        // The discriminating property is the ~3× gap to the ~15s uncapped path,
+        // not the absolute value.  Deleting proxy_analytics.rs line 262 must fail.
         assert!(
-            elapsed < std::time::Duration::from_millis(2_000),
+            elapsed < std::time::Duration::from_millis(5_000),
             "AC15 busy_timeout cap: drained {N_EVENTS} events under exclusive lock in \
-             {elapsed:?}; expected < 2s (each BUSY capped at 100ms). Without \
+             {elapsed:?}; expected < 5s (each BUSY capped at 100ms). Without \
              set_busy_timeout(100ms) the fallback is 5000ms/event (~15s total)."
         );
 

@@ -205,6 +205,36 @@ pub trait TransformStage: Send + Sync {
     /// Always returns `Outcome` (no error variant). Passthrough when the stage
     /// cannot or should not modify the body.
     fn apply(&self, body: &[u8], ctx: &TransformContext<'_>, sink: &dyn DecisionSink) -> Outcome;
+
+    /// Maximum number of bytes by which this stage's output is permitted to exceed
+    /// its input.
+    ///
+    /// # AD-CA-5 / AD-PXY-21 — Per-stage growth allowance for `#306`
+    ///
+    /// The default is `0` (never-inflate: output MUST be ≤ input bytes). This keeps
+    /// `BlockRouterStage` (`#304`) and `#307` byte-identical after the `#306` seam
+    /// extension — they never override this method and therefore always pass the strict
+    /// zero-growth gate.
+    ///
+    /// `CacheAlignStage` (`#306`) overrides this to return `2 × MARKER_BYTES` (74),
+    /// reflecting the maximum of two `cache_control` marker injections it may perform.
+    /// The seam passes this value to `guarded_transform_with_growth` so the gate
+    /// accepts the growth while the sink-failure rule (invariant 8) and the `Modified`
+    /// `DecisionRecord` are preserved via the single-home implementation.
+    ///
+    /// # Arguments
+    ///
+    /// - `_input_len` — byte length of the stage's input (the pre-stage body). Provided
+    ///   so growth can be expressed as a function of input size if needed; the default
+    ///   ignores it (constant zero).
+    ///
+    /// # Non-breaking default
+    ///
+    /// Adding this method to the trait is backward-compatible: all existing `TransformStage`
+    /// implementors receive the zero-growth default and are unaffected.
+    fn max_growth(&self, _input_len: usize) -> usize {
+        0
+    }
 }
 
 // ============================================================================
@@ -352,7 +382,7 @@ impl TransformPipeline {
         ctx: &TransformContext<'_>,
         sink: &dyn DecisionSink,
     ) -> Outcome {
-        use rskim_contract::guardrail::guarded_transform;
+        use rskim_contract::guardrail::guarded_transform_with_growth;
 
         // AD-PXY-02: Unknown provider → bypass transform seam entirely.
         // The seam is skipped; the forward layer routes to default upstream or 502.
@@ -415,11 +445,28 @@ impl TransformPipeline {
                 current = stage_output;
             } else {
                 // Stage proposed a modification — run through the gate.
-                // guarded_transform enforces candidate_len <= input_len and records
-                // a Modified DecisionRecord; falls back to passthrough if the gate
-                // rejects inflation.
-                let gated =
-                    guarded_transform(pre_stage, stage_output, ctx.request_id, stage.name(), sink);
+                //
+                // AD-CA-5 / AD-PXY-21 — growth-aware gate (single call site).
+                //
+                // `guarded_transform_with_growth` enforces `candidate_len ≤ pre_stage.len()
+                // + stage.max_growth(pre_stage.len())`, records a Modified DecisionRecord,
+                // and falls back to passthrough if the gate rejects (or sink is full).
+                //
+                // For all stages that do not override `max_growth` (including #304
+                // BlockRouterStage and #307), `max_growth` returns 0 — byte-identical
+                // behaviour to the former `guarded_transform` call (AC21 regression).
+                //
+                // For #306 CacheAlignStage, `max_growth` returns `2 × MARKER_BYTES`
+                // so the gate accepts the bounded growth while preserving invariant 8.
+                let growth = stage.max_growth(pre_stage.len());
+                let gated = guarded_transform_with_growth(
+                    pre_stage,
+                    stage_output,
+                    growth,
+                    ctx.request_id,
+                    stage.name(),
+                    sink,
+                );
                 current = gated.bytes;
             }
         }
@@ -558,6 +605,254 @@ mod tests {
         assert!(
             outcome.is_passthrough(),
             "contract adapter must return passthrough outcome"
+        );
+    }
+
+    // ========================================================================
+    // AC21 — max_growth regression: seam preserves #304/#307 byte-identity
+    //        and enforces the per-stage growth cap (AD-CA-5 / AD-PXY-21).
+    // ========================================================================
+
+    /// AC21 (NEGATIVE, seam regression): a modifying stage with default max_growth=0
+    /// that returns shrunk output must pass the gate — byte-identical to before #306.
+    ///
+    /// Discriminating: if the seam accidentally used a non-zero growth default,
+    /// a stage output that should fail could incorrectly pass.
+    #[test]
+    fn test_seam_default_max_growth_zero_pass() {
+        // A stage that shrinks its input (always passes the strict zero-growth gate).
+        struct ShrinkStage;
+        impl TransformStage for ShrinkStage {
+            fn name(&self) -> &'static str {
+                "shrink"
+            }
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                _sink: &dyn DecisionSink,
+            ) -> Outcome {
+                // Return half the body (a shrinking modification).
+                let half = &body[..body.len() / 2];
+                Outcome::modified(half.to_vec(), body.len(), ctx.request_id, self.name())
+            }
+        }
+
+        let body = b"hello world extended".to_vec(); // 20 bytes
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext {
+            provider: ProxyProvider::Anthropic,
+            auth_mode: AuthMode::ApiKey,
+            request_id: "ac21-a",
+            headers: &hv,
+        };
+        let sink = MockSink::new();
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(ShrinkStage)]);
+        let outcome = pipeline.run(body, &ctx, &sink);
+        // Half of 20 bytes = 10 bytes — well within zero-growth gate.
+        assert_eq!(
+            outcome.bytes.len(),
+            10,
+            "shrink must pass the zero-growth gate"
+        );
+    }
+
+    /// AC21 (NEGATIVE, seam regression): a stage with default max_growth=0 that
+    /// attempts to inflate is rejected to passthrough — the gate enforces zero-growth.
+    ///
+    /// Discriminating: if `guarded_transform_with_growth` is called with max_growth=0
+    /// and the candidate exceeds input length, the outcome MUST be the input (passthrough).
+    /// Deleting the gate call would let the inflated output through.
+    #[test]
+    fn test_seam_default_max_growth_zero_reject_inflate() {
+        // A stage that tries to inflate its output.
+        struct InflateStage;
+        impl TransformStage for InflateStage {
+            fn name(&self) -> &'static str {
+                "inflate"
+            }
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                _sink: &dyn DecisionSink,
+            ) -> Outcome {
+                let mut out = body.to_vec();
+                out.extend_from_slice(b"EXTRA_BYTES");
+                Outcome::modified(out, body.len(), ctx.request_id, self.name())
+            }
+        }
+
+        let body = b"original".to_vec(); // 8 bytes
+        let original = body.clone();
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext {
+            provider: ProxyProvider::Anthropic,
+            auth_mode: AuthMode::ApiKey,
+            request_id: "ac21-b",
+            headers: &hv,
+        };
+        let sink = MockSink::new();
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(InflateStage)]);
+        let outcome = pipeline.run(body, &ctx, &sink);
+        // Gate must reject the inflation and fall back to the pre-stage input.
+        assert_eq!(
+            outcome.bytes, original,
+            "inflate stage with max_growth=0 must be rejected to passthrough"
+        );
+    }
+
+    /// AC21 (POSITIVE): a waivered stage with max_growth > 0 can inflate up to the allowance.
+    ///
+    /// Discriminating: if `max_growth` is ignored (always zero), a waivered stage's
+    /// growth would be incorrectly rejected and forwarded as the pre-stage bytes.
+    #[test]
+    fn test_seam_waivered_stage_growth_accepted() {
+        const GROWTH: usize = 37; // One MARKER_BYTES worth of growth
+
+        // A stage that inflates by exactly GROWTH bytes and declares that allowance.
+        struct WaivedGrowthStage;
+        impl TransformStage for WaivedGrowthStage {
+            fn name(&self) -> &'static str {
+                "waived-grow"
+            }
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                _sink: &dyn DecisionSink,
+            ) -> Outcome {
+                let mut out = body.to_vec();
+                // Append exactly GROWTH bytes to simulate marker injection.
+                out.extend(std::iter::repeat_n(b'M', GROWTH));
+                Outcome::modified(out, body.len(), ctx.request_id, self.name())
+            }
+            fn max_growth(&self, _input_len: usize) -> usize {
+                GROWTH
+            }
+        }
+
+        let body = b"input body bytes".to_vec(); // 16 bytes
+        let expected_len = body.len() + GROWTH;
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext {
+            provider: ProxyProvider::Anthropic,
+            auth_mode: AuthMode::ApiKey,
+            request_id: "ac21-c",
+            headers: &hv,
+        };
+        let sink = MockSink::new();
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(WaivedGrowthStage)]);
+        let outcome = pipeline.run(body, &ctx, &sink);
+        assert_eq!(
+            outcome.bytes.len(),
+            expected_len,
+            "waivered stage growth within allowance must pass the gate"
+        );
+    }
+
+    /// AC21 (NEGATIVE, invariant 8): a waivered stage with SinkFull falls back to
+    /// passthrough — the marker is NOT injected even with growth allowance.
+    ///
+    /// Discriminating: if the SinkFull branch of `guarded_transform_with_growth` is
+    /// removed, the inflated output would be forwarded without a decision record,
+    /// violating invariant 8.
+    #[test]
+    fn test_seam_waivered_stage_sink_full_falls_back() {
+        const GROWTH: usize = 37;
+
+        struct WaivedGrowthStage;
+        impl TransformStage for WaivedGrowthStage {
+            fn name(&self) -> &'static str {
+                "waived-grow-sink-full"
+            }
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                _sink: &dyn DecisionSink,
+            ) -> Outcome {
+                let mut out = body.to_vec();
+                out.extend(std::iter::repeat_n(b'M', GROWTH));
+                Outcome::modified(out, body.len(), ctx.request_id, self.name())
+            }
+            fn max_growth(&self, _input_len: usize) -> usize {
+                GROWTH
+            }
+        }
+
+        let body = b"input body bytes".to_vec();
+        let original = body.clone();
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext {
+            provider: ProxyProvider::Anthropic,
+            auth_mode: AuthMode::ApiKey,
+            request_id: "ac21-d",
+            headers: &hv,
+        };
+        // Set sink to full — any try_send returns SinkFull.
+        let sink = MockSink::new();
+        sink.set_full(true);
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(WaivedGrowthStage)]);
+        let outcome = pipeline.run(body, &ctx, &sink);
+        // SinkFull → passthrough (marker NOT injected, invariant 8 preserved).
+        assert_eq!(
+            outcome.bytes, original,
+            "SinkFull must cause passthrough even with growth allowance (invariant 8)"
+        );
+    }
+
+    /// AC21 (NEGATIVE): a waivered stage that inflates BEYOND its max_growth is
+    /// rejected to passthrough.
+    ///
+    /// Discriminating: if the gate used a blanket allowance rather than the per-stage
+    /// max_growth value, an over-inflating stage's output would be incorrectly accepted.
+    #[test]
+    fn test_seam_waivered_stage_over_cap_rejected() {
+        const GROWTH: usize = 10; // stage declares only 10 bytes of growth
+
+        struct OverCapStage;
+        impl TransformStage for OverCapStage {
+            fn name(&self) -> &'static str {
+                "over-cap"
+            }
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                _sink: &dyn DecisionSink,
+            ) -> Outcome {
+                let mut out = body.to_vec();
+                // Inflate by 50 bytes — well beyond the declared growth of 10.
+                out.extend(std::iter::repeat_n(b'X', 50));
+                Outcome::modified(out, body.len(), ctx.request_id, self.name())
+            }
+            fn max_growth(&self, _input_len: usize) -> usize {
+                GROWTH
+            }
+        }
+
+        let body = b"input".to_vec();
+        let original = body.clone();
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext {
+            provider: ProxyProvider::Anthropic,
+            auth_mode: AuthMode::ApiKey,
+            request_id: "ac21-e",
+            headers: &hv,
+        };
+        let sink = MockSink::new();
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(OverCapStage)]);
+        let outcome = pipeline.run(body, &ctx, &sink);
+        // Over-cap → rejected to passthrough.
+        assert_eq!(
+            outcome.bytes, original,
+            "over-cap stage output must be rejected to passthrough"
         );
     }
 

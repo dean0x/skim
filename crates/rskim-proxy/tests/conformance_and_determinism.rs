@@ -135,11 +135,7 @@ impl FakeUpstream {
 
     /// Drain and return all captured bodies recorded so far.
     fn drain_captured(&self) -> Vec<CapturedBody> {
-        self.captured
-            .lock()
-            .expect("captured lock")
-            .drain(..)
-            .collect()
+        std::mem::take(&mut *self.captured.lock().expect("captured lock"))
     }
 }
 

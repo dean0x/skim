@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`skim proxy` KV-cache alignment (L3 #306)** — `skim proxy` now canonicalizes
+  Anthropic and OpenAI request bodies to maximise KV-cache hit rates:
+  - Within-object key sort on all tool/schema/system objects (compact, deterministic form).
+  - `tools`/`functions` array element reorder using a provider-shape-aware two-part sort key
+    (tool name, then canonicalized-compact-bytes tie-break) verified lossless by multiset equality.
+  - Top-level (envelope) key order sorted alphabetically.
+  - Up to 2 `cache_control: {type: ephemeral}` markers injected at stable structural positions
+    (last tool object; last block-form system text block) — Anthropic only.
+  - **One-time provider-cache warm on skim upgrade (OD-3).** Upgrading to this version
+    causes one cache miss per unique request shape: the canonical form is new, so the
+    provider's cache has not seen it yet. Subsequent turns using the same tools/system
+    converge on the cached form and restore hit rates. Use `--no-cache-align` to opt out
+    during the warm-up period. `SKIM_PASSTHROUGH=1` bypasses all transforms (raw passthrough).
+    No `canonical_version` marker is injected; the warm cost is intentional and documented.
+  - Disable with `skim proxy --no-cache-align` (BlockRouter compression still runs).
+    `SKIM_PASSTHROUGH=1` bypasses all transforms entirely.
+  - **AC17 latency (R6 applied):** after the R6 parse-once optimisation
+    (commits `be24ef81`, `7b0ed407`) the worst-case upper bound across three
+    criterion runs is `6.97 ms` (`align_anthropic_64tools`, 64 tools × depth 8).
+    CI gate: `< 9.0 ms` (worst upper bound 6.97 ms × 1.25 headroom = 8.71 ms,
+    rounded up; hard ceiling is #303's 10 ms proxy budget).
+
 ### Changed
 - **`skim proxy` is now gated behind a non-default `proxy` cargo feature** — default builds are
   HTTP/TLS-free (AC9); release binaries include the proxy. Source builds opt in via

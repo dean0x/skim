@@ -1,0 +1,46 @@
+[package]
+name = "rskim-align"
+version = "0.1.0"
+edition = "2024"
+authors = ["Skim Contributors"]
+license = "MIT"
+description = "KV-cache alignment: deterministic canonical ordering + cache_control breakpoints for skim Layer-3"
+repository = "https://github.com/dean0x/skim"
+# AD-CA-1: pure sync crate, no hyper/tokio/RNG/clock; determinism enforced by
+# the crate-local clippy.toml gate. publish=false following rskim-contract precedent.
+# The binary crate (rskim) is the only legal link point for both rskim-proxy and
+# this pure crate, mirroring rskim-compress's R2 / AC9.
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+# workspace pins: preserve_order (byte-stable key ordering) + raw_value (number
+# tokens compared as source bytes, NOT arbitrary_precision). AD-CA-2.
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+rskim-contract = { path = "../rskim-contract" }
+rskim-llm = { path = "../rskim-llm" }
+# AC7/AD-CA-1: structured logging facade — zero overhead when no subscriber is
+# installed. Does not violate the no-clock/no-RNG constraint (log::debug! emits
+# no wall-clock or entropy reads). The log crate is a pure synchronous facade.
+log = "0.4"
+
+[dev-dependencies]
+rskim-contract = { path = "../rskim-contract", features = ["harness"] }
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[lints.clippy]
+# Enforce strict error handling matching rskim-contract pattern.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "warn"
+
+[lib]
+name = "rskim_align"
+path = "src/lib.rs"
+
+[[bench]]
+name = "align_bench"
+harness = false

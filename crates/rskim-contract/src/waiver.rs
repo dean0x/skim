@@ -59,7 +59,45 @@ pub fn marker_injection_cap(input_len: usize) -> Option<u64> {
     input_u64.checked_add(addition)
 }
 
-/// Waiver trait for #306: metadata-only reorder + bounded `cache_control` marker injection.
+/// Waiver trait for `#306`: bounded `cache_control` marker injection with
+/// deterministic canonicalization.
+///
+/// # AC25 — Reconciled rustdoc (2026-07-17 user resolution OD-1 / OD-2)
+///
+/// The original draft of this trait made two statements that the `#306` v1
+/// implementation supersedes:
+///
+/// 1. **Marker position (superseded):** the draft stated "markers MUST be injected
+///    only at block-form positions in the `content[]` array." v1 places markers at
+///    **tool-definition objects** (the last element of the top-level `tools` array)
+///    and **block-form system text blocks** (the last `{"type":"text",…}` element of
+///    a block-form `system` array). Neither position is inside a `content[]` array.
+///    The operative rule that survives is: markers MUST be injected at positions that
+///    are a **pure function of request structure** (deterministic placement), and MUST
+///    NOT appear inside the `messages` value span.
+///
+/// 2. **Reorder scope (superseded):** the draft stated "only `metadata` fields may be
+///    reordered." v1 performs three distinct reordering operations, each verified
+///    lossless by the conformance harness or the AD-CA-7 self-verify gate:
+///    - **(a) Within-object key ordering** of every key-value pair inside tool-definition
+///      objects (in `tools`), their nested `input_schema`/`parameters` objects, and
+///      block-form system text blocks (in `system`). All leaf string/number values are
+///      copied verbatim (never re-serialized); only the key emission order changes.
+///    - **(b) `tools`/`functions` array element ordering** — elements are emitted in a
+///      deterministic canonical order (two-part sort key: provider-shape-aware tool name,
+///      then canonicalized-compact-bytes tie-break). Verified meaning-preserving by
+///      `rskim_contract::canonical::tools_arrays_set_equal` (multiset equality). The
+///      resulting model-visible tool-order change is product-approved (user sign-off
+///      2026-07-17). `system` content-block order is NOT changed.
+///    - **(c) Top-level (envelope) key ordering** — the envelope object keys are emitted
+///      in canonical sorted order via messages-span-safe restructuring: whole `key:value`
+///      pairs are relocated by sorted key, every value except `tools`/`system` (which
+///      carry their own canonicalization) is copied byte-for-byte, and **the entire
+///      `messages` value span is byte-verbatim** (self-verified by AD-CA-7).
+///
+/// The operative invariant that survives is: **no message content may be modified.**
+/// v1 honours this — every byte inside the `messages` value span is byte-identical
+/// to the corresponding byte in the input.
 ///
 /// # Invariant encoded in the trait
 ///
@@ -67,23 +105,19 @@ pub fn marker_injection_cap(input_len: usize) -> Option<u64> {
 /// `output.len() as u64 ≤ marker_injection_cap(input.len())`
 ///
 /// In addition:
-/// - Markers MUST be injected only at block-form positions in the `content[]` array,
-///   never inside the `messages` array structure itself.
-/// - Only `metadata` fields may be reordered; no message content may be modified.
-/// - The output is verified by the harness before acceptance (AC15).
+/// - Markers MUST be injected at sanctioned structural positions: the last tool-definition
+///   object in the top-level `tools` array, and/or the last block-form system text block
+///   in the `system` array. Markers MUST NOT appear inside the `messages` value span.
+/// - The reorder operations listed in AC25 are sanctioned; all other bytes MUST be
+///   byte-identical to the corresponding input bytes.
+/// - The output is verified by the harness before acceptance (AC20).
 ///
 /// # Default deny
 ///
 /// A component that only implements [`crate::contract::Contract`] (without this
 /// waiver trait) cannot inject markers. The type system enforces this.
-///
-/// # Block-form position constraint
-///
-/// "Block-form position" means a position inside a `content: [...]` array where
-/// content blocks appear as `{"type": "text", ...}` objects. Marker injection at
-/// message level or at scalar `"content": "string"` positions is prohibited.
 pub trait MetadataReorderWithMarkers: crate::contract::Contract {
-    /// Apply a metadata-only reorder with bounded marker injection.
+    /// Apply canonicalization and bounded marker injection.
     ///
     /// # Arguments
     ///
@@ -94,8 +128,10 @@ pub trait MetadataReorderWithMarkers: crate::contract::Contract {
     ///
     /// Output bytes where:
     /// - `output.len() as u64 ≤ marker_injection_cap(input.len())`
-    /// - Markers appear only at block-form content positions
-    /// - Only metadata fields are reordered
+    /// - Markers appear only at sanctioned structural positions (tool-definition objects
+    ///   and block-form system text blocks; never inside the `messages` span)
+    /// - Within-object key ordering, element ordering, and envelope key ordering are
+    ///   canonicalized per AC25; all message content bytes are byte-verbatim
     ///
     /// Returns `None` to trigger passthrough (fail-open), e.g., on parse failure.
     fn apply_reorder(&self, input: &[u8], request_id: &str) -> Option<Vec<u8>>;

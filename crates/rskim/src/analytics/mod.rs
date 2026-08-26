@@ -21,6 +21,12 @@ mod schema;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+// Arc, AtomicUsize, and Ordering are only used in the proxy-gated
+// ChannelAlignmentRecorder and its test helpers (AD-CA-9).
+#[cfg(feature = "proxy")]
+use std::sync::Arc;
+#[cfg(feature = "proxy")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rayon::prelude::*;
@@ -28,7 +34,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::tokens;
-use rskim_tokens::{Encoding, encoding_for_model};
+use rskim_tokens::{Encoding, encoding_for_provider_model};
 
 // ============================================================================
 // Shared time constant
@@ -203,265 +209,6 @@ pub(crate) struct SessionStats {
 }
 
 // ============================================================================
-// Proxy query result types
-// ============================================================================
-
-/// Per-(provider, model) proxy breakdown row — the authoritative token-sum unit.
-///
-/// **AD-AN-9:** per-(provider,model) is the single-encoding unit.  A per-provider
-/// rollup that spans multiple bases (e.g. openai = cl100k + o200k) carries
-/// `basis = "mixed"` and omits the combined token figure (JSON null).
-///
-/// Token aggregates exclude rows where `upstream_error_status IS NOT NULL`
-/// (AD-PXY-25), so only successfully-relayed requests contribute.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ProxyModelStats {
-    /// Provider name — `None` for unknown / undetected provider (NULL column).
-    pub provider: Option<String>,
-    /// Model identifier — verbatim as stored (AD-PXY-22), `None` when undetected.
-    pub model: Option<String>,
-    /// Number of successfully forwarded+relayed requests
-    /// (rows with `upstream_error_status IS NULL`).
-    pub requests: u64,
-    /// Number of transformed-but-upstream-errored requests
-    /// (rows with `upstream_error_status IS NOT NULL`).
-    pub upstream_errors: u64,
-    /// Combined raw token count.  `None` when no counted rows exist
-    /// (all rows have NULL token columns).
-    pub raw_tokens: Option<u64>,
-    /// Combined compressed token count.  `None` when no counted rows exist.
-    pub compressed_tokens: Option<u64>,
-    /// Average savings percentage across success-scope counted rows.
-    /// `None` when no counted rows exist.
-    pub avg_savings_pct: Option<f64>,
-    /// Fraction of success-scope requests with tier=full (0.0 – 100.0).
-    pub tier_full_pct: f64,
-    /// Fraction of success-scope requests with tier=degraded (0.0 – 100.0).
-    pub tier_degraded_pct: f64,
-    /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
-    pub tier_passthrough_pct: f64,
-    /// Counting basis: one of `"exact"`, `"approximation"`, or `"heuristic"`.
-    /// Derived from `select_encoding(provider, model)` (AD-AN-9).
-    pub basis: String,
-    /// Success-scope rows with non-NULL token columns (countable).
-    pub counted_rows: u64,
-    /// Success-scope rows with NULL token columns (uncountable).
-    pub uncounted_rows: u64,
-}
-
-/// Per-provider proxy rollup.
-///
-/// **AD-AN-9:** when a provider spans multiple counting bases (e.g. openai with
-/// both cl100k models and o200k models), `basis = "mixed"` and `raw_tokens` /
-/// `compressed_tokens` are `None` — the per-model rows carry the authoritative
-/// token figures.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ProxyProviderStats {
-    /// Provider name — `None` for unknown / undetected.
-    pub provider: Option<String>,
-    /// Number of successfully forwarded+relayed requests.
-    pub requests: u64,
-    /// Number of transformed-but-upstream-errored requests.
-    pub upstream_errors: u64,
-    /// Combined raw token count.
-    /// `None` when `basis = "mixed"` or no countable rows exist.
-    pub raw_tokens: Option<u64>,
-    /// Combined compressed token count.
-    /// `None` when `basis = "mixed"` or no countable rows exist.
-    pub compressed_tokens: Option<u64>,
-    /// Average savings percentage.
-    /// `None` when `basis = "mixed"` or no countable rows.
-    pub avg_savings_pct: Option<f64>,
-    /// Fraction of success-scope requests with tier=full (0.0 – 100.0).
-    pub tier_full_pct: f64,
-    /// Fraction of success-scope requests with tier=degraded (0.0 – 100.0).
-    pub tier_degraded_pct: f64,
-    /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
-    pub tier_passthrough_pct: f64,
-    /// Counting basis: `"exact"`, `"approximation"`, `"heuristic"`, or `"mixed"`.
-    pub basis: String,
-    /// Success-scope rows with non-NULL token columns (countable).
-    pub counted_rows: u64,
-    /// Success-scope rows with NULL token columns (uncountable).
-    pub uncounted_rows: u64,
-}
-
-/// Row returned by `query_block_decisions` (via `AnalyticsStore` trait).
-///
-/// Only constructed in the trait impl and consumed in tests / the deferred
-/// `--audit` CLI path (#469). Suppress dead_code in non-test builds.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[allow(dead_code)]
-pub(crate) struct ProxyBlockDecisionRow {
-    pub id: i64,
-    pub savings_id: i64,
-    pub block_index: u64,
-    pub component: String,
-    pub outcome: String,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-}
-
-// ============================================================================
-// Proxy recording types (always compiled — no rskim-proxy dependency)
-// ============================================================================
-
-/// Provider classification for proxy analytics recording.
-///
-/// AD-PXY-21: Local enum (no rskim-proxy dependency) so the recording core
-/// compiles in default builds without the HTTP/TLS stack (ADR-008).  The
-/// feature-gated bridge in `proxy_analytics.rs` converts from
-/// `rskim_proxy::detect::ProxyProvider` to this type.
-///
-/// Column mapping in `token_savings.provider`:
-/// - `Unknown`   → `NULL`
-/// - `Anthropic` → `"anthropic"`
-/// - `OpenAI`    → `"openai"`
-// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecordingProvider {
-    /// Provider could not be determined from the request.
-    Unknown,
-    /// Anthropic API (Claude family).
-    Anthropic,
-    /// OpenAI API (GPT / o-series family).
-    OpenAI,
-}
-
-/// Per-block decision record from the proxy's BlockRouter.
-///
-/// AD-AN-13: the unit is bytes (not tokens); `bytes_in`/`bytes_out` are exact
-/// and always present (verified log.rs:390-393).  One row per
-/// `rskim_contract::log::DecisionRecord` projected from the collecting sink in
-/// `server.rs` (AD-PXY-21).
-///
-/// **Byte-reconciliation caveat:** the `Σ bytes_in` over all `ProxyBlockDecision`
-/// rows for a parent equals the sum of the *live-zone candidate* block lengths,
-/// NOT the full raw body length.  `BlockRouter` partitions only live-zone
-/// mutable classified blocks (zone.rs AC-27); stale/orientation/immutable
-/// blocks are forwarded byte-identical and do NOT emit `DecisionRecord`s.
-/// This was verified against the `#304` BlockRouter implementation.
-// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct ProxyBlockDecision {
-    /// Zero-indexed position of this block in the decision sequence.
-    pub block_index: usize,
-    /// Component/engine identifier (e.g. `"block-router"`, `"json"`, `"log"`).
-    pub component: String,
-    /// Decision outcome string (e.g. `"passthrough"`, `"modified"`, `"degraded"`).
-    pub outcome: String,
-    /// Input bytes fed into this block.
-    pub bytes_in: u64,
-    /// Output bytes produced by this block.
-    pub bytes_out: u64,
-}
-
-/// Input to [`AnalyticsDb::record_proxy`] — bundles all fields for one proxy
-/// request recording.
-///
-/// **Pair-jointly-NULL semantics (AD-AN-7):** `raw_tokens`, `compressed_tokens`,
-/// and `savings_pct` are **all** `None` when token counting was unavailable
-/// (counter construction failed, or either body was not valid UTF-8).  They are
-/// **all** `Some` otherwise — no mixed state, never a fabricated or estimated
-/// value.
-///
-/// The consumer thread in `proxy_analytics.rs` populates the three token fields
-/// after calling [`select_encoding`] and constructing a
-/// [`rskim_tokens::Counter`] for the resolved encoding.
-// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct ProxyRecordInput {
-    /// Unix timestamp of the request (seconds since epoch).
-    pub timestamp: i64,
-    /// Provider classification.
-    pub provider: RecordingProvider,
-    /// Model identifier — verbatim as extracted from the request body, no
-    /// casing/alias folding (AD-PXY-22).  `None` when the model could not be
-    /// detected.
-    pub model: Option<String>,
-    /// Turn-level attribution.  `None` until `#344` emits it.
-    pub turn_id: Option<String>,
-    /// Request tier: `"passthrough"`, `"full"`, or `"degraded"`.
-    pub tier: String,
-    /// Duration from first request byte to last relayed response byte (AC4).
-    pub duration_ms: u64,
-    /// Project path for grouping (current working directory at recording time).
-    pub project_path: String,
-    /// Session ID for per-session attribution (AD-AN-4).
-    pub session_id: Option<String>,
-    /// Original command string.  The bridge stores the constant `"proxy"` —
-    /// the request URL path is deliberately NOT stored, because
-    /// `query_by_original_cmd` is CLI-scoped (AD-AN-6) and a path would put
-    /// caller-controlled, unbounded text into the column for no consumer.
-    pub original_cmd: String,
-    /// Pre-counted raw (pre-transform) tokens.  `None` per AD-AN-7 when
-    /// counting is unavailable; paired with `compressed_tokens` and
-    /// `savings_pct`.
-    pub raw_tokens: Option<i64>,
-    /// Pre-counted compressed (post-transform) tokens.
-    pub compressed_tokens: Option<i64>,
-    /// Pre-computed savings percentage.
-    pub savings_pct: Option<f64>,
-    /// HTTP status code generated by the proxy when the upstream errored
-    /// (502 or 504).  `None` for normal relayed rows (AD-PXY-25).
-    pub upstream_error_status: Option<i64>,
-    /// Per-block decision log (AD-AN-13).
-    pub blocks: Vec<ProxyBlockDecision>,
-}
-
-// ============================================================================
-// select_encoding — provider + model → token counting basis (AD-AN-11)
-// ============================================================================
-
-/// Select the token encoding for a proxy request based on provider and model.
-///
-/// **AD-AN-11:** reconciles `#300`'s model-string API with the provider-enum
-/// fallback.  `encoding_for_model` (rskim-tokens) is model-string-only and
-/// returns `Heuristic` for unknown strings (verified encoding.rs:138), so this
-/// function adds provider-level family defaults so an unrecognized model within
-/// a known family uses the family encoding rather than the conservative
-/// `Heuristic`.
-///
-/// ## Fallback table (AC21)
-///
-/// | Provider  | `model = None`     | recognized model   | unrecognized model |
-/// |-----------|--------------------|--------------------|---------------------|
-/// | `Unknown` | `Heuristic`        | `Heuristic`        | `Heuristic`         |
-/// | `Anthropic` | `AnthropicOffline` | family encoding | `AnthropicOffline`  |
-/// | `OpenAI`  | `O200k`            | family encoding    | `O200k`             |
-///
-/// All 9 cases are pinned by a table-driven unit test (AC21).
-// Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
-#[allow(dead_code)]
-pub(crate) fn select_encoding(provider: &RecordingProvider, model: Option<&str>) -> Encoding {
-    match provider {
-        // AD-AN-11 challenge #5b: unknown provider → Heuristic even when a model
-        // string is present (the model may belong to an unclassifiable provider).
-        RecordingProvider::Unknown => Encoding::Heuristic,
-        RecordingProvider::Anthropic => match model {
-            // AD-AN-11 challenge #5a: family default when model absent.
-            None => Encoding::AnthropicOffline,
-            // AD-AN-11: unrecognized-within-family → family default;
-            // recognized model keeps its own encoding.
-            Some(m) => match encoding_for_model(m) {
-                Encoding::Heuristic => Encoding::AnthropicOffline,
-                e => e,
-            },
-        },
-        RecordingProvider::OpenAI => match model {
-            None => Encoding::O200k,
-            Some(m) => match encoding_for_model(m) {
-                Encoding::Heuristic => Encoding::O200k,
-                e => e,
-            },
-        },
-    }
-}
-
-// ============================================================================
 // Pricing
 // ============================================================================
 
@@ -576,6 +323,226 @@ impl AnalyticsConfig {
     pub(crate) fn parse_disable_value(val: &str) -> bool {
         matches!(val.to_lowercase().as_str(), "1" | "true" | "yes")
     }
+}
+
+// ============================================================================
+// Proxy query result types
+// ============================================================================
+
+/// Per-(provider, model) proxy breakdown row — the authoritative token-sum unit.
+///
+/// **AD-AN-9:** per-(provider,model) is the single-encoding unit.  A per-provider
+/// rollup that spans multiple bases (e.g. openai = cl100k + o200k) carries
+/// `basis = "mixed"` and omits the combined token figure (JSON null).
+///
+/// Token aggregates exclude rows where `upstream_error_status IS NOT NULL`
+/// (AD-PXY-25), so only successfully-relayed requests contribute.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ProxyModelStats {
+    /// Provider name — `None` for unknown / undetected provider (NULL column).
+    pub provider: Option<String>,
+    /// Model identifier — verbatim as stored (AD-PXY-22), `None` when undetected.
+    pub model: Option<String>,
+    /// Number of successfully forwarded+relayed requests
+    /// (rows with `upstream_error_status IS NULL`).
+    pub requests: u64,
+    /// Number of transformed-but-upstream-errored requests
+    /// (rows with `upstream_error_status IS NOT NULL`).
+    pub upstream_errors: u64,
+    /// Combined raw token count.  `None` when no counted rows exist
+    /// (all rows have NULL token columns).
+    pub raw_tokens: Option<u64>,
+    /// Combined compressed token count.  `None` when no counted rows exist.
+    pub compressed_tokens: Option<u64>,
+    /// Average savings percentage across success-scope counted rows.
+    /// `None` when no counted rows exist.
+    pub avg_savings_pct: Option<f64>,
+    /// Fraction of success-scope requests with tier=full (0.0 – 100.0).
+    pub tier_full_pct: f64,
+    /// Fraction of success-scope requests with tier=degraded (0.0 – 100.0).
+    pub tier_degraded_pct: f64,
+    /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
+    pub tier_passthrough_pct: f64,
+    /// Counting basis: one of `"exact"`, `"approximation"`, or `"heuristic"`.
+    /// Derived from `encoding_for_provider_model(provider, model)` (AD-AN-9).
+    pub basis: String,
+    /// Success-scope rows with non-NULL token columns (countable).
+    pub counted_rows: u64,
+    /// Success-scope rows with NULL token columns (uncountable).
+    pub uncounted_rows: u64,
+}
+
+/// Per-provider proxy rollup.
+///
+/// **AD-AN-9:** when a provider spans multiple counting bases (e.g. openai with
+/// both cl100k models and o200k models), `basis = "mixed"` and `raw_tokens` /
+/// `compressed_tokens` are `None` — the per-model rows carry the authoritative
+/// token figures.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ProxyProviderStats {
+    /// Provider name — `None` for unknown / undetected.
+    pub provider: Option<String>,
+    /// Number of successfully forwarded+relayed requests.
+    pub requests: u64,
+    /// Number of transformed-but-upstream-errored requests.
+    pub upstream_errors: u64,
+    /// Combined raw token count.
+    /// `None` when `basis = "mixed"` or no countable rows exist.
+    pub raw_tokens: Option<u64>,
+    /// Combined compressed token count.
+    /// `None` when `basis = "mixed"` or no countable rows exist.
+    pub compressed_tokens: Option<u64>,
+    /// Average savings percentage.
+    /// `None` when `basis = "mixed"` or no countable rows.
+    pub avg_savings_pct: Option<f64>,
+    /// Fraction of success-scope requests with tier=full (0.0 – 100.0).
+    pub tier_full_pct: f64,
+    /// Fraction of success-scope requests with tier=degraded (0.0 – 100.0).
+    pub tier_degraded_pct: f64,
+    /// Fraction of success-scope requests with tier=passthrough (0.0 – 100.0).
+    pub tier_passthrough_pct: f64,
+    /// Counting basis: `"exact"`, `"approximation"`, `"heuristic"`, or `"mixed"`.
+    pub basis: String,
+    /// Success-scope rows with non-NULL token columns (countable).
+    pub counted_rows: u64,
+    /// Success-scope rows with NULL token columns (uncountable).
+    pub uncounted_rows: u64,
+}
+
+/// Row returned by `query_block_decisions` (via `AnalyticsStore` trait).
+///
+/// Only constructed in the trait impl and consumed in tests / the deferred
+/// `--audit` CLI path (#469). Suppress dead_code in non-test builds.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[allow(dead_code)]
+pub(crate) struct ProxyBlockDecisionRow {
+    pub id: i64,
+    pub savings_id: i64,
+    pub block_index: u64,
+    pub component: String,
+    pub outcome: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+// ============================================================================
+// Proxy recording types (always compiled — no rskim-proxy dependency)
+// ============================================================================
+
+/// Provider classification for proxy analytics recording.
+///
+/// AD-PXY-21: Local enum (no rskim-proxy dependency) so the recording core
+/// compiles in default builds without the HTTP/TLS stack (ADR-008).  The
+/// feature-gated bridge in `proxy_analytics.rs` converts from
+/// `rskim_proxy::detect::ProxyProvider` to this type.
+///
+/// Column mapping in `token_savings.provider`:
+/// - `Unknown`   → `NULL`
+/// - `Anthropic` → `"anthropic"`
+/// - `OpenAI`    → `"openai"`
+// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingProvider {
+    /// Provider could not be determined from the request.
+    Unknown,
+    /// Anthropic API (Claude family).
+    Anthropic,
+    /// OpenAI API (GPT / o-series family).
+    OpenAI,
+}
+
+impl From<RecordingProvider> for rskim_tokens::Provider {
+    fn from(p: RecordingProvider) -> Self {
+        match p {
+            RecordingProvider::Anthropic => rskim_tokens::Provider::Anthropic,
+            RecordingProvider::OpenAI => rskim_tokens::Provider::OpenAI,
+            RecordingProvider::Unknown => rskim_tokens::Provider::Unknown,
+        }
+    }
+}
+
+/// Per-block decision record from the proxy's BlockRouter.
+///
+/// AD-AN-13: the unit is bytes (not tokens); `bytes_in`/`bytes_out` are exact
+/// and always present (verified log.rs:390-393).  One row per
+/// `rskim_contract::log::DecisionRecord` projected from the collecting sink in
+/// `server.rs` (AD-PXY-21).
+///
+/// **Byte-reconciliation caveat:** the `Σ bytes_in` over all `ProxyBlockDecision`
+/// rows for a parent equals the sum of the *live-zone candidate* block lengths,
+/// NOT the full raw body length.  `BlockRouter` partitions only live-zone
+/// mutable classified blocks (zone.rs AC-27); stale/orientation/immutable
+/// blocks are forwarded byte-identical and do NOT emit `DecisionRecord`s.
+/// This was verified against the `#304` BlockRouter implementation.
+// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyBlockDecision {
+    /// Zero-indexed position of this block in the decision sequence.
+    pub block_index: usize,
+    /// Component/engine identifier (e.g. `"block-router"`, `"json"`, `"log"`).
+    pub component: String,
+    /// Decision outcome string (e.g. `"passthrough"`, `"modified"`, `"degraded"`).
+    pub outcome: String,
+    /// Input bytes fed into this block.
+    pub bytes_in: u64,
+    /// Output bytes produced by this block.
+    pub bytes_out: u64,
+}
+
+/// Input to [`AnalyticsDb::record_proxy`] — bundles all fields for one proxy
+/// request recording.
+///
+/// **Pair-jointly-NULL semantics (AD-AN-7):** `raw_tokens`, `compressed_tokens`,
+/// and `savings_pct` are **all** `None` when token counting was unavailable
+/// (counter construction failed, or either body was not valid UTF-8).  They are
+/// **all** `Some` otherwise — no mixed state, never a fabricated or estimated
+/// value.
+///
+/// The consumer thread in `proxy_analytics.rs` populates the three token fields
+/// after calling `rskim_tokens::encoding_for_provider_model` and constructing a
+/// [`rskim_tokens::Counter`] for the resolved encoding.
+// Used by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct ProxyRecordInput {
+    /// Unix timestamp of the request (seconds since epoch).
+    pub timestamp: i64,
+    /// Provider classification.
+    pub provider: RecordingProvider,
+    /// Model identifier — verbatim as extracted from the request body, no
+    /// casing/alias folding (AD-PXY-22).  `None` when the model could not be
+    /// detected.
+    pub model: Option<String>,
+    /// Turn-level attribution.  `None` until `#344` emits it.
+    pub turn_id: Option<String>,
+    /// Request tier: `"passthrough"`, `"full"`, or `"degraded"`.
+    pub tier: String,
+    /// Duration from first request byte to last relayed response byte (AC4).
+    pub duration_ms: u64,
+    /// Project path for grouping (current working directory at recording time).
+    pub project_path: String,
+    /// Session ID for per-session attribution (AD-AN-4).
+    pub session_id: Option<String>,
+    /// Original command string.  The bridge stores the constant `"proxy"` —
+    /// the request URL path is deliberately NOT stored, because
+    /// `query_by_original_cmd` is CLI-scoped (AD-AN-6) and a path would put
+    /// caller-controlled, unbounded text into the column for no consumer.
+    pub original_cmd: String,
+    /// Pre-counted raw (pre-transform) tokens.  `None` per AD-AN-7 when
+    /// counting is unavailable; paired with `compressed_tokens` and
+    /// `savings_pct`.
+    pub raw_tokens: Option<i64>,
+    /// Pre-counted compressed (post-transform) tokens.
+    pub compressed_tokens: Option<i64>,
+    /// Pre-computed savings percentage.
+    pub savings_pct: Option<f64>,
+    /// HTTP status code generated by the proxy when the upstream errored
+    /// (502 or 504).  `None` for normal relayed rows (AD-PXY-25).
+    pub upstream_error_status: Option<i64>,
+    /// Per-block decision log (AD-AN-13).
+    pub blocks: Vec<ProxyBlockDecision>,
 }
 
 // ============================================================================
@@ -1005,12 +972,20 @@ impl AnalyticsDb {
             .as_secs() as i64
             - (days as i64 * SECONDS_PER_DAY as i64);
         let tx = self.conn.unchecked_transaction()?;
+        // Children before parents (FK ordering): proxy_block_decisions references
+        // token_savings, so detail rows must be deleted before parent rows.
         tx.execute(
             "DELETE FROM proxy_block_decisions WHERE savings_id IN \
              (SELECT id FROM token_savings WHERE timestamp < ?1)",
             [cutoff],
         )?;
         let count = tx.execute("DELETE FROM token_savings WHERE timestamp < ?1", [cutoff])?;
+        // alignment_decisions is a standalone table (no FK children); delete in
+        // the same transaction so the retention window is applied atomically.
+        tx.execute(
+            "DELETE FROM alignment_decisions WHERE timestamp < ?1",
+            [cutoff],
+        )?;
         tx.commit()?;
         Ok(count)
     }
@@ -1099,6 +1074,45 @@ impl AnalyticsDb {
         Ok(count)
     }
 
+    /// Record an alignment decision into the `alignment_decisions` table.
+    ///
+    /// # AD-CA-9 / AD-AN-5
+    ///
+    /// Called by the `ChannelAlignmentRecorder` consumer thread. Silently
+    /// ignores errors (fire-and-forget analytics path). Gated on `proxy`
+    /// feature because only the proxy-gated consumer thread calls this.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn record_alignment(&self, r: &AlignmentDecisionRecord) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO alignment_decisions (
+                timestamp, request_id, provider,
+                tools_key_sorted, spans_compacted,
+                skim_breakpoints_injected, client_breakpoint_count,
+                volatile_warn_count, fail_open,
+                input_len, output_len,
+                input_sha256, output_sha256
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+            )",
+            rusqlite::params![
+                r.timestamp,
+                r.request_id,
+                r.provider,
+                r.tools_key_sorted as i64,
+                r.spans_compacted as i64,
+                r.skim_breakpoints_injected as i64,
+                r.client_breakpoint_count as i64,
+                r.volatile_warn_count as i64,
+                r.fail_open as i64,
+                r.input_len as i64,
+                r.output_len as i64,
+                r.input_sha256.as_ref(),
+                r.output_sha256.as_ref(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Query per-session statistics grouped by session_id.
     ///
     /// Uses a single conditional-aggregation query instead of two separate queries
@@ -1146,20 +1160,15 @@ impl AnalyticsDb {
         })
     }
 
-    /// Record a proxy request analytics row and its per-block decision log.
+    /// Record one proxy request in `token_savings` + per-block rows in
+    /// `proxy_block_decisions`.
     ///
-    /// **AD-AN-13:** the parent `token_savings` row and all
-    /// `proxy_block_decisions` detail rows are written inside **one
-    /// transaction** — a parent never exists without its block rows and vice
-    /// versa.  Any INSERT failure rolls back the entire batch before persisting,
-    /// leaving the database intact (ADR-006).
+    /// **AD-AN-7:** `raw_tokens`, `compressed_tokens`, `savings_pct` are stored
+    /// as a jointly-NULL triple — never partial; the caller must ensure all three
+    /// are `Some` or all three are `None`.  A partial `Some` is an invariant
+    /// violation detectable only at the caller (BPE counter construction).
     ///
-    /// **AD-AN-7 / pair-jointly-NULL:** `raw_tokens`, `compressed_tokens`, and
-    /// `savings_pct` are bound from `Option` fields.  When all three are `None`
-    /// the columns are stored as `NULL`; when all are `Some` the measured values
-    /// are stored.  Never a fabricated or estimated value.
-    ///
-    /// **AD-PXY-25:** `upstream_error_status` is non-`NULL` for
+    /// **AD-PXY-25:** `upstream_error_status` is non-`None` for
     /// transformed-but-upstream-errored rows (502/504).  These rows are excluded
     /// from savings and tier aggregates by the query layer.
     // Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
@@ -1237,21 +1246,9 @@ impl AnalyticsDb {
     ///
     /// Persist failure is fail-open per AD-AN-8 — the **caller** is responsible
     /// for deciding whether to log or discard the error.
-    ///
-    /// **Bounded default constants (ADR-003/PF-005):** the bridge's queue
-    /// capacities (`PROXY_QUEUE_RECORD_CAPACITY = 2048`,
-    /// `PROXY_QUEUE_BYTE_BUDGET = 128 MiB`) are **bounded defaults chosen to
-    /// minimise drop-bias, NOT empirically-derived thresholds**.  A persistently
-    /// non-zero `proxy_dropped_records` is the disclosure counter that signals
-    /// these constants should be raised (or that the workload is unusually
-    /// large).
     // Called by proxy_analytics.rs bridge (proxy feature build); dead_code in default build.
     #[allow(dead_code)]
     pub(crate) fn analytics_meta_add_drop_count(&self, count: u64) -> anyhow::Result<()> {
-        // INSERT … ON CONFLICT(key) DO UPDATE is the upsert syntax available in
-        // SQLite ≥ 3.24.0 (2018-06-04).  rusqlite "bundled" (0.31) ships
-        // SQLite 3.49+.  The monotonic absolute-add ensures drops are never
-        // lost across restarts.
         self.conn.execute(
             "INSERT INTO analytics_meta (key, value) VALUES ('proxy_dropped_records', ?1) \
              ON CONFLICT(key) DO UPDATE SET value = value + ?1",
@@ -1267,9 +1264,6 @@ impl AnalyticsDb {
     /// `upstream_error_status IS NOT NULL` (AD-PXY-25).  Rows are ordered
     /// `(provider IS NULL, provider, model IS NULL, model)` — NULL-last — so
     /// identical input produces byte-identical JSON (AC13).
-    ///
-    /// The `basis` field is derived via [`counting_basis_label`] from the stored
-    /// provider+model strings.
     #[allow(dead_code)]
     pub(crate) fn query_by_model(
         &self,
@@ -1368,12 +1362,7 @@ impl AnalyticsDb {
     ///
     /// **AD-AN-9:** Derives provider-level stats from [`query_by_model`] by
     /// grouping model rows in Rust.  When a provider spans multiple encoding
-    /// bases (e.g. openai = cl100k + o200k models), `basis = "mixed"` is set
-    /// and `raw_tokens` / `compressed_tokens` / `avg_savings_pct` are `None`
-    /// (AC11) — the per-model rows carry the authoritative figures.
-    ///
-    /// Ordering is preserved from the underlying model query: non-NULL providers
-    /// appear first (alphabetic), unknown (NULL) providers appear last (AC13).
+    /// bases, `basis = "mixed"` is set and token fields are `None` (AC11).
     #[allow(dead_code)]
     pub(crate) fn query_by_provider(
         &self,
@@ -1381,9 +1370,6 @@ impl AnalyticsDb {
     ) -> anyhow::Result<Vec<ProxyProviderStats>> {
         let models = self.query_by_model(since)?;
 
-        // Group model rows by provider, preserving order from the SQL query.
-        // AD-AN-9: the SQL ORDER BY (provider IS NULL, provider, ...) ensures
-        // NULL-last ordering; grouping in Rust preserves that order.
         let mut provider_groups: Vec<(Option<String>, Vec<&ProxyModelStats>)> = Vec::new();
         for m in &models {
             if let Some(entry) = provider_groups.iter_mut().find(|(p, _)| p == &m.provider) {
@@ -1400,7 +1386,6 @@ impl AnalyticsDb {
             let counted_rows: u64 = rows.iter().map(|r| r.counted_rows).sum();
             let uncounted_rows: u64 = rows.iter().map(|r| r.uncounted_rows).sum();
 
-            // Recompute tier counts from model-row percentages × requests.
             let t = if requests > 0 { requests as f64 } else { 1.0 };
             let full_count: f64 = rows
                 .iter()
@@ -1415,44 +1400,25 @@ impl AnalyticsDb {
                 .map(|r| r.tier_passthrough_pct / 100.0 * r.requests as f64)
                 .sum();
 
-            // Mixed-basis detection: re-derive the Encoding per model and compare
-            // *encoding variants*, not display labels.
-            //
-            // AD-AN-9: even when all models share the same basis *label*
-            // (e.g. both Cl100k and O200k resolve to "exact"), they use
-            // different vocabularies whose token counts are not addable.
-            // Comparing `ProxyModelStats::basis` strings would miss that case;
-            // comparing `Encoding` discriminants catches it.
             let encodings: Vec<Encoding> = rows
                 .iter()
                 .map(|r| {
                     let prov = recording_provider_from_str(r.provider.as_deref());
-                    select_encoding(&prov, r.model.as_deref())
+                    encoding_for_provider_model(prov.into(), r.model.as_deref())
                 })
                 .collect();
             let first_encoding = encodings.first().copied().unwrap_or(Encoding::Heuristic);
             let is_mixed = encodings.iter().any(|&e| e != first_encoding);
-            // Display basis: use the model row's label (derived from first_encoding).
             let first_basis = rows
                 .first()
                 .map(|r| r.basis.as_str())
                 .unwrap_or("heuristic");
 
             let (basis, raw_tokens, compressed_tokens, avg_savings_pct) = if is_mixed {
-                // AD-AN-9: mixed basis — omit combined token figure (JSON null).
                 ("mixed".to_string(), None, None, None)
             } else if counted_rows > 0 {
                 let raw: u64 = rows.iter().filter_map(|r| r.raw_tokens).sum();
                 let comp: u64 = rows.iter().filter_map(|r| r.compressed_tokens).sum();
-                // Row-weighted mean savings_pct over counted model rows.
-                //
-                // Each `ProxyModelStats::avg_savings_pct` is itself an average
-                // over that model's `counted_rows` requests, so the model
-                // averages must be weighted by `counted_rows` to reproduce the
-                // provider-level mean.  An unweighted mean of the model averages
-                // would let a single-request model outweigh a thousand-request
-                // one (e.g. gpt-4 @ 90% over 1 request + gpt-4o @ 0% over 999
-                // reporting 45% instead of ~0.09%).
                 let weight_total: u64 = rows
                     .iter()
                     .filter(|r| r.avg_savings_pct.is_some())
@@ -1493,13 +1459,9 @@ impl AnalyticsDb {
     /// Count transformed-but-upstream-errored proxy requests.
     ///
     /// **AD-PXY-25:** these rows have `upstream_error_status IS NOT NULL` and
-    /// are excluded from savings/tier aggregates.  The count is surfaced
-    /// separately in `skim stats` so the gap is never silent (AC17/AC25).
+    /// are excluded from savings/tier aggregates.
     #[allow(dead_code)]
     pub(crate) fn query_by_upstream_error(&self, since: Option<i64>) -> anyhow::Result<u64> {
-        // Compose proxy scope + the upstream-error filter.
-        // proxy_scope_clause returns "WHERE command_type = 'proxy' ..." so we
-        // append the extra condition with AND.
         let (base_clause, params) = proxy_scope_clause(since);
         let sql = format!(
             "SELECT COUNT(*) FROM token_savings {base_clause} \
@@ -1533,13 +1495,7 @@ impl AnalyticsDb {
     /// Adjust the SQLite busy-wait timeout on the underlying connection.
     ///
     /// Used by [`spawn_consumer`] to cap per-call SQLITE_BUSY waits at a short
-    /// bound so a locked DB does not stall the consumer drain loop for the full
-    /// `open()` default (5 s). The consumer is a fail-open background thread
-    /// (AC15 / AD-AN-8): it must not delay forwarding even when the DB is locked.
-    ///
-    /// Gated to `cfg(feature = "proxy")` because the only caller is `spawn_consumer`
-    /// in `proxy_analytics.rs`, which is itself proxy-gated. Without this gate,
-    /// clippy reports `dead_code` in the default build (PF-009 / CMD-5 analogue).
+    /// bound so a locked DB does not stall the consumer drain loop.
     #[cfg(feature = "proxy")]
     pub(crate) fn set_busy_timeout(&self, d: Duration) -> anyhow::Result<()> {
         self.conn.busy_timeout(d).map_err(Into::into)
@@ -1549,11 +1505,7 @@ impl AnalyticsDb {
     ///
     /// **AD-AN-13:** exercises the full block table — used by proxy_analytics.rs tests to
     /// assert the byte-reconciliation invariant without needing the parent `savings_id` in
-    /// advance. Not available in production builds (`#[cfg(all(test, feature = "proxy"))]`).
-    ///
-    /// The `feature = "proxy"` gate matches the caller: `proxy_analytics.rs` is compiled
-    /// only under `#[cfg(feature = "proxy")]` (see `cmd/mod.rs`). Without this gate, clippy
-    /// reports `dead_code` when compiling `--all-targets` without `--features proxy` (CMD-5).
+    /// advance.
     #[cfg(all(test, feature = "proxy"))]
     pub(crate) fn all_block_decisions(&self) -> anyhow::Result<Vec<ProxyBlockDecisionRow>> {
         let mut stmt = self.conn.prepare(
@@ -1660,6 +1612,19 @@ impl AnalyticsStore for AnalyticsDb {
     }
 }
 
+/// Build WHERE clause for optional since filter (unconstrained by command_type).
+///
+/// Used only in tests (to verify `since_clause_with_extra` in isolation).
+/// All production query methods use [`cli_scope_clause`] or [`cli_scope_clause_with_extra`]
+/// instead to exclude proxy rows (AD-AN-6).
+#[cfg(test)]
+fn since_clause(since: Option<i64>) -> (String, Vec<i64>) {
+    match since {
+        Some(ts) => ("WHERE timestamp >= ?1".to_string(), vec![ts]),
+        None => (String::new(), vec![]),
+    }
+}
+
 /// Build WHERE clause for CLI-scope queries — excludes proxy rows.
 ///
 /// **AD-AN-6:** all eight CLI-scope aggregates (`query_summary`, `query_daily`,
@@ -1687,6 +1652,27 @@ fn cli_scope_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (St
     (format!("{base} AND {extra_condition}"), params)
 }
 
+/// Build WHERE clause with an optional extra condition appended.
+///
+/// Composes the `since` filter with an additional SQL predicate (e.g.
+/// `"language IS NOT NULL"`). The extra condition is AND-ed to the since
+/// clause when present, or becomes its own WHERE clause when since is None.
+/// Used only in tests; production code uses [`cli_scope_clause_with_extra`].
+#[cfg(test)]
+fn since_clause_with_extra(since: Option<i64>, extra_condition: &str) -> (String, Vec<i64>) {
+    let (base, params) = since_clause(since);
+    let clause = if base.is_empty() {
+        format!("WHERE {extra_condition}")
+    } else {
+        format!("{base} AND {extra_condition}")
+    };
+    (clause, params)
+}
+
+// ============================================================================
+// Proxy query helpers
+// ============================================================================
+
 /// Build WHERE clause scoped to proxy rows only.
 fn proxy_scope_clause(since: Option<i64>) -> (String, Vec<i64>) {
     match since {
@@ -1697,10 +1683,6 @@ fn proxy_scope_clause(since: Option<i64>) -> (String, Vec<i64>) {
         None => ("WHERE command_type = 'proxy'".to_string(), vec![]),
     }
 }
-
-// ============================================================================
-// Proxy query helpers
-// ============================================================================
 
 /// Map a stored provider column value back to a [`RecordingProvider`].
 fn recording_provider_from_str(s: Option<&str>) -> RecordingProvider {
@@ -1714,14 +1696,13 @@ fn recording_provider_from_str(s: Option<&str>) -> RecordingProvider {
 /// Derive the coarse 3-way counting-basis label from the stored provider+model.
 ///
 /// **AD-AN-9:** the label is stable across additive `encoding.rs` changes that
-/// stay within the same bucket.  Residual drift on a re-bucketing binary upgrade
-/// is documented; stored token counts are immutable and never change.
+/// stay within the same bucket.
 ///
 /// Returns `"exact"` (Cl100k/O200k), `"approximation"` (AnthropicOffline),
 /// or `"heuristic"` (Heuristic).
 fn counting_basis_label(provider: Option<&str>, model: Option<&str>) -> &'static str {
     let rp = recording_provider_from_str(provider);
-    match select_encoding(&rp, model) {
+    match encoding_for_provider_model(rp.into(), model) {
         Encoding::Cl100k | Encoding::O200k => "exact",
         Encoding::AnthropicOffline => "approximation",
         Encoding::Heuristic => "heuristic",
@@ -1901,6 +1882,257 @@ pub(crate) fn flush_pending() {
     };
     for handle in handles.drain(..) {
         let _ = handle.join();
+    }
+}
+
+// ============================================================================
+// AlignmentDecisionRecord — per-request cache-alignment record (AD-CA-9)
+// ============================================================================
+
+/// A single per-request cache-alignment decision record.
+///
+/// # AD-CA-9 / AD-AN-5
+///
+/// The record type is **unconditional** (no proxy feature gate) so the schema
+/// migration and this type are always present regardless of build variant.
+/// Only the writer wiring (`ChannelAlignmentRecorder`) is proxy-gated.
+///
+/// Fields mirror [`crate::analytics::AlignStats`] from rskim-align, plus
+/// `timestamp`, `request_id`, and `provider` for the DB row context.
+///
+/// # Note on dead_code in non-proxy builds
+///
+/// AD-CA-9 keeps this struct unconditional so the schema migration always
+/// runs regardless of build variant. Non-proxy builds define but never
+/// construct it — `#[allow(dead_code)]` is the correct suppression here.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct AlignmentDecisionRecord {
+    /// Unix timestamp (seconds) recorded at the point of the alignment call.
+    pub timestamp: i64,
+    /// Caller-assigned request identifier (forwarded from the proxy seam).
+    pub request_id: String,
+    /// Detected provider — `"Anthropic"` or `"OpenAi"`.
+    pub provider: String,
+    /// True when at least one tool/schema span had its keys sorted.
+    pub tools_key_sorted: bool,
+    /// True when at least one span was compacted (whitespace removed).
+    pub spans_compacted: bool,
+    /// Number of `cache_control` markers injected by skim (0–2 in v1).
+    pub skim_breakpoints_injected: usize,
+    /// Number of client-supplied `cache_control` markers found in the body.
+    pub client_breakpoint_count: usize,
+    /// Number of volatile-pattern detections (warn/stats only — no effect on placement).
+    pub volatile_warn_count: usize,
+    /// True when the stage returned the input unchanged (fail-open passthrough).
+    pub fail_open: bool,
+    /// Input byte length.
+    pub input_len: usize,
+    /// Output byte length.
+    pub output_len: usize,
+    /// SHA-256 of the stage input.
+    pub input_sha256: [u8; 32],
+    /// SHA-256 of the stage output.
+    pub output_sha256: [u8; 32],
+}
+
+// ============================================================================
+// AlignmentRecorder trait — proxy-gated (AD-CA-9: writer proxy-gated)
+// ============================================================================
+
+/// Writer trait for alignment decision records.
+///
+/// # AD-CA-9 / AD-AN-5
+///
+/// A focused writer trait — NOT an extension of the query-only
+/// [`AnalyticsStore`] trait (verified `AnalyticsStore` exposes only `query_*`
+/// methods and `clear`, mod.rs:326-372). Implementations are fire-and-forget:
+/// a blocked, slow, or panicking recorder MUST NEVER delay or alter request
+/// forwarding. The production implementation (`ChannelAlignmentRecorder`) uses
+/// `try_send` with drop-on-overflow to enforce this.
+#[cfg(feature = "proxy")]
+pub(crate) trait AlignmentRecorder: Send + Sync {
+    /// Record one alignment decision.
+    ///
+    /// Must return immediately without blocking. Drop-on-overflow is the
+    /// correct failure mode (see `ChannelAlignmentRecorder`).
+    fn record(&self, rec: AlignmentDecisionRecord);
+}
+
+// ============================================================================
+// NoopRecorder — no-op implementation for disabled analytics (proxy-gated)
+// ============================================================================
+
+/// No-op recorder used when `analytics.enabled` is false.
+///
+/// # AD-CA-9
+///
+/// Returned by [`ChannelAlignmentRecorder::new_boxed`] when analytics are
+/// disabled so call sites need not check `enabled` on every invocation.
+#[cfg(feature = "proxy")]
+pub(crate) struct NoopRecorder;
+
+#[cfg(feature = "proxy")]
+impl AlignmentRecorder for NoopRecorder {
+    fn record(&self, _rec: AlignmentDecisionRecord) {}
+}
+
+// ============================================================================
+// ChannelAlignmentRecorder — production implementation (proxy-gated)
+// ============================================================================
+
+/// Bounded channel capacity for alignment decision records.
+///
+/// 256 slots is generous for typical proxy throughput (a few requests/second).
+/// When the channel is full, records are dropped and counted — the proxy path
+/// is never stalled.
+#[cfg(feature = "proxy")]
+const ALIGN_CHANNEL_CAP: usize = 256;
+
+/// Bundle returned by [`ChannelAlignmentRecorder::new_boxed`].
+///
+/// The `handle` and `done_rx` are `Some` when analytics are enabled (i.e. a
+/// consumer thread was spawned) and `None` when disabled.  The proxy's bounded
+/// shutdown block (Cross-Plan Amendment #4) uses them directly — the alignment
+/// consumer is **not** registered via `register_thread` / `flush_pending()`.
+/// Both consumers (#305 proxy-analytics and #306 alignment) drain concurrently
+/// under a single `FLUSH_BOUND` window each.
+#[cfg(feature = "proxy")]
+pub(crate) struct AlignmentRecorderBundle {
+    pub(crate) recorder: Box<dyn AlignmentRecorder>,
+    /// Consumer thread handle.  `None` when analytics are disabled.
+    pub(crate) handle: Option<std::thread::JoinHandle<()>>,
+    /// Fires once when the consumer has drained all queued records and exited.
+    /// `None` when analytics are disabled.
+    pub(crate) done_rx: Option<crossbeam_channel::Receiver<()>>,
+}
+
+/// Production [`AlignmentRecorder`] backed by a bounded crossbeam channel.
+///
+/// # Design (AD-CA-9 / AD-AN-5)
+///
+/// - **Bounded channel + `try_send`**: a blocked/full channel causes drop-on-overflow,
+///   never a stall. The drop counter is observable for diagnostics.
+/// - **One consumer thread**: opens `AnalyticsDb::open_default()` once, caps
+///   `busy_timeout` to 100 ms (matching the #305 proxy-analytics consumer — see
+///   Cross-Plan Amendment #4), and drains the channel until the sender is dropped.
+/// - **Proxy-owned lifecycle**: `new_boxed` returns the thread handle and done
+///   channel in [`AlignmentRecorderBundle`] so `proxy.rs` can join the thread
+///   within the same bounded `FLUSH_BOUND` gate it uses for the #305 consumer.
+///   The consumer is **not** registered via `register_thread` / `flush_pending()`.
+///
+/// # Drain sequence (proxy shutdown)
+///
+/// When `serve_with_stage()` returns (SIGINT / SIGTERM), the
+/// `TransformPipeline` drops, which drops `CacheAlignStage`, which drops this
+/// recorder, which drops the `Sender`. The channel is then closed; the consumer
+/// drains remaining records, fires `done_tx`, and exits. `proxy.rs` joins the
+/// thread within `FLUSH_BOUND` before process exit (Cross-Plan Amendment #4).
+#[cfg(feature = "proxy")]
+pub(crate) struct ChannelAlignmentRecorder {
+    sender: crossbeam_channel::Sender<AlignmentDecisionRecord>,
+    /// Observable overflow count — incremented on every `try_send` failure.
+    /// Never fatal: a dropped record is less harmful than a stalled request.
+    drop_count: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "proxy")]
+impl ChannelAlignmentRecorder {
+    /// Construct a recorder and spawn its consumer thread.
+    ///
+    /// Returns an [`AlignmentRecorderBundle`] with a [`NoopRecorder`] and
+    /// `handle`/`done_rx` both `None` when `analytics.enabled` is false.
+    /// Otherwise constructs a bounded channel, spawns the consumer, and
+    /// returns the bundle. The caller (proxy.rs) owns the lifecycle — the
+    /// consumer is not registered via `register_thread` (Cross-Plan Amendment #4).
+    pub(crate) fn new_boxed(analytics: &AnalyticsConfig) -> AlignmentRecorderBundle {
+        if !analytics.enabled {
+            return AlignmentRecorderBundle {
+                recorder: Box::new(NoopRecorder),
+                handle: None,
+                done_rx: None,
+            };
+        }
+        let (tx, rx) = crossbeam_channel::bounded::<AlignmentDecisionRecord>(ALIGN_CHANNEL_CAP);
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        let handle = std::thread::spawn(move || {
+            // Open once — WAL + busy_timeout(5000) inherited from open_default.
+            // Honouring SKIM_ANALYTICS_DB > SKIM_CACHE_DIR (mod.rs:414).
+            let db = match AnalyticsDb::open_default() {
+                Ok(d) => d,
+                Err(_) => {
+                    // Fail-open: silently skip all records and still signal done
+                    // so the bounded shutdown block in proxy.rs is not orphaned.
+                    let _ = done_tx.send(());
+                    return;
+                }
+            };
+            // Cap per-write SQLITE_BUSY wait to 100 ms (Cross-Plan Amendment #4):
+            // both the #305 proxy-analytics consumer and this consumer write to
+            // analytics.db from the same process, so contention is routine.
+            // Without this cap the full 5 s open_default() busy_timeout applies
+            // per write; with ALIGN_CHANNEL_CAP=256 queued records that bounds
+            // proxy exit at up to 1280 s — longer than any operator would wait.
+            let _ = db.set_busy_timeout(Duration::from_millis(100));
+            while let Ok(rec) = rx.recv() {
+                let _ = db.record_alignment(&rec);
+            }
+            // Channel closed (sender dropped) → drain complete.  Signal proxy.rs.
+            let _ = done_tx.send(());
+        });
+        // Do NOT call register_thread — proxy.rs owns this handle via the bounded
+        // block (Cross-Plan Amendment #4).  A flush_pending() join here would be
+        // the second divergent drain the amendment explicitly forbids.
+        AlignmentRecorderBundle {
+            recorder: Box::new(Self {
+                sender: tx,
+                drop_count,
+            }),
+            handle: Some(handle),
+            done_rx: Some(done_rx),
+        }
+    }
+
+    /// Number of records dropped because the bounded channel was full or disconnected.
+    ///
+    /// # AC18 — Observable drop counter
+    ///
+    /// Drop-on-overflow is the correct failure mode for a fire-and-forget analytics
+    /// path, but a silent drop is not observable. Observability has two halves, and
+    /// this accessor is only the second one:
+    /// - **In production builds**, each drop emits a `SKIM_DEBUG`-gated stderr notice
+    ///   from [`AlignmentRecorder::record`] carrying the running total. That notice —
+    ///   not this accessor — is what an operator reads.
+    /// - **In test builds**, this accessor exposes the same counter so the overflow
+    ///   path is assertable. It is `#[cfg(test)]` because no production call site
+    ///   reads it, and an unused `pub(crate)` method would trip the zero-warnings gate.
+    #[cfg(test)]
+    pub(crate) fn drop_count(&self) -> usize {
+        self.drop_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "proxy")]
+impl AlignmentRecorder for ChannelAlignmentRecorder {
+    /// Send a record via `try_send`.
+    ///
+    /// On overflow (`Err(Full)`) or disconnected (`Err(Disconnected)`), increments
+    /// `drop_count`, emits a `SKIM_DEBUG` notice, and returns immediately. Never blocks.
+    ///
+    /// # AC18 — Observable drop counter
+    ///
+    /// The counter is readable via [`ChannelAlignmentRecorder::drop_count`] and each
+    /// drop emits a debug-gated stderr notice, so overflow is diagnosable rather than
+    /// silent. Dropping is still the correct failure mode: a stalled request is worse
+    /// than a missing analytics row.
+    fn record(&self, rec: AlignmentDecisionRecord) {
+        if self.sender.try_send(rec).is_err() {
+            let dropped = self.drop_count.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::debug_log!(
+                "skim proxy: alignment analytics channel full — record dropped (total dropped: {dropped})"
+            );
+        }
     }
 }
 
@@ -2186,7 +2418,7 @@ pub(crate) fn try_record_command_with_counts(
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
@@ -2721,6 +2953,24 @@ mod tests {
             is_safe_session_id("session-2024-01-15_abc123"),
             "typical session ID format should be accepted"
         );
+    }
+
+    // ========================================================================
+    // since_clause_with_extra helper test
+    // ========================================================================
+
+    #[test]
+    fn test_since_clause_with_extra_no_since() {
+        let (clause, params) = since_clause_with_extra(None, "language IS NOT NULL");
+        assert_eq!(clause, "WHERE language IS NOT NULL");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn test_since_clause_with_extra_with_since() {
+        let (clause, params) = since_clause_with_extra(Some(12345), "mode IS NOT NULL");
+        assert_eq!(clause, "WHERE timestamp >= ?1 AND mode IS NOT NULL");
+        assert_eq!(params, vec![12345]);
     }
 
     // ========================================================================
@@ -3315,6 +3565,366 @@ mod tests {
     }
 
     // ========================================================================
+    // Schema migration v5 tests — alignment_decisions table (AD-CA-9)
+    // ========================================================================
+
+    /// POSITIVE: v5 migration creates the alignment_decisions table.
+    /// DISCRIMINATING (PF-007): if the migration were removed, this test fails.
+    #[test]
+    fn test_alignment_decisions_table_created_by_migration() {
+        let (db, _tmp) = test_db();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='alignment_decisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "alignment_decisions table must be created by migration v5"
+        );
+    }
+
+    /// POSITIVE: schema version is 5 after migration.
+    /// DISCRIMINATING: if PRAGMA user_version = 5 were not the last statement, version would be wrong.
+    #[test]
+    fn test_schema_version_is_5_after_migration() {
+        let (db, _tmp) = test_db();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5, "schema version must be 5 after all migrations");
+    }
+
+    /// POSITIVE: record_alignment inserts a row into alignment_decisions.
+    /// DISCRIMINATING: deleting record_alignment would cause this to return 0.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_record_alignment_inserts_row() {
+        let (db, _tmp) = test_db();
+        let rec = AlignmentDecisionRecord {
+            timestamp: 1711300000,
+            request_id: "req-test-001".to_string(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: true,
+            spans_compacted: true,
+            skim_breakpoints_injected: 1,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: false,
+            input_len: 512,
+            output_len: 486,
+            input_sha256: [0u8; 32],
+            output_sha256: [1u8; 32],
+        };
+        db.record_alignment(&rec).unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM alignment_decisions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "one alignment decision row must be inserted");
+
+        // Verify round-trip of key fields.
+        let (stored_req, stored_provider, stored_injected): (String, String, i64) = db
+            .conn
+            .query_row(
+                "SELECT request_id, provider, skim_breakpoints_injected FROM alignment_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_req, "req-test-001");
+        assert_eq!(stored_provider, "Anthropic");
+        assert_eq!(stored_injected, 1);
+    }
+
+    /// POSITIVE: fail_open=true record round-trips correctly (SHA-256 pair equal).
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_record_alignment_fail_open_row() {
+        let (db, _tmp) = test_db();
+        let sha = [0xAB_u8; 32];
+        let rec = AlignmentDecisionRecord {
+            timestamp: 1711300001,
+            request_id: "req-failopen".to_string(),
+            provider: "OpenAi".to_string(),
+            tools_key_sorted: false,
+            spans_compacted: false,
+            skim_breakpoints_injected: 0,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: true,
+            input_len: 100,
+            output_len: 100,
+            input_sha256: sha,
+            output_sha256: sha,
+        };
+        db.record_alignment(&rec).unwrap();
+
+        let (stored_fail_open, stored_in_len, stored_out_len): (i64, i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT fail_open, input_len, output_len FROM alignment_decisions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_fail_open, 1, "fail_open must be stored as 1");
+        assert_eq!(stored_in_len, 100);
+        assert_eq!(stored_out_len, 100);
+    }
+
+    // ========================================================================
+    // AlignmentRecorder test helper types (AC18 / AD-CA-9) — proxy-gated
+    // ========================================================================
+
+    /// Synchronous mock recorder — stores all records for test assertion.
+    ///
+    /// Shares the internal list via `Arc<Mutex<...>>` so callers can inspect
+    /// records after moving the recorder into a stage.
+    ///
+    /// Used in proxy.rs tests (AC18): prove that a call to `CacheAlignStage::apply`
+    /// records exactly one `AlignmentDecisionRecord` per request.
+    #[cfg(feature = "proxy")]
+    pub(crate) struct BlockingMockRecorder {
+        records: Arc<Mutex<Vec<AlignmentDecisionRecord>>>,
+    }
+
+    #[cfg(feature = "proxy")]
+    impl BlockingMockRecorder {
+        pub(crate) fn new() -> Self {
+            Self {
+                records: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// Return a cloned handle to the shared record list.
+        pub(crate) fn handle(&self) -> Arc<Mutex<Vec<AlignmentDecisionRecord>>> {
+            Arc::clone(&self.records)
+        }
+    }
+
+    #[cfg(feature = "proxy")]
+    impl AlignmentRecorder for BlockingMockRecorder {
+        fn record(&self, rec: AlignmentDecisionRecord) {
+            let mut g = self.records.lock().unwrap_or_else(|p| p.into_inner());
+            g.push(rec);
+        }
+    }
+
+    /// Counting mock recorder — counts `record` calls.
+    ///
+    /// Used in proxy.rs tests (AC18) to prove `CacheAlignStage::apply` emits exactly
+    /// one record per request. Drop-on-overflow is covered separately by
+    /// `test_channel_recorder_overflow_increments_observable_drop_count`, which
+    /// exercises the real `ChannelAlignmentRecorder`.
+    #[cfg(feature = "proxy")]
+    pub(crate) struct CountingMockRecorder {
+        pub(crate) count: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "proxy")]
+    impl CountingMockRecorder {
+        pub(crate) fn new() -> Self {
+            Self {
+                count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        pub(crate) fn handle(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.count)
+        }
+    }
+
+    #[cfg(feature = "proxy")]
+    impl AlignmentRecorder for CountingMockRecorder {
+        fn record(&self, _rec: AlignmentDecisionRecord) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // AC18 / AD-CA-9: NoopRecorder never panics.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_noop_recorder_does_not_panic() {
+        let rec = NoopRecorder;
+        rec.record(AlignmentDecisionRecord {
+            timestamp: 0,
+            request_id: String::new(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: false,
+            spans_compacted: false,
+            skim_breakpoints_injected: 0,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: true,
+            input_len: 0,
+            output_len: 0,
+            input_sha256: [0u8; 32],
+            output_sha256: [0u8; 32],
+        });
+    }
+
+    /// Build an `AlignmentDecisionRecord` for tests (content-free by construction).
+    #[cfg(feature = "proxy")]
+    fn sample_alignment_record(request_id: &str) -> AlignmentDecisionRecord {
+        AlignmentDecisionRecord {
+            timestamp: 0,
+            request_id: request_id.to_string(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: true,
+            spans_compacted: true,
+            skim_breakpoints_injected: 1,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: false,
+            input_len: 10,
+            output_len: 10,
+            input_sha256: [0u8; 32],
+            output_sha256: [0u8; 32],
+        }
+    }
+
+    // AC18 / AD-CA-9: bounded-channel overflow drops the record AND increments an
+    // OBSERVABLE counter. DISCRIMINATING (PF-007): if `record` blocked instead of
+    // using try_send, this test would hang; if the counter were not incremented,
+    // the final assertion fails.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_channel_recorder_overflow_increments_observable_drop_count() {
+        // Capacity 1, and no consumer draining it: the second send must overflow.
+        let (tx, rx) = crossbeam_channel::bounded::<AlignmentDecisionRecord>(1);
+        let recorder = ChannelAlignmentRecorder {
+            sender: tx,
+            drop_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        recorder.record(sample_alignment_record("fits"));
+        assert_eq!(recorder.drop_count(), 0, "first record fits in the channel");
+
+        recorder.record(sample_alignment_record("overflows"));
+        recorder.record(sample_alignment_record("overflows-again"));
+        assert_eq!(
+            recorder.drop_count(),
+            2,
+            "AC18: each overflow must increment the observable drop counter"
+        );
+
+        // The one record that fit is still intact and content-free.
+        let received = rx.try_recv().expect("first record must be queued");
+        assert_eq!(received.request_id, "fits");
+        drop(rx);
+
+        // A disconnected channel also counts as a drop, never a block.
+        recorder.record(sample_alignment_record("disconnected"));
+        assert_eq!(recorder.drop_count(), 3);
+    }
+
+    // AC18 / AD-CA-9: ChannelAlignmentRecorder returns NoopRecorder when disabled.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_channel_recorder_noop_when_disabled() {
+        let cfg = AnalyticsConfig {
+            enabled: false,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+        // new_boxed now returns an AlignmentRecorderBundle; destructure the recorder.
+        let AlignmentRecorderBundle {
+            recorder,
+            handle,
+            done_rx,
+        } = ChannelAlignmentRecorder::new_boxed(&cfg);
+        // Disabled path: no thread is spawned.
+        assert!(handle.is_none());
+        assert!(done_rx.is_none());
+        // Must not panic — NoopRecorder::record is a no-op.
+        recorder.record(AlignmentDecisionRecord {
+            timestamp: 0,
+            request_id: "r".to_string(),
+            provider: "Anthropic".to_string(),
+            tools_key_sorted: false,
+            spans_compacted: false,
+            skim_breakpoints_injected: 0,
+            client_breakpoint_count: 0,
+            volatile_warn_count: 0,
+            fail_open: true,
+            input_len: 0,
+            output_len: 0,
+            input_sha256: [0u8; 32],
+            output_sha256: [0u8; 32],
+        });
+    }
+
+    // Cross-Plan Amendment #4 regression: AlignmentRecorderBundle lifecycle.
+    //
+    // new_boxed must:
+    //   (a) return Some(handle) + Some(done_rx) when analytics are enabled;
+    //   (b) NOT register the thread via register_thread (PENDING_THREADS stays
+    //       empty — the caller owns the lifecycle);
+    //   (c) fire done_rx after the sender is dropped (channel closes).
+    //
+    // Uses REGISTRY_TEST_LOCK + drain_registry() for PENDING_THREADS isolation.
+    // Points SKIM_ANALYTICS_DB at a non-existent path so the consumer takes the
+    // fail-open branch (done_tx.send fires on open error); this avoids touching
+    // the real analytics.db and still exercises the critical lifecycle guarantee.
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn test_alignment_recorder_bundle_done_rx_fires_not_registered() {
+        use std::time::Duration;
+
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_registry(); // clean slate
+
+        // Non-existent path → AnalyticsDb::open_default() fails → fail-open path
+        // → consumer fires done_tx immediately without opening the real DB.
+        let bad_path = std::path::PathBuf::from("/nonexistent-skim-align-test-dir-xyz/align.db");
+        // SAFETY: single-threaded under REGISTRY_TEST_LOCK; no other thread
+        // reads SKIM_ANALYTICS_DB concurrently.
+        unsafe { std::env::set_var("SKIM_ANALYTICS_DB", &bad_path) };
+
+        let cfg = AnalyticsConfig {
+            enabled: true,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+        let AlignmentRecorderBundle {
+            recorder,
+            handle,
+            done_rx,
+        } = ChannelAlignmentRecorder::new_boxed(&cfg);
+
+        // Reset env var before any assertion that could panic.
+        // SAFETY: single-threaded under REGISTRY_TEST_LOCK.
+        unsafe { std::env::remove_var("SKIM_ANALYTICS_DB") };
+
+        let handle = handle.expect("enabled path must return Some(handle)");
+        let done_rx = done_rx.expect("enabled path must return Some(done_rx)");
+
+        // (b) PENDING_THREADS must be empty — consumer is NOT registered.
+        let registry_len = PENDING_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            registry_len, 0,
+            "Cross-Plan Amendment #4: new_boxed must NOT call register_thread"
+        );
+
+        // (c) Drop the sender; done_rx must fire within FLUSH_BOUND.
+        drop(recorder);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("done_rx must fire after sender drop");
+        let _ = handle.join();
+    }
+
     // Schema v4 migration tests (AC1–AC4, #305)
     //
     // AD-AN-5: covers the single-transaction table-rebuild migration that adds
@@ -3379,8 +3989,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            version, 4,
-            "fresh DB must be at schema version 4 after all migrations"
+            version, 5,
+            "fresh DB must be at schema version 5 after all migrations"
         );
 
         // 2. token_savings columns include all v4 additions (nullable).
@@ -3665,7 +4275,10 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "AC2: version must be 4 after migration");
+        assert_eq!(
+            version, 5,
+            "AC2: version must be 5 after full migration (v4+v5)"
+        );
 
         // All 2 original rows are still there.
         let count: i64 = db
@@ -4055,7 +4668,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4, "AC4 (early): clean re-open must migrate to v4");
+        assert_eq!(version, 5, "AC4 (early): clean re-open must migrate to v5");
         let count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM token_savings", [], |r| r.get(0))
@@ -4149,8 +4762,8 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 4,
-            "AC4 (detail-table): clean re-open must reach v4"
+            version, 5,
+            "AC4 (detail-table): clean re-open must reach v5"
         );
         let count: i64 = db
             .conn
@@ -4294,14 +4907,17 @@ mod tests {
         );
     }
 
-    /// AC21 — `select_encoding` covers all 9 cells of the
-    /// {Unknown, Anthropic, OpenAI} × {None, recognized, unrecognized} matrix.
+    /// AC21 — `encoding_for_provider_model` covers all 9 cells of the
+    /// {Unknown, Anthropic, OpenAI} × {None, recognized, unrecognized} matrix,
+    /// routed through the `RecordingProvider → rskim_tokens::Provider` conversion.
     ///
     /// The OpenAI + "gpt-4" cell is the **discriminating case**: gpt-4 maps to
     /// `Cl100k` (not `O200k`), so a regression that always returns the family
-    /// default would produce the wrong answer here.
+    /// default would produce the wrong answer here. The `.into()` conversion is
+    /// exercised on every row, so a mismap in `From<RecordingProvider>` would
+    /// also be caught.
     #[test]
-    fn test_select_encoding_table_driven() {
+    fn test_encoding_for_provider_model_table_driven() {
         use Encoding::*;
         use RecordingProvider::*;
 
@@ -4342,13 +4958,47 @@ mod tests {
             ("OpenAI+unrecognized", OpenAI, Some("mystery-llm"), O200k),
         ];
 
-        for &(label, ref provider, model, expected) in cases {
-            let got = select_encoding(provider, model);
+        for &(label, provider, model, expected) in cases {
+            let got = encoding_for_provider_model(provider.into(), model);
             assert_eq!(
                 got, expected,
-                "select_encoding case '{label}': expected {expected:?} got {got:?}"
+                "encoding_for_provider_model case '{label}': expected {expected:?} got {got:?}"
             );
         }
+    }
+
+    /// Pins the `RecordingProvider → rskim_tokens::Provider` variant correspondence
+    /// for the three current variants.
+    ///
+    /// What this test actually proves:
+    /// 1. The three current `RecordingProvider` variants (`Anthropic`, `OpenAI`,
+    ///    `Unknown`) each map to the correct `rskim_tokens::Provider` counterpart.
+    /// 2. The exhaustive `match` in `From<RecordingProvider>` forces any future
+    ///    `RecordingProvider` variant to get an explicit arm — a compile error at
+    ///    add-time, not a silent mismatch.
+    ///
+    /// What this test does NOT prove: a wrongly-coded fourth arm (e.g.
+    /// `RecordingProvider::Google => TP::Unknown` when `TP::Google` is correct)
+    /// would compile and these three assertions would still pass. The exhaustive
+    /// match enforces the presence of an arm, not its correctness.
+    #[test]
+    fn test_recording_provider_maps_to_tokens_provider() {
+        use rskim_tokens::Provider as TP;
+        assert_eq!(
+            TP::from(RecordingProvider::Anthropic),
+            TP::Anthropic,
+            "RecordingProvider::Anthropic must map to rskim_tokens::Provider::Anthropic"
+        );
+        assert_eq!(
+            TP::from(RecordingProvider::OpenAI),
+            TP::OpenAI,
+            "RecordingProvider::OpenAI must map to rskim_tokens::Provider::OpenAI"
+        );
+        assert_eq!(
+            TP::from(RecordingProvider::Unknown),
+            TP::Unknown,
+            "RecordingProvider::Unknown must map to rskim_tokens::Provider::Unknown"
+        );
     }
 
     /// AD-AN-13 + AD-PXY-21 — record_proxy writes a correctly-populated parent

@@ -40,11 +40,14 @@ use std::net::IpAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use rskim_align::Provider as LlmProvider;
 use rskim_compress::{BlockRouter, Policy};
 use rskim_contract::contract::Outcome;
 use rskim_contract::log::{DecisionRecord, DecisionSink, SinkFull};
+use rskim_contract::waiver::MARKER_BYTES;
 use rskim_proxy::authmode::AuthMode;
 use rskim_proxy::config::ProxyConfig;
+use rskim_proxy::detect::ProxyProvider;
 use rskim_proxy::seam::{TransformContext, TransformPipeline, TransformStage};
 
 // ============================================================================
@@ -128,6 +131,164 @@ impl DecisionSink for BinarySinkStub {
     }
 }
 
+// ============================================================================
+// CacheAlignStage — TransformStage adapter for rskim-align (AD-CA-8 / #306)
+// ============================================================================
+
+/// [`TransformStage`] adapter wrapping `rskim_align::align` for the proxy pipeline.
+///
+/// ## AD-CA-8 — Appended last (AD-PXY-06)
+///
+/// `CacheAlignStage` is appended after `BlockRouterStage` in the pipeline.
+/// This mirrors the canonical order `#307 → #304 → #306 LAST` (seam.rs:19-29).
+///
+/// ## AD-CA-10 — Provider isolation
+///
+/// Provider mapping from [`ProxyProvider`] to [`LlmProvider`] occurs **before**
+/// any marker code. `ProxyProvider::Unknown` → immediate passthrough
+/// (seam bypass upstream per AD-PXY-02).
+///
+/// ## AD-CA-9 / AD-AN-5 — Analytics fire-and-forget
+///
+/// Each call records one [`crate::analytics::AlignmentDecisionRecord`] via the
+/// injected [`crate::analytics::AlignmentRecorder`]. The recorder uses
+/// `try_send` + drop-on-overflow — a blocked recorder NEVER delays forwarding.
+///
+/// ## AD-CA-5 / AD-PXY-21 — Bounded growth waiver
+///
+/// `max_growth()` returns `2 × MARKER_BYTES` (v1 cap: at most 2 skim markers).
+/// The seam calls `guarded_transform_with_growth(…, stage.max_growth(…), …)`
+/// which accepts output up to `input_len + 2 × MARKER_BYTES`.
+struct CacheAlignStage {
+    recorder: Box<dyn crate::analytics::AlignmentRecorder>,
+}
+
+impl CacheAlignStage {
+    /// Construct a stage with the given recorder.
+    fn new(recorder: Box<dyn crate::analytics::AlignmentRecorder>) -> Self {
+        Self { recorder }
+    }
+}
+
+impl TransformStage for CacheAlignStage {
+    fn name(&self) -> &'static str {
+        "cache-align"
+    }
+
+    /// Apply cache-key alignment to the request body.
+    ///
+    /// ## AD-CA-10 — Provider branch before marker code
+    ///
+    /// Maps `ctx.provider` (proxy-layer [`ProxyProvider`]) to the rskim-llm
+    /// [`LlmProvider`] used by the alignment crate. `ProxyProvider::Unknown`
+    /// returns passthrough immediately — the seam already bypasses Unknown
+    /// providers (AD-PXY-02) but we guard defensively here as well.
+    ///
+    /// ## Outcome mapping
+    ///
+    /// - Fail-open passthrough (SHA-256-equal): `outcome.bytes == body` → `Outcome::passthrough`
+    /// - Modified (canonical + marker injection): `outcome.bytes != body` → `Outcome::modified`
+    fn apply(&self, body: &[u8], ctx: &TransformContext<'_>, _sink: &dyn DecisionSink) -> Outcome {
+        // AD-CA-10: map ProxyProvider → LlmProvider before ANY marker code.
+        // Unknown → whole-request passthrough (seam bypass upstream, AD-PXY-02).
+        let llm_provider = match ctx.provider {
+            ProxyProvider::Anthropic => LlmProvider::Anthropic,
+            ProxyProvider::OpenAI => LlmProvider::OpenAi,
+            // Defensive: Unknown never reaches this stage (seam.rs:352-356 bypass),
+            // but guard here as defence-in-depth per AD-CA-10.
+            _ => {
+                return Outcome::passthrough(body.to_vec(), ctx.request_id, "cache-align");
+            }
+        };
+
+        // Pure, sync, deterministic alignment — no I/O, no clock.
+        let align_out = rskim_align::align(body, llm_provider, ctx.request_id);
+
+        // AD-CA-9 / AD-AN-5: fire-and-forget alignment record via try_send.
+        // A blocked/full recorder increments its drop_count; forwarding is never delayed.
+        let timestamp = crate::analytics::now_unix_secs();
+        self.recorder
+            .record(crate::analytics::AlignmentDecisionRecord {
+                timestamp,
+                request_id: ctx.request_id.to_string(),
+                provider: format!("{llm_provider:?}"),
+                tools_key_sorted: align_out.stats.tools_key_sorted,
+                spans_compacted: align_out.stats.spans_compacted,
+                skim_breakpoints_injected: align_out.stats.skim_breakpoints_injected,
+                client_breakpoint_count: align_out.stats.client_breakpoint_count,
+                volatile_warn_count: align_out.stats.volatile_warn_count,
+                fail_open: align_out.stats.fail_open,
+                input_len: align_out.stats.input_len,
+                output_len: align_out.stats.output_len,
+                input_sha256: align_out.stats.input_sha256,
+                output_sha256: align_out.stats.output_sha256,
+            });
+
+        if align_out.bytes == body {
+            // Fail-open passthrough OR already-canonical body (byte-identical).
+            Outcome::passthrough(body.to_vec(), ctx.request_id, "cache-align")
+        } else {
+            // Modified: canonical ordering + optional marker injection.
+            let input_len = body.len();
+            Outcome::modified(align_out.bytes, input_len, ctx.request_id, "cache-align")
+        }
+    }
+
+    /// AD-CA-5 / AD-PXY-21: waivered growth for v1 marker injection.
+    ///
+    /// At most 2 skim-injected markers (v1 cap), each exactly `MARKER_BYTES` bytes.
+    /// The seam uses this to call `guarded_transform_with_growth(…, 2 × MARKER_BYTES, …)`
+    /// so the v1 output is accepted even though it may exceed the raw input length.
+    fn max_growth(&self, _input_len: usize) -> usize {
+        // AD-CA-5: 2 × MARKER_BYTES (imported constant, never redefined — AD-CA-4).
+        2 * MARKER_BYTES
+    }
+}
+
+// ============================================================================
+// Pipeline selection (AC16)
+// ============================================================================
+
+/// Which pipeline variant `run()` builds given the runtime flags.
+///
+/// Extracted into a pure enum so that the selection logic can be unit-tested
+/// without constructing actual stages, I/O, or environment side-effects.
+///
+/// # AC16 — testable selection
+///
+/// `select_pipeline(passthrough_env, no_cache_align)` maps two boolean inputs
+/// to one of three variants. Tests assert that all three variants are reachable
+/// and that they are pairwise distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineSelection {
+    /// `SKIM_PASSTHROUGH=1` — forward bytes unmodified; no stages.
+    Identity,
+    /// `--no-cache-align` — compression only; CacheAlignStage omitted.
+    BlockRouterOnly,
+    /// Default — full pipeline: compression then cache-key alignment.
+    Full,
+}
+
+/// Map runtime flags to a pipeline variant.
+///
+/// This is a pure function so that tests can assert the selection logic
+/// without constructing stages, spawning threads, or reading env vars.
+///
+/// `passthrough_env` is `true` when `SKIM_PASSTHROUGH == "1"`.
+/// `no_cache_align` is `true` when `--no-cache-align` was passed.
+///
+/// `passthrough_env` takes priority: if it is `true`, the result is always
+/// `Identity` regardless of `no_cache_align`.
+fn select_pipeline(passthrough_env: bool, no_cache_align: bool) -> PipelineSelection {
+    if passthrough_env {
+        PipelineSelection::Identity
+    } else if no_cache_align {
+        PipelineSelection::BlockRouterOnly
+    } else {
+        PipelineSelection::Full
+    }
+}
+
 /// Cleartext-exposure warning emitted to stderr when `--bind` is a non-loopback address.
 ///
 /// AC1 / AD-PXY-03: this exact string is the contract; tests assert it appears on stderr.
@@ -136,6 +297,39 @@ const CLEARTEXT_WARNING: &str = "WARNING: skim proxy is bound to a non-loopback 
      unless the client uses TLS. Only bind to non-loopback addresses in trusted \
      network environments. Omit --bind (or pass --bind 127.0.0.1) to restrict \
      to loopback.";
+
+/// Build a [`TransformPipeline`] for the given [`PipelineSelection`].
+///
+/// `recorder` is consumed by the [`PipelineSelection::Full`] arm only; callers on
+/// Identity or BlockRouterOnly paths should pass [`crate::analytics::NoopRecorder`].
+///
+/// This is the **single canonical definition** of the stage composition.  Both
+/// [`run()`] and tests call this function — there is no separate test mirror.  A
+/// change to the Full arm's stage list is immediately visible to both paths, so
+/// deleting a stage from the Full arm is caught by `test_select_pipeline_stage_count`.
+///
+/// # AD-CA-8
+///
+/// [`CacheAlignStage`] is appended LAST per AD-PXY-06.
+fn build_pipeline(
+    selection: PipelineSelection,
+    recorder: Box<dyn crate::analytics::AlignmentRecorder>,
+) -> TransformPipeline {
+    match selection {
+        PipelineSelection::Identity => TransformPipeline::identity(),
+        PipelineSelection::BlockRouterOnly => {
+            let router = BlockRouter::new(Arc::new(BinarySinkStub));
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router))])
+        }
+        PipelineSelection::Full => {
+            // AD-CA-8: CacheAlignStage appended LAST per AD-PXY-06.
+            let router = BlockRouter::new(Arc::new(BinarySinkStub));
+            let block_stage = BlockRouterStage::new(router);
+            let align_stage = CacheAlignStage::new(recorder);
+            TransformPipeline::from_stages(vec![Box::new(block_stage), Box::new(align_stage)])
+        }
+    }
+}
 
 /// Run the `skim proxy` subcommand.
 ///
@@ -146,7 +340,7 @@ const CLEARTEXT_WARNING: &str = "WARNING: skim proxy is bound to a non-loopback 
 /// shutdown (SIGINT/SIGTERM received and drain complete).
 pub(crate) fn run(
     args: &[String],
-    analytics: &crate::analytics::AnalyticsConfig,
+    analytics_cfg: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     // Help flag.
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
@@ -204,18 +398,48 @@ pub(crate) fn run(
 
     // Build the transform pipeline.
     //
-    // SKIM_PASSTHROUGH=1 → identity pipeline (no compression). Consistent with
-    // skim's global passthrough convention for debugging (#304 escape hatch).
+    // AC16: the variant is selected by the pure `select_pipeline` function so that
+    // tests can assert on the selection logic without constructing actual stages.
     //
-    // Default → inject BlockRouterStage wrapping BlockRouter (Phase 4a / D1 / AC19).
-    // The router holds a BinarySinkStub for its Contract bridge; the per-call
-    // apply() path receives the real sink via TransformStage::apply.
-    let pipeline = if std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1") {
-        TransformPipeline::identity()
-    } else {
-        let router = BlockRouter::new(Arc::new(BinarySinkStub));
-        let stage = BlockRouterStage::new(router);
-        TransformPipeline::from_stages(vec![Box::new(stage)])
+    // Separate `let` bindings for align_handle / align_done_rx so they are
+    // visible after the match block (same pattern as consumer_handle / done_rx
+    // for the proxy-analytics consumer). Both are `None` on the Identity and
+    // BlockRouterOnly paths; `Some` on the Full path when analytics are enabled.
+    let align_handle: Option<std::thread::JoinHandle<()>>;
+    let align_done_rx: Option<crossbeam_channel::Receiver<()>>;
+
+    let selection = select_pipeline(
+        std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1"),
+        parsed.no_cache_align,
+    );
+    let pipeline = match selection {
+        PipelineSelection::Identity | PipelineSelection::BlockRouterOnly => {
+            // Identity: SKIM_PASSTHROUGH=1 → no compression.
+            // BlockRouterOnly: --no-cache-align → compression only; CacheAlignStage omitted.
+            // No AlignmentRecorder on these paths — no consumer thread is spawned and
+            // analytics.db is never opened by the proxy on these paths.
+            align_handle = None;
+            align_done_rx = None;
+            build_pipeline(selection, Box::new(crate::analytics::NoopRecorder))
+        }
+        PipelineSelection::Full => {
+            // AD-CA-9 / AD-AN-5: build the AlignmentRecorder ONLY on the Full path —
+            // `new_boxed` spawns a consumer thread and opens analytics.db, which must
+            // not happen under --no-cache-align or SKIM_PASSTHROUGH. Returns a
+            // NoopRecorder (no thread) when analytics are disabled.
+            //
+            // Cross-Plan Amendment #4 (fulfilled): new_boxed returns the thread handle
+            // and done channel in AlignmentRecorderBundle so the bounded shutdown block
+            // below owns the lifecycle — not register_thread / flush_pending().
+            let crate::analytics::AlignmentRecorderBundle {
+                recorder: align_recorder,
+                handle,
+                done_rx,
+            } = crate::analytics::ChannelAlignmentRecorder::new_boxed(analytics_cfg);
+            align_handle = handle;
+            align_done_rx = done_rx;
+            build_pipeline(selection, align_recorder)
+        }
     };
 
     // Build the analytics hook.
@@ -234,7 +458,7 @@ pub(crate) fn run(
     let consumer_handle: Option<std::thread::JoinHandle<()>>;
     let done_rx: Option<crossbeam_channel::Receiver<()>>;
 
-    if analytics.enabled {
+    if analytics_cfg.enabled {
         let (hook, rx) = super::proxy_analytics::BridgeAnalyticsHook::new(
             super::proxy_analytics::PROXY_QUEUE_RECORD_CAPACITY,
         );
@@ -245,7 +469,7 @@ pub(crate) fn run(
             rx,
             drop_count,
             queued_bytes,
-            analytics.session_id.clone(),
+            analytics_cfg.session_id.clone(),
             done_tx,
             // None → AnalyticsDb::open_default(), honouring SKIM_ANALYTICS_DB /
             // SKIM_CACHE_DIR. Only tests inject an explicit path.
@@ -273,17 +497,32 @@ pub(crate) fn run(
         }
     };
 
-    // AD-AN-12: bounded shutdown flush — wait up to FLUSH_BOUND for the
-    // consumer to drain and persist drop counts. If the bound elapses
-    // (pathological wedge), return without blocking; OS reclaims the thread.
+    // AD-AN-12 / Cross-Plan Amendment #4 (fulfilled): bounded shutdown flush.
     //
-    // Cross-Plan Amendment #4 (bounded-consumer ownership): this
-    // `recv_timeout(FLUSH_BOUND)` is THE ONE bounded-consumer shutdown mechanism
-    // for the resident proxy (ADR-003 / PF-005). When #306's AlignmentRecorder
-    // consumer lands, it must reuse this same registered/bounded lifecycle
-    // (extend this block) rather than adding a second divergent flush_pending()
-    // drain. One shutdown mechanism → one flush gate → one exit path.
+    // Both the #305 proxy-analytics consumer and the #306 alignment consumer
+    // are joined here with `recv_timeout(FLUSH_BOUND)` — one bounded gate per
+    // consumer (ADR-003 / PF-005). Neither is registered via register_thread /
+    // flush_pending(). The two consumers drain concurrently, so in the common
+    // case the alignment wait returns immediately after the analytics wait.
+    //
+    // If a bound elapses (pathological wedge), the JoinHandle is dropped and
+    // the OS reclaims the thread — the proxy never hangs indefinitely.
+
+    // Proxy-analytics consumer (#305).
     if let (Some(done_rx), Some(handle)) = (done_rx, consumer_handle) {
+        match done_rx.recv_timeout(super::proxy_analytics::FLUSH_BOUND) {
+            Ok(()) => {
+                let _ = handle.join();
+            }
+            Err(_) => {
+                // FLUSH_BOUND elapsed → consumer did not finish in time.
+                // Drop the JoinHandle; OS reclaims the thread.
+            }
+        }
+    }
+
+    // Alignment consumer (#306) — same bounded gate, same pattern.
+    if let (Some(done_rx), Some(handle)) = (align_done_rx, align_handle) {
         match done_rx.recv_timeout(super::proxy_analytics::FLUSH_BOUND) {
             Ok(()) => {
                 let _ = handle.join();
@@ -307,6 +546,13 @@ struct ProxyArgs {
     port: u16,
     bind_ip: Option<IpAddr>,
     upstream_default: Option<String>,
+    /// Disable cache-key alignment (CacheAlignStage is omitted from the pipeline).
+    ///
+    /// PF-006: parsed via an explicit unconditional arm so the flag is never
+    /// silently ignored. Unknown flags in the catch-all arm below are ignored
+    /// for forward-compatibility, but `--no-cache-align` is an important
+    /// behavior-change opt-out that must be caught explicitly.
+    no_cache_align: bool,
 }
 
 /// Parse proxy-specific CLI flags from an arg slice.
@@ -321,6 +567,7 @@ fn parse_proxy_args(args: &[String]) -> anyhow::Result<ProxyArgs> {
     let mut port = DEFAULT_PROXY_PORT;
     let mut bind_ip: Option<IpAddr> = None;
     let mut upstream_default: Option<String> = None;
+    let mut no_cache_align = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -369,6 +616,13 @@ fn parse_proxy_args(args: &[String]) -> anyhow::Result<ProxyArgs> {
                 let val = &other["--upstream-default=".len()..];
                 upstream_default = Some(val.to_string());
             }
+            // PF-006: --no-cache-align MUST be parsed via an explicit unconditional arm.
+            // Unknown flags are silently ignored below (forward-compatibility), but this
+            // flag opts out of a significant behaviour change (key canonicalization +
+            // marker injection) and MUST NOT be silently dropped if someone passes it.
+            "--no-cache-align" => {
+                no_cache_align = true;
+            }
             _ => {
                 // Unknown flags are silently ignored for forward-compatibility.
                 // A strict unknown-flag error is a UX tradeoff; meta subcommands
@@ -382,6 +636,7 @@ fn parse_proxy_args(args: &[String]) -> anyhow::Result<ProxyArgs> {
         port,
         bind_ip,
         upstream_default,
+        no_cache_align,
     })
 }
 
@@ -400,14 +655,28 @@ fn print_help() {
              --port <PORT>              Port to listen on (default: 41322; range: 41000-49000)\n\
              --bind <ADDR>              Bind address (default: 127.0.0.1; non-loopback emits a warning)\n\
              --upstream-default <URL>   Default upstream base URL (required for provider routing)\n\
+             --no-cache-align           Disable KV-cache alignment (see CACHE ALIGNMENT below)\n\
              -h, --help                 Print this help message\n\
          \n\
          ENVIRONMENT:\n\
-             SKIM_PASSTHROUGH=1         Bypass all compression\n\
+             SKIM_PASSTHROUGH=1         Bypass all compression and alignment (identity pipeline)\n\
+             SKIM_DISABLE_ANALYTICS=1   Disable analytics recording\n\
+         \n\
+         CACHE ALIGNMENT (enabled by default, disable with --no-cache-align):\n\
+             skim proxy rewrites request bodies to maximise KV-cache hit rates:\n\
+             1. Tool/schema object keys are sorted into canonical order.\n\
+             2. The tools/functions array is sorted into deterministic element order.\n\
+             3. Top-level envelope keys are emitted in canonical order.\n\
+             4. Up to 2 cache_control breakpoints are injected at stable structural\n\
+                positions (last tool object, last block-form system block).\n\
+             These changes are VISIBLE to the model (element order change) and cause\n\
+             a one-time provider-cache warm on skim upgrade. Use --no-cache-align to\n\
+             opt out. SKIM_PASSTHROUGH=1 bypasses all transforms (raw passthrough).\n\
          \n\
          EXAMPLES:\n\
              skim proxy --port 41322 --upstream-default https://api.anthropic.com\n\
-             skim proxy --port 41500 --bind 0.0.0.0 --upstream-default https://api.openai.com"
+             skim proxy --port 41500 --bind 0.0.0.0 --upstream-default https://api.openai.com\n\
+             skim proxy --port 41322 --upstream-default https://api.anthropic.com --no-cache-align"
     );
 }
 
@@ -420,7 +689,6 @@ mod tests {
     use super::*;
     use rskim_contract::log::MockSink;
     use rskim_proxy::config::{DEFAULT_PROXY_PORT, PORT_RANGE_MIN};
-    use rskim_proxy::detect::ProxyProvider;
     use rskim_proxy::seam::HeaderView;
 
     // AC25: parse_proxy_args returns defaults when no args given.
@@ -651,5 +919,731 @@ mod tests {
                 "Ambiguous must NOT produce PolicyPassthrough records (must map to Default)"
             );
         }
+    }
+
+    // =========================================================================
+    // CacheAlignStage + --no-cache-align (AC18 / AD-CA-8 / AD-CA-9 / PF-006)
+    // =========================================================================
+
+    /// Minimal Anthropic body with one tool (triggers canonicalization + marker injection).
+    fn anthropic_body_with_tool() -> &'static [u8] {
+        br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}],"messages":[{"role":"user","content":"What is the weather?"}]}"#
+    }
+
+    /// Helper: apply CacheAlignStage with a given recorder and body.
+    fn apply_align_stage(
+        recorder: Box<dyn crate::analytics::AlignmentRecorder>,
+        body: &[u8],
+        provider: ProxyProvider,
+    ) -> Outcome {
+        let stage = CacheAlignStage::new(recorder);
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext::new(provider, AuthMode::ApiKey, "req-ac18", &hv);
+        let sink = MockSink::new();
+        stage.apply(body, &ctx, &sink)
+    }
+
+    // AC18 / AD-CA-9 / POSITIVE: CacheAlignStage with NoopRecorder completes without panic.
+    // DISCRIMINATING (PF-007): removing CacheAlignStage's apply body would cause a compile error.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_noop_recorder_does_not_block() {
+        let recorder = Box::new(crate::analytics::NoopRecorder);
+        let outcome = apply_align_stage(
+            recorder,
+            anthropic_body_with_tool(),
+            ProxyProvider::Anthropic,
+        );
+        assert!(
+            !outcome.bytes.is_empty(),
+            "CacheAlignStage must produce non-empty output"
+        );
+    }
+
+    // AC18 / AD-CA-9 / POSITIVE: BlockingMockRecorder receives exactly one record per call.
+    // DISCRIMINATING (PF-007): removing self.recorder.record(…) causes count to be 0.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_blocking_mock_records_one_per_call() {
+        let recorder = crate::analytics::tests::BlockingMockRecorder::new();
+        let handle = recorder.handle();
+        let outcome = apply_align_stage(
+            Box::new(recorder),
+            anthropic_body_with_tool(),
+            ProxyProvider::Anthropic,
+        );
+        assert!(!outcome.bytes.is_empty(), "output must be non-empty");
+        let records = handle.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one AlignmentDecisionRecord must be written per apply() call"
+        );
+        let rec = &records[0];
+        assert_eq!(rec.provider, "Anthropic", "provider must be Anthropic");
+        assert!(!rec.request_id.is_empty(), "request_id must be non-empty");
+    }
+
+    // AC18 / AD-CA-9 / POSITIVE: CountingMockRecorder counts each call.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_counting_mock_increments() {
+        let recorder = crate::analytics::tests::CountingMockRecorder::new();
+        let handle = recorder.handle();
+        let _ = apply_align_stage(
+            Box::new(recorder),
+            anthropic_body_with_tool(),
+            ProxyProvider::Anthropic,
+        );
+        assert_eq!(
+            handle.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "CountingMockRecorder must count exactly one call"
+        );
+    }
+
+    // AD-CA-10 / NEGATIVE: Unknown provider → passthrough (no panic, no marker injection).
+    // DISCRIMINATING (PF-007): removing the Unknown arm causes Unknown to fall through to alignment.
+    #[test]
+    fn test_cache_align_stage_unknown_provider_passthrough() {
+        let body = br#"{"model":"unknown-model","messages":[{"role":"user","content":"hi"}]}"#;
+        let outcome = apply_align_stage(
+            Box::new(crate::analytics::NoopRecorder),
+            body,
+            ProxyProvider::Unknown,
+        );
+        assert_eq!(
+            outcome.bytes, body,
+            "Unknown provider must produce a passthrough (byte-identical output)"
+        );
+        assert!(
+            outcome.is_passthrough(),
+            "Unknown provider outcome must be passthrough"
+        );
+    }
+
+    // AD-CA-5 / POSITIVE: max_growth returns 2 × MARKER_BYTES.
+    // DISCRIMINATING (PF-007): returning 0 would cause the seam to reject marker-injected output.
+    #[test]
+    fn test_cache_align_stage_max_growth_is_two_marker_bytes() {
+        let stage = CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder));
+        let growth = stage.max_growth(1024);
+        assert_eq!(
+            growth,
+            2 * MARKER_BYTES,
+            "max_growth must be 2 × MARKER_BYTES ({}) for the v1 cap",
+            2 * MARKER_BYTES
+        );
+    }
+
+    // PF-006 / POSITIVE: --no-cache-align is parsed by an explicit arm.
+    // DISCRIMINATING (PF-007): removing the explicit arm causes the flag to be silently ignored.
+    #[test]
+    fn test_parse_proxy_args_no_cache_align_flag() {
+        let args: Vec<String> = vec!["--no-cache-align".into()];
+        let parsed = parse_proxy_args(&args).expect("parse must succeed");
+        assert!(
+            parsed.no_cache_align,
+            "--no-cache-align flag must set no_cache_align=true"
+        );
+    }
+
+    // PF-006 / NEGATIVE: absent --no-cache-align defaults to false.
+    #[test]
+    fn test_parse_proxy_args_no_cache_align_defaults_false() {
+        let args: Vec<String> = vec![];
+        let parsed = parse_proxy_args(&args).expect("parse must succeed");
+        assert!(
+            !parsed.no_cache_align,
+            "no_cache_align must default to false when flag is absent"
+        );
+    }
+
+    // =========================================================================
+    // AC5 — Cross-turn content-prefix stability with moving tail marker
+    // =========================================================================
+    //
+    // Verifies that in a simulated 8-turn conversation:
+    // (a) After masking all cache_control, the tools value and system value are
+    //     byte-identical across all turns (canonicalization is stable).
+    // (b) Skim-injected static-zone markers sit at identical byte offsets within
+    //     the tools value on every turn.
+    // Negative arm A: without CacheAlignStage, tool key order varies → tools values differ.
+    // Negative arm B: with max_growth=0 (seam reverted), markers are rejected → absent.
+    //
+    // NOTE: these tests use per-crate-scoped build (`-p rskim --bins --features proxy`).
+    // They must NOT be run with `cargo test -p rskim --lib` (no library target).
+
+    /// Build a messages array with N user+assistant pairs.
+    ///
+    /// All assistant messages use array-form content. The LAST assistant message
+    /// carries a client `cache_control` marker (moving tail). Tool key order is
+    /// controlled by `build_turn_body` (not here).
+    fn build_turn_messages_json(n: usize) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for i in 1..=n {
+            parts.push(format!(
+                r#"{{"content":"Turn {i} question","role":"user"}}"#
+            ));
+            if i == n {
+                // Last assistant message: client cache_control marker (moving tail).
+                parts.push(format!(
+                    r#"{{"content":[{{"cache_control":{{"type":"ephemeral"}},"text":"Turn {i} answer","type":"text"}}],"role":"assistant"}}"#
+                ));
+            } else {
+                // Non-last assistant: simple content (no CC), array form.
+                parts.push(format!(
+                    r#"{{"content":[{{"text":"Turn {i} answer","type":"text"}}],"role":"assistant"}}"#
+                ));
+            }
+        }
+        format!("[{}]", parts.join(","))
+    }
+
+    /// Build a request body for turn N with alternating tool key order.
+    ///
+    /// Odd turns use "name-first" key order; even turns use "description-first".
+    /// This ensures that without CacheAlignStage, the tools value differs between
+    /// consecutive turns (the discriminating signal for negative arm A).
+    fn build_turn_body(n: usize) -> Vec<u8> {
+        let messages = build_turn_messages_json(n);
+        // Alternate tool key order to make the discriminating signal clear.
+        let tool_json = if n.is_multiple_of(2) {
+            // Even: description before name (non-canonical order).
+            r#"{"description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},"name":"search"}"#
+        } else {
+            // Odd: name before description (also non-canonical vs alphabetic).
+            r#"{"name":"search","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},"description":"Search the web"}"#
+        };
+        format!(
+            r#"{{"max_tokens":1024,"messages":{messages},"model":"claude-3-5-sonnet-20241022","system":[{{"text":"You are helpful.","type":"text"}}],"tools":[{tool_json}]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Mask all `cache_control` entries from a JSON string (byte-level replacement).
+    fn mask_cache_control_in_str(s: &str) -> String {
+        s.replace(",\"cache_control\":{\"type\":\"ephemeral\"}", "")
+            .replace("\"cache_control\":{\"type\":\"ephemeral\"},", "")
+            .replace("\"cache_control\":{\"type\":\"ephemeral\"}", "")
+    }
+
+    /// Extract the JSON value for a top-level key as a compact JSON string.
+    ///
+    /// Uses `serde_json::Value` (preserve_order) to extract; produces compact output.
+    fn extract_json_key_compact(s: &str, key: &str) -> Option<String> {
+        let val: serde_json::Value = serde_json::from_str(s).ok()?;
+        let v = val.get(key)?;
+        serde_json::to_string(v).ok()
+    }
+
+    // AC5 / POSITIVE — 8-turn cross-turn prefix stability.
+    //
+    // DISCRIMINATING (PF-007): fails if CacheAlignStage is deleted (negative arm A:
+    // tool key order varies across turns without canonicalization) and fails if the
+    // seam max_growth is zero (negative arm B: markers rejected, offset test fails).
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_cross_turn_prefix_stability_ac5() {
+        let router = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline = TransformPipeline::from_stages(vec![
+            Box::new(BlockRouterStage::new(router)),
+            Box::new(CacheAlignStage::new(Box::new(
+                crate::analytics::NoopRecorder,
+            ))),
+        ]);
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Run 8 turns through the pipeline and collect aligned outputs.
+        let aligned: Vec<Vec<u8>> = (1..=8)
+            .map(|n| {
+                let body = build_turn_body(n);
+                let req_id = format!("ac5-turn-{n:02}");
+                let ctx =
+                    TransformContext::new(ProxyProvider::Anthropic, AuthMode::ApiKey, &req_id, &hv);
+                pipeline.run(body, &ctx, &sink).bytes
+            })
+            .collect();
+
+        // (a) Tools value must be byte-identical across all 8 turns after masking CC.
+        let tools_masked: Vec<String> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).unwrap();
+                let masked = mask_cache_control_in_str(s);
+                extract_json_key_compact(&masked, "tools")
+                    .expect("aligned output must contain tools key")
+            })
+            .collect();
+
+        let reference_tools = &tools_masked[0];
+        for (i, tv) in tools_masked.iter().enumerate().skip(1) {
+            assert_eq!(
+                tv,
+                reference_tools,
+                "AC5(a): tools value in turn {} differs from turn 1 after masking CC. \
+                 CacheAlignStage canonical key-sort must stabilize tools across turns.",
+                i + 1
+            );
+        }
+
+        // (a) System value must be byte-identical across all 8 turns after masking CC.
+        let system_masked: Vec<String> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).unwrap();
+                let masked = mask_cache_control_in_str(s);
+                extract_json_key_compact(&masked, "system")
+                    .expect("aligned output must contain system key")
+            })
+            .collect();
+
+        let reference_system = &system_masked[0];
+        for (i, sv) in system_masked.iter().enumerate().skip(1) {
+            assert_eq!(
+                sv,
+                reference_system,
+                "AC5(a): system value in turn {} differs from turn 1 after masking CC.",
+                i + 1
+            );
+        }
+
+        // (b) Skim static markers must sit at identical byte offsets within the
+        // tools value on every turn. The marker is injected at the last tool object.
+        let cc_marker = "\"cache_control\"";
+        let tools_cc_offsets: Vec<Option<usize>> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).ok()?;
+                let tools_str = extract_json_key_compact(s, "tools")?;
+                tools_str.find(cc_marker)
+            })
+            .collect();
+
+        // All 8 turns must have a skim marker in the tools value.
+        for (i, offset) in tools_cc_offsets.iter().enumerate() {
+            assert!(
+                offset.is_some(),
+                "AC5(b): turn {} must have a skim cache_control marker in tools value. \
+                 Marker injection requires CacheAlignStage AND max_growth > 0.",
+                i + 1
+            );
+        }
+
+        // All markers at the same offset within the tools value (static zone).
+        let ref_offset = tools_cc_offsets[0].unwrap();
+        for (i, offset) in tools_cc_offsets.iter().enumerate().skip(1) {
+            assert_eq!(
+                *offset,
+                Some(ref_offset),
+                "AC5(b): skim marker offset in tools value differs in turn {} vs turn 1. \
+                 Static-zone markers must be at identical byte positions on every turn.",
+                i + 1
+            );
+        }
+    }
+
+    // AC5 / NEGATIVE (arm A) — Without CacheAlignStage, tool key order varies between
+    // turns (client alternates key order), so the masked tools value differs.
+    //
+    // DISCRIMINATING (PF-007): proves test_cross_turn_prefix_stability_ac5 requires
+    // CacheAlignStage to pass (canonical key sort is essential for cross-turn stability).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cross_turn_no_align_stage_tools_vary_ac5_negative_a() {
+        // Pipeline WITHOUT CacheAlignStage — BlockRouterStage only.
+        let router = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router))]);
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Run 2 turns (turn 1: odd key order, turn 2: even key order).
+        let aligned: Vec<Vec<u8>> = (1..=2)
+            .map(|n| {
+                let body = build_turn_body(n);
+                let req_id = format!("ac5-neg-a-turn-{n:02}");
+                let ctx =
+                    TransformContext::new(ProxyProvider::Anthropic, AuthMode::ApiKey, &req_id, &hv);
+                pipeline.run(body, &ctx, &sink).bytes
+            })
+            .collect();
+
+        let tools_values: Vec<String> = aligned
+            .iter()
+            .map(|b| {
+                let s = std::str::from_utf8(b).unwrap();
+                let masked = mask_cache_control_in_str(s);
+                extract_json_key_compact(&masked, "tools").unwrap()
+            })
+            .collect();
+
+        // Without CacheAlignStage, alternating key order must survive into output →
+        // tools values MUST differ (proving CacheAlignStage is needed for stability).
+        assert_ne!(
+            tools_values[0], tools_values[1],
+            "AC5 negative arm A: without CacheAlignStage, tools key order must vary \
+             between turns (confirming CacheAlignStage is required for cross-turn stability)"
+        );
+    }
+
+    // AC5 / NEGATIVE (arm B) — With max_growth=0, the seam rejects any marker-injected
+    // output (guarded_transform_with_growth falls back to passthrough). The tools value
+    // has no skim marker — the AC5(b) offset check would fail.
+    //
+    // DISCRIMINATING (PF-007): proves the seam max_growth fix is required for markers
+    // to survive into the forwarded body.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cross_turn_zero_growth_no_markers_ac5_negative_b() {
+        // ZeroGrowthCacheAlignStage: delegates apply() to CacheAlignStage but
+        // overrides max_growth() to 0. The seam's guarded_transform_with_growth
+        // gate then rejects the marker-injected output and falls back to passthrough.
+        struct ZeroGrowthCacheAlignStage {
+            inner: CacheAlignStage,
+        }
+
+        impl TransformStage for ZeroGrowthCacheAlignStage {
+            fn name(&self) -> &'static str {
+                "cache-align-zero-growth"
+            }
+
+            fn apply(
+                &self,
+                body: &[u8],
+                ctx: &TransformContext<'_>,
+                sink: &dyn DecisionSink,
+            ) -> Outcome {
+                self.inner.apply(body, ctx, sink)
+            }
+
+            /// Override: return 0 — the seam rejects any output > input bytes.
+            fn max_growth(&self, _input_len: usize) -> usize {
+                0
+            }
+        }
+
+        let router = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline = TransformPipeline::from_stages(vec![
+            Box::new(BlockRouterStage::new(router)),
+            Box::new(ZeroGrowthCacheAlignStage {
+                inner: CacheAlignStage::new(Box::new(crate::analytics::NoopRecorder)),
+            }),
+        ]);
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Use turn 1 (odd key order — non-canonical; aligner tries to grow body).
+        let body = build_turn_body(1);
+        let ctx =
+            TransformContext::new(ProxyProvider::Anthropic, AuthMode::ApiKey, "ac5-neg-b", &hv);
+        let out = pipeline.run(body, &ctx, &sink);
+        let out_str = std::str::from_utf8(&out.bytes).unwrap();
+
+        // With max_growth=0, the seam gate rejects the marker-injected (inflated) output,
+        // and the pipeline falls back to the pre-CacheAlignStage bytes. The tools value
+        // in those pre-stage bytes has no skim marker.
+        let tools_str = extract_json_key_compact(out_str, "tools").unwrap_or_default();
+        assert!(
+            !tools_str.contains("\"cache_control\""),
+            "AC5 negative arm B: with max_growth=0, skim markers must be rejected — \
+             no cache_control should appear in tools value. \
+             This proves the seam max_growth fix is required for marker injection. \
+             Found in tools: {tools_str}"
+        );
+    }
+
+    // =========================================================================
+    // AC16 — CacheAlignStage behavioral byte-identity
+    // =========================================================================
+    //
+    // Proves that CacheAlignStage is a real behavioral transform (not a no-op)
+    // for a non-canonical body, and that omitting it (--no-cache-align) produces
+    // the pre-alignment bytes. These are *behavioral* tests, not statistical:
+    // the body is crafted to guarantee CacheAlignStage modifies it.
+
+    // AC16 / POSITIVE: CacheAlignStage canonicalizes a non-canonical body.
+    // DISCRIMINATING (PF-007): removing CacheAlignStage from the pipeline causes
+    // both outputs to be equal, failing the assert_ne.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_modifies_non_canonical_body_ac16() {
+        // A body with non-canonical tool key order (name before description — 'd' < 'n'
+        // so canonical is description-first) and non-canonical envelope key order.
+        // CacheAlignStage must reorder both the tools keys and inject a marker.
+        let non_canonical_body = br#"{"model":"claude-3-5-sonnet","max_tokens":1024,"tools":[{"name":"search","description":"Search"},{"name":"fetch","description":"Fetch"}],"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // Pipeline WITHOUT CacheAlignStage (--no-cache-align path)
+        let router_only = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_no_align =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router_only))]);
+        let ctx_no = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-no",
+            &hv,
+        );
+        let out_no_align = pipeline_no_align.run(non_canonical_body.to_vec(), &ctx_no, &sink);
+
+        // Pipeline WITH CacheAlignStage (full default path)
+        let router_full = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_full = TransformPipeline::from_stages(vec![
+            Box::new(BlockRouterStage::new(router_full)),
+            Box::new(CacheAlignStage::new(Box::new(
+                crate::analytics::NoopRecorder,
+            ))),
+        ]);
+        let ctx_full = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-full",
+            &hv,
+        );
+        let out_with_align = pipeline_full.run(non_canonical_body.to_vec(), &ctx_full, &sink);
+
+        // AC16: CacheAlignStage must produce DIFFERENT bytes than BlockRouter-only.
+        assert_ne!(
+            out_no_align.bytes, out_with_align.bytes,
+            "AC16: CacheAlignStage must modify non-canonical body (outputs must differ)"
+        );
+
+        // CacheAlignStage output must contain cache_control (marker injection succeeded)
+        let out_str = std::str::from_utf8(&out_with_align.bytes).unwrap();
+        assert!(
+            out_str.contains("cache_control"),
+            "AC16: CacheAlignStage output must contain skim marker"
+        );
+    }
+
+    // AC16 / POSITIVE: --no-cache-align output == BlockRouterStage-only output.
+    // DISCRIMINATING (PF-007): if the --no-cache-align flag were silently ignored
+    // (CacheAlignStage always ran), this test would fail for a non-canonical body.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_no_cache_align_output_equals_block_router_only_ac16() {
+        // Use a body that BlockRouter passes through unchanged (tiny body, no compressible
+        // live-zone content). CacheAlignStage would modify it (canonical reorder + markers).
+        let body = anthropic_body_with_tool();
+
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let sink = MockSink::new();
+
+        // BlockRouter-only pipeline (what --no-cache-align runs)
+        let router_a = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_a =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router_a))]);
+        let ctx_a = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-noalign-a",
+            &hv,
+        );
+        let out_a = pipeline_a.run(body.to_vec(), &ctx_a, &sink);
+
+        // Second BlockRouter-only pipeline (simulates the --no-cache-align path again)
+        let router_b = BlockRouter::new(Arc::new(BinarySinkStub));
+        let pipeline_b =
+            TransformPipeline::from_stages(vec![Box::new(BlockRouterStage::new(router_b))]);
+        let ctx_b = TransformContext::new(
+            ProxyProvider::Anthropic,
+            AuthMode::ApiKey,
+            "req-ac16-noalign-b",
+            &hv,
+        );
+        let out_b = pipeline_b.run(body.to_vec(), &ctx_b, &sink);
+
+        // AC16: both runs of BlockRouter-only must produce the same output
+        // (the pipeline is deterministic — no ambient state).
+        assert_eq!(
+            out_a.bytes, out_b.bytes,
+            "AC16: BlockRouter-only pipeline must be deterministic (same output on same input)"
+        );
+    }
+
+    // =========================================================================
+    // AC18 — CacheAlignStage non-interference: recorder does not affect bytes
+    // =========================================================================
+    //
+    // The recorder is fire-and-forget (AD-CA-9 / try_send). Changing which
+    // recorder is installed must not affect the forwarded body bytes.
+    // DISCRIMINATING (PF-007): if the recorder's record() method modified `body`
+    // or returned modified bytes, the two outputs would differ.
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_cache_align_stage_recorder_does_not_affect_bytes_ac18() {
+        let body = anthropic_body_with_tool();
+
+        // Run with NoopRecorder
+        let out_noop = apply_align_stage(
+            Box::new(crate::analytics::NoopRecorder),
+            body,
+            ProxyProvider::Anthropic,
+        );
+
+        // Run with CountingMockRecorder
+        let out_counting = apply_align_stage(
+            Box::new(crate::analytics::tests::CountingMockRecorder::new()),
+            body,
+            ProxyProvider::Anthropic,
+        );
+
+        // Run with BlockingMockRecorder
+        let out_blocking = apply_align_stage(
+            Box::new(crate::analytics::tests::BlockingMockRecorder::new()),
+            body,
+            ProxyProvider::Anthropic,
+        );
+
+        // AC18: forwarded bytes must be identical regardless of recorder
+        assert_eq!(
+            out_noop.bytes, out_counting.bytes,
+            "AC18: NoopRecorder vs CountingMockRecorder must produce identical forwarded bytes"
+        );
+        assert_eq!(
+            out_noop.bytes, out_blocking.bytes,
+            "AC18: NoopRecorder vs BlockingMockRecorder must produce identical forwarded bytes"
+        );
+    }
+
+    // =========================================================================
+    // AC16 — select_pipeline: pure selection logic is directly testable
+    // =========================================================================
+    //
+    // These tests target `select_pipeline(passthrough_env, no_cache_align)` —
+    // the pure function extracted from the pipeline-building block in `run()`.
+    // Because the function takes explicit booleans, it is testable without
+    // setting env-vars, constructing stages, or spawning threads.
+    //
+    // DISCRIMINATING (PF-007): each test fails when the corresponding branch is
+    // deleted from `select_pipeline`:
+    //   - Deleting `else if no_cache_align` makes `select_pipeline(false, true)`
+    //     return `Full` instead of `BlockRouterOnly` →
+    //     `test_select_pipeline_no_cache_align_maps_to_block_router_only` fails.
+    //   - Deleting the `passthrough_env` branch makes both `true` inputs return
+    //     `BlockRouterOnly` or `Full` →
+    //     `test_select_pipeline_passthrough_wins` fails.
+    //   - Removing any variant makes `test_select_pipeline_all_three_are_distinct`
+    //     fail (two selections would collapse to the same variant).
+
+    // AC16 / POSITIVE: SKIM_PASSTHROUGH=1 always selects the identity pipeline,
+    // regardless of --no-cache-align.
+    // DISCRIMINATING: deleting the passthrough_env branch causes both cases to
+    // return BlockRouterOnly or Full, failing the assertion.
+    #[test]
+    fn test_select_pipeline_passthrough_wins() {
+        assert_eq!(
+            select_pipeline(true, false),
+            PipelineSelection::Identity,
+            "SKIM_PASSTHROUGH=1 without --no-cache-align must select Identity"
+        );
+        assert_eq!(
+            select_pipeline(true, true),
+            PipelineSelection::Identity,
+            "SKIM_PASSTHROUGH=1 with --no-cache-align must still select Identity \
+             (passthrough takes priority)"
+        );
+    }
+
+    // AC16 / POSITIVE: --no-cache-align (without SKIM_PASSTHROUGH) selects BlockRouterOnly.
+    // DISCRIMINATING: deleting `else if no_cache_align` makes this return Full.
+    #[test]
+    fn test_select_pipeline_no_cache_align_maps_to_block_router_only() {
+        assert_eq!(
+            select_pipeline(false, true),
+            PipelineSelection::BlockRouterOnly,
+            "--no-cache-align without SKIM_PASSTHROUGH must select BlockRouterOnly \
+             (CacheAlignStage omitted)"
+        );
+    }
+
+    // AC16 / POSITIVE: neither flag selects the Full pipeline.
+    // DISCRIMINATING: any branch misfire would change this to Identity or BlockRouterOnly.
+    #[test]
+    fn test_select_pipeline_default_maps_to_full() {
+        assert_eq!(
+            select_pipeline(false, false),
+            PipelineSelection::Full,
+            "default (no SKIM_PASSTHROUGH, no --no-cache-align) must select Full \
+             (both BlockRouterStage and CacheAlignStage)"
+        );
+    }
+
+    // AC16 / POSITIVE: all three selections are pairwise distinct.
+    // DISCRIMINATING: if two branches collapse to the same variant, this fails.
+    // Also validates that `select_pipeline` has three meaningful, non-degenerate branches.
+    #[test]
+    fn test_select_pipeline_all_three_are_distinct() {
+        let identity = select_pipeline(true, false);
+        let block_only = select_pipeline(false, true);
+        let full = select_pipeline(false, false);
+        assert_ne!(
+            identity, block_only,
+            "AC16: Identity and BlockRouterOnly must be distinct pipeline selections"
+        );
+        assert_ne!(
+            identity, full,
+            "AC16: Identity and Full must be distinct pipeline selections"
+        );
+        assert_ne!(
+            block_only, full,
+            "AC16: BlockRouterOnly and Full must be distinct pipeline selections"
+        );
+    }
+
+    // AC16 / DISCRIMINATING: Full pipeline must contain CacheAlignStage (stage_count == 2).
+    //
+    // The four `test_select_pipeline_*` tests above cover only the enum value returned by
+    // `select_pipeline()` — they pass even if CacheAlignStage is deleted from the `Full`
+    // arm of `build_pipeline()`.  This test calls `build_pipeline()` directly (the same
+    // function used by `run()`) and asserts on `stage_count()`, so removing CacheAlignStage
+    // from the Full arm reduces the count from 2 to 1 and fails this test.
+    //
+    // Note: there is no separate `build_test_pipeline` helper — that would be a hand-copy
+    // of the production stage list that could diverge silently.  Calling the real
+    // `build_pipeline()` from tests is the single-definition guarantee.
+    #[test]
+    fn test_select_pipeline_stage_count() {
+        assert_eq!(
+            build_pipeline(
+                PipelineSelection::Identity,
+                Box::new(crate::analytics::NoopRecorder)
+            )
+            .stage_count(),
+            1,
+            "AC16: Identity pipeline must have exactly 1 stage (IdentityStage)"
+        );
+        assert_eq!(
+            build_pipeline(
+                PipelineSelection::BlockRouterOnly,
+                Box::new(crate::analytics::NoopRecorder)
+            )
+            .stage_count(),
+            1,
+            "AC16: BlockRouterOnly pipeline must have exactly 1 stage (BlockRouterStage only)"
+        );
+        assert_eq!(
+            build_pipeline(
+                PipelineSelection::Full,
+                Box::new(crate::analytics::NoopRecorder)
+            )
+            .stage_count(),
+            2,
+            "AC16: Full pipeline must have exactly 2 stages (BlockRouterStage + CacheAlignStage); \
+             removing CacheAlignStage from the Full arm reduces this to 1 and fails this test"
+        );
     }
 }

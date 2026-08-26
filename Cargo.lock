@@ -2563,6 +2563,7 @@ dependencies = [
  "quick-xml",
  "rayon",
  "regex",
+ "rskim-align",
  "rskim-compress",
  "rskim-contract",
  "rskim-core",
@@ -2580,6 +2581,20 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tree-sitter",
+]
+
+[[package]]
+name = "rskim-align"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "log",
+ "proptest",
+ "rskim-contract",
+ "rskim-llm",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

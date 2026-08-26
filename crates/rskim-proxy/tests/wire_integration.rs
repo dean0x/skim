@@ -258,11 +258,11 @@ impl FakeUpstream {
     }
 
     fn drain_headers(&self) -> Vec<hyper::HeaderMap> {
-        self.captured_headers.lock().unwrap().drain(..).collect()
+        std::mem::take(&mut *self.captured_headers.lock().unwrap())
     }
 
     fn drain_bodies(&self) -> Vec<Vec<u8>> {
-        self.captured_bodies.lock().unwrap().drain(..).collect()
+        std::mem::take(&mut *self.captured_bodies.lock().unwrap())
     }
 }
 

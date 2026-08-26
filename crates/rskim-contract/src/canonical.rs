@@ -52,14 +52,30 @@ use serde_json::Value;
 
 /// Node parsed from a raw JSON string, keeping numbers as their raw token bytes.
 ///
-/// This is the internal representation used by [`tools_arrays_equal`] to ensure
-/// number tokens are compared byte-for-byte rather than as parsed f64 values.
-enum RawNode {
+/// This is the canonical representation used by [`tools_arrays_equal`] and related
+/// functions to ensure number tokens are compared byte-for-byte rather than as parsed
+/// f64 values.
+///
+/// # Visibility (R6 — parse-once optimization)
+///
+/// `RawNode` is `pub` so that callers (e.g. `rskim-align`) can receive
+/// pre-parsed node vectors from [`parse_array_nodes`] and pass them to
+/// [`tools_arrays_set_equal_nodes`] / [`tools_arrays_equal_nodes`], eliminating
+/// redundant `parse_raw_node` calls on the same canonical bytes.  Callers never
+/// construct `RawNode` variants directly — they receive them from the `parse_*`
+/// helpers in this module.
+pub enum RawNode {
+    /// JSON `null`.
     Null,
+    /// JSON boolean (`true` or `false`).
     Bool(bool),
-    Number(String), // raw token bytes, owned
+    /// JSON number, kept as the raw source-token bytes (never re-serialized).
+    Number(String),
+    /// JSON string, stored as the decoded UTF-8 value.
     JsonString(String),
+    /// JSON array, elements in source order.
     Array(Vec<RawNode>),
+    /// JSON object.  Keys are in BTreeMap-sorted order (guaranteed at parse time).
     Object(Vec<(String, RawNode)>),
 }
 
@@ -138,6 +154,12 @@ fn parse_raw_node(raw_src: &str, depth: usize) -> Option<RawNode> {
 /// can only receive trees whose depth is ≤ `MAX_CANONICAL_DEPTH`.
 /// This satisfies AC17's "all recursion explicitly bounded" requirement,
 /// though the bound is at the parse site rather than the comparison site.
+///
+/// # Relationship to `canonical_bytes_of_node`
+///
+/// `raw_nodes_equal(a, b)` iff `canonical_bytes_of_node(a) == canonical_bytes_of_node(b)`.
+/// This is the property exploited by [`tools_arrays_set_equal`] to replace the O(n²)
+/// greedy scan with an O(n log n) sort-and-compare.
 fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
     match (a, b) {
         (RawNode::Null, RawNode::Null) => true,
@@ -167,6 +189,100 @@ fn raw_nodes_equal(a: &RawNode, b: &RawNode) -> bool {
             })
         }
         _ => false, // type mismatch
+    }
+}
+
+/// Serialize a `RawNode` tree to its canonical compact bytes.
+///
+/// # Canonical form
+///
+/// - `Null` → `b"null"`
+/// - `Bool` → `b"true"` / `b"false"`
+/// - `Number(raw)` → verbatim raw token bytes (preserves `1e3`, `1.0`, etc.)
+/// - `JsonString(s)` → the decoded string re-serialized as compact JSON
+///   (normalises `"A"` → `"A"`, matching the decoded-value comparison in
+///   [`raw_nodes_equal`])
+/// - `Array(elems)` → compact JSON array, elements in source order
+/// - `Object(pairs)` → compact JSON object with keys in BTreeMap-sorted order
+///   (guaranteed by [`parse_raw_node`], which builds objects via `BTreeMap`)
+///
+/// # Semantic equivalence with `raw_nodes_equal`
+///
+/// `raw_nodes_equal(a, b)` iff `canonical_bytes_of_node(a) == canonical_bytes_of_node(b)`.
+///
+/// Proof sketch:
+/// - **Object**: `raw_nodes_equal` is key-order-insensitive; `canonical_bytes_of_node`
+///   iterates in BTreeMap order (both `a` and `b` were parsed via BTreeMap, so same
+///   sorted key order). Equal objects → same key-value pairs → same sorted-key bytes.
+/// - **Number**: both compare raw token bytes directly.
+/// - **String**: both compare decoded values; re-serialization produces identical
+///   compact bytes for the same decoded string.
+/// - **Array/null/bool**: direct structural equality → identical serialization.
+///
+/// # Depth bound (AC17)
+///
+/// The `RawNode` tree depth is bounded to [`MAX_CANONICAL_DEPTH`] by [`parse_raw_node`].
+/// `canonical_bytes_of_node` recurses only into children of already-parsed nodes,
+/// so its recursion depth is also ≤ `MAX_CANONICAL_DEPTH`.
+fn canonical_bytes_of_node(node: &RawNode) -> Vec<u8> {
+    match node {
+        RawNode::Null => b"null".to_vec(),
+        RawNode::Bool(true) => b"true".to_vec(),
+        RawNode::Bool(false) => b"false".to_vec(),
+        RawNode::Number(raw) => raw.as_bytes().to_vec(),
+        RawNode::JsonString(s) => {
+            // Re-serialise the decoded string to canonical compact JSON.
+            // `serde_json::to_vec` for a `&str` is infallible: Rust strings
+            // are always valid UTF-8 and always representable as JSON strings.
+            serde_json::to_vec(s.as_str()).unwrap_or_else(|_| {
+                // Unreachable: String is always a valid JSON string value.
+                // Emit a quoted copy as a last-resort defensive fallback so that
+                // the serialization is at worst pessimistic (two inputs that
+                // differ only in this unreachable case will produce differing bytes
+                // and be treated as non-equal — the conservative outcome).
+                let mut out = Vec::with_capacity(s.len() + 2);
+                out.push(b'"');
+                out.extend_from_slice(s.as_bytes());
+                out.push(b'"');
+                out
+            })
+        }
+        RawNode::Array(elems) => {
+            let mut out = vec![b'['];
+            for (i, elem) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(&canonical_bytes_of_node(elem));
+            }
+            out.push(b']');
+            out
+        }
+        RawNode::Object(pairs) => {
+            // Pairs are already in BTreeMap-sorted order (guaranteed at parse time
+            // by `parse_raw_node`, which builds objects via a `BTreeMap` that
+            // iterates in lexicographic key order).
+            let mut out = vec![b'{'];
+            for (i, (key, val)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                // Serialise the key as a JSON string.  Infallible for &str.
+                let key_bytes = serde_json::to_vec(key.as_str()).unwrap_or_else(|_| {
+                    // Unreachable: String key is always a valid JSON string.
+                    let mut b = Vec::with_capacity(key.len() + 2);
+                    b.push(b'"');
+                    b.extend_from_slice(key.as_bytes());
+                    b.push(b'"');
+                    b
+                });
+                out.extend_from_slice(&key_bytes);
+                out.push(b':');
+                out.extend_from_slice(&canonical_bytes_of_node(val));
+            }
+            out.push(b'}');
+            out
+        }
     }
 }
 
@@ -341,6 +457,235 @@ pub fn tools_arrays_equal(raw_original: &str, raw_reordered: &str) -> bool {
     };
     // Both must be arrays.
     matches!((&a, &b), (RawNode::Array(_), RawNode::Array(_))) && raw_nodes_equal(&a, &b)
+}
+
+/// Check **multiset (bag) equality** between two tools arrays.
+///
+/// This is the **set-equality gate** used exclusively by `#306` (`CacheAlignStage`)
+/// to verify that a deterministic element-reorder of the tools array dropped, duplicated,
+/// and mutated nothing. It is the complement of the order-sensitive [`tools_arrays_equal`],
+/// which remains the gate for every other transform (preserving strict byte round-trip
+/// globally and narrowing the set-equality relaxation to this one deliberate reorder).
+///
+/// # AD-CA-7 — ADR-007 re-argued for element reorder
+///
+/// A deliberate tools-array element reorder cannot satisfy byte-round-trip (the elements
+/// appear in a different order). ADR-007's losslessness gate for this specific transform
+/// is therefore **set-equality + total-order determinism** (approved by the user's
+/// 2026-07-17 sign-off). This function proves the reorder lost, duplicated, and mutated
+/// nothing, while permitting a deliberate order change; [`tools_arrays_equal`] stays
+/// order-sensitive so every other transform keeps strict round-trip.
+///
+/// # Algorithm
+///
+/// Parse both `raw_a` and `raw_b` as JSON arrays. Require equal length (a length mismatch
+/// immediately returns `false`). Convert each element to a canonical byte string via
+/// [`canonical_bytes_of_node`], sort both vectors, and compare them pairwise. Two arrays
+/// are set-equal iff their sorted canonical-byte vectors are identical.
+///
+/// Complexity: O(n log n) sort + O(n · |elem|) comparison, where `n` is the element count
+/// and `|elem|` is the average canonical byte length per element.
+///
+/// # Number comparison
+///
+/// Uses **raw source-token bytes** (the AC11 / Decision 1 invariant). `1e3` and `1000`
+/// are treated as distinct tokens even though they are mathematically equal. This is
+/// the correct invariant for cache-key faithfulness.
+///
+/// # Returns
+///
+/// - `true` — both arrays parse successfully, have equal length, and their sorted
+///   canonical-byte vectors are identical
+/// - `false` — either array fails to parse, arrays differ in length, or any element's
+///   canonical bytes differ after sorting
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_contract::canonical::tools_arrays_set_equal;
+///
+/// // Permutation → equal under set equality
+/// let a = r#"[{"name":"a"},{"name":"b"}]"#;
+/// let b = r#"[{"name":"b"},{"name":"a"}]"#;
+/// assert!(tools_arrays_set_equal(a, b));
+///
+/// // Same order → also equal
+/// assert!(tools_arrays_set_equal(a, a));
+///
+/// // Drop one element → false
+/// let dropped = r#"[{"name":"a"}]"#;
+/// assert!(!tools_arrays_set_equal(a, dropped));
+///
+/// // Duplicate one element → false (b has two "a", a has one "a" + one "b")
+/// let dup = r#"[{"name":"a"},{"name":"a"}]"#;
+/// assert!(!tools_arrays_set_equal(a, dup));
+///
+/// // Mutated element → false
+/// let mutated = r#"[{"name":"a"},{"name":"CHANGED"}]"#;
+/// assert!(!tools_arrays_set_equal(a, mutated));
+/// ```
+pub fn tools_arrays_set_equal(raw_a: &str, raw_b: &str) -> bool {
+    // Parse both arrays using the raw-node path so numbers are compared as
+    // token bytes (AC11 invariant). Fail-open (false) on any parse error.
+    let (a_node, b_node) = match (parse_raw_node(raw_a, 0), parse_raw_node(raw_b, 0)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return false,
+    };
+
+    // Both must be arrays.
+    let (a_elems, b_elems) = match (a_node, b_node) {
+        (RawNode::Array(a), RawNode::Array(b)) => (a, b),
+        _ => return false,
+    };
+
+    // Require equal length — a drop or duplication changes the count.
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+
+    // Fast path: empty arrays are trivially equal.
+    if a_elems.is_empty() {
+        return true;
+    }
+
+    // O(n log n) multiset equality via canonical-bytes sort-and-compare.
+    //
+    // `canonical_bytes_of_node` produces a deterministic compact JSON byte string
+    // for each element, with the property:
+    //
+    //   raw_nodes_equal(a, b)  iff  canonical_bytes_of_node(a) == canonical_bytes_of_node(b)
+    //
+    // Sorting both sides' byte-string vectors and comparing pairwise is therefore
+    // equivalent to multiset equality:
+    //  - Any element drop or duplication changes the sorted-byte multiset → mismatch.
+    //  - Any content mutation changes at least one element's canonical bytes → mismatch.
+    //  - A pure permutation changes neither the multiset nor any element's bytes → equal.
+    //
+    // Complexity: O(n log n) sort + O(n · |elem|) comparison, versus the former
+    // O(n²) greedy scan with O(k²) raw_nodes_equal calls per element pair (where k
+    // is the number of object keys per element). At 64 tools the old code made ~4096
+    // deep tree comparisons; the new code sorts 64 compact byte strings.
+    //
+    // Semantics unchanged: the AC11 raw-token number invariant is preserved because
+    // `canonical_bytes_of_node` copies number tokens verbatim (see its implementation).
+    let mut a_keys: Vec<Vec<u8>> = a_elems.iter().map(canonical_bytes_of_node).collect();
+    let mut b_keys: Vec<Vec<u8>> = b_elems.iter().map(canonical_bytes_of_node).collect();
+
+    a_keys.sort_unstable();
+    b_keys.sort_unstable();
+
+    a_keys == b_keys
+}
+
+// ============================================================================
+// R6 — parse-once optimization variants
+// ============================================================================
+
+/// Parse a JSON array string into its element nodes.
+///
+/// This is the entry point for the **R6 parse-once optimization**: callers that
+/// need to verify the same canonical array in multiple gates (e.g. reorder gate
+/// and injection-path self-verify in AD-CA-7) call this once, cache the result,
+/// and pass it to [`tools_arrays_set_equal_nodes`] /
+/// [`tools_arrays_equal_nodes`] — eliminating the redundant `parse_raw_node`
+/// calls that those functions would otherwise make on the same bytes.
+///
+/// Returns `None` if `raw` fails to parse as a JSON array (fail-open: the caller
+/// must fall back to the `&str`-based variants).
+/// Returns `Some(Vec<RawNode>)` with one `RawNode` per array element.
+pub fn parse_array_nodes(raw: &str) -> Option<Vec<RawNode>> {
+    match parse_raw_node(raw, 0)? {
+        RawNode::Array(elems) => Some(elems),
+        _ => None,
+    }
+}
+
+/// Multiset (bag) equality between a tools array `raw_a` and pre-parsed nodes for `b`.
+///
+/// This is the **R6 parse-once optimization** variant of [`tools_arrays_set_equal`].
+/// It accepts pre-parsed nodes for the `b` (canonical) side, eliminating one
+/// `parse_raw_node` call when the caller has already built `b`'s nodes via
+/// [`parse_array_nodes`].
+///
+/// # Safety
+///
+/// **`b_elems` must correspond exactly to the bytes of the `b` array being
+/// compared.**  Passing nodes parsed from *different* bytes than the actual `b`
+/// string would make this check a tautology (comparing `b` against itself), which
+/// is exactly the class of bug that caused the AD-CA-7 rewrite (plan §R11).  The
+/// caller (AD-CA-7 reorder gate in `rskim-align`) guarantees correspondence by
+/// parsing `b_elems` from the same `canonical_str` span that produced `b`'s bytes.
+///
+/// `raw_a` is always parsed **fresh** from the original input bytes — no risk of
+/// reuse mismatch on the `a` side.
+///
+/// # Semantics
+///
+/// Identical to [`tools_arrays_set_equal`]: O(n log n) sort-and-compare of canonical
+/// element bytes, raw-token number invariant (AC11), fail-open (false) on any parse
+/// error or length mismatch.
+pub fn tools_arrays_set_equal_nodes(raw_a: &str, b_elems: &[RawNode]) -> bool {
+    let a_node = match parse_raw_node(raw_a, 0) {
+        Some(n) => n,
+        None => return false,
+    };
+    let a_elems = match a_node {
+        RawNode::Array(elems) => elems,
+        _ => return false,
+    };
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+    if a_elems.is_empty() {
+        return true;
+    }
+    let mut a_keys: Vec<Vec<u8>> = a_elems.iter().map(canonical_bytes_of_node).collect();
+    let mut b_keys: Vec<Vec<u8>> = b_elems.iter().map(canonical_bytes_of_node).collect();
+    a_keys.sort_unstable();
+    b_keys.sort_unstable();
+    a_keys == b_keys
+}
+
+/// Order-sensitive equality between pre-parsed nodes for `a` and a tools array string `raw_b`.
+///
+/// This is the **R6 parse-once optimization** variant of [`tools_arrays_equal`].
+/// It accepts pre-parsed nodes for the `a` (canonical, pre-injection) side,
+/// eliminating one `parse_raw_node` call when the caller has already built `a`'s
+/// nodes via [`parse_array_nodes`].
+///
+/// # Safety
+///
+/// **`a_elems` must correspond exactly to the bytes of the `a` (canonical,
+/// pre-injection) array.**  Passing nodes from *different* bytes than the actual
+/// `a` value would make this check a tautology.  The caller (AD-CA-7 injection-path
+/// self-verify via `verify_injection_with_nodes` in `rskim-align`) guarantees
+/// correspondence by using nodes parsed from the same canonical tools span that
+/// `verify_injection_with_nodes` received as `canonical`.
+///
+/// `raw_b` is always parsed **fresh** from the stripped (post-injection, marker-removed)
+/// bytes — no risk of reuse mismatch on the `b` side.
+///
+/// # Semantics
+///
+/// Identical to [`tools_arrays_equal`]: order-sensitive comparison, raw-token number
+/// invariant (AC11), fail-open (false) on any parse error or length mismatch.
+pub fn tools_arrays_equal_nodes(a_elems: &[RawNode], raw_b: &str) -> bool {
+    let b_node = match parse_raw_node(raw_b, 0) {
+        Some(n) => n,
+        None => return false,
+    };
+    let b_elems = match b_node {
+        RawNode::Array(elems) => elems,
+        _ => return false,
+    };
+    if a_elems.len() != b_elems.len() {
+        return false;
+    }
+    // Order-sensitive: zip pairwise and compare with raw-node equality (AC11)
+    a_elems
+        .iter()
+        .zip(b_elems.iter())
+        .all(|(a, b)| raw_nodes_equal(a, b))
 }
 
 // ============================================================================
@@ -600,6 +945,7 @@ fn value_equiv_inner(raw_a: &str, raw_b: &str, depth: usize, budget: &mut usize)
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -767,6 +1113,296 @@ mod tests {
         let a = r#"[{"name":"a"},{"name":"b"}]"#;
         let b = r#"[{"name":"a"}]"#;
         assert!(!tools_arrays_equal(a, b));
+    }
+
+    // ========================================================================
+    // tools_arrays_set_equal tests (AD-CA-7 multiset gate, AC29)
+    // ========================================================================
+
+    /// Permutation → true (the primary use case: element reorder is still set-equal).
+    ///
+    /// Discriminating: if this were [`tools_arrays_equal`] (order-sensitive), it would
+    /// return `false` for a permuted array, proving the two functions serve different roles.
+    #[test]
+    fn tools_arrays_set_equal_permutation_is_true() {
+        let a = r#"[{"name":"search","description":"Search files"},{"name":"compile","description":"Compile"}]"#;
+        let b = r#"[{"name":"compile","description":"Compile"},{"name":"search","description":"Search files"}]"#;
+        assert!(
+            tools_arrays_set_equal(a, b),
+            "permuted arrays must be set-equal"
+        );
+        // Confirm the order-sensitive check disagrees (non-tautology proof).
+        assert!(
+            !tools_arrays_equal(a, b),
+            "permuted arrays must NOT be order-equal (proves tools_arrays_equal is distinct)"
+        );
+    }
+
+    /// Same order → also set-equal (symmetric, reflexive).
+    #[test]
+    fn tools_arrays_set_equal_same_order_is_true() {
+        let a = r#"[{"name":"a"},{"name":"b"},{"name":"c"}]"#;
+        assert!(
+            tools_arrays_set_equal(a, a),
+            "identical arrays must be set-equal"
+        );
+    }
+
+    /// Drop one element → false (length mismatch catches it).
+    ///
+    /// Discriminating: the length check at the top of `tools_arrays_set_equal` returns
+    /// `false` immediately on a length mismatch. If that check were removed, the
+    /// subsequent sorted-vector comparison (`a_keys == b_keys`) would still return
+    /// `false` for different-length inputs (Rust's `Vec` equality is length-sensitive),
+    /// but the early-exit optimisation would be absent.
+    #[test]
+    fn tools_arrays_set_equal_drop_is_false() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let dropped = r#"[{"name":"a"}]"#;
+        assert!(
+            !tools_arrays_set_equal(a, dropped),
+            "dropped element must fail set-equality"
+        );
+        assert!(
+            !tools_arrays_set_equal(dropped, a),
+            "set-equality must be symmetric: drop fails in both directions"
+        );
+    }
+
+    /// Duplicate one element → false.
+    ///
+    /// `b` has two copies of `{"name":"a"}` and zero copies of `{"name":"b"}`.
+    /// After sorting, `a`'s canonical keys are `[b"a", b"b"]` and `b`'s are
+    /// `[b"a", b"a"]`; the pairwise comparison fails at the second element.
+    ///
+    /// Discriminating: the sort-and-compare correctly distinguishes a duplicated
+    /// element from the original because the sorted multisets differ.
+    #[test]
+    fn tools_arrays_set_equal_duplicate_is_false() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let dup = r#"[{"name":"a"},{"name":"a"}]"#; // "b" replaced with second "a"
+        assert!(
+            !tools_arrays_set_equal(a, dup),
+            "array with duplicated element must fail set-equality"
+        );
+    }
+
+    /// Single-element mutation → false.
+    ///
+    /// One element in `b` has its description changed. The raw-token comparison
+    /// (`raw_nodes_equal`) catches the content mutation.
+    ///
+    /// Discriminating: if raw-token comparison were replaced with structural
+    /// type-only comparison (ignoring string values), this would return true,
+    /// letting a mutated description through the gate.
+    #[test]
+    fn tools_arrays_set_equal_mutation_is_false() {
+        let original = r#"[{"name":"search","description":"Search files"},{"name":"compile","description":"Compile"}]"#;
+        let mutated = r#"[{"name":"compile","description":"Compile"},{"name":"search","description":"MUTATED"}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, mutated),
+            "mutated element must fail set-equality"
+        );
+    }
+
+    /// Empty arrays → set-equal (vacuous).
+    #[test]
+    fn tools_arrays_set_equal_empty_is_true() {
+        assert!(
+            tools_arrays_set_equal("[]", "[]"),
+            "empty arrays are set-equal"
+        );
+    }
+
+    /// Non-array inputs → false.
+    #[test]
+    fn tools_arrays_set_equal_non_array_is_false() {
+        assert!(
+            !tools_arrays_set_equal(r#"{"name":"a"}"#, r#"[{"name":"a"}]"#),
+            "object is not set-equal to array"
+        );
+    }
+
+    /// Raw-number token faithfulness in set-equality (AC11 invariant preserved).
+    ///
+    /// `1e3` and `1000` are different raw tokens; set-equality must treat them as
+    /// distinct elements. Without raw-token comparison, they would normalise to f64
+    /// and the mutation would be invisible.
+    #[test]
+    fn tools_arrays_set_equal_raw_number_mutation_is_false() {
+        let original = r#"[{"name":"t","parameters":{"default":1e3}},{"name":"u"}]"#;
+        let mutated = r#"[{"name":"u"},{"name":"t","parameters":{"default":1000}}]"#;
+        assert!(
+            !tools_arrays_set_equal(original, mutated),
+            "1e3 vs 1000 raw-token mutation must fail set-equality (AC11)"
+        );
+    }
+
+    /// Genuine duplicates in both arrays are handled correctly (count-preserving).
+    ///
+    /// If both `a` and `b` contain two identical elements, set-equality must pass —
+    /// the multiset {x, x} equals the multiset {x, x}.
+    #[test]
+    fn tools_arrays_set_equal_genuine_duplicates_both_sides() {
+        let a = r#"[{"name":"x"},{"name":"x"}]"#;
+        let b = r#"[{"name":"x"},{"name":"x"}]"#;
+        assert!(
+            tools_arrays_set_equal(a, b),
+            "identical arrays with genuine duplicates must be set-equal"
+        );
+    }
+
+    // ========================================================================
+    // proptest cross-check: new O(n log n) implementation vs O(n²) reference
+    //
+    // The new sort-and-compare implementation must agree with the original
+    // greedy multiset matcher on every input reachable by the strategy below.
+    // ========================================================================
+
+    /// O(n²) reference implementation preserved for proptest cross-checking.
+    ///
+    /// This is the original greedy multiset matcher. It is intentionally kept
+    /// here (rather than deleted) so the proptest can verify the new O(n log n)
+    /// `tools_arrays_set_equal` produces identical results on all generated inputs.
+    fn tools_arrays_set_equal_reference(raw_a: &str, raw_b: &str) -> bool {
+        let (a_node, b_node) = match (parse_raw_node(raw_a, 0), parse_raw_node(raw_b, 0)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return false,
+        };
+        let (a_elems, b_elems) = match (a_node, b_node) {
+            (RawNode::Array(a), RawNode::Array(b)) => (a, b),
+            _ => return false,
+        };
+        if a_elems.len() != b_elems.len() {
+            return false;
+        }
+        let mut used = vec![false; b_elems.len()];
+        for a_elem in &a_elems {
+            let matched = b_elems
+                .iter()
+                .enumerate()
+                .find(|(j, b_elem)| !used[*j] && raw_nodes_equal(a_elem, b_elem));
+            match matched {
+                Some((j, _)) => used[j] = true,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    use proptest::prelude::*;
+
+    /// Strategy: generate a compact JSON representation of one tool element.
+    ///
+    /// Elements are simple objects to keep proptest shrinking fast while still
+    /// covering the key shape space: name, optional description, optional integer,
+    /// optional raw-number token (for AC11 coverage), optional nested object.
+    ///
+    /// Integer values are drawn from a fixed small set (not filtered arbitrary
+    /// i32) to avoid prop_filter local-reject exhaustion at high rejection rates.
+    fn arb_tool_element() -> impl Strategy<Value = String> {
+        // Fixed-shape tools so keys are stable; proptest varies only values.
+        prop_oneof![
+            // Simple name-only tool
+            prop_oneof![Just("alpha"), Just("beta"), Just("gamma"), Just("delta"),]
+                .prop_map(|name| format!(r#"{{"name":"{name}"}}"#)),
+            // Tool with name + description
+            (
+                prop_oneof![Just("search"), Just("read"), Just("write"), Just("exec")],
+                prop_oneof![Just("do it"), Just("do something else"), Just("run")],
+            )
+                .prop_map(|(name, desc)| format!(r#"{{"name":"{name}","description":"{desc}"}}"#)),
+            // Tool with name + integer parameter.
+            // Use a small fixed set instead of filtered i32::ANY: a filter
+            // that passes only 2M out of 4B values causes >65k local rejects
+            // and proptest aborts the run.
+            (
+                prop_oneof![Just("compute"), Just("fetch"), Just("store")],
+                prop_oneof![
+                    Just(0i32),
+                    Just(1),
+                    Just(-1),
+                    Just(42),
+                    Just(-100),
+                    Just(1000),
+                ],
+            )
+                .prop_map(|(name, n)| {
+                    format!(r#"{{"name":"{name}","parameters":{{"limit":{n}}}}}"#)
+                }),
+            // Tool with raw-number token (AC11 coverage: 1e3 vs 1000 are distinct)
+            prop_oneof![Just("raw_num_1e3"), Just("raw_num_42")]
+                .prop_map(|name| format!(r#"{{"name":"{name}","default":1e3}}"#)),
+        ]
+    }
+
+    /// Strategy: generate a tools JSON array with 0–5 elements.
+    fn arb_tools_array() -> impl Strategy<Value = String> {
+        prop::collection::vec(arb_tool_element(), 0..=5)
+            .prop_map(|elems| format!("[{}]", elems.join(",")))
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 300,
+            max_shrink_iters: 500,
+            ..ProptestConfig::default()
+        })]
+
+        /// Cross-check: new O(n log n) implementation must agree with the O(n²)
+        /// reference greedy matcher on all generated (a, b) array pairs.
+        ///
+        /// This is the primary regression guard for the algorithmic refactor.
+        /// Any input on which the two implementations disagree is a bug.
+        #[test]
+        fn prop_tools_arrays_set_equal_agrees_with_reference(
+            a in arb_tools_array(),
+            b in arb_tools_array(),
+        ) {
+            let new_result = tools_arrays_set_equal(&a, &b);
+            let ref_result = tools_arrays_set_equal_reference(&a, &b);
+            prop_assert_eq!(
+                new_result, ref_result,
+                "new O(n log n) impl disagrees with O(n²) reference for a={:?} b={:?}",
+                a,
+                b
+            );
+        }
+
+        /// Cross-check: permuted array is always set-equal to original (both impls agree).
+        #[test]
+        fn prop_permuted_array_is_set_equal(
+            elems in prop::collection::vec(arb_tool_element(), 0..=4),
+            // Use a simple rotation as the permutation
+            rotation in 0usize..=4,
+        ) {
+            if elems.is_empty() {
+                return Ok(());
+            }
+            let rotation = rotation % elems.len();
+            let a_str = format!("[{}]", elems.join(","));
+            let mut rotated = elems.clone();
+            rotated.rotate_right(rotation);
+            let b_str = format!("[{}]", rotated.join(","));
+
+            let new_result = tools_arrays_set_equal(&a_str, &b_str);
+            let ref_result = tools_arrays_set_equal_reference(&a_str, &b_str);
+
+            // Both must agree
+            prop_assert_eq!(
+                new_result, ref_result,
+                "impls disagree on permuted array: a={:?} b={:?}",
+                a_str,
+                b_str
+            );
+            // And both must say true (permutation is always set-equal)
+            prop_assert!(
+                new_result,
+                "permuted array must be set-equal: a={:?} b={:?}",
+                a_str,
+                b_str
+            );
+        }
     }
 
     // ========================================================================
@@ -1131,5 +1767,128 @@ mod tests {
         let mut b = 100usize;
         assert_eq!(value_equivalent_raw("{invalid}", "{}", &mut b), None);
         assert_eq!(value_equivalent_raw("{}", "{invalid}", &mut b), None);
+    }
+
+    // ── R6 parse-once variants ────────────────────────────────────────────────
+
+    /// `parse_array_nodes` returns elements for a valid array.
+    #[test]
+    fn parse_array_nodes_returns_elements() {
+        let arr = r#"[{"name":"a"},{"name":"b"}]"#;
+        let nodes = parse_array_nodes(arr);
+        assert!(nodes.is_some());
+        assert_eq!(nodes.expect("valid array JSON").len(), 2);
+    }
+
+    /// `parse_array_nodes` returns `None` for non-array JSON.
+    #[test]
+    fn parse_array_nodes_non_array_is_none() {
+        assert!(parse_array_nodes(r#"{"x":1}"#).is_none());
+        assert!(parse_array_nodes("{invalid}").is_none());
+    }
+
+    /// `parse_array_nodes` returns empty vec for `[]`.
+    #[test]
+    fn parse_array_nodes_empty_array() {
+        let nodes = parse_array_nodes("[]").expect("empty array is valid");
+        assert!(nodes.is_empty());
+    }
+
+    /// `tools_arrays_set_equal_nodes` matches `tools_arrays_set_equal` for a permutation.
+    #[test]
+    fn tools_arrays_set_equal_nodes_permutation_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"b"},{"name":"a"}]"#;
+        let b_nodes = parse_array_nodes(b).expect("valid array JSON");
+        // Both variants must agree: permutation → true
+        assert_eq!(
+            tools_arrays_set_equal(a, b),
+            tools_arrays_set_equal_nodes(a, &b_nodes),
+        );
+        assert!(tools_arrays_set_equal_nodes(a, &b_nodes));
+    }
+
+    /// `tools_arrays_set_equal_nodes` matches `tools_arrays_set_equal` for a drop.
+    #[test]
+    fn tools_arrays_set_equal_nodes_drop_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"a"}]"#;
+        let b_nodes = parse_array_nodes(b).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_set_equal(a, b),
+            tools_arrays_set_equal_nodes(a, &b_nodes),
+        );
+        assert!(!tools_arrays_set_equal_nodes(a, &b_nodes));
+    }
+
+    /// `tools_arrays_set_equal_nodes` matches `tools_arrays_set_equal` for a mutation.
+    #[test]
+    fn tools_arrays_set_equal_nodes_mutation_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"CHANGED"},{"name":"b"}]"#;
+        let b_nodes = parse_array_nodes(b).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_set_equal(a, b),
+            tools_arrays_set_equal_nodes(a, &b_nodes),
+        );
+        assert!(!tools_arrays_set_equal_nodes(a, &b_nodes));
+    }
+
+    /// `tools_arrays_set_equal_nodes` returns false when `raw_a` is not an array.
+    #[test]
+    fn tools_arrays_set_equal_nodes_non_array_a_is_false() {
+        let b_nodes: Vec<RawNode> = vec![];
+        assert!(!tools_arrays_set_equal_nodes(r#"{"x":1}"#, &b_nodes));
+        assert!(!tools_arrays_set_equal_nodes("{invalid}", &b_nodes));
+    }
+
+    /// `tools_arrays_equal_nodes` matches `tools_arrays_equal` for equal arrays.
+    #[test]
+    fn tools_arrays_equal_nodes_equal_matches_str_variant() {
+        // Element 0 in `a` has keys in one order; element 0 in `b` reverses them.
+        // `tools_arrays_equal` compares objects order-insensitively, so both must agree
+        // this is equal.
+        let a = r#"[{"description":"x","name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"a","description":"x"},{"name":"b"}]"#; // key reorder in elem 0
+        let a_nodes = parse_array_nodes(a).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_equal(a, b),
+            tools_arrays_equal_nodes(&a_nodes, b),
+        );
+        assert!(tools_arrays_equal_nodes(&a_nodes, b));
+    }
+
+    /// `tools_arrays_equal_nodes` is order-sensitive (matches `tools_arrays_equal`).
+    #[test]
+    fn tools_arrays_equal_nodes_order_sensitive_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"b"},{"name":"a"}]"#;
+        let a_nodes = parse_array_nodes(a).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_equal(a, b),
+            tools_arrays_equal_nodes(&a_nodes, b),
+        );
+        assert!(!tools_arrays_equal_nodes(&a_nodes, b));
+    }
+
+    /// `tools_arrays_equal_nodes` returns false for a mutation.
+    #[test]
+    fn tools_arrays_equal_nodes_mutation_matches_str_variant() {
+        let a = r#"[{"name":"a"},{"name":"b"}]"#;
+        let b = r#"[{"name":"a"},{"name":"CHANGED"}]"#;
+        let a_nodes = parse_array_nodes(a).expect("valid array JSON");
+        assert_eq!(
+            tools_arrays_equal(a, b),
+            tools_arrays_equal_nodes(&a_nodes, b),
+        );
+        assert!(!tools_arrays_equal_nodes(&a_nodes, b));
+    }
+
+    /// `tools_arrays_equal_nodes` returns false when `raw_b` is not an array.
+    #[test]
+    fn tools_arrays_equal_nodes_non_array_b_is_false() {
+        let a_nodes = parse_array_nodes(r#"[{"name":"a"}]"#).expect("valid array JSON");
+        assert!(!tools_arrays_equal_nodes(&a_nodes, r#"{"x":1}"#));
+        assert!(!tools_arrays_equal_nodes(&a_nodes, "{invalid}"));
     }
 }
