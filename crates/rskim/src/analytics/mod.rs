@@ -654,6 +654,68 @@ pub(crate) struct AnalyticsDb {
     conn: Connection,
 }
 
+/// Switch the connection to WAL journal mode, retrying a bounded number of times
+/// on `SQLITE_BUSY`.
+///
+/// # Why this needs its own retry loop
+///
+/// `PRAGMA journal_mode=WAL` is the one statement in [`AnalyticsDb::open`] that
+/// does **not** honour `busy_timeout`. Converting a database into WAL requires an
+/// EXCLUSIVE file lock, and SQLite's pager takes that lock directly
+/// (`pagerExclusiveLock`) without going through the busy handler — so a
+/// contending opener gets a bare `SQLITE_BUSY` immediately rather than waiting.
+/// Setting `busy_timeout` earlier (which `open()` now does) fixes the
+/// `PRAGMA user_version` read and `run_migrations`' `BEGIN IMMEDIATE`, but it
+/// cannot fix this statement.
+///
+/// The contended window is narrow and self-closing: it exists only while a
+/// brand-new database is still in rollback-journal mode. As soon as *any* opener
+/// completes the flip, the file header says WAL and the statement becomes a
+/// read-only no-op for everyone else. So a short bounded backoff is sufficient —
+/// we are waiting for a peer to finish one flip, not for a long transaction.
+///
+/// The bound is explicit (project reliability rule: every retry has a fixed upper
+/// bound). Exhausting it returns the underlying `SQLITE_BUSY` with context rather
+/// than silently continuing in rollback-journal mode, which would leave this
+/// connection's pager disagreeing with the on-disk header.
+fn enable_wal(conn: &Connection) -> anyhow::Result<()> {
+    /// ~500 ms ceiling (50 × 10 ms) — orders of magnitude more than one flip needs.
+    const MAX_ATTEMPTS: u32 = 50;
+    const BACKOFF: Duration = Duration::from_millis(10);
+
+    let mut attempt = 0;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy(&e) && attempt + 1 < MAX_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(BACKOFF);
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "PRAGMA journal_mode=WAL failed after {} attempt(s); another process may be \
+                     converting the analytics database concurrently",
+                    attempt + 1
+                )));
+            }
+        }
+    }
+}
+
+/// True when a rusqlite error is a lock-contention error worth retrying.
+fn is_busy(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _
+        )
+    )
+}
+
 impl AnalyticsDb {
     /// Open database at the given path, run migrations, enable WAL mode.
     ///
@@ -663,8 +725,22 @@ impl AnalyticsDb {
     pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
 
-        // AD-AN-5: future-version rejection — the FIRST step after Connection::open,
-        // before chmod, busy_timeout, WAL, and run_migrations (AC3).
+        // busy_timeout MUST be set before the PRAGMA user_version read below.
+        //
+        // A freshly created DB is still in rollback-journal mode until the
+        // `PRAGMA journal_mode=WAL` flip further down, and that flip needs the
+        // EXCLUSIVE lock. While a concurrent opener holds it, a zero-timeout
+        // `PRAGMA user_version` read returns SQLITE_BUSY and fails this open
+        // outright. `run_migrations` likewise needs the timeout to bound its
+        // `BEGIN IMMEDIATE` wait.
+        //
+        // This does NOT weaken AD-AN-5 (AC3): `busy_timeout` is a connection-level
+        // setting that writes nothing to the database file — no schema write, no
+        // WAL journal_mode flip, and no chmod happens before the version check.
+        conn.busy_timeout(Duration::from_millis(5000))?;
+
+        // AD-AN-5: future-version rejection — the first step that inspects the DB,
+        // before chmod, WAL, and run_migrations (AC3).
         //
         // Opening the connection is unavoidable (needed to read PRAGMA user_version),
         // but `Connection::open` does not mutate the DB file on its own.  Checking
@@ -694,8 +770,9 @@ impl AnalyticsDb {
             }
         }
 
-        conn.busy_timeout(Duration::from_millis(5000))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // journal_mode MUST be flipped BEFORE run_migrations: SQLite cannot change
+        // journal_mode from inside a transaction, and run_migrations opens one.
+        enable_wal(&conn)?;
         schema::run_migrations(&conn)?;
         Ok(Self { conn })
     }
@@ -1524,6 +1601,22 @@ impl AnalyticsDb {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count rows in `token_savings` written by the proxy recording path.
+    ///
+    /// Test helper for the proxy-consumer drain tests: it answers "did the
+    /// consumer actually persist what it dequeued?" without depending on the
+    /// CLI-scope aggregates, which deliberately exclude `command_type = 'proxy'`
+    /// rows (AD-AN-6).
+    #[cfg(all(test, feature = "proxy"))]
+    pub(crate) fn query_proxy_row_count(&self) -> anyhow::Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM token_savings WHERE command_type = 'proxy'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 }
 
@@ -2468,6 +2561,55 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM token_savings", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Eight threads racing to create and migrate the SAME fresh database must
+    /// all succeed.
+    ///
+    /// A `Barrier` releases every thread into `open()` at the same instant. That
+    /// matters: the contended window is only open while the file is brand new and
+    /// still in rollback-journal mode, so staggered spawns can miss it entirely.
+    ///
+    /// DISCRIMINATING — this test reproduces all three failure modes the fix
+    /// addresses:
+    ///
+    /// 1. Reverting `schema::run_migrations` to an untransacted version read:
+    ///    two threads both read `user_version = 0`, both run the migration blocks,
+    ///    and the loser aborts with `duplicate column name: session_id` (v3
+    ///    `ALTER TABLE`) or `table proxy_block_decisions already exists` (v4
+    ///    `CREATE TABLE`).
+    /// 2. Removing the `busy_timeout` call that now precedes the `PRAGMA
+    ///    user_version` read in `open()`: SQLITE_BUSY on the version read while a
+    ///    peer holds the write lock.
+    /// 3. Replacing [`enable_wal`] with a bare `PRAGMA journal_mode=WAL`:
+    ///    `database is locked` (SQLITE_BUSY, code 5) — that statement does not
+    ///    honour `busy_timeout`, so it needs its own bounded retry.
+    #[test]
+    fn open_is_safe_under_concurrent_first_open() {
+        const THREADS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("race.db");
+        let gate = std::sync::Barrier::new(THREADS);
+
+        let errs: Vec<String> = std::thread::scope(|s| {
+            (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        gate.wait();
+                        AnalyticsDb::open(&path).err().map(|e| format!("{e:#}"))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert!(
+            errs.is_empty(),
+            "concurrent first-open must not fail; got: {errs:?}"
+        );
     }
 
     #[test]
