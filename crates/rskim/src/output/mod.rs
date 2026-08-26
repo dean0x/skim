@@ -704,11 +704,17 @@ mod rewrite_transparency_tests {
         // With origin: "transformed view" header + class description.
         let result = lossy_view_marker(Some("cat"), "pseudo", 1, 1);
         let marker = result.expect("differing=1 must produce a marker");
-        assert!(marker.contains("[skim] transformed view"), "must have header");
+        assert!(
+            marker.contains("[skim] transformed view"),
+            "must have header"
+        );
         assert!(marker.contains("cat"), "must name origin");
         assert!(marker.contains("pseudo"), "must name mode");
         assert!(marker.contains("bodies"), "B4: must name elided class");
-        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "must carry remedy hint");
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must carry remedy hint"
+        );
     }
 
     #[test]
@@ -718,7 +724,10 @@ mod rewrite_transparency_tests {
         assert!(marker.contains("transformed view"), "must have header");
         assert!(marker.contains("2/3"), "must have file counts");
         assert!(marker.contains("pseudo"), "must name mode");
-        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "must carry remedy hint");
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must carry remedy hint"
+        );
     }
 
     #[test]
@@ -729,7 +738,10 @@ mod rewrite_transparency_tests {
         // B4: class label is the primary identifier for direct invocations.
         assert!(marker.contains("pseudo"), "must name mode class");
         assert!(marker.contains("bodies"), "B4: must name elided class");
-        assert!(marker.contains("SKIM_PASSTHROUGH=1"), "must carry remedy hint");
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must carry remedy hint"
+        );
     }
 
     #[test]
@@ -744,9 +756,15 @@ mod rewrite_transparency_tests {
             .expect("head + differing=1 must produce a marker");
         assert!(m.contains("head"), "marker must name the origin command");
         assert!(m.contains("structure"), "marker must name the mode");
-        assert!(m.contains("SKIM_PASSTHROUGH=1"), "marker must include passthrough hint");
+        assert!(
+            m.contains("SKIM_PASSTHROUGH=1"),
+            "marker must include passthrough hint"
+        );
         // B4: structure class is named
-        assert!(m.contains("bodies removed"), "B4: structure marker must name 'bodies removed'");
+        assert!(
+            m.contains("bodies removed"),
+            "B4: structure marker must name 'bodies removed'"
+        );
     }
 
     #[test]
@@ -759,7 +777,10 @@ mod rewrite_transparency_tests {
         // Ensure mode_class_label returns meaningful strings for all known modes.
         for mode in &["pseudo", "minimal", "structure", "signatures", "types"] {
             let label = super::mode_class_label(mode);
-            assert!(!label.is_empty(), "class label must be non-empty for mode {mode}");
+            assert!(
+                !label.is_empty(),
+                "class label must be non-empty for mode {mode}"
+            );
             assert!(
                 label.len() > "transformed view".len(),
                 "B4: class label must be more descriptive than 'transformed view' for mode {mode}"

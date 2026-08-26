@@ -245,9 +245,16 @@ fn test_cli_all_languages_structure() {
         .success()
         .stdout(predicate::str::contains("{...}"));
 
-    // Rust
+    // Rust — needs a multi-statement body so structure mode saves tokens vs raw.
+    // A single-expression body like `{ 42 }` ties on token count with `{...}`,
+    // triggering the tie→Passthrough rule (A2/A4 guardrail). Two statements
+    // produce a body substantially larger than `{...}` in bytes and tokens.
     let rs_file = temp_dir.path().join("test.rs");
-    fs::write(&rs_file, "fn test() { 42 }").unwrap();
+    fs::write(
+        &rs_file,
+        "fn compute_result(x: i64, y: i64) -> i64 { let sum = x + y; let product = x * y; sum + product }",
+    )
+    .unwrap();
     common::skim()
         .arg(&rs_file)
         .assert()

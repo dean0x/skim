@@ -51,7 +51,7 @@ pub(crate) enum SavingsDecision {
 /// unified gate (A2).  Keep compressed IFF strictly smaller in BOTH bytes AND
 /// tokens; tie → Passthrough.  See `output/fidelity.rs` for full semantics.
 pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
-    use crate::output::fidelity::{decide, FidelityDecision};
+    use crate::output::fidelity::{FidelityDecision, decide};
     match decide(raw, compressed) {
         FidelityDecision::Keep => SavingsDecision::Keep,
         FidelityDecision::Passthrough => SavingsDecision::Passthrough,
@@ -2234,7 +2234,8 @@ mod tests {
     /// and compressed is strictly smaller, Keep is correct.
     #[test]
     fn a1_guard_baseline_smaller_gives_keep() {
-        let user_baseline = "On branch main\nChanges not staged for commit:\n  modified: src/main.rs\n\n";
+        let user_baseline =
+            "On branch main\nChanges not staged for commit:\n  modified: src/main.rs\n\n";
         // Skim compresses to a one-liner — strictly smaller.
         let compressed = "1 modified\n";
         assert_eq!(

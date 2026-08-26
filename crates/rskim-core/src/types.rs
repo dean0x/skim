@@ -372,8 +372,12 @@ impl Language {
 
         // Apply last_lines truncation as a post-processing step (B5: pass elision_hint).
         let (result, line_map) = if let Some(n) = config.last_lines {
-            let truncated =
-                crate::transform::truncate::simple_last_line_truncate(&result, self, n, config.elision_hint.as_deref())?;
+            let truncated = crate::transform::truncate::simple_last_line_truncate(
+                &result,
+                self,
+                n,
+                config.elision_hint.as_deref(),
+            )?;
             let final_map = if let Some(ref map) = line_map {
                 // Reconcile the line map after last_lines truncation
                 let reconciled =
@@ -419,7 +423,12 @@ impl Language {
             // Content line i (0-indexed within content) gets source_line:
             //   source_line_count - n_content + 1 + i  (1-indexed)
             let source_line_count = source.lines().count();
-            let truncated = crate::transform::truncate::simple_last_line_truncate(source, self, n, config.elision_hint.as_deref())?;
+            let truncated = crate::transform::truncate::simple_last_line_truncate(
+                source,
+                self,
+                n,
+                config.elision_hint.as_deref(),
+            )?;
             let line_map = if config.line_numbers {
                 if source_line_count <= n {
                     // No truncation occurred: identity map
@@ -447,8 +456,12 @@ impl Language {
         // but for passthrough (Full mode or serde/Markdown Minimal/Pseudo) we must
         // apply it here as a simple line truncation (B5: pass elision_hint).
         if let Some(max_lines) = config.max_lines {
-            let truncated =
-                crate::transform::truncate::simple_line_truncate(source, self, max_lines, config.elision_hint.as_deref())?;
+            let truncated = crate::transform::truncate::simple_line_truncate(
+                source,
+                self,
+                max_lines,
+                config.elision_hint.as_deref(),
+            )?;
             let line_map = if config.line_numbers {
                 // After simple_line_truncate the output is a prefix of the source
                 // (with an optional trailing truncation marker). Build the map by
@@ -496,13 +509,23 @@ impl Language {
         // Apply max_lines truncation (no meaningful line map for restructured output)
         // (B5: pass elision_hint through).
         let result = if let Some(max_lines) = config.max_lines {
-            crate::transform::truncate::simple_line_truncate(&raw_result, self, max_lines, config.elision_hint.as_deref())?
+            crate::transform::truncate::simple_line_truncate(
+                &raw_result,
+                self,
+                max_lines,
+                config.elision_hint.as_deref(),
+            )?
         } else {
             raw_result
         };
         // Apply last_lines truncation (B5: pass elision_hint through).
         let result = if let Some(n) = config.last_lines {
-            crate::transform::truncate::simple_last_line_truncate(&result, self, n, config.elision_hint.as_deref())?
+            crate::transform::truncate::simple_last_line_truncate(
+                &result,
+                self,
+                n,
+                config.elision_hint.as_deref(),
+            )?
         } else {
             result
         };

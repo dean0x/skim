@@ -215,9 +215,28 @@ fn test_max_lines_without_flag_returns_full_output() {
 fn test_max_lines_show_stats_interaction() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.ts");
+    // Use a file with substantial function bodies so the B5 elision-hint overhead
+    // (≈10 tokens appended to every truncation marker) is absorbed by genuine body
+    // savings. A 3-line file with return-only bodies compresses to roughly the same
+    // token count as the marker alone, causing the guardrail to fire and emit raw
+    // (bypassing --max-lines entirely).
     std::fs::write(
         &file,
-        "type A = string;\nfunction foo(): void { return; }\nfunction bar(): void { return; }\n",
+        concat!(
+            "type A = string;\n",
+            "function foo(): void {\n",
+            "    const x = Math.random();\n",
+            "    const y = Math.floor(x * 100);\n",
+            "    console.log('Result:', y);\n",
+            "    return;\n",
+            "}\n",
+            "function bar(): void {\n",
+            "    const items = [1, 2, 3, 4, 5];\n",
+            "    const sum = items.reduce((a, b) => a + b, 0);\n",
+            "    console.log('Sum:', sum);\n",
+            "    return;\n",
+            "}\n",
+        ),
     )
     .unwrap();
 

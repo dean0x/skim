@@ -52,7 +52,7 @@ pub(crate) fn apply(
     compressed: String,
     writer: &mut impl Write,
 ) -> Result<GuardrailOutcome> {
-    use crate::output::fidelity::{decide, FidelityDecision};
+    use crate::output::fidelity::{FidelityDecision, decide};
     match decide(&raw, &compressed) {
         FidelityDecision::Keep => Ok(GuardrailOutcome::Passed { output: compressed }),
         FidelityDecision::Passthrough => {

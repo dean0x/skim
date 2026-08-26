@@ -99,7 +99,11 @@ fn prepare_args(args: &mut Vec<String>) {
             return true;
         }
         // -C N (context with separate N argument)
-        if a == "-C" && args.get(i + 1).is_some_and(|next| next.parse::<u32>().is_ok()) {
+        if a == "-C"
+            && args
+                .get(i + 1)
+                .is_some_and(|next| next.parse::<u32>().is_ok())
+        {
             return true;
         }
         // Long-form context
@@ -565,7 +569,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_c_context_format() {
         // -c selects context diff format (incompatible with -u).
-        let mut args = vec!["-c".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "-c".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -576,7 +584,12 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_c_n_context_format() {
         // -C N (context with N lines) selects context diff format.
-        let mut args = vec!["-C".to_string(), "3".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "-C".to_string(),
+            "3".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -587,7 +600,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_context_long() {
         // --context selects context diff format.
-        let mut args = vec!["--context".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "--context".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -598,7 +615,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_y_side_by_side_short() {
         // -y selects side-by-side format (incompatible with -u).
-        let mut args = vec!["-y".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "-y".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -609,7 +630,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_side_by_side_long() {
         // --side-by-side selects side-by-side format.
-        let mut args = vec!["--side-by-side".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "--side-by-side".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -620,7 +645,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_e_ed_format() {
         // -e selects ed script format (incompatible with -u).
-        let mut args = vec!["-e".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "-e".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -631,7 +660,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_n_rcs_format() {
         // -n selects RCS format (incompatible with -u).
-        let mut args = vec!["-n".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "-n".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -642,7 +675,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_brief_long() {
         // --brief (report only whether files differ, no content) — incompatible with -u.
-        let mut args = vec!["--brief".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "--brief".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),
@@ -653,7 +690,11 @@ mod tests {
     #[test]
     fn a3_prepare_args_no_inject_when_normal() {
         // --normal selects the default (normal) diff format — incompatible with -u.
-        let mut args = vec!["--normal".to_string(), "file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = vec![
+            "--normal".to_string(),
+            "file1.txt".to_string(),
+            "file2.txt".to_string(),
+        ];
         prepare_args(&mut args);
         assert!(
             !args.contains(&"-u".to_string()),

@@ -94,9 +94,15 @@ fn ac2_closure_adapter_drives_truncate() {
         let counter = Counter::new(encoding).unwrap();
         let budget = 20usize;
 
-        let truncated =
-            truncate_to_token_budget(text, Language::Rust, budget, counter.as_closure(), None, None)
-                .unwrap_or_else(|e| panic!("truncate failed for {encoding:?}: {e}"));
+        let truncated = truncate_to_token_budget(
+            text,
+            Language::Rust,
+            budget,
+            counter.as_closure(),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("truncate failed for {encoding:?}: {e}"));
 
         let actual_count = counter.count(&truncated);
         assert!(
@@ -115,7 +121,8 @@ fn ac2_near_zero_budget_returns_empty_or_marker() {
 
     // Near-zero budget: per the documented invariant, if the budget is smaller
     // than the omission marker, an empty string is returned (not a panic).
-    let result = truncate_to_token_budget(text, Language::Rust, 1, counter.as_closure(), None, None);
+    let result =
+        truncate_to_token_budget(text, Language::Rust, 1, counter.as_closure(), None, None);
     match result {
         Ok(s) => {
             let count = counter.count(&s);

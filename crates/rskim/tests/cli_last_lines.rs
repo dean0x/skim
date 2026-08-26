@@ -150,9 +150,38 @@ fn test_last_lines_with_structure_mode() {
 fn test_last_lines_with_pseudo_mode() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.py");
+    // Use a file with substantial bodies so the B5 elision-hint overhead (≈10 tokens
+    // appended to every truncation marker) is absorbed by genuine body savings.
+    // A tiny pass-only file has almost no savings, causing the guardrail to fire and
+    // emit raw (bypassing --last-lines entirely).
     std::fs::write(
         &file,
-        "import os\nimport sys\ndef foo():\n    pass\ndef bar():\n    pass\ndef baz():\n    pass\n",
+        concat!(
+            "import os\n",
+            "import sys\n",
+            "import json\n",
+            "\n",
+            "def process_items(items, config):\n",
+            "    result = []\n",
+            "    for item in items:\n",
+            "        if item.get('active'):\n",
+            "            value = item['value'] * config.get('multiplier', 1)\n",
+            "            result.append(value)\n",
+            "    return result\n",
+            "\n",
+            "def validate_config(config):\n",
+            "    required = ['name', 'version', 'items']\n",
+            "    for key in required:\n",
+            "        if key not in config:\n",
+            "            return False\n",
+            "    return True\n",
+            "\n",
+            "def transform_data(data, config):\n",
+            "    if not validate_config(config):\n",
+            "        return None\n",
+            "    processed = process_items(data.get('items', []), config)\n",
+            "    return json.dumps(processed)\n",
+        ),
     )
     .unwrap();
 

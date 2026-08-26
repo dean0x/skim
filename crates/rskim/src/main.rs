@@ -1027,8 +1027,8 @@ fn process_single_arg(
             // File passthrough: read raw bytes and copy to stdout.
             // Skip validation (size limits, UTF-8) — the point of passthrough
             // is byte-faithful forwarding without skim's transform guards.
-            let contents = std::fs::read(file)
-                .map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
+            let contents =
+                std::fs::read(file).map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
             out.write_all(&contents)
                 .map_err(|e| anyhow::anyhow!("passthrough write: {e}"))?;
         }

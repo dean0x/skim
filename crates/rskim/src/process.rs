@@ -636,14 +636,13 @@ pub(crate) fn process_stdin(
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Same protection as process_file; token counting happens after so stats reflect
     // the final output. Guardrail comparison uses UN-annotated output.
-    let (final_output, guardrail_triggered) =
-        if options.mode != Mode::Full {
-            let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
-            let triggered = outcome.was_triggered();
-            (outcome.into_output(), triggered)
-        } else {
-            (transformed, false)
-        };
+    let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
+        let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
+        let triggered = outcome.was_triggered();
+        (outcome.into_output(), triggered)
+    } else {
+        (transformed, false)
+    };
 
     // Transparency marker: did the transformation produce a different view?
     // Compare pre-line-numbers output against raw buffer. When guardrail fired,
@@ -745,14 +744,13 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
     // Guardrail comparison uses UN-annotated output (before line number formatting).
-    let (final_output, guardrail_triggered) =
-        if options.mode != Mode::Full {
-            let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
-            let triggered = outcome.was_triggered();
-            (outcome.into_output(), triggered)
-        } else {
-            (result, false)
-        };
+    let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
+        let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
+        let triggered = outcome.was_triggered();
+        (outcome.into_output(), triggered)
+    } else {
+        (result, false)
+    };
 
     // Transparency marker: did transformation produce a different view than raw bytes?
     // Compare pre-line-numbers output to raw contents. When guardrail fired,
