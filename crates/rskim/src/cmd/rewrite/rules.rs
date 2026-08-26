@@ -1799,34 +1799,16 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     },
     // diff
     //
-    // Skip flags that select a non-unified output format — injecting `-u` on top
-    // of them would change what the command does (A3: format-conflict detection).
-    // Keep parity with `prepare_args` in `cmd/file/diff.rs`.
+    // `skim diff` is a pure passthrough (RawPassthrough for every input), so
+    // any flag form the user passes is forwarded unchanged.  No format-specific
+    // flags need to be excluded from the rewrite — the handler no longer injects
+    // `-u` and therefore cannot conflict with the user's chosen format.
+    // `prepare_args` in `cmd/file/diff.rs` is a no-op; this skip list is kept
+    // consistent with it (PF-024: remove dead conflict-detection).
     RewriteRule {
         prefix: &["diff"],
         rewrite_to: &["skim", "diff"],
-        skip_if_flag_prefix: &[
-            "--help",
-            "--version",
-            // context format
-            "-c",
-            "-C",
-            "--context",
-            // side-by-side
-            "-y",
-            "--side-by-side",
-            // summary only
-            "-q",
-            "--brief",
-            // ed script
-            "-e",
-            "--ed",
-            // RCS format
-            "-n",
-            "--rcs",
-            // explicit default format
-            "--normal",
-        ],
+        skip_if_flag_prefix: &["--help", "--version"],
         category: RewriteCategory::FileOps,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],

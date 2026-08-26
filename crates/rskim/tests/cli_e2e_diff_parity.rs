@@ -9,30 +9,33 @@
 //! byte parity is what these tests assert — not "contains the changed lines",
 //! which a re-render can satisfy while still inflating the reader's context.
 //!
-//! ## Two yardsticks, deliberately different
+//! ## One yardstick: the user's literal command
 //!
 //! | invocation | must equal | why |
 //! |---|---|---|
-//! | `skim diff <conflicting-flag> …` | `diff <flag> …` | no `-u` is injected, so skim ran the user's literal command |
-//! | `skim diff a b` (flagless) | `diff -u a b` | `prepare_args` injects `-u`; that is the command skim ran |
-//! | `SKIM_PASSTHROUGH=1 skim diff a b` | `diff a b` | the escape hatch fires at the dispatch convergence point, BEFORE `prepare_args`, so the user's literal command is what runs |
+//! | `skim diff <flag> …` | `diff <flag> …` | pure passthrough, no flag injection |
+//! | `skim diff a b` (flagless) | `diff a b` | `prepare_args` is a no-op; skim runs the user's literal command |
+//! | `SKIM_PASSTHROUGH=1 skim diff a b` | `diff a b` | escape hatch fires before any handler; user's argv unchanged |
 //!
-//! The middle row is a KNOWN residual (PF-024): with no parser left, the `-u`
-//! injection buys nothing and costs the reader the difference between normal and
-//! unified format. It is pinned here as a measurement rather than asserted away,
-//! so that removing the injection shows up as a test change, not a silent drift.
+//! Before commit `ec64e53` (A3b) the flagless path injected `-u`, making
+//! `skim diff a b` emit `diff -u` output — a different format and LARGER than
+//! native `diff a b` in every measured region (PF-024, PF-011).  That injection
+//! is now removed: all three rows above produce byte-identical output to the
+//! corresponding native invocation.
 
 use std::path::Path;
 use std::process::Command;
 
 mod common;
 
-/// The 18 `diff` flag forms `prepare_args` must recognise as format-conflicting
-/// or already-unified — i.e. every form for which `-u` must NOT be injected.
+/// The 18 `diff` flag forms that must reach the reader as the native tool's
+/// bytes with the native exit code.  `skim diff` is a pure passthrough for
+/// every input — no `-u` is injected on any path — so all 18 forms now satisfy
+/// the same invariant as the flagless default.
 ///
-/// MEASURED: with `-u` prepended, every one of the 12 non-unified forms exits 2
-/// with zero stdout on this platform, where the native form exits 1 with output.
-/// A missing entry is a total-loss path, not a formatting nit.
+/// Historical note: before the injection was removed, 10 of these forms would
+/// have run `diff -u <flag> …` and exited 2 with zero stdout, where native
+/// `diff <flag> …` exits 1 with output (PF-024, total-loss paths).
 const FLAG_FORMS: &[&[&str]] = &[
     // already-unified family
     &["-u"],
@@ -125,63 +128,41 @@ fn a3a_every_conflicting_flag_form_matches_native_bytes_and_exit_code() {
     }
 }
 
-/// The flagless default path: skim injects `-u`, so `diff -u` is the command it
-/// actually ran, and its bytes are what must reach the reader unmodified.
+/// The flagless default path: `prepare_args` is a no-op, so `skim diff a b`
+/// runs the user's literal `diff a b` and emits its bytes unchanged.
+///
+/// Before commit `ec64e53` (A3b) `prepare_args` injected `-u`, making this path
+/// emit `diff -u` output — a different format, measured 3–6× LARGER than native
+/// `diff a b` on sparse changes (PF-024 / PF-011).  The injection is gone;
+/// `skim diff a b` is now byte-identical to `diff a b`.
 #[test]
-fn a3b_flagless_diff_is_byte_identical_to_the_injected_command() {
+fn a3b_flagless_diff_is_byte_identical_to_native_diff() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = fixture(dir.path());
-    let (native_stdout, native_code) = native_diff(&["-u", &a, &b]);
+    let (native_stdout, native_code) = native_diff(&[&a, &b]);
 
     let out = common::skim().args(["diff", &a, &b]).output().unwrap();
 
     assert_eq!(
         out.stdout,
         native_stdout,
-        "flagless `skim diff` must be byte-identical to `diff -u`; got {:?}",
+        "flagless `skim diff` must be byte-identical to `diff a b` (no `-u`); got {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
-    assert_eq!(out.status.code(), native_code, "exit code must propagate");
-}
-
-/// MEASUREMENT, not an aspiration: the flagless path still costs the reader the
-/// normal→unified format difference, because `prepare_args` injects `-u` even
-/// though nothing parses the result any more (PF-024, unremediated).
-///
-/// This test exists so that the residual is a recorded number rather than an
-/// unstated assumption. If the `-u` injection is ever removed, this test fails
-/// and the removal must be acknowledged rather than slipping through.
-#[test]
-fn a3b_flagless_diff_still_diverges_from_the_users_literal_command() {
-    let dir = tempfile::tempdir().unwrap();
-    let (a, b) = fixture(dir.path());
-    let (literal_stdout, _) = native_diff(&[&a, &b]);
-
-    let out = common::skim().args(["diff", &a, &b]).output().unwrap();
-
-    assert_ne!(
-        out.stdout, literal_stdout,
-        "if these are now equal, the `-u` injection was removed — delete this \
-         test and tighten a3b_flagless_diff_is_byte_identical_to_the_injected_command \
-         to compare against the literal command instead"
-    );
-    assert!(
-        out.stdout.len() > literal_stdout.len(),
-        "the injected unified form is expected to be LARGER than the user's \
-         literal `diff` output ({} vs {} bytes)",
-        out.stdout.len(),
-        literal_stdout.len()
+    assert_eq!(
+        out.status.code(),
+        native_code,
+        "exit code must propagate faithfully"
     );
 }
 
-/// `SKIM_PASSTHROUGH=1` must deliver the USER's literal command — no `-u`.
+/// `SKIM_PASSTHROUGH=1` must deliver the user's literal command — byte-identical
+/// to `diff a b`.
 ///
-/// This is the PF-024 consequence the dispatch convergence gate closes: the
-/// execution-layer hatch streamed `stream_passthrough_raw(program, args, …)`
-/// with `args` taken AFTER `prepare_args` had mutated them, so the documented
-/// escape hatch emitted a different FORMAT than the user asked for and measured
-/// 3.6% LARGER than never invoking skim at all. The gate fires before any
-/// handler runs, so the argv is the user's.
+/// With the `-u` injection removed the normal path and the escape-hatch path now
+/// produce the same output for the flagless invocation.  This test remains as an
+/// explicit passthrough-mode contract pin: the dispatch convergence gate fires
+/// before any handler runs, so the argv is always the user's.
 #[test]
 fn a3b_escape_hatch_delivers_the_users_literal_diff_not_the_injected_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,6 +217,9 @@ fn a3b_identical_files_emit_nothing_and_exit_zero() {
 /// `execution.rs` runs BEFORE `parse()` and shadows the `output` binding, so
 /// `RawPassthrough` does NOT bypass it. Standalone `diff` never colorizes its
 /// own output, so every ESC byte present is content.
+///
+/// The baseline is `diff a b` (no `-u`): the flagless path no longer injects
+/// unified format, so the ESC byte appears in the normal-diff `>` line.
 #[test]
 fn a3b_esc_bytes_in_file_content_survive_verbatim() {
     let dir = tempfile::tempdir().unwrap();
@@ -245,10 +229,10 @@ fn a3b_esc_bytes_in_file_content_survive_verbatim() {
     std::fs::write(&b, "\x1b[32mcolored line\x1b[0m\n").unwrap();
     let (a, b) = (a.to_str().unwrap(), b.to_str().unwrap());
 
-    let (native_stdout, _) = native_diff(&["-u", a, b]);
+    let (native_stdout, _) = native_diff(&[a, b]);
     assert!(
         native_stdout.contains(&0x1b),
-        "precondition: native output must carry the ESC byte"
+        "precondition: native `diff a b` output must carry the ESC byte"
     );
 
     let out = common::skim().args(["diff", a, b]).output().unwrap();
@@ -258,16 +242,32 @@ fn a3b_esc_bytes_in_file_content_survive_verbatim() {
     );
 }
 
-/// TAB bytes in the `--- path\t<mtime>` header must survive (PF-006).
+/// TAB bytes in the `--- path\t<mtime>` unified-format header must survive (PF-006).
+///
+/// The `--- path\t<mtime>` header is produced only by unified format (`-u`).
+/// The flagless path no longer injects `-u`, so we pass it explicitly here.
+/// The principle under test is `skip_ansi_strip: true`: the ANSI-strip step
+/// runs BEFORE `parse()`, so without the flag it would consume the `\t` before
+/// `RawPassthrough` can serve the raw bytes.
 #[test]
-fn a3b_tab_delimiter_in_header_survives_verbatim() {
+fn a3b_tab_delimiter_in_unified_header_survives_verbatim() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = fixture(dir.path());
 
-    let out = common::skim().args(["diff", &a, &b]).output().unwrap();
+    // Pass -u explicitly: unified format emits `--- path\t<mtime>` headers.
+    let (native_stdout, native_code) = native_diff(&["-u", &a, &b]);
     assert!(
-        out.stdout.contains(&b'\t'),
-        "the `--- path\\t<mtime>` TAB must survive; got {:?}",
-        String::from_utf8_lossy(&out.stdout)
+        native_stdout.contains(&b'\t'),
+        "precondition: native `diff -u` must emit a TAB in the file header"
     );
+
+    let out = common::skim()
+        .args(["diff", "-u", &a, &b])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.stdout, native_stdout,
+        "`skim diff -u` must be byte-identical to `diff -u`; TAB in header must survive"
+    );
+    assert_eq!(out.status.code(), native_code, "exit code must propagate");
 }

@@ -75,80 +75,11 @@ pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Resu
     run_tool(CONFIG, args, ctx, prepare_args, parse_impl)
 }
 
-/// Inject `-u` (unified diff) if no format-conflicting flag is present.
-///
-/// Format-conflicting flags select a diff output format that is mutually
-/// exclusive with `-u` (unified).  Injecting `-u` on top of them would
-/// change what the command does — overriding the user's chosen format.
-///
-/// Flags that suppress injection:
-/// - Already-unified: `-u`, `--unified`, `-UN`, `--unified=N`
-/// - Context format: `-c`, `-CN` (short), `-C N` (separate arg), `--context`
-/// - Side-by-side: `-y`, `--side-by-side`
-/// - Ed script: `-e`, `--ed`
-/// - RCS format: `-n`, `--rcs`
-/// - Summary only: `-q`, `--brief`
-/// - Explicit default: `--normal`
-///
-/// Measured on this platform, every one of these forms exits **1 with output**
-/// natively and **2 with no output** once `-u` is prepended — so a missing entry
-/// is not a formatting nit, it is a total-loss path (PF-024).
-fn prepare_args(args: &mut Vec<String>) {
-    let has_conflicting = args.iter().enumerate().any(|(i, a)| {
-        // Already-unified family
-        if a == "-u" || a == "--unified" || a.starts_with("-U") || a.starts_with("--unified=") {
-            return true;
-        }
-        // Context format: -c, -cN (no space), or "-C" with separate numeric arg
-        if a == "-c"
-            || (a.starts_with("-c")
-                && a.len() > 2
-                && a.chars().nth(2).is_some_and(|c| c.is_ascii_digit()))
-        {
-            return true;
-        }
-        // -C N (context with separate N argument)
-        if a == "-C"
-            && args
-                .get(i + 1)
-                .is_some_and(|next| next.parse::<u32>().is_ok())
-        {
-            return true;
-        }
-        // Long-form context
-        if a == "--context" || a.starts_with("--context=") {
-            return true;
-        }
-        // Side-by-side
-        if a == "-y" || a == "--side-by-side" {
-            return true;
-        }
-        // Ed script format
-        if a == "-e" || a == "--ed" {
-            return true;
-        }
-        // RCS format
-        if a == "-n" || a == "--rcs" {
-            return true;
-        }
-        // Summary only.  `-q` is the short form of `--brief`; it was present in
-        // the rewrite-engine skip list but missing here, so `skim diff -q a b`
-        // ran `diff -u -q a b` → exit 2, zero stdout, where native `diff -q a b`
-        // exits 1 with "Files a and b differ".
-        if a == "-q" || a == "--brief" {
-            return true;
-        }
-        // Explicit default format
-        if a == "--normal" {
-            return true;
-        }
-        false
-    });
-    if !has_conflicting {
-        // Insert at the beginning so it precedes file arguments
-        args.insert(0, "-u".to_string());
-    }
-}
+/// No-op: `parse_impl` is `RawPassthrough` for every input, so there is
+/// nothing to normalise the format for.  The previous `-u` injection is
+/// removed: it silently converted the user's normal-format request into
+/// unified format while buying nothing (see module header, PF-011, PF-024).
+fn prepare_args(_args: &mut Vec<String>) {}
 
 /// Route every `diff` invocation to byte-faithful raw passthrough (A3b / PF-011).
 ///
@@ -198,197 +129,22 @@ mod tests {
         );
     }
 
-    // ---- prepare_args tests ----
-
-    #[test]
-    fn test_prepare_args_injects_u() {
-        let mut args = vec!["file1.txt".to_string(), "file2.txt".to_string()];
-        prepare_args(&mut args);
-        assert_eq!(args[0], "-u", "Should inject -u at position 0");
-    }
-
-    #[test]
-    fn test_prepare_args_no_inject_when_short_u_present() {
-        let mut args = vec!["-u".to_string(), "file1.txt".to_string()];
-        prepare_args(&mut args);
-        assert_eq!(args.iter().filter(|a| a.as_str() == "-u").count(), 1);
-    }
-
-    #[test]
-    fn test_prepare_args_no_inject_when_unified_present() {
-        let mut args = vec!["--unified".to_string(), "file1.txt".to_string()];
-        prepare_args(&mut args);
-        assert!(!args.contains(&"-u".to_string()));
-    }
-
-    #[test]
-    #[allow(non_snake_case)] // `U3` refers to the `-U3` diff flag under test; renaming the
-    // test would obscure intent. Annotated rather than renamed to keep test identity stable.
-    fn test_prepare_args_no_inject_when_U3_present() {
-        let mut args = vec!["-U3".to_string(), "file1.txt".to_string()];
-        prepare_args(&mut args);
-        assert!(!args.contains(&"-u".to_string()));
-    }
-
-    // ---- A3: prepare_args conflict-detection for non-unified format flags ----
+    // ---- prepare_args: no-op (injection removed) ----
     //
-    // These flags select a different diff output FORMAT — injecting `-u` on top
-    // would change what the command does (overrides the user's chosen format).
-    // A3 widens the existing "already has unified" guard to cover all format flags
-    // that are incompatible with `-u`.
+    // `prepare_args` no longer injects `-u` — `parse_impl` returns
+    // `RawPassthrough` for every input, so there is nothing to normalise the
+    // format for.  The E2E contract (all flag forms produce native bytes) is
+    // pinned in `tests/cli_e2e_diff_parity.rs`.
 
     #[test]
-    fn a3_prepare_args_no_inject_when_c_context_format() {
-        // -c selects context diff format (incompatible with -u).
-        let mut args = vec![
-            "-c".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
+    fn test_prepare_args_is_noop() {
+        // After the injection removal, `prepare_args` must not modify args.
+        let original = vec!["file1.txt".to_string(), "file2.txt".to_string()];
+        let mut args = original.clone();
         prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: -c (context format) must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_c_n_context_format() {
-        // -C N (context with N lines) selects context diff format.
-        let mut args = vec![
-            "-C".to_string(),
-            "3".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: -C N (context N lines) must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_context_long() {
-        // --context selects context diff format.
-        let mut args = vec![
-            "--context".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: --context must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_y_side_by_side_short() {
-        // -y selects side-by-side format (incompatible with -u).
-        let mut args = vec![
-            "-y".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: -y (side-by-side) must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_side_by_side_long() {
-        // --side-by-side selects side-by-side format.
-        let mut args = vec![
-            "--side-by-side".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: --side-by-side must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_e_ed_format() {
-        // -e selects ed script format (incompatible with -u).
-        let mut args = vec![
-            "-e".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: -e (ed format) must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_n_rcs_format() {
-        // -n selects RCS format (incompatible with -u).
-        let mut args = vec![
-            "-n".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: -n (RCS format) must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_brief_long() {
-        // --brief (report only whether files differ, no content) — incompatible with -u.
-        let mut args = vec![
-            "--brief".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: --brief must suppress -u injection; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_normal() {
-        // --normal selects the default (normal) diff format — incompatible with -u.
-        let mut args = vec![
-            "--normal".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: --normal must suppress -u injection; args={args:?}"
-        );
-    }
-
-    // ---- prepare_args: `-q` (short --brief) ----
-
-    #[test]
-    fn a3_prepare_args_no_inject_when_q_brief_short() {
-        // MEASURED: native `diff -q a b` exits 1 with "Files a and b differ";
-        // `diff -u -q a b` exits 2 with zero stdout.  `-q` was in the rewrite
-        // engine's skip list but missing from prepare_args — a total-loss path.
-        let mut args = vec![
-            "-q".to_string(),
-            "file1.txt".to_string(),
-            "file2.txt".to_string(),
-        ];
-        prepare_args(&mut args);
-        assert!(
-            !args.contains(&"-u".to_string()),
-            "A3: -q must suppress -u injection; args={args:?}"
+        assert_eq!(
+            args, original,
+            "prepare_args must not modify args — no injection, no removal"
         );
     }
 

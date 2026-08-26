@@ -239,13 +239,11 @@ fn test_diff_differing_files_exit1_passthrough_byte_parity_hint_suppressed() {
     fs::write(&file_b, "alpha\ngamma\n").unwrap();
     let (a, b) = (file_a.to_str().unwrap(), file_b.to_str().unwrap());
 
-    // Baseline: the command skim actually runs. `prepare_args` injects `-u`
-    // when no format-conflicting flag is present, so THIS is the yardstick for
-    // the default path. (`SKIM_PASSTHROUGH=1` parity against the user's literal
-    // `diff a b` — with no `-u` — is pinned separately in
-    // `tests/cli_e2e_diff_parity.rs`.)
+    // Baseline: the user's literal command. `prepare_args` is a no-op — no
+    // `-u` is injected — so `skim diff a b` runs exactly `diff a b`.
+    // (Full parity across all flag forms is pinned in `tests/cli_e2e_diff_parity.rs`.)
     let native = std::process::Command::new("diff")
-        .args(["-u", a, b])
+        .args([a, b])
         .output()
         .expect("native diff must run");
     assert_eq!(native.status.code(), Some(1), "precondition: files differ");
