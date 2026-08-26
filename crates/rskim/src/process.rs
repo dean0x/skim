@@ -253,7 +253,11 @@ fn try_cached_result(
             }
         }
     } else {
-        (hit.original_tokens, hit.transformed_tokens, cache_hit_view_differs)
+        (
+            hit.original_tokens,
+            hit.transformed_tokens,
+            cache_hit_view_differs,
+        )
     };
 
     // Effective language for a cache hit: explicit override wins, else detect from path.

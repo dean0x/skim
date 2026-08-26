@@ -629,6 +629,91 @@ fn dispatch_dotnet(
 // Top-level dispatcher
 // ============================================================================
 
+/// Spawn-failure hint for the convergence-point passthrough gate.
+///
+/// The gate is family-agnostic by construction, so the per-handler
+/// `install_hint` (e.g. go's `https://go.dev/dl/`) is not reachable here.  The
+/// richer hints are still served on the paths the gate declines — notably the
+/// FILTER role, which is where `test_go_passthrough_exec_path_surfaces_install_hint`
+/// exercises them.
+const PASSTHROUGH_INSTALL_HINT: &str =
+    "SKIM_PASSTHROUGH=1 runs the tool directly — install it or put it on PATH";
+
+/// Subcommands whose DISPATCHER consumes one leading sub-subcommand token before
+/// handing the remainder to a category handler.
+///
+/// `skim swift test` reaches `test::run` as `["swift"]` — the handler's own arg
+/// slice is `[]`, not `["test"]`.
+///
+/// INVARIANT: this list must match the multi-level `dispatch_*` arms in
+/// [`dispatch`].  `test_multi_level_dispatchers_match_dispatch_arms` pins it.
+const MULTI_LEVEL_DISPATCHERS: &[&str] = &["cargo", "dotnet", "go", "swift"];
+
+/// `(tool, token)` pairs where the HANDLER — not the dispatcher — strips a
+/// leading literal before deciding whether to read stdin.
+///
+/// Which layer eats the token is an implementation detail of each family, so the
+/// gate has to account for both.  `cypress` is listed even though
+/// [`super::should_read_stdin`]'s own `"run"` exception already covers it, so
+/// this table reads as the complete picture rather than as a residue of whatever
+/// happened to break.
+///
+/// Drift guard: the per-family stdin-passthrough E2E tests
+/// (`tests/cli_e2e_new_parsers.rs`, `tests/cli_passthrough_coverage.rs`) fail
+/// loudly if a family is missing here — that is exactly how `playwright` was
+/// caught.
+const HANDLER_CONSUMED_TOKENS: &[(&str, &str)] = &[("cypress", "run"), ("playwright", "test")];
+
+/// Would the handler for `subcommand` read PIPED STDIN rather than spawn the tool?
+///
+/// This is the discriminator between skim's two roles, and the convergence gate
+/// must not conflate them:
+///
+/// - **Wrapper role** (`SKIM_PASSTHROUGH=1 skim git log -n 3`): skim runs the
+///   tool.  Passthrough means "spawn it with the user's argv and pump its bytes
+///   through untouched" — which is what the gate does.
+/// - **Filter role** (`SKIM_PASSTHROUGH=1 … | skim cypress run`): the caller
+///   already ran the tool and piped its output in for compression.  Passthrough
+///   means "hand those bytes back verbatim".  Exec-ing the tool here would
+///   DISCARD the piped payload and, for a tool that is not installed, emit
+///   nothing at all.
+///
+/// The filter role is already implemented per-family, with the correct exit-code
+/// semantics, by `cmd/test/shared.rs::run_passthrough` and by the `use_stdin`
+/// arm of `execution::run_parsed_command_with_mode`.  The gate therefore
+/// DECLINES in that role and lets those paths serve it, rather than
+/// re-implementing them here against a different arg shape.
+///
+/// [`super::should_read_stdin`] is the single authoritative predicate; the only
+/// thing this wrapper adds is normalising argv to the slice the HANDLER sees
+/// (see [`handler_visible_args`]).
+fn handler_reads_stdin(subcommand: &str, args: &[String]) -> bool {
+    super::should_read_stdin(handler_visible_args(subcommand, args))
+}
+
+/// The argv slice the category handler will actually receive.
+///
+/// Pure, so the normalisation can be tested without a controlled stdin.  A
+/// leading FLAG is never a sub-subcommand token — `skim cargo --version` must
+/// keep `--version`, or it would look like a bare `skim cargo` and read stdin.
+fn handler_visible_args<'a>(subcommand: &str, args: &'a [String]) -> &'a [String] {
+    // Dispatcher-level: any leading non-flag token is the sub-subcommand.
+    if MULTI_LEVEL_DISPATCHERS.contains(&subcommand)
+        && args.first().is_some_and(|a| !a.starts_with('-'))
+    {
+        return &args[1..];
+    }
+    // Handler-level: only the one literal that family strips.
+    if let Some((_, token)) = HANDLER_CONSUMED_TOKENS
+        .iter()
+        .find(|(tool, _)| *tool == subcommand)
+        && args.first().is_some_and(|a| a == token)
+    {
+        return &args[1..];
+    }
+    args
+}
+
 /// Dispatch a subcommand by name. Returns the process exit code.
 ///
 /// v2.8.0: Flat dispatch — tool names are top-level subcommands.
@@ -650,6 +735,51 @@ pub(crate) fn dispatch(
     } else {
         args
     };
+
+    // Structural passthrough convergence gate (B1 / ADR-011).
+    //
+    // `SKIM_PASSTHROUGH=1` is documented (cmd/mod.rs) as bypassing ALL
+    // compression.  Honouring it per-handler made that false in practice: every
+    // `git` subcommand, every `build` tool and `gh run watch` reached the reader
+    // compressed, and the handlers that DID honour it did so at the execution
+    // layer, i.e. AFTER `prepare_args` had injected format flags — so the
+    // "escape hatch" streamed the *injected* command's output, not the user's
+    // (PF-024).  Both defects are structural, so the check belongs at the one
+    // point every command family converges on, with the user's literal argv.
+    //
+    // Two exclusions, both deliberate:
+    //   • meta subcommands — skim's own management commands; exec-ing them as OS
+    //     binaries would fail or run an unrelated system program.  `log` and
+    //     `proxy` are META and therefore carry their own checks.
+    //   • `env` — PF-012: credential redaction is a security control that must
+    //     hold on every branch, so it must not be reachable via the hatch.  The
+    //     execution-level `never_passthrough` flag in `cmd/file/env.rs` is the
+    //     independent second layer; both are required (defense in depth).
+    //
+    // The gate deliberately does NOT fire in stdin-filter mode — see
+    // `handler_reads_stdin`.  It sits BEFORE the daemon guard so that
+    // `SKIM_PASSTHROUGH=1 skim vitest` reaches the real tool.
+    //
+    // The sink is `stream_passthrough_raw`, NOT `run_inherited_passthrough`.
+    // Inherited stdio looks byte-faithful but silently drops the PF-021 pipe
+    // contract: `Command::status()` reports the SHELL's exit code, so
+    // `SKIM_PASSTHROUGH=1 skim grep … | head -20` reported 0 instead of 141
+    // (measured against the `cat out; cat err >&2; exit 0` stub).  The pump owns
+    // that contract — early close → `pipe_closed_exit()`, no 64 MiB ceiling, no
+    // lossy UTF-8 decode — and it is the same sink the execution layer already
+    // used for the families that did honour the hatch.
+    if super::is_passthrough_mode()
+        && !super::registry::is_meta_subcommand(subcommand)
+        && subcommand != "env"
+        && !handler_reads_stdin(subcommand, args)
+    {
+        return super::execution::stream_passthrough_raw(
+            subcommand,
+            args,
+            &[],
+            PASSTHROUGH_INSTALL_HINT,
+        );
+    }
 
     // Daemon / streaming guard (ADR-008 Part C).
     //
@@ -1130,5 +1260,96 @@ mod tests {
             let _success =
                 run_inherited_passthrough("sh", &["-c".to_string(), "exit 0".to_string()]);
         }
+    }
+
+    // ========================================================================
+    // B1 convergence gate: `handler_reads_stdin` / `MULTI_LEVEL_DISPATCHERS`
+    //
+    // These pin the discriminator that decides whether the gate fires.  Getting
+    // it wrong is not a cosmetic bug: treating the FILTER role as the WRAPPER
+    // role makes `SKIM_PASSTHROUGH=1 … | skim cypress run` exec an uninstalled
+    // `cypress` and emit nothing, discarding the caller's piped payload.
+    // ========================================================================
+
+    /// Every subcommand that routes to a `dispatch_*` helper consuming a leading
+    /// sub-subcommand token must be listed, or `handler_reads_stdin` computes
+    /// the predicate against the wrong arg slice.
+    #[test]
+    fn test_multi_level_dispatchers_match_dispatch_arms() {
+        // Mirrors the `"cargo" | "go" | "swift" | "dotnet"` arms in `dispatch`.
+        let mut expected = ["cargo", "dotnet", "go", "swift"];
+        expected.sort_unstable();
+        let mut actual = MULTI_LEVEL_DISPATCHERS.to_vec();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "MULTI_LEVEL_DISPATCHERS drifted from the dispatch_* arms in dispatch()"
+        );
+    }
+
+    /// `skim swift test` reaches `test::run` as `["swift"]`, i.e. the handler's
+    /// own slice is `[]` — the stdin predicate must be evaluated against `[]`,
+    /// not against `["test"]`.  Getting this wrong is what made
+    /// `SKIM_PASSTHROUGH=1 skim swift test` exec swift instead of forwarding
+    /// the caller's piped bytes.
+    #[test]
+    fn test_handler_visible_args_strips_multi_level_subcommand() {
+        for (sub, token) in [
+            ("swift", "test"),
+            ("dotnet", "test"),
+            ("cargo", "test"),
+            ("go", "test"),
+        ] {
+            let args = sv(&[token]);
+            assert!(
+                handler_visible_args(sub, &args).is_empty(),
+                "`skim {sub} {token}` must present [] to the handler"
+            );
+        }
+    }
+
+    /// `playwright` and `cypress` strip their token inside the HANDLER, not the
+    /// dispatcher — `playwright::run` drops a leading `test`, `cypress::run`
+    /// drops a leading `run`.  Missing `playwright` here is what left
+    /// `SKIM_PASSTHROUGH=1 … | skim playwright test` exec-ing an uninstalled
+    /// playwright instead of forwarding the caller's bytes.
+    #[test]
+    fn test_handler_visible_args_strips_handler_consumed_token() {
+        for (tool, token) in HANDLER_CONSUMED_TOKENS {
+            let args = sv(&[token]);
+            assert!(
+                handler_visible_args(tool, &args).is_empty(),
+                "`skim {tool} {token}` must present [] to the handler"
+            );
+        }
+    }
+
+    /// The handler-level strip is literal-scoped: `skim playwright show-report`
+    /// keeps its token, because `playwright::run` only strips `test`.
+    #[test]
+    fn test_handler_visible_args_strips_only_the_declared_literal() {
+        let args = sv(&["show-report"]);
+        assert_eq!(handler_visible_args("playwright", &args), args.as_slice());
+    }
+
+    /// Families with no consumed token forward argv unchanged.  `git status`
+    /// must keep `status`, or the gate would misread it as the filter role and
+    /// let `SKIM_PASSTHROUGH=1 skim git status` fall back to compression.
+    #[test]
+    fn test_handler_visible_args_preserves_single_level_args() {
+        let args = sv(&["status"]);
+        assert_eq!(handler_visible_args("git", &args), args.as_slice());
+
+        let args = sv(&["log", "-n", "3"]);
+        assert_eq!(handler_visible_args("git", &args), args.as_slice());
+    }
+
+    /// A leading FLAG is never a sub-subcommand token, so it must not be eaten.
+    /// `skim cargo --version` must keep `--version`, or it would look like a
+    /// bare `skim cargo` and be misrouted into the stdin-filter role.
+    #[test]
+    fn test_handler_visible_args_does_not_eat_a_leading_flag() {
+        let args = sv(&["--version"]);
+        assert_eq!(handler_visible_args("cargo", &args), args.as_slice());
     }
 }

@@ -626,7 +626,7 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 /// Child's own code on clean EOF; [`pipe_closed_exit`] (`141` on unix) when the
 /// reader closes the pipe. **Never `1` on pipe closure** — for `grep`/`rg`/`diff`
 /// exit 1 is the wire protocol for "no matches found".
-fn stream_passthrough_raw(
+pub(crate) fn stream_passthrough_raw(
     program: &str,
     args: &[String],
     env_overrides: &[(&str, &str)],

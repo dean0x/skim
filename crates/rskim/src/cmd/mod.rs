@@ -239,6 +239,32 @@ pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
 /// When passthrough mode is active, all compression is bypassed and raw output
 /// is forwarded unchanged. Useful for debugging or when the compressed output
 /// is too aggressive for a particular workflow.
+///
+/// # Where the hatch is honoured
+///
+/// The claim above is enforced STRUCTURALLY, at the convergence point in
+/// [`crate::cmd::dispatch::dispatch`] — not per handler.  Honouring it per
+/// handler is what made the claim false in the first place: every `git`
+/// subcommand, every `build` tool and `gh run watch` ignored it outright
+/// (measured: `SKIM_PASSTHROUGH=1 skim git log -n 3` emitted 361 bytes against
+/// 7733 raw), and the handlers that DID honour it read argv AFTER `prepare_args`
+/// had injected format flags, so the hatch streamed a command the user never
+/// typed (PF-024).  ADR-011 states the constraint directly: "the hatch must be
+/// honored centrally rather than re-implemented per handler."
+///
+/// Three call sites remain, and each covers something the convergence point
+/// structurally cannot:
+///
+/// - `main.rs::process_single_arg` — the READ path never enters `cmd::dispatch`.
+/// - `cmd/log.rs`, `cmd/proxy.rs` — META subcommands, excluded from the gate by
+///   construction (exec-ing them as OS binaries would run an unrelated program).
+/// - `cmd/execution.rs`, `cmd/test/shared.rs` — the FILTER role (piped stdin, no
+///   real args), where the correct answer is "hand the caller's bytes back", not
+///   "exec the tool".  The gate declines in that role rather than duplicating
+///   these paths against a different arg shape.
+///
+/// `cmd/file/env.rs` is the one deliberate REFUSAL: `never_passthrough: true`
+/// keeps credential redaction on both branches (PF-012).
 pub(crate) fn is_passthrough_mode() -> bool {
     check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok())
 }

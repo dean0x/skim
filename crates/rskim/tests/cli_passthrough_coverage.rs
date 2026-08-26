@@ -100,6 +100,196 @@ fn test_ls_passthrough_equals_raw_ls() {
         .stdout(predicate::eq(raw_str.as_ref()));
 }
 
+/// Build a throwaway git repo with one commit and return its path.
+#[cfg(unix)]
+fn git_repo(dir: &std::path::Path) {
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git must be available")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    fs::write(
+        dir.join("src.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&[
+        "commit",
+        "-qm",
+        "seed commit with a reasonably long subject line",
+    ]);
+}
+
+/// Run `program args…` in `cwd` and return stdout bytes.
+fn raw_stdout(program: &str, args: &[&str], cwd: &std::path::Path) -> Vec<u8> {
+    std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap_or_else(|e| panic!("{program} must be available: {e}"))
+        .stdout
+}
+
+/// `git log` was the WORST measured leak: before the convergence gate,
+/// `SKIM_PASSTHROUGH=1 skim git log -n 3` emitted **361 bytes against 7733 raw**
+/// in this repo. `cmd/git/log.rs` never routes through
+/// `run_parsed_command_with_mode`, so the execution-layer hatch never saw it.
+#[cfg(unix)]
+#[test]
+fn test_git_log_passthrough_equals_raw_git_log() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    let raw = raw_stdout("git", &["log", "-n", "1"], dir.path());
+    assert!(!raw.is_empty(), "precondition: git log must produce output");
+
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "log", "-n", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.stdout,
+        raw,
+        "SKIM_PASSTHROUGH=1 skim git log must be byte-identical to git log; got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `git status` — a second git subcommand, and the one PF-024 measured emitting
+/// the 121-byte `--porcelain=v2` stream where the user's command costs 100 B.
+/// The gate runs the user's literal argv, so no substitution can survive it.
+#[cfg(unix)]
+#[test]
+fn test_git_status_passthrough_equals_raw_git_status() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    fs::write(dir.path().join("untracked.txt"), "x").unwrap();
+    let raw = raw_stdout("git", &["status"], dir.path());
+
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, raw, "git status must pass through verbatim");
+}
+
+/// `git show <rev>:<path>` — ADR-011 named this as confirmed hole #1: file-content
+/// mode dropped 20% of a code file with ZERO stderr bytes, and `show.rs` never
+/// called `is_passthrough_mode()`, so the hatch was a documented NO-OP there.
+/// It flows through `cmd::dispatch`, so the convergence gate covers it.
+#[cfg(unix)]
+#[test]
+fn test_git_show_rev_path_passthrough_equals_raw() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    let raw = raw_stdout("git", &["show", "HEAD:src.rs"], dir.path());
+    assert!(!raw.is_empty(), "precondition: blob must have content");
+
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "show", "HEAD:src.rs"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.stdout, raw,
+        "git show <rev>:<path> must pass through verbatim (ADR-011 hole #1)"
+    );
+}
+
+/// Build family (`make`): a stubbed tool proves the gate covers the family
+/// without depending on a real build toolchain.
+#[cfg(unix)]
+#[test]
+fn test_build_tool_passthrough_equals_raw_make() {
+    let dir = TempDir::new().unwrap();
+    let payload = "cc -c a.c\ncc -c b.c\na.c:3:1: warning: unused variable 'x'\nld -o app\n";
+    common::make_stub(dir.path(), "make", payload, "", 0);
+
+    let out = passthrough_skim()
+        .env("PATH", common::stub_path(dir.path()))
+        .args(["make", "all"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        payload,
+        "build-family output must pass through verbatim"
+    );
+}
+
+/// `gh run watch` — named in the plan as a family the per-handler checks missed.
+#[cfg(unix)]
+#[test]
+fn test_gh_run_watch_passthrough_equals_raw() {
+    let dir = TempDir::new().unwrap();
+    let payload = "* build in 1m2s (ID 123)\n* test in 44s (ID 124)\n✓ deploy in 12s (ID 125)\n";
+    common::make_stub(dir.path(), "gh", payload, "", 0);
+
+    let out = passthrough_skim()
+        .env("PATH", common::stub_path(dir.path()))
+        .args(["gh", "run", "watch"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        payload,
+        "gh run watch must pass through verbatim"
+    );
+}
+
+// ============================================================================
+// B1: the gate must NOT hijack the FILTER role
+//
+// REGRESSION GUARD for the defect that made the first attempt at this gate
+// break 11 tests: `SKIM_PASSTHROUGH=1` has two meanings depending on whether
+// skim is being used as a command WRAPPER or as a compressing FILTER over piped
+// input, and the gate must only claim the first.  Exec-ing the tool in filter
+// mode DISCARDS the caller's piped payload — and for a tool that is not
+// installed (the common case in CI) emits nothing whatsoever.
+// ============================================================================
+
+/// Piped stdin + no real args ⇒ FILTER role: the caller's bytes come back, and
+/// `cypress` is never exec'd (it is not installed in this environment).
+#[test]
+fn test_passthrough_filter_role_forwards_piped_stdin_verbatim() {
+    let raw = "{\"stats\":{\"suites\":1,\"tests\":2,\"passes\":2},\"results\":[]}";
+
+    passthrough_skim()
+        .args(["cypress", "run"])
+        .write_stdin(raw)
+        .assert()
+        .stdout(predicate::str::contains("\"stats\""))
+        .stdout(predicate::str::contains("\"suites\""));
+}
+
+/// The same discriminator for a MULTI-LEVEL dispatcher, where the handler sees
+/// `[]` but dispatch sees `["test"]`.  Normalising argv wrong here is what made
+/// `swift` / `dotnet` / `cargo` / `go` regress.
+#[test]
+fn test_passthrough_filter_role_forwards_piped_stdin_for_multi_level_dispatcher() {
+    let raw = "swift raw output line 1\nswift raw output line 2\n";
+
+    passthrough_skim()
+        .args(["swift", "test"])
+        .write_stdin(raw)
+        .assert()
+        .stdout(predicate::str::contains("swift raw output line 1"))
+        .stdout(predicate::str::contains("swift raw output line 2"));
+}
+
 // ============================================================================
 // B1: Log passthrough — `SKIM_PASSTHROUGH=1 skim log`
 // ============================================================================
