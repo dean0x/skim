@@ -50,8 +50,8 @@ mod common;
 #[cfg(unix)]
 mod cross_surface {
     use std::os::unix::process::CommandExt as _;
-    use std::process::{Command, Output};
     use std::path::Path;
+    use std::process::{Command, Output};
 
     use tempfile::TempDir;
 
@@ -232,7 +232,12 @@ mod cross_surface {
         // On the rewrite surface there is simply no rule; the agent would run
         // `cargo --version` natively. Both reach the same stub; the dispatch
         // mechanism differs between surfaces.
-        assert_class_a("cargo", &["--version"], "cargo 1.80.0 (f28de0b 2024-01-01)\n", 0);
+        assert_class_a(
+            "cargo",
+            &["--version"],
+            "cargo 1.80.0 (f28de0b 2024-01-01)\n",
+            0,
+        );
     }
 
     #[test]
@@ -268,7 +273,12 @@ mod cross_surface {
     #[test]
     fn class_a_pnpm_add() {
         // pnpm add: unknown pnpm subcommand → D2 in pnpm handler.
-        assert_class_a("pnpm", &["add", "lodash"], "Packages: +1\n+ lodash 4.17.21\n", 0);
+        assert_class_a(
+            "pnpm",
+            &["add", "lodash"],
+            "Packages: +1\n+ lodash 4.17.21\n",
+            0,
+        );
     }
 
     // =========================================================================
@@ -286,12 +296,7 @@ mod cross_surface {
     /// output on wrapper surface.
     ///
     /// `diverge_note`: if non-empty, documents a known surface difference.
-    fn assert_skip_flag(
-        tool: &str,
-        args: &[&str],
-        stub_out: &str,
-        diverge_note: &str,
-    ) {
+    fn assert_skip_flag(tool: &str, args: &[&str], stub_out: &str, diverge_note: &str) {
         let stub_dir = tempfile::tempdir().unwrap();
         let cache_dir = fresh_cache_dir();
         add_stub(stub_dir.path(), tool, stub_out, 0);
@@ -465,11 +470,7 @@ mod cross_surface {
     #[test]
     fn diff_bare() {
         // diff a.txt b.txt: exit 1 is normal when files differ.
-        assert_diff_passthrough(
-            &["a.txt", "b.txt"],
-            "1c1\n< foo\n---\n> bar\n",
-            1,
-        );
+        assert_diff_passthrough(&["a.txt", "b.txt"], "1c1\n< foo\n---\n> bar\n", 1);
     }
 
     #[test]
@@ -506,8 +507,7 @@ mod cross_surface {
         add_stub(stub_dir.path(), "cargo", "test passed\n", 0);
         let path = stub_path(stub_dir.path());
 
-        let rewrite_out =
-            run_rewrite("SKIM_PASSTHROUGH=1 cargo test", &path, cache_dir.path());
+        let rewrite_out = run_rewrite("SKIM_PASSTHROUGH=1 cargo test", &path, cache_dir.path());
         assert_eq!(
             rewrite_out.status.code(),
             Some(1),
@@ -541,10 +541,12 @@ mod cross_surface {
             .env("SKIM_CACHE_DIR", cache_dir.path())
             .env("SKIM_DISABLE_ANALYTICS", "1")
             .env("NO_COLOR", "1")
-            .env("SKIM_PASSTHROUGH", "1")       // ← the gate under test
+            .env("SKIM_PASSTHROUGH", "1") // ← the gate under test
             .env_remove("SKIM_REWRITTEN_FROM")
             .env_remove("SKIM_DEBUG");
-        let out = cmd.output().expect("wrapper SKIM_PASSTHROUGH must be spawnable");
+        let out = cmd
+            .output()
+            .expect("wrapper SKIM_PASSTHROUGH must be spawnable");
 
         assert_eq!(
             out.status.code(),
@@ -578,7 +580,12 @@ mod cross_surface {
     // dispatch_for_wrapper() → dispatch()), so they must agree.
 
     /// Assert that both surfaces produce identical stdout and exit code.
-    fn assert_both_surfaces_agree(tool: &str, args: &[&str], stub_out: &str, expected_rewrite_prefix: &str) {
+    fn assert_both_surfaces_agree(
+        tool: &str,
+        args: &[&str],
+        stub_out: &str,
+        expected_rewrite_prefix: &str,
+    ) {
         let stub_dir = tempfile::tempdir().unwrap();
         // Each surface gets its own cache dir to prevent force-raw sidecar leaks.
         let rewrite_cache = fresh_cache_dir();
@@ -625,7 +632,8 @@ mod cross_surface {
             String::from_utf8_lossy(&wrapper_out.stderr),
         );
         assert_eq!(
-            exec_out.stdout, wrapper_out.stdout,
+            exec_out.stdout,
+            wrapper_out.stdout,
             "Both-surfaces `{cmd_str}`: stdout must be byte-identical; \
              rewrite-exec: {:?}, wrapper: {:?}",
             String::from_utf8_lossy(&exec_out.stdout),
