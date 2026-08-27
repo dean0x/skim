@@ -253,7 +253,8 @@ pub(crate) fn truncate_to_lines(
 
 /// Simple line truncation for serde-based languages (JSON, YAML) or fallback
 ///
-/// Takes the first N-1 lines plus an omission marker.
+/// Emits the first N content lines then appends an omission marker as line N+1.
+/// The marker is extra — it does not consume one of the N requested lines (#317).
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
 pub(crate) fn simple_line_truncate(
@@ -270,17 +271,16 @@ pub(crate) fn simple_line_truncate(
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
+    // E4.2 fix: emit max_lines content lines (not max_lines-1). The marker is
+    // line N+1 — it does not consume one of the N requested lines.
+    let omitted = lines.len() - max_lines;
     let marker = append_hint(
-        format!(
-            "{prefix} ... ({} lines truncated){suffix}",
-            lines.len() - max_lines + 1,
-        ),
+        format!("{prefix} ... ({omitted} lines truncated){suffix}"),
         hint,
     );
 
-    // Take first max_lines - 1 lines, then append marker
-    let content_lines = max_lines.saturating_sub(1);
-    let mut result: Vec<&str> = lines[..content_lines].to_vec();
+    // Take first max_lines lines, then append marker
+    let mut result: Vec<&str> = lines[..max_lines].to_vec();
     result.push(&marker);
 
     let mut output = result.join("\n");
@@ -293,8 +293,9 @@ pub(crate) fn simple_line_truncate(
 
 /// Simple last-line truncation: keeps only the last N lines of output
 ///
-/// Takes the last (N-1) lines plus a truncation marker indicating how many
-/// lines were omitted above. Uses language-appropriate comment syntax.
+/// Emits a truncation marker followed by the last N content lines.
+/// The marker is extra — it does not consume one of the N requested lines (#317).
+/// Uses language-appropriate comment syntax.
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
 pub(crate) fn simple_last_line_truncate(
@@ -311,18 +312,18 @@ pub(crate) fn simple_last_line_truncate(
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
-    let content_lines = n.saturating_sub(1);
-    let omitted = total - n + 1;
+    // E4.2 fix: emit n content lines (not n-1). The marker is an additional header
+    // line — it does not consume one of the N requested lines.
+    let omitted = total - n;
     let marker = append_hint(
         format!("{prefix} ... ({omitted} lines above){suffix}"),
         hint,
     );
 
     // Skip to the tail without collecting all lines into a Vec
-    let skip = total - content_lines;
-    let mut result: Vec<&str> = Vec::with_capacity(n);
+    let mut result: Vec<&str> = Vec::with_capacity(n + 1);
     result.push(&marker);
-    result.extend(text.lines().skip(skip));
+    result.extend(text.lines().skip(omitted));
 
     let mut output = result.join("\n");
     if text.ends_with('\n') {
@@ -635,32 +636,82 @@ mod tests {
 
     #[test]
     fn test_empty_spans_falls_back_to_simple() {
+        // E4.2: simple fallback emits N content lines + 1 marker = N+1 total.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
         let spans: Vec<NodeSpan> = vec![];
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
         let line_count = result.lines().count();
         assert!(
-            line_count <= 3,
-            "Expected at most 3 lines, got {}",
+            line_count <= 4,
+            "Expected at most 4 lines (3 content + 1 marker), got {}",
             line_count
         );
     }
 
     #[test]
     fn test_simple_line_truncate() {
+        // E4.2: marker is line N+1 (does not consume a content slot).
+        // Input 5 lines, max_lines=3 → 3 content + 1 marker = 4 lines total.
+        // Omitted = 5 - 3 = 2 lines.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
 
         let result = simple_line_truncate(text, Language::TypeScript, 3, None).unwrap();
-        let line_count = result.lines().count();
-        assert!(
-            line_count <= 3,
-            "Expected at most 3 lines, got {}",
-            line_count
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(
+            result_lines.len(),
+            4,
+            "Expected 3 content lines + 1 marker = 4 lines, got {:?}",
+            result_lines
         );
         assert!(result.contains("line 1"));
         assert!(result.contains("line 2"));
-        assert!(result.contains("// ... (3 lines truncated)"));
+        assert!(result.contains("line 3"));
+        assert!(
+            result.contains("// ... (2 lines truncated)"),
+            "marker must count omitted lines correctly, got: {result}"
+        );
+    }
+
+    /// E4.2 regression: N=1 emits 1 content line + 1 marker.
+    #[test]
+    fn test_simple_line_truncate_n1() {
+        let text = "line 1\nline 2\nline 3\n";
+        let result = simple_line_truncate(text, Language::TypeScript, 1, None).unwrap();
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(
+            result_lines.len(),
+            2,
+            "N=1: 1 content line + 1 marker = 2 total, got {:?}",
+            result_lines
+        );
+        assert_eq!(result_lines[0], "line 1");
+        assert!(
+            result_lines[1].contains("// ... (2 lines truncated)"),
+            "marker line count wrong, got: {:?}",
+            result_lines[1]
+        );
+    }
+
+    /// E4.2 regression: N=20 emits 20 content lines + 1 marker.
+    #[test]
+    fn test_simple_line_truncate_n20() {
+        let lines_25: String = (1..=25).map(|i| format!("line {i}\n")).collect();
+        let result = simple_line_truncate(&lines_25, Language::TypeScript, 20, None).unwrap();
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(
+            result_lines.len(),
+            21,
+            "N=20: 20 content lines + 1 marker = 21 total, got {:?}",
+            result_lines.len()
+        );
+        assert_eq!(result_lines[0], "line 1");
+        assert_eq!(result_lines[19], "line 20");
+        assert!(
+            result_lines[20].contains("// ... (5 lines truncated)"),
+            "marker must say 5 lines truncated (25-20), got: {:?}",
+            result_lines[20]
+        );
     }
 
     #[test]
@@ -1298,13 +1349,25 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_keeps_last_lines() {
+        // E4.2: marker is an extra header line (N+1 total). n=3, total=5.
+        // Omitted = 5-3 = 2. Shows lines 3,4,5 (n=3 content lines) + marker.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
         let result = simple_last_line_truncate(text, Language::TypeScript, 3, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
-        assert_eq!(result_lines.len(), 3);
-        assert!(result_lines[0].contains("... (3 lines above)"));
-        assert_eq!(result_lines[1], "line 4");
-        assert_eq!(result_lines[2], "line 5");
+        assert_eq!(
+            result_lines.len(),
+            4,
+            "3 content + 1 marker = 4, got {:?}",
+            result_lines
+        );
+        assert!(
+            result_lines[0].contains("... (2 lines above)"),
+            "got {:?}",
+            result_lines[0]
+        );
+        assert_eq!(result_lines[1], "line 3");
+        assert_eq!(result_lines[2], "line 4");
+        assert_eq!(result_lines[3], "line 5");
     }
 
     #[test]
@@ -1331,33 +1394,45 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_python_marker() {
+        // E4.2: n=2, total=3. Omitted = 3-2 = 1.
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
         let result = simple_last_line_truncate(text, Language::Python, 2, None).unwrap();
         assert!(
-            result.contains("# ... (2 lines above)"),
-            "Python should use # for marker: {:?}",
+            result.contains("# ... (1 lines above)"),
+            "Python should use # for marker, omit=1: {:?}",
             result
         );
     }
 
     #[test]
     fn test_last_line_truncation_markdown_marker() {
+        // E4.2: n=2, total=4. Omitted = 4-2 = 2.
         let text = "# H1\n## H2\n## H3\n## H4\n";
         let result = simple_last_line_truncate(text, Language::Markdown, 2, None).unwrap();
         assert!(
-            result.contains("<!-- ... (3 lines above) -->"),
-            "Markdown should use HTML comment for marker: {:?}",
+            result.contains("<!-- ... (2 lines above) -->"),
+            "Markdown should use HTML comment for marker, omit=2: {:?}",
             result
         );
     }
 
     #[test]
     fn test_last_line_truncation_single_line_budget() {
+        // E4.2: n=1, total=3. Omitted = 3-1 = 2. Shows 1 content + 1 marker = 2 total.
         let text = "line 1\nline 2\nline 3\n";
         let result = simple_last_line_truncate(text, Language::TypeScript, 1, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
-        // With n=1: marker only (n-1 = 0 content lines)
-        assert_eq!(result_lines.len(), 1);
-        assert!(result_lines[0].contains("... (3 lines above)"));
+        assert_eq!(
+            result_lines.len(),
+            2,
+            "1 content + 1 marker = 2 total, got {:?}",
+            result_lines
+        );
+        assert!(
+            result_lines[0].contains("... (2 lines above)"),
+            "got {:?}",
+            result_lines[0]
+        );
+        assert_eq!(result_lines[1], "line 3");
     }
 }

@@ -2839,12 +2839,17 @@ fn fix_e_git_show_pipe_passes_through() {
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
-    // Use TypeScript so pseudo mode strips parameter type annotations (`: number`),
-    // guaranteeing view_differs = true and the transparency marker fires.
+    // Use a class with a decorator so pseudo mode strips content and fires the
+    // transparency marker.  A plain typed function is no longer sufficient after
+    // E1 (ADR-008): parameter type annotations are now preserved, and A4 already
+    // preserved return types — together they make simple functions byte-identical
+    // to raw.  The @injectable() decorator and the `private name: string` property
+    // type annotation are both still stripped in pseudo mode, guaranteeing
+    // view_differs = true.
     let file = dir.path().join("roundtrip.ts");
     fs::write(
         &file,
-        "export function answer(x: number, y: number): number {\n  return x + y;\n}\n",
+        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
     )
     .unwrap();
 
@@ -2903,7 +2908,7 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
         .args(&tokens[skim_start + 1..])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("answer"))
+        .stdout(predicate::str::contains("greet"))
         .get_output()
         .stderr
         .clone();

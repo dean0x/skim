@@ -798,8 +798,11 @@ fn test_cli_pseudo_mode() {
         .success()
         .stdout(predicate::str::contains("function add"))
         .stdout(predicate::str::contains("return a + b"))
-        // Param type annotations should be stripped; return type preserved (A4 contract)
-        .stdout(predicate::str::contains("function add(a, b)"))
+        // ADR-008/E1: param type annotations are API surface — preserved in pseudo mode.
+        // Both parameter and return type annotations survive.
+        .stdout(predicate::str::contains(
+            "function add(a: number, b: number)",
+        ))
         .stdout(predicate::str::contains("): number"))
         // `export` is preserved as API surface (A4 contract)
         .stdout(predicate::str::contains("export"));

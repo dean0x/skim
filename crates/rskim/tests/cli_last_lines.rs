@@ -42,8 +42,8 @@ fn test_last_lines_basic() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let line_count = stdout.lines().count();
     assert!(
-        line_count <= 3,
-        "Output should have at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "Output should have at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         stdout,
     );
@@ -139,8 +139,8 @@ fn test_last_lines_with_structure_mode() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let line_count = stdout.lines().count();
     assert!(
-        line_count <= 3,
-        "Output should have at most 3 lines in structure mode, got {}: {:?}",
+        line_count <= 4,
+        "Output should have at most 4 lines in structure mode (3 content + 1 marker), got {}: {:?}",
         line_count,
         stdout,
     );
@@ -197,8 +197,8 @@ fn test_last_lines_with_pseudo_mode() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let line_count = stdout.lines().count();
     assert!(
-        line_count <= 4,
-        "Output should have at most 4 lines in pseudo mode, got {}: {:?}",
+        line_count <= 5,
+        "Output should have at most 5 lines in pseudo mode (4 content + 1 marker), got {}: {:?}",
         line_count,
         stdout,
     );

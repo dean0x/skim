@@ -415,13 +415,13 @@ impl Language {
             // forward scanning which matches duplicate lines (e.g. `}`) to their
             // FIRST occurrence rather than the correct tail occurrence.
             //
-            // simple_last_line_truncate produces:
+            // simple_last_line_truncate produces (E4.2: marker does not consume a slot):
             //   - If total <= n: unchanged (identity map)
-            //   - If total > n: 1 marker line + (n-1) content lines from the tail
+            //   - If total > n: 1 marker line + n content lines from the tail
             //
             // Marker line gets source_line = 0 (no annotation).
             // Content line i (0-indexed within content) gets source_line:
-            //   source_line_count - n_content + 1 + i  (1-indexed)
+            //   source_line_count - n + 1 + i  (1-indexed)
             let source_line_count = source.lines().count();
             let truncated = crate::transform::truncate::simple_last_line_truncate(
                 source,
@@ -435,8 +435,11 @@ impl Language {
                     let count = truncated.lines().count();
                     Some((1..=count).collect::<Vec<usize>>())
                 } else {
-                    // Truncation occurred: marker + n_content tail lines
-                    let n_content = n.saturating_sub(1); // lines reserved for content
+                    // Truncation occurred: 1 marker line + n content tail lines.
+                    // E4.2: the marker does not consume one of the N requested lines;
+                    // n_content = n (not n-1). start_line is the first content source
+                    // line (1-indexed): source_line_count - n + 1.
+                    let n_content = n; // all N requested lines are content
                     let start_line = source_line_count - n_content + 1; // 1-indexed
                     let mut map = Vec::with_capacity(1 + n_content);
                     map.push(0_usize); // marker line has no annotation

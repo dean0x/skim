@@ -1842,9 +1842,10 @@ fn test_max_lines_with_full_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4.2: max_lines=N produces N content lines + 1 marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Full mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count <= 6,
+        "Full mode with max_lines=5 should produce at most 6 lines (5 content + 1 marker), got {}",
         line_count,
     );
 }
@@ -1929,9 +1930,10 @@ fn test_max_lines_json_simple_truncation() {
     let result = transform_with_config(source, Language::Json, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4.2: max_lines=N produces N content lines + 1 marker = N+1 total.
     assert!(
-        line_count <= 3,
-        "JSON max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "JSON max_lines=3 should produce at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1946,9 +1948,10 @@ fn test_max_lines_yaml_simple_truncation() {
     let result = transform_with_config(source, Language::Yaml, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4.2: max_lines=N produces N content lines + 1 marker = N+1 total.
     assert!(
-        line_count <= 3,
-        "YAML max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "YAML max_lines=3 should produce at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -2845,19 +2848,19 @@ fn test_typescript_pseudo() {
     let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
     let result = transform(source, Language::TypeScript, Mode::Pseudo).unwrap();
 
-    // Param type annotations should be stripped; return type preserved (A4 contract).
-    // Fixture: `add(a: number, b: number): number` — params stripped, return kept.
+    // ADR-008/E1: param type annotations are now preserved as API surface.
+    // Fixture: `add(a: number, b: number): number` — both params and return preserved.
     assert!(
-        result.contains("function add(a, b)"),
-        "param type annotations should be stripped, got: {result}"
+        result.contains("function add(a: number, b: number)"),
+        "param type annotations must be preserved (ADR-008), got: {result}"
     );
     assert!(
         result.contains("): number"),
         "return type annotation must be preserved as API surface (A4), got: {result}"
     );
     assert!(
-        result.contains("function greet(name)"),
-        "param type annotation stripped in greet, got: {result}"
+        result.contains("function greet(name: string)"),
+        "param type annotation preserved in greet (ADR-008), got: {result}"
     );
     assert!(
         result.contains("): string"),
@@ -3049,10 +3052,10 @@ fn test_pseudo_with_config() {
         result.contains("export"),
         "export preserved as API surface via config API"
     );
-    // Param type annotations stripped; return type preserved (A4 contract).
+    // ADR-008/E1: param type annotations preserved; return type preserved (A4 contract).
     assert!(
-        result.contains("function add(a, b)"),
-        "param type annotations stripped via config API, got: {result}"
+        result.contains("function add(a: number, b: number)"),
+        "param type annotations preserved via config API (ADR-008), got: {result}"
     );
     assert!(
         result.contains("): number"),

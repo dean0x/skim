@@ -70,13 +70,13 @@ fn test_transparency_marker_fires_on_tagged_pseudo_read() {
 fn test_lossy_marker_fires_without_origin_tag_b3() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
-    // TypeScript pseudo mode strips `: number` parameter type annotations →
-    // the transformed view differs from raw bytes → marker fires.
-    // (Rust pseudo mode on a trivially simple function may return the raw
-    // content unchanged, making view_differs=false and producing no marker.)
+    // TypeScript pseudo mode strips decorators and non-parameter type annotations.
+    // The @inject() decorator is removed; parameter types are preserved (E1/ADR-008).
+    // (A plain function only loses its semicolons, which may not change the token count
+    // enough to pass the fidelity guardrail — use a class with a decorator instead.)
     fs::write(
         &file,
-        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+        "@inject()\nexport class Calculator {\n  private value: number;\n  add(a: number, b: number): number { return a + b; }\n}\n",
     )
     .unwrap();
 
@@ -250,15 +250,15 @@ fn test_multi_file_aggregate_marker_emitted_once() {
     let dir = TempDir::new().unwrap();
     let f1 = dir.path().join("a.ts");
     let f2 = dir.path().join("b.ts");
-    // TS pseudo mode strips `: number` type annotations → view differs from raw.
+    // TS pseudo mode strips decorators → view differs from raw. Parameter types preserved (E1).
     fs::write(
         &f1,
-        "export function foo(x: number): number {\n  return x * 2;\n}\n",
+        "@service()\nexport class Foo {\n  private x: number;\n  foo(x: number): number { return x * 2; }\n}\n",
     )
     .unwrap();
     fs::write(
         &f2,
-        "export function bar(x: number): number {\n  return x + 1;\n}\n",
+        "@service()\nexport class Bar {\n  private x: number;\n  bar(x: number): number { return x + 1; }\n}\n",
     )
     .unwrap();
 
@@ -290,16 +290,16 @@ fn test_multi_file_aggregate_marker_emitted_once() {
 // ============================================================================
 
 /// Cache hit path: the marker must also fire when the result comes from the
-/// skim cache (not just on fresh reads). Uses a TypeScript file so pseudo
-/// mode definitely produces a different view (strips parameter type annotations).
+/// skim cache (not just on fresh reads). Uses a TypeScript class with a decorator
+/// so pseudo mode definitely produces a different view (E1: parameter types preserved).
 #[test]
 fn test_transparency_marker_fires_on_cache_hit() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("cached.ts");
-    // TS pseudo mode strips `: number` type annotations → view differs from raw.
+    // TS pseudo mode strips decorators → view differs from raw. Parameter types preserved (E1).
     fs::write(
         &file,
-        "export function square(x: number): number {\n  return x * x;\n}\n",
+        "@service()\nexport class Calc {\n  private v: number;\n  square(x: number): number { return x * x; }\n}\n",
     )
     .unwrap();
 

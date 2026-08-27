@@ -414,10 +414,11 @@ fn test_passthrough_yes_uppercase_activates_gate() {
 fn test_lossy_view_marker_fires_without_origin_tag() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
-    // TypeScript pseudo mode strips `: string` type annotations — view always differs.
+    // TypeScript pseudo mode strips decorators and non-parameter type annotations.
+    // The @injectable() decorator is removed; the greet() parameter type is preserved (E1/ADR-008).
     fs::write(
         &file,
-        "export function greet(name: string): string {\n  return `Hi ${name}`;\n}\n",
+        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
     )
     .unwrap();
 
@@ -439,9 +440,10 @@ fn test_lossy_view_marker_fires_without_origin_tag() {
 fn test_lossy_marker_fires_without_skim_debug() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
+    // Use a class with a decorator so pseudo mode strips content; greet() parameter type preserved (E1).
     fs::write(
         &file,
-        "export function greet(name: string): string {\n  return `Hi ${name}`;\n}\n",
+        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
     )
     .unwrap();
 
@@ -493,9 +495,11 @@ fn test_no_loss_guardrail_emits_no_stderr_without_skim_debug() {
 fn test_lossy_marker_names_pseudo_class() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
+    // Use a class with a decorator so pseudo mode strips content and fires the lossy marker.
+    // The @injectable() decorator is removed; greet() parameter type is preserved (E1/ADR-008).
     fs::write(
         &file,
-        "export function greet(name: string): string {\n  return `Hi ${name}`;\n}\n",
+        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
     )
     .unwrap();
 

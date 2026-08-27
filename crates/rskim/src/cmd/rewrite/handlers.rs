@@ -289,6 +289,29 @@ mod tests {
         assert!(tail.tokens.join(" ").contains("--mode=structure"));
     }
 
+    /// E4.1: bare-number line count (`-20`) must produce a rewrite for markdown files.
+    ///
+    /// `CHANGELOG.md` is a common file pattern. Previously had no test coverage
+    /// for this argument form on `.md` files.
+    #[test]
+    fn test_head_bare_number_changelog_produces_rewrite() {
+        let result = try_rewrite_head(&["-20", "CHANGELOG.md"])
+            .expect("head -20 CHANGELOG.md must produce a rewrite");
+        let joined = result.tokens.join(" ");
+        assert!(
+            joined.contains("--max-lines"),
+            "rewrite must include --max-lines, got: {joined}"
+        );
+        assert!(
+            joined.contains("20"),
+            "rewrite must preserve the line count, got: {joined}"
+        );
+        assert!(
+            joined.contains("--mode=pseudo"),
+            "markdown file uses pseudo mode, got: {joined}"
+        );
+    }
+
     /// #322: the `is_code_file` gate runs BEFORE `is_declaration_file`, so the
     /// `.d.mts`/`.d.cts` terminal extensions must be known to
     /// `Language::from_extension` or the whole declaration path is unreachable

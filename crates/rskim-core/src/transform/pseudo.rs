@@ -8,9 +8,11 @@
 //!   position, Rust `-> T` via normal recursion since Rust has no strip_kinds for
 //!   return types)
 //!
-//! For Python and TypeScript, parameter, variable, and property type annotations are
-//! still stripped. Rust preserves parameter types (pseudo mode strips only lifetimes,
-//! type parameters, where clauses, and attributes for Rust).
+//! For Python, parameter and variable type annotations are still stripped.
+//! TypeScript now preserves parameter type annotations (ADR-008); only decorator,
+//! `readonly`, and `abstract` are stripped alongside variable/property `type_annotation`.
+//! Rust strips lifetimes, type parameters, where clauses, and attribute items only;
+//! `mutable_specifier` is preserved as it is part of the function's API surface.
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
 //! Token reduction target: 30-50%
@@ -211,10 +213,8 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 /// Type annotations and decorators are NOT inline modifiers — their trailing spaces
 /// may belong to surrounding syntax (e.g., `: number = 42`).
 fn is_inline_modifier_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "lifetime" | "mutable_specifier" | "readonly" | "abstract"
-    )
+    // `mutable_specifier` was removed because it is no longer stripped (E2.4).
+    matches!(kind, "lifetime" | "readonly" | "abstract")
 }
 
 /// Per-language rules for what constitutes "noise" in pseudo mode
@@ -233,9 +233,12 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
     match language {
         Language::TypeScript => PseudoRules {
             strip_kinds: &[
+                // `type_annotation` is stripped for variable/property positions; parameter
+                // annotations are preserved via a guard in collect_noise_ranges (ADR-008).
                 "type_annotation",
-                "type_parameters",
-                "type_arguments",
+                // `type_parameters` and `type_arguments` were removed so generic signatures
+                // like `identity<T>` and call-sites like `Migration<'a'>` survive intact
+                // (E2.2/E2.3 — declaration/use-site consistency).
                 "decorator",
                 "readonly",
                 "abstract",
@@ -272,7 +275,8 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
                 "type_parameters",
                 "where_clause",
                 "attribute_item",
-                "mutable_specifier",
+                // "mutable_specifier" intentionally NOT listed — `&mut self` and `&mut T`
+                // convey mutation intent and are part of the function's API surface (E2.4).
             ],
             strip_keywords: &[],
             strip_semicolons: true,
@@ -467,12 +471,13 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     };
     // The root has no parent, no previous sibling and no field name — exactly
     // `WalkPosition::default()`. Every deeper position is supplied by the caller's
-    // child loop.
+    // child loop.  `in_for_header` starts false at the root.
     collect_noise_ranges(
         tree.root_node(),
         &mut ctx,
         &rules,
         0,
+        false,
         false,
         WalkPosition::default(),
     )?;
@@ -748,6 +753,8 @@ fn collect_noise_ranges(
     rules: &PseudoRules,
     depth: usize,
     in_function_body: bool,
+    // `in_for_header`: true when node is in a for-loop's non-body clause (E2.1).
+    in_for_header: bool,
     pos: WalkPosition,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST
@@ -801,6 +808,21 @@ fn collect_noise_ranges(
             return Ok(());
         }
 
+        // E1 (ADR-008): TypeScript parameter type annotations are API surface.
+        // `type_annotation` was historically stripped for all positions as
+        // undifferentiated noise; the A4 contract now extends to parameters.
+        // Guard fires when the immediate parent is a parameter node kind.
+        if kind == "type_annotation"
+            && pos.parent_kind.is_some_and(|pk| {
+                matches!(
+                    pk,
+                    "required_parameter" | "optional_parameter" | "rest_parameter" | "rest_pattern"
+                )
+            })
+        {
+            return Ok(());
+        }
+
         let start = node.start_byte();
         let end = node.end_byte();
         let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
@@ -828,16 +850,28 @@ fn collect_noise_ranges(
     }
 
     // Check for semicolon stripping (statement-terminating only, not for-loop headers).
+    //
+    // Two conditions gate preservation:
+    // 1. Direct child of a for-loop node — the `pos.parent_kind` check catches `;`
+    //    nodes that are direct children of `for_statement` (e.g., the condition
+    //    separator in `for(;;)`).
+    // 2. `in_for_header` — catches `;` nodes nested INSIDE a for-loop's non-body
+    //    children (e.g., the `;` inside `lexical_declaration` in `for(let i=0;…)`).
+    //
     // The parent kind is threaded from the parent's child loop rather than read back
     // via `parent()`, which re-descends from the tree root (PF-020).
     if rules.strip_semicolons && kind == ";" {
-        let is_for_loop = pos.parent_kind.is_some_and(|parent_kind| {
+        let is_for_loop_direct_child = pos.parent_kind.is_some_and(|parent_kind| {
             matches!(
                 parent_kind,
-                "for_statement" | "for_in_statement" | "for_of_statement"
+                "for_statement"
+                    | "for_in_statement"
+                    | "for_of_statement"
+                    | "for_range_loop"
+                    | "enhanced_for_statement"
             )
         });
-        if !is_for_loop {
+        if !is_for_loop_direct_child && !in_for_header {
             ctx.ranges.push((node.start_byte(), node.end_byte()));
             return Ok(());
         }
@@ -860,9 +894,49 @@ fn collect_noise_ranges(
     // `child_in_body` is threaded on the same principle, so `is_removable_comment`
     // never calls `parent()` either.
     let child_in_body = in_function_body || is_function_scope_kind(kind, ctx.language);
+
+    // E2.1: Propagate `in_for_header` so that semicolons nested inside a for-loop's
+    // header (e.g., the `;` inside `lexical_declaration` in `for(let i=0;…)`) are not
+    // stripped.  Strategy:
+    // - When the current node IS a for-loop node: non-body children are in the header.
+    // - When already inside a for-header: propagate through non-block intermediaries.
+    //   A new scope boundary (statement_block, compound_statement, block) resets the
+    //   flag so that statement-terminating semicolons inside nested closures or lambdas
+    //   in a for-header are still stripped correctly.
+    let is_for_loop_node = matches!(
+        kind,
+        "for_statement"
+            | "for_in_statement"
+            | "for_of_statement"
+            | "for_range_loop"
+            | "enhanced_for_statement"
+    );
+    let for_body_child_id: Option<usize> = if is_for_loop_node {
+        node.child_by_field_name("body").map(|n| n.id())
+    } else {
+        None
+    };
+
     let language = ctx.language;
     for (child, child_pos) in ChildPositions::new(node, language) {
-        collect_noise_ranges(child, ctx, rules, depth + 1, child_in_body, child_pos)?;
+        let child_in_for_header = if is_for_loop_node {
+            // Non-body children of a for-loop are inside its header.
+            Some(child.id()) != for_body_child_id
+        } else if in_for_header {
+            // Propagate through intermediate nodes that are not new scope boundaries.
+            !matches!(kind, "statement_block" | "compound_statement" | "block")
+        } else {
+            false
+        };
+        collect_noise_ranges(
+            child,
+            ctx,
+            rules,
+            depth + 1,
+            child_in_body,
+            child_in_for_header,
+            child_pos,
+        )?;
     }
 
     Ok(())
@@ -998,17 +1072,17 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_typescript_pseudo_strips_type_annotations() {
-        // Param type annotations are stripped; RETURN type annotation is preserved
-        // as API surface (A4 contract — pseudo mode preserves return types).
+    fn test_typescript_pseudo_preserves_param_annotations() {
+        // ADR-008 / E1: parameter type annotations are API surface — preserved in
+        // pseudo mode.  Both param annotations and the return annotation survive.
         let source = "function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
-        // Parameter type annotations should be stripped
+        // Parameter type annotations must be preserved (ADR-008)
         assert!(
-            result.contains("function add(a, b)"),
-            "function name and params preserved without param types, got: {result}"
+            result.contains("function add(a: number, b: number)"),
+            "param type annotations must be preserved as API surface (ADR-008), got: {result}"
         );
-        // Return type annotation is preserved as API surface
+        // Return type annotation is preserved as API surface (ADR-007)
         assert!(
             result.contains("): number"),
             "return type annotation must be preserved as API surface, got: {result}"
@@ -1019,6 +1093,7 @@ mod tests {
     #[test]
     fn test_typescript_pseudo_preserves_export() {
         // `export` is API-surface information — preserved in pseudo mode (A4 contract).
+        // After ADR-008 / E1, param annotations are also API surface and preserved.
         let source =
             "export function greet(name: string): string {\n    return `Hello, ${name}!`;\n}\n";
         let result = transform(source, Language::TypeScript);
@@ -1027,31 +1102,60 @@ mod tests {
             "export keyword must be preserved as API surface, got: {result}"
         );
         assert!(
-            result.contains("function greet(name)"),
-            "function signature preserved without types, got: {result}"
+            result.contains("function greet(name: string)"),
+            "function signature with param types preserved (ADR-008), got: {result}"
         );
     }
 
     #[test]
-    fn test_typescript_pseudo_strips_type_parameters() {
+    fn test_typescript_pseudo_preserves_type_parameters() {
+        // E2.3: `type_parameters` removed from TypeScript strip_kinds — generic
+        // signatures like `identity<T>` must survive so callers see the type contract.
         let source = "function identity<T>(value: T): T {\n    return value;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
-            !result.contains("<T>"),
-            "type parameters should be stripped"
+            result.contains("<T>"),
+            "type parameters must be preserved (E2.3), got: {result}"
         );
+        // With E1 (param annotations preserved) and E2.3 (type params preserved),
+        // the full typed signature is retained.
         assert!(
-            result.contains("function identity(value)"),
-            "function preserved"
+            result.contains("function identity<T>(value: T): T"),
+            "full typed signature preserved, got: {result}"
         );
     }
 
+    #[test]
+    fn test_typescript_pseudo_preserves_type_arguments() {
+        // E2.2: `type_arguments` removed from TypeScript strip_kinds — call-site
+        // generics like `Migration<'a'>` must not be silently erased.
+        let source = "const m = new Migration<User>();\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("Migration<User>"),
+            "type arguments must be preserved (E2.2), got: {result}"
+        );
+    }
+
+    /// E2.5 / PF-025: byte-exact for-loop test.
+    ///
+    /// The previous version only asserted `contains("i < 10")` — a vacuous check
+    /// that passes even when the for-header semicolons are corrupted.  This test
+    /// pins the FULL for-header to catch any future regression.
     #[test]
     fn test_typescript_pseudo_preserves_for_loop_semicolons() {
         let source = "function loop() {\n    for (let i = 0; i < 10; i++) {\n        console.log(i);\n    }\n}\n";
         let result = transform(source, Language::TypeScript);
-        // For-loop header semicolons should be preserved
-        assert!(result.contains("i < 10"), "for-loop condition preserved");
+        // Both for-header semicolons must be preserved; the body semicolon is stripped.
+        assert!(
+            result.contains("for (let i = 0; i < 10; i++)"),
+            "for-loop header must be intact (both semicolons preserved), got: {result}"
+        );
+        // Statement-terminating semicolon in the body is stripped.
+        assert!(
+            result.contains("console.log(i)") && !result.contains("console.log(i);"),
+            "body semicolons still stripped, got: {result}"
+        );
     }
 
     #[test]
@@ -1076,6 +1180,26 @@ mod tests {
     // ========================================================================
     // JavaScript pseudo tests
     // ========================================================================
+
+    /// E2.1 / PF-025: JavaScript for-loop header semicolons preserved (byte-exact).
+    ///
+    /// JavaScript uses the same `for_statement` node kind as TypeScript.
+    /// This verifies the `in_for_header` propagation works identically for JS.
+    #[test]
+    fn test_javascript_pseudo_preserves_for_loop_semicolons() {
+        let source = "function loop() {\n    for (let i = 0; i < 10; i++) {\n        console.log(i);\n    }\n}\n";
+        let result = transform(source, Language::JavaScript);
+        // Both for-header semicolons must be preserved; the body semicolon is stripped.
+        assert!(
+            result.contains("for (let i = 0; i < 10; i++)"),
+            "JavaScript for-loop header must be intact (E2.1), got: {result}"
+        );
+        // Body semicolons stripped
+        assert!(
+            result.contains("console.log(i)") && !result.contains("console.log(i);"),
+            "JavaScript body semicolons still stripped, got: {result}"
+        );
+    }
 
     #[test]
     fn test_javascript_pseudo_preserves_export_strips_semicolons() {
@@ -1230,9 +1354,57 @@ mod tests {
         assert!(result.contains("fn add"), "function preserved");
     }
 
+    #[test]
+    fn test_rust_pseudo_preserves_mutable_specifier() {
+        // E2.4: `mutable_specifier` removed from Rust strip_kinds — `&mut self` and
+        // `&mut T` convey mutation intent and are part of the API contract.
+        let source = "impl Counter {\n    pub fn increment(&mut self) {\n        self.count += 1;\n    }\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("&mut self"),
+            "mutable_specifier must be preserved as API surface (E2.4), got: {result}"
+        );
+        // Ensure `& self` (stripped form) is NOT produced
+        assert!(
+            !result.contains("& self"),
+            "mutable_specifier must not be stripped, got: {result}"
+        );
+    }
+
     // ========================================================================
     // Java pseudo tests
     // ========================================================================
+
+    /// E2.1: Java basic for-loop header semicolons preserved.
+    ///
+    /// Java uses `for_statement` for basic C-style for loops. The `in_for_header`
+    /// flag must propagate through Java's `local_variable_declaration` initializer
+    /// into the `;` nodes nested inside it.
+    #[test]
+    fn test_java_pseudo_preserves_for_loop_semicolons() {
+        let source = "class Example {\n    void run() {\n        for (int i = 0; i < 10; i++) {\n            System.out.println(i);\n        }\n    }\n}\n";
+        let result = transform(source, Language::Java);
+        // Both for-header semicolons preserved
+        assert!(
+            result.contains("for (int i = 0; i < 10; i++)"),
+            "Java for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
+    /// E2.1: Java enhanced for (for-each) semicolon-free header preserved.
+    ///
+    /// Java enhanced_for_statement (`for (Type x : collection)`) does not use
+    /// semicolons in its header — the `:` is preserved, and no incorrect
+    /// semicolon stripping should occur.
+    #[test]
+    fn test_java_pseudo_preserves_enhanced_for() {
+        let source = "class Example {\n    void run(int[] arr) {\n        for (int x : arr) {\n            System.out.println(x);\n        }\n    }\n}\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            result.contains("for (int x : arr)"),
+            "Java enhanced for-each must be intact (E2.1), got: {result}"
+        );
+    }
 
     #[test]
     fn test_java_pseudo_preserves_visibility() {
@@ -1293,6 +1465,21 @@ mod tests {
     // C pseudo tests
     // ========================================================================
 
+    /// E2.1: C for-loop header semicolons preserved.
+    ///
+    /// C uses `for_statement` with a `for_statement_block` or `expression_statement`
+    /// initializer. The `;` inside the initializer must survive via `in_for_header`.
+    #[test]
+    fn test_c_pseudo_preserves_for_loop_semicolons() {
+        let source = "void loop() {\n    for (int i = 0; i < 10; i++) {\n        printf(\"%d\", i);\n    }\n}\n";
+        let result = transform(source, Language::C);
+        // Both for-header semicolons preserved (byte-exact header).
+        assert!(
+            result.contains("for (int i = 0; i < 10; i++)"),
+            "C for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
     #[test]
     fn test_c_pseudo_strips_qualifiers() {
         let source = "static const int MAX = 100;\n";
@@ -1313,6 +1500,35 @@ mod tests {
     // ========================================================================
     // C++ pseudo tests
     // ========================================================================
+
+    /// E2.1: C++ basic for-loop header semicolons preserved.
+    ///
+    /// C++ uses `for_statement` (same as C) for basic loops. The `in_for_header`
+    /// propagation must work here too.
+    #[test]
+    fn test_cpp_pseudo_preserves_for_loop_semicolons() {
+        let source = "void loop() {\n    for (int i = 0; i < 10; i++) {\n        std::cout << i;\n    }\n}\n";
+        let result = transform(source, Language::Cpp);
+        // Both for-header semicolons preserved (byte-exact header).
+        assert!(
+            result.contains("for (int i = 0; i < 10; i++)"),
+            "C++ for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
+    /// E2.1: C++ range-based for (for_range_loop) preserved.
+    ///
+    /// C++ range-based for uses `for_range_loop` node kind. No semicolons in
+    /// the header, but the colon `:` separator must survive.
+    #[test]
+    fn test_cpp_pseudo_preserves_for_range_loop() {
+        let source = "void process(std::vector<int>& vec) {\n    for (int x : vec) {\n        std::cout << x;\n    }\n}\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            result.contains("for (int x : vec)"),
+            "C++ range-based for must be intact (E2.1), got: {result}"
+        );
+    }
 
     #[test]
     fn test_cpp_pseudo_preserves_access_specifiers() {
@@ -1544,6 +1760,7 @@ mod tests {
         // BUG 5 (historical): Stripping `export` used to leave a leading space.
         // Now `export` is preserved (A4), so output starts with "export function …"
         // — no leading space in either case.  The no-leading-space invariant holds.
+        // After ADR-008/E1: param type annotations are also preserved.
         let source = "export function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
@@ -1551,8 +1768,8 @@ mod tests {
             "output should not start with a leading space, got: {result}"
         );
         assert!(
-            result.contains("function add(a, b)"),
-            "function signature clean (type annotations stripped), got: {result}"
+            result.contains("function add(a: number, b: number)"),
+            "function signature with param types preserved (ADR-008), got: {result}"
         );
     }
 
@@ -1660,13 +1877,15 @@ mod tests {
     #[test]
     fn test_is_inline_modifier_kind_positives() {
         assert!(is_inline_modifier_kind("lifetime"));
-        assert!(is_inline_modifier_kind("mutable_specifier"));
+        // `mutable_specifier` removed from is_inline_modifier_kind (E2.4) —
+        // it is no longer in the strip list so the trailing-space consumer is moot.
         assert!(is_inline_modifier_kind("readonly"));
         assert!(is_inline_modifier_kind("abstract"));
     }
 
     #[test]
     fn test_is_inline_modifier_kind_negatives() {
+        assert!(!is_inline_modifier_kind("mutable_specifier")); // E2.4: no longer inline modifier
         assert!(!is_inline_modifier_kind("type_annotation"));
         assert!(!is_inline_modifier_kind("decorator"));
         assert!(!is_inline_modifier_kind("identifier"));
@@ -1723,7 +1942,7 @@ mod tests {
     #[test]
     fn test_rust_special_case_continues_recursion_into_body() {
         // Rust function body children are still reachable via normal recursion.
-        // mutable_specifier inside params should still be stripped.
+        // After E2.4: mutable_specifier is NO LONGER stripped — `&mut self` is API surface.
         // visibility_modifier (pub) is PRESERVED as API surface (A4 contract).
         // Return type is PRESERVED as API surface (A4 contract).
         let source =
@@ -1734,8 +1953,8 @@ mod tests {
             "pub must be preserved as API surface (A4), got: {result}"
         );
         assert!(
-            !result.contains("mut "),
-            "mut should be stripped via child recursion, got: {result}"
+            result.contains("&mut self"),
+            "mutable_specifier must be preserved as API surface (E2.4), got: {result}"
         );
         assert!(
             result.contains("-> bool"),
@@ -1938,6 +2157,7 @@ mod tests {
     /// TypeScript: arrow function with return type preserved.
     #[test]
     fn test_typescript_pseudo_preserves_arrow_return() {
+        // After ADR-008/E1, param annotations are also preserved.
         let source =
             "const getUser = async (id: number): Promise<User> => {\n    return fetch(id);\n};\n";
         let result = transform(source, Language::TypeScript);
@@ -1945,14 +2165,14 @@ mod tests {
             result.contains("): Promise<User>"),
             "arrow function return type must be preserved, got: {result}"
         );
-        // Param type stripped
+        // E1: param type annotations preserved (ADR-008)
         assert!(
-            !result.contains("id: number"),
-            "param type annotation must be stripped, got: {result}"
+            result.contains("id: number"),
+            "param type annotation must be preserved (ADR-008), got: {result}"
         );
     }
 
-    /// TypeScript: interface method return type preserved; param type stripped.
+    /// TypeScript: interface method return type preserved; param type preserved (ADR-008).
     #[test]
     fn test_typescript_pseudo_interface_method_return_preserved() {
         let source = "interface Repo {\n    find(id: number): User;\n}\n";
@@ -1961,14 +2181,14 @@ mod tests {
             result.contains("): User"),
             "interface method return type must be preserved, got: {result}"
         );
-        // Param type stripped
+        // E1/ADR-008: param type annotations are now preserved as API surface
         assert!(
-            !result.contains("id: number"),
-            "param type must be stripped in interface method, got: {result}"
+            result.contains("id: number"),
+            "param type annotation preserved in interface method (ADR-008), got: {result}"
         );
     }
 
-    /// TypeScript: optional param with return type — param type stripped, return preserved.
+    /// TypeScript: optional param with return type — both preserved (ADR-007/ADR-008).
     #[test]
     fn test_typescript_pseudo_optional_param_return_preserved() {
         let source = "function opt(a?: string): string {\n    return a ?? '';\n}\n";
@@ -1976,6 +2196,11 @@ mod tests {
         assert!(
             result.contains("): string"),
             "return type must be preserved for optional-param function, got: {result}"
+        );
+        // E1: optional param type annotation also preserved
+        assert!(
+            result.contains("a?: string"),
+            "optional param type annotation preserved (ADR-008), got: {result}"
         );
     }
 

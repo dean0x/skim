@@ -271,13 +271,12 @@ Pseudo mode strips syntactic noise (type annotations, decorators, semicolons) wh
 
 ### What's Removed
 
-- Parameter type annotations (`: number`, `: int`, `: str`) — Python and TypeScript only; Rust preserves parameter types (see per-language table below). Return types are preserved in all languages (see above)
-- Type parameters and generics (`<T>`, `<'a>`) — except inside preserved return types (e.g., `-> Result<T, E>`, `): Promise<User>`)
-- Non-visibility keyword modifiers (`static`, `final`, `abstract`, Kotlin `open`)
-- Decorators and attributes (`@Override`, `#[derive(Debug)]`)
-- Statement-terminating semicolons (preserves for-loop semicolons)
-- Language-specific noise (lifetimes, where clauses, mutable specifiers)
-- Non-doc comments — same as Minimal mode; Python/Ruby/SQL/Bash module header comments (SPDX, `frozen_string_literal`, provenance lines) are preserved
+- Parameter type annotations (`: int`, `: str`) — **Python only**; TypeScript and Rust both preserve parameter types as API surface (ADR-008). Return types are preserved in all languages (see above)
+- Rust-specific noise: lifetimes (`<'a>`), type parameters and where clauses, attribute items (`#[derive(...)]`)
+- Non-visibility keyword modifiers (`static`, `final`, Kotlin `open`)
+- Decorators (`@Override`, `@cache`)
+- Statement-terminating semicolons — preserved inside for-loop headers (`for (let i = 0; i < n; i++)`)
+- Non-doc comments at declaration/module scope — same as Minimal mode; Python/Ruby/SQL/Bash module header comments (SPDX, `frozen_string_literal`, provenance lines) are preserved; inline comments inside function bodies are also preserved (they document logic)
 - Python `self`/`cls` first parameter
 
 ### Usage
@@ -301,7 +300,7 @@ export function processUser(id: string, options: ProcessOptions): Promise<User> 
 
 **Output:**
 ```
-export function processUser(id, options): Promise<User> {
+export function processUser(id: string, options: ProcessOptions): Promise<User> {
     const user = await db.find(id)
     if (!user) throw new NotFoundError()
     return transform(user, options)
@@ -327,10 +326,10 @@ def calculate(x, y) -> float:
 
 | Language   | What's Stripped                                                                 |
 |------------|--------------------------------------------------------------------------------|
-| TypeScript | Parameter type annotations, type params, decorators, `readonly`, `abstract`, `;` (return types preserved) |
+| TypeScript | Decorators, `readonly`, `abstract`, `;` — parameter and return types preserved (ADR-008) |
 | JavaScript | Decorators, `;`                                                                   |
 | Python     | Parameter type annotations, decorators, `self`/`cls` first param (return types preserved) |
-| Rust       | Lifetimes, type params, where clauses, attributes, `mut`, `;` (return types preserved)    |
+| Rust       | Lifetimes, type params, where clauses, attribute items, `;` — parameter and return types preserved |
 | Go         | Conservative (no stripping) — Go types are integral to understanding           |
 | Java       | Annotations, type params, `throws`, `;`                                        |
 | C          | `static`/`extern`/`const`/`volatile`, `;`                                      |

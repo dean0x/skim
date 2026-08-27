@@ -573,8 +573,9 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
     }
 
     // 2. Numbered content lines must have the CORRECT source line numbers.
-    //    simple_last_line_truncate(n=3) reserves 1 slot for the marker, so
-    //    it keeps the last 2 content lines: source lines 9 and 10 of a 10-line file.
+    //    E4.2: simple_last_line_truncate(n=3) emits n=3 content lines + 1 marker
+    //    (the marker does NOT consume a content slot). Content lines are the last 3:
+    //    source lines 8, 9, and 10 of a 10-line file.
     //    Before the bug fix, content lines got sequential numbers [1, 2] instead.
     let content_line_nums: Vec<usize> = lines
         .iter()
@@ -586,14 +587,14 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
 
     assert_eq!(
         content_line_nums.len(),
-        2,
-        "simple_last_line_truncate(n=3) yields 1 marker + 2 content lines, got: {:?}",
+        3,
+        "simple_last_line_truncate(n=3) yields 1 marker + 3 content lines (E4.2), got: {:?}",
         content_line_nums
     );
     assert_eq!(
         content_line_nums,
-        vec![9, 10],
-        "Content lines should have real source line numbers 9 and 10 (not sequential from 1 or 2)"
+        vec![8, 9, 10],
+        "Content lines should have real source line numbers 8, 9, and 10 (not sequential from 1)"
     );
 }
 
@@ -1209,20 +1210,21 @@ fn test_line_numbers_last_lines_correct_source_numbers() {
         })
         .collect();
 
-    // simple_last_line_truncate(n=3) reserves 1 slot for the marker, so it keeps
-    // the last 2 content lines: source lines 4 and 5 of a 5-line file.
+    // E4.2: simple_last_line_truncate(n=3) emits n=3 content lines + 1 marker
+    // (the marker does NOT consume a content slot). Content lines are the last 3:
+    // source lines 3, 4, and 5 of a 5-line file.
     // Before the bug fix, content lines got sequential numbers [1, 2] instead.
     assert_eq!(
         content_lines.len(),
-        2,
-        "simple_last_line_truncate(n=3) yields 1 marker + 2 content lines, got: {:?}",
+        3,
+        "simple_last_line_truncate(n=3) yields 1 marker + 3 content lines (E4.2), got: {:?}",
         content_lines
     );
     let nums: Vec<usize> = content_lines.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         nums,
-        vec![4, 5],
-        "Content lines should have source line numbers 4 and 5 (not sequential from 1)"
+        vec![3, 4, 5],
+        "Content lines should have source line numbers 3, 4, and 5 (not sequential from 1)"
     );
 }
 
@@ -1328,11 +1330,12 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
 
-    // Should have exactly 3 lines: marker + 2 content lines
+    // E4.2: --last-lines 3 on a 6-line file emits 1 marker + 3 content lines = 4 total.
+    // The marker does not consume one of the 3 requested content slots.
     assert_eq!(
         lines.len(),
-        3,
-        "With --last-lines 3, output should have 3 lines (marker + 2 content). Got:\n{}",
+        4,
+        "With --last-lines 3, output should have 4 lines (1 marker + 3 content). Got:\n{}",
         stdout
     );
 
@@ -1349,24 +1352,34 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
         num_str.parse::<usize>().ok()
     };
 
-    // Second line: source line 5 (`    return 2;`)
+    // Second line (lines[1]): source line 4 (`function bar() {`)
     let num1 = parse_line_num(lines[1]);
     assert_eq!(
         num1,
-        Some(5),
-        "Content line 1 should map to source line 5, got: {:?} (full line: {:?})",
+        Some(4),
+        "Content line 1 should map to source line 4, got: {:?} (full line: {:?})",
         num1,
         lines[1]
     );
 
-    // Third line: source line 6 (`}`) — NOT line 3 which is also `}`
+    // Third line (lines[2]): source line 5 (`    return 2;`)
     let num2 = parse_line_num(lines[2]);
     assert_eq!(
         num2,
-        Some(6),
-        "Content line 2 (closing `}}`) should map to source line 6 (its real position), \
-         not line 3 (first `}}` occurrence). Got: {:?} (full line: {:?})",
+        Some(5),
+        "Content line 2 should map to source line 5, got: {:?} (full line: {:?})",
         num2,
         lines[2]
+    );
+
+    // Fourth line (lines[3]): source line 6 (`}`) — NOT line 3 which is also `}`
+    let num3 = parse_line_num(lines[3]);
+    assert_eq!(
+        num3,
+        Some(6),
+        "Content line 3 (closing `}}`) should map to source line 6 (its real position), \
+         not line 3 (first `}}` occurrence). Got: {:?} (full line: {:?})",
+        num3,
+        lines[3]
     );
 }

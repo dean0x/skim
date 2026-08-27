@@ -27,7 +27,11 @@ use super::{
 };
 
 /// JSON fields to inject for `gh run view`.
-const RUN_VIEW_FIELDS: &str = "name,status,conclusion,event,jobs,databaseId,createdAt,updatedAt";
+///
+/// Only fields that are actually read in `try_parse_json` are requested here.
+/// `createdAt` and `updatedAt` were removed because they are not rendered in the output —
+/// requesting fields that do not affect output is misleading (E3).
+const RUN_VIEW_FIELDS: &str = "name,status,conclusion,event,jobs,databaseId";
 
 /// Inject `--json` for run view if not already present.
 pub(super) fn prepare_args(cmd_args: &mut Vec<String>) {
