@@ -821,13 +821,24 @@ fn stdout_should_serve_raw() -> bool {
 }
 
 /// Return `true` when the rewrite surface marked the current command as needing
-/// byte-exact stdout.
+/// byte-exact stdout **for `tool`**.
 ///
 /// This closes the one gap `fstat` cannot: a pipe's far end. When the PreToolUse
 /// hook sees `| tee out.txt`, `$(…)`, or a redirect onto a file/named FIFO, it
 /// records a force-raw marker in the PID-keyed sidecar; this wrapper invocation
 /// discovers it by walking its process ancestry. The marker is re-evaluated —
 /// set *or cleared* — on every hook invocation, so it never outlives one command.
+///
+/// # Why the tool name is part of the key
+///
+/// PPID is not a command identity. Every command an agent runs shares that one
+/// PID, so a PPID-only marker was shared mutable state: a `| tee` verdict leaked
+/// onto every *other* wrapper invocation under the same agent — a concurrent
+/// tool call, a background job, a hook-less nested sub-agent — and an unrelated
+/// command's clear could delete a live one. Keying on the command heads the hook
+/// saw (`cmd/rewrite/compound.rs::command_heads`) narrows it to the tools that
+/// command actually names. See `set_force_raw` for the residual exposure that
+/// remains: two *same-tool* commands under one agent still share a key.
 ///
 /// **ACCEPTED LIMITATION (documented, and pinned by
 /// `no_hook_means_fstat_only_behaviour` in `tests/cli_stdout_destination.rs`):**
@@ -840,10 +851,10 @@ fn stdout_should_serve_raw() -> bool {
 ///
 /// Failure direction is deliberate: a stale or missing marker costs compression
 /// (lossless), never bytes.
-fn force_raw_requested() -> bool {
+fn force_raw_requested(tool: &str) -> bool {
     cmd::resolve_cache_dir()
         .as_deref()
-        .is_some_and(cmd::session_sidecar::read_force_raw)
+        .is_some_and(|dir| cmd::session_sidecar::read_force_raw(dir, tool))
 }
 
 fn main() -> ExitCode {
@@ -939,7 +950,8 @@ fn main() -> ExitCode {
         // ground truth about fd 1 (files, non-terminal char devices, sockets);
         // `force_raw_requested` carries the rewrite surface's verdict about the
         // one thing fd 1 cannot reveal — the far end of a pipe (`| tee f`,
-        // `$(…)`). TTYs and plain `| cat` match neither and still compress.
+        // `$(…)`) — for THIS tool. TTYs and plain `| cat` match neither and
+        // still compress.
         //
         // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
         // and FileOperation branches below are intentionally NOT guarded:
@@ -947,7 +959,7 @@ fn main() -> ExitCode {
         // invocations where the user wants skim's output saved — hoisting this
         // guard above detect_argv0_dispatch() would break that workflow. See the
         // case-8 rationale on `stdout_redirected_to_file` in cmd/rewrite/compound.rs.
-        if stdout_should_serve_raw() || force_raw_requested() {
+        if stdout_should_serve_raw() || force_raw_requested(&name) {
             // ADR-011 class 2: choosing raw loses nothing, so this is a
             // debug-gated banner, never an unconditional marker.
             crate::debug_log!("[skim] wrapper: stdout needs exact bytes; serving raw for '{name}'");

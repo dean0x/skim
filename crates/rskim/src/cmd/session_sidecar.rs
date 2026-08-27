@@ -154,8 +154,82 @@ pub(crate) fn read_session_id(cache_dir: &Path) -> Option<String> {
 // Force-raw marker (cross-surface fidelity parity)
 // ============================================================================
 
+/// Maximum length of a tool name embedded in a marker file name.
+const MAX_MARKER_TOOL_LEN: usize = 64;
+
+/// Return `true` when `tool` is safe to embed in a marker file name.
+///
+/// The command string is untrusted hook input (it arrives as JSON on stdin), so
+/// a head like `../../../etc/cron.d/x` must never reach `Path::join`. Parse at
+/// the boundary: a name that does not survive this check simply gets no
+/// per-tool marker, and [`set_force_raw`] falls back to the wildcard.
+///
+/// Conservative basename alphabet, and the first byte may not be `.` — that
+/// alone excludes `.`, `..` and hidden files without a special case.
+///
+/// Also called by `cmd::rewrite::compound::command_heads`, which must know
+/// whether a head it extracted is *representable* before deciding the tool set
+/// is knowable. Both sides share this one definition on purpose: if the
+/// producer and the file-name contract could disagree, a head would be silently
+/// dropped here and its tool would go unmarked — a byte loss.
+pub(crate) fn is_safe_marker_tool(tool: &str) -> bool {
+    if tool.len() > MAX_MARKER_TOOL_LEN {
+        return false;
+    }
+    let mut bytes = tool.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.'))
+}
+
+/// Path of the force-raw marker for `pid`.
+///
+/// `Some(tool)` yields the per-tool marker `{pid}.{tool}.raw`; `None` yields the
+/// wildcard marker `{pid}.raw`, which matches every tool.
+fn marker_path(sessions_dir: &Path, pid: u32, tool: Option<&str>) -> std::path::PathBuf {
+    match tool {
+        Some(t) => sessions_dir.join(format!("{pid}.{t}.{FORCE_RAW_SUFFIX}")),
+        None => sessions_dir.join(format!("{pid}.{FORCE_RAW_SUFFIX}")),
+    }
+}
+
+/// Write (`present == true`) or remove (`present == false`) a marker file.
+///
+/// All failures are silently ignored — see [`set_force_raw`].
+fn write_or_remove_marker(path: &Path, present: bool) {
+    if !present {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+
+    // Mode 0o600 in the same syscall as create, matching write_session_id: the
+    // file is never briefly world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = f.write_all(b"1");
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(path, b"1");
+    }
+}
+
 /// Record — or clear — the rewrite surface's "this command's stdout needs
-/// byte-exact output" verdict for the current command.
+/// byte-exact output" verdict, scoped to the tools the command names.
 ///
 /// # Why a sidecar rather than the command text
 ///
@@ -174,67 +248,95 @@ pub(crate) fn read_session_id(cache_dir: &Path) -> Option<String> {
 /// assignment to `a` alone). This mirrors the session-id channel instead
 /// (ADR-004 / AD-SC-1): out-of-band, command text untouched.
 ///
+/// # Keying: PPID **and** tool name
+///
+/// PPID alone is not a command identity. Every command an agent runs — in
+/// parallel, in a background job, in a nested hook-less sub-agent — shares that
+/// one PID, so a PPID-only marker is shared mutable state across unrelated
+/// commands: one command's verdict silently decided another's, in both
+/// directions (see the module tests and `force_raw_requested` in `main.rs`).
+///
+/// `tools` narrows the key to the command heads the hook actually saw, so
+/// `git log | tee f` writes `{ppid}.git.raw` + `{ppid}.tee.raw` and leaves a
+/// concurrent `cargo build`'s wrapper untouched. One hook invocation legitimately
+/// produces several wrapper invocations (`a | b` with both wrapped), so markers
+/// are *never* consumed on read — every reader sees the same file.
+///
+/// An **empty** `tools` means the command's shape defeated head extraction
+/// (`$(…)`, backticks, process substitution). That falls back to the wildcard
+/// marker `{ppid}.raw`, which matches every tool — erring wide costs
+/// compression, erring narrow costs bytes.
+///
 /// # Lifetime
 ///
-/// Keyed by **PPID**, exactly like [`write_session_id`], so the wrapper finds it
-/// via the ancestry walk in [`read_force_raw`]. Called on EVERY hook invocation
-/// with the verdict for that command — `true` writes the marker, `false` removes
-/// it — so it never outlives a single command.
+/// Called on EVERY hook invocation with the verdict for that command: `true`
+/// writes the markers for `tools`, `false` removes them, so a marker does not
+/// outlive the command that set it. [`FORCE_RAW_MAX_AGE`] bounds the leftovers
+/// of a hook that crashed before it could clear.
 ///
 /// All failures are silently ignored: a marker that fails to write costs
 /// compression fidelity, and one that fails to clear costs compression. Both
 /// are recoverable; neither may break the pipeline.
-pub(crate) fn set_force_raw(force_raw: bool, cache_dir: &Path) {
+pub(crate) fn set_force_raw(force_raw: bool, tools: &[String], cache_dir: &Path) {
     let Some(ppid) = get_ppid() else { return };
 
     let dir = cache_dir.join(SESSIONS_DIR);
-    let file_path = dir.join(format!("{ppid}.{FORCE_RAW_SUFFIX}"));
 
-    if !force_raw {
-        let _ = std::fs::remove_file(&file_path);
-        return;
+    let safe: Vec<&str> = tools
+        .iter()
+        .map(String::as_str)
+        .filter(|t| is_safe_marker_tool(t))
+        .collect();
+
+    // The wildcard is written only when there is no usable tool set: a
+    // per-tool marker is always the narrower, preferred encoding of the same
+    // verdict. Any other case removes it, so an earlier opaque command's
+    // wildcard cannot linger.
+    let wildcard = force_raw && safe.is_empty();
+
+    if force_raw {
+        let _ = std::fs::create_dir_all(&dir);
     }
 
-    let _ = std::fs::create_dir_all(&dir);
-
-    // Mode 0o600 in the same syscall as create, matching write_session_id: the
-    // file is never briefly world-readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&file_path)
-        {
-            let _ = f.write_all(b"1");
-        }
+    write_or_remove_marker(&marker_path(&dir, ppid, None), wildcard);
+    for tool in &safe {
+        write_or_remove_marker(&marker_path(&dir, ppid, Some(tool)), force_raw);
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&file_path, b"1");
-    }
+    // Bound the sessions directory. `write_session_id` also cleans, but only
+    // when the agent supplies a session id; this call runs on every hook
+    // invocation, so `sessions/` has a bound that does not depend on
+    // attribution being configured.
+    cleanup_stale_rate_limited(&dir);
 }
 
-/// Return `true` when a fresh force-raw marker covers this process.
+/// Return `true` when a fresh force-raw marker covers this process and `tool`.
 ///
-/// Walks process ancestry up to [`MAX_ANCESTRY_DEPTH`] levels looking for
-/// `{cache_dir}/sessions/{pid}.raw`, mirroring [`read_session_id`]. The walk is
-/// needed because the hook keys the marker to the agent process while the
-/// wrapper runs two levels deeper (wrapper ← shell ← agent).
+/// Walks process ancestry up to [`MAX_ANCESTRY_DEPTH`] levels, mirroring
+/// [`read_session_id`]. The walk is needed because the hook keys the marker to
+/// the agent process while the wrapper runs two levels deeper (wrapper ← shell
+/// ← agent). At each level two names match: the per-tool marker
+/// `{pid}.{tool}.raw` and the wildcard `{pid}.raw`.
+///
+/// The marker is never removed on read: `git log | tee f` runs two wrapped
+/// tools off one hook invocation, and both must see it.
 ///
 /// A marker older than [`FORCE_RAW_MAX_AGE`] is ignored, so a leftover from a
 /// crashed hook cannot disable compression indefinitely.
-pub(crate) fn read_force_raw(cache_dir: &Path) -> bool {
+pub(crate) fn read_force_raw(cache_dir: &Path, tool: &str) -> bool {
     let sessions_dir = cache_dir.join(SESSIONS_DIR);
+    // An unrepresentable tool name can still match the wildcard; it just has no
+    // per-tool marker to look for.
+    let tool = is_safe_marker_tool(tool).then_some(tool);
     let mut pid = std::process::id();
 
     for _ in 0..MAX_ANCESTRY_DEPTH {
-        let file_path = sessions_dir.join(format!("{pid}.{FORCE_RAW_SUFFIX}"));
-        if is_fresh(&file_path, FORCE_RAW_MAX_AGE) {
+        if is_fresh(&marker_path(&sessions_dir, pid, None), FORCE_RAW_MAX_AGE) {
+            return true;
+        }
+        if let Some(t) = tool
+            && is_fresh(&marker_path(&sessions_dir, pid, Some(t)), FORCE_RAW_MAX_AGE)
+        {
             return true;
         }
         let Some(parent) = parent_of(pid) else {
@@ -322,10 +424,19 @@ fn cleanup_stale_rate_limited(sessions_dir: &Path) {
     let _ = std::fs::write(&sentinel, b"");
 }
 
-/// Remove sidecar files older than [`CLEANUP_MAX_AGE`].
+/// Remove sidecar files past their useful life: [`FORCE_RAW_MAX_AGE`] for
+/// force-raw markers, [`CLEANUP_MAX_AGE`] for session-id sidecars.
 ///
-/// Called via [`cleanup_stale_rate_limited`] on the write path. All errors are
-/// silently ignored.
+/// Two clocks because the two file classes have very different lifetimes. A
+/// `.raw` marker is dead the moment it exceeds [`FORCE_RAW_MAX_AGE`] — no
+/// reader will honour it — so reaping it on the session sidecar's 24 h clock
+/// would leave up to a day of provably-inert files behind. Reaping it on its
+/// own clock is what makes `sessions/` bounded by *live* markers rather than by
+/// a day of accumulated ones.
+///
+/// Called via [`cleanup_stale_rate_limited`] from both write paths
+/// ([`write_session_id`] and [`set_force_raw`]). All errors are silently
+/// ignored.
 fn cleanup_stale(sessions_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(sessions_dir) else {
         return;
@@ -338,11 +449,17 @@ fn cleanup_stale(sessions_dir: &Path) {
         if entry.file_name() == CLEANUP_SENTINEL {
             continue;
         }
+        let path = entry.path();
+        let max_age = if path.extension().is_some_and(|e| e == FORCE_RAW_SUFFIX) {
+            FORCE_RAW_MAX_AGE
+        } else {
+            CLEANUP_MAX_AGE
+        };
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
         let age = now.duration_since(mtime).unwrap_or(Duration::MAX);
-        if age > CLEANUP_MAX_AGE {
-            let _ = std::fs::remove_file(entry.path());
+        if age > max_age {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -468,21 +585,33 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Write a force-raw marker directly for `pid`, bypassing `set_force_raw`
-    /// (which can only key the CURRENT process's PPID).
-    fn write_raw_marker(sessions_dir: &Path, pid: u32) -> PathBuf {
+    /// (which can only key the CURRENT process's PPID). `tool` selects the
+    /// per-tool marker; `None` writes the wildcard.
+    fn write_raw_marker(sessions_dir: &Path, pid: u32, tool: Option<&str>) -> PathBuf {
         std::fs::create_dir_all(sessions_dir).unwrap();
-        let path = sessions_dir.join(format!("{pid}.{FORCE_RAW_SUFFIX}"));
+        let path = marker_path(sessions_dir, pid, tool);
         std::fs::write(&path, b"1").unwrap();
         path
+    }
+
+    /// Convenience: the tool-name vector `set_force_raw` takes.
+    fn tools(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
     }
 
     /// A marker keyed to this process is found on the first step of the walk.
     #[test]
     fn test_read_force_raw_finds_marker_for_self() {
         let tmp = TempDir::new().unwrap();
-        assert!(!read_force_raw(tmp.path()), "no marker means no force-raw");
-        write_raw_marker(&tmp.path().join(SESSIONS_DIR), std::process::id());
-        assert!(read_force_raw(tmp.path()), "marker for self must be found");
+        assert!(
+            !read_force_raw(tmp.path(), "git"),
+            "no marker means no force-raw"
+        );
+        write_raw_marker(&tmp.path().join(SESSIONS_DIR), std::process::id(), None);
+        assert!(
+            read_force_raw(tmp.path(), "git"),
+            "marker for self must be found"
+        );
     }
 
     /// A stale marker is ignored, so a crashed hook cannot disable compression
@@ -490,10 +619,10 @@ mod tests {
     #[test]
     fn test_read_force_raw_ignores_stale_marker() {
         let tmp = TempDir::new().unwrap();
-        let path = write_raw_marker(&tmp.path().join(SESSIONS_DIR), std::process::id());
+        let path = write_raw_marker(&tmp.path().join(SESSIONS_DIR), std::process::id(), None);
         set_file_age(&path, FORCE_RAW_MAX_AGE + Duration::from_secs(60));
         assert!(
-            !read_force_raw(tmp.path()),
+            !read_force_raw(tmp.path(), "git"),
             "a marker older than FORCE_RAW_MAX_AGE must be ignored"
         );
     }
@@ -504,13 +633,13 @@ mod tests {
     fn test_set_force_raw_clears_previous_marker() {
         let tmp = TempDir::new().unwrap();
         let sessions = tmp.path().join(SESSIONS_DIR);
-
-        set_force_raw(true, tmp.path());
         let ppid = get_ppid().expect("unix ppid");
-        let path = sessions.join(format!("{ppid}.{FORCE_RAW_SUFFIX}"));
+
+        set_force_raw(true, &tools(&["git", "tee"]), tmp.path());
+        let path = marker_path(&sessions, ppid, Some("git"));
         assert!(path.exists(), "set_force_raw(true) must write the marker");
 
-        set_force_raw(false, tmp.path());
+        set_force_raw(false, &tools(&["git", "cat"]), tmp.path());
         assert!(
             !path.exists(),
             "set_force_raw(false) must remove the marker, not just skip writing"
@@ -522,9 +651,9 @@ mod tests {
     #[test]
     fn test_set_force_raw_clear_is_idempotent() {
         let tmp = TempDir::new().unwrap();
-        set_force_raw(false, tmp.path());
-        set_force_raw(false, tmp.path());
-        assert!(!read_force_raw(tmp.path()));
+        set_force_raw(false, &tools(&["ls"]), tmp.path());
+        set_force_raw(false, &tools(&["ls"]), tmp.path());
+        assert!(!read_force_raw(tmp.path(), "ls"));
     }
 
     /// The marker never collides with a session-id sidecar for the same PID:
@@ -535,17 +664,169 @@ mod tests {
         let sessions = tmp.path().join(SESSIONS_DIR);
         let pid = std::process::id();
         write_raw_sidecar(&sessions, pid, "session-abc");
-        write_raw_marker(&sessions, pid);
+        write_raw_marker(&sessions, pid, None);
 
         assert_eq!(read_session_id(tmp.path()).as_deref(), Some("session-abc"));
-        assert!(read_force_raw(tmp.path()));
+        assert!(read_force_raw(tmp.path(), "git"));
 
-        std::fs::remove_file(sessions.join(format!("{pid}.{FORCE_RAW_SUFFIX}"))).unwrap();
-        assert!(!read_force_raw(tmp.path()));
+        std::fs::remove_file(marker_path(&sessions, pid, None)).unwrap();
+        assert!(!read_force_raw(tmp.path(), "git"));
         assert_eq!(
             read_session_id(tmp.path()).as_deref(),
             Some("session-abc"),
             "clearing the force-raw marker must not disturb session attribution"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-tool keying: PPID alone is not a command identity
+    // -----------------------------------------------------------------------
+
+    /// A marker written for `git` must not answer for `cargo`.
+    ///
+    /// This is the whole point of the tool component: PPID is shared by every
+    /// command an agent runs, so a PPID-only marker made one command's verdict
+    /// decide an unrelated one's.
+    #[test]
+    fn test_per_tool_marker_does_not_answer_for_another_tool() {
+        let tmp = TempDir::new().unwrap();
+        set_force_raw(true, &tools(&["git", "tee"]), tmp.path());
+
+        assert!(
+            read_force_raw(tmp.path(), "git"),
+            "the marked tool must serve raw"
+        );
+        assert!(
+            read_force_raw(tmp.path(), "tee"),
+            "one hook invocation covers every tool the command names"
+        );
+        assert!(
+            !read_force_raw(tmp.path(), "cargo"),
+            "an unnamed tool must not inherit another command's verdict"
+        );
+    }
+
+    /// An unrelated command's hook must not delete a live marker.
+    ///
+    /// Models two Bash tool calls in one agent turn: `git log | tee f` sets the
+    /// marker, `cargo build`'s hook fires before `git` execs. With a PPID-only
+    /// key the second call cleared the first's marker and the tee captured
+    /// compressed bytes — a byte-fidelity loss (#317).
+    #[test]
+    fn test_unrelated_command_clear_preserves_live_marker() {
+        let tmp = TempDir::new().unwrap();
+
+        set_force_raw(true, &tools(&["git", "tee"]), tmp.path());
+        set_force_raw(false, &tools(&["cargo"]), tmp.path());
+
+        assert!(
+            read_force_raw(tmp.path(), "git"),
+            "a concurrent unrelated command must not clear another tool's marker"
+        );
+    }
+
+    /// An empty tool set means "shape defeated head extraction" — `$(…)`,
+    /// backticks, process substitution — and falls back to the wildcard, which
+    /// matches every tool. Erring wide costs compression; erring narrow costs
+    /// bytes.
+    #[test]
+    fn test_empty_tool_set_writes_matching_wildcard() {
+        let tmp = TempDir::new().unwrap();
+        set_force_raw(true, &[], tmp.path());
+
+        assert!(read_force_raw(tmp.path(), "git"));
+        assert!(read_force_raw(tmp.path(), "anything-at-all"));
+
+        let ppid = get_ppid().expect("unix ppid");
+        assert!(
+            marker_path(&tmp.path().join(SESSIONS_DIR), ppid, None).exists(),
+            "the fallback must be the wildcard file name"
+        );
+    }
+
+    /// A named command never leaves the wildcard behind: the narrower per-tool
+    /// encoding always replaces it, so an earlier `$(…)` cannot keep serving raw
+    /// for unrelated tools.
+    #[test]
+    fn test_named_command_clears_a_previous_wildcard() {
+        let tmp = TempDir::new().unwrap();
+        set_force_raw(true, &[], tmp.path());
+        assert!(read_force_raw(tmp.path(), "cargo"));
+
+        set_force_raw(true, &tools(&["git"]), tmp.path());
+        assert!(read_force_raw(tmp.path(), "git"));
+        assert!(
+            !read_force_raw(tmp.path(), "cargo"),
+            "the wildcard must not survive a command that names its tools"
+        );
+    }
+
+    /// The command string is untrusted hook input. A head that would escape the
+    /// sessions directory is rejected outright — it must never reach `join`.
+    #[test]
+    fn test_unsafe_tool_names_are_rejected() {
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            ".",
+            ".hidden",
+            "with/slash",
+            "with space",
+            "semi;colon",
+            "",
+        ] {
+            assert!(!is_safe_marker_tool(bad), "{bad:?} must be rejected");
+        }
+        for good in ["git", "cargo", "sha256sum", "python3.11", "g++", "_x"] {
+            assert!(is_safe_marker_tool(good), "{good:?} must be accepted");
+        }
+    }
+
+    /// A traversal-shaped head writes no per-tool file anywhere, and because the
+    /// safe set is then empty the command still gets wildcard coverage rather
+    /// than silently losing its verdict.
+    #[test]
+    fn test_traversal_tool_name_writes_no_file_outside_sessions_dir() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(SESSIONS_DIR);
+        set_force_raw(true, &tools(&["../escape"]), tmp.path());
+
+        assert!(
+            !tmp.path().join("escape.raw").exists(),
+            "a traversal head must not create a file outside sessions/"
+        );
+        let ppid = get_ppid().expect("unix ppid");
+        assert!(
+            marker_path(&sessions, ppid, None).exists(),
+            "the rejected head must fall back to wildcard coverage"
+        );
+        assert!(read_force_raw(tmp.path(), "escape"));
+    }
+
+    /// `sessions/` is bounded without depending on session attribution being
+    /// configured: `set_force_raw` runs on every hook invocation and reaps
+    /// markers on the marker's own clock.
+    #[test]
+    fn test_set_force_raw_reaps_stale_markers() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(SESSIONS_DIR);
+
+        // A marker from a long-dead process, well past its useful life.
+        let dead = write_raw_marker(&sessions, 99_999, Some("git"));
+        set_file_age(&dead, FORCE_RAW_MAX_AGE + Duration::from_secs(600));
+        // A session sidecar of the same age must NOT be reaped — different clock.
+        let sidecar = write_raw_sidecar(&sessions, 99_998, "still-valid");
+        set_file_age(&sidecar, FORCE_RAW_MAX_AGE + Duration::from_secs(600));
+
+        set_force_raw(false, &tools(&["ls"]), tmp.path());
+
+        assert!(
+            !dead.exists(),
+            "a marker past FORCE_RAW_MAX_AGE must be reaped on the write path"
+        );
+        assert!(
+            sidecar.exists(),
+            "session sidecars keep the 24 h clock; only .raw uses the short one"
         );
     }
 

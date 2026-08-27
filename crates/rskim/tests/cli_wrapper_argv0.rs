@@ -42,6 +42,19 @@ mod argv0_dispatch {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt as _;
 
+    /// Per-binary cache sandbox (PF-017) — see the identical note in
+    /// `cli_e2e_rewrite.rs`.
+    ///
+    /// These are *reader*-side tests: `force_raw_requested()` walks this
+    /// process's ancestry for a force-raw marker. Left pointing at the real
+    /// `~/.cache/skim`, the PID it reaches is the shared nextest runner, so a
+    /// marker written by a hook-mode test in a concurrently-running binary
+    /// flips these invocations to `run_inherited_passthrough` — bypassing the
+    /// session-id stripping and tree compression they assert. The collision is
+    /// scheduling-dependent, so it appears only at certain suite sizes.
+    static CACHE_SANDBOX: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir"));
+
     /// Path to the skim binary built by `cargo test`.
     ///
     /// `CARGO_BIN_EXE_skim` is set by cargo for integration tests of bin crates.
@@ -121,6 +134,7 @@ mod argv0_dispatch {
             // Pass no positional args so stub ls uses its sidecar output.
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -175,6 +189,7 @@ mod argv0_dispatch {
             .arg0("grep")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -232,6 +247,7 @@ mod argv0_dispatch {
             .arg0("grep")
             .args(["--session-id=skew-test", "hello", file.to_str().unwrap()])
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -289,6 +305,7 @@ mod argv0_dispatch {
             .arg0("grep")
             .args(["--session-id", "skew-test", "hello", file.to_str().unwrap()])
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -373,6 +390,7 @@ mod argv0_dispatch {
             .arg0("ls")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             // Redirect stdout to a real file — NOT assert_cmd's default pipe.
@@ -510,6 +528,7 @@ mod argv0_dispatch {
             .arg0("tree")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -569,6 +588,7 @@ mod argv0_dispatch {
             .arg0("skim")
             .arg("--help")
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .output()
             .expect("skim binary must be spawnable");
 

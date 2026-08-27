@@ -314,7 +314,7 @@ const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
 /// and keeps compressing.
 pub(super) fn command_needs_exact_bytes(cmd: &str) -> bool {
     // Rule S: the shell captures stdout as a value or plumbs it into an fd.
-    if cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(") {
+    if is_capture_shape(cmd) {
         return true;
     }
     // Rule R: stdout (or both streams) lands on a file or named FIFO.
@@ -323,6 +323,100 @@ pub(super) fn command_needs_exact_bytes(cmd: &str) -> bool {
     }
     // Rule T: the downstream pipe stage needs the bytes verbatim.
     pipe_consumer_needs_exact_bytes(cmd)
+}
+
+/// Rule S: the shell consumes stdout as a value (`$(…)`, backticks) or wires it
+/// into another command's fd (`<(…)`, `>(…)`).
+///
+/// (`${…}` is parameter expansion, not capture, and is deliberately excluded.)
+///
+/// Also the authoritative "tokenisation cannot be trusted here" predicate:
+/// these shapes nest a whole command inside one whitespace-delimited token, so
+/// [`command_heads`] refuses to guess at head names for them.
+fn is_capture_shape(cmd: &str) -> bool {
+    cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(")
+}
+
+/// Upper bound on the number of distinct command heads recorded for one
+/// command.
+///
+/// Every loop and resource gets an explicit bound. Real commands name a handful
+/// of tools; a pathological one-liner must not be able to make the hook write an
+/// unbounded number of marker files. Exceeding it reports *unknown* rather than
+/// a truncated set — see [`command_heads`].
+const MAX_COMMAND_HEADS: usize = 16;
+
+/// Commands that exec *another* command given as their argument.
+///
+/// For these the segment head names the launcher, not the tool whose stdout is
+/// actually captured: `timeout 60 git log | tee f` has head `timeout`, and
+/// marking `timeout` would leave `git` unmarked — a byte loss. Each takes its
+/// own options with its own arity (`timeout 60 …`, `nice -n 5 …`), so the real
+/// tool cannot be recovered by skipping a fixed number of tokens. They report
+/// *unknown* instead and fall back to the wildcard.
+///
+/// `sudo` and `command` are absent deliberately: [`tokens_head`] already steps
+/// over them to reach the real tool.
+const EXEC_PREFIXES: &[&str] = &[
+    "env", "nice", "ionice", "chrt", "nohup", "setsid", "timeout", "stdbuf", "unbuffer", "xargs",
+    "time", "doas", "watch", "script",
+];
+
+/// The basenames of every command head in `cmd`, deduplicated and capped at
+/// [`MAX_COMMAND_HEADS`].
+///
+/// This is the *scope* of [`command_needs_exact_bytes`]: the set of tools whose
+/// wrapper invocations belong to this command. The hook records the verdict
+/// under these names so a marker set for `git log | tee f` cannot change what a
+/// concurrent, hook-less, or later `cargo`/`grep`/`ls` wrapper invocation does.
+///
+/// An **empty** result means "the tool set is not knowable from this text".
+/// Callers must treat that as *all tools*, never as *no tools*: erring wide
+/// costs compression, erring narrow costs bytes.
+///
+/// **Partial knowledge is not knowledge.** If any segment's head cannot be
+/// resolved to a plain tool name — a capture shape, a `Bail` shape, an
+/// [`EXEC_PREFIXES`] launcher, an unrepresentable name (`sudo -u bob git` heads
+/// on `-u`), or more heads than [`MAX_COMMAND_HEADS`] — the whole command
+/// reports unknown. Returning the heads it *could* read would leave the
+/// unreadable stage's tool unmarked, and an unmarked byte-exact stage is
+/// exactly the byte loss this marker exists to prevent.
+pub(super) fn command_heads(cmd: &str) -> Vec<String> {
+    // A capture shape hides a command inside a single whitespace token
+    // (`out=$(git log)` tokenises to `out=$(git`, `log`, …), so `tokens_head`
+    // would confidently return the wrong name. Report "unknown" instead.
+    if is_capture_shape(cmd) {
+        return Vec::new();
+    }
+
+    let segments = match split_compound(cmd) {
+        CompoundSplitResult::Simple(tokens) => vec![tokens],
+        CompoundSplitResult::Compound(segments) => segments.into_iter().map(|s| s.tokens).collect(),
+        // Unsupported shell syntax — the token stream is not trustworthy.
+        CompoundSplitResult::Bail => return Vec::new(),
+    };
+
+    let mut heads: Vec<String> = Vec::new();
+    for tokens in &segments {
+        // An empty segment is not a command (`git log;` trails one).
+        if tokens.is_empty() {
+            continue;
+        }
+        let Some(head) = tokens_head(tokens).filter(|h| {
+            crate::cmd::session_sidecar::is_safe_marker_tool(h) && !EXEC_PREFIXES.contains(h)
+        }) else {
+            return Vec::new();
+        };
+        if heads.iter().any(|h| h == head) {
+            continue;
+        }
+        if heads.len() == MAX_COMMAND_HEADS {
+            return Vec::new();
+        }
+        heads.push(head.to_string());
+    }
+
+    heads
 }
 
 /// Return `true` when any pipe stage of `cmd` feeds a [`BYTE_EXACT_PIPE_CONSUMERS`]
@@ -343,7 +437,13 @@ fn pipe_consumer_needs_exact_bytes(cmd: &str) -> bool {
 /// `VAR=VAL` assignment nor a privilege/dispatch prefix, reduced to its basename
 /// so `/usr/bin/tee` matches `tee`.
 fn segment_head(seg: &CommandSegment) -> Option<&str> {
-    seg.tokens
+    tokens_head(&seg.tokens)
+}
+
+/// [`segment_head`] over a bare token slice, for the `Simple` (no compound
+/// operator) split result which carries tokens rather than segments.
+fn tokens_head(tokens: &[String]) -> Option<&str> {
+    tokens
         .iter()
         .map(String::as_str)
         .find(|t| !t.contains('=') && *t != "sudo" && *t != "command")
@@ -1166,6 +1266,157 @@ mod tests {
         assert!(command_needs_exact_bytes("git log | gzip > out.gz"));
         // stderr-only redirects leave stdout alone.
         assert!(!command_needs_exact_bytes("git log -n 5 2> err.txt"));
+    }
+
+    // ========================================================================
+    // command_heads — the SCOPE of that verdict
+    // ========================================================================
+
+    /// Every stage of a pipeline is named, so one hook invocation covers every
+    /// wrapper invocation it will produce.
+    #[test]
+    fn test_command_heads_names_every_pipeline_stage() {
+        assert_eq!(command_heads("git log -n 5 | tee out.txt"), ["git", "tee"]);
+        assert_eq!(command_heads("cargo test && git log"), ["cargo", "git"]);
+        assert_eq!(command_heads("git log -n 5"), ["git"]);
+    }
+
+    /// The same normalisation `segment_head` already applies for rule T:
+    /// basename reduction, and leading `VAR=VAL` / `sudo` / `command` skipped.
+    #[test]
+    fn test_command_heads_normalises_like_rule_t() {
+        assert_eq!(
+            command_heads("git log | /usr/bin/tee out.txt"),
+            ["git", "tee"]
+        );
+        assert_eq!(
+            command_heads("git log | LC_ALL=C tee out.txt"),
+            ["git", "tee"]
+        );
+        assert_eq!(command_heads("git log | sudo tee /etc/x"), ["git", "tee"]);
+    }
+
+    /// Repeats collapse, and the list is bounded — a pathological one-liner must
+    /// not make the hook write an unbounded number of marker files. Overflowing
+    /// the bound reports *unknown* (wildcard), never a truncated set: a
+    /// truncated set would leave the dropped tools unmarked.
+    #[test]
+    fn test_command_heads_dedupes_and_is_bounded() {
+        assert_eq!(command_heads("git log | git cat-file --batch"), ["git"]);
+
+        let at_bound: String = (0..MAX_COMMAND_HEADS)
+            .map(|i| format!("tool{i} x"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        assert_eq!(command_heads(&at_bound).len(), MAX_COMMAND_HEADS);
+
+        let over_bound: String = (0..MAX_COMMAND_HEADS + 1)
+            .map(|i| format!("tool{i} x"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        assert!(
+            command_heads(&over_bound).is_empty(),
+            "overflowing the bound must report unknown, not a truncated set"
+        );
+    }
+
+    /// **A launcher is not the tool whose stdout is captured.**
+    ///
+    /// `timeout 60 git log | tee f` heads on `timeout`; marking `timeout` would
+    /// leave `git` unmarked and the tee would capture compressed bytes. These
+    /// report unknown so the wildcard covers `git`.
+    #[test]
+    fn test_command_heads_unknown_for_exec_prefixes() {
+        for cmd in [
+            "timeout 60 git log | tee out.txt",
+            "env GIT_PAGER=cat git log | tee out.txt",
+            "nice -n 5 git log > out.txt",
+            "nohup git log > out.txt",
+            "xargs git show < list",
+        ] {
+            assert!(
+                command_heads(cmd).is_empty(),
+                "`{cmd}` heads on a launcher — must report unknown"
+            );
+        }
+        // `sudo` and `command` are stepped over, so the real tool is reached.
+        assert_eq!(command_heads("sudo git log | tee out.txt"), ["git", "tee"]);
+    }
+
+    /// A head that is not a representable tool name makes the whole command
+    /// unknown, rather than being silently dropped from an otherwise-populated
+    /// set. `sudo -u bob git log` heads on `-u`: dropping it would mark only
+    /// `tee` and leave `git` unmarked.
+    #[test]
+    fn test_command_heads_unknown_when_a_head_is_unrepresentable() {
+        assert!(command_heads("sudo -u bob git log | tee out.txt").is_empty());
+    }
+
+    /// **Empty means "unknown", never "none".** A capture shape hides a whole
+    /// command inside one whitespace token, so `tokens_head` would confidently
+    /// return the wrong name (`out=$(git log)` tokenises to `out=$(git`, `log`).
+    /// Reporting an empty set routes these to the wildcard marker instead.
+    #[test]
+    fn test_command_heads_refuses_to_guess_on_capture_shapes() {
+        assert!(command_heads("out=$(git log -n 5)").is_empty());
+        assert!(command_heads("echo `git log -n 5`").is_empty());
+        assert!(command_heads("diff <(git log) <(git log -n 1)").is_empty());
+        assert!(command_heads("tee >(gzip > out.gz)").is_empty());
+    }
+
+    /// `${VAR}` is parameter expansion, not capture: it must NOT arm rule S
+    /// (asserted in `test_needs_exact_bytes_capture_and_process_substitution`).
+    /// Head extraction is separately unknown for it, because `split_compound`
+    /// bails on `${` for tokenisation safety — so the two answers are
+    /// "not byte-exact" and "tools unknown", which together mean *no* marker.
+    ///
+    /// Pinned because the two predicates arrive at "unknown" by different
+    /// routes, and a future change to either must not silently make this
+    /// command start writing a wildcard marker.
+    #[test]
+    fn test_command_heads_unknown_for_parameter_expansion() {
+        assert!(!command_needs_exact_bytes("git log -n ${N}"));
+        assert!(command_heads("git log -n ${N}").is_empty());
+    }
+
+    /// **The invariant that keeps the narrowing lossless in the byte direction.**
+    ///
+    /// For every shape `command_needs_exact_bytes` accepts, the tool that
+    /// actually produces the captured stdout must end up covered: either the
+    /// head list names it, or the list is empty and the wildcard covers
+    /// everything. A command that is byte-exact but whose producer is missing
+    /// from a *non-empty* list would compress into a file — the exact loss this
+    /// marker exists to prevent.
+    #[test]
+    fn test_byte_exact_producer_is_always_covered() {
+        let cases = [
+            ("git log -n 5 | tee out.txt", "git"),
+            ("git log | sha256sum", "git"),
+            ("git log -n 5 > out.txt", "git"),
+            ("git log -n 5 >> out.txt", "git"),
+            ("git log -n 5 2>f >&2", "git"),
+            ("git log | gzip > out.gz", "git"),
+            ("git log -n 5 > myfifo", "git"),
+            ("out=$(git log -n 5)", "git"),
+            ("echo `git log -n 5`", "git"),
+            ("diff <(git log) <(git log -n 1)", "diff"),
+            ("timeout 60 git log | tee out.txt", "git"),
+            ("env GIT_PAGER=cat git log > out.txt", "git"),
+            ("sudo -u bob git log | tee out.txt", "git"),
+            ("cargo test && git log | tee out.txt", "git"),
+        ];
+        for (cmd, producer) in cases {
+            assert!(
+                command_needs_exact_bytes(cmd),
+                "precondition: `{cmd}` must be byte-exact"
+            );
+            let heads = command_heads(cmd);
+            assert!(
+                heads.is_empty() || heads.iter().any(|h| h == producer),
+                "`{cmd}`: producer `{producer}` is not covered by {heads:?} — \
+                 a non-empty list that omits the producer leaves it unmarked"
+            );
+        }
     }
 
     /// #322: a recognized redirect token sitting *inside* quoted text becomes a

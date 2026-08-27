@@ -423,6 +423,11 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // told apart. `set_force_raw` is called unconditionally with the verdict, so
     // a `false` CLEARS any previous marker and it never outlives one command.
     //
+    // The verdict is scoped to `command_heads` — the tools this command names —
+    // because PPID alone is not a command identity: every command an agent runs
+    // shares it, so an unscoped marker lets one command's verdict decide an
+    // unrelated concurrent or nested one's. See `set_force_raw`.
+    //
     // Placed before every early return below (already-skim, corrupt-bail,
     // indefinite) so the clear always happens: a marker that outlived its
     // command would silently disable compression for the next one.
@@ -434,6 +439,7 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     if let Some(dir) = crate::cmd::resolve_cache_dir() {
         crate::cmd::session_sidecar::set_force_raw(
             super::compound::command_needs_exact_bytes(&command),
+            &super::compound::command_heads(&command),
             &dir,
         );
     }

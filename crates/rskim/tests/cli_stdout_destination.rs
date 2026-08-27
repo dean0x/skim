@@ -872,6 +872,77 @@ mod destination {
     }
 
     // ========================================================================
+    // The marker's scope: PPID is not a command identity
+    // ========================================================================
+
+    /// **A marker set for one command must not decide an unrelated one.**
+    ///
+    /// The marker is keyed by a PID in the wrapper's *ancestry*, and every
+    /// command an agent runs shares that ancestor. So a wrapper invocation the
+    /// hook never saw — inside a shell script, a `&` background job, a
+    /// `Makefile` recipe, or a nested sub-agent that bypasses PreToolUse hooks
+    /// (which is exactly why `--wrappers` exists) — walks up into the marker a
+    /// *previous, different* command left behind.
+    ///
+    /// Here the hook only ever sees `cargo build | tee f`. The `git log | cat`
+    /// below is a different command, and `| cat` is the shape whose compression
+    /// is skim's core value. Before the marker was scoped to the command's own
+    /// heads this served raw.
+    ///
+    /// Failure direction is compression, not bytes — but it is a real
+    /// production exposure, not a test-parallelism artifact.
+    #[test]
+    fn marker_does_not_leak_to_an_unrelated_tool() {
+        let sb = Sandbox::new();
+        let tee_file = sb.out("other-command.txt");
+
+        // The only command the hook sees. It is byte-exact, and it does not
+        // name `git`.
+        sb.fire_hook(&format!("cargo build | tee {}", tee_file.display()));
+
+        // A different command, never seen by the hook, sharing an ancestor PID.
+        let out = sb
+            .wrapped_sh("git log -n 5 | cat")
+            .output()
+            .expect("run | cat");
+
+        assert_eq!(
+            classify(&out.stdout),
+            Served::Compressed,
+            "`git log | cat` must compress: the live marker belongs to \
+             `cargo build | tee f`, a different command"
+        );
+    }
+
+    /// **An unrelated command's hook must not delete a live marker.**
+    ///
+    /// Models two Bash tool calls in one agent turn: both hooks fire against the
+    /// same agent PID before either command execs. With a PPID-only key the
+    /// second hook cleared the first's marker, and the `tee` captured compressed
+    /// bytes — a byte-fidelity loss (#317), the direction that actually costs
+    /// the user data.
+    #[test]
+    fn concurrent_command_hook_does_not_clear_a_live_marker() {
+        let sb = Sandbox::new();
+        let tee_file = sb.out("concurrent-tee.txt");
+        let script = format!("git log -n 5 | tee {}", tee_file.display());
+
+        // Call 1's hook sets the marker …
+        sb.fire_hook(&script);
+        // … call 2's hook fires before call 1's shell execs `git`.
+        sb.fire_hook("cargo build");
+
+        sb.wrapped_sh(&script).output().expect("run | tee");
+
+        assert_eq!(
+            classify(&std::fs::read(&tee_file).expect("tee output file")),
+            Served::Raw,
+            "an unrelated concurrent command must not clear this command's \
+             marker — the tee would capture compressed bytes"
+        );
+    }
+
+    // ========================================================================
     // Regression pins
     // ========================================================================
 
