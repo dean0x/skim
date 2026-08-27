@@ -1,7 +1,7 @@
 ---
 feature: file-wrapper-fidelity
 name: File-Wrapper Output Fidelity (grep/rg/diff/status/log passthrough & budgets)
-description: "Use when adding or modifying file/git command wrappers, debugging byte-fidelity issues, changing passthrough logic, working on the diff hunk-budget parser, modifying git status flag-stripping or AheadBehind rendering, adjusting memory caps on git log output, touching the skip_ansi_strip flag, working on the ANSI strip scanner, or modifying git-diff AST breadcrumb source resolution. Keywords: RawPassthrough, skip_ansi_strip, strip_escape_sequences, MAX_SEQ_SCAN, hunk budget, AheadBehind, elision marker, passthrough_parse, run_stdout_degrade, CONFLICTING_SHORT_OPTS, net-savings guard, source_matches_diff, is_show, get_file_source."
+description: "Use when adding or modifying file/git command wrappers, debugging byte-fidelity issues, changing passthrough logic, working on the fidelity gate (fidelity.rs::decide), modifying git status flag-stripping or AheadBehind rendering, adjusting memory caps on git log output, touching the skip_ansi_strip flag, working on the ANSI strip scanner, modifying git-diff AST breadcrumb source resolution, adding a raw_override field, changing the lossy-view marker, or working on the SKIM_PASSTHROUGH convergence gate. Keywords: RawPassthrough, skip_ansi_strip, strip_escape_sequences, MAX_SEQ_SCAN, AheadBehind, elision marker, passthrough_parse, run_stdout_degrade, CONFLICTING_SHORT_OPTS, net-savings guard, source_matches_diff, is_show, get_file_source, fidelity.rs, decide(), raw_override, never_passthrough, lossy_view_marker, emit_source_line, verify_ast_render, EmittedCursor, stream_passthrough_raw, command_needs_exact_bytes."
 category: component-patterns
 directories:
   - crates/rskim/src/cmd/file
@@ -9,213 +9,233 @@ directories:
   - crates/rskim/src/output
   - crates/rskim/src/runner.rs
 created: 2026-07-25
-updated: 2026-08-12
+updated: 2026-08-27
 ---
 
 # File-Wrapper Output Fidelity
 
 ## Overview
 
-This feature area covers the end-to-end fidelity contract for skim's file and git command wrappers: grep, rg, diff, git status, git log, and git show. The #317 invariant — "never show less than raw" — is enforced at three distinct points: the `ParseResult::RawPassthrough` variant (byte-faithful zero-clone passthrough), the `skip_ansi_strip` flag (opt-out of the ANSI strip step), and the net-savings guard in `execution.rs`.
+This feature area covers the end-to-end fidelity contract for skim's file and git command wrappers: grep, rg, diff, git status, git log, and git show. The #317 invariant — "never show less than raw" — is enforced through three coordinated mechanisms: the `ParseResult::RawPassthrough` variant (byte-faithful zero-clone passthrough), the `skip_ansi_strip` flag (opt-out of the ANSI strip step), and the unified fidelity gate in `output/fidelity.rs`.
 
-The wrappers share a three-tier degradation pipeline (`Full → Degraded → Passthrough`) mediated by `run_parsed_command_with_mode` in `execution.rs`. Several subsystems within this area have non-obvious invariants — the `@@`-budget authority in the diff hunk parser, the closed `CONFLICTING_SHORT_OPTS` set for git status, the three-state `AheadBehind` enum, the unconditional elision marker on the 64 MiB log ceiling, and the explicit `is_show` flag for git-diff AST breadcrumb source resolution — that must be preserved across changes.
+Post-branch, the guard architecture is consolidated. A single `decide()` function in `crates/rskim/src/output/fidelity.rs` replaces two diverging sites that had different tie semantics and a 256-byte floor exemption. `SKIM_PASSTHROUGH=1` is now honored at the `cmd/dispatch.rs` convergence point rather than ~8 scattered per-handler sites, with a filter-vs-wrapper role distinction that prevents the escape hatch from discarding piped input. Standalone `diff` was reclassified as pure passthrough (PF-011) — its hunk-budget parser has been deleted.
 
 ## Core Responsibilities
 
 **These wrappers MUST:**
-- Emit exactly what the raw tool emits when compression produces no savings (net-savings guard)
+- Emit exactly what the raw tool emits when compression produces no net saving (`fidelity.rs::decide()` → Passthrough)
 - Preserve all bytes — including TABs and non-ESC C0 controls — in tools whose output reaches the reader unparsed (`skip_ansi_strip: true`)
 - Forward unexpected non-zero exit codes as raw passthrough before any parsing
-- Carry exact counts and `SKIM_PASSTHROUGH=1` in any elision marker (loss-bearing; unconditional)
-- Debug-gate no-loss fallback banners (ADR-011 distinction: banner vs. marker)
+- Carry exact counts and `SKIM_PASSTHROUGH=1` in any elision marker (loss-bearing; unconditional; ADR-011 class-1)
+- Debug-gate no-loss fallback banners (ADR-011 class-2 distinction: banner vs. marker)
+- Feed the guard baseline, raw-fallback emission, and `SKIM_PASSTHROUGH=1` path from the same `raw_override` field — not the injected command's output (PF-024)
 
 **These wrappers MUST NOT:**
 - Clone `CommandOutput::stdout` into a parse-result payload when `RawPassthrough` is the right signal
 - Silently render an ambiguous state as "in sync" (PF-008 fail-loud rule)
 - Impose a commit cap on git log output (ADR-010: removed entirely)
+- Allow the `SKIM_PASSTHROUGH=1` hatch to reach `env` (PF-012 security control; `never_passthrough: true`)
 
 ## Standard Patterns
 
+### Unified Fidelity Gate: `fidelity.rs::decide()`
+
+`output/fidelity.rs::decide(raw, compressed)` is the **single** L2 guard used by both:
+- **L2-A** (`output/guardrail.rs`): the file-transform path (`process.rs`)
+- **L2-B** (`cmd/execution.rs::savings_decision`): the command-handler path
+
+**Unified rule: Keep IFF compressed is strictly smaller than raw in BOTH bytes AND tokens. Tie (equal) → Passthrough.**
+
+Breaking changes from the prior split implementation:
+- **256-byte floor removed (A4)**: small inputs are no longer exempt. A 1-byte raw with a 100-byte compressed form now falls through to Passthrough rather than being silently kept.
+- **Tie semantics unified**: both sites now use the same `>=` early-exit (formerly L2-A used `<=` — tied bytes were Kept).
+- **L3 (`rskim-contract`) is deliberately unchanged**: it has per-unit byte-only gate, no tokeniser, no floor, and is tracked for migration separately (#325).
+
+The `gh` wrapper no longer has a wholesale exemption from the guard. The `env` wrapper's exemption is **kept** via `never_passthrough: true` on `ToolRunConfig` — a new field meaning "this handler implements a non-negotiable security property; the escape hatch must not bypass it."
+
+### `raw_override` — Consistent Baseline and Fallback Source
+
+**New `Option<String>` field on `ParsedCommandConfig`** that carries the output of the command *the user typed*, before skim injected any flag.
+
+Three consumers, all must agree:
+1. **Guard baseline**: `savings_decision` compares compressed against `raw_override` (not the injected command's output)
+2. **Raw-fallback emission**: `emit_raw_passthrough` emits `raw_override` when present
+3. **`SKIM_PASSTHROUGH=1` path**: streams `raw_override`, not the injected-flag output
+
+Without `raw_override`, all three consumers used the injected command's output — so the "escape hatch" emitted a different format than doing nothing (PF-024). The pattern generalizes what `git status` already did via `user_raw_override`; it is now armed unconditionally there and available to all handlers.
+
+### `SKIM_PASSTHROUGH=1` Convergence Gate
+
+Honored at `cmd/dispatch.rs::dispatch()` as a structural convergence point, replacing ~8 scattered per-handler sites that each re-implemented (and sometimes missed) the check.
+
+**The critical role distinction that makes this correct:**
+- **Wrapper role** (`skim git log -n 3`): skim runs the tool. The gate fires → exec the real binary with the user's literal argv.
+- **Filter role** (`cat out.log | skim cypress run`): the caller already ran the tool and piped its output in for compression. The gate must NOT fire, or it discards the caller's piped payload.
+
+The gate fires iff: `is_passthrough_mode() && !is_meta_subcommand && subcommand != "env" && !handler_reads_stdin(...)`.
+
+**`MULTI_LEVEL_DISPATCHERS` and `HANDLER_CONSUMED_TOKENS`** handle two special cases: `cargo`, `dotnet`, `go`, and `swift` dispatch internally and are modelled in `MULTI_LEVEL_DISPATCHERS`; `cypress` and `playwright` consume their action token inside the handler, so `("cypress", "run")` etc. appear in `HANDLER_CONSUMED_TOKENS` so the dispatcher knows the full command string.
+
+### Lossy-View Marker: `lossy_view_marker` and `multi_file_lossy_marker`
+
+Renamed and generalized from `rewrite_transparency_marker`. Key changes:
+- **Fires when the served view differs from baseline** — no longer requires `SKIM_REWRITTEN_FROM`, no longer gated on non-zero exit
+- **`origin` parameter is `Option<&str>`**: `None` means direct invocation; `Some("cat")` means hook-rewrite origin
+- **`mode_class_label(mode_str)`** names the elided class (e.g., "structural view", "pseudo view") in the marker text
+- **Returns `None` when `differing == 0`** — byte-identical view fires no marker (correct: a lossless passthrough is an ADR-011 class-2 banner, not a class-1 marker)
+
+`rewrite_transparency_marker` is now a deprecated compatibility alias that delegates to `lossy_view_marker`. ADR-011 class-1 → unconditional.
+
+**Trap to avoid:** an early implementation fired the marker on lossless passthrough paths too (when compressed == raw → guard chose passthrough → marker fired incorrectly). That is an ADR-011 class-2 banner and must be `SKIM_DEBUG`-gated. The correct trigger is "view differs from raw baseline", not "guard chose passthrough."
+
 ### ParseResult::RawPassthrough — Zero-Clone Passthrough
 
-`RawPassthrough` is a payload-less enum variant that signals `execution.rs` to serve `CommandOutput::stdout` directly, bypassing the parse-result payload round-trip. Used by grep and rg, which have no compression opportunity.
+`RawPassthrough` is a payload-less enum variant that signals `execution.rs` to serve `CommandOutput::stdout` directly, bypassing the parse-result payload round-trip. Used by grep, rg, diff, and all `run_passthrough_tool` entries.
 
-The shared implementation for all pure-passthrough handlers lives in `cmd/file/mod.rs`:
+The shared implementation lives in `cmd/file/mod.rs`:
 
 ```rust
 // cmd/file/mod.rs — single implementation of the byte-faithful contract (ADR-009)
-// Both grep.rs and rg.rs delegate to this function so a future fidelity fix
-// lands in one place.
 pub(super) fn passthrough_parse(_output: &CommandOutput) -> ParseResult<FileResult> {
     ParseResult::RawPassthrough
-    // Note: _output is intentionally ignored — RawPassthrough carries no payload.
+    // _output intentionally ignored — RawPassthrough carries no payload.
 }
 ```
 
-Key behavioral invariants for `RawPassthrough` (all verified in `output/mod.rs`):
+Key invariants:
 - `content()` returns `""` — never call it expecting actual bytes
-- `tier_name()` returns `"passthrough"` — this suppresses the compressed-output hint
-- `to_json_envelope()` contains `unreachable!()` — execution.rs handles it before reaching `serialize_output`; correct callers never reach that arm
+- `tier_name()` returns `"passthrough"` — suppresses the compressed-output hint
+- `to_json_envelope()` contains `unreachable!()` — execution.rs handles it before `serialize_output`
 
-**`ParseResult::RawPassthrough` vs `ParseResult::Passthrough(String)` — two different tiers by design:**
-`RawPassthrough` has no payload; its bytes bypass the parser and are served from `CommandOutput::stdout` directly. `Passthrough(String)` is parser-constructed and carries the string payload. Callers that call `content()` on a `RawPassthrough` result get `""` — the bytes live elsewhere. This distinction is easy to confuse and must be respected when adding new passthrough handlers (issue #464, investigated and closed invalid).
+**`ParseResult::RawPassthrough` vs `ParseResult::Passthrough(String)`:** `RawPassthrough` has no payload; bytes bypass the parser. `Passthrough(String)` is parser-constructed and carries a string payload. Callers that call `content()` on `RawPassthrough` get `""`.
 
-### skip_ansi_strip: true — Mandatory for RawPassthrough and Content-Bearing Wrappers
+### skip_ansi_strip: true — Mandatory for RawPassthrough
 
-The ANSI strip step in `execution.rs` runs **before** `parse()` and **shadows the `output` binding** — `RawPassthrough` does NOT bypass it. The stripped bytes are what both the parser and the passthrough path serve to the reader.
+The ANSI strip step in `execution.rs` runs **before** `parse()` and **shadows the `output` binding** — `RawPassthrough` does NOT bypass it. `strip_ansi_escapes` has been removed from the workspace entirely; the replacement `strip_escape_sequences` (private to `output/mod.rs`) is ESC-scoped only and preserves TABs and all non-ESC C0 controls (PF-006).
 
-**The current scanner (`strip_escape_sequences`, replacing the former `strip_ansi_escapes::strip_str`):**
+Any wrapper whose bytes reach the reader unparsed MUST set `skip_ansi_strip: true`. A `debug_assert!` in `execution.rs` fires whenever `parse()` returns `RawPassthrough` while `skip_ansi_strip` is `false`.
 
-`strip_ansi_escapes::strip_str` was removed from the workspace entirely (issue #465). It used a vte state machine that discarded ALL C0 control bytes — including TABs (`\t`, `0x09`) — whenever any ESC byte was present in the buffer. One colorized filename would silently destroy POSIX tab separators on every other line.
+### Standalone `diff` — Pure Passthrough (PF-011)
 
-The replacement `strip_escape_sequences` (private to `output/mod.rs`) is ESC-scoped only:
-- Removes only ESC-rooted sequences: CSI (`ESC [`), OSC (`ESC ]`), and 2-byte (`ESC x`)
-- TABs, newlines, and all non-ESC C0 controls are **preserved**
-- Bounded by `MAX_SEQ_SCAN = 2048` bytes per sequence body: on overrun, or when a non-CSI/OSC byte is encountered inside a sequence body (e.g. a newline), the consumed bytes are emitted **literally** — never silently dropped (#317)
-- `strip_ansi_cow(input)` preserves the `Cow::Borrowed` fast path: when no `\x1b` byte is present (the common case), the entire buffer is returned as-is without allocation
+`skim diff` is now byte-identical to native `diff` across all 18 flag forms and under `SKIM_PASSTHROUGH=1`. The hunk-budget parser (`try_parse_standalone_unified`, `DiffParserState`, `parse_hunk_counts`, `build_file_result`) has been **deleted** from `diff.rs`.
 
-**Historical root cause worth preserving:** The old `strip_ansi_cow()` had the same `Cow::Borrowed` no-ESC fast path — but any ESC byte anywhere caused `Cow::Owned` via `strip_ansi_escapes::strip_str`, which then destroyed ALL C0 controls from the entire buffer. So the fast path only skipped the allocation; a single coloured cell destroyed tabs on every other line in the buffer.
+**Measurement basis (52 controlled cases + 10 real file pairs):** no region of the space where skim's former `diff` compression beat native `diff`. Every sub-1.0× ratio came from the fidelity guard falling back to raw — the win belonged to unified encoding, not skim. The "compression" was header-collapse worth exactly 1 byte per path character (content-independent), while `FileResult::render` added one leading space per patch line. The worst region was scattered single-line changes — 5.02× worse than native at n=5000.
 
-**Two wrapper classes that still require `skip_ansi_strip: true`:**
+`git diff` is explicitly NOT in this class: it is natively unified, injects only `--no-color`, and genuinely compresses (0.64×–0.94× on single-file Rust diffs). PF-011 applies only to standalone `diff`.
 
-1. **RawPassthrough wrappers (grep, rg, and all `run_passthrough_tool` entries):** bytes in `output.stdout` are served directly to the reader after the strip step; any stripping — even ESC-sequence-only stripping — removes content the reader expects intact (PF-006). The `passthrough_config()` factory in `cmd/file/mod.rs` bakes `skip_ansi_strip: true` for the entire family.
+### Git-diff AST Render: `emit_source_line` and `verify_ast_render`
 
-2. **Content-bearing wrappers (ADR-012):** wrappers whose tool output may contain ANSI/ESC bytes that are literal file content (not UI coloring) must also set `skip_ansi_strip: true` to reach the reader byte-faithfully.
+**Critical Invariant 1 (reintroducing this is a known bug):** `emit_source_line` is the **only valid emission path** in `render.rs`. Every source-derived line must route through it. The function consults the `EmittedCursor` (preventing duplicate emissions) and stamps the diff's `Marker` (preventing added-as-context corruption).
 
-A cross-family `debug_assert!` in `execution.rs` fires whenever `parse()` returns `RawPassthrough` while `skip_ansi_strip` is `false` — catching any future hand-rolled `ToolRunConfig` literal that bypasses `passthrough_config`. Uses `debug_assert` (not `assert`) so a misconfigured wrapper fails the test suite without aborting a live command.
+A direct `writeln!(output, " {:>ln_width$} {line}")` reintroduces **two** bugs simultaneously:
+1. A duplicate line (the cursor was not consulted)
+2. An added (`+`) line rendered as unchanged context (the marker was not recorded)
 
-**Exception — tree:** `CONFIG_TREE.skip_ansi_strip` stays `false` because tree genuinely parses its output via `RE_TREE_ENTRY`, which matches box-drawing characters at line-start. An ANSI prefix ahead of a box-drawing character would break the regex. This is a deliberate asymmetry with the ls passthrough arm (in the same `ls.rs` file), which returns `RawPassthrough` and therefore requires `skip_ansi_strip: true`. A unit test in `ls.rs` pins `CONFIG_TREE.skip_ansi_strip == false` to make the asymmetry visible.
+**`verify_ast_render` now guards every mode** (previously Default only). It runs after both the `DiffMode::Default` scoped-render and the `DiffMode::Structure`/`DiffMode::Full` `render_with_unchanged_context` paths, at the single post-render call site in `render_diff_file`. **Four checks:**
+
+1. **Per-axis uniqueness**: no line number emitted twice on the same axis
+2. **New-axis monotonicity**: new-side line numbers don't go backward
+3. **`+`/`-` coverage**: every hunk's added/removed lines reached the reader
+4. **Marker fidelity (C1d — the critical one)**: each emitted line number's marker matches what the diff says. An added-as-context corruption emits the correct *number* with the wrong *prefix*, so uniqueness, monotonicity, and coverage all pass while the render lies. Only marker fidelity catches it.
+
+Rejection → `render_raw_hunks` (no-loss path) → ADR-011 class-2 banner, `SKIM_DEBUG`-gated.
+
+The ADR-001 size guard is **structurally blind** to content-substitution: a corrupt render that replaces real context lines with shorter wrong lines is often smaller than raw, so being wrong makes it pass a byte-count guard.
 
 ### Git-diff AST Breadcrumb Source Validation
 
-The diff pipeline builds AST breadcrumbs by parsing the file at the relevant revision. Before this branch, `get_file_source` read the **working-tree file from disk** whenever argv had no `..`/`...` range — which is wrong for `git show <sha>` (whose hunk line numbers come from the blob at `<sha>`, not from the working tree) and for `git diff A B` (whose new-side lines come from `B`, not disk).
+`get_file_source` accepts an explicit `is_show: bool` parameter passed by the caller (`cmd/git/show.rs`). It never re-sniffs argv to infer the invocation context — doing so recreated the exact class of bug the design addresses (#467).
 
-**The fix has two parts:**
-
-**1. Explicit `is_show` parameter:**
-`render_diff_file` and `try_ast_render` accept an `is_show: bool` parameter passed **explicitly by the caller** (`cmd/git/show.rs`). `get_file_source` never re-sniffs argv to infer the invocation context — doing so recreated the exact class of bug the design addresses (#467). When `is_show` is true, `get_file_source` calls `git show <ref>:<path>` using the ref extracted by `extract_show_ref`.
-
-**2. `source_matches_diff` validation:**
-Before building AST breadcrumbs, `render.rs` calls `source_matches_diff(source_lines, hunks)` which verifies every context (`' '`) and added (`+`) hunk line against `source_lines[new_line - 1]`. A single mismatch returns `None` → the caller falls back to `render_raw_hunks` with a `debug_log!`-gated notice (ADR-011: no-loss fallback, debug-gated). This backstop catches any residual source/diff revision mismatch, including the `git diff HEAD path.ts` pathspec trap.
-
-**Pathspec trap (`git diff HEAD path.ts`):**
-`git diff HEAD src/foo.ts` — a ref plus a `--`-less pathspec — looks identical to `git diff A B` (two refs) at the positional-argument level. `positional_refs()` in `source.rs` treats both as two positional refs. The resolution: attempt `git show src/foo.ts:src/foo.ts` — it fails because `src/foo.ts` is not a valid revision — then fall back to the working-tree read. This fallback is safe **only because** `source_matches_diff` independently rejects a mismatched source and routes to raw hunks.
-
-**ADR-001 net-savings guard architectural blindspot:**
-The ADR-001 net-savings guard measures compressed vs. raw bytes. It is structurally incapable of catching content-substitution corruption: wrong AST breadcrumbs that drop real context lines in favour of shorter summary lines pass the guard precisely because being wrong makes the output smaller. A byte-count guard can only detect when compression inflates output; it cannot detect when compression replaces content with shorter wrong content.
-
-### diff.rs Hunk-Budget Parser
-
-`try_parse_standalone_unified` is a stateful line-by-line parser. The `@@` hunk header is the sole authority on how many lines belong to the hunk body.
-
-Critical invariants (all enforced in `diff.rs`):
-
-**1. In-hunk guard is unconditional.** While `state.in_hunk == true`, every line is body content — regardless of prefix. A deleted SQL comment emitted by diff as `--- some comment` would otherwise match the `--- ` file-header check, trigger a false flush, fabricate a phantom path, and silently drop hunk content.
-
-**2. An empty line inside an open hunk consumes both budgets.** The parser handles `None` (empty line) identically to `' '` (context line): both decrement `hunk_old_remaining` and `hunk_new_remaining`.
-
-**3. `shown_count == entries.len()` contract.** `build_file_result` passes `entries.len()` as `shown_entry_count` to `FileResult::new`. The `total_entry_count` uses `patch_line_count` (not `patch_lines.len()`) because files past the display cap have `patch_lines` cleared while `patch_line_count` stays accurate.
-
-**4. Elision marker travels in the footer, not as an entry.** The `footer` parameter to `FileResult::new` carries the marker.
-
-**5. Hand-written fixtures MUST have hunk headers matching body counts.** A fixture with `@@ -1,3 +1,2 @@` followed by 2 lines triggers early `in_hunk=false`, leaving one expected line unaccounted.
+`source_matches_diff(source_lines, hunks)` validates every context and added hunk line against `source_lines[new_line - 1]`. A single mismatch → `None` → caller falls back to `render_raw_hunks` with a `debug_log!`-gated banner (ADR-011 class-2).
 
 ### git status: CONFLICTING_SHORT_OPTS and AheadBehind
 
-**Closed set of conflicting short options:**
+Conflicting flags stripped before forwarding: `CONFLICTING_SHORT_OPTS = &['s', 'z']`. The scan stops at `--`.
 
-```rust
-// status.rs — the ONLY chars that conflict with --porcelain=v2
-const CONFLICTING_SHORT_OPTS: &[char] = &['s', 'z'];
-// 's' = short format (overrides porcelain)
-// 'z' = NUL-termination (corrupts output.lines() line-based parse)
-```
-
-Conflicting flags are stripped before forwarding to git, with partial cluster rewriting. The scan stops at `--` — pathspecs after the terminator are not flags.
-
-**AheadBehind three-state model** (never silently renders as in-sync):
-
-```rust
-enum AheadBehind {
-    Absent,            // No # branch.ab line → remote ref gone → renders "[gone]"
-    Counts { ahead: u64, behind: u64 },  // Parsed → renders [ahead N] / [behind N] / both / nothing
-    Malformed(String), // Parse failed → raw payload in brackets (PF-008 fail-loud)
-}
-```
-
-The `Absent` vs. `Counts(0, 0)` distinction is essential: when a remote ref is deleted, git omits the `# branch.ab` line entirely. Treating that as `(0, 0)` would falsely imply in-sync.
+`AheadBehind` three-state model: `Absent` (no `# branch.ab` line → renders `[gone]`), `Counts { ahead, behind }`, `Malformed(String)` (PF-008 fail-loud). `Absent` vs. `Counts(0, 0)` distinction is essential.
 
 ### git log: run_stdout_degrade + Unconditional Elision Marker
 
-git log uses `runner.run_stdout_degrade()` instead of `runner.run()`. This reads stdout into a 64 MiB (`MAX_OUTPUT_BYTES`) ceiling via `read_pipe_degrade`, returning `(CommandOutput, stdout_truncated: bool)`.
-
-When truncated, the partial output is kept and an **unconditional elision marker** is appended (loss-bearing per ADR-011). There is no commit count cap (ADR-010 removed the former silent 20-commit cap). When the net-savings guard falls back to raw even after truncation, the elision marker is still emitted.
+Uses `runner.run_stdout_degrade()` with a 64 MiB (`MAX_OUTPUT_BYTES`) ceiling. When truncated, an **unconditional elision marker** is appended (ADR-011 class-1). No commit count cap (ADR-010).
 
 ## Error Handling
 
-**Unexpected exit codes forward raw, before ANSI stripping.** `execution.rs` checks `classify_exit(output.exit_code, expected_exit_codes)` before the ANSI strip step. An `UnexpectedFailure` result calls `passthrough_raw(&output)` and returns immediately.
-
-**Signal kill (exit_code: None) is always `UnexpectedFailure`.** This must be classified on the raw `Option<i32>` before any `unwrap_or` default.
-
-**No-loss fallback banners are debug-gated (ADR-011).** When the net-savings guard falls back to raw because compressed >= raw, `execution.rs` emits no stderr notice by default. Only real elision (showing less than raw) gets an unconditional marker with `SKIM_PASSTHROUGH=1`.
+Unexpected exit codes forward raw before ANSI stripping. Signal kill (`exit_code: None`) is always `UnexpectedFailure`. No-loss fallback banners are debug-gated (ADR-011 class-2).
 
 ## Anti-Patterns
 
-**Returning `Passthrough(output.stdout.clone())` from a pure-passthrough handler.** This clones the entire stdout buffer into the parse result only to have `serialize_output` read it back immediately. Use `RawPassthrough` instead — `passthrough_parse` is the shared implementation.
+**Adding a direct `writeln!` into `render.rs` instead of routing through `emit_source_line`.** This is two bugs at once: the `EmittedCursor` is not consulted (duplicate line) and the `Marker` is not stamped (added-as-context corruption). `verify_ast_render` catches the marker mismatch — but the fallback to raw hunks means the user loses AST context without warning.
 
-**Setting `skip_ansi_strip: false` for any wrapper that returns `RawPassthrough` or handles content-bearing bytes.** Even though the new `strip_escape_sequences` scanner preserves TABs, it still removes ESC sequences that may be legitimate content bytes. The correct rule: any wrapper whose bytes reach the reader unparsed MUST set `skip_ansi_strip: true` (PF-006, ADR-012).
+**Assuming the ADR-001 net-savings guard catches content corruption.** The guard measures compressed bytes vs. raw bytes. Wrong breadcrumbs that are shorter than raw pass the guard. Only `verify_ast_render` (content equality) catches this class.
 
-**Treating `AheadBehind::Absent` as `Counts(0, 0)`.** Absent means the remote ref is gone — rendering it as in-sync silently drops the `[gone]` signal that mirrors `git status -sb`.
+**Returning `Passthrough(output.stdout.clone())` from a pure-passthrough handler.** Use `RawPassthrough` instead — `passthrough_parse` is the shared implementation.
+
+**Setting `skip_ansi_strip: false` for any wrapper returning `RawPassthrough`.** Even the ESC-scoped scanner removes ESC sequences that may be legitimate content bytes (PF-006, ADR-012).
+
+**Treating `AheadBehind::Absent` as `Counts(0, 0)`.** Absent means the remote ref is gone.
 
 **Adding a commit cap to git log.** ADR-010 forbids this.
 
-**Calling `content()` on a `RawPassthrough` result and using the empty string as actual output.** `content()` returns `""` for this variant by design — the bytes live in `CommandOutput::stdout`.
+**Placing a security control (redaction, sanitization) inside only one branch of the fidelity guard.** The guard may choose the other branch; every non-negotiable property must hold before or independently of the guard (PF-012). `env`'s `never_passthrough: true` and its exclusion from the B1 convergence gate are two independent layers.
 
-**Re-sniffing argv inside `get_file_source` to infer `is_show`.** The `is_show` parameter must be passed explicitly by the caller. Inferring it from argv recreates the bug that `source_matches_diff` guards against — and the guard is a backstop, not a license to introduce known-wrong sources (#467).
+**Sizing a test fixture until the guard agrees instead of fixing the behavior.** `decide()` grades on output SIZE — fixture size is a free parameter that flips the guard verdict without touching behavior (PF-027). Always verify by diffing stdout bytes, not by confirming the test is green.
 
-**Assuming the ADR-001 net-savings guard catches content corruption.** The guard measures compressed bytes vs. raw bytes. Wrong breadcrumbs that replace real context lines with shorter wrong lines pass the guard by making the output smaller. Only a content-equality check (`source_matches_diff`) can catch this class of bug.
+**Firing `lossy_view_marker` on lossless passthrough paths.** If the view is byte-identical to raw, the marker must not fire. A no-loss raw-fallback notice is ADR-011 class-2 and must be `SKIM_DEBUG`-gated.
+
+**Re-sniffing argv inside `get_file_source` to infer `is_show`.** The parameter must be passed explicitly by the caller.
 
 ## Gotchas
 
-**`to_json_envelope()` panics on `RawPassthrough` at runtime.** The `unreachable!()` is intentional and enforces that execution.rs handles this variant before `serialize_output`.
+**`verify_ast_render` runs for ALL modes now (C1e), not just Default.** Prior to this branch, `--mode structure` and `--mode full` kept the old `EmittedCursor` path and were never measured — they shipped duplicate lines and added-as-context renders in ~27% of the files they AST-rendered, all of which passed ADR-001. Mode is a correctness boundary in this codebase, not a presentation flag (PF-019 generalization).
 
-**The net-savings guard baseline for git status substitutions.** When the user supplies a format-substituting flag like `--short` or `-s`, skim replaces it with `--porcelain=v2 --branch`. The guard compares compressed output against what the user's literal command would have produced (`user_raw_override`), not against the porcelain output.
+**`to_json_envelope()` panics on `RawPassthrough` at runtime.** The `unreachable!()` is intentional.
 
-**diff.rs `---` header parsing only runs outside a hunk.** A hunk body can contain lines starting with `---` (deleted comments, SQL code). The outer `if state.in_hunk { ... continue; }` guard is the critical check.
+**Guard baseline for git status substitutions.** `raw_override` carries what the user's literal command would produce; the guard compares compressed against that — not against the porcelain output skim injected.
 
-**Empty-line hunk context (blank context line).** When `line.chars().next()` returns `None`, that's a blank context line consumed by both old and new budgets. Fixtures generated by removing trailing whitespace may silently change the budget accounting.
+**`SKIM_PASSTHROUGH=1` is a NO-OP in filter role.** If the caller piped output into skim for compression (`cat log | skim cypress run`), the B1 gate correctly skips exec because `handler_reads_stdin` returns true. Without this guard, the piped payload would be discarded.
 
-**`strip_ansi_cow` still allocates for ANY ESC byte.** Even with the fixed scanner that preserves TABs, if a buffer contains even one ESC byte, `strip_ansi_cow` returns `Cow::Owned` (the entire buffer is re-encoded). The fast path (`Cow::Borrowed`) only fires when no `\x1b` byte is present at all. This is correct behavior but means the "no allocation" guarantee requires a completely ESC-free buffer.
+**`strip_ansi_cow` still allocates for ANY ESC byte.** The "no allocation" guarantee requires a completely ESC-free buffer. One coloured cell anywhere allocates for the entire buffer.
 
-**`source_matches_diff` is a one-directional backstop.** It can only *reject* a source, never bless a wrong one. A false negative (rejecting a valid source, e.g. due to CRLF or trailing-whitespace differences) costs only the AST breadcrumbs — the caller falls back to raw hunks, which is always safe.
+**`source_matches_diff` is one-directional.** It can only reject a source, never bless a wrong one. A false negative (CRLF, trailing-whitespace differences) costs only AST breadcrumbs — raw hunks are always safe.
 
-**`git diff HEAD path.ts` pathspec trap.** `positional_refs()` cannot distinguish `git diff A B` (two revisions) from `git diff HEAD src/foo.ts` (revision + pathspec) — both appear as two positional args. The resolution is to attempt the blob fetch and fall back to the working-tree read when it fails. `source_matches_diff` then independently validates the fallback source.
+**`git diff HEAD path.ts` pathspec trap.** `positional_refs()` cannot distinguish `git diff A B` from `git diff HEAD src/foo.ts`. The resolution is to attempt the blob fetch and fall back to the working-tree read; `source_matches_diff` independently validates the fallback.
 
-**Guardrail banner testability for git show.** `git show HEAD:file` uses Pseudo mode, which can never inflate output — so the net-savings guard never fires for file-content mode. Tests for the guardrail banner must target commit mode (structure-mode reads).
-
-**analytics BPE short-circuit.** When compressed equals raw (passthrough tier), `execution.rs` passes the same string for both `original_stdout` and `compressed` to `try_record_command`. The analytics background thread detects this identical-input case and skips one BPE tokenization call.
+**`analytics BPE short-circuit.** When compressed equals raw (passthrough tier), `execution.rs` passes the same string for both sides to `try_record_command`, which skips one BPE tokenization call.
 
 ## Key Files
 
-- `crates/rskim/src/output/mod.rs` — `ParseResult` enum; `content()`, `tier_name()`, `to_json_envelope()` with `unreachable!()` arm; `strip_ansi()`, `strip_ansi_cow()`, `strip_escape_sequences()` (the new ESC-scoped scanner, `MAX_SEQ_SCAN=2048`); `elision_marker` / `elision_marker_unbounded`
-- `crates/rskim/src/cmd/execution.rs` — `run_parsed_command_with_mode`; `RawPassthrough` fast-path; ANSI strip step; `savings_decision`; `emit_raw_passthrough`; `debug_assert!` for RawPassthrough+skip_ansi_strip invariant
-- `crates/rskim/src/cmd/file/mod.rs` — `passthrough_parse` shared implementation; `MAX_DISPLAY_ENTRIES` / `MAX_INPUT_LINES`; `passthrough_config()` factory (bakes `skip_ansi_strip: true` for the whole passthrough family)
-- `crates/rskim/src/cmd/file/grep.rs` — reference implementation for `RawPassthrough` + `skip_ansi_strip: true` + `expected_exit_codes: &[1]`
-- `crates/rskim/src/cmd/file/rg.rs` — mirrors grep.rs exactly
-- `crates/rskim/src/cmd/file/diff.rs` — hunk-budget parser (`DiffParserState`, `parse_hunk_counts`, `try_parse_standalone_unified`); `build_file_result` / `shown_count == entries.len()` contract
-- `crates/rskim/src/cmd/git/diff/render.rs` — `render_diff_file` (accepts `is_show: bool`); `source_matches_diff` (validates source against hunk content before AST render); `render_raw_hunks` (safe fallback)
-- `crates/rskim/src/cmd/git/diff/source.rs` — `get_file_source` (explicit `is_show` flag, pathspec fallback, path-traversal guard); `extract_show_ref`; `positional_refs`; `VALUE_FLAGS`
-- `crates/rskim/src/cmd/git/show.rs` — caller that sets `is_show: true` before invoking `render_diff_file`
-- `crates/rskim/src/cmd/git/status.rs` — `CONFLICTING_SHORT_OPTS`; `strip_conflicting_short_chars`; `AheadBehind` enum; `parse_ahead_behind`
-- `crates/rskim/src/cmd/git/log.rs` — `run_stdout_degrade`; unconditional elision on truncation; `is_commit_line` for patch-body exclusion
+- `crates/rskim/src/output/fidelity.rs` — `decide()` (unified L2 gate); `FidelityDecision` enum; 256-byte floor removed (A4); Tie → Passthrough rule
+- `crates/rskim/src/output/mod.rs` — `ParseResult` enum; `strip_escape_sequences` (ESC-scoped, preserves TABs, `MAX_SEQ_SCAN=2048`); `lossy_view_marker`, `multi_file_lossy_marker`, `mode_class_label`; `elision_marker`
+- `crates/rskim/src/cmd/dispatch.rs` — `dispatch_for_wrapper()` (D3/D4 wrapper entry point); `dispatch()` (B1 SKIM_PASSTHROUGH convergence gate); `MULTI_LEVEL_DISPATCHERS`; `HANDLER_CONSUMED_TOKENS`
+- `crates/rskim/src/cmd/execution.rs` — `run_parsed_command_with_mode`; `RawPassthrough` fast-path; ANSI strip step; `savings_decision`; `emit_raw_passthrough`; `raw_override` consumers; `never_passthrough` gate
+- `crates/rskim/src/cmd/file/mod.rs` — `passthrough_parse` shared implementation; `passthrough_config()` factory
+- `crates/rskim/src/cmd/file/diff.rs` — pure passthrough (no parser); `CONFIG` with `skip_ansi_strip: true` and `expected_exit_codes: &[1]`
+- `crates/rskim/src/cmd/file/grep.rs` — reference RawPassthrough + `skip_ansi_strip: true` + `expected_exit_codes: &[1]`
+- `crates/rskim/src/cmd/file/env.rs` — `never_passthrough: true`; credential redaction before and independent of guard (PF-012)
+- `crates/rskim/src/cmd/git/diff/render.rs` — `emit_source_line` (single emission path with cursor + marker); `EmittedCursor`; `verify_ast_render` (4 checks, all modes); `render_raw_hunks` (safe fallback)
+- `crates/rskim/src/cmd/git/diff/source.rs` — `get_file_source` (explicit `is_show`, pathspec fallback); `extract_show_ref`; `positional_refs`
+- `crates/rskim/src/cmd/git/status.rs` — `CONFLICTING_SHORT_OPTS`; `AheadBehind` enum; `parse_ahead_behind`
+- `crates/rskim/src/cmd/git/log.rs` — `run_stdout_degrade`; unconditional elision on truncation
+- `crates/rskim/src/cmd/git/show.rs` — caller that sets `is_show: true`
+- `crates/rskim/src/main.rs` — `stdout_should_serve_raw()` using `isatty(1)`; `force_raw_requested()` reading session sidecar
+- `crates/rskim/src/cmd/session_sidecar.rs` — `set_force_raw`/`read_force_raw`; `{ppid}.{tool}.raw` key; wildcard fallback; 300 s reap clock
 - `crates/rskim/src/runner.rs` — `CommandRunner`; `MAX_OUTPUT_BYTES` (64 MiB); `read_pipe_degrade`; `run_stdout_degrade`
 
 ## Related
 
-- **ADR-009**: `skim grep` byte-faithful passthrough — native `path:line:content` format; no grouped 2-line-per-match envelope
-- **ADR-010**: git log commit cap removed entirely — no silent `-n 20` injection; no cap even for explicit rev-ranges
-- **ADR-011**: Elision markers (loss-bearing) are unconditional; raw-fallback banners (no-loss) are debug-gated (`crate::debug_log!`)
-- **ADR-002**: Count-cap oversized inputs degrade to lossless Passthrough; depth/size caps remain hard errors
-- **PF-006**: `strip_ansi_escapes` (removed) destroyed `\t` — root cause of the ANSI rewrite; the replacement `strip_escape_sequences` preserves all non-ESC bytes
-- **PF-008**: Short-flag cluster matching must use `CONFLICTING_SHORT_OPTS` char-set scan, not exact-token match; `AheadBehind::Malformed` for unparseable `# branch.ab` (never silent in-sync)
-- **PF-004**: Rewrite engine must bail on stdout-to-file redirects; wrapper surface uses `fstat` on fd 1 — two independent fidelity surfaces
+- **ADR-001**: Net-savings guard — byte comparison baseline, token fallback, cap strategy; the guard is blind to content-substitution corruption (only `verify_ast_render` catches that)
+- **ADR-003**: git diff guardrail; generalized 2026-08-27 — size guard is blind to duplication and reordering, not just omission
+- **ADR-009**: `skim grep` byte-faithful passthrough; native `path:line:content` format
+- **ADR-010**: git log commit cap removed
+- **ADR-011**: Elision markers (class-1, unconditional) vs. raw-fallback banners (class-2, `SKIM_DEBUG`-gated)
+- **ADR-012**: Content bytes never filtered; tool colorization neutralized at child invocation (`--no-color`)
+- **PF-004**: Two interception surfaces (rewrite engine vs PATH wrappers); `stdout_redirected_to_file` is rewrite-engine-only; wrapper uses `isatty(1)` + `fstat` on fd 1
+- **PF-006**: `strip_ansi_escapes` removed; `strip_escape_sequences` preserves TABs
+- **PF-008**: Short-flag cluster matching must use char-set scan; `AheadBehind::Malformed` for unparseable `# branch.ab`
+- **PF-011**: Thin wrappers over already-minimal tools are net-negative; standalone `diff` is the newest confirmed member
+- **PF-012**: Security controls must hold on both branches of the fidelity guard; `env` uses `never_passthrough: true`
+- **PF-021**: Streaming passthrough required; buffered passthrough loses output under early-closing readers
+- **PF-024**: Guard baseline and fallback must use the user's literal command output, not the injected-flag output; `raw_override` is the fix
+- **PF-025**: Proposed invariants must be tested against known-corrupt inputs; `verify_ast_render`'s four checks each required a failing case to be trusted
+- **PF-027**: Resizing fixtures until the guard agrees is a silent revert; always verify by diffing bytes
+- Feature: `hook-binary-pinning` — `dispatch_for_wrapper()` also gates `SKIM_PASSTHROUGH` at the wrapper entry (cross-reference for the D3/D4 architecture)
