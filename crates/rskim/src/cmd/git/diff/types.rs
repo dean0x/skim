@@ -103,18 +103,28 @@ pub(super) struct ParentContext {
     pub close_line: usize,
 }
 
-/// Shared context for mode-aware rendering functions.
+/// Shared context for mode-aware rendering DISPATCH.
 ///
-/// Groups the parameters that are threaded through the rendering call chain.
+/// Carries what deciding *how* to render a node needs: which ranges changed,
+/// the raw source (for structure mode's per-node transform) and the mode.
+/// The inputs an individual line EMISSION needs — hunks, source lines, the
+/// line-number column width and the hunk marker table — live in `EmitInputs`
+/// in `render.rs` instead, so that adding an emission input reaches every
+/// emission site at once rather than being threaded past some of them.
+///
 /// The tree-sitter `Parser` is passed separately as `&mut` (cannot be shared
 /// via an immutable context).
 pub(super) struct ModeRenderContext<'a> {
     pub changed_ranges: &'a [ChangedNodeRange],
-    pub hunks: &'a [DiffHunk<'a>],
-    pub source_lines: &'a [&'a str],
+    /// New-side line numbers touched by the diff, from `build_changed_lines`.
+    ///
+    /// `changed_ranges` records one entry per top-level node (or per direct
+    /// child of a container), so it cannot classify a node at any other depth.
+    /// Container MEMBERS live one level below that — a Rust `impl`'s methods are
+    /// children of its `declaration_list`, not of the `impl` itself — so they
+    /// are classified by line overlap against this set instead, which is the
+    /// same test `find_changed_node_ranges` applies at its own depth.
+    pub changed_lines: &'a std::collections::BTreeSet<usize>,
     pub source: &'a str,
     pub diff_mode: DiffMode,
-    /// Width for right-aligned line number column. Derived from the maximum
-    /// line number across all hunks so columns align across the whole file.
-    pub ln_width: usize,
 }
