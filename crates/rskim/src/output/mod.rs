@@ -677,27 +677,9 @@ pub(crate) fn lossy_view_marker(
     Some(marker)
 }
 
-/// Compatibility alias: `rewrite_transparency_marker` is superseded by
-/// `lossy_view_marker` (B3). Retained for any callers that have not been
-/// migrated yet; delegates with `origin = Some(origin_str)`.
-///
-/// DEPRECATED: use `lossy_view_marker(Some(origin), mode_str, differing, total)`.
-#[allow(dead_code)]
-pub(crate) fn rewrite_transparency_marker(
-    origin: &str,
-    mode_str: &str,
-    differing: usize,
-    total: usize,
-) -> Option<String> {
-    lossy_view_marker(Some(origin), mode_str, differing, total)
-}
-
 #[cfg(test)]
-mod rewrite_transparency_tests {
+mod lossy_view_marker_tests {
     use super::*;
-
-    // B3/B4: tests migrated to lossy_view_marker (the superseding function).
-    // The rewrite_transparency_marker compatibility alias delegates to it.
 
     #[test]
     fn test_lossy_view_marker_with_origin_single_file() {
