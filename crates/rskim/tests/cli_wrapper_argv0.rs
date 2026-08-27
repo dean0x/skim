@@ -405,7 +405,7 @@ mod argv0_dispatch {
     }
 
     /// D2b control: when stdout is a PIPE, the wrapper runs skim's handler normally —
-    /// the `stdout_is_regular_file()` fstat gate must NOT fire.
+    /// the `stdout_should_serve_raw()` fstat gate must NOT fire.
     ///
     /// Uses `tree` (Tier-2 text parser, structural compression) with a stub that
     /// includes depth-4+ entries hidden by skim's MAX_DEPTH=3 cap.  Skim strips the

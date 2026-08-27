@@ -416,6 +416,28 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         crate::cmd::session_sidecar::write_session_id(sid, &dir);
     }
 
+    // Cross-surface fidelity parity: hand the WRAPPER surface this command's
+    // stdout-destination verdict. `| tee out.txt`, `$(…)` and a named-FIFO
+    // redirect all present the wrapper with a FIFO on fd 1, indistinguishable
+    // from `| cat` — only here, where the pipeline shape is visible, can they be
+    // told apart. `set_force_raw` is called unconditionally with the verdict, so
+    // a `false` CLEARS any previous marker and it never outlives one command.
+    //
+    // Placed before every early return below (already-skim, corrupt-bail,
+    // indefinite) so the clear always happens: a marker that outlived its
+    // command would silently disable compression for the next one.
+    //
+    // ACCEPTED LIMITATION: this is the only writer, so the marker exists only
+    // when the hook actually fires. A wrapper invoked from a shell with no
+    // PreToolUse hook gets fstat-only behaviour. See `force_raw_requested` in
+    // main.rs.
+    if let Some(dir) = crate::cmd::resolve_cache_dir() {
+        crate::cmd::session_sidecar::set_force_raw(
+            super::compound::command_needs_exact_bytes(&command),
+            &dir,
+        );
+    }
+
     // If already starts with "skim " — already rewritten, passthrough
     if command.starts_with("skim ") {
         audit_hook(&command, false, "");

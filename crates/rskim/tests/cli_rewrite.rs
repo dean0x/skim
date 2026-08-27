@@ -330,7 +330,7 @@ fn test_rewrite_redirect_stdout_json_append() {
 //     with exit 1 + empty stdout (this section + hook equivalents in
 //     cli_e2e_rewrite.rs: test_hook_redirect_fd2x_bails,
 //     test_hook_redirect_backslash_desync_bails).
-//   Wrapper surface: stdout_is_regular_file() in main.rs — passes raw bytes
+//   Wrapper surface: stdout_should_serve_raw() in main.rs — passes raw bytes
 //     through; tested in cli_wrapper_argv0.rs
 //     (argv0_wrapper_stdout_file_passes_raw_bytes and
 //     argv0_ls_wrapper_stdout_pipe_compresses).

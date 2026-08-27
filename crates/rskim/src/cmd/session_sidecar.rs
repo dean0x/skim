@@ -56,6 +56,18 @@ const SESSIONS_DIR: &str = "sessions";
 /// Walking 5 levels covers agent → shell → hook → skim invocations in practice.
 const MAX_ANCESTRY_DEPTH: usize = 5;
 
+/// File-name suffix for the force-raw marker (see [`set_force_raw`]).
+const FORCE_RAW_SUFFIX: &str = "raw";
+
+/// Maximum age of a force-raw marker before it is ignored.
+///
+/// Much shorter than [`SIDECAR_MAX_AGE`]: the marker describes ONE command, and
+/// the hook rewrites it before each command, so anything older than a few
+/// minutes is a leftover from a crashed or hook-less invocation. Erring long
+/// costs compression (lossless); erring short costs fidelity — so the bound is
+/// generous enough to cover a slow command but far below a session lifetime.
+const FORCE_RAW_MAX_AGE: Duration = Duration::from_secs(300);
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -136,6 +148,113 @@ pub(crate) fn read_session_id(cache_dir: &Path) -> Option<String> {
     }
 
     None
+}
+
+// ============================================================================
+// Force-raw marker (cross-surface fidelity parity)
+// ============================================================================
+
+/// Record — or clear — the rewrite surface's "this command's stdout needs
+/// byte-exact output" verdict for the current command.
+///
+/// # Why a sidecar rather than the command text
+///
+/// The wrapper surface (`~/.skim/bin/git`) and the rewrite surface (PreToolUse
+/// hook) are different processes with no shared channel, and only the rewrite
+/// surface can see pipeline shape: `| cat` and `| tee out.txt` both present the
+/// wrapper with an indistinguishable FIFO on fd 1. The verdict therefore has to
+/// travel out of band.
+///
+/// The alternative — prefixing an env assignment onto the emitted command — was
+/// rejected twice over. It shifts the command into a parallel text namespace
+/// that host permission matchers no longer match (PF-010: pre-approved commands
+/// re-prompt, and hard-deny in headless sub-agents), and it would have to be
+/// applied to commands the engine otherwise declines to touch, where prepending
+/// text is not semantics-preserving for compound shapes (`X=1 a && b` scopes the
+/// assignment to `a` alone). This mirrors the session-id channel instead
+/// (ADR-004 / AD-SC-1): out-of-band, command text untouched.
+///
+/// # Lifetime
+///
+/// Keyed by **PPID**, exactly like [`write_session_id`], so the wrapper finds it
+/// via the ancestry walk in [`read_force_raw`]. Called on EVERY hook invocation
+/// with the verdict for that command — `true` writes the marker, `false` removes
+/// it — so it never outlives a single command.
+///
+/// All failures are silently ignored: a marker that fails to write costs
+/// compression fidelity, and one that fails to clear costs compression. Both
+/// are recoverable; neither may break the pipeline.
+pub(crate) fn set_force_raw(force_raw: bool, cache_dir: &Path) {
+    let Some(ppid) = get_ppid() else { return };
+
+    let dir = cache_dir.join(SESSIONS_DIR);
+    let file_path = dir.join(format!("{ppid}.{FORCE_RAW_SUFFIX}"));
+
+    if !force_raw {
+        let _ = std::fs::remove_file(&file_path);
+        return;
+    }
+
+    let _ = std::fs::create_dir_all(&dir);
+
+    // Mode 0o600 in the same syscall as create, matching write_session_id: the
+    // file is never briefly world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&file_path)
+        {
+            let _ = f.write_all(b"1");
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&file_path, b"1");
+    }
+}
+
+/// Return `true` when a fresh force-raw marker covers this process.
+///
+/// Walks process ancestry up to [`MAX_ANCESTRY_DEPTH`] levels looking for
+/// `{cache_dir}/sessions/{pid}.raw`, mirroring [`read_session_id`]. The walk is
+/// needed because the hook keys the marker to the agent process while the
+/// wrapper runs two levels deeper (wrapper ← shell ← agent).
+///
+/// A marker older than [`FORCE_RAW_MAX_AGE`] is ignored, so a leftover from a
+/// crashed hook cannot disable compression indefinitely.
+pub(crate) fn read_force_raw(cache_dir: &Path) -> bool {
+    let sessions_dir = cache_dir.join(SESSIONS_DIR);
+    let mut pid = std::process::id();
+
+    for _ in 0..MAX_ANCESTRY_DEPTH {
+        let file_path = sessions_dir.join(format!("{pid}.{FORCE_RAW_SUFFIX}"));
+        if is_fresh(&file_path, FORCE_RAW_MAX_AGE) {
+            return true;
+        }
+        let Some(parent) = parent_of(pid) else {
+            return false;
+        };
+        pid = parent;
+    }
+
+    false
+}
+
+/// Return `true` when `path` exists and its mtime is within `max_age`.
+fn is_fresh(path: &Path, max_age: Duration) -> bool {
+    let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(mtime)
+        .unwrap_or(Duration::MAX)
+        <= max_age
 }
 
 // ============================================================================
@@ -342,6 +461,92 @@ mod tests {
             .unwrap_or(SystemTime::UNIX_EPOCH);
         let ft = FileTime::from_system_time(target_mtime);
         set_file_mtime(path, ft).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Force-raw marker
+    // -----------------------------------------------------------------------
+
+    /// Write a force-raw marker directly for `pid`, bypassing `set_force_raw`
+    /// (which can only key the CURRENT process's PPID).
+    fn write_raw_marker(sessions_dir: &Path, pid: u32) -> PathBuf {
+        std::fs::create_dir_all(sessions_dir).unwrap();
+        let path = sessions_dir.join(format!("{pid}.{FORCE_RAW_SUFFIX}"));
+        std::fs::write(&path, b"1").unwrap();
+        path
+    }
+
+    /// A marker keyed to this process is found on the first step of the walk.
+    #[test]
+    fn test_read_force_raw_finds_marker_for_self() {
+        let tmp = TempDir::new().unwrap();
+        assert!(!read_force_raw(tmp.path()), "no marker means no force-raw");
+        write_raw_marker(&tmp.path().join(SESSIONS_DIR), std::process::id());
+        assert!(read_force_raw(tmp.path()), "marker for self must be found");
+    }
+
+    /// A stale marker is ignored, so a crashed hook cannot disable compression
+    /// indefinitely. Failing this way costs compression, never bytes.
+    #[test]
+    fn test_read_force_raw_ignores_stale_marker() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_raw_marker(&tmp.path().join(SESSIONS_DIR), std::process::id());
+        set_file_age(&path, FORCE_RAW_MAX_AGE + Duration::from_secs(60));
+        assert!(
+            !read_force_raw(tmp.path()),
+            "a marker older than FORCE_RAW_MAX_AGE must be ignored"
+        );
+    }
+
+    /// `set_force_raw(false, …)` REMOVES the marker. The clear path is what
+    /// keeps a marker from outliving the one command it describes.
+    #[test]
+    fn test_set_force_raw_clears_previous_marker() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(SESSIONS_DIR);
+
+        set_force_raw(true, tmp.path());
+        let ppid = get_ppid().expect("unix ppid");
+        let path = sessions.join(format!("{ppid}.{FORCE_RAW_SUFFIX}"));
+        assert!(path.exists(), "set_force_raw(true) must write the marker");
+
+        set_force_raw(false, tmp.path());
+        assert!(
+            !path.exists(),
+            "set_force_raw(false) must remove the marker, not just skip writing"
+        );
+    }
+
+    /// Clearing when nothing is there is a no-op, not an error — the hook calls
+    /// it on every command, most of which never set a marker.
+    #[test]
+    fn test_set_force_raw_clear_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        set_force_raw(false, tmp.path());
+        set_force_raw(false, tmp.path());
+        assert!(!read_force_raw(tmp.path()));
+    }
+
+    /// The marker never collides with a session-id sidecar for the same PID:
+    /// different suffixes, independent lifetimes.
+    #[test]
+    fn test_force_raw_marker_is_distinct_from_session_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(SESSIONS_DIR);
+        let pid = std::process::id();
+        write_raw_sidecar(&sessions, pid, "session-abc");
+        write_raw_marker(&sessions, pid);
+
+        assert_eq!(read_session_id(tmp.path()).as_deref(), Some("session-abc"));
+        assert!(read_force_raw(tmp.path()));
+
+        std::fs::remove_file(sessions.join(format!("{pid}.{FORCE_RAW_SUFFIX}"))).unwrap();
+        assert!(!read_force_raw(tmp.path()));
+        assert_eq!(
+            read_session_id(tmp.path()).as_deref(),
+            Some("session-abc"),
+            "clearing the force-raw marker must not disturb session attribution"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -740,65 +740,71 @@ fn strip_skim_wrappers_from_path() {
 // D2b (#370) / D5: stdout gate — serve raw when stdout is not a TTY or pipe
 // ============================================================================
 
-/// Testable seam: return `true` when stdout should serve raw bytes
-/// (i.e., fd 1 is not a TTY/char-device and not a pipe/FIFO).
+/// Testable seam: return `true` when stdout should serve raw bytes.
 ///
-/// Kept separate from [`stdout_should_serve_raw`] so tests can construct
-/// synthetic `Metadata` via a mock filesystem without touching real fds.
+/// The gate compresses **iff fd 1 is a terminal or a FIFO**, and serves raw for
+/// everything else — regular files, non-terminal character devices, sockets,
+/// block devices, directories.
 ///
-/// D5 widens the original `is_file` check to also catch sockets and other
-/// non-compressible sink types — anything that is neither a TTY nor a pipe
-/// receives raw bytes. Regular files (the D2b case) still trigger; the only
-/// new cases under D5 are AF_UNIX sockets (rare for fd 1) and block devices.
+/// Kept separate from [`stdout_should_serve_raw`] so tests can drive it with a
+/// `Metadata` obtained from a real fd of a chosen type plus an explicit
+/// `is_tty`, without having to install that fd as the process's own fd 1.
 ///
-/// **Accepted pinned divergence:** `$(skim grep …)` (command substitution) sets
-/// fd 1 to a pipe → compress path → compressed output captured by the shell.
-/// On the rewrite surface, `grep …` inside `$(…)` is not intercepted (the
-/// compound-expression handler detects the pipe). This is an accepted
-/// divergence documented here rather than silently surprising the user.
+/// # Why `is_tty` is a parameter and not `FileType::is_char_device()`
+///
+/// This gate used `is_char_device()` as a stand-in for `isatty(1)`. Every
+/// character device that is *not* a terminal — `/dev/null`, `/dev/zero`,
+/// `/dev/random` — was therefore misclassified as a terminal and compressed
+/// into. `is_tty` must come from a real `isatty(1)` test
+/// (`std::io::stdout().is_terminal()`); the file type alone cannot answer it.
+///
+/// # Pipes are ambiguous here by construction
+///
+/// `| cat` and `| tee out.txt` present fd 1 as the same FIFO. `fstat` cannot
+/// see the far end of a pipe, so this gate deliberately defaults FIFOs to
+/// *compress* — `| cat` is the overwhelmingly common shape and compressing it
+/// is skim's core value. The byte-exact pipe shapes are resolved on the one
+/// surface that can observe pipeline structure, the rewrite engine, which
+/// hands its verdict to the wrapper out of band (see [`force_raw_requested`]).
 #[cfg(unix)]
-fn stdout_should_serve_raw_impl(meta: std::io::Result<std::fs::Metadata>) -> bool {
+fn stdout_should_serve_raw_impl(meta: std::io::Result<std::fs::Metadata>, is_tty: bool) -> bool {
     use std::os::unix::fs::FileTypeExt;
-    match meta {
-        Err(_) => false, // Cannot determine — compress (safe default)
-        Ok(m) => {
-            let ft = m.file_type();
-            // Compress on TTY (char device) or pipe (FIFO).
-            // Serve raw for everything else: regular files, sockets, …
-            !ft.is_char_device() && !ft.is_fifo()
-        }
+    if is_tty {
+        // A terminal is a live reader — compression is the whole point.
+        return false;
     }
-}
-
-/// Backward-compat alias for tests that drive the D2b `is_file` predicate.
-///
-/// The underlying logic moved to [`stdout_should_serve_raw_impl`] (D5).
-/// This wrapper is kept so the D2b test coverage remains exercisable.
-#[cfg(unix)]
-#[cfg(test)]
-fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
-    meta.map(|m| m.is_file()).unwrap_or(false)
+    match meta {
+        // Cannot determine the sink (e.g. fd 1 closed) — compress. Preserves
+        // the pre-existing defensive default; there is no file to corrupt.
+        Err(_) => false,
+        Ok(m) => !m.file_type().is_fifo(),
+    }
 }
 
 /// Return `true` when the process's stdout (fd 1) should receive raw bytes.
 ///
-/// D5 widens the original D2b `is_regular_file` check: serve raw when stdout
-/// is not a TTY (char device) and not a pipe (FIFO). This covers regular
-/// files (the common case for `> file` redirection), sockets, and other
-/// non-compressible sink types.
+/// Compress iff fd 1 is a terminal or a pipe; serve raw for every other sink.
 ///
-/// **Shared invariant (cross-surface):** "stdout redirected to a regular file
-/// must receive the tool's raw bytes, never a skim summary." This invariant is
-/// enforced by two independent mechanisms — one per interception surface —
-/// because each surface observes the redirect at a different stage:
-/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` after the shell has
-///   already consumed `>` and opened the file; no `>` token remains in argv.
-/// - **Rewrite surface (static):** `stdout_redirected_to_file` in
-///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
+/// **Shared invariant (cross-surface):** "stdout going somewhere that needs an
+/// exact capture must receive the tool's raw bytes, never a skim summary."
+/// This invariant is enforced by two independent mechanisms — one per
+/// interception surface — because each surface observes the destination at a
+/// different stage, and each can see something the other structurally cannot:
+/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` + `isatty(1)` after the
+///   shell has already consumed `>` and opened the target; no redirect token
+///   remains in argv. Ground truth about the fd — blind to the far end of a pipe.
+/// - **Rewrite surface (static):** `stdout_redirected_to_file` and
+///   `command_needs_exact_bytes` in `cmd/rewrite/compound.rs` — a syntactic scan
+///   before the command runs. Blind to what the shell actually did — but it is
+///   the only surface that can see `| tee out.txt` and `$(…)`.
+///
+/// Ground truth decides where it can observe; syntax fills the one gap it cannot
+/// (see [`force_raw_requested`]).
 ///
 /// Non-Unix: always returns `false` (compression proceeds normally).
 #[cfg(unix)]
-fn stdout_is_regular_file() -> bool {
+fn stdout_should_serve_raw() -> bool {
+    use std::io::IsTerminal;
     use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
     // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
@@ -806,12 +812,38 @@ fn stdout_is_regular_file() -> bool {
     // (no double-close). If fd 1 is invalid (e.g. the process was started with
     // stdout closed), metadata() returns Err; we fall back to false (compress).
     let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-    stdout_should_serve_raw_impl(f.metadata())
+    stdout_should_serve_raw_impl(f.metadata(), std::io::stdout().is_terminal())
 }
 
 #[cfg(not(unix))]
-fn stdout_is_regular_file() -> bool {
+fn stdout_should_serve_raw() -> bool {
     false
+}
+
+/// Return `true` when the rewrite surface marked the current command as needing
+/// byte-exact stdout.
+///
+/// This closes the one gap `fstat` cannot: a pipe's far end. When the PreToolUse
+/// hook sees `| tee out.txt`, `$(…)`, or a redirect onto a file/named FIFO, it
+/// records a force-raw marker in the PID-keyed sidecar; this wrapper invocation
+/// discovers it by walking its process ancestry. The marker is re-evaluated —
+/// set *or cleared* — on every hook invocation, so it never outlives one command.
+///
+/// **ACCEPTED LIMITATION (documented, and pinned by
+/// `no_hook_means_fstat_only_behaviour` in `tests/cli_stdout_destination.rs`):**
+/// the marker exists only when the hook actually fires. A bare wrapper
+/// invocation with no PreToolUse hook installed — a plain interactive shell with
+/// `~/.skim/bin` on `PATH`, or an agent that bypasses hooks — gets `fstat`-only
+/// behaviour, so `git log | tee out.txt` still compresses there. Closing that
+/// would require the wrapper to inspect its sibling processes, which is neither
+/// portable nor reliable. Skim does not pretend otherwise.
+///
+/// Failure direction is deliberate: a stale or missing marker costs compression
+/// (lossless), never bytes.
+fn force_raw_requested() -> bool {
+    cmd::resolve_cache_dir()
+        .as_deref()
+        .is_some_and(cmd::session_sidecar::read_force_raw)
 }
 
 fn main() -> ExitCode {
@@ -898,16 +930,27 @@ fn main() -> ExitCode {
     // parsing and route directly to the appropriate handler. PATH stripping
     // above ensures the handler won't find the symlink again (no recursion).
     let result: anyhow::Result<ExitCode> = if let Some((name, args)) = detect_argv0_dispatch() {
-        // D2b (#370): when stdout is a regular file the shell has already
-        // redirected fd 1 to the file before exec-ing us. Run the real tool
-        // with inherited stdio so its raw bytes reach the file unmodified (#317).
-        // Pipes/ttys are not regular files → still compress (normal path).
+        // D2b (#370): when stdout is going somewhere that needs an exact
+        // capture, the shell has already wired fd 1 up before exec-ing us. Run
+        // the real tool with inherited stdio so its raw bytes reach that
+        // destination unmodified (#317).
+        //
+        // Two inputs, one per observable: `stdout_should_serve_raw` is
+        // ground truth about fd 1 (files, non-terminal char devices, sockets);
+        // `force_raw_requested` carries the rewrite surface's verdict about the
+        // one thing fd 1 cannot reveal — the far end of a pipe (`| tee f`,
+        // `$(…)`). TTYs and plain `| cat` match neither and still compress.
+        //
         // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
         // and FileOperation branches below are intentionally NOT guarded:
         // `skim file.ts > out.txt` and `skim grep … > out.txt` are explicit skim
         // invocations where the user wants skim's output saved — hoisting this
-        // guard above detect_argv0_dispatch() would break that workflow.
-        if stdout_is_regular_file() {
+        // guard above detect_argv0_dispatch() would break that workflow. See the
+        // case-8 rationale on `stdout_redirected_to_file` in cmd/rewrite/compound.rs.
+        if stdout_should_serve_raw() || force_raw_requested() {
+            // ADR-011 class 2: choosing raw loses nothing, so this is a
+            // debug-gated banner, never an unconditional marker.
+            crate::debug_log!("[skim] wrapper: stdout needs exact bytes; serving raw for '{name}'");
             Ok(cmd::run_inherited_passthrough(&name, &args))
         } else {
             // D3: use dispatch_for_wrapper on the wrapper surface so that
@@ -1203,83 +1246,130 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // D2b (#370): is_regular_file_stdout unit tests
+    // stdout_should_serve_raw_impl — compress iff terminal or FIFO
+    //
+    // Every case below is driven by a REAL fd of the relevant type (a real
+    // /dev/null, a real socketpair, a real mkfifo), not by synthetic metadata:
+    // the whole defect this gate had was believing a file-type bit answered a
+    // question only isatty() can answer, so the tests must exercise the real
+    // types the kernel reports.
     // ========================================================================
 
-    #[cfg(unix)]
-    #[test]
-    fn test_is_regular_file_stdout_true_for_file() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let meta = tmp.as_file().metadata();
-        assert!(
-            is_regular_file_stdout(meta),
-            "metadata from a regular file must return true"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_is_regular_file_stdout_false_for_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta = std::fs::metadata(tmp.path());
-        assert!(
-            !is_regular_file_stdout(meta),
-            "metadata from a directory must return false"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_is_regular_file_stdout_false_for_err() {
-        let meta: std::io::Result<std::fs::Metadata> =
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(
-            !is_regular_file_stdout(meta),
-            "Err metadata must return false (defensive)"
-        );
-    }
-
-    // ========================================================================
-    // D5: stdout_should_serve_raw_impl — wider gate (not-TTY, not-pipe)
-    // ========================================================================
-
-    /// D5: regular file → serve raw (D2b behaviour preserved).
+    /// Regular file → serve raw (the `> out.txt` case).
     #[cfg(unix)]
     #[test]
     fn test_stdout_should_serve_raw_true_for_regular_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let meta = tmp.as_file().metadata();
         assert!(
-            stdout_should_serve_raw_impl(meta),
-            "regular file must trigger raw-serve (D5)"
+            stdout_should_serve_raw_impl(tmp.as_file().metadata(), false),
+            "regular file must serve raw"
         );
     }
 
-    /// D5: error result → compress (defensive default unchanged).
+    /// Error result → compress (defensive default; nothing to corrupt).
     #[cfg(unix)]
     #[test]
     fn test_stdout_should_serve_raw_false_for_err() {
         let meta: std::io::Result<std::fs::Metadata> =
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(
-            !stdout_should_serve_raw_impl(meta),
+            !stdout_should_serve_raw_impl(meta, false),
             "Err metadata must fall through to compress (defensive)"
         );
     }
 
-    /// D5: directory → serve raw (not a TTY or FIFO; edge case, but widened gate handles it).
-    ///
-    /// This is an accepted deviation from D2b which only served raw for regular files.
-    /// A directory as fd 1 is vanishingly rare in practice, so any behaviour is fine;
-    /// pinning it here makes the widened gate explicit.
+    /// Directory → serve raw (not a terminal, not a FIFO).
     #[cfg(unix)]
     #[test]
     fn test_stdout_should_serve_raw_true_for_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let meta = std::fs::metadata(tmp.path());
         assert!(
-            stdout_should_serve_raw_impl(meta),
-            "directory metadata (not TTY, not FIFO) must trigger raw-serve (D5)"
+            stdout_should_serve_raw_impl(std::fs::metadata(tmp.path()), false),
+            "directory metadata (not terminal, not FIFO) must serve raw"
+        );
+    }
+
+    /// A terminal compresses — that is the whole point of skim.
+    ///
+    /// Driven through the `is_tty` parameter rather than a real pty because
+    /// `is_tty` is exactly what `isatty(1)` produces at the call site.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_false_for_terminal() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            !stdout_should_serve_raw_impl(tmp.as_file().metadata(), true),
+            "a terminal must compress regardless of the underlying file type"
+        );
+    }
+
+    /// **The char-device bug.** `/dev/null` is a character device but NOT a
+    /// terminal. The old gate used `is_char_device()` as an `isatty()` proxy and
+    /// therefore compressed into `/dev/null`, `/dev/zero` and `/dev/random`
+    /// alike. A real `/dev/null` fd, with `is_tty` false as `isatty(1)` would
+    /// report it, must serve raw.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_non_terminal_char_device() {
+        use std::os::unix::fs::FileTypeExt;
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null must be openable");
+        let meta = devnull.metadata().expect("metadata on /dev/null");
+        // Guard the premise: if this is not a char device the test proves nothing.
+        assert!(
+            meta.file_type().is_char_device(),
+            "/dev/null must be a character device for this test to be meaningful"
+        );
+        assert!(
+            stdout_should_serve_raw_impl(devnull.metadata(), false),
+            "/dev/null is a char device but not a terminal — must serve raw, \
+             not be mistaken for a TTY"
+        );
+    }
+
+    /// A FIFO compresses by default: `fstat` cannot see the far end, and
+    /// `| cat` is the common shape. The byte-exact pipe shapes are resolved by
+    /// `force_raw_requested`, not here.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_false_for_fifo() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode; both are valid.
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+        let meta = std::fs::metadata(&fifo).expect("metadata on fifo");
+        assert!(meta.file_type().is_fifo(), "premise: path must be a FIFO");
+        assert!(
+            !stdout_should_serve_raw_impl(std::fs::metadata(&fifo), false),
+            "a FIFO must compress by default — `| cat` must not regress"
+        );
+    }
+
+    /// An AF_UNIX socket is neither a terminal nor a FIFO → serve raw.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_socket() {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: socketpair fills a 2-element array of fds; the buffer is sized
+        // correctly and the domain/type constants are valid.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        // SAFETY: fds[0] is a fresh, owned fd from socketpair; File takes ownership.
+        let sock = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same for the peer end; dropped at end of scope.
+        let _peer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        assert!(
+            stdout_should_serve_raw_impl(sock.metadata(), false),
+            "an AF_UNIX socket is neither a terminal nor a FIFO — must serve raw"
         );
     }
 

@@ -101,9 +101,30 @@ pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
 /// `>` inside single or double quotes is ignored (no over-bail). Maximally
 /// strict: catches spaced/glued/append/fd-prefixed forms, `&>file`, `>&FILE`,
 /// and glued-middle `foo>out`. Skips `2>`/`2>>` (stderr — stdout still reaches
-/// the agent) and fd-dups (`>&1`, `>&2`, `>&-`, `1>&2`).
+/// the agent) and fd-dups (`>&1`, `>&2`, `>&-`, `1>&2`) whose source fd does not
+/// itself point at a file.
 ///
 /// CHECK ORDER (source-fd before target) is load-bearing.
+///
+/// # fd-2 tracking: `cmd 2>f >&2` (case 8)
+///
+/// `2>f` looks stderr-only and `>&2` looks like a harmless fd-dup, so a scanner
+/// that judges each token in isolation sees no stdout→file redirect at all — yet
+/// the pair routes fd 1 onto `f`. Running the rewrite this scan used to permit
+/// for `git log -n 5 2>f >&2` put 623 compressed bytes into a file where raw git
+/// wrote 10716 (measured on this branch). The scan therefore carries one bit of
+/// state, `fd2_is_file`, updated left-to-right so ORDER is honoured: `>&2 2>f`
+/// (dup first, redirect after) leaves fd 1 on the original stderr and correctly
+/// does not bail.
+///
+/// This is the deliberate fix for case 8, rather than moving the check to an
+/// `fstat` on the explicit-subcommand path. An fd-1 `fstat` gate on
+/// `Invocation::Subcommand` would also fire for `skim git log > out.txt` — a
+/// command where the user typed `skim` themselves — and silently serve raw,
+/// overriding an explicit request. That path cannot distinguish a user-authored
+/// `skim …` from a hook-injected one, so ground truth there would defeat intent.
+/// Ground truth belongs on the surface where skim was never asked for (the
+/// wrapper); syntax belongs on the surface that can see the redirect.
 fn stdout_redirected_to_file(cmd: &str) -> bool {
     // Byte-indexed scanner: avoids a Vec<char> heap allocation on the rewrite
     // hot path. All operator characters (`>`, `'`, `"`, `\`, `2`, `&`, `-`,
@@ -119,6 +140,9 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
     let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
+    // Does fd 2 currently point at a file? Set by `2>FILE` / `2>>FILE`, cleared
+    // by `2>&N`. Read when fd 1 is dup'd from fd 2 (`>&2`, `1>&2`).
+    let mut fd2_is_file = false;
 
     while i < len {
         let ch = bytes[i];
@@ -173,6 +197,15 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
             if i < len && bytes[i] == b'>' {
                 i += 1;
             }
+            // Record where fd 2 lands. `2>&N` is an fd-dup (fd 2 follows another
+            // fd, which is not a file here — a file-bound fd 1 would already have
+            // bailed); anything else, including a bare trailing `2>`, is a file
+            // target. A later `>&2` then routes stdout into that file (case 8).
+            let mut t = i;
+            while t < len && bytes[t] == b' ' {
+                t += 1;
+            }
+            fd2_is_file = !(t < len && bytes[t] == b'&');
             continue;
         }
 
@@ -202,6 +235,12 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
                 let is_fd_dup = (bytes[k] == b'-' && m == k + 1)
                     || bytes[k..m].iter().all(|b| b.is_ascii_digit());
                 if is_fd_dup {
+                    // `>&2` / `1>&2` points fd 1 wherever fd 2 currently points.
+                    // If a preceding `2>FILE` put fd 2 on a file, stdout now
+                    // lands in that file — bail (case 8).
+                    if fd2_is_file && bytes[k] == b'2' && m == k + 1 {
+                        return true;
+                    }
                     i = m;
                     continue;
                 }
@@ -212,6 +251,103 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
     }
 
     false
+}
+
+// ---- Byte-exact destination detection (cross-surface fidelity parity) ----
+
+/// Pipe consumers that persist or digest the EXACT bytes of their stdin.
+///
+/// Membership means "compressing the producer corrupts this consumer's result",
+/// not merely "this consumer reads bytes". `cat`, `head`, `grep`, `less`, `jq`
+/// and friends are deliberately ABSENT: they render the stream for a reader, and
+/// compressing what an agent is about to read is skim's entire purpose.
+///
+/// The set only needs to cover consumers that persist WITHOUT a `>` redirect —
+/// `| gzip > out.gz` is already caught by [`stdout_redirected_to_file`] via its
+/// `>`. That keeps the list small and reviewable.
+///
+/// HEURISTIC, and honest about it: this is a denylist, so an unlisted persisting
+/// consumer still gets compressed bytes. A denylist was chosen over an allowlist
+/// of safe readers because the allowlist's failure mode — serving raw for every
+/// unlisted consumer — would silently kill compression for `| grep`, `| wc`,
+/// `| head` and every other everyday pipeline, which is the outcome this work
+/// explicitly rejects.
+const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
+    // Write the stream verbatim to a destination of their own.
+    "tee",
+    "dd",
+    "sponge", // Archive or re-encode the stream verbatim.
+    "gzip",
+    "bzip2",
+    "xz",
+    "zstd",
+    "base64",
+    "tar",
+    "openssl",
+    // Digest the exact bytes — any substitution changes the answer.
+    "cksum",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "shasum",
+];
+
+/// Return `true` when `cmd`'s stdout destination requires the tool's exact
+/// bytes, so the wrapper surface must serve raw even though `fstat` alone would
+/// choose to compress.
+///
+/// This is the rewrite engine acting as the authority on the one thing it can
+/// see and `fstat` cannot: **pipeline shape**. `| cat` and `| tee out.txt` are
+/// the same FIFO to the wrapper; only a look at the far end distinguishes them.
+///
+/// Three rules, in cost order:
+/// - **S — capture/plumbing**: `$(…)`, backticks and process substitution make
+///   the shell consume stdout as a value or wire it to another command's fd.
+///   (`${…}` is parameter expansion, not capture, and is deliberately excluded.)
+/// - **R — redirect**: stdout or both streams land on a file or named FIFO,
+///   including the `2>f … >&2` fd-dup shape.
+/// - **T — byte-exact pipe consumer**: the pipeline's next stage persists or
+///   digests the exact bytes ([`BYTE_EXACT_PIPE_CONSUMERS`]).
+///
+/// Anything else — plain `| cat`, `| grep`, `| head`, a TTY — returns `false`
+/// and keeps compressing.
+pub(super) fn command_needs_exact_bytes(cmd: &str) -> bool {
+    // Rule S: the shell captures stdout as a value or plumbs it into an fd.
+    if cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(") {
+        return true;
+    }
+    // Rule R: stdout (or both streams) lands on a file or named FIFO.
+    if stdout_redirected_to_file(cmd) {
+        return true;
+    }
+    // Rule T: the downstream pipe stage needs the bytes verbatim.
+    pipe_consumer_needs_exact_bytes(cmd)
+}
+
+/// Return `true` when any pipe stage of `cmd` feeds a [`BYTE_EXACT_PIPE_CONSUMERS`]
+/// command.
+fn pipe_consumer_needs_exact_bytes(cmd: &str) -> bool {
+    let CompoundSplitResult::Compound(segments) = split_compound(cmd) else {
+        // Simple (no operator) has no consumer; Bail shapes are already caught
+        // by rule S, which runs first.
+        return false;
+    };
+    segments.windows(2).any(|pair| {
+        pair[0].trailing_operator == Some(CompoundOp::Pipe)
+            && segment_head(&pair[1]).is_some_and(|head| BYTE_EXACT_PIPE_CONSUMERS.contains(&head))
+    })
+}
+
+/// Extract a segment's command name: the first token that is neither a leading
+/// `VAR=VAL` assignment nor a privilege/dispatch prefix, reduced to its basename
+/// so `/usr/bin/tee` matches `tee`.
+fn segment_head(seg: &CommandSegment) -> Option<&str> {
+    seg.tokens
+        .iter()
+        .map(String::as_str)
+        .find(|t| !t.contains('=') && *t != "sudo" && *t != "command")
+        .map(|t| t.rsplit('/').next().unwrap_or(t))
 }
 
 /// Return `true` when a recognized redirect token (`2>&1`, `>/dev/null`, …)
@@ -905,6 +1041,131 @@ mod tests {
             !rewrite_would_corrupt(r#"git commit -m "x > y""#),
             "quoted >"
         );
+    }
+
+    // ========================================================================
+    // Case 8: `2>f >&2` — fd 1 dup'd from a file-bound fd 2
+    // ========================================================================
+
+    /// The measured data-loss case. `2>f` then `>&2` routes stdout onto `f`,
+    /// but each token in isolation looks harmless (stderr-only, then fd-dup).
+    /// Before this guard the engine emitted `skim git log -n 5 2>f >&2`, which
+    /// wrote 623 compressed bytes where raw git wrote 10716.
+    #[test]
+    fn test_corrupt_guard_stderr_file_then_dup_to_stdout_bails() {
+        assert!(
+            rewrite_would_corrupt("git log -n 5 2>f >&2"),
+            "2>f then >&2 puts stdout in f — must bail"
+        );
+        assert!(
+            rewrite_would_corrupt("git log -n 5 2>/tmp/x.txt >&2"),
+            "absolute path target"
+        );
+        assert!(
+            rewrite_would_corrupt("cargo test 2> log.txt >&2"),
+            "spaced 2> form"
+        );
+        assert!(
+            rewrite_would_corrupt("cargo test 2>>log.txt >&2"),
+            "2>> append then dup"
+        );
+        assert!(
+            rewrite_would_corrupt("cargo test 2>f 1>&2"),
+            "explicit 1>&2 dup form"
+        );
+    }
+
+    /// ORDER is load-bearing: dup FIRST, then redirect fd 2, leaves fd 1 on the
+    /// original stderr — no stdout→file redirect exists, so the fd-2 tracking
+    /// must NOT fire.
+    ///
+    /// Asserted against `stdout_redirected_to_file` directly, not
+    /// `rewrite_would_corrupt`: the outer guard bails on this shape anyway via
+    /// the deliberately coarse `redirect_order_hazard` (a recognized `>&2`
+    /// followed by an unrecognized `>`-bearing `2>f`), which would mask whether
+    /// the fd-2 state machine got the ordering right.
+    #[test]
+    fn test_stdout_redirect_scan_respects_dup_before_stderr_redirect() {
+        assert!(
+            !stdout_redirected_to_file("cargo test >&2 2>f"),
+            ">&2 before 2>f — fd 1 follows the ORIGINAL stderr, no stdout->file"
+        );
+        // Sanity: the reverse order DOES route stdout into the file.
+        assert!(
+            stdout_redirected_to_file("cargo test 2>f >&2"),
+            "2>f before >&2 — fd 1 lands on f"
+        );
+    }
+
+    /// `2>&1` points fd 2 at fd 1 (not a file), so a later `>&2` is a no-op dup
+    /// and must not bail — otherwise the extremely common `cmd 2>&1` shapes
+    /// would stop being rewritten.
+    #[test]
+    fn test_corrupt_guard_fd2_dup_does_not_arm_the_guard() {
+        assert!(
+            !rewrite_would_corrupt("cargo test 2>&1 >&2"),
+            "2>&1 leaves fd 2 off-file; >&2 must stay a harmless dup"
+        );
+        assert!(!rewrite_would_corrupt("cargo test >&2"), "bare >&2");
+        assert!(!rewrite_would_corrupt("cargo test 1>&2"), "bare 1>&2");
+    }
+
+    // ========================================================================
+    // command_needs_exact_bytes — the rewrite surface's verdict for the wrapper
+    // ========================================================================
+
+    /// Rule T: a pipe consumer that persists or digests exact bytes.
+    #[test]
+    fn test_needs_exact_bytes_byte_exact_pipe_consumers() {
+        assert!(command_needs_exact_bytes("git log -n 5 | tee out.txt"));
+        assert!(command_needs_exact_bytes("git log -n 5 | tee -a out.txt"));
+        assert!(command_needs_exact_bytes("git log | sha256sum"));
+        assert!(command_needs_exact_bytes("git log | dd of=out.bin"));
+        assert!(command_needs_exact_bytes("git log | base64"));
+        // Basename reduction: an absolute path to the same tool still matches.
+        assert!(command_needs_exact_bytes("git log | /usr/bin/tee out.txt"));
+        // Leading env assignments and `sudo` do not hide the consumer.
+        assert!(command_needs_exact_bytes("git log | LC_ALL=C tee out.txt"));
+        assert!(command_needs_exact_bytes("git log | sudo tee /etc/x"));
+    }
+
+    /// **The case that must not regress.** Readers keep compressing — this is
+    /// skim's core value, and a blanket "any pipe → raw" rule was rejected
+    /// precisely because it would destroy it.
+    #[test]
+    fn test_needs_exact_bytes_reader_pipes_still_compress() {
+        assert!(!command_needs_exact_bytes("git log -n 5 | cat"));
+        assert!(!command_needs_exact_bytes("git log -n 5 | head -20"));
+        assert!(!command_needs_exact_bytes("git log | grep fix"));
+        assert!(!command_needs_exact_bytes("git log | wc -l"));
+        assert!(!command_needs_exact_bytes("git log | less"));
+        assert!(!command_needs_exact_bytes("git log -n 5"));
+        assert!(!command_needs_exact_bytes("cargo test && cargo build"));
+    }
+
+    /// Rule S: the shell consumes stdout as a value or plumbs it into an fd.
+    #[test]
+    fn test_needs_exact_bytes_capture_and_process_substitution() {
+        assert!(command_needs_exact_bytes("out=$(git log -n 5)"));
+        assert!(command_needs_exact_bytes("echo `git log -n 5`"));
+        assert!(command_needs_exact_bytes("diff <(git log) <(git log -n 1)"));
+        assert!(command_needs_exact_bytes("tee >(gzip > out.gz)"));
+        // `${VAR}` is parameter expansion, not capture — must NOT arm the rule.
+        assert!(!command_needs_exact_bytes("git log -n ${N}"));
+    }
+
+    /// Rule R: file and named-FIFO redirects, including the case-8 shape.
+    #[test]
+    fn test_needs_exact_bytes_redirects() {
+        assert!(command_needs_exact_bytes("git log -n 5 > out.txt"));
+        assert!(command_needs_exact_bytes("git log -n 5 >> out.txt"));
+        assert!(command_needs_exact_bytes("git log -n 5 > /dev/null"));
+        assert!(command_needs_exact_bytes("git log -n 5 > myfifo"));
+        assert!(command_needs_exact_bytes("git log -n 5 2>f >&2"));
+        // A `>` inside a pipeline stage still counts (`| gzip > f.gz`).
+        assert!(command_needs_exact_bytes("git log | gzip > out.gz"));
+        // stderr-only redirects leave stdout alone.
+        assert!(!command_needs_exact_bytes("git log -n 5 2> err.txt"));
     }
 
     /// #322: a recognized redirect token sitting *inside* quoted text becomes a
