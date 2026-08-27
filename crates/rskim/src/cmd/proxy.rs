@@ -39,6 +39,7 @@
 use std::net::IpAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rskim_align::Provider as LlmProvider;
 use rskim_compress::{BlockRouter, Policy};
@@ -457,6 +458,10 @@ pub(crate) fn run(
     let analytics_arc: Arc<dyn rskim_proxy::analytics::AnalyticsHook>;
     let consumer_handle: Option<std::thread::JoinHandle<()>>;
     let done_rx: Option<crossbeam_channel::Receiver<()>>;
+    // Second handle on the in-flight byte counter, retained by run() so the
+    // FLUSH_BOUND timeout arm below can report how much is still outstanding.
+    // It must be taken BEFORE `hook` is moved into `analytics_arc`.
+    let outstanding_bytes: Option<Arc<AtomicU64>>;
 
     if analytics_cfg.enabled {
         let (hook, rx) = super::proxy_analytics::BridgeAnalyticsHook::new(
@@ -464,6 +469,8 @@ pub(crate) fn run(
         );
         let drop_count = hook.drop_count_handle();
         let queued_bytes = hook.queued_bytes_handle();
+        // Taken here, while `hook` is still owned locally.
+        let outstanding = hook.queued_bytes_handle();
         let (done_tx, drx) = crossbeam_channel::bounded(1);
         let handle = super::proxy_analytics::spawn_consumer(
             rx,
@@ -478,10 +485,12 @@ pub(crate) fn run(
         analytics_arc = Arc::new(hook);
         consumer_handle = Some(handle);
         done_rx = Some(drx);
+        outstanding_bytes = Some(outstanding);
     } else {
         analytics_arc = Arc::new(rskim_proxy::analytics::NoopAnalyticsHook);
         consumer_handle = None;
         done_rx = None;
+        outstanding_bytes = None;
     }
 
     // Call serve_with_stage() — blocks until SIGINT/SIGTERM and drain completes (AC23).
@@ -515,7 +524,28 @@ pub(crate) fn run(
                 let _ = handle.join();
             }
             Err(_) => {
-                // FLUSH_BOUND elapsed → consumer did not finish in time.
+                // ADR-011 classification: LOSS-BEARING MARKER → unconditional
+                // stderr. It is NOT a no-loss raw-fallback banner, so it must
+                // NOT be moved behind SKIM_DEBUG / debug_log!.
+                //
+                // Records still sitting in the channel when the bound elapses are
+                // abandoned. They never reach `drop_count` (that counter only
+                // increments on enqueue overflow and fail-open DB errors), and
+                // the accumulated total is persisted only AFTER the drain loop,
+                // so abandonment also destroys the disclosure counter itself.
+                // `skim stats` therefore under-reports this run in a way nothing
+                // else discloses — the reader sees less than reality, which is
+                // exactly the condition that makes a notice a marker.
+                let outstanding = outstanding_bytes
+                    .as_ref()
+                    .map_or(0, |b| b.load(Ordering::Relaxed));
+                eprintln!(
+                    "skim proxy: analytics flush bound ({}s) elapsed with ~{outstanding} bytes \
+                     of proxy events still queued; those records were discarded WITHOUT being \
+                     added to the dropped-record counter, so `skim stats` will under-report \
+                     this run.",
+                    super::proxy_analytics::FLUSH_BOUND.as_secs()
+                );
                 // Drop the JoinHandle; OS reclaims the thread.
             }
         }
@@ -528,7 +558,15 @@ pub(crate) fn run(
                 let _ = handle.join();
             }
             Err(_) => {
-                // FLUSH_BOUND elapsed → consumer did not finish in time.
+                // ADR-011 classification: LOSS-BEARING MARKER → unconditional
+                // stderr, same reasoning as the analytics arm above. Do not
+                // convert this into a SKIM_DEBUG-gated banner.
+                eprintln!(
+                    "skim proxy: alignment flush bound ({}s) elapsed; cache-alignment records \
+                     still queued were discarded without being counted, so `skim stats` \
+                     alignment figures will under-report this run.",
+                    super::proxy_analytics::FLUSH_BOUND.as_secs()
+                );
                 // Drop the JoinHandle; OS reclaims the thread.
             }
         }

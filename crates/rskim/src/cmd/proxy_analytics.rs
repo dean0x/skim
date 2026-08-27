@@ -87,10 +87,30 @@ pub(crate) const PROXY_QUEUE_BYTE_BUDGET: u64 = 128 * 1024 * 1024;
 /// ## AD-AN-12 — bounded shutdown termination (ADR-003 / PF-005)
 ///
 /// Defaults to `DEFAULT_GRACEFUL_DRAIN_SECS` (5 s) — reusing the existing
-/// proxy shutdown-drain constant rather than inventing a new number. This
-/// satisfies "joins within a fixed bound; records past the bound dropped and
-/// counted" (AC18). The consumer is not waited on past this bound; the OS
-/// reclaims the thread; its last action is to persist the drop total.
+/// proxy shutdown-drain constant rather than inventing a new number.
+///
+/// ## What the bound actually does (and what it does NOT do)
+///
+/// When the bound elapses, `run()` stops **waiting**. That is all it does:
+///
+/// - It does **not** stop the consumer thread. The consumer keeps draining until
+///   the channel closes; the OS reclaims it when the process exits.
+/// - It does **not** count what is left. Records still in the channel never touch
+///   `drop_count` — that counter only increments on enqueue overflow
+///   (`BridgeAnalyticsHook::on_request`) and on fail-open DB errors inside
+///   [`spawn_consumer`]'s drain loop. And because the accumulated total is
+///   persisted only AFTER the drain loop finishes, abandoning the wait also
+///   abandons the `proxy_dropped_records` disclosure counter this module's
+///   header designates.
+///
+/// An earlier version of this doc claimed records past the bound are "dropped
+/// and counted". They are not, on either count. Making that literally true would
+/// require an extra DB write on the hot drain path for a condition that the
+/// process-wide BPE cache in `rskim-tokens` has made roughly 19× less reachable,
+/// so the honest disclosure lives on stderr instead: `cmd/proxy.rs` emits an
+/// unconditional loss-bearing marker (ADR-011) on the `recv_timeout` timeout arm
+/// naming the bound, the approximate outstanding bytes, and the fact that
+/// `skim stats` will under-report that run.
 pub(crate) const FLUSH_BOUND: Duration = Duration::from_secs(DEFAULT_GRACEFUL_DRAIN_SECS);
 
 // ============================================================================
@@ -220,8 +240,8 @@ pub(crate) fn event_payload_bytes(event: &ProxyEvent) -> u64 {
 /// path (AC14 / AD-AN-8).
 ///
 /// Cross-Plan Amendment #4 (fulfilled): #305 swaps:
-/// - `NullSink` → `ChannelDecisionSink` (collector) in `server.rs:422`
-/// - `NoopAnalyticsHook` → real `BridgeAnalyticsHook` here in `proxy.rs:238`
+/// - `NullSink` → `ChannelDecisionSink` (collector) in `rskim_proxy::server`
+/// - `NoopAnalyticsHook` → real `BridgeAnalyticsHook` in `cmd::proxy::run`
 ///
 /// #306's `AlignmentRecorder` consumer adopts the same bounded lifecycle:
 /// `ChannelAlignmentRecorder::new_boxed` returns the thread handle and done
@@ -758,8 +778,9 @@ mod tests {
         );
     }
 
-    /// PF-007 discriminating: `spawn_consumer` calls `db.set_busy_timeout(100ms)`
-    /// (proxy_analytics.rs line 262) to cap each blocked write to at most 100ms.
+    /// PF-007 discriminating: `spawn_consumer` calls
+    /// `AnalyticsDb::set_busy_timeout(100ms)` immediately after opening the DB, to
+    /// cap each blocked write to at most 100ms.
     /// Without that call, `AnalyticsDb::open` leaves the timeout at 5000ms, and
     /// draining N events under an exclusive lock takes N × 5000ms ≈ 15s for N=3.
     /// With the cap, it takes N × 100ms ≈ 300ms. The wall-clock assertion below
@@ -836,7 +857,8 @@ mod tests {
         // fallback from AnalyticsDb::open is 5000ms/event → ~15s total.
         // 5s bound: observed 2.115s on CI (run 32871027659) with ~2.4× headroom.
         // The discriminating property is the ~3× gap to the ~15s uncapped path,
-        // not the absolute value.  Deleting proxy_analytics.rs line 262 must fail.
+        // not the absolute value.  Deleting the `set_busy_timeout(100ms)` call in
+        // `spawn_consumer` must fail this assertion.
         assert!(
             elapsed < std::time::Duration::from_millis(5_000),
             "AC15 busy_timeout cap: drained {N_EVENTS} events under exclusive lock in \
@@ -1623,15 +1645,51 @@ mod tests {
         }
     }
 
-    /// AC15 arm e: concurrent `stats --clear` (clearing `token_savings`) while
-    /// the consumer writes must not crash the consumer.
+    /// Liveness backstop, NOT a latency SLO (ADR-003 — ground-truthed, not baseless).
     ///
-    /// `AnalyticsDb::clear()` deletes from `token_savings`; the consumer writes
-    /// to `token_savings` in a separate WAL connection. SQLite WAL allows
-    /// concurrent readers + writers; the worst observable outcome is a rusqlite
-    /// error which the consumer counts as a fail-open drop.
+    /// Measured consumer shutdown for the 20-event drain in
+    /// [`test_concurrent_clear_does_not_crash_consumer`]:
+    ///
+    /// | | idle p50 | 30× CPU oversubscription |
+    /// |---|---|---|
+    /// | before the `rskim-tokens` BPE cache | 4573 ms | 18972 ms (13/13 failures) |
+    /// | after  | ≈240 ms | ≈970 ms |
+    ///
+    /// A 10 s bound was 46 % consumed at idle before the fix and blew through it
+    /// at load. Afterwards a single one-time BPE build still lands on the consumer
+    /// thread, so the residual cost is ≈240 ms — leaving ≈41× headroom at idle,
+    /// ≈10× at the worst measured load, and 2× the production [`FLUSH_BOUND`] of
+    /// 5 s.
+    ///
+    /// This bound exists only so a wedged consumer fails the test instead of
+    /// hanging it. It is **not** the regression detector: the behavioural
+    /// assertions below (`queued_bytes == 0`, persisted row count) are. The
+    /// timing-free guard against reintroducing the per-event BPE rebuild lives in
+    /// `crates/rskim-tokens/src/counter.rs`
+    /// (`counter_new_shares_one_cl100k_table_across_constructions`).
+    const CONSUMER_LIVENESS_BOUND: Duration = Duration::from_secs(10);
+
+    /// AC15 arm e: concurrent `stats --clear` (clearing `token_savings`) while
+    /// the consumer writes must not crash the consumer — and everything the
+    /// consumer dequeues afterwards must still be accounted for.
+    ///
+    /// `AnalyticsDb::clear()` deletes from `token_savings`; the consumer writes to
+    /// `token_savings` on a separate connection. WAL allows readers to run
+    /// concurrently with **one** writer — it does not make two writers concurrent.
+    /// `clear()` and `record_proxy()` are both writers to `token_savings`, so they
+    /// serialise on the WAL write lock; the loser waits up to the consumer's
+    /// 100 ms `busy_timeout` and then fails open as a counted drop. The conclusion
+    /// is unchanged: the worst case is a counted drop, never a panic or a hang.
+    ///
+    /// The scenario is driven in two phases so the assertions cannot be vacuous:
+    /// 20 events are sent into the contended window, then `clear()` runs, then a
+    /// further `POST_CLEAR` events are sent with no contention at all — nothing
+    /// deletes those, so each one must be persisted or counted.
     #[test]
     fn test_concurrent_clear_does_not_crash_consumer() {
+        const PRE_CLEAR: usize = 20;
+        const POST_CLEAR: usize = 5;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("concurrent.db");
 
@@ -1649,26 +1707,61 @@ mod tests {
             done_tx,
         );
 
-        // Send several events to give the consumer something to process.
-        for _ in 0..20 {
+        // Phase 1 — send events into the window the clear will contend with.
+        for _ in 0..PRE_CLEAR {
             hook.on_request(&make_small_event());
         }
 
-        // Concurrently clear the DB while the consumer writes.
-        // AC15 arm e: clear must not crash the consumer.
-        if let Ok(db) = AnalyticsDb::open(&db_path) {
-            let _ = AnalyticsStore::clear(&db);
+        // Phase 2 — concurrent `stats --clear` while the consumer writes.
+        // No `if let Ok(...)` escape hatch: a failed open here IS the concurrent-open
+        // bug fixed in `schema::run_migrations` / `AnalyticsDb::open`, and it must
+        // fail loudly rather than silently skipping the whole scenario.
+        let db = AnalyticsDb::open(&db_path).expect("concurrent open must succeed");
+        AnalyticsStore::clear(&db).expect("clear must succeed");
+        drop(db);
+
+        // Phase 3 — post-clear events. Nothing contends for the write lock now and
+        // nothing deletes these rows afterwards.
+        for _ in 0..POST_CLEAR {
+            hook.on_request(&make_small_event());
         }
 
-        // Close the sender and wait for consumer to finish.
+        // Close the sender and wait for the consumer to finish.
         drop(hook);
-        let consumer_finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        let consumer_finished = done_rx.recv_timeout(CONSUMER_LIVENESS_BOUND).is_ok();
         let _ = handle.join();
 
         // Consumer must finish — no panic, no hang (AC15).
         assert!(
             consumer_finished,
             "consumer must signal completion after channel closes"
+        );
+
+        // Byte accounting must balance exactly: every enqueued event was dequeued
+        // and its payload subtracted. A leak or a double-subtract shows up here.
+        assert_eq!(
+            queued_bytes.load(Ordering::Relaxed),
+            0,
+            "every enqueued event must be dequeued and byte-accounted"
+        );
+
+        // The post-clear events must have landed. Channel capacity is
+        // PROXY_QUEUE_RECORD_CAPACITY (2048) and only 25 events were sent, so an
+        // enqueue-overflow drop is impossible — any shortfall here is a DB failure.
+        //
+        // `drops == 0` is deliberately NOT asserted: under heavy CPU
+        // oversubscription a scheduling stall could exceed the consumer's 100 ms
+        // busy_timeout and produce a legitimate fail-open drop. The row-count
+        // assertion captures the same claim without that flake.
+        let db = AnalyticsDb::open(&db_path).expect("post-run open must succeed");
+        let rows = db
+            .query_proxy_row_count()
+            .expect("proxy row count must be queryable");
+        assert!(
+            rows >= POST_CLEAR as u64,
+            "at least the {POST_CLEAR} uncontended post-clear events must be persisted; \
+             got {rows} rows (drops={})",
+            drop_count.load(Ordering::Relaxed)
         );
     }
 

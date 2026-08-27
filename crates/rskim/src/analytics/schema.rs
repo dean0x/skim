@@ -1,6 +1,6 @@
 //! Database schema and migrations for analytics.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// Current schema version of this skim release.
 ///
@@ -8,9 +8,56 @@ use rusqlite::Connection;
 /// this constant before any schema mutation, WAL flip, or chmod (AC3).
 pub(super) const CURRENT_SCHEMA_VERSION: i64 = 5;
 
-/// Run all database migrations.
+/// Run all database migrations inside ONE `BEGIN IMMEDIATE` transaction.
+///
+/// # Why `BEGIN IMMEDIATE` wraps the version read
+///
+/// Reading `PRAGMA user_version` and then migrating used to be two separate,
+/// unsynchronised steps. Two processes (or two threads) opening the same fresh
+/// database concurrently both read version 0 and both ran the migration blocks;
+/// the loser then failed with `duplicate column name: session_id` (the v3
+/// `ALTER TABLE`) or `table proxy_block_decisions already exists` (the v4
+/// `CREATE TABLE`), aborting `AnalyticsDb::open()` outright. Measured: 24 of 55
+/// concurrent-open runs failed this way.
+///
+/// `BEGIN IMMEDIATE` takes the database write lock **before** the version is
+/// read, so the two openers serialise: the winner reads 0, migrates, and
+/// commits; the loser blocks on the write lock, and once it acquires it reads
+/// the already-migrated version and skips every block. Neither sees a partially
+/// migrated schema.
+///
+/// # Why no deadlock is possible
+///
+/// There is exactly one lock (the SQLite write lock) and it is acquired once, up
+/// front. No read lock is taken first and later promoted to a write lock — the
+/// classic SQLite `SQLITE_BUSY_SNAPSHOT` upgrade deadlock cannot occur here. A
+/// waiter is bounded by the connection's `busy_timeout`, which the caller must
+/// have already set (see the caller contract below), so the worst case is a
+/// bounded wait ending in `SQLITE_BUSY`, never an indefinite block.
+///
+/// # Rollback semantics
+///
+/// The [`Transaction`] guard defaults to `DropBehavior::Rollback`, so an early
+/// `?` return rolls the whole batch back and leaves no transaction open on the
+/// connection. `PRAGMA user_version` is itself transactional in SQLite and rolls
+/// back with the batch — which is why each version block still keeps
+/// `PRAGMA user_version = N` as its FINAL statement: a mid-block abort leaves
+/// the prior version intact and the migration safely retryable (ADR-006).
+///
+/// # Caller contract
+///
+/// - The connection MUST already have a `busy_timeout` set; otherwise a
+///   concurrent opener's `BEGIN IMMEDIATE` returns `SQLITE_BUSY` immediately.
+/// - The connection MUST NOT already be inside a transaction —
+///   [`Transaction::new_unchecked`] does not check, and SQLite has no nested
+///   transactions. For the same reason the individual version blocks below must
+///   NOT contain their own `BEGIN;` / `COMMIT;`.
+/// - `PRAGMA journal_mode` cannot be changed inside a transaction, so the WAL
+///   flip must happen BEFORE this call.
 pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
     // AD-AN-5 / ADR-006: reject databases written by a newer skim build.
     // This is the same guard as `AnalyticsDb::open()` in mod.rs, replicated here
@@ -29,7 +76,7 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version < 1 {
-        conn.execute_batch(
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS token_savings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
@@ -51,7 +98,7 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version < 2 {
-        conn.execute_batch(
+        tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS analytics_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER
@@ -64,7 +111,7 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         // AD-AN-4: session_id is nullable for backward compatibility — rows
         // recorded before this migration have NULL session_id and are excluded
         // from per-session average calculations.
-        conn.execute_batch(
+        tx.execute_batch(
             "ALTER TABLE token_savings ADD COLUMN session_id TEXT;
             CREATE INDEX IF NOT EXISTS idx_ts_session_id ON token_savings(session_id);
             PRAGMA user_version = 3;",
@@ -72,7 +119,11 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
 
     if version < 4 {
-        // AD-AN-5: v4 migration — single contiguous BEGIN..COMMIT block.
+        // AD-AN-5: v4 migration — runs inside the outer BEGIN IMMEDIATE opened by
+        // `run_migrations`. It must NOT open its own BEGIN/COMMIT: SQLite has no
+        // nested transactions, so an inner `BEGIN;` here would fail with
+        // "cannot start a transaction within a transaction". Its atomicity is
+        // subsumed by the outer transaction.
         //
         // Nullable token columns (raw_tokens, compressed_tokens, savings_pct)
         // require a table rebuild because SQLite cannot ALTER COLUMN to drop a
@@ -82,7 +133,7 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         // interrupted rebuild — at any step including the proxy_block_decisions
         // detail-table DDL — rolls back the entire transaction leaving intact v3
         // (ADR-006: abort before persisting, old state survives). SQLite
-        // PRAGMA user_version is transactional and rolls back with the BEGIN block.
+        // PRAGMA user_version is transactional and rolls back with the transaction.
         //
         // AD-AN-13: proxy_block_decisions detail table (savings_id FK →
         // token_savings(id)) and its index are created inside the same transaction
@@ -91,9 +142,8 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         // AC5/AC6: provider, model, turn_id, upstream_error_status are nullable
         // to support both CLI rows (always non-NULL tokens, NULL provider/model)
         // and proxy rows (NULL or non-NULL tokens, present provider/model/turn_id).
-        conn.execute_batch(
-            "BEGIN;
-            CREATE TABLE token_savings_new (
+        tx.execute_batch(
+            "CREATE TABLE token_savings_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 command_type TEXT NOT NULL,
@@ -138,8 +188,7 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
                 bytes_out INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_pbd_savings_id ON proxy_block_decisions(savings_id);
-            PRAGMA user_version = 4;
-            COMMIT;",
+            PRAGMA user_version = 4;",
         )?;
     }
 
@@ -149,16 +198,16 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         // SHA-256 pair for losslessness audit). Migration is UNCONDITIONAL (not
         // proxy-gated) so DB versions never fork across build variants (finding 19).
         //
-        // ADR-006: wrapped in a single BEGIN..COMMIT transaction so any mid-batch
-        // failure (e.g. a pre-existing alignment_decisions with an incompatible
-        // schema causing the CREATE INDEX to fail) rolls back the entire batch and
-        // leaves user_version at 4, allowing a safe retry — identical structure to
-        // the v4 batch above.  PRAGMA user_version = 5 is the FINAL statement so a
-        // partial abort at any earlier statement rolls back before the version is
-        // advanced.
-        conn.execute_batch(
-            "BEGIN;
-            CREATE TABLE IF NOT EXISTS alignment_decisions (
+        // ADR-006: this batch runs inside the outer BEGIN IMMEDIATE opened by
+        // `run_migrations` (no inner BEGIN/COMMIT — SQLite has no nested
+        // transactions). Any mid-batch failure (e.g. a pre-existing
+        // alignment_decisions with an incompatible schema causing the CREATE INDEX
+        // to fail) rolls back the entire transaction and leaves user_version at 4,
+        // allowing a safe retry — identical structure to the v4 batch above.
+        // PRAGMA user_version = 5 is the FINAL statement so a partial abort at any
+        // earlier statement rolls back before the version is advanced.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS alignment_decisions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL,
                 request_id TEXT NOT NULL,
@@ -175,11 +224,11 @@ pub(super) fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
                 output_sha256 BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_ad_timestamp ON alignment_decisions(timestamp);
-            PRAGMA user_version = 5;
-            COMMIT;",
+            PRAGMA user_version = 5;",
         )?;
     }
 
+    tx.commit()?;
     Ok(())
 }
 
@@ -333,17 +382,17 @@ mod tests {
     // schema (no `timestamp` column).  Call run_migrations: the v5 batch's
     // `CREATE TABLE IF NOT EXISTS` is a no-op (table exists), but `CREATE INDEX
     // ... ON alignment_decisions(timestamp)` fails (no such column).  With
-    // BEGIN..COMMIT wrapping the v5 batch (ADR-006), the whole batch rolls back
-    // and user_version stays at 4.  Drop the conflicting table, re-run migrations
-    // and confirm v5 completes.
+    // the outer BEGIN IMMEDIATE that `run_migrations` opens (ADR-006), the whole
+    // batch rolls back and user_version stays at 4.  Drop the conflicting table,
+    // re-run migrations and confirm v5 completes.
     //
     // DISCRIMINATING (PF-007): if PRAGMA user_version = 5 were placed BEFORE the
     // CREATE INDEX in the v5 batch, it would autocommit before the index fails,
     // leaving user_version = 5 after the error — this test catches that violation.
     // Unlike the previous version of this test (which hand-wrote its own BEGIN and
     // never called run_migrations), Phase 2 here drives the production migration
-    // code path — the statement ORDER of schema.rs:130-149 is what determines the
-    // outcome.
+    // code path — the statement ORDER inside the `version < 5` block of
+    // `run_migrations` is what determines the outcome.
     #[test]
     fn schema_mid_migration_failure_leaves_prior_version_intact() {
         // Phase 1: advance to v4.
@@ -362,7 +411,7 @@ mod tests {
 
         // Phase 2: inject a conflicting alignment_decisions table (wrong schema —
         // no `timestamp` column).  The v5 CREATE INDEX will fail at the column
-        // reference; with the BEGIN..COMMIT wrapper the whole batch rolls back and
+        // reference; with the outer BEGIN IMMEDIATE the whole batch rolls back and
         // user_version stays at 4.
         conn.execute_batch(
             "CREATE TABLE alignment_decisions (id INTEGER PRIMARY KEY, wrong_col TEXT);",
@@ -392,12 +441,14 @@ mod tests {
             "setup check: conflicting alignment_decisions must still be present"
         );
 
-        // SQLite does not auto-rollback when execute_batch fails mid-batch: the
-        // BEGIN; opened a transaction and the index-creation failure left it open.
-        // Explicitly roll it back so the connection is in a clean state before
-        // Phase 3 tries to start a new transaction.
-        conn.execute_batch("ROLLBACK;")
-            .expect("rollback the failed v5 transaction before retry");
+        // `run_migrations` owns its transaction via a `Transaction` guard whose
+        // DropBehavior is Rollback, so the early `?` return already rolled the
+        // failed v5 batch back and left NO transaction open on the connection.
+        // Starting (and immediately committing) a fresh one proves that.
+        assert!(
+            conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").is_ok(),
+            "run_migrations must leave no transaction open after a mid-migration failure"
+        );
 
         // Phase 3: remove the conflicting table, then re-run — v5 must complete.
         conn.execute_batch("DROP TABLE alignment_decisions;")
