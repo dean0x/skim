@@ -20,10 +20,24 @@ use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
 mod common;
 
+/// Per-binary cache sandbox for the hook-mode invocations below.
+///
+/// `skim rewrite --hook` writes the D5 force-raw marker to
+/// `{SKIM_CACHE_DIR}/sessions/{ppid}.raw`.  With no override that resolves to
+/// the developer's real `~/.cache/skim`, and the PID it keys on is the shared
+/// nextest runner — so a hook test here leaves a marker that
+/// `force_raw_requested()` finds from an unrelated wrapper-surface test binary
+/// running concurrently, flipping it to serve raw and fail.  The collision is
+/// scheduling-dependent, so it surfaces only at certain suite sizes; adding any
+/// new test binary can move the schedule enough to expose it.
+static CACHE_SANDBOX: std::sync::LazyLock<TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir must succeed"));
+
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_REWRITTEN_FROM");
+    cmd.env("SKIM_CACHE_DIR", CACHE_SANDBOX.path());
     cmd
 }
 
