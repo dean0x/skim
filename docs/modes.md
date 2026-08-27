@@ -8,7 +8,7 @@ Skim offers six transformation modes, each with different levels of aggressivene
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
 | Minimal    | 15-30%          | All code, doc comments, Python/Ruby/SQL/Bash module header comments | Non-doc comments; module headers stripped in Rust, C, TypeScript, Go, and all other languages |
-| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types | Parameter type annotations (Python, TypeScript), generics (except inside preserved return types), decorators, semicolons |
+| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types | Parameter type annotations (Python only), generics (except inside preserved return types), decorators, semicolons |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
@@ -257,7 +257,7 @@ skim file.ts --mode full
 
 **Token reduction: 30-50%**
 
-Pseudo mode strips syntactic noise (type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
+Pseudo mode strips syntactic noise (Python parameter type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. TypeScript and Rust parameter types are preserved as API surface (ADR-008). The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
 
 ### What's Preserved
 

@@ -657,6 +657,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A wrapped tool's own colorization is still neutralized at the child-invocation boundary via
   `--no-color`.
 
+### Fixed (backfill — shipped in #370 without CHANGELOG entry)
+- **`skim grep`/`skim rg` emitted a double-header with a mis-pluralised file count (#370)** —
+  The grep/rg handler prepended a `GREP: N matches in M files` summary line AND a canonical
+  `tool N` header, producing two consecutive header lines. The file count also pluralised
+  incorrectly ("1 files"). Fixed by removing the duplicate prepend and correcting pluralisation.
+- **Rewrite engine no longer rewrites commands that redirect stdout to a file (#370)** —
+  A command such as `gh api repos/o/r > out.json` was being rewritten to
+  `skim gh api repos/o/r > out.json`, causing skim's compressed summary to land in the file
+  instead of the raw tool bytes. The rewrite engine now detects `> file`, `>> file`, and
+  `N> file` redirections and bails (leaves the command unchanged). Both the PreToolUse hook
+  and the `skim rewrite` CLI apply this check. The wrapper surface was unaffected — it
+  uses an independent `stdout_is_regular_file` (`fstat` on fd 1) check at exec time.
+
+### Fixed (omnibus fidelity overhaul — fix/fidelity-parity-overhaul branch)
+- **Net-savings guard baseline always measured; 256-byte floor removed (A1, A2)** — The
+  fidelity gate that decides whether to serve compressed or raw output previously skipped the
+  baseline measurement on some paths, and a 256-byte floor allowed expansions to pass as
+  improvements. Both defects are fixed: raw bytes are always measured before the
+  compression/passthrough decision, and a tie now routes to Passthrough.
+- **Standalone `diff` routes to raw passthrough; dead `-u` injection removed (A3)** —
+  `diff` has no text-compression benefit (PF-011), so the dispatch now routes it directly
+  to `run_raw_passthrough`. The `prepare_args` function no longer injects `-u` when the
+  caller has not requested it, eliminating a silent argument mutation. Conflicting-flag
+  detection prevents skim from injecting flags that would override user-supplied format flags.
+- **`SKIM_PASSTHROUGH=1` convergence gate restored at dispatch (B1)** — The gate that
+  bypasses all compression when `SKIM_PASSTHROUGH=1` is set was missing from the primary
+  `cmd::dispatch::dispatch()` entry point, requiring each handler to re-check the variable
+  independently (and many did not). The gate is now the first check in `dispatch()`, before
+  any family match arm. `env` is explicitly excluded at the gate (PF-012 credential
+  redaction) and retains its `never_passthrough: true` handler-level guard as a second layer.
+- **Lossy-view transparency marker added to all truncation paths (B2-B5)** — Handlers that
+  elide entries (line caps, file-count caps, field drops) now emit an `output::elision_marker`
+  carrying exact counts (`N of M shown`) and a `SKIM_PASSTHROUGH=1` hint. The hint is also
+  threaded through `rskim-core` truncation markers, so core-level elision is observable
+  without `SKIM_DEBUG=1` (per ADR-011). Raw-fallback banners remain debug-gated.
+- **Wrapper and rewrite surfaces now share a single skip-flag registry (D4)** — The rewrite
+  engine's per-tool skip-flag table (`rules.rs`) was previously unreachable from the wrapper
+  surface: wrappers dispatched directly to handlers which had no flag-skip step. A new
+  `skip_flags_for_tool()` function in `registry.rs` is consulted by `dispatch_for_wrapper()`
+  before entering any handler. Tools where specific flags suppress compression (`rg --json`,
+  `tree --json`, `grep --help`) now pass through on both surfaces.
+- **Unknown wrapper subcommands exec the real tool instead of returning an error (D2)** —
+  The wrapper-surface catch-all previously called `bail!` for any subcommand not in the
+  explicit dispatch table, so `git branch -a` via a PATH wrapper would fail. The catch-all
+  now calls `run_raw_passthrough`, which exec-replaces the process with the real binary.
+- **`dispatch_for_wrapper()` passes through `--help`/`-h`/`--version`/`-V` to the native
+  tool (D3)** — Help and version flags are now detected in `dispatch_for_wrapper()` before
+  entering `dispatch()`. When detected, the native binary is exec-replaced without any
+  skim processing. Previously these flags fell into skim's own handler, printing skim
+  output instead of the tool's.
+- **Diff render replaced with single-pass positional walk; verifier added (C1)** —
+  The previous two-pass diff renderer could duplicate hunks when AST node ranges overlapped.
+  The replacement uses a monotonically-advancing `EmittedCursor` so each byte is emitted
+  exactly once. A post-render verifier (gated behind `cfg(test)`) checks for duplicate output
+  lines, backward cursor jumps, and lines added-as-context on every test run. The cursor/
+  marker-aware structure and full-mode diff render is bounded by the ADR-001 net-savings guard:
+  if the enriched render exceeds the raw diff size, raw is emitted instead.
+- **Pseudo and minimal mode literal preservation (C2)** — Five defects fixed:
+  (C2a) string-literal content was stripped by the type-annotation stripper for some
+  languages; (C2b) numeric literals inside struct initialisers were replaced with a
+  placeholder; (C2c) minimal mode incorrectly stripped non-doc inline comments inside
+  function bodies; (C2d) the pseudo pass for TypeScript parameter annotations incorrectly
+  walked into return-type position; (C2e) the minimal strip incorrectly removed module-level
+  comments in Python/Ruby/SQL/Bash files.
+- **Pseudo mode TypeScript/Rust parameter type annotations preserved (E1)** — Pseudo mode
+  was stripping TypeScript and Rust parameter type annotations as if they were Python
+  annotations. TypeScript and Rust parameter types are API surface per ADR-008; only Python
+  parameter types (`: int`, `: str`) are removed. Return types are preserved in all languages.
+- **`gh` JSON-field extractor no longer drops `conclusion` field (E2)** — The structured
+  `gh` response handler omitted `conclusion` from its extraction set, so `gh run list --json`
+  responses silently dropped the conclusion status column.
+- **Truncation off-by-one corrected in list-elision paths (E3/E4)** — Several handlers used
+  `items[..cap]` (exclusive upper bound) when they intended `items[..=cap]` (inclusive),
+  emitting one fewer item than the cap. The elision marker counts are now consistent with
+  the actual number of emitted items.
+- **stdout-destination parity across both interception surfaces (D5)** — Previously the
+  wrapper surface used a `is_passthrough_mode()` flag with no terminal-detection refinement,
+  serving compressed output even when fd 1 was a regular file. The wrapper surface now calls
+  `isatty(1)` (via `stdout_should_serve_raw()`) and serves compressed output only when fd 1
+  is a terminal or named pipe (FIFO). For the pipe→file case (a shell has already redirected
+  fd 1 before exec-ing the wrapper), a PID-keyed force-raw sidecar file at
+  `{SKIM_CACHE_DIR}/sessions/{ppid}.raw` is written by the rewrite-engine hook and read by
+  the wrapper — both surfaces are fstat-equivalent for the common case; the sidecar bridges
+  the gap for hook-mediated redirections. Accepted limitation: a bare wrapper invocation with
+  no PreToolUse hook active uses fstat-only behaviour (sidecar is absent).
+
+### Added (omnibus fidelity overhaul)
+- **Cross-surface conformance harness (D7)** — 22 integration tests that drive both the
+  rewrite surface (`skim rewrite '<cmd>'` then execute the emitted command) and the argv0
+  wrapper surface (skim binary invoked with `arg0("<tool>")`) for the same tool × arg-set
+  matrix. Coverage: 9 Class-A families that previously `bail!`-ed on the wrapper surface
+  (`git rev-parse`, `git branch`, `cargo run`, `cargo --version`, `go build`, `go install`,
+  `npm publish`, `pip freeze`, `pnpm add`); skip-flag suppression (`grep --help`,
+  `rg --json`, `tree --json`); `env FOO=1 printenv FOO` exclusion on both surfaces;
+  `diff` across three flag forms; `SKIM_PASSTHROUGH=1` convergence on both surfaces.
+  Surface divergences are pinned with explicit `diverge_note` strings so regressions are
+  detected immediately. Each test binary sandboxes `SKIM_CACHE_DIR` in a fresh TempDir
+  to prevent force-raw sidecar cross-contamination (Phase 8 fix).
+
 ## [2.11.0] - 2026-07-11
 
 Consent-gated permissions seeding for `skim init`; Copilot hook re-homed to `~/.copilot`; `ls -a` fidelity fix. 4,329 tests passing (up from 3,558 in v2.10.0).
