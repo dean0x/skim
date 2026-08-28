@@ -277,6 +277,20 @@ fn write_or_remove_marker(path: &Path, present: bool) {
 /// All failures are silently ignored: a marker that fails to write costs
 /// compression fidelity, and one that fails to clear costs compression. Both
 /// are recoverable; neither may break the pipeline.
+///
+/// # Accepted residual: same-tool key collision
+///
+/// Because the key is `{ppid}.{tool}.raw`, **two commands using the same
+/// tool under one agent share a key**. `set_force_raw` is called on every
+/// hook invocation and a `false` verdict calls [`write_or_remove_marker`]
+/// to *remove* the marker. So a concurrent `git status` (verdict `false`)
+/// deletes the live marker set by `git log -n 5 | tee out.txt` (verdict
+/// `true`): the `git` wrapper then sees only a FIFO via `fstat` and
+/// compresses into the tee.
+///
+/// This is the one accepted marker limitation that costs bytes rather than
+/// failing toward lossless compression — noted in `force_raw_requested` in
+/// `main.rs`.
 pub(crate) fn set_force_raw(force_raw: bool, tools: &[String], cache_dir: &Path) {
     let Some(ppid) = get_ppid() else { return };
 
