@@ -167,10 +167,26 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
+/// Cache schema version — MUST be bumped whenever output bytes change.
+///
+/// This constant is folded into the SHA-256 hash that names every cache file.
+/// When this value changes, every existing cache entry silently misses (the
+/// old file is at a different hash path) and is re-generated on first access.
+/// This guarantees that a warm cache never serves stale bytes after an
+/// output-format change in a later phase of the fidelity overhaul.
+///
+/// **Rule**: bump this constant in the same commit that changes output bytes.
+/// Do not update it for changes that do not affect what `transform()` emits.
+const CACHE_SCHEMA_VERSION: u32 = 1;
+
 /// Generate cache key from file path, mtime, mode, truncation options, and line_numbers flag.
 ///
 /// `line_numbers` is included in the key because line-numbered and unnumbered outputs
 /// differ in content and should be cached independently.
+///
+/// `CACHE_SCHEMA_VERSION` is included so that any change to the output format
+/// (a later phase of the fidelity overhaul) automatically invalidates all warm
+/// entries without needing to clear the cache manually.
 fn cache_key(
     path: &Path,
     mtime: SystemTime,
@@ -184,7 +200,8 @@ fn cache_key(
     let opt_str = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
 
     let hash_input = format!(
-        "{}|{}|{:?}|{}|{}|{}|{}",
+        "cache_schema_v{}|{}|{}|{:?}|{}|{}|{}|{}",
+        CACHE_SCHEMA_VERSION,
         canonical_path.display(),
         mtime_secs,
         mode,
@@ -666,5 +683,61 @@ mod tests {
 
         // Cache should be invalidated (mtime changed)
         assert!(read_cache(&path, Mode::Structure, &default_trunc, false).is_none());
+    }
+
+    /// A1: CACHE_SCHEMA_VERSION is folded into the hash key.
+    ///
+    /// Proof strategy: compare the production key (which includes
+    /// `cache_schema_v{N}|...`) against a key computed from the same inputs
+    /// but WITHOUT any version prefix (the pre-A1 baseline).  They must
+    /// differ, which means bumping CACHE_SCHEMA_VERSION always produces a
+    /// different filename and automatically invalidates any warm entry written
+    /// by an older build.
+    ///
+    /// If this test ever fails, `hash_input` no longer includes the schema
+    /// version and the safety guarantee is broken — a format change in a
+    /// later phase of the fidelity overhaul could serve stale cached bytes.
+    #[test]
+    fn test_schema_version_in_cache_key() {
+        use sha2::{Digest, Sha256};
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "schema version test content").unwrap();
+        let path = temp_file.path();
+        let metadata = fs::metadata(path).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let trunc = TruncationOptions::default();
+
+        // Production key — uses `cache_schema_v{CACHE_SCHEMA_VERSION}|...`
+        let key_production =
+            cache_key(path, mtime, Mode::Structure, &trunc, false).unwrap();
+
+        // Simulate the pre-A1 hash: same inputs, NO version prefix.
+        // If `key_production == key_legacy`, CACHE_SCHEMA_VERSION is absent
+        // from hash_input and the invalidation guarantee is broken.
+        let canonical = path.canonicalize().unwrap();
+        let mtime_secs = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let legacy_input = format!(
+            "{}|{}|{:?}|none|none|none|0",
+            canonical.display(),
+            mtime_secs,
+            Mode::Structure,
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(legacy_input.as_bytes());
+        let key_legacy = format!("{:x}", hasher.finalize());
+
+        assert_ne!(
+            key_production,
+            key_legacy,
+            "CACHE_SCHEMA_VERSION must be included in hash_input. \
+             Without it, output-format changes in later phases cannot \
+             invalidate warm cache entries. \
+             Bump CACHE_SCHEMA_VERSION in the same commit that changes \
+             what transform() emits."
+        );
     }
 }
