@@ -2775,8 +2775,8 @@ mod tests {
         );
 
         // Ratio uses MIN (ratio gate — scaling_guard rule).
-        // A3 discrimination evidence: under a quadratic walk the ratio was X.XX×;
-        // normal implementation measures 2.01×–2.07×.
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.86×;
+        // normal implementation measures 2.07×.
         let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
@@ -2812,8 +2812,8 @@ mod tests {
              reliably (expected ≥ 6ms; ~27.3ms measured). DO NOT convert to a skip."
         );
 
-        // A3 discrimination evidence: under a quadratic walk the ratio was X.XX×;
-        // normal implementation measures ~2.04×.
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.79×;
+        // normal implementation measures 2.04×.
         let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
@@ -2843,8 +2843,8 @@ mod tests {
              reliably (expected ≥ 5ms; ~24.2ms measured). DO NOT convert to a skip."
         );
 
-        // A3 discrimination evidence: under a quadratic walk the ratio was X.XX×;
-        // normal implementation measures ~2.01×.
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.03×;
+        // normal implementation measures 2.01×.
         let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
