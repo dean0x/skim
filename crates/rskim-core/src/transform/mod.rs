@@ -8,6 +8,8 @@ pub(crate) mod json;
 pub(crate) mod literals;
 pub(crate) mod minimal;
 pub(crate) mod pseudo;
+#[cfg(test)]
+pub(crate) mod scaling_guard;
 pub(crate) mod signatures;
 pub(crate) mod structure;
 pub(crate) mod toml;

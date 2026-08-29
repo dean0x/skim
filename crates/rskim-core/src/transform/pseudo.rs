@@ -2694,15 +2694,24 @@ mod tests {
     // linear (2.0×) and quadratic (4.0×), matching the Go guards in minimal.rs.
     // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
 
-    fn time_pseudo(source: &str, language: Language) -> f64 {
+    /// Time the pseudo transform for `source` in `language`.
+    ///
+    /// Returns `(min, median)` of 5 samples (see `scaling_guard` module doc):
+    /// - Use `min`    for ratio gates:    `ratio = t2_min / t1_min; assert!(ratio < 2.8)`
+    /// - Use `median` for absolute gates: `assert!(t1_median >= FLOOR)`
+    ///
+    /// The parse is hoisted outside the sampling loop — we time the walk, not the
+    /// parser (per `scaling_guard` module doc).
+    fn time_pseudo(source: &str, language: Language) -> (f64, f64) {
         let mut parser = Parser::new(language).unwrap();
-        let tree = parser.parse(source).unwrap();
+        let tree = parser.parse(source).unwrap(); // hoisted outside the sample loop
         let config = TransformConfig::with_mode(Mode::Pseudo);
-        let start = std::time::Instant::now();
-        let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-        ms
+        crate::transform::scaling_guard::time_5(|| {
+            let start = std::time::Instant::now();
+            let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
+            assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
+            start.elapsed().as_secs_f64() * 1000.0
+        })
     }
 
     /// N top-level statements, each terminated by a `;` — the site-1 population.
@@ -2749,27 +2758,32 @@ mod tests {
 
         // N=8000 is ~56 k AST nodes, comfortably under MAX_AST_NODES (100 k);
         // above it this would silently become an Err(ComplexityLimit) assertion.
-        let t1 = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
-        let t2 = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
+        //
+        // Each call returns (min, median) of 5 samples.  Parse is hoisted outside
+        // the sample loop (see scaling_guard module doc).
+        let (t1_min, t1_median) = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
+        let (t2_min, _) = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
 
-        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
-        // in this work went vacuous when a fix made it too fast to measure, and
-        // a silently-passing scaling guard provides no protection at all.
+        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
+        // We FAIL rather than skip: a vacuous floor provides no protection.
         assert!(
-            t1 >= 8.0,
-            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 8ms; ~36.0ms measured on debug builds). Either the \
-             transform is being cached/skipped or N must be raised. \
+            t1_median >= 8.0,
+            "N=4000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 8ms; ~36.0ms measured on debug builds). \
+             Either the transform is being cached/skipped or N must be raised. \
              DO NOT convert this to a skip."
         );
 
-        let ratio = t2 / t1;
+        // Ratio uses MIN (ratio gate — scaling_guard rule).
+        // A3 discrimination evidence: under a quadratic walk the ratio was X.XX×;
+        // normal implementation measures 2.01×–2.07×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
              (got {ratio:.2}×; measured 2.07×). O(N) → ~2.0×; O(N²) → ~4.0×; \
-             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 took {t1:.2}ms, \
-             N=8000 took {t2:.2}ms. Check that the walker threads WalkPosition \
+             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 min {t1_min:.2}ms, \
+             N=8000 min {t2_min:.2}ms. Check that the walker threads WalkPosition \
              and does not walk siblings per node (PF-020)."
         );
     }
@@ -2788,21 +2802,24 @@ mod tests {
             "pseudo must still strip Python parameter annotations, got: {out}"
         );
 
-        let t1 = time_pseudo(&python_return_type_source(1000), Language::Python);
-        let t2 = time_pseudo(&python_return_type_source(2000), Language::Python);
+        let (t1_min, t1_median) = time_pseudo(&python_return_type_source(1000), Language::Python);
+        let (t2_min, _) = time_pseudo(&python_return_type_source(2000), Language::Python);
 
+        // Noise floor uses MEDIAN (absolute gate).
         assert!(
-            t1 >= 6.0,
-            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 6ms; ~27.3ms measured). DO NOT convert this to a skip."
+            t1_median >= 6.0,
+            "N=1000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 6ms; ~27.3ms measured). DO NOT convert to a skip."
         );
 
-        let ratio = t2 / t1;
+        // A3 discrimination evidence: under a quadratic walk the ratio was X.XX×;
+        // normal implementation measures ~2.04×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.04×). N=1000 took {t1:.2}ms, \
-             N=2000 took {t2:.2}ms."
+             (got {ratio:.2}×; measured 2.04×). N=1000 min {t1_min:.2}ms, \
+             N=2000 min {t2_min:.2}ms."
         );
     }
 
@@ -2816,21 +2833,24 @@ mod tests {
             "the `template` keyword must be consumed with its parameter list, got: {out}"
         );
 
-        let t1 = time_pseudo(&cpp_template_source(1000), Language::Cpp);
-        let t2 = time_pseudo(&cpp_template_source(2000), Language::Cpp);
+        let (t1_min, t1_median) = time_pseudo(&cpp_template_source(1000), Language::Cpp);
+        let (t2_min, _) = time_pseudo(&cpp_template_source(2000), Language::Cpp);
 
+        // Noise floor uses MEDIAN (absolute gate).
         assert!(
-            t1 >= 5.0,
-            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 5ms; ~24.2ms measured). DO NOT convert this to a skip."
+            t1_median >= 5.0,
+            "N=1000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 5ms; ~24.2ms measured). DO NOT convert to a skip."
         );
 
-        let ratio = t2 / t1;
+        // A3 discrimination evidence: under a quadratic walk the ratio was X.XX×;
+        // normal implementation measures ~2.01×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.01×). N=1000 took {t1:.2}ms, \
-             N=2000 took {t2:.2}ms."
+             (got {ratio:.2}×; measured 2.01×). N=1000 min {t1_min:.2}ms, \
+             N=2000 min {t2_min:.2}ms."
         );
     }
 
