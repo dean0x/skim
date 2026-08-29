@@ -2,13 +2,28 @@
 //!
 //! # Purpose
 //!
-//! Walks the real git history of this repository and asserts that skim's diff
-//! output never drops `+` or `-` lines that appear in the raw diff.  This is
-//! the operationalisation of invariant #317 ("compress, never truncate") for
-//! the diff code path.
+//! Walks the real git history of this repository and asserts that skim's
+//! DEFAULT-mode diff output never drops `+` or `-` lines that appear in the
+//! raw diff.  This is the operationalisation of invariant #317 ("compress,
+//! never truncate") for the default-mode diff code path.
 //!
-//! Also reports the AST-aware render vs raw-fallback rate per mode so that
-//! regression in fallback rate is visible in CI logs.
+//! Additionally tracks per-mode fallback rates and violation counts for the
+//! `structure` and `full` modes — as informational (no assertion) because
+//! those modes apply AST compression to the diff and intentionally compact
+//! content: the resulting pre-B3 violations are KNOWN and are what B3 is
+//! designed to cure.  Asserting on them before B3 would make the corpus test
+//! permanently broken.
+//!
+//! # Mode breakdown rationale
+//!
+//! - Phase B2 (default-mode breadcrumb routing) is validated by a DECREASE in
+//!   the default-mode raw-fallback rate (more commits successfully enriched
+//!   instead of bailing to raw).
+//! - Phase B3 (orphan gap fill) is validated by a DECREASE in the
+//!   structure/full violation count (fewer dropped content lines).
+//!
+//! Both signals are mode-specific; an aggregate-only harness cannot
+//! discriminate them.
 //!
 //! # PF-026 compliance
 //!
@@ -23,13 +38,9 @@
 //! This test is `#[ignore]` by default.  Run explicitly:
 //!
 //! ```text
-//! cargo nextest run -p rskim --all-targets -j 4 -- --ignored
-//! ```
-//!
-//! Or target this file only:
-//!
-//! ```text
-//! cargo nextest run -p rskim --all-targets -E 'binary(cli_git_diff_corpus)' -- --ignored
+//! SKIM_PASSTHROUGH=1 cargo nextest run -p rskim --all-targets -j 1 \
+//!     -E 'binary(cli_git_diff_corpus)' --run-ignored ignored-only \
+//!     --no-capture
 //! ```
 //!
 //! The test never fails on CI in normal mode (ignored); it is intended for
@@ -55,6 +66,84 @@ const MAX_COMMITS: usize = 200;
 /// many bytes are skipped to keep the test fast on binary-heavy commits.
 const MAX_DIFF_BYTES: usize = 256 * 1024; // 256 KB
 
+/// The three rendering paths exposed by `skim git diff`.
+///
+/// `Default` = no `--mode` flag (skim chooses the rendering strategy itself).
+/// `Structure` and `Full` select explicit modes, each routing through a
+/// distinct AST-rendering code path.  Per-mode breakdown is needed because:
+/// - B2 (default-mode breadcrumb routing) only affects `Default`.
+/// - B3 (orphan-gap fill) only affects `Structure` and `Full`.
+#[derive(Clone, Copy, Debug)]
+enum DiffMode {
+    Default,
+    Structure,
+    Full,
+}
+
+impl DiffMode {
+    fn all() -> [Self; 3] {
+        [Self::Default, Self::Structure, Self::Full]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Structure => "structure",
+            Self::Full => "full",
+        }
+    }
+
+    /// Extra CLI args to select this mode.  `Default` adds nothing.
+    fn extra_args(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Structure => Some("--mode=structure"),
+            Self::Full => Some("--mode=full"),
+        }
+    }
+
+    /// Whether the safety invariant assertion applies to this mode.
+    ///
+    /// `Default` mode is subject to compress-never-truncate (#317): skim may
+    /// enrich the diff but must never drop `+`/`-` lines relative to raw.
+    ///
+    /// `Structure` and `Full` apply AST compression to the diff, which
+    /// intentionally compacts content lines.  Pre-B3 violations in those modes
+    /// are KNOWN and expected.  Asserting on them before B3 is implemented
+    /// would make this harness permanently broken, defeating its purpose as a
+    /// baseline measurement instrument.
+    fn invariant_asserted(self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-mode stats accumulator
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Debug)]
+struct ModeStats {
+    examined: usize,
+    raw_fallback: usize,
+    /// Lines-dropped violations.  For `Default`, this is asserted == 0.
+    /// For `Structure`/`Full`, this is informational (pre-B3 expected state).
+    violations: usize,
+}
+
+impl ModeStats {
+    fn fallback_pct(&self) -> f64 {
+        if self.examined == 0 {
+            0.0
+        } else {
+            (self.raw_fallback as f64 / self.examined as f64) * 100.0
+        }
+    }
+
+    fn ast_rendered(&self) -> usize {
+        self.examined.saturating_sub(self.raw_fallback)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -64,8 +153,8 @@ const MAX_DIFF_BYTES: usize = 256 * 1024; // 256 KB
 /// PF-026: must be absolute to prevent a skim wrapper in `~/.skim/bin/` from
 /// intercepting the control command.
 fn git_bin() -> PathBuf {
-    // `which git` gives the first match on PATH.  If the skim wrapper
-    // directory is first, walk past it to find the real binary.
+    // Walk PATH entries in order.  Skip any entry whose grandparent is `.skim`
+    // (the skim wrapper directory installed by `skim init --wrappers`).
     let candidates = std::env::var("PATH")
         .unwrap_or_default()
         .split(':')
@@ -76,14 +165,12 @@ fn git_bin() -> PathBuf {
         .collect::<Vec<_>>();
 
     for candidate in &candidates {
-        // Skip any path whose parent is a known skim wrapper directory.
         let parent_name = candidate
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("");
         if parent_name == "bin" {
-            // Could be ~/.skim/bin — check the grandparent.
             let gp_name = candidate
                 .parent()
                 .and_then(|p| p.parent())
@@ -91,7 +178,7 @@ fn git_bin() -> PathBuf {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             if gp_name == ".skim" {
-                continue; // skip wrapper
+                continue; // skip skim wrapper
             }
         }
         return candidate.clone();
@@ -102,7 +189,6 @@ fn git_bin() -> PathBuf {
 
 /// Return the repository root (directory containing `.git`).
 fn repo_root() -> PathBuf {
-    // This test lives inside the repo, so we can ask git itself.
     let out = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -123,7 +209,7 @@ fn recent_commits(root: &std::path::Path, limit: usize) -> Vec<String> {
         .collect()
 }
 
-/// Run `git diff <sha>^1..<sha>` via the REAL git binary with SKIM_PASSTHROUGH=1.
+/// Run `git diff <sha>^1 <sha>` via the REAL git binary with `SKIM_PASSTHROUGH=1`.
 ///
 /// Returns `None` when the commit has no parent (initial commit) or the diff
 /// exceeds `MAX_DIFF_BYTES`.
@@ -131,7 +217,7 @@ fn raw_diff(git: &std::path::Path, root: &std::path::Path, sha: &str) -> Option<
     let out = Command::new(git)
         .args(["diff", &format!("{sha}^1"), sha])
         .current_dir(root)
-        // PF-026: passthrough prevents rewrite hook from compressing the control.
+        // PF-026: passthrough prevents the rewrite hook from compressing the control.
         .env("SKIM_PASSTHROUGH", "1")
         .output()
         .ok()?;
@@ -146,16 +232,18 @@ fn raw_diff(git: &std::path::Path, root: &std::path::Path, sha: &str) -> Option<
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Run `skim git diff <sha>^1..<sha>` via the debug binary with analytics off.
-fn skim_diff(root: &std::path::Path, sha: &str) -> Option<String> {
+/// Run `skim git diff <sha>^1 <sha>` in the given mode via the debug binary.
+fn skim_diff_mode(root: &std::path::Path, sha: &str, mode: DiffMode) -> Option<String> {
     let skim = common::skim_bin();
-    let out = Command::new(&skim)
-        .args(["git", "diff", &format!("{sha}^1"), sha])
+    let mut cmd = Command::new(&skim);
+    cmd.args(["git", "diff", &format!("{sha}^1"), sha])
         .current_dir(root)
         .env("SKIM_DISABLE_ANALYTICS", "1")
-        .env("NO_COLOR", "1")
-        .output()
-        .ok()?;
+        .env("NO_COLOR", "1");
+    if let Some(flag) = mode.extra_args() {
+        cmd.arg(flag);
+    }
+    let out = cmd.output().ok()?;
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -173,18 +261,14 @@ fn skim_diff(root: &std::path::Path, sha: &str) -> Option<String> {
 ///
 /// Returns `(ok, missing_count)`.
 fn check_no_line_dropped(raw: &str, compressed: &str) -> (bool, usize) {
-    // If skim passed through raw, the invariant trivially holds.
-    if compressed == raw {
-        return (true, 0);
+    if compressed.trim() == raw.trim() {
+        return (true, 0); // raw fallback — invariant trivially holds
     }
     let mut missing = 0usize;
     for line in raw.lines() {
-        // Only check content lines — hunk headers and context lines are not
-        // required to survive re-encoding.
-        if line.starts_with('+') && !line.starts_with("+++")
-            || line.starts_with('-') && !line.starts_with("---")
+        if (line.starts_with('+') && !line.starts_with("+++"))
+            || (line.starts_with('-') && !line.starts_with("---"))
         {
-            // The line content after the prefix must appear somewhere.
             let content = &line[1..];
             if !content.is_empty() && !compressed.contains(content) {
                 missing += 1;
@@ -195,11 +279,11 @@ fn check_no_line_dropped(raw: &str, compressed: &str) -> (bool, usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Test
+// Main corpus test
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "corpus test: run with --ignored; reads live git history"]
+#[ignore = "corpus test: run with SKIM_PASSTHROUGH=1 --no-capture --run-ignored ignored-only; reads live git history"]
 fn git_diff_corpus_compress_never_truncate() {
     let git = git_bin();
     let root = repo_root();
@@ -210,40 +294,54 @@ fn git_diff_corpus_compress_never_truncate() {
         "git log must return at least one commit; got none (is this a git repo?)"
     );
 
-    let mut checked = 0usize;
+    let modes = DiffMode::all();
+    // stats[0] = default, stats[1] = structure, stats[2] = full
+    let mut stats: [ModeStats; 3] = Default::default();
     let mut skipped_no_parent = 0usize;
     let skipped_too_large = 0usize;
-    let mut raw_fallback = 0usize; // skim returned raw unchanged
-    let mut violations: Vec<(String, usize)> = Vec::new(); // (sha, missing_count)
+
+    // Violations where the safety ASSERTION fires (default mode only).
+    let mut asserted_violations: Vec<(String, DiffMode, usize)> = Vec::new();
+    // Violations in structure/full — tracked informational, no assertion.
+    let mut advisory_violations: Vec<(String, DiffMode, usize)> = Vec::new();
 
     for sha in &commits {
-        match raw_diff(&git, &root, sha) {
+        let raw = match raw_diff(&git, &root, sha) {
             None => {
                 skipped_no_parent += 1;
                 continue;
             }
-            Some(ref raw) if raw.is_empty() => {
-                // Empty diff (e.g. docs-only commit with no tracked change).
-                checked += 1;
+            Some(r) if r.is_empty() => {
+                // Empty diff — count as examined but skip content checks.
+                for s in &mut stats {
+                    s.examined += 1;
+                }
                 continue;
             }
-            Some(raw) => {
-                let compressed = skim_diff(&root, sha)
-                    .unwrap_or_else(|| raw.clone()); // on skim failure, treat as raw
+            Some(r) => r,
+        };
 
-                if compressed.trim() == raw.trim() {
-                    raw_fallback += 1;
-                }
+        for (i, &mode) in modes.iter().enumerate() {
+            let compressed = skim_diff_mode(&root, sha, mode)
+                .unwrap_or_else(|| raw.clone()); // skim failure → treat as raw
 
-                let (ok, missing) = check_no_line_dropped(&raw, &compressed);
-                if !ok {
-                    violations.push((sha.clone(), missing));
+            stats[i].examined += 1;
+            if compressed.trim() == raw.trim() {
+                stats[i].raw_fallback += 1;
+            }
+
+            let (ok, missing) = check_no_line_dropped(&raw, &compressed);
+            if !ok {
+                stats[i].violations += 1;
+                if mode.invariant_asserted() {
+                    asserted_violations.push((sha.clone(), mode, missing));
+                } else {
+                    advisory_violations.push((sha.clone(), mode, missing));
                 }
-                checked += 1;
             }
         }
-        // Check after adding allows the skipped counts to be exact.
-        if skipped_no_parent + skipped_too_large + checked >= MAX_COMMITS {
+
+        if skipped_no_parent + skipped_too_large + stats[0].examined >= MAX_COMMITS {
             break;
         }
     }
@@ -251,50 +349,106 @@ fn git_diff_corpus_compress_never_truncate() {
     // -----------------------------------------------------------------------
     // Report
     // -----------------------------------------------------------------------
-    let fallback_pct = if checked > 0 {
-        (raw_fallback as f64 / checked as f64) * 100.0
-    } else {
-        0.0
-    };
-
     println!("=== cli_git_diff_corpus results ===");
-    println!("  commits examined : {checked}");
-    println!("  skipped (initial): {skipped_no_parent}");
-    println!("  skipped (>256KB) : {skipped_too_large}");
-    println!("  raw fallback     : {raw_fallback} ({fallback_pct:.1}%)");
-    println!("  violations       : {}", violations.len());
-    for (sha, n) in &violations {
-        println!("    {sha}: {n} dropped lines");
+    println!(
+        "  commits in history  : {}",
+        commits.len()
+    );
+    println!(
+        "  skipped (no parent) : {skipped_no_parent}"
+    );
+    println!(
+        "  skipped (>256KB)    : {skipped_too_large}"
+    );
+    println!();
+    println!(
+        "  {:<12}  {:>8}  {:>12}  {:>13}  {:>11}  {:>10}",
+        "mode", "examined", "ast-rendered", "raw-fallback", "fallback %", "violations"
+    );
+    println!("  {}", "-".repeat(80));
+    for (i, mode) in modes.iter().enumerate() {
+        let s = &stats[i];
+        let asserted_marker = if mode.invariant_asserted() { " [asserted]" } else { " [advisory]" };
+        println!(
+            "  {:<12}  {:>8}  {:>12}  {:>13}  {:>10.1}%  {:>10}{}",
+            mode.label(),
+            s.examined,
+            s.ast_rendered(),
+            s.raw_fallback,
+            s.fallback_pct(),
+            s.violations,
+            asserted_marker,
+        );
+    }
+    println!();
+    if !advisory_violations.is_empty() {
+        println!(
+            "  Advisory (structure/full) violations: {} — expected pre-B3 state;",
+            advisory_violations.len()
+        );
+        println!(
+            "  these represent AST-compression dropping content lines, which B3 cures."
+        );
+        for (sha, mode, n) in advisory_violations.iter().take(10) {
+            println!("    {} [{}]: {n} dropped lines", &sha[..8], mode.label());
+        }
+        if advisory_violations.len() > 10 {
+            println!("    … ({} more)", advisory_violations.len() - 10);
+        }
+        println!();
+    }
+    if !asserted_violations.is_empty() {
+        println!("  ASSERTED violations (default mode):");
+        for (sha, mode, n) in &asserted_violations {
+            println!("    {} [{}]: {n} dropped lines", &sha[..8], mode.label());
+        }
+        println!();
     }
     println!("===================================");
 
     // -----------------------------------------------------------------------
-    // Assert
+    // Assert: compress-never-truncate must hold for DEFAULT mode
+    //
+    // Structure/full violations are advisory — they are the pre-B3 known state
+    // and do not block the corpus harness from serving as a baseline
+    // instrument.  After B3 is implemented, violations in those modes will
+    // decrease; if they reach zero the invariant will be extended.
     // -----------------------------------------------------------------------
     assert!(
-        violations.is_empty(),
-        "compress-never-truncate (#317) violated on {} commit(s).\n\
+        asserted_violations.is_empty(),
+        "compress-never-truncate (#317) violated in DEFAULT mode on {} case(s).\n\
          Dropped lines were found in skim's diff output that existed in the \
-         raw `git diff` output.  Violations:\n{:#?}",
-        violations.len(),
-        violations,
+         raw `git diff` output.  This is the safety assertion for the default \
+         rendering path.  Violations:\n{:#?}",
+        asserted_violations.len(),
+        asserted_violations,
     );
 }
 
 // ---------------------------------------------------------------------------
-// Smoke test (always runs): harness itself is wired up
+// Smoke test (always runs): harness infrastructure is wired up
 // ---------------------------------------------------------------------------
 
-/// Verify the git_bin() / repo_root() helpers return sensible values without
-/// running the full corpus.  This runs in normal (non-ignored) mode.
+/// Verify the `git_bin()` / `repo_root()` / `recent_commits()` helpers return
+/// sensible values without running the full corpus.  Runs in normal (non-ignored)
+/// mode so it executes on every CI pass.
 #[test]
 fn git_diff_corpus_harness_sanity() {
     let git = git_bin();
     assert!(git.is_file(), "git_bin() must return an existing file: {git:?}");
+
     let root = repo_root();
     assert!(root.join(".git").exists(), "repo_root() must contain .git: {root:?}");
-    // One commit must exist.
+
     let commits = recent_commits(&root, 1);
     assert!(!commits.is_empty(), "recent_commits must return at least one SHA");
     assert_eq!(commits[0].len(), 40, "SHA must be 40 hex chars");
+
+    // Verify the mode label/arg/assertion plumbing.
+    assert_eq!(DiffMode::Default.label(), "default");
+    assert_eq!(DiffMode::Structure.extra_args(), Some("--mode=structure"));
+    assert_eq!(DiffMode::Full.extra_args(), Some("--mode=full"));
+    assert!(DiffMode::Default.invariant_asserted());
+    assert!(!DiffMode::Structure.invariant_asserted());
+    assert!(!DiffMode::Full.invariant_asserted());
 }
