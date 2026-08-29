@@ -1,0 +1,18 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(15))"
+---
+"""
+FIXTURE: Simple Python functions
+TESTS: Basic function signature extraction
+"""
+
+def calculate_sum(a, b) -> int:
+    """Calculate sum of two numbers"""
+    result = a + b
+    return result
+
+def greet_user(name) -> str:
+    """Greet a user by name"""
+    message = f"Hello, {name}!"
+    return message

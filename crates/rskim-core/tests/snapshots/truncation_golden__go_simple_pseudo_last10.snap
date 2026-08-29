@@ -1,0 +1,15 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(GO_SIMPLE, Language::Go,\nTransformConfig::with_mode(Mode::Pseudo).with_last_lines(10))"
+---
+// ... (21 lines above)
+    Compute(x int) int
+}
+
+type Status int
+
+const (
+    Active Status = iota
+    Inactive
+    Pending
+)

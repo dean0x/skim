@@ -1,0 +1,12 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(RUST_COMMENTS, Language::Rust,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(15))"
+---
+// ... (truncated)
+pub fn add(a: i32, b: i32) -> i32  {...}
+// ... (truncated)
+pub struct Calculator {
+    /// Field doc comment (KEEP)
+    value: i32,
+}
+// ... (truncated)

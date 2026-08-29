@@ -1,0 +1,20 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(MD_SIMPLE, Language::Markdown,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(15))"
+---
+# Main Title
+
+This is some introductory content that should not appear in structure mode.
+
+## Section One
+
+Content for section one with implementation details.
+
+### Subsection 1.1
+
+More detailed content here.
+
+#### Deep Header Level 4
+
+This is a level 4 header that should only appear in signatures/types modes.
+<!-- ... (22 lines truncated) -->

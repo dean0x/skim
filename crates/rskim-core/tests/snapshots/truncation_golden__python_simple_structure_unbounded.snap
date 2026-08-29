@@ -1,0 +1,21 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Structure))"
+---
+"""
+FIXTURE: Simple Python functions
+TESTS: Basic function signature extraction
+"""
+
+def calculate_sum(a: int, b: int) -> int:
+     {...}
+
+def greet_user(name: str) -> str:
+     {...}
+
+class Calculator:
+    def add(self, x: int, y: int) -> int:
+         {...}
+
+    def multiply(self, x: int, y: int) -> int:
+         {...}

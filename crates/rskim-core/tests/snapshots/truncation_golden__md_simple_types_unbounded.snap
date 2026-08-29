@@ -1,0 +1,23 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Types))"
+---
+# Main Title
+
+## Section One
+
+### Subsection 1.1
+
+#### Deep Header Level 4
+
+##### Even Deeper Level 5
+
+###### Deepest Level 6
+
+## Section Two
+
+Setext Style H1
+===============
+
+Setext Style H2
+---------------

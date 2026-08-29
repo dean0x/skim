@@ -1,0 +1,17 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(MD_SIMPLE, Language::Markdown,\nTransformConfig::with_mode(Mode::Structure))"
+---
+# Main Title
+
+## Section One
+
+### Subsection 1.1
+
+## Section Two
+
+Setext Style H1
+===============
+
+Setext Style H2
+---------------

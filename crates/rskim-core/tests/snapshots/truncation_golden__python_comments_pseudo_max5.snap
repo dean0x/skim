@@ -1,0 +1,7 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(PYTHON_COMMENTS, Language::Python,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(5))"
+---
+#!/usr/bin/env python3
+# FIXTURE: Python file with various comment types
+# TESTS: Minimal mode comment stripping

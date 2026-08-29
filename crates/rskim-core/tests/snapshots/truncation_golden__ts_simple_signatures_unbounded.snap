@@ -1,0 +1,6 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(TS_SIMPLE, Language::TypeScript,\nTransformConfig::with_mode(Mode::Signatures))"
+---
+function add(a: number, b: number): number
+function greet(name: string): string

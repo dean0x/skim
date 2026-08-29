@@ -1,0 +1,5 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Types))"
+---
+class Calculator:

@@ -1,0 +1,9 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(GO_SIMPLE, Language::Go,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(5))"
+---
+// ... (truncated)
+type Calculator struct {
+    value int
+}
+// ... (truncated)
