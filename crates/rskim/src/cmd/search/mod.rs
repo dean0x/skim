@@ -1793,7 +1793,7 @@ fn print_help() {
 /// - `head` comes from the `HeadState` returned by `auto_refresh_if_stale`
 ///   (Finding 2) or from `TemporalUnavailable::to_anchor_state`'s implicit Resolved.
 /// - `anchor` comes from `TemporalUnavailable::to_anchor_state()` (Finding 1/3).
-pub(super) fn temporal_unavailable_msg(
+fn temporal_unavailable_msg(
     head: &staleness::HeadState,
     anchor: &staleness::AnchorState,
 ) -> String {

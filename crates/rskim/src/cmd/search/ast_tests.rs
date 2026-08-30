@@ -1488,6 +1488,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 /// AST matches (filtered_count == unfiltered_count), failing the strict-subset assertion.
 #[test]
 fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
+    use super::super::gitdir::HeadState;
     use super::super::manifest::FileManifest;
     use rskim_search::FileId;
 
@@ -1560,6 +1561,7 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         &db_path,
         &sorted,
         false,
+        &HeadState::NotARepo,
     )
     .unwrap();
 
@@ -1632,6 +1634,7 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         &absent_db,
         &sorted,
         false,
+        &HeadState::NotARepo,
     )
     .unwrap();
     // When the DB is absent, resolve_blast_radius_file_ids returns None.

@@ -27,7 +27,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
-    COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, GixSource, HistoryResult, HotspotRow,
+    COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, HistoryResult, HotspotRow,
     MIN_COCHANGE_JACCARD, RiskRow, TemporalDb,
 };
 
@@ -356,12 +356,14 @@ macro_rules! warn_skip {
 /// - `head`: full git HEAD SHA to record in the `meta` table.
 /// - `now_epoch`: injectable clock for deterministic tests (pass
 ///   `SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()` in production).
+#[cfg(test)]
 pub(super) fn rebuild_temporal(
     root: &Path,
     cache_dir: &Path,
     head: &str,
     now_epoch: u64,
 ) -> anyhow::Result<()> {
+    use rskim_search::GixSource;
     rebuild_temporal_with_source(
         &GixSource,
         root,

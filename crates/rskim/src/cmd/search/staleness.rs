@@ -34,14 +34,17 @@ use super::manifest::FileManifest;
 // Re-export git-plumbing items (owned by gitdir.rs).
 // `hooks.rs` accesses `resolve_git_dir` and `resolve_common_dir` via
 // `super::staleness::*` — these re-exports keep that path valid.
+#[cfg(test)]
+pub(super) use super::gitdir::resolve_repo_toplevel;
 pub(super) use super::gitdir::{
     HeadState, git_head_state, read_git_head, resolve_common_dir, resolve_git_dir,
-    resolve_repo_toplevel,
 };
 
 // Re-export temporal-DB items (owned by temporal_state.rs).
+#[cfg(test)]
+pub(super) use super::temporal_state::temporal_anchor_state;
 pub(super) use super::temporal_state::{
-    AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_anchor_state, temporal_db_is_stale,
+    AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_db_is_stale,
     try_rebuild_temporal_nonfatal, warn_if_temporal_unverifiable,
 };
 

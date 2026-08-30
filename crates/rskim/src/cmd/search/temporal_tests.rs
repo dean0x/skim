@@ -7,10 +7,10 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    TemporalQueryOutput, TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice,
-    check_temporal_staleness, enrich_ast_results, format_temporal_json, format_temporal_text,
-    normalize_blast_radius_path, open_temporal_db, open_temporal_db_for, query_standalone,
-    resort_window,
+    HeadState, TemporalQueryOutput, TemporalUnavailable, apply_temporal_enrichment,
+    bounded_page_notice, check_temporal_staleness, enrich_ast_results, format_temporal_json,
+    format_temporal_text, normalize_blast_radius_path, open_temporal_db, open_temporal_db_for,
+    query_standalone, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -198,7 +198,7 @@ fn open_temporal_db_for_anchor_differs_returns_err() {
 
     let result = open_temporal_db_for(&root, cache.path());
     assert!(
-        matches!(result, Err(TemporalUnavailable::AnchorDiffers)),
+        matches!(result, Err(TemporalUnavailable::AnchorDiffers { .. })),
         "AD-413-16: open_temporal_db_for must return Err(AnchorDiffers) \
          when temporal.db belongs to a different repo, got: {result:?}"
     );
@@ -233,7 +233,13 @@ fn resolve_blast_radius_paths_anchor_differs_returns_ok_none() {
 
     // blast_radius path does not need to exist — the anchor guard fires before
     // path normalization, so the function returns Ok(None) early.
-    let result = super::resolve_blast_radius_paths(Some("src/auth.rs"), &root, cache.path(), false);
+    let result = super::resolve_blast_radius_paths(
+        Some("src/auth.rs"),
+        &root,
+        cache.path(),
+        false,
+        &HeadState::NotARepo,
+    );
     assert!(
         result.is_ok(),
         "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"
