@@ -798,11 +798,15 @@ fn render_with_unchanged_context(
             if r.start > node_end {
                 return false;
             }
-            // Either the range is directly this node, or it's a child within this node
-            (r.start >= node_start && r.end <= node_end)
-                || r.parent_context
-                    .as_ref()
-                    .is_some_and(|p| p.header_line == node_start)
+            // B3: overlap test (was containment).  partition_point guarantees
+            // r.start >= node_start; the early-exit above guarantees
+            // r.start <= node_end.  Any range reaching here overlaps this node.
+            // The old `r.end <= node_end` containment guard and the now-dead
+            // parent_context fallback are both removed — they were redundant
+            // given that tree-sitter always positions grandchildren inside their
+            // parent's span, but the containment form would silently skip a
+            // range that starts inside the node but ends past it.
+            true
         });
 
         if has_changes {
@@ -924,10 +928,38 @@ fn render_container_with_mode(
 
         if child_start == node_start {
             // The container body — render its members, not the body node itself.
+            //
+            // B3: interleave `render_orphan_gap` calls between members so that
+            // changed lines that belong to no member node — typically blank lines
+            // separating fields or methods — are served rather than silently
+            // dropped.  This mirrors the top-level orphan-fill in
+            // `render_with_unchanged_context` (ADR-003 coverage).
+            //
+            // `next_member_line` tracks the first line not yet accounted for by
+            // a rendered member.  Starting at `node_start + 1` skips the header
+            // line (`{` is on the header line, already emitted above).  After
+            // each member, it advances past the member's last line so the next
+            // `render_orphan_gap` call covers only the inter-member gap.
+            let mut next_member_line = node_start + 1;
             let mut body_cursor = child.walk();
             for member in child.children(&mut body_cursor) {
+                let member_start = member.start_position().row + 1;
+                let member_end = member.end_position().row + 1;
+                render_orphan_gap(
+                    output,
+                    next_member_line,
+                    member_start,
+                    ctx,
+                    inputs,
+                    state,
+                );
                 render_container_member(output, node, &member, ctx, inputs, parser, state);
+                next_member_line = next_member_line.max(member_end + 1);
             }
+            // Trailing gap inside the container body: changed lines between the
+            // last member and the closing brace (e.g. a trailing blank line
+            // added before `}`).
+            render_orphan_gap(output, next_member_line, node_end, ctx, inputs, state);
             continue;
         }
 

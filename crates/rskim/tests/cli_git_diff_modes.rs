@@ -565,6 +565,178 @@ fn default_mode_render_stays_faithful() {
     }
 }
 
+// ============================================================================
+// B3 gap-fill regression tests (#512)
+// ============================================================================
+
+/// A blank line added between struct fields must appear in the rendered output.
+///
+/// Without B3, `render_container_with_mode` iterated body members with no gap
+/// fill between them.  A blank `+` line between two field declarations is an
+/// orphan (no AST node covers it), so the verifier's coverage check detected
+/// the missing added line and bailed to the raw-hunk fallback.  After B3 the
+/// gap fill serves the blank line and the verifier passes.
+///
+/// The direct assertion on `"+3 "` is load-bearing: the coverage check in
+/// `assert_render_fidelity` skips blank-line content, so only this assertion
+/// catches the absence of the orphan line.
+#[test]
+fn added_blank_line_between_struct_fields_reaches_reader() {
+    // After: blank added between the two field lines.
+    // New-side line numbers: 1=header 2=timeout 3=blank(+) 4=retries 5=closing
+    let before = "\
+pub struct Config {
+    pub timeout: u32,
+    pub retries: u32,
+}
+";
+    let after = "\
+pub struct Config {
+    pub timeout: u32,
+
+    pub retries: u32,
+}
+";
+    let (_dir, repo) = two_commit_repo(before, after);
+    let ctx = "-U100000";
+    let raw = raw_diff(&repo, ctx);
+    let rendered = skim_diff(&repo, ctx, Some("full"));
+    let label = "blank-line-gap full -U100000";
+    assert_ast_rendered(label, &rendered);
+    assert_render_fidelity(label, &rendered, &raw);
+    // The added blank line at new-side line 3 must appear with a `+` marker.
+    // In the render format, an added line at line N (ln_width=1) is "+N ".
+    assert!(
+        rendered.lines().any(|l| l == "+3 "),
+        "{label}: added blank at line 3 must appear as \"+3 \" in the render:\n{rendered}",
+    );
+}
+
+/// Blank lines between impl methods (not just struct fields) must also reach
+/// the reader.  An impl block's body is a `declaration_list` with method
+/// declarations as members; inter-method blank lines are orphans.
+///
+/// This fixture verifies the gap fill path for function-body containers, which
+/// have a deeper tree shape than struct field lists.
+#[test]
+fn blank_lines_between_impl_methods_reach_reader() {
+    let before = "\
+pub struct Widget {
+    id: u32,
+}
+
+impl Widget {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn doubled(&self) -> u32 {
+        self.id * 2
+    }
+}
+";
+    let after = "\
+pub struct Widget {
+    id: u32,
+}
+
+impl Widget {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn tripled(&self) -> u32 {
+        self.id * 3
+    }
+}
+";
+    let (_dir, repo) = two_commit_repo(before, after);
+    let ctx = "-U100000";
+    let raw = raw_diff(&repo, ctx);
+    let rendered = skim_diff(&repo, ctx, Some("full"));
+    let label = "impl-method-blank-gap full -U100000";
+    assert_ast_rendered(label, &rendered);
+    assert_render_fidelity(label, &rendered, &raw);
+    // The changed method body must reach the reader.
+    assert!(
+        rendered.contains("self.id * 3"),
+        "{label}: changed method body must appear in render:\n{rendered}"
+    );
+}
+
+/// A struct where a new field is added after existing fields, with blank
+/// separator lines that are themselves added.  Pins that structure mode also
+/// produces an AST render (not just full mode).
+#[test]
+fn struct_new_field_with_blank_separator_structure_mode() {
+    let before = "\
+//! Config types.
+
+pub struct Config {
+    pub timeout: u32,
+    pub retries: u32,
+}
+";
+    let after = "\
+//! Config types.
+
+pub struct Config {
+    pub timeout: u32,
+    pub retries: u32,
+
+    pub max_connections: u32,
+}
+";
+    let (_dir, repo) = two_commit_repo(before, after);
+    let ctx = "-U100000";
+    for mode in ["structure", "full"] {
+        let raw = raw_diff(&repo, ctx);
+        let rendered = skim_diff(&repo, ctx, Some(mode));
+        let label = format!("struct-new-field-gap {mode} {ctx}");
+        assert_ast_rendered(&label, &rendered);
+        assert_render_fidelity(&label, &rendered, &raw);
+        assert!(
+            rendered.contains("max_connections"),
+            "{label}: the new field must reach the reader:\n{rendered}"
+        );
+    }
+}
+
+/// Guard: unchanged inter-member blank lines must NOT be emitted by the gap
+/// fill.  Only blank lines that fall in a changed hunk (`+` in the raw diff)
+/// should appear.  Without this guard a refactoring with no content change
+/// could emit extra blank lines that aren't in the diff.
+#[test]
+fn unchanged_blank_lines_between_members_are_not_emitted() {
+    // The blank line between the two methods exists in BOTH before and after,
+    // so it appears as a context line (`' '`) in the raw diff, not as `+`.
+    let before = "\
+pub struct Thing {
+    pub a: u32,
+
+    pub b: u32,
+}
+";
+    let after = "\
+pub struct Thing {
+    pub a: u32,
+
+    pub b: u32,
+    pub c: u32,
+}
+";
+    let (_dir, repo) = two_commit_repo(before, after);
+    let ctx = "-U100000";
+    let raw = raw_diff(&repo, ctx);
+    let rendered = skim_diff(&repo, ctx, Some("full"));
+    let label = "unchanged-blank-gap full -U100000";
+    assert_ast_rendered(label, &rendered);
+    assert_render_fidelity(label, &rendered, &raw);
+    assert!(
+        rendered.contains("pub c: u32"),
+        "{label}: the new field must appear:\n{rendered}"
+    );
+}
+
 /// ADR-011 class-2 pin: when the verifier rejects a render, skim serves the raw
 /// hunks — a no-loss fallback — so the banner must cost ZERO stderr bytes
 /// without `SKIM_DEBUG`, and must appear with it.
