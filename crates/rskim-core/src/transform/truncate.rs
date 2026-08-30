@@ -818,8 +818,15 @@ mod tests {
             result
         );
         // Must have at least one content line.
-        let content = result.lines().filter(|l| !l.contains("lines truncated")).count();
-        assert!(content >= 1, "Expected at least 1 content line, got only markers: {:?}", result);
+        let content = result
+            .lines()
+            .filter(|l| !l.contains("lines truncated"))
+            .count();
+        assert!(
+            content >= 1,
+            "Expected at least 1 content line, got only markers: {:?}",
+            result
+        );
     }
 
     #[test]

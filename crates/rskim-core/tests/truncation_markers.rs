@@ -15,7 +15,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rskim_core::{truncate_to_token_budget, Language, Mode, TransformConfig};
+use rskim_core::{Language, Mode, TransformConfig, truncate_to_token_budget};
 
 // ---------------------------------------------------------------------------
 // Fixtures — same files used by truncation_golden.rs
@@ -170,9 +170,15 @@ fn test_token_budget_extreme_small_never_returns_empty_string() {
     // Budget = 1 token, but the marker "// ... (3 lines truncated)" is ~5 tokens.
     // Before the fix: returns Ok("") — silent total data loss.
     let text = "line one\nline two\nline three\n";
-    let result =
-        truncate_to_token_budget(text, Language::Rust, 1, |s: &str| s.split_whitespace().count(), None, None)
-            .expect("truncation must not error");
+    let result = truncate_to_token_budget(
+        text,
+        Language::Rust,
+        1,
+        |s: &str| s.split_whitespace().count(),
+        None,
+        None,
+    )
+    .expect("truncation must not error");
     assert!(
         !result.is_empty(),
         "truncate_to_token_budget must never return an empty string (silent loss);\n\
@@ -189,9 +195,15 @@ fn test_token_budget_extreme_small_never_returns_empty_string() {
 #[test]
 fn test_token_budget_zero_budget_never_returns_empty() {
     let text = "word1\nword2\nword3\n";
-    let result =
-        truncate_to_token_budget(text, Language::Python, 0, |s: &str| s.split_whitespace().count(), None, None)
-            .expect("truncation must not error");
+    let result = truncate_to_token_budget(
+        text,
+        Language::Python,
+        0,
+        |s: &str| s.split_whitespace().count(),
+        None,
+        None,
+    )
+    .expect("truncation must not error");
     assert!(
         !result.is_empty(),
         "budget=0 must still emit the truncation marker, not empty string;\n\
@@ -234,7 +246,11 @@ fn test_pseudo_max_lines_n_emits_n_content_lines_go() {
         Language::Go,
         TransformConfig::with_mode(Mode::Pseudo).with_max_lines(n),
     );
-    let total_pseudo = xform(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Pseudo));
+    let total_pseudo = xform(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo),
+    );
     // Only run the assertion when the pseudo output exceeds the budget.
     if total_pseudo.lines().count() > n {
         let content = content_lines(&out);
@@ -300,7 +316,10 @@ fn test_pseudo_max_lines_marker_count_is_positive_and_plausible() {
         "marker must contain a digit; got: {marker:?}"
     );
     let stated: usize = count_str.parse().unwrap_or(0);
-    assert!(stated > 0, "stated count must be > 0; got {stated} in {marker:?}");
+    assert!(
+        stated > 0,
+        "stated count must be > 0; got {stated} in {marker:?}"
+    );
     assert!(
         stated <= source_lines,
         "stated count ({stated}) must not exceed source line count ({source_lines}); \
