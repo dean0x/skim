@@ -336,10 +336,24 @@ fn install_search_integration() {
         return;
     };
 
-    if let Err(e) = crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
-        eprintln!("  Note: could not install search hooks: {e}");
-    } else {
-        println!("  {} Search hooks installed", check_mark(true));
+    match crate::cmd::search::hooks::install_search_hooks(project_root.as_path()) {
+        Err(e) => eprintln!("  Note: could not install search hooks: {e}"),
+        Ok(outcome) => {
+            println!("  {} Search hooks installed", check_mark(true));
+            // AC34(b): when `resolve_hooks_dir` routes to `<commondir>/hooks`
+            // rather than the local `<root>/.git/hooks`, print the resolved path
+            // in the skim init stdout stream.  `install_search_hooks` already
+            // emits SHARED_HOOKS_SCOPE_MSG to stderr for all callers; this line
+            // adds the absolute path disclosure in the `skim init` output itself,
+            // matching the parity that `skim search --install-hooks` provides via
+            // `run_install_hooks` (which always prints the resolved dir).
+            if outcome.dir != project_root.join(".git").join("hooks") {
+                println!(
+                    "    note: hooks installed in {} (shared by every worktree of this clone)",
+                    outcome.dir.display()
+                );
+            }
+        }
     }
 
     // Spawn a background build — fire-and-forget, non-blocking, non-fatal.
