@@ -1432,7 +1432,11 @@ mod tests {
         crate::transform::scaling_guard::time_5(|| {
             let start = std::time::Instant::now();
             let r = transform_minimal(source, &tree, Language::Python, &config);
-            assert!(r.is_ok(), "Python minimal transform must succeed: {:?}", r.err());
+            assert!(
+                r.is_ok(),
+                "Python minimal transform must succeed: {:?}",
+                r.err()
+            );
             start.elapsed().as_secs_f64() * 1000.0
         })
     }

@@ -54,83 +54,147 @@ fn snap(source: &str, language: Language, config: TransformConfig) -> String {
 
 #[test]
 fn rust_simple_structure_unbounded() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn rust_simple_signatures_unbounded() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Signatures)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Signatures)
+    ));
 }
 
 #[test]
 fn rust_simple_types_unbounded() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Types)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Types)
+    ));
 }
 
 #[test]
 fn rust_simple_minimal_unbounded() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Minimal)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Minimal)
+    ));
 }
 
 #[test]
 fn rust_simple_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn rust_simple_full_unbounded() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Full)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Full)
+    ));
 }
 
 #[test]
 fn rust_simple_structure_max15() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn rust_simple_pseudo_max15() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn rust_simple_structure_last10() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Structure).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Structure).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn rust_simple_pseudo_last10() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn rust_simple_structure_max5() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Structure).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(5)
+    ));
 }
 
 #[test]
 fn rust_simple_pseudo_max5() {
-    insta::assert_snapshot!(snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // Additional Rust fixture
 #[test]
 fn rust_comments_structure_unbounded() {
-    insta::assert_snapshot!(snap(RUST_COMMENTS, Language::Rust, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        RUST_COMMENTS,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn rust_comments_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(RUST_COMMENTS, Language::Rust, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        RUST_COMMENTS,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn rust_comments_structure_max15() {
-    insta::assert_snapshot!(snap(RUST_COMMENTS, Language::Rust, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        RUST_COMMENTS,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn rust_comments_pseudo_max5() {
-    insta::assert_snapshot!(snap(RUST_COMMENTS, Language::Rust, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        RUST_COMMENTS,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -139,83 +203,147 @@ fn rust_comments_pseudo_max5() {
 
 #[test]
 fn python_simple_structure_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn python_simple_signatures_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Signatures)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Signatures)
+    ));
 }
 
 #[test]
 fn python_simple_types_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Types)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Types)
+    ));
 }
 
 #[test]
 fn python_simple_minimal_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Minimal)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Minimal)
+    ));
 }
 
 #[test]
 fn python_simple_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn python_simple_full_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Full)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Full)
+    ));
 }
 
 #[test]
 fn python_simple_structure_max15() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn python_simple_pseudo_max15() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn python_simple_structure_last10() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Structure).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Structure).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn python_simple_pseudo_last10() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn python_simple_structure_max5() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Structure).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(5)
+    ));
 }
 
 #[test]
 fn python_simple_pseudo_max5() {
-    insta::assert_snapshot!(snap(PYTHON_SIMPLE, Language::Python, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        PYTHON_SIMPLE,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // Python comments fixture
 #[test]
 fn python_comments_structure_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_COMMENTS, Language::Python, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        PYTHON_COMMENTS,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn python_comments_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(PYTHON_COMMENTS, Language::Python, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        PYTHON_COMMENTS,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn python_comments_structure_max15() {
-    insta::assert_snapshot!(snap(PYTHON_COMMENTS, Language::Python, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        PYTHON_COMMENTS,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn python_comments_pseudo_max5() {
-    insta::assert_snapshot!(snap(PYTHON_COMMENTS, Language::Python, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        PYTHON_COMMENTS,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -224,83 +352,147 @@ fn python_comments_pseudo_max5() {
 
 #[test]
 fn go_simple_structure_unbounded() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn go_simple_signatures_unbounded() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Signatures)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Signatures)
+    ));
 }
 
 #[test]
 fn go_simple_types_unbounded() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Types)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Types)
+    ));
 }
 
 #[test]
 fn go_simple_minimal_unbounded() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Minimal)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Minimal)
+    ));
 }
 
 #[test]
 fn go_simple_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn go_simple_full_unbounded() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Full)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Full)
+    ));
 }
 
 #[test]
 fn go_simple_structure_max15() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn go_simple_pseudo_max15() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn go_simple_structure_last10() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Structure).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Structure).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn go_simple_pseudo_last10() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn go_simple_structure_max5() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Structure).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(5)
+    ));
 }
 
 #[test]
 fn go_simple_pseudo_max5() {
-    insta::assert_snapshot!(snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        GO_SIMPLE,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // Go comments fixture
 #[test]
 fn go_comments_structure_unbounded() {
-    insta::assert_snapshot!(snap(GO_COMMENTS, Language::Go, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        GO_COMMENTS,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn go_comments_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(GO_COMMENTS, Language::Go, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        GO_COMMENTS,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn go_comments_structure_max15() {
-    insta::assert_snapshot!(snap(GO_COMMENTS, Language::Go, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        GO_COMMENTS,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn go_comments_pseudo_max5() {
-    insta::assert_snapshot!(snap(GO_COMMENTS, Language::Go, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        GO_COMMENTS,
+        Language::Go,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -309,83 +501,147 @@ fn go_comments_pseudo_max5() {
 
 #[test]
 fn ts_simple_structure_unbounded() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn ts_simple_signatures_unbounded() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Signatures)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Signatures)
+    ));
 }
 
 #[test]
 fn ts_simple_types_unbounded() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Types)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Types)
+    ));
 }
 
 #[test]
 fn ts_simple_minimal_unbounded() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Minimal)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Minimal)
+    ));
 }
 
 #[test]
 fn ts_simple_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn ts_simple_full_unbounded() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Full)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Full)
+    ));
 }
 
 #[test]
 fn ts_simple_structure_max15() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn ts_simple_pseudo_max15() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn ts_simple_structure_last10() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Structure).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Structure).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn ts_simple_pseudo_last10() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn ts_simple_structure_max5() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Structure).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(5)
+    ));
 }
 
 #[test]
 fn ts_simple_pseudo_max5() {
-    insta::assert_snapshot!(snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        TS_SIMPLE,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // TypeScript comments fixture
 #[test]
 fn ts_comments_structure_unbounded() {
-    insta::assert_snapshot!(snap(TS_COMMENTS, Language::TypeScript, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        TS_COMMENTS,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn ts_comments_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(TS_COMMENTS, Language::TypeScript, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        TS_COMMENTS,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn ts_comments_structure_max15() {
-    insta::assert_snapshot!(snap(TS_COMMENTS, Language::TypeScript, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        TS_COMMENTS,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn ts_comments_pseudo_max5() {
-    insta::assert_snapshot!(snap(TS_COMMENTS, Language::TypeScript, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        TS_COMMENTS,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -394,60 +650,108 @@ fn ts_comments_pseudo_max5() {
 
 #[test]
 fn md_simple_structure_unbounded() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Structure)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Structure)
+    ));
 }
 
 #[test]
 fn md_simple_signatures_unbounded() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Signatures)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Signatures)
+    ));
 }
 
 #[test]
 fn md_simple_types_unbounded() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Types)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Types)
+    ));
 }
 
 #[test]
 fn md_simple_minimal_unbounded() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Minimal)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Minimal)
+    ));
 }
 
 #[test]
 fn md_simple_pseudo_unbounded() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Pseudo)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Pseudo)
+    ));
 }
 
 #[test]
 fn md_simple_full_unbounded() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Full)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Full)
+    ));
 }
 
 #[test]
 fn md_simple_structure_max15() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Structure).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn md_simple_pseudo_max15() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(15)
+    ));
 }
 
 #[test]
 fn md_simple_structure_last10() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Structure).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Structure).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn md_simple_pseudo_last10() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Pseudo).with_last_lines(10)
+    ));
 }
 
 #[test]
 fn md_simple_structure_max5() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Structure).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(5)
+    ));
 }
 
 #[test]
 fn md_simple_pseudo_max5() {
-    insta::assert_snapshot!(snap(MD_SIMPLE, Language::Markdown, TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)));
+    insta::assert_snapshot!(snap(
+        MD_SIMPLE,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5)
+    ));
 }
