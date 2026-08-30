@@ -46,10 +46,23 @@ const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-checkout"];
 /// so `install_search_hooks`, `remove_search_hooks`, and `has_search_hooks`
 /// can never disagree about where the hooks live (they all call this function).
 ///
-/// For a plain repo (`.git` is a directory), submodule, or non-repo root,
-/// falls back to `<root>/.git/hooks` — identical to the pre-413 behavior.
-/// The fallback is also used for bare temp directories (as `hooks_tests.rs`
-/// creates) because those have no `commondir` file.
+/// For a plain repo (`.git` is a directory) or a non-repo root, this returns
+/// `<root>/.git/hooks` — byte-identical to the pre-#413 behavior, because a plain
+/// repo has no `commondir` file and a non-repo root has no git dir at all.  The
+/// same fallback covers the bare temp directories `hooks_tests.rs` creates.
+///
+/// **Submodules also move, deliberately.** A submodule's `.git` is a *file* whose
+/// gitdir is `<super>/.git/modules/<name>`, so the pre-#413 hand-built path
+/// `<sub>/.git/hooks` did not exist and both install and `has_search_hooks` were
+/// silently broken there too.  This resolver returns `<super>/.git/modules/<name>/hooks`,
+/// which is what `git -C <sub> rev-parse --git-path hooks` reports — a fix, not a
+/// regression (the submodule gitdir is a complete ref store with no `commondir`,
+/// so no redirection happens; only the `.git`-file indirection is followed).
+///
+/// Scope boundary (AD-413-15): this handles the worktree/submodule gitdir
+/// indirection ONLY.  It deliberately does NOT adopt an ancestor repository for a
+/// subdirectory root the way `staleness::git_head_state` does, so a subdirectory
+/// root keeps today's `<root>/.git/hooks` behavior.
 pub(crate) fn resolve_hooks_dir(project_root: &Path) -> PathBuf {
     match super::staleness::resolve_git_dir(project_root) {
         Some(git_dir) => super::staleness::resolve_common_dir(&git_dir)

@@ -1310,6 +1310,15 @@ fn create_real_git_worktree(
     super::create_real_git_worktree(primary, worktree, branch)
 }
 
+/// Shared helper: build `temporal.db` directly (bypassing the lexical pipeline).
+///
+/// Used by the AD-413-16 anchor tests, which need a `temporal.db` that carries a
+/// real `meta.git_toplevel` row without paying for a full index build.
+fn build_temporal_for_test(root: &std::path::Path, cache_dir: &std::path::Path, head: &str) {
+    use crate::cmd::search::temporal_build::{current_epoch_secs, rebuild_temporal};
+    rebuild_temporal(root, cache_dir, head, current_epoch_secs()).expect("rebuild_temporal");
+}
+
 /// AC (hook wiring): auto_refresh_if_stale on a real git repo MUST populate
 /// temporal.db — this is the ticket's core contract (#289: temporal.db was
 /// never written outside direct rebuild_temporal calls before this feature).
@@ -3679,5 +3688,254 @@ fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
     assert!(
         matches!(verdict3, StalenessCheck::Current),
         "AC10 step-3: still Current on third check (monotonicity); got {verdict3:?}"
+    );
+}
+
+// ============================================================================
+// #413 / AD-413-16 — the persisted repository anchor (AC16(d), AC24, AC32, AC33(f))
+// ============================================================================
+
+/// AC24 / AC32 guard-ordering — a root that owns its own `.git` is `NotAdopted`,
+/// and that verdict is reached BEFORE any `temporal.db` read.
+///
+/// Discriminating: a `git_toplevel` row deliberately planted with a bogus value
+/// must NOT change the answer.  An implementation that read the DB before
+/// checking `resolve_repo_toplevel` would return `Differs` here and would also
+/// pay a SQLite open on every temporal query for every pre-existing user.
+#[test]
+fn test_temporal_anchor_state_not_adopted_for_root_owning_dot_git() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let head = create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    // Build real temporal data so a DB exists to be (incorrectly) read.
+    build_temporal_for_test(&repo, &cache_dir, &head);
+    assert!(
+        cache_dir.join("temporal.db").exists(),
+        "precondition: temporal.db must exist so the gate ordering is observable"
+    );
+    // Plant a bogus anchor: a gate-2-first implementation would report Differs.
+    super::plant_meta_raw(
+        &cache_dir.join("temporal.db"),
+        rskim_search::META_GIT_TOPLEVEL,
+        "/definitely/not/this/repo",
+    );
+
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &repo),
+        super::AnchorState::NotAdopted,
+        "a root with its own .git must be NotAdopted regardless of any planted anchor row"
+    );
+}
+
+/// AD-413-16 — `Absent` / `Agrees` / `Differs` for an ADOPTED (subdirectory) root.
+///
+/// Absent is the adopt-and-record case ("built before this key existed") and must
+/// never be a refusal; `Agrees` is the steady state; `Differs` is the refusal.
+#[test]
+fn test_temporal_anchor_state_absent_agrees_differs_for_subdir_root() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(outer.join("sub")).unwrap();
+
+    let head = create_real_git_repo(&outer, &[("init", &[("sub/s.rs", "fn s(){}\n")])]);
+    let sub = outer.join("sub");
+    assert!(!sub.join(".git").exists(), "precondition: sub has no .git");
+
+    // No temporal.db yet → Absent (gate 2).
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Absent,
+        "no temporal.db must be Absent (adopt-and-record), never a refusal"
+    );
+
+    // Build → the anchor is recorded and agrees.
+    build_temporal_for_test(&sub, &cache_dir, &head);
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Agrees,
+        "after a build for an adopted root the recorded anchor must agree"
+    );
+
+    // Delete the row → Absent again (never a refusal).
+    {
+        let conn = rusqlite::Connection::open(cache_dir.join("temporal.db")).unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            rusqlite::params![rskim_search::META_GIT_TOPLEVEL],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Absent,
+        "a deleted anchor row must be Absent (adopt-and-record), never a refusal"
+    );
+
+    // Plant a foreign toplevel → Differs.
+    super::plant_meta_raw(
+        &cache_dir.join("temporal.db"),
+        rskim_search::META_GIT_TOPLEVEL,
+        "/some/other/repo",
+    );
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, .. } if recorded == "/some/other/repo"
+        ),
+        "a foreign recorded toplevel must be Differs and carry the recorded value"
+    );
+}
+
+/// **PF-017 regression** — a PLAIN LEXICAL QUERY interleaved between two
+/// repositories must NOT retarget `meta.git_toplevel`.
+///
+/// This is the exact hole PF-017 names: a changed enclosing repository also
+/// changes the adopted HEAD, so `check_staleness` reports `HeadChanged`,
+/// `auto_refresh_if_stale` rebuilds, and — without the `allow_reanchor` gate —
+/// `record_temporal_anchor` would overwrite the anchor on a query that never
+/// asked for temporal data, making the AD-413-16 refusal unreachable forever.
+///
+/// Sequence: build under repo A → make repo B the nearest enclosing repo →
+/// one plain query (`allow_reanchor = false`) → anchor and `temporal.db` MUST be
+/// byte-unchanged → then an explicit build arm (`allow_reanchor = true`) DOES
+/// re-anchor.
+///
+/// Discriminating: remove the `allow_reanchor` gate from
+/// `try_rebuild_temporal_nonfatal` and the mid-test `Differs` assertion fails
+/// because the plain query already rewrote the anchor to repo B.
+#[test]
+fn test_pf017_plain_query_does_not_retarget_anchor_across_repos() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let mid = outer.join("mid");
+    let sub = mid.join("sub");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Repo A at `outer`, with the search root two levels down.
+    create_real_git_repo(&outer, &[("init", &[("mid/sub/s.rs", "fn s(){}\n")])]);
+    let outer_canon = outer.canonicalize().unwrap();
+
+    // Explicit build arm: records the anchor for the adopted root.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, true).unwrap();
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "precondition: an adopted subdirectory root must build temporal.db (OD-3/AD-413-14)"
+    );
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Agrees,
+        "precondition: the anchor must agree immediately after the build"
+    );
+
+    // Repo B appears at `mid`, so `sub`'s NEAREST enclosing repo changes.
+    // It must have a commit, otherwise HEAD is unborn and the anchor would be
+    // preserved for the wrong reason (head = None short-circuit), not by the gate.
+    create_real_git_repo(&mid, &[("init", &[("m.rs", "fn m(){}\n")])]);
+    let mid_canon = mid.canonicalize().unwrap();
+    assert_ne!(outer_canon, mid_canon, "precondition: the two repos differ");
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, ref live }
+                if std::path::Path::new(recorded) == outer_canon && live == &mid_canon
+        ),
+        "precondition: the live toplevel must now differ from the recorded one; got {:?}",
+        super::temporal_anchor_state(&cache_dir, &sub)
+    );
+
+    let len_before = fs::metadata(&db_path).unwrap().len();
+
+    // THE PF-017 CASE: one plain lexical query (allow_reanchor = false).
+    // check_staleness sees HeadChanged (repo B's HEAD), the lexical index is
+    // legitimately rebuilt, but the temporal rebuild — and therefore the anchor
+    // write — must be suppressed.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, .. }
+                if std::path::Path::new(recorded) == outer_canon
+        ),
+        "PF-017: a plain lexical query must NOT retarget meta.git_toplevel; got {:?}",
+        super::temporal_anchor_state(&cache_dir, &sub)
+    );
+    assert_eq!(
+        fs::metadata(&db_path).unwrap().len(),
+        len_before,
+        "PF-017: temporal.db must be byte-length-unchanged after a refused plain query"
+    );
+
+    // A second plain query must be equally inert (no loop — AC16(d)).
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, .. }
+                if std::path::Path::new(recorded) == outer_canon
+        ),
+        "PF-017: repeated plain queries must stay inert (no rebuild loop)"
+    );
+
+    // The documented escape hatch: an explicit build arm DOES re-anchor.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, true).unwrap();
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Agrees,
+        "an explicit build arm (--build/--rebuild/--update) must re-anchor to the live toplevel"
+    );
+}
+
+/// AC17 supplement / AD-413-7 — a `HEAD` file that EXISTS but cannot be decoded is
+/// `Unresolved`, not `NotARepo`.
+///
+/// The three-state enum exists so that "not a git repo" and "git repo whose HEAD I
+/// could not resolve" stay different facts (avoids PF-016).  An `Err` from the HEAD
+/// read has two causes — the file is absent (F10: `mkdir .git` ⇒ `NotARepo`) or the
+/// file is present and unreadable (fs error / non-UTF-8 ⇒ `Unresolved`, the cause
+/// `HeadState::Unresolved`'s own doc names).  Collapsing both into `NotARepo` emits
+/// the "run 'skim search' on a git repo" lie about a directory that plainly is one.
+///
+/// Discriminating: with the `is_file()` split removed this returns `NotARepo` and the
+/// assertion fails.  Uses non-UTF-8 bytes rather than a permission bit so the test is
+/// portable and does not silently pass when the suite runs as root.
+#[test]
+fn test_git_head_state_unreadable_head_file_is_unresolved_not_not_a_repo() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("bad_utf8_head");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    // Invalid UTF-8: a lone continuation byte. `read_to_string` fails; the file exists.
+    fs::write(git_dir.join("HEAD"), [0xff, 0xfe, 0x80]).unwrap();
+    assert!(
+        git_dir.join("HEAD").is_file(),
+        "precondition: HEAD must exist as a file"
+    );
+    assert!(
+        fs::read_to_string(git_dir.join("HEAD")).is_err(),
+        "precondition: HEAD must be undecodable so the Err arm is exercised"
+    );
+
+    assert_eq!(
+        git_head_state(&root),
+        HeadState::Unresolved,
+        "a present-but-unreadable HEAD is a repo with an unresolvable HEAD, not a non-repo"
+    );
+
+    // Control (F10): the SAME gitdir with NO HEAD file stays NotARepo.
+    fs::remove_file(git_dir.join("HEAD")).unwrap();
+    assert_eq!(
+        git_head_state(&root),
+        HeadState::NotARepo,
+        "F10: a gitdir with no HEAD file must stay NotARepo (mkdir .git must not lie)"
     );
 }

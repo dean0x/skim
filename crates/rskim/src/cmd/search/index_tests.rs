@@ -3869,6 +3869,31 @@ fn test_ac11_stats_json_back_compat_keys() {
         stats_json["skipped_by_reason"]
     );
 
+    // #413 / AC20 (additive extension of this same test — C4/C9: one shared
+    // back-compat test for the whole wave, extended rather than duplicated).
+    // `git_head_state` is the LIVE resolution status, distinct from `git_head`
+    // (the manifest's HEAD-at-last-build), so absence of `git_head` alone can no
+    // longer be read as "not a git repo" (avoids PF-016).
+    let head_state = stats_json["git_head_state"].as_str().unwrap_or_else(|| {
+        panic!(
+            "AC20 (#413): additive key 'git_head_state' must be a string; got: {:?}",
+            stats_json["git_head_state"]
+        )
+    });
+    assert!(
+        matches!(head_state, "resolved" | "unresolved" | "not_a_repo"),
+        "AC20 (#413): git_head_state must be one of resolved/unresolved/not_a_repo; \
+         got {head_state:?}"
+    );
+    // This fixture is an EMPTY `.git` directory with no HEAD file, which is the
+    // F10 case: repo-shaped but not a repo.  Asserting the exact value (not just
+    // membership) keeps the test discriminating — an implementation that reported
+    // `unresolved` here would emit the opposite lie (AD-413-7).
+    assert_eq!(
+        head_state, "not_a_repo",
+        "AC17/F10: an empty `.git` directory with no HEAD must report not_a_repo"
+    );
+
     // The envelope itself must be a single JSON object.
     assert!(
         stats_json.is_object(),
@@ -4142,4 +4167,60 @@ fn test_ac_405_text_stats_ast_section_column_alignment() {
             );
         }
     }
+}
+
+// ============================================================================
+// #413 / AC26 — no on-disk format version is bumped by this wave
+// ============================================================================
+
+/// AC26 (NEGATIVE, one shared wave-level pin) — #413 changes HEAD *resolution* and
+/// adds one key/value `meta` row (`git_toplevel`); it must not bump any on-disk
+/// format version.
+///
+/// Why this is load-bearing: every one of these constants is a rebuild trigger in
+/// `check_staleness` / `staleness.rs`.  Bumping one forces a **full cold rebuild for
+/// every skim user on their next query**, not just for the previously-unresolvable
+/// roots #413 intends to repair (R4).  `meta` is a key/value table, so the new
+/// `META_GIT_TOPLEVEL` row needs no schema bump — this test is what keeps that
+/// claim honest.
+///
+/// Discriminating: change any literal below (or bump the corresponding production
+/// constant) and this fails.
+///
+/// Scope note: `rskim_search::temporal::storage::CURRENT_VERSION` (the SQLite
+/// `PRAGMA user_version` migration counter, currently 2) is **private** to
+/// `rskim-search`, so it cannot be asserted from this crate; it belongs to a
+/// companion pin inside `rskim-search`, and the pair is one logical test.
+/// #414 EXTENDS this test rather than adding a second one.
+#[test]
+fn test_ac26_no_on_disk_format_version_is_bumped() {
+    use super::super::manifest::FileManifest;
+
+    assert_eq!(
+        FileManifest::FORMAT_VERSION,
+        7,
+        "AC26: manifest FORMAT_VERSION must stay 7 — a bump forces a full rebuild for \
+         every user, not only for roots whose HEAD was previously unresolvable"
+    );
+    assert_eq!(
+        rskim_search::LEXICAL_INDEX_FORMAT_VERSION,
+        7,
+        "AC26: LEXICAL_INDEX_FORMAT_VERSION must stay 7"
+    );
+    assert_eq!(
+        rskim_search::AST_INDEX_FORMAT_VERSION,
+        3,
+        "AC26: AST_INDEX_FORMAT_VERSION must stay 3"
+    );
+    assert_eq!(
+        rskim_search::AST_CACHE_FORMAT_VERSION,
+        2,
+        "AC26: AstNgramCache CACHE_FORMAT_VERSION must stay 2"
+    );
+    assert_eq!(
+        rskim_search::TEMPORAL_DATA_VERSION,
+        1,
+        "AC26: TEMPORAL_DATA_VERSION must stay 1 — the additive `git_toplevel` meta row \
+         is a key/value insert and needs no data-version bump"
+    );
 }

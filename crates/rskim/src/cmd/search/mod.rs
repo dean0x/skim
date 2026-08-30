@@ -2838,6 +2838,84 @@ mod tests {
     }
 
     // ============================================================================
+    // #413 / AD-413-8 — the degraded message is TRIAGED by HEAD state
+    // ============================================================================
+
+    /// AC18 — the unresolvable-HEAD message must not repeat the "not a git repo"
+    /// lie, must name BOTH remaining causes, and must carry the real ticket number.
+    ///
+    /// AC18(c)/ADR-004: the `#481` literal is asserted against the constant itself,
+    /// not against a regex for `#<n>`, so a placeholder ticket number or a renumber
+    /// fails this test rather than shipping.
+    #[test]
+    fn test_head_unresolved_message_content_ac18() {
+        assert!(
+            !HEAD_UNRESOLVED_TEMPORAL_MSG.contains("run 'skim search' on a git repo"),
+            "AC18(a): the unresolvable-HEAD message must NOT claim this is not a git repo"
+        );
+        assert!(
+            HEAD_UNRESOLVED_TEMPORAL_MSG.contains("unborn branch"),
+            "AC18(b): must name the unborn-branch cause"
+        );
+        assert!(
+            HEAD_UNRESOLVED_TEMPORAL_MSG.contains("reftable"),
+            "AC18(b): must name the unsupported-ref-backend (reftable) cause"
+        );
+        assert!(
+            HEAD_UNRESOLVED_TEMPORAL_MSG.contains("#481"),
+            "AC18(c)/ADR-004: must cite the filed reftable ticket #481 verbatim"
+        );
+        assert!(
+            !SUBDIR_ROOT_TEMPORAL_MSG.contains("run 'skim search' on a git repo"),
+            "AC33(c): the anchor-refusal message must NOT claim this is not a git repo"
+        );
+    }
+
+    /// AC19 back-compat + AD-413-8 triage — `temporal_unavailable_msg` returns the
+    /// byte-identical `NO_TEMPORAL_DATA_MSG` for a genuine non-repo, and a DIFFERENT
+    /// message for a repo whose HEAD cannot be resolved.
+    ///
+    /// Hermeticity (PF-007): the non-repo fixture asserts no ancestor `.git` first —
+    /// after OD-3 a tempdir created under a clone would legitimately adopt it and the
+    /// assertion would be testing the harness rather than the code.
+    #[test]
+    fn test_temporal_unavailable_msg_triage_ac18_ac19() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut d = dir.path().canonicalize().unwrap();
+            loop {
+                assert!(
+                    !d.join(".git").exists(),
+                    "NOGIT precondition failed: ancestor {d:?} contains .git"
+                );
+                match d.parent() {
+                    Some(p) if p != d => d = p.to_path_buf(),
+                    _ => break,
+                }
+            }
+        }
+
+        // Genuine non-repo → byte-identical legacy text (AC19).
+        let non_repo = dir.path().join("non_repo");
+        std::fs::create_dir_all(&non_repo).unwrap();
+        assert_eq!(
+            temporal_unavailable_msg(&non_repo),
+            NO_TEMPORAL_DATA_MSG,
+            "AC19: a genuine non-repo must keep the byte-identical legacy message"
+        );
+
+        // Repo whose HEAD exists but does not resolve → the triaged message (AC18).
+        let broken = dir.path().join("broken_head");
+        std::fs::create_dir_all(broken.join(".git")).unwrap();
+        std::fs::write(broken.join(".git").join("HEAD"), "not a valid head\n").unwrap();
+        assert_eq!(
+            temporal_unavailable_msg(&broken),
+            HEAD_UNRESOLVED_TEMPORAL_MSG,
+            "AD-413-8: an unresolvable HEAD inside a repo must not get the non-repo message"
+        );
+    }
+
+    // ============================================================================
     // AC9 — User-facing message accuracy: strings reference auto-refresh, not
     //        stale manual-refresh advice.
     // ============================================================================

@@ -199,9 +199,23 @@ pub(super) fn git_head_state(project_root: &Path) -> HeadState {
     else {
         return HeadState::NotARepo;
     };
-    // F10: a gitdir with no HEAD file is NOT a repo — do not emit the opposite lie.
-    let Ok(content) = std::fs::read_to_string(git_dir.join("HEAD")) else {
-        return HeadState::NotARepo;
+    let head_path = git_dir.join("HEAD");
+    let Ok(content) = std::fs::read_to_string(&head_path) else {
+        // F10: a gitdir with NO `HEAD` file is NOT a repo (`mkdir .git`, or a
+        // `.git`-file pointer at a directory that does not exist) — classifying it
+        // as `Unresolved` would tell the user "this repo's HEAD cannot be resolved"
+        // about something that is not a repo.
+        //
+        // But a `HEAD` that EXISTS and cannot be READ (permissions, I/O error,
+        // non-UTF-8 bytes) is the OTHER fact: a repo whose HEAD is unresolvable.
+        // Collapsing that into `NotARepo` emits the opposite lie and is exactly the
+        // absence-overloading AD-413-7 exists to prevent (avoids PF-016) — it is
+        // also the "fs error" cause named in `HeadState::Unresolved`'s own doc.
+        return if head_path.is_file() {
+            HeadState::Unresolved
+        } else {
+            HeadState::NotARepo
+        };
     };
     let head_str = content.trim();
     if let Some(ref_path) = head_str.strip_prefix("ref: ") {
@@ -927,6 +941,17 @@ pub(super) fn temporal_anchor_state(cache_dir: &Path, root: &Path) -> AnchorStat
 ///   temporal rebuild to be SKIPPED, leaving `temporal.db` byte-unchanged.  Pass
 ///   `true` only from the explicit build arms (`--build`, `--rebuild`, `--update`)
 ///   so that only user-initiated rebuilds may retarget the repository anchor.
+///   With `true` a `Differs` anchor is re-anchored and DISCLOSED on stderr naming
+///   both the recorded and the live toplevel (AD-413-16 / R17): the retarget is a
+///   user action, so it must never be silent.
+///
+/// # Cost (AC24 / AC32)
+///
+/// [`temporal_anchor_state`]'s first gate is [`resolve_repo_toplevel`], which
+/// returns `None` after a single `.git` existence probe for every root that owns
+/// its own `.git` — every pre-existing user.  Such roots therefore perform zero
+/// anchor reads and zero SQLite opens on both the `allow_reanchor` and the
+/// refusal path.
 pub(super) fn try_rebuild_temporal_nonfatal(
     root: &Path,
     cache_dir: &Path,
@@ -943,17 +968,28 @@ pub(super) fn try_rebuild_temporal_nonfatal(
     // PLAIN LEXICAL QUERY that never asked for temporal data.  Only the three explicit
     // build arms pass `allow_reanchor: true`; every other caller (self-heal, query-path
     // post-rebuild) passes `false`, leaving `temporal.db` untouched on anchor mismatch.
-    if !allow_reanchor
-        && let AnchorState::Differs { recorded, live } = temporal_anchor_state(cache_dir, root)
-    {
-        if crate::debug::is_debug_enabled() {
-            eprintln!(
-                "skim search [debug]: temporal rebuild skipped — anchor mismatch \
-                 (recorded={recorded}, live={}); use `skim search --rebuild` to re-anchor",
-                live.display(),
-            );
+    if let AnchorState::Differs { recorded, live } = temporal_anchor_state(cache_dir, root) {
+        if !allow_reanchor {
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: temporal rebuild skipped — anchor mismatch \
+                     (recorded={recorded}, live={}); use `skim search --rebuild` to re-anchor",
+                    live.display(),
+                );
+            }
+            return;
         }
-        return;
+        // AD-413-16 / R17: an explicit build arm MAY retarget, but never silently —
+        // this is the one line that turns the retarget into a user-visible action and
+        // the documented recovery from the refusal.  Unconditional (not debug-gated):
+        // AC33(f) asserts it on a plain `--rebuild`.  `{:?}` on both paths follows the
+        // AD-412-4 hardening (untrusted path bytes are quoted, never raw).
+        eprintln!(
+            "skim search: re-anchoring temporal data to a different repository \
+             (recorded: {:?}, live: {:?})",
+            recorded,
+            live.display().to_string(),
+        );
     }
     if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {
         // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).

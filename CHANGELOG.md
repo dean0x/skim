@@ -206,6 +206,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON
   output gains optional `line` and `snippet` fields — additive, so existing consumers of
   `path`/`score` are unaffected. (#201)
+- **`--root <subdirectory-of-a-repo>` now resolves the enclosing repository** (#413) —
+  a `--root` that is a subdirectory of a git repository adopts that repository's HEAD
+  (bounded ancestor walk, nearest match) and therefore builds real temporal data, where
+  it previously reported `git HEAD : (none)` and `no temporal data`.  The temporal rows
+  are scoped and re-anchored to the indexed subtree, so one `--root` is one result
+  universe: every temporal arm returns only paths inside the subtree, and `--blast-radius`
+  co-change peers outside it are dropped.  Pass the repository toplevel as `--root` for
+  repository-wide ranking.  The repository that produced the rows is recorded as
+  `meta.git_toplevel`; if the enclosing repository later changes, temporal arms refuse
+  (no rows served, `temporal.db` byte-unchanged, exit 0) instead of silently rescoring —
+  `--build`/`--rebuild`/`--update` re-anchor and disclose the old and the new toplevel.
+  A subdirectory root gains its own `temporal.db`, so its first build walks history once.
+- **`skim search --install-hooks`/`--remove-hooks` now resolve git's own hooks directory**
+  (#413) — the hooks path is resolved through the `commondir` chain (matching
+  `git rev-parse --git-path hooks`) instead of being hand-built as `<root>/.git/hooks`.
+  In a linked worktree this is the shared `<commondir>/hooks`, so installing or removing
+  from one worktree changes hook behaviour for **every worktree** of the clone; both
+  commands print the absolute resolved directory and disclose that scope on stderr, and
+  `--remove-hooks` no longer prints a success line when nothing was removed.  Plain
+  repositories and non-repository roots resolve to the same path as before.
 
 ### Fixed
 - **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit
