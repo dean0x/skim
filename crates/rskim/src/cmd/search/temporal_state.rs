@@ -240,7 +240,12 @@ pub(super) enum AnchorState {
     /// Persisted toplevel was written by a DIFFERENT repository than the current one.
     /// Temporal-consuming query arms must refuse (no rows served, no rebuild, exit 0).
     /// Explicit build arms (`--build`/`--rebuild`/`--update`) re-anchor loudly.
-    Differs { recorded: String, live: PathBuf },
+    ///
+    /// Both fields are `PathBuf` so they format identically with `{:?}` at every
+    /// emit site — `recorded` originates as a TEXT row from `temporal.db` and is
+    /// converted to `PathBuf` on construction (AD-412-4: ensures non-UTF-8 path
+    /// bytes are escaped the same way regardless of which arm reports the mismatch).
+    Differs { recorded: PathBuf, live: PathBuf },
 }
 
 /// AD-413-16: compare the persisted repository anchor in `temporal.db` against
@@ -262,7 +267,9 @@ pub(super) fn temporal_anchor_state(cache_dir: &Path, root: &Path) -> AnchorStat
         None => AnchorState::Absent,
         Some(rec) if Path::new(&rec) == top.as_path() => AnchorState::Agrees,
         Some(rec) => AnchorState::Differs {
-            recorded: rec,
+            // Convert the TEXT row from temporal.db to PathBuf so both fields
+            // carry the same type and format identically at every emit site.
+            recorded: PathBuf::from(rec),
             live: top,
         },
     }
@@ -331,14 +338,13 @@ pub(super) fn try_rebuild_temporal_nonfatal(
     if let AnchorState::Differs { recorded, live } = temporal_anchor_state(cache_dir, root) {
         if reanchor == ReanchorPolicy::Refuse {
             if crate::debug::is_debug_enabled() {
-                // AD-412-4: both `recorded` (from temporal.db — untrusted) and
-                // `live` (a PathBuf — filesystem-derived) use `{:?}` so that ESC/CR/LF
-                // bytes in either value are quoted rather than emitted raw to stderr.
+                // AD-412-4: both `recorded` and `live` are `PathBuf`, so `{:?}` on
+                // both fields quotes ESC/CR/LF and non-UTF-8 bytes identically at
+                // every emit site — no lossy-then-quoted divergence.
                 eprintln!(
                     "skim search [debug]: temporal rebuild skipped — anchor mismatch \
                      (recorded={:?}, live={:?}); use `skim search --rebuild` to re-anchor",
-                    recorded,
-                    live.display().to_string(),
+                    recorded, live,
                 );
             }
             return;
@@ -346,13 +352,13 @@ pub(super) fn try_rebuild_temporal_nonfatal(
         // AD-413-16 / R17: an explicit build arm MAY retarget, but never silently —
         // this is the one line that turns the retarget into a user-visible action and
         // the documented recovery from the refusal.  Unconditional (not debug-gated):
-        // AC33(f) asserts it on a plain `--rebuild`.  `{:?}` on both paths follows the
-        // AD-412-4 hardening (untrusted path bytes are quoted, never raw).
+        // AC33(f) asserts it on a plain `--rebuild`.  Both fields are `PathBuf`, so
+        // `{:?}` quotes non-UTF-8 bytes identically — no lossy-then-quoted divergence
+        // (AD-412-4 hardening).
         eprintln!(
             "skim search: re-anchoring temporal data to a different repository \
              (recorded: {:?}, live: {:?})",
-            recorded,
-            live.display().to_string(),
+            recorded, live,
         );
     }
     if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {

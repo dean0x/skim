@@ -321,25 +321,29 @@ fn read_packed_ref(dir: &Path, ref_path: &str) -> Option<String> {
 ///
 /// AD-413-4: four probes in order — worktree loose, commondir loose, commondir
 /// `packed-refs` (mandatory: the post-`git gc` steady state), worktree `packed-refs`.
-/// `refs/bisect|worktree|rewritten/*` stop at probe 1: git keeps those per-worktree.
 ///
-/// AD-413-5: probe 1 stays FIRST and probe 4 stays LAST, and a plain repo or submodule
+/// AD-413-5: probe 1 stays FIRST and probe 4 stays LAST.  A plain repo or submodule
 /// has no `commondir`, so probes 2–3 are skipped and this collapses to the pre-#413
 /// two-probe behaviour — loose-beats-packed precedence and every existing test hold.
 /// A `commondir` resolving to `git_dir` itself short-circuits for the same reason.
+///
+/// Per-worktree ref namespaces (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/`)
+/// skip ONLY probes 2–3 (the commondir redirect), because those refs are never shared
+/// across worktrees.  Probe 4 (worktree-private `packed-refs`) still applies: a
+/// `git pack-refs` on a worktree-private ref places it in the worktree's own
+/// `packed-refs`, and skipping probe 4 would silently break resolution whenever that
+/// file exists — contradicting the monotonicity guarantee in the doc above.
 fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
     if let Some(sha) = read_loose_ref(git_dir, ref_path) {
         // probe 1: worktree-private loose ref
         return Some(sha);
     }
-    if PER_WORKTREE_REF_PREFIXES
+    // Probes 2–3 only: per-worktree namespaces are never stored in the commondir.
+    // Probe 4 below still applies to all ref paths (including per-worktree).
+    let is_per_worktree = PER_WORKTREE_REF_PREFIXES
         .iter()
-        .any(|p| ref_path.starts_with(p))
-    {
-        // per-worktree namespaces are never redirected to the common dir
-        return None;
-    }
-    if let Some(common) = resolve_common_dir(git_dir) {
+        .any(|p| ref_path.starts_with(p));
+    if !is_per_worktree && let Some(common) = resolve_common_dir(git_dir) {
         let same = git_dir.canonicalize().ok().is_some_and(|g| g == common);
         if !same {
             // I2 short-circuit: skip probes 2–3 when commondir == git_dir
@@ -353,7 +357,9 @@ fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
             }
         }
     }
-    // probe 4: worktree-private packed-refs (pre-#413 fallback, kept for monotonicity)
+    // probe 4: worktree-private packed-refs (applies to all ref paths, including
+    // per-worktree namespaces — the monotonicity guarantee requires probe 4 to be
+    // reachable even when probes 2–3 were skipped for a per-worktree prefix).
     read_packed_ref(git_dir, ref_path)
 }
 

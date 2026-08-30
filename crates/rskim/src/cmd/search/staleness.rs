@@ -392,6 +392,19 @@ pub(super) fn check_staleness(
         }
     };
 
+    // AD-413-14-OD: an ADOPTED root (no `.git` entry of its own, HEAD comes from an
+    // enclosing repository via resolve_repo_toplevel) must NOT use HEAD-based
+    // invalidation.  A commit anywhere in the enclosing repo changes the repo HEAD
+    // even when no files under the subtree changed, so `HeadChanged` would trigger a
+    // full lexical+temporal rebuild on every unrelated commit (e.g. a commit to
+    // `crates/rskim` when `--root crates/rskim-search` is in use).  For adopted roots
+    // the working-tree metadata scan already detects any real change under the subtree
+    // (mtime + size, same as the standard path), so HEAD-based invalidation is both
+    // redundant and over-broad.  `resolve_git_dir` returning `None` is the correct
+    // adopted-root signal: the root has no `.git` file/dir of its own, so its HEAD
+    // comes from the ancestor walk and may advance on any unrelated commit.
+    let is_adopted_root = resolve_git_dir(project_root).is_none();
+
     let outcome = match (stored.as_deref(), current.as_deref()) {
         // Non-git project (both None): no commit can have changed, but the
         // working tree still can — scan it (AD-379-3).
@@ -406,6 +419,13 @@ pub(super) fn check_staleness(
         // Both present — compare HEADs first, then the working tree on a match.
         (Some(s), Some(c)) => {
             if s == c {
+                current_or_working_tree(&manifest)
+            } else if is_adopted_root {
+                // AD-413-14-OD: adopted root — HEAD diverged because a commit in the
+                // enclosing repo advanced the repo HEAD, but that commit may have touched
+                // nothing under this subtree.  Scope invalidation to the working-tree
+                // scan so that only changes actually landing under `project_root` drive
+                // a rebuild (avoids full rebuild on every unrelated commit).
                 current_or_working_tree(&manifest)
             } else {
                 StalenessCheck::HeadChanged {
@@ -757,16 +777,22 @@ pub(super) fn create_real_git_worktree(
     use std::process::Command;
 
     // Create the branch at HEAD of the primary repository.
-    Command::new("git")
+    let out = Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .args(["branch", branch])
         .current_dir(primary)
         .output()
-        .expect("git branch");
+        .expect("git branch (spawn)");
+    assert!(
+        out.status.success(),
+        "git branch {:?} failed: {}",
+        branch,
+        String::from_utf8_lossy(&out.stderr),
+    );
 
     // Add the linked worktree checked out on that branch.
-    Command::new("git")
+    let out = Command::new("git")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .arg("worktree")
@@ -775,7 +801,13 @@ pub(super) fn create_real_git_worktree(
         .arg(branch)
         .current_dir(primary)
         .output()
-        .expect("git worktree add");
+        .expect("git worktree add (spawn)");
+    assert!(
+        out.status.success(),
+        "git worktree add {:?} failed: {}",
+        branch,
+        String::from_utf8_lossy(&out.stderr),
+    );
 
     // Return the resolved HEAD SHA from the linked worktree.
     let out = Command::new("git")

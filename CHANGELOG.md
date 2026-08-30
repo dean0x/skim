@@ -218,6 +218,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (no rows served, `temporal.db` byte-unchanged, exit 0) instead of silently rescoring —
   `--build`/`--rebuild`/`--update` re-anchor and disclose the old and the new toplevel.
   A subdirectory root gains its own `temporal.db`, so its first build walks history once.
+  Staleness for adopted roots is scoped to a working-tree metadata scan (mtime + size)
+  rather than a HEAD-SHA comparison: a commit that touches only files OUTSIDE the
+  subtree does not trigger a rebuild of the subdirectory index, because the repo-wide
+  HEAD advancing is not evidence that the subtree changed.
 - **`skim search --install-hooks`/`--remove-hooks` now resolve git's own hooks directory**
   (#413) — the hooks path is resolved through the `commondir` chain (matching
   `git rev-parse --git-path hooks`) instead of being hand-built as `<root>/.git/hooks`.

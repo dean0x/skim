@@ -3939,7 +3939,8 @@ fn test_temporal_anchor_state_absent_agrees_differs_for_subdir_root() {
     assert!(
         matches!(
             super::temporal_anchor_state(&cache_dir, &sub),
-            super::AnchorState::Differs { ref recorded, .. } if recorded == "/some/other/repo"
+            super::AnchorState::Differs { ref recorded, .. }
+                if recorded == &std::path::PathBuf::from("/some/other/repo")
         ),
         "a foreign recorded toplevel must be Differs and carry the recorded value"
     );
@@ -3999,7 +4000,7 @@ fn test_pf017_plain_query_does_not_retarget_anchor_across_repos() {
         matches!(
             super::temporal_anchor_state(&cache_dir, &sub),
             super::AnchorState::Differs { ref recorded, ref live }
-                if std::path::Path::new(recorded) == outer_canon && live == &mid_canon
+                if recorded == &outer_canon && live == &mid_canon
         ),
         "precondition: the live toplevel must now differ from the recorded one; got {:?}",
         super::temporal_anchor_state(&cache_dir, &sub)
@@ -4008,16 +4009,23 @@ fn test_pf017_plain_query_does_not_retarget_anchor_across_repos() {
     let len_before = fs::metadata(&db_path).unwrap().len();
 
     // THE PF-017 CASE: one plain lexical query (allow_reanchor = false).
-    // check_staleness sees HeadChanged (repo B's HEAD), the lexical index is
-    // legitimately rebuilt, but the temporal rebuild — and therefore the anchor
-    // write — must be suppressed.
+    // After AD-413-14-OD, `check_staleness` for an adopted root returns
+    // `current_or_working_tree` (working-tree scan) rather than `HeadChanged` even
+    // though the HEAD SHA changed — the files under `sub` are unchanged so the scan
+    // returns `Current`.  The `Current` self-heal path then calls
+    // `try_rebuild_temporal_nonfatal(..., Refuse)`, which detects `AnchorState::Differs`
+    // and suppresses the temporal rebuild.  The PF-017 guarantee (anchor unchanged on
+    // a plain query) therefore holds through the self-heal arm rather than the
+    // post-rebuild arm, but the discriminating property is identical: removing the
+    // `allow_reanchor` gate from `try_rebuild_temporal_nonfatal` causes the self-heal
+    // to retarget the anchor to repo B, and the mid-test `Differs` assertion fails.
     auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         matches!(
             super::temporal_anchor_state(&cache_dir, &sub),
             super::AnchorState::Differs { ref recorded, .. }
-                if std::path::Path::new(recorded) == outer_canon
+                if recorded == &outer_canon
         ),
         "PF-017: a plain lexical query must NOT retarget meta.git_toplevel; got {:?}",
         super::temporal_anchor_state(&cache_dir, &sub)
@@ -4034,7 +4042,7 @@ fn test_pf017_plain_query_does_not_retarget_anchor_across_repos() {
         matches!(
             super::temporal_anchor_state(&cache_dir, &sub),
             super::AnchorState::Differs { ref recorded, .. }
-                if std::path::Path::new(recorded) == outer_canon
+                if recorded == &outer_canon
         ),
         "PF-017: repeated plain queries must stay inert (no rebuild loop)"
     );
@@ -4045,6 +4053,88 @@ fn test_pf017_plain_query_does_not_retarget_anchor_across_repos() {
         super::temporal_anchor_state(&cache_dir, &sub),
         super::AnchorState::Agrees,
         "an explicit build arm (--build/--rebuild/--update) must re-anchor to the live toplevel"
+    );
+}
+
+/// **AD-413-14-OD regression** — an adopted subdirectory root must NOT return
+/// `HeadChanged` when the enclosing repository advances due to an UNRELATED commit
+/// (one that touches no files under the subtree).
+///
+/// Pre-fix behaviour: `read_git_head(subdir)` resolved the ENCLOSING repository's
+/// HEAD (via the ancestor walk added in #413), so any commit anywhere in the repo
+/// bumped `current` away from the manifest's `stored` HEAD, triggering a full
+/// lexical+temporal rebuild even though nothing under the subtree changed.
+/// Fix (AD-413-14-OD): when `resolve_git_dir(root).is_none()` (adopted root),
+/// `check_staleness` falls through to `current_or_working_tree` regardless of the
+/// SHA divergence, so invalidation is scoped to real file changes under the subtree.
+///
+/// Discriminating: remove the `is_adopted_root` branch from `check_staleness` and
+/// this test fails because `check_staleness` returns `HeadChanged`.
+#[test]
+fn test_adopted_subdir_unrelated_commit_does_not_return_head_changed() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let sub = repo.join("subdir");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Repo with one commit that writes a file under the search root (subdir).
+    create_real_git_repo(&repo, &[("init", &[("subdir/s.rs", "fn s() {}\n")])]);
+
+    // Build the index for the subdirectory root.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Allow).unwrap();
+
+    // Verify the manifest captured a HEAD SHA.
+    let (staleness_pre, _) = check_staleness(&cache_dir, &sub);
+    assert!(
+        matches!(staleness_pre, StalenessCheck::Current),
+        "precondition: index must be Current immediately after build; got {staleness_pre:?}"
+    );
+
+    // Make a commit that touches ONLY a file OUTSIDE the search root.
+    // This advances the repo HEAD but leaves subdir/ files unchanged.
+    fs::write(repo.join("outside.rs"), "fn outside() {}\n").expect("write outside.rs");
+    let add_out = Command::new("git")
+        .args(["add", "outside.rs"])
+        .current_dir(&repo)
+        .output()
+        .expect("git add (spawn)");
+    assert!(
+        add_out.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let commit_out = Command::new("git")
+        .args(["commit", "-m", "unrelated: outside subdir"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit (spawn)");
+    assert!(
+        commit_out.status.success(),
+        "git commit: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+
+    // The repo HEAD has advanced, but the subdir files are unchanged.
+    let new_head = read_git_head(&sub).expect("HEAD must resolve after unrelated commit");
+    // (The stored HEAD in the manifest is the old SHA from the initial build.)
+
+    // check_staleness must NOT return HeadChanged for an adopted root.
+    // It must instead use current_or_working_tree, which finds no changes and
+    // returns Current (no files under subdir changed).
+    let (staleness_post, _) = check_staleness(&cache_dir, &sub);
+    assert!(
+        !matches!(staleness_post, StalenessCheck::HeadChanged { .. }),
+        "AD-413-14-OD REGRESSION: adopted subdir root returned HeadChanged on an \
+         unrelated commit (new HEAD={new_head}); got {staleness_post:?}",
+    );
+    assert!(
+        matches!(staleness_post, StalenessCheck::Current),
+        "adopted subdir root with unchanged files must be Current after unrelated commit; \
+         got {staleness_post:?}",
     );
 }
 
