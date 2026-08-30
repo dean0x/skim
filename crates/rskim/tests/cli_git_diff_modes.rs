@@ -765,3 +765,151 @@ fn verifier_raw_fallback_banner_is_debug_gated() {
          SKIM_DEBUG; got stderr:\n{quiet_err}"
     );
 }
+
+// ============================================================================
+// Phase B-repair golden tests: structure-mode rendering integrity (#512)
+//
+// These tests pin the properties that B3's gap-fill change violated.  They are
+// RED at the B3 commit (1c6faa9 / ef91183) and GREEN after reverting the
+// gap-fill in render_container_with_mode.  See Phase B-repair task description.
+//
+// PF-025 discipline: each assertion was confirmed to FAIL against the buggy
+// (post-B3) binary before being committed.  B3's own four regression tests
+// pass in both states (they never discriminated); see the step-3 report.
+// ============================================================================
+
+/// Structure-mode rendering of a struct with an added blank line between fields
+/// must preserve source line numbers and indentation on unchanged field lines,
+/// and must NOT produce orphaned commas on their own output lines.
+///
+/// **Why this test discriminates:**
+/// B3's gap-fill change causes `render_container_with_mode` to iterate the
+/// container body's children including `,` separator tokens.  In structure
+/// mode, `render_unchanged_node` calls `parser.transform(",", structure_config)`
+/// which writes ` ,\n` — a comma on its own line.  The field text is
+/// simultaneously transformed WITHOUT its comma, losing the source-line number
+/// and the leading indentation.
+///
+/// Pre-B3 the body was rendered as a unit via `render_node_with_hunks`, which
+/// walks hunk patch lines and emits them with their original prefix and line
+/// number.  The unchanged fields appeared as ` 2     pub timeout: u32,` and
+/// ` 4     pub retries: u32,` — with number, indent, and comma intact.
+///
+/// This test is RED at HEAD (B3 present) and GREEN after reverting the gap-fill.
+#[test]
+fn structure_mode_struct_fields_preserve_line_numbers_and_indentation() {
+    // Adding a blank line between two struct fields.
+    // New-side line numbers after: 1=header 2=timeout 3=blank(+) 4=retries 5=closing.
+    let before = "\
+pub struct Config {
+    pub timeout: u32,
+    pub retries: u32,
+}
+";
+    let after = "\
+pub struct Config {
+    pub timeout: u32,
+
+    pub retries: u32,
+}
+";
+    let (_dir, repo) = two_commit_repo(before, after);
+    let ctx = "-U100000";
+    let raw = raw_diff(&repo, ctx);
+    let rendered = skim_diff(&repo, ctx, Some("structure"));
+    let label = "structure-mode struct field integrity";
+
+    // Must be AST-rendered (not a raw-hunk fallback).
+    assert_ast_rendered(label, &rendered);
+
+    // Render fidelity: changed-line coverage + marker checks.
+    assert_render_fidelity(label, &rendered, &raw);
+
+    // The added blank line at new-side line 3 must appear with a `+` prefix.
+    // In the render format (ln_width=1), an added line at line 3 is "+3 ".
+    assert!(
+        rendered.lines().any(|l| l == "+3 "),
+        "{label}: added blank at line 3 must appear as \"+3 \" in the render;\n\
+         got:\n{rendered}"
+    );
+
+    // Regression guard — B3 gap-fill: structure mode must NOT produce a line
+    // that is only a comma (orphaned `,` from field separator token).
+    assert!(
+        !rendered.lines().any(|l| l.trim() == ","),
+        "{label}: structure mode produced an orphaned comma on its own line — \
+         this is the B3 gap-fill regression;\ngot:\n{rendered}"
+    );
+
+    // Regression guard — B3 gap-fill: unchanged field content must appear WITH
+    // its source line number, not as numberless synthetic structure text.
+    // Correct format for ln_width=1: " 2     pub timeout: u32,"
+    // Broken format: " pub timeout: u32" (no line number, no indent, no comma).
+    assert!(
+        rendered.contains("pub timeout: u32,"),
+        "{label}: field 'pub timeout: u32,' must appear intact (with comma) \
+         in the render;\ngot:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("pub retries: u32,"),
+        "{label}: field 'pub retries: u32,' must appear intact (with comma) \
+         in the render;\ngot:\n{rendered}"
+    );
+}
+
+/// Structure-mode rendering of an impl block must preserve line numbers on all
+/// emitted lines and must not collapse the changed method into `{...}`.
+///
+/// This pins the impl-fixture behavior described in the Phase B-repair task.
+/// Both pre-B3 and post-B3 binaries produce the same output for this fixture
+/// (the regression is only triggered when body-gap lines are present), so this
+/// test stays GREEN in both states — it documents the correct behavior rather
+/// than discriminating the regression.  Included here for completeness.
+#[test]
+fn structure_mode_impl_changed_method_is_not_collapsed() {
+    let before = "\
+pub struct Widget {
+    id: u32,
+}
+
+impl Widget {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn doubled(&self) -> u32 {
+        self.id * 2
+    }
+}
+";
+    let after = "\
+pub struct Widget {
+    id: u32,
+}
+
+impl Widget {
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    pub fn tripled(&self) -> u32 {
+        self.id * 3
+    }
+}
+";
+    let (_dir, repo) = two_commit_repo(before, after);
+    let ctx = "-U100000";
+    let raw = raw_diff(&repo, ctx);
+    let rendered = skim_diff(&repo, ctx, Some("structure"));
+    let label = "structure-mode impl method integrity";
+
+    assert_ast_rendered(label, &rendered);
+    assert_render_fidelity(label, &rendered, &raw);
+
+    // The changed method body must reach the reader — it must not be collapsed.
+    assert!(
+        rendered.contains("self.id * 3"),
+        "{label}: changed method body must appear in render (must not be \
+         collapsed to {{...}});\ngot:\n{rendered}"
+    );
+}
