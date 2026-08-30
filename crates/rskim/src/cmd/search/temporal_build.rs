@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
     COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, HistoryResult, HotspotRow,
-    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb,
+    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb, TemporalMetadata,
 };
 
 // ============================================================================
@@ -263,27 +263,6 @@ pub(super) fn build_risk_rows(
             }
         })
         .collect()
-}
-
-// ============================================================================
-// Internal helper (D5 graceful-degradation pattern)
-// ============================================================================
-
-/// Emit a debug-gated warning and return `Ok(())` to degrade gracefully.
-///
-/// All recoverable early-return arms in `rebuild_temporal` use this helper so
-/// the D5 isolation policy ("temporal failure MUST NOT fail lexical") is
-/// expressed once and the function body reads as sequential happy-path logic.
-macro_rules! warn_skip {
-    ($fmt:literal $(, $arg:expr)* $(,)?) => {{
-        if crate::debug::is_debug_enabled() {
-            eprintln!(
-                concat!("skim search [debug]: ", $fmt, " — skipping temporal build"),
-                $($arg)*
-            );
-        }
-        return Ok(());
-    }};
 }
 
 // ============================================================================
@@ -542,15 +521,59 @@ pub(super) fn rebuild_temporal_with_source(
     now_epoch: u64,
     reanchor: super::staleness::ReanchorPolicy,
 ) -> anyhow::Result<()> {
+    // ── Build-backoff sentinel (Finding 2 / D5) ──────────────────────────────
+    // Written when TemporalDb::open fails or a fallback empty sync fails (the
+    // only failure modes that cannot write META_GIT_HEAD directly). If the
+    // sentinel records the same HEAD as `head`, a prior non-transient failure
+    // already occurred for this HEAD; skip the expensive parse_history call and
+    // everything after it until HEAD advances.
+    // Note: the parse_history-failure path is handled differently (fall-through
+    // with empty HistoryResult), so the sentinel is NOT set for that case.
+    let backoff_sentinel = cache_dir.join("temporal.db.build_backoff");
+    if std::fs::read(&backoff_sentinel).ok().as_deref() == Some(head.as_bytes()) {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal rebuild skipped — \
+                 build-backoff sentinel present for HEAD {}… \
+                 (prior open/sync failure); will retry when HEAD advances",
+                head.get(..8).unwrap_or(head),
+            );
+        }
+        return Ok(());
+    }
+
     // ── Single full-history walk ──────────────────────────────────────────────
     // One parse_history call supplies all data. The 30d/90d windowing for
     // changes_30d/changes_90d is done inside compute_file_temporal_stats via
     // timestamp comparison against now_epoch — no separate windowed walk needed
     // (Decision O-B: the former 90-day hotspot walk was dead I/O; it was only
     // used for an is_empty() guard that risk_history already provides).
+    //
+    // Finding 2 / D5 backoff: on parse_history failure, fall through with an
+    // empty HistoryResult (same path as the zero-commits case — LOCKED DECISION
+    // 2026-06-24) so the lock+open+sync block writes META_GIT_HEAD.  Without
+    // this, a bare warn_skip! left META_GIT_HEAD unwritten, causing
+    // temporal_db_is_stale to return true on every subsequent query, forever.
+    // This is the primary exposure widened by #413: resolve_repo_toplevel adopts
+    // roots that gix::discover refuses, so HEAD now resolves for roots whose
+    // parse_history cannot.
     let risk_history = match src.parse_history(root, 0) {
         Ok(h) => h,
-        Err(e) => warn_skip!("parse_history failed: {}", e),
+        Err(e) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: parse_history failed: {e} — \
+                     falling through with empty rows to prevent retry loop",
+                );
+            }
+            HistoryResult {
+                commits: vec![],
+                metadata: TemporalMetadata {
+                    is_shallow: false,
+                    commit_count: 0,
+                },
+            }
+        }
     };
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
@@ -662,16 +685,37 @@ pub(super) fn rebuild_temporal_with_source(
     let db_path = cache_dir.join("temporal.db");
     let db = match TemporalDb::open(&db_path) {
         Ok(d) => d,
-        Err(e) => warn_skip!("failed to open temporal.db: {}", e),
+        Err(e) => {
+            // D5 + Finding 2 backoff: TemporalDb::open failed — write a sentinel
+            // so subsequent queries skip the rebuild for this HEAD.  Without this,
+            // temporal_db_is_stale returns true forever (no temporal.db → stale →
+            // rebuild → open fails again → loop).  The sentinel is best-effort; if
+            // the cache directory is also unwritable the loop continues until HEAD
+            // advances, which is acceptable degradation (D5).
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: failed to open temporal.db: {e} — \
+                     writing build-backoff sentinel to prevent retry loop",
+                );
+            }
+            let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            return Ok(());
+        }
+    };
+
+    // Helper: called on any successful sync (full-rows or fallback empty-rows).
+    // Deletes the stale backoff sentinel and records the git-toplevel anchor.
+    // AD-413-16: the anchor write is a SECOND, separate transaction after sync
+    // so that process death between the two leaves the anchor absent (Absent →
+    // adopt-and-record on the next query) rather than mismatched.
+    let on_sync_ok = |db: &TemporalDb| {
+        let _ = std::fs::remove_file(&backoff_sentinel);
+        record_temporal_anchor(db, root, &ghost_root, reanchor);
     };
 
     match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head) {
         Ok(()) => {
-            // AD-413-16: write the git-toplevel anchor as a SECOND, separate
-            // transaction. Process death between sync and this call leaves the
-            // anchor absent, which is the "adopt-and-record" path in
-            // `temporal_anchor_state` -- never a false refusal.
-            record_temporal_anchor(&db, root, &ghost_root, reanchor);
+            on_sync_ok(&db);
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",
@@ -684,10 +728,39 @@ pub(super) fn rebuild_temporal_with_source(
         }
         Err(rskim_search::SearchError::CapacityExceeded(msg)) => {
             // Too many rows (>500k) — degrade gracefully (D5).
-            warn_skip!("CapacityExceeded — {}. Consider a smaller repository", msg);
+            // Finding 2 backoff: try an empty-row sync so META_GIT_HEAD is written
+            // and temporal_db_is_stale returns false on subsequent queries.
+            // CapacityExceeded is a pre-transaction check so the DB is clean;
+            // db.sync(&[], ...) starts a fresh transaction.  If it also fails,
+            // write the sentinel as a last resort.
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: CapacityExceeded — {msg}. Consider a smaller repository — \
+                     attempting empty-row fallback sync to prevent retry loop",
+                );
+            }
+            if db.sync(&[], &[], &[], head).is_ok() {
+                on_sync_ok(&db);
+            } else {
+                let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            }
         }
         Err(e) => {
-            warn_skip!("sync failed: {}", e);
+            // Sync failed for a non-capacity reason (DB error, disk full, etc.).
+            // The failed transaction was rolled back, leaving the connection clean.
+            // Apply the same fallback pattern: try an empty-row sync to write
+            // META_GIT_HEAD; write the sentinel if that also fails.
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: sync failed: {e} — \
+                     attempting empty-row fallback sync to prevent retry loop",
+                );
+            }
+            if db.sync(&[], &[], &[], head).is_ok() {
+                on_sync_ok(&db);
+            } else {
+                let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            }
         }
     }
 

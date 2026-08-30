@@ -449,7 +449,10 @@ fn test_rebuild_temporal_head_full_sha_and_fresh() {
 /// AC7 — Temporal failure on non-git directory does NOT fail lexical query.
 ///
 /// Discriminating: rebuild_temporal returns Ok(()) on a non-git dir AND
-/// temporal.db is NOT created (no data to write on a non-git root).
+/// temporal.db IS created with META_GIT_HEAD set (Finding 2 / D5 backoff:
+/// parse_history failure falls through with empty rows so META_GIT_HEAD is
+/// written, preventing temporal_db_is_stale from returning true on every
+/// subsequent query and triggering an infinite rebuild retry loop).
 #[test]
 fn test_rebuild_temporal_nongit_returns_ok() {
     let dir = tempdir().unwrap();
@@ -457,23 +460,40 @@ fn test_rebuild_temporal_nongit_returns_ok() {
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     // No git repo here — GixSource::parse_history will fail.
+    let fake_head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     let now = super::current_epoch_secs();
-    let result = rebuild_temporal(
-        dir.path(),
-        &cache_dir,
-        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        now,
-    );
+    let result = rebuild_temporal(dir.path(), &cache_dir, fake_head, now);
 
     assert!(
         result.is_ok(),
         "rebuild_temporal must return Ok(()) on non-git directory (AC7), got: {result:?}"
     );
-    // temporal.db must NOT be created — parse_history fails before TemporalDb::open.
+    // temporal.db MUST be created even when parse_history fails: the empty-row
+    // fall-through writes META_GIT_HEAD so temporal_db_is_stale returns false
+    // on subsequent queries, breaking the per-query rebuild retry loop.
     let db_path = cache_dir.join("temporal.db");
     assert!(
-        !db_path.exists(),
-        "temporal.db must not be created on non-git root (AC7 postcondition)"
+        db_path.exists(),
+        "temporal.db must be created on non-git root to prevent retry loop (Finding 2)"
+    );
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .expect("META_GIT_HEAD must be set even when parse_history failed");
+    assert_eq!(
+        stored, fake_head,
+        "META_GIT_HEAD must equal the passed head on non-git root"
+    );
+    assert!(
+        db.top_hotspots(20).unwrap().is_empty(),
+        "temporal.db on non-git root must have zero hotspot rows"
+    );
+    // The backoff sentinel must NOT be written — parse_history failure is handled
+    // via the empty-row fall-through, not the sentinel path.
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "backoff sentinel must not be written when parse_history fall-through succeeds"
     );
 }
 
@@ -1270,6 +1290,119 @@ impl rskim_search::TemporalSource for CountingSource {
                 },
             })
         }
+    }
+}
+
+/// A `TemporalSource` test double that always returns a `SearchError::Git` error.
+///
+/// Used to simulate the exposure widened by #413: `resolve_repo_toplevel` (naive
+/// `.git`-exists walk) adopts roots that `gix::discover` (respects filesystem
+/// boundaries) refuses, so HEAD resolves but `parse_history` fails.
+struct FailingSource;
+
+impl rskim_search::TemporalSource for FailingSource {
+    fn parse_history(
+        &self,
+        _repo_path: &std::path::Path,
+        _lookback_days: u32,
+    ) -> rskim_search::Result<rskim_search::HistoryResult> {
+        Err(rskim_search::SearchError::Git(
+            "simulated parse_history failure (#413 test)".to_string(),
+        ))
+    }
+}
+
+/// API CONTRACT (parse_history failure no-loop): When `TemporalSource::parse_history`
+/// returns an error, `rebuild_temporal_with_source` must fall through with empty rows
+/// and write a present-but-empty `temporal.db` with `META_GIT_HEAD` set — preventing
+/// the per-query rebuild retry loop that would otherwise occur because
+/// `temporal_db_is_stale` returns `true` whenever `META_GIT_HEAD` is absent.
+///
+/// This is the primary exposure widened by #413: `resolve_repo_toplevel` (naive
+/// `.git`-exists ancestor walk) adopts roots that `gix::discover` (respects
+/// filesystem boundaries and ceiling directories) refuses.  Before this fix, a
+/// bare `warn_skip!` returned `Ok(())` before `TemporalDb::open`, leaving
+/// `temporal.db` absent so `temporal_db_is_stale` fired on every subsequent query
+/// and the full-history walk was re-attempted forever.
+///
+/// Discriminating: `META_GIT_HEAD` is set so `temporal_db_is_stale` returns
+/// `false` after the call.
+#[test]
+fn test_parse_history_failure_writes_meta_head_to_prevent_retry_loop() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = FailingSource;
+    let fake_head = "cccc2222cccc2222cccc2222cccc2222cccc2222";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "rebuild_temporal_with_source must return Ok(()) when parse_history fails (D5), got: {result:?}"
+    );
+
+    // temporal.db MUST be written with META_GIT_HEAD so temporal_db_is_stale
+    // returns false on the next query — no retry loop.
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "temporal.db must be created even when parse_history fails (Finding 2 / D5 backoff)"
+    );
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .expect("META_GIT_HEAD must be set so temporal_db_is_stale returns false");
+    assert_eq!(
+        stored, fake_head,
+        "META_GIT_HEAD must equal the passed head even when parse_history failed"
+    );
+    assert!(
+        db.top_hotspots(20).unwrap().is_empty(),
+        "temporal.db written after parse_history failure must have zero hotspot rows"
+    );
+
+    // The backoff sentinel must NOT be written — the empty-row fall-through
+    // writes META_GIT_HEAD directly, making the sentinel unnecessary.
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "backoff sentinel must not be written when the empty-row fall-through succeeds"
+    );
+
+    // Idempotency: second call sees META_GIT_HEAD matches — no retry.
+    // (In production this is checked by temporal_db_is_stale, not by a second
+    // rebuild_temporal_with_source call; we verify stability here.)
+    let src2 = FailingSource;
+    let result2 = rebuild_temporal_with_source(
+        &src2,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result2.is_ok(),
+        "second rebuild_temporal_with_source after parse_history failure must return Ok, got: {result2:?}"
+    );
+    // DB still present and HEAD unchanged (idempotent).
+    assert!(db_path.exists());
+    {
+        let db2 = rskim_search::TemporalDb::open(&db_path).unwrap();
+        let stored2 = db2.get_meta(rskim_search::META_GIT_HEAD).unwrap().unwrap();
+        assert_eq!(
+            stored2, fake_head,
+            "META_GIT_HEAD must be stable across calls"
+        );
     }
 }
 
