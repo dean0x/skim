@@ -333,6 +333,232 @@ fn test_resolve_hooks_dir_rejects_crafted_gitdir_with_no_git_structure() {
     );
 }
 
+// ============================================================================
+// #413 / AC34(b) — SHARED_HOOKS_SCOPE_MSG constant content guard
+// ============================================================================
+
+/// AC34(b) constant guard — the disclosure message printed by both
+/// `install_search_hooks` and `remove_search_hooks` when the resolved hooks
+/// directory is the shared `<commondir>/hooks` must contain both key phrases.
+///
+/// This test anchors the string content of `SHARED_HOOKS_SCOPE_MSG` so that
+/// the two `eprintln!` call sites in `hooks.rs` cannot drift away from the
+/// phrases that AC34(b) requires ("every worktree" and "clone").
+///
+/// Combined with `test_ac34_multi_worktree_blast_radius` below, which asserts
+/// that `is_shared_hooks_dir` returns `true` for a real linked-worktree root,
+/// the two tests together prove that the disclosure path is taken and emits the
+/// required content — without requiring stderr capture in a unit test.
+#[test]
+fn test_shared_hooks_scope_msg_contains_required_phrases() {
+    let msg = super::SHARED_HOOKS_SCOPE_MSG;
+    assert!(
+        msg.contains("every worktree"),
+        "AC34(b): SHARED_HOOKS_SCOPE_MSG must contain 'every worktree'; got: {msg:?}"
+    );
+    assert!(
+        msg.contains("clone"),
+        "AC34(b): SHARED_HOOKS_SCOPE_MSG must contain 'clone'; got: {msg:?}"
+    );
+    // The message must not inadvertently claim a per-worktree scope.
+    assert!(
+        !msg.contains("/.git/hooks"),
+        "AC34(b): SHARED_HOOKS_SCOPE_MSG must not reference a per-worktree hooks path; \
+         got: {msg:?}"
+    );
+}
+
+// ============================================================================
+// #413 / AC34(b)/(c)/(d) — multi-worktree blast radius is real, bounded,
+// idempotent across worktrees, and the disclosure predicate fires correctly
+// ============================================================================
+
+/// AC34(b)/(c)/(d) — S37 scenario in unit-test form.
+///
+/// Fixture: primary + wt1 + wt2, with a foreign `post-commit` body and a
+/// `pre-push` file planted in `<commondir>/hooks` **before** any skim command.
+///
+/// **(b)** `is_shared_hooks_dir` returns `true` for both linked-worktree roots,
+/// proving the predicate that gates `eprintln!({SHARED_HOOKS_SCOPE_MSG})` in
+/// both `install_search_hooks` and `remove_search_hooks`.  Together with
+/// `test_shared_hooks_scope_msg_contains_required_phrases`, this establishes
+/// that the disclosure string has the required content AND the predicate fires.
+///
+/// **(c)** After install the planted foreign `post-commit` body is byte-identical
+/// to its pre-install content (the skim block was appended, not prepended over
+/// it).  The planted `pre-push` file is untouched.  After remove the foreign
+/// body is byte-identical to its original form and `pre-push` remains untouched.
+///
+/// **(d)** Installing a second time from `wt2` and a third time from `primary`
+/// each return `changed=false` (the idempotency no-op) and each leave the
+/// `# skim-search-start` marker count at exactly 1 per hook file.
+#[test]
+fn test_ac34_multi_worktree_blast_radius() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let wt1 = dir.path().join("wt1");
+    let wt2 = dir.path().join("wt2");
+    fs::create_dir_all(&primary).unwrap();
+
+    super::super::staleness::create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    super::super::staleness::create_real_git_worktree(&primary, &wt1, "b1");
+    super::super::staleness::create_real_git_worktree(&primary, &wt2, "b2");
+
+    // Ground-truth shared hooks directory for wt1 (same for wt2 and primary).
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["rev-parse", "--git-path", "hooks"])
+        .current_dir(&wt1)
+        .output()
+        .expect("git rev-parse --git-path hooks");
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let gt_hooks = {
+        let p = std::path::PathBuf::from(&rel);
+        let p = if p.is_absolute() { p } else { wt1.join(p) };
+        let parent = p.parent().unwrap().canonicalize().unwrap();
+        parent.join(p.file_name().unwrap())
+    };
+
+    // Precondition: both wt1 and wt2 have a .git FILE (linked worktree).
+    assert!(
+        wt1.join(".git").is_file(),
+        "precondition: wt1/.git must be a file (linked worktree)"
+    );
+    assert!(
+        wt2.join(".git").is_file(),
+        "precondition: wt2/.git must be a file (linked worktree)"
+    );
+
+    // Plant a foreign post-commit body BEFORE any skim command (AC34(c)).
+    let foreign_pc_body = "#!/bin/sh\necho FOREIGN_POST_COMMIT\n";
+    let pc_path = gt_hooks.join("post-commit");
+    fs::create_dir_all(&gt_hooks).unwrap();
+    fs::write(&pc_path, foreign_pc_body).unwrap();
+
+    // Plant a foreign pre-push file that skim must never touch (AC34(c)).
+    let foreign_pp_body = "#!/bin/sh\necho FOREIGN_PRE_PUSH\n";
+    let pp_path = gt_hooks.join("pre-push");
+    fs::write(&pp_path, foreign_pp_body).unwrap();
+
+    // ── AC34(b): is_shared_hooks_dir fires for every linked-worktree root ──
+    // Both linked-worktree roots must return true so the eprintln! path is taken.
+    assert!(
+        super::is_shared_hooks_dir(&wt1, &gt_hooks),
+        "AC34(b): is_shared_hooks_dir must be true for wt1 (linked worktree)"
+    );
+    assert!(
+        super::is_shared_hooks_dir(&wt2, &gt_hooks),
+        "AC34(b): is_shared_hooks_dir must be true for wt2 (linked worktree)"
+    );
+
+    // ── First install (from wt1) ──────────────────────────────────────────────
+    let out1 = install_search_hooks(&wt1).unwrap();
+    assert!(
+        out1.changed,
+        "first install from wt1 must report changed=true"
+    );
+
+    // Foreign post-commit body must be preserved — skim block appended, not overwriting.
+    let pc_after_install1 = fs::read_to_string(&pc_path).unwrap();
+    assert!(
+        pc_after_install1.starts_with(foreign_pc_body),
+        "AC34(c): foreign post-commit body must be byte-identical (as prefix) after 1st install; \
+         got: {pc_after_install1:?}"
+    );
+    assert!(
+        pc_after_install1.contains("# skim-search-start"),
+        "AC34(c): skim block must be appended after the foreign body"
+    );
+
+    // pre-push must be completely untouched.
+    assert_eq!(
+        fs::read_to_string(&pp_path).unwrap(),
+        foreign_pp_body,
+        "AC34(c): pre-push file must be byte-identical after 1st install"
+    );
+
+    // Exactly one marker block per hook file installed.
+    for name in ["post-commit", "post-merge", "post-checkout"] {
+        let content =
+            fs::read_to_string(gt_hooks.join(name)).expect("hook file must exist after install");
+        assert_eq!(
+            content.matches("# skim-search-start").count(),
+            1,
+            "AC34(d): exactly one marker block in {name} after 1st install"
+        );
+    }
+
+    // ── Second install (from wt2 — DIFFERENT worktree) ───────────────────────
+    let out2 = install_search_hooks(&wt2).unwrap();
+    assert!(
+        !out2.changed,
+        "AC34(d): 2nd install from wt2 must report changed=false (idempotent)"
+    );
+    for name in ["post-commit", "post-merge", "post-checkout"] {
+        let count = fs::read_to_string(gt_hooks.join(name))
+            .unwrap()
+            .matches("# skim-search-start")
+            .count();
+        assert_eq!(
+            count, 1,
+            "AC34(d): marker count must still be 1 in {name} after 2nd install from wt2"
+        );
+    }
+
+    // ── Third install (from primary) ──────────────────────────────────────────
+    let out3 = install_search_hooks(&primary).unwrap();
+    assert!(
+        !out3.changed,
+        "AC34(d): 3rd install from primary must report changed=false (idempotent)"
+    );
+    for name in ["post-commit", "post-merge", "post-checkout"] {
+        let count = fs::read_to_string(gt_hooks.join(name))
+            .unwrap()
+            .matches("# skim-search-start")
+            .count();
+        assert_eq!(
+            count, 1,
+            "AC34(d): marker count must still be 1 in {name} after 3rd install from primary"
+        );
+    }
+
+    // ── Remove (from wt2 — DIFFERENT worktree from installer) ────────────────
+    let rm_out = remove_search_hooks(&wt2).unwrap();
+    assert!(
+        rm_out.changed,
+        "AC34(c): remove from wt2 must report changed=true (markers were present)"
+    );
+
+    // Marker blocks gone from all three hook names.
+    for name in ["post-commit", "post-merge", "post-checkout"] {
+        let path = gt_hooks.join(name);
+        if path.exists() {
+            let content = fs::read_to_string(&path).unwrap();
+            assert!(
+                !content.contains("# skim-search-start"),
+                "AC34(c): skim-search-start must be removed from {name} after remove"
+            );
+        }
+    }
+
+    // Foreign post-commit body must be byte-identical after remove (AC34(c)).
+    let pc_after_remove = fs::read_to_string(&pc_path).unwrap();
+    assert_eq!(
+        pc_after_remove, foreign_pc_body,
+        "AC34(c): foreign post-commit body must be byte-identical after remove"
+    );
+
+    // pre-push must still be completely untouched (AC34(c)).
+    assert_eq!(
+        fs::read_to_string(&pp_path).unwrap(),
+        foreign_pp_body,
+        "AC34(c): pre-push file must be byte-identical after remove"
+    );
+}
+
 /// AC31(e) / AC5b monotonicity — a plain repo and a non-repo directory keep the
 /// pre-#413 `<root>/.git/hooks` path, byte for byte.
 #[test]
