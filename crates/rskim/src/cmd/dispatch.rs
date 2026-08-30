@@ -87,7 +87,13 @@ pub(crate) fn strip_session_id_flag(args: &[String]) -> Option<Vec<String>> {
 /// **Scoping (PF-008 — only strip flags that are skim-only for the given tool):**
 ///
 /// - **All tools**: `--show-stats` (extracted by every handler via
-///   `extract_show_stats()`) and `--passthrough` (always skim-only; C2).
+///   `extract_show_stats()`), `--passthrough` (always skim-only; C2),
+///   `--max-lines`/`--max-lines=N` (value-bearing; no wrapped tool owns this),
+///   `--tokens`/`--tokens=N` (value-bearing; no wrapped tool owns this),
+///   `--line-numbers` (boolean long form; short form `-n` is NOT stripped —
+///   `git log -n <count>` is tool-owned), and `--debug` (boolean; skim global
+///   flag extracted before dispatch — `--debug` for many tools maps to their
+///   own flag, but skim intercepts it as a global before argv reaches the tool).
 /// - **`git` only**: bare `--json` (before `--`, extracted by
 ///   `extract_json_flag()` in every git subcommand handler) and
 ///   `--mode`/`--mode=<val>` (extracted by `extract_diff_mode()` in git
@@ -101,6 +107,9 @@ pub(crate) fn strip_session_id_flag(args: &[String]) -> Option<Vec<String>> {
 ///
 /// **POSIX `--` end-of-options:** nothing is stripped after a bare `--`.
 ///
+/// **`-n` is NOT stripped.** `git log -n <count>` is a legitimate tool flag.
+/// Only the long form `--line-numbers` is skim-only.
+///
 /// Returns `None` (allocation-free) when no skim-only flags are present.
 ///
 /// **Sync-guard:** `test_strip_skim_flags_sync_guard` asserts that every
@@ -111,6 +120,10 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
     let has_candidate = args.iter().any(|a| {
         a == "--show-stats"
             || a == "--passthrough"
+            || a == "--line-numbers"
+            || a == "--debug"
+            || a.starts_with("--max-lines")
+            || a.starts_with("--tokens")
             || (subcommand == "git" && (a == "--json" || a.starts_with("--mode")))
     });
     if !has_candidate {
@@ -145,6 +158,50 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
         if arg == "--show-stats" || arg == "--passthrough" {
             // Bare boolean flag — drop this token.
             i += 1;
+            continue;
+        }
+
+        // `--line-numbers` (boolean; long form only — `-n` is NOT stripped).
+        if arg == "--line-numbers" {
+            i += 1;
+            continue;
+        }
+
+        // `--debug` (boolean; skim global flag intercepted before dispatch).
+        if arg == "--debug" {
+            i += 1;
+            continue;
+        }
+
+        // `--max-lines=N` (equals form — single token).
+        if arg.starts_with("--max-lines=") {
+            i += 1;
+            continue;
+        }
+
+        // `--max-lines N` (space-separated two-token form).
+        if arg == "--max-lines" {
+            i += 1;
+            // Consume the value token when present (it does not start with '-').
+            if i < args.len() && !args[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+
+        // `--tokens=N` (equals form — single token).
+        if arg.starts_with("--tokens=") {
+            i += 1;
+            continue;
+        }
+
+        // `--tokens N` (space-separated two-token form).
+        if arg == "--tokens" {
+            i += 1;
+            // Consume the value token when present.
+            if i < args.len() && !args[i].starts_with('-') {
+                i += 1;
+            }
             continue;
         }
 
@@ -1295,6 +1352,10 @@ mod tests {
     /// Covers:
     /// - `extract_show_stats()` → `--show-stats` (all tools)
     /// - `--passthrough` / `set_passthrough_flag()` (all tools; C2)
+    /// - `--max-lines` / `--max-lines=N` (all tools; skim file-read flag)
+    /// - `--tokens` / `--tokens=N` (all tools; skim file-read flag)
+    /// - `--line-numbers` (all tools; long form only; `-n` is NOT stripped)
+    /// - `--debug` (all tools; skim global flag)
     /// - `extract_json_flag()` → `--json` bare (git only)
     /// - `extract_diff_mode()` → `--mode` / `--mode=val` (git only)
     #[test]
@@ -1365,6 +1426,159 @@ mod tests {
             "sync-guard FAIL: strip_skim_flags(\"git\") must strip --mode=val \
              (extracted by extract_diff_mode() in git diff/show)"
         );
+
+        // --- All-tools: --max-lines / --max-lines=N ---
+        for tool in &["git", "npm", "cargo"] {
+            // Equals form
+            let eq = sv(&["diff", "--max-lines=50"]);
+            let r = strip_skim_flags(tool, &eq).expect("must strip --max-lines=N");
+            assert!(
+                !r.iter().any(|a| a.starts_with("--max-lines")),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --max-lines=N"
+            );
+            // Space form
+            let sp = sv(&["diff", "--max-lines", "50"]);
+            let r = strip_skim_flags(tool, &sp).expect("must strip --max-lines N");
+            assert!(
+                !r.iter().any(|a| a == "--max-lines" || a == "50"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --max-lines N"
+            );
+        }
+
+        // --- All-tools: --tokens / --tokens=N ---
+        for tool in &["git", "npm", "cargo"] {
+            let eq = sv(&["diff", "--tokens=200"]);
+            let r = strip_skim_flags(tool, &eq).expect("must strip --tokens=N");
+            assert!(
+                !r.iter().any(|a| a.starts_with("--tokens")),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --tokens=N"
+            );
+            let sp = sv(&["diff", "--tokens", "200"]);
+            let r = strip_skim_flags(tool, &sp).expect("must strip --tokens N");
+            assert!(
+                !r.iter().any(|a| a == "--tokens" || a == "200"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --tokens N"
+            );
+        }
+
+        // --- All-tools: --line-numbers (long form only; -n must NOT be stripped) ---
+        for tool in &["git", "npm", "cargo"] {
+            let args = sv(&["log", "--line-numbers", "-n", "5"]);
+            let r = strip_skim_flags(tool, &args).expect("must strip --line-numbers");
+            assert!(
+                !r.iter().any(|a| a == "--line-numbers"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --line-numbers"
+            );
+            // -n must survive (git log -n <count> is tool-owned).
+            assert!(
+                r.iter().any(|a| a == "-n"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must NOT strip -n \
+                 (git log -n <count> is tool-owned)"
+            );
+        }
+
+        // --- All-tools: --debug ---
+        for tool in &["git", "npm", "cargo"] {
+            let args = sv(&["diff", "--debug", "--cached"]);
+            let r = strip_skim_flags(tool, &args).expect("must strip --debug");
+            assert!(
+                !r.iter().any(|a| a == "--debug"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --debug"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Unit tests for new flags (C1 Step 5 — --max-lines, --tokens,
+    // --line-numbers, --debug)
+    // ========================================================================
+
+    /// `--max-lines=N` (equals form) is stripped for all tools.
+    #[test]
+    fn test_strip_skim_flags_max_lines_equals_form() {
+        let args = sv(&["diff", "--max-lines=100", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --max-lines=100");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+        // Also for non-git tools.
+        let result = strip_skim_flags("npm", &sv(&["list", "--max-lines=5"]));
+        assert!(result.is_some() && !result.unwrap().iter().any(|a| a.starts_with("--max-lines")));
+    }
+
+    /// `--max-lines N` (space form) strips both the flag and its value.
+    #[test]
+    fn test_strip_skim_flags_max_lines_space_form() {
+        let args = sv(&["diff", "--max-lines", "100", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --max-lines 100");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// `--tokens=N` (equals form) is stripped for all tools.
+    #[test]
+    fn test_strip_skim_flags_tokens_equals_form() {
+        let args = sv(&["diff", "--tokens=500", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --tokens=500");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// `--tokens N` (space form) strips both the flag and its value.
+    #[test]
+    fn test_strip_skim_flags_tokens_space_form() {
+        let args = sv(&["diff", "--tokens", "500", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --tokens 500");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// `--line-numbers` (long form) is stripped for all tools; `-n` is NOT stripped.
+    #[test]
+    fn test_strip_skim_flags_line_numbers_long_form_stripped_short_not() {
+        // Long form is stripped.
+        let args = sv(&["log", "-n", "5", "--line-numbers"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --line-numbers");
+        // --line-numbers removed; -n and 5 must survive.
+        assert_eq!(result, sv(&["log", "-n", "5"]));
+
+        // -n alone is NOT stripped (git log -n is tool-owned).
+        let args_n_only = sv(&["log", "-n", "5"]);
+        assert!(
+            strip_skim_flags("git", &args_n_only).is_none(),
+            "-n must not be stripped (tool-owned flag)"
+        );
+    }
+
+    /// `--debug` (boolean) is stripped for all tools.
+    #[test]
+    fn test_strip_skim_flags_debug_all_tools() {
+        for tool in &["git", "npm", "cargo"] {
+            let args = sv(&["diff", "--debug", "--cached"]);
+            let result = strip_skim_flags(tool, &args).expect("must strip --debug");
+            assert_eq!(
+                result,
+                sv(&["diff", "--cached"]),
+                "--debug must be stripped for {tool}"
+            );
+        }
+    }
+
+    /// Flags after `--` (POSIX end-of-options) are NOT stripped.
+    #[test]
+    fn test_strip_skim_flags_new_flags_after_separator_not_stripped() {
+        let args = sv(&["diff", "--", "--max-lines", "--tokens", "--line-numbers", "--debug"]);
+        // Nothing should be stripped because all occurrences are after `--`.
+        // The result should be None (no stripping), since the candidates are
+        // only in the fast-path scan and they appear after `--`.
+        // Actually the fast-path DOES see them and returns Some, but the loop
+        // respects past_separator and keeps them.
+        // The key assertion is that the output equals the input.
+        let result = strip_skim_flags("git", &args);
+        if let Some(ref stripped) = result {
+            assert_eq!(
+                stripped,
+                &args,
+                "flags after -- must not be stripped; got {stripped:?}"
+            );
+        }
+        // Whether it returns None or Some(same_as_input) is an implementation
+        // detail; the invariant is that the content is unchanged.
     }
 
     // ========================================================================
