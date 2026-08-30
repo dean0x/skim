@@ -233,8 +233,7 @@ fn resolve_blast_radius_paths_anchor_differs_returns_ok_none() {
 
     // blast_radius path does not need to exist — the anchor guard fires before
     // path normalization, so the function returns Ok(None) early.
-    let result =
-        super::resolve_blast_radius_paths(Some("src/auth.rs"), &root, cache.path(), false);
+    let result = super::resolve_blast_radius_paths(Some("src/auth.rs"), &root, cache.path(), false);
     assert!(
         result.is_ok(),
         "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"

@@ -15,6 +15,7 @@
 
 mod ast;
 mod build_lock;
+mod gitdir;
 pub(crate) mod hooks;
 mod index;
 mod manifest;
@@ -23,6 +24,7 @@ mod snippet;
 mod staleness;
 mod temporal;
 mod temporal_build;
+mod temporal_state;
 mod types;
 mod walk;
 
@@ -208,8 +210,12 @@ pub(crate) fn run(
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
-            let (_outcome, manifest) =
-                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
+            let (_outcome, manifest) = staleness::auto_refresh_if_stale(
+                &root,
+                &cache_dir,
+                analytics,
+                staleness::ReanchorPolicy::Refuse,
+            )?;
             // Step 7 wiring (d): advisory on the --ast temporal-consuming branch.
             if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
                 let head_state = staleness::git_head_state(&root);
@@ -940,7 +946,7 @@ fn run_build(
         &cache_dir,
         head_state.sha(),
         "--rebuild hook",
-        true, // allow_reanchor: explicit build arm re-anchors (PF-017)
+        staleness::ReanchorPolicy::Allow, // explicit build arm re-anchors (PF-017)
     );
 
     Ok(ExitCode::SUCCESS)
@@ -956,7 +962,12 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    let (outcome, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, true)?;
+    let (outcome, manifest) = staleness::auto_refresh_if_stale(
+        &root,
+        &cache_dir,
+        analytics,
+        staleness::ReanchorPolicy::Allow,
+    )?;
     // Step 7 wiring (b): emit the HEAD-unresolvable advisory on --update (AC23).
     let head_state = staleness::git_head_state(&root);
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
@@ -1223,8 +1234,12 @@ fn run_query(
     // swallows temporal errors internally — callers only see lexical failures.
     let pre_loaded_manifest_from_refresh =
         if flags.temporal_sort.is_some() || flags.blast_radius.is_some() || flags.ast.is_some() {
-            let (_outcome, manifest) =
-                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
+            let (_outcome, manifest) = staleness::auto_refresh_if_stale(
+                &root,
+                &cache_dir,
+                analytics,
+                staleness::ReanchorPolicy::Refuse,
+            )?;
             Some(manifest)
         } else {
             // No temporal or AST flag: skip early refresh; execute_query_with_manifest
@@ -1502,7 +1517,12 @@ fn run_temporal_standalone(
     // comment above claimed it was guaranteed.
     // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
-    staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
+    staleness::auto_refresh_if_stale(
+        &root,
+        &cache_dir,
+        analytics,
+        staleness::ReanchorPolicy::Refuse,
+    )?;
 
     // Step 7 wiring (d): temporal-consuming standalone arm (--hot/--cold/--risky/--blast-radius).
     let head_state = staleness::git_head_state(&root);
@@ -2898,10 +2918,7 @@ mod tests {
     fn test_temporal_unavailable_msg_resolved_differs_returns_subdir_msg() {
         // Create an outer git repo so git_head_state(root) resolves.
         let outer = tempfile::TempDir::new().unwrap();
-        create_real_git_repo(
-            outer.path(),
-            &[("init", &[("README.md", "# outer")])],
-        );
+        create_real_git_repo(outer.path(), &[("init", &[("README.md", "# outer")])]);
 
         // root = a subdirectory inside the outer repo (so resolve_repo_toplevel finds outer).
         let root = outer.path().join("sub");
@@ -2914,7 +2931,11 @@ mod tests {
         // Create temporal.db and plant a wrong git_toplevel (triggers AnchorState::Differs).
         let db_path = cache_dir.join("temporal.db");
         drop(rskim_search::TemporalDb::open(&db_path).unwrap());
-        staleness::plant_meta_raw(&db_path, rskim_search::META_GIT_TOPLEVEL, "/wrong/repo/path");
+        staleness::plant_meta_raw(
+            &db_path,
+            rskim_search::META_GIT_TOPLEVEL,
+            "/wrong/repo/path",
+        );
 
         let msg = temporal_unavailable_msg(&root);
 
@@ -2950,10 +2971,7 @@ mod tests {
         // (so .git is directly in root → resolve_repo_toplevel returns None →
         // NotAdopted → no Differs branch → TEMPORAL_BUILD_EMPTY_MSG).
         let dir = tempfile::TempDir::new().unwrap();
-        create_real_git_repo(
-            dir.path(),
-            &[("init", &[("README.md", "# repo")])],
-        );
+        create_real_git_repo(dir.path(), &[("init", &[("README.md", "# repo")])]);
 
         let msg = temporal_unavailable_msg(dir.path());
         assert_eq!(
