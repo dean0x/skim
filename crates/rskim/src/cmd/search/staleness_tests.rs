@@ -4134,6 +4134,11 @@ fn test_resolve_repo_toplevel_not_reached_when_root_has_dot_git() {
 /// lexical index, and stores the live SHA in the manifest — the second snapshot
 /// shows the expected resolved value.
 ///
+/// Fixture: a real **linked worktree** (plan S22), exercising the `git_head` /
+/// `git_head_state` provenance divergence that #413 introduces.  A plain repo's
+/// HEAD already resolved before #413, so using a plain repo here would carry no
+/// discriminating power for the worktree-specific resolution path.
+///
 /// Discriminating:
 /// - Without the `git_head_state` key (#413), the second assertion cannot
 ///   distinguish "resolved and recorded" from "resolved but still null".
@@ -4141,13 +4146,9 @@ fn test_resolve_repo_toplevel_not_reached_when_root_has_dot_git() {
 ///   `git_head` null permanently; the second assertion catches it.
 #[test]
 fn test_ac22_frozen_manifest_git_head_advances_after_refresh() {
-    let dir = tempdir().unwrap();
-    let root = dir.path().join("repo");
+    let (dir, _primary, root, gt) = worktree_fixture("b1");
     let cache_dir = dir.path().join("cache");
-    fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&cache_dir).unwrap();
-
-    let gt = create_real_git_repo(&root, &[("init", &[("a.rs", "fn a(){}\n")])]);
 
     // Plant a frozen manifest: valid stubs + stored HEAD = None.
     write_manifest_with_head(&root, &cache_dir, None);
@@ -4203,35 +4204,43 @@ fn test_ac22_frozen_manifest_git_head_advances_after_refresh() {
 /// so a regression that drops a call site is caught without requiring 11 binary
 /// invocations.
 ///
-/// Discriminating: deleting any call site reduces the count below 6 and fails
-/// the assertion; adding a new temporal arm without a call site keeps the count
-/// unchanged — THAT case requires the CLI acceptance run in S23.
+/// Discriminating: deleting any direct call site changes the exact direct-call count
+/// (currently 5) and fails the assertion; adding a spurious call site without a new
+/// temporal arm also fails (exact `==`, not `>=`).  Adding a new temporal arm without
+/// a call site keeps both counts unchanged — THAT case requires the CLI acceptance run
+/// in S23.  Comment references to the function name are excluded by using call-syntax
+/// patterns (name + opening paren) so a masked-deletion via comment cannot pass.
 #[test]
 fn test_ac23_warn_if_temporal_unverifiable_call_site_count() {
     let mod_src = include_str!("mod.rs");
-    // Count bare occurrences of `warn_if_temporal_unverifiable` in mod.rs only.
-    // mod.rs is the sole consumer of this API; staleness.rs is excluded via a
-    // separate include_str! target.  The bare pattern intentionally captures the
-    // `_at` wrapper (whose name starts with the same prefix) and the one inline
-    // comment reference at line 1255, so the real total is > 6.
-    // Bare pattern — matches all 6 direct call sites plus incidental occurrences
-    // (the `_at` wrapper call whose name contains the bare string as a prefix, and
-    // one comment reference).  Scoping to mod.rs keeps staleness.rs doc-comments
-    // out of the count.
-    let call_count = mod_src.matches("warn_if_temporal_unverifiable").count();
-    // Expected: ≥ 6 occurrences in mod.rs (6 direct call sites; total count ≥ 6):
-    //   line 231  : run()                   — text+AST compound arm (--ast)
-    //   line 957  : run_build()             — --build / --rebuild arm
-    //   line 988  : run_update()            — --update arm
-    //   line 1037 : run_stats()             — --stats / --stats --json arm (via warn_if_temporal_unverifiable_at)
-    //   line 1281 : run_query()             — plain-text query arm
+    // Use call-syntax patterns (function name + opening paren) rather than bare name
+    // references so that comment mentions of the name are excluded.  A bare-name `>=`
+    // bound would allow masking a deleted call site by adding a comment reference;
+    // exact `==` on a call-syntax pattern closes that gap.
+    //
+    // `warn_if_temporal_unverifiable(` does NOT match the `_at` variant because
+    // `warn_if_temporal_unverifiable_at(` has `_at` between `unverifiable` and `(`.
+    let direct_call_count = mod_src.matches("warn_if_temporal_unverifiable(").count();
+    // Direct calls via the bare function (mod.rs is the sole consumer):
+    //   line 231  : run()                     — text+AST compound arm (--ast)
+    //   line 957  : run_build()               — --build / --rebuild arm
+    //   line 988  : run_update()              — --update arm
+    //   line 1281 : run_query()               — plain-text query arm
     //   line 1573 : run_temporal_standalone() — --hot / --cold / --risky / --blast-radius arm
-    // The doc reference in staleness.rs is excluded (different include_str! target).
-    assert!(
-        call_count >= 6,
-        "AC23: mod.rs must contain at least 6 warn_if_temporal_unverifiable references \
-         (one per temporal-data-serving arm); found {call_count} — a temporal arm lost its \
-         advisory call or a new arm was added without wiring"
+    assert_eq!(
+        direct_call_count, 5,
+        "AC23: mod.rs must contain exactly 5 direct warn_if_temporal_unverifiable(...) \
+         call sites; found {direct_call_count} — a temporal arm lost its advisory call \
+         or a new arm was added without wiring (update expected value if arms change)"
+    );
+    let at_call_count = mod_src.matches("warn_if_temporal_unverifiable_at(").count();
+    // Wrapper call via the `_at` convenience wrapper (mod.rs):
+    //   line 1037 : run_stats() — --stats / --stats --json arm
+    assert_eq!(
+        at_call_count, 1,
+        "AC23: mod.rs must contain exactly 1 warn_if_temporal_unverifiable_at(...) \
+         call site; found {at_call_count} — the stats arm lost its advisory wrapper \
+         or a duplicate was added"
     );
 }
 
@@ -4292,6 +4301,85 @@ fn test_ac24_advisory_early_return_before_sqlite_on_resolved_and_not_a_repo() {
         "AC24: guard 1 (!matches!(head, Unresolved)) must short-circuit before any \
          SQLite open for HeadState::Resolved and HeadState::NotARepo; \
          TEMPORAL_META_READ_COUNT delta = {delta} — guard is missing or bypassed",
+    );
+}
+
+// ============================================================================
+// AC16(a) — No rebuild loop on a healthy linked worktree:
+//            temporal.db and index.skfiles mtimes unchanged on second call
+// ============================================================================
+
+/// AC16(a) — Two consecutive identical `auto_refresh_if_stale` calls on a healthy
+/// linked worktree must leave both `temporal.db` and `index.skfiles` mtimes
+/// unchanged on the second call (no rebuild loop).
+///
+/// This path is newly reachable because of #413's worktree HEAD resolution; the
+/// no-loop guarantee must be asserted explicitly for the linked-worktree case.
+/// The existing `test_bug_b_no_rebuild_loop_when_temporal_is_current` covers a
+/// plain repo; this test covers the newly introduced worktree path.
+///
+/// Discriminating:
+///   - A regression that rebuilds the lexical index on every call would advance
+///     `index.skfiles` mtime, failing the manifest assertion.
+///   - A regression that rebuilds `temporal.db` on every call would advance its
+///     mtime, failing the temporal assertion.
+///   - A regression that returns an error on the second call would fail `.unwrap()`.
+#[test]
+fn test_ac16a_healthy_worktree_no_rebuild_loop() {
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // First call: build the complete index (lexical + temporal) on the healthy
+    // linked worktree.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let manifest_path = cache_dir.join("index.skfiles");
+    assert!(
+        temporal_db_path.exists(),
+        "AC16(a) precondition: temporal.db must exist after first build"
+    );
+    assert!(
+        manifest_path.exists(),
+        "AC16(a) precondition: index.skfiles must exist after first build"
+    );
+
+    let temporal_mtime_before = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
+    let manifest_mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+
+    // Small delay so that any rewrite on the second call would produce a
+    // measurably later mtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second call: both temporal and lexical indexes are Current.
+    // Neither temporal.db nor index.skfiles must be rewritten.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let temporal_mtime_after = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
+    let manifest_mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+
+    assert_eq!(
+        temporal_mtime_before, temporal_mtime_after,
+        "AC16(a): temporal.db mtime must be unchanged on the second call \
+         (no rebuild loop on healthy linked worktree)"
+    );
+    assert_eq!(
+        manifest_mtime_before, manifest_mtime_after,
+        "AC16(a): index.skfiles mtime must be unchanged on the second call \
+         (no rebuild loop on healthy linked worktree)"
     );
 }
 
