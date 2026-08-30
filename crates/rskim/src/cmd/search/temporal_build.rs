@@ -610,7 +610,7 @@ pub(super) fn rebuild_temporal_with_source(
     // rewrites them to be root-relative.
     // When `root == ghost_root` (plain single-root repo), `strip_prefix` yields
     // an empty string which is filtered out, so `scope` is `None` and
-    // `apply_scope_filter` is not called — identity path for every non-worktree
+    // `apply_scope_filter` is not called — identity path for every non-subdirectory
     // invocation.
     //
     // Prefix construction: Path components joined with '/', using to_str() (not
