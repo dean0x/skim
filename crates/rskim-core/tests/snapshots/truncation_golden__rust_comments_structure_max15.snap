@@ -10,4 +10,12 @@ pub struct Calculator {
     /// Field doc comment (KEEP)
     value: i32,
 }
-// ... (22 lines truncated)
+// ... (4 lines truncated)
+impl Calculator {
+    /// Constructor doc (KEEP)
+    pub fn new(value: i32) -> Self  {...}
+
+    /// Add method doc (KEEP)
+    pub fn add(&self, x: i32) -> i32  {...}
+}
+// ... (11 lines truncated)

@@ -7,4 +7,5 @@ expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(M
 class Calculator:
     def add(self, x: int, y: int) -> int:
          {...}
-# ... (3 lines truncated)
+
+# ... (2 lines truncated)

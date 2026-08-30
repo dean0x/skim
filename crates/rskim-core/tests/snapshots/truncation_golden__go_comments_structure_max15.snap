@@ -5,7 +5,9 @@ expression: "snap(GO_COMMENTS, Language::Go,\nTransformConfig::with_mode(Mode::S
 ---
 // FIXTURE: Go file with various comment types
 // TESTS: Minimal mode comment stripping
-// ... (9 lines truncated)
+// ... (1 lines truncated)
+package main
+// ... (7 lines truncated)
 func Add(a int, b int) int  {...}
 // ... (5 lines truncated)
 type Calculator struct {

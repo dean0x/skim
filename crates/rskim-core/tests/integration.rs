@@ -1743,9 +1743,10 @@ fn test_max_lines_output_never_exceeds_limit() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Output should be at most 5 lines, got {}: {:?}",
+        line_count <= 6,
+        "Output should be at most 6 lines (5 content + 1 trailing marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1771,9 +1772,10 @@ fn test_max_lines_types_preferred_over_functions() {
     );
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 10,
-        "Output should be at most 10 lines, got {}",
+        line_count <= 11,
+        "Output should be at most 11 lines (10 content + 1 trailing marker), got {}",
         line_count,
     );
 }
@@ -1813,9 +1815,10 @@ fn test_max_lines_with_signatures_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 3,
-        "Signatures mode with max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "Signatures mode with max_lines=3 should produce at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1828,9 +1831,10 @@ fn test_max_lines_with_types_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Types mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count <= 6,
+        "Types mode with max_lines=5 should produce at most 6 lines (5 content + 1 marker), got {}",
         line_count,
     );
 }
@@ -1965,15 +1969,20 @@ fn test_max_lines_1_returns_at_least_one_meaningful_line() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total. For max_lines=1 the no-content
+    // safety fallback triggers simple_line_truncate → 1 content + 1 marker = 2 lines.
     assert!(
-        line_count <= 1,
-        "max_lines=1 should produce at most 1 line, got {}: {:?}",
+        line_count <= 2,
+        "max_lines=1 should produce at most 2 lines (1 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
+    // Must contain at least 1 content line (non-marker).
+    let has_content = result.lines().any(|l| !l.contains("lines truncated"));
     assert!(
-        !result.trim().is_empty(),
-        "max_lines=1 should produce at least one meaningful line"
+        has_content,
+        "max_lines=1 should contain at least one content line: {:?}",
+        result,
     );
 }
 

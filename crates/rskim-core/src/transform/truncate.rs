@@ -165,13 +165,18 @@ pub(crate) fn truncate_to_lines(
     let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
     let mut markers = count_markers(&selected_spans, lines.len());
 
-    // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines
+    // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines + 1.
+    //
+    // E4: the trailing marker occupies slot N+1 (beyond the content budget), so we allow
+    // one extra line here.  Leading and gap markers still count against the N budget, so
+    // the sum of content + ALL markers may be at most max_lines + 1.
     //
     // Performance note: This loop is O(n^2) where n = number of selected spans.
     // Vec::remove() is O(n) and count_markers() rescans the selection each iteration.
     // This is acceptable because n is bounded by the number of top-level AST nodes,
     // which is typically tens to low hundreds even for large files.
-    while lines_used + markers > max_lines && selected.len() > 1 {
+    let trim_limit = max_lines.saturating_add(1);
+    while lines_used + markers > trim_limit && selected.len() > 1 {
         // Find the span with lowest priority (tie-break: drop highest position first)
         let Some(drop_idx) = selected
             .iter()
@@ -224,6 +229,7 @@ pub(crate) fn truncate_to_lines(
     // Cow: content lines borrow from `lines`, markers are owned Strings.
     let mut result_lines: Vec<Cow<'_, str>> = Vec::with_capacity(max_lines + 1);
     let mut last_end: usize = 0;
+    let mut content_count: usize = 0;
 
     // Leading marker: content before the first selected span
     if selected[0].transformed_range.start > 0 {
@@ -235,19 +241,37 @@ pub(crate) fn truncate_to_lines(
         let start = span.transformed_range.start;
         let end = span.transformed_range.end.min(lines.len());
 
-        // Gap marker between spans — count the skipped output lines
+        // Gap marker between spans — count the skipped output lines.
+        //
+        // Fold rule (ADR-011 class 1): if adding the gap marker would leave 0 budget
+        // for content from the span that follows, fold the gap + the span's own lines
+        // into a SINGLE combined marker and skip the span.  Without this, the build
+        // emits gap_marker + trailing_marker with no content in between — two
+        // consecutive elision markers that confuse agents.  The fold keeps it to one
+        // marker and still discloses every omitted line.
+        let remaining_after_gap = max_lines.saturating_sub(result_lines.len() + 1);
         if start > last_end && last_end > 0 {
+            if remaining_after_gap == 0 {
+                // Fold: a single marker covers the gap AND the full span content.
+                let omitted = end.saturating_sub(last_end); // gap lines + span lines
+                result_lines.push(Cow::Owned(make_marker(omitted)));
+                // Advance past the entire span so trailing marker is not double-counted.
+                last_end = end;
+                continue; // skip content-addition loop for this span
+            }
             let omitted = start - last_end;
             result_lines.push(Cow::Owned(make_marker(omitted)));
         }
 
-        // Add lines from this span, reserving 1 slot for a potential trailing marker
-        let remaining_budget = max_lines.saturating_sub(result_lines.len() + 1);
+        // Add lines from this span. E4: the trailing marker occupies slot N+1, so the
+        // content budget is the full remaining capacity (no -1 reservation).
+        let remaining_budget = max_lines.saturating_sub(result_lines.len());
         let span_end = end.min(start + remaining_budget);
 
         for line_idx in start..span_end {
             if line_idx < lines.len() {
                 result_lines.push(Cow::Borrowed(lines[line_idx]));
+                content_count += 1;
             }
         }
 
@@ -256,18 +280,24 @@ pub(crate) fn truncate_to_lines(
         last_end = span_end;
     }
 
+    // Safety: if no content lines fit (e.g. max_lines=1 with a leading marker consuming
+    // the only slot), fall through to simple_line_truncate which always emits at least
+    // 1 content line.  Without this guard the output would be pure elision markers with
+    // zero visible code — confusing and unhelpful for agents.
+    if content_count == 0 && !lines.is_empty() {
+        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+    }
+
     // Trailing marker: content after the last emitted line
     if last_end < lines.len() {
         let omitted = lines.len() - last_end;
         result_lines.push(Cow::Owned(make_marker(omitted)));
     }
 
-    // Final enforcement: cap the total output at max_lines.
-    // NOTE: E4 (unify budget rule to N content + 1 marker = N+1 total) is
-    // implemented for the single-span fast-path (simple_line_truncate).
-    // The multi-span path uses the existing budget logic here; E4 for multi-span
-    // is a separate commit.
-    result_lines.truncate(max_lines);
+    // E4: cap at max_lines + 1 — N content lines plus 1 trailing elision marker.
+    // The trailing marker is the only line allowed beyond the content budget; leading
+    // and gap markers already count against max_lines in the trim step above.
+    result_lines.truncate(max_lines.saturating_add(1));
 
     let mut output = result_lines.join("\n");
     // Preserve trailing newline if original had one
@@ -580,9 +610,10 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         let line_count = result.lines().count();
+        // E4: N content + 1 trailing marker = N+1 total.
         assert!(
-            line_count <= 3,
-            "Expected at most 3 lines, got {}: {:?}",
+            line_count <= 4,
+            "Expected at most 4 lines (3 content + 1 trailing marker), got {}: {:?}",
             line_count,
             result
         );
@@ -778,12 +809,17 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 1, None, None).unwrap();
         let line_count = result.lines().count();
+        // E4: N content + 1 trailing marker = N+1 total. For max_lines=1 the
+        // no-content fallback triggers simple_line_truncate → 2 lines max.
         assert!(
-            line_count <= 1,
-            "Expected at most 1 line, got {}: {:?}",
+            line_count <= 2,
+            "Expected at most 2 lines (1 content + 1 trailing marker), got {}: {:?}",
             line_count,
             result
         );
+        // Must have at least one content line.
+        let content = result.lines().filter(|l| !l.contains("lines truncated")).count();
+        assert!(content >= 1, "Expected at least 1 content line, got only markers: {:?}", result);
     }
 
     #[test]
@@ -947,9 +983,11 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None, None).unwrap();
         let line_count = result.lines().count();
+        // E4: N content + 1 trailing marker = N+1 total. Budget is 4 lines of content
+        // plus 1 trailing elision marker, so the ceiling is 5.
         assert!(
-            line_count <= 4,
-            "Adjacent spans should not cause output to exceed budget of 4 lines, got {}: {:?}",
+            line_count <= 5,
+            "Adjacent spans should not cause output to exceed budget of 5 lines (4 content + 1 marker), got {}: {:?}",
             line_count,
             result
         );
@@ -1025,12 +1063,15 @@ mod tests {
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
 
+        // E4: N content + 1 trailing marker = N+1 total.  With trim_limit=N+1=6 the
+        // trim stops earlier, so 3 content + 3 markers (2 gaps + 1 trailing) = 6 all fit.
         assert!(
-            result_lines.len() <= 5,
-            "Output should not exceed 5 lines, got {}: {:?}",
+            result_lines.len() <= 6,
+            "Output should not exceed 6 lines (5 content budget + 1 trailing marker), got {}: {:?}",
             result_lines.len(),
             result
         );
+        // Both type declarations must be present (priority 5).
         assert!(
             result.contains("type A"),
             "Should contain type A (priority 5): {:?}",
@@ -1041,10 +1082,16 @@ mod tests {
             "Should contain type B (priority 5): {:?}",
             result
         );
-        // Function should be trimmed because markers + content > budget
+        // With E4, fn foo (priority 4) ALSO fits: 3 content + 3 markers = 6 = N+1.
         assert!(
-            !result.contains("fn foo()"),
-            "Function should be trimmed to make room for markers: {:?}",
+            result.contains("fn foo()"),
+            "With E4 trim_limit=6, fn foo (prio 4) should be retained: {:?}",
+            result
+        );
+        // Elision markers must be present for the content gaps.
+        assert!(
+            result.contains("lines truncated"),
+            "Should contain omission markers for skipped lines: {:?}",
             result
         );
     }
@@ -1079,8 +1126,8 @@ mod tests {
             "Import (prio 3) should be dropped before function (prio 4). Got: {:?}",
             result
         );
-        // Output respects budget
-        assert!(result.lines().count() <= 3);
+        // Output respects E4 budget: N content + 1 trailing marker = N+1 total.
+        assert!(result.lines().count() <= 4);
     }
 
     #[test]
