@@ -129,10 +129,57 @@ pub(super) fn normalize_blast_radius_path(
 // DB helpers
 // ============================================================================
 
+/// Typed reason why the temporal DB cannot be served.
+///
+/// Returned by [`open_temporal_db_for`], the single funnel for all temporal DB
+/// access.  Each consumer arm renders the reason (typically via
+/// [`super::temporal_unavailable_msg`]) and degrades gracefully.
+///
+/// AD-413-16: this enum exists so the anchor-refusal contract is enforced by
+/// the API shape rather than by convention at every call site.  A future
+/// temporal consumer that forgets the pre-check receives a compile error
+/// (it cannot get a `TemporalDb` without calling through the funnel).
+#[derive(Debug)]
+pub(super) enum TemporalUnavailable {
+    /// `temporal.db` does not exist, is corrupt, or cannot be opened.
+    Absent,
+    /// DB was written by a different repository root.  Serving it would return
+    /// wrong hotspot / co-change data (AD-413-16).
+    AnchorDiffers,
+}
+
+/// AD-413-16: single funnel for all temporal DB access.
+///
+/// Enforces the anchor-refusal guard in one place so production consumers do
+/// not repeat the check independently.  The API shape makes omission a compile
+/// error: callers cannot obtain a `TemporalDb` without going through this
+/// function.
+///
+/// Returns:
+/// - `Ok(db)` — DB open, present, and anchored to the same repository.
+/// - `Err(AnchorDiffers)` — DB belongs to a different repository.
+/// - `Err(Absent)` — DB absent or corrupt.
+pub(super) fn open_temporal_db_for(
+    root: &Path,
+    cache_dir: &Path,
+) -> Result<TemporalDb, TemporalUnavailable> {
+    // AD-413-16: refuse DB from a different repository BEFORE opening.
+    if matches!(
+        super::staleness::temporal_anchor_state(cache_dir, root),
+        super::staleness::AnchorState::Differs { .. }
+    ) {
+        return Err(TemporalUnavailable::AnchorDiffers);
+    }
+    open_temporal_db(&cache_dir.join("temporal.db")).ok_or(TemporalUnavailable::Absent)
+}
+
 /// Try to open the temporal database at `db_path`.
 ///
 /// Returns `None` when the file does not exist, is corrupt, or cannot be opened.
-/// This allows callers to degrade gracefully rather than hard-fail.
+///
+/// **Production code MUST use [`open_temporal_db_for`] instead**, which enforces
+/// the AD-413-16 anchor-refusal guard.  This lower-level helper is retained for
+/// tests that construct a DB directly and need only the open/None semantics.
 pub(super) fn open_temporal_db(db_path: &Path) -> Option<TemporalDb> {
     if !db_path.exists() {
         return None;
@@ -217,49 +264,35 @@ pub(super) fn paths_to_file_ids(
 pub(super) fn resolve_blast_radius_paths(
     blast_radius: Option<&str>,
     root: &Path,
-    db_path: &Path,
+    cache_dir: &Path,
     json: bool,
 ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
     let Some(raw_path) = blast_radius else {
         return Ok(None);
     };
 
-    // AD-413-16: refuse temporal DB from a different repository BEFORE open_temporal_db.
-    // AnchorState::Differs means the DB exists but was anchored to a different repo —
-    // open_temporal_db would succeed and we'd serve wrong co-change data.
-    // derive cache_dir = parent of db_path (e.g. .../search/<hash>/).
-    if let Some(cache_dir) = db_path.parent()
-        && let super::staleness::AnchorState::Differs { .. } =
-            super::staleness::temporal_anchor_state(cache_dir, root)
-    {
-        let base_msg = super::temporal_unavailable_msg(root);
-        let msg = format!("no temporal data for --blast-radius — {base_msg}");
-        if json {
-            let envelope = serde_json::json!({ "warning": msg });
-            eprintln!("{}", serde_json::to_string(&envelope)?);
-        } else {
-            eprintln!("skim search: {msg}");
+    // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
+    // place.  AnchorDiffers → wrong co-change data would be served; Absent →
+    // degrade gracefully.  Both arms emit the same message format so callers
+    // get a reason-specific human-readable string via temporal_unavailable_msg.
+    //
+    // Site 5 (Step 8): temporal_unavailable_msg dispatches to the correct
+    // constant (SUBDIR_ROOT_TEMPORAL_MSG for AnchorDiffers, NO_TEMPORAL_DATA_MSG
+    // for non-repo, etc.) so the doubled composition "no temporal data for
+    // --blast-radius — <reason>" is always accurate (C8 / AC19).
+    let db = match open_temporal_db_for(root, cache_dir) {
+        Ok(db) => db,
+        Err(_reason) => {
+            let base_msg = super::temporal_unavailable_msg(root);
+            let msg = format!("no temporal data for --blast-radius — {base_msg}");
+            if json {
+                let envelope = serde_json::json!({ "warning": msg });
+                eprintln!("{}", serde_json::to_string(&envelope)?);
+            } else {
+                eprintln!("skim search: {msg}");
+            }
+            return Ok(None);
         }
-        return Ok(None);
-    }
-
-    // Site 5 (Step 8): temporal_unavailable_msg replaces bare NO_TEMPORAL_DATA_MSG
-    // so the reason reflects the actual state (no repo, unborn branch, etc.).
-    // C8: for the non-repo case temporal_unavailable_msg returns NO_TEMPORAL_DATA_MSG
-    // so the doubled composition "no temporal data for --blast-radius — no temporal
-    // data — run …" stays byte-identical (AC19).
-    let Some(db) = open_temporal_db(db_path) else {
-        let msg = format!(
-            "no temporal data for --blast-radius — {}",
-            super::temporal_unavailable_msg(root)
-        );
-        if json {
-            let envelope = serde_json::json!({ "warning": msg });
-            eprintln!("{}", serde_json::to_string(&envelope)?);
-        } else {
-            eprintln!("skim search: {msg}");
-        }
-        return Ok(None);
     };
 
     let normalized = normalize_blast_radius_path(raw_path, root)?;
@@ -296,11 +329,12 @@ pub(super) fn resolve_blast_radius_paths(
 pub(super) fn resolve_blast_radius_file_ids(
     blast_radius: Option<&str>,
     root: &Path,
-    db_path: &Path,
+    cache_dir: &Path,
     sorted_paths: &[&str],
     json: bool,
 ) -> anyhow::Result<Option<HashSet<FileId>>> {
-    let Some(allowed_paths) = resolve_blast_radius_paths(blast_radius, root, db_path, json)? else {
+    let Some(allowed_paths) = resolve_blast_radius_paths(blast_radius, root, cache_dir, json)?
+    else {
         return Ok(None);
     };
     let file_ids = paths_to_file_ids(sorted_paths, &allowed_paths);

@@ -294,14 +294,52 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
 
     // Remove reports truthfully and is reversible from the primary (AC31(a)/AC34(c)).
     assert!(
-        remove_search_hooks(&primary).unwrap(),
-        "AC31(a): remove must report true when a marker block was actually removed"
+        remove_search_hooks(&primary).unwrap().changed,
+        "AC31(a): remove must report changed=true when a marker block was actually removed"
     );
     assert!(
-        !remove_search_hooks(&primary).unwrap(),
-        "AC31(a): a second remove must report false so no false success line is printed"
+        !remove_search_hooks(&primary).unwrap().changed,
+        "AC31(a): a second remove must report changed=false so no false success line is printed"
     );
     assert!(!has_search_hooks(&worktree));
+}
+
+/// Security (AD-413-3 extension): a crafted `gitdir:` pointer that resolves to a
+/// directory which is NOT a real git directory (`HEAD` present but `objects/` and
+/// `refs/` absent) must NOT be used as a write destination.  `resolve_hooks_dir`
+/// must fall back to the safe local `<root>/.git/hooks` instead.
+///
+/// This tests the write-path sanity gate added in the fix for the hooks.rs security
+/// finding (hooks.rs `looks_like_git_dir`).  The attacker scenario:
+/// - A tarball is extracted and contains a `.git` FILE (git itself won't check
+///   one out, but archive tools will) pointing at an arbitrary target directory.
+/// - skim must not create executables in that arbitrary directory.
+#[test]
+fn test_resolve_hooks_dir_rejects_crafted_gitdir_with_no_git_structure() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+
+    // A target that has a HEAD file but NOT objects/ or refs/ — just enough to
+    // look superficially like a git dir but not enough to pass looks_like_git_dir.
+    let target = dir.path().join("attacker_target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Deliberately omitting objects/ and refs/ subdirectories.
+
+    // Plant a .git FILE that points to the attacker's directory.
+    let gitdir_line = format!("gitdir: {}\n", target.display());
+    fs::write(project.join(".git"), &gitdir_line).unwrap();
+
+    let resolved = super::resolve_hooks_dir(&project);
+
+    // Must fall back to the safe local path, not the attacker's directory.
+    assert_eq!(
+        resolved,
+        project.join(".git").join("hooks"),
+        "security: a gitdir: pointer to a non-git-dir (HEAD only, no objects/refs) \
+         must fall back to the safe local hooks path; got {resolved:?}"
+    );
 }
 
 /// AC31(e) / AC5b monotonicity — a plain repo and a non-repo directory keep the
