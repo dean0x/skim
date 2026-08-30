@@ -350,18 +350,21 @@ pub(super) fn run_diff(
         let file_diffs = parse_unified_diff(&raw_diff);
 
         if file_diffs.is_empty() {
-            eprintln!("No changes");
-            // This branch is only hit when parse_unified_diff returns an empty vec
-            // despite raw_diff being non-empty (malformed diff). Keep a consistent
-            // analytics record identical to the trim-is-empty branch above.
-            // Drop file_diffs first so the borrow on raw_diff ends, then move
-            // raw_diff into the passthrough variant (PF-018 resolution).
+            // The unified diff parser produced no files despite non-empty raw output.
+            // This happens when git is invoked with a flag that produces non-unified
+            // output (e.g., `--raw`, `--dirstat`).  Serve the raw bytes verbatim so
+            // the caller sees what git actually produced (#317 compress-never-truncate).
+            // Drop file_diffs first so the borrow on raw_diff ends, then move it
+            // to the stdout write and analytics (PF-018 resolution).
             drop(file_diffs);
+            if exec::write_to_stdout(&raw_diff)? == exec::StdoutStatus::PipeClosed {
+                return Ok(exec::pipe_closed_exit());
+            }
             super::finalize_git_output_passthrough(
                 raw_diff,
                 label,
                 show_stats,
-                rec.with_tier("degraded"),
+                rec.with_tier("passthrough"),
                 duration,
             );
             return Ok(ExitCode::SUCCESS);
