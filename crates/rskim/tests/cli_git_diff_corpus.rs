@@ -228,8 +228,7 @@ fn repo_root() -> PathBuf {
 /// Fix: replaced `git log -N` (population shifts with each new commit) with a
 /// fixed list that makes measurements comparable across runs.
 fn pinned_corpus(root: &std::path::Path) -> Vec<String> {
-    let fixture = root
-        .join("crates/rskim/tests/fixtures/corpus_shas.txt");
+    let fixture = root.join("crates/rskim/tests/fixtures/corpus_shas.txt");
     let text = std::fs::read_to_string(&fixture)
         .unwrap_or_else(|e| panic!("corpus fixture not found at {fixture:?}: {e}"));
     text.lines()
@@ -310,9 +309,9 @@ fn skim_diff_mode(root: &std::path::Path, sha: &str, mode: DiffMode) -> String {
     if let Some(flag) = mode.extra_args() {
         cmd.arg(flag);
     }
-    let out = cmd.output().unwrap_or_else(|e| {
-        panic!("skim binary {skim:?} failed to spawn: {e}")
-    });
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("skim binary {skim:?} failed to spawn: {e}"));
     // Fix: hard panic on non-zero exit so an exit-129 run can never be scored
     // as data (old code: `unwrap_or_else(|| raw.clone())` → silent pass).
     assert!(
@@ -345,7 +344,11 @@ fn skim_diff_mode(root: &std::path::Path, sha: &str, mode: DiffMode) -> String {
 /// caught B3's structure-mode regression (orphaned commas, lost line numbers).
 ///
 /// Returns `(changed_ok, changed_missing, context_missing)`.
-fn check_coverage(raw: &str, compressed: &str, _numstat: &BTreeMap<String, (usize, usize)>) -> (bool, usize, usize) {
+fn check_coverage(
+    raw: &str,
+    compressed: &str,
+    _numstat: &BTreeMap<String, (usize, usize)>,
+) -> (bool, usize, usize) {
     if compressed.trim() == raw.trim() {
         return (true, 0, 0); // raw fallback — invariant trivially holds
     }
@@ -445,7 +448,8 @@ fn git_diff_corpus_compress_never_truncate() {
                 stats[i].ast_rendered += 1;
             }
 
-            let (ok, changed_missing, context_missing) = check_coverage(&raw, &compressed, &numstat);
+            let (ok, changed_missing, context_missing) =
+                check_coverage(&raw, &compressed, &numstat);
             if !ok {
                 stats[i].violations += 1;
                 if mode.invariant_asserted() {
@@ -472,7 +476,13 @@ fn git_diff_corpus_compress_never_truncate() {
     println!();
     println!(
         "  {:<12}  {:>8}  {:>12}  {:>13}  {:>11}  {:>10}  {:>15}",
-        "mode", "examined", "ast-rendered", "raw-fallback", "fallback %", "violations", "ctx-violations"
+        "mode",
+        "examined",
+        "ast-rendered",
+        "raw-fallback",
+        "fallback %",
+        "violations",
+        "ctx-violations"
     );
     println!("  {}", "-".repeat(95));
     for (i, mode) in modes.iter().enumerate() {
@@ -501,7 +511,11 @@ fn git_diff_corpus_compress_never_truncate() {
             advisory_violations.len()
         );
         for (sha, mode, n) in advisory_violations.iter().take(5) {
-            println!("    {} [{}]: {n} dropped changed lines", &sha[..8], mode.label());
+            println!(
+                "    {} [{}]: {n} dropped changed lines",
+                &sha[..8],
+                mode.label()
+            );
         }
         if advisory_violations.len() > 5 {
             println!("    … ({} more)", advisory_violations.len() - 5);
@@ -514,7 +528,11 @@ fn git_diff_corpus_compress_never_truncate() {
             context_advisory.len()
         );
         for (sha, mode, n) in context_advisory.iter().take(5) {
-            println!("    {} [{}]: {n} dropped context lines", &sha[..8], mode.label());
+            println!(
+                "    {} [{}]: {n} dropped context lines",
+                &sha[..8],
+                mode.label()
+            );
         }
         if context_advisory.len() > 5 {
             println!("    … ({} more)", context_advisory.len() - 5);
@@ -524,7 +542,11 @@ fn git_diff_corpus_compress_never_truncate() {
     if !asserted_violations.is_empty() {
         println!("  ASSERTED violations (default mode):");
         for (sha, mode, n) in &asserted_violations {
-            println!("    {} [{}]: {n} dropped changed lines", &sha[..8], mode.label());
+            println!(
+                "    {} [{}]: {n} dropped changed lines",
+                &sha[..8],
+                mode.label()
+            );
         }
         println!();
     }
@@ -593,7 +615,10 @@ fn git_diff_corpus_harness_sanity() {
     match raw_diff(&git, &root, sha) {
         Ok(s) => {
             // The diff might be empty (merge commit) or have content — both are fine.
-            assert!(s.len() < MAX_DIFF_BYTES * 2, "sanity: diff is implausibly large");
+            assert!(
+                s.len() < MAX_DIFF_BYTES * 2,
+                "sanity: diff is implausibly large"
+            );
         }
         Err(SkipReason::NoParent) => {
             panic!("corpus[0] ({sha}) has no parent — very unexpected for the latest commit");

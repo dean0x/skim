@@ -1562,7 +1562,14 @@ mod tests {
     /// Flags after `--` (POSIX end-of-options) are NOT stripped.
     #[test]
     fn test_strip_skim_flags_new_flags_after_separator_not_stripped() {
-        let args = sv(&["diff", "--", "--max-lines", "--tokens", "--line-numbers", "--debug"]);
+        let args = sv(&[
+            "diff",
+            "--",
+            "--max-lines",
+            "--tokens",
+            "--line-numbers",
+            "--debug",
+        ]);
         // Nothing should be stripped because all occurrences are after `--`.
         // The result should be None (no stripping), since the candidates are
         // only in the fast-path scan and they appear after `--`.
@@ -1572,8 +1579,7 @@ mod tests {
         let result = strip_skim_flags("git", &args);
         if let Some(ref stripped) = result {
             assert_eq!(
-                stripped,
-                &args,
+                stripped, &args,
                 "flags after -- must not be stripped; got {stripped:?}"
             );
         }
