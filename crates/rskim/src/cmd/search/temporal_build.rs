@@ -765,20 +765,19 @@ fn record_temporal_anchor(
     // skip the write.  The auto-refresh path must not silently retarget a DB
     // anchored by a prior explicit build arm.  Use `skim search --rebuild` to
     // force re-anchoring.
-    if reanchor == super::staleness::ReanchorPolicy::Refuse {
-        if let Ok(Some(existing)) = db.get_meta(rskim_search::META_GIT_TOPLEVEL) {
-            if existing.as_str() != top_str {
-                if crate::debug::is_debug_enabled() {
-                    eprintln!(
-                        "skim search [debug]: temporal anchor write skipped \
-                         (Refuse policy, anchor would change from {:?} to {:?}); \
-                         use `skim search --rebuild` to re-anchor (PF-017)",
-                        existing, top_str,
-                    );
-                }
-                return;
-            }
+    if reanchor == super::staleness::ReanchorPolicy::Refuse
+        && let Ok(Some(existing)) = db.get_meta(rskim_search::META_GIT_TOPLEVEL)
+        && existing.as_str() != top_str
+    {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal anchor write skipped \
+                 (Refuse policy, anchor would change from {:?} to {:?}); \
+                 use `skim search --rebuild` to re-anchor (PF-017)",
+                existing, top_str,
+            );
         }
+        return;
     }
     if let Err(e) = db.set_meta(rskim_search::META_GIT_TOPLEVEL, top_str)
         && crate::debug::is_debug_enabled()

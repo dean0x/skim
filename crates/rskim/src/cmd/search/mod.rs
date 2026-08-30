@@ -1267,10 +1267,10 @@ fn run_query(
     // Finding 2 fix: use refresh_head_state from auto_refresh_if_stale instead of
     // a second git_head_state call (refresh_head_state is always Some on this path
     // because the guard above ensures auto_refresh_if_stale ran for temporal flags).
-    if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-        if let Some(ref hs) = refresh_head_state {
-            staleness::warn_if_temporal_unverifiable(&cache_dir, hs);
-        }
+    if (flags.temporal_sort.is_some() || flags.blast_radius.is_some())
+        && let Some(hs) = &refresh_head_state
+    {
+        staleness::warn_if_temporal_unverifiable(&cache_dir, hs);
     }
 
     // Open the temporal DB once (AFTER refresh above). Used for both
