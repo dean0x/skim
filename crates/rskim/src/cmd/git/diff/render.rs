@@ -945,14 +945,7 @@ fn render_container_with_mode(
             for member in child.children(&mut body_cursor) {
                 let member_start = member.start_position().row + 1;
                 let member_end = member.end_position().row + 1;
-                render_orphan_gap(
-                    output,
-                    next_member_line,
-                    member_start,
-                    ctx,
-                    inputs,
-                    state,
-                );
+                render_orphan_gap(output, next_member_line, member_start, ctx, inputs, state);
                 render_container_member(output, node, &member, ctx, inputs, parser, state);
                 next_member_line = next_member_line.max(member_end + 1);
             }

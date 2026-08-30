@@ -322,8 +322,7 @@ fn git_diff_corpus_compress_never_truncate() {
         };
 
         for (i, &mode) in modes.iter().enumerate() {
-            let compressed = skim_diff_mode(&root, sha, mode)
-                .unwrap_or_else(|| raw.clone()); // skim failure → treat as raw
+            let compressed = skim_diff_mode(&root, sha, mode).unwrap_or_else(|| raw.clone()); // skim failure → treat as raw
 
             stats[i].examined += 1;
             if compressed.trim() == raw.trim() {
@@ -350,16 +349,9 @@ fn git_diff_corpus_compress_never_truncate() {
     // Report
     // -----------------------------------------------------------------------
     println!("=== cli_git_diff_corpus results ===");
-    println!(
-        "  commits in history  : {}",
-        commits.len()
-    );
-    println!(
-        "  skipped (no parent) : {skipped_no_parent}"
-    );
-    println!(
-        "  skipped (>256KB)    : {skipped_too_large}"
-    );
+    println!("  commits in history  : {}", commits.len());
+    println!("  skipped (no parent) : {skipped_no_parent}");
+    println!("  skipped (>256KB)    : {skipped_too_large}");
     println!();
     println!(
         "  {:<12}  {:>8}  {:>12}  {:>13}  {:>11}  {:>10}",
@@ -368,7 +360,11 @@ fn git_diff_corpus_compress_never_truncate() {
     println!("  {}", "-".repeat(80));
     for (i, mode) in modes.iter().enumerate() {
         let s = &stats[i];
-        let asserted_marker = if mode.invariant_asserted() { " [asserted]" } else { " [advisory]" };
+        let asserted_marker = if mode.invariant_asserted() {
+            " [asserted]"
+        } else {
+            " [advisory]"
+        };
         println!(
             "  {:<12}  {:>8}  {:>12}  {:>13}  {:>10.1}%  {:>10}{}",
             mode.label(),
@@ -386,9 +382,7 @@ fn git_diff_corpus_compress_never_truncate() {
             "  Advisory (structure/full) violations: {} — expected pre-B3 state;",
             advisory_violations.len()
         );
-        println!(
-            "  these represent AST-compression dropping content lines, which B3 cures."
-        );
+        println!("  these represent AST-compression dropping content lines, which B3 cures.");
         for (sha, mode, n) in advisory_violations.iter().take(10) {
             println!("    {} [{}]: {n} dropped lines", &sha[..8], mode.label());
         }
@@ -435,13 +429,22 @@ fn git_diff_corpus_compress_never_truncate() {
 #[test]
 fn git_diff_corpus_harness_sanity() {
     let git = git_bin();
-    assert!(git.is_file(), "git_bin() must return an existing file: {git:?}");
+    assert!(
+        git.is_file(),
+        "git_bin() must return an existing file: {git:?}"
+    );
 
     let root = repo_root();
-    assert!(root.join(".git").exists(), "repo_root() must contain .git: {root:?}");
+    assert!(
+        root.join(".git").exists(),
+        "repo_root() must contain .git: {root:?}"
+    );
 
     let commits = recent_commits(&root, 1);
-    assert!(!commits.is_empty(), "recent_commits must return at least one SHA");
+    assert!(
+        !commits.is_empty(),
+        "recent_commits must return at least one SHA"
+    );
     assert_eq!(commits[0].len(), 40, "SHA must be 40 hex chars");
 
     // Verify the mode label/arg/assertion plumbing.

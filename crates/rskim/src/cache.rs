@@ -709,8 +709,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         // Production key — uses `cache_schema_v{CACHE_SCHEMA_VERSION}|...`
-        let key_production =
-            cache_key(path, mtime, Mode::Structure, &trunc, false).unwrap();
+        let key_production = cache_key(path, mtime, Mode::Structure, &trunc, false).unwrap();
 
         // Simulate the pre-A1 hash: same inputs, NO version prefix.
         // If `key_production == key_legacy`, CACHE_SCHEMA_VERSION is absent
@@ -731,8 +730,7 @@ mod tests {
         let key_legacy = format!("{:x}", hasher.finalize());
 
         assert_ne!(
-            key_production,
-            key_legacy,
+            key_production, key_legacy,
             "CACHE_SCHEMA_VERSION must be included in hash_input. \
              Without it, output-format changes in later phases cannot \
              invalidate warm cache entries. \
