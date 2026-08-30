@@ -543,6 +543,62 @@ pub(super) fn rebuild_temporal_with_source(
         &mut cochange_rows,
     );
 
+    // ── AD-413-17: subdirectory scope filter ─────────────────────────────────
+    // When `root` is a proper subdirectory of `ghost_root`, git history paths
+    // are repo-root-relative (e.g. `crates/rskim-search/src/lib.rs`) while
+    // skim-search query consumers expect paths relative to `root`
+    // (e.g. `src/lib.rs`). Compute the scope prefix once and retain only rows
+    // whose paths start with it, rewriting them to strip the prefix.
+    // When `root == ghost_root` (plain single-root repo), `strip_prefix` yields
+    // an empty string which is filtered out, so `scope` is `None` and this
+    // block is a no-op — identity path for every non-worktree invocation.
+    let scope: Option<String> = root
+        .canonicalize()
+        .ok()
+        .zip(ghost_root.canonicalize().ok())
+        .and_then(|(r, g)| {
+            r.strip_prefix(&g)
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        })
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{p}/"));
+
+    if let Some(ref pfx) = scope {
+        hotspot_rows.retain_mut(|r| {
+            if let Some(stripped) = r.file_path.strip_prefix(pfx.as_str()) {
+                r.file_path = stripped.to_string();
+                true
+            } else {
+                false
+            }
+        });
+        risk_rows.retain_mut(|r| {
+            if let Some(stripped) = r.file_path.strip_prefix(pfx.as_str()) {
+                r.file_path = stripped.to_string();
+                true
+            } else {
+                false
+            }
+        });
+        // Cochange: only retain pairs where BOTH sides are within the scope.
+        // A row where only one side is scoped would silently point at a path that
+        // the query-side would never find — drop it rather than produce a ghost
+        // co-change result.
+        cochange_rows.retain_mut(|r| {
+            let a = r.file_a.strip_prefix(pfx.as_str()).map(String::from);
+            let b = r.file_b.strip_prefix(pfx.as_str()).map(String::from);
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    r.file_a = a;
+                    r.file_b = b;
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // Single sync path for both the empty-history and non-empty cases:
     // eliminates the duplicated lock+open+sync block and consolidates the
@@ -562,6 +618,11 @@ pub(super) fn rebuild_temporal_with_source(
 
     match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head) {
         Ok(()) => {
+            // AD-413-16: write the git-toplevel anchor as a SECOND, separate
+            // transaction. Process death between sync and this call leaves the
+            // anchor absent, which is the "adopt-and-record" path in
+            // `temporal_anchor_state` -- never a false refusal.
+            record_temporal_anchor(&db, root);
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",
@@ -584,10 +645,44 @@ pub(super) fn rebuild_temporal_with_source(
     Ok(())
 }
 
+/// Write the git repository toplevel anchor into an open [`TemporalDb`] after a
+/// successful [`TemporalDb::sync`] for a root that is inside (but not at) a git
+/// repository (AD-413-16).
+///
+/// This must be called as a **second, separate transaction** after `db.sync`
+/// completes successfully. Process death between `sync` and this call leaves
+/// [`rskim_search::META_GIT_TOPLEVEL`] absent, which maps to
+/// [`super::staleness::AnchorState::Absent`] -- the "adopt-and-record" path in
+/// [`super::staleness::temporal_anchor_state`], never a false refusal.
+///
+/// For a root whose directory already contains `.git` (a plain single-root
+/// repo), [`super::staleness::resolve_repo_toplevel`] returns `None` and this
+/// function is a no-op (Gate 1 in `temporal_anchor_state`: `NotAdopted`).
+/// Zero DB reads are issued for all plain-repo users.
+fn record_temporal_anchor(db: &TemporalDb, root: &Path) {
+    let Some(top) = super::staleness::resolve_repo_toplevel(root) else {
+        return; // plain repo or discovery failed -- nothing to anchor
+    };
+    let Some(top_str) = top.to_str() else {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal anchor: toplevel path is not valid \
+                 UTF-8, skipping anchor write"
+            );
+        }
+        return;
+    };
+    if let Err(e) = db.set_meta(rskim_search::META_GIT_TOPLEVEL, top_str)
+        && crate::debug::is_debug_enabled()
+    {
+        eprintln!("skim search [debug]: temporal anchor write failed (non-fatal): {e}");
+    }
+}
+
 /// Return the current Unix epoch timestamp in seconds.
 ///
 /// Used by `rebuild_temporal`'s call site in `staleness.rs` to pin `now_epoch`
-/// at the start of the refresh — all score computations use the same reference
+/// at the start of the refresh -- all score computations use the same reference
 /// point rather than reading `SystemTime::now()` inside library functions.
 ///
 /// Returns `0` if the system clock is before the Unix epoch (impossible in

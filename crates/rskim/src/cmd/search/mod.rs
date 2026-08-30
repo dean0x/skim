@@ -179,8 +179,13 @@ pub(crate) fn run(
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
             let (_outcome, manifest) =
-                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
             let temporal_db_path = cache_dir.join("temporal.db");
+            // Step 7 wiring (d): advisory on the --ast temporal-consuming branch.
+            if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
+                let head_state = staleness::git_head_state(&root);
+                staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
+            }
             // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
             // temporal::resolve_blast_radius_file_ids is the single resolver for all
             // three blast-radius call sites, so JSON-aware warning and PF-004 widening
@@ -891,17 +896,18 @@ fn run_build(
     // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
     // the only other temporal hook lives, so temporal must be populated here too.
     // Non-fatal by ADR-006/D5: a temporal failure must NOT fail the explicit build.
-    // HEAD read via the pure file-IO read_git_head (no subprocess); None on non-git →
-    // try_rebuild_temporal_nonfatal no-ops gracefully. The `force` flag is intentionally
-    // NOT forwarded: rebuild_temporal always does a full history walk (no cache) —
-    // see the `parse_history(root, 0)` call in `rebuild_temporal_with_source`
-    // (temporal_build.rs, "Single full-history walk" comment).
-    let current_head = staleness::read_git_head(&root);
+    // Step 7 wiring (a): classify HEAD state once, emit the advisory, then rebuild.
+    // The `force` flag is intentionally NOT forwarded: rebuild_temporal always does a
+    // full history walk (no cache) — see `parse_history(root, 0)` in
+    // `rebuild_temporal_with_source` (temporal_build.rs, "Single full-history walk").
+    let head_state = staleness::git_head_state(&root);
+    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
     staleness::try_rebuild_temporal_nonfatal(
         &root,
         &cache_dir,
-        current_head.as_deref(),
+        head_state.sha(),
         "--rebuild hook",
+        true, // allow_reanchor: explicit build arm re-anchors (PF-017)
     );
 
     Ok(ExitCode::SUCCESS)
@@ -917,7 +923,12 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    let (outcome, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+    let (outcome, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, true)?;
+    // Step 7 wiring (b): emit the HEAD-unresolvable advisory on --update (AC23).
+    {
+        let head_state = staleness::git_head_state(&root);
+        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
+    }
     if !outcome.refreshed() {
         eprintln!("skim search: index is current");
     } else {
@@ -958,6 +969,14 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             eprintln!("  cache dir     : {cache_dir_display}");
         }
         return Ok(ExitCode::FAILURE);
+    }
+
+    // Step 7 wiring (c): emit HEAD-unresolvable advisory BEFORE the `if json` split
+    // so both text and JSON modes see it (wiring it inside one branch loses the other,
+    // F3; wiring it in the early-return above would fire even without an index, AC24).
+    {
+        let head_state = staleness::git_head_state(&root);
+        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
     }
 
     let mut out = BufWriter::new(std::io::stdout());
@@ -1167,13 +1186,21 @@ fn run_query(
     let pre_loaded_manifest_from_refresh =
         if flags.temporal_sort.is_some() || flags.blast_radius.is_some() || flags.ast.is_some() {
             let (_outcome, manifest) =
-                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+                staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
             Some(manifest)
         } else {
             // No temporal or AST flag: skip early refresh; execute_query_with_manifest
             // will call auto_refresh_if_stale internally exactly once.
             None
         };
+
+    // Step 7 wiring (d): emit the HEAD-unresolvable advisory on temporal-consuming
+    // arms only (AC23). Plain lexical queries that do not request temporal data must
+    // NOT produce advisory stderr output (A1 wiring correction, #414 SE-1/AC-30).
+    if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
+        let head_state = staleness::git_head_state(&root);
+        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
+    }
 
     // Open the temporal DB once (AFTER refresh above). Used for both
     // blast-radius filtering (before the query, so LIMIT applies to the filtered
@@ -1430,7 +1457,13 @@ fn run_temporal_standalone(
     // comment above claimed it was guaranteed.
     // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
-    staleness::auto_refresh_if_stale(&root, &cache_dir, analytics)?;
+    staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
+
+    // Step 7 wiring (d): temporal-consuming standalone arm (--hot/--cold/--risky/--blast-radius).
+    {
+        let head_state = staleness::git_head_state(&root);
+        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
+    }
 
     let temporal_db_path = cache_dir.join("temporal.db");
 

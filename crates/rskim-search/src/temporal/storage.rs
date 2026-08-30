@@ -66,6 +66,18 @@ pub const META_LAST_UPDATED: &str = "last_updated";
 /// Key storing the git HEAD SHA at the time of the last [`TemporalDb::sync`].
 pub const META_GIT_HEAD: &str = "git_head";
 
+/// Key storing the canonical git repository toplevel path at the time of the
+/// last [`TemporalDb::sync`] for an adopted subdirectory root (AD-413-16).
+///
+/// Written after `sync` completes (a second transaction on purpose — process
+/// death between the two leaves the anchor absent, which is the adopt-and-record
+/// case, never a false refusal). An absent row means "built before #413" and is
+/// adopted rather than refused.
+///
+/// No schema bump required: `meta` is a key/value table and `CURRENT_VERSION`
+/// and `TEMPORAL_DATA_VERSION` remain unchanged (AC26).
+pub const META_GIT_TOPLEVEL: &str = "git_toplevel";
+
 /// Version number attesting that the temporal data was written by a binary
 /// whose `rebuild_temporal` applies the ghost filter.
 ///

@@ -103,24 +103,87 @@ pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Read the current git HEAD for `project_root`.
+/// AD-413-7: three states, deliberately NOT `Option<String>` — "not a git repo" and
+/// "git repo whose HEAD I could not resolve" are different facts, and collapsing them
+/// is what made #413 silent and its message wrong (avoids PF-016). A gitdir with no
+/// `HEAD` file is `NotARepo`, not `Unresolved`, or `mkdir .git` gets the opposite lie.
+#[derive(Debug, PartialEq)]
+pub(super) enum HeadState {
+    /// No `.git` entry found at `project_root` or any enclosing ancestor.
+    NotARepo,
+    /// git dir found and HEAD readable, but the commit SHA could not be resolved
+    /// (unborn branch, unsupported ref backend, corrupt HEAD, fs error).
+    Unresolved,
+    /// git dir found and HEAD successfully resolved to a commit SHA.
+    Resolved(String),
+}
+
+impl HeadState {
+    /// Return the commit SHA when resolved, or `None` for `NotARepo` / `Unresolved`.
+    pub(super) fn sha(&self) -> Option<&str> {
+        match self {
+            HeadState::Resolved(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// AD-413-14: walk up from `project_root` to the nearest enclosing git repository
+/// when `project_root` itself has no `.git` entry of its own.
+///
+/// Returns `None` when:
+/// - `project_root` already has a `.git` entry (never re-point it — AC17).
+/// - No enclosing repo is found within the `MAX_ANCESTORS` bound.
+/// - The first-match ancestor does not contain `project_root` (containment check).
+/// - The ancestor's git directory has no readable `HEAD` file (F10).
+///
+/// This is what makes `--root <subdirectory>` adopt the enclosing repo's HEAD
+/// instead of returning nothing (OD-3, A9).  Reuses the same bounded walk
+/// that [`super::walk::discover_project_root`] uses, keeping the two callers
+/// consistent.
+pub(super) fn resolve_repo_toplevel(project_root: &Path) -> Option<PathBuf> {
+    // Never re-point a root that claims to be a repository already (AC17).
+    if project_root.join(".git").exists() {
+        return None;
+    }
+    let canonical = project_root.canonicalize().ok()?;
+    // Bounded ancestor walk (same MAX_ANCESTORS constant as the builder walk).
+    let top = super::walk::discover_project_root(&canonical).ok()?;
+    // `discover_project_root` returns the start path when no enclosing repo is found.
+    if top == canonical {
+        return None;
+    }
+    // Containment: `project_root` must live inside the discovered toplevel.
+    if !canonical.starts_with(&top) {
+        return None;
+    }
+    // F10: the toplevel must have a git dir with a readable HEAD file.
+    let git_dir = resolve_git_dir(&top)?;
+    git_dir.join("HEAD").is_file().then_some(top)
+}
+
+/// Classify the git HEAD state for `project_root`.
 ///
 /// Resolution order:
 /// 1. `resolve_git_dir(project_root)` — locate `.git` or follow the worktree pointer.
-/// 2. Read `<git_dir>/HEAD`.
-/// 3. If it is a symbolic ref (`ref: refs/heads/<branch>`):
-///    a. Try `<git_dir>/<ref_path>` (loose ref).
-///    b. Fall back to `<git_dir>/packed-refs`.
-/// 4. If HEAD is a raw 40-hex SHA (detached HEAD), return it directly.
-///
-/// Returns `None` when:
-/// - `.git` does not exist (not a git repo).
-/// - Any I/O failure prevents reading the necessary files.
-pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
-    let git_dir = resolve_git_dir(project_root)?;
-    let head_content = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head_str = head_content.trim();
-
+/// 2. If that fails: `resolve_repo_toplevel(project_root).and_then(resolve_git_dir)` —
+///    walk up to the nearest enclosing repo (enables `--root <subdirectory>`, AD-413-14).
+/// 3. Read `<git_dir>/HEAD`.
+/// 4. If a symbolic ref (`ref: refs/heads/<branch>`): validate via AD-413-6 guard,
+///    then `resolve_symbolic_ref` (4-probe ladder, AD-413-4/5, including commondir).
+/// 5. If a raw 40/64-hex SHA (detached HEAD): return `Resolved` directly.
+/// 6. Otherwise: `Unresolved` (unborn branch, unsupported ref backend, corrupt HEAD).
+pub(super) fn git_head_state(project_root: &Path) -> HeadState {
+    let Some(git_dir) = resolve_git_dir(project_root)
+        .or_else(|| resolve_repo_toplevel(project_root).and_then(|t| resolve_git_dir(&t)))
+    else {
+        return HeadState::NotARepo;
+    };
+    // F10: a gitdir with no HEAD file is NOT a repo — do not emit the opposite lie.
+    let Ok(content) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+        return HeadState::NotARepo;
+    };
+    let head_str = content.trim();
     if let Some(ref_path) = head_str.strip_prefix("ref: ") {
         // AD-413-6: a symbolic HEAD must both start with `refs/` AND pass
         // `crate::cmd::is_repo_relative_safe` (the ADR-008 canonical guard). The prefix check
@@ -128,15 +191,36 @@ pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
         // into `index.skfiles` and `temporal.db`'s `META_GIT_HEAD` (measured, #413).
         if !ref_path.starts_with("refs/") || !crate::cmd::is_repo_relative_safe(Path::new(ref_path))
         {
-            return None;
+            return HeadState::Unresolved;
         }
-        // Symbolic ref — resolve through loose refs then packed-refs
-        resolve_symbolic_ref(&git_dir, ref_path)
+        match resolve_symbolic_ref(&git_dir, ref_path) {
+            Some(sha) => HeadState::Resolved(sha),
+            None => HeadState::Unresolved,
+        }
     } else if is_hex_sha(head_str) {
-        // Detached HEAD — raw SHA
-        Some(head_str.to_string())
+        HeadState::Resolved(head_str.to_string())
     } else {
-        None
+        HeadState::Unresolved
+    }
+}
+
+/// Read the current git HEAD SHA for `project_root`.
+///
+/// Resolution order (AD-413-7):
+/// 1. `git_head_state(project_root)` — full state resolution including linked-worktree
+///    commondir ladder (AD-413-4/5) and subdirectory ancestor walk (AD-413-14).
+/// 2. Returns the SHA from `HeadState::Resolved`, or `None` for `NotARepo`/`Unresolved`.
+///
+/// Returns `None` when:
+/// - No `.git` exists at or above `project_root`.
+/// - HEAD is readable but the commit SHA cannot be resolved (unborn branch,
+///   unsupported ref backend, corrupt HEAD, fs error).
+///   Call `git_head_state` directly when you need to distinguish `NotARepo`
+///   from `Unresolved` (e.g. for advisory messages or anchor checks).
+pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
+    match git_head_state(project_root) {
+        HeadState::Resolved(sha) => Some(sha),
+        _ => None,
     }
 }
 
@@ -620,8 +704,37 @@ pub(super) fn check_staleness(
 }
 
 // ============================================================================
-// Temporal staleness helper
+// Temporal staleness helpers
 // ============================================================================
+
+/// Read a single TEXT value from the `meta` table of `temporal.db`.
+///
+/// Opens a lightweight read-only connection (no WAL pragma, no permission
+/// reset, no migrations) and queries the `meta` table for `key`.  Returns
+/// `None` when the file is absent, the connection cannot be opened, or the key
+/// has no row.
+///
+/// Shared by [`temporal_db_is_stale`] (for both `git_head` and `data_version`
+/// keys), [`warn_if_temporal_unverifiable`] (for `git_head`), and
+/// [`temporal_anchor_state`] (for `git_toplevel`) — one implementation, no drift.
+fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
+    let db_path = cache_dir.join("temporal.db");
+    if !db_path.exists() {
+        return None;
+    }
+    // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
 
 /// Return `true` when `temporal.db` is missing or its stored `META_GIT_HEAD`
 /// does not match `current_head`.
@@ -632,12 +745,12 @@ pub(super) fn check_staleness(
 ///
 /// # Performance (ADR-003)
 ///
-/// Uses a minimal read-only SQLite open (no WAL pragma, no permission reset, no
-/// migrations) to read just the one `meta` row.  This avoids the full
-/// `TemporalDb::open` cost (WAL handshake + two metadata syscalls + migration
-/// version check) on the steady-state Current-path where the DB is checked but
-/// then immediately re-opened by the dispatch arm.  The caller is responsible
-/// for the full `TemporalDb::open` when it actually queries the DB.
+/// Delegates to [`read_temporal_meta`] which uses the same lightweight
+/// read-only SQLite open (no WAL pragma, no permission reset, no migrations).
+/// This avoids the full `TemporalDb::open` cost on the steady-state
+/// Current-path where the DB is checked but then immediately re-opened by the
+/// dispatch arm.  The caller is responsible for the full `TemporalDb::open`
+/// when it actually queries the DB.
 ///
 /// # AD-TMP-2 / AD-TMP-3
 ///
@@ -662,29 +775,9 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
     if !db_path.exists() {
         return true;
     }
-    // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
-    // We read at most two meta rows (git_head + data_version); the full
-    // TemporalDb::open setup is deferred to the dispatch arm that actually queries.
-    let conn = match rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(_) => return true,
-    };
-
-    // Shared helper: read a single TEXT value from the meta table by key.
-    let read_meta = |key: &str| -> Option<String> {
-        conn.query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            rusqlite::params![key],
-            |row| row.get(0),
-        )
-        .ok()
-    };
 
     // Check 1: HEAD match — absent row or mismatch both report stale.
-    let stored_head: Option<String> = read_meta(rskim_search::META_GIT_HEAD);
+    let stored_head = read_temporal_meta(cache_dir, rskim_search::META_GIT_HEAD);
     if stored_head.as_deref() != Some(current_head) {
         return true;
     }
@@ -698,7 +791,7 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
     // An absent or non-integer stored value is treated as stale (pre-fix DB).
     // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
     // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
-    let stored_version: Option<String> = read_meta(rskim_search::META_DATA_VERSION);
+    let stored_version = read_temporal_meta(cache_dir, rskim_search::META_DATA_VERSION);
     match stored_version.as_deref() {
         Some(v) => match v.parse::<u64>() {
             Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
@@ -707,6 +800,80 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         },
         // Absent data_version row → stale (pre-fix DB that lacks the ghost filter).
         None => true,
+    }
+}
+
+/// Emit an advisory warning when git HEAD is unresolvable but `temporal.db`
+/// has data that cannot be verified as current (AD-413-9).
+///
+/// Triple-gated (R5):
+/// 1. `HeadState::Unresolved` (zero cost on healthy repos or non-repos).
+/// 2. `temporal.db` exists (zero SQLite opens unless needed — AC24).
+/// 3. A `git_head` row is recorded (no DB on the unborn-branch no-loop case).
+///
+/// Never called from `auto_refresh_if_stale` — that path is reached on every
+/// query, so emitting there would produce permanent stderr noise on plain
+/// non-temporal queries, which #414 SE-1/AC-30 forbids (A1 wiring correction).
+/// See Step 7 wiring in the plan for the correct call sites.
+pub(super) fn warn_if_temporal_unverifiable(cache_dir: &Path, head: &HeadState) {
+    if !matches!(head, HeadState::Unresolved) {
+        return; // zero cost on healthy repos and on non-repos
+    }
+    if !cache_dir.join("temporal.db").exists() {
+        return; // zero SQLite opens unless needed (AC24 guard ordering)
+    }
+    let Some(stored) = read_temporal_meta(cache_dir, rskim_search::META_GIT_HEAD) else {
+        return; // no recorded HEAD → no advisory (unborn-branch no-loop case, Case A)
+    };
+    eprintln!(
+        "skim search: git HEAD is unresolvable here — temporal ranking is served from \
+         recorded commit {}… and cannot be verified as current",
+        stored.get(..8).unwrap_or(&stored)
+    );
+}
+
+/// State of the repository anchor recorded in `temporal.db`'s `meta` table.
+///
+/// AD-413-16: the toplevel that produced temporal rows is persisted as
+/// `meta.git_toplevel` so query arms can refuse rather than silently serving
+/// data from a different repository when the indexed root has been retargeted.
+#[derive(Debug, PartialEq)]
+pub(super) enum AnchorState {
+    /// Root has its own `.git` — the anchor mechanism is irrelevant (plain repo or submodule).
+    /// Gate 1 of `temporal_anchor_state` returns this for every non-adopted root (AC32).
+    NotAdopted,
+    /// No `temporal.db` or no `git_toplevel` row — adopt and record on the next rebuild.
+    Absent,
+    /// Persisted toplevel matches the live resolution — temporal data is trustworthy.
+    Agrees,
+    /// Persisted toplevel was written by a DIFFERENT repository than the current one.
+    /// Temporal-consuming query arms must refuse (no rows served, no rebuild, exit 0).
+    /// Explicit build arms (`--build`/`--rebuild`/`--update`) re-anchor loudly.
+    Differs { recorded: String, live: PathBuf },
+}
+
+/// AD-413-16: compare the persisted repository anchor in `temporal.db` against
+/// the toplevel that would be adopted for `root` today.
+///
+/// Cost: `NotAdopted` is returned for every root that has a `.git` entry — both
+/// AC32 corpora and every existing user — performing zero DB reads and zero
+/// SQLite opens.  Only an adopted (subdirectory) root reads the anchor row.
+pub(super) fn temporal_anchor_state(cache_dir: &Path, root: &Path) -> AnchorState {
+    // Gate 1: root that owns `.git` is never re-pointed (AC17, AC32).
+    let Some(top) = resolve_repo_toplevel(root) else {
+        return AnchorState::NotAdopted;
+    };
+    // Gate 2: no DB means no anchor — adopt and record on the next build.
+    if !cache_dir.join("temporal.db").exists() {
+        return AnchorState::Absent;
+    }
+    match read_temporal_meta(cache_dir, rskim_search::META_GIT_TOPLEVEL) {
+        None => AnchorState::Absent,
+        Some(rec) if Path::new(&rec) == top.as_path() => AnchorState::Agrees,
+        Some(rec) => AnchorState::Differs {
+            recorded: rec,
+            live: top,
+        },
     }
 }
 
@@ -733,15 +900,38 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
 /// - `head`: the git HEAD SHA to record; `None` skips the rebuild (non-git dir).
 /// - `debug_label`: short label for the debug message (e.g. `"self-heal"`,
 ///   `"post-rebuild"`, `"--rebuild hook"`).
+/// - `allow_reanchor`: when `false`, a `Differs` anchor state (PF-017) causes the
+///   temporal rebuild to be SKIPPED, leaving `temporal.db` byte-unchanged.  Pass
+///   `true` only from the explicit build arms (`--build`, `--rebuild`, `--update`)
+///   so that only user-initiated rebuilds may retarget the repository anchor.
 pub(super) fn try_rebuild_temporal_nonfatal(
     root: &Path,
     cache_dir: &Path,
     head: Option<&str>,
     debug_label: &str,
+    allow_reanchor: bool,
 ) {
     use super::temporal_build::{current_epoch_secs, rebuild_temporal};
 
     let Some(head) = head else { return };
+    // PF-017: a changed `--root` toplevel also changes the adopted HEAD, so without
+    // this gate `check_staleness` would report `HeadChanged`, `auto_refresh_if_stale`
+    // would rebuild, and `record_temporal_anchor` would overwrite the anchor — on a
+    // PLAIN LEXICAL QUERY that never asked for temporal data.  Only the three explicit
+    // build arms pass `allow_reanchor: true`; every other caller (self-heal, query-path
+    // post-rebuild) passes `false`, leaving `temporal.db` untouched on anchor mismatch.
+    if !allow_reanchor
+        && let AnchorState::Differs { recorded, live } = temporal_anchor_state(cache_dir, root)
+    {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal rebuild skipped — anchor mismatch \
+                 (recorded={recorded}, live={}); use `skim search --rebuild` to re-anchor",
+                live.display(),
+            );
+        }
+        return;
+    }
     if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {
         // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
         if crate::debug::is_debug_enabled() {
@@ -819,13 +1009,17 @@ pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
+    allow_reanchor: bool,
 ) -> anyhow::Result<(RefreshOutcome, FileManifest)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
 
-    // Read the current git HEAD once at function entry so rebuild_temporal can
-    // record the same SHA that will be in the manifest after build_index runs.
-    let current_head: Option<String> = read_git_head(root);
+    // Classify git HEAD state once at function entry so rebuild_temporal records
+    // the same SHA that will be in the manifest after build_index runs.
+    // Step 6 (AD-413-7): use the three-state HeadState rather than Option<String>
+    // so the same read feeds both the temporal rebuild and the anchor check.
+    let head_state = git_head_state(root);
+    let current_head: Option<&str> = head_state.sha();
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
 
@@ -845,14 +1039,14 @@ pub(super) fn auto_refresh_if_stale(
         // fresh temporal data when the lexical index is current.
         // Non-fatal by ADR-006/D5: temporal failure must NOT fail the query.
         //
-        // Guard ordering (#357 cycle-2 finding 19): `let Some(ref head)` is
-        // evaluated FIRST (short-circuits on non-git dirs where current_head=None
-        // BEFORE the temporal_db_is_stale() call, avoiding a wasted DB open).
+        // Guard ordering (#357 cycle-2 finding 19): `let Some(head)` is evaluated
+        // FIRST (short-circuits on non-git dirs where current_head=None BEFORE the
+        // temporal_db_is_stale() call, avoiding a wasted DB open).
         // `temporal_db_is_stale` only runs when HEAD is readable.
-        if let Some(ref head) = current_head
+        if let Some(head) = current_head
             && temporal_db_is_stale(cache_dir, head)
         {
-            try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal");
+            try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal", allow_reanchor);
         }
 
         return Ok((RefreshOutcome::UpToDate, manifest));
@@ -957,7 +1151,16 @@ pub(super) fn auto_refresh_if_stale(
     //
     // `head` is the HEAD SHA read at function entry above. Passing `None` when
     // the project is non-git: try_rebuild_temporal_nonfatal no-ops gracefully.
-    try_rebuild_temporal_nonfatal(root, cache_dir, current_head.as_deref(), "post-rebuild");
+    // `allow_reanchor` is threaded from the caller: only the explicit build arms
+    // (`--build`, `--rebuild`, `--update`) pass `true`; query-triggered refreshes
+    // pass `false` so anchor mismatch leaves temporal.db untouched (PF-017).
+    try_rebuild_temporal_nonfatal(
+        root,
+        cache_dir,
+        current_head,
+        "post-rebuild",
+        allow_reanchor,
+    );
     // ─────────────────────────────────────────────────────────────────────────
 
     let outcome = if is_no_index {
