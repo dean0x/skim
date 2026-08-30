@@ -453,6 +453,31 @@ impl TemporalDb {
             .map_err(db_err)
     }
 
+    /// Delete a metadata entry by key from the `meta` table.
+    ///
+    /// Returns `Ok(())` when the key is absent (idempotent delete) — the caller
+    /// does not need to check whether a row existed.
+    ///
+    /// The version-attestation keys `META_GIT_HEAD` and `META_DATA_VERSION` must
+    /// not be deleted through this API — use [`TemporalDb::sync`] for those
+    /// (AD-408-3).  The `debug_assert!` below fires in debug builds if this
+    /// contract is violated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure.
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        debug_assert!(
+            key != META_GIT_HEAD && key != META_DATA_VERSION,
+            "delete_meta must not delete version-attestation keys; \
+             use TemporalDb::sync (AD-408-3)"
+        );
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .map(|_| ())
+            .map_err(db_err)
+    }
+
     // ========================================================================
     // Load methods
     // ========================================================================

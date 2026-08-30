@@ -10,11 +10,12 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rskim_search::{FileId, HotspotRow, RiskRow, TemporalDb};
 use serde::Serialize;
 
+use super::staleness::{AnchorState, HeadState};
 use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
 
 // ============================================================================
@@ -139,13 +140,37 @@ pub(super) fn normalize_blast_radius_path(
 /// the API shape rather than by convention at every call site.  A future
 /// temporal consumer that forgets the pre-check receives a compile error
 /// (it cannot get a `TemporalDb` without calling through the funnel).
+///
+/// Finding 1/3: the variants carry enough information for callers to call
+/// `temporal_unavailable_msg(head, &reason.to_anchor_state())` without
+/// re-deriving state from disk, making the final message pure + allocation-free.
 #[derive(Debug)]
 pub(super) enum TemporalUnavailable {
     /// `temporal.db` does not exist, is corrupt, or cannot be opened.
     Absent,
     /// DB was written by a different repository root.  Serving it would return
     /// wrong hotspot / co-change data (AD-413-16).
-    AnchorDiffers,
+    ///
+    /// Both paths are carried so callers can format the message without a
+    /// second `temporal_anchor_state` call (Finding 1/3).
+    AnchorDiffers { recorded: PathBuf, live: PathBuf },
+}
+
+impl TemporalUnavailable {
+    /// Convert to an [`AnchorState`] suitable for [`super::temporal_unavailable_msg`].
+    ///
+    /// `AnchorDiffers { recorded, live }` → `AnchorState::Differs { recorded, live }`.
+    /// `Absent` → `AnchorState::Absent` (the head state drives the message in
+    /// this case; anchor is irrelevant when the DB is simply absent).
+    pub(super) fn to_anchor_state(&self) -> AnchorState {
+        match self {
+            TemporalUnavailable::AnchorDiffers { recorded, live } => AnchorState::Differs {
+                recorded: recorded.clone(),
+                live: live.clone(),
+            },
+            TemporalUnavailable::Absent => AnchorState::Absent,
+        }
+    }
 }
 
 /// AD-413-16: single funnel for all temporal DB access.
@@ -155,22 +180,31 @@ pub(super) enum TemporalUnavailable {
 /// error: callers cannot obtain a `TemporalDb` without going through this
 /// function.
 ///
+/// Finding 4 fix: opens the DB **once** (via `open_temporal_db`), then reads
+/// `META_GIT_TOPLEVEL` through the already-open connection via
+/// `anchor_state_on_db` — no separate read-only SQLite open for the anchor
+/// check.  Non-adopted roots (those with their own `.git`) pay no DB cost
+/// for the anchor gate, identical to the pre-fix behaviour (Gate 1 fast-path).
+///
 /// Returns:
 /// - `Ok(db)` — DB open, present, and anchored to the same repository.
-/// - `Err(AnchorDiffers)` — DB belongs to a different repository.
+/// - `Err(AnchorDiffers { recorded, live })` — DB belongs to a different repository.
 /// - `Err(Absent)` — DB absent or corrupt.
 pub(super) fn open_temporal_db_for(
     root: &Path,
     cache_dir: &Path,
 ) -> Result<TemporalDb, TemporalUnavailable> {
-    // AD-413-16: refuse DB from a different repository BEFORE opening.
-    if matches!(
-        super::staleness::temporal_anchor_state(cache_dir, root),
-        super::staleness::AnchorState::Differs { .. }
-    ) {
-        return Err(TemporalUnavailable::AnchorDiffers);
+    // Open the DB first.  For non-adopted roots (the common case) the anchor
+    // gate short-circuits via Gate 1 in `anchor_state_on_db` with zero DB reads.
+    let db = open_temporal_db(&cache_dir.join("temporal.db")).ok_or(TemporalUnavailable::Absent)?;
+    // AD-413-16: check anchor via the already-open connection (Finding 4 fix —
+    // no second SQLite open; `anchor_state_on_db` reads META_GIT_TOPLEVEL from
+    // `db` instead of opening a fresh read-only connection).
+    if let AnchorState::Differs { recorded, live } = super::staleness::anchor_state_on_db(&db, root)
+    {
+        return Err(TemporalUnavailable::AnchorDiffers { recorded, live });
     }
-    open_temporal_db(&cache_dir.join("temporal.db")).ok_or(TemporalUnavailable::Absent)
+    Ok(db)
 }
 
 /// Try to open the temporal database at `db_path`.
@@ -256,6 +290,11 @@ pub(super) fn paths_to_file_ids(
 /// repo-relative path strings that the blast-radius filter should allow, including
 /// the target file itself.  JSON-aware warning emitted when the temporal DB is absent.
 ///
+/// `head` is the [`HeadState`] already resolved by the caller (Finding 2 fix:
+/// returned by `auto_refresh_if_stale` so it need not be re-derived here).
+/// It is passed to `temporal_unavailable_msg` instead of re-calling `git_head_state`
+/// (Finding 1/3 fix: the message function is pure, zero I/O).
+///
 /// Returns `Ok(None)` when `blast_radius` is `None` or the DB is absent/corrupt.
 ///
 /// # Errors
@@ -266,6 +305,7 @@ pub(super) fn resolve_blast_radius_paths(
     root: &Path,
     cache_dir: &Path,
     json: bool,
+    head: &HeadState,
 ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
     let Some(raw_path) = blast_radius else {
         return Ok(None);
@@ -280,10 +320,15 @@ pub(super) fn resolve_blast_radius_paths(
     // constant (SUBDIR_ROOT_TEMPORAL_MSG for AnchorDiffers, NO_TEMPORAL_DATA_MSG
     // for non-repo, etc.) so the doubled composition "no temporal data for
     // --blast-radius — <reason>" is always accurate (C8 / AC19).
+    //
+    // Finding 1/3 fix: pass the pre-resolved `head` and convert the
+    // `TemporalUnavailable` reason to `AnchorState` so `temporal_unavailable_msg`
+    // performs zero I/O.
     let db = match open_temporal_db_for(root, cache_dir) {
         Ok(db) => db,
-        Err(_reason) => {
-            let base_msg = super::temporal_unavailable_msg(root);
+        Err(ref reason) => {
+            let anchor = reason.to_anchor_state();
+            let base_msg = super::temporal_unavailable_msg(head, &anchor);
             let msg = format!("no temporal data for --blast-radius — {base_msg}");
             if json {
                 let envelope = serde_json::json!({ "warning": msg });
@@ -332,8 +377,10 @@ pub(super) fn resolve_blast_radius_file_ids(
     cache_dir: &Path,
     sorted_paths: &[&str],
     json: bool,
+    head: &HeadState,
 ) -> anyhow::Result<Option<HashSet<FileId>>> {
-    let Some(allowed_paths) = resolve_blast_radius_paths(blast_radius, root, cache_dir, json)?
+    let Some(allowed_paths) =
+        resolve_blast_radius_paths(blast_radius, root, cache_dir, json, head)?
     else {
         return Ok(None);
     };

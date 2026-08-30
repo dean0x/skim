@@ -14,9 +14,10 @@
 //! `resolve_git_dir` still resolves ONE directory and never walks up, because
 //! `walk::resolve_git_index_path` and the bare-repo boundary (AD-413-11) depend on that.
 //! Ancestor discovery lives one level up in `git_head_state`, which for a root with NO `.git`
-//! at all adopts the nearest enclosing repository via `walk::discover_project_root`
-//! (walk.rs:177-195), the same bounded walk the default entry point already uses, so
-//! `--root <subdir>` and a bare invocation from that subdirectory agree.
+//! at all adopts the nearest enclosing repository via `resolve_repo_toplevel` (AD-413-14),
+//! using `discover_project_root_from_canonical` — the same bounded ancestor scan that
+//! `walk::discover_project_root` delegates to, so `--root <subdir>` and a bare invocation
+//! from that subdirectory agree.
 
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,34 @@ impl HeadState {
 // Git directory resolution
 // ============================================================================
 
+/// Maximum number of ancestors to traverse when looking for a `.git` root.
+/// 256 ancestors is far beyond any real filesystem depth.
+pub(super) const MAX_ANCESTORS: usize = 256;
+
+/// Walk up from `canonical` (a pre-canonicalized path) looking for the nearest
+/// ancestor that contains a `.git` entry.
+///
+/// Returns the first matching ancestor as a `PathBuf`, or `canonical` itself
+/// when no enclosing `.git` is found within the [`MAX_ANCESTORS`] bound.
+///
+/// The caller is responsible for canonicalizing `canonical` first — this variant
+/// skips the `canonicalize()` call to avoid a redundant O(path depth) syscall
+/// chain when the caller already holds a canonical path (e.g. `resolve_repo_toplevel`
+/// and `walk::discover_project_root`).
+pub(super) fn discover_project_root_from_canonical(canonical: &Path) -> PathBuf {
+    let mut current = canonical;
+    for _ in 0..MAX_ANCESTORS {
+        if current.join(".git").exists() {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    canonical.to_path_buf()
+}
+
 /// Resolve the git directory for a project root.
 ///
 /// - If `.git` is a **directory**, returns it directly.
@@ -123,19 +152,19 @@ pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
 /// - The ancestor's git directory has no readable `HEAD` file (F10).
 ///
 /// This is what makes `--root <subdirectory>` adopt the enclosing repo's HEAD
-/// instead of returning nothing (OD-3, A9).  Reuses the same bounded walk
-/// that [`super::walk::discover_project_root`] uses, keeping the two callers
-/// consistent.
+/// instead of returning nothing (OD-3, A9).  Uses `discover_project_root_from_canonical`
+/// (the same bounded ancestor scan that `walk::discover_project_root` delegates to),
+/// keeping the two callers consistent.
 pub(super) fn resolve_repo_toplevel(project_root: &Path) -> Option<PathBuf> {
     // Never re-point a root that claims to be a repository already (AC17).
     if project_root.join(".git").exists() {
         return None;
     }
     let canonical = project_root.canonicalize().ok()?;
-    // Use the from-canonical variant to skip the redundant canonicalize() that
-    // discover_project_root would perform on the already-canonical path
+    // Call the local from-canonical variant to skip the redundant canonicalize()
+    // that discover_project_root would perform on the already-canonical path
     // (O(path depth) lstat/readlink syscalls — measured, fixed per finding F2).
-    let top = super::walk::discover_project_root_from_canonical(&canonical);
+    let top = discover_project_root_from_canonical(&canonical);
     // `discover_project_root_from_canonical` returns the start path when no
     // enclosing repo is found.
     if top == canonical {

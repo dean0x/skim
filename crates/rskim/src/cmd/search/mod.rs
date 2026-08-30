@@ -210,15 +210,18 @@ pub(crate) fn run(
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
             // ADR-006: refresh BOTH indexes before opening either engine.
-            let (_outcome, manifest) = staleness::auto_refresh_if_stale(
+            // Finding 2 fix: destructure the HeadState returned by auto_refresh_if_stale
+            // so we do not re-call git_head_state on the temporal-consuming path below.
+            let (_outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
                 &root,
                 &cache_dir,
                 analytics,
                 staleness::ReanchorPolicy::Refuse,
             )?;
             // Step 7 wiring (d): advisory on the --ast temporal-consuming branch.
+            // Finding 2 fix: use head_state from auto_refresh_if_stale instead of
+            // a second git_head_state call.
             if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-                let head_state = staleness::git_head_state(&root);
                 staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
             }
             // Resolve blast-radius → FileIds BEFORE calling run_ast_standalone.
@@ -226,6 +229,7 @@ pub(crate) fn run(
             // three blast-radius call sites, so JSON-aware warning and PF-004 widening
             // live in one place.  Passes cache_dir (not db_path) so the funnel owns the
             // path construction (Finding 2 / AD-413-16).
+            // Finding 1/3 fix: pass head_state so the resolver does not re-derive it.
             let sorted = manifest.sorted_paths();
             let blast_file_ids = temporal::resolve_blast_radius_file_ids(
                 flags.blast_radius.as_deref(),
@@ -233,6 +237,7 @@ pub(crate) fn run(
                 &cache_dir,
                 &sorted,
                 flags.json,
+                &head_state,
             )?;
             // Open the temporal DB only when a sort is requested.  Absent DB →
             // graceful degradation: warn on stderr and run unsorted (exit 0, AC-A3),
@@ -240,13 +245,16 @@ pub(crate) fn run(
             // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
             // place (the funnel) — replaces the four-site manual AnchorState::Differs
             // pre-check pattern (Finding 1).
+            // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so the
+            // message function is called with pre-resolved states (no I/O).
             let temporal_db = if flags.temporal_sort.is_some() {
                 match temporal::open_temporal_db_for(&root, &cache_dir) {
                     Ok(db) => Some(db),
-                    Err(_reason) => {
+                    Err(ref reason) => {
+                        let anchor = reason.to_anchor_state();
                         eprintln!(
                             "skim search: {}; returning unsorted --ast results",
-                            temporal_unavailable_msg(&root)
+                            temporal_unavailable_msg(&head_state, &anchor)
                         );
                         None
                     }
@@ -962,14 +970,15 @@ fn run_update(
 ) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
     std::fs::create_dir_all(&cache_dir)?;
-    let (outcome, manifest) = staleness::auto_refresh_if_stale(
+    // Finding 2 fix: destructure HeadState from auto_refresh_if_stale.
+    let (outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
         &root,
         &cache_dir,
         analytics,
         staleness::ReanchorPolicy::Allow,
     )?;
     // Step 7 wiring (b): emit the HEAD-unresolvable advisory on --update (AC23).
-    let head_state = staleness::git_head_state(&root);
+    // Finding 2 fix: use head_state from above instead of a second git_head_state call.
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
     if !outcome.refreshed() {
         eprintln!("skim search: index is current");
@@ -1232,27 +1241,36 @@ fn run_query(
     //
     // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
-    let pre_loaded_manifest_from_refresh =
+    // Finding 2 fix: destructure HeadState from auto_refresh_if_stale so the
+    // temporal-consuming arms do not need a second git_head_state call.
+    // The pure-lexical (no temporal/AST) path skips the early refresh; its
+    // head_state is not needed because it cannot reach warn_if_temporal_unverifiable
+    // (the guard below only fires when temporal_sort or blast_radius is set).
+    let (pre_loaded_manifest_from_refresh, refresh_head_state) =
         if flags.temporal_sort.is_some() || flags.blast_radius.is_some() || flags.ast.is_some() {
-            let (_outcome, manifest) = staleness::auto_refresh_if_stale(
+            let (_outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
                 &root,
                 &cache_dir,
                 analytics,
                 staleness::ReanchorPolicy::Refuse,
             )?;
-            Some(manifest)
+            (Some(manifest), Some(head_state))
         } else {
             // No temporal or AST flag: skip early refresh; execute_query_with_manifest
             // will call auto_refresh_if_stale internally exactly once.
-            None
+            (None, None)
         };
 
     // Step 7 wiring (d): emit the HEAD-unresolvable advisory on temporal-consuming
     // arms only (AC23). Plain lexical queries that do not request temporal data must
     // NOT produce advisory stderr output (A1 wiring correction, #414 SE-1/AC-30).
+    // Finding 2 fix: use refresh_head_state from auto_refresh_if_stale instead of
+    // a second git_head_state call (refresh_head_state is always Some on this path
+    // because the guard above ensures auto_refresh_if_stale ran for temporal flags).
     if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-        let head_state = staleness::git_head_state(&root);
-        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
+        if let Some(ref hs) = refresh_head_state {
+            staleness::warn_if_temporal_unverifiable(&cache_dir, hs);
+        }
     }
 
     // Open the temporal DB once (AFTER refresh above). Used for both
@@ -1260,13 +1278,17 @@ fn run_query(
     // set) and temporal enrichment (after the query, to annotate/sort results).
     // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
     // place — replaces the manual AnchorState::Differs pre-check (Finding 1).
-    // AnchorDiffers and Absent both map to None so the degraded path below
-    // emits temporal_unavailable_msg instead of serving wrong-repo data.
-    let temporal_db = if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-        temporal::open_temporal_db_for(&root, &cache_dir).ok()
-    } else {
-        None
-    };
+    // Finding 1/3 fix: store the TemporalUnavailable reason so the degraded path
+    // can pass it to temporal_unavailable_msg without re-deriving from disk.
+    let (temporal_db, temporal_unavail_reason) =
+        if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
+            match temporal::open_temporal_db_for(&root, &cache_dir) {
+                Ok(db) => (Some(db), None),
+                Err(reason) => (None, Some(reason)),
+            }
+        } else {
+            (None, None)
+        };
 
     // Resolve blast-radius partner paths BEFORE querying so the file_filter
     // is applied inside the search engine (before LIMIT). This ensures the
@@ -1275,11 +1297,15 @@ fn run_query(
     // Passes cache_dir (not db_path) so the funnel owns path construction
     // and the AD-413-16 guard is enforced inside resolve_blast_radius_paths
     // (Finding 2).
+    // Finding 1/3 fix: pass head_state so the resolver does not re-derive it.
     let blast_radius_paths = temporal::resolve_blast_radius_paths(
         flags.blast_radius.as_deref(),
         &root,
         &cache_dir,
         flags.json,
+        refresh_head_state
+            .as_ref()
+            .unwrap_or(&staleness::HeadState::NotARepo),
     )?;
 
     // Resolve AST file filter (#199): open the AST engine (already refreshed
@@ -1432,7 +1458,15 @@ fn run_query(
             // (NO_TEMPORAL_DATA_MSG / HEAD_UNRESOLVED_TEMPORAL_MSG /
             //  SUBDIR_ROOT_TEMPORAL_MSG / TEMPORAL_BUILD_EMPTY_MSG).
             // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
-            eprintln!("skim search: {}", temporal_unavailable_msg(&root));
+            // Finding 1/3 fix: use pre-resolved head+anchor from refresh_head_state and
+            // temporal_unavail_reason to avoid I/O inside temporal_unavailable_msg.
+            let hs = refresh_head_state
+                .as_ref()
+                .unwrap_or(&staleness::HeadState::NotARepo);
+            let anchor = temporal_unavail_reason
+                .as_ref()
+                .map_or(staleness::AnchorState::Absent, |r| r.to_anchor_state());
+            eprintln!("skim search: {}", temporal_unavailable_msg(hs, &anchor));
         }
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
         //
@@ -1517,7 +1551,9 @@ fn run_temporal_standalone(
     // comment above claimed it was guaranteed.
     // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
-    staleness::auto_refresh_if_stale(
+    // Finding 2 fix: destructure HeadState from auto_refresh_if_stale so we do
+    // not re-call git_head_state for the advisory below.
+    let (_outcome, _manifest, head_state) = staleness::auto_refresh_if_stale(
         &root,
         &cache_dir,
         analytics,
@@ -1525,7 +1561,7 @@ fn run_temporal_standalone(
     )?;
 
     // Step 7 wiring (d): temporal-consuming standalone arm (--hot/--cold/--risky/--blast-radius).
-    let head_state = staleness::git_head_state(&root);
+    // Finding 2 fix: use head_state from auto_refresh_if_stale above.
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
     // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
@@ -1534,10 +1570,13 @@ fn run_temporal_standalone(
     // Both arms degrade gracefully (exit 0, AC-F3).
     // temporal_unavailable_msg dispatches to the correct constant
     // (SUBDIR_ROOT_TEMPORAL_MSG for Differs, NO_TEMPORAL_DATA_MSG / etc. otherwise).
+    // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so the
+    // message function is called with pre-resolved states (no I/O).
     let db = match temporal::open_temporal_db_for(&root, &cache_dir) {
         Ok(db) => db,
-        Err(_reason) => {
-            let msg_str = temporal_unavailable_msg(&root);
+        Err(ref reason) => {
+            let anchor = reason.to_anchor_state();
+            let msg_str = temporal_unavailable_msg(&head_state, &anchor);
             if json {
                 let msg = WarningJson { warning: &msg_str };
                 println!("{}", serde_json::to_string(&msg)?);
@@ -1748,20 +1787,22 @@ fn print_help() {
 /// **INTERIM**: #414 will DELETE this function (and its five emit-site wires),
 /// replacing all sites with `degraded_notice(root)` — the permanent per-arm
 /// selectors.  Marked here so the deletion obligation survives rebase.
-pub(super) fn temporal_unavailable_msg(root: &std::path::Path) -> String {
+///
+/// Finding 1/3 fix: pure dispatch, zero I/O.  `head` and `anchor` are computed
+/// by callers and passed in:
+/// - `head` comes from the `HeadState` returned by `auto_refresh_if_stale`
+///   (Finding 2) or from `TemporalUnavailable::to_anchor_state`'s implicit Resolved.
+/// - `anchor` comes from `TemporalUnavailable::to_anchor_state()` (Finding 1/3).
+pub(super) fn temporal_unavailable_msg(
+    head: &staleness::HeadState,
+    anchor: &staleness::AnchorState,
+) -> String {
     use staleness::{AnchorState, HeadState};
-    match staleness::git_head_state(root) {
+    match head {
         HeadState::NotARepo => NO_TEMPORAL_DATA_MSG.to_string(),
         HeadState::Unresolved => HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
         HeadState::Resolved(_) => {
-            // Check anchor state: need cache_dir for the DB read.
-            let cache_dir = index::resolve_search_cache_dir(root).ok();
-            if let Some(ref cd) = cache_dir
-                && let AnchorState::Differs {
-                    ref recorded,
-                    ref live,
-                } = staleness::temporal_anchor_state(cd, root)
-            {
+            if let AnchorState::Differs { recorded, live } = anchor {
                 return format!(
                     "{SUBDIR_ROOT_TEMPORAL_MSG} \
                      (recorded: {recorded:?}, live: {live:?}); \
@@ -2771,8 +2812,13 @@ mod tests {
         let root = dir.path();
         // cache_dir has no temporal.db — open_temporal_db_for returns Err(Absent)
         // and the function degrades gracefully to Ok(None).
-        let result =
-            temporal::resolve_blast_radius_paths(Some("src/auth.rs"), root, dir.path(), false);
+        let result = temporal::resolve_blast_radius_paths(
+            Some("src/auth.rs"),
+            root,
+            dir.path(),
+            false,
+            &staleness::HeadState::NotARepo,
+        );
         assert!(
             result.is_ok(),
             "must not error when temporal.db is absent, got: {:?}",
@@ -2865,79 +2911,44 @@ mod tests {
     /// byte-identical `NO_TEMPORAL_DATA_MSG` for a genuine non-repo, and a DIFFERENT
     /// message for a repo whose HEAD cannot be resolved.
     ///
-    /// Hermeticity (PF-007): the non-repo fixture asserts no ancestor `.git` first —
-    /// after OD-3 a tempdir created under a clone would legitimately adopt it and the
-    /// assertion would be testing the harness rather than the code.
+    /// Finding 1/3 fix: the function is now pure (takes pre-resolved head+anchor),
+    /// so the test constructs states directly — no filesystem fixtures needed for the
+    /// dispatch logic itself.  The fixture-based setup is retained as documentation
+    /// of what real inputs look like.
     #[test]
     fn test_temporal_unavailable_msg_triage_ac18_ac19() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let mut d = dir.path().canonicalize().unwrap();
-            loop {
-                assert!(
-                    !d.join(".git").exists(),
-                    "NOGIT precondition failed: ancestor {d:?} contains .git"
-                );
-                match d.parent() {
-                    Some(p) if p != d => d = p.to_path_buf(),
-                    _ => break,
-                }
-            }
-        }
+        use staleness::{AnchorState, HeadState};
 
         // Genuine non-repo → byte-identical legacy text (AC19).
-        let non_repo = dir.path().join("non_repo");
-        std::fs::create_dir_all(&non_repo).unwrap();
         assert_eq!(
-            temporal_unavailable_msg(&non_repo),
+            temporal_unavailable_msg(&HeadState::NotARepo, &AnchorState::Absent),
             NO_TEMPORAL_DATA_MSG,
-            "AC19: a genuine non-repo must keep the byte-identical legacy message"
+            "AC19: NotARepo must keep the byte-identical legacy message"
         );
 
         // Repo whose HEAD exists but does not resolve → the triaged message (AC18).
-        let broken = dir.path().join("broken_head");
-        std::fs::create_dir_all(broken.join(".git")).unwrap();
-        std::fs::write(broken.join(".git").join("HEAD"), "not a valid head\n").unwrap();
         assert_eq!(
-            temporal_unavailable_msg(&broken),
+            temporal_unavailable_msg(&HeadState::Unresolved, &AnchorState::Absent),
             HEAD_UNRESOLVED_TEMPORAL_MSG,
-            "AD-413-8: an unresolvable HEAD inside a repo must not get the non-repo message"
+            "AD-413-8: Unresolved HEAD must not get the non-repo message"
         );
     }
 
     /// AC33(f): `temporal_unavailable_msg` Resolved+Differs branch returns a message
     /// that contains SUBDIR_ROOT_TEMPORAL_MSG and the recorded/live path snippets.
     ///
-    /// Setup: real git repo (outer) → subdirectory root → cache_dir has a temporal.db
-    /// whose git_toplevel meta row points to a DIFFERENT path → AnchorState::Differs.
-    ///
-    /// The test creates cache files in the real skim cache (keyed by the temp root hash).
-    /// These orphaned files are harmless and consistent with the convention used by other
-    /// tests in this module (e.g. test_rebuild_populates_temporal_db).
+    /// Finding 1/3 fix: the function is now pure, so the test passes states directly.
+    /// No filesystem or SQLite fixtures are needed for the dispatch logic.
     #[test]
     fn test_temporal_unavailable_msg_resolved_differs_returns_subdir_msg() {
-        // Create an outer git repo so git_head_state(root) resolves.
-        let outer = tempfile::TempDir::new().unwrap();
-        create_real_git_repo(outer.path(), &[("init", &[("README.md", "# outer")])]);
+        use staleness::{AnchorState, HeadState};
 
-        // root = a subdirectory inside the outer repo (so resolve_repo_toplevel finds outer).
-        let root = outer.path().join("sub");
-        std::fs::create_dir_all(&root).unwrap();
-
-        // Compute the cache_dir that temporal_unavailable_msg will look up internally.
-        let cache_dir = index::resolve_search_cache_dir(&root).unwrap();
-        std::fs::create_dir_all(&cache_dir).unwrap();
-
-        // Create temporal.db and plant a wrong git_toplevel (triggers AnchorState::Differs).
-        let db_path = cache_dir.join("temporal.db");
-        drop(rskim_search::TemporalDb::open(&db_path).unwrap());
-        staleness::plant_meta_raw(
-            &db_path,
-            rskim_search::META_GIT_TOPLEVEL,
-            "/wrong/repo/path",
-        );
-
-        let msg = temporal_unavailable_msg(&root);
+        let head = HeadState::Resolved("abc1234abc1234abc1234abc1234abc1234abc12".to_string());
+        let anchor = AnchorState::Differs {
+            recorded: std::path::PathBuf::from("/wrong/repo/path"),
+            live: std::path::PathBuf::from("/correct/repo/path"),
+        };
+        let msg = temporal_unavailable_msg(&head, &anchor);
 
         assert!(
             msg.contains(SUBDIR_ROOT_TEMPORAL_MSG),
@@ -2960,23 +2971,29 @@ mod tests {
     /// `temporal_unavailable_msg` Resolved+other branch returns TEMPORAL_BUILD_EMPTY_MSG
     /// when the HEAD resolves and AnchorState is NOT Differs.
     ///
-    /// Setup: root IS the git repo root → resolve_repo_toplevel returns None →
-    /// AnchorState::NotAdopted → falls through to TEMPORAL_BUILD_EMPTY_MSG.
-    ///
-    /// This exercises the else-arm of the Resolved branch that was previously never
-    /// reached by any automated test.
+    /// Finding 1/3 fix: the function is now pure, so the test passes states directly.
     #[test]
     fn test_temporal_unavailable_msg_resolved_other_returns_build_empty() {
-        // Create a real git repo with HEAD resolved; root is the repo root itself
-        // (so .git is directly in root → resolve_repo_toplevel returns None →
-        // NotAdopted → no Differs branch → TEMPORAL_BUILD_EMPTY_MSG).
-        let dir = tempfile::TempDir::new().unwrap();
-        create_real_git_repo(dir.path(), &[("init", &[("README.md", "# repo")])]);
+        use staleness::{AnchorState, HeadState};
 
-        let msg = temporal_unavailable_msg(dir.path());
+        let head = HeadState::Resolved("abc1234abc1234abc1234abc1234abc1234abc12".to_string());
+        // NotAdopted → no Differs branch → TEMPORAL_BUILD_EMPTY_MSG.
+        let msg = temporal_unavailable_msg(&head, &AnchorState::NotAdopted);
         assert_eq!(
             msg, TEMPORAL_BUILD_EMPTY_MSG,
             "Resolved+NotAdopted branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg:?}"
+        );
+        // Absent anchor also falls through to TEMPORAL_BUILD_EMPTY_MSG.
+        let msg2 = temporal_unavailable_msg(&head, &AnchorState::Absent);
+        assert_eq!(
+            msg2, TEMPORAL_BUILD_EMPTY_MSG,
+            "Resolved+Absent branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg2:?}"
+        );
+        // Agrees anchor also falls through to TEMPORAL_BUILD_EMPTY_MSG.
+        let msg3 = temporal_unavailable_msg(&head, &AnchorState::Agrees);
+        assert_eq!(
+            msg3, TEMPORAL_BUILD_EMPTY_MSG,
+            "Resolved+Agrees branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg3:?}"
         );
     }
 

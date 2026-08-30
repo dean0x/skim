@@ -41,7 +41,7 @@ pub(super) use super::gitdir::{
 
 // Re-export temporal-DB items (owned by temporal_state.rs).
 pub(super) use super::temporal_state::{
-    AnchorState, ReanchorPolicy, temporal_anchor_state, temporal_db_is_stale,
+    AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_anchor_state, temporal_db_is_stale,
     try_rebuild_temporal_nonfatal, warn_if_temporal_unverifiable,
 };
 
@@ -504,12 +504,19 @@ impl RefreshOutcome {
 /// the two reads the manifest will record the pre-commit HEAD and temporal.db
 /// will record the post-commit HEAD; both will appear stale on the next query,
 /// triggering one more refresh. This is the accepted TOCTOU trade-off.
+/// AD-413 Finding 2: returns the `HeadState` resolved at function entry so
+/// temporal-consuming call sites do not need a second `git_head_state` call.
+/// All four call sites in `mod.rs` (--ast arm, `run_update`, `execute_query`,
+/// `run_temporal_standalone`) previously discarded this value and re-called
+/// `git_head_state` right after returning, triggering an extra full HEAD-ladder
+/// traversal on every query (three traversals instead of two on a linked
+/// worktree with packed-refs).
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
     reanchor: ReanchorPolicy,
-) -> anyhow::Result<(RefreshOutcome, FileManifest)> {
+) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
 
@@ -548,7 +555,7 @@ pub(super) fn auto_refresh_if_stale(
             try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal", reanchor);
         }
 
-        return Ok((RefreshOutcome::UpToDate, manifest));
+        return Ok((RefreshOutcome::UpToDate, manifest, head_state));
     }
 
     // All rebuild paths share the same config.
@@ -627,7 +634,7 @@ pub(super) fn auto_refresh_if_stale(
         // return UpToDate (steady-state no-op contract AC7/AC14).
         let manifest = existing_manifest
             .unwrap_or_else(|| FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf()));
-        return Ok((RefreshOutcome::UpToDate, manifest));
+        return Ok((RefreshOutcome::UpToDate, manifest, head_state));
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
@@ -656,7 +663,7 @@ pub(super) fn auto_refresh_if_stale(
     } else {
         RefreshOutcome::Incremental
     };
-    Ok((outcome, manifest))
+    Ok((outcome, manifest, head_state))
 }
 
 // ============================================================================

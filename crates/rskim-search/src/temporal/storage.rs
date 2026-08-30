@@ -285,6 +285,30 @@ impl TemporalDb {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(db_err)
     }
+
+    // ========================================================================
+    // Meta access through an already-open connection
+    // ========================================================================
+
+    /// Read a single TEXT value from the `meta` table of this open connection.
+    ///
+    /// Used by callers that need to read meta through an already-open connection
+    /// to avoid opening a second SQLite connection for the same data.
+    /// Returns `None` when the key is absent or the query fails.
+    ///
+    /// Currently used by `rskim::cmd::search::temporal_state::anchor_state_on_db`
+    /// to read `META_GIT_TOPLEVEL` through the connection that
+    /// `open_temporal_db_for` already returned, eliminating the extra read-only
+    /// open that the pre-fix code performed (Finding 4 / AD-413-16).
+    pub fn read_meta(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
 }
 
 // ============================================================================

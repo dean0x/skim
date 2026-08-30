@@ -110,10 +110,6 @@ const MINIFY_AVG_LINE_BYTES: usize = 500;
 /// (single-digit KiB, including the 1.4 KiB ticket repro) are indexed.
 pub(super) const MINIFY_MIN_BYTES: usize = 8 * MINIFY_PROBE_BYTES; // 65_536
 
-/// Maximum number of ancestors to traverse when looking for a `.git` root.
-/// 256 ancestors is far beyond any real filesystem depth.
-const MAX_ANCESTORS: usize = 256;
-
 /// Maximum number of skip reasons collected during a walk or producer phase.
 ///
 /// Large monorepos may encounter millions of unsupported files.  Collecting an
@@ -171,6 +167,11 @@ pub(super) enum ReadOutcome {
 /// Returns the first ancestor that contains `.git/`, or `start` itself if none
 /// is found (fallback: treat the provided directory as the root).
 ///
+/// Delegates the bounded ancestor scan to
+/// [`super::gitdir::discover_project_root_from_canonical`] after canonicalizing,
+/// so both this entry-point and `gitdir::resolve_repo_toplevel` share the same
+/// walk logic (AD-413-14).
+///
 /// # Errors
 ///
 /// Returns `Err` if `start` cannot be canonicalized.
@@ -178,43 +179,9 @@ pub(super) fn discover_project_root(start: &Path) -> anyhow::Result<PathBuf> {
     let canonical = start
         .canonicalize()
         .with_context(|| format!("failed to canonicalize path: {}", start.display()))?;
-
-    let mut current = canonical.as_path();
-    for _ in 0..MAX_ANCESTORS {
-        if current.join(".git").exists() {
-            return Ok(current.to_path_buf());
-        }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-
-    // No .git found — fall back to the canonical form of the provided path.
-    Ok(canonical)
-}
-
-/// [`discover_project_root`] variant that skips the `canonicalize()` call.
-///
-/// Use this when the caller already holds a canonical path — for example,
-/// [`super::gitdir::resolve_repo_toplevel`] calls `canonicalize()` before
-/// invoking this function, so passing the result here avoids a redundant
-/// `realpath(3)` (O(path depth) lstat/readlink syscalls).
-///
-/// Returns `canonical` unchanged when no enclosing `.git` is found, mirroring
-/// the fallback behaviour of [`discover_project_root`].
-pub(super) fn discover_project_root_from_canonical(canonical: &Path) -> PathBuf {
-    let mut current = canonical;
-    for _ in 0..MAX_ANCESTORS {
-        if current.join(".git").exists() {
-            return current.to_path_buf();
-        }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
-    canonical.to_path_buf()
+    Ok(super::gitdir::discover_project_root_from_canonical(
+        &canonical,
+    ))
 }
 
 // ============================================================================
@@ -640,8 +607,8 @@ fn merge_tracked_union(
 /// ONE parser.  Two near-copies drifted (line-scan vs whole-file `strip_prefix`); #413
 /// touches worktree indirection, so the duplicate is removed with it (applies ADR-001).
 /// NOT a claim that all `.git`-path consumers are unified: `walk::discover_project_root`
-/// (walk.rs:184) owns the bounded ANCESTOR walk (a different job, reused by AD-413-14)
-/// and walk.rs:500's `.git` existence probe stays local.  `hooks.rs` no longer hand-builds
+/// owns the bounded ANCESTOR walk (a different job, reused by AD-413-14) and
+/// `walk_metadata`'s `.git` existence probe stays local.  `hooks.rs` no longer hand-builds
 /// `.git/hooks`: it resolves through this same parser plus `resolve_common_dir`
 /// (AD-413-15), which is what makes the shared-hooks route correct.
 fn resolve_git_index_path(root: &Path) -> Option<PathBuf> {

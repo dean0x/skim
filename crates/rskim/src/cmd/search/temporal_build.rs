@@ -362,7 +362,14 @@ pub(super) fn rebuild_temporal(
     head: &str,
     now_epoch: u64,
 ) -> anyhow::Result<()> {
-    rebuild_temporal_with_source(&GixSource, root, cache_dir, head, now_epoch)
+    rebuild_temporal_with_source(
+        &GixSource,
+        root,
+        cache_dir,
+        head,
+        now_epoch,
+        super::staleness::ReanchorPolicy::Allow,
+    )
 }
 
 /// Return `true` when `rel` names a regular file that exists under `root`.
@@ -472,6 +479,54 @@ fn apply_ghost_filter(
     cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
 }
 
+/// Strip a scope-prefix from temporal rows in-place, retaining only rows within
+/// the subtree and rewriting their paths to be `root`-relative.
+///
+/// This is the AD-413-17 scope filter, extracted from `rebuild_temporal_with_source`
+/// to match the structure of [`apply_ghost_filter`].  Called only when `root` is a
+/// proper subdirectory of the git worktree root; when `root == ghost_root` the
+/// caller holds `scope = None` and this function is never invoked.
+///
+/// # Allocation (Finding 2)
+///
+/// Prefix stripping uses [`String::drain`] (zero extra allocation per retained
+/// row) rather than `*path = stripped.to_string()`, which cloned the tail on
+/// every retained row.  `starts_with` is checked first so `drain` is never
+/// called on a path that would be dropped anyway.
+///
+/// # Cochange both-sides rule
+///
+/// A cochange row where only one side falls within the scope would silently
+/// reference an unreachable path on the query side — it is dropped rather than
+/// emitted as a ghost co-change result.
+fn apply_scope_filter(
+    pfx: &str,
+    hotspot_rows: &mut Vec<rskim_search::HotspotRow>,
+    risk_rows: &mut Vec<rskim_search::RiskRow>,
+    cochange_rows: &mut Vec<rskim_search::CochangeRow>,
+) {
+    // In-place prefix drain: O(n_chars_shifted) per row, zero allocation.
+    let strip_in_place = |path: &mut String| -> bool {
+        if path.starts_with(pfx) {
+            path.drain(..pfx.len());
+            true
+        } else {
+            false
+        }
+    };
+    hotspot_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
+    risk_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
+    cochange_rows.retain_mut(|r| {
+        if r.file_a.starts_with(pfx) && r.file_b.starts_with(pfx) {
+            r.file_a.drain(..pfx.len());
+            r.file_b.drain(..pfx.len());
+            true
+        } else {
+            false
+        }
+    });
+}
+
 /// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
 ///
 /// Separated from `rebuild_temporal` so tests can supply a counting or fake
@@ -483,6 +538,7 @@ pub(super) fn rebuild_temporal_with_source(
     cache_dir: &Path,
     head: &str,
     now_epoch: u64,
+    reanchor: super::staleness::ReanchorPolicy,
 ) -> anyhow::Result<()> {
     // ── Single full-history walk ──────────────────────────────────────────────
     // One parse_history call supplies all data. The 30d/90d windowing for
@@ -549,53 +605,45 @@ pub(super) fn rebuild_temporal_with_source(
     // When `root` is a proper subdirectory of `ghost_root`, git history paths
     // are repo-root-relative (e.g. `crates/rskim-search/src/lib.rs`) while
     // skim-search query consumers expect paths relative to `root`
-    // (e.g. `src/lib.rs`). Compute the scope prefix once and retain only rows
-    // whose paths start with it, rewriting them to strip the prefix.
+    // (e.g. `src/lib.rs`). Compute the scope prefix once and delegate to
+    // `apply_scope_filter`, which retains only paths within the subtree and
+    // rewrites them to be root-relative.
     // When `root == ghost_root` (plain single-root repo), `strip_prefix` yields
-    // an empty string which is filtered out, so `scope` is `None` and this
-    // block is a no-op — identity path for every non-worktree invocation.
+    // an empty string which is filtered out, so `scope` is `None` and
+    // `apply_scope_filter` is not called — identity path for every non-worktree
+    // invocation.
+    //
+    // Prefix construction: Path components joined with '/', using to_str() (not
+    // to_string_lossy()) so a non-UTF-8 component produces None → scope = None
+    // → filter skipped with a debug notice, rather than a U+FFFD-mangled prefix
+    // that matches no history path and silently drops every row (Finding 4).
+    // Component-joining omits replace('\\', "/"), preventing corruption of Unix
+    // paths that legitimately contain '\' as a filename byte.
     let scope: Option<String> = root
         .canonicalize()
         .ok()
         .zip(ghost_root.canonicalize().ok())
         .and_then(|(r, g)| {
-            r.strip_prefix(&g)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
+            r.strip_prefix(&g).ok().and_then(|p| {
+                let result = p
+                    .components()
+                    .map(|c| c.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|parts| parts.join("/"));
+                if result.is_none() && crate::debug::is_debug_enabled() {
+                    eprintln!(
+                        "skim search [debug]: scope filter: subdirectory path \
+                         contains non-UTF-8 components — skipping scope filter",
+                    );
+                }
+                result
+            })
         })
         .filter(|p| !p.is_empty())
         .map(|p| format!("{p}/"));
 
     if let Some(ref pfx) = scope {
-        let pfx_str = pfx.as_str();
-        // Strip the scope prefix from a single path field in-place.
-        // Shared by hotspot_rows and risk_rows (identical structure).
-        let strip_in_place = |path: &mut String| -> bool {
-            if let Some(stripped) = path.strip_prefix(pfx_str) {
-                *path = stripped.to_string();
-                true
-            } else {
-                false
-            }
-        };
-        hotspot_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
-        risk_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
-        // Cochange: only retain pairs where BOTH sides are within the scope.
-        // A row where only one side is scoped would silently point at a path that
-        // the query-side would never find — drop it rather than produce a ghost
-        // co-change result.
-        cochange_rows.retain_mut(|r| {
-            let a = r.file_a.strip_prefix(pfx_str).map(String::from);
-            let b = r.file_b.strip_prefix(pfx_str).map(String::from);
-            match (a, b) {
-                (Some(a), Some(b)) => {
-                    r.file_a = a;
-                    r.file_b = b;
-                    true
-                }
-                _ => false,
-            }
-        });
+        apply_scope_filter(pfx, &mut hotspot_rows, &mut risk_rows, &mut cochange_rows);
     }
 
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
@@ -621,7 +669,7 @@ pub(super) fn rebuild_temporal_with_source(
             // transaction. Process death between sync and this call leaves the
             // anchor absent, which is the "adopt-and-record" path in
             // `temporal_anchor_state` -- never a false refusal.
-            record_temporal_anchor(&db, root);
+            record_temporal_anchor(&db, root, &ghost_root, reanchor);
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",
@@ -649,28 +697,87 @@ pub(super) fn rebuild_temporal_with_source(
 /// repository (AD-413-16).
 ///
 /// This must be called as a **second, separate transaction** after `db.sync`
-/// completes successfully. Process death between `sync` and this call leaves
+/// completes successfully.  Process death between `sync` and this call leaves
 /// [`rskim_search::META_GIT_TOPLEVEL`] absent, which maps to
-/// [`super::staleness::AnchorState::Absent`] -- the "adopt-and-record" path in
+/// [`super::staleness::AnchorState::Absent`] — the "adopt-and-record" path in
 /// [`super::staleness::temporal_anchor_state`], never a false refusal.
 ///
-/// For a root whose directory already contains `.git` (a plain single-root
-/// repo), [`super::staleness::resolve_repo_toplevel`] returns `None` and this
-/// function is a no-op (Gate 1 in `temporal_anchor_state`: `NotAdopted`).
-/// Zero DB reads are issued for all plain-repo users.
-fn record_temporal_anchor(db: &TemporalDb, root: &Path) {
-    let Some(top) = super::staleness::resolve_repo_toplevel(root) else {
-        return; // plain repo or discovery failed -- nothing to anchor
-    };
-    let Some(top_str) = top.to_str() else {
+/// # Gate 1 — not adopted (Finding 1)
+///
+/// Compares canonicalized `root` against `ghost_root` (the gix-discovered
+/// worktree workdir, already computed by the caller) instead of re-deriving via
+/// `resolve_repo_toplevel` (a hand-rolled ancestor walk that ignores env vars).
+/// When `root == ghost_root` (plain single-root repo, or gix discovery failed
+/// and the fallback `ghost_root = root` is in force), the function deletes any
+/// stale anchor row and returns — zero DB reads for all plain-repo users.
+///
+/// # Finding 5 — stale anchor cleanup
+///
+/// When Gate 1 fires (NotAdopted), any pre-existing [`rskim_search::META_GIT_TOPLEVEL`]
+/// row is deleted so a leftover anchor from a prior invocation cannot trigger
+/// false re-anchor refusals on subsequent queries.
+///
+/// # PF-017 — anchor-write guard on `Refuse` policy
+///
+/// When `reanchor == ReanchorPolicy::Refuse` and the DB already holds a
+/// *different* anchor value, the write is skipped with a debug notice.  This
+/// prevents the auto-refresh path (a plain lexical query that happens to
+/// trigger a HEAD-stale rebuild) from silently retargeting a linked-worktree DB
+/// whose anchor was set by a prior explicit `--build` or `--rebuild`.
+fn record_temporal_anchor(
+    db: &TemporalDb,
+    root: &Path,
+    ghost_root: &Path,
+    reanchor: super::staleness::ReanchorPolicy,
+) {
+    // Gate 1: is root a proper subdirectory of ghost_root?
+    // When gix discovery failed, ghost_root == root (caller's unwrap_or fallback),
+    // so canonicalize equality holds → NotAdopted → correct no-op per D5.
+    let adopted = root
+        .canonicalize()
+        .ok()
+        .zip(ghost_root.canonicalize().ok())
+        .is_some_and(|(r, g)| r != g);
+    if !adopted {
+        // Finding 5: remove any stale anchor from a previous invocation so it
+        // cannot drive false refusals on the next query-path anchor check.
+        let _ = db
+            .delete_meta(rskim_search::META_GIT_TOPLEVEL)
+            .inspect_err(|e| {
+                if crate::debug::is_debug_enabled() {
+                    eprintln!("skim search [debug]: temporal anchor clear failed (non-fatal): {e}");
+                }
+            });
+        return;
+    }
+    let Some(top_str) = ghost_root.to_str() else {
         if crate::debug::is_debug_enabled() {
             eprintln!(
-                "skim search [debug]: temporal anchor: toplevel path is not valid \
+                "skim search [debug]: temporal anchor: git workdir path is not valid \
                  UTF-8, skipping anchor write"
             );
         }
         return;
     };
+    // PF-017: Refuse policy — if the DB already has a *different* anchor value,
+    // skip the write.  The auto-refresh path must not silently retarget a DB
+    // anchored by a prior explicit build arm.  Use `skim search --rebuild` to
+    // force re-anchoring.
+    if reanchor == super::staleness::ReanchorPolicy::Refuse {
+        if let Ok(Some(existing)) = db.get_meta(rskim_search::META_GIT_TOPLEVEL) {
+            if existing.as_str() != top_str {
+                if crate::debug::is_debug_enabled() {
+                    eprintln!(
+                        "skim search [debug]: temporal anchor write skipped \
+                         (Refuse policy, anchor would change from {:?} to {:?}); \
+                         use `skim search --rebuild` to re-anchor (PF-017)",
+                        existing, top_str,
+                    );
+                }
+                return;
+            }
+        }
+    }
     if let Err(e) = db.set_meta(rskim_search::META_GIT_TOPLEVEL, top_str)
         && crate::debug::is_debug_enabled()
     {

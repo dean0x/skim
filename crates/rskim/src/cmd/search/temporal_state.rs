@@ -16,6 +16,8 @@
 
 use std::path::{Path, PathBuf};
 
+use rskim_search::TemporalDb;
+
 use super::gitdir::{HeadState, resolve_repo_toplevel};
 
 // ============================================================================
@@ -276,6 +278,39 @@ pub(super) fn temporal_anchor_state(cache_dir: &Path, root: &Path) -> AnchorStat
     }
 }
 
+/// AD-413-16: check anchor via an already-open `TemporalDb` connection.
+///
+/// Mirrors `temporal_anchor_state` but reads `META_GIT_TOPLEVEL` from `db`
+/// instead of opening a separate read-only connection — avoids the double SQLite
+/// open that the pre-fix `open_temporal_db_for` performed (Finding 4):
+/// the caller already paid to open `temporal.db` as a `TemporalDb`, so we
+/// must not open it a second time just to read one meta row.
+///
+/// Gate 1 (`resolve_repo_toplevel`) is identical to `temporal_anchor_state`:
+/// non-adopted roots (those that have their own `.git`) return `NotAdopted`
+/// immediately with zero DB reads — the same zero-cost fast-path as before.
+///
+/// # When to use
+///
+/// Call this when `db` is the `TemporalDb` that `open_temporal_db_for` just
+/// opened (i.e. the same handle used to serve the query).  Use the standalone
+/// `temporal_anchor_state` only when no live connection is available.
+pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {
+    // Gate 1: root that owns `.git` is never re-pointed (AC17, AC32).
+    let Some(top) = resolve_repo_toplevel(root) else {
+        return AnchorState::NotAdopted;
+    };
+    // Read META_GIT_TOPLEVEL from the already-open connection (no second open).
+    match db.read_meta(rskim_search::META_GIT_TOPLEVEL) {
+        None => AnchorState::Absent,
+        Some(rec) if Path::new(&rec) == top.as_path() => AnchorState::Agrees,
+        Some(rec) => AnchorState::Differs {
+            recorded: PathBuf::from(rec),
+            live: top,
+        },
+    }
+}
+
 // ============================================================================
 // Non-fatal rebuild orchestrator
 // ============================================================================
@@ -326,7 +361,7 @@ pub(super) fn try_rebuild_temporal_nonfatal(
     debug_label: &str,
     reanchor: ReanchorPolicy,
 ) {
-    use super::temporal_build::{current_epoch_secs, rebuild_temporal};
+    use super::temporal_build::{current_epoch_secs, rebuild_temporal_with_source};
 
     let Some(head) = head else { return };
     // PF-017: a changed `--root` toplevel also changes the adopted HEAD, so without
@@ -362,7 +397,14 @@ pub(super) fn try_rebuild_temporal_nonfatal(
             recorded, live,
         );
     }
-    if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {
+    if let Err(e) = rebuild_temporal_with_source(
+        &rskim_search::GixSource,
+        root,
+        cache_dir,
+        head,
+        current_epoch_secs(),
+        reanchor,
+    ) {
         // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
         if crate::debug::is_debug_enabled() {
             eprintln!("skim search [debug]: temporal {debug_label} error (non-fatal): {e}");

@@ -13,6 +13,7 @@ use std::process::Command;
 use rskim_search::{CommitInfo, FileChangeInfo, FileRiskScores, FileTemporalStats, HistoryResult};
 use tempfile::tempdir;
 
+use super::super::staleness::ReanchorPolicy;
 use super::{
     build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
     rebuild_temporal_with_source, rel_is_regular_file,
@@ -1135,7 +1136,14 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
     let now = super::current_epoch_secs();
 
     // First call: empty history — must write present-but-empty temporal.db.
-    let result1 = rebuild_temporal_with_source(&src, dir.path(), &cache_dir, fake_head, now);
+    let result1 = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
     assert!(
         result1.is_ok(),
         "rebuild_temporal_with_source on empty-history repo must return Ok (non-fatal), got: {result1:?}"
@@ -1171,7 +1179,14 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
     // caller (auto_refresh_if_stale) will NOT call rebuild_temporal again.
     // We call rebuild_temporal_with_source a second time to confirm idempotency.
     let src2 = CountingSource::new_empty();
-    let result2 = rebuild_temporal_with_source(&src2, dir.path(), &cache_dir, fake_head, now);
+    let result2 = rebuild_temporal_with_source(
+        &src2,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
     assert!(
         result2.is_ok(),
         "second rebuild_temporal_with_source on empty-history repo must return Ok, got: {result2:?}"
@@ -1287,7 +1302,14 @@ fn test_rebuild_temporal_parse_history_called_once() {
     let src = CountingSource::new_real();
     let now = super::current_epoch_secs();
 
-    let result = rebuild_temporal_with_source(&src, dir.path(), &cache_dir, &head, now);
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Allow,
+    );
     assert!(
         result.is_ok(),
         "rebuild_temporal_with_source must succeed on a real git repo, got: {result:?}"
@@ -1694,4 +1716,102 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
             "AC4: ghost file '{name}' must not appear in top_coldspots"
         );
     }
+}
+
+// ============================================================================
+// PF-017 — Refuse policy must not overwrite a differing temporal anchor
+// ============================================================================
+
+/// PF-017 regression: `ReanchorPolicy::Refuse` must not overwrite an existing
+/// [`rskim_search::META_GIT_TOPLEVEL`] anchor that differs from the live
+/// `ghost_root`.
+///
+/// Without the PF-017 gate in `record_temporal_anchor`, a plain lexical query
+/// whose HEAD changed could trigger an auto-refresh rebuild, and that rebuild
+/// would silently overwrite the anchor set by a prior explicit `--rebuild` —
+/// corrupting the per-worktree isolation invariant (AD-413-16 / ADR-009).
+///
+/// Method:
+/// 1. Create a real git repo so `discover_git_workdir` can find it.
+/// 2. Create a plain subdirectory inside the repo.
+/// 3. Rebuild with `root = subdir`, `Allow` → anchor is written (adopted case).
+/// 4. Overwrite the anchor with a sentinel (`/pf017-sentinel/...`) to simulate
+///    a DB anchored to a *different* linked-worktree root.
+/// 5. Rebuild again with `Refuse` → PF-017 guard must block the write.
+/// 6. Assert the anchor is still the sentinel.
+///
+/// The test skips gracefully when the subdirectory adoption check does not fire
+/// (e.g. `gix::discover` returns `None` so `ghost_root` falls back to `root`);
+/// that scenario cannot exercise the PF-017 guard and is not a regression.
+#[test]
+fn test_pf017_refuse_policy_does_not_overwrite_anchor() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join(".cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Step 1: real git repo so discover_git_workdir returns dir.path().
+    let head = create_real_git_repo(
+        dir.path(),
+        &[("feat: initial", &[("src/lib.rs", "fn main() {}")])],
+    );
+
+    // Step 2: plain subdirectory — not a separate git repo.
+    let sub_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+
+    let now = super::current_epoch_secs();
+
+    // Step 3: Allow rebuild with root = sub_dir.
+    let src1 = CountingSource::new_empty();
+    let r1 = rebuild_temporal_with_source(
+        &src1,
+        &sub_dir,
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(r1.is_ok(), "Allow rebuild must succeed: {r1:?}");
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let anchor_after_allow = db
+        .get_meta(rskim_search::META_GIT_TOPLEVEL)
+        .expect("get_meta must not fail");
+
+    // If adopted check did not fire (ghost_root fallback == root), there is no
+    // anchor to protect and the PF-017 guard path is never reached — skip.
+    let Some(_live_anchor) = anchor_after_allow else {
+        return;
+    };
+
+    // Step 4: overwrite with a sentinel representing a different repo.
+    const SENTINEL: &str = "/pf017-sentinel/other/repo";
+    db.set_meta(rskim_search::META_GIT_TOPLEVEL, SENTINEL)
+        .expect("sentinel write must succeed");
+    drop(db);
+
+    // Step 5: Refuse rebuild — PF-017 gate must block the anchor overwrite.
+    let src2 = CountingSource::new_empty();
+    let r2 = rebuild_temporal_with_source(
+        &src2,
+        &sub_dir,
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Refuse,
+    );
+    assert!(r2.is_ok(), "Refuse rebuild must succeed: {r2:?}");
+
+    // Step 6: anchor must still be the sentinel.
+    let db2 = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let anchor_after_refuse = db2
+        .get_meta(rskim_search::META_GIT_TOPLEVEL)
+        .expect("get_meta must not fail after Refuse rebuild")
+        .expect("anchor must remain present after Refuse rebuild");
+    assert_eq!(
+        anchor_after_refuse, SENTINEL,
+        "PF-017 regression: Refuse policy must not overwrite a differing anchor \
+         (sentinel={SENTINEL:?}, overwritten_to={anchor_after_refuse:?})"
+    );
 }
