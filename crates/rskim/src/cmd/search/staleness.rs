@@ -140,21 +140,27 @@ pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
     }
 }
 
-/// Resolve a symbolic ref (e.g. `refs/heads/main`) to its SHA.
+/// Read a loose ref from `dir` (e.g. `dir/refs/heads/main`).
 ///
-/// Tries the loose ref file first; falls back to `packed-refs`.
-fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
-    // 1. Loose ref: <git_dir>/refs/heads/<branch>
-    let loose_path = git_dir.join(ref_path);
+/// Returns `None` when the file is absent, unreadable, or its content is not
+/// a valid 40/64-hex commit SHA.
+fn read_loose_ref(dir: &Path, ref_path: &str) -> Option<String> {
+    let loose_path = dir.join(ref_path);
     if let Ok(content) = std::fs::read_to_string(&loose_path) {
         let sha = content.trim().to_string();
         if is_hex_sha(&sha) {
             return Some(sha);
         }
     }
+    None
+}
 
-    // 2. packed-refs fallback
-    let packed_refs_path = git_dir.join("packed-refs");
+/// Scan `dir/packed-refs` for the SHA assigned to `ref_path`.
+///
+/// Returns `None` when the file is absent, unreadable, or the ref is not
+/// listed.
+fn read_packed_ref(dir: &Path, ref_path: &str) -> Option<String> {
+    let packed_refs_path = dir.join("packed-refs");
     if let Ok(content) = std::fs::read_to_string(&packed_refs_path) {
         for line in content.lines() {
             // Skip comment lines
@@ -171,8 +177,117 @@ fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
             }
         }
     }
-
     None
+}
+
+/// Maximum bytes read from a `commondir` pointer file.
+///
+/// AD-413-3: `commondir` is untrusted input (applies ADR-008): the read is capped at
+/// `MAX_COMMONDIR_BYTES`, the target is canonicalized, and it must be a directory
+/// containing `HEAD`. A sanity gate, not a sandbox — a real commondir lives outside the root.
+const MAX_COMMONDIR_BYTES: u64 = 4096;
+
+/// AD-413-1: reads a linked worktree's `commondir` pointer, which names the SHARED
+/// ref store. `refs/heads/*`, `refs/tags/*`, `refs/remotes/*` and `packed-refs` live
+/// there — the worktree-private gitdir's `refs/` is empty (measured, #413).
+fn resolve_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(git_dir.join("commondir")).ok()?;
+    let mut buf = String::new();
+    if file
+        .take(MAX_COMMONDIR_BYTES)
+        .read_to_string(&mut buf)
+        .is_err()
+    {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: commondir unreadable in {}",
+                git_dir.display()
+            );
+        }
+        return None;
+    }
+    let first = buf.lines().next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+    let raw = PathBuf::from(first);
+    // AD-413-2: a relative `commondir` resolves against the WORKTREE GITDIR (git's
+    // default content is `"../.."`); an absolute one is used as-is. Same `is_absolute()`
+    // branch shape as `resolve_git_dir`, DIFFERENT anchor: `commondir` resolves against
+    // `git_dir`, not `project_root` (staleness.rs:99) — anchoring on `project_root` lands
+    // two levels above the worktree root.
+    let joined = if raw.is_absolute() {
+        raw
+    } else {
+        git_dir.join(raw)
+    };
+    let canonical = match joined.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: commondir target is not a git dir ({})",
+                    joined.display()
+                );
+            }
+            return None;
+        }
+    };
+    if !canonical.is_dir() || !canonical.join("HEAD").is_file() {
+        // AD-413-3 sanity gate: the target must be a directory containing HEAD.
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: commondir target is not a git dir ({})",
+                canonical.display()
+            );
+        }
+        return None;
+    }
+    Some(canonical)
+}
+
+/// Per-worktree ref namespaces — these are never redirected to the common dir.
+const PER_WORKTREE_REF_PREFIXES: [&str; 3] = ["refs/bisect/", "refs/worktree/", "refs/rewritten/"];
+
+/// Resolve a symbolic ref (e.g. `refs/heads/main`) to its SHA.
+///
+/// AD-413-4: four probes in order — worktree loose, commondir loose, commondir
+/// `packed-refs` (mandatory: the post-`git gc` steady state), worktree `packed-refs`.
+/// `refs/bisect|worktree|rewritten/*` stop at probe 1: git keeps those per-worktree.
+///
+/// AD-413-5: probe 1 stays FIRST and probe 4 stays LAST, and a plain repo or submodule
+/// has no `commondir`, so probes 2–3 are skipped and this collapses to the pre-#413
+/// two-probe behaviour — loose-beats-packed precedence and every existing test hold.
+/// A `commondir` resolving to `git_dir` itself short-circuits for the same reason.
+fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
+    if let Some(sha) = read_loose_ref(git_dir, ref_path) {
+        // probe 1: worktree-private loose ref
+        return Some(sha);
+    }
+    if PER_WORKTREE_REF_PREFIXES
+        .iter()
+        .any(|p| ref_path.starts_with(p))
+    {
+        // per-worktree namespaces are never redirected to the common dir
+        return None;
+    }
+    if let Some(common) = resolve_common_dir(git_dir) {
+        let same = git_dir.canonicalize().ok().is_some_and(|g| g == common);
+        if !same {
+            // I2 short-circuit: skip probes 2–3 when commondir == git_dir
+            if let Some(sha) = read_loose_ref(&common, ref_path) {
+                // probe 2: commondir loose ref
+                return Some(sha);
+            }
+            if let Some(sha) = read_packed_ref(&common, ref_path) {
+                // probe 3: commondir packed-refs (post-git-gc steady state)
+                return Some(sha);
+            }
+        }
+    }
+    // probe 4: worktree-private packed-refs (pre-#413 fallback, kept for monotonicity)
+    read_packed_ref(git_dir, ref_path)
 }
 
 /// Return `true` if `s` looks like a 40-character (SHA-1) or 64-character
