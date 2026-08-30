@@ -85,11 +85,29 @@ fn read_meta_on(conn: &rusqlite::Connection, key: &str) -> Option<String> {
 /// This function uses an intentionally lighter open for read-path performance
 /// (ADR-003); both paths execute the same `SELECT value FROM meta WHERE key = ?1`
 /// query. Keeping both in this module ensures schema drift is caught at review time.
+/// Test-only open counter — incremented each time `read_temporal_meta` reaches the
+/// SQLite open attempt (i.e. after the `exists()` guard passes).  Used by
+/// `test_ac24_advisory_early_return_before_sqlite_on_resolved_and_not_a_repo` to
+/// assert that guard 1 (`!matches!(head, Unresolved)`) short-circuits before any
+/// DB access for `HeadState::Resolved` and `HeadState::NotARepo` inputs.
+///
+/// AC24 discriminating condition: if guard 1 is removed, the counter increments
+/// (because the DB exists and `exists()` returns true), causing the assertion to
+/// fail.  The counter is atomic so parallel tests do not interfere — each AC24
+/// test saves a snapshot before its calls and asserts the delta is zero.
+#[cfg(test)]
+pub(super) static TEMPORAL_META_READ_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
     let db_path = cache_dir.join("temporal.db");
     if !db_path.exists() {
         return None;
     }
+    // AC24 counter: count opens AFTER the exists() guard so parallel tests that
+    // hit the guard-2 early-return (no DB present) do not skew the baseline.
+    #[cfg(test)]
+    TEMPORAL_META_READ_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
     let conn = rusqlite::Connection::open_with_flags(
         &db_path,

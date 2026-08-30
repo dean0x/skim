@@ -7,8 +7,8 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    HeadState, ReanchorPolicy, StalenessCheck, auto_refresh_if_stale, check_staleness,
-    git_head_state, read_git_head, resolve_git_dir, temporal_db_is_stale,
+    HeadState, ReanchorPolicy, StalenessCheck, TEMPORAL_META_READ_COUNT, auto_refresh_if_stale,
+    check_staleness, git_head_state, read_git_head, resolve_git_dir, temporal_db_is_stale,
 };
 
 // Minimal analytics config for tests — analytics recording is disabled.
@@ -1343,6 +1343,42 @@ fn create_real_git_worktree(
     branch: &str,
 ) -> String {
     super::create_real_git_worktree(primary, worktree, branch)
+}
+
+/// Shared fixture: create a primary git repo + one linked worktree, returning all
+/// four handles the caller needs.
+///
+/// Encapsulates the 6-line linked-worktree preamble that was duplicated across
+/// 13 test functions (ADR-001 deduplication):
+/// ```
+///     let dir = tempdir().unwrap();
+///     let primary = dir.path().join("primary");
+///     let worktree = dir.path().join("wt1");
+///     fs::create_dir_all(&primary).unwrap();
+///     let head = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+///     create_real_git_worktree(&primary, &worktree, branch);
+/// ```
+///
+/// Returns `(dir, primary, worktree, head_sha)` where:
+/// - `dir` — the `TempDir` root; must be kept alive for the test duration
+/// - `primary` — path to the primary repo (`<dir>/primary`)
+/// - `worktree` — path to the linked worktree (`<dir>/wt1`)
+/// - `head_sha` — 40-char initial commit SHA shared by both primary and worktree
+fn worktree_fixture(
+    branch: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+    let head = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, branch);
+    (dir, primary, worktree, head)
 }
 
 /// Shared helper: build `temporal.db` directly (bypassing the lexical pipeline).
@@ -2731,36 +2767,19 @@ fn test_display_head_changed_exactly_8_chars() {
 /// Discriminating: pre-fix this returned `None`; post-fix it returns the exact GT SHA.
 #[test]
 fn test_read_git_head_resolves_commondir_loose_ref_in_real_worktree() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let gt = create_real_git_repo(
-        &primary,
-        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
-    );
+    let (_dir, _primary, worktree, gt) = worktree_fixture("b1");
     assert_eq!(gt.len(), 40, "GT must be a 40-char SHA");
 
-    let wt_sha = create_real_git_worktree(&primary, &worktree, "b1");
+    // Verify worktree HEAD equals the primary HEAD at creation (fixture invariant).
+    let wt_sha = read_git_head(&worktree).expect("worktree HEAD must be readable");
     assert_eq!(
         wt_sha, gt,
         "worktree HEAD must equal primary HEAD at branch creation"
     );
 
     // Precondition: per-worktree refs/ must be empty and packed-refs absent.
-    let wt_gitdir = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
     let wt_refs = wt_gitdir.join("refs").join("heads");
     if wt_refs.exists() {
         let entries: Vec<_> = fs::read_dir(&wt_refs).unwrap().collect();
@@ -2791,16 +2810,7 @@ fn test_read_git_head_resolves_commondir_loose_ref_in_real_worktree() {
 fn test_read_git_head_resolves_commondir_packed_refs_after_pack_refs() {
     use std::process::Command;
 
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let gt = create_real_git_repo(
-        &primary,
-        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
-    );
-    let _wt_sha = create_real_git_worktree(&primary, &worktree, "b1");
+    let (_dir, primary, worktree, gt) = worktree_fixture("b1");
 
     // Pack all refs so the loose ref disappears.
     Command::new("git")
@@ -2840,27 +2850,11 @@ fn test_read_git_head_resolves_commondir_packed_refs_after_pack_refs() {
 /// Precondition (asserted): the commondir file starts with `/`.
 #[test]
 fn test_read_git_head_handles_absolute_commondir() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    let _wt_sha = create_real_git_worktree(&primary, &worktree, "b1");
+    let (_dir, primary, worktree, gt) = worktree_fixture("b1");
 
     // Rewrite the commondir to the canonical absolute path.
-    let wt_gitdir: std::path::PathBuf = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
     let abs_common = primary.join(".git").canonicalize().unwrap();
     assert!(
         abs_common.is_absolute(),
@@ -2937,27 +2931,11 @@ fn test_read_git_head_resolves_slashed_branch_loose_and_packed() {
 /// Case 2: per-worktree file removed → resolved SHA is None, NOT shaB from commondir.
 #[test]
 fn test_read_git_head_per_worktree_ref_namespace_is_not_redirected() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    create_real_git_worktree(&primary, &worktree, "b1");
+    let (_dir, primary, worktree, _gt) = worktree_fixture("b1");
 
     // Locate the per-worktree gitdir.
-    let wt_gitdir: std::path::PathBuf = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
 
     let sha_a = "a".repeat(40);
     let sha_b = "b".repeat(40);
@@ -3008,13 +2986,7 @@ fn test_read_git_head_per_worktree_ref_namespace_is_not_redirected() {
 fn test_read_git_head_detached_head_in_linked_worktree_still_resolves() {
     use std::process::Command;
 
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    create_real_git_worktree(&primary, &worktree, "b1");
+    let (_dir, _primary, worktree, gt) = worktree_fixture("b1");
 
     // Detach HEAD in the linked worktree.
     Command::new("git")
@@ -3037,27 +3009,11 @@ fn test_read_git_head_detached_head_in_linked_worktree_still_resolves() {
 /// that SHA must NOT be returned.
 #[test]
 fn test_read_git_head_rejects_commondir_pointing_at_non_git_dir() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
     let fake_common = dir.path().join("fake_common");
-    fs::create_dir_all(&primary).unwrap();
 
-    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    create_real_git_worktree(&primary, &worktree, "b1");
-
-    let wt_gitdir: std::path::PathBuf = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
 
     // Create a fake commondir with a valid-looking SHA file but NO HEAD.
     let planted_sha = "c".repeat(40);
@@ -3088,26 +3044,10 @@ fn test_read_git_head_rejects_commondir_pointing_at_non_git_dir() {
 /// AC8 (b) / S8b — `commondir` points at a non-existent path (dangling): no HEAD.
 #[test]
 fn test_read_git_head_rejects_dangling_commondir() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
 
-    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    create_real_git_worktree(&primary, &worktree, "b1");
-
-    let wt_gitdir: std::path::PathBuf = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
 
     // Dangling path — does not exist.
     let dangling = dir.path().join("does-not-exist");
@@ -3128,26 +3068,10 @@ fn test_read_git_head_rejects_dangling_commondir() {
 /// no panic, no OOM.
 #[test]
 fn test_read_git_head_rejects_oversized_commondir() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
+    let (_dir, _primary, worktree, _gt) = worktree_fixture("b1");
 
-    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    create_real_git_worktree(&primary, &worktree, "b1");
-
-    let wt_gitdir: std::path::PathBuf = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
 
     // 8192 bytes of 'x' with no newline — exceeds the 4096-byte bounded read.
     let junk = "x".repeat(8192);
@@ -3163,27 +3087,11 @@ fn test_read_git_head_rejects_oversized_commondir() {
 /// AC8 (d) / S8d — `commondir` is a regular file rather than a directory: no HEAD.
 #[test]
 fn test_read_git_head_rejects_commondir_is_a_file() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
     let file_common = dir.path().join("file_that_is_not_a_dir");
-    fs::create_dir_all(&primary).unwrap();
 
-    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
-    create_real_git_worktree(&primary, &worktree, "b1");
-
-    let wt_gitdir: std::path::PathBuf = {
-        let dot_git = worktree.join(".git");
-        let content = fs::read_to_string(&dot_git).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
 
     // commondir points at a regular file (not a directory).
     fs::write(&file_common, b"this is a file, not a dir\n").unwrap();
@@ -3208,18 +3116,9 @@ fn test_read_git_head_rejects_commondir_is_a_file() {
 fn test_check_staleness_reports_head_changed_in_linked_worktree() {
     use std::process::Command;
 
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
+    let (dir, _primary, worktree, old_head) = worktree_fixture("b1");
     let cache_dir = dir.path().join("cache");
-    fs::create_dir_all(&primary).unwrap();
     fs::create_dir_all(&cache_dir).unwrap();
-
-    let old_head = create_real_git_repo(
-        &primary,
-        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
-    );
-    create_real_git_worktree(&primary, &worktree, "b1");
 
     // Write a manifest with old_head so check_staleness has something to compare.
     write_manifest_with_head(&worktree, &cache_dir, Some(&old_head));
@@ -3276,17 +3175,7 @@ fn test_check_staleness_reports_head_changed_in_linked_worktree() {
 fn test_temporal_db_resyncs_when_worktree_branch_advances() {
     use std::process::Command;
 
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let old_head = create_real_git_repo(
-        &primary,
-        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
-    );
-    create_real_git_worktree(&primary, &worktree, "b1");
-
+    let (dir, _primary, worktree, old_head) = worktree_fixture("b1");
     // First build.
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
@@ -3377,17 +3266,7 @@ fn test_temporal_db_resyncs_when_worktree_branch_advances() {
 /// equals GT and `meta.git_head` equals GT.
 #[test]
 fn test_frozen_manifest_without_head_recovers_on_next_query_in_worktree() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let gt = create_real_git_repo(
-        &primary,
-        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
-    );
-    create_real_git_worktree(&primary, &worktree, "b1");
-
+    let (dir, _primary, worktree, gt) = worktree_fixture("b1");
     // Set up with a real index + temporal.db, then wipe the manifest's git_head.
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
@@ -3449,17 +3328,7 @@ fn test_frozen_manifest_without_head_recovers_on_next_query_in_worktree() {
 /// corrects it to the GT SHA.
 #[test]
 fn test_temporal_db_with_divergent_recorded_head_self_heals_in_worktree() {
-    let dir = tempdir().unwrap();
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
-    fs::create_dir_all(&primary).unwrap();
-
-    let gt = create_real_git_repo(
-        &primary,
-        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
-    );
-    create_real_git_worktree(&primary, &worktree, "b1");
-
+    let (dir, _primary, worktree, gt) = worktree_fixture("b1");
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
     auto_refresh_if_stale(
@@ -3826,22 +3695,20 @@ fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
         "AC10(c): index.skfiles mtime must be unchanged on the second run (no rebuild loop)"
     );
 
-    // AC10(d): the poisoned SHA must never appear in the stored HEAD after the refresh
-    // (the manifest keeps whatever was there — this verifies no phantom write occurs).
-    // This is a code-path check: if a rebuild happened, the stored HEAD would change.
-    // We assert the manifest HEAD is still the poisoned SHA (no rebuild rewrote it with None).
+    // AC10(d): the planted poisoned SHA must still be the stored HEAD after both refreshes.
+    // AC10(c) already proved no rebuild fired (mtime stable).  If a rebuild had fired,
+    // `auto_refresh_if_stale` would write the live HEAD (None here) into the manifest,
+    // changing the stored value away from `poisoned`.  Asserting equality here is the
+    // strong form: it FAILS if a rebuild mistakenly ran, regardless of what value was written.
     use crate::cmd::search::manifest::FileManifest;
-    let manifest = FileManifest::load(project_root.clone(), cache_dir.clone()).ok();
-    // Stored HEAD may be the poisoned SHA (from our plant) or None (if rebuild fired).
-    // A rebuild-loop would produce a different stored value; the inert path keeps it stable.
-    // We assert that stored HEAD has not changed to the escape SHA via a live-HEAD read.
-    if let Some(m) = manifest {
-        assert_ne!(
-            m.stored_git_head(),
-            Some(""),
-            "AC10(d): stored HEAD must not be overwritten with an empty value"
-        );
-    }
+    let manifest = FileManifest::load(project_root.clone(), cache_dir.clone())
+        .expect("AC10(d): manifest must load after two inert auto_refresh_if_stale calls");
+    assert_eq!(
+        manifest.stored_git_head(),
+        Some(poisoned.as_str()),
+        "AC10(d): stored HEAD must still equal the planted poisoned SHA after inert refresh — \
+         a rebuild would have overwritten it",
+    );
 }
 
 // ============================================================================
@@ -4342,19 +4209,23 @@ fn test_ac22_frozen_manifest_git_head_advances_after_refresh() {
 #[test]
 fn test_ac23_warn_if_temporal_unverifiable_call_site_count() {
     let mod_src = include_str!("mod.rs");
-    // Count actual invocations (not the doc-comment reference, which is in staleness.rs).
-    // The pattern `staleness::warn_if_temporal_unverifiable` matches exactly the call
-    // sites; the bare function name `warn_if_temporal_unverifiable` would also match
-    // the staleness.rs doc-comment reference included by include_str! above if this
-    // test ran against staleness.rs — so we count from mod.rs only.
+    // Count bare occurrences of `warn_if_temporal_unverifiable` in mod.rs only.
+    // mod.rs is the sole consumer of this API; staleness.rs is excluded via a
+    // separate include_str! target.  The bare pattern intentionally captures the
+    // `_at` wrapper (whose name starts with the same prefix) and the one inline
+    // comment reference at line 1255, so the real total is > 6.
+    // Bare pattern — matches all 6 direct call sites plus incidental occurrences
+    // (the `_at` wrapper call whose name contains the bare string as a prefix, and
+    // one comment reference).  Scoping to mod.rs keeps staleness.rs doc-comments
+    // out of the count.
     let call_count = mod_src.matches("warn_if_temporal_unverifiable").count();
-    // Expected: ≥ 6 occurrences in mod.rs (one per dispatch arm that serves temporal data):
-    //   line ~217 : plain temporal arm (--hot / --cold / --risky / --blast-radius / text+temporal)
-    //   line ~942 : --update arm
-    //   line ~967 : --build arm
-    //   line ~1014: --rebuild arm
-    //   line ~1264: --stats / --stats --json arm
-    //   line ~1535: AST+temporal compound arm
+    // Expected: ≥ 6 occurrences in mod.rs (6 direct call sites; total count ≥ 6):
+    //   line 231  : run()                   — text+AST compound arm (--ast)
+    //   line 957  : run_build()             — --build / --rebuild arm
+    //   line 988  : run_update()            — --update arm
+    //   line 1037 : run_stats()             — --stats / --stats --json arm (via warn_if_temporal_unverifiable_at)
+    //   line 1281 : run_query()             — plain-text query arm
+    //   line 1573 : run_temporal_standalone() — --hot / --cold / --risky / --blast-radius arm
     // The doc reference in staleness.rs is excluded (different include_str! target).
     assert!(
         call_count >= 6,
@@ -4372,18 +4243,18 @@ fn test_ac23_warn_if_temporal_unverifiable_call_site_count() {
 /// AC24 — `warn_if_temporal_unverifiable` returns immediately (zero SQLite opens)
 /// when the live HEAD state is not `Unresolved`.
 ///
-/// The guard `if !matches!(head, HeadState::Unresolved) { return; }` is the
-/// first statement in the function.  We verify it fires before any DB access by
-/// placing an INVALID temporal.db (a directory, not a file) at the expected path
-/// and asserting the call completes without error.  A call that attempted to open
-/// the DB as an SQLite connection would return an error or panic because the path
-/// is a directory, not a file.
+/// The guard `if !matches!(head, HeadState::Unresolved) { return; }` is the first
+/// statement in the function.  We verify it fires before any DB access by:
+///   1. Creating a real `temporal.db` with `META_GIT_HEAD` set — so guard 2
+///      (`!exists()`) would also pass if guard 1 were absent — then
+///   2. Asserting that `TEMPORAL_META_READ_COUNT` (the in-process counter
+///      incremented inside `read_temporal_meta` after the `exists()` check) does
+///      NOT move across the two calls.
 ///
-/// Discriminating: removing the early-return guard causes the function to call
-/// `rusqlite::Connection::open(cache_dir.join("temporal.db"))` on a directory,
-/// which returns an error that propagates as a panic in the test (the function
-/// currently uses `?` internally — the discriminating failure mode is an
-/// unreachable-code path that opens SQLite for Resolved / NotARepo).
+/// Discriminating: removing guard 1 causes `read_temporal_meta` to be called,
+/// which increments `TEMPORAL_META_READ_COUNT` by 2 (one per sub-case), failing
+/// the assertion.  The DB-as-directory approach previously used would not catch
+/// this because `open_with_flags` swallows the error via `.ok()?`.
 ///
 /// Sub-cases:
 ///   C5-R: `HeadState::Resolved("sha")` — the common healthy-repo case.
@@ -4394,22 +4265,34 @@ fn test_ac24_advisory_early_return_before_sqlite_on_resolved_and_not_a_repo() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    // Plant temporal.db as a DIRECTORY (not a file) so any SQLite open attempt fails.
-    let fake_db = cache_dir.join("temporal.db");
-    fs::create_dir_all(&fake_db).unwrap();
-    assert!(
-        fake_db.is_dir(),
-        "precondition: temporal.db must be a directory to make SQLite open fail"
-    );
+    // Build a real temporal.db so guard 2 (`!temporal.db.exists()`) passes.
+    // Without guard 1, `read_temporal_meta` would reach the SQLite open and
+    // increment TEMPORAL_META_READ_COUNT.
+    let db_path = cache_dir.join("temporal.db");
+    {
+        rskim_search::TemporalDb::open(&db_path).unwrap();
+    }
+    super::plant_meta_raw(&db_path, rskim_search::META_GIT_HEAD, &"a".repeat(40));
 
-    // C5-R: resolved HEAD — advisory must short-circuit without touching the DB.
+    // Snapshot the counter before the guarded calls.
+    let before = TEMPORAL_META_READ_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+    // C5-R: resolved HEAD — guard 1 must short-circuit before any DB open.
     let sha = "a".repeat(40);
     super::warn_if_temporal_unverifiable(&cache_dir, &HeadState::Resolved(sha));
 
-    // C5-N: not-a-repo — advisory must also short-circuit.
+    // C5-N: not-a-repo — guard 1 must also short-circuit.
     super::warn_if_temporal_unverifiable(&cache_dir, &HeadState::NotARepo);
 
-    // Both calls completed without error → the guard fires before any SQLite open.
+    // Assert zero DB opens: the counter must not have moved across either call.
+    let after = TEMPORAL_META_READ_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+    let delta = after.wrapping_sub(before);
+    assert_eq!(
+        delta, 0,
+        "AC24: guard 1 (!matches!(head, Unresolved)) must short-circuit before any \
+         SQLite open for HeadState::Resolved and HeadState::NotARepo; \
+         TEMPORAL_META_READ_COUNT delta = {delta} — guard is missing or bypassed",
+    );
 }
 
 // ============================================================================

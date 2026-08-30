@@ -270,17 +270,8 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
     }
 
     // AC31(c): nothing written per-worktree.
-    let wt_gitdir = {
-        let content = fs::read_to_string(worktree.join(".git")).unwrap();
-        let target = content
-            .lines()
-            .find(|l| l.starts_with("gitdir:"))
-            .unwrap()
-            .strip_prefix("gitdir:")
-            .unwrap()
-            .trim();
-        std::path::PathBuf::from(target)
-    };
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = super::super::staleness::resolve_git_dir(&worktree).unwrap();
     assert!(
         !wt_gitdir.join("hooks").exists(),
         "AC31(c): no per-worktree hooks directory may be created ({wt_gitdir:?})"

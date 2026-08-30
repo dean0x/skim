@@ -42,6 +42,8 @@ pub(super) use super::gitdir::{
 
 // Re-export temporal-DB items (owned by temporal_state.rs).
 #[cfg(test)]
+pub(super) use super::temporal_state::TEMPORAL_META_READ_COUNT;
+#[cfg(test)]
 pub(super) use super::temporal_state::temporal_anchor_state;
 pub(super) use super::temporal_state::{
     AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_db_is_stale,
