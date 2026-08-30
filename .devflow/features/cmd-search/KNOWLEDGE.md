@@ -1,7 +1,7 @@
 ---
 feature: cmd-search
 name: Search CLI (skim search subcommand)
-description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, binary manifest, SKFM, MANIFEST_FORMAT_VERSION, version_matches, manifest_stale, total-on-disk size, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, cochange_partner_paths, temporal_build, build_lock, AstNgramCache, CachedAstEntry, CompositeWeights6, --weights, layers_matched, AstResult, format_ast_json, format_ast_text, recover_line, read_line_at, resolve_git_dir, is_hex_sha, warn_skip, MIN_COCHANGE_JACCARD, LOCK_POLL_MS, LOCK_DEADLINE_SECS, stderr prefix, skim search:, skim search [debug]:, skim_bin_path, query_substring_present, run_compound_query, filter_set, disjoint blast radius, accumulate_posting_tfs, collect_scored_results, temporal_annotation_tag, shrink_to_fit, postings_buf, WorkingTreeDelta, WorkingTreeChanged, scan_working_tree, freshness_entries, temporal_db_is_stale, try_rebuild_temporal_nonfatal, ValidityMarker, validity, weights_inert_notice, wilson_lower_bound, risk_score_wilson_decay, AD-378, AD-379, AD-376, AD-377."
+description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, binary manifest, SKFM, MANIFEST_FORMAT_VERSION, version_matches, manifest_stale, total-on-disk size, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, cochange_partner_paths, temporal_build, build_lock, AstNgramCache, CachedAstEntry, CompositeWeights6, --weights, layers_matched, AstResult, format_ast_json, format_ast_text, recover_line, read_line_at, resolve_git_dir, is_hex_sha, warn_skip, MIN_COCHANGE_JACCARD, LOCK_POLL_MS, LOCK_DEADLINE_SECS, stderr prefix, skim search:, skim search [debug]:, skim_bin_path, query_substring_present, run_compound_query, filter_set, disjoint blast radius, accumulate_posting_tfs, collect_scored_results, temporal_annotation_tag, shrink_to_fit, postings_buf, WorkingTreeDelta, WorkingTreeChanged, scan_working_tree, freshness_entries, temporal_db_is_stale, try_rebuild_temporal_nonfatal, ValidityMarker, validity, weights_inert_notice, wilson_lower_bound, risk_score_wilson_decay, AD-378, AD-379, AD-376, AD-377, AD-413-15, AD-413-16, AD-413-17, HeadState, git_head_state, resolve_common_dir, resolve_repo_toplevel, ReanchorPolicy, AnchorState, temporal_anchor_state, anchor_state_on_db, warn_if_temporal_unverifiable, warn_if_temporal_unverifiable_at, read_temporal_meta, RefreshOutcome, resolve_hooks_dir, SHARED_HOOKS_SCOPE_MSG, HooksOutcome, create_real_git_worktree, apply_scope_filter, record_temporal_anchor, gitdir.rs, temporal_state.rs."
 category: architecture
 directories: [crates/rskim/src/cmd/search/]
 referencedFiles:
@@ -18,9 +18,11 @@ referencedFiles:
   - crates/rskim/src/cmd/search/hooks.rs
   - crates/rskim/src/cmd/search/temporal_build.rs
   - crates/rskim/src/cmd/search/build_lock.rs
+  - crates/rskim/src/cmd/search/gitdir.rs
+  - crates/rskim/src/cmd/search/temporal_state.rs
 created: 2026-06-21
-updated: 2026-07-01
-version: 5
+updated: 2026-08-30
+version: 6
 ---
 
 # Search CLI (skim search subcommand)
@@ -43,8 +45,10 @@ crate). This module owns:
 - Manifest sidecar — file content hashes for incremental build (`manifest.rs`)
 - File walk and project root discovery (`walk.rs`)
 - Snippet extraction (`snippet.rs`)
-- Git hook installation (`hooks.rs`)
+- Git hook installation with linked-worktree routing (`hooks.rs`)
 - Build mutex (`build_lock.rs`)
+- Git plumbing — HEAD resolution, linked-worktree gitdir, commondir, ancestor walk (`gitdir.rs`)
+- Temporal DB anchor management — repository anchor, staleness gate, unverifiable advisory (`temporal_state.rs`)
 
 ## Module Structure (complete)
 
@@ -59,10 +63,17 @@ cmd/search/
   query.rs              — execute_query_with_manifest; format_json_output; format_text_output;
                           temporal_annotation_tag (array-of-options+flatten idiom, no mut Vec);
                           weights_inert_notice; candidate_pool
-  staleness.rs          — StalenessCheck; check_staleness; auto_refresh_if_stale;
-                          read_git_head; resolve_git_dir; is_hex_sha;
-                          WorkingTreeDelta; scan_working_tree; temporal_db_is_stale;
-                          try_rebuild_temporal_nonfatal; create_real_git_repo (#[cfg(test)])
+  gitdir.rs             — HeadState; git_head_state; read_git_head; resolve_git_dir;
+                          resolve_common_dir; resolve_repo_toplevel; is_hex_sha
+  temporal_state.rs     — ReanchorPolicy; AnchorState; temporal_anchor_state;
+                          anchor_state_on_db; read_temporal_meta (private);
+                          temporal_db_is_stale; warn_if_temporal_unverifiable;
+                          warn_if_temporal_unverifiable_at; try_rebuild_temporal_nonfatal
+  staleness.rs          — StalenessCheck; check_staleness; RefreshOutcome;
+                          auto_refresh_if_stale; WorkingTreeDelta; scan_working_tree;
+                          re-exports from gitdir + temporal_state (see sub-module layout);
+                          create_real_git_repo; create_real_git_repo_with_dates;
+                          create_real_git_worktree; plant_meta_raw (#[cfg(test)])
   types.rs              — SearchAction, Flags, QueryConfig, IndexConfig, IndexResult,
                           ResolvedResult, QueryOutput, WalkEntry, ProcessedFile, SkipReason,
                           TemporalSort, TemporalAnnotation, SnippetLine, SnippetContext
@@ -81,7 +92,10 @@ cmd/search/
                           normalize_rel_path (now pub(super) for scan_working_tree)
   snippet.rs            — extract_snippet context window from file content;
                           query_substring_present (thin delegate → rskim_search::query_substring_present)
-  hooks.rs              — install_search_hooks; remove_search_hooks (git post-commit/merge)
+  hooks.rs              — resolve_hooks_dir (AD-413-15: routes to <commondir>/hooks for
+                          linked worktrees; gitdir/hooks for plain repos + submodules);
+                          install_search_hooks; remove_search_hooks
+                          (git post-commit/post-merge/post-checkout)
   build_lock.rs         — acquire; acquire_bounded (inner testable impl); LOCK_POLL_MS=200;
                           LOCK_DEADLINE_SECS=120; advisory .skim-build.lock mutex
   *_tests.rs            — co-located test files included via #[path] for each module
@@ -108,7 +122,8 @@ Accepted flags for `skim search`:
 --rebuild          Force full rebuild from scratch
 --update           Auto-refresh if stale (git HEAD changed)
 --stats [--json]   Show index statistics (now shows true on-disk sizes, #380)
---install-hooks    Install git post-commit/merge hooks for auto-refresh
+--install-hooks    Install git post-commit/merge/checkout hooks for auto-refresh
+                     (writes to <commondir>/hooks for linked worktrees, AD-413-15)
 --remove-hooks     Remove skim git hooks
 --json / -j        Output results as JSON
 --limit N / -n N   Max results (default: 20; equals form --limit=N supported)
@@ -335,7 +350,7 @@ display consumers (e.g. `--stats`) show the real HEAD.
 - **Never walks up**: this function resolves ONE directory; ancestor discovery is in `git_head_state` and `walk::discover_project_root`.
 
 **`git_head_state(project_root) -> HeadState`** (#413): three-state HEAD classifier.
-- `resolved` — HEAD resolves to a commit SHA; includes linked worktrees (via `commondir` ladder: probe 1 = worktree-local loose ref, probe 2 = commondir loose ref, probe 3 = commondir `packed-refs`, probe 4 = commondir `packed-refs` via symref) and subdirectory roots (adopted via nearest enclosing repo, AD-413-14).
+- `resolved` — HEAD resolves to a commit SHA; includes linked worktrees (via `commondir` ladder: probe 1 = worktree-local loose ref, probe 2 = commondir loose ref, probe 3 = commondir `packed-refs`, probe 4 = worktree-private `packed-refs` (pre-#413 fallback, kept for monotonicity)) and subdirectory roots (adopted via nearest enclosing repo, AD-413-14).
 - `unresolved` — git dir found but HEAD could not be resolved (unborn branch, unsupported ref backend, corrupt HEAD).
 - `not_a_repo` — no `.git` entry at `project_root` or within `MAX_ANCESTORS`.
 Exposed in `--stats --json` as `git_head_state` key (AD-413-13). Per-worktree ref namespaces (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/`) are never redirected to the commondir.
@@ -346,12 +361,14 @@ Resolution order: `resolve_git_dir` OR `resolve_repo_toplevel` → read `HEAD` �
 **`is_hex_sha(s) -> bool`**: accepts both 40-char (SHA-1) and 64-char (SHA-256)
 hex strings (for `extensions.objectFormat = sha256` repos).
 
-`auto_refresh_if_stale(root, cache_dir, analytics) -> anyhow::Result<(bool, FileManifest)>`
+`auto_refresh_if_stale(root, cache_dir, analytics, reanchor: ReanchorPolicy) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)>`
 
-The primary entry point used by all query paths. Returns `(refreshed, manifest)`.
+The primary entry point used by all query paths. Returns `(outcome, manifest, head_state)`.
 
-**HEAD threading (O-A / #289)**: `read_git_head(root)` is called ONCE at function
-entry; the result is threaded into `rebuild_temporal` and `temporal_db_is_stale`.
+**HEAD threading (O-A / #289)**: `git_head_state(root)` is called ONCE at function
+entry; the result is threaded into `rebuild_temporal`, `temporal_db_is_stale`, and
+returned as `HeadState` to callers (AD-413 Finding 2 — avoids a second full
+HEAD-ladder traversal on every query).
 
 **Self-heal ordering (applies ADR-006)**: in combined text+`--ast` queries and
 standalone `--ast` queries, `auto_refresh_if_stale` is called BEFORE opening the
@@ -368,6 +385,37 @@ case the rebuild proceeds. Callers should not distinguish `WorkingTreeChanged` f
 **Decision O-B**: `check_temporal_staleness` is `#[cfg(test)]` only — it is NOT
 called from any production query path.
 
+**AD-413-16 — Repository anchor (`meta.git_toplevel`)**:
+
+Subdirectory roots adopt the nearest enclosing git repository (`resolve_repo_toplevel`).
+To prevent temporal data from one repository being silently served for a different
+repository after a root move or symlink, the adopted toplevel path is persisted as
+`meta.git_toplevel` in `temporal.db` and checked on every temporal query.
+
+`AnchorState` (in `temporal_state.rs`):
+- `NotAdopted` — root owns its own `.git` — gate returns immediately (zero DB reads, AC32).
+- `Absent` — no `temporal.db` or no `git_toplevel` row — adopt and record on the next build.
+- `Agrees` — persisted toplevel matches the live resolution — data is trustworthy.
+- `Differs { recorded: PathBuf, live: PathBuf }` — DIFFERENT repository — refuse to serve data.
+
+`temporal_anchor_state(cache_dir, root) -> AnchorState`: standalone check (opens a
+separate read-only SQLite connection). Used when no live DB handle is available.
+
+`anchor_state_on_db(db, root) -> AnchorState`: same check against an **already-open**
+`TemporalDb` — avoids a second SQLite open when the caller already holds the handle
+(used by `open_temporal_db_for` in `temporal.rs` to enforce the anchor-refusal guard
+in one funnel, AD-413-16 Finding 4).
+
+Query arms (`open_temporal_db_for`) refuse on `Differs` — exit 0 with no rows served.
+Explicit build arms (`--build`/`--rebuild`/`--update`) pass `ReanchorPolicy::Allow` and
+re-anchor loudly on `Differs`.
+
+`ReanchorPolicy` (in `temporal_state.rs`): `Allow` (build arms) | `Refuse` (query and
+self-heal arms). Passed as `reanchor` into `auto_refresh_if_stale` and
+`try_rebuild_temporal_nonfatal` to gate the `record_temporal_anchor` write in
+`temporal_build.rs` (PF-017: a plain lexical query must NEVER silently retarget
+`temporal.db`).
+
 ## Temporal Index Build (temporal_build.rs)
 
 `rebuild_temporal(root, cache_dir, head, now_epoch) -> anyhow::Result<()>`
@@ -377,8 +425,18 @@ Called from `try_rebuild_temporal_nonfatal` when the lexical index was refreshed
 2. `compute_file_risk_scores` + `compute_file_temporal_stats` → per-file scores
 3. `build_cochange_rows(history)` → `Vec<CochangeRow>` (inline Jaccard, no external builder)
 4. `build_hotspot_rows` + `build_risk_rows` → `Vec<HotspotRow>` / `Vec<RiskRow>`
+4a. `apply_ghost_filter` — removes rows for files no longer on disk (AD-408-1).
+4b. **AD-413-17**: `apply_scope_filter` — when `root` is a proper subdirectory of the
+    git worktree toplevel, strip the scope prefix from all row paths and retain only
+    rows within the subtree. When `root == ghost_root` (plain repo), scope is `None`
+    and this step is a no-op. Non-UTF-8 path components skip the filter with a debug
+    notice rather than mangling the prefix. Cochange rows where only one side falls
+    within the scope are dropped (both-sides rule).
 5. `build_lock::acquire("skim search", cache_dir)` — acquire lock AFTER pure compute
-6. `TemporalDb::open(db_path)` + `db.sync(hotspots, risks, cochanges, head)`
+6. `TemporalDb::open(db_path)` + `db.sync(hotspots, risks, cochanges, head)` then
+   `record_temporal_anchor` (AD-413-16): writes `meta.git_toplevel` as a SECOND
+   transaction; process death between sync and anchor leaves Absent (not Differs),
+   so the next build adopts cleanly rather than refusing.
 
 **`build_risk_rows` uses `risk_score_wilson_decay` (#378)**: computes
 `RiskRow.risk_score = risk_score_wilson_decay(scores[path].fix_density,
@@ -891,10 +949,16 @@ Files:
 - `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`;
   `validate_ast_pattern`; `resolve_ast_scored`; `run_ast_standalone`;
   `read_line_at`; re-exports `AstResult`/`format_ast_json`/`format_ast_text`
-- `crates/rskim/src/cmd/search/staleness.rs` — `auto_refresh_if_stale`;
-  `check_staleness`; `read_git_head`; `resolve_git_dir`; `is_hex_sha`;
-  `WorkingTreeDelta`; `scan_working_tree`; `temporal_db_is_stale`;
-  `try_rebuild_temporal_nonfatal`; `create_real_git_repo` (#[cfg(test)])
+- `crates/rskim/src/cmd/search/gitdir.rs` — `HeadState`; `git_head_state`;
+  `read_git_head`; `resolve_git_dir`; `resolve_common_dir`; `resolve_repo_toplevel`;
+  `is_hex_sha`
+- `crates/rskim/src/cmd/search/temporal_state.rs` — `ReanchorPolicy`; `AnchorState`;
+  `temporal_anchor_state`; `anchor_state_on_db`; `temporal_db_is_stale`;
+  `warn_if_temporal_unverifiable`; `try_rebuild_temporal_nonfatal`
+- `crates/rskim/src/cmd/search/staleness.rs` — `StalenessCheck`; `check_staleness`;
+  `RefreshOutcome`; `auto_refresh_if_stale`; `WorkingTreeDelta`; `scan_working_tree`;
+  re-exports from `gitdir` + `temporal_state`;
+  `create_real_git_repo`; `create_real_git_worktree` (#[cfg(test)])
 - `crates/rskim/src/cmd/search/query.rs` — `execute_query_with_manifest`;
   `execute_query` (test-only); JSON/text formatters; `weights_inert_notice`;
   `candidate_pool`
