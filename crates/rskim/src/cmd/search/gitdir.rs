@@ -46,7 +46,7 @@ const MAX_PACKED_REFS_BYTES: u64 = 1 << 20; // 1 MiB
 /// "git repo whose HEAD I could not resolve" are different facts, and collapsing them
 /// is what made #413 silent and its message wrong (avoids PF-016). A gitdir with no
 /// `HEAD` file is `NotARepo`, not `Unresolved`, or `mkdir .git` gets the opposite lie.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum HeadState {
     /// No `.git` entry found at `project_root` or any enclosing ancestor.
     NotARepo,
@@ -132,9 +132,12 @@ pub(super) fn resolve_repo_toplevel(project_root: &Path) -> Option<PathBuf> {
         return None;
     }
     let canonical = project_root.canonicalize().ok()?;
-    // Bounded ancestor walk (same MAX_ANCESTORS constant as the builder walk).
-    let top = super::walk::discover_project_root(&canonical).ok()?;
-    // `discover_project_root` returns the start path when no enclosing repo is found.
+    // Use the from-canonical variant to skip the redundant canonicalize() that
+    // discover_project_root would perform on the already-canonical path
+    // (O(path depth) lstat/readlink syscalls — measured, fixed per finding F2).
+    let top = super::walk::discover_project_root_from_canonical(&canonical);
+    // `discover_project_root_from_canonical` returns the start path when no
+    // enclosing repo is found.
     if top == canonical {
         return None;
     }
@@ -282,19 +285,23 @@ fn read_loose_ref(dir: &Path, ref_path: &str) -> Option<String> {
 /// [`MAX_PACKED_REFS_BYTES`], or the ref is not listed.
 ///
 /// The read is capped at 1 MiB (defense-in-depth: a crafted checkout with an
-/// enormous `packed-refs` must not drive the process OOM).
+/// enormous `packed-refs` must not drive the process OOM).  The scan uses
+/// `BufReader::lines()` so that O(1) memory is used regardless of file size —
+/// only one line is in memory at a time, and the existing early return stops
+/// reading as soon as the target ref is found.  The `take()` cap is preserved
+/// for the OOM guard; hitting it surfaces as an `Ok("")` EOF, not an error.
 fn read_packed_ref(dir: &Path, ref_path: &str) -> Option<String> {
-    use std::io::Read as _;
+    use std::io::{BufRead as _, BufReader, Read as _};
 
     let packed_refs_path = dir.join("packed-refs");
-    let mut content = String::new();
-    std::fs::File::open(&packed_refs_path)
-        .ok()?
-        .take(MAX_PACKED_REFS_BYTES)
-        .read_to_string(&mut content)
-        .ok()?;
-    for line in content.lines() {
-        // Skip comment lines
+    let file = std::fs::File::open(&packed_refs_path).ok()?;
+    let reader = BufReader::new(file.take(MAX_PACKED_REFS_BYTES));
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break, // I/O error mid-read — stop scanning
+        };
+        // Skip comment/peeled-tag lines
         if line.starts_with('#') || line.starts_with('^') {
             continue;
         }

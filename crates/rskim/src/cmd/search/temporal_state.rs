@@ -47,6 +47,24 @@ pub(super) enum ReanchorPolicy {
 // Lightweight meta reader (performance-optimised — no WAL / migrations)
 // ============================================================================
 
+/// Read a single TEXT value from an already-open `meta` table connection.
+///
+/// Low-level primitive used by [`temporal_db_is_stale`] so that function can
+/// issue both its key reads against **one** connection — avoiding a second
+/// `db_path.exists()` stat + `Connection::open_with_flags` + `sqlite_master`
+/// schema parse per query (AC32 / ADR-003).
+///
+/// Also used directly from [`read_temporal_meta`] so the query text lives in
+/// exactly one place.
+fn read_meta_on(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
 /// Read a single TEXT value from the `meta` table of `temporal.db`.
 ///
 /// Opens a lightweight read-only connection (no WAL pragma, no permission
@@ -54,9 +72,10 @@ pub(super) enum ReanchorPolicy {
 /// `None` when the file is absent, the connection cannot be opened, or the key
 /// has no row.
 ///
-/// Shared by [`temporal_db_is_stale`] (for both `git_head` and `data_version`
-/// keys), [`warn_if_temporal_unverifiable`] (for `git_head`), and
-/// [`temporal_anchor_state`] (for `git_toplevel`) — one implementation, no drift.
+/// Shared by [`warn_if_temporal_unverifiable`] (for `git_head`) and
+/// [`temporal_anchor_state`] (for `git_toplevel`) — single-key callers that
+/// each open their own connection.  [`temporal_db_is_stale`] opens its own
+/// connection and calls [`read_meta_on`] directly to avoid a second open.
 ///
 /// # Read/write symmetry note
 ///
@@ -75,12 +94,7 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    conn.query_row(
-        "SELECT value FROM meta WHERE key = ?1",
-        rusqlite::params![key],
-        |row| row.get(0),
-    )
-    .ok()
+    read_meta_on(&conn, key)
 }
 
 // ============================================================================
@@ -96,12 +110,14 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
 ///
 /// # Performance (ADR-003)
 ///
-/// Delegates to [`read_temporal_meta`] which uses the same lightweight
-/// read-only SQLite open (no WAL pragma, no permission reset, no migrations).
-/// This avoids the full `TemporalDb::open` cost on the steady-state
-/// Current-path where the DB is checked but then immediately re-opened by the
-/// dispatch arm.  The caller is responsible for the full `TemporalDb::open`
-/// when it actually queries the DB.
+/// Opens ONE lightweight read-only SQLite connection (no WAL pragma, no
+/// permission reset, no migrations) and reads BOTH `META_GIT_HEAD` and
+/// `META_DATA_VERSION` against it via [`read_meta_on`].  A single open avoids
+/// the extra `db_path.exists()` stat + `Connection::open_with_flags` +
+/// `sqlite_master` schema parse that a second call to `read_temporal_meta`
+/// would incur — zero new overhead on the steady-state Current path where
+/// both checks are needed (AC32).  The full `TemporalDb::open` cost is
+/// deferred to the dispatch arm that actually queries the DB.
 ///
 /// # AD-TMP-2 / AD-TMP-3
 ///
@@ -127,8 +143,21 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         return true;
     }
 
+    // Open ONE read-only connection and issue BOTH key reads against it.
+    // Pre-diff: two `read_temporal_meta` calls each performed their own
+    // `db_path.exists()` stat + `Connection::open_with_flags` + first-statement
+    // `sqlite_master` schema parse — an avoidable +1 open on every query on the
+    // steady-state Current path (AC32 / ADR-003).
+    let conn = match rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return true, // unreadable → treat as stale
+    };
+
     // Check 1: HEAD match — absent row or mismatch both report stale.
-    let stored_head = read_temporal_meta(cache_dir, rskim_search::META_GIT_HEAD);
+    let stored_head: Option<String> = read_meta_on(&conn, rskim_search::META_GIT_HEAD);
     if stored_head.as_deref() != Some(current_head) {
         return true;
     }
@@ -142,7 +171,7 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
     // An absent or non-integer stored value is treated as stale (pre-fix DB).
     // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
     // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
-    let stored_version = read_temporal_meta(cache_dir, rskim_search::META_DATA_VERSION);
+    let stored_version: Option<String> = read_meta_on(&conn, rskim_search::META_DATA_VERSION);
     match stored_version.as_deref() {
         Some(v) => match v.parse::<u64>() {
             Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
@@ -199,7 +228,7 @@ pub(super) fn warn_if_temporal_unverifiable(cache_dir: &Path, head: &HeadState) 
 /// AD-413-16: the toplevel that produced temporal rows is persisted as
 /// `meta.git_toplevel` so query arms can refuse rather than silently serving
 /// data from a different repository when the indexed root has been retargeted.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum AnchorState {
     /// Root has its own `.git` — the anchor mechanism is irrelevant (plain repo or submodule).
     /// Gate 1 of `temporal_anchor_state` returns this for every non-adopted root (AC32).

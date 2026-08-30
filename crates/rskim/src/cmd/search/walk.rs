@@ -194,6 +194,29 @@ pub(super) fn discover_project_root(start: &Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
+/// [`discover_project_root`] variant that skips the `canonicalize()` call.
+///
+/// Use this when the caller already holds a canonical path — for example,
+/// [`super::gitdir::resolve_repo_toplevel`] calls `canonicalize()` before
+/// invoking this function, so passing the result here avoids a redundant
+/// `realpath(3)` (O(path depth) lstat/readlink syscalls).
+///
+/// Returns `canonical` unchanged when no enclosing `.git` is found, mirroring
+/// the fallback behaviour of [`discover_project_root`].
+pub(super) fn discover_project_root_from_canonical(canonical: &Path) -> PathBuf {
+    let mut current = canonical;
+    for _ in 0..MAX_ANCESTORS {
+        if current.join(".git").exists() {
+            return current.to_path_buf();
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    canonical.to_path_buf()
+}
+
 // ============================================================================
 // File walking (batch) — retained for tests; streaming pipeline uses walk_metadata
 // ============================================================================
