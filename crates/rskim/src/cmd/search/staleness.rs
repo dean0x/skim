@@ -122,9 +122,12 @@ pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
     let head_str = head_content.trim();
 
     if let Some(ref_path) = head_str.strip_prefix("ref: ") {
-        // Validate the ref path to prevent path traversal attacks via a
-        // crafted `.git/HEAD` (e.g. `ref: ../../etc/shadow`).
-        if !ref_path.starts_with("refs/") {
+        // AD-413-6: a symbolic HEAD must both start with `refs/` AND pass
+        // `crate::cmd::is_repo_relative_safe` (the ADR-008 canonical guard). The prefix check
+        // alone let `ref: refs/../../../outside-sha` read a file outside the root and PERSIST it
+        // into `index.skfiles` and `temporal.db`'s `META_GIT_HEAD` (measured, #413).
+        if !ref_path.starts_with("refs/") || !crate::cmd::is_repo_relative_safe(Path::new(ref_path))
+        {
             return None;
         }
         // Symbolic ref — resolve through loose refs then packed-refs

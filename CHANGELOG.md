@@ -130,6 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON output is unchanged.
 
 ### Fixed
+- **`skim search` symbolic-ref path validation tightened** (#482) — a `HEAD` file
+  containing `ref: refs/../../../outside-sha` (a path that starts with `refs/` but
+  escapes the git directory via `..` components) was read and its out-of-tree SHA was
+  persisted into `index.skfiles` and `temporal.db`.  Fixed by applying the ADR-008
+  canonical guard (`is_repo_relative_safe`) in addition to the existing `refs/` prefix
+  check, so any symbolic-ref path containing `..`, an absolute root `/`, or a Windows
+  prefix is rejected before the file is opened.
 - **`skim search --near` silently dropped when `--phrase` was also set** (#403):
   Two independent layers each had the same bug: reader.rs used `if want_phrase { phrase_alignments } else { near_match }`,
   and query.rs used `if phrase { Phrase } else if near { Near }`.  In both cases `--near N`

@@ -291,6 +291,56 @@ fn test_read_git_head_rejects_path_traversal_ref() {
     );
 }
 
+/// AC9 / S9 — a ref path starting with `refs/` but containing `..` components
+/// (three levels, e.g. `refs/../../../outside-sha`) escapes the git directory.
+/// The old `starts_with("refs/")` guard did not normalise `..` and would read
+/// the out-of-tree file and persist its SHA.  AD-413-6 closes the hole.
+///
+/// MANDATORY PRECONDITION (PF-007): `git_dir.join(ref_path)` must be an existing
+/// file — without it the test is vacuous (the old code returns `None` because the
+/// file is absent, not because the guard fired).
+#[test]
+fn test_read_git_head_rejects_ref_path_escaping_the_git_dir() {
+    // Build:  <parent>/
+    //           repo/.git/refs/  ← project root with a real .git/refs dir
+    //           outside-sha      ← the escape target planted at parent level
+    let parent = tempdir().unwrap();
+    let project_root = parent.path().join("repo");
+    let git_dir = project_root.join(".git");
+    fs::create_dir_all(git_dir.join("refs")).unwrap();
+
+    // Plant the escape SHA outside the project root.
+    let escape_sha = "2".repeat(40);
+    let escape_target = parent.path().join("outside-sha");
+    fs::write(&escape_target, format!("{escape_sha}\n")).unwrap();
+
+    // The ref path starts with "refs/" (passes the old prefix-only guard) but
+    // has three ".." components that walk up past the git dir and the project root.
+    let ref_path = "refs/../../../outside-sha";
+
+    // MANDATORY PRECONDITION: assert the escape target is actually reachable via
+    // git_dir.join(ref_path) so the test fails pre-fix, not vacuously.
+    assert!(
+        git_dir.join(ref_path).exists(),
+        "precondition: git_dir.join(ref_path) must reach the escape target — \
+         if this fails the OS cannot resolve the path and the test is vacuous"
+    );
+
+    fs::write(git_dir.join("HEAD"), format!("ref: {ref_path}\n")).unwrap();
+
+    let result = read_git_head(&project_root);
+    assert!(
+        result.is_none(),
+        "ref path escaping the git dir via '..` must be rejected, got {result:?}"
+    );
+    // Belt-and-suspenders: the escape SHA must never appear in the result.
+    assert_ne!(
+        result.as_deref(),
+        Some(escape_sha.as_str()),
+        "escape SHA must not be returned"
+    );
+}
+
 #[test]
 fn test_read_git_head_accepts_sha256_hash() {
     let dir = tempdir().unwrap();
