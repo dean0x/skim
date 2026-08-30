@@ -517,29 +517,33 @@ impl Language {
             // SAFETY: callers must only invoke this for is_serde_based() languages.
             _ => unreachable!("transform_serde_with_line_map called for non-serde language"),
         };
+        // E5: compute source line count ONCE — serde transforms restructure the text
+        // so raw_result has far fewer lines than source (e.g. 29 vs 327 for ci.yml,
+        // a 11.3× understatement). The marker must state SOURCE lines omitted so
+        // agents know the true scope of what they cannot see (ADR-011 class 1).
+        let source_line_count = source.lines().count();
+
         // Apply max_lines truncation (no meaningful line map for restructured output)
-        // (B5: pass elision_hint through).
-        // NOTE: source_line_count=None here; E5 (next commit) wires up source-space
-        // counts for the serde path.
+        // (B5: pass elision_hint through; E5: pass source_line_count for honest counts).
         let result = if let Some(max_lines) = config.max_lines {
             crate::transform::truncate::simple_line_truncate(
                 &raw_result,
                 self,
                 max_lines,
                 config.elision_hint.as_deref(),
-                None,
+                Some(source_line_count),
             )?
         } else {
             raw_result
         };
-        // Apply last_lines truncation (B5: pass elision_hint through).
+        // Apply last_lines truncation (B5: pass elision_hint through; E5: source count).
         let result = if let Some(n) = config.last_lines {
             crate::transform::truncate::simple_last_line_truncate(
                 &result,
                 self,
                 n,
                 config.elision_hint.as_deref(),
-                None,
+                Some(source_line_count),
             )?
         } else {
             result
