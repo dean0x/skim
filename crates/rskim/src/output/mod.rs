@@ -612,7 +612,10 @@ pub(crate) fn rewrite_origin() -> Option<String> {
 ///
 /// The class label names what was elided so the reader knows what information
 /// they are missing without needing to know skim internals.
-fn mode_class_label(mode_str: &str) -> &'static str {
+///
+/// Made `pub(crate)` by D1 so downstream callers (e.g. `fidelity::remedy_for`
+/// contexts) can name the elided class without duplicating the label table.
+pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
     match mode_str {
         "pseudo" => "pseudo view: bodies and syntactic detail removed",
         "minimal" => "minimal view: comments and bodies removed",

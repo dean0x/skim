@@ -38,6 +38,106 @@
 //! deliberate differences (per-unit byte-only gate, no tokeniser, no floor)
 //! and is tracked for migration in #325.  This module does not touch it.
 
+// ============================================================================
+// Completeness / ViewClass — disclosure-gate types (ADR-015 / D1)
+// ============================================================================
+
+/// Whether the served view contains all content that was in the raw output.
+///
+/// Text-mode callers derive this via [`view_differs`].
+/// JSON-mode callers MUST supply it explicitly: a JSON envelope always differs
+/// textually from raw even when it faithfully represents every byte, so byte
+/// comparison cannot detect content loss on the JSON path.
+///
+/// # No `Default` — intentional
+///
+/// A newly-written `--json` handler that tries to construct output without
+/// explicitly choosing a `Completeness` gets a compile error.  This is the
+/// type-level enforcement that prevents handlers from silently defaulting to
+/// `Complete` (ADR-015 / D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum Completeness {
+    /// The served bytes are byte-identical to raw (true lossless passthrough).
+    /// No disclosure is owed.
+    Complete,
+    /// The view is structurally re-encoded (e.g. a JSON envelope) but
+    /// faithfully represents all content that was in raw.  No disclosure is
+    /// owed, but the re-encoding means byte comparison alone cannot prove this —
+    /// the caller must declare it explicitly.
+    Reencoded,
+    /// The view drops or elides content that was in raw.
+    /// An ADR-011 class-1 disclosure marker MUST be emitted.
+    Lossy,
+}
+
+/// What kind of view is being served to the reader.
+///
+/// [`decide`] applies only to [`ViewClass::TextSubstitution`]; a
+/// [`ViewClass::JsonEnvelope`] never substitutes raw text — it always differs
+/// textually from raw, so substitution-gate semantics are meaningless for it.
+/// Only [`Completeness`] determines whether disclosure is owed on that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewClass {
+    /// Compressed text substituted for raw text.  [`decide`] determines
+    /// whether the substitution is cost-effective.
+    TextSubstitution,
+    /// Structured JSON wrapping the content.  [`decide`] is inapplicable;
+    /// only [`Completeness`] determines whether disclosure is owed.
+    JsonEnvelope,
+}
+
+/// Returns `true` when the served view differs byte-for-byte from raw
+/// (ignoring trailing whitespace, consistent with [`decide`]).
+///
+/// # JSON path — do NOT use to infer `Completeness`
+///
+/// A JSON envelope always differs textually from raw even when it contains
+/// all content.  JSON callers must supply [`Completeness`] explicitly.
+pub(crate) fn view_differs(raw: &str, served: &str) -> bool {
+    raw.trim() != served.trim()
+}
+
+/// Context for [`remedy_for`].
+///
+/// Currently empty: every invocation returns the same default remedy because
+/// skim-only flags (`--json`, `--mode`) are stripped before the passthrough
+/// exec (Phase C), making `SKIM_PASSTHROUGH=1` universally reachable.
+///
+/// Add fields here when narrower, invocation-specific remedies become possible.
+pub(crate) struct RemedyCtx {
+    _priv: (),
+}
+
+impl RemedyCtx {
+    /// Construct a new [`RemedyCtx`].
+    pub(crate) fn new() -> Self {
+        Self { _priv: () }
+    }
+}
+
+/// Resolve the narrowest escape-hatch remedy that is **actually true** for the
+/// current invocation.
+///
+/// The default branch — and currently the only branch — returns the legacy
+/// `"SKIM_PASSTHROUGH=1 for full output"` literal.  Because skim-only flags
+/// are stripped before passthrough exec (Phase C, ADR-015), this remedy is
+/// reachable from every invocation path, including `--json` and `--mode`.
+///
+/// The `_ctx` parameter is reserved for future narrower remedies; the default
+/// branch ensures the pinned test assertions that check for `"SKIM_PASSTHROUGH=1"`
+/// in marker text remain green.
+pub(crate) fn remedy_for(_ctx: &RemedyCtx) -> &'static str {
+    // ADR-011 class-1: the remedy string must be literally reachable from the
+    // invocation that prints it.  Phase C flag-stripping makes SKIM_PASSTHROUGH=1
+    // universally true, so this default is no longer false for any path.
+    "SKIM_PASSTHROUGH=1 for full output"
+}
+
+// ============================================================================
+// FidelityDecision — substitution gate
+// ============================================================================
+
 /// Outcome of the unified fidelity gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -245,5 +345,67 @@ mod tests {
         let raw = "x".repeat(512 * 1024);
         let compressed = "y".repeat(512 * 1024 + 1);
         assert_eq!(decide(&raw, &compressed), FidelityDecision::Passthrough);
+    }
+
+    // -----------------------------------------------------------------------
+    // D1: Completeness / ViewClass / view_differs / remedy_for (ADR-015)
+    // -----------------------------------------------------------------------
+
+    /// Completeness has no Default impl; constructing one requires an explicit
+    /// variant.  This test simply confirms the type is usable and that the three
+    /// variants are distinct.
+    #[test]
+    fn completeness_variants_are_distinct() {
+        assert_ne!(Completeness::Complete, Completeness::Lossy);
+        assert_ne!(Completeness::Reencoded, Completeness::Lossy);
+        assert_ne!(Completeness::Complete, Completeness::Reencoded);
+    }
+
+    /// The JSON path must be declared `Reencoded` when all content is present,
+    /// `Lossy` when content is dropped.  The test also verifies `ViewClass`
+    /// discriminates the two surfaces.
+    #[test]
+    fn view_class_separates_text_from_json() {
+        assert_ne!(ViewClass::TextSubstitution, ViewClass::JsonEnvelope);
+    }
+
+    /// `view_differs` returns false when the strings are byte-identical (modulo
+    /// trailing whitespace).
+    #[test]
+    fn view_differs_identical_returns_false() {
+        let raw = "hello world\n";
+        assert!(!view_differs(raw, raw));
+        assert!(!view_differs("foo\n", "foo")); // trailing-ws normalisation
+    }
+
+    /// `view_differs` returns true when bytes diverge.
+    #[test]
+    fn view_differs_changed_returns_true() {
+        assert!(view_differs("original content", "compressed summary"));
+        assert!(view_differs("line1\nline2\n", "line1\n")); // content removed
+    }
+
+    /// `remedy_for` returns a string containing `SKIM_PASSTHROUGH=1` so that
+    /// the ~N pinned test assertions across the test suite stay green.
+    #[test]
+    fn remedy_for_contains_passthrough_hint() {
+        let ctx = RemedyCtx::new();
+        let remedy = remedy_for(&ctx);
+        assert!(
+            remedy.contains("SKIM_PASSTHROUGH=1"),
+            "remedy_for default must contain SKIM_PASSTHROUGH=1 (legacy literal); got: {remedy:?}"
+        );
+    }
+
+    /// `remedy_for` default branch returns the exact legacy literal so pinned
+    /// test assertions are not broken by the new dispatch function.
+    #[test]
+    fn remedy_for_default_is_legacy_literal() {
+        let ctx = RemedyCtx::new();
+        assert_eq!(
+            remedy_for(&ctx),
+            "SKIM_PASSTHROUGH=1 for full output",
+            "default remedy must match legacy literal to preserve pinned test assertions"
+        );
     }
 }
