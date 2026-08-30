@@ -1,14 +1,15 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
+assertion_line: 260
 expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(15))"
 ---
-# ... (truncated)
+# ... (5 lines truncated)
 def calculate_sum(a: int, b: int) -> int:
      {...}
-# ... (truncated)
+# ... (1 lines truncated)
 def greet_user(name: str) -> str:
      {...}
-# ... (truncated)
+# ... (1 lines truncated)
 class Calculator:
     def add(self, x: int, y: int) -> int:
          {...}

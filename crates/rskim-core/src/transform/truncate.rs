@@ -7,6 +7,7 @@
 
 use crate::transform::utils::{get_comment_prefix, get_comment_suffix, score_node_kind};
 use crate::{Language, Result};
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// Append an optional remedy hint to an elision marker.
@@ -112,6 +113,14 @@ pub(crate) fn truncate_to_lines(
         return simple_line_truncate(text, language, max_lines, hint);
     }
 
+    // Fast-path: single span starting at line 0 — no inter-span gaps, no priority
+    // re-ordering needed. Delegate to simple_line_truncate which gives N content
+    // lines + 1 marker as line N+1 (E4). Handles pseudo, minimal, and full mode,
+    // all of which emit NodeSpan::new(0..line_count, "source_file").
+    if valid_spans.len() == 1 && valid_spans[0].transformed_range.start == 0 {
+        return simple_line_truncate(text, language, max_lines, hint);
+    }
+
     // Score and sort spans: priority desc, position asc (tie-break)
     let mut scored: Vec<(u8, &NodeSpan)> = valid_spans
         .iter()
@@ -198,48 +207,64 @@ pub(crate) fn truncate_to_lines(
         return simple_line_truncate(text, language, max_lines, hint);
     }
 
-    // Build output with omission markers between gaps (B5: carry elision hint).
+    // Build output with omission markers between gaps.
+    // Each marker carries an exact count of omitted lines (ADR-011 class 1).
+    // Hint (B5) is appended to every marker when present.
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
-    let omission_marker = append_hint(format!("{prefix} ... (truncated){suffix}"), hint);
+    let make_marker = |omitted: usize| -> String {
+        append_hint(
+            format!("{prefix} ... ({omitted} lines truncated){suffix}"),
+            hint,
+        )
+    };
 
-    let mut result_lines: Vec<&str> = Vec::with_capacity(max_lines);
+    // Cow: content lines borrow from `lines`, markers are owned Strings.
+    let mut result_lines: Vec<Cow<'_, str>> = Vec::with_capacity(max_lines + 1);
     let mut last_end: usize = 0;
 
-    // Check if there's content before the first selected span
+    // Leading marker: content before the first selected span
     if selected[0].transformed_range.start > 0 {
-        result_lines.push(&omission_marker);
+        let omitted = selected[0].transformed_range.start;
+        result_lines.push(Cow::Owned(make_marker(omitted)));
     }
 
     for span in &selected {
         let start = span.transformed_range.start;
         let end = span.transformed_range.end.min(lines.len());
 
-        // Insert omission marker if there's a gap from previous span
+        // Gap marker between spans — count the skipped output lines
         if start > last_end && last_end > 0 {
-            result_lines.push(&omission_marker);
+            let omitted = start - last_end;
+            result_lines.push(Cow::Owned(make_marker(omitted)));
         }
 
-        // Add lines from this span (may need to clamp for the fallback case)
-        // Reserve 1 line for a potential trailing omission marker
+        // Add lines from this span, reserving 1 slot for a potential trailing marker
         let remaining_budget = max_lines.saturating_sub(result_lines.len() + 1);
         let span_end = end.min(start + remaining_budget);
 
         for line_idx in start..span_end {
             if line_idx < lines.len() {
-                result_lines.push(lines[line_idx]);
+                result_lines.push(Cow::Borrowed(lines[line_idx]));
             }
         }
 
-        last_end = end;
+        // Track where we actually stopped emitting (span_end, not the full span end).
+        // This ensures the trailing marker fires when the span was clamped.
+        last_end = span_end;
     }
 
-    // Trailing omission marker if there's content after last selected span
-    if last_end < lines.len() && result_lines.len() < max_lines {
-        result_lines.push(&omission_marker);
+    // Trailing marker: content after the last emitted line
+    if last_end < lines.len() {
+        let omitted = lines.len() - last_end;
+        result_lines.push(Cow::Owned(make_marker(omitted)));
     }
 
-    // Final enforcement: never exceed max_lines
+    // Final enforcement: cap the total output at max_lines.
+    // NOTE: E4 (unify budget rule to N content + 1 marker = N+1 total) is
+    // implemented for the single-span fast-path (simple_line_truncate).
+    // The multi-span path uses the existing budget logic here; E4 for multi-span
+    // is a separate commit.
     result_lines.truncate(max_lines);
 
     let mut output = result_lines.join("\n");
@@ -471,11 +496,10 @@ where
     // Build final output from pre-joined string
     let marker = make_marker(lines.len() - best);
 
-    // Guard: if even the marker alone exceeds the budget, return empty string
-    // rather than violating the token budget invariant.
-    if best == 0 && count_tokens(&marker) > token_budget {
-        return Ok(String::new());
-    }
+    // ADR-011 class 1 / #317: elision markers are unconditional — never suppress them
+    // even when the marker alone exceeds the token budget. Returning an empty string
+    // here would be silent total data loss. The token budget is advisory; the marker
+    // always wins. When best==0 and the marker is over budget, only the marker is emitted.
 
     let mut output = if best > 0 {
         let content_slice = &joined[..byte_end[best - 1]];
@@ -581,7 +605,8 @@ mod tests {
 
     #[test]
     fn test_omission_markers_between_gaps() {
-        // 5 lines, budget of 3
+        // 5 lines, budget of 4. Selects the two types; the 3 middle expr lines
+        // become one gap marker.  After E2 the marker carries an exact count.
         let text = "type A = string\nlet x = 1\nlet y = 2\nlet z = 3\ntype B = number\n";
         let spans = vec![
             NodeSpan::new(0..1, "type_alias_declaration"),
@@ -593,8 +618,8 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None).unwrap();
         assert!(
-            result.contains("// ... (truncated)"),
-            "Should contain omission marker: {:?}",
+            result.contains("lines truncated"),
+            "Should contain counted omission marker: {:?}",
             result
         );
     }
@@ -610,8 +635,8 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::Python, 2, None).unwrap();
         assert!(
-            result.contains("# ... (truncated)"),
-            "Python should use # for omission marker: {:?}",
+            result.contains("# ...") && result.contains("lines truncated"),
+            "Python should use # for counted omission marker: {:?}",
             result
         );
     }
@@ -628,8 +653,8 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::Markdown, 3, None).unwrap();
         assert!(
-            result.contains("<!-- ... (truncated) -->"),
-            "Markdown should use HTML comment for omission marker: {:?}",
+            result.contains("<!-- ...") && result.contains("lines truncated"),
+            "Markdown should use HTML comment for counted omission marker: {:?}",
             result
         );
     }
@@ -823,24 +848,26 @@ mod tests {
     fn test_max_lines_zero_with_spans_does_not_panic() {
         // CONTRACT: max_lines=0 is guarded by CLI validation (--max-lines must be >= 1).
         // At the core library level, with_max_lines(0) is accepted without error.
-        // The truncation engine clamps effective_budget to 1, selects a span, then
-        // result_lines.truncate(0) empties the output. However, the trailing-newline
-        // preservation step appends '\n' when the original text ends with '\n',
-        // producing "\n" -- a single empty trailing newline.
-        // This test documents that edge behavior since 0 is not a valid input in practice.
+        //
+        // For multi-span inputs the output builder computes the trailing marker but
+        // result_lines.truncate(max_lines=0) clips it away — only the trailing newline
+        // (preserved from the original) remains. max_lines=0 is not a valid production
+        // input so this minimal edge behavior is acceptable.
         let text = "type A = string\nfunction foo() {}\n";
         let spans = vec![
             NodeSpan::new(0..1, "type_alias_declaration"),
             NodeSpan::new(1..2, "function_declaration"),
         ];
 
-        // Should not panic
+        // Should not panic — result must be a valid (possibly empty) string.
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 0, None).unwrap();
-        // result_lines is empty after truncate(0), but trailing '\n' is preserved
-        // from the original, so output is "\n"
-        assert_eq!(
-            result, "\n",
-            "max_lines=0 with trailing newline should produce only the preserved newline"
+        let line_count = result.lines().count();
+        // truncate(0) removes all entries; only the preserved trailing '\n' survives.
+        assert!(
+            line_count <= 1,
+            "max_lines=0 must produce at most 1 line, got {}: {:?}",
+            line_count,
+            result
         );
     }
 
@@ -1151,14 +1178,20 @@ mod tests {
 
     #[test]
     fn test_token_budget_very_small_budget() {
+        // Budget of 1: marker (~5 word-tokens) exceeds budget.
+        // After ADR-011 / #317 fix: always emit the marker, never return empty string.
         let text = "line one\nline two\nline three\n";
-        // Budget of 1: marker exceeds budget (~5 word-tokens), so empty string
         let result =
             truncate_to_token_budget(text, Language::TypeScript, 1, word_count, None, None)
                 .unwrap();
-        assert_eq!(
-            result, "",
-            "When budget is smaller than the marker, return empty string: {:?}",
+        assert!(
+            !result.is_empty(),
+            "budget < marker size must still emit the marker, not return empty string: {:?}",
+            result
+        );
+        assert!(
+            result.contains("truncated"),
+            "emitted output must be the truncation marker: {:?}",
             result
         );
     }
@@ -1207,9 +1240,15 @@ mod tests {
 
     #[test]
     fn test_token_budget_output_invariant() {
-        // The fundamental invariant: output tokens <= budget
+        // The fundamental invariant (ADR-011 / #317): when truncation occurs,
+        // the output is NEVER empty. The elision marker is always emitted, even if
+        // it alone exceeds the budget (unconditional class 1). The token budget is
+        // advisory once the marker is the only remaining content.
+        //
+        // When the text fits (no truncation), the original is returned unchanged.
         let text =
             "word1 word2 word3\nword4 word5 word6\nword7 word8 word9\nword10 word11 word12\n";
+        let full_token_count = word_count(text); // 12 words
         for budget in 1..20 {
             let result = truncate_to_token_budget(
                 text,
@@ -1220,17 +1259,43 @@ mod tests {
                 None,
             )
             .unwrap();
-            let token_count = word_count(&result);
-            // The invariant must hold for ALL budgets: when the marker exceeds
-            // the budget, an empty string is returned (0 tokens <= budget).
+            // Output must never be empty.
             assert!(
-                token_count <= budget,
-                "Budget {}: output has {} word-tokens, expected <= {}: {:?}",
-                budget,
-                token_count,
-                budget,
-                result
+                !result.is_empty(),
+                "Budget {}: output must not be empty (silent loss prohibited)",
+                budget
             );
+            let truncated = budget < full_token_count;
+            if truncated {
+                // Truncation occurred: marker must be present.
+                assert!(
+                    result.contains("truncated"),
+                    "Budget {}: truncation must emit the elision marker: {:?}",
+                    budget,
+                    result
+                );
+                // When over-budget (marker alone > budget), verify no content slipped through.
+                let token_count = word_count(&result);
+                if token_count > budget {
+                    assert!(
+                        !result.contains("word1")
+                            && !result.contains("word4")
+                            && !result.contains("word7")
+                            && !result.contains("word10"),
+                        "Budget {}: tokens ({}) > budget but content lines present: {:?}",
+                        budget,
+                        token_count,
+                        result
+                    );
+                }
+            } else {
+                // No truncation: original returned unchanged.
+                assert_eq!(
+                    result, text,
+                    "Budget {} >= full count ({}): original must be returned unchanged",
+                    budget, full_token_count
+                );
+            }
         }
     }
 

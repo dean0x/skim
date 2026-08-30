@@ -1857,9 +1857,10 @@ fn test_max_lines_with_minimal_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: minimal mode (single-span fast-path) emits N content + 1 marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Minimal mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count <= 6,
+        "Minimal mode with max_lines=5 should produce at most 6 lines (5 content + 1 marker), got {}",
         line_count,
     );
 }
@@ -1982,10 +1983,11 @@ fn test_max_lines_omission_markers_present() {
     let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(5);
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
-    // The file is large enough that truncation should produce omission markers
+    // The file is large enough that truncation should produce omission markers.
+    // After E2 every marker carries an exact count: "// ... (N lines truncated)".
     assert!(
-        result.contains("// ... (truncated)"),
-        "Should contain TypeScript omission markers: {:?}",
+        result.contains("// ...") && result.contains("lines truncated"),
+        "Should contain TypeScript counted omission markers: {:?}",
         result,
     );
 }

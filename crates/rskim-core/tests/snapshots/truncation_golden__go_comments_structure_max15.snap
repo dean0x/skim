@@ -1,18 +1,19 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
+assertion_line: 482
 expression: "snap(GO_COMMENTS, Language::Go,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(15))"
 ---
 // FIXTURE: Go file with various comment types
 // TESTS: Minimal mode comment stripping
-// ... (truncated)
+// ... (9 lines truncated)
 func Add(a int, b int) int  {...}
-// ... (truncated)
+// ... (5 lines truncated)
 type Calculator struct {
 	// Value field comment inside struct (STRIP - not a function body)
 	value int
 }
-// ... (truncated)
+// ... (4 lines truncated)
 func NewCalculator(value int) *Calculator  {...}
-// ... (truncated)
+// ... (2 lines truncated)
 func (c *Calculator) Add(x int) int  {...}
-// ... (truncated)
+// ... (9 lines truncated)

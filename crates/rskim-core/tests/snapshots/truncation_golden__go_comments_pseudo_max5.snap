@@ -1,8 +1,11 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
+assertion_line: 491
 expression: "snap(GO_COMMENTS, Language::Go,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(5))"
 ---
 package main
 
 
 // Add adds two numbers together.
+// This is a Go doc comment adjacent to a declaration (KEEP).
+// ... (27 lines truncated)

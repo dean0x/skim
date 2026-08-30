@@ -1,16 +1,17 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
+assertion_line: 111
 expression: "snap(RUST_SIMPLE, Language::Rust,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(15))"
 ---
-// ... (truncated)
+// ... (7 lines truncated)
 pub struct Calculator {
     value: i32,
 }
-// ... (truncated)
+// ... (7 lines truncated)
 pub trait Compute {
     fn compute(&self, x: i32) -> i32;
 }
-// ... (truncated)
+// ... (1 lines truncated)
 pub enum Status {
     Active,
     Inactive,

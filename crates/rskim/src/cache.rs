@@ -177,7 +177,7 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 ///
 /// **Rule**: bump this constant in the same commit that changes output bytes.
 /// Do not update it for changes that do not affect what `transform()` emits.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Generate cache key from file path, mtime, mode, truncation options, and line_numbers flag.
 ///
