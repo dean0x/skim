@@ -447,7 +447,8 @@ pub(super) fn execute_query_with_manifest(
     let manifest = match pre_loaded_manifest {
         Some(m) => m,
         None => {
-            let (outcome, m) = auto_refresh_if_stale(root, cache_dir, analytics, ReanchorPolicy::Refuse)?;
+            let (outcome, m) =
+                auto_refresh_if_stale(root, cache_dir, analytics, ReanchorPolicy::Refuse)?;
             // AC-405-7 / AC-405-8: emit AST coverage notice ONLY when a first-time
             // (NoIndex) build fires on the pure-lexical query path (D-4 cadence).
             // Incremental self-heals (HeadChanged / WorkingTreeChanged) must be

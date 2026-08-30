@@ -1750,7 +1750,8 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
     let analytics = TEST_ANALYTICS;
 
     // First call: builds lexical+AST+temporal.
-    let (refreshed1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed1, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(refreshed1.refreshed(), "first call must build the index");
 
     let temporal_db_path = cache_dir.join("temporal.db");
@@ -1768,7 +1769,8 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
 
     // Second call: lexical is Current, temporal.db is missing.
     // BUG B fix: must self-heal temporal.db before the Current early-return.
-    let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed2, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "lexical must NOT be rebuilt (index is Current) even during temporal self-heal"
@@ -1851,7 +1853,8 @@ fn test_bug_b_auto_refresh_self_heals_head_divergent_temporal_db() {
 
     // Second call: lexical is Current; temporal.db exists but HEAD-divergent.
     // BUG B fix: must detect and self-heal the divergent temporal.db.
-    let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed2, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "lexical must NOT be rebuilt on Current branch"
@@ -1911,7 +1914,8 @@ fn test_bug_b_no_rebuild_loop_when_temporal_is_current() {
 
     // Second call: both lexical and temporal are Current.
     // Must NOT rebuild temporal.db (mtime must stay unchanged).
-    let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed2, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "second call must not rebuild lexical (Current)"
@@ -1984,7 +1988,8 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 
         let analytics = TEST_ANALYTICS;
 
-        let result1 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
+        let result1 =
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
         assert!(result1.is_ok(), "Case A: first call must return Ok");
         let (refreshed1, _) = result1.unwrap();
         assert!(
@@ -1995,7 +2000,8 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         let temporal_db_path = cache_dir.join("temporal.db");
         let exists_after_first = temporal_db_path.exists();
 
-        let result2 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
+        let result2 =
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
         assert!(result2.is_ok(), "Case A: second call must return Ok");
         let (refreshed2, _) = result2.unwrap();
         assert!(
@@ -2027,7 +2033,8 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 
         // First call: NoIndex → build lexical + write empty temporal.db.
         let (outcome1, _) =
-            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse)
+                .unwrap();
         assert!(
             outcome1.is_first_build(),
             "Case B: first call must build index (NoIndex → FirstBuild)"
@@ -2055,7 +2062,8 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         // Second call: both lexical and temporal are Current.
         // MUST NOT rewrite temporal.db — mtime must be unchanged.
         let (outcome2, _) =
-            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse)
+                .unwrap();
         assert!(
             !outcome2.refreshed(),
             "Case B: second call must not rebuild lexical (Current)"
@@ -2293,8 +2301,10 @@ fn test_auto_refresh_clean_tree_no_rebuild_idempotent() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let analytics = TEST_ANALYTICS;
-    let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
-    let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (r1, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (r2, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         !r1.refreshed(),
@@ -2367,7 +2377,8 @@ fn test_auto_refresh_same_mtime_and_size_does_not_reindex() {
     set_mtime_secs(&abs, 1_700_000_000);
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed.refreshed(),
         "same-size + same-second swap must NOT reindex (AD-379-2 pinned boundary, AC9)"
@@ -2399,7 +2410,8 @@ fn test_auto_refresh_size_change_with_preserved_mtime_reindexes() {
     set_mtime_secs(&abs, 1_700_000_000);
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "size change with preserved mtime MUST reindex (size comparison, AC9a)"
@@ -2439,7 +2451,8 @@ fn test_auto_refresh_non_git_working_tree_change_reindexes() {
     .unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "non-git working-tree change MUST reindex (AD-379-3, AC12)"
@@ -2482,7 +2495,8 @@ fn test_auto_refresh_corrupt_head_with_working_tree_change_reindexes() {
     .unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "corrupt-HEAD + working-tree edit MUST reindex (AD-379-6, AC13)"
@@ -2516,7 +2530,8 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
     let analytics = TEST_ANALYTICS;
 
     // First call rebuilds.
-    let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (r1, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(r1.refreshed(), "first call must rebuild on the edit (AC14)");
     assert!(
         !r1.is_first_build(),
@@ -2526,7 +2541,8 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Second call: index is now Current (manifest carries fresh mtime+size).
-    let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (r2, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !r2.refreshed(),
         "second call must NOT rebuild — index already refreshed (AC14 / AD-379-8)"
@@ -2580,7 +2596,8 @@ fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
 
     // First query: the None mtime/size forces a changed verdict → one rebuild.
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (refreshed, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "pre-#379 manifest (mtime/size None) must self-heal via one rebuild (AC10)"
@@ -3273,7 +3290,13 @@ fn test_temporal_db_resyncs_when_worktree_branch_advances() {
     // First build.
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
 
     let temporal_db_path = cache_dir.join("temporal.db");
     let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
@@ -3324,7 +3347,13 @@ fn test_temporal_db_resyncs_when_worktree_branch_advances() {
     assert_ne!(old_head, new_head, "HEAD must advance after commit");
 
     // Trigger update.
-    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
 
     let db2 = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
     let head_after = db2
@@ -3362,7 +3391,13 @@ fn test_frozen_manifest_without_head_recovers_on_next_query_in_worktree() {
     // Set up with a real index + temporal.db, then wipe the manifest's git_head.
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
     write_lexical_index_stub(&cache_dir);
     write_ast_index_stub(&cache_dir);
     write_manifest_with_head(&worktree, &cache_dir, None);
@@ -3375,7 +3410,13 @@ fn test_frozen_manifest_without_head_recovers_on_next_query_in_worktree() {
     );
 
     // One auto-refresh must recover the stored HEAD.
-    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
 
     // Verify the manifest now has the GT stored HEAD.
     let (verdict2, manifest) = check_staleness(&cache_dir, &worktree);
@@ -3421,7 +3462,13 @@ fn test_temporal_db_with_divergent_recorded_head_self_heals_in_worktree() {
 
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
-    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
 
     let temporal_db_path = cache_dir.join("temporal.db");
     let stale_head = "deadbeef".repeat(5); // 40-char pseudo-SHA
@@ -3441,7 +3488,13 @@ fn test_temporal_db_with_divergent_recorded_head_self_heals_in_worktree() {
     }
 
     // One query triggers the AD-TMP-2 self-heal.
-    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
 
     let db2 = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
     let healed = db2
@@ -3748,11 +3801,23 @@ fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
     // AC10(c): run auto_refresh_if_stale twice and capture index.skfiles mtime.
     // The working-tree scan may see a.rs as modified, but without working-tree changes
     // between the two calls the second run must be mtime-stable.
-    auto_refresh_if_stale(&project_root, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &project_root,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
     let mtime1 = fs::metadata(cache_dir.join("index.skfiles"))
         .map(|m| m.modified().unwrap())
         .ok();
-    auto_refresh_if_stale(&project_root, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    auto_refresh_if_stale(
+        &project_root,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
     let mtime2 = fs::metadata(cache_dir.join("index.skfiles"))
         .map(|m| m.modified().unwrap())
         .ok();

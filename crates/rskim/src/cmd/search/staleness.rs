@@ -27,7 +27,7 @@
 //! `mod.rs`, `hooks.rs`, and the test suite — callers do not need to know which
 //! sub-module owns each item.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::manifest::FileManifest;
 
@@ -36,6 +36,7 @@ use super::manifest::FileManifest;
 // `super::staleness::*` — these re-exports keep that path valid.
 pub(super) use super::gitdir::{
     HeadState, git_head_state, read_git_head, resolve_common_dir, resolve_git_dir,
+    resolve_repo_toplevel,
 };
 
 // Re-export temporal-DB items (owned by temporal_state.rs).
@@ -585,7 +586,15 @@ pub(super) fn auto_refresh_if_stale(
             // AD-379-8: a concurrent peer may have already rebuilt the index.
             // `build_index_rechecked` re-runs check_staleness under the build lock
             // and skips the rebuild if the index is now current.
-            build_ran = build_index_rechecked(&config)?;
+            let built = build_index_rechecked(&config, || {
+                // Re-evaluate staleness under the lock: skip the rebuild unless the
+                // working tree is STILL dirty (a peer may have already rebuilt).
+                matches!(
+                    check_staleness(cache_dir, root).0,
+                    StalenessCheck::WorkingTreeChanged { .. }
+                )
+            })?;
+            build_ran = built.is_some();
         }
         StalenessCheck::Current => {
             // Already handled above — unreachable here.
