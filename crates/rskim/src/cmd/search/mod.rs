@@ -1847,10 +1847,14 @@ fn temporal_unavailable_msg(
 /// `{"git_head": null, "git_head_state": "resolved"}`, which is a legal transient
 /// state, not a contradiction.
 ///
+/// `head_state` is resolved ONCE by the caller (`run_stats`) and passed in so the
+/// same snapshot feeds both [`staleness::warn_if_temporal_unverifiable`] and the
+/// `git_head_state` JSON key without a second `git_head_state` syscall sequence.
+///
 /// AD-395-6: `skipped` / `skipped_by_reason` are additive keys; all nine pre-existing
 /// keys are unchanged (AC11 back-compat).  `skipped_by_reason` uses `BTreeMap` for
 /// byte-stable key order consistent with the text-mode path (PF-012).
-pub(super) fn build_stats_json(
+fn build_stats_json(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
     head_state: &staleness::HeadState,

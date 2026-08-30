@@ -4222,25 +4222,30 @@ fn test_ac23_warn_if_temporal_unverifiable_call_site_count() {
     // `warn_if_temporal_unverifiable_at(` has `_at` between `unverifiable` and `(`.
     let direct_call_count = mod_src.matches("warn_if_temporal_unverifiable(").count();
     // Direct calls via the bare function (mod.rs is the sole consumer):
-    //   line 231  : run()                     — text+AST compound arm (--ast)
-    //   line 957  : run_build()               — --build / --rebuild arm
-    //   line 988  : run_update()              — --update arm
-    //   line 1281 : run_query()               — plain-text query arm
-    //   line 1573 : run_temporal_standalone() — --hot / --cold / --risky / --blast-radius arm
+    //   run()                     — text+AST compound arm (--ast)
+    //   run_build()               — --build / --rebuild arm
+    //   run_update()              — --update arm
+    //   run_stats()               — --stats / --stats --json arm (reliability fix:
+    //                               HEAD resolved once here instead of via _at wrapper,
+    //                               so the same HeadState can be forwarded to
+    //                               build_stats_json without a second resolution)
+    //   run_query()               — plain-text query arm
+    //   run_temporal_standalone() — --hot / --cold / --risky / --blast-radius arm
     assert_eq!(
-        direct_call_count, 5,
-        "AC23: mod.rs must contain exactly 5 direct warn_if_temporal_unverifiable(...) \
+        direct_call_count, 6,
+        "AC23: mod.rs must contain exactly 6 direct warn_if_temporal_unverifiable(...) \
          call sites; found {direct_call_count} — a temporal arm lost its advisory call \
          or a new arm was added without wiring (update expected value if arms change)"
     );
     let at_call_count = mod_src.matches("warn_if_temporal_unverifiable_at(").count();
-    // Wrapper call via the `_at` convenience wrapper (mod.rs):
-    //   line 1037 : run_stats() — --stats / --stats --json arm
+    // The _at wrapper is no longer used in mod.rs: run_stats now resolves HeadState
+    // once and forwards it to both warn_if_temporal_unverifiable and build_stats_json
+    // (reliability fix — eliminates the duplicate git_head_state call).
     assert_eq!(
-        at_call_count, 1,
-        "AC23: mod.rs must contain exactly 1 warn_if_temporal_unverifiable_at(...) \
-         call site; found {at_call_count} — the stats arm lost its advisory wrapper \
-         or a duplicate was added"
+        at_call_count, 0,
+        "AC23: mod.rs must contain exactly 0 warn_if_temporal_unverifiable_at(...) \
+         call sites; found {at_call_count} — the _at wrapper was re-introduced in mod.rs \
+         (it leads to a second git_head_state call when build_stats_json also reads HEAD)"
     );
 }
 

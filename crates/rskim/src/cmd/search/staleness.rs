@@ -50,7 +50,7 @@ pub(super) use super::temporal_state::TEMPORAL_META_READ_COUNT;
 pub(super) use super::temporal_state::temporal_anchor_state;
 pub(super) use super::temporal_state::{
     AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_db_is_stale,
-    try_rebuild_temporal_nonfatal, warn_if_temporal_unverifiable, warn_if_temporal_unverifiable_at,
+    try_rebuild_temporal_nonfatal, warn_if_temporal_unverifiable,
 };
 
 // ============================================================================

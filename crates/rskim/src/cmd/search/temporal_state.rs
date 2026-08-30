@@ -240,19 +240,6 @@ pub(super) fn warn_if_temporal_unverifiable(cache_dir: &Path, head: &HeadState) 
     );
 }
 
-/// Convenience wrapper: resolve HEAD state from `root` and call
-/// [`warn_if_temporal_unverifiable`].
-///
-/// Used by callers that do not already hold a [`HeadState`] binding.
-/// When a caller already holds `head_state` from `auto_refresh_if_stale`
-/// or an explicit `git_head_state` call, pass it directly to
-/// `warn_if_temporal_unverifiable` to avoid a second HEAD resolution.
-pub(super) fn warn_if_temporal_unverifiable_at(cache_dir: &Path, root: &Path) {
-    use super::gitdir::git_head_state;
-    let head = git_head_state(root);
-    warn_if_temporal_unverifiable(cache_dir, &head);
-}
-
 // ============================================================================
 // Anchor state
 // ============================================================================
