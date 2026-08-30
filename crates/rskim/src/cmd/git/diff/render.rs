@@ -929,30 +929,19 @@ fn render_container_with_mode(
         if child_start == node_start {
             // The container body — render its members, not the body node itself.
             //
-            // B3: interleave `render_orphan_gap` calls between members so that
-            // changed lines that belong to no member node — typically blank lines
-            // separating fields or methods — are served rather than silently
-            // dropped.  This mirrors the top-level orphan-fill in
-            // `render_with_unchanged_context` (ADR-003 coverage).
-            //
-            // `next_member_line` tracks the first line not yet accounted for by
-            // a rendered member.  Starting at `node_start + 1` skips the header
-            // line (`{` is on the header line, already emitted above).  After
-            // each member, it advances past the member's last line so the next
-            // `render_orphan_gap` call covers only the inter-member gap.
-            let mut next_member_line = node_start + 1;
+            // Note: the B3 gap-fill (interleaving render_orphan_gap between
+            // members) was reverted here because it caused a structure-mode
+            // rendering regression.  When the body's direct children include
+            // separator tokens (`,` in Rust field_declaration_list), the gap-fill
+            // iterated over them and called render_unchanged_node, which applied
+            // the structure transform to a bare `,` token, writing ` ,\n` and
+            // also splitting field text from its comma.  The stated defect (an
+            // orphan blank line being dropped) did not reproduce on any tested
+            // fixture before B3.  See Phase B-repair commit for full analysis.
             let mut body_cursor = child.walk();
             for member in child.children(&mut body_cursor) {
-                let member_start = member.start_position().row + 1;
-                let member_end = member.end_position().row + 1;
-                render_orphan_gap(output, next_member_line, member_start, ctx, inputs, state);
                 render_container_member(output, node, &member, ctx, inputs, parser, state);
-                next_member_line = next_member_line.max(member_end + 1);
             }
-            // Trailing gap inside the container body: changed lines between the
-            // last member and the closing brace (e.g. a trailing blank line
-            // added before `}`).
-            render_orphan_gap(output, next_member_line, node_end, ctx, inputs, state);
             continue;
         }
 
