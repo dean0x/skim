@@ -493,6 +493,10 @@ fn try_ast_render(
     };
     let markers = HunkLineMarkers::from_hunks(&file_diff.hunks);
 
+    // B2: EmitInputs is built once and shared by both branches so
+    // render_default_scoped can route breadcrumbs through emit_source_line.
+    let inputs = EmitInputs::new(&file_diff.hunks, &source_lines, ln_width, &markers);
+
     if diff_mode != DiffMode::Default {
         let changed_lines = build_changed_lines(&file_diff.hunks);
         let ctx = ModeRenderContext {
@@ -501,21 +505,13 @@ fn try_ast_render(
             source: &source,
             diff_mode,
         };
-        let inputs = EmitInputs::new(&file_diff.hunks, &source_lines, ln_width, &markers);
         render_with_unchanged_context(&mut output, &tree, &ctx, &inputs, parser, &mut state);
     } else {
         // Default mode: hunk-scoped render — breadcrumb + hunk lines only.
         // This replaces the old render_changed_only → render_node_with_hunks path
         // that emitted the ENTIRE enclosing node body, producing 2-5x bloat vs raw
         // for small changes inside large functions (ADR-001).
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &file_diff.hunks,
-            &source_lines,
-            ln_width,
-            &mut state.emissions,
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
     }
 
     // C1e: the verifier now guards EVERY mode, not just Default.  `structure`
@@ -650,10 +646,8 @@ fn render_changed_only(
 fn render_default_scoped(
     output: &mut String,
     changed_ranges: &[ChangedNodeRange],
-    hunks: &[DiffHunk<'_>],
-    source_lines: &[&str],
-    ln_width: usize,
-    emissions: &mut Vec<Emission>,
+    inputs: &EmitInputs<'_>,
+    state: &mut RenderState,
 ) {
     // -------------------------------------------------------------------------
     // Phase 1 — breadcrumb schedule
@@ -676,13 +670,13 @@ fn render_default_scoped(
             .map_or(range.start, |p| p.header_line);
 
         // Skip to the first hunk whose new-range ends at/after range.start.
-        let first = hunks.partition_point(|h| {
+        let first = inputs.hunks.partition_point(|h| {
             h.new_start.saturating_add(h.new_count.saturating_sub(1)) < range.start
         });
 
         // Walk overlapping hunks to find the first one where
         // `breadcrumb_line < hunk.new_start`.
-        let emit_before = hunks[first..]
+        let emit_before = inputs.hunks[first..]
             .iter()
             .enumerate()
             .take_while(|(_, h)| h.new_start <= range.end)
@@ -701,7 +695,7 @@ fn render_default_scoped(
 
     // Build a per-hunk list of breadcrumb lines, sorted for deterministic output.
     // hunk_crumbs[i] = breadcrumb lines to emit before hunk i, in source order.
-    let mut hunk_crumbs: Vec<Vec<usize>> = vec![Vec::new(); hunks.len()];
+    let mut hunk_crumbs: Vec<Vec<usize>> = vec![Vec::new(); inputs.hunks.len()];
     for (&bl, &hi) in &schedule {
         hunk_crumbs[hi].push(bl);
     }
@@ -710,33 +704,33 @@ fn render_default_scoped(
     }
 
     // -------------------------------------------------------------------------
-    // Phase 2 — single positional walk (C1a fix)
+    // Phase 2 — single positional walk (C1a fix, B2 breadcrumb routing fix)
     //
     // Walk hunks in document order. Before each hunk, emit any scheduled
     // breadcrumbs (guaranteed breadcrumb_line < hunk.new_start, so no
     // overlap with the hunk's patch lines). Then walk ALL patch lines.
+    //
+    // B2 fix: breadcrumbs now route through `emit_source_line`, which is the
+    // ONLY valid emission path (file-wrapper-fidelity KB anti-pattern).  This
+    // fixes two defects that existed in the old direct-writeln! path (#512):
+    //   1. The EmittedCursor was not consulted — `emit_source_line` updates
+    //      state.cursor.last_new so the cursor participates in tracking.
+    //      Breadcrumbs sorted by schedule construction + hunk order are
+    //      monotonically increasing, so the cursor never incorrectly blocks.
+    //   2. Marker::Context was hard-coded — `emit_source_line` looks up the
+    //      real marker via inputs.markers.new_side(), so an added (`+`) header
+    //      line is rendered with the `+` prefix instead of a misleading space.
+    //      The old code relied on the C1d verifier to catch the corruption and
+    //      bail to raw hunks; that bail is now avoidable.
     // -------------------------------------------------------------------------
-    let mut emitted_breadcrumbs: HashSet<usize> = HashSet::new();
-
-    for (hunk_idx, hunk) in hunks.iter().enumerate() {
-        // --- Breadcrumbs ---
+    for (hunk_idx, hunk) in inputs.hunks.iter().enumerate() {
+        // --- Breadcrumbs (B2: routed through emit_source_line) ---
         for &breadcrumb_line in &hunk_crumbs[hunk_idx] {
-            if emitted_breadcrumbs.insert(breadcrumb_line)
-                && let Some(idx) = breadcrumb_line.checked_sub(1)
-                && let Some(line) = source_lines.get(idx)
-            {
-                let _ = writeln!(output, " {:>ln_width$} {line}", breadcrumb_line);
-                // Track on New axis for verifier monotonicity.
-                // breadcrumb_line < hunk.new_start by construction — strictly
-                // before the hunk window, so no conflict with hunk emissions.
-                //
-                // The breadcrumb is written in context format unconditionally,
-                // so it is recorded as `Marker::Context`.  C1d's marker-fidelity
-                // check then rejects the render if that line is in fact a `+`
-                // line — the one failure mode the uniqueness, monotonicity and
-                // coverage checks all pass through.
-                emissions.push((Axis::New, breadcrumb_line, Marker::Context));
-            }
+            // emit_source_line consults state.cursor.last_new for monotonic
+            // de-duplication and updates it on success — no separate HashSet
+            // needed.  The schedule already maps each breadcrumb_line to
+            // exactly one hunk, so no duplicate breadcrumb can appear here.
+            emit_source_line(output, breadcrumb_line, inputs, state);
         }
 
         // --- Hunk patch lines (single pass, no clipping) ---
@@ -747,8 +741,9 @@ fn render_default_scoped(
         let mut cur_new = hunk.new_start;
         let mut cur_old = hunk.old_start;
         for patch_line in &hunk.patch_lines {
-            let (nd, od, marker) = emit_patch_line(output, patch_line, cur_new, cur_old, ln_width);
-            record_patch_emission(emissions, cur_new, cur_old, marker);
+            let (nd, od, marker) =
+                emit_patch_line(output, patch_line, cur_new, cur_old, inputs.ln_width);
+            record_patch_emission(&mut state.emissions, cur_new, cur_old, marker);
             cur_new += nd;
             cur_old += od;
         }
@@ -2245,15 +2240,11 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            2,
-            &mut vec![],
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // Breadcrumb must appear.
         assert!(
@@ -2309,15 +2300,11 @@ mod tests {
         // No changed ranges — the deletion at old line 3 has no AST node.
         let changed_ranges: Vec<super::super::types::ChangedNodeRange> = vec![];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut vec![],
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // The orphan deletion line must appear in the output.
         assert!(
@@ -2375,15 +2362,11 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut vec![],
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // The edited in-node line must appear (attributed emission).
         assert!(
@@ -2462,15 +2445,11 @@ mod tests {
             },
         ];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut vec![],
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // Breadcrumb must appear exactly once.
         let breadcrumb_count = output.lines().filter(|l| l.contains("MyClass {")).count();
@@ -2515,15 +2494,11 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut vec![],
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // The no-newline markers must appear verbatim.
         assert!(
@@ -2756,16 +2731,11 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        let mut emissions: Vec<Emission> = Vec::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut emissions,
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // fn compute must appear exactly once (Bug 1: old code emits it twice).
         let fn_count = output.lines().filter(|l| l.contains("fn compute")).count();
@@ -2787,7 +2757,7 @@ mod tests {
 
         // Verifier must accept the new render.
         assert!(
-            verify_ast_render(&emissions, &hunks).is_ok(),
+            verify_ast_render(&state.emissions, &hunks).is_ok(),
             "render must pass verifier:\n{output}"
         );
     }
@@ -2845,16 +2815,11 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        let mut emissions: Vec<Emission> = Vec::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            2,
-            &mut emissions,
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // The orphan comment update must appear BEFORE fn foo (Bug 2 check).
         let comment_pos = output
@@ -2877,7 +2842,7 @@ mod tests {
 
         // Verifier must accept the render.
         assert!(
-            verify_ast_render(&emissions, &hunks).is_ok(),
+            verify_ast_render(&state.emissions, &hunks).is_ok(),
             "render must pass verifier:\n{output}"
         );
     }
@@ -2918,16 +2883,11 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        let mut emissions: Vec<Emission> = Vec::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut emissions,
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         // fn inserted must appear exactly once (no breadcrumb + hunk double-emission).
         let count = output.lines().filter(|l| l.contains("fn inserted")).count();
@@ -2957,7 +2917,7 @@ mod tests {
 
         // Verifier must accept the render.
         assert!(
-            verify_ast_render(&emissions, &hunks).is_ok(),
+            verify_ast_render(&state.emissions, &hunks).is_ok(),
             "render must pass verifier:\n{output}"
         );
     }
@@ -3379,21 +3339,17 @@ mod tests {
             parent_context: None,
         }];
 
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let mut state = RenderState::default();
         let mut output = String::new();
-        let mut emissions: Vec<Emission> = Vec::new();
-        render_default_scoped(
-            &mut output,
-            &changed_ranges,
-            &hunks,
-            &source_lines,
-            1,
-            &mut emissions,
-        );
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
 
         assert!(
-            verify_ast_render(&emissions, &hunks).is_ok(),
+            verify_ast_render(&state.emissions, &hunks).is_ok(),
             "single-walk render must pass all three verifier invariants;\
-             \nemissions: {emissions:?}\noutput:\n{output}"
+             \nemissions: {:?}\noutput:\n{output}",
+            state.emissions,
         );
 
         // Sanity check on content.
