@@ -33,6 +33,15 @@ const HOOK_BLOCK: &str =
     "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end";
 const SHEBANG: &str = "#!/bin/sh";
 
+/// User-facing notice emitted when the resolved hooks directory is the shared
+/// `<commondir>/hooks` (every worktree of the clone shares it).
+///
+/// Named constant so the two emit sites (`install_search_hooks` and
+/// `remove_search_hooks`) cannot drift — per the project convention established
+/// by `NO_TEMPORAL_DATA_MSG` in `mod.rs` (#357 cycle-2 finding 2).
+pub(super) const SHARED_HOOKS_SCOPE_MSG: &str =
+    "skim search: this hooks directory is shared by every worktree of this clone";
+
 /// Hook filenames to install into.
 const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-checkout"];
 
@@ -232,7 +241,7 @@ pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<HooksO
     // AC34(b): disclose the clone-wide scope from inside this function so every
     // caller (including `skim init`) inherits the notice automatically.
     if is_shared_hooks_dir(project_root, &hooks_dir) {
-        eprintln!("skim search: this hooks directory is shared by every worktree of this clone");
+        eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
     }
 
     Ok(HooksOutcome {
@@ -267,7 +276,7 @@ pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOu
     // AC34(b): disclose the clone-wide scope only when something was actually
     // removed — mirrors the conditional disclosure in `run_remove_hooks`.
     if any_removed && is_shared_hooks_dir(project_root, &hooks_dir) {
-        eprintln!("skim search: this hooks directory is shared by every worktree of this clone");
+        eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
     }
     Ok(HooksOutcome {
         dir: hooks_dir,
