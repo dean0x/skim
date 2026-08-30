@@ -157,8 +157,8 @@ pub use ngram::{
     extract_query_ngrams_with_weights, is_single_token,
 };
 pub use temporal::storage::{
-    CochangeRow, HotspotRow, META_DATA_VERSION, META_GIT_HEAD, META_GIT_TOPLEVEL, META_LAST_UPDATED,
-    MIN_COCHANGE_JACCARD, RiskRow, TEMPORAL_DATA_VERSION, TemporalDb,
+    CochangeRow, HotspotRow, META_DATA_VERSION, META_GIT_HEAD, META_GIT_TOPLEVEL,
+    META_LAST_UPDATED, MIN_COCHANGE_JACCARD, RiskRow, TEMPORAL_DATA_VERSION, TemporalDb,
 };
 pub use temporal::{
     DEFAULT_HALF_LIFE_DAYS, GixSource, compute_file_risk_scores, compute_file_temporal_stats,
