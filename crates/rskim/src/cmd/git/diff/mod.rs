@@ -198,10 +198,34 @@ fn render_and_format<'a>(
             skip_ast,
             false,
         );
+        // D3 (issue #510): carry raw hunk content so --json consumers get the
+        // full patch body.  Reconstruct each hunk header from the parsed fields
+        // (old/new start + count) and append the original patch lines verbatim.
+        //
+        // This makes the JSON envelope `Completeness::Reencoded` — all content
+        // is faithfully represented in a different encoding.  ADR-011 class-1
+        // disclosure is not owed when Reencoded is declared.
+        let patch = {
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            for hunk in &file_diff.hunks {
+                let _ = writeln!(
+                    buf,
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                );
+                for line in &hunk.patch_lines {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            }
+            if buf.is_empty() { None } else { Some(buf) }
+        };
         let entry = DiffFileEntry {
             path: file_diff.path.clone(),
             status: file_diff.status.clone(),
             changed_regions: file_diff.hunks.len(),
+            patch, // Completeness::Reencoded — all hunk content preserved
         };
         (rendered, entry)
     };

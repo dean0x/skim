@@ -1587,11 +1587,13 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 status: DiffFileStatus::Modified,
                 changed_regions: 2,
+                patch: None,
             },
             DiffFileEntry {
                 path: "src/lib.rs".to_string(),
                 status: DiffFileStatus::Added,
                 changed_regions: 1,
+                patch: None,
             },
         ];
         let result = DiffResult::new(entries, "test rendered output".to_string());
@@ -1605,6 +1607,7 @@ mod tests {
             path: "src/main.rs".to_string(),
             status: DiffFileStatus::Modified,
             changed_regions: 1,
+            patch: None,
         }];
         let original = DiffResult::new(entries, "rendered output".to_string());
         let json = serde_json::to_string(&original).unwrap();
