@@ -25,6 +25,7 @@ use crate::tokens;
 // ============================================================================
 
 /// Run the `skim stats` subcommand.
+#[allow(clippy::disallowed_methods)] // Analytics stats display; locked handle for atomic multi-line dashboard output
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,

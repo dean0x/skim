@@ -87,6 +87,7 @@ fn index_args_are_build(rest: &[String]) -> bool {
 /// - `skim search [--json] [--limit N] <QUERY>` — search (`--` forces the rest
 ///   to be query terms, e.g. `skim search -- index` searches for "index")
 /// - No args / `--help` / `-h` — print help
+#[allow(clippy::disallowed_methods)] // Search output entry point; delegates to streaming BufWriter sinks in subordinate fns
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -530,6 +531,7 @@ fn run_update(
 // --stats
 // ============================================================================
 
+#[allow(clippy::disallowed_methods)] // Search stats output; streaming BufWriter for potentially large index statistics
 fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
 
@@ -605,6 +607,7 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 // Query execution
 // ============================================================================
 
+#[allow(clippy::disallowed_methods)] // Search result streaming; result set may be large, BufWriter for throughput
 fn run_query(
     text: &str,
     flags: &Flags,
@@ -725,6 +728,7 @@ struct WarningJson<'a> {
 /// staleness, dispatches the query (hotspot, cold, risky, or blast-radius),
 /// and writes the result as JSON or plain text to stdout. Degrades gracefully
 /// when the temporal DB is absent — prints a warning and returns exit 0.
+#[allow(clippy::disallowed_methods)] // Temporal search output; streaming handle for sorted result set
 fn run_temporal_standalone(
     limit: usize,
     json: bool,

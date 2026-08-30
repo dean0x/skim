@@ -65,6 +65,7 @@ fn parse_flags(args: &[String]) -> LogFlags {
 /// Run the `skim log` subcommand.
 ///
 /// Reads from stdin (mandatory — log is stdin-primary).
+#[allow(clippy::disallowed_methods)] // Log streaming; unbounded stdin-primary input, streaming handle required
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -303,6 +304,7 @@ fn convert_log_result(r: rskim_compress::log::LogResult) -> LogResult {
 // Output emission
 // ============================================================================
 
+#[allow(clippy::disallowed_methods)] // Log result emission; streaming handle for potentially large log output
 fn emit_result(result: &ParseResult<LogResult>, flags: &LogFlags) -> anyhow::Result<String> {
     let mut stdout = io::stdout().lock();
 

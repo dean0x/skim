@@ -317,6 +317,7 @@ pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
 }
 
 /// Raw (non-TTY) fallback for [`confirm_proceed`].
+#[allow(clippy::disallowed_methods)] // TTY interaction: flush after print! before blocking read; bounded init output
 fn confirm_proceed_raw() -> anyhow::Result<bool> {
     use std::io::{BufRead, Read, Write};
     print!("Proceed? [Y/n] ");
@@ -367,6 +368,7 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 /// - `agent_label` — human-readable agent name for the prompt (e.g. "Claude Code").
 /// - `config_file` — exact path of the file that will be modified.
 /// - `entries` — each entry that will be added, printed verbatim.
+#[allow(clippy::disallowed_methods)] // TTY interaction: flush after print! before blocking read; bounded init output
 pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[String]) -> bool {
     use std::io::{BufRead, IsTerminal, Read, Write};
 

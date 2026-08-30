@@ -819,6 +819,7 @@ fn stdout_should_serve_raw_impl(meta: std::io::Result<std::fs::Metadata>, is_tty
 ///
 /// Non-Unix: always returns `false` (compression proceeds normally).
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // fd 1 identity check: ManuallyDrop borrow without I/O; not a write sink
 fn stdout_should_serve_raw() -> bool {
     use std::io::IsTerminal;
     use std::mem::ManuallyDrop;
@@ -1137,6 +1138,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 /// 2. directory → recursive directory walk
 /// 3. glob      → glob pattern expansion
 /// 4. file path → single file processing
+#[allow(clippy::disallowed_methods)] // Top-level arg dispatcher; delegates to write_result_and_stats and process_files which hold the locks
 fn process_single_arg(
     file: &str,
     args: &Args,

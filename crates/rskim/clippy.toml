@@ -1,0 +1,22 @@
+# crates/rskim/clippy.toml
+#
+# D-lint gate: every new direct `io::stdout()` acquisition must be reviewed
+# before landing. Legitimate streaming sinks in the core output infrastructure
+# carry `#[allow(clippy::disallowed_methods)]` with a one-line justification.
+# New callsites that bypass the centralized path (execution::write_to_stdout /
+# write_line_to_stdout / emit_raw_passthrough) are rejected by this gate.
+#
+# Rationale: this crate's cmd/mod.rs documents the rule that tool output MUST
+# go through the centralized write_to_stdout / write_line_to_stdout / emit_raw_
+# passthrough path so that PipeClosed is handled gracefully. A new io::stdout()
+# in production code is a policy defect unless the site IS that infrastructure.
+#
+# What is NOT banned here:
+# - `print!` / `println!` for skim's own short notices (help text, banners,
+#   token-stats lines). These are explicitly exempted in cmd/mod.rs policy.
+# - `std::io::stderr` — stderr is already gated by the ADR-011 marker taxonomy
+#   (class-1 unconditional, class-2 debug-gated) which is enforced by code review.
+
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "use execution::write_to_stdout / emit_raw_passthrough for tool output (cmd/mod.rs policy); add #[allow] with justification for core infrastructure sites" },
+]

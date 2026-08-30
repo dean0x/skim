@@ -346,6 +346,7 @@ impl Drop for DropGuard {
 ///
 /// Analytics are recorded at EOF via the Drop guard.
 #[allow(dead_code)]
+#[allow(clippy::disallowed_methods)] // GH response streaming sink; unbounded JSON stream must be streamed, not buffered
 pub(super) fn run_streamed_stdin(
     mut parser: Box<dyn StreamingParser>,
     cfg: StreamConfig,
@@ -426,6 +427,7 @@ pub(super) fn run_streamed_stdin(
 ///
 /// If `cmd` is not on PATH, prints `error: gh not found on PATH` to stderr
 /// and returns exit code 127.
+#[allow(clippy::disallowed_methods)] // GH spawned-process stream; unbounded response requires streaming handle
 pub(super) fn run_streamed_spawned(
     mut parser: Box<dyn StreamingParser>,
     cmd: &str,

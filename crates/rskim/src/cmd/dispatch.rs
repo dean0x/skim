@@ -452,6 +452,7 @@ pub(crate) fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitC
 /// now returns [`pipe_closed_exit`] (141 on unix, never 1) and kills the child,
 /// where before skim waited for the child to finish and then propagated the
 /// `BrokenPipe` error up to the `main.rs` boundary.
+#[allow(clippy::disallowed_methods)] // Direct streaming pump for raw passthrough; bytes too large to buffer
 pub(crate) fn run_raw_passthrough(
     program: &str,
     args: &[String],

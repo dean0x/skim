@@ -182,6 +182,7 @@ fn no_ignore_hint(no_ignore: bool) -> &'static str {
 ///
 /// Precondition: `paths` must be non-empty. Callers should validate and
 /// produce a descriptive error (with `--no-ignore` hint) before calling.
+#[allow(clippy::disallowed_methods)] // Multi-file streaming output; may span thousands of files, streaming handle required
 fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Result<()> {
     debug_assert!(
         !paths.is_empty(),

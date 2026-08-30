@@ -850,6 +850,7 @@ fn print_text_report(corrections: &[CorrectionPair], agent: AgentKind, config: &
     println!("hint: run `skim learn --generate` to write corrections to {target}");
 }
 
+#[allow(clippy::disallowed_methods)] // Learning JSON report output; skim-generated, streaming handle for correctness
 fn print_json_report(corrections: &[CorrectionPair]) -> anyhow::Result<()> {
     let report = serde_json::json!({
         "version": 1,

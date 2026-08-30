@@ -187,6 +187,7 @@ fn write_line_and_flush(out: &mut impl Write, s: &str) -> io::Result<()> {
 /// A [`StdoutStatus::PipeClosed`] result is *not* an error: callers must stop
 /// producing output and return [`pipe_closed_exit`] so the closed pipe never
 /// reports as exit `1`.
+#[allow(clippy::disallowed_methods)] // IS the foundational raw-passthrough sink; cmd/mod.rs policy terminus
 pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, StdoutStatus)> {
     let mut out = io::stdout().lock();
     let status = classify_write(write_and_flush(&mut out, raw, true))?;
@@ -225,6 +226,7 @@ pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, Stdou
 /// A closed downstream pipe returns [`StdoutStatus::PipeClosed`] rather than an
 /// error — see [`pipe_closed_code`] for why a broken pipe must never become
 /// exit `1`.
+#[allow(clippy::disallowed_methods)] // IS the centralized write_to_stdout channel; cmd/mod.rs policy terminus
 pub(crate) fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stdout().lock();
     Ok(classify_write(write_and_flush(&mut handle, s, false))?)
@@ -235,6 +237,7 @@ pub(crate) fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
 ///
 /// Byte-identical to `println!`, including the newline it appends to a body that
 /// already ends in one; see [`write_line_and_flush`].
+#[allow(clippy::disallowed_methods)] // IS the centralized write_line_to_stdout channel; cmd/mod.rs policy terminus
 pub(crate) fn write_line_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stdout().lock();
     Ok(classify_write(write_line_and_flush(&mut handle, s))?)
@@ -576,6 +579,7 @@ where
 /// The `SKIM_PASSTHROUGH=1` escape hatch over a *spawned* child uses
 /// [`stream_passthrough_raw`] instead, which reproduces this byte contract
 /// exactly while streaming.
+#[allow(clippy::disallowed_methods)] // Low-level raw passthrough; within the foundational output infrastructure
 fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     let code = output.exit_code.unwrap_or(1);
     {
@@ -626,6 +630,7 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 /// Child's own code on clean EOF; [`pipe_closed_exit`] (`141` on unix) when the
 /// reader closes the pipe. **Never `1` on pipe closure** — for `grep`/`rg`/`diff`
 /// exit 1 is the wire protocol for "no matches found".
+#[allow(clippy::disallowed_methods)] // Streaming passthrough sink; too large to buffer, must stream byte-by-byte
 pub(crate) fn stream_passthrough_raw(
     program: &str,
     args: &[String],

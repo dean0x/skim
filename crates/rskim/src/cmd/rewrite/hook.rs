@@ -251,6 +251,7 @@ fn log_drift_warnings(
 ///
 /// The watchdog thread may call `process::exit(0)` after the flush completes;
 /// `write_all + flush` before returning ensures the full JSON is on the wire.
+#[allow(clippy::disallowed_methods)] // Hook JSON response to Claude; must hold lock across write+flush to prevent interleaving
 fn write_hook_response(response: &serde_json::Value) -> anyhow::Result<()> {
     use std::io::Write;
     let json_out = serde_json::to_string(response)?;

@@ -489,6 +489,7 @@ fn flush_failure(
 /// Returns [`StdoutStatus::PipeClosed`] when the downstream reader went away, so
 /// the caller can stop and return `pipe_closed_exit()` instead of continuing to
 /// produce output.
+#[allow(clippy::disallowed_methods)] // Test result emission; streaming handle for potentially large test output
 fn emit_result(
     result: &ParseResult<TestResult>,
     output: &CommandOutput,

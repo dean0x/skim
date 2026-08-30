@@ -160,6 +160,7 @@ pub(crate) fn report_token_stats(
 /// and the served view differs from raw bytes, emits a one-line stderr transparency
 /// marker so agents can distinguish structured views from byte-identical passthroughs
 /// (per ADR-005: agents learn about passthrough via stderr hints, not guidance prose).
+#[allow(clippy::disallowed_methods)] // Central result+stats emitter; BufWriter wraps the single stdout lock for coherent output
 pub(crate) fn write_result_and_stats(
     result: &ProcessResult,
     show_stats: bool,
