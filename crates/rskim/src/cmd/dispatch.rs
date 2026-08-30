@@ -72,6 +72,124 @@ pub(crate) fn strip_session_id_flag(args: &[String]) -> Option<Vec<String>> {
 }
 
 // ============================================================================
+// Strip skim-only flags before the passthrough exec (C1 — ADR-011)
+// ============================================================================
+
+/// Strip skim-only flags from args before the SKIM_PASSTHROUGH exec.
+///
+/// When `SKIM_PASSTHROUGH=1` (or `--passthrough`) is active, skim execs the
+/// wrapped tool with the argv it received. But that argv can contain skim-only
+/// flags the real tool has never heard of — `--json` is the measured case for
+/// `git` subcommands (`SKIM_PASSTHROUGH=1 skim git diff --json` → git error).
+/// This function strips those flags so the passthrough exec reaches the tool
+/// cleanly.
+///
+/// **Scoping (PF-008 — only strip flags that are skim-only for the given tool):**
+///
+/// - **All tools**: `--show-stats` (extracted by every handler via
+///   `extract_show_stats()`) and `--passthrough` (always skim-only; C2).
+/// - **`git` only**: bare `--json` (before `--`, extracted by
+///   `extract_json_flag()` in every git subcommand handler) and
+///   `--mode`/`--mode=<val>` (extracted by `extract_diff_mode()` in git
+///   diff/show).  Other tools such as npm accept `--json` as their own flag;
+///   stripping it there would change semantics.
+///
+/// **Forms handled (PF-008):**
+/// - `--flag` bare token
+/// - `--flag=value` equals-separated single token
+/// - `--flag value` space-separated two-token form (for value-bearing flags)
+///
+/// **POSIX `--` end-of-options:** nothing is stripped after a bare `--`.
+///
+/// Returns `None` (allocation-free) when no skim-only flags are present.
+///
+/// **Sync-guard:** `test_strip_skim_flags_sync_guard` asserts that every
+/// handler-extracted skim-only flag is in this function's strip set.  When a
+/// handler gains a new skim-only flag, add it here and to the test.
+pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<String>> {
+    // Fast-path: skip the scan entirely when no candidate tokens are present.
+    let has_candidate = args.iter().any(|a| {
+        a == "--show-stats"
+            || a == "--passthrough"
+            || (subcommand == "git" && (a == "--json" || a.starts_with("--mode")))
+    });
+    if !has_candidate {
+        return None;
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    let mut past_separator = false;
+
+    while i < args.len() {
+        let arg = &args[i];
+
+        // POSIX end-of-options: stop stripping after `--`.
+        if arg == "--" {
+            past_separator = true;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if past_separator {
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        // ----------------------------------------------------------------
+        // All-tools flags (always skim-only)
+        // ----------------------------------------------------------------
+
+        if arg == "--show-stats" || arg == "--passthrough" {
+            // Bare boolean flag — drop this token.
+            i += 1;
+            continue;
+        }
+
+        // ----------------------------------------------------------------
+        // Git-specific skim-only flags
+        // ----------------------------------------------------------------
+
+        if subcommand == "git" {
+            // `--json` (bare only; `--json=value` is a tool-owned form such
+            // as `gh pr list --json title,number` and must NOT be stripped).
+            if arg == "--json" {
+                i += 1;
+                continue;
+            }
+
+            // `--mode=value` (single equals-separated token)
+            if arg.starts_with("--mode=") {
+                i += 1;
+                continue;
+            }
+
+            // `--mode value` (space-separated two-token form)
+            if arg == "--mode" {
+                // Drop the flag token and its value token (if present).
+                i += 1;
+                if i < args.len() && !args[i].starts_with('-') {
+                    i += 1; // skip the value
+                }
+                continue;
+            }
+        }
+
+        out.push(arg.clone());
+        i += 1;
+    }
+
+    // Return Some only when at least one token was stripped.
+    if out.len() < args.len() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+// ============================================================================
 // Private argument helpers
 // ============================================================================
 
@@ -828,9 +946,20 @@ pub(crate) fn dispatch(
         && subcommand != "env"
         && !handler_reads_stdin(subcommand, args)
     {
+        // C1 (ADR-011): strip skim-only flags (e.g. `--json`, `--mode`,
+        // `--show-stats`, `--passthrough`) before exec so the real tool
+        // never sees flags it does not understand.  `strip_skim_flags`
+        // returns `None` (allocation-free) when no skim flags are present.
+        let cleaned;
+        let passthrough_args = if let Some(c) = strip_skim_flags(subcommand, args) {
+            cleaned = c;
+            &cleaned
+        } else {
+            args
+        };
         return super::execution::stream_passthrough_raw(
             subcommand,
-            args,
+            passthrough_args,
             &[],
             PASSTHROUGH_INSTALL_HINT,
         );
@@ -1019,6 +1148,223 @@ mod tests {
     #[test]
     fn test_strip_session_id_flag_empty_args() {
         assert!(strip_session_id_flag(&[]).is_none());
+    }
+
+    // ========================================================================
+    // strip_skim_flags tests (C1 — ADR-011)
+    // ========================================================================
+
+    /// No skim-only flags present: returns None (allocation-free fast path).
+    #[test]
+    fn test_strip_skim_flags_no_op_when_clean() {
+        let args = sv(&["diff", "--cached", "--stat"]);
+        assert!(strip_skim_flags("git", &args).is_none());
+    }
+
+    /// `--show-stats` is stripped for ALL tools.
+    #[test]
+    fn test_strip_skim_flags_show_stats_all_tools() {
+        for tool in &["git", "npm", "cargo", "eslint", "ls"] {
+            let args = sv(&["build", "--show-stats", "--release"]);
+            let result = strip_skim_flags(tool, &args).expect("must strip --show-stats");
+            assert_eq!(
+                result,
+                sv(&["build", "--release"]),
+                "--show-stats must be stripped for {tool}"
+            );
+        }
+    }
+
+    /// `--passthrough` is stripped for ALL tools (it is always skim-only; C2).
+    #[test]
+    fn test_strip_skim_flags_passthrough_all_tools() {
+        for tool in &["git", "npm", "cargo"] {
+            let args = sv(&["diff", "--passthrough", "--cached"]);
+            let result = strip_skim_flags(tool, &args).expect("must strip --passthrough");
+            assert_eq!(
+                result,
+                sv(&["diff", "--cached"]),
+                "--passthrough must be stripped for {tool}"
+            );
+        }
+    }
+
+    /// Bare `--json` is stripped for `git` (git has no --json flag).
+    #[test]
+    fn test_strip_skim_flags_json_git() {
+        let args = sv(&["diff", "--json", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --json for git");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// `--json` after `--` (POSIX end-of-options) is NOT stripped.
+    #[test]
+    fn test_strip_skim_flags_json_after_separator_not_stripped() {
+        let args = sv(&["diff", "--", "--json"]);
+        assert!(
+            strip_skim_flags("git", &args).is_none(),
+            "--json after -- is a positional argument, not skim's flag"
+        );
+    }
+
+    /// `--json=value` is NOT stripped (tool-owned equals form, e.g. gh field-selector).
+    #[test]
+    fn test_strip_skim_flags_json_equals_form_not_stripped() {
+        let args = sv(&["diff", "--json=title"]);
+        assert!(
+            strip_skim_flags("git", &args).is_none(),
+            "--json=value must not be stripped (tool-owned form)"
+        );
+    }
+
+    /// `--json` is NOT stripped for non-git tools (npm/yarn accept it as their own flag).
+    #[test]
+    fn test_strip_skim_flags_json_not_stripped_for_npm() {
+        let args = sv(&["list", "--json"]);
+        assert!(
+            strip_skim_flags("npm", &args).is_none(),
+            "--json must not be stripped for npm (tool-owned flag)"
+        );
+    }
+
+    /// `--mode value` (space-separated) is stripped for `git`.
+    #[test]
+    fn test_strip_skim_flags_mode_space_form_git() {
+        let args = sv(&["diff", "--mode", "structure", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --mode");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// `--mode=value` (equals form) is stripped for `git`.
+    #[test]
+    fn test_strip_skim_flags_mode_equals_form_git() {
+        let args = sv(&["diff", "--mode=structure", "--cached"]);
+        let result = strip_skim_flags("git", &args).expect("must strip --mode=structure");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// `--mode=value` is NOT stripped for non-git tools (e.g. cargo has --mode).
+    #[test]
+    fn test_strip_skim_flags_mode_not_stripped_for_cargo() {
+        let args = sv(&["build", "--mode=debug"]);
+        assert!(
+            strip_skim_flags("cargo", &args).is_none(),
+            "--mode must not be stripped for cargo (tool-owned flag)"
+        );
+    }
+
+    /// Multiple skim-only flags are all stripped in a single pass.
+    #[test]
+    fn test_strip_skim_flags_multiple_flags_single_pass() {
+        let args = sv(&[
+            "diff",
+            "--json",
+            "--show-stats",
+            "--passthrough",
+            "--cached",
+        ]);
+        let result = strip_skim_flags("git", &args).expect("must strip multiple flags");
+        assert_eq!(result, sv(&["diff", "--cached"]));
+    }
+
+    /// Empty arg slice: returns None (nothing to strip).
+    #[test]
+    fn test_strip_skim_flags_empty_args() {
+        assert!(strip_skim_flags("git", &[]).is_none());
+    }
+
+    // ========================================================================
+    // Sync-guard: strip_skim_flags vs handler flag extraction (C1 — ADR-011)
+    // ========================================================================
+    //
+    // INVARIANT: The set of flags stripped by `strip_skim_flags` must stay in
+    // sync with the set of flags skim's handlers extract as skim-only.
+    //
+    // WHY NO SHARED SOURCE: Handlers use inline string matching — not consts —
+    // inside `extract_show_stats()`, `extract_json_flag()`, and
+    // `extract_diff_mode()`. Factoring them into shared consts would require
+    // refactoring every handler call site, which is out of scope for C1.
+    // Instead this test explicitly compares both lists so drift fails loudly.
+    //
+    // MAINTENANCE: When a handler gains a new skim-only flag, (a) add it to
+    // `strip_skim_flags` and (b) add an assertion here verifying it is stripped.
+
+    /// Guard: every skim-only flag extracted by a handler is also stripped by
+    /// `strip_skim_flags` before the passthrough exec.
+    ///
+    /// Covers:
+    /// - `extract_show_stats()` → `--show-stats` (all tools)
+    /// - `--passthrough` / `set_passthrough_flag()` (all tools; C2)
+    /// - `extract_json_flag()` → `--json` bare (git only)
+    /// - `extract_diff_mode()` → `--mode` / `--mode=val` (git only)
+    #[test]
+    fn test_strip_skim_flags_sync_guard() {
+        // --- All-tools: --show-stats ---
+        // extract_show_stats() strips --show-stats for every handler.
+        // strip_skim_flags must strip it for every tool too.
+        let show_stats_cases: &[(&str, &[&str])] = &[
+            ("git", &["status", "--show-stats"]),
+            ("npm", &["install", "--show-stats"]),
+            ("cargo", &["build", "--show-stats"]),
+            ("eslint", &["src/", "--show-stats"]),
+        ];
+        for (tool, raw) in show_stats_cases {
+            let args = sv(raw);
+            let result = strip_skim_flags(tool, &args);
+            assert!(
+                result.is_some() && !result.unwrap().iter().any(|a| a == "--show-stats"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --show-stats \
+                 (extracted by extract_show_stats() in every handler)"
+            );
+        }
+
+        // --- All-tools: --passthrough (C2) ---
+        // The --passthrough flag is always skim-only; passing it to any real
+        // tool would error. strip_skim_flags must remove it universally.
+        let passthrough_cases: &[(&str, &[&str])] = &[
+            ("git", &["diff", "--passthrough"]),
+            ("npm", &["list", "--passthrough"]),
+        ];
+        for (tool, raw) in passthrough_cases {
+            let args = sv(raw);
+            let result = strip_skim_flags(tool, &args);
+            assert!(
+                result.is_some() && !result.unwrap().iter().any(|a| a == "--passthrough"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --passthrough \
+                 (always skim-only; C2)"
+            );
+        }
+
+        // --- Git-specific: --json ---
+        // extract_json_flag() strips bare --json in every git subcommand handler.
+        // strip_skim_flags("git", ...) must strip it too.
+        let git_json_args = sv(&["diff", "--json", "--cached"]);
+        let r = strip_skim_flags("git", &git_json_args);
+        assert!(
+            r.is_some() && !r.unwrap().iter().any(|a| a == "--json"),
+            "sync-guard FAIL: strip_skim_flags(\"git\") must strip bare --json \
+             (extracted by extract_json_flag() in git diff/log/show/status)"
+        );
+
+        // --- Git-specific: --mode / --mode=val ---
+        // extract_diff_mode() strips --mode and --mode=val in git diff/show handlers.
+        let git_mode_space = sv(&["diff", "--mode", "structure"]);
+        let r = strip_skim_flags("git", &git_mode_space);
+        assert!(
+            r.is_some()
+                && !r.clone().unwrap().iter().any(|a| a == "--mode")
+                && !r.unwrap().iter().any(|a| a == "structure"),
+            "sync-guard FAIL: strip_skim_flags(\"git\") must strip --mode <val> \
+             (extracted by extract_diff_mode() in git diff/show)"
+        );
+
+        let git_mode_eq = sv(&["diff", "--mode=structure"]);
+        let r = strip_skim_flags("git", &git_mode_eq);
+        assert!(
+            r.is_some() && !r.unwrap().iter().any(|a| a.starts_with("--mode")),
+            "sync-guard FAIL: strip_skim_flags(\"git\") must strip --mode=val \
+             (extracted by extract_diff_mode() in git diff/show)"
+        );
     }
 
     // ========================================================================

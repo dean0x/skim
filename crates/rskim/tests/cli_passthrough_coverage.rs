@@ -654,3 +654,165 @@ fn test_max_lines_marker_hint_absent_when_not_set() {
         .success()
         .stdout(predicate::str::contains("truncated"));
 }
+
+// ============================================================================
+// C1: strip_skim_flags — byte-comparison verification (PF-027)
+//
+// These tests verify the C1 fix: `strip_skim_flags` removes skim-only flags
+// before the passthrough exec so the real tool never sees them.
+//
+// Invokes raw git via `/usr/bin/git` (absolute path) per PF-026 — a skim rewrite
+// hook may be live on the developer machine; absolute paths bypass it.
+// ============================================================================
+
+/// `SKIM_PASSTHROUGH=1 skim git diff --json` must produce byte-identical output
+/// to `/usr/bin/git diff`.
+///
+/// Before C1: git exited 129 with "error: invalid option: --json" because the
+/// passthrough exec forwarded skim-only flags verbatim.
+/// After C1: `strip_skim_flags("git", args)` removes `--json` before exec.
+#[cfg(unix)]
+#[test]
+fn test_passthrough_git_diff_json_strips_flag() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    // Modify the file without staging to produce an unstaged diff.
+    fs::write(
+        dir.path().join("src.rs"),
+        "fn main() {\n    println!(\"world\");\n}\n",
+    )
+    .unwrap();
+
+    // Raw baseline: /usr/bin/git diff (absolute path per PF-026).
+    let raw = raw_stdout("/usr/bin/git", &["diff"], dir.path());
+    assert!(
+        !raw.is_empty(),
+        "precondition: unstaged diff must produce output"
+    );
+
+    // Skim passthrough with --json: C1 strips --json before exec.
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "diff", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "SKIM_PASSTHROUGH=1 skim git diff --json must succeed \
+         (C1 strips --json before passthrough exec); got exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, raw,
+        "byte-comparison FAILED: SKIM_PASSTHROUGH=1 skim git diff --json \
+         vs /usr/bin/git diff must be byte-identical; \
+         C1 regression: strip_skim_flags must remove --json before passthrough exec"
+    );
+}
+
+/// `SKIM_PASSTHROUGH=1 skim git show --json HEAD:src.rs` must produce
+/// byte-identical output to `/usr/bin/git show HEAD:src.rs`.
+#[cfg(unix)]
+#[test]
+fn test_passthrough_git_show_json_strips_flag() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    let raw = raw_stdout("/usr/bin/git", &["show", "HEAD:src.rs"], dir.path());
+    assert!(!raw.is_empty(), "precondition: blob must have content");
+
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "show", "--json", "HEAD:src.rs"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "SKIM_PASSTHROUGH=1 skim git show --json must succeed; got exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, raw,
+        "byte-comparison FAILED: SKIM_PASSTHROUGH=1 skim git show --json HEAD:src.rs \
+         vs /usr/bin/git show HEAD:src.rs must be byte-identical"
+    );
+}
+
+/// `SKIM_PASSTHROUGH=1 skim git log -n 1 --json` must produce byte-identical output
+/// to `/usr/bin/git log -n 1`.
+#[cfg(unix)]
+#[test]
+fn test_passthrough_git_log_json_strips_flag() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    let raw = raw_stdout("/usr/bin/git", &["log", "-n", "1"], dir.path());
+    assert!(!raw.is_empty(), "precondition: git log must produce output");
+
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "log", "-n", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "SKIM_PASSTHROUGH=1 skim git log -n 1 --json must succeed; got exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, raw,
+        "byte-comparison FAILED: SKIM_PASSTHROUGH=1 skim git log -n 1 --json \
+         vs /usr/bin/git log -n 1 must be byte-identical;\n\
+         C1 regression: strip_skim_flags must remove --json before passthrough exec"
+    );
+}
+
+// ============================================================================
+// C2: --passthrough CLI flag parity with SKIM_PASSTHROUGH=1
+// ============================================================================
+
+/// `skim --passthrough git log -n 1` must produce byte-identical output to
+/// `SKIM_PASSTHROUGH=1 skim git log -n 1`.
+///
+/// C2 adds `--passthrough` as a CLI-flag alternative to `SKIM_PASSTHROUGH=1`.
+/// Both paths must trigger the same structural passthrough gate.
+#[cfg(unix)]
+#[test]
+fn test_passthrough_flag_parity_with_env_var() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+
+    // Path A: SKIM_PASSTHROUGH=1 env var.
+    let env_out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "log", "-n", "1"])
+        .output()
+        .unwrap();
+    assert!(env_out.status.success(), "env-var path must succeed");
+    assert!(
+        !env_out.stdout.is_empty(),
+        "env-var path must produce output"
+    );
+
+    // Path B: --passthrough CLI flag (no env var).
+    let flag_out = common::skim()
+        .env_remove("SKIM_PASSTHROUGH")
+        .current_dir(dir.path())
+        .args(["--passthrough", "git", "log", "-n", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        flag_out.status.success(),
+        "--passthrough flag path must succeed; got exit {:?}\nstderr: {}",
+        flag_out.status.code(),
+        String::from_utf8_lossy(&flag_out.stderr)
+    );
+    assert_eq!(
+        flag_out.stdout, env_out.stdout,
+        "byte-comparison FAILED: --passthrough flag must produce byte-identical output \
+         to SKIM_PASSTHROUGH=1;\n\
+         C2 regression: set_passthrough_flag() must activate the same convergence gate \
+         as the env var"
+    );
+}
