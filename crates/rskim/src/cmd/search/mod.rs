@@ -59,14 +59,20 @@ pub(super) const NO_TEMPORAL_DATA_MSG: &str =
 pub(super) const HEAD_UNRESOLVED_TEMPORAL_MSG: &str = "git HEAD could not be resolved to a SHA (unborn branch, or unsupported ref \
      backend such as reftable — tracked in #481); temporal data unavailable";
 
-/// git HEAD resolved but the temporal build produced no data.
+/// Emitted by [`temporal_unavailable_msg`] for any [`staleness::HeadState::Resolved`]
+/// root that has no usable temporal data and no [`staleness::AnchorState::Differs`]
+/// mismatch.  The three covered cases are:
 ///
-/// This happens when `rebuild_temporal` ran successfully but the git log for the
-/// root produced zero entries (e.g. a brand-new repo with one commit and no
-/// file-change history, or a first build on a root whose entire history was
-/// ghost-filtered by AD-413-17).  Re-running with SKIM_DEBUG=1 surfaces the
-/// internal count.
-/// AD-413-13.
+/// 1. **Absent DB** — `temporal.db` was never built (first run, or after
+///    `--rebuild`); `open_temporal_db` returns `None`.
+/// 2. **Unopenable DB** — the file exists but is corrupt, schema-gated, or at an
+///    incompatible `PRAGMA user_version`; `TemporalDb::open` returns `Err`.
+/// 3. **Empty build** — `rebuild_temporal` ran successfully but the git log for
+///    the root produced zero entries (e.g. a brand-new repo with one commit and
+///    no file-change history, or a root whose entire history was ghost-filtered
+///    by AD-413-17).  Re-running with `SKIM_DEBUG=1` surfaces the internal count.
+///
+/// AD-413-8.
 pub(super) const TEMPORAL_BUILD_EMPTY_MSG: &str = "git HEAD resolved but the temporal build produced no data; \
      re-run with `SKIM_DEBUG=1`";
 

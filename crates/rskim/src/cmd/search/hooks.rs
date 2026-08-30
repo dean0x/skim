@@ -186,14 +186,27 @@ fn looks_like_git_dir(path: &Path) -> bool {
         && path.join("refs").is_dir()
 }
 
-/// Return `true` when `hooks_dir` differs from the plain `<root>/.git/hooks`.
+/// Return `true` when a `commondir` redirect is in effect for `project_root`,
+/// meaning every linked worktree of this clone shares the same hooks directory.
 ///
-/// A simple path inequality is sufficient because `resolve_hooks_dir` builds
-/// the plain path with the same `project_root.join(".git").join("hooks")`
-/// expression, so the comparison is byte-identical for plain repos.
-fn is_shared_hooks_dir(project_root: &Path, hooks_dir: &Path) -> bool {
-    let plain = project_root.join(".git").join("hooks");
-    hooks_dir != plain
+/// Uses the same `resolve_git_dir` → `resolve_common_dir` resolution chain that
+/// [`resolve_hooks_dir`]'s Stage 1 follows, so the predicate stays in sync with
+/// the actual write-path logic.
+///
+/// A plain repository (no `commondir` file) returns `false` — it has exactly one
+/// worktree and nothing to share.  A submodule (`.git` is a file but the
+/// referenced gitdir has no `commondir`) also returns `false` — the submodule's
+/// gitdir is a private, self-contained ref store, not a shared anchor.
+///
+/// The previous path-inequality approach (`hooks_dir != root.join(".git/hooks")`)
+/// was incorrect for submodules: `resolve_hooks_dir` reaches
+/// `<super>/.git/modules/<name>/hooks` via the `.git`-file pointer (Stage 2 of
+/// the write-path gate), which differs from the hand-built plain path even though
+/// no clone-wide sharing is occurring.
+fn is_shared_hooks_dir(project_root: &Path, _hooks_dir: &Path) -> bool {
+    super::staleness::resolve_git_dir(project_root)
+        .and_then(|d| super::staleness::resolve_common_dir(&d))
+        .is_some()
 }
 
 // ============================================================================
