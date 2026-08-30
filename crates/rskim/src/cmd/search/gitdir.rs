@@ -409,7 +409,8 @@ pub(super) fn resolve_common_dir(git_dir: &Path) -> Option<PathBuf> {
     // AD-413-2: a relative `commondir` resolves against the WORKTREE GITDIR (git's
     // default content is `"../.."`); an absolute one is used as-is. Same `is_absolute()`
     // branch shape as `resolve_git_dir`, DIFFERENT anchor: `commondir` resolves against
-    // `git_dir`, not `project_root` (staleness.rs:99) — anchoring on `project_root` lands
+    // `git_dir`, not `project_root` (unlike resolve_git_dir, which anchors its relative
+    // `.git` pointer against project_root) — anchoring on `project_root` lands
     // two levels above the worktree root.
     let joined = if raw.is_absolute() {
         raw

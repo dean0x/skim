@@ -197,8 +197,9 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
 ///
 /// Never called from `auto_refresh_if_stale` — that path is reached on every
 /// query, so emitting there would produce permanent stderr noise on plain
-/// non-temporal queries, which #414 SE-1/AC-30 forbids (A1 wiring correction).
-/// See Step 7 wiring in the plan for the correct call sites.
+/// non-temporal queries (#414 forbids this — A1 wiring correction).
+/// Call only from temporal-consuming arms (e.g. `--hot`/`--cold`/`--risky`/
+/// `--blast-radius`, `--ast`); never from `auto_refresh_if_stale`.
 pub(super) fn warn_if_temporal_unverifiable(cache_dir: &Path, head: &HeadState) {
     if !matches!(head, HeadState::Unresolved) {
         return; // zero cost on healthy repos and on non-repos

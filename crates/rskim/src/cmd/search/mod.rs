@@ -1745,9 +1745,9 @@ fn print_help() {
 ///   [`SUBDIR_ROOT_TEMPORAL_MSG`] + recorded/live paths (AD-413-16 / AC33(f))
 /// - [`HeadState::Resolved`] other → [`TEMPORAL_BUILD_EMPTY_MSG`]
 ///
-/// **INTERIM**: #414 will DELETE this function (and its five emit-site wires) in
-/// its Step 0, replacing all sites with `degraded_notice(root)` — the permanent
-/// per-arm selectors.  Marked here so the deletion obligation survives rebase.
+/// **INTERIM**: #414 will DELETE this function (and its five emit-site wires),
+/// replacing all sites with `degraded_notice(root)` — the permanent per-arm
+/// selectors.  Marked here so the deletion obligation survives rebase.
 pub(super) fn temporal_unavailable_msg(root: &std::path::Path) -> String {
     use staleness::{AnchorState, HeadState};
     match staleness::git_head_state(root) {

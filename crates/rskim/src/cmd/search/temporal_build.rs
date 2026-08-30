@@ -326,7 +326,7 @@ macro_rules! warn_skip {
 /// subdirectory root (OD-3/AD-413-14) has zero qualifying commits; the direct-call test
 /// (`rebuild_temporal_with_source` with a synthetic `fake_head`) exercises the same path
 /// at unit level.  The subdirectory-root route is now live in production: AD-408-5's ghost
-/// anchor (L529–538) is reachable for the first time via `--root <subdir>` (#413).
+/// anchor (the `ghost_root` binding) is reachable for the first time via `--root <subdir>` (#413).
 ///
 /// # Lookback semantics (O-C / ADR-003)
 ///
