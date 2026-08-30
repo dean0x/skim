@@ -740,6 +740,24 @@ fn record_temporal_anchor(
         .ok()
         .zip(ghost_root.canonicalize().ok())
         .is_some_and(|(r, g)| r != g);
+    // debug_assert: gix's ghost_root and the hand-rolled resolve_repo_toplevel
+    // must agree on the adopted repository toplevel so that the scope prefix
+    // derived from ghost_root stays consistent with temporal_anchor_state Gate 1.
+    // A mismatch here signals that gix::discover and the ancestor walk have
+    // drifted — catching it in tests prevents silent temporal data misattribution
+    // (finding F3a).
+    debug_assert_eq!(
+        super::gitdir::resolve_repo_toplevel(root)
+            .as_deref()
+            .unwrap_or(root)
+            .canonicalize()
+            .ok(),
+        ghost_root.canonicalize().ok(),
+        "record_temporal_anchor: ghost_root {:?} disagrees with hand-rolled \
+         resolve_repo_toplevel for root {:?}",
+        ghost_root,
+        root,
+    );
     if !adopted {
         // Finding 5: remove any stale anchor from a previous invocation so it
         // cannot drive false refusals on the next query-path anchor check.

@@ -1031,10 +1031,15 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     // Step 7 wiring (c): emit HEAD-unresolvable advisory BEFORE the `if json` split
     // so both text and JSON modes see it (wiring it inside one branch loses the other,
     // F3; wiring it in the early-return above would fire even without an index, AC24).
-    // Finding 2 fix: use the single-call wrapper — run_stats does not reuse the
-    // HeadState binding elsewhere, so constructing it only to hand to the next line
-    // was the two-call idiom identified by the review panel.
-    staleness::warn_if_temporal_unverifiable_at(&cache_dir, &root);
+    // Finding [reliability] fix: resolve HeadState ONCE here and thread it into both
+    // warn_if_temporal_unverifiable and build_stats_json.  The previous code used
+    // warn_if_temporal_unverifiable_at (which called git_head_state internally) and
+    // then build_stats_json called git_head_state a second time — two unsynchronised
+    // snapshots instead of one.  On a linked worktree each git_head_state traversal
+    // is ~10 syscalls; on a repo that gets a commit between the two reads the advisory
+    // and the JSON key would describe a different HEAD than the other.
+    let head_state = staleness::git_head_state(&root);
+    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {
@@ -1047,7 +1052,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         // — doing so would run a second NgramIndexReader::open and a second
         // check_staleness (full working-tree metadata walk) before immediately
         // discarding the results.
-        let extended = build_stats_json(&cache_dir, &root)?;
+        let extended = build_stats_json(&cache_dir, &root, &head_state)?;
         writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
         // Text mode: gather stats once here (not needed by the JSON path above).
@@ -1848,6 +1853,7 @@ fn temporal_unavailable_msg(
 pub(super) fn build_stats_json(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
+    head_state: &staleness::HeadState,
 ) -> anyhow::Result<serde_json::Value> {
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
@@ -1905,7 +1911,9 @@ pub(super) fn build_stats_json(
     // AC20 (#413): additive `git_head_state` key with one of three string values.
     // Not in either error object (AC21 — the no-index early-return above is before
     // this computation). Owned by #413; #414 extends this with `temporal_state`.
-    let git_head_state_str = match staleness::git_head_state(root) {
+    // Finding [reliability] fix: `head_state` is resolved ONCE by the caller
+    // (run_stats) and passed in — no second git_head_state call here.
+    let git_head_state_str = match head_state {
         staleness::HeadState::Resolved(_) => "resolved",
         staleness::HeadState::Unresolved => "unresolved",
         staleness::HeadState::NotARepo => "not_a_repo",
@@ -1941,12 +1949,16 @@ pub(super) fn build_stats_json(
 /// Used by `index_tests.rs` for:
 /// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
 /// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
+///
+/// Resolves the live `HeadState` from `root` and passes it to `build_stats_json`,
+/// matching the single-resolve contract the production `run_stats` path now enforces.
 #[cfg(test)]
 pub(crate) fn stats_json_for_test(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
-    build_stats_json(cache_dir, root)
+    let head_state = staleness::git_head_state(root);
+    build_stats_json(cache_dir, root, &head_state)
 }
 
 // ============================================================================

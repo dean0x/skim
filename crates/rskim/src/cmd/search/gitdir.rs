@@ -157,7 +157,12 @@ pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
 /// keeping the two callers consistent.
 pub(super) fn resolve_repo_toplevel(project_root: &Path) -> Option<PathBuf> {
     // Never re-point a root that claims to be a repository already (AC17).
-    if project_root.join(".git").exists() {
+    // Use try_exists() to distinguish "absent" from "exists but unreadable" —
+    // a permission error on `.git` must not silently trigger ancestor adoption
+    // of an enclosing repository; treat the error conservatively as "present"
+    // (return None / NotAdopted) so we never index a different repository's
+    // history when the intended root is blocked by a permission fence.
+    if project_root.join(".git").try_exists().unwrap_or(true) {
         return None;
     }
     let canonical = project_root.canonicalize().ok()?;
