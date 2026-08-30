@@ -89,11 +89,12 @@ pub(crate) fn truncate_to_lines(
     language: Language,
     max_lines: usize,
     hint: Option<&str>,
+    source_line_count: Option<usize>,
 ) -> Result<String> {
     // If no spans provided, fall back to simple line truncation immediately
     // to avoid a redundant lines().collect() (simple_line_truncate does its own)
     if spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint);
+        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
     }
 
     let lines: Vec<&str> = text.lines().collect();
@@ -110,15 +111,16 @@ pub(crate) fn truncate_to_lines(
         .collect();
 
     if valid_spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint);
+        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
     }
 
     // Fast-path: single span starting at line 0 — no inter-span gaps, no priority
     // re-ordering needed. Delegate to simple_line_truncate which gives N content
     // lines + 1 marker as line N+1 (E4). Handles pseudo, minimal, and full mode,
     // all of which emit NodeSpan::new(0..line_count, "source_file").
+    // E3: pass source_line_count so the marker states omitted SOURCE lines.
     if valid_spans.len() == 1 && valid_spans[0].transformed_range.start == 0 {
-        return simple_line_truncate(text, language, max_lines, hint);
+        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
     }
 
     // Score and sort spans: priority desc, position asc (tie-break)
@@ -204,7 +206,7 @@ pub(crate) fn truncate_to_lines(
     let selected: Vec<&NodeSpan> = selected.into_iter().map(|(_, s)| s).collect();
 
     if selected.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint);
+        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
     }
 
     // Build output with omission markers between gaps.
@@ -282,11 +284,22 @@ pub(crate) fn truncate_to_lines(
 /// The marker is extra — it does not consume one of the N requested lines (#317).
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
+///
+/// # Source-space counts (E3)
+///
+/// When `source_line_count` is `Some(k)`, the marker reports `k - max_lines` lines
+/// omitted — the count in **source** space (how many original source lines the agent
+/// cannot see), regardless of how many lines the transformed output contains.
+/// `None` falls back to `text.lines().count() - max_lines` (output-space count).
+/// For serde paths, the caller (E5) passes `Some(source.lines().count())` because
+/// the serde transform restructures text so the output has far fewer lines than
+/// the source.
 pub(crate) fn simple_line_truncate(
     text: &str,
     language: Language,
     max_lines: usize,
     hint: Option<&str>,
+    source_line_count: Option<usize>,
 ) -> Result<String> {
     let lines: Vec<&str> = text.lines().collect();
 
@@ -296,9 +309,10 @@ pub(crate) fn simple_line_truncate(
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
-    // E4.2 fix: emit max_lines content lines (not max_lines-1). The marker is
-    // line N+1 — it does not consume one of the N requested lines.
-    let omitted = lines.len() - max_lines;
+    // E3: use source-space line count when provided; fall back to output-space.
+    // E4.2: marker is line N+1 — it does not consume one of the N requested lines.
+    let total = source_line_count.unwrap_or(lines.len());
+    let omitted = total.saturating_sub(max_lines);
     let marker = append_hint(
         format!("{prefix} ... ({omitted} lines truncated){suffix}"),
         hint,
@@ -323,11 +337,17 @@ pub(crate) fn simple_line_truncate(
 /// Uses language-appropriate comment syntax.
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
+///
+/// # Source-space counts (E3)
+///
+/// When `source_line_count` is `Some(k)`, the marker reports `k - n` lines above —
+/// the count in **source** space. `None` falls back to `text.lines().count() - n`.
 pub(crate) fn simple_last_line_truncate(
     text: &str,
     language: Language,
     n: usize,
     hint: Option<&str>,
+    source_line_count: Option<usize>,
 ) -> Result<String> {
     let total = text.lines().count();
 
@@ -337,9 +357,10 @@ pub(crate) fn simple_last_line_truncate(
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
-    // E4.2 fix: emit n content lines (not n-1). The marker is an additional header
-    // line — it does not consume one of the N requested lines.
-    let omitted = total - n;
+    // E3: use source-space line count when provided; fall back to output-space.
+    // E4.2: marker is an extra header line — not one of the N requested content lines.
+    let source_total = source_line_count.unwrap_or(total);
+    let omitted = source_total.saturating_sub(n);
     let marker = append_hint(
         format!("{prefix} ... ({omitted} lines above){suffix}"),
         hint,
@@ -348,7 +369,7 @@ pub(crate) fn simple_last_line_truncate(
     // Skip to the tail without collecting all lines into a Vec
     let mut result: Vec<&str> = Vec::with_capacity(n + 1);
     result.push(&marker);
-    result.extend(text.lines().skip(omitted));
+    result.extend(text.lines().skip(total - n));
 
     let mut output = result.join("\n");
     if text.ends_with('\n') {
@@ -533,7 +554,7 @@ mod tests {
         let text = "line 1\nline 2\nline 3\n";
         let spans = vec![NodeSpan::new(0..3, "source_file")];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 10, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 10, None, None).unwrap();
         assert_eq!(result, text);
     }
 
@@ -542,7 +563,7 @@ mod tests {
         let text = "line 1\nline 2\nline 3\n";
         let spans = vec![NodeSpan::new(0..3, "source_file")];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         assert_eq!(result, text);
     }
 
@@ -557,7 +578,7 @@ mod tests {
             NodeSpan::new(4..5, "expression_statement"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 3,
@@ -577,7 +598,7 @@ mod tests {
         ];
 
         // Budget of 3: should prefer interface (priority 5) over functions (priority 4)
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         assert!(
             result.contains("interface Bar"),
             "Should contain the interface: {:?}",
@@ -595,7 +616,7 @@ mod tests {
         ];
 
         // Budget of 3: should prefer type (priority 5) over imports (priority 3)
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         assert!(
             result.contains("type A"),
             "Should contain the type alias: {:?}",
@@ -616,7 +637,7 @@ mod tests {
             NodeSpan::new(4..5, "type_alias_declaration"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None, None).unwrap();
         assert!(
             result.contains("lines truncated"),
             "Should contain counted omission marker: {:?}",
@@ -633,7 +654,7 @@ mod tests {
             NodeSpan::new(2..3, "function_definition"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::Python, 2, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::Python, 2, None, None).unwrap();
         assert!(
             result.contains("# ...") && result.contains("lines truncated"),
             "Python should use # for counted omission marker: {:?}",
@@ -651,7 +672,7 @@ mod tests {
             NodeSpan::new(3..4, "atx_heading"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::Markdown, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::Markdown, 3, None, None).unwrap();
         assert!(
             result.contains("<!-- ...") && result.contains("lines truncated"),
             "Markdown should use HTML comment for counted omission marker: {:?}",
@@ -665,7 +686,7 @@ mod tests {
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
         let spans: Vec<NodeSpan> = vec![];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 4,
@@ -681,7 +702,7 @@ mod tests {
         // Omitted = 5 - 3 = 2 lines.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
 
-        let result = simple_line_truncate(text, Language::TypeScript, 3, None).unwrap();
+        let result = simple_line_truncate(text, Language::TypeScript, 3, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
@@ -702,7 +723,7 @@ mod tests {
     #[test]
     fn test_simple_line_truncate_n1() {
         let text = "line 1\nline 2\nline 3\n";
-        let result = simple_line_truncate(text, Language::TypeScript, 1, None).unwrap();
+        let result = simple_line_truncate(text, Language::TypeScript, 1, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
@@ -722,7 +743,7 @@ mod tests {
     #[test]
     fn test_simple_line_truncate_n20() {
         let lines_25: String = (1..=25).map(|i| format!("line {i}\n")).collect();
-        let result = simple_line_truncate(&lines_25, Language::TypeScript, 20, None).unwrap();
+        let result = simple_line_truncate(&lines_25, Language::TypeScript, 20, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
@@ -743,7 +764,7 @@ mod tests {
     fn test_simple_line_truncate_no_truncation() {
         let text = "line 1\nline 2\n";
 
-        let result = simple_line_truncate(text, Language::TypeScript, 5, None).unwrap();
+        let result = simple_line_truncate(text, Language::TypeScript, 5, None, None).unwrap();
         assert_eq!(result, text);
     }
 
@@ -755,7 +776,7 @@ mod tests {
             NodeSpan::new(1..2, "function_declaration"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 1, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 1, None, None).unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 1,
@@ -778,7 +799,7 @@ mod tests {
             NodeSpan::new(4..5, "expression_statement"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
 
         // Types should appear before any omission markers
@@ -799,7 +820,7 @@ mod tests {
             NodeSpan::new(4..5, "expression_statement"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None, None).unwrap();
         assert!(
             result.contains("interface Foo"),
             "Should contain the interface: {:?}",
@@ -820,7 +841,7 @@ mod tests {
             NodeSpan::new(1..4, "expression_statement"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         assert!(
             result.ends_with('\n'),
             "Should preserve trailing newline: {:?}",
@@ -836,7 +857,7 @@ mod tests {
             NodeSpan::new(1..4, "expression_statement"),
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
         assert!(
             !result.ends_with('\n'),
             "Should not add trailing newline: {:?}",
@@ -860,7 +881,7 @@ mod tests {
         ];
 
         // Should not panic — result must be a valid (possibly empty) string.
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 0, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 0, None, None).unwrap();
         let line_count = result.lines().count();
         // truncate(0) removes all entries; only the preserved trailing '\n' survives.
         assert!(
@@ -878,7 +899,7 @@ mod tests {
         // Then truncation to 0 would clip everything. This documents the edge behavior.
         let text = "line 1\nline 2\nline 3\n";
 
-        let result = simple_line_truncate(text, Language::TypeScript, 0, None).unwrap();
+        let result = simple_line_truncate(text, Language::TypeScript, 0, None, None).unwrap();
         let line_count = result.lines().count();
         // saturating_sub(1) => content_lines=0, then push marker => 1 line,
         // but no final truncate(0) call exists in simple_line_truncate
@@ -903,7 +924,7 @@ mod tests {
             NodeSpan::new(3..6, "function_declaration"),   // lines 3-5 (overlaps with second)
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None, None).unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 4,
@@ -924,7 +945,7 @@ mod tests {
             NodeSpan::new(4..6, "function_declaration"),   // lines 4-5 (adjacent)
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 4, None, None).unwrap();
         let line_count = result.lines().count();
         assert!(
             line_count <= 4,
@@ -1001,7 +1022,7 @@ mod tests {
             NodeSpan::new(9..10, "expression_statement"),  // line 9
         ];
 
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
 
         assert!(
@@ -1044,7 +1065,7 @@ mod tests {
         // Import (prio 3) is dropped first, but this creates a gap between type(0..1)
         // and fn(2..3), adding a gap marker. Now 2 content + 2 markers = 4 > 3,
         // so fn is also dropped. Final: type + trailing marker = 2 lines.
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 3, None, None).unwrap();
 
         // Highest priority (type) must always be preserved
         assert!(
@@ -1074,7 +1095,7 @@ mod tests {
         ];
 
         // Budget tight enough that one type must be dropped
-        let result = truncate_to_lines(text, &spans, Language::TypeScript, 2, None).unwrap();
+        let result = truncate_to_lines(text, &spans, Language::TypeScript, 2, None, None).unwrap();
 
         // If one type was dropped, it should be type B (higher position)
         if result.contains("type A") && !result.contains("type B") {
@@ -1401,14 +1422,14 @@ mod tests {
     #[test]
     fn test_last_line_no_truncation_when_within_budget() {
         let text = "line 1\nline 2\nline 3\n";
-        let result = simple_last_line_truncate(text, Language::TypeScript, 5, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::TypeScript, 5, None, None).unwrap();
         assert_eq!(result, text);
     }
 
     #[test]
     fn test_last_line_no_truncation_when_exact() {
         let text = "line 1\nline 2\nline 3\n";
-        let result = simple_last_line_truncate(text, Language::TypeScript, 3, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::TypeScript, 3, None, None).unwrap();
         assert_eq!(result, text);
     }
 
@@ -1417,7 +1438,7 @@ mod tests {
         // E4.2: marker is an extra header line (N+1 total). n=3, total=5.
         // Omitted = 5-3 = 2. Shows lines 3,4,5 (n=3 content lines) + marker.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
-        let result = simple_last_line_truncate(text, Language::TypeScript, 3, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::TypeScript, 3, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
@@ -1438,7 +1459,7 @@ mod tests {
     #[test]
     fn test_last_line_truncation_preserves_trailing_newline() {
         let text = "line 1\nline 2\nline 3\nline 4\n";
-        let result = simple_last_line_truncate(text, Language::TypeScript, 2, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::TypeScript, 2, None, None).unwrap();
         assert!(
             result.ends_with('\n'),
             "Should preserve trailing newline: {:?}",
@@ -1449,7 +1470,7 @@ mod tests {
     #[test]
     fn test_last_line_truncation_no_trailing_newline() {
         let text = "line 1\nline 2\nline 3\nline 4";
-        let result = simple_last_line_truncate(text, Language::TypeScript, 2, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::TypeScript, 2, None, None).unwrap();
         assert!(
             !result.ends_with('\n'),
             "Should not add trailing newline: {:?}",
@@ -1461,7 +1482,7 @@ mod tests {
     fn test_last_line_truncation_python_marker() {
         // E4.2: n=2, total=3. Omitted = 3-2 = 1.
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
-        let result = simple_last_line_truncate(text, Language::Python, 2, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::Python, 2, None, None).unwrap();
         assert!(
             result.contains("# ... (1 lines above)"),
             "Python should use # for marker, omit=1: {:?}",
@@ -1473,7 +1494,7 @@ mod tests {
     fn test_last_line_truncation_markdown_marker() {
         // E4.2: n=2, total=4. Omitted = 4-2 = 2.
         let text = "# H1\n## H2\n## H3\n## H4\n";
-        let result = simple_last_line_truncate(text, Language::Markdown, 2, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::Markdown, 2, None, None).unwrap();
         assert!(
             result.contains("<!-- ... (2 lines above) -->"),
             "Markdown should use HTML comment for marker, omit=2: {:?}",
@@ -1485,7 +1506,7 @@ mod tests {
     fn test_last_line_truncation_single_line_budget() {
         // E4.2: n=1, total=3. Omitted = 3-1 = 2. Shows 1 content + 1 marker = 2 total.
         let text = "line 1\nline 2\nline 3\n";
-        let result = simple_last_line_truncate(text, Language::TypeScript, 1, None).unwrap();
+        let result = simple_last_line_truncate(text, Language::TypeScript, 1, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),

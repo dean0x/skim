@@ -8,4 +8,4 @@ expression: "snap(TS_COMMENTS, Language::TypeScript,\nTransformConfig::with_mode
  * @param x - first number
  * @param y - second number
  * @returns the sum
-// ... (36 lines truncated)
+// ... (49 lines truncated)

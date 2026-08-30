@@ -8,4 +8,4 @@ expression: "snap(PYTHON_COMMENTS, Language::Python,\nTransformConfig::with_mode
 # TESTS: Minimal mode comment stripping
 
 
-# ... (31 lines truncated)
+# ... (41 lines truncated)
