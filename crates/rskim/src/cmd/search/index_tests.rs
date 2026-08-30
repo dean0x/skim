@@ -3894,6 +3894,43 @@ fn test_ac11_stats_json_back_compat_keys() {
         "AC17/F10: an empty `.git` directory with no HEAD must report not_a_repo"
     );
 
+    // AC20 key-set equality: the object must contain EXACTLY the eleven
+    // pre-existing keys plus this wave's additive keys.  `ast_coverage` is
+    // absent here because the fixture is clean (one small file, within cap).
+    // #414 extends this constant by appending "temporal_state".
+    // AD-413-13: key-set contract for the AC20 additive extension.
+    const EXPECTED_STATS_JSON_KEYS: &[&str] = &[
+        // eleven pre-existing keys (AC11 / AC20) — alphabetical
+        "cache_dir",
+        "file_count",
+        "git_head",
+        "index_size_bytes",
+        "last_updated",
+        "skipped",
+        "skipped_by_reason",
+        "staleness",
+        "temporal_db_bytes",
+        "total_ngrams",
+        "total_on_disk_bytes",
+        // #413 additive key (AC20)
+        "git_head_state",
+    ];
+    let mut actual_keys: Vec<&str> = stats_json
+        .as_object()
+        .expect("AC20: stats_json must be an object for key-set check")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    actual_keys.sort_unstable();
+    let mut expected_keys: Vec<&str> = EXPECTED_STATS_JSON_KEYS.to_vec();
+    expected_keys.sort_unstable();
+    assert_eq!(
+        actual_keys, expected_keys,
+        "AC20: --stats --json key set must equal exactly the pre-existing keys \
+         plus this wave's additive keys (`ast_coverage` absent when clean). \
+         Unexpected keys or missing keys signal a silent schema change."
+    );
+
     // The envelope itself must be a single JSON object.
     assert!(
         stats_json.is_object(),
