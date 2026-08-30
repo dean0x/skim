@@ -567,29 +567,26 @@ pub(super) fn rebuild_temporal_with_source(
         .map(|p| format!("{p}/"));
 
     if let Some(ref pfx) = scope {
-        hotspot_rows.retain_mut(|r| {
-            if let Some(stripped) = r.file_path.strip_prefix(pfx.as_str()) {
-                r.file_path = stripped.to_string();
+        let pfx_str = pfx.as_str();
+        // Strip the scope prefix from a single path field in-place.
+        // Shared by hotspot_rows and risk_rows (identical structure).
+        let strip_in_place = |path: &mut String| -> bool {
+            if let Some(stripped) = path.strip_prefix(pfx_str) {
+                *path = stripped.to_string();
                 true
             } else {
                 false
             }
-        });
-        risk_rows.retain_mut(|r| {
-            if let Some(stripped) = r.file_path.strip_prefix(pfx.as_str()) {
-                r.file_path = stripped.to_string();
-                true
-            } else {
-                false
-            }
-        });
+        };
+        hotspot_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
+        risk_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
         // Cochange: only retain pairs where BOTH sides are within the scope.
         // A row where only one side is scoped would silently point at a path that
         // the query-side would never find — drop it rather than produce a ghost
         // co-change result.
         cochange_rows.retain_mut(|r| {
-            let a = r.file_a.strip_prefix(pfx.as_str()).map(String::from);
-            let b = r.file_b.strip_prefix(pfx.as_str()).map(String::from);
+            let a = r.file_a.strip_prefix(pfx_str).map(String::from);
+            let b = r.file_b.strip_prefix(pfx_str).map(String::from);
             match (a, b) {
                 (Some(a), Some(b)) => {
                     r.file_a = a;

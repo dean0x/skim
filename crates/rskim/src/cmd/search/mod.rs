@@ -963,10 +963,8 @@ fn run_update(
     std::fs::create_dir_all(&cache_dir)?;
     let (outcome, manifest) = staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, true)?;
     // Step 7 wiring (b): emit the HEAD-unresolvable advisory on --update (AC23).
-    {
-        let head_state = staleness::git_head_state(&root);
-        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-    }
+    let head_state = staleness::git_head_state(&root);
+    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
     if !outcome.refreshed() {
         eprintln!("skim search: index is current");
     } else {
@@ -1012,10 +1010,8 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     // Step 7 wiring (c): emit HEAD-unresolvable advisory BEFORE the `if json` split
     // so both text and JSON modes see it (wiring it inside one branch loses the other,
     // F3; wiring it in the early-return above would fire even without an index, AC24).
-    {
-        let head_state = staleness::git_head_state(&root);
-        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-    }
+    let head_state = staleness::git_head_state(&root);
+    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
     let mut out = BufWriter::new(std::io::stdout());
     if json {
@@ -1535,10 +1531,8 @@ fn run_temporal_standalone(
     staleness::auto_refresh_if_stale(&root, &cache_dir, analytics, false)?;
 
     // Step 7 wiring (d): temporal-consuming standalone arm (--hot/--cold/--risky/--blast-radius).
-    {
-        let head_state = staleness::git_head_state(&root);
-        staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
-    }
+    let head_state = staleness::git_head_state(&root);
+    staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
     let temporal_db_path = cache_dir.join("temporal.db");
 
