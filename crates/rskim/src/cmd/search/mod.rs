@@ -1646,8 +1646,11 @@ Options:
   --rebuild        Rebuild the index from scratch
   --update         Refresh if index is stale (git HEAD changed)
   --stats          Show index statistics
-  --install-hooks  Install git post-commit/merge hooks for auto-refresh
-  --remove-hooks   Remove skim git hooks
+  --install-hooks  Install git post-commit/merge hooks for auto-refresh.
+                   In a linked worktree, writes to the shared hooks dir
+                   (applies to all worktrees in the clone).
+  --remove-hooks   Remove skim git hooks. In a linked worktree, removes
+                   from the shared hooks dir (applies clone-wide).
   --json, -j       Output results as JSON
   --limit N, -n N  Maximum results to return (default: 20)
   --offset N       Skip N verified results (pagination; default: 0)
@@ -1758,7 +1761,7 @@ General examples:
   skim search --rebuild                     Rebuild from scratch
   skim search --update                      Refresh stale index
   skim search --stats                       Show index statistics
-  skim search --install-hooks               Auto-refresh on git commit/merge
+  skim search --install-hooks               Install hooks (clone-wide in a linked worktree)
   skim search --hot                         Top hotspot files (standalone)
   skim search --hot --limit 5 --offset 5   Hotspot page 2 (items 6-10)
   skim search --risky                       Top risky files (standalone)
