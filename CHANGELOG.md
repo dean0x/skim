@@ -128,6 +128,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-empty human summary reads `N result(s) for "query" in Tms` (previously
   `N result(s) in Tms`) so a mangled query can never masquerade as a successful search.
   JSON output is unchanged.
+- **`git_head_state` in `skim search --stats --json`** (#413) — the `--stats --json`
+  object now includes a `"git_head_state"` string key alongside the existing
+  `"git_head"` key.  Values: `"resolved"` (HEAD resolves to a SHA), `"unresolved"`
+  (HEAD exists but cannot be resolved to a commit — unborn branch or reftable backend),
+  `"not_a_repo"` (root is not inside a git repository).  Unlike `"git_head"` (which
+  is the SHA stored at the last index build), `"git_head_state"` reflects the live
+  resolution status at call time and can legitimately diverge from `"git_head"` before
+  the first post-upgrade rebuild (e.g. a linked worktree with `"git_head": null` and
+  `"git_head_state": "resolved"`).  Additive — all pre-existing keys are byte-identical
+  on upgrade; the key is absent from the `{"error": "no index found"}` object (AC21).
 
 ### Fixed
 - **`skim search` linked worktree HEAD resolution and temporal data** (#413) — in a
@@ -230,6 +240,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commands print the absolute resolved directory and disclose that scope on stderr, and
   `--remove-hooks` no longer prints a success line when nothing was removed.  Plain
   repositories and non-repository roots resolve to the same path as before.
+  A `--root` that is a subdirectory of a git repository but has no `.git` entry of
+  its own is **refused** — the command exits with an error naming the enclosing
+  repository so the caller can re-run with the correct `--root`.
+- **`skim search` temporal-arm degradation messages are now reason-specific** (#413) —
+  previously, all "no temporal data" conditions on `--hot`/`--cold`/`--risky`/
+  `--blast-radius` (and the temporal path of `--ast`) emitted a single generic message:
+  `"no temporal data — run 'skim search' on a git repo to auto-populate"`.  That
+  message is now reserved for the non-git case (root is not inside any git repository).
+  Three reason-specific messages replace it for the remaining conditions:
+  (1) **Unresolved HEAD** (unborn branch or reftable backend): starts with
+  `"git HEAD could not be resolved to a SHA"`;
+  (2) **Resolved HEAD, empty temporal build** (no git-log entries for the root):
+  starts with `"git HEAD resolved but the temporal build produced no data"`;
+  (3) **Resolved HEAD, anchor mismatch** (on-disk `temporal.db` was built from a
+  different repository): starts with `"temporal data on disk was built from a
+  different repository"`.
+  Scripts or automation that matched the previous generic text will not match
+  conditions (1)–(3); the stable prefix of each new message is the named constant
+  in source (`HEAD_UNRESOLVED_TEMPORAL_MSG`, `TEMPORAL_BUILD_EMPTY_MSG`,
+  `SUBDIR_ROOT_TEMPORAL_MSG`) for tests that need a reliable assertion target.
 
 ### Fixed
 - **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit
