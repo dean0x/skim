@@ -365,6 +365,22 @@ struct Args {
     /// Enable debug output (warnings/notices on stderr)
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Bypass all compression and exec the real tool with raw argv.
+    ///
+    /// Equivalent to setting `SKIM_PASSTHROUGH=1`. When set, skim-only flags
+    /// (`--json` for git, `--mode`, `--show-stats`, `--passthrough` itself)
+    /// are stripped from the forwarded argv so the underlying tool never sees
+    /// flags it does not understand.
+    ///
+    /// ORDERING: detected and latched into an atomic BEFORE threads are
+    /// spawned (see `main()` startup sequence), so analytics background
+    /// threads always observe the correct passthrough state.
+    #[arg(
+        long,
+        help = "Bypass all compression (equivalent to SKIM_PASSTHROUGH=1)"
+    )]
+    passthrough: bool,
 }
 
 /// Build the clap `Command` from `Args` for use by shell completion generation.
@@ -869,6 +885,18 @@ fn main() -> ExitCode {
     // Extract --debug before routing so it applies to all subcommands.
     if std::env::args().any(|a| a == "--debug") {
         debug::force_enable_debug();
+    }
+
+    // C2: latch --passthrough into an atomic BEFORE THREADS_SPAWNED so that
+    // analytics background threads always observe the correct value.
+    // Mirrors the --debug pre-parse pattern above.
+    //
+    // ORDERING INVARIANT: this store happens before THREADS_SPAWNED.store(true)
+    // below. strip_skim_wrappers_from_path() asserts THREADS_SPAWNED is still
+    // false at the top of main(), so any future reordering that moves code
+    // below THREADS_SPAWNED will be caught by that assertion.
+    if std::env::args().any(|a| a == "--passthrough") {
+        cmd::set_passthrough_flag();
     }
 
     // B4: hidden early-exit used by `skim doctor` to identify each binary on $PATH.

@@ -267,8 +267,43 @@ pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
 ///
 /// `cmd/file/env.rs` is the one deliberate REFUSAL: `never_passthrough: true`
 /// keeps credential redaction on both branches (PF-012).
+///
+/// C2: also returns `true` when the `--passthrough` CLI flag has been set via
+/// [`set_passthrough_flag`] — providing flag parity with `SKIM_PASSTHROUGH=1`.
 pub(crate) fn is_passthrough_mode() -> bool {
-    check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok())
+    check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok()) || is_passthrough_flag_set()
+}
+
+// ============================================================================
+// --passthrough CLI flag (C2)
+// ============================================================================
+
+/// Process-wide flag that activates passthrough mode via `--passthrough`.
+///
+/// Written with `Release` ordering before `THREADS_SPAWNED` is set in
+/// `main()`, so analytics threads always see the correct value.
+/// Mirrors the `DEBUG_FORCE_ENABLED` pattern in `debug.rs`.
+static PASSTHROUGH_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable passthrough mode via the `--passthrough` CLI flag.
+///
+/// Must be called in `main()` BEFORE `THREADS_SPAWNED.store(true, …)` so
+/// that any background analytics threads observe the correct value.  The
+/// `strip_skim_wrappers_from_path()` assertion in `main()` catches future
+/// reorderings at runtime.
+///
+/// Thread-safe alternative to `std::env::set_var("SKIM_PASSTHROUGH", "1")`,
+/// which is not safe to call after threads are spawned.
+pub(crate) fn set_passthrough_flag() {
+    PASSTHROUGH_FLAG.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Check whether `--passthrough` was given on the command line.
+///
+/// Returns `true` if [`set_passthrough_flag`] has been called.  This is a
+/// pure atomic load with no allocations or syscalls.
+pub(crate) fn is_passthrough_flag_set() -> bool {
+    PASSTHROUGH_FLAG.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Core truthy-value check for a `SKIM_PASSTHROUGH` value already extracted as

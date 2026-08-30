@@ -103,7 +103,7 @@ skim intercepts a sub-agent's shell command through **two independent mechanisms
 
 ## Environment Variables
 
-- `SKIM_PASSTHROUGH=1` — bypass all compression (use when compressed output hides an error). Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
+- `SKIM_PASSTHROUGH=1` (or `--passthrough` CLI flag) — bypass all compression and exec the real tool with raw argv. The `--passthrough` flag strips skim-only flags (`--json` for git, `--mode`, `--show-stats`) from the forwarded argv so the real tool never sees flags it does not understand. Indefinite commands (`vite dev`, `jest --watch`, bare `skim vitest`) auto-pass-through live; use `skim vitest run` for a compressed one-shot.
 - `SKIM_DEBUG=1` (or `--debug`) — enables raw-fallback diagnostic banners on stderr for no-loss raw-fallback paths (see **Stderr notice taxonomy** in Design Constraints below; loss-bearing elision markers and the ADR-008 transparency marker are unconditional and not gated by this variable). In hook mode the startup provenance line goes to `hook.log`, never stderr (GRANITE #361 Bug 3); drift events are also logged to `hook.log` unconditionally — `skim doctor` is the primary on-demand diagnosis path.
 - `SKIM_SESSION_ID` — analytics session attribution; priority sidecar > env > `--session-id` flag (flag is a forward-compat fallback only — the hook no longer injects it). Set it alongside the PATH export so sub-agents inherit it.
 - `SKIM_CACHE_DIR` — relocates **all** skim cache state: parser cache (`.json` files),
