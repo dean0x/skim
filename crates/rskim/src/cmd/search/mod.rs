@@ -48,6 +48,36 @@ use serde::Serialize;
 pub(super) const NO_TEMPORAL_DATA_MSG: &str =
     "no temporal data — run 'skim search' on a git repo to auto-populate";
 
+/// git HEAD is inside a repo but the symbolic-ref could not be resolved to a SHA.
+///
+/// Causes: (1) unborn branch — HEAD points to a branch that has no commits yet;
+/// (2) unsupported ref backend (e.g. reftable — tracked in #481).
+/// Named constant so tests can assert against it without hardcoding the text.
+/// AD-413-8. Must NOT contain "run 'skim search' on a git repo" (AC18(a)/AC33(c)).
+pub(super) const HEAD_UNRESOLVED_TEMPORAL_MSG: &str = "git HEAD could not be resolved to a SHA (unborn branch, or unsupported ref \
+     backend such as reftable — tracked in #481); temporal data unavailable";
+
+/// git HEAD resolved but the temporal build produced no data.
+///
+/// This happens when `rebuild_temporal` ran successfully but the git log for the
+/// root produced zero entries (e.g. a brand-new repo with one commit and no
+/// file-change history, or a first build on a root whose entire history was
+/// ghost-filtered by AD-413-17).  Re-running with SKIM_DEBUG=1 surfaces the
+/// internal count.
+/// AD-413-13.
+pub(super) const TEMPORAL_BUILD_EMPTY_MSG: &str = "git HEAD resolved but the temporal build produced no data; \
+     re-run with `SKIM_DEBUG=1`";
+
+/// Anchor refusal prefix — temporal data on disk was built from a different
+/// repository than the one this root now resolves to.
+///
+/// The full emitted message appends "(recorded: …, live: …); run …" so tests
+/// can assert `stderr.contains(SUBDIR_ROOT_TEMPORAL_MSG)` for the stable prefix.
+/// Must NOT contain "run 'skim search' on a git repo" (AC18(a)/AC33(c)).
+/// AD-413-16.
+pub(super) const SUBDIR_ROOT_TEMPORAL_MSG: &str =
+    "temporal data on disk was built from a different repository";
+
 /// Canonical enumeration of all recognised flags for `skim search`.
 ///
 /// Single source of truth: used in the unknown-flag error message so that
@@ -201,14 +231,22 @@ pub(crate) fn run(
             // Open the temporal DB only when a sort is requested.  Absent DB →
             // graceful degradation: warn on stderr and run unsorted (exit 0, AC-A3),
             // mirroring run_temporal_standalone's missing-data message.
-            // Message composed from NO_TEMPORAL_DATA_MSG (single source of truth,
-            // mod.rs:47-48) so the two can't silently drift (#357 cycle-2 finding 2).
+            // Step 8: temporal_unavailable_msg replaces the bare NO_TEMPORAL_DATA_MSG so
+            // the reason reflects the actual state (unborn branch, anchor mismatch, etc.).
             let temporal_db = if flags.temporal_sort.is_some() {
-                let db = temporal::open_temporal_db(&temporal_db_path);
+                // AD-413-16: pre-check for anchor mismatch.  When AnchorState::Differs
+                // the DB EXISTS but was built for a different repository — refuse it
+                // before open_temporal_db would succeed and return wrong data.
+                let anchor = staleness::temporal_anchor_state(&cache_dir, &root);
+                let db = if matches!(anchor, staleness::AnchorState::Differs { .. }) {
+                    None
+                } else {
+                    temporal::open_temporal_db(&temporal_db_path)
+                };
                 if db.is_none() {
                     eprintln!(
                         "skim search: {}; returning unsorted --ast results",
-                        NO_TEMPORAL_DATA_MSG
+                        temporal_unavailable_msg(&root)
                     );
                 }
                 db
@@ -1140,15 +1178,43 @@ fn total_on_disk_bytes(cache_dir: &std::path::Path) -> u64 {
 
 fn run_install_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let (root, _) = resolve_root_and_cache(root_override)?;
+    // AD-413-15: resolve the shared hooks dir BEFORE install so the message
+    // names what was actually touched (may differ from `<root>/.git/hooks`).
+    let hooks_dir = hooks::resolve_hooks_dir(&root);
     hooks::install_search_hooks(&root)?;
-    eprintln!("skim search: git hooks installed in {}", root.display());
+    eprintln!(
+        "skim search: git hooks installed in {}",
+        hooks_dir.display()
+    );
+    // AC34(b): when the resolved dir is not the local `<root>/.git/hooks`,
+    // name the clone-wide scope so the user knows the footprint (R15).
+    let plain_hooks_dir = root.join(".git").join("hooks");
+    if hooks_dir != plain_hooks_dir {
+        eprintln!("skim search: this hooks directory is shared by every worktree of this clone");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let (root, _) = resolve_root_and_cache(root_override)?;
-    hooks::remove_search_hooks(&root)?;
-    eprintln!("skim search: git hooks removed from {}", root.display());
+    // AD-413-15: resolve the shared hooks dir so remove targets the same
+    // directory that install used.
+    let hooks_dir = hooks::resolve_hooks_dir(&root);
+    // AC31(a): only print "removed from" when a marker block was actually removed.
+    let any_removed = hooks::remove_search_hooks(&root)?;
+    if any_removed {
+        eprintln!(
+            "skim search: git hooks removed from {}",
+            hooks_dir.display()
+        );
+        // AC34(b): disclose scope when the resolved dir is the shared commondir hooks.
+        let plain_hooks_dir = root.join(".git").join("hooks");
+        if hooks_dir != plain_hooks_dir {
+            eprintln!(
+                "skim search: this hooks directory is shared by every worktree of this clone"
+            );
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1205,8 +1271,17 @@ fn run_query(
     // Open the temporal DB once (AFTER refresh above). Used for both
     // blast-radius filtering (before the query, so LIMIT applies to the filtered
     // set) and temporal enrichment (after the query, to annotate/sort results).
+    // AD-413-16: pre-check anchor mismatch before attempting to open the DB.
+    // AnchorState::Differs means the DB was built from a different repository —
+    // refuse it (return None) so the degraded path below emits SUBDIR_ROOT_TEMPORAL_MSG
+    // instead of silently serving wrong-repository hotspot scores.
     let temporal_db = if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-        temporal::open_temporal_db(&cache_dir.join("temporal.db"))
+        let anchor = staleness::temporal_anchor_state(&cache_dir, &root);
+        if matches!(anchor, staleness::AnchorState::Differs { .. }) {
+            None
+        } else {
+            temporal::open_temporal_db(&cache_dir.join("temporal.db"))
+        }
     } else {
         None
     };
@@ -1329,7 +1404,7 @@ fn run_query(
             flags.offset
         },
         json: flags.json,
-        root,
+        root: root.clone(),
         cache_dir,
         blast_radius_paths,
         ast_scored,
@@ -1367,12 +1442,12 @@ fn run_query(
         if let Some(ref db) = temporal_db {
             temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
         } else {
-            // AD-404-6 degraded path: no temporal.db present (non-git repo or
-            // heatmap not yet built).  Emit the advisory message that mirrors
-            // run_temporal_standalone (mod.rs:1198) — single source of truth via
-            // NO_TEMPORAL_DATA_MSG.  Goes to stderr so --json stdout stays
-            // byte-identical (PF-006 / AD-404-8).
-            eprintln!("skim search: {NO_TEMPORAL_DATA_MSG}");
+            // AD-404-6 degraded path: temporal DB absent or refused (anchor mismatch).
+            // Step 8: temporal_unavailable_msg dispatches to the reason-specific constant
+            // (NO_TEMPORAL_DATA_MSG / HEAD_UNRESOLVED_TEMPORAL_MSG /
+            //  SUBDIR_ROOT_TEMPORAL_MSG / TEMPORAL_BUILD_EMPTY_MSG).
+            // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
+            eprintln!("skim search: {}", temporal_unavailable_msg(&root));
         }
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
         //
@@ -1467,14 +1542,31 @@ fn run_temporal_standalone(
 
     let temporal_db_path = cache_dir.join("temporal.db");
 
-    let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
+    // AD-413-16: refuse DB from a different repository BEFORE open_temporal_db.
+    // If AnchorState::Differs the DB exists but was anchored to a different repo —
+    // open_temporal_db would succeed and we'd serve wrong-repository rows.
+    // temporal_unavailable_msg dispatches to SUBDIR_ROOT_TEMPORAL_MSG here.
+    if let staleness::AnchorState::Differs { .. } =
+        staleness::temporal_anchor_state(&cache_dir, &root)
+    {
+        let msg_str = temporal_unavailable_msg(&root);
         if json {
-            let msg = WarningJson {
-                warning: NO_TEMPORAL_DATA_MSG,
-            };
+            let msg = WarningJson { warning: &msg_str };
             println!("{}", serde_json::to_string(&msg)?);
         } else {
-            eprintln!("skim search: {NO_TEMPORAL_DATA_MSG}");
+            eprintln!("skim search: {msg_str}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Sites 3 & 4 (Step 8): temporal_unavailable_msg replaces bare NO_TEMPORAL_DATA_MSG.
+    let Some(db) = temporal::open_temporal_db(&temporal_db_path) else {
+        let msg_str = temporal_unavailable_msg(&root);
+        if json {
+            let msg = WarningJson { warning: &msg_str };
+            println!("{}", serde_json::to_string(&msg)?);
+        } else {
+            eprintln!("skim search: {msg_str}");
         }
         return Ok(ExitCode::SUCCESS);
     };
@@ -1660,6 +1752,51 @@ fn print_help() {
 }
 
 // ============================================================================
+// Temporal-unavailable message selector (Step 8 — INTERIM for #413)
+// ============================================================================
+
+/// Dispatch "temporal data unavailable" to the reason-specific message constant.
+///
+/// Called at every site where temporal data is absent or refused so the printed
+/// message tells the user *why*, rather than giving a generic "not a git repo" line
+/// for a root that is clearly inside one.
+///
+/// Dispatch table:
+/// - [`HeadState::NotARepo`] → [`NO_TEMPORAL_DATA_MSG`] (byte-identical, C8 / AC19)
+/// - [`HeadState::Unresolved`] → [`HEAD_UNRESOLVED_TEMPORAL_MSG`] (AC18)
+/// - [`HeadState::Resolved`] + [`AnchorState::Differs`] →
+///   [`SUBDIR_ROOT_TEMPORAL_MSG`] + recorded/live paths (AD-413-16 / AC33(f))
+/// - [`HeadState::Resolved`] other → [`TEMPORAL_BUILD_EMPTY_MSG`]
+///
+/// **INTERIM**: #414 will DELETE this function (and its five emit-site wires) in
+/// its Step 0, replacing all sites with `degraded_notice(root)` — the permanent
+/// per-arm selectors.  Marked here so the deletion obligation survives rebase.
+pub(super) fn temporal_unavailable_msg(root: &std::path::Path) -> String {
+    use staleness::{AnchorState, HeadState};
+    match staleness::git_head_state(root) {
+        HeadState::NotARepo => NO_TEMPORAL_DATA_MSG.to_string(),
+        HeadState::Unresolved => HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
+        HeadState::Resolved(_) => {
+            // Check anchor state: need cache_dir for the DB read.
+            let cache_dir = index::resolve_search_cache_dir(root).ok();
+            if let Some(ref cd) = cache_dir
+                && let AnchorState::Differs {
+                    ref recorded,
+                    ref live,
+                } = staleness::temporal_anchor_state(cd, root)
+            {
+                return format!(
+                    "{SUBDIR_ROOT_TEMPORAL_MSG} \
+                     (recorded: {recorded:?}, live: {live:?}); \
+                     run `skim search --rebuild --root <this root>` to re-anchor",
+                );
+            }
+            TEMPORAL_BUILD_EMPTY_MSG.to_string()
+        }
+    }
+}
+
+// ============================================================================
 // Shared JSON stats builder
 // ============================================================================
 
@@ -1729,6 +1866,14 @@ pub(super) fn build_stats_json(
         .map(serde_json::to_value)
         .transpose()
         .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?;
+    // AC20 (#413): additive `git_head_state` key with one of three string values.
+    // Not in either error object (AC21 — the no-index early-return above is before
+    // this computation). Owned by #413; #414 extends this with `temporal_state`.
+    let git_head_state_str = match staleness::git_head_state(root) {
+        staleness::HeadState::Resolved(_) => "resolved",
+        staleness::HeadState::Unresolved => "unresolved",
+        staleness::HeadState::NotARepo => "not_a_repo",
+    };
     let mut result = serde_json::json!({
         "file_count": stats.file_count,
         "total_ngrams": stats.total_ngrams,
@@ -1737,6 +1882,7 @@ pub(super) fn build_stats_json(
         "temporal_db_bytes": temporal_db_bytes,
         "last_updated": stats.last_updated,
         "git_head": git_head,
+        "git_head_state": git_head_state_str,
         "staleness": staleness_status.to_string(),
         "cache_dir": cache_dir.display().to_string(),
         "skipped": skipped_arr,

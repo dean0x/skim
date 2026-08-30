@@ -19,7 +19,7 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
@@ -37,15 +37,42 @@ const SHEBANG: &str = "#!/bin/sh";
 const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-checkout"];
 
 // ============================================================================
+// Hooks directory resolver
+// ============================================================================
+
+/// AD-413-15: resolve the hooks directory for the given project root.
+///
+/// For a linked worktree, routes to the shared `<commondir>/hooks` directory
+/// so `install_search_hooks`, `remove_search_hooks`, and `has_search_hooks`
+/// can never disagree about where the hooks live (they all call this function).
+///
+/// For a plain repo (`.git` is a directory), submodule, or non-repo root,
+/// falls back to `<root>/.git/hooks` — identical to the pre-413 behavior.
+/// The fallback is also used for bare temp directories (as `hooks_tests.rs`
+/// creates) because those have no `commondir` file.
+pub(crate) fn resolve_hooks_dir(project_root: &Path) -> PathBuf {
+    match super::staleness::resolve_git_dir(project_root) {
+        Some(git_dir) => super::staleness::resolve_common_dir(&git_dir)
+            .unwrap_or(git_dir)
+            .join("hooks"),
+        None => project_root.join(".git").join("hooks"),
+    }
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
-/// Install skim search hooks in `.git/hooks/` for the given `project_root`.
+/// Install skim search hooks in the resolved hooks directory for `project_root`.
 ///
 /// For each of `post-commit`, `post-merge`, and `post-checkout`:
 /// - If the hook doesn't exist, creates it with `#!/bin/sh` and the skim block.
 /// - If the hook exists but doesn't have the markers, appends the block.
 /// - If the hook already has the markers, leaves it unchanged (idempotent).
+///
+/// For a linked worktree, the resolved directory is `<commondir>/hooks` (shared
+/// by every worktree of the clone).  For a plain repo, it is `<root>/.git/hooks`
+/// (identical to the pre-413 behavior — AC5b monotonicity).
 ///
 /// The hooks directory is created if it doesn't exist.
 ///
@@ -53,7 +80,7 @@ const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-checkout"];
 ///
 /// Returns `Err` on I/O failures during file creation or modification.
 pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<()> {
-    let hooks_dir = project_root.join(".git").join("hooks");
+    let hooks_dir = resolve_hooks_dir(project_root);
     std::fs::create_dir_all(&hooks_dir)?;
 
     for name in HOOK_NAMES {
@@ -64,23 +91,28 @@ pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Remove the skim marker block from all search hooks in `project_root`.
+/// Remove the skim marker block from all search hooks for `project_root`.
 ///
 /// For each hook, strips the `# skim-search-start … # skim-search-end` block.
 /// Leaves all other content intact.  Non-fatal: missing hooks are silently skipped.
 ///
+/// Returns `true` if at least one marker block was found and removed; `false`
+/// if the hooks directory had no skim marker blocks.  Callers use this to
+/// suppress the "removed from" success line when no block was present (AC31(a)).
+///
 /// # Errors
 ///
 /// Returns `Err` on I/O failures when reading or writing hook files.
-pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<()> {
-    let hooks_dir = project_root.join(".git").join("hooks");
+pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<bool> {
+    let hooks_dir = resolve_hooks_dir(project_root);
+    let mut any_removed = false;
     for name in HOOK_NAMES {
         let hook_path = hooks_dir.join(name);
         if hook_path.exists() {
-            remove_from_hook(&hook_path)?;
+            any_removed |= remove_from_hook(&hook_path)?;
         }
     }
-    Ok(())
+    Ok(any_removed)
 }
 
 /// Return `true` if any of the search hook files contain the skim markers.
@@ -88,7 +120,7 @@ pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<()> {
 /// Used in tests and by external callers that check hook installation state.
 #[allow(dead_code)]
 pub(crate) fn has_search_hooks(project_root: &Path) -> bool {
-    let hooks_dir = project_root.join(".git").join("hooks");
+    let hooks_dir = resolve_hooks_dir(project_root);
     HOOK_NAMES.iter().any(|name| {
         let p = hooks_dir.join(name);
         std::fs::read_to_string(&p)
@@ -121,14 +153,17 @@ fn install_one_hook(hook_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Strip the skim marker block from a hook file.
-fn remove_from_hook(hook_path: &Path) -> anyhow::Result<()> {
+///
+/// Returns `true` if a marker block was found and removed; `false` if the file
+/// contained no skim markers (no-op).
+fn remove_from_hook(hook_path: &Path) -> anyhow::Result<bool> {
     let content = std::fs::read_to_string(hook_path)?;
     if !content.contains(MARKER_START) {
-        return Ok(()); // Nothing to remove.
+        return Ok(false); // Nothing to remove.
     }
     let stripped = strip_block(&content);
     write_hook_atomic(hook_path, &stripped)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Append the skim block to existing hook content.

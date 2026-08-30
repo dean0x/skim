@@ -224,14 +224,34 @@ pub(super) fn resolve_blast_radius_paths(
         return Ok(None);
     };
 
+    // AD-413-16: refuse temporal DB from a different repository BEFORE open_temporal_db.
+    // AnchorState::Differs means the DB exists but was anchored to a different repo —
+    // open_temporal_db would succeed and we'd serve wrong co-change data.
+    // derive cache_dir = parent of db_path (e.g. .../search/<hash>/).
+    if let Some(cache_dir) = db_path.parent()
+        && let super::staleness::AnchorState::Differs { .. } =
+            super::staleness::temporal_anchor_state(cache_dir, root)
+    {
+        let base_msg = super::temporal_unavailable_msg(root);
+        let msg = format!("no temporal data for --blast-radius — {base_msg}");
+        if json {
+            let envelope = serde_json::json!({ "warning": msg });
+            eprintln!("{}", serde_json::to_string(&envelope)?);
+        } else {
+            eprintln!("skim search: {msg}");
+        }
+        return Ok(None);
+    }
+
+    // Site 5 (Step 8): temporal_unavailable_msg replaces bare NO_TEMPORAL_DATA_MSG
+    // so the reason reflects the actual state (no repo, unborn branch, etc.).
+    // C8: for the non-repo case temporal_unavailable_msg returns NO_TEMPORAL_DATA_MSG
+    // so the doubled composition "no temporal data for --blast-radius — no temporal
+    // data — run …" stays byte-identical (AC19).
     let Some(db) = open_temporal_db(db_path) else {
-        // Compose from the shared constant in mod.rs so this message can't drift
-        // from run_temporal_standalone's message (#357 cycle-2 finding 2).
-        // The constant lives in mod.rs (the parent module — `super::NO_TEMPORAL_DATA_MSG`)
-        // and is the single source of truth for AC9 (no "skim heatmap" advice).
         let msg = format!(
             "no temporal data for --blast-radius — {}",
-            super::NO_TEMPORAL_DATA_MSG
+            super::temporal_unavailable_msg(root)
         );
         if json {
             let envelope = serde_json::json!({ "warning": msg });

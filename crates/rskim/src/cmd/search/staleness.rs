@@ -274,7 +274,10 @@ const MAX_COMMONDIR_BYTES: u64 = 4096;
 /// AD-413-1: reads a linked worktree's `commondir` pointer, which names the SHARED
 /// ref store. `refs/heads/*`, `refs/tags/*`, `refs/remotes/*` and `packed-refs` live
 /// there — the worktree-private gitdir's `refs/` is empty (measured, #413).
-fn resolve_common_dir(git_dir: &Path) -> Option<PathBuf> {
+///
+/// `pub(super)` so `hooks.rs` can call `super::staleness::resolve_common_dir` without
+/// duplicating the parsing logic (AD-413-15 / Step 9).
+pub(super) fn resolve_common_dir(git_dir: &Path) -> Option<PathBuf> {
     use std::io::Read as _;
     let file = std::fs::File::open(git_dir.join("commondir")).ok()?;
     let mut buf = String::new();
