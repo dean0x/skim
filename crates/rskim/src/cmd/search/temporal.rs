@@ -295,7 +295,14 @@ pub(super) fn paths_to_file_ids(
 /// It is passed to `temporal_unavailable_msg` instead of re-calling `git_head_state`
 /// (Finding 1/3 fix: the message function is pure, zero I/O).
 ///
-/// Returns `Ok(None)` when `blast_radius` is `None` or the DB is absent/corrupt.
+/// Returns:
+/// - `Ok(None)` when `blast_radius` is `None` (not requested) or the DB is `Absent`.
+/// - `Ok(Some(empty_set))` when the DB exists but belongs to a different repository
+///   ([`TemporalUnavailable::AnchorDiffers`]).  The empty allowlist forces zero
+///   results on all three blast-radius call sites, matching the standalone arm
+///   (`run_temporal_standalone`) which also serves zero rows on `AnchorDiffers`.
+///   Returning `Ok(None)` here would overload the "not requested" sentinel and cause
+///   the query to run unfiltered (PF-016 absence-overloading class, AD-413-16).
 ///
 /// # Errors
 ///
@@ -335,6 +342,16 @@ pub(super) fn resolve_blast_radius_paths(
                 eprintln!("{}", serde_json::to_string(&envelope)?);
             } else {
                 eprintln!("skim search: {msg}");
+            }
+            // AD-413-16 / PF-016: AnchorDiffers means the DB belongs to a
+            // different repository.  Returning Ok(None) would overload the
+            // "not requested" sentinel — callers' .map() would yield None,
+            // bypassing the file filter entirely and serving the full unfiltered
+            // index.  Return an empty allowlist instead so every blast-radius
+            // call site (AST arm, lexical arm, standalone arm) agrees: wrong
+            // repo → zero results, not all results.
+            if matches!(reason, TemporalUnavailable::AnchorDiffers { .. }) {
+                return Ok(Some(std::collections::HashSet::new()));
             }
             return Ok(None);
         }

@@ -243,7 +243,8 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
         parent.join(p.file_name().unwrap())
     };
 
-    let resolved = super::resolve_hooks_dir(&worktree);
+    let resolved = super::resolve_hooks_dir(&worktree)
+        .expect("linked worktree has a .git FILE — resolve_hooks_dir must return Some");
     // `.git` is a FILE in a linked worktree — the pre-#413 path is not a directory.
     assert!(
         worktree.join(".git").is_file(),
@@ -322,7 +323,8 @@ fn test_resolve_hooks_dir_rejects_crafted_gitdir_with_no_git_structure() {
     let gitdir_line = format!("gitdir: {}\n", target.display());
     fs::write(project.join(".git"), &gitdir_line).unwrap();
 
-    let resolved = super::resolve_hooks_dir(&project);
+    let resolved = super::resolve_hooks_dir(&project)
+        .expect("project with .git FILE (invalid gitdir) — resolve_hooks_dir must return Some");
 
     // Must fall back to the safe local path, not the attacker's directory.
     assert_eq!(
@@ -574,17 +576,86 @@ fn test_resolve_hooks_dir_unchanged_for_plain_repo_and_non_repo() {
         "precondition: a plain repo has no commondir"
     );
     assert_eq!(
-        super::resolve_hooks_dir(&plain),
+        super::resolve_hooks_dir(&plain).unwrap(),
         plain.join(".git").join("hooks"),
         "AC31(e): a plain repo must resolve to <root>/.git/hooks exactly as before"
     );
 
     // Non-repo directory (the shape every pre-existing hooks_tests case uses).
+    // This directory has no .git and no enclosing git repository (it is inside
+    // a system temp dir), so resolve_hooks_dir still returns Some(<root>/.git/hooks).
     let non_repo = dir.path().join("non_repo");
     fs::create_dir_all(&non_repo).unwrap();
     assert_eq!(
-        super::resolve_hooks_dir(&non_repo),
+        super::resolve_hooks_dir(&non_repo).unwrap(),
         non_repo.join(".git").join("hooks"),
         "AC31(e): a non-repo root must resolve to <root>/.git/hooks exactly as before"
+    );
+}
+
+// ============================================================================
+// Subdirectory-root refusal (review finding — AD-413-15 extension)
+// ============================================================================
+
+/// A subdirectory of a git repo must not receive a fabricated `.git` entry.
+///
+/// Pre-fix: `resolve_hooks_dir` fell through to `<root>/.git/hooks` for any
+/// root with no `.git`, and `install_search_hooks` then called `create_dir_all`
+/// on that path, creating a real `.git` **directory** at the subdirectory level.
+/// This permanently disabled `resolve_repo_toplevel` (AC17: it refuses to walk
+/// past an existing `.git` entry) and made the temporal layer silently dead
+/// (PF-017).
+///
+/// Post-fix:
+/// - `resolve_hooks_dir` returns `None` for a subdirectory root.
+/// - `install_search_hooks` returns `Err` naming the enclosing repository.
+/// - No `.git` entry is created.
+#[test]
+fn test_install_hooks_refuses_subdirectory_root() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    super::super::staleness::create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+
+    // Create a subdirectory inside the repo — no .git of its own.
+    let subdir = repo.join("src");
+    fs::create_dir_all(&subdir).unwrap();
+
+    // resolve_hooks_dir must return None for a subdirectory of a git repo.
+    assert!(
+        super::resolve_hooks_dir(&subdir).is_none(),
+        "a subdirectory of a git repo must yield None from resolve_hooks_dir; \
+         pre-fix: returned <subdir>/.git/hooks and let create_dir_all fabricate \
+         a fake .git directory"
+    );
+
+    // install_search_hooks must refuse with an Err naming the enclosing repo.
+    let err = install_search_hooks(&subdir).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("subdirectory") || msg.contains("inside"),
+        "error must describe the subdirectory constraint; got: {msg}"
+    );
+
+    // Most critical invariant: no .git entry must exist at the subdirectory level.
+    assert!(
+        !subdir.join(".git").exists(),
+        "install must not create a .git entry in a subdirectory root; \
+         this breaks ancestor adoption (resolve_repo_toplevel AC17) and \
+         makes the temporal layer silently dead (PF-017)"
+    );
+
+    // remove_search_hooks is symmetric: also refuses on subdirectory roots.
+    let remove_err = remove_search_hooks(&subdir).unwrap_err();
+    let remove_msg = remove_err.to_string();
+    assert!(
+        remove_msg.contains("subdirectory") || remove_msg.contains("inside"),
+        "remove_search_hooks must also refuse a subdirectory root; got: {remove_msg}"
+    );
+
+    // has_search_hooks returns false rather than panicking on a subdirectory root.
+    assert!(
+        !has_search_hooks(&subdir),
+        "has_search_hooks must return false for a subdirectory root"
     );
 }

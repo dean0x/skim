@@ -1934,7 +1934,7 @@ fn test_temporal_rows_are_scoped_and_reanchored_to_subdir_root() {
         ),
         make_commit(
             "aaa0000003",
-            now_epoch as i64 - 86400 * 1,
+            now_epoch as i64 - 86400,
             "feat: update sub again",
             &["sub/foo.rs", "sub/bar.rs"],
         ),
@@ -2150,7 +2150,7 @@ fn test_toplevel_root_rows_are_byte_identical_to_pre_change() {
         // toplevel root (identity) and the sub/ root (scope filter rewrites them).
         make_commit(
             "bbb0000005",
-            now_epoch as i64 - 86400 * 1,
+            now_epoch as i64 - 86400,
             "feat: update both sub files",
             &["sub/foo.rs", "sub/bar.rs"],
         ),

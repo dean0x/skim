@@ -32,13 +32,16 @@ use std::path::Path;
 use super::manifest::FileManifest;
 
 // Re-export git-plumbing items (owned by gitdir.rs).
-// `hooks.rs` accesses `resolve_git_dir` and `resolve_common_dir` via
-// `super::staleness::*` — these re-exports keep that path valid.
-#[cfg(test)]
-pub(super) use super::gitdir::resolve_repo_toplevel;
+// `hooks.rs` accesses `resolve_git_dir`, `resolve_common_dir`, and
+// `resolve_repo_toplevel` via `super::staleness::*` — these re-exports keep
+// those paths valid.
 pub(super) use super::gitdir::{
     HeadState, git_head_state, read_git_head, resolve_common_dir, resolve_git_dir,
 };
+// `resolve_repo_toplevel` is used by `hooks.rs` via `super::staleness::resolve_repo_toplevel`
+// but not within `staleness.rs` itself — suppress the false-positive unused_imports lint.
+#[allow(unused_imports)]
+pub(super) use super::gitdir::resolve_repo_toplevel;
 
 // Re-export temporal-DB items (owned by temporal_state.rs).
 #[cfg(test)]

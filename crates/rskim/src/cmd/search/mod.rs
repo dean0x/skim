@@ -2843,6 +2843,75 @@ mod tests {
     }
 
     // ============================================================================
+    // AD-413-16 / PF-016: AnchorDiffers must return Some(empty) not None.
+    // ============================================================================
+
+    /// When blast_radius is Some and temporal.db exists but belongs to a
+    /// different repository (AnchorDiffers), `resolve_blast_radius_paths` must
+    /// return `Ok(Some(empty_set))` — NOT `Ok(None)`.
+    ///
+    /// Returning `Ok(None)` overloads the "not requested" sentinel: callers'
+    /// `.map()` produces `None → no file filter → full unfiltered index` (PF-016).
+    /// An empty allowlist forces every blast-radius call site to emit zero results,
+    /// matching the standalone arm (`run_temporal_standalone`) which also serves
+    /// zero rows on `AnchorDiffers`.
+    #[test]
+    fn test_resolve_blast_radius_anchor_differs_returns_empty_set() {
+        use staleness::HeadState;
+
+        // Set up:
+        //   parent_dir/.git/HEAD   ← fake git repo (so resolve_repo_toplevel
+        //                            discovers parent_dir as the live toplevel)
+        //   parent_dir/sub/        ← `root` (no own .git, so it is a subdir root)
+        //   parent_dir/sub/temporal.db ← DB whose META_GIT_TOPLEVEL is a
+        //                                 sentinel for a *different* repo path,
+        //                                 triggering AnchorDiffers.
+        let parent_dir = tempfile::TempDir::new().unwrap();
+        let git_dir = parent_dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let sub_dir = parent_dir.path().join("sub");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let db_path = sub_dir.join("temporal.db");
+
+        // Write temporal.db whose git_toplevel is a sentinel that does NOT match
+        // parent_dir — `anchor_state_on_db` will return AnchorDiffers.
+        {
+            let db = rskim_search::TemporalDb::open(&db_path).expect("must create temporal.db");
+            db.set_meta(rskim_search::META_GIT_TOPLEVEL, "/other/repo/sentinel")
+                .expect("must set toplevel");
+        }
+
+        // sub_dir has no .git → resolve_repo_toplevel walks up to parent_dir.
+        // Stored toplevel ("/other/repo/sentinel") ≠ parent_dir → AnchorDiffers.
+        let result = temporal::resolve_blast_radius_paths(
+            Some("src/auth.rs"),
+            &sub_dir, // root
+            &sub_dir, // cache_dir (DB lives at sub_dir/temporal.db)
+            false,
+            &HeadState::NotARepo,
+        );
+
+        assert!(
+            result.is_ok(),
+            "must not return Err on AnchorDiffers, got: {:?}",
+            result.unwrap_err()
+        );
+        let paths = result.unwrap();
+        assert!(
+            paths.is_some(),
+            "must return Some(empty_set) on AnchorDiffers, not None \
+             (None overloads the 'not requested' sentinel — PF-016 / AD-413-16)"
+        );
+        assert!(
+            paths.unwrap().is_empty(),
+            "empty allowlist forces zero results on all blast-radius arms"
+        );
+    }
+
+    // ============================================================================
     // F12: Missing temporal.db must produce exit 0 (graceful degradation), not
     //      exit 1. AC says: "Missing temporal.db → warning on stderr, exit 0".
     // ============================================================================
