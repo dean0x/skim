@@ -313,18 +313,20 @@ macro_rules! warn_skip {
 /// fails, the file may exist with no `META_GIT_HEAD` row (same partial-file risk
 /// as the non-empty path) — see inline comment on the `Err` arm.
 ///
-/// **Production reachability note**: a genuine zero-commit git repo has an
-/// *unborn branch* — `read_git_head` returns `None` because `resolve_symbolic_ref`
-/// finds no loose ref and no packed-refs entry.  With `current_head = None`, both
-/// the BUG-B self-heal gate (`if let Some(ref head) = current_head && …` in
-/// `staleness.rs`) and `try_rebuild_temporal_nonfatal` (early `let Some(head) =
-/// head else { return }`) short-circuit before this function is ever invoked with
-/// a `Some(head)`.  The no-rebuild-loop guarantee for zero-commit repos therefore
-/// derives from the `read_git_head = None` short-circuit, **not** from the
-/// empty-DB write.  The empty-DB code path is exercised only by the direct-call
-/// test (`rebuild_temporal_with_source` with a synthetic `fake_head`).  Both
-/// rationales are valid and complementary — the empty-DB write remains correct
-/// for any future call path that does supply a synthetic HEAD.
+/// **Production reachability note**: the remaining causes of `read_git_head = None`
+/// in production are unborn branch, unsupported ref backend (reftable — #481), corrupt
+/// HEAD, and fs error — the linked-worktree route that previously caused `None` is fixed
+/// by #413.  With `current_head = None` for any of those reasons, both the BUG-B
+/// self-heal gate (`if let Some(ref head) = current_head && …` in `staleness.rs`) and
+/// `try_rebuild_temporal_nonfatal` (early `let Some(head) = head else { return }`)
+/// short-circuit before this function is ever invoked with a `Some(head)`.
+/// The no-rebuild-loop guarantee for zero-commit repos therefore derives from the
+/// `read_git_head = None` short-circuit, **not** from the empty-DB write.  The empty-DB
+/// code path is also exercised from `auto_refresh_if_stale` when the subtree under a
+/// subdirectory root (OD-3/AD-413-14) has zero qualifying commits; the direct-call test
+/// (`rebuild_temporal_with_source` with a synthetic `fake_head`) exercises the same path
+/// at unit level.  The subdirectory-root route is now live in production: AD-408-5's ghost
+/// anchor (L529–538) is reachable for the first time via `--root <subdir>` (#413).
 ///
 /// # Lookback semantics (O-C / ADR-003)
 ///

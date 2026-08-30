@@ -130,6 +130,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON output is unchanged.
 
 ### Fixed
+- **`skim search` linked worktree HEAD resolution and temporal data** (#413) — in a
+  repository with linked worktrees (`git worktree add`), `skim search` read HEAD from
+  the per-worktree `.git` file and then attempted to resolve the symbolic ref in the same
+  directory, finding nothing.  The result was `git HEAD : (none)`, a zero-byte temporal
+  database, and `--hot`/`--cold`/`--risky` serving no temporal data in the linked worktree
+  even though the history was fully present in the primary clone.  Fixed by following the
+  `commondir` pointer from the per-worktree git dir to the shared repository, resolving the
+  ref in the common directory's ref namespaces (loose refs then `packed-refs`).  Also fixes
+  `--install-hooks`/`--remove-hooks` in a linked worktree (previously died with
+  `Not a directory (os error 20)`): hooks now route to the shared `<commondir>/hooks`
+  directory and both commands disclose the shared scope on stderr.  First-query cost after
+  upgrade: one rebuild of `temporal.db` (previously the DB was absent or frozen).
+  `--root <subdirectory-of-a-repo>` now also adopts the enclosing repository's HEAD
+  instead of reporting no temporal data.
 - **`skim search` symbolic-ref path validation tightened** (#482) — a `HEAD` file
   containing `ref: refs/../../../outside-sha` (a path that starts with `refs/` but
   escapes the git directory via `..` components) was read and its out-of-tree SHA was

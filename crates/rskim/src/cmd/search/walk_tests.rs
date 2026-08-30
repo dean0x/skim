@@ -1615,3 +1615,73 @@ fn test_merge_tracked_union_truncates_to_smallest_k() {
          after union+truncation (AD-402-2 / PF-012)"
     );
 }
+
+// ============================================================================
+// #413 / AC28 / S28 — Both gitdir resolvers agree
+// ============================================================================
+
+/// AC28 / S28 — `walk::resolve_git_index_path` and
+/// `staleness::resolve_git_dir(…).map(|d| d.join("index"))` must produce
+/// identical results on (1) a plain repo, (2) a linked worktree, and
+/// (3) a non-git directory.
+///
+/// The post-consolidation invariant (AD-413-12): the two code paths must not
+/// diverge because there is now only one parser for the `gitdir:` pointer and
+/// one lookup for the commondir chain.  Pre-fix they diverged on linked
+/// worktrees (walk returned None; staleness returned the common gitdir).
+#[test]
+fn test_both_gitdir_resolvers_agree() {
+    use super::super::staleness::{create_real_git_repo, create_real_git_worktree};
+    use std::path::PathBuf;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Case 1: plain git repo.
+    let plain = dir.path().join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    create_real_git_repo(&plain, &[("init", &[("a.rs", "fn a(){}\n")])]);
+
+    let walk_result: Option<PathBuf> = super::resolve_git_index_path(&plain);
+    let stale_result: Option<PathBuf> =
+        super::super::staleness::resolve_git_dir(&plain).map(|d| d.join("index"));
+    assert_eq!(
+        walk_result, stale_result,
+        "AC28 case 1 (plain repo): resolvers must agree; walk={walk_result:?}, staleness={stale_result:?}"
+    );
+
+    // Case 2: linked worktree.
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+    create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let walk_wt: Option<PathBuf> = super::resolve_git_index_path(&worktree);
+    let stale_wt: Option<PathBuf> =
+        super::super::staleness::resolve_git_dir(&worktree).map(|d| d.join("index"));
+    assert_eq!(
+        walk_wt, stale_wt,
+        "AC28 case 2 (linked worktree): resolvers must agree; walk={walk_wt:?}, staleness={stale_wt:?}"
+    );
+    // Both must be Some and point inside the common .git dir.
+    assert!(
+        walk_wt.is_some(),
+        "AC28 case 2: walk result must be Some for a linked worktree"
+    );
+
+    // Case 3: non-git directory.
+    let non_git = dir.path().join("non_git");
+    fs::create_dir_all(&non_git).unwrap();
+
+    let walk_ng: Option<PathBuf> = super::resolve_git_index_path(&non_git);
+    let stale_ng: Option<PathBuf> =
+        super::super::staleness::resolve_git_dir(&non_git).map(|d| d.join("index"));
+    assert_eq!(
+        walk_ng, stale_ng,
+        "AC28 case 3 (non-git dir): resolvers must agree; walk={walk_ng:?}, staleness={stale_ng:?}"
+    );
+    assert!(
+        walk_ng.is_none(),
+        "AC28 case 3: both resolvers must return None for a non-git dir"
+    );
+}

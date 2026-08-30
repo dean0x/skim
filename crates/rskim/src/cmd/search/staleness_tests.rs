@@ -7,8 +7,8 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    StalenessCheck, auto_refresh_if_stale, check_staleness, read_git_head, resolve_git_dir,
-    temporal_db_is_stale,
+    HeadState, StalenessCheck, auto_refresh_if_stale, check_staleness, git_head_state,
+    read_git_head, resolve_git_dir, temporal_db_is_stale,
 };
 
 // Minimal analytics config for tests — analytics recording is disabled.
@@ -1297,6 +1297,17 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
 /// cycle-2 finding 3).
 fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
     super::create_real_git_repo(dir, commit_files)
+}
+
+/// Shared helper: create a linked git worktree.
+///
+/// Delegates to `staleness::create_real_git_worktree`.
+fn create_real_git_worktree(
+    primary: &std::path::Path,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> String {
+    super::create_real_git_worktree(primary, worktree, branch)
 }
 
 /// AC (hook wiring): auto_refresh_if_stale on a real git repo MUST populate
@@ -2646,4 +2657,1027 @@ fn test_display_head_changed_exactly_8_chars() {
     let current = "abcdef01".to_string();
     let s = StalenessCheck::HeadChanged { stored, current }.to_string();
     assert_eq!(s, "stale (HEAD changed: 12345678…→abcdef01…)");
+}
+
+// ============================================================================
+// #413 — linked worktree HEAD resolution and temporal data
+// ============================================================================
+
+/// AC1 / S1 — Linked-worktree HEAD resolves via the commondir loose ref.
+///
+/// Preconditions: the per-worktree gitdir has no local `refs/heads/<branch>` file
+/// and no `packed-refs` (the SHA lives only in the common dir's `refs/heads/<branch>`).
+/// Discriminating: pre-fix this returned `None`; post-fix it returns the exact GT SHA.
+#[test]
+fn test_read_git_head_resolves_commondir_loose_ref_in_real_worktree() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    assert_eq!(gt.len(), 40, "GT must be a 40-char SHA");
+
+    let wt_sha = create_real_git_worktree(&primary, &worktree, "b1");
+    assert_eq!(
+        wt_sha, gt,
+        "worktree HEAD must equal primary HEAD at branch creation"
+    );
+
+    // Precondition: per-worktree refs/ must be empty and packed-refs absent.
+    let wt_gitdir = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+    let wt_refs = wt_gitdir.join("refs").join("heads");
+    if wt_refs.exists() {
+        let entries: Vec<_> = fs::read_dir(&wt_refs).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "precondition: wt refs/heads must be empty"
+        );
+    }
+    assert!(
+        !wt_gitdir.join("packed-refs").exists(),
+        "precondition: wt packed-refs absent"
+    );
+
+    // The key assertion: read_git_head resolves via commondir.
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "linked worktree HEAD must resolve to the primary branch SHA via commondir"
+    );
+}
+
+/// AC2 / S2 — After `git pack-refs --all`, HEAD still resolves via commondir packed-refs.
+///
+/// Preconditions (asserted): the commondir loose ref for `b1` is absent after packing;
+/// `packed-refs` in the commondir contains `refs/heads/b1`.
+#[test]
+fn test_read_git_head_resolves_commondir_packed_refs_after_pack_refs() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    let _wt_sha = create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Pack all refs so the loose ref disappears.
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["pack-refs", "--all"])
+        .current_dir(&primary)
+        .output()
+        .expect("git pack-refs");
+
+    // Precondition: loose ref for b1 must be absent in the commondir.
+    let primary_git = primary.join(".git");
+    let loose_b1 = primary_git.join("refs").join("heads").join("b1");
+    assert!(
+        !loose_b1.exists(),
+        "precondition: loose b1 must be absent after pack-refs --all"
+    );
+
+    // Precondition: packed-refs must contain b1.
+    let packed = fs::read_to_string(primary_git.join("packed-refs")).unwrap_or_default();
+    assert!(
+        packed.contains("refs/heads/b1"),
+        "precondition: packed-refs must contain refs/heads/b1; got: {packed}"
+    );
+
+    // Key assertion: still resolves.
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "packed-refs path must resolve linked worktree HEAD after pack-refs --all"
+    );
+}
+
+/// AC3 / S3 — Resolves when `commondir` contains an ABSOLUTE path.
+///
+/// Precondition (asserted): the commondir file starts with `/`.
+#[test]
+fn test_read_git_head_handles_absolute_commondir() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    let _wt_sha = create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Rewrite the commondir to the canonical absolute path.
+    let wt_gitdir: std::path::PathBuf = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+    let abs_common = primary.join(".git").canonicalize().unwrap();
+    assert!(
+        abs_common.is_absolute(),
+        "precondition: abs_common must be absolute"
+    );
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", abs_common.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "absolute commondir path must resolve linked worktree HEAD"
+    );
+}
+
+/// AC4 / S4 — Slashed branch names (`wave/probe-413`) resolve, both loose and packed.
+#[test]
+fn test_read_git_head_resolves_slashed_branch_loose_and_packed() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree_loose = dir.path().join("wt-loose");
+    let worktree_packed = dir.path().join("wt-packed");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+
+    // Sub-case 1: loose ref (wave/probe-413 in refs/heads/wave/probe-413).
+    let _ = create_real_git_worktree(&primary, &worktree_loose, "wave/probe-413");
+    let result_loose = read_git_head(&worktree_loose);
+    assert_eq!(
+        result_loose.as_deref(),
+        Some(gt.as_str()),
+        "S4 loose: slashed branch must resolve via commondir loose ref"
+    );
+
+    // Sub-case 2: packed-refs (after git pack-refs --all).
+    let _ = create_real_git_worktree(&primary, &worktree_packed, "wave/probe-413-packed");
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["pack-refs", "--all"])
+        .current_dir(&primary)
+        .output()
+        .expect("git pack-refs");
+
+    // Precondition: loose ref must be absent.
+    let loose_wave = primary.join(".git").join("refs").join("heads").join("wave");
+    if loose_wave.exists() {
+        let probe_file = loose_wave.join("probe-413-packed");
+        assert!(
+            !probe_file.exists(),
+            "precondition: loose wave/probe-413-packed must be absent after pack-refs --all"
+        );
+    }
+
+    let result_packed = read_git_head(&worktree_packed);
+    assert_eq!(
+        result_packed.as_deref(),
+        Some(gt.as_str()),
+        "S4 packed: slashed branch must resolve via commondir packed-refs"
+    );
+}
+
+/// AC6 / S6 — Per-worktree ref namespaces (`refs/bisect/`, `refs/worktree/`,
+/// `refs/rewritten/`) are never redirected to the commondir.
+///
+/// Case 1: per-worktree file present → resolved SHA is shaA (from the local file), NOT shaB.
+/// Case 2: per-worktree file removed → resolved SHA is None, NOT shaB from commondir.
+#[test]
+fn test_read_git_head_per_worktree_ref_namespace_is_not_redirected() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Locate the per-worktree gitdir.
+    let wt_gitdir: std::path::PathBuf = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+
+    let sha_a = "a".repeat(40);
+    let sha_b = "b".repeat(40);
+
+    for namespace in &["refs/bisect", "refs/worktree", "refs/rewritten"] {
+        let per_wt_dir = wt_gitdir.join(namespace);
+        fs::create_dir_all(&per_wt_dir).unwrap();
+        let per_wt_ref = per_wt_dir.join("testref");
+        let primary_dir = primary.join(".git").join(namespace);
+        fs::create_dir_all(&primary_dir).unwrap();
+        let primary_ref = primary_dir.join("testref");
+
+        fs::write(&per_wt_ref, format!("{sha_a}\n")).unwrap();
+        fs::write(&primary_ref, format!("{sha_b}\n")).unwrap();
+
+        // Point HEAD at a per-worktree ref.
+        let head_ref = format!("{namespace}/testref");
+        fs::write(wt_gitdir.join("HEAD"), format!("ref: {head_ref}\n")).unwrap();
+
+        // Case 1: per-worktree file present — must return shaA.
+        let result = read_git_head(&worktree);
+        assert_eq!(
+            result.as_deref(),
+            Some(sha_a.as_str()),
+            "{namespace}: case 1 must return shaA from the per-worktree ref, not shaB"
+        );
+
+        // Case 2: per-worktree file removed — must return None (NOT shaB).
+        fs::remove_file(&per_wt_ref).unwrap();
+        let result2 = read_git_head(&worktree);
+        assert!(
+            result2.is_none(),
+            "{namespace}: case 2 (per-wt ref removed) must return None, not shaB; got {result2:?}"
+        );
+        assert_ne!(
+            result2.as_deref(),
+            Some(sha_b.as_str()),
+            "{namespace}: shaB from commondir must never be returned for a per-worktree namespace"
+        );
+
+        // Clean up for the next namespace iteration.
+        fs::remove_file(&primary_ref).unwrap();
+    }
+}
+
+/// AC7 / S7 — Detached HEAD in a linked worktree still resolves (raw-SHA branch).
+#[test]
+fn test_read_git_head_detached_head_in_linked_worktree_still_resolves() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Detach HEAD in the linked worktree.
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["checkout", "--detach"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git checkout --detach");
+
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "detached HEAD in linked worktree must still resolve to the commit SHA"
+    );
+}
+
+/// AC8 (a) / S8a — `commondir` points at a directory with a valid SHA file but NO `HEAD`:
+/// that SHA must NOT be returned.
+#[test]
+fn test_read_git_head_rejects_commondir_pointing_at_non_git_dir() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    let fake_common = dir.path().join("fake_common");
+    fs::create_dir_all(&primary).unwrap();
+
+    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let wt_gitdir: std::path::PathBuf = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+
+    // Create a fake commondir with a valid-looking SHA file but NO HEAD.
+    let planted_sha = "c".repeat(40);
+    let refs_heads = fake_common.join("refs").join("heads");
+    fs::create_dir_all(&refs_heads).unwrap();
+    fs::write(refs_heads.join("b1"), format!("{planted_sha}\n")).unwrap();
+    // Deliberately NO HEAD file.
+
+    // Rewrite commondir to point at this fake directory.
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", fake_common.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "commondir without HEAD must return None; got {result:?}"
+    );
+    assert_ne!(
+        result.as_deref(),
+        Some(planted_sha.as_str()),
+        "the planted SHA from a commondir without HEAD must never be returned"
+    );
+}
+
+/// AC8 (b) / S8b — `commondir` points at a non-existent path (dangling): no HEAD.
+#[test]
+fn test_read_git_head_rejects_dangling_commondir() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let wt_gitdir: std::path::PathBuf = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+
+    // Dangling path — does not exist.
+    let dangling = dir.path().join("does-not-exist");
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", dangling.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "dangling commondir must return None; got {result:?}"
+    );
+}
+
+/// AC8 (c) / S8c — `commondir` contains 8 KiB of newline-free junk: no HEAD,
+/// no panic, no OOM.
+#[test]
+fn test_read_git_head_rejects_oversized_commondir() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let wt_gitdir: std::path::PathBuf = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+
+    // 8192 bytes of 'x' with no newline — exceeds the 4096-byte bounded read.
+    let junk = "x".repeat(8192);
+    fs::write(wt_gitdir.join("commondir"), junk.as_bytes()).unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "oversized junk commondir must return None; got {result:?}"
+    );
+}
+
+/// AC8 (d) / S8d — `commondir` is a regular file rather than a directory: no HEAD.
+#[test]
+fn test_read_git_head_rejects_commondir_is_a_file() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    let file_common = dir.path().join("file_that_is_not_a_dir");
+    fs::create_dir_all(&primary).unwrap();
+
+    let _gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let wt_gitdir: std::path::PathBuf = {
+        let dot_git = worktree.join(".git");
+        let content = fs::read_to_string(&dot_git).unwrap();
+        let target = content
+            .lines()
+            .find(|l| l.starts_with("gitdir:"))
+            .unwrap()
+            .strip_prefix("gitdir:")
+            .unwrap()
+            .trim();
+        std::path::PathBuf::from(target)
+    };
+
+    // commondir points at a regular file (not a directory).
+    fs::write(&file_common, b"this is a file, not a dir\n").unwrap();
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", file_common.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "commondir pointing at a regular file must return None; got {result:?}"
+    );
+}
+
+/// AC11 / S11 — `check_staleness` reports `HeadChanged` after a commit in a linked worktree.
+///
+/// Pre-fix: the verdict was `WorkingTreeChanged` (the new file appeared as an untracked
+/// addition before the commit was recognized). Post-fix: `HeadChanged`.
+#[test]
+fn test_check_staleness_reports_head_changed_in_linked_worktree() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let old_head = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Write a manifest with old_head so check_staleness has something to compare.
+    write_manifest_with_head(&worktree, &cache_dir, Some(&old_head));
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+
+    // Make a commit in the linked worktree.
+    fs::write(worktree.join("c.rs"), "fn c(){}\n").unwrap();
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["add", "c.rs"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git add c.rs");
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-c",
+            "user.email=t@e.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-m",
+            "add c",
+        ])
+        .current_dir(&worktree)
+        .output()
+        .expect("git commit");
+
+    let new_head = {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_ne!(old_head, new_head, "HEAD must advance after commit");
+
+    let (verdict, _manifest) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(&verdict, StalenessCheck::HeadChanged { stored, current }
+            if stored == &old_head && current == &new_head),
+        "AC11: verdict must be HeadChanged {{ stored: old, current: new }}; got {verdict:?}"
+    );
+}
+
+/// AC12 / S12 — After AC11's commit-and-update, `temporal.db` `meta.git_head` equals the new GT.
+#[test]
+fn test_temporal_db_resyncs_when_worktree_branch_advances() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let old_head = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    // First build.
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+    let head_before = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    drop(db);
+    assert_eq!(
+        head_before, old_head,
+        "meta.git_head must equal old HEAD after first build"
+    );
+
+    // Make a commit in the worktree.
+    fs::write(worktree.join("c.rs"), "fn c(){}\n").unwrap();
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["add", "c.rs"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git add c.rs");
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-c",
+            "user.email=t@e.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-m",
+            "add c",
+        ])
+        .current_dir(&worktree)
+        .output()
+        .expect("git commit");
+    let new_head = {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_ne!(old_head, new_head, "HEAD must advance after commit");
+
+    // Trigger update.
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    let db2 = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+    let head_after = db2
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        head_after, new_head,
+        "AC12: meta.git_head must equal new GT after --update"
+    );
+    assert_ne!(
+        head_after, head_before,
+        "AC12: meta.git_head must have changed"
+    );
+}
+
+/// AC13 / S13 — A frozen manifest (git_head = None) recovers on the first query.
+///
+/// Constructed with `write_manifest_with_head(.., None)` on a real linked worktree.
+/// The staleness verdict must be `NoStoredHead`; afterwards the manifest's stored HEAD
+/// equals GT and `meta.git_head` equals GT.
+#[test]
+fn test_frozen_manifest_without_head_recovers_on_next_query_in_worktree() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Set up with a real index + temporal.db, then wipe the manifest's git_head.
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+    write_manifest_with_head(&worktree, &cache_dir, None);
+
+    // Staleness check must see NoStoredHead.
+    let (verdict, _) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(verdict, StalenessCheck::NoStoredHead),
+        "AC13: verdict must be NoStoredHead when manifest has no git_head; got {verdict:?}"
+    );
+
+    // One auto-refresh must recover the stored HEAD.
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    // Verify the manifest now has the GT stored HEAD.
+    let (verdict2, manifest) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(verdict2, StalenessCheck::Current),
+        "AC13: after recovery, check_staleness must be Current; got {verdict2:?}"
+    );
+    let stored = manifest.unwrap().stored_git_head().map(str::to_string);
+    assert_eq!(
+        stored.as_deref(),
+        Some(gt.as_str()),
+        "AC13: stored git_head must equal GT after recovery"
+    );
+
+    // Verify temporal.db also has the GT HEAD.
+    let db = rskim_search::TemporalDb::open(&cache_dir.join("temporal.db")).unwrap();
+    let meta_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        meta_head, gt,
+        "AC13: meta.git_head in temporal.db must equal GT after recovery"
+    );
+}
+
+/// AC14 / S14 — A divergent `meta.git_head` self-heals on the next query.
+///
+/// Plants `deadbeef...` as `meta.git_head` and verifies that one auto-refresh
+/// corrects it to the GT SHA.
+#[test]
+fn test_temporal_db_with_divergent_recorded_head_self_heals_in_worktree() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let stale_head = "deadbeef".repeat(5); // 40-char pseudo-SHA
+    super::plant_meta_raw(&temporal_db_path, rskim_search::META_GIT_HEAD, &stale_head);
+
+    // Confirm the stale value was planted.
+    {
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+        let planted = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            planted, stale_head,
+            "precondition: planted stale head must match"
+        );
+    }
+
+    // One query triggers the AD-TMP-2 self-heal.
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    let db2 = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+    let healed = db2
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        healed, gt,
+        "AC14: meta.git_head must equal GT after divergent-head self-heal"
+    );
+}
+
+/// AC17 / S17 — Three HEAD states are distinguishable.
+///
+/// Tests all six representative roots described in S17:
+/// (1) bare tempdir — not_a_repo
+/// (2) `mkdir .git` empty — not_a_repo (a .git dir with no HEAD is not a repo)
+/// (3) `.git` file → nonexistent gitdir — not_a_repo
+/// (4) `.git/HEAD` = `garbage` — unresolved
+/// (5) real linked worktree — resolved
+/// (6) real subdirectory of a repo — resolved (via ancestor walk)
+///
+/// Hermeticity note: cases (1)–(4) are created under a fresh tempdir that has no
+/// ancestor repository.  The NOGIT precondition is asserted inside the test.
+#[test]
+fn test_git_head_state_distinguishes_not_a_repo_from_unresolved() {
+    let dir = tempdir().unwrap();
+
+    // NOGIT precondition: no ancestor of dir.path() must contain .git.
+    {
+        let mut d = dir.path().canonicalize().unwrap();
+        loop {
+            assert!(
+                !d.join(".git").exists(),
+                "NOGIT precondition failed: ancestor {d:?} contains .git"
+            );
+            let parent = match d.parent() {
+                Some(p) if p != d => p.to_path_buf(),
+                _ => break,
+            };
+            d = parent;
+        }
+    }
+
+    // (1) bare tempdir — not_a_repo
+    let bare = dir.path().join("bare");
+    fs::create_dir_all(&bare).unwrap();
+    assert_eq!(
+        git_head_state(&bare),
+        HeadState::NotARepo,
+        "(1) bare dir: expected NotARepo"
+    );
+
+    // (2) mkdir .git (no HEAD) — not_a_repo
+    let empty_git = dir.path().join("empty_git");
+    fs::create_dir_all(empty_git.join(".git")).unwrap();
+    assert_eq!(
+        git_head_state(&empty_git),
+        HeadState::NotARepo,
+        "(2) .git dir with no HEAD: expected NotARepo"
+    );
+
+    // (3) .git file pointing at nonexistent gitdir — not_a_repo
+    let gitfile = dir.path().join("gitfile_root");
+    fs::create_dir_all(&gitfile).unwrap();
+    fs::write(gitfile.join(".git"), "gitdir: /does/not/exist\n").unwrap();
+    assert_eq!(
+        git_head_state(&gitfile),
+        HeadState::NotARepo,
+        "(3) .git file pointing at nonexistent path: expected NotARepo"
+    );
+
+    // (4) .git/HEAD = garbage — unresolved
+    let garbage = dir.path().join("garbage_head");
+    let garbage_git = garbage.join(".git");
+    fs::create_dir_all(&garbage_git).unwrap();
+    fs::write(garbage_git.join("HEAD"), "this is not a valid HEAD\n").unwrap();
+    assert_eq!(
+        git_head_state(&garbage),
+        HeadState::Unresolved,
+        "(4) garbage HEAD: expected Unresolved"
+    );
+
+    // (5) real linked worktree — resolved
+    let primary5 = dir.path().join("primary5");
+    let worktree5 = dir.path().join("wt5");
+    fs::create_dir_all(&primary5).unwrap();
+    let gt5 = create_real_git_repo(&primary5, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary5, &worktree5, "b1");
+
+    assert_eq!(
+        git_head_state(&worktree5),
+        HeadState::Resolved(gt5.clone()),
+        "(5) linked worktree: expected Resolved"
+    );
+
+    // (6) subdirectory of a repo — resolved (OD-3)
+    let sub = primary5.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    // sub has no .git of its own → adopt primary5's HEAD.
+    assert_eq!(
+        git_head_state(&sub),
+        HeadState::Resolved(gt5),
+        "(6) subdirectory of repo: expected Resolved via ancestor walk"
+    );
+}
+
+/// AC29 / S29 — All 17 AD-413-* markers are present in their documented source files.
+///
+/// Each marker is anchored to the file the plan names for it:
+/// - AD-413-1..7, AD-413-9, AD-413-10, AD-413-11, AD-413-14  in staleness.rs
+/// - AD-413-8, AD-413-13  in mod.rs  (AD-413-8: error-message format; AD-413-13: provenance)
+/// - AD-413-12  in walk.rs
+/// - AD-413-15  in staleness.rs or hooks.rs
+/// - AD-413-16  in staleness.rs or temporal_build.rs
+/// - AD-413-17  in temporal_build.rs
+///
+/// The test asserts that the exact ID string appears in AT LEAST ONE of the files
+/// the plan lists for it.  A missing marker means the design decision anchor has
+/// drifted and must be restored before merge.
+#[test]
+fn test_ac_413_ad_series_comments_present() {
+    let staleness_src = include_str!("staleness.rs");
+    let mod_src = include_str!("mod.rs");
+    let walk_src = include_str!("walk.rs");
+    let hooks_src = include_str!("hooks.rs");
+    let temporal_src = include_str!("temporal.rs");
+    let temporal_build_src = include_str!("temporal_build.rs");
+
+    // AD-413-1..7 and AD-413-9 are in staleness.rs.
+    // AD-413-8 is in mod.rs (error-message format spec — AC18(a)/AC33(c)).
+    for n in [1u8, 2, 3, 4, 5, 6, 7, 9] {
+        let marker = format!("AD-413-{n}");
+        assert!(
+            staleness_src.contains(&marker),
+            "AD-413-{n} must be present in staleness.rs"
+        );
+    }
+    assert!(mod_src.contains("AD-413-8"), "AD-413-8 must be in mod.rs");
+
+    // AD-413-10 and AD-413-11 are in staleness.rs (module doc and fn doc)
+    assert!(
+        staleness_src.contains("AD-413-10"),
+        "AD-413-10 must be in staleness.rs"
+    );
+    assert!(
+        staleness_src.contains("AD-413-11"),
+        "AD-413-11 must be in staleness.rs"
+    );
+
+    // AD-413-12 is in walk.rs
+    assert!(
+        walk_src.contains("AD-413-12"),
+        "AD-413-12 must be in walk.rs"
+    );
+
+    // AD-413-13 is in mod.rs
+    assert!(mod_src.contains("AD-413-13"), "AD-413-13 must be in mod.rs");
+
+    // AD-413-14 is in staleness.rs
+    assert!(
+        staleness_src.contains("AD-413-14"),
+        "AD-413-14 must be in staleness.rs"
+    );
+
+    // AD-413-15 is in staleness.rs and hooks.rs
+    assert!(
+        staleness_src.contains("AD-413-15") || hooks_src.contains("AD-413-15"),
+        "AD-413-15 must be in staleness.rs or hooks.rs"
+    );
+
+    // AD-413-16 is in staleness.rs and temporal_build.rs
+    assert!(
+        staleness_src.contains("AD-413-16") || temporal_build_src.contains("AD-413-16"),
+        "AD-413-16 must be in staleness.rs or temporal_build.rs"
+    );
+
+    // AD-413-17 is in temporal_build.rs
+    assert!(
+        temporal_build_src.contains("AD-413-17"),
+        "AD-413-17 must be in temporal_build.rs"
+    );
+
+    // Provenance sentence: build_stats_json must document that git_head is stored and git_head_state is live.
+    // AC29 requires the PROVENANCE sentence from AD-413-13's rustdoc.
+    assert!(
+        mod_src.contains("AD-413-13"),
+        "AD-413-13 provenance sentence must be present in mod.rs build_stats_json rustdoc"
+    );
+
+    // Belt-and-suspenders: every file also must not have any bare #NEW markers
+    // (ADR-004: no phantom tickets; real numbers only).
+    for (name, src) in &[
+        ("staleness.rs", staleness_src),
+        ("mod.rs", mod_src),
+        ("walk.rs", walk_src),
+        ("hooks.rs", hooks_src),
+        ("temporal.rs", temporal_src),
+        ("temporal_build.rs", temporal_build_src),
+    ] {
+        assert!(
+            !src.contains("#NEW"),
+            "ADR-004: {name} must not contain #NEW placeholder tickets"
+        );
+    }
+}
+
+/// AC17 supplement / S17 (6) — `resolve_repo_toplevel` is live for subdirectory roots.
+///
+/// A directory without its own `.git` that sits inside a real git repo returns
+/// `HeadState::Resolved` — the ancestor walk adopts the nearest enclosing repo.
+#[test]
+fn test_git_head_state_resolves_subdirectory_root() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(&primary, &[("init", &[("src/lib.rs", "fn f(){}\n")])]);
+
+    // src/ exists but has no .git — must resolve via ancestor walk.
+    let sub = primary.join("src");
+    assert!(!sub.join(".git").exists(), "precondition: src/ has no .git");
+
+    let state = git_head_state(&sub);
+    assert_eq!(
+        state,
+        HeadState::Resolved(gt),
+        "subdirectory root must resolve to the enclosing repo's HEAD"
+    );
+}
+
+/// AC10 / S10 — Poisoned stored HEAD in a linked worktree fires HeadChanged exactly ONCE,
+/// then recovers to Current on the second query (no rebuild loop).
+///
+/// Discriminating: monotonicity — no existing assertion may be weakened (AC5b).
+/// Pre-fix: HEAD resolution returned None → staleness used a stale verdict,
+/// potentially looping. Post-fix: resolves correctly, fires HeadChanged, then Current.
+#[test]
+fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&primary).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let gt = create_real_git_repo(
+        &primary,
+        &[("init", &[("a.rs", "fn a(){}\n"), ("b.rs", "fn b(){}\n")])],
+    );
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    // Plant a "poison" stored HEAD (mismatch) and real index stubs.
+    let poisoned = "deadbeef".repeat(5);
+    write_manifest_with_head(&worktree, &cache_dir, Some(&poisoned));
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+
+    // First check: must see HeadChanged (poison → gt).
+    let (verdict1, _) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(&verdict1, StalenessCheck::HeadChanged { stored, current }
+            if stored == &poisoned && current == &gt),
+        "AC10 step-1: expected HeadChanged {{ poisoned→gt }}; got {verdict1:?}"
+    );
+
+    // Recover with one auto-refresh.
+    auto_refresh_if_stale(&worktree, &cache_dir, &TEST_ANALYTICS, false).unwrap();
+
+    // Second check: must be Current (no loop).
+    let (verdict2, _) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(verdict2, StalenessCheck::Current),
+        "AC10 step-2: after recovery the check must be Current (no rebuild loop); got {verdict2:?}"
+    );
+
+    // Third check: still Current — confirms the no-loop invariant holds across multiple reads.
+    let (verdict3, _) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(verdict3, StalenessCheck::Current),
+        "AC10 step-3: still Current on third check (monotonicity); got {verdict3:?}"
+    );
 }

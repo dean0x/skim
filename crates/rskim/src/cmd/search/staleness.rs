@@ -10,6 +10,22 @@
 //! - Handles ordinary repos (`.git/` directory) and worktrees (`.git` file).
 //! - Follows `ref: refs/heads/<branch>` symbolic refs with packed-refs fallback.
 //! - All failures are soft: if we can't read git state we degrade gracefully.
+//!
+//! AD-413-10: #413 extended this hand-rolled reader instead of switching to `gix`
+//! (ADR-008's in-process rule is satisfied either way): `gix 0.72.1`/`gix-ref 0.52.1`
+//! contain ZERO reftable support (measured), so gix buys no correctness the ladder lacks,
+//! while `check_staleness` runs on every query and ADR-003 forbids an unmeasured hot-path cost.
+//! `resolve_git_dir` still resolves ONE directory and never walks up, because
+//! `walk::resolve_git_index_path` and the bare-repo boundary (AD-413-11) depend on that.
+//! Ancestor discovery lives one level up in `git_head_state`, which for a root with NO `.git`
+//! at all adopts the nearest enclosing repository via `walk::discover_project_root`
+//! (walk.rs:177-195), the same bounded walk the default entry point already uses, so
+//! `--root <subdir>` and a bare invocation from that subdirectory agree.
+//! "A different repo than it indexed" is prevented, not assumed: first-match stops at the
+//! nearest `.git` (a submodule or nested worktree terminates the search), the adopted toplevel
+//! must contain the canonical root and expose a readable `HEAD`, and the toplevel that produced
+//! the rows is recorded in `temporal.db` `meta` and REFUSED on mismatch rather than retargeted
+//! (AD-413-16).
 
 use std::path::{Path, PathBuf};
 
@@ -81,6 +97,10 @@ impl std::fmt::Display for StalenessCheck {
 /// - Returns `None` when `.git` doesn't exist.
 ///
 /// This mirrors git's own resolution logic for `git rev-parse --git-dir`.
+/// AD-413-11: a BARE repo has no `.git` entry, so this returns `None` before any ref
+/// logic — out of scope for #413 (0 files indexed; the AD-408-1 ghost filter would drop
+/// every row).  `reftable` repos are also unresolvable: their `HEAD` is the stub
+/// `ref: refs/heads/.invalid`.
 pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
     let dot_git = project_root.join(".git");
     if dot_git.is_dir() {
@@ -1264,6 +1284,62 @@ pub(super) fn create_real_git_repo_with_dates(
         .current_dir(dir)
         .output()
         .expect("git rev-parse HEAD");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Create a linked git worktree rooted at `worktree` and checked out on `branch`.
+///
+/// Runs `git -C primary branch <branch>` (creates the branch from the current HEAD)
+/// then `git -C primary worktree add <worktree> <branch>`, and returns the full 40-hex
+/// SHA of `HEAD` as seen from the linked worktree.
+///
+/// **Hermeticity (I3/I5):** sets `GIT_CONFIG_GLOBAL=/dev/null` and
+/// `GIT_CONFIG_SYSTEM=/dev/null` on every subprocess so ambient `core.hooksPath`,
+/// `init.defaultBranch`, and `extensions.*` configuration does not bleed in.
+/// Branch names may contain `/` (e.g. `wave/probe-413` — F12 slashed-branch coverage).
+///
+/// `primary` must already be an initialised git repository with at least one commit
+/// (call [`create_real_git_repo`] first).  `worktree` must not yet exist.
+///
+/// `pub(super)` makes it accessible from all `#[cfg(test)]` modules within
+/// `crate::cmd::search` via `super::staleness::create_real_git_worktree`.
+#[cfg(test)]
+pub(super) fn create_real_git_worktree(
+    primary: &std::path::Path,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> String {
+    use std::process::Command;
+
+    // Create the branch at HEAD of the primary repository.
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["branch", branch])
+        .current_dir(primary)
+        .output()
+        .expect("git branch");
+
+    // Add the linked worktree checked out on that branch.
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .arg("worktree")
+        .arg("add")
+        .arg(worktree)
+        .arg(branch)
+        .current_dir(primary)
+        .output()
+        .expect("git worktree add");
+
+    // Return the resolved HEAD SHA from the linked worktree.
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree)
+        .output()
+        .expect("git rev-parse HEAD in worktree");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

@@ -612,26 +612,17 @@ fn merge_tracked_union(
 /// Returns `None` if `root/.git` is neither a directory nor a readable file
 /// (non-git root). The caller should not invoke this for non-git roots
 /// (gated by the `root.join(".git").exists()` check in [`walk_metadata`]).
+///
+/// AD-413-12: delegates to `staleness::resolve_git_dir` so the `gitdir:` POINTER has
+/// ONE parser.  Two near-copies drifted (line-scan vs whole-file `strip_prefix`); #413
+/// touches worktree indirection, so the duplicate is removed with it (applies ADR-001).
+/// NOT a claim that all `.git`-path consumers are unified: `walk::discover_project_root`
+/// (walk.rs:184) owns the bounded ANCESTOR walk (a different job, reused by AD-413-14)
+/// and walk.rs:500's `.git` existence probe stays local.  `hooks.rs` no longer hand-builds
+/// `.git/hooks`: it resolves through this same parser plus `resolve_common_dir`
+/// (AD-413-15), which is what makes the shared-hooks route correct.
 fn resolve_git_index_path(root: &Path) -> Option<PathBuf> {
-    let git_entry = root.join(".git");
-    if git_entry.is_dir() {
-        // Regular repository: index is at .git/index.
-        Some(git_entry.join("index"))
-    } else if git_entry.is_file() {
-        // Linked worktree: .git is a file containing "gitdir: <path>\n".
-        // git always writes an absolute path on modern versions; support a
-        // relative path (relative to root) as a defensive fallback.
-        let content = fs::read_to_string(&git_entry).ok()?;
-        let gitdir_str = content.strip_prefix("gitdir: ")?.trim_end();
-        let gitdir = if Path::new(gitdir_str).is_absolute() {
-            PathBuf::from(gitdir_str)
-        } else {
-            root.join(gitdir_str)
-        };
-        Some(gitdir.join("index"))
-    } else {
-        None
-    }
+    super::staleness::resolve_git_dir(root).map(|d| d.join("index"))
 }
 
 /// Memoized tracked-file enumeration.
