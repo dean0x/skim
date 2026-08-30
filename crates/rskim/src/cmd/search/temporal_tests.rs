@@ -204,13 +204,15 @@ fn open_temporal_db_for_anchor_differs_returns_err() {
     );
 }
 
-/// AD-413-16: `resolve_blast_radius_paths` must return `Ok(None)` (not an error,
-/// not wrong data) when the temporal DB was written for a different repository.
+/// AD-413-16: `resolve_blast_radius_paths` must return `Ok(Some(empty_set))`
+/// (not `Ok(None)`, not an error) when the temporal DB was written for a
+/// different repository.  An empty allowlist forces zero results on all
+/// blast-radius callers; `Ok(None)` would be misread as "not requested".
 ///
 /// Uses the same fake-git-root fixture as `open_temporal_db_for_anchor_differs_returns_err`
 /// to trigger `AnchorState::Differs` inside the funnel.
 #[test]
-fn resolve_blast_radius_paths_anchor_differs_returns_ok_none() {
+fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
     // Outer dir acts as the git repo root.
     let outer = TempDir::new().unwrap();
     let git_dir = outer.path().join(".git");
@@ -232,7 +234,7 @@ fn resolve_blast_radius_paths_anchor_differs_returns_ok_none() {
     );
 
     // blast_radius path does not need to exist — the anchor guard fires before
-    // path normalization, so the function returns Ok(None) early.
+    // path normalization.
     let result = super::resolve_blast_radius_paths(
         Some("src/auth.rs"),
         &root,
@@ -244,11 +246,17 @@ fn resolve_blast_radius_paths_anchor_differs_returns_ok_none() {
         result.is_ok(),
         "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"
     );
-    assert_eq!(
-        result.unwrap(),
-        None,
-        "AD-413-16: resolve_blast_radius_paths must return Ok(None) when anchor differs, \
-         not serve wrong co-change data"
+    let paths = result.unwrap();
+    assert!(
+        paths.is_some(),
+        "AD-413-16: resolve_blast_radius_paths must return Ok(Some(empty_set)) on \
+         AnchorDiffers, not Ok(None) — None overloads the 'not requested' sentinel \
+         (PF-016 / AD-413-16)"
+    );
+    assert!(
+        paths.unwrap().is_empty(),
+        "AD-413-16: the returned set must be empty — wrong-repo anchor forces zero results \
+         on all blast-radius arms"
     );
 }
 

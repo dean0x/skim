@@ -3474,10 +3474,13 @@ fn test_git_head_state_distinguishes_not_a_repo_from_unresolved() {
 /// AC29 / S29 — All 17 AD-413-* markers are present in their documented source files.
 ///
 /// Each marker is anchored to the file the plan names for it:
-/// - AD-413-1..7, AD-413-9, AD-413-10, AD-413-11, AD-413-14  in staleness.rs
+/// - AD-413-1..7  in gitdir.rs (git-plumbing module extracted from staleness.rs)
+/// - AD-413-9     in temporal_state.rs (warn_if_temporal_unverifiable advisory)
+/// - AD-413-10, AD-413-11  in gitdir.rs (module doc and fn doc)
 /// - AD-413-8, AD-413-13  in mod.rs  (AD-413-8: error-message format; AD-413-13: provenance)
 /// - AD-413-12  in walk.rs
-/// - AD-413-15  in staleness.rs or hooks.rs
+/// - AD-413-14  in staleness.rs or gitdir.rs
+/// - AD-413-15  in staleness.rs, gitdir.rs, or hooks.rs
 /// - AD-413-16  in staleness.rs or temporal_build.rs
 /// - AD-413-17  in temporal_build.rs
 ///
@@ -3487,31 +3490,36 @@ fn test_git_head_state_distinguishes_not_a_repo_from_unresolved() {
 #[test]
 fn test_ac_413_ad_series_comments_present() {
     let staleness_src = include_str!("staleness.rs");
+    let gitdir_src = include_str!("gitdir.rs");
+    let temporal_state_src = include_str!("temporal_state.rs");
     let mod_src = include_str!("mod.rs");
     let walk_src = include_str!("walk.rs");
     let hooks_src = include_str!("hooks.rs");
     let temporal_src = include_str!("temporal.rs");
     let temporal_build_src = include_str!("temporal_build.rs");
 
-    // AD-413-1..7 and AD-413-9 are in staleness.rs.
+    // AD-413-1..7 are in gitdir.rs (the git-plumbing module extracted from
+    // staleness.rs during #413).  AD-413-9 is in temporal_state.rs.
     // AD-413-8 is in mod.rs (error-message format spec — AC18(a)/AC33(c)).
     for n in [1u8, 2, 3, 4, 5, 6, 7, 9] {
         let marker = format!("AD-413-{n}");
         assert!(
-            staleness_src.contains(&marker),
-            "AD-413-{n} must be present in staleness.rs"
+            staleness_src.contains(&marker)
+                || gitdir_src.contains(&marker)
+                || temporal_state_src.contains(&marker),
+            "AD-413-{n} must be present in staleness.rs, gitdir.rs, or temporal_state.rs"
         );
     }
     assert!(mod_src.contains("AD-413-8"), "AD-413-8 must be in mod.rs");
 
-    // AD-413-10 and AD-413-11 are in staleness.rs (module doc and fn doc)
+    // AD-413-10 and AD-413-11 are in gitdir.rs (module doc and fn doc).
     assert!(
-        staleness_src.contains("AD-413-10"),
-        "AD-413-10 must be in staleness.rs"
+        gitdir_src.contains("AD-413-10"),
+        "AD-413-10 must be in gitdir.rs"
     );
     assert!(
-        staleness_src.contains("AD-413-11"),
-        "AD-413-11 must be in staleness.rs"
+        gitdir_src.contains("AD-413-11"),
+        "AD-413-11 must be in gitdir.rs"
     );
 
     // AD-413-12 is in walk.rs
@@ -3562,6 +3570,8 @@ fn test_ac_413_ad_series_comments_present() {
     // (ADR-004: no phantom tickets; real numbers only).
     for (name, src) in &[
         ("staleness.rs", staleness_src),
+        ("gitdir.rs", gitdir_src),
+        ("temporal_state.rs", temporal_state_src),
         ("mod.rs", mod_src),
         ("walk.rs", walk_src),
         ("hooks.rs", hooks_src),
@@ -4150,10 +4160,14 @@ fn test_ac22_frozen_manifest_git_head_advances_after_refresh() {
     let cache_dir = dir.path().join("cache");
     fs::create_dir_all(&cache_dir).unwrap();
 
-    // Plant a frozen manifest: valid stubs + stored HEAD = None.
+    // Build a real index first so cache_dir contains valid index files
+    // (NgramIndexReader::open requires a full header — a 6-byte stub is
+    // insufficient; write_lexical_index_stub cannot satisfy build_stats_json).
+    auto_refresh_if_stale(&root, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+
+    // Now freeze the manifest: overwrite stored HEAD = None to simulate a
+    // worktree whose manifest was written before the HEAD-recording fix.
     write_manifest_with_head(&root, &cache_dir, None);
-    write_lexical_index_stub(&cache_dir);
-    write_ast_index_stub(&cache_dir);
 
     // First stats call: stored HEAD is None, live HEAD resolves → frozen state.
     let stats1 = super::super::stats_json_for_test(&cache_dir, &root)

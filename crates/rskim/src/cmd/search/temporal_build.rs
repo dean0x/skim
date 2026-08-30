@@ -843,7 +843,15 @@ fn record_temporal_anchor(
             });
         return;
     }
-    let Some(top_str) = ghost_root.to_str() else {
+    // Canonicalize before storing so the recorded path agrees with the live
+    // path returned by `resolve_repo_toplevel` (which calls `.canonicalize()`).
+    // On macOS, `gix::discover` can return `/var/...` while the live path is
+    // `/private/var/...` — without this step the anchor comparison always
+    // disagrees on `/tmp`-rooted temp dirs and the anchor check is unreliable.
+    let canonical_ghost = ghost_root
+        .canonicalize()
+        .unwrap_or_else(|_| ghost_root.to_path_buf());
+    let Some(top_str) = canonical_ghost.to_str() else {
         if crate::debug::is_debug_enabled() {
             eprintln!(
                 "skim search [debug]: temporal anchor: git workdir path is not valid \

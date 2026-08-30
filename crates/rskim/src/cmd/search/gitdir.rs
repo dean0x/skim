@@ -412,6 +412,10 @@ fn is_hex_sha(s: &str) -> bool {
 
 /// Resolve the `commondir` of a linked-worktree gitdir.
 ///
+/// AD-413-1: the `commondir` file is the shared ref store for a linked
+/// worktree — all global refs (branches, tags) live in the main repo's
+/// gitdir; the per-worktree gitdir only holds HEAD and per-worktree state.
+///
 /// A linked worktree's gitdir (e.g. `.git/worktrees/<name>/`) contains a
 /// `commondir` file pointing at the main repo's gitdir.  Global refs live
 /// there — the worktree-private gitdir's `refs/` is empty (measured, #413).
