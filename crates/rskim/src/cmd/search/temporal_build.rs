@@ -681,7 +681,7 @@ fn record_temporal_anchor(db: &TemporalDb, root: &Path) {
 /// Return the current Unix epoch timestamp in seconds.
 ///
 /// Used by `rebuild_temporal`'s call site in `staleness.rs` to pin `now_epoch`
-/// at the start of the refresh -- all score computations use the same reference
+/// at the start of the refresh — all score computations use the same reference
 /// point rather than reading `SystemTime::now()` inside library functions.
 ///
 /// Returns `0` if the system clock is before the Unix epoch (impossible in

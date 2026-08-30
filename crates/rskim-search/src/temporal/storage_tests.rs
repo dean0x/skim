@@ -55,6 +55,27 @@ fn schema_version_is_2() {
     assert_eq!(db.schema_version().unwrap(), 2);
 }
 
+/// AC26 companion pin — `storage::CURRENT_VERSION == 2`.
+///
+/// This is the companion to `test_ac26_no_on_disk_format_version_is_bumped` in
+/// `rskim/src/cmd/search/index_tests.rs`, which pins the five format-version constants
+/// visible from `rskim` but cannot reach `rskim-search::temporal::storage::CURRENT_VERSION`
+/// (it is `const`, not `pub`).  Together they form one logical test: no on-disk format
+/// version is bumped by #413, so existing indexes do not trigger a user-visible rebuild.
+///
+/// Discriminating: bump `CURRENT_VERSION` (even to 3 then back) and this fails,
+/// alerting the developer that doing so would force every user's `temporal.db` to
+/// re-migrate on the next query.
+#[test]
+fn ac26_current_version_pin() {
+    assert_eq!(
+        super::CURRENT_VERSION,
+        2,
+        "AC26: CURRENT_VERSION must stay 2 — bumping it forces every user's temporal.db \
+         to re-migrate on the next query, not only previously-unresolvable roots"
+    );
+}
+
 #[test]
 fn open_idempotent() {
     let dir = TempDir::new().unwrap();

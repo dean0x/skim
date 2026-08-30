@@ -1800,6 +1800,13 @@ pub(super) fn temporal_unavailable_msg(root: &std::path::Path) -> String {
 /// rather than a hand-duplicated reimplementation.  `run_stats` calls this in its
 /// JSON branch; `stats_json_for_test` delegates to it directly.
 ///
+/// AD-413-13: `git_head` is the manifest's stored HEAD ("HEAD-at-last-build" from
+/// [`FileManifest::stored_git_head`]) while `git_head_state` is the live HEAD state
+/// resolved at call time.  The two keys can legitimately diverge — for example, a
+/// frozen linked worktree before its first post-fix rebuild produces
+/// `{"git_head": null, "git_head_state": "resolved"}`, which is a legal transient
+/// state, not a contradiction.
+///
 /// AD-395-6: `skipped` / `skipped_by_reason` are additive keys; all nine pre-existing
 /// keys are unchanged (AC11 back-compat).  `skipped_by_reason` uses `BTreeMap` for
 /// byte-stable key order consistent with the text-mode path (PF-012).
