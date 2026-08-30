@@ -1486,43 +1486,59 @@ fn test_ghost_filter_containment_guard() {
 }
 
 /// Regression: ghost filter must NOT false-drop rows when `root` is a
-/// subdirectory of the git worktree (AD-408-5).
+/// subdirectory of the git worktree (AD-408-5), and the AD-413-17 scope filter
+/// must re-anchor surviving paths to be root-relative.
 ///
-/// Before the fix, `apply_ghost_filter` joined REPO-ROOT-relative paths against
-/// the search `root` subdir, double-nesting the prefix and causing every row to
-/// fail `is_file()`. With the fix, paths are joined against the discovered git
-/// workdir (the true repo root), so present files are correctly retained.
+/// Before the AD-408-5 fix, `apply_ghost_filter` joined REPO-ROOT-relative paths
+/// against the search `root` subdir, double-nesting the prefix and causing every
+/// row to fail `is_file()`:
 ///
-/// Failure scenario (pre-fix):
-///   `skim search --hot --root <repo>/subdir`
-///   → gix discovers `<repo>` from `subdir`, emits `src/lib.rs`
-///   → ghost filter: `subdir.join("src/lib.rs")` = `<repo>/subdir/src/lib.rs`
+/// Failure scenario (pre-AD-408-5-fix):
+///   `skim search --hot --root <repo>/sub`
+///   → gix discovers `<repo>` from `sub`, emits `sub/src/lib.rs`
+///   → ghost filter (old): `sub.join("sub/src/lib.rs")` = `<repo>/sub/sub/src/lib.rs`
 ///     (double-nested; file does not exist there)
 ///   → all rows dropped; `--hot` returns empty output with exit 0 (silent loss).
 ///
-/// Discriminating: without the fix every hotspot row is false-ghosted; with the
-/// fix `src/lib.rs` is retained because `<workdir>.join("src/lib.rs")` exists.
+/// With the AD-408-5 fix, paths are joined against `ghost_root` (the discovered
+/// git workdir), so `<repo>/sub/src/lib.rs` exists and is retained.
+///
+/// The AD-413-17 scope filter then strips the `sub/` prefix so the stored path
+/// is root-relative (`src/lib.rs`), matching what a lexical query on the same
+/// root would return.
+///
+/// Files outside the `sub/` scope (e.g. top-level `a.rs`) are correctly excluded
+/// by the scope filter — this is intentional: one `--root`, one result universe.
+///
+/// Discriminating: without the ghost-filter fix every hotspot row is false-ghosted
+/// (double-path → `is_file()` miss); with it the row survives and after the scope
+/// filter the stored path is `src/lib.rs`, not `sub/src/lib.rs`.
 #[test]
 fn test_ghost_filter_subdir_root_rows_survive() {
     let dir = tempdir().unwrap();
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    // Create a real git repo at dir.path() and commit `src/lib.rs` there.
-    // These paths are REPO-ROOT-relative from gix's perspective.
+    // Create a real git repo at dir.path() and commit `sub/src/lib.rs` there.
+    // The file is INSIDE the `sub/` subtree; gix reports it as `sub/src/lib.rs`
+    // (REPO-ROOT-relative).  Also commit `a.rs` at the repo root so we can
+    // assert it is absent from results (AD-413-17 scope filter: one root, one
+    // result universe).
     let head = create_real_git_repo(
         dir.path(),
         &[
-            ("feat: add lib", &[("src/lib.rs", "pub fn a() {}")]),
-            ("feat: update lib", &[("src/lib.rs", "pub fn b() {}")]),
+            (
+                "feat: add lib",
+                &[("sub/src/lib.rs", "pub fn a() {}"), ("a.rs", "fn top() {}")],
+            ),
+            ("feat: update lib", &[("sub/src/lib.rs", "pub fn b() {}")]),
         ],
     );
 
-    // Create a subdirectory and use it as the search root — simulating
-    // `skim search --hot --root <repo>/subdir`.
-    // `src/lib.rs` does NOT exist under `subdir`; it exists under `dir.path()`.
-    let subdir = dir.path().join("subdir");
-    std::fs::create_dir_all(&subdir).unwrap();
+    // Use `sub` as the search root — simulating
+    // `skim search --hot --root <repo>/sub`.
+    // `create_real_git_repo` already created `dir.path()/sub/src/lib.rs` on disk.
+    let subdir = dir.path().join("sub");
 
     let now = super::current_epoch_secs();
     rebuild_temporal(&subdir, &cache_dir, &head, now).unwrap();
@@ -1539,11 +1555,24 @@ fn test_ghost_filter_subdir_root_rows_survive() {
         hotspots.len()
     );
 
+    // AD-413-17: paths must be root-relative (prefix stripped), not repo-relative.
     let lib_present = hotspots.iter().any(|r| r.file_path == "src/lib.rs");
     assert!(
         lib_present,
-        "src/lib.rs must survive the ghost filter when rebuild root is a subdirectory \
-         of the worktree (paths are repo-root-relative from gix)"
+        "src/lib.rs must survive with root-relative path after ghost filter + scope filter \
+         (AD-408-5 / AD-413-17: gix emits repo-root-relative `sub/src/lib.rs`; \
+         scope filter strips `sub/` prefix yielding `src/lib.rs`); \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // AD-413-17: the out-of-scope top-level file must NOT appear.
+    let out_of_scope = hotspots.iter().any(|r| r.file_path == "a.rs");
+    assert!(
+        !out_of_scope,
+        "a.rs lives outside sub/ and must be excluded by the AD-413-17 scope filter \
+         (one --root, one result universe); hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
     );
 }
 
