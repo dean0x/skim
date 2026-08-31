@@ -127,23 +127,84 @@ pub(super) fn normalize_blast_radius_path(
 }
 
 // ============================================================================
+// Degraded-state message SSOT (AD-414-1)
+// ============================================================================
+
+/// How the search degrades when temporal data is unavailable (AD-414-1).
+///
+/// Passed to [`degraded_notice`] to communicate which ranking was served
+/// instead and to tailor remediation advice.  Step 5 wires this into the
+/// full `DegradedReason` mechanism together with the `TemporalUnavailable`
+/// refactor; `flag` and `fallback` are reserved in Phase A (Step 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Fallback {
+    /// Pure-lexical BM25F order is served.
+    Lexical,
+    /// Raw AST structural ranking is served without temporal enrichment.
+    Ast,
+    /// No fallback is possible (standalone temporal arm — no results served).
+    NoResults,
+}
+
+/// Single source of truth for "temporal data unavailable" messages (AD-414-1).
+///
+/// Subsumes #413's interim `mod.rs::temporal_unavailable_msg`.  Dispatch table:
+///
+/// | `head` state  | `anchor` state    | message emitted                     |
+/// |---------------|-------------------|-------------------------------------|
+/// | `NotARepo`    | —                 | [`super::NO_TEMPORAL_DATA_MSG`]     |
+/// | `Unresolved`  | —                 | [`super::HEAD_UNRESOLVED_TEMPORAL_MSG`] |
+/// | `Resolved`    | `Differs { … }`   | [`super::SUBDIR_ROOT_TEMPORAL_MSG`] + paths |
+/// | `Resolved`    | other             | [`super::TEMPORAL_BUILD_EMPTY_MSG`] |
+///
+/// **Phase A (Step 0):** routes via `head` + `anchor` for backward compat with
+/// pre-Step-5 call sites.  Step 5 replaces this with a `DegradedReason`-based
+/// dispatch when the full `TemporalUnavailable` refactor lands.
+///
+/// `flag`: the `skim search --<flag>` that triggered the query (reserved for
+/// Step 5 remediation strings; ignored in Phase A).  `fallback`: the ranking
+/// served instead (reserved; ignored in Phase A).
+pub(super) fn degraded_notice(
+    head: &HeadState,
+    anchor: &AnchorState,
+    _flag: &str,
+    _fallback: Fallback,
+) -> String {
+    match head {
+        HeadState::NotARepo => super::NO_TEMPORAL_DATA_MSG.to_string(),
+        HeadState::Unresolved => super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
+        HeadState::Resolved(_) => {
+            if let AnchorState::Differs { recorded, live } = anchor {
+                return format!(
+                    "{} \
+                     (recorded: {recorded:?}, live: {live:?}); \
+                     run `skim search --rebuild --root <this root>` to re-anchor",
+                    super::SUBDIR_ROOT_TEMPORAL_MSG,
+                );
+            }
+            super::TEMPORAL_BUILD_EMPTY_MSG.to_string()
+        }
+    }
+}
+
+// ============================================================================
 // DB helpers
 // ============================================================================
 
 /// Typed reason why the temporal DB cannot be served.
 ///
 /// Returned by [`open_temporal_db_for`], the single funnel for all temporal DB
-/// access.  Each consumer arm renders the reason (typically via
-/// [`super::temporal_unavailable_msg`]) and degrades gracefully.
+/// access.  Each consumer arm renders the reason (via [`degraded_notice`]) and
+/// degrades gracefully.
 ///
 /// AD-413-16: this enum exists so the anchor-refusal contract is enforced by
 /// the API shape rather than by convention at every call site.  A future
 /// temporal consumer that forgets the pre-check receives a compile error
 /// (it cannot get a `TemporalDb` without calling through the funnel).
 ///
-/// Finding 1/3: the variants carry enough information for callers to call
-/// `temporal_unavailable_msg(head, &reason.to_anchor_state())` without
-/// re-deriving state from disk, making the final message pure + allocation-free.
+/// Finding 1/3: the variants carry enough information for callers to build the
+/// `anchor` arg to [`degraded_notice`] without re-deriving state from disk,
+/// making the final message pure + allocation-free.
 #[derive(Debug)]
 pub(super) enum TemporalUnavailable {
     /// `temporal.db` does not exist, is corrupt, or cannot be opened.
@@ -157,7 +218,7 @@ pub(super) enum TemporalUnavailable {
 }
 
 impl TemporalUnavailable {
-    /// Convert to an [`AnchorState`] suitable for [`super::temporal_unavailable_msg`].
+    /// Convert to an [`AnchorState`] suitable for [`degraded_notice`].
     ///
     /// `AnchorDiffers { recorded, live }` → `AnchorState::Differs { recorded, live }`.
     /// `Absent` → `AnchorState::Absent` (the head state drives the message in
@@ -292,7 +353,7 @@ pub(super) fn paths_to_file_ids(
 ///
 /// `head` is the [`HeadState`] already resolved by the caller (Finding 2 fix:
 /// returned by `auto_refresh_if_stale` so it need not be re-derived here).
-/// It is passed to `temporal_unavailable_msg` instead of re-calling `git_head_state`
+/// It is passed to [`degraded_notice`] instead of re-calling `git_head_state`
 /// (Finding 1/3 fix: the message function is pure, zero I/O).
 ///
 /// Returns:
@@ -321,21 +382,21 @@ pub(super) fn resolve_blast_radius_paths(
     // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
     // place.  AnchorDiffers → wrong co-change data would be served; Absent →
     // degrade gracefully.  Both arms emit the same message format so callers
-    // get a reason-specific human-readable string via temporal_unavailable_msg.
+    // get a reason-specific human-readable string via degraded_notice (AD-414-1).
     //
-    // Site 5 (Step 8): temporal_unavailable_msg dispatches to the correct
-    // constant (SUBDIR_ROOT_TEMPORAL_MSG for AnchorDiffers, NO_TEMPORAL_DATA_MSG
+    // degraded_notice dispatches to the correct constant
+    // (SUBDIR_ROOT_TEMPORAL_MSG for AnchorDiffers, NO_TEMPORAL_DATA_MSG
     // for non-repo, etc.) so the doubled composition "no temporal data for
     // --blast-radius — <reason>" is always accurate (C8 / AC19).
     //
     // Finding 1/3 fix: pass the pre-resolved `head` and convert the
-    // `TemporalUnavailable` reason to `AnchorState` so `temporal_unavailable_msg`
+    // `TemporalUnavailable` reason to `AnchorState` so `degraded_notice`
     // performs zero I/O.
     let db = match open_temporal_db_for(root, cache_dir) {
         Ok(db) => db,
         Err(ref reason) => {
             let anchor = reason.to_anchor_state();
-            let base_msg = super::temporal_unavailable_msg(head, &anchor);
+            let base_msg = degraded_notice(head, &anchor, "--blast-radius", Fallback::NoResults);
             let msg = format!("no temporal data for --blast-radius — {base_msg}");
             if json {
                 let envelope = serde_json::json!({ "warning": msg });

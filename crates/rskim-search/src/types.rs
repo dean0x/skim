@@ -1302,6 +1302,28 @@ pub enum SearchError {
     #[error("Database error: {0}")]
     Database(String),
 
+    /// The SQLite file is not a valid database (SQLITE_NOTADB) or is structurally
+    /// corrupt (SQLITE_CORRUPT).
+    ///
+    /// Distinguished from [`SearchError::Database`] so callers can trigger a
+    /// bounded discard-and-recreate rather than treating all open failures alike
+    /// (AD-414-2).  The inner string carries the rusqlite error message verbatim
+    /// for context; no structured rusqlite types are exposed.
+    #[error("Database corrupt: {0}")]
+    DatabaseCorrupt(String),
+
+    /// The `temporal.db` was written by a newer schema version than this binary
+    /// supports (forward-compat guard, `PRAGMA user_version`, AD-414-11).
+    ///
+    /// Refusal is the correct action: overwriting a newer-schema DB would
+    /// silently corrupt data or lose columns that a newer binary expects.
+    /// The user should upgrade skim rather than delete the file.
+    #[error(
+        "Database schema version {found} is newer than supported version {supported}; \
+         upgrade skim to open this database"
+    )]
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
+
     /// AST processing error (e.g. grammar load failure for a tree-sitter language).
     ///
     /// Distinct from parse errors (which produce empty results gracefully):

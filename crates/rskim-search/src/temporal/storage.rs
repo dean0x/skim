@@ -113,6 +113,30 @@ pub(super) fn db_err(e: impl std::fmt::Display) -> SearchError {
     SearchError::Database(e.to_string())
 }
 
+/// Classify a rusqlite error into the most specific [`SearchError`] variant.
+///
+/// Returns [`SearchError::DatabaseCorrupt`] for `SQLITE_NOTADB`
+/// (`ErrorCode::NotADatabase`) and `SQLITE_CORRUPT` (`ErrorCode::DatabaseCorrupt`),
+/// which signal that the file is structurally invalid and can be safely discarded
+/// and recreated (AD-414-2, bounded self-heal).  All other errors fall through to
+/// [`SearchError::Database`] so the distinction is tight and never misclassifies a
+/// transient I/O failure or a lock-contention error as corruption.
+///
+/// Verified against `rusqlite = "0.31"` / `libsqlite3-sys 0.28` where both
+/// `ErrorCode::NotADatabase` (SQLITE_NOTADB = 26) and `ErrorCode::DatabaseCorrupt`
+/// (SQLITE_CORRUPT = 11) exist as named variants.
+pub(super) fn classify_sqlite_err(e: &rusqlite::Error) -> SearchError {
+    use rusqlite::ErrorCode;
+    match e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) =>
+        {
+            SearchError::DatabaseCorrupt(e.to_string())
+        }
+        _ => SearchError::Database(e.to_string()),
+    }
+}
+
 // ============================================================================
 // Migrations
 // ============================================================================
@@ -130,13 +154,16 @@ pub(super) fn db_err(e: impl std::fmt::Display) -> SearchError {
 fn run_migrations(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(db_err)?;
+        .map_err(|e| classify_sqlite_err(&e))?;
 
     if version > CURRENT_VERSION {
-        return Err(SearchError::Database(format!(
-            "database schema version {version} is newer than supported version \
-             {CURRENT_VERSION}; upgrade rskim-search to open this database"
-        )));
+        // AD-414-11: return the typed variant so callers can distinguish a
+        // forward-compat refusal (upgrade skim) from an I/O error (retry later)
+        // or structural corruption (discard and recreate).
+        return Err(SearchError::UnsupportedSchemaVersion {
+            found: version,
+            supported: CURRENT_VERSION,
+        });
     }
 
     if version < 1 {
@@ -175,7 +202,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
             COMMIT;",
         )
-        .map_err(db_err)?;
+        .map_err(|e| classify_sqlite_err(&e))?;
     }
 
     if version < 2 {
@@ -192,7 +219,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
             COMMIT;",
         )
-        .map_err(db_err)?;
+        .map_err(|e| classify_sqlite_err(&e))?;
     }
 
     Ok(())
@@ -236,7 +263,7 @@ impl TemporalDb {
     /// Returns [`SearchError::Database`] if the file cannot be opened, the
     /// WAL pragma fails, or the migrations fail (including forward-compat guard).
     pub fn open(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(db_path).map_err(db_err)?;
+        let conn = Connection::open(db_path).map_err(|e| classify_sqlite_err(&e))?;
 
         // Restrict file permissions to owner-only on Unix.
         #[cfg(unix)]
@@ -254,18 +281,18 @@ impl TemporalDb {
         }
 
         conn.busy_timeout(Duration::from_millis(5_000))
-            .map_err(db_err)?;
+            .map_err(|e| classify_sqlite_err(&e))?;
 
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .map_err(db_err)?;
+            .map_err(|e| classify_sqlite_err(&e))?;
         if journal_mode.to_lowercase() != "wal" {
             return Err(SearchError::Database(format!(
                 "failed to enable WAL mode; journal_mode is '{journal_mode}'"
             )));
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
-            .map_err(db_err)?;
+            .map_err(|e| classify_sqlite_err(&e))?;
 
         run_migrations(&conn)?;
 

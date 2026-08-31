@@ -1017,3 +1017,73 @@ fn v1_database_migrates_to_v2_on_reopen() {
         "v1 database should be migrated to v2 on reopen"
     );
 }
+
+// ============================================================================
+// Group 9: Typed error classification (T-1 / T-2 — #414 Step 1)
+// ============================================================================
+
+/// T-1 (#414 AC-Step-1): garbage bytes (not a SQLite file) must produce
+/// `SearchError::DatabaseCorrupt`, not a generic `Database` error.
+///
+/// `TemporalDb::open` calls `Connection::open` which triggers a WAL pragma;
+/// that WAL `query_row` is the first SQLite operation on the corrupt file and
+/// returns `SQLITE_NOTADB` / `ErrorCode::NotADatabase`.  `classify_sqlite_err`
+/// must promote this to the `DatabaseCorrupt` variant so callers can
+/// distinguish "safe to discard and recreate" from "transient lock/I/O failure"
+/// (AD-414-2).
+#[test]
+fn t1_corrupt_file_returns_database_corrupt() {
+    use crate::types::SearchError;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("corrupt.db");
+    // Write 1024 bytes of 0xAB — deterministic, clearly not SQLite (PF-012).
+    std::fs::write(&path, vec![0xABu8; 1024]).unwrap();
+
+    let result = TemporalDb::open(&path);
+    assert!(result.is_err(), "corrupt file must fail to open");
+    match result.unwrap_err() {
+        SearchError::DatabaseCorrupt(msg) => {
+            // The error message should contain the rusqlite description.
+            assert!(
+                !msg.is_empty(),
+                "T-1: DatabaseCorrupt message must be non-empty"
+            );
+        }
+        other => panic!("T-1: expected SearchError::DatabaseCorrupt, got {other:?}"),
+    }
+}
+
+/// T-2 (#414 AC-Step-1): a future-schema DB must return
+/// `SearchError::UnsupportedSchemaVersion { found, supported }`, not a
+/// generic `Database` string.
+///
+/// The typed variant allows callers to emit an actionable message naming the
+/// exact versions without string-matching the error text (G-5 / AD-414-11).
+#[test]
+fn t2_future_schema_returns_unsupported_schema_version() {
+    use crate::types::SearchError;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("future.db");
+
+    // Stamp user_version = 99 — guaranteed > CURRENT_VERSION (2).
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+    }
+
+    let result = TemporalDb::open(&path);
+    assert!(result.is_err(), "future-schema DB must fail to open");
+    match result.unwrap_err() {
+        SearchError::UnsupportedSchemaVersion { found, supported } => {
+            assert_eq!(found, 99, "T-2: `found` must reflect the stamped version");
+            assert_eq!(
+                supported,
+                super::CURRENT_VERSION,
+                "T-2: `supported` must equal CURRENT_VERSION"
+            );
+        }
+        other => panic!("T-2: expected SearchError::UnsupportedSchemaVersion, got {other:?}"),
+    }
+}

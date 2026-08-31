@@ -62,7 +62,7 @@ fn write_ast_index_stub(cache_dir: &std::path::Path) {
 
 /// Write a minimal valid lexical index stub file in `cache_dir`.
 ///
-/// `lexical_index_version` reads the first 6 bytes: magic `SKIX` + version u16 LE.
+/// `lexical_index_integrity` reads the first 6 bytes for the version check.
 /// Writing the current FORMAT_VERSION prevents the lexical self-heal from
 /// reporting `NoStoredHead` in unit tests that only want to exercise the
 /// HEAD-comparison or AST-self-heal logic paths

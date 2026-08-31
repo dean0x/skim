@@ -296,6 +296,141 @@ impl AstIndexReader {
         Ok(version)
     }
 
+    /// Probe the format version and structural integrity of an on-disk AST index
+    /// without fully opening it.
+    ///
+    /// Reads the first 6 bytes (magic + version).  When `version == FORMAT_VERSION`,
+    /// performs a full-header decode and validates both the `.skidx` file length and
+    /// (when `postings_file_size > 0`) the `.skpost` file length.  The legitimate
+    /// `postings_file_size == 0` case (an index built over files that produced no
+    /// structural nodes) skips the postings-size check entirely (E-9).
+    ///
+    /// When the version does not match `FORMAT_VERSION`, returns the version
+    /// immediately without size validation — the layout of a foreign header is
+    /// unknown, so size validation must not proceed (AD-414-6).
+    ///
+    /// Used by `check_staleness` in place of the version-only [`Self::index_version`]
+    /// probe.  The structural check ensures that a truncated or size-inconsistent
+    /// AST index triggers a rebuild via the `Err(_) => true` staleness arm.
+    ///
+    /// **Keep [`Self::index_version`]** — it has four live callers outside
+    /// `check_staleness` (`ast_tests.rs:1294`, `:3160`, `:3182`, `:4566`) and doc
+    /// references at `staleness.rs:375` and `lib.rs:56`.  This function is additive
+    /// and does not subsume those uses.
+    ///
+    /// # Errors
+    ///
+    /// - [`SearchError::Io`] if `ast_index.skidx` cannot be opened, or
+    ///   `ast_index.skpost` is absent when a non-zero size is expected.
+    /// - [`SearchError::IndexCorrupted`] if the header is too short, has wrong
+    ///   magic bytes, or the file lengths disagree with the header-encoded sizes.
+    pub fn index_integrity(dir: &Path) -> Result<u16> {
+        use super::format::FORMAT_VERSION;
+        use std::io::Read;
+
+        let idx_path = dir.join("ast_index.skidx");
+
+        // Step 1: open and read up to HEADER_SIZE bytes.
+        let mut file = std::fs::File::open(&idx_path)?;
+        let mut buf = [0u8; HEADER_SIZE];
+        let n = file.read(&mut buf)?;
+
+        // Step 2: need at least 6 bytes for magic + version.
+        if n < 6 {
+            return Err(SearchError::IndexCorrupted(format!(
+                "ast_index.skidx too short: need 6 bytes for magic+version, got {n}"
+            )));
+        }
+
+        // Step 3: validate magic.
+        let magic = &buf[0..4];
+        if magic != SKAX_MAGIC {
+            return Err(SearchError::IndexCorrupted(format!(
+                "ast_index.skidx bad magic: expected {:?}, got {:?}",
+                SKAX_MAGIC, magic
+            )));
+        }
+
+        // Step 4: read version; if it doesn't match FORMAT_VERSION, return
+        // immediately — do NOT validate size (AD-414-6: foreign layout unknown).
+        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        if version != FORMAT_VERSION {
+            return Ok(version);
+        }
+
+        // Step 5: full-header check — need HEADER_SIZE bytes.
+        if n < HEADER_SIZE {
+            return Err(SearchError::IndexCorrupted(format!(
+                "ast_index.skidx header truncated: need {HEADER_SIZE} bytes, got {n}"
+            )));
+        }
+
+        // Step 6: decode header and compute expected .skidx size.
+        let header = decode_header(&buf[..HEADER_SIZE])?;
+        let bigram_bytes = (header.bigram_count as usize)
+            .checked_mul(BIGRAM_ENTRY_SIZE)
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted("bigram_count * BIGRAM_ENTRY_SIZE overflow".into())
+            })?;
+        let trigram_bytes = (header.trigram_count as usize)
+            .checked_mul(TRIGRAM_ENTRY_SIZE)
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted("trigram_count * TRIGRAM_ENTRY_SIZE overflow".into())
+            })?;
+        let meta_bytes = (header.file_count as usize)
+            .checked_mul(FILE_META_SIZE)
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
+            })?;
+        let expected_idx = HEADER_SIZE
+            .checked_add(bigram_bytes)
+            .and_then(|s| s.checked_add(trigram_bytes))
+            .and_then(|s| s.checked_add(meta_bytes))
+            .ok_or_else(|| {
+                SearchError::IndexCorrupted("expected ast_index.skidx size overflow".into())
+            })?;
+        let actual_idx = std::fs::metadata(&idx_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if actual_idx != expected_idx {
+            return Err(SearchError::IndexCorrupted(format!(
+                "ast_index.skidx size mismatch: expected {expected_idx}, got {actual_idx}"
+            )));
+        }
+
+        // Step 7: validate .skpost size.
+        // postings_file_size == 0 is legitimate (E-9): an index built over files
+        // that produced no structural nodes has no postings file.
+        let expected_post = header.postings_file_size;
+        if expected_post == 0 {
+            return Ok(version);
+        }
+        let post_path = dir.join("ast_index.skpost");
+        let expected_post_usize = usize::try_from(expected_post).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "postings_file_size {expected_post} exceeds platform usize"
+            ))
+        })?;
+        match std::fs::metadata(&post_path) {
+            Err(_) => {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "ast_index.skpost missing (expected {expected_post} bytes) at {}",
+                    dir.display()
+                )));
+            }
+            Ok(m) => {
+                let actual_post = m.len() as usize;
+                if actual_post != expected_post_usize {
+                    return Err(SearchError::IndexCorrupted(format!(
+                        "ast_index.skpost size mismatch: expected {expected_post}, got {actual_post}"
+                    )));
+                }
+            }
+        }
+
+        Ok(version)
+    }
+
     /// Return the number of files in the index.
     #[must_use]
     pub fn file_count(&self) -> u32 {

@@ -498,6 +498,30 @@ pub struct NgramIndexReader {
 // NgramIndexReader is automatically Send + Sync because all fields
 // (SkidxHeader: Copy, Mmap: Send+Sync) satisfy the auto-trait bounds.
 
+/// Compute the expected `.skidx` file size in bytes from a decoded header.
+///
+/// Used by both [`NgramIndexReader::open`] (after mmap) and
+/// [`NgramIndexReader::lexical_index_integrity`] (before mmap, using `fs::metadata`).
+/// Single source of truth so the two size-validation paths cannot drift.
+///
+/// Returns `Err(IndexCorrupted)` on overflow.
+fn expected_idx_size(header: &SkidxHeader) -> Result<usize> {
+    let entries_bytes = (header.ngram_count as usize)
+        .checked_mul(SKIDX_ENTRY_SIZE)
+        .ok_or_else(|| {
+            SearchError::IndexCorrupted("ngram_count * SKIDX_ENTRY_SIZE overflow".into())
+        })?;
+    let meta_bytes = (header.file_count as usize)
+        .checked_mul(FILE_META_SIZE)
+        .ok_or_else(|| {
+            SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
+        })?;
+    SKIDX_HEADER_SIZE
+        .checked_add(entries_bytes)
+        .and_then(|s| s.checked_add(meta_bytes))
+        .ok_or_else(|| SearchError::IndexCorrupted("expected_idx_size overflow".into()))
+}
+
 impl NgramIndexReader {
     /// Open an existing index from `dir`.
     ///
@@ -523,21 +547,9 @@ impl NgramIndexReader {
 
         let header = decode_header(&idx_mmap)?;
 
-        // Validate sizes are internally consistent.
-        let entries_bytes = (header.ngram_count as usize)
-            .checked_mul(SKIDX_ENTRY_SIZE)
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted("ngram_count * SKIDX_ENTRY_SIZE overflow".into())
-            })?;
-        let meta_bytes = (header.file_count as usize)
-            .checked_mul(FILE_META_SIZE)
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
-            })?;
-        let expected_idx_size = SKIDX_HEADER_SIZE
-            .checked_add(entries_bytes)
-            .and_then(|s| s.checked_add(meta_bytes))
-            .ok_or_else(|| SearchError::IndexCorrupted("expected_idx_size overflow".into()))?;
+        // Validate sizes are internally consistent (uses the extracted helper so
+        // the integrity probe and the full open share the same arithmetic).
+        let expected_idx_size = expected_idx_size(&header)?;
         if idx_mmap.len() != expected_idx_size {
             return Err(SearchError::IndexCorrupted(format!(
                 "skidx size mismatch: expected {expected_idx_size}, got {}",
@@ -590,7 +602,7 @@ impl NgramIndexReader {
             if actual_checksum != header.checksum {
                 return Err(SearchError::IndexCorrupted(format!(
                     "checksum mismatch: expected {:#010x}, got {:#010x}. \
-                     The index may be corrupt; rebuild with `skim search index --rebuild`.",
+                     The index may be corrupt; rebuild with `skim search --rebuild`.",
                     header.checksum, actual_checksum
                 )));
             }
@@ -609,39 +621,114 @@ impl NgramIndexReader {
         })
     }
 
-    /// Read the lexical index format version from the first 6 bytes of `index.skidx`.
+    /// Probe the lexical index for structural integrity.
     ///
-    /// Opens only 6 bytes (magic + version) — no mmap, no CRC, no full validation.
-    /// Used by `check_staleness` to detect a stale/below-current lexical
-    /// FORMAT_VERSION (currently v7) and trigger a rebuild before
-    /// `NgramIndexReader::open` hard-errors on the version mismatch.
-    /// For example, a v6 index on disk (pre-AD-411-7 token_length posting field)
-    /// reads version=6 here, which is less than FORMAT_VERSION=7, so the
-    /// staleness check fires and a full rebuild is triggered.
+    /// Reads up to [`SKIDX_HEADER_SIZE`] (62) bytes from `index.skidx` and checks
+    /// magic, version, and — for current-version files — the header-encoded size
+    /// against the actual on-disk lengths of both `index.skidx` and `index.skpost`.
+    /// No mmap, no CRC, no full-file read: at most one 62-byte read + two
+    /// `fs::metadata` calls (AD-414-6, T-28 performance bound).
+    ///
+    /// Returns `Ok(version)` on success.  For **foreign-version** files (version ≠
+    /// `FORMAT_VERSION`) the function returns `Ok(version)` **immediately after
+    /// the magic check** — the layout of a foreign header is unknown, so size
+    /// validation must not proceed (AD-414-6).  The caller (`check_staleness`)
+    /// already treats any version below `FORMAT_VERSION` as stale and triggers a
+    /// rebuild; a version above it is a future format that must not be touched.
+    ///
+    /// Used by `check_staleness` in place of the now-deleted `lexical_index_version`.
+    /// The structural check ensures that a truncated or otherwise size-inconsistent
+    /// lexical index triggers a rebuild via the `Err(_) => true` staleness arm
+    /// (S3 self-heal, AC-11).  A foreign-format file still triggers a rebuild via
+    /// the `v < FORMAT_VERSION` arm.
     ///
     /// # Errors
     ///
-    /// - [`SearchError::Io`] if the file cannot be opened.
-    /// - [`SearchError::IndexCorrupted`] if the file is too short or has bad magic.
-    pub fn lexical_index_version(dir: &Path) -> Result<u16> {
+    /// - [`SearchError::Io`] if `index.skidx` cannot be opened or `index.skpost`
+    ///   is absent and the version matches `FORMAT_VERSION`.
+    /// - [`SearchError::IndexCorrupted`] if the header is too short, has wrong
+    ///   magic bytes, or the file lengths disagree with the header-encoded sizes.
+    pub fn lexical_index_integrity(dir: &Path) -> Result<u16> {
+        use super::format::{FORMAT_VERSION, SKIDX_MAGIC};
         use std::io::Read;
+
         let idx_path = dir.join("index.skidx");
+
+        // Step 1: open and read up to SKIDX_HEADER_SIZE bytes.
         let mut file = std::fs::File::open(&idx_path)?;
-        let mut buf = [0u8; 6];
-        file.read_exact(&mut buf).map_err(|_| {
-            SearchError::IndexCorrupted(
-                "lexical_index_version: index.skidx too short (need 6 bytes)".into(),
-            )
-        })?;
-        let magic = &buf[0..4];
-        if magic != super::format::SKIDX_MAGIC {
+        let mut buf = [0u8; SKIDX_HEADER_SIZE];
+        let n = file.read(&mut buf)?;
+
+        // Step 2: need at least 6 bytes for magic + version.
+        if n < 6 {
             return Err(SearchError::IndexCorrupted(format!(
-                "lexical_index_version: bad magic: expected {:?}, got {:?}",
-                super::format::SKIDX_MAGIC,
-                magic
+                "index.skidx too short: need 6 bytes for magic+version, got {n}"
             )));
         }
+
+        // Step 3: validate magic.
+        let magic = &buf[0..4];
+        if magic != SKIDX_MAGIC.as_ref() {
+            return Err(SearchError::IndexCorrupted(format!(
+                "index.skidx bad magic: expected {:?}, got {:?}",
+                SKIDX_MAGIC, magic
+            )));
+        }
+
+        // Step 4: read version; if it doesn't match FORMAT_VERSION, return
+        // immediately — do NOT validate size (AD-414-6: foreign layout).
         let version = u16::from_le_bytes([buf[4], buf[5]]);
+        if version != FORMAT_VERSION {
+            return Ok(version);
+        }
+
+        // Step 5: full-header check — need SKIDX_HEADER_SIZE (62) bytes.
+        if n < SKIDX_HEADER_SIZE {
+            return Err(SearchError::IndexCorrupted(format!(
+                "index.skidx header truncated: need {SKIDX_HEADER_SIZE} bytes, got {n}"
+            )));
+        }
+
+        // Step 6: decode header and check .skidx size.
+        let header = decode_header(&buf[..SKIDX_HEADER_SIZE])?;
+        let expected_idx = expected_idx_size(&header)?;
+        let actual_idx = std::fs::metadata(&idx_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if actual_idx != expected_idx {
+            return Err(SearchError::IndexCorrupted(format!(
+                "index.skidx size mismatch: expected {expected_idx}, got {actual_idx}"
+            )));
+        }
+
+        // Step 7: validate .skpost size.
+        let post_path = dir.join("index.skpost");
+        let expected_post = usize::try_from(header.postings_file_size).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "postings_file_size {} exceeds platform usize",
+                header.postings_file_size
+            ))
+        })?;
+        match std::fs::metadata(&post_path) {
+            Err(_) => {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "index.skpost missing (expected {expected_post} bytes) at {}",
+                    dir.display()
+                )));
+            }
+            Ok(m) => {
+                let actual_post = m.len() as usize;
+                if actual_post != expected_post {
+                    return Err(SearchError::IndexCorrupted(format!(
+                        "index.skpost size mismatch: expected {expected_post}, \
+                         got {actual_post} at {}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+
+        // Step 8: all checks passed.
         Ok(version)
     }
 

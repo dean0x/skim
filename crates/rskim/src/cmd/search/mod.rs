@@ -251,8 +251,8 @@ pub(crate) fn run(
             // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
             // place (the funnel) — replaces the four-site manual AnchorState::Differs
             // pre-check pattern (Finding 1).
-            // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so the
-            // message function is called with pre-resolved states (no I/O).
+            // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so
+            // degraded_notice is called with pre-resolved states (no I/O).
             let temporal_db = if flags.temporal_sort.is_some() {
                 match temporal::open_temporal_db_for(&root, &cache_dir) {
                     Ok(db) => Some(db),
@@ -260,7 +260,12 @@ pub(crate) fn run(
                         let anchor = reason.to_anchor_state();
                         eprintln!(
                             "skim search: {}; returning unsorted --ast results",
-                            temporal_unavailable_msg(&head_state, &anchor)
+                            temporal::degraded_notice(
+                                &head_state,
+                                &anchor,
+                                "--ast",
+                                temporal::Fallback::Ast,
+                            )
                         );
                         None
                     }
@@ -1478,19 +1483,22 @@ fn run_query(
             temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
         } else {
             // AD-404-6 degraded path: temporal DB absent or refused (anchor mismatch).
-            // Step 8: temporal_unavailable_msg dispatches to the reason-specific constant
+            // degraded_notice (AD-414-1) dispatches to the reason-specific constant
             // (NO_TEMPORAL_DATA_MSG / HEAD_UNRESOLVED_TEMPORAL_MSG /
             //  SUBDIR_ROOT_TEMPORAL_MSG / TEMPORAL_BUILD_EMPTY_MSG).
             // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
             // Finding 1/3 fix: use pre-resolved head+anchor from refresh_head_state and
-            // temporal_unavail_reason to avoid I/O inside temporal_unavailable_msg.
+            // temporal_unavail_reason to avoid I/O inside degraded_notice.
             let hs = refresh_head_state
                 .as_ref()
                 .unwrap_or(&staleness::HeadState::NotARepo);
             let anchor = temporal_unavail_reason
                 .as_ref()
                 .map_or(staleness::AnchorState::Absent, |r| r.to_anchor_state());
-            eprintln!("skim search: {}", temporal_unavailable_msg(hs, &anchor));
+            eprintln!(
+                "skim search: {}",
+                temporal::degraded_notice(hs, &anchor, "", temporal::Fallback::Lexical)
+            );
         }
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
         //
@@ -1592,15 +1600,16 @@ fn run_temporal_standalone(
     // place — replaces the two-step manual AnchorState::Differs pre-check + open
     // pattern (Finding 1).  AnchorDiffers → wrong-repo rows; Absent → no data.
     // Both arms degrade gracefully (exit 0, AC-F3).
-    // temporal_unavailable_msg dispatches to the correct constant
+    // degraded_notice (AD-414-1) dispatches to the correct constant
     // (SUBDIR_ROOT_TEMPORAL_MSG for Differs, NO_TEMPORAL_DATA_MSG / etc. otherwise).
-    // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so the
-    // message function is called with pre-resolved states (no I/O).
+    // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so
+    // degraded_notice is called with pre-resolved states (no I/O).
     let db = match temporal::open_temporal_db_for(&root, &cache_dir) {
         Ok(db) => db,
         Err(ref reason) => {
             let anchor = reason.to_anchor_state();
-            let msg_str = temporal_unavailable_msg(&head_state, &anchor);
+            let msg_str =
+                temporal::degraded_notice(&head_state, &anchor, "", temporal::Fallback::NoResults);
             if json {
                 let msg = WarningJson { warning: &msg_str };
                 println!("{}", serde_json::to_string(&msg)?);
@@ -1792,53 +1801,6 @@ fn print_help() {
     // --build / --rebuild / --update (already documented in Options above).
     // Body lives in SEARCH_HELP_TEXT so AC10 can assert it without driving the CLI.
     println!("{SEARCH_HELP_TEXT}");
-}
-
-// ============================================================================
-// Temporal-unavailable message selector (Step 8 — INTERIM for #413)
-// ============================================================================
-
-/// Dispatch "temporal data unavailable" to the reason-specific message constant.
-///
-/// Called at every site where temporal data is absent or refused so the printed
-/// message tells the user *why*, rather than giving a generic "not a git repo" line
-/// for a root that is clearly inside one.
-///
-/// Dispatch table:
-/// - [`HeadState::NotARepo`] → [`NO_TEMPORAL_DATA_MSG`] (byte-identical, C8 / AC19)
-/// - [`HeadState::Unresolved`] → [`HEAD_UNRESOLVED_TEMPORAL_MSG`] (AC18)
-/// - [`HeadState::Resolved`] + [`AnchorState::Differs`] →
-///   [`SUBDIR_ROOT_TEMPORAL_MSG`] + recorded/live paths (AD-413-16 / AC33(f))
-/// - [`HeadState::Resolved`] other → [`TEMPORAL_BUILD_EMPTY_MSG`]
-///
-/// **INTERIM**: #414 will DELETE this function (and its five emit-site wires),
-/// replacing all sites with `degraded_notice(root)` — the permanent per-arm
-/// selectors.  Marked here so the deletion obligation survives rebase.
-///
-/// Finding 1/3 fix: pure dispatch, zero I/O.  `head` and `anchor` are computed
-/// by callers and passed in:
-/// - `head` comes from the `HeadState` returned by `auto_refresh_if_stale`
-///   (Finding 2) or from `TemporalUnavailable::to_anchor_state`'s implicit Resolved.
-/// - `anchor` comes from `TemporalUnavailable::to_anchor_state()` (Finding 1/3).
-fn temporal_unavailable_msg(
-    head: &staleness::HeadState,
-    anchor: &staleness::AnchorState,
-) -> String {
-    use staleness::{AnchorState, HeadState};
-    match head {
-        HeadState::NotARepo => NO_TEMPORAL_DATA_MSG.to_string(),
-        HeadState::Unresolved => HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
-        HeadState::Resolved(_) => {
-            if let AnchorState::Differs { recorded, live } = anchor {
-                return format!(
-                    "{SUBDIR_ROOT_TEMPORAL_MSG} \
-                     (recorded: {recorded:?}, live: {live:?}); \
-                     run `skim search --rebuild --root <this root>` to re-anchor",
-                );
-            }
-            TEMPORAL_BUILD_EMPTY_MSG.to_string()
-        }
-    }
 }
 
 // ============================================================================
@@ -3014,40 +2976,49 @@ mod tests {
         );
     }
 
-    /// AC19 back-compat + AD-413-8 triage — `temporal_unavailable_msg` returns the
+    /// AC19 back-compat + AD-413-8 triage — `degraded_notice` returns the
     /// byte-identical `NO_TEMPORAL_DATA_MSG` for a genuine non-repo, and a DIFFERENT
-    /// message for a repo whose HEAD cannot be resolved.
+    /// message for a repo whose HEAD cannot be resolved (AD-414-1).
     ///
-    /// Finding 1/3 fix: the function is now pure (takes pre-resolved head+anchor),
-    /// so the test constructs states directly — no filesystem fixtures needed for the
-    /// dispatch logic itself.  The fixture-based setup is retained as documentation
-    /// of what real inputs look like.
+    /// Finding 1/3 fix: the function is pure (takes pre-resolved head+anchor),
+    /// so the test constructs states directly — no filesystem fixtures needed.
     #[test]
-    fn test_temporal_unavailable_msg_triage_ac18_ac19() {
+    fn test_degraded_notice_triage_ac18_ac19() {
         use staleness::{AnchorState, HeadState};
 
         // Genuine non-repo → byte-identical legacy text (AC19).
         assert_eq!(
-            temporal_unavailable_msg(&HeadState::NotARepo, &AnchorState::Absent),
+            temporal::degraded_notice(
+                &HeadState::NotARepo,
+                &AnchorState::Absent,
+                "",
+                temporal::Fallback::Lexical
+            ),
             NO_TEMPORAL_DATA_MSG,
             "AC19: NotARepo must keep the byte-identical legacy message"
         );
 
         // Repo whose HEAD exists but does not resolve → the triaged message (AC18).
         assert_eq!(
-            temporal_unavailable_msg(&HeadState::Unresolved, &AnchorState::Absent),
+            temporal::degraded_notice(
+                &HeadState::Unresolved,
+                &AnchorState::Absent,
+                "",
+                temporal::Fallback::Lexical
+            ),
             HEAD_UNRESOLVED_TEMPORAL_MSG,
             "AD-413-8: Unresolved HEAD must not get the non-repo message"
         );
     }
 
-    /// AC33(f): `temporal_unavailable_msg` Resolved+Differs branch returns a message
-    /// that contains SUBDIR_ROOT_TEMPORAL_MSG and the recorded/live path snippets.
+    /// AC33(f): `degraded_notice` Resolved+Differs branch returns a message that
+    /// contains SUBDIR_ROOT_TEMPORAL_MSG and the recorded/live path snippets
+    /// (AD-414-1).
     ///
-    /// Finding 1/3 fix: the function is now pure, so the test passes states directly.
+    /// Finding 1/3 fix: the function is pure, so the test passes states directly.
     /// No filesystem or SQLite fixtures are needed for the dispatch logic.
     #[test]
-    fn test_temporal_unavailable_msg_resolved_differs_returns_subdir_msg() {
+    fn test_degraded_notice_resolved_differs_returns_subdir_msg() {
         use staleness::{AnchorState, HeadState};
 
         let head = HeadState::Resolved("abc1234abc1234abc1234abc1234abc1234abc12".to_string());
@@ -3055,7 +3026,7 @@ mod tests {
             recorded: std::path::PathBuf::from("/wrong/repo/path"),
             live: std::path::PathBuf::from("/correct/repo/path"),
         };
-        let msg = temporal_unavailable_msg(&head, &anchor);
+        let msg = temporal::degraded_notice(&head, &anchor, "", temporal::Fallback::Lexical);
 
         assert!(
             msg.contains(SUBDIR_ROOT_TEMPORAL_MSG),
@@ -3075,29 +3046,36 @@ mod tests {
         );
     }
 
-    /// `temporal_unavailable_msg` Resolved+other branch returns TEMPORAL_BUILD_EMPTY_MSG
-    /// when the HEAD resolves and AnchorState is NOT Differs.
+    /// `degraded_notice` Resolved+other branch returns TEMPORAL_BUILD_EMPTY_MSG
+    /// when the HEAD resolves and AnchorState is NOT Differs (AD-414-1).
     ///
-    /// Finding 1/3 fix: the function is now pure, so the test passes states directly.
+    /// Finding 1/3 fix: the function is pure, so the test passes states directly.
     #[test]
-    fn test_temporal_unavailable_msg_resolved_other_returns_build_empty() {
+    fn test_degraded_notice_resolved_other_returns_build_empty() {
         use staleness::{AnchorState, HeadState};
 
         let head = HeadState::Resolved("abc1234abc1234abc1234abc1234abc1234abc12".to_string());
         // NotAdopted → no Differs branch → TEMPORAL_BUILD_EMPTY_MSG.
-        let msg = temporal_unavailable_msg(&head, &AnchorState::NotAdopted);
+        let msg = temporal::degraded_notice(
+            &head,
+            &AnchorState::NotAdopted,
+            "",
+            temporal::Fallback::Lexical,
+        );
         assert_eq!(
             msg, TEMPORAL_BUILD_EMPTY_MSG,
             "Resolved+NotAdopted branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg:?}"
         );
         // Absent anchor also falls through to TEMPORAL_BUILD_EMPTY_MSG.
-        let msg2 = temporal_unavailable_msg(&head, &AnchorState::Absent);
+        let msg2 =
+            temporal::degraded_notice(&head, &AnchorState::Absent, "", temporal::Fallback::Lexical);
         assert_eq!(
             msg2, TEMPORAL_BUILD_EMPTY_MSG,
             "Resolved+Absent branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg2:?}"
         );
         // Agrees anchor also falls through to TEMPORAL_BUILD_EMPTY_MSG.
-        let msg3 = temporal_unavailable_msg(&head, &AnchorState::Agrees);
+        let msg3 =
+            temporal::degraded_notice(&head, &AnchorState::Agrees, "", temporal::Fallback::Lexical);
         assert_eq!(
             msg3, TEMPORAL_BUILD_EMPTY_MSG,
             "Resolved+Agrees branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg3:?}"

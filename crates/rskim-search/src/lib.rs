@@ -79,7 +79,7 @@ const _: () = assert!(
 ///
 /// v2 → v3 (#355 Part B): n-gram key widened from u16 (bigram) to u32 (trigram).
 /// A v2 index encounters a format version mismatch and `decode_header` emits an
-/// actionable "please rebuild the index" error (`skim search index --rebuild`).
+/// actionable "please rebuild the index" error (`skim search --rebuild`).
 ///
 /// v3 → v4 (#358 Item 2): posting codec changed from fixed 9-byte entries to
 /// variable-length delta+varint encoding (see `encode_postings_varint`). Old v3
