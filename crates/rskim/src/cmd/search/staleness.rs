@@ -298,9 +298,9 @@ fn scan_working_tree(
 /// When the lexical index is CURRENT but the AST index is ABSENT or has a
 /// FORMAT_VERSION below the current version (post-upgrade / crash-between-builds),
 /// this function reports `NoStoredHead` so the next query triggers a full rebuild.
-/// The version check uses [`rskim_search::AstIndexReader::index_version`] which
-/// reads only the first 6 bytes of `ast_index.skidx` (magic + version) — cheap,
-/// no mmap, no CRC verification.
+/// The version check uses [`rskim_search::AstIndexReader::index_integrity`] which
+/// validates the header size, magic bytes, and (for the current FORMAT_VERSION)
+/// the .skidx and .skpost file sizes — cheap, no mmap, no CRC verification.
 ///
 /// # Lexical self-heal (ADR-006, #355 Finding 9)
 ///
@@ -325,7 +325,7 @@ pub(super) fn check_staleness(
     // version, return NoStoredHead to trigger a full rebuild so the user does not
     // see a hard error from NgramIndexReader::open (ADR-006, #355 Finding 9).
     // This is the exact mirror of the AST index_version check below.
-    let lexical_stale = match rskim_search::NgramIndexReader::lexical_index_version(cache_dir) {
+    let lexical_stale = match rskim_search::NgramIndexReader::lexical_index_integrity(cache_dir) {
         Ok(v) => v < rskim_search::LEXICAL_INDEX_FORMAT_VERSION,
         Err(_) => true, // Corrupt / unreadable → rebuild.
     };
@@ -344,7 +344,7 @@ pub(super) fn check_staleness(
     let ast_stale = if !ast_index_path.exists() {
         true
     } else {
-        match rskim_search::AstIndexReader::index_version(cache_dir) {
+        match rskim_search::AstIndexReader::index_integrity(cache_dir) {
             Ok(v) => v < rskim_search::AST_INDEX_FORMAT_VERSION,
             Err(_) => true, // Corrupt / unreadable → rebuild.
         }
@@ -558,8 +558,12 @@ pub(super) fn auto_refresh_if_stale(
         // FIRST (short-circuits on non-git dirs where current_head=None BEFORE the
         // temporal_db_is_stale() call, avoiding a wasted DB open).
         // `temporal_db_is_stale` only runs when HEAD is readable.
+        // AD-414-14: pass the git_dir so Check 3 (shallow→full) can probe the
+        // `.git/shallow` file. Stored in a local so the PathBuf lifetime extends
+        // across the condition expression.
+        let git_dir_for_stale = resolve_git_dir(root);
         if let Some(head) = current_head
-            && temporal_db_is_stale(cache_dir, head)
+            && temporal_db_is_stale(cache_dir, head, git_dir_for_stale.as_deref())
         {
             try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal", reanchor);
         }

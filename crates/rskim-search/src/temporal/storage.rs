@@ -101,6 +101,18 @@ pub const TEMPORAL_DATA_VERSION: u16 = 1;
 /// [`META_GIT_HEAD`] and [`META_LAST_UPDATED`] (AD-408-3).
 pub const META_DATA_VERSION: &str = "data_version";
 
+/// Meta table key storing whether the repository was shallow at build time.
+///
+/// AD-414-14: written as `"1"` when the `.git/shallow` file exists at
+/// `TemporalDb::sync` time (indicating a `git clone --depth N`).  When the
+/// stored value is `"1"` but `.git/shallow` is subsequently absent (because
+/// `git fetch --unshallow` ran), the shallow→full transition triggers a
+/// staleness rebuild so the now-reachable history is ingested.
+///
+/// Absent row (DBs written before AD-414-14 was implemented) means the check
+/// is skipped — no spurious rebuilds on upgrade.
+pub const META_IS_SHALLOW: &str = "is_shallow";
+
 // ============================================================================
 // Error helper
 // ============================================================================

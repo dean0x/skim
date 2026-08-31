@@ -12,10 +12,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rskim_search::{FileId, HotspotRow, RiskRow, TemporalDb};
+use rskim_search::{FileId, HotspotRow, RiskRow, SearchError, TemporalDb};
 use serde::Serialize;
 
-use super::staleness::{AnchorState, HeadState};
+use super::staleness::HeadState;
 use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
 
 // ============================================================================

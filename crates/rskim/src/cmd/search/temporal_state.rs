@@ -157,13 +157,35 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
 /// the single HEAD read already performed at `auto_refresh_if_stale` entry;
 /// passing it here avoids a second HEAD read and keeps one HEAD-reading
 /// authority per call.
-pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool {
+/// Returns `true` when `temporal.db` is missing or its stored metadata is out
+/// of date with respect to `current_head` or the current binary.
+///
+/// # Checks performed (in order)
+///
+/// 1. **HEAD match** (`META_GIT_HEAD`): absent row or SHA mismatch → stale.
+/// 2. **Data-version** (`META_DATA_VERSION`, AD-408-4): stored version absent or
+///    numerically less than [`rskim_search::TEMPORAL_DATA_VERSION`] → stale.
+///    Uses `stored < current` (not `!=`) so a DB written by a newer binary is
+///    not needlessly rebuilt by an older binary (no downgrade loop).
+/// 3. **Shallow→full transition** (AD-414-14, `META_IS_SHALLOW`): if the stored
+///    `is_shallow` flag is `"1"` but `.git/shallow` no longer exists, a
+///    `git fetch --unshallow` ran since the last build and the now-reachable
+///    history should be ingested.  Only probed when `git_dir` is `Some`;
+///    absent `is_shallow` row (pre-AD-414-14 DBs) skips the check.
+///
+/// Opens ONE read-only SQLite connection and issues all key reads against it
+/// (ADR-003 / AC32 — avoids a second stat+open on the steady-state Current path).
+pub(super) fn temporal_db_is_stale(
+    cache_dir: &Path,
+    current_head: &str,
+    git_dir: Option<&Path>,
+) -> bool {
     let db_path = cache_dir.join("temporal.db");
     if !db_path.exists() {
         return true;
     }
 
-    // Open ONE read-only connection and issue BOTH key reads against it.
+    // Open ONE read-only connection and issue all key reads against it.
     // Pre-diff: two `read_temporal_meta` calls each performed their own
     // `db_path.exists()` stat + `Connection::open_with_flags` + first-statement
     // `sqlite_master` schema parse — an avoidable +1 open on every query on the
@@ -192,7 +214,7 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
     // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
     // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
     let stored_version: Option<String> = read_meta_on(&conn, rskim_search::META_DATA_VERSION);
-    match stored_version.as_deref() {
+    let version_stale = match stored_version.as_deref() {
         Some(v) => match v.parse::<u64>() {
             Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
             // Non-integer stored value → treat as stale.
@@ -200,7 +222,25 @@ pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool
         },
         // Absent data_version row → stale (pre-fix DB that lacks the ghost filter).
         None => true,
+    };
+    if version_stale {
+        return true;
     }
+
+    // AD-414-14: Check 3: shallow→full transition.
+    // If the stored is_shallow flag is "1" but .git/shallow no longer exists,
+    // a `git fetch --unshallow` ran since the last temporal build and the
+    // empty/partial history is now reachable — trigger a self-heal rebuild.
+    // Absent is_shallow row (pre-AD-414-14 DBs) → check skipped (false negative
+    // is safe: we simply don't notice the unshallow until the next HEAD change).
+    if let Some(gd) = git_dir {
+        let stored_shallow: Option<String> = read_meta_on(&conn, rskim_search::META_IS_SHALLOW);
+        if stored_shallow.as_deref() == Some("1") && !gd.join("shallow").exists() {
+            return true;
+        }
+    }
+
+    false
 }
 
 // ============================================================================

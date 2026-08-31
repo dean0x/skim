@@ -53,11 +53,25 @@ fn create_ref_file(dir: &std::path::Path, ref_path: &str, sha: &str) {
 /// so this stub automatically tracks future FORMAT_VERSION bumps without requiring
 /// a manual edit — the same maintenance-safety pattern used by `write_lexical_index_stub`.
 fn write_ast_index_stub(cache_dir: &std::path::Path) {
-    let version_bytes = rskim_search::AST_INDEX_FORMAT_VERSION.to_le_bytes();
-    let mut stub = Vec::with_capacity(6);
-    stub.extend_from_slice(b"SKAX");
-    stub.extend_from_slice(&version_bytes);
-    fs::write(cache_dir.join("ast_index.skidx"), &stub).unwrap();
+    // Write a minimum-valid AST index: 48-byte header with all-zero fields.
+    //
+    // AD-414-6: index_integrity now validates the full header size and the
+    // .skidx expected size (HEADER_SIZE + bigram_count*BIGRAM_ENTRY_SIZE +
+    // trigram_count*TRIGRAM_ENTRY_SIZE + file_count*FILE_META_SIZE).
+    // With all counts = 0, expected = 48; the stub file must be exactly 48 bytes.
+    //
+    // E-9 case: postings_file_size = 0 → index_integrity returns Ok(version)
+    // before checking for .skpost, so no ast_index.skpost is needed.
+    //
+    // All f32 fields are 0.0 (finite, >= 0.0) — pass decode_header validation.
+    let version = rskim_search::AST_INDEX_FORMAT_VERSION;
+    let mut header = [0u8; 48];
+    header[0..4].copy_from_slice(b"SKAX");
+    header[4..6].copy_from_slice(&version.to_le_bytes());
+    // Remaining fields (bigram_count, trigram_count, file_count,
+    // postings_file_size, avg_bigram/trigram/node/max_depth, checksum) stay 0.
+    fs::write(cache_dir.join("ast_index.skidx"), &header).unwrap();
+    // No ast_index.skpost created: E-9 early-return skips the .skpost probe.
 }
 
 /// Write a minimal valid lexical index stub file in `cache_dir`.
@@ -73,11 +87,27 @@ fn write_ast_index_stub(cache_dir: &std::path::Path) {
 /// a manual edit (Finding 8 / #358 cycle-3: hardcoded literal bytes are a
 /// maintenance trap that silently exercises the self-heal path on the next bump).
 fn write_lexical_index_stub(cache_dir: &std::path::Path) {
-    let version_bytes = rskim_search::LEXICAL_INDEX_FORMAT_VERSION.to_le_bytes();
-    let mut stub = Vec::with_capacity(6);
-    stub.extend_from_slice(b"SKIX");
-    stub.extend_from_slice(&version_bytes);
-    fs::write(cache_dir.join("index.skidx"), &stub).unwrap();
+    // Write a minimum-valid lexical index: 62-byte header + empty index.skpost.
+    //
+    // AD-414-6: lexical_index_integrity now validates the full header size and
+    // the .skidx expected size (HEADER_SIZE + ngram_count*ENTRY_SIZE +
+    // file_count*FILE_META_SIZE). With all counts = 0, expected = 62; the stub
+    // .skidx must be exactly 62 bytes.
+    //
+    // Step 7 of lexical_index_integrity always checks for .skpost — even when
+    // postings_file_size = 0 — so an empty file must exist; unlike the AST path,
+    // there is no early-return for a zero postings_file_size.
+    //
+    // All f32 fields are 0.0 (finite, >= 0.0) — pass decode_header validation.
+    let version = rskim_search::LEXICAL_INDEX_FORMAT_VERSION;
+    let mut header = [0u8; 62];
+    header[0..4].copy_from_slice(b"SKIX");
+    header[4..6].copy_from_slice(&version.to_le_bytes());
+    // Remaining fields (ngram_count, file_count, postings_file_size,
+    // avg_doc_length, avg_field_lengths[8], checksum) stay 0.
+    fs::write(cache_dir.join("index.skidx"), &header).unwrap();
+    // Empty .skpost: postings_file_size = 0 in header → expected 0 bytes.
+    fs::write(cache_dir.join("index.skpost"), b"").unwrap();
 }
 
 /// Write a manifest with the given git_head into `cache_dir`.
@@ -1532,7 +1562,7 @@ fn test_temporal_db_is_stale_when_absent() {
     let dir = tempdir().unwrap();
     // No temporal.db in dir — must report stale.
     assert!(
-        temporal_db_is_stale(dir.path(), "abc1234"),
+        temporal_db_is_stale(dir.path(), "abc1234", None),
         "absent temporal.db must be reported stale"
     );
 }
@@ -1551,7 +1581,7 @@ fn test_temporal_db_is_not_stale_when_head_matches() {
     drop(db);
 
     assert!(
-        !temporal_db_is_stale(dir.path(), head),
+        !temporal_db_is_stale(dir.path(), head, None),
         "temporal.db with matching META_GIT_HEAD must NOT be stale"
     );
 }
@@ -1575,7 +1605,7 @@ fn test_temporal_db_is_stale_when_head_diverges() {
     drop(db);
 
     assert!(
-        temporal_db_is_stale(dir.path(), real_head),
+        temporal_db_is_stale(dir.path(), real_head, None),
         "temporal.db with diverged META_GIT_HEAD must be reported stale (deadbeef case)"
     );
 }
@@ -1603,7 +1633,7 @@ fn test_temporal_db_data_version_absent_is_stale() {
     super::plant_meta_raw(&db_path, rskim_search::META_GIT_HEAD, head);
 
     assert!(
-        temporal_db_is_stale(dir.path(), head),
+        temporal_db_is_stale(dir.path(), head, None),
         "AC5: temporal.db with matching HEAD but no data_version must be stale \
          (pre-fix DB contains ghost rows)"
     );
@@ -1626,7 +1656,7 @@ fn test_temporal_db_after_sync_data_version_is_not_stale() {
     drop(db);
 
     assert!(
-        !temporal_db_is_stale(dir.path(), head),
+        !temporal_db_is_stale(dir.path(), head, None),
         "AC5: temporal.db written by sync() (with data_version) must NOT be stale"
     );
 }
@@ -1648,7 +1678,7 @@ fn test_temporal_db_data_version_non_integer_is_stale() {
     super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "not-a-number");
 
     assert!(
-        temporal_db_is_stale(dir.path(), head),
+        temporal_db_is_stale(dir.path(), head, None),
         "AC5: non-integer data_version must be treated as stale (numeric parse required)"
     );
 }
@@ -1671,12 +1701,12 @@ fn test_temporal_db_data_version_no_rebuild_loop() {
 
     // First post-sync check.
     assert!(
-        !temporal_db_is_stale(dir.path(), head),
+        !temporal_db_is_stale(dir.path(), head, None),
         "AC6: first post-sync check must be Current (no rebuild loop)"
     );
     // Second post-sync check — must still be Current.
     assert!(
-        !temporal_db_is_stale(dir.path(), head),
+        !temporal_db_is_stale(dir.path(), head, None),
         "AC6: second post-sync check must be Current (no oscillation)"
     );
 }
@@ -1705,7 +1735,7 @@ fn test_temporal_db_data_version_forward_compat() {
     );
 
     assert!(
-        !temporal_db_is_stale(dir.path(), head),
+        !temporal_db_is_stale(dir.path(), head, None),
         "AC7: data_version > TEMPORAL_DATA_VERSION must NOT be stale (forward compat: \
          gate uses stored < current, not stored != current)"
     );
@@ -1743,10 +1773,95 @@ fn test_temporal_db_data_version_lower_integer_is_stale() {
     super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "0");
 
     assert!(
-        temporal_db_is_stale(dir.path(), head),
+        temporal_db_is_stale(dir.path(), head, None),
         "AD-408-4: data_version=\"0\" (valid integer < TEMPORAL_DATA_VERSION) must be \
          stale — the `stored < current` numeric gate must fire for any lower version \
          (self-heal trigger for versioned-but-outdated pre-fix DBs, applies ADR-006)"
+    );
+}
+
+// ============================================================================
+// T-8: AD-414-14 — Check 3: shallow→full transition
+// ============================================================================
+
+/// T-8a: When the stored is_shallow flag is "1" AND .git/shallow is absent
+/// (shallow→full transition: `git fetch --unshallow` removed it), the DB is
+/// reported stale so the now-reachable history can be ingested.
+///
+/// AD-414-14: this gate fires only when `git_dir` is `Some`; passing `None`
+/// skips it (backward compat with pre-AD-414-14 callers / tests).
+#[test]
+fn test_temporal_db_shallow_to_full_is_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+
+    // Create a current-format DB via sync().
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    drop(db);
+
+    // Plant is_shallow = "1" to simulate a DB built on a shallow clone.
+    super::plant_meta_raw(&db_path, rskim_search::META_IS_SHALLOW, "1");
+
+    // Provide a fake git_dir WITHOUT a "shallow" file — simulates an unshallowed repo.
+    let fake_git_dir = dir.path().join(".git");
+    fs::create_dir_all(&fake_git_dir).unwrap();
+    // No "shallow" file → transition detected.
+
+    assert!(
+        temporal_db_is_stale(dir.path(), head, Some(&fake_git_dir)),
+        "T-8a: is_shallow=1 + absent .git/shallow must be reported stale \
+         (shallow→full transition, AD-414-14)"
+    );
+}
+
+/// T-8b: When the stored is_shallow flag is "1" AND .git/shallow STILL EXISTS
+/// (the repo is still shallow), the DB is NOT stale on that account.
+#[test]
+fn test_temporal_db_still_shallow_is_not_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    drop(db);
+
+    // Plant is_shallow = "1".
+    super::plant_meta_raw(&db_path, rskim_search::META_IS_SHALLOW, "1");
+
+    // Provide a fake git_dir WITH a "shallow" file — repo is still shallow.
+    let fake_git_dir = dir.path().join(".git");
+    fs::create_dir_all(&fake_git_dir).unwrap();
+    fs::write(fake_git_dir.join("shallow"), b"abc1234\n").unwrap();
+
+    assert!(
+        !temporal_db_is_stale(dir.path(), head, Some(&fake_git_dir)),
+        "T-8b: is_shallow=1 + present .git/shallow must NOT be stale \
+         (repo is still shallow, no transition, AD-414-14)"
+    );
+}
+
+/// T-8c: When git_dir is None, Check 3 is skipped entirely (backward compat).
+/// A DB with is_shallow="1" and no shallow file is NOT stale when git_dir=None.
+#[test]
+fn test_temporal_db_check3_skipped_when_git_dir_none() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "cccc3333cccc3333cccc3333cccc3333cccc3333";
+
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head).unwrap();
+    drop(db);
+
+    // Plant is_shallow = "1" — would trigger stale if git_dir were supplied.
+    super::plant_meta_raw(&db_path, rskim_search::META_IS_SHALLOW, "1");
+    // No .git/shallow file anywhere — but git_dir is None so check is skipped.
+
+    assert!(
+        !temporal_db_is_stale(dir.path(), head, None),
+        "T-8c: Check 3 must be skipped when git_dir=None (backward compat)"
     );
 }
 
