@@ -1,19 +1,57 @@
-//! Staleness detection via git HEAD comparison.
+//! Index staleness detection and auto-refresh orchestration.
 //!
 //! Compares the git HEAD commit recorded in the manifest (`index.skfiles`)
 //! against the current git HEAD at query time.  When they diverge, the index
 //! is stale and should be rebuilt.
 //!
-//! # Design
+//! # Module layout
 //!
-//! - Pure file I/O — no git binary subprocess, no libgit2 dependency.
-//! - Handles ordinary repos (`.git/` directory) and worktrees (`.git` file).
-//! - Follows `ref: refs/heads/<branch>` symbolic refs with packed-refs fallback.
-//! - All failures are soft: if we can't read git state we degrade gracefully.
+//! This module owns four distinct concerns, separated into sibling modules to
+//! keep each one's scope clear:
+//!
+//! 1. **Git plumbing** ([`super::gitdir`]) — `HeadState`, `resolve_git_dir`,
+//!    `resolve_common_dir`, `git_head_state`, `read_git_head`.  Pure file I/O,
+//!    no git binary, no libgit2.
+//!
+//! 2. **Index staleness policy** (this file) — `StalenessCheck`, `WorkingTreeDelta`,
+//!    `scan_working_tree`, `check_staleness`, `RefreshOutcome`, `auto_refresh_if_stale`.
+//!
+//! 3. **Temporal-DB concerns** ([`super::temporal_state`]) — `ReanchorPolicy`,
+//!    `AnchorState`, `temporal_anchor_state`, `temporal_db_is_stale`,
+//!    `warn_if_temporal_unverifiable`, `try_rebuild_temporal_nonfatal`.
+//!
+//! 4. **Git-fixture test helpers** (this file, `#[cfg(test)]`) — `create_real_git_repo`,
+//!    `create_real_git_repo_with_dates`, `create_real_git_worktree`, `plant_meta_raw`.
+//!
+//! Re-exports from (1) and (3) preserve the `staleness::*` access path used by
+//! `mod.rs`, `hooks.rs`, and the test suite — callers do not need to know which
+//! sub-module owns each item.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::manifest::FileManifest;
+
+// Re-export git-plumbing items (owned by gitdir.rs).
+// `hooks.rs` accesses `resolve_git_dir`, `resolve_common_dir`, and
+// `resolve_repo_toplevel` via `super::staleness::*` — these re-exports keep
+// those paths valid.
+pub(super) use super::gitdir::{
+    HeadState, git_head_state, read_git_head, resolve_common_dir, resolve_git_dir,
+};
+// `resolve_repo_toplevel` is used by `hooks.rs` via `super::staleness::resolve_repo_toplevel`
+// but not within `staleness.rs` itself — suppress the false-positive unused_imports lint.
+#[allow(unused_imports)]
+pub(super) use super::gitdir::resolve_repo_toplevel;
+
+// Re-export temporal-DB items (owned by temporal_state.rs).
+#[cfg(test)]
+pub(super) use super::temporal_state::TEMPORAL_META_READ_COUNT;
+#[cfg(test)]
+pub(super) use super::temporal_state::temporal_anchor_state;
+pub(super) use super::temporal_state::{
+    AnchorState, ReanchorPolicy, anchor_state_on_db, temporal_db_is_stale,
+    try_rebuild_temporal_nonfatal, warn_if_temporal_unverifiable,
+};
 
 // ============================================================================
 // Staleness outcome
@@ -67,118 +105,6 @@ impl std::fmt::Display for StalenessCheck {
             ),
         }
     }
-}
-
-// ============================================================================
-// Git HEAD resolution
-// ============================================================================
-
-/// Resolve the git directory for a project root.
-///
-/// - If `.git` is a **directory**, returns it directly.
-/// - If `.git` is a **file** (worktree), parses the `gitdir: <path>` pointer
-///   and returns the resolved target path.
-/// - Returns `None` when `.git` doesn't exist.
-///
-/// This mirrors git's own resolution logic for `git rev-parse --git-dir`.
-pub(super) fn resolve_git_dir(project_root: &Path) -> Option<PathBuf> {
-    let dot_git = project_root.join(".git");
-    if dot_git.is_dir() {
-        return Some(dot_git);
-    }
-    if dot_git.is_file() {
-        // Worktree: .git is a file containing "gitdir: <absolute-or-relative-path>"
-        let content = std::fs::read_to_string(&dot_git).ok()?;
-        let gitdir_line = content.lines().find(|l| l.starts_with("gitdir:"))?;
-        let target = gitdir_line.strip_prefix("gitdir:").map(str::trim)?;
-        let target_path = PathBuf::from(target);
-        if target_path.is_absolute() {
-            Some(target_path)
-        } else {
-            // Relative to the directory containing the .git file
-            Some(project_root.join(target_path))
-        }
-    } else {
-        None
-    }
-}
-
-/// Read the current git HEAD for `project_root`.
-///
-/// Resolution order:
-/// 1. `resolve_git_dir(project_root)` — locate `.git` or follow the worktree pointer.
-/// 2. Read `<git_dir>/HEAD`.
-/// 3. If it is a symbolic ref (`ref: refs/heads/<branch>`):
-///    a. Try `<git_dir>/<ref_path>` (loose ref).
-///    b. Fall back to `<git_dir>/packed-refs`.
-/// 4. If HEAD is a raw 40-hex SHA (detached HEAD), return it directly.
-///
-/// Returns `None` when:
-/// - `.git` does not exist (not a git repo).
-/// - Any I/O failure prevents reading the necessary files.
-pub(super) fn read_git_head(project_root: &Path) -> Option<String> {
-    let git_dir = resolve_git_dir(project_root)?;
-    let head_content = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head_str = head_content.trim();
-
-    if let Some(ref_path) = head_str.strip_prefix("ref: ") {
-        // Validate the ref path to prevent path traversal attacks via a
-        // crafted `.git/HEAD` (e.g. `ref: ../../etc/shadow`).
-        if !ref_path.starts_with("refs/") {
-            return None;
-        }
-        // Symbolic ref — resolve through loose refs then packed-refs
-        resolve_symbolic_ref(&git_dir, ref_path)
-    } else if is_hex_sha(head_str) {
-        // Detached HEAD — raw SHA
-        Some(head_str.to_string())
-    } else {
-        None
-    }
-}
-
-/// Resolve a symbolic ref (e.g. `refs/heads/main`) to its SHA.
-///
-/// Tries the loose ref file first; falls back to `packed-refs`.
-fn resolve_symbolic_ref(git_dir: &Path, ref_path: &str) -> Option<String> {
-    // 1. Loose ref: <git_dir>/refs/heads/<branch>
-    let loose_path = git_dir.join(ref_path);
-    if let Ok(content) = std::fs::read_to_string(&loose_path) {
-        let sha = content.trim().to_string();
-        if is_hex_sha(&sha) {
-            return Some(sha);
-        }
-    }
-
-    // 2. packed-refs fallback
-    let packed_refs_path = git_dir.join("packed-refs");
-    if let Ok(content) = std::fs::read_to_string(&packed_refs_path) {
-        for line in content.lines() {
-            // Skip comment lines
-            if line.starts_with('#') || line.starts_with('^') {
-                continue;
-            }
-            // Format: "<sha> <ref>"
-            let mut parts = line.splitn(2, ' ');
-            if let (Some(sha), Some(name)) = (parts.next(), parts.next())
-                && name.trim() == ref_path
-                && is_hex_sha(sha)
-            {
-                return Some(sha.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-/// Return `true` if `s` looks like a 40-character (SHA-1) or 64-character
-/// (SHA-256) hex commit hash.
-///
-/// Git repos using `extensions.objectFormat = sha256` emit 64-hex-char hashes.
-/// Accepting both lengths avoids silent staleness degradation in SHA-256 repos.
-fn is_hex_sha(s: &str) -> bool {
-    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ============================================================================
@@ -474,20 +400,41 @@ pub(super) fn check_staleness(
         }
     };
 
+    // AD-413-14-OD: an ADOPTED root (no `.git` entry of its own, HEAD comes from an
+    // enclosing repository via resolve_repo_toplevel) must NOT use HEAD-based
+    // invalidation.  A commit anywhere in the enclosing repo changes the repo HEAD
+    // even when no files under the subtree changed, so `HeadChanged` would trigger a
+    // full lexical+temporal rebuild on every unrelated commit (e.g. a commit to
+    // `crates/rskim` when `--root crates/rskim-search` is in use).  For adopted roots
+    // the working-tree metadata scan already detects any real change under the subtree
+    // (mtime + size, same as the standard path), so HEAD-based invalidation is both
+    // redundant and over-broad.  `resolve_git_dir` returning `None` is the correct
+    // adopted-root signal: the root has no `.git` file/dir of its own, so its HEAD
+    // comes from the ancestor walk and may advance on any unrelated commit.
+    let is_adopted_root = resolve_git_dir(project_root).is_none();
+
     let outcome = match (stored.as_deref(), current.as_deref()) {
         // Non-git project (both None): no commit can have changed, but the
         // working tree still can — scan it (AD-379-3).
         (None, None) => current_or_working_tree(&manifest),
         // Git repo appeared since last build — rebuild to record HEAD.
         (None, Some(_)) => StalenessCheck::NoStoredHead,
-        // Git is unreadable (worktree detached, submodule, fs error).
-        // Stored HEAD exists so the project was a git repo at build time; trust
-        // is broken, so scan the working tree and rebuild on any edit to recover
-        // (AD-379-6) rather than serving a possibly-stale index unconditionally.
+        // Git is unreadable (AD-379-6): the project was a git repo at build time
+        // but git HEAD is now unreadable; trust is broken, so scan the working tree
+        // and rebuild on any edit to recover.  Includes the Unresolved sub-case
+        // (dangling symref, deleted branch) — the working-tree scan is still correct
+        // there; an unchanged tree returns Current, avoiding a rebuild loop.
         (Some(_), None) => current_or_working_tree(&manifest),
         // Both present — compare HEADs first, then the working tree on a match.
         (Some(s), Some(c)) => {
             if s == c {
+                current_or_working_tree(&manifest)
+            } else if is_adopted_root {
+                // AD-413-14-OD: adopted root — HEAD diverged because a commit in the
+                // enclosing repo advanced the repo HEAD, but that commit may have touched
+                // nothing under this subtree.  Scope invalidation to the working-tree
+                // scan so that only changes actually landing under `project_root` drive
+                // a rebuild (avoids full rebuild on every unrelated commit).
                 current_or_working_tree(&manifest)
             } else {
                 StalenessCheck::HeadChanged {
@@ -499,137 +446,6 @@ pub(super) fn check_staleness(
     };
 
     (outcome, Some(manifest))
-}
-
-// ============================================================================
-// Temporal staleness helper
-// ============================================================================
-
-/// Return `true` when `temporal.db` is missing or its stored `META_GIT_HEAD`
-/// does not match `current_head`.
-///
-/// `current_head` is the HEAD SHA already read by the caller (non-optional —
-/// callers must check `current_head.is_some()` BEFORE calling this helper; on
-/// non-git dirs the guard short-circuits before reaching this function).
-///
-/// # Performance (ADR-003)
-///
-/// Uses a minimal read-only SQLite open (no WAL pragma, no permission reset, no
-/// migrations) to read just the one `meta` row.  This avoids the full
-/// `TemporalDb::open` cost (WAL handshake + two metadata syscalls + migration
-/// version check) on the steady-state Current-path where the DB is checked but
-/// then immediately re-opened by the dispatch arm.  The caller is responsible
-/// for the full `TemporalDb::open` when it actually queries the DB.
-///
-/// # AD-TMP-2 / AD-TMP-3
-///
-/// AD-TMP-2: temporal.db staleness is INDEPENDENT of lexical staleness (#357
-/// BUG B). The lexical-Current early-return in `auto_refresh_if_stale` (below)
-/// skipped the temporal hook, so a missing or HEAD-divergent temporal.db stayed
-/// stale forever while the lexical index was current (post-upgrade, manual
-/// delete, or 2nd+ query after a temporal-less rebuild due to BUG A). This
-/// helper checks temporal.db's stored META_GIT_HEAD against the `current_head`
-/// already read at function entry in `auto_refresh_if_stale`. Self-heals the
-/// stuck-stale (deadbeef) case. Non-fatal by ADR-006/D5.
-///
-/// AD-TMP-3: production temporal staleness uses file-IO HEAD comparison here,
-/// not `check_temporal_staleness` from `temporal.rs` — that helper is
-/// `#[cfg(test)]`-only and uses a `git rev-parse` subprocess, which is
-/// inconsistent with this module's subprocess-free design. `current_head` is
-/// the single HEAD read already performed at `auto_refresh_if_stale` entry;
-/// passing it here avoids a second HEAD read and keeps one HEAD-reading
-/// authority per call.
-pub(super) fn temporal_db_is_stale(cache_dir: &Path, current_head: &str) -> bool {
-    let db_path = cache_dir.join("temporal.db");
-    if !db_path.exists() {
-        return true;
-    }
-    // Lightweight read-only open: no WAL pragma, no permission reset, no migrations.
-    // We read at most two meta rows (git_head + data_version); the full
-    // TemporalDb::open setup is deferred to the dispatch arm that actually queries.
-    let conn = match rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
-        Ok(c) => c,
-        Err(_) => return true,
-    };
-
-    // Shared helper: read a single TEXT value from the meta table by key.
-    let read_meta = |key: &str| -> Option<String> {
-        conn.query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            rusqlite::params![key],
-            |row| row.get(0),
-        )
-        .ok()
-    };
-
-    // Check 1: HEAD match — absent row or mismatch both report stale.
-    let stored_head: Option<String> = read_meta(rskim_search::META_GIT_HEAD);
-    if stored_head.as_deref() != Some(current_head) {
-        return true;
-    }
-
-    // AD-408-4: Check 2: data-version gate.
-    // The DB is stale when the stored data_version is absent or numerically less
-    // than TEMPORAL_DATA_VERSION, forcing a self-heal rebuild on the next query
-    // (applies ADR-006; mirrors the lexical/AST/manifest self-heal in
-    // check_staleness). Meta values are TEXT — version comparison is numeric to
-    // correctly order multi-digit values (string compare mis-orders "10" vs "2").
-    // An absent or non-integer stored value is treated as stale (pre-fix DB).
-    // Uses `stored < current` (NOT `!=`) so a DB written by a newer binary is
-    // NOT needlessly rebuilt by an older post-fix binary (no downgrade loop).
-    let stored_version: Option<String> = read_meta(rskim_search::META_DATA_VERSION);
-    match stored_version.as_deref() {
-        Some(v) => match v.parse::<u64>() {
-            Ok(n) => n < u64::from(rskim_search::TEMPORAL_DATA_VERSION),
-            // Non-integer stored value → treat as stale.
-            Err(_) => true,
-        },
-        // Absent data_version row → stale (pre-fix DB that lacks the ghost filter).
-        None => true,
-    }
-}
-
-/// Rebuild `temporal.db` non-fatally, swallowing any error per ADR-006/D5.
-///
-/// This is the single implementation of the D5 non-fatal-swallow contract that
-/// was previously duplicated in three structurally-divergent copies across
-/// `run_build` (mod.rs), the BUG-B self-heal (here), and the post-rebuild hook
-/// (below). Centralising it prevents the copies from drifting independently —
-/// a single edit here updates all three call sites.
-///
-/// # Contract (ADR-006/D5)
-///
-/// - `rebuild_temporal` is always called when `head` is `Some`.
-/// - If `rebuild_temporal` returns `Err`, the error is SWALLOWED (never propagated).
-/// - A debug-gated warning is emitted to stderr via `eprintln!` when the error
-///   is swallowed and `SKIM_DEBUG=1` / `--debug` is set.
-/// - Callers never see a temporal failure — only lexical/AST failures propagate.
-///
-/// # Parameters
-///
-/// - `root`: project root passed to `rebuild_temporal`.
-/// - `cache_dir`: cache directory containing `temporal.db`.
-/// - `head`: the git HEAD SHA to record; `None` skips the rebuild (non-git dir).
-/// - `debug_label`: short label for the debug message (e.g. `"self-heal"`,
-///   `"post-rebuild"`, `"--rebuild hook"`).
-pub(super) fn try_rebuild_temporal_nonfatal(
-    root: &Path,
-    cache_dir: &Path,
-    head: Option<&str>,
-    debug_label: &str,
-) {
-    use super::temporal_build::{current_epoch_secs, rebuild_temporal};
-
-    let Some(head) = head else { return };
-    if let Err(e) = rebuild_temporal(root, cache_dir, head, current_epoch_secs()) {
-        // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
-        if crate::debug::is_debug_enabled() {
-            eprintln!("skim search [debug]: temporal {debug_label} error (non-fatal): {e}");
-        }
-    }
 }
 
 // ============================================================================
@@ -697,17 +513,28 @@ impl RefreshOutcome {
 /// the two reads the manifest will record the pre-commit HEAD and temporal.db
 /// will record the post-commit HEAD; both will appear stale on the next query,
 /// triggering one more refresh. This is the accepted TOCTOU trade-off.
+/// AD-413 Finding 2: returns the `HeadState` resolved at function entry so
+/// temporal-consuming call sites do not need a second `git_head_state` call.
+/// All four call sites in `mod.rs` (--ast arm, `run_update`, `execute_query`,
+/// `run_temporal_standalone`) previously discarded this value and re-called
+/// `git_head_state` right after returning, triggering an extra full HEAD-ladder
+/// traversal on every query (three traversals instead of two on a linked
+/// worktree with packed-refs).
 pub(super) fn auto_refresh_if_stale(
     root: &Path,
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
-) -> anyhow::Result<(RefreshOutcome, FileManifest)> {
+    reanchor: ReanchorPolicy,
+) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
 
-    // Read the current git HEAD once at function entry so rebuild_temporal can
-    // record the same SHA that will be in the manifest after build_index runs.
-    let current_head: Option<String> = read_git_head(root);
+    // Classify git HEAD state once at function entry so rebuild_temporal records
+    // the same SHA that will be in the manifest after build_index runs.
+    // Step 6 (AD-413-7): use the three-state HeadState rather than Option<String>
+    // so the same read feeds both the temporal rebuild and the anchor check.
+    let head_state = git_head_state(root);
+    let current_head: Option<&str> = head_state.sha();
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
 
@@ -727,17 +554,17 @@ pub(super) fn auto_refresh_if_stale(
         // fresh temporal data when the lexical index is current.
         // Non-fatal by ADR-006/D5: temporal failure must NOT fail the query.
         //
-        // Guard ordering (#357 cycle-2 finding 19): `let Some(ref head)` is
-        // evaluated FIRST (short-circuits on non-git dirs where current_head=None
-        // BEFORE the temporal_db_is_stale() call, avoiding a wasted DB open).
+        // Guard ordering (#357 cycle-2 finding 19): `let Some(head)` is evaluated
+        // FIRST (short-circuits on non-git dirs where current_head=None BEFORE the
+        // temporal_db_is_stale() call, avoiding a wasted DB open).
         // `temporal_db_is_stale` only runs when HEAD is readable.
-        if let Some(ref head) = current_head
+        if let Some(head) = current_head
             && temporal_db_is_stale(cache_dir, head)
         {
-            try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal");
+            try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal", reanchor);
         }
 
-        return Ok((RefreshOutcome::UpToDate, manifest));
+        return Ok((RefreshOutcome::UpToDate, manifest, head_state));
     }
 
     // All rebuild paths share the same config.
@@ -757,54 +584,44 @@ pub(super) fn auto_refresh_if_stale(
     // a concurrent peer already refreshed the index (AD-379-8). When the build is
     // skipped we must report `UpToDate` and skip the post-rebuild temporal hook
     // (nothing was rebuilt), so the steady-state no-op contract (AC7/AC14) holds.
-    let did_build: bool = match staleness {
-        StalenessCheck::Current => unreachable!(),
-        StalenessCheck::NoIndex => {
-            eprintln!("skim search: building index…");
-            let result = build_index(&config)?;
-            eprintln!(
-                "skim search: indexed {} files in {:.1}s",
-                result.file_count,
-                result.duration.as_secs_f64()
-            );
-            true
-        }
+    let mut build_ran = true;
+
+    match staleness {
         StalenessCheck::HeadChanged { stored, current } => {
             if crate::debug::is_debug_enabled() {
                 eprintln!(
-                    "skim search [debug]: HEAD changed ({} -> {}), refreshing index…",
+                    "skim search [debug]: index stale — HEAD changed ({}…→{}…); rebuilding",
                     stored.get(..8).unwrap_or(&stored),
-                    current.get(..8).unwrap_or(&current)
+                    current.get(..8).unwrap_or(&current),
                 );
-            } else {
-                eprintln!("skim search: index stale (HEAD changed), refreshing…");
             }
             build_index(&config)?;
-            true
         }
         StalenessCheck::NoStoredHead => {
-            // Manifest exists but no HEAD recorded — could be an old build or
-            // a git repo that appeared since the last non-git build.
-            // Rebuild to get a fresh manifest with HEAD stored.
-            eprintln!("skim search: refreshing index (no HEAD recorded)…");
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: index stale — no stored HEAD or format upgrade; rebuilding",
+                );
+            }
             build_index(&config)?;
-            true
+        }
+        StalenessCheck::NoIndex => {
+            build_index(&config)?;
         }
         StalenessCheck::WorkingTreeChanged {
             changed,
             added,
             removed,
         } => {
-            // Uncommitted working-tree edits with an unchanged git HEAD (#379).
-            // AD-379-4: a FULL rebuild (not a per-file incremental writer) so the
-            // FileId↔sorted_paths alignment invariant is preserved (ADR-006).
-            // AD-379-8: build_index_rechecked re-checks staleness AFTER acquiring
-            // the build lock and SKIPS the rebuild when a concurrent peer already
-            // refreshed the index — collapsing a rebuild stampede to one build.
-            eprintln!(
-                "skim search: index stale (working tree changed: \
-                 {changed} modified, {added} added, {removed} removed), refreshing…"
-            );
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: index stale — working tree changed \
+                     ({changed} modified, {added} added, {removed} removed); rebuilding",
+                );
+            }
+            // AD-379-8: a concurrent peer may have already rebuilt the index.
+            // `build_index_rechecked` re-runs check_staleness under the build lock
+            // and skips the rebuild if the index is now current.
             let built = build_index_rechecked(&config, || {
                 // Re-evaluate staleness under the lock: skip the rebuild unless the
                 // working tree is STILL dirty (a peer may have already rebuilt).
@@ -813,15 +630,20 @@ pub(super) fn auto_refresh_if_stale(
                     StalenessCheck::WorkingTreeChanged { .. }
                 )
             })?;
-            built.is_some()
+            build_ran = built.is_some();
         }
-    };
+        StalenessCheck::Current => {
+            // Already handled above — unreachable here.
+            unreachable!("Current branch handled before staleness match");
+        }
+    }
 
-    // If the rebuild was skipped because a peer already refreshed (AD-379-8),
-    // the index is now Current: return without re-running the temporal hook.
-    if !did_build {
-        let manifest = FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())?;
-        return Ok((RefreshOutcome::UpToDate, manifest));
+    if !build_ran {
+        // Concurrent peer already refreshed the index — reload the manifest and
+        // return UpToDate (steady-state no-op contract AC7/AC14).
+        let manifest = existing_manifest
+            .unwrap_or_else(|| FileManifest::new(root.to_path_buf(), cache_dir.to_path_buf()));
+        return Ok((RefreshOutcome::UpToDate, manifest, head_state));
     }
 
     // After a rebuild, load the freshly written manifest for the caller.
@@ -839,7 +661,10 @@ pub(super) fn auto_refresh_if_stale(
     //
     // `head` is the HEAD SHA read at function entry above. Passing `None` when
     // the project is non-git: try_rebuild_temporal_nonfatal no-ops gracefully.
-    try_rebuild_temporal_nonfatal(root, cache_dir, current_head.as_deref(), "post-rebuild");
+    // `reanchor` is threaded from the caller: only the explicit build arms
+    // (`--build`, `--rebuild`, `--update`) pass `Allow`; query-triggered refreshes
+    // pass `Refuse` so anchor mismatch leaves temporal.db untouched (PF-017).
+    try_rebuild_temporal_nonfatal(root, cache_dir, current_head, "post-rebuild", reanchor);
     // ─────────────────────────────────────────────────────────────────────────
 
     let outcome = if is_no_index {
@@ -847,7 +672,7 @@ pub(super) fn auto_refresh_if_stale(
     } else {
         RefreshOutcome::Incremental
     };
-    Ok((outcome, manifest))
+    Ok((outcome, manifest, head_state))
 }
 
 // ============================================================================
@@ -940,6 +765,74 @@ pub(super) fn create_real_git_repo_with_dates(
         .current_dir(dir)
         .output()
         .expect("git rev-parse HEAD");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Create a linked git worktree rooted at `worktree` and checked out on `branch`.
+///
+/// Runs `git -C primary branch <branch>` (creates the branch from the current HEAD)
+/// then `git -C primary worktree add <worktree> <branch>`, and returns the full 40-hex
+/// SHA of `HEAD` as seen from the linked worktree.
+///
+/// **Hermeticity (I3/I5):** sets `GIT_CONFIG_GLOBAL=/dev/null` and
+/// `GIT_CONFIG_SYSTEM=/dev/null` on every subprocess so ambient `core.hooksPath`,
+/// `init.defaultBranch`, and `extensions.*` configuration does not bleed in.
+/// Branch names may contain `/` (e.g. `wave/probe-413` — F12 slashed-branch coverage).
+///
+/// `primary` must already be an initialised git repository with at least one commit
+/// (call [`create_real_git_repo`] first).  `worktree` must not yet exist.
+///
+/// `pub(super)` makes it accessible from all `#[cfg(test)]` modules within
+/// `crate::cmd::search` via `super::staleness::create_real_git_worktree`.
+#[cfg(test)]
+pub(super) fn create_real_git_worktree(
+    primary: &std::path::Path,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> String {
+    use std::process::Command;
+
+    // Create the branch at HEAD of the primary repository.
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["branch", branch])
+        .current_dir(primary)
+        .output()
+        .expect("git branch (spawn)");
+    assert!(
+        out.status.success(),
+        "git branch {:?} failed: {}",
+        branch,
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Add the linked worktree checked out on that branch.
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .arg("worktree")
+        .arg("add")
+        .arg(worktree)
+        .arg(branch)
+        .current_dir(primary)
+        .output()
+        .expect("git worktree add (spawn)");
+    assert!(
+        out.status.success(),
+        "git worktree add {:?} failed: {}",
+        branch,
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Return the resolved HEAD SHA from the linked worktree.
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(worktree)
+        .output()
+        .expect("git rev-parse HEAD in worktree");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 

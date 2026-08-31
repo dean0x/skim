@@ -25,7 +25,7 @@ use rskim_search::{
 
 use super::manifest::FileManifest;
 use super::snippet::{SnippetOutcome, VerifyMode, extract_snippet_and_verify};
-use super::staleness::auto_refresh_if_stale;
+use super::staleness::{ReanchorPolicy, auto_refresh_if_stale};
 use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 
 // ============================================================================
@@ -447,7 +447,8 @@ pub(super) fn execute_query_with_manifest(
     let manifest = match pre_loaded_manifest {
         Some(m) => m,
         None => {
-            let (outcome, m) = auto_refresh_if_stale(root, cache_dir, analytics)?;
+            let (outcome, m, _head_state) =
+                auto_refresh_if_stale(root, cache_dir, analytics, ReanchorPolicy::Refuse)?;
             // AC-405-7 / AC-405-8: emit AST coverage notice ONLY when a first-time
             // (NoIndex) build fires on the pure-lexical query path (D-4 cadence).
             // Incremental self-heals (HeadChanged / WorkingTreeChanged) must be
@@ -943,6 +944,26 @@ fn run_blast_radius_composite_query(
     let weights = config
         .composite_weights
         .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
+
+    // AD-413-16: Some(empty) means AnchorDiffers — the temporal DB belongs to a
+    // different repository.  The allowlist is intentionally empty; every call site
+    // must return zero results to match the standalone arm (run_temporal_standalone
+    // returns 0 rows on AnchorDiffers).  Falling through would collapse to pure
+    // lexical (UNION skips the empty temporal layer), returning all text matches
+    // without the blast-radius filter — wrong repo data silently expanded, not
+    // isolated.  Early-out mirrors run_compound_query's filter_set.is_empty() guard.
+    if matches!(blast_file_ids, Some(ids) if ids.is_empty()) {
+        return Ok(QueryOutput {
+            query: config.text.clone(),
+            total: 0,
+            has_more: false,
+            verify_mode: vm_label,
+            results: vec![],
+            duration_ms: ctx.start.elapsed().as_millis() as u64,
+            index_stats: Some(ctx.stats),
+            ast_coverage: None,
+        });
+    }
 
     // Step 1: fetch a WIDE lexical ranked list WITHOUT a file_filter.
     //

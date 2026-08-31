@@ -27,8 +27,8 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
-    COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, GixSource, HistoryResult, HotspotRow,
-    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb,
+    COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, HistoryResult, HotspotRow,
+    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb, TemporalMetadata,
 };
 
 // ============================================================================
@@ -266,27 +266,6 @@ pub(super) fn build_risk_rows(
 }
 
 // ============================================================================
-// Internal helper (D5 graceful-degradation pattern)
-// ============================================================================
-
-/// Emit a debug-gated warning and return `Ok(())` to degrade gracefully.
-///
-/// All recoverable early-return arms in `rebuild_temporal` use this helper so
-/// the D5 isolation policy ("temporal failure MUST NOT fail lexical") is
-/// expressed once and the function body reads as sequential happy-path logic.
-macro_rules! warn_skip {
-    ($fmt:literal $(, $arg:expr)* $(,)?) => {{
-        if crate::debug::is_debug_enabled() {
-            eprintln!(
-                concat!("skim search [debug]: ", $fmt, " — skipping temporal build"),
-                $($arg)*
-            );
-        }
-        return Ok(());
-    }};
-}
-
-// ============================================================================
 // Main entry point (D1 / D3 / D4 / D5)
 // ============================================================================
 
@@ -313,18 +292,20 @@ macro_rules! warn_skip {
 /// fails, the file may exist with no `META_GIT_HEAD` row (same partial-file risk
 /// as the non-empty path) — see inline comment on the `Err` arm.
 ///
-/// **Production reachability note**: a genuine zero-commit git repo has an
-/// *unborn branch* — `read_git_head` returns `None` because `resolve_symbolic_ref`
-/// finds no loose ref and no packed-refs entry.  With `current_head = None`, both
-/// the BUG-B self-heal gate (`if let Some(ref head) = current_head && …` in
-/// `staleness.rs`) and `try_rebuild_temporal_nonfatal` (early `let Some(head) =
-/// head else { return }`) short-circuit before this function is ever invoked with
-/// a `Some(head)`.  The no-rebuild-loop guarantee for zero-commit repos therefore
-/// derives from the `read_git_head = None` short-circuit, **not** from the
-/// empty-DB write.  The empty-DB code path is exercised only by the direct-call
-/// test (`rebuild_temporal_with_source` with a synthetic `fake_head`).  Both
-/// rationales are valid and complementary — the empty-DB write remains correct
-/// for any future call path that does supply a synthetic HEAD.
+/// **Production reachability note**: the remaining causes of `read_git_head = None`
+/// in production are unborn branch, unsupported ref backend (reftable — #481), corrupt
+/// HEAD, and fs error — the linked-worktree route that previously caused `None` is fixed
+/// by #413.  With `current_head = None` for any of those reasons, both the BUG-B
+/// self-heal gate (`if let Some(ref head) = current_head && …` in `staleness.rs`) and
+/// `try_rebuild_temporal_nonfatal` (early `let Some(head) = head else { return }`)
+/// short-circuit before this function is ever invoked with a `Some(head)`.
+/// The no-rebuild-loop guarantee for zero-commit repos therefore derives from the
+/// `read_git_head = None` short-circuit, **not** from the empty-DB write.  The empty-DB
+/// code path is also exercised from `auto_refresh_if_stale` when the subtree under a
+/// subdirectory root (OD-3/AD-413-14) has zero qualifying commits; the direct-call test
+/// (`rebuild_temporal_with_source` with a synthetic `fake_head`) exercises the same path
+/// at unit level.  The subdirectory-root route is now live in production: AD-408-5's ghost
+/// anchor (the `ghost_root` binding) is reachable for the first time via `--root <subdir>` (#413).
 ///
 /// # Lookback semantics (O-C / ADR-003)
 ///
@@ -354,13 +335,22 @@ macro_rules! warn_skip {
 /// - `head`: full git HEAD SHA to record in the `meta` table.
 /// - `now_epoch`: injectable clock for deterministic tests (pass
 ///   `SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()` in production).
+#[cfg(test)]
 pub(super) fn rebuild_temporal(
     root: &Path,
     cache_dir: &Path,
     head: &str,
     now_epoch: u64,
 ) -> anyhow::Result<()> {
-    rebuild_temporal_with_source(&GixSource, root, cache_dir, head, now_epoch)
+    use rskim_search::GixSource;
+    rebuild_temporal_with_source(
+        &GixSource,
+        root,
+        cache_dir,
+        head,
+        now_epoch,
+        super::staleness::ReanchorPolicy::Allow,
+    )
 }
 
 /// Return `true` when `rel` names a regular file that exists under `root`.
@@ -470,6 +460,54 @@ fn apply_ghost_filter(
     cochange_rows.retain(|r| existing.contains(&r.file_a) && existing.contains(&r.file_b));
 }
 
+/// Strip a scope-prefix from temporal rows in-place, retaining only rows within
+/// the subtree and rewriting their paths to be `root`-relative.
+///
+/// This is the AD-413-17 scope filter, extracted from `rebuild_temporal_with_source`
+/// to match the structure of [`apply_ghost_filter`].  Called only when `root` is a
+/// proper subdirectory of the git worktree root; when `root == ghost_root` the
+/// caller holds `scope = None` and this function is never invoked.
+///
+/// # Allocation (Finding 2)
+///
+/// Prefix stripping uses [`String::drain`] (zero extra allocation per retained
+/// row) rather than `*path = stripped.to_string()`, which cloned the tail on
+/// every retained row.  `starts_with` is checked first so `drain` is never
+/// called on a path that would be dropped anyway.
+///
+/// # Cochange both-sides rule
+///
+/// A cochange row where only one side falls within the scope would silently
+/// reference an unreachable path on the query side — it is dropped rather than
+/// emitted as a ghost co-change result.
+fn apply_scope_filter(
+    pfx: &str,
+    hotspot_rows: &mut Vec<rskim_search::HotspotRow>,
+    risk_rows: &mut Vec<rskim_search::RiskRow>,
+    cochange_rows: &mut Vec<rskim_search::CochangeRow>,
+) {
+    // In-place prefix drain: O(n_chars_shifted) per row, zero allocation.
+    let strip_in_place = |path: &mut String| -> bool {
+        if path.starts_with(pfx) {
+            path.drain(..pfx.len());
+            true
+        } else {
+            false
+        }
+    };
+    hotspot_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
+    risk_rows.retain_mut(|r| strip_in_place(&mut r.file_path));
+    cochange_rows.retain_mut(|r| {
+        if r.file_a.starts_with(pfx) && r.file_b.starts_with(pfx) {
+            r.file_a.drain(..pfx.len());
+            r.file_b.drain(..pfx.len());
+            true
+        } else {
+            false
+        }
+    });
+}
+
 /// Inner implementation of `rebuild_temporal` with an injectable `TemporalSource`.
 ///
 /// Separated from `rebuild_temporal` so tests can supply a counting or fake
@@ -481,16 +519,61 @@ pub(super) fn rebuild_temporal_with_source(
     cache_dir: &Path,
     head: &str,
     now_epoch: u64,
+    reanchor: super::staleness::ReanchorPolicy,
 ) -> anyhow::Result<()> {
+    // ── Build-backoff sentinel (Finding 2 / D5) ──────────────────────────────
+    // Written when TemporalDb::open fails or a fallback empty sync fails (the
+    // only failure modes that cannot write META_GIT_HEAD directly). If the
+    // sentinel records the same HEAD as `head`, a prior non-transient failure
+    // already occurred for this HEAD; skip the expensive parse_history call and
+    // everything after it until HEAD advances.
+    // Note: the parse_history-failure path is handled differently (fall-through
+    // with empty HistoryResult), so the sentinel is NOT set for that case.
+    let backoff_sentinel = cache_dir.join("temporal.db.build_backoff");
+    if std::fs::read(&backoff_sentinel).ok().as_deref() == Some(head.as_bytes()) {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal rebuild skipped — \
+                 build-backoff sentinel present for HEAD {}… \
+                 (prior open/sync failure); will retry when HEAD advances",
+                head.get(..8).unwrap_or(head),
+            );
+        }
+        return Ok(());
+    }
+
     // ── Single full-history walk ──────────────────────────────────────────────
     // One parse_history call supplies all data. The 30d/90d windowing for
     // changes_30d/changes_90d is done inside compute_file_temporal_stats via
     // timestamp comparison against now_epoch — no separate windowed walk needed
     // (Decision O-B: the former 90-day hotspot walk was dead I/O; it was only
     // used for an is_empty() guard that risk_history already provides).
+    //
+    // Finding 2 / D5 backoff: on parse_history failure, fall through with an
+    // empty HistoryResult (same path as the zero-commits case — LOCKED DECISION
+    // 2026-06-24) so the lock+open+sync block writes META_GIT_HEAD.  Without
+    // this, a bare warn_skip! left META_GIT_HEAD unwritten, causing
+    // temporal_db_is_stale to return true on every subsequent query, forever.
+    // This is the primary exposure widened by #413: resolve_repo_toplevel adopts
+    // roots that gix::discover refuses, so HEAD now resolves for roots whose
+    // parse_history cannot.
     let risk_history = match src.parse_history(root, 0) {
         Ok(h) => h,
-        Err(e) => warn_skip!("parse_history failed: {}", e),
+        Err(e) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: parse_history failed: {e} — \
+                     falling through with empty rows to prevent retry loop",
+                );
+            }
+            HistoryResult {
+                commits: vec![],
+                metadata: TemporalMetadata {
+                    is_shallow: false,
+                    commit_count: 0,
+                },
+            }
+        }
     };
 
     // ── Score computation (pure, no I/O) ─────────────────────────────────────
@@ -543,6 +626,51 @@ pub(super) fn rebuild_temporal_with_source(
         &mut cochange_rows,
     );
 
+    // ── AD-413-17: subdirectory scope filter ─────────────────────────────────
+    // When `root` is a proper subdirectory of `ghost_root`, git history paths
+    // are repo-root-relative (e.g. `crates/rskim-search/src/lib.rs`) while
+    // skim-search query consumers expect paths relative to `root`
+    // (e.g. `src/lib.rs`). Compute the scope prefix once and delegate to
+    // `apply_scope_filter`, which retains only paths within the subtree and
+    // rewrites them to be root-relative.
+    // When `root == ghost_root` (plain single-root repo), `strip_prefix` yields
+    // an empty string which is filtered out, so `scope` is `None` and
+    // `apply_scope_filter` is not called — identity path for every non-subdirectory
+    // invocation.
+    //
+    // Prefix construction: Path components joined with '/', using to_str() (not
+    // to_string_lossy()) so a non-UTF-8 component produces None → scope = None
+    // → filter skipped with a debug notice, rather than a U+FFFD-mangled prefix
+    // that matches no history path and silently drops every row (Finding 4).
+    // Component-joining omits replace('\\', "/"), preventing corruption of Unix
+    // paths that legitimately contain '\' as a filename byte.
+    let scope: Option<String> = root
+        .canonicalize()
+        .ok()
+        .zip(ghost_root.canonicalize().ok())
+        .and_then(|(r, g)| {
+            r.strip_prefix(&g).ok().and_then(|p| {
+                let result = p
+                    .components()
+                    .map(|c| c.as_os_str().to_str())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|parts| parts.join("/"));
+                if result.is_none() && crate::debug::is_debug_enabled() {
+                    eprintln!(
+                        "skim search [debug]: scope filter: subdirectory path \
+                         contains non-UTF-8 components — skipping scope filter",
+                    );
+                }
+                result
+            })
+        })
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{p}/"));
+
+    if let Some(ref pfx) = scope {
+        apply_scope_filter(pfx, &mut hotspot_rows, &mut risk_rows, &mut cochange_rows);
+    }
+
     // ── Acquire lock (D4), then sync ─────────────────────────────────────────
     // Single sync path for both the empty-history and non-empty cases:
     // eliminates the duplicated lock+open+sync block and consolidates the
@@ -557,11 +685,37 @@ pub(super) fn rebuild_temporal_with_source(
     let db_path = cache_dir.join("temporal.db");
     let db = match TemporalDb::open(&db_path) {
         Ok(d) => d,
-        Err(e) => warn_skip!("failed to open temporal.db: {}", e),
+        Err(e) => {
+            // D5 + Finding 2 backoff: TemporalDb::open failed — write a sentinel
+            // so subsequent queries skip the rebuild for this HEAD.  Without this,
+            // temporal_db_is_stale returns true forever (no temporal.db → stale →
+            // rebuild → open fails again → loop).  The sentinel is best-effort; if
+            // the cache directory is also unwritable the loop continues until HEAD
+            // advances, which is acceptable degradation (D5).
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: failed to open temporal.db: {e} — \
+                     writing build-backoff sentinel to prevent retry loop",
+                );
+            }
+            let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            return Ok(());
+        }
+    };
+
+    // Helper: called on any successful sync (full-rows or fallback empty-rows).
+    // Deletes the stale backoff sentinel and records the git-toplevel anchor.
+    // AD-413-16: the anchor write is a SECOND, separate transaction after sync
+    // so that process death between the two leaves the anchor absent (Absent →
+    // adopt-and-record on the next query) rather than mismatched.
+    let on_sync_ok = |db: &TemporalDb| {
+        let _ = std::fs::remove_file(&backoff_sentinel);
+        record_temporal_anchor(db, root, &ghost_root, reanchor);
     };
 
     match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head) {
         Ok(()) => {
+            on_sync_ok(&db);
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",
@@ -574,14 +728,161 @@ pub(super) fn rebuild_temporal_with_source(
         }
         Err(rskim_search::SearchError::CapacityExceeded(msg)) => {
             // Too many rows (>500k) — degrade gracefully (D5).
-            warn_skip!("CapacityExceeded — {}. Consider a smaller repository", msg);
+            // Finding 2 backoff: try an empty-row sync so META_GIT_HEAD is written
+            // and temporal_db_is_stale returns false on subsequent queries.
+            // CapacityExceeded is a pre-transaction check so the DB is clean;
+            // db.sync(&[], ...) starts a fresh transaction.  If it also fails,
+            // write the sentinel as a last resort.
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: CapacityExceeded — {msg}. Consider a smaller repository — \
+                     attempting empty-row fallback sync to prevent retry loop",
+                );
+            }
+            if db.sync(&[], &[], &[], head).is_ok() {
+                on_sync_ok(&db);
+            } else {
+                let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            }
         }
         Err(e) => {
-            warn_skip!("sync failed: {}", e);
+            // Sync failed for a non-capacity reason (DB error, disk full, etc.).
+            // The failed transaction was rolled back, leaving the connection clean.
+            // Apply the same fallback pattern: try an empty-row sync to write
+            // META_GIT_HEAD; write the sentinel if that also fails.
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: sync failed: {e} — \
+                     attempting empty-row fallback sync to prevent retry loop",
+                );
+            }
+            if db.sync(&[], &[], &[], head).is_ok() {
+                on_sync_ok(&db);
+            } else {
+                let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            }
         }
     }
 
     Ok(())
+}
+
+/// Write the git repository toplevel anchor into an open [`TemporalDb`] after a
+/// successful [`TemporalDb::sync`] for a root that is inside (but not at) a git
+/// repository (AD-413-16).
+///
+/// This must be called as a **second, separate transaction** after `db.sync`
+/// completes successfully.  Process death between `sync` and this call leaves
+/// [`rskim_search::META_GIT_TOPLEVEL`] absent, which maps to
+/// [`super::staleness::AnchorState::Absent`] — the "adopt-and-record" path in
+/// [`super::staleness::temporal_anchor_state`], never a false refusal.
+///
+/// # Gate 1 — not adopted (Finding 1)
+///
+/// Compares canonicalized `root` against `ghost_root` (the gix-discovered
+/// worktree workdir, already computed by the caller) instead of re-deriving via
+/// `resolve_repo_toplevel` (a hand-rolled ancestor walk that ignores env vars).
+/// When `root == ghost_root` (plain single-root repo, or gix discovery failed
+/// and the fallback `ghost_root = root` is in force), the function deletes any
+/// stale anchor row and returns — zero DB reads for all plain-repo users.
+///
+/// # Finding 5 — stale anchor cleanup
+///
+/// When Gate 1 fires (NotAdopted), any pre-existing [`rskim_search::META_GIT_TOPLEVEL`]
+/// row is deleted so a leftover anchor from a prior invocation cannot trigger
+/// false re-anchor refusals on subsequent queries.
+///
+/// # PF-017 — anchor-write guard on `Refuse` policy
+///
+/// When `reanchor == ReanchorPolicy::Refuse` and the DB already holds a
+/// *different* anchor value, the write is skipped with a debug notice.  This
+/// prevents the auto-refresh path (a plain lexical query that happens to
+/// trigger a HEAD-stale rebuild) from silently retargeting a linked-worktree DB
+/// whose anchor was set by a prior explicit `--build` or `--rebuild`.
+fn record_temporal_anchor(
+    db: &TemporalDb,
+    root: &Path,
+    ghost_root: &Path,
+    reanchor: super::staleness::ReanchorPolicy,
+) {
+    // Gate 1: is root a proper subdirectory of ghost_root?
+    // When gix discovery failed, ghost_root == root (caller's unwrap_or fallback),
+    // so canonicalize equality holds → NotAdopted → correct no-op per D5.
+    let adopted = root
+        .canonicalize()
+        .ok()
+        .zip(ghost_root.canonicalize().ok())
+        .is_some_and(|(r, g)| r != g);
+    // debug_assert: gix's ghost_root and the hand-rolled resolve_repo_toplevel
+    // must agree on the adopted repository toplevel so that the scope prefix
+    // derived from ghost_root stays consistent with temporal_anchor_state Gate 1.
+    // A mismatch here signals that gix::discover and the ancestor walk have
+    // drifted — catching it in tests prevents silent temporal data misattribution
+    // (finding F3a).
+    debug_assert_eq!(
+        super::gitdir::resolve_repo_toplevel(root)
+            .as_deref()
+            .unwrap_or(root)
+            .canonicalize()
+            .ok(),
+        ghost_root.canonicalize().ok(),
+        "record_temporal_anchor: ghost_root {:?} disagrees with hand-rolled \
+         resolve_repo_toplevel for root {:?}",
+        ghost_root,
+        root,
+    );
+    if !adopted {
+        // Finding 5: remove any stale anchor from a previous invocation so it
+        // cannot drive false refusals on the next query-path anchor check.
+        let _ = db
+            .delete_meta(rskim_search::META_GIT_TOPLEVEL)
+            .inspect_err(|e| {
+                if crate::debug::is_debug_enabled() {
+                    eprintln!("skim search [debug]: temporal anchor clear failed (non-fatal): {e}");
+                }
+            });
+        return;
+    }
+    // Canonicalize before storing so the recorded path agrees with the live
+    // path returned by `resolve_repo_toplevel` (which calls `.canonicalize()`).
+    // On macOS, `gix::discover` can return `/var/...` while the live path is
+    // `/private/var/...` — without this step the anchor comparison always
+    // disagrees on `/tmp`-rooted temp dirs and the anchor check is unreliable.
+    let canonical_ghost = ghost_root
+        .canonicalize()
+        .unwrap_or_else(|_| ghost_root.to_path_buf());
+    let Some(top_str) = canonical_ghost.to_str() else {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal anchor: git workdir path is not valid \
+                 UTF-8, skipping anchor write"
+            );
+        }
+        return;
+    };
+    // PF-017: Refuse policy — if the DB already has a *different* anchor value,
+    // skip the write.  The auto-refresh path must not silently retarget a DB
+    // anchored by a prior explicit build arm.  Use `skim search --rebuild` to
+    // force re-anchoring.
+    if reanchor == super::staleness::ReanchorPolicy::Refuse
+        && let Ok(Some(existing)) = db.get_meta(rskim_search::META_GIT_TOPLEVEL)
+        && existing.as_str() != top_str
+    {
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: temporal anchor write skipped \
+                 (Refuse policy, anchor would change from {:?} to {:?}); \
+                 use `skim search --rebuild` to re-anchor (PF-017)",
+                existing, top_str,
+            );
+        }
+        return;
+    }
+    if let Err(e) = db.set_meta(rskim_search::META_GIT_TOPLEVEL, top_str)
+        && crate::debug::is_debug_enabled()
+    {
+        eprintln!("skim search [debug]: temporal anchor write failed (non-fatal): {e}");
+    }
 }
 
 /// Return the current Unix epoch timestamp in seconds.

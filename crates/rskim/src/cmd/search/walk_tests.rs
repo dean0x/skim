@@ -1615,3 +1615,77 @@ fn test_merge_tracked_union_truncates_to_smallest_k() {
          after union+truncation (AD-402-2 / PF-012)"
     );
 }
+
+// ============================================================================
+// #413 / AC28 / S28 — Both gitdir resolvers agree
+// ============================================================================
+
+/// AC28 / S28 — `walk::resolve_git_index_path` must return the correct
+/// per-worktree git index path for (1) a plain repo, (2) a linked worktree,
+/// and (3) a non-git directory.
+///
+/// Post-consolidation invariant (AD-413-12): `resolve_git_index_path` is now
+/// `staleness::resolve_git_dir(root).map(|d| d.join("index"))` — a direct
+/// delegation, not a parallel implementation.  Asserting that the two calls
+/// agree would be vacuous by construction; each case instead pins the expected
+/// concrete path so a future refactor that drifts from the correct semantics
+/// will actually fail.
+///
+/// For a linked worktree the correct path is the **per-worktree**
+/// `.git/worktrees/<name>/index` — NOT the common gitdir's index — because
+/// git's index (staging area) is scoped to the worktree, not the repository.
+#[test]
+fn test_both_gitdir_resolvers_agree() {
+    use super::super::staleness::{create_real_git_repo, create_real_git_worktree};
+    use std::path::PathBuf;
+
+    let dir = tempfile::tempdir().unwrap();
+    // macOS: /var is a symlink to /private/var; tempdir() returns the uncanonicalized
+    // path but git resolves paths canonically.  Canonicalize once so all expected paths
+    // match what the resolver produces (#413 Fix 4).
+    let base = dir.path().canonicalize().unwrap();
+
+    // Case 1: plain git repo — index is at <root>/.git/index.
+    let plain = base.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    create_real_git_repo(&plain, &[("init", &[("a.rs", "fn a(){}\n")])]);
+
+    let walk_result: Option<PathBuf> = super::resolve_git_index_path(&plain);
+    assert_eq!(
+        walk_result,
+        Some(plain.join(".git").join("index")),
+        "AC28 case 1 (plain repo): index must be at <root>/.git/index"
+    );
+
+    // Case 2: linked worktree — index is at the per-worktree gitdir
+    // (<primary>/.git/worktrees/<name>/index), NOT the common .git/index.
+    let primary = base.join("primary");
+    let worktree = base.join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+    create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, "b1");
+
+    let walk_wt: Option<PathBuf> = super::resolve_git_index_path(&worktree);
+    // git names the per-worktree gitdir after the worktree directory's basename.
+    let expected_wt_index = primary
+        .join(".git")
+        .join("worktrees")
+        .join("wt1")
+        .join("index");
+    assert_eq!(
+        walk_wt,
+        Some(expected_wt_index),
+        "AC28 case 2 (linked worktree): index must be at \
+         <primary>/.git/worktrees/wt1/index; got walk_wt={walk_wt:?}"
+    );
+
+    // Case 3: non-git directory — resolver returns None.
+    let non_git = base.join("non_git");
+    fs::create_dir_all(&non_git).unwrap();
+
+    let walk_ng: Option<PathBuf> = super::resolve_git_index_path(&non_git);
+    assert!(
+        walk_ng.is_none(),
+        "AC28 case 3: resolver must return None for a non-git dir; got walk_ng={walk_ng:?}"
+    );
+}

@@ -13,6 +13,7 @@ use std::process::Command;
 use rskim_search::{CommitInfo, FileChangeInfo, FileRiskScores, FileTemporalStats, HistoryResult};
 use tempfile::tempdir;
 
+use super::super::staleness::ReanchorPolicy;
 use super::{
     build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
     rebuild_temporal_with_source, rel_is_regular_file,
@@ -448,7 +449,10 @@ fn test_rebuild_temporal_head_full_sha_and_fresh() {
 /// AC7 — Temporal failure on non-git directory does NOT fail lexical query.
 ///
 /// Discriminating: rebuild_temporal returns Ok(()) on a non-git dir AND
-/// temporal.db is NOT created (no data to write on a non-git root).
+/// temporal.db IS created with META_GIT_HEAD set (Finding 2 / D5 backoff:
+/// parse_history failure falls through with empty rows so META_GIT_HEAD is
+/// written, preventing temporal_db_is_stale from returning true on every
+/// subsequent query and triggering an infinite rebuild retry loop).
 #[test]
 fn test_rebuild_temporal_nongit_returns_ok() {
     let dir = tempdir().unwrap();
@@ -456,23 +460,40 @@ fn test_rebuild_temporal_nongit_returns_ok() {
     std::fs::create_dir_all(&cache_dir).unwrap();
 
     // No git repo here — GixSource::parse_history will fail.
+    let fake_head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     let now = super::current_epoch_secs();
-    let result = rebuild_temporal(
-        dir.path(),
-        &cache_dir,
-        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        now,
-    );
+    let result = rebuild_temporal(dir.path(), &cache_dir, fake_head, now);
 
     assert!(
         result.is_ok(),
         "rebuild_temporal must return Ok(()) on non-git directory (AC7), got: {result:?}"
     );
-    // temporal.db must NOT be created — parse_history fails before TemporalDb::open.
+    // temporal.db MUST be created even when parse_history fails: the empty-row
+    // fall-through writes META_GIT_HEAD so temporal_db_is_stale returns false
+    // on subsequent queries, breaking the per-query rebuild retry loop.
     let db_path = cache_dir.join("temporal.db");
     assert!(
-        !db_path.exists(),
-        "temporal.db must not be created on non-git root (AC7 postcondition)"
+        db_path.exists(),
+        "temporal.db must be created on non-git root to prevent retry loop (Finding 2)"
+    );
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .expect("META_GIT_HEAD must be set even when parse_history failed");
+    assert_eq!(
+        stored, fake_head,
+        "META_GIT_HEAD must equal the passed head on non-git root"
+    );
+    assert!(
+        db.top_hotspots(20).unwrap().is_empty(),
+        "temporal.db on non-git root must have zero hotspot rows"
+    );
+    // The backoff sentinel must NOT be written — parse_history failure is handled
+    // via the empty-row fall-through, not the sentinel path.
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "backoff sentinel must not be written when parse_history fall-through succeeds"
     );
 }
 
@@ -1135,7 +1156,14 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
     let now = super::current_epoch_secs();
 
     // First call: empty history — must write present-but-empty temporal.db.
-    let result1 = rebuild_temporal_with_source(&src, dir.path(), &cache_dir, fake_head, now);
+    let result1 = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
     assert!(
         result1.is_ok(),
         "rebuild_temporal_with_source on empty-history repo must return Ok (non-fatal), got: {result1:?}"
@@ -1171,7 +1199,14 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
     // caller (auto_refresh_if_stale) will NOT call rebuild_temporal again.
     // We call rebuild_temporal_with_source a second time to confirm idempotency.
     let src2 = CountingSource::new_empty();
-    let result2 = rebuild_temporal_with_source(&src2, dir.path(), &cache_dir, fake_head, now);
+    let result2 = rebuild_temporal_with_source(
+        &src2,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
     assert!(
         result2.is_ok(),
         "second rebuild_temporal_with_source on empty-history repo must return Ok, got: {result2:?}"
@@ -1258,6 +1293,139 @@ impl rskim_search::TemporalSource for CountingSource {
     }
 }
 
+/// A `TemporalSource` test double that always returns a `SearchError::Git` error.
+///
+/// Used to simulate the exposure widened by #413: `resolve_repo_toplevel` (naive
+/// `.git`-exists walk) adopts roots that `gix::discover` (respects filesystem
+/// boundaries) refuses, so HEAD resolves but `parse_history` fails.
+struct FailingSource;
+
+impl rskim_search::TemporalSource for FailingSource {
+    fn parse_history(
+        &self,
+        _repo_path: &std::path::Path,
+        _lookback_days: u32,
+    ) -> rskim_search::Result<rskim_search::HistoryResult> {
+        Err(rskim_search::SearchError::Git(
+            "simulated parse_history failure (#413 test)".to_string(),
+        ))
+    }
+}
+
+/// API CONTRACT (parse_history failure no-loop): When `TemporalSource::parse_history`
+/// returns an error, `rebuild_temporal_with_source` must fall through with empty rows
+/// and write a present-but-empty `temporal.db` with `META_GIT_HEAD` set — preventing
+/// the per-query rebuild retry loop that would otherwise occur because
+/// `temporal_db_is_stale` returns `true` whenever `META_GIT_HEAD` is absent.
+///
+/// This is the primary exposure widened by #413: `resolve_repo_toplevel` (naive
+/// `.git`-exists ancestor walk) adopts roots that `gix::discover` (respects
+/// filesystem boundaries and ceiling directories) refuses.  Before this fix, a
+/// bare `warn_skip!` returned `Ok(())` before `TemporalDb::open`, leaving
+/// `temporal.db` absent so `temporal_db_is_stale` fired on every subsequent query
+/// and the full-history walk was re-attempted forever.
+///
+/// Discriminating: `META_GIT_HEAD` is set so `temporal_db_is_stale` returns
+/// `false` after the call.
+#[test]
+fn test_parse_history_failure_writes_meta_head_to_prevent_retry_loop() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = FailingSource;
+    let fake_head = "cccc2222cccc2222cccc2222cccc2222cccc2222";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "rebuild_temporal_with_source must return Ok(()) when parse_history fails (D5), got: {result:?}"
+    );
+
+    // temporal.db MUST be written with META_GIT_HEAD so temporal_db_is_stale
+    // returns false on the next query — no retry loop.
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "temporal.db must be created even when parse_history fails (Finding 2 / D5 backoff)"
+    );
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .expect("META_GIT_HEAD must be set so temporal_db_is_stale returns false");
+    assert_eq!(
+        stored, fake_head,
+        "META_GIT_HEAD must equal the passed head even when parse_history failed"
+    );
+    assert!(
+        db.top_hotspots(20).unwrap().is_empty(),
+        "temporal.db written after parse_history failure must have zero hotspot rows"
+    );
+
+    // The backoff sentinel must NOT be written — the empty-row fall-through
+    // writes META_GIT_HEAD directly, making the sentinel unnecessary.
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "backoff sentinel must not be written when the empty-row fall-through succeeds"
+    );
+
+    // Idempotency: second call sees META_GIT_HEAD matches — no retry.
+    // (In production this is checked by temporal_db_is_stale, not by a second
+    // rebuild_temporal_with_source call; we verify stability here.)
+    let src2 = FailingSource;
+    let result2 = rebuild_temporal_with_source(
+        &src2,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result2.is_ok(),
+        "second rebuild_temporal_with_source after parse_history failure must return Ok, got: {result2:?}"
+    );
+    // DB still present and HEAD unchanged (idempotent).
+    assert!(db_path.exists());
+    {
+        let db2 = rskim_search::TemporalDb::open(&db_path).unwrap();
+        let stored2 = db2.get_meta(rskim_search::META_GIT_HEAD).unwrap().unwrap();
+        assert_eq!(
+            stored2, fake_head,
+            "META_GIT_HEAD must be stable across calls"
+        );
+    }
+}
+
+/// A `TemporalSource` test double that returns a fixed, pre-built `HistoryResult`
+/// on every call.
+///
+/// Used by the AD-413-17 scope-filter tests to inject deterministic commit data
+/// without relying on gix or a real git repo's history — decoupling the scope-filter
+/// logic under test from the history-parsing layer.
+struct FixedSource {
+    history: rskim_search::HistoryResult,
+}
+
+impl rskim_search::TemporalSource for FixedSource {
+    fn parse_history(
+        &self,
+        _repo_path: &std::path::Path,
+        _lookback_days: u32,
+    ) -> rskim_search::Result<rskim_search::HistoryResult> {
+        Ok(self.history.clone())
+    }
+}
+
 /// PERFORMANCE (ADR-003): parse_history is invoked exactly ONCE during a
 /// rebuild_temporal_with_source call on a real git repo.
 ///
@@ -1287,7 +1455,14 @@ fn test_rebuild_temporal_parse_history_called_once() {
     let src = CountingSource::new_real();
     let now = super::current_epoch_secs();
 
-    let result = rebuild_temporal_with_source(&src, dir.path(), &cache_dir, &head, now);
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Allow,
+    );
     assert!(
         result.is_ok(),
         "rebuild_temporal_with_source must succeed on a real git repo, got: {result:?}"
@@ -1486,43 +1661,59 @@ fn test_ghost_filter_containment_guard() {
 }
 
 /// Regression: ghost filter must NOT false-drop rows when `root` is a
-/// subdirectory of the git worktree (AD-408-5).
+/// subdirectory of the git worktree (AD-408-5), and the AD-413-17 scope filter
+/// must re-anchor surviving paths to be root-relative.
 ///
-/// Before the fix, `apply_ghost_filter` joined REPO-ROOT-relative paths against
-/// the search `root` subdir, double-nesting the prefix and causing every row to
-/// fail `is_file()`. With the fix, paths are joined against the discovered git
-/// workdir (the true repo root), so present files are correctly retained.
+/// Before the AD-408-5 fix, `apply_ghost_filter` joined REPO-ROOT-relative paths
+/// against the search `root` subdir, double-nesting the prefix and causing every
+/// row to fail `is_file()`:
 ///
-/// Failure scenario (pre-fix):
-///   `skim search --hot --root <repo>/subdir`
-///   → gix discovers `<repo>` from `subdir`, emits `src/lib.rs`
-///   → ghost filter: `subdir.join("src/lib.rs")` = `<repo>/subdir/src/lib.rs`
+/// Failure scenario (pre-AD-408-5-fix):
+///   `skim search --hot --root <repo>/sub`
+///   → gix discovers `<repo>` from `sub`, emits `sub/src/lib.rs`
+///   → ghost filter (old): `sub.join("sub/src/lib.rs")` = `<repo>/sub/sub/src/lib.rs`
 ///     (double-nested; file does not exist there)
 ///   → all rows dropped; `--hot` returns empty output with exit 0 (silent loss).
 ///
-/// Discriminating: without the fix every hotspot row is false-ghosted; with the
-/// fix `src/lib.rs` is retained because `<workdir>.join("src/lib.rs")` exists.
+/// With the AD-408-5 fix, paths are joined against `ghost_root` (the discovered
+/// git workdir), so `<repo>/sub/src/lib.rs` exists and is retained.
+///
+/// The AD-413-17 scope filter then strips the `sub/` prefix so the stored path
+/// is root-relative (`src/lib.rs`), matching what a lexical query on the same
+/// root would return.
+///
+/// Files outside the `sub/` scope (e.g. top-level `a.rs`) are correctly excluded
+/// by the scope filter — this is intentional: one `--root`, one result universe.
+///
+/// Discriminating: without the ghost-filter fix every hotspot row is false-ghosted
+/// (double-path → `is_file()` miss); with it the row survives and after the scope
+/// filter the stored path is `src/lib.rs`, not `sub/src/lib.rs`.
 #[test]
 fn test_ghost_filter_subdir_root_rows_survive() {
     let dir = tempdir().unwrap();
     let cache_dir = dir.path().join("cache");
     std::fs::create_dir_all(&cache_dir).unwrap();
 
-    // Create a real git repo at dir.path() and commit `src/lib.rs` there.
-    // These paths are REPO-ROOT-relative from gix's perspective.
+    // Create a real git repo at dir.path() and commit `sub/src/lib.rs` there.
+    // The file is INSIDE the `sub/` subtree; gix reports it as `sub/src/lib.rs`
+    // (REPO-ROOT-relative).  Also commit `a.rs` at the repo root so we can
+    // assert it is absent from results (AD-413-17 scope filter: one root, one
+    // result universe).
     let head = create_real_git_repo(
         dir.path(),
         &[
-            ("feat: add lib", &[("src/lib.rs", "pub fn a() {}")]),
-            ("feat: update lib", &[("src/lib.rs", "pub fn b() {}")]),
+            (
+                "feat: add lib",
+                &[("sub/src/lib.rs", "pub fn a() {}"), ("a.rs", "fn top() {}")],
+            ),
+            ("feat: update lib", &[("sub/src/lib.rs", "pub fn b() {}")]),
         ],
     );
 
-    // Create a subdirectory and use it as the search root — simulating
-    // `skim search --hot --root <repo>/subdir`.
-    // `src/lib.rs` does NOT exist under `subdir`; it exists under `dir.path()`.
-    let subdir = dir.path().join("subdir");
-    std::fs::create_dir_all(&subdir).unwrap();
+    // Use `sub` as the search root — simulating
+    // `skim search --hot --root <repo>/sub`.
+    // `create_real_git_repo` already created `dir.path()/sub/src/lib.rs` on disk.
+    let subdir = dir.path().join("sub");
 
     let now = super::current_epoch_secs();
     rebuild_temporal(&subdir, &cache_dir, &head, now).unwrap();
@@ -1539,11 +1730,24 @@ fn test_ghost_filter_subdir_root_rows_survive() {
         hotspots.len()
     );
 
+    // AD-413-17: paths must be root-relative (prefix stripped), not repo-relative.
     let lib_present = hotspots.iter().any(|r| r.file_path == "src/lib.rs");
     assert!(
         lib_present,
-        "src/lib.rs must survive the ghost filter when rebuild root is a subdirectory \
-         of the worktree (paths are repo-root-relative from gix)"
+        "src/lib.rs must survive with root-relative path after ghost filter + scope filter \
+         (AD-408-5 / AD-413-17: gix emits repo-root-relative `sub/src/lib.rs`; \
+         scope filter strips `sub/` prefix yielding `src/lib.rs`); \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // AD-413-17: the out-of-scope top-level file must NOT appear.
+    let out_of_scope = hotspots.iter().any(|r| r.file_path == "a.rs");
+    assert!(
+        !out_of_scope,
+        "a.rs lives outside sub/ and must be excluded by the AD-413-17 scope filter \
+         (one --root, one result universe); hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
     );
 }
 
@@ -1665,4 +1869,510 @@ fn test_ghost_filter_coldspot_limit_no_underfill() {
             "AC4: ghost file '{name}' must not appear in top_coldspots"
         );
     }
+}
+
+// ============================================================================
+// PF-017 — Refuse policy must not overwrite a differing temporal anchor
+// ============================================================================
+
+/// PF-017 regression: `ReanchorPolicy::Refuse` must not overwrite an existing
+/// [`rskim_search::META_GIT_TOPLEVEL`] anchor that differs from the live
+/// `ghost_root`.
+///
+/// Without the PF-017 gate in `record_temporal_anchor`, a plain lexical query
+/// whose HEAD changed could trigger an auto-refresh rebuild, and that rebuild
+/// would silently overwrite the anchor set by a prior explicit `--rebuild` —
+/// corrupting the per-worktree isolation invariant (AD-413-16 / ADR-009).
+///
+/// Method:
+/// 1. Create a real git repo so `discover_git_workdir` can find it.
+/// 2. Create a plain subdirectory inside the repo.
+/// 3. Rebuild with `root = subdir`, `Allow` → anchor is written (adopted case).
+/// 4. Overwrite the anchor with a sentinel (`/pf017-sentinel/...`) to simulate
+///    a DB anchored to a *different* linked-worktree root.
+/// 5. Rebuild again with `Refuse` → PF-017 guard must block the write.
+/// 6. Assert the anchor is still the sentinel.
+///
+/// The test skips gracefully when the subdirectory adoption check does not fire
+/// (e.g. `gix::discover` returns `None` so `ghost_root` falls back to `root`);
+/// that scenario cannot exercise the PF-017 guard and is not a regression.
+#[test]
+fn test_pf017_refuse_policy_does_not_overwrite_anchor() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join(".cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Step 1: real git repo so discover_git_workdir returns dir.path().
+    let head = create_real_git_repo(
+        dir.path(),
+        &[("feat: initial", &[("src/lib.rs", "fn main() {}")])],
+    );
+
+    // Step 2: plain subdirectory — not a separate git repo.
+    let sub_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+
+    let now = super::current_epoch_secs();
+
+    // Step 3: Allow rebuild with root = sub_dir.
+    let src1 = CountingSource::new_empty();
+    let r1 = rebuild_temporal_with_source(
+        &src1,
+        &sub_dir,
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(r1.is_ok(), "Allow rebuild must succeed: {r1:?}");
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let anchor_after_allow = db
+        .get_meta(rskim_search::META_GIT_TOPLEVEL)
+        .expect("get_meta must not fail");
+
+    // If adopted check did not fire (ghost_root fallback == root), there is no
+    // anchor to protect and the PF-017 guard path is never reached — skip.
+    let Some(_live_anchor) = anchor_after_allow else {
+        return;
+    };
+
+    // Step 4: overwrite with a sentinel representing a different repo.
+    const SENTINEL: &str = "/pf017-sentinel/other/repo";
+    db.set_meta(rskim_search::META_GIT_TOPLEVEL, SENTINEL)
+        .expect("sentinel write must succeed");
+    drop(db);
+
+    // Step 5: Refuse rebuild — PF-017 gate must block the anchor overwrite.
+    let src2 = CountingSource::new_empty();
+    let r2 = rebuild_temporal_with_source(
+        &src2,
+        &sub_dir,
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Refuse,
+    );
+    assert!(r2.is_ok(), "Refuse rebuild must succeed: {r2:?}");
+
+    // Step 6: anchor must still be the sentinel.
+    let db2 = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let anchor_after_refuse = db2
+        .get_meta(rskim_search::META_GIT_TOPLEVEL)
+        .expect("get_meta must not fail after Refuse rebuild")
+        .expect("anchor must remain present after Refuse rebuild");
+    assert_eq!(
+        anchor_after_refuse, SENTINEL,
+        "PF-017 regression: Refuse policy must not overwrite a differing anchor \
+         (sentinel={SENTINEL:?}, overwritten_to={anchor_after_refuse:?})"
+    );
+}
+
+// ============================================================================
+// AD-413-17 scope-filter unit tests (S36)
+// ============================================================================
+
+/// AD-413-17: `apply_scope_filter` retains and re-anchors ALL THREE row types
+/// (hotspot, risk, cochange) when `root` is a proper subdirectory of the git
+/// worktree.
+///
+/// # Fixture layout
+///
+/// ```text
+/// <dir>/
+///   .git/                     ← git workdir (ghost_root)
+///   sub/
+///     foo.rs                  ← inside scope; 3 commits (1 fix)
+///     bar.rs                  ← inside scope; 2 commits
+///     baz.rs                  ← inside scope; 1 commit
+///   a.rs                      ← OUTSIDE scope; 2 commits
+/// ```
+///
+/// Fake commits (repo-root-relative paths, as gix would report them):
+///
+/// | # | message            | files                     |
+/// |---|--------------------|---------------------------|
+/// | 1 | fix: fix foo       | sub/foo.rs                |
+/// | 2 | feat: update sub   | sub/foo.rs, sub/bar.rs    |
+/// | 3 | feat: update sub again | sub/foo.rs, sub/bar.rs |
+/// | 4 | feat: update a     | a.rs                      |
+/// | 5 | feat: cross boundary | a.rs, sub/baz.rs        |
+///
+/// Expected cochange pairs produced by `build_cochange_rows`:
+/// - `(sub/bar.rs, sub/foo.rs)`: count=2, Jaccard=2/3≈0.67 ≥ 0.10 → retained
+/// - `(a.rs, sub/baz.rs)`: count=1, Jaccard=1/2=0.50 ≥ 0.10 → cross-boundary → dropped
+///
+/// # Assertions
+///
+/// **hotspot:** `foo.rs`, `bar.rs`, `baz.rs` present (prefix stripped); `a.rs` absent;
+/// no path retains the `sub/` prefix.
+///
+/// **risk:** `foo.rs` present (only file with a fix commit, so risk rows include it);
+/// `a.rs` absent; no path retains the `sub/` prefix.
+///
+/// **cochange:** `(bar.rs, foo.rs)` present (both sides inside scope, both rewritten);
+/// no partner for `baz.rs` (cross-boundary pair `(a.rs, sub/baz.rs)` dropped);
+/// no path retains the `sub/` prefix.
+///
+/// # Reverted behaviour (discriminating)
+///
+/// - Delete `risk_rows.retain_mut` from `apply_scope_filter` → `a.rs` appears in
+///   risk results and this test fails.
+/// - Delete `cochange_rows.retain_mut` from `apply_scope_filter` → the cross-boundary
+///   pair `(a.rs, sub/baz.rs)` survives (unreachable path on the query side) and the
+///   `bar.rs` partner check fails because stored paths still carry the `sub/` prefix.
+/// - Delete `hotspot_rows.retain_mut` → `a.rs` appears in hotspot results.
+#[test]
+fn test_temporal_rows_are_scoped_and_reanchored_to_subdir_root() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a real git repo at dir.path() so that discover_git_workdir(sub_dir)
+    // resolves to dir.path() (ghost_root == dir.path()).  The commit also writes
+    // the actual files to disk so apply_ghost_filter does NOT false-drop any row
+    // (rel_is_regular_file checks disk existence against ghost_root).
+    let head = create_real_git_repo(
+        dir.path(),
+        &[(
+            "feat: seed all files",
+            &[
+                ("sub/foo.rs", "pub fn foo() {}"),
+                ("sub/bar.rs", "pub fn bar() {}"),
+                ("sub/baz.rs", "pub fn baz() {}"),
+                ("a.rs", "fn a() {}"),
+            ],
+        )],
+    );
+
+    // Pinned epoch (same as other tests referencing "2026-06-13 08:00:00 UTC").
+    let now_epoch: u64 = 1_781_337_600;
+
+    // Handcrafted commits using repo-root-relative paths, matching what gix
+    // reports.  Commit 1 is a fix commit (message starts with "fix:") so
+    // sub/foo.rs acquires fix_density > 0 and a risk row.
+    let commits = vec![
+        make_commit(
+            "aaa0000001",
+            now_epoch as i64 - 86400 * 3,
+            "fix: fix foo",
+            &["sub/foo.rs"],
+        ),
+        make_commit(
+            "aaa0000002",
+            now_epoch as i64 - 86400 * 2,
+            "feat: update sub",
+            &["sub/foo.rs", "sub/bar.rs"],
+        ),
+        make_commit(
+            "aaa0000003",
+            now_epoch as i64 - 86400,
+            "feat: update sub again",
+            &["sub/foo.rs", "sub/bar.rs"],
+        ),
+        make_commit(
+            "aaa0000004",
+            now_epoch as i64 - 86400 * 5,
+            "feat: update a",
+            &["a.rs"],
+        ),
+        // This commit creates a cross-boundary cochange pair (a.rs, sub/baz.rs).
+        // The scope filter must drop it because a.rs is outside sub/.
+        make_commit(
+            "aaa0000005",
+            now_epoch as i64 - 86400 * 6,
+            "feat: cross boundary",
+            &["a.rs", "sub/baz.rs"],
+        ),
+    ];
+
+    let src = FixedSource {
+        history: make_history(commits),
+    };
+    let sub_dir = dir.path().join("sub");
+    rebuild_temporal_with_source(
+        &src,
+        &sub_dir,
+        &cache_dir,
+        &head,
+        now_epoch,
+        ReanchorPolicy::Allow,
+    )
+    .expect("rebuild_temporal_with_source must succeed for subdir root");
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).expect("temporal.db must be openable");
+
+    // ── hotspot rows ─────────────────────────────────────────────────────────
+    let hotspots = db.top_hotspots(50).expect("top_hotspots must not fail");
+
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "foo.rs"),
+        "AD-413-17: foo.rs must appear in hotspots after scope filter strips sub/ prefix; \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "bar.rs"),
+        "AD-413-17: bar.rs must appear in hotspots after scope filter strips sub/ prefix; \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "baz.rs"),
+        "AD-413-17: baz.rs must appear in hotspots after scope filter strips sub/ prefix; \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        hotspots.iter().all(|r| r.file_path != "a.rs"),
+        "AD-413-17: a.rs is outside sub/ scope and must be absent from hotspots; \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        hotspots.iter().all(|r| !r.file_path.starts_with("sub/")),
+        "AD-413-17: no hotspot path must retain the sub/ prefix after reanchoring; \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // ── risk rows ─────────────────────────────────────────────────────────────
+    // Only files with at least one commit appear in risk_rows; foo.rs is the only
+    // file with a fix commit so it must carry risk_score > 0 and fix_density > 0.
+    let risks = db.top_risks(50).expect("top_risks must not fail");
+
+    assert!(
+        risks.iter().any(|r| r.file_path == "foo.rs"),
+        "AD-413-17: foo.rs must appear in risk rows after scope filter strips sub/ prefix; \
+         risk paths: {:?}",
+        risks.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    // foo.rs has 1 fix commit out of 3 total → fix_density > 0.
+    let foo_risk = risks.iter().find(|r| r.file_path == "foo.rs").unwrap();
+    assert!(
+        foo_risk.fix_density > 0.0,
+        "AD-413-17: foo.rs fix_density must be > 0 (has 1 fix commit); got {}",
+        foo_risk.fix_density
+    );
+    assert!(
+        risks.iter().all(|r| r.file_path != "a.rs"),
+        "AD-413-17: a.rs is outside sub/ scope and must be absent from risk rows; \
+         risk paths: {:?}",
+        risks.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        risks.iter().all(|r| !r.file_path.starts_with("sub/")),
+        "AD-413-17: no risk path must retain the sub/ prefix after reanchoring; \
+         risk paths: {:?}",
+        risks.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // ── cochange rows ─────────────────────────────────────────────────────────
+    // (bar.rs, foo.rs): both inside scope, count=2, Jaccard=2/3≈0.67 → retained +
+    // rewritten.
+    let foo_partners = db
+        .cochanges_for_file("foo.rs")
+        .expect("cochanges_for_file(foo.rs) must not fail");
+    let bar_partner = foo_partners
+        .iter()
+        .find(|r| r.file_a == "bar.rs" || r.file_b == "bar.rs");
+    assert!(
+        bar_partner.is_some(),
+        "AD-413-17: cochange pair (bar.rs, foo.rs) must be retained and rewritten by scope \
+         filter (both sides inside sub/); foo.rs partners: {:?}",
+        foo_partners
+    );
+    // (a.rs, sub/baz.rs) cross-boundary: scope filter drops it (cochange both-sides rule).
+    let baz_partners = db
+        .cochanges_for_file("baz.rs")
+        .expect("cochanges_for_file(baz.rs) must not fail");
+    let a_partner = baz_partners
+        .iter()
+        .find(|r| r.file_a == "a.rs" || r.file_b == "a.rs");
+    assert!(
+        a_partner.is_none(),
+        "AD-413-17: cross-boundary pair (a.rs, baz.rs) must be dropped by scope filter \
+         (cochange both-sides rule — a.rs is outside sub/); baz.rs partners: {:?}",
+        baz_partners
+    );
+    // No cochange path must retain the sub/ prefix.
+    let all_partners: Vec<_> = foo_partners.iter().chain(baz_partners.iter()).collect();
+    assert!(
+        all_partners
+            .iter()
+            .all(|r| !r.file_a.starts_with("sub/") && !r.file_b.starts_with("sub/")),
+        "AD-413-17: no cochange path must retain the sub/ prefix after reanchoring; \
+         found: {:?}",
+        all_partners
+    );
+}
+
+/// AD-413-17: when `root == ghost_root` (a plain toplevel repository, no subdirectory),
+/// `scope` is `None` and `apply_scope_filter` is never called.
+///
+/// The stored rows are therefore byte-identical to the pre-AD-413-17 state —
+/// every computed row survives, every path retains its original form, and in
+/// particular the repository's hottest file (`a.rs`, touched by more commits
+/// than any file under `sub/`) appears first in hotspot results when the root is
+/// the toplevel repository.
+///
+/// # Discriminating
+///
+/// If `scope` were accidentally non-`None` for a toplevel root (e.g., an empty
+/// string passed as a prefix), `apply_scope_filter` would be called.  A
+/// non-empty prefix would silently drop every row; an empty prefix used in
+/// `starts_with("")` would always return `true` but `drain(..0)` is a no-op,
+/// so rows would survive — but this test guards the whole identity path by also
+/// asserting that `a.rs` (the out-of-`sub/`-scope file) IS present, which is
+/// the exact row that `test_temporal_rows_are_scoped_and_reanchored_to_subdir_root`
+/// asserts is absent when the root is `sub/`.
+#[test]
+fn test_toplevel_root_rows_are_byte_identical_to_pre_change() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Real git repo at dir.path(): discover_git_workdir(dir.path()) returns
+    // dir.path() itself, so canonical(root).strip_prefix(canonical(ghost_root))
+    // yields an empty path → scope = None → apply_scope_filter is never called.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[(
+            "feat: seed all files",
+            &[
+                ("a.rs", "fn a() {}"),
+                ("sub/foo.rs", "pub fn foo() {}"),
+                ("sub/bar.rs", "pub fn bar() {}"),
+            ],
+        )],
+    );
+
+    let now_epoch: u64 = 1_781_337_600;
+
+    // a.rs is given strictly more commits than any sub/ file so it ranks first
+    // in hotspots — matching AD-413-17's fixture requirement that the hottest
+    // file lives OUTSIDE the sub/ subtree.
+    let commits = vec![
+        make_commit(
+            "bbb0000001",
+            now_epoch as i64 - 86400 * 5,
+            "fix: fix a",
+            &["a.rs"],
+        ),
+        make_commit(
+            "bbb0000002",
+            now_epoch as i64 - 86400 * 4,
+            "fix: fix a again",
+            &["a.rs"],
+        ),
+        make_commit(
+            "bbb0000003",
+            now_epoch as i64 - 86400 * 3,
+            "fix: fix a third time",
+            &["a.rs"],
+        ),
+        make_commit(
+            "bbb0000004",
+            now_epoch as i64 - 86400 * 2,
+            "feat: update sub/foo",
+            &["sub/foo.rs"],
+        ),
+        // Co-change pair entirely inside sub/: both sides survive at both the
+        // toplevel root (identity) and the sub/ root (scope filter rewrites them).
+        make_commit(
+            "bbb0000005",
+            now_epoch as i64 - 86400,
+            "feat: update both sub files",
+            &["sub/foo.rs", "sub/bar.rs"],
+        ),
+    ];
+
+    let src = FixedSource {
+        history: make_history(commits),
+    };
+    rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        &head,
+        now_epoch,
+        ReanchorPolicy::Allow,
+    )
+    .expect("rebuild_temporal_with_source must succeed for toplevel root");
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).expect("temporal.db must be openable");
+
+    // ── hotspot rows (identity path: all rows survive unchanged) ─────────────
+    let hotspots = db.top_hotspots(50).expect("top_hotspots must not fail");
+
+    // a.rs must be present — it is the hottest file in the repo-wide history.
+    // This is the core identity assertion: a.rs would be absent if scope were
+    // incorrectly applied for a toplevel root.
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "a.rs"),
+        "AD-413-17 identity: a.rs must appear in hotspots for toplevel root \
+         (scope filter must NOT run when root == ghost_root); \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    // sub/foo.rs and sub/bar.rs must appear with their full repo-relative paths
+    // (NOT stripped to foo.rs / bar.rs — scope filter is the identity).
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "sub/foo.rs"),
+        "AD-413-17 identity: sub/foo.rs must appear with its full repo-relative path \
+         (scope filter must NOT strip the sub/ prefix for a toplevel root); \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "sub/bar.rs"),
+        "AD-413-17 identity: sub/bar.rs must appear with its full repo-relative path; \
+         hotspot paths: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // ── risk rows (identity path) ─────────────────────────────────────────────
+    let risks = db.top_risks(50).expect("top_risks must not fail");
+
+    assert!(
+        risks.iter().any(|r| r.file_path == "a.rs"),
+        "AD-413-17 identity: a.rs must appear in risk rows for toplevel root; \
+         risk paths: {:?}",
+        risks.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+    // a.rs has 3 fix commits out of 3 → fix_density == 1.0.
+    let a_risk = risks.iter().find(|r| r.file_path == "a.rs").unwrap();
+    assert!(
+        (a_risk.fix_density - 1.0_f64).abs() < 1e-9,
+        "AD-413-17 identity: a.rs fix_density must be 1.0 (3 fix commits / 3 total); \
+         got {}",
+        a_risk.fix_density
+    );
+    // sub/foo.rs must appear with its full path (not stripped).
+    assert!(
+        risks.iter().any(|r| r.file_path == "sub/foo.rs"),
+        "AD-413-17 identity: sub/foo.rs must appear in risk rows with full path; \
+         risk paths: {:?}",
+        risks.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // ── cochange rows (identity path) ─────────────────────────────────────────
+    // (sub/bar.rs, sub/foo.rs): count=1, Jaccard=1/(2+2-1)=0.33 ≥ 0.10 → present
+    // with FULL repo-relative paths (scope filter is the identity for toplevel root).
+    let foo_partners = db
+        .cochanges_for_file("sub/foo.rs")
+        .expect("cochanges_for_file(sub/foo.rs) must not fail");
+    let bar_partner = foo_partners
+        .iter()
+        .find(|r| r.file_a == "sub/bar.rs" || r.file_b == "sub/bar.rs");
+    assert!(
+        bar_partner.is_some(),
+        "AD-413-17 identity: cochange pair (sub/bar.rs, sub/foo.rs) must appear with full \
+         repo-relative paths for a toplevel root (scope filter must NOT rewrite paths); \
+         sub/foo.rs partners: {:?}",
+        foo_partners
+    );
 }

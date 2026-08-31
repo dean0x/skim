@@ -7,9 +7,10 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    TemporalQueryOutput, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
-    enrich_ast_results, format_temporal_json, format_temporal_text, normalize_blast_radius_path,
-    open_temporal_db, query_standalone, resort_window,
+    HeadState, TemporalQueryOutput, TemporalUnavailable, apply_temporal_enrichment,
+    bounded_page_notice, check_temporal_staleness, enrich_ast_results, format_temporal_json,
+    format_temporal_text, normalize_blast_radius_path, open_temporal_db, open_temporal_db_for,
+    query_standalone, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -160,6 +161,103 @@ fn open_temporal_db_missing_returns_none() {
     let dir = TempDir::new().unwrap();
     let nonexistent = dir.path().join("nonexistent.db");
     assert!(open_temporal_db(&nonexistent).is_none());
+}
+
+/// AD-413-16: `open_temporal_db_for` must return `Err(AnchorDiffers)` when the
+/// temporal.db was built for a different repository root.
+///
+/// Setup:
+/// - `outer` = a fake git root (has `.git/HEAD`) so `resolve_repo_toplevel(root)` resolves.
+/// - `root`  = `outer/sub/` — a subdirectory (no `.git` of its own).
+/// - `cache_dir` = a fresh temp dir whose `temporal.db` has a `git_toplevel` row
+///   pointing to `/wrong/repo/path`, which differs from the live `outer` toplevel.
+///
+/// The test does NOT require a real `git` binary — the toplevel is discovered by
+/// walking for `.git`, which the fake outer dir provides.
+#[test]
+fn open_temporal_db_for_anchor_differs_returns_err() {
+    // Outer dir acts as the git repo root (has .git/HEAD).
+    let outer = TempDir::new().unwrap();
+    let git_dir = outer.path().join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // root is a subdirectory inside the "git repo".
+    let root = outer.path().join("sub");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // cache_dir with temporal.db that records a wrong git_toplevel.
+    let cache = TempDir::new().unwrap();
+    let db_path = cache.path().join("temporal.db");
+    drop(TemporalDb::open(&db_path).unwrap());
+    crate::cmd::search::staleness::plant_meta_raw(
+        &db_path,
+        rskim_search::META_GIT_TOPLEVEL,
+        "/wrong/repo/path",
+    );
+
+    let result = open_temporal_db_for(&root, cache.path());
+    assert!(
+        matches!(result, Err(TemporalUnavailable::AnchorDiffers { .. })),
+        "AD-413-16: open_temporal_db_for must return Err(AnchorDiffers) \
+         when temporal.db belongs to a different repo, got: {result:?}"
+    );
+}
+
+/// AD-413-16: `resolve_blast_radius_paths` must return `Ok(Some(empty_set))`
+/// (not `Ok(None)`, not an error) when the temporal DB was written for a
+/// different repository.  An empty allowlist forces zero results on all
+/// blast-radius callers; `Ok(None)` would be misread as "not requested".
+///
+/// Uses the same fake-git-root fixture as `open_temporal_db_for_anchor_differs_returns_err`
+/// to trigger `AnchorState::Differs` inside the funnel.
+#[test]
+fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
+    // Outer dir acts as the git repo root.
+    let outer = TempDir::new().unwrap();
+    let git_dir = outer.path().join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // root is a subdirectory; no .git of its own.
+    let root = outer.path().join("sub");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // cache_dir with temporal.db containing a wrong git_toplevel.
+    let cache = TempDir::new().unwrap();
+    let db_path = cache.path().join("temporal.db");
+    drop(TemporalDb::open(&db_path).unwrap());
+    crate::cmd::search::staleness::plant_meta_raw(
+        &db_path,
+        rskim_search::META_GIT_TOPLEVEL,
+        "/wrong/repo/path",
+    );
+
+    // blast_radius path does not need to exist — the anchor guard fires before
+    // path normalization.
+    let result = super::resolve_blast_radius_paths(
+        Some("src/auth.rs"),
+        &root,
+        cache.path(),
+        false,
+        &HeadState::NotARepo,
+    );
+    assert!(
+        result.is_ok(),
+        "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"
+    );
+    let paths = result.unwrap();
+    assert!(
+        paths.is_some(),
+        "AD-413-16: resolve_blast_radius_paths must return Ok(Some(empty_set)) on \
+         AnchorDiffers, not Ok(None) — None overloads the 'not requested' sentinel \
+         (PF-016 / AD-413-16)"
+    );
+    assert!(
+        paths.unwrap().is_empty(),
+        "AD-413-16: the returned set must be empty — wrong-repo anchor forces zero results \
+         on all blast-radius arms"
+    );
 }
 
 #[test]

@@ -128,8 +128,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-empty human summary reads `N result(s) for "query" in Tms` (previously
   `N result(s) in Tms`) so a mangled query can never masquerade as a successful search.
   JSON output is unchanged.
+- **`git_head_state` in `skim search --stats --json`** (#413) — the `--stats --json`
+  object now includes a `"git_head_state"` string key alongside the existing
+  `"git_head"` key.  Values: `"resolved"` (HEAD resolves to a SHA), `"unresolved"`
+  (HEAD exists but cannot be resolved to a commit — unborn branch or reftable backend),
+  `"not_a_repo"` (root is not inside a git repository).  Unlike `"git_head"` (which
+  is the SHA stored at the last index build), `"git_head_state"` reflects the live
+  resolution status at call time and can legitimately diverge from `"git_head"` before
+  the first post-upgrade rebuild (e.g. a linked worktree with `"git_head": null` and
+  `"git_head_state": "resolved"`).  Additive — all pre-existing keys are byte-identical
+  on upgrade; the key is absent from the `{"error": "no index found"}` object (AC21).
 
 ### Fixed
+- **`skim search` linked worktree HEAD resolution and temporal data** (#413) — in a
+  repository with linked worktrees (`git worktree add`), `skim search` read HEAD from
+  the per-worktree `.git` file and then attempted to resolve the symbolic ref in the same
+  directory, finding nothing.  The result was `git HEAD : (none)`, a zero-byte temporal
+  database, and `--hot`/`--cold`/`--risky` serving no temporal data in the linked worktree
+  even though the history was fully present in the primary clone.  Fixed by following the
+  `commondir` pointer from the per-worktree git dir to the shared repository, resolving the
+  ref in the common directory's ref namespaces (loose refs then `packed-refs`).  Also fixes
+  `--install-hooks`/`--remove-hooks` in a linked worktree (previously died with
+  `Not a directory (os error 20)`): hooks now route to the shared `<commondir>/hooks`
+  directory and both commands disclose the shared scope on stderr.  First-query cost after
+  upgrade: one rebuild of `temporal.db` (previously the DB was absent or frozen).
+  `--root <subdirectory-of-a-repo>` now also adopts the enclosing repository's HEAD
+  instead of reporting no temporal data.
+- **`skim search` symbolic-ref path validation tightened** (#482) — a `HEAD` file
+  containing `ref: refs/../../../outside-sha` (a path that starts with `refs/` but
+  escapes the git directory via `..` components) was read and its out-of-tree SHA was
+  persisted into `index.skfiles` and `temporal.db`.  Fixed by applying the ADR-008
+  canonical guard (`is_repo_relative_safe`) in addition to the existing `refs/` prefix
+  check, so any symbolic-ref path containing `..`, an absolute root `/`, or a Windows
+  prefix is rejected before the file is opened.
 - **`skim search --near` silently dropped when `--phrase` was also set** (#403):
   Two independent layers each had the same bug: reader.rs used `if want_phrase { phrase_alignments } else { near_match }`,
   and query.rs used `if phrase { Phrase } else if near { Near }`.  In both cases `--near N`
@@ -185,6 +216,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON
   output gains optional `line` and `snippet` fields — additive, so existing consumers of
   `path`/`score` are unaffected. (#201)
+- **`--root <subdirectory-of-a-repo>` now resolves the enclosing repository** (#413) —
+  a `--root` that is a subdirectory of a git repository adopts that repository's HEAD
+  (bounded ancestor walk, nearest match) and therefore builds real temporal data, where
+  it previously reported `git HEAD : (none)` and `no temporal data`.  The temporal rows
+  are scoped and re-anchored to the indexed subtree, so one `--root` is one result
+  universe: every temporal arm returns only paths inside the subtree, and `--blast-radius`
+  co-change peers outside it are dropped.  Pass the repository toplevel as `--root` for
+  repository-wide ranking.  The repository that produced the rows is recorded as
+  `meta.git_toplevel`; if the enclosing repository later changes, temporal arms refuse
+  (no rows served, `temporal.db` byte-unchanged, exit 0) instead of silently rescoring —
+  `--build`/`--rebuild`/`--update` re-anchor and disclose the old and the new toplevel.
+  A subdirectory root gains its own `temporal.db`, so its first build walks history once.
+  Staleness for adopted roots is scoped to a working-tree metadata scan (mtime + size)
+  rather than a HEAD-SHA comparison: a commit that touches only files OUTSIDE the
+  subtree does not trigger a rebuild of the subdirectory index, because the repo-wide
+  HEAD advancing is not evidence that the subtree changed.
+- **`skim search --install-hooks`/`--remove-hooks` now resolve git's own hooks directory**
+  (#413) — the hooks path is resolved through the `commondir` chain (matching
+  `git rev-parse --git-path hooks`) instead of being hand-built as `<root>/.git/hooks`.
+  In a linked worktree this is the shared `<commondir>/hooks`, so installing or removing
+  from one worktree changes hook behaviour for **every worktree** of the clone; both
+  commands print the absolute resolved directory and disclose that scope on stderr, and
+  `--remove-hooks` no longer prints a success line when nothing was removed.  Plain
+  repositories and non-repository roots resolve to the same path as before.
+  A `--root` that is a subdirectory of a git repository but has no `.git` entry of
+  its own is **refused** — the command exits with an error naming the enclosing
+  repository so the caller can re-run with the correct `--root`.
+- **`skim search` temporal-arm degradation messages are now reason-specific** (#413) —
+  previously, all "no temporal data" conditions on `--hot`/`--cold`/`--risky`/
+  `--blast-radius` (and the temporal path of `--ast`) emitted a single generic message:
+  `"no temporal data — run 'skim search' on a git repo to auto-populate"`.  That
+  message is now reserved for the non-git case (root is not inside any git repository).
+  Three reason-specific messages replace it for the remaining conditions:
+  (1) **Unresolved HEAD** (unborn branch or reftable backend): starts with
+  `"git HEAD could not be resolved to a SHA"`;
+  (2) **Resolved HEAD, empty temporal build** (no git-log entries for the root):
+  starts with `"git HEAD resolved but the temporal build produced no data"`;
+  (3) **Resolved HEAD, anchor mismatch** (on-disk `temporal.db` was built from a
+  different repository): starts with `"temporal data on disk was built from a
+  different repository"`.
+  Scripts or automation that matched the previous generic text will not match
+  conditions (1)–(3); the stable prefix of each new message is the named constant
+  in source (`HEAD_UNRESOLVED_TEMPORAL_MSG`, `TEMPORAL_BUILD_EMPTY_MSG`,
+  `SUBDIR_ROOT_TEMPORAL_MSG`) for tests that need a reliable assertion target.
 
 ### Fixed
 - **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit

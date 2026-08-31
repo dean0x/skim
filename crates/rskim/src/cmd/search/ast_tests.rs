@@ -1488,6 +1488,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 /// AST matches (filtered_count == unfiltered_count), failing the strict-subset assertion.
 #[test]
 fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
+    use super::super::gitdir::HeadState;
     use super::super::manifest::FileManifest;
     use rskim_search::FileId;
 
@@ -1557,9 +1558,10 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     let blast_fids = super::super::temporal::resolve_blast_radius_file_ids(
         Some("src/plain.rs"),
         project.path(),
-        &db_path,
+        cache.path(), // cache_dir, not db_path — signature changed in #413 (#413 Fix 3)
         &sorted,
         false,
+        &HeadState::NotARepo,
     )
     .unwrap();
 
@@ -1625,13 +1627,16 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     // --- Step 5: Graceful-degrade — absent temporal DB → full AST set, exit 0, no error ---
     // When the temporal DB is missing, resolve_blast_radius_file_ids returns None and
     // run_ast_standalone returns the full AST result set (no intersection).
-    let absent_db = cache.path().join("no_such_temporal.db");
+    // Use a fresh empty tempdir as cache_dir — the function looks for temporal.db
+    // inside the directory, so an empty dir correctly simulates an absent DB (#413 Fix 3).
+    let absent_cache = tempfile::tempdir().unwrap();
     let degrade_blast_fids = super::super::temporal::resolve_blast_radius_file_ids(
         Some("src/plain.rs"),
         project.path(),
-        &absent_db,
+        absent_cache.path(), // empty cache_dir → no temporal.db → Absent → Ok(None)
         &sorted,
         false,
+        &HeadState::NotARepo,
     )
     .unwrap();
     // When the DB is absent, resolve_blast_radius_file_ids returns None.

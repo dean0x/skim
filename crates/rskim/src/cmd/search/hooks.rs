@@ -19,7 +19,7 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
 
@@ -33,62 +33,379 @@ const HOOK_BLOCK: &str =
     "# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end";
 const SHEBANG: &str = "#!/bin/sh";
 
+/// User-facing notice emitted when the resolved hooks directory is the shared
+/// `<commondir>/hooks` (every worktree of the clone shares it).
+///
+/// Named constant so the two emit sites (`install_search_hooks` and
+/// `remove_search_hooks`) cannot drift — per the project convention established
+/// by `NO_TEMPORAL_DATA_MSG` in `mod.rs` (#357 cycle-2 finding 2).
+pub(super) const SHARED_HOOKS_SCOPE_MSG: &str =
+    "skim search: this hooks directory is shared by every worktree of this clone";
+
 /// Hook filenames to install into.
 const HOOK_NAMES: &[&str] = &["post-commit", "post-merge", "post-checkout"];
+
+// ============================================================================
+// Outcome type
+// ============================================================================
+
+/// Outcome of a hooks install or remove operation.
+///
+/// Returned by [`install_search_hooks`] and [`remove_search_hooks`] so every
+/// caller — including `skim init` — receives the resolved directory without
+/// requiring a separate [`resolve_hooks_dir`] call.
+///
+/// The shared-scope notice (AC34(b)) is emitted by the operation itself;
+/// callers receive `dir` for their own path-disclosure messages and `changed`
+/// for suppression of empty-operation output.
+#[derive(Debug)]
+pub(crate) struct HooksOutcome {
+    /// The resolved hooks directory (the directory written to or read from).
+    pub dir: PathBuf,
+    /// `true` when the operation actually changed at least one hook file.
+    ///
+    /// For `install_search_hooks`: `true` means at least one hook was created
+    /// or had the skim block appended.  `false` means every hook already
+    /// contained the markers (idempotent no-op).
+    ///
+    /// For `remove_search_hooks`: `true` means at least one marker block was
+    /// found and removed.  `false` means no block was present.
+    pub changed: bool,
+    /// `true` when the resolved hooks directory is the shared `<commondir>/hooks`
+    /// of a linked-worktree clone — every worktree of this clone shares it.
+    ///
+    /// `false` for plain repos, submodules, and true non-repos: their hooks
+    /// directory is private and clone-wide sharing does NOT apply.
+    ///
+    /// Callers use this flag (not a path-inequality heuristic) to gate the
+    /// AC34(b) scope-disclosure line so that submodule roots — whose gitdir
+    /// is `<super>/.git/modules/<name>` and therefore differs from the
+    /// hand-built `<root>/.git/hooks` even though nothing is shared — do not
+    /// incorrectly receive the "shared by every worktree" notice.
+    pub shared: bool,
+}
+
+// ============================================================================
+// Hooks directory resolver
+// ============================================================================
+
+/// AD-413-15: resolve the hooks directory for the given project root.
+///
+/// Returns `None` when `project_root` has no `.git` entry of its own but IS
+/// inside an enclosing git repository (i.e.
+/// [`staleness::resolve_repo_toplevel`] finds an ancestor).  Callers
+/// **must not** create the directory in this case: doing so would fabricate a
+/// `<root>/.git` directory that permanently disables ancestor adoption
+/// ([`staleness::resolve_repo_toplevel`] refuses to walk past an existing
+/// `.git` entry — AC17, PF-017) and silently kills the temporal layer.
+///
+/// For a linked worktree, routes to the shared `<commondir>/hooks` directory
+/// so `install_search_hooks`, `remove_search_hooks`, and `has_search_hooks`
+/// can never disagree about where the hooks live (they all call this function).
+///
+/// For a plain repo (`.git` is a directory) or a **true** non-repo root (no
+/// enclosing repository either), returns `Some(<root>/.git/hooks)` —
+/// byte-identical to the pre-#413 behavior.  The true-non-repo case covers
+/// the bare temp directories `hooks_tests.rs` creates; those are never inside
+/// any real git clone so no fabricated `.git` harm is possible.
+///
+/// **Submodules also move, deliberately.** A submodule's `.git` is a *file* whose
+/// gitdir is `<super>/.git/modules/<name>`, so the pre-#413 hand-built path
+/// `<sub>/.git/hooks` did not exist and both install and `has_search_hooks` were
+/// silently broken there too.  This resolver returns `<super>/.git/modules/<name>/hooks`,
+/// which is what `git -C <sub> rev-parse --git-path hooks` reports — a fix, not a
+/// regression (the submodule gitdir is a complete ref store with no `commondir`,
+/// so no redirection happens; only the `.git`-file indirection is followed).
+///
+/// **Write-path security (AD-413-3 extension):** when `.git` is a FILE, the
+/// `gitdir:` pointer is untrusted, repository-controlled input (ADR-008).
+/// The resolver applies a two-stage gate before using any derived path as a
+/// write destination:
+///
+/// 1. [`staleness::resolve_common_dir`] is tried first — it is already validated
+///    by the AD-413-3 sanity gate (`HEAD` is_file + is_dir).  When it resolves,
+///    the result is used directly (this is the normal linked-worktree path).
+/// 2. If the commondir is absent (submodule, or unusual gitdir), the gitdir
+///    itself must pass [`looks_like_git_dir`] (`HEAD` is_file plus `objects/`
+///    and `refs/` subdirectories) before skim writes into it.  A malicious
+///    pointer to an arbitrary directory — e.g. `~/Library/LaunchAgents` — has
+///    no `objects/` or `refs/`, so it fails the gate and skim falls back to the
+///    safe local `<root>/.git/hooks`.
+pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Option<PathBuf> {
+    match super::staleness::resolve_git_dir(project_root) {
+        Some(git_dir) => {
+            let dot_git = project_root.join(".git");
+            if dot_git.is_file() {
+                // `.git` is a FILE — the resolved gitdir is untrusted,
+                // repository-controlled input.  Apply the AD-413-3 write-path
+                // sanity gate in two stages before using any derived path as a
+                // write destination.
+                //
+                // Stage 1: try the commondir.  `resolve_common_dir` validates
+                // it (is_dir + HEAD is_file — the existing AD-413-3 gate).
+                // A real linked worktree always has a commondir, so this is the
+                // expected fast path.
+                if let Some(common) = super::staleness::resolve_common_dir(&git_dir) {
+                    return Some(common.join("hooks"));
+                }
+                // Stage 2: no commondir (submodule gitdir, or an unusual
+                // configuration).  The gitdir itself must look like a complete
+                // git directory (HEAD + objects/ + refs/) before skim writes
+                // into it.  A linked-worktree per-worktree gitdir does NOT have
+                // objects/ or refs/ (those live in the primary .git/), so it
+                // correctly fails this check — but it always resolves via the
+                // commondir in Stage 1 above.
+                if !looks_like_git_dir(&git_dir) {
+                    if crate::debug::is_debug_enabled() {
+                        eprintln!(
+                            "skim search [debug]: gitdir {git_dir:?} failed the AD-413-3 \
+                             write-path sanity gate (HEAD + objects/ + refs/ required); \
+                             falling back to local hooks path"
+                        );
+                    }
+                    // Safe fallback: contained inside the project root.
+                    return Some(project_root.join(".git").join("hooks"));
+                }
+                Some(git_dir.join("hooks"))
+            } else {
+                // `.git` is a directory — already known to exist on disk and is
+                // therefore a trustworthy base path.  Follow the commondir if
+                // present (plain repos typically have none), otherwise use
+                // git_dir directly.
+                Some(
+                    super::staleness::resolve_common_dir(&git_dir)
+                        .unwrap_or(git_dir)
+                        .join("hooks"),
+                )
+            }
+        }
+        None => {
+            // No `.git` at this root.  Check whether the root is a subdirectory
+            // of an enclosing git repository.
+            //
+            // If it IS inside a repo, return None.  The caller must refuse:
+            // creating `<root>/.git/hooks` here would permanently break ancestor
+            // adoption and make the temporal layer silently dead (PF-017 + the
+            // review finding that led to this change).
+            //
+            // If it is NOT inside any repo (true non-repo, e.g. the bare temp
+            // dirs that hooks_tests creates), return the pre-#413 fallback —
+            // creating an empty `.git/hooks` there is safe because no ancestor
+            // adoption can be disrupted.
+            if super::staleness::resolve_repo_toplevel(project_root).is_some() {
+                return None;
+            }
+            Some(project_root.join(".git").join("hooks"))
+        }
+    }
+}
+
+/// Return `true` if `path` looks like a complete git directory.
+///
+/// Requires all three:
+/// - `path` itself is a directory,
+/// - `path/HEAD` is a file,
+/// - `path/objects/` is a directory,
+/// - `path/refs/` is a directory.
+///
+/// Used as the AD-413-3 write-path sanity gate for gitdir pointers that
+/// arrived via an untrusted `gitdir:` file.  A linked-worktree per-worktree
+/// gitdir (`<primary>/.git/worktrees/<name>/`) has `HEAD` but NOT `objects/`
+/// or `refs/` (those belong to the primary repo), so it correctly FAILS this
+/// check — in that case skim always reaches the write destination through
+/// `commondir` (Stage 1 of `resolve_hooks_dir`), never through this gate.
+fn looks_like_git_dir(path: &Path) -> bool {
+    path.is_dir()
+        && path.join("HEAD").is_file()
+        && path.join("objects").is_dir()
+        && path.join("refs").is_dir()
+}
+
+/// Return `true` when a `commondir` redirect is in effect for `project_root`,
+/// meaning every linked worktree of this clone shares the same hooks directory.
+///
+/// Uses the same `resolve_git_dir` → `resolve_common_dir` resolution chain that
+/// [`resolve_hooks_dir`]'s Stage 1 follows, so the predicate stays in sync with
+/// the actual write-path logic.
+///
+/// A plain repository (no `commondir` file) returns `false` — it has exactly one
+/// worktree and nothing to share.  A submodule (`.git` is a file but the
+/// referenced gitdir has no `commondir`) also returns `false` — the submodule's
+/// gitdir is a private, self-contained ref store, not a shared anchor.
+///
+/// The previous path-inequality approach (`hooks_dir != root.join(".git/hooks")`)
+/// was incorrect for submodules: `resolve_hooks_dir` reaches
+/// `<super>/.git/modules/<name>/hooks` via the `.git`-file pointer (Stage 2 of
+/// the write-path gate), which differs from the hand-built plain path even though
+/// no clone-wide sharing is occurring.
+fn is_shared_hooks_dir(project_root: &Path, _hooks_dir: &Path) -> bool {
+    super::staleness::resolve_git_dir(project_root)
+        .and_then(|d| super::staleness::resolve_common_dir(&d))
+        .is_some()
+}
 
 // ============================================================================
 // Public API
 // ============================================================================
 
-/// Install skim search hooks in `.git/hooks/` for the given `project_root`.
+/// Install skim search hooks in the resolved hooks directory for `project_root`.
 ///
 /// For each of `post-commit`, `post-merge`, and `post-checkout`:
 /// - If the hook doesn't exist, creates it with `#!/bin/sh` and the skim block.
 /// - If the hook exists but doesn't have the markers, appends the block.
 /// - If the hook already has the markers, leaves it unchanged (idempotent).
 ///
+/// For a linked worktree, the resolved directory is `<commondir>/hooks` (shared
+/// by every worktree of the clone).  For a plain repo, it is `<root>/.git/hooks`
+/// (identical to the pre-413 behavior — AC5b monotonicity).
+///
 /// The hooks directory is created if it doesn't exist.
+///
+/// # Subdirectory roots
+///
+/// Returns `Err` when `project_root` has no `.git` entry of its own but lies
+/// inside an enclosing git repository.  Creating a hooks directory there would
+/// fabricate a `.git` entry and permanently disable ancestor adoption
+/// (PF-017).  The error message names the enclosing repository so the caller
+/// can re-run with the correct `--root`.
+///
+/// # Shared-scope disclosure (AC34(b))
+///
+/// When the resolved hooks directory is the shared `<commondir>/hooks` rather
+/// than the local `<root>/.git/hooks`, this function emits a notice to stderr:
+///
+/// ```text
+/// skim search: this hooks directory is shared by every worktree of this clone
+/// ```
+///
+/// The notice is emitted here — not at the call site — so every caller
+/// (including `skim init`) inherits it automatically without repeating the check.
 ///
 /// # Errors
 ///
-/// Returns `Err` on I/O failures during file creation or modification.
-pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<()> {
-    let hooks_dir = project_root.join(".git").join("hooks");
+/// Returns `Err` on I/O failures during file creation or modification, or when
+/// `project_root` is a subdirectory of a git repository (see above).
+pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<HooksOutcome> {
+    let hooks_dir = match resolve_hooks_dir(project_root) {
+        Some(d) => d,
+        None => {
+            // resolve_hooks_dir returns None only when resolve_git_dir found no
+            // `.git` at this root BUT resolve_repo_toplevel found an enclosing
+            // repo.  Refuse loudly — installing here would create a fake `.git`
+            // that permanently breaks ancestor adoption (PF-017).
+            let ancestor = super::staleness::resolve_repo_toplevel(project_root);
+            let hint = ancestor
+                .map(|p| {
+                    format!(
+                        "; re-run with `--root {}` to install hooks in the enclosing repository",
+                        p.display()
+                    )
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "\"{}\" is a subdirectory of a git repository and cannot itself host git hooks{}",
+                project_root.display(),
+                hint,
+            );
+        }
+    };
     std::fs::create_dir_all(&hooks_dir)?;
 
+    let mut any_changed = false;
     for name in HOOK_NAMES {
         let hook_path = hooks_dir.join(name);
-        install_one_hook(&hook_path)?;
+        any_changed |= install_one_hook(&hook_path)?;
     }
 
-    Ok(())
+    // AC34(b): disclose the clone-wide scope from inside this function so every
+    // caller (including `skim init`) inherits the notice automatically.
+    let shared = is_shared_hooks_dir(project_root, &hooks_dir);
+    if shared {
+        eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
+    }
+
+    Ok(HooksOutcome {
+        dir: hooks_dir,
+        changed: any_changed,
+        shared,
+    })
 }
 
-/// Remove the skim marker block from all search hooks in `project_root`.
+/// Remove the skim marker block from all search hooks for `project_root`.
 ///
 /// For each hook, strips the `# skim-search-start … # skim-search-end` block.
 /// Leaves all other content intact.  Non-fatal: missing hooks are silently skipped.
 ///
+/// # Subdirectory roots
+///
+/// Returns `Err` (symmetric with `install_search_hooks`) when `project_root`
+/// has no `.git` entry of its own but lies inside an enclosing git repository.
+/// The error message names the enclosing repository so the caller can re-run
+/// with the correct `--root`.
+///
+/// # Shared-scope disclosure (AC34(b))
+///
+/// When the resolved hooks directory is the shared `<commondir>/hooks` AND at
+/// least one marker block was removed, this function emits a notice to stderr.
+/// The notice is emitted here so every caller inherits it automatically.
+///
 /// # Errors
 ///
-/// Returns `Err` on I/O failures when reading or writing hook files.
-pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<()> {
-    let hooks_dir = project_root.join(".git").join("hooks");
+/// Returns `Err` on I/O failures when reading or writing hook files, or when
+/// `project_root` is a subdirectory of a git repository (see above).
+pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOutcome> {
+    let hooks_dir = match resolve_hooks_dir(project_root) {
+        Some(d) => d,
+        None => {
+            // Symmetric refusal with install_search_hooks (see comment there).
+            let ancestor = super::staleness::resolve_repo_toplevel(project_root);
+            let hint = ancestor
+                .map(|p| {
+                    format!(
+                        "; re-run with `--root {}` to remove hooks from the enclosing repository",
+                        p.display()
+                    )
+                })
+                .unwrap_or_default();
+            anyhow::bail!(
+                "\"{}\" is a subdirectory of a git repository and cannot itself host git hooks{}",
+                project_root.display(),
+                hint,
+            );
+        }
+    };
+    let mut any_removed = false;
     for name in HOOK_NAMES {
         let hook_path = hooks_dir.join(name);
         if hook_path.exists() {
-            remove_from_hook(&hook_path)?;
+            any_removed |= remove_from_hook(&hook_path)?;
         }
     }
-    Ok(())
+    // AC34(b): disclose the clone-wide scope only when something was actually
+    // removed — mirrors the conditional disclosure in `run_remove_hooks`.
+    let shared = is_shared_hooks_dir(project_root, &hooks_dir);
+    if any_removed && shared {
+        eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
+    }
+    Ok(HooksOutcome {
+        dir: hooks_dir,
+        changed: any_removed,
+        shared,
+    })
 }
 
 /// Return `true` if any of the search hook files contain the skim markers.
 ///
+/// Returns `false` when `project_root` is a subdirectory of a git repository
+/// (no hooks can have been installed there — `install_search_hooks` refuses
+/// such roots).
+///
 /// Used in tests and by external callers that check hook installation state.
 #[allow(dead_code)]
 pub(crate) fn has_search_hooks(project_root: &Path) -> bool {
-    let hooks_dir = project_root.join(".git").join("hooks");
+    let Some(hooks_dir) = resolve_hooks_dir(project_root) else {
+        return false;
+    };
     HOOK_NAMES.iter().any(|name| {
         let p = hooks_dir.join(name);
         std::fs::read_to_string(&p)
@@ -102,12 +419,15 @@ pub(crate) fn has_search_hooks(project_root: &Path) -> bool {
 // ============================================================================
 
 /// Install the skim block into a single hook file.
-fn install_one_hook(hook_path: &Path) -> anyhow::Result<()> {
+///
+/// Returns `true` if the file was created or had the block appended;
+/// `false` if the skim markers were already present (idempotent no-op).
+fn install_one_hook(hook_path: &Path) -> anyhow::Result<bool> {
     if hook_path.exists() {
         let content = std::fs::read_to_string(hook_path)?;
         // Idempotent: if markers already present, skip.
         if content.contains(MARKER_START) {
-            return Ok(());
+            return Ok(false);
         }
         // Append block to existing hook.
         let new_content = append_block(&content);
@@ -117,18 +437,21 @@ fn install_one_hook(hook_path: &Path) -> anyhow::Result<()> {
         let content = format!("{SHEBANG}\n{HOOK_BLOCK}\n");
         write_hook_atomic(hook_path, &content)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Strip the skim marker block from a hook file.
-fn remove_from_hook(hook_path: &Path) -> anyhow::Result<()> {
+///
+/// Returns `true` if a marker block was found and removed; `false` if the file
+/// contained no skim markers (no-op).
+fn remove_from_hook(hook_path: &Path) -> anyhow::Result<bool> {
     let content = std::fs::read_to_string(hook_path)?;
     if !content.contains(MARKER_START) {
-        return Ok(()); // Nothing to remove.
+        return Ok(false); // Nothing to remove.
     }
     let stripped = strip_block(&content);
     write_hook_atomic(hook_path, &stripped)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Append the skim block to existing hook content.

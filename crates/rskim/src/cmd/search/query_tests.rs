@@ -927,6 +927,70 @@ fn test_positional_cochange_only_peer_is_dropped() {
 }
 
 // ============================================================================
+// AD-413-16: empty-allowlist (AnchorDiffers) early-out in composite query
+//
+// When blast_radius_paths is Some(empty_set) — produced by resolve_blast_radius_paths
+// on AnchorDiffers (wrong-repo temporal DB) — run_blast_radius_composite_query MUST
+// return zero results rather than degrading to a full unfiltered lexical search.
+//
+// The pre-fix code used `.unwrap_or_default()` which collapsed Some(empty) into an
+// empty temporal_layer, bypassing the blast-radius filter and returning all lexical
+// matches.  This test is the discriminating regression guard.
+// ============================================================================
+
+/// AD-413-16 regression: empty blast_radius_paths (AnchorDiffers sentinel) must
+/// return zero results, not the full unfiltered lexical result set.
+#[test]
+fn test_blast_radius_empty_allowlist_returns_zero_results() {
+    use std::collections::HashSet;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // Use a project where the query "authenticate" produces lexical results.
+    create_test_project(&root);
+
+    // Some(empty) = AnchorDiffers sentinel — wrong repo DB.
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(HashSet::new()), // empty allowlist → AnchorDiffers path
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AD-413-16: empty allowlist MUST yield zero results.
+    // Before the fix, this returned all lexical "authenticate" matches (up to limit)
+    // because Some(empty) collapsed to an empty temporal_layer via unwrap_or_default(),
+    // effectively disabling the blast-radius filter.
+    assert!(
+        output.results.is_empty(),
+        "AD-413-16: empty blast_radius_paths must return zero results (not full lexical set); \
+         got {} results: {:?}",
+        output.results.len(),
+        output
+            .results
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output.total, 0,
+        "AD-413-16: total must be 0 for empty allowlist"
+    );
+}
+
+// ============================================================================
 // format_json_output
 // ============================================================================
 

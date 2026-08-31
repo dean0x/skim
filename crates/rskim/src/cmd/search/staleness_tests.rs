@@ -7,8 +7,8 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    StalenessCheck, auto_refresh_if_stale, check_staleness, read_git_head, resolve_git_dir,
-    temporal_db_is_stale,
+    HeadState, ReanchorPolicy, StalenessCheck, TEMPORAL_META_READ_COUNT, auto_refresh_if_stale,
+    check_staleness, git_head_state, read_git_head, resolve_git_dir, temporal_db_is_stale,
 };
 
 // Minimal analytics config for tests — analytics recording is disabled.
@@ -230,6 +230,11 @@ fn test_read_git_head_detached_head_raw_sha() {
     let dir = tempdir().unwrap();
     let sha = "abcdef1234567890abcdef1234567890abcdef12";
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+    // AC5a precondition: no commondir file (ensures the commondir ladder is not in play).
+    assert!(
+        !dir.path().join(".git").join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
 
     let result = read_git_head(dir.path());
     assert_eq!(result.as_deref(), Some(sha));
@@ -241,6 +246,11 @@ fn test_read_git_head_follows_symbolic_ref_to_loose_ref() {
     let sha = "deadbeef12345678deadbeef12345678deadbeef";
     create_fake_git_repo(dir.path(), "ref: refs/heads/main\n");
     create_ref_file(dir.path(), "refs/heads/main", sha);
+    // AC5a precondition: no commondir file.
+    assert!(
+        !dir.path().join(".git").join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
 
     let result = read_git_head(dir.path());
     assert_eq!(result.as_deref(), Some(sha));
@@ -256,6 +266,11 @@ fn test_read_git_head_falls_back_to_packed_refs() {
         dir.path(),
         &format!("# pack-refs with: peeled fully-peeled sorted\n{sha} refs/heads/feature\n"),
     );
+    // AC5a precondition: no commondir file.
+    assert!(
+        !dir.path().join(".git").join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
 
     let result = read_git_head(dir.path());
     assert_eq!(result.as_deref(), Some(sha));
@@ -269,6 +284,11 @@ fn test_read_git_head_loose_ref_takes_priority_over_packed() {
     create_fake_git_repo(dir.path(), "ref: refs/heads/main\n");
     create_ref_file(dir.path(), "refs/heads/main", loose_sha);
     write_packed_refs(dir.path(), &format!("{packed_sha} refs/heads/main\n"));
+    // AC5a precondition: no commondir file.
+    assert!(
+        !dir.path().join(".git").join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
 
     let result = read_git_head(dir.path());
     assert_eq!(
@@ -283,11 +303,71 @@ fn test_read_git_head_rejects_path_traversal_ref() {
     let dir = tempdir().unwrap();
     // Crafted HEAD that tries to escape the git dir via path traversal.
     create_fake_git_repo(dir.path(), "ref: ../../etc/shadow\n");
+    // AC5a precondition: no commondir file.
+    assert!(
+        !dir.path().join(".git").join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
 
     let result = read_git_head(dir.path());
     assert!(
         result.is_none(),
         "path traversal ref should be rejected, got {result:?}"
+    );
+}
+
+/// AC9 / S9 — a ref path starting with `refs/` but containing `..` components
+/// (three levels, e.g. `refs/../../../outside-sha`) escapes the git directory.
+/// The old `starts_with("refs/")` guard did not normalise `..` and would read
+/// the out-of-tree file and persist its SHA.  AD-413-6 closes the hole.
+///
+/// MANDATORY PRECONDITION (PF-007): `git_dir.join(ref_path)` must be an existing
+/// file — without it the test is vacuous (the old code returns `None` because the
+/// file is absent, not because the guard fired).
+#[test]
+fn test_read_git_head_rejects_ref_path_escaping_the_git_dir() {
+    // Build:  <parent>/
+    //           repo/.git/refs/  ← project root with a real .git/refs dir
+    //           outside-sha      ← the escape target planted at parent level
+    let parent = tempdir().unwrap();
+    let project_root = parent.path().join("repo");
+    let git_dir = project_root.join(".git");
+    fs::create_dir_all(git_dir.join("refs")).unwrap();
+
+    // Plant the escape SHA outside the project root.
+    let escape_sha = "2".repeat(40);
+    let escape_target = parent.path().join("outside-sha");
+    fs::write(&escape_target, format!("{escape_sha}\n")).unwrap();
+
+    // The ref path starts with "refs/" (passes the old prefix-only guard) but
+    // has three ".." components that walk up past the git dir and the project root.
+    let ref_path = "refs/../../../outside-sha";
+
+    // MANDATORY PRECONDITION: assert the escape target is actually reachable via
+    // git_dir.join(ref_path) so the test fails pre-fix, not vacuously.
+    assert!(
+        git_dir.join(ref_path).exists(),
+        "precondition: git_dir.join(ref_path) must reach the escape target — \
+         if this fails the OS cannot resolve the path and the test is vacuous"
+    );
+    // AC5a precondition: no commondir file (case vi of six no-commondir sub-cases).
+    assert!(
+        !git_dir.join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
+
+    fs::write(git_dir.join("HEAD"), format!("ref: {ref_path}\n")).unwrap();
+
+    let result = read_git_head(&project_root);
+    assert!(
+        result.is_none(),
+        "ref path escaping the git dir via '..` must be rejected, got {result:?}"
+    );
+    // Belt-and-suspenders: the escape SHA must never appear in the result.
+    assert_ne!(
+        result.as_deref(),
+        Some(escape_sha.as_str()),
+        "escape SHA must not be returned"
     );
 }
 
@@ -297,6 +377,11 @@ fn test_read_git_head_accepts_sha256_hash() {
     // 64-hex SHA-256 detached HEAD
     let sha256 = "a".repeat(64);
     create_fake_git_repo(dir.path(), &format!("{sha256}\n"));
+    // AC5a precondition: no commondir file (case iv of six no-commondir sub-cases).
+    assert!(
+        !dir.path().join(".git").join("commondir").exists(),
+        "AC5a: no commondir file must be present for the no-redirect case"
+    );
 
     let result = read_git_head(dir.path());
     assert_eq!(
@@ -849,13 +934,13 @@ fn test_v5_manifest_stale_reclassifies_with_new_ad411_field_semantics() {
     // check_staleness: lexical v5 < v7 → stale; manifest v5 ≠ v7 → stale →
     // NoStoredHead → build_index with empty manifest → classify_source fresh.
     let analytics = TEST_ANALYTICS;
-    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
     assert!(
         result.is_ok(),
         "auto_refresh_if_stale must succeed on v5 self-heal: {:?}",
         result.err()
     );
-    let (outcome, rebuilt_manifest) = result.unwrap();
+    let (outcome, rebuilt_manifest, _) = result.unwrap();
     assert!(
         outcome.refreshed(),
         "v5 manifest + v5 lexical must trigger a rebuild \
@@ -1057,7 +1142,8 @@ fn test_auto_refresh_returns_false_when_current() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (outcome, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (outcome, _manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         !outcome.refreshed(),
@@ -1076,7 +1162,8 @@ fn test_auto_refresh_returns_manifest_when_current() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (_outcome, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (_outcome, manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     // The returned manifest should reflect the stored HEAD.
     assert_eq!(
@@ -1103,7 +1190,8 @@ fn test_auto_refresh_rebuilds_on_head_changed() {
     fs::write(git_dir.join("HEAD"), format!("{new_sha}\n")).unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (outcome, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (outcome, manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         outcome.refreshed(),
@@ -1134,7 +1222,8 @@ fn test_auto_refresh_rebuilds_on_no_stored_head() {
     create_fake_git_repo(dir.path(), &format!("{sha}\n"));
 
     let analytics = TEST_ANALYTICS;
-    let (outcome, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (outcome, manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         outcome.refreshed(),
@@ -1160,8 +1249,10 @@ fn test_auto_refresh_non_git_project_no_rebuild_loop() {
     build_index_in(dir.path(), &cache_dir);
 
     let analytics = TEST_ANALYTICS;
-    let (first_outcome, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    let (second_outcome, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (first_outcome, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (second_outcome, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         !first_outcome.refreshed(),
@@ -1200,7 +1291,7 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
     let analytics = TEST_ANALYTICS;
     // auto_refresh_if_stale on a fresh non-git dir: NoIndex → build_index → rebuild_temporal.
     // rebuild_temporal will fail gracefully (no git) and must NOT propagate the error.
-    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
 
     assert!(
         result.is_ok(),
@@ -1209,7 +1300,7 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
     );
 
     // The returned manifest must be valid (lexical index was built).
-    let (_outcome, manifest) = result.unwrap();
+    let (_outcome, manifest, _) = result.unwrap();
     // Non-git project: stored_git_head is None (no git repo).
     assert_eq!(
         manifest.stored_git_head(),
@@ -1241,6 +1332,62 @@ fn test_auto_refresh_hook_temporal_failure_does_not_fail_lexical() {
 /// cycle-2 finding 3).
 fn create_real_git_repo(dir: &std::path::Path, commit_files: &[(&str, &[(&str, &str)])]) -> String {
     super::create_real_git_repo(dir, commit_files)
+}
+
+/// Shared helper: create a linked git worktree.
+///
+/// Delegates to `staleness::create_real_git_worktree`.
+fn create_real_git_worktree(
+    primary: &std::path::Path,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> String {
+    super::create_real_git_worktree(primary, worktree, branch)
+}
+
+/// Shared fixture: create a primary git repo + one linked worktree, returning all
+/// four handles the caller needs.
+///
+/// Encapsulates the 6-line linked-worktree preamble that was duplicated across
+/// 13 test functions (ADR-001 deduplication):
+/// ```
+///     let dir = tempdir().unwrap();
+///     let primary = dir.path().join("primary");
+///     let worktree = dir.path().join("wt1");
+///     fs::create_dir_all(&primary).unwrap();
+///     let head = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+///     create_real_git_worktree(&primary, &worktree, branch);
+/// ```
+///
+/// Returns `(dir, primary, worktree, head_sha)` where:
+/// - `dir` — the `TempDir` root; must be kept alive for the test duration
+/// - `primary` — path to the primary repo (`<dir>/primary`)
+/// - `worktree` — path to the linked worktree (`<dir>/wt1`)
+/// - `head_sha` — 40-char initial commit SHA shared by both primary and worktree
+fn worktree_fixture(
+    branch: &str,
+) -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+) {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree = dir.path().join("wt1");
+    fs::create_dir_all(&primary).unwrap();
+    let head = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary, &worktree, branch);
+    (dir, primary, worktree, head)
+}
+
+/// Shared helper: build `temporal.db` directly (bypassing the lexical pipeline).
+///
+/// Used by the AD-413-16 anchor tests, which need a `temporal.db` that carries a
+/// real `meta.git_toplevel` row without paying for a full index build.
+fn build_temporal_for_test(root: &std::path::Path, cache_dir: &std::path::Path, head: &str) {
+    use crate::cmd::search::temporal_build::{current_epoch_secs, rebuild_temporal};
+    rebuild_temporal(root, cache_dir, head, current_epoch_secs()).expect("rebuild_temporal");
 }
 
 /// AC (hook wiring): auto_refresh_if_stale on a real git repo MUST populate
@@ -1278,13 +1425,13 @@ fn test_auto_refresh_hook_populates_temporal_db_on_real_git_repo() {
 
     // This is the call under test: auto_refresh_if_stale must build the index
     // (NoIndex → build_index) AND populate temporal.db (via rebuild_temporal hook).
-    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+    let result = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
     assert!(
         result.is_ok(),
         "auto_refresh_if_stale must succeed on a real git repo"
     );
 
-    let (outcome, manifest) = result.unwrap();
+    let (outcome, manifest, _) = result.unwrap();
     assert!(
         outcome.is_first_build(),
         "index must have been built (NoIndex → FirstBuild)"
@@ -1350,13 +1497,13 @@ fn test_auto_refresh_temporal_success_does_not_affect_lexical_manifest() {
     let analytics = TEST_ANALYTICS;
 
     // First refresh: builds index + populates temporal.db.
-    let (refreshed1, manifest1) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed1, manifest1, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(refreshed1.refreshed(), "first refresh must build the index");
 
     // Second refresh: index is current — must not rebuild, manifest unchanged.
-    let (refreshed2, manifest2) =
-        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed2, manifest2, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "second refresh must not rebuild (index is current)"
@@ -1639,7 +1786,8 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
     let analytics = TEST_ANALYTICS;
 
     // First call: builds lexical+AST+temporal.
-    let (refreshed1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed1, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(refreshed1.refreshed(), "first call must build the index");
 
     let temporal_db_path = cache_dir.join("temporal.db");
@@ -1657,7 +1805,8 @@ fn test_bug_b_auto_refresh_self_heals_deleted_temporal_db() {
 
     // Second call: lexical is Current, temporal.db is missing.
     // BUG B fix: must self-heal temporal.db before the Current early-return.
-    let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed2, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "lexical must NOT be rebuilt (index is Current) even during temporal self-heal"
@@ -1712,7 +1861,7 @@ fn test_bug_b_auto_refresh_self_heals_head_divergent_temporal_db() {
     let analytics = TEST_ANALYTICS;
 
     // First call: builds everything.
-    auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     let temporal_db_path = cache_dir.join("temporal.db");
     assert!(
@@ -1740,7 +1889,8 @@ fn test_bug_b_auto_refresh_self_heals_head_divergent_temporal_db() {
 
     // Second call: lexical is Current; temporal.db exists but HEAD-divergent.
     // BUG B fix: must detect and self-heal the divergent temporal.db.
-    let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed2, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "lexical must NOT be rebuilt on Current branch"
@@ -1784,7 +1934,7 @@ fn test_bug_b_no_rebuild_loop_when_temporal_is_current() {
     let analytics = TEST_ANALYTICS;
 
     // First call: builds everything including temporal.
-    auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     let temporal_db_path = cache_dir.join("temporal.db");
     assert!(
@@ -1800,7 +1950,8 @@ fn test_bug_b_no_rebuild_loop_when_temporal_is_current() {
 
     // Second call: both lexical and temporal are Current.
     // Must NOT rebuild temporal.db (mtime must stay unchanged).
-    let (refreshed2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed2, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed2.refreshed(),
         "second call must not rebuild lexical (Current)"
@@ -1873,9 +2024,10 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 
         let analytics = TEST_ANALYTICS;
 
-        let result1 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+        let result1 =
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
         assert!(result1.is_ok(), "Case A: first call must return Ok");
-        let (refreshed1, _) = result1.unwrap();
+        let (refreshed1, _, _) = result1.unwrap();
         assert!(
             !refreshed1.refreshed(),
             "Case A: lexical must not be rebuilt (Current)"
@@ -1884,9 +2036,10 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         let temporal_db_path = cache_dir.join("temporal.db");
         let exists_after_first = temporal_db_path.exists();
 
-        let result2 = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics);
+        let result2 =
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse);
         assert!(result2.is_ok(), "Case A: second call must return Ok");
-        let (refreshed2, _) = result2.unwrap();
+        let (refreshed2, _, _) = result2.unwrap();
         assert!(
             !refreshed2.refreshed(),
             "Case A: second call must not rebuild lexical"
@@ -1915,7 +2068,9 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
         let analytics = TEST_ANALYTICS;
 
         // First call: NoIndex → build lexical + write empty temporal.db.
-        let (outcome1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+        let (outcome1, _, _) =
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse)
+                .unwrap();
         assert!(
             outcome1.is_first_build(),
             "Case B: first call must build index (NoIndex → FirstBuild)"
@@ -1942,7 +2097,9 @@ fn test_bug_b_degenerate_repo_empty_history_no_rebuild_loop() {
 
         // Second call: both lexical and temporal are Current.
         // MUST NOT rewrite temporal.db — mtime must be unchanged.
-        let (outcome2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+        let (outcome2, _, _) =
+            auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse)
+                .unwrap();
         assert!(
             !outcome2.refreshed(),
             "Case B: second call must not rebuild lexical (Current)"
@@ -2054,7 +2211,8 @@ fn test_auto_refresh_rebuilds_on_working_tree_edit() {
     .unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         refreshed.refreshed(),
@@ -2093,7 +2251,8 @@ fn test_auto_refresh_indexes_new_working_tree_file() {
     fs::write(dir.path().join("src/b.rs"), "fn b() {}\n").unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "a new working-tree file must trigger a rebuild (AC2)"
@@ -2136,7 +2295,8 @@ fn test_auto_refresh_reflects_delete_and_rename() {
     fs::write(dir.path().join("src/new.rs"), "fn renamed_me() {}\n").unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _manifest) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _manifest, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "delete+add must trigger a rebuild (AC3)"
@@ -2177,8 +2337,10 @@ fn test_auto_refresh_clean_tree_no_rebuild_idempotent() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     let analytics = TEST_ANALYTICS;
-    let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
-    let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (r1, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
+    let (r2, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
 
     assert!(
         !r1.refreshed(),
@@ -2251,7 +2413,8 @@ fn test_auto_refresh_same_mtime_and_size_does_not_reindex() {
     set_mtime_secs(&abs, 1_700_000_000);
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !refreshed.refreshed(),
         "same-size + same-second swap must NOT reindex (AD-379-2 pinned boundary, AC9)"
@@ -2283,7 +2446,8 @@ fn test_auto_refresh_size_change_with_preserved_mtime_reindexes() {
     set_mtime_secs(&abs, 1_700_000_000);
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "size change with preserved mtime MUST reindex (size comparison, AC9a)"
@@ -2323,7 +2487,8 @@ fn test_auto_refresh_non_git_working_tree_change_reindexes() {
     .unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "non-git working-tree change MUST reindex (AD-379-3, AC12)"
@@ -2366,7 +2531,8 @@ fn test_auto_refresh_corrupt_head_with_working_tree_change_reindexes() {
     .unwrap();
 
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "corrupt-HEAD + working-tree edit MUST reindex (AD-379-6, AC13)"
@@ -2400,7 +2566,8 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
     let analytics = TEST_ANALYTICS;
 
     // First call rebuilds.
-    let (r1, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (r1, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(r1.refreshed(), "first call must rebuild on the edit (AC14)");
     assert!(
         !r1.is_first_build(),
@@ -2410,7 +2577,8 @@ fn test_auto_refresh_working_tree_change_single_rebuild_across_pair() {
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Second call: index is now Current (manifest carries fresh mtime+size).
-    let (r2, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (r2, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         !r2.refreshed(),
         "second call must NOT rebuild — index already refreshed (AC14 / AD-379-8)"
@@ -2464,7 +2632,8 @@ fn test_auto_refresh_pre_379_manifest_self_heals_populates_mtime_size() {
 
     // First query: the None mtime/size forces a changed verdict → one rebuild.
     let analytics = TEST_ANALYTICS;
-    let (refreshed, _) = auto_refresh_if_stale(dir.path(), &cache_dir, &analytics).unwrap();
+    let (refreshed, _, _) =
+        auto_refresh_if_stale(dir.path(), &cache_dir, &analytics, ReanchorPolicy::Refuse).unwrap();
     assert!(
         refreshed.refreshed(),
         "pre-#379 manifest (mtime/size None) must self-heal via one rebuild (AC10)"
@@ -2585,4 +2754,1756 @@ fn test_display_head_changed_exactly_8_chars() {
     let current = "abcdef01".to_string();
     let s = StalenessCheck::HeadChanged { stored, current }.to_string();
     assert_eq!(s, "stale (HEAD changed: 12345678…→abcdef01…)");
+}
+
+// ============================================================================
+// #413 — linked worktree HEAD resolution and temporal data
+// ============================================================================
+
+/// AC1 / S1 — Linked-worktree HEAD resolves via the commondir loose ref.
+///
+/// Preconditions: the per-worktree gitdir has no local `refs/heads/<branch>` file
+/// and no `packed-refs` (the SHA lives only in the common dir's `refs/heads/<branch>`).
+/// Discriminating: pre-fix this returned `None`; post-fix it returns the exact GT SHA.
+#[test]
+fn test_read_git_head_resolves_commondir_loose_ref_in_real_worktree() {
+    let (_dir, _primary, worktree, gt) = worktree_fixture("b1");
+    assert_eq!(gt.len(), 40, "GT must be a 40-char SHA");
+
+    // Verify worktree HEAD equals the primary HEAD at creation (fixture invariant).
+    let wt_sha = read_git_head(&worktree).expect("worktree HEAD must be readable");
+    assert_eq!(
+        wt_sha, gt,
+        "worktree HEAD must equal primary HEAD at branch creation"
+    );
+
+    // Precondition: per-worktree refs/ must be empty and packed-refs absent.
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+    let wt_refs = wt_gitdir.join("refs").join("heads");
+    if wt_refs.exists() {
+        let entries: Vec<_> = fs::read_dir(&wt_refs).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "precondition: wt refs/heads must be empty"
+        );
+    }
+    assert!(
+        !wt_gitdir.join("packed-refs").exists(),
+        "precondition: wt packed-refs absent"
+    );
+
+    // The key assertion: read_git_head resolves via commondir.
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "linked worktree HEAD must resolve to the primary branch SHA via commondir"
+    );
+}
+
+/// AC2 / S2 — After `git pack-refs --all`, HEAD still resolves via commondir packed-refs.
+///
+/// Preconditions (asserted): the commondir loose ref for `b1` is absent after packing;
+/// `packed-refs` in the commondir contains `refs/heads/b1`.
+#[test]
+fn test_read_git_head_resolves_commondir_packed_refs_after_pack_refs() {
+    use std::process::Command;
+
+    let (_dir, primary, worktree, gt) = worktree_fixture("b1");
+
+    // Pack all refs so the loose ref disappears.
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["pack-refs", "--all"])
+        .current_dir(&primary)
+        .output()
+        .expect("git pack-refs");
+
+    // Precondition: loose ref for b1 must be absent in the commondir.
+    let primary_git = primary.join(".git");
+    let loose_b1 = primary_git.join("refs").join("heads").join("b1");
+    assert!(
+        !loose_b1.exists(),
+        "precondition: loose b1 must be absent after pack-refs --all"
+    );
+
+    // Precondition: packed-refs must contain b1.
+    let packed = fs::read_to_string(primary_git.join("packed-refs")).unwrap_or_default();
+    assert!(
+        packed.contains("refs/heads/b1"),
+        "precondition: packed-refs must contain refs/heads/b1; got: {packed}"
+    );
+
+    // Key assertion: still resolves.
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "packed-refs path must resolve linked worktree HEAD after pack-refs --all"
+    );
+}
+
+/// AC3 / S3 — Resolves when `commondir` contains an ABSOLUTE path.
+///
+/// Precondition (asserted): the commondir file starts with `/`.
+#[test]
+fn test_read_git_head_handles_absolute_commondir() {
+    let (_dir, primary, worktree, gt) = worktree_fixture("b1");
+
+    // Rewrite the commondir to the canonical absolute path.
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+    let abs_common = primary.join(".git").canonicalize().unwrap();
+    assert!(
+        abs_common.is_absolute(),
+        "precondition: abs_common must be absolute"
+    );
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", abs_common.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "absolute commondir path must resolve linked worktree HEAD"
+    );
+}
+
+/// AC4 / S4 — Slashed branch names (`wave/probe-413`) resolve, both loose and packed.
+#[test]
+fn test_read_git_head_resolves_slashed_branch_loose_and_packed() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    let worktree_loose = dir.path().join("wt-loose");
+    let worktree_packed = dir.path().join("wt-packed");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
+
+    // Sub-case 1: loose ref (wave/probe-413 in refs/heads/wave/probe-413).
+    let _ = create_real_git_worktree(&primary, &worktree_loose, "wave/probe-413");
+    let result_loose = read_git_head(&worktree_loose);
+    assert_eq!(
+        result_loose.as_deref(),
+        Some(gt.as_str()),
+        "S4 loose: slashed branch must resolve via commondir loose ref"
+    );
+
+    // Sub-case 2: packed-refs (after git pack-refs --all).
+    let _ = create_real_git_worktree(&primary, &worktree_packed, "wave/probe-413-packed");
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["pack-refs", "--all"])
+        .current_dir(&primary)
+        .output()
+        .expect("git pack-refs");
+
+    // Precondition: loose ref must be absent.
+    let loose_wave = primary.join(".git").join("refs").join("heads").join("wave");
+    if loose_wave.exists() {
+        let probe_file = loose_wave.join("probe-413-packed");
+        assert!(
+            !probe_file.exists(),
+            "precondition: loose wave/probe-413-packed must be absent after pack-refs --all"
+        );
+    }
+
+    let result_packed = read_git_head(&worktree_packed);
+    assert_eq!(
+        result_packed.as_deref(),
+        Some(gt.as_str()),
+        "S4 packed: slashed branch must resolve via commondir packed-refs"
+    );
+}
+
+/// AC6 / S6 — Per-worktree ref namespaces (`refs/bisect/`, `refs/worktree/`,
+/// `refs/rewritten/`) are never redirected to the commondir.
+///
+/// Case 1: per-worktree file present → resolved SHA is shaA (from the local file), NOT shaB.
+/// Case 2: per-worktree file removed → resolved SHA is None, NOT shaB from commondir.
+#[test]
+fn test_read_git_head_per_worktree_ref_namespace_is_not_redirected() {
+    let (_dir, primary, worktree, _gt) = worktree_fixture("b1");
+
+    // Locate the per-worktree gitdir.
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+
+    let sha_a = "a".repeat(40);
+    let sha_b = "b".repeat(40);
+
+    for namespace in &["refs/bisect", "refs/worktree", "refs/rewritten"] {
+        let per_wt_dir = wt_gitdir.join(namespace);
+        fs::create_dir_all(&per_wt_dir).unwrap();
+        let per_wt_ref = per_wt_dir.join("testref");
+        let primary_dir = primary.join(".git").join(namespace);
+        fs::create_dir_all(&primary_dir).unwrap();
+        let primary_ref = primary_dir.join("testref");
+
+        fs::write(&per_wt_ref, format!("{sha_a}\n")).unwrap();
+        fs::write(&primary_ref, format!("{sha_b}\n")).unwrap();
+
+        // Point HEAD at a per-worktree ref.
+        let head_ref = format!("{namespace}/testref");
+        fs::write(wt_gitdir.join("HEAD"), format!("ref: {head_ref}\n")).unwrap();
+
+        // Case 1: per-worktree file present — must return shaA.
+        let result = read_git_head(&worktree);
+        assert_eq!(
+            result.as_deref(),
+            Some(sha_a.as_str()),
+            "{namespace}: case 1 must return shaA from the per-worktree ref, not shaB"
+        );
+
+        // Case 2: per-worktree file removed — must return None (NOT shaB).
+        fs::remove_file(&per_wt_ref).unwrap();
+        let result2 = read_git_head(&worktree);
+        assert!(
+            result2.is_none(),
+            "{namespace}: case 2 (per-wt ref removed) must return None, not shaB; got {result2:?}"
+        );
+        assert_ne!(
+            result2.as_deref(),
+            Some(sha_b.as_str()),
+            "{namespace}: shaB from commondir must never be returned for a per-worktree namespace"
+        );
+
+        // Clean up for the next namespace iteration.
+        fs::remove_file(&primary_ref).unwrap();
+    }
+}
+
+/// AC7 / S7 — Detached HEAD in a linked worktree still resolves (raw-SHA branch).
+#[test]
+fn test_read_git_head_detached_head_in_linked_worktree_still_resolves() {
+    use std::process::Command;
+
+    let (_dir, _primary, worktree, gt) = worktree_fixture("b1");
+
+    // Detach HEAD in the linked worktree.
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["checkout", "--detach"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git checkout --detach");
+
+    let result = read_git_head(&worktree);
+    assert_eq!(
+        result.as_deref(),
+        Some(gt.as_str()),
+        "detached HEAD in linked worktree must still resolve to the commit SHA"
+    );
+}
+
+/// AC8 (a) / S8a — `commondir` points at a directory with a valid SHA file but NO `HEAD`:
+/// that SHA must NOT be returned.
+#[test]
+fn test_read_git_head_rejects_commondir_pointing_at_non_git_dir() {
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
+    let fake_common = dir.path().join("fake_common");
+
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+
+    // Create a fake commondir with a valid-looking SHA file but NO HEAD.
+    let planted_sha = "c".repeat(40);
+    let refs_heads = fake_common.join("refs").join("heads");
+    fs::create_dir_all(&refs_heads).unwrap();
+    fs::write(refs_heads.join("b1"), format!("{planted_sha}\n")).unwrap();
+    // Deliberately NO HEAD file.
+
+    // Rewrite commondir to point at this fake directory.
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", fake_common.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "commondir without HEAD must return None; got {result:?}"
+    );
+    assert_ne!(
+        result.as_deref(),
+        Some(planted_sha.as_str()),
+        "the planted SHA from a commondir without HEAD must never be returned"
+    );
+}
+
+/// AC8 (b) / S8b — `commondir` points at a non-existent path (dangling): no HEAD.
+#[test]
+fn test_read_git_head_rejects_dangling_commondir() {
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
+
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+
+    // Dangling path — does not exist.
+    let dangling = dir.path().join("does-not-exist");
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", dangling.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "dangling commondir must return None; got {result:?}"
+    );
+}
+
+/// AC8 (c) / S8c — `commondir` contains 8 KiB of newline-free junk: no HEAD,
+/// no panic, no OOM.
+#[test]
+fn test_read_git_head_rejects_oversized_commondir() {
+    let (_dir, _primary, worktree, _gt) = worktree_fixture("b1");
+
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+
+    // 8192 bytes of 'x' with no newline — exceeds the 4096-byte bounded read.
+    let junk = "x".repeat(8192);
+    fs::write(wt_gitdir.join("commondir"), junk.as_bytes()).unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "oversized junk commondir must return None; got {result:?}"
+    );
+}
+
+/// AC8 (d) / S8d — `commondir` is a regular file rather than a directory: no HEAD.
+#[test]
+fn test_read_git_head_rejects_commondir_is_a_file() {
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
+    let file_common = dir.path().join("file_that_is_not_a_dir");
+
+    // AD-413-12: delegate to resolve_git_dir — the single `gitdir:` parser.
+    let wt_gitdir = resolve_git_dir(&worktree).unwrap();
+
+    // commondir points at a regular file (not a directory).
+    fs::write(&file_common, b"this is a file, not a dir\n").unwrap();
+    fs::write(
+        wt_gitdir.join("commondir"),
+        format!("{}\n", file_common.display()),
+    )
+    .unwrap();
+
+    let result = read_git_head(&worktree);
+    assert!(
+        result.is_none(),
+        "commondir pointing at a regular file must return None; got {result:?}"
+    );
+}
+
+/// AC11 / S11 — `check_staleness` reports `HeadChanged` after a commit in a linked worktree.
+///
+/// Pre-fix: the verdict was `WorkingTreeChanged` (the new file appeared as an untracked
+/// addition before the commit was recognized). Post-fix: `HeadChanged`.
+#[test]
+fn test_check_staleness_reports_head_changed_in_linked_worktree() {
+    use std::process::Command;
+
+    let (dir, _primary, worktree, old_head) = worktree_fixture("b1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Write a manifest with old_head so check_staleness has something to compare.
+    write_manifest_with_head(&worktree, &cache_dir, Some(&old_head));
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+
+    // Make a commit in the linked worktree.
+    fs::write(worktree.join("c.rs"), "fn c(){}\n").unwrap();
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["add", "c.rs"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git add c.rs");
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-c",
+            "user.email=t@e.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-m",
+            "add c",
+        ])
+        .current_dir(&worktree)
+        .output()
+        .expect("git commit");
+
+    let new_head = {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .output()
+            .expect("git rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_ne!(old_head, new_head, "HEAD must advance after commit");
+
+    let (verdict, _manifest) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(&verdict, StalenessCheck::HeadChanged { stored, current }
+            if stored == &old_head && current == &new_head),
+        "AC11: verdict must be HeadChanged {{ stored: old, current: new }}; got {verdict:?}"
+    );
+}
+
+/// AC12 / S12 — After AC11's commit-and-update, `temporal.db` `meta.git_head` equals the new GT.
+#[test]
+fn test_temporal_db_resyncs_when_worktree_branch_advances() {
+    use std::process::Command;
+
+    let (dir, _primary, worktree, old_head) = worktree_fixture("b1");
+    // First build.
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+    let head_before = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    drop(db);
+    assert_eq!(
+        head_before, old_head,
+        "meta.git_head must equal old HEAD after first build"
+    );
+
+    // Make a commit in the worktree.
+    fs::write(worktree.join("c.rs"), "fn c(){}\n").unwrap();
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(["add", "c.rs"])
+        .current_dir(&worktree)
+        .output()
+        .expect("git add c.rs");
+    Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-c",
+            "user.email=t@e.com",
+            "-c",
+            "user.name=T",
+            "commit",
+            "-m",
+            "add c",
+        ])
+        .current_dir(&worktree)
+        .output()
+        .expect("git commit");
+    let new_head = {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .output()
+            .expect("git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_ne!(old_head, new_head, "HEAD must advance after commit");
+
+    // Trigger update.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let db2 = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+    let head_after = db2
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        head_after, new_head,
+        "AC12: meta.git_head must equal new GT after --update"
+    );
+    assert_ne!(
+        head_after, head_before,
+        "AC12: meta.git_head must have changed"
+    );
+}
+
+/// AC13 / S13 — A frozen manifest (git_head = None) recovers on the first query.
+///
+/// Constructed with `write_manifest_with_head(.., None)` on a real linked worktree.
+/// The staleness verdict must be `NoStoredHead`; afterwards the manifest's stored HEAD
+/// equals GT and `meta.git_head` equals GT.
+#[test]
+fn test_frozen_manifest_without_head_recovers_on_next_query_in_worktree() {
+    let (dir, _primary, worktree, gt) = worktree_fixture("b1");
+    // Set up with a real index + temporal.db, then wipe the manifest's git_head.
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+    write_lexical_index_stub(&cache_dir);
+    write_ast_index_stub(&cache_dir);
+    write_manifest_with_head(&worktree, &cache_dir, None);
+
+    // Staleness check must see NoStoredHead.
+    let (verdict, _) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(verdict, StalenessCheck::NoStoredHead),
+        "AC13: verdict must be NoStoredHead when manifest has no git_head; got {verdict:?}"
+    );
+
+    // One auto-refresh must recover the stored HEAD.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    // Verify the manifest now has the GT stored HEAD.
+    let (verdict2, manifest) = check_staleness(&cache_dir, &worktree);
+    assert!(
+        matches!(verdict2, StalenessCheck::Current),
+        "AC13: after recovery, check_staleness must be Current; got {verdict2:?}"
+    );
+    let stored = manifest.unwrap().stored_git_head().map(str::to_string);
+    assert_eq!(
+        stored.as_deref(),
+        Some(gt.as_str()),
+        "AC13: stored git_head must equal GT after recovery"
+    );
+
+    // Verify temporal.db also has the GT HEAD.
+    let db = rskim_search::TemporalDb::open(&cache_dir.join("temporal.db")).unwrap();
+    let meta_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        meta_head, gt,
+        "AC13: meta.git_head in temporal.db must equal GT after recovery"
+    );
+}
+
+/// AC14 / S14 — A divergent `meta.git_head` self-heals on the next query.
+///
+/// Plants `deadbeef...` as `meta.git_head` and verifies that one auto-refresh
+/// corrects it to the GT SHA.
+#[test]
+fn test_temporal_db_with_divergent_recorded_head_self_heals_in_worktree() {
+    let (dir, _primary, worktree, gt) = worktree_fixture("b1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let stale_head = "deadbeef".repeat(5); // 40-char pseudo-SHA
+    super::plant_meta_raw(&temporal_db_path, rskim_search::META_GIT_HEAD, &stale_head);
+
+    // Confirm the stale value was planted.
+    {
+        let db = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+        let planted = db
+            .get_meta(rskim_search::META_GIT_HEAD)
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(
+            planted, stale_head,
+            "precondition: planted stale head must match"
+        );
+    }
+
+    // One query triggers the AD-TMP-2 self-heal.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let db2 = rskim_search::TemporalDb::open(&temporal_db_path).unwrap();
+    let healed = db2
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        healed, gt,
+        "AC14: meta.git_head must equal GT after divergent-head self-heal"
+    );
+}
+
+/// AC17 / S17 — Three HEAD states are distinguishable.
+///
+/// Tests all six representative roots described in S17:
+/// (1) bare tempdir — not_a_repo
+/// (2) `mkdir .git` empty — not_a_repo (a .git dir with no HEAD is not a repo)
+/// (3) `.git` file → nonexistent gitdir — not_a_repo
+/// (4) `.git/HEAD` = `garbage` — unresolved
+/// (5) real linked worktree — resolved
+/// (6) real subdirectory of a repo — resolved (via ancestor walk)
+///
+/// Hermeticity note: cases (1)–(4) are created under a fresh tempdir that has no
+/// ancestor repository.  The NOGIT precondition is asserted inside the test.
+#[test]
+fn test_git_head_state_distinguishes_not_a_repo_from_unresolved() {
+    let dir = tempdir().unwrap();
+
+    // NOGIT precondition: no ancestor of dir.path() must contain .git.
+    {
+        let mut d = dir.path().canonicalize().unwrap();
+        loop {
+            assert!(
+                !d.join(".git").exists(),
+                "NOGIT precondition failed: ancestor {d:?} contains .git"
+            );
+            let parent = match d.parent() {
+                Some(p) if p != d => p.to_path_buf(),
+                _ => break,
+            };
+            d = parent;
+        }
+    }
+
+    // (1) bare tempdir — not_a_repo
+    let bare = dir.path().join("bare");
+    fs::create_dir_all(&bare).unwrap();
+    assert_eq!(
+        git_head_state(&bare),
+        HeadState::NotARepo,
+        "(1) bare dir: expected NotARepo"
+    );
+
+    // (2) mkdir .git (no HEAD) — not_a_repo
+    let empty_git = dir.path().join("empty_git");
+    fs::create_dir_all(empty_git.join(".git")).unwrap();
+    assert_eq!(
+        git_head_state(&empty_git),
+        HeadState::NotARepo,
+        "(2) .git dir with no HEAD: expected NotARepo"
+    );
+
+    // (3) .git file pointing at nonexistent gitdir — not_a_repo
+    let gitfile = dir.path().join("gitfile_root");
+    fs::create_dir_all(&gitfile).unwrap();
+    fs::write(gitfile.join(".git"), "gitdir: /does/not/exist\n").unwrap();
+    assert_eq!(
+        git_head_state(&gitfile),
+        HeadState::NotARepo,
+        "(3) .git file pointing at nonexistent path: expected NotARepo"
+    );
+
+    // (4) .git/HEAD = garbage — unresolved
+    let garbage = dir.path().join("garbage_head");
+    let garbage_git = garbage.join(".git");
+    fs::create_dir_all(&garbage_git).unwrap();
+    fs::write(garbage_git.join("HEAD"), "this is not a valid HEAD\n").unwrap();
+    assert_eq!(
+        git_head_state(&garbage),
+        HeadState::Unresolved,
+        "(4) garbage HEAD: expected Unresolved"
+    );
+
+    // (5) real linked worktree — resolved
+    let primary5 = dir.path().join("primary5");
+    let worktree5 = dir.path().join("wt5");
+    fs::create_dir_all(&primary5).unwrap();
+    let gt5 = create_real_git_repo(&primary5, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    create_real_git_worktree(&primary5, &worktree5, "b1");
+
+    assert_eq!(
+        git_head_state(&worktree5),
+        HeadState::Resolved(gt5.clone()),
+        "(5) linked worktree: expected Resolved"
+    );
+
+    // (6) subdirectory of a repo — resolved (OD-3)
+    let sub = primary5.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    // sub has no .git of its own → adopt primary5's HEAD.
+    assert_eq!(
+        git_head_state(&sub),
+        HeadState::Resolved(gt5),
+        "(6) subdirectory of repo: expected Resolved via ancestor walk"
+    );
+}
+
+/// AC29 / S29 — All 17 AD-413-* markers are present in their documented source files.
+///
+/// Each marker is anchored to the file the plan names for it:
+/// - AD-413-1..7  in gitdir.rs (git-plumbing module extracted from staleness.rs)
+/// - AD-413-9     in temporal_state.rs (warn_if_temporal_unverifiable advisory)
+/// - AD-413-10, AD-413-11  in gitdir.rs (module doc and fn doc)
+/// - AD-413-8, AD-413-13  in mod.rs  (AD-413-8: error-message format; AD-413-13: provenance)
+/// - AD-413-12  in walk.rs
+/// - AD-413-14  in staleness.rs or gitdir.rs
+/// - AD-413-15  in staleness.rs, gitdir.rs, or hooks.rs
+/// - AD-413-16  in staleness.rs or temporal_build.rs
+/// - AD-413-17  in temporal_build.rs
+///
+/// The test asserts that the exact ID string appears in AT LEAST ONE of the files
+/// the plan lists for it.  A missing marker means the design decision anchor has
+/// drifted and must be restored before merge.
+#[test]
+fn test_ac_413_ad_series_comments_present() {
+    let staleness_src = include_str!("staleness.rs");
+    let gitdir_src = include_str!("gitdir.rs");
+    let temporal_state_src = include_str!("temporal_state.rs");
+    let mod_src = include_str!("mod.rs");
+    let walk_src = include_str!("walk.rs");
+    let hooks_src = include_str!("hooks.rs");
+    let temporal_src = include_str!("temporal.rs");
+    let temporal_build_src = include_str!("temporal_build.rs");
+
+    // AD-413-1..7 are in gitdir.rs (the git-plumbing module extracted from
+    // staleness.rs during #413).  AD-413-9 is in temporal_state.rs.
+    // AD-413-8 is in mod.rs (error-message format spec — AC18(a)/AC33(c)).
+    for n in [1u8, 2, 3, 4, 5, 6, 7, 9] {
+        let marker = format!("AD-413-{n}");
+        assert!(
+            staleness_src.contains(&marker)
+                || gitdir_src.contains(&marker)
+                || temporal_state_src.contains(&marker),
+            "AD-413-{n} must be present in staleness.rs, gitdir.rs, or temporal_state.rs"
+        );
+    }
+    assert!(mod_src.contains("AD-413-8"), "AD-413-8 must be in mod.rs");
+
+    // AD-413-10 and AD-413-11 are in gitdir.rs (module doc and fn doc).
+    assert!(
+        gitdir_src.contains("AD-413-10"),
+        "AD-413-10 must be in gitdir.rs"
+    );
+    assert!(
+        gitdir_src.contains("AD-413-11"),
+        "AD-413-11 must be in gitdir.rs"
+    );
+
+    // AD-413-12 is in walk.rs
+    assert!(
+        walk_src.contains("AD-413-12"),
+        "AD-413-12 must be in walk.rs"
+    );
+
+    // AD-413-13 is in mod.rs
+    assert!(mod_src.contains("AD-413-13"), "AD-413-13 must be in mod.rs");
+
+    // AD-413-14 is in staleness.rs
+    assert!(
+        staleness_src.contains("AD-413-14"),
+        "AD-413-14 must be in staleness.rs"
+    );
+
+    // AD-413-15 is in staleness.rs and hooks.rs
+    assert!(
+        staleness_src.contains("AD-413-15") || hooks_src.contains("AD-413-15"),
+        "AD-413-15 must be in staleness.rs or hooks.rs"
+    );
+
+    // AD-413-16 is in staleness.rs and temporal_build.rs
+    assert!(
+        staleness_src.contains("AD-413-16") || temporal_build_src.contains("AD-413-16"),
+        "AD-413-16 must be in staleness.rs or temporal_build.rs"
+    );
+
+    // AD-413-17 is in temporal_build.rs
+    assert!(
+        temporal_build_src.contains("AD-413-17"),
+        "AD-413-17 must be in temporal_build.rs"
+    );
+
+    // AC29: build_stats_json must carry the AD-413-13 provenance sentence explaining that
+    // `git_head` is the manifest's stored HEAD ("HEAD-at-last-build") while `git_head_state`
+    // is live, so the pair can legitimately diverge.
+    // The assertion checks for the distinguishing clause, not just the AD marker, so it
+    // cannot be vacuously satisfied by an AD-413-13 occurrence elsewhere in the file.
+    assert!(
+        mod_src.contains("HEAD-at-last-build"),
+        "AC29: build_stats_json rustdoc must contain 'HEAD-at-last-build' \
+         (the AD-413-13 provenance sentence explaining git_head vs git_head_state divergence)"
+    );
+
+    // Belt-and-suspenders: every file also must not have any bare #NEW markers
+    // (ADR-004: no phantom tickets; real numbers only).
+    for (name, src) in &[
+        ("staleness.rs", staleness_src),
+        ("gitdir.rs", gitdir_src),
+        ("temporal_state.rs", temporal_state_src),
+        ("mod.rs", mod_src),
+        ("walk.rs", walk_src),
+        ("hooks.rs", hooks_src),
+        ("temporal.rs", temporal_src),
+        ("temporal_build.rs", temporal_build_src),
+    ] {
+        assert!(
+            !src.contains("#NEW"),
+            "ADR-004: {name} must not contain #NEW placeholder tickets"
+        );
+    }
+}
+
+/// AC17 supplement / S17 (6) — `resolve_repo_toplevel` is live for subdirectory roots.
+///
+/// A directory without its own `.git` that sits inside a real git repo returns
+/// `HeadState::Resolved` — the ancestor walk adopts the nearest enclosing repo.
+#[test]
+fn test_git_head_state_resolves_subdirectory_root() {
+    let dir = tempdir().unwrap();
+    let primary = dir.path().join("primary");
+    fs::create_dir_all(&primary).unwrap();
+
+    let gt = create_real_git_repo(&primary, &[("init", &[("src/lib.rs", "fn f(){}\n")])]);
+
+    // src/ exists but has no .git — must resolve via ancestor walk.
+    let sub = primary.join("src");
+    assert!(!sub.join(".git").exists(), "precondition: src/ has no .git");
+
+    let state = git_head_state(&sub);
+    assert_eq!(
+        state,
+        HeadState::Resolved(gt),
+        "subdirectory root must resolve to the enclosing repo's HEAD"
+    );
+}
+
+/// AC10 / S10 — An escape-derived poisoned stored HEAD with an UNRESOLVABLE live HEAD
+/// is inert: verdict is `Current` on every call and `index.skfiles` mtime is stable.
+///
+/// The criterion's scenario:
+/// - Stored HEAD = "2222…40" (the escape-derived SHA from AC9's fixture)
+/// - Live HEAD = None (`read_git_head` returns None because the ref escapes the git dir)
+/// - Expected: `(Some(stored), None)` arm → `Current` (not HeadChanged, not NoStoredHead)
+/// - Expected: `git_head_state` == Unresolved (HEAD exists but does not resolve)
+/// - Expected: mtime of `index.skfiles` unchanged across two consecutive `auto_refresh_if_stale` calls
+///
+/// Discriminating: pre-fix, live HEAD resolved to the escape SHA → HeadChanged would fire and
+/// (a) would assert `git_head_state` == "resolved", not "unresolved".
+/// On a *wrong fix* that forces a rebuild whenever live HEAD is None, the mtime assertions fail.
+///
+/// Note: the ORIGINAL test (deleted here) tested a linked worktree with a RESOLVABLE live HEAD
+/// and asserted `HeadChanged` fires — that scenario belongs to AC11 (which is kept separately).
+/// AC10 is specifically about "already-poisoned stored HEAD + unresolvable live HEAD is INERT".
+#[test]
+fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
+    // Reuse the AC9 fixture topology: a repo whose HEAD = "ref: refs/../../../outside-sha"
+    // so the escape guard rejects it and read_git_head returns None (live HEAD unresolvable).
+    let parent = tempdir().unwrap();
+    let project_root = parent.path().join("repo");
+    let cache_dir = parent.path().join("cache");
+    fs::create_dir_all(&project_root).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build a real git repo with a.rs committed, then build a real lexical+AST index so
+    // the manifest reflects the on-disk tree before switching HEAD to the escape ref.
+    // Using write_manifest_with_head+stubs would produce an empty manifest, causing
+    // scan_working_tree to see a.rs as "added" → dirty → WorkingTreeChanged, masking
+    // the no-rebuild-loop contract this test asserts (same root cause as AC16c Fix 1).
+    create_real_git_repo(&project_root, &[("init", &[("a.rs", "fn a(){}\n")])]);
+
+    let escape_sha = "2".repeat(40);
+    let escape_target = parent.path().join("outside-sha");
+    fs::write(&escape_target, format!("{escape_sha}\n")).unwrap();
+    let ref_path = "refs/../../../outside-sha";
+
+    // Build the index while HEAD is still valid so the manifest records a.rs.
+    build_index_in(&project_root, &cache_dir);
+
+    // Patch the manifest's git_head to the poisoned escape-derived SHA.
+    // This simulates the state S10 reuses: S9 wrote 2222… into the manifest when the
+    // escape guard first fired; we reproduce that stored value without disturbing the
+    // file entries that make the working-tree scan come back clean.
+    let poisoned = escape_sha.clone();
+    {
+        use crate::cmd::search::manifest::FileManifest;
+        let mut manifest = FileManifest::load(project_root.clone(), cache_dir.clone())
+            .expect("manifest must load after build_index_in");
+        manifest.set_git_head(Some(poisoned.clone()));
+        manifest.save().unwrap();
+    }
+
+    // Now switch HEAD to the escape ref to make read_git_head return None.
+    let git_dir = project_root.join(".git");
+
+    // MANDATORY PRECONDITION: the escape target is reachable (pre-fix would resolve it).
+    assert!(
+        git_dir.join(ref_path).exists(),
+        "AC10 precondition: escape target must be reachable so the guard fires post-fix"
+    );
+    fs::write(git_dir.join("HEAD"), format!("ref: {ref_path}\n")).unwrap();
+
+    // Post-fix: read_git_head must return None (escape guard rejects the ref path).
+    assert!(
+        read_git_head(&project_root).is_none(),
+        "AC10 precondition: live HEAD must be None after the escape guard"
+    );
+    // Post-fix: git_head_state must be Unresolved (HEAD file exists, but ref escapes).
+    assert_eq!(
+        git_head_state(&project_root),
+        HeadState::Unresolved,
+        "AC10(a): git_head_state must be Unresolved when HEAD exists but ref escapes"
+    );
+
+    // AC10(b): verdict must be Current (not HeadChanged, not NoStoredHead).
+    // The `(Some(stored), None)` arm in check_staleness returns current_or_working_tree.
+    // With a real index that reflects the on-disk tree, the working-tree scan is clean,
+    // so current_or_working_tree returns Current — not WorkingTreeChanged.
+    let (verdict1, _) = check_staleness(&cache_dir, &project_root);
+    assert!(
+        matches!(verdict1, StalenessCheck::Current),
+        "AC10(b): (Some(stored), None) arm must be Current — got {verdict1:?}"
+    );
+
+    // AC10(c): run auto_refresh_if_stale twice and capture index.skfiles mtime.
+    // The working-tree is clean (manifest reflects the on-disk tree), so both calls
+    // return early without rebuilding; the second run must be mtime-stable.
+    auto_refresh_if_stale(
+        &project_root,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+    let mtime1 = fs::metadata(cache_dir.join("index.skfiles"))
+        .map(|m| m.modified().unwrap())
+        .ok();
+    auto_refresh_if_stale(
+        &project_root,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+    let mtime2 = fs::metadata(cache_dir.join("index.skfiles"))
+        .map(|m| m.modified().unwrap())
+        .ok();
+    assert_eq!(
+        mtime1, mtime2,
+        "AC10(c): index.skfiles mtime must be unchanged on the second run (no rebuild loop)"
+    );
+
+    // AC10(d): the planted poisoned SHA must still be the stored HEAD after both refreshes.
+    // AC10(c) already proved no rebuild fired (mtime stable).  If a rebuild had fired,
+    // `auto_refresh_if_stale` would write the live HEAD (None here) into the manifest,
+    // changing the stored value away from `poisoned`.  Asserting equality here is the
+    // strong form: it FAILS if a rebuild mistakenly ran, regardless of what value was written.
+    use crate::cmd::search::manifest::FileManifest;
+    let manifest = FileManifest::load(project_root.clone(), cache_dir.clone())
+        .expect("AC10(d): manifest must load after two inert auto_refresh_if_stale calls");
+    assert_eq!(
+        manifest.stored_git_head(),
+        Some(poisoned.as_str()),
+        "AC10(d): stored HEAD must still equal the planted poisoned SHA after inert refresh — \
+         a rebuild would have overwritten it",
+    );
+}
+
+// ============================================================================
+// #413 / AD-413-16 — the persisted repository anchor (AC16(d), AC24, AC32, AC33(f))
+// ============================================================================
+
+/// AC24 / AC32 guard-ordering — a root that owns its own `.git` is `NotAdopted`,
+/// and that verdict is reached BEFORE any `temporal.db` read.
+///
+/// Discriminating: a `git_toplevel` row deliberately planted with a bogus value
+/// must NOT change the answer.  An implementation that read the DB before
+/// checking `resolve_repo_toplevel` would return `Differs` here and would also
+/// pay a SQLite open on every temporal query for every pre-existing user.
+#[test]
+fn test_temporal_anchor_state_not_adopted_for_root_owning_dot_git() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let head = create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    // Build real temporal data so a DB exists to be (incorrectly) read.
+    build_temporal_for_test(&repo, &cache_dir, &head);
+    assert!(
+        cache_dir.join("temporal.db").exists(),
+        "precondition: temporal.db must exist so the gate ordering is observable"
+    );
+    // Plant a bogus anchor: a gate-2-first implementation would report Differs.
+    super::plant_meta_raw(
+        &cache_dir.join("temporal.db"),
+        rskim_search::META_GIT_TOPLEVEL,
+        "/definitely/not/this/repo",
+    );
+
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &repo),
+        super::AnchorState::NotAdopted,
+        "a root with its own .git must be NotAdopted regardless of any planted anchor row"
+    );
+}
+
+/// AD-413-16 — `Absent` / `Agrees` / `Differs` for an ADOPTED (subdirectory) root.
+///
+/// Absent is the adopt-and-record case ("built before this key existed") and must
+/// never be a refusal; `Agrees` is the steady state; `Differs` is the refusal.
+#[test]
+fn test_temporal_anchor_state_absent_agrees_differs_for_subdir_root() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::create_dir_all(outer.join("sub")).unwrap();
+
+    let head = create_real_git_repo(&outer, &[("init", &[("sub/s.rs", "fn s(){}\n")])]);
+    let sub = outer.join("sub");
+    assert!(!sub.join(".git").exists(), "precondition: sub has no .git");
+
+    // No temporal.db yet → Absent (gate 2).
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Absent,
+        "no temporal.db must be Absent (adopt-and-record), never a refusal"
+    );
+
+    // Build → the anchor is recorded and agrees.
+    build_temporal_for_test(&sub, &cache_dir, &head);
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Agrees,
+        "after a build for an adopted root the recorded anchor must agree"
+    );
+
+    // Delete the row → Absent again (never a refusal).
+    {
+        let conn = rusqlite::Connection::open(cache_dir.join("temporal.db")).unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            rusqlite::params![rskim_search::META_GIT_TOPLEVEL],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Absent,
+        "a deleted anchor row must be Absent (adopt-and-record), never a refusal"
+    );
+
+    // Plant a foreign toplevel → Differs.
+    super::plant_meta_raw(
+        &cache_dir.join("temporal.db"),
+        rskim_search::META_GIT_TOPLEVEL,
+        "/some/other/repo",
+    );
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, .. }
+                if recorded == &std::path::PathBuf::from("/some/other/repo")
+        ),
+        "a foreign recorded toplevel must be Differs and carry the recorded value"
+    );
+}
+
+/// **PF-017 regression** — a PLAIN LEXICAL QUERY interleaved between two
+/// repositories must NOT retarget `meta.git_toplevel`.
+///
+/// This is the exact hole PF-017 names: a changed enclosing repository also
+/// changes the adopted HEAD, so `check_staleness` reports `HeadChanged`,
+/// `auto_refresh_if_stale` rebuilds, and — without the `allow_reanchor` gate —
+/// `record_temporal_anchor` would overwrite the anchor on a query that never
+/// asked for temporal data, making the AD-413-16 refusal unreachable forever.
+///
+/// Sequence: build under repo A → make repo B the nearest enclosing repo →
+/// one plain query (`allow_reanchor = false`) → anchor and `temporal.db` MUST be
+/// byte-unchanged → then an explicit build arm (`allow_reanchor = true`) DOES
+/// re-anchor.
+///
+/// Discriminating: remove the `allow_reanchor` gate from
+/// `try_rebuild_temporal_nonfatal` and the mid-test `Differs` assertion fails
+/// because the plain query already rewrote the anchor to repo B.
+#[test]
+fn test_pf017_plain_query_does_not_retarget_anchor_across_repos() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let mid = outer.join("mid");
+    let sub = mid.join("sub");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Repo A at `outer`, with the search root two levels down.
+    create_real_git_repo(&outer, &[("init", &[("mid/sub/s.rs", "fn s(){}\n")])]);
+    let outer_canon = outer.canonicalize().unwrap();
+
+    // Explicit build arm: records the anchor for the adopted root.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Allow).unwrap();
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "precondition: an adopted subdirectory root must build temporal.db (OD-3/AD-413-14)"
+    );
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Agrees,
+        "precondition: the anchor must agree immediately after the build"
+    );
+
+    // Repo B appears at `mid`, so `sub`'s NEAREST enclosing repo changes.
+    // It must have a commit, otherwise HEAD is unborn and the anchor would be
+    // preserved for the wrong reason (head = None short-circuit), not by the gate.
+    create_real_git_repo(&mid, &[("init", &[("m.rs", "fn m(){}\n")])]);
+    let mid_canon = mid.canonicalize().unwrap();
+    assert_ne!(outer_canon, mid_canon, "precondition: the two repos differ");
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, ref live }
+                if recorded == &outer_canon && live == &mid_canon
+        ),
+        "precondition: the live toplevel must now differ from the recorded one; got {:?}",
+        super::temporal_anchor_state(&cache_dir, &sub)
+    );
+
+    let len_before = fs::metadata(&db_path).unwrap().len();
+
+    // THE PF-017 CASE: one plain lexical query (allow_reanchor = false).
+    // After AD-413-14-OD, `check_staleness` for an adopted root returns
+    // `current_or_working_tree` (working-tree scan) rather than `HeadChanged` even
+    // though the HEAD SHA changed — the files under `sub` are unchanged so the scan
+    // returns `Current`.  The `Current` self-heal path then calls
+    // `try_rebuild_temporal_nonfatal(..., Refuse)`, which detects `AnchorState::Differs`
+    // and suppresses the temporal rebuild.  The PF-017 guarantee (anchor unchanged on
+    // a plain query) therefore holds through the self-heal arm rather than the
+    // post-rebuild arm, but the discriminating property is identical: removing the
+    // `allow_reanchor` gate from `try_rebuild_temporal_nonfatal` causes the self-heal
+    // to retarget the anchor to repo B, and the mid-test `Differs` assertion fails.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, .. }
+                if recorded == &outer_canon
+        ),
+        "PF-017: a plain lexical query must NOT retarget meta.git_toplevel; got {:?}",
+        super::temporal_anchor_state(&cache_dir, &sub)
+    );
+    assert_eq!(
+        fs::metadata(&db_path).unwrap().len(),
+        len_before,
+        "PF-017: temporal.db must be byte-length-unchanged after a refused plain query"
+    );
+
+    // A second plain query must be equally inert (no loop — AC16(d)).
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+    assert!(
+        matches!(
+            super::temporal_anchor_state(&cache_dir, &sub),
+            super::AnchorState::Differs { ref recorded, .. }
+                if recorded == &outer_canon
+        ),
+        "PF-017: repeated plain queries must stay inert (no rebuild loop)"
+    );
+
+    // The documented escape hatch: an explicit build arm DOES re-anchor.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Allow).unwrap();
+    assert_eq!(
+        super::temporal_anchor_state(&cache_dir, &sub),
+        super::AnchorState::Agrees,
+        "an explicit build arm (--build/--rebuild/--update) must re-anchor to the live toplevel"
+    );
+}
+
+/// **AD-413-14-OD regression** — an adopted subdirectory root must NOT return
+/// `HeadChanged` when the enclosing repository advances due to an UNRELATED commit
+/// (one that touches no files under the subtree).
+///
+/// Pre-fix behaviour: `read_git_head(subdir)` resolved the ENCLOSING repository's
+/// HEAD (via the ancestor walk added in #413), so any commit anywhere in the repo
+/// bumped `current` away from the manifest's `stored` HEAD, triggering a full
+/// lexical+temporal rebuild even though nothing under the subtree changed.
+/// Fix (AD-413-14-OD): when `resolve_git_dir(root).is_none()` (adopted root),
+/// `check_staleness` falls through to `current_or_working_tree` regardless of the
+/// SHA divergence, so invalidation is scoped to real file changes under the subtree.
+///
+/// Discriminating: remove the `is_adopted_root` branch from `check_staleness` and
+/// this test fails because `check_staleness` returns `HeadChanged`.
+#[test]
+fn test_adopted_subdir_unrelated_commit_does_not_return_head_changed() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let sub = repo.join("subdir");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Repo with one commit that writes a file under the search root (subdir).
+    create_real_git_repo(&repo, &[("init", &[("subdir/s.rs", "fn s() {}\n")])]);
+
+    // Build the index for the subdirectory root.
+    auto_refresh_if_stale(&sub, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Allow).unwrap();
+
+    // Verify the manifest captured a HEAD SHA.
+    let (staleness_pre, _) = check_staleness(&cache_dir, &sub);
+    assert!(
+        matches!(staleness_pre, StalenessCheck::Current),
+        "precondition: index must be Current immediately after build; got {staleness_pre:?}"
+    );
+
+    // Make a commit that touches ONLY a file OUTSIDE the search root.
+    // This advances the repo HEAD but leaves subdir/ files unchanged.
+    fs::write(repo.join("outside.rs"), "fn outside() {}\n").expect("write outside.rs");
+    let add_out = Command::new("git")
+        .args(["add", "outside.rs"])
+        .current_dir(&repo)
+        .output()
+        .expect("git add (spawn)");
+    assert!(
+        add_out.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+    let commit_out = Command::new("git")
+        .args(["commit", "-m", "unrelated: outside subdir"])
+        .current_dir(&repo)
+        .output()
+        .expect("git commit (spawn)");
+    assert!(
+        commit_out.status.success(),
+        "git commit: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+
+    // The repo HEAD has advanced, but the subdir files are unchanged.
+    let new_head = read_git_head(&sub).expect("HEAD must resolve after unrelated commit");
+    // (The stored HEAD in the manifest is the old SHA from the initial build.)
+
+    // check_staleness must NOT return HeadChanged for an adopted root.
+    // It must instead use current_or_working_tree, which finds no changes and
+    // returns Current (no files under subdir changed).
+    let (staleness_post, _) = check_staleness(&cache_dir, &sub);
+    assert!(
+        !matches!(staleness_post, StalenessCheck::HeadChanged { .. }),
+        "AD-413-14-OD REGRESSION: adopted subdir root returned HeadChanged on an \
+         unrelated commit (new HEAD={new_head}); got {staleness_post:?}",
+    );
+    assert!(
+        matches!(staleness_post, StalenessCheck::Current),
+        "adopted subdir root with unchanged files must be Current after unrelated commit; \
+         got {staleness_post:?}",
+    );
+}
+
+/// AC17 supplement / AD-413-7 — a `HEAD` file that EXISTS but cannot be decoded is
+/// `Unresolved`, not `NotARepo`.
+///
+/// The three-state enum exists so that "not a git repo" and "git repo whose HEAD I
+/// could not resolve" stay different facts (avoids PF-016).  An `Err` from the HEAD
+/// read has two causes — the file is absent (F10: `mkdir .git` ⇒ `NotARepo`) or the
+/// file is present and unreadable (fs error / non-UTF-8 ⇒ `Unresolved`, the cause
+/// `HeadState::Unresolved`'s own doc names).  Collapsing both into `NotARepo` emits
+/// the "run 'skim search' on a git repo" lie about a directory that plainly is one.
+///
+/// Discriminating: with the `is_file()` split removed this returns `NotARepo` and the
+/// assertion fails.  Uses non-UTF-8 bytes rather than a permission bit so the test is
+/// portable and does not silently pass when the suite runs as root.
+#[test]
+fn test_git_head_state_unreadable_head_file_is_unresolved_not_not_a_repo() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("bad_utf8_head");
+    let git_dir = root.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    // Invalid UTF-8: a lone continuation byte. `read_to_string` fails; the file exists.
+    fs::write(git_dir.join("HEAD"), [0xff, 0xfe, 0x80]).unwrap();
+    assert!(
+        git_dir.join("HEAD").is_file(),
+        "precondition: HEAD must exist as a file"
+    );
+    assert!(
+        fs::read_to_string(git_dir.join("HEAD")).is_err(),
+        "precondition: HEAD must be undecodable so the Err arm is exercised"
+    );
+
+    assert_eq!(
+        git_head_state(&root),
+        HeadState::Unresolved,
+        "a present-but-unreadable HEAD is a repo with an unresolvable HEAD, not a non-repo"
+    );
+
+    // Control (F10): the SAME gitdir with NO HEAD file stays NotARepo.
+    fs::remove_file(git_dir.join("HEAD")).unwrap();
+    assert_eq!(
+        git_head_state(&root),
+        HeadState::NotARepo,
+        "F10: a gitdir with no HEAD file must stay NotARepo (mkdir .git must not lie)"
+    );
+}
+
+// ============================================================================
+// AC33 — resolve_repo_toplevel unit tests (OD-3 / AD-413-14)
+// ============================================================================
+
+/// AC33 unit — `resolve_repo_toplevel` adopts the nearest enclosing repository
+/// for a subdirectory root that has no `.git` of its own.
+///
+/// This is the OD-3 / AD-413-14 behaviour: `--root <subdir>` resolves the
+/// enclosing repo's HEAD instead of reporting `NotARepo`.
+///
+/// Discriminating: if the ancestor walk is removed, `resolve_repo_toplevel`
+/// returns `None` for `sub/` and this assertion fails.
+#[test]
+fn test_resolve_repo_toplevel_adopts_nearest_enclosing_repo() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let sub = outer.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+
+    create_real_git_repo(&outer, &[("init", &[("sub/s.rs", "fn s(){}\n")])]);
+
+    // sub/ exists but has no .git → must resolve to outer/.
+    assert!(!sub.join(".git").exists(), "precondition: sub has no .git");
+    let top = super::resolve_repo_toplevel(&sub);
+    assert!(
+        top.is_some(),
+        "AC33: resolve_repo_toplevel must return Some for a subdir of a git repo"
+    );
+    let outer_canon = outer.canonicalize().unwrap();
+    assert_eq!(
+        top.unwrap(),
+        outer_canon,
+        "AC33: resolve_repo_toplevel must return the enclosing repo root"
+    );
+}
+
+/// AC33 unit — `resolve_repo_toplevel` returns `None` for a root that owns its own `.git`.
+///
+/// This is the AC17 / AC32 invariant: a root with its own `.git` entry is NEVER
+/// re-pointed to an ancestor repo.  Gate 1 of `temporal_anchor_state` relies on
+/// this returning `None` (→ `NotAdopted`) before any DB read is attempted.
+///
+/// Discriminating: if the early `project_root.join(".git").exists()` guard is
+/// removed, an inner repo sitting inside an outer repo would be re-pointed to
+/// the outer one, producing wrong anchor state (Differs) and wrong temporal data.
+#[test]
+fn test_resolve_repo_toplevel_not_reached_when_root_has_dot_git() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+
+    // Both repos must exist so the ancestor walk would find `outer` if unchecked.
+    create_real_git_repo(&outer, &[("init", &[("inner/i.rs", "fn i(){}\n")])]);
+    create_real_git_repo(&inner, &[("init", &[("i2.rs", "fn i2(){}\n")])]);
+
+    // inner/ owns .git → must NOT be re-pointed to outer/.
+    assert!(
+        inner.join(".git").exists(),
+        "precondition: inner has its own .git"
+    );
+    let top = super::resolve_repo_toplevel(&inner);
+    assert!(
+        top.is_none(),
+        "AC33: resolve_repo_toplevel must return None for a root that owns .git; got {top:?}"
+    );
+}
+
+// ============================================================================
+// AC22 — Frozen manifest: git_head advances after the first auto_refresh
+// ============================================================================
+
+/// AC22 — A frozen manifest (stored HEAD = `None`) paired with valid lexical/AST
+/// indexes reports `{git_head: null, git_head_state: "resolved"}` on the first
+/// `--stats --json` call and `{git_head: "<GT>", git_head_state: "resolved"}`
+/// on the second (after one `auto_refresh_if_stale`).
+///
+/// "Frozen" means the index was built before #413 landed (or in any situation
+/// where the manifest stores no HEAD): the first `stats_json` snapshot shows the
+/// null/resolved pair that AD-413-13 documents as a legal transient state.
+/// After one query, `auto_refresh_if_stale` sees `NoStoredHead`, rebuilds the
+/// lexical index, and stores the live SHA in the manifest — the second snapshot
+/// shows the expected resolved value.
+///
+/// Fixture: a real **linked worktree** (plan S22), exercising the `git_head` /
+/// `git_head_state` provenance divergence that #413 introduces.  A plain repo's
+/// HEAD already resolved before #413, so using a plain repo here would carry no
+/// discriminating power for the worktree-specific resolution path.
+///
+/// Discriminating:
+/// - Without the `git_head_state` key (#413), the second assertion cannot
+///   distinguish "resolved and recorded" from "resolved but still null".
+/// - An implementation that never wrote the HEAD to the manifest would keep
+///   `git_head` null permanently; the second assertion catches it.
+#[test]
+fn test_ac22_frozen_manifest_git_head_advances_after_refresh() {
+    let (dir, _primary, root, gt) = worktree_fixture("b1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build a real index first so cache_dir contains valid index files
+    // (NgramIndexReader::open requires a full header — a 6-byte stub is
+    // insufficient; write_lexical_index_stub cannot satisfy build_stats_json).
+    auto_refresh_if_stale(&root, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+
+    // Now freeze the manifest: overwrite stored HEAD = None to simulate a
+    // worktree whose manifest was written before the HEAD-recording fix.
+    write_manifest_with_head(&root, &cache_dir, None);
+
+    // First stats call: stored HEAD is None, live HEAD resolves → frozen state.
+    let stats1 = super::super::stats_json_for_test(&cache_dir, &root)
+        .expect("stats_json_for_test must succeed");
+    assert!(
+        stats1["git_head"].is_null(),
+        "AC22: frozen manifest must report null git_head; got {:?}",
+        stats1["git_head"]
+    );
+    assert_eq!(
+        stats1["git_head_state"].as_str().unwrap_or(""),
+        "resolved",
+        "AC22: live HEAD resolves so git_head_state must be 'resolved'; got {:?}",
+        stats1["git_head_state"]
+    );
+
+    // One auto_refresh_if_stale to advance the stored HEAD.
+    auto_refresh_if_stale(&root, &cache_dir, &TEST_ANALYTICS, ReanchorPolicy::Refuse).unwrap();
+
+    // Second stats call: stored HEAD now equals the live SHA.
+    let stats2 = super::super::stats_json_for_test(&cache_dir, &root)
+        .expect("stats_json_for_test must succeed");
+    assert_eq!(
+        stats2["git_head"].as_str().unwrap_or(""),
+        gt.as_str(),
+        "AC22: after refresh git_head must equal the live SHA; got {:?}",
+        stats2["git_head"]
+    );
+    assert_eq!(
+        stats2["git_head_state"].as_str().unwrap_or(""),
+        "resolved",
+        "AC22: git_head_state must still be 'resolved'; got {:?}",
+        stats2["git_head_state"]
+    );
+}
+
+// ============================================================================
+// AC23 — warn_if_temporal_unverifiable call-site coverage (source inspection)
+// ============================================================================
+
+/// AC23 — `staleness::warn_if_temporal_unverifiable` is wired into every search
+/// arm that can serve temporal data.
+///
+/// The criterion lists 11 CLI arms: `--hot`, `--cold`, `--risky`,
+/// `--blast-radius`, `fn --hot` (text+temporal), `--ast --hot` (AST+temporal),
+/// `--update`, `--build`, `--rebuild`, `--stats`, `--stats --json`.  All 11
+/// route through one of the call sites in `mod.rs`.  This test pins the count
+/// so a regression that drops a call site is caught without requiring 11 binary
+/// invocations.
+///
+/// Discriminating: deleting any direct call site changes the exact direct-call count
+/// (currently 5) and fails the assertion; adding a spurious call site without a new
+/// temporal arm also fails (exact `==`, not `>=`).  Adding a new temporal arm without
+/// a call site keeps both counts unchanged — THAT case requires the CLI acceptance run
+/// in S23.  Comment references to the function name are excluded by using call-syntax
+/// patterns (name + opening paren) so a masked-deletion via comment cannot pass.
+#[test]
+fn test_ac23_warn_if_temporal_unverifiable_call_site_count() {
+    let mod_src = include_str!("mod.rs");
+    // Use call-syntax patterns (function name + opening paren) rather than bare name
+    // references so that comment mentions of the name are excluded.  A bare-name `>=`
+    // bound would allow masking a deleted call site by adding a comment reference;
+    // exact `==` on a call-syntax pattern closes that gap.
+    //
+    // `warn_if_temporal_unverifiable(` does NOT match the `_at` variant because
+    // `warn_if_temporal_unverifiable_at(` has `_at` between `unverifiable` and `(`.
+    let direct_call_count = mod_src.matches("warn_if_temporal_unverifiable(").count();
+    // Direct calls via the bare function (mod.rs is the sole consumer):
+    //   run()                     — text+AST compound arm (--ast)
+    //   run_build()               — --build / --rebuild arm
+    //   run_update()              — --update arm
+    //   run_stats()               — --stats / --stats --json arm (reliability fix:
+    //                               HEAD resolved once here instead of via _at wrapper,
+    //                               so the same HeadState can be forwarded to
+    //                               build_stats_json without a second resolution)
+    //   run_query()               — plain-text query arm
+    //   run_temporal_standalone() — --hot / --cold / --risky / --blast-radius arm
+    assert_eq!(
+        direct_call_count, 6,
+        "AC23: mod.rs must contain exactly 6 direct warn_if_temporal_unverifiable(...) \
+         call sites; found {direct_call_count} — a temporal arm lost its advisory call \
+         or a new arm was added without wiring (update expected value if arms change)"
+    );
+    let at_call_count = mod_src.matches("warn_if_temporal_unverifiable_at(").count();
+    // The _at wrapper is no longer used in mod.rs: run_stats now resolves HeadState
+    // once and forwards it to both warn_if_temporal_unverifiable and build_stats_json
+    // (reliability fix — eliminates the duplicate git_head_state call).
+    assert_eq!(
+        at_call_count, 0,
+        "AC23: mod.rs must contain exactly 0 warn_if_temporal_unverifiable_at(...) \
+         call sites; found {at_call_count} — the _at wrapper was re-introduced in mod.rs \
+         (it leads to a second git_head_state call when build_stats_json also reads HEAD)"
+    );
+}
+
+// ============================================================================
+// AC24 — Guard ordering: advisory early-returns before any SQLite open
+//         when HEAD resolves (HEAD-resolves path, C5)
+// ============================================================================
+
+/// AC24 — `warn_if_temporal_unverifiable` returns immediately (zero SQLite opens)
+/// when the live HEAD state is not `Unresolved`.
+///
+/// The guard `if !matches!(head, HeadState::Unresolved) { return; }` is the first
+/// statement in the function.  We verify it fires before any DB access by:
+///   1. Creating a real `temporal.db` with `META_GIT_HEAD` set — so guard 2
+///      (`!exists()`) would also pass if guard 1 were absent — then
+///   2. Asserting that `TEMPORAL_META_READ_COUNT` (the in-process counter
+///      incremented inside `read_temporal_meta` after the `exists()` check) does
+///      NOT move across the two calls.
+///
+/// Discriminating: removing guard 1 causes `read_temporal_meta` to be called,
+/// which increments `TEMPORAL_META_READ_COUNT` by 2 (one per sub-case), failing
+/// the assertion.  The DB-as-directory approach previously used would not catch
+/// this because `open_with_flags` swallows the error via `.ok()?`.
+///
+/// Sub-cases:
+///   C5-R: `HeadState::Resolved("sha")` — the common healthy-repo case.
+///   C5-N: `HeadState::NotARepo` — non-git directory.
+#[test]
+fn test_ac24_advisory_early_return_before_sqlite_on_resolved_and_not_a_repo() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build a real temporal.db so guard 2 (`!temporal.db.exists()`) passes.
+    // Without guard 1, `read_temporal_meta` would reach the SQLite open and
+    // increment TEMPORAL_META_READ_COUNT.
+    let db_path = cache_dir.join("temporal.db");
+    {
+        rskim_search::TemporalDb::open(&db_path).unwrap();
+    }
+    super::plant_meta_raw(&db_path, rskim_search::META_GIT_HEAD, &"a".repeat(40));
+
+    // Snapshot the counter before the guarded calls.
+    let before = TEMPORAL_META_READ_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+
+    // C5-R: resolved HEAD — guard 1 must short-circuit before any DB open.
+    let sha = "a".repeat(40);
+    super::warn_if_temporal_unverifiable(&cache_dir, &HeadState::Resolved(sha));
+
+    // C5-N: not-a-repo — guard 1 must also short-circuit.
+    super::warn_if_temporal_unverifiable(&cache_dir, &HeadState::NotARepo);
+
+    // Assert zero DB opens: the counter must not have moved across either call.
+    let after = TEMPORAL_META_READ_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+    let delta = after.wrapping_sub(before);
+    assert_eq!(
+        delta, 0,
+        "AC24: guard 1 (!matches!(head, Unresolved)) must short-circuit before any \
+         SQLite open for HeadState::Resolved and HeadState::NotARepo; \
+         TEMPORAL_META_READ_COUNT delta = {delta} — guard is missing or bypassed",
+    );
+}
+
+// ============================================================================
+// AC16(a) — No rebuild loop on a healthy linked worktree:
+//            temporal.db and index.skfiles mtimes unchanged on second call
+// ============================================================================
+
+/// AC16(a) — Two consecutive identical `auto_refresh_if_stale` calls on a healthy
+/// linked worktree must leave both `temporal.db` and `index.skfiles` mtimes
+/// unchanged on the second call (no rebuild loop).
+///
+/// This path is newly reachable because of #413's worktree HEAD resolution; the
+/// no-loop guarantee must be asserted explicitly for the linked-worktree case.
+/// The existing `test_bug_b_no_rebuild_loop_when_temporal_is_current` covers a
+/// plain repo; this test covers the newly introduced worktree path.
+///
+/// Discriminating:
+///   - A regression that rebuilds the lexical index on every call would advance
+///     `index.skfiles` mtime, failing the manifest assertion.
+///   - A regression that rebuilds `temporal.db` on every call would advance its
+///     mtime, failing the temporal assertion.
+///   - A regression that returns an error on the second call would fail `.unwrap()`.
+#[test]
+fn test_ac16a_healthy_worktree_no_rebuild_loop() {
+    let (dir, _primary, worktree, _gt) = worktree_fixture("b1");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // First call: build the complete index (lexical + temporal) on the healthy
+    // linked worktree.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let temporal_db_path = cache_dir.join("temporal.db");
+    let manifest_path = cache_dir.join("index.skfiles");
+    assert!(
+        temporal_db_path.exists(),
+        "AC16(a) precondition: temporal.db must exist after first build"
+    );
+    assert!(
+        manifest_path.exists(),
+        "AC16(a) precondition: index.skfiles must exist after first build"
+    );
+
+    let temporal_mtime_before = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
+    let manifest_mtime_before = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+
+    // Small delay so that any rewrite on the second call would produce a
+    // measurably later mtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Second call: both temporal and lexical indexes are Current.
+    // Neither temporal.db nor index.skfiles must be rewritten.
+    auto_refresh_if_stale(
+        &worktree,
+        &cache_dir,
+        &TEST_ANALYTICS,
+        ReanchorPolicy::Refuse,
+    )
+    .unwrap();
+
+    let temporal_mtime_after = fs::metadata(&temporal_db_path).unwrap().modified().unwrap();
+    let manifest_mtime_after = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+
+    assert_eq!(
+        temporal_mtime_before, temporal_mtime_after,
+        "AC16(a): temporal.db mtime must be unchanged on the second call \
+         (no rebuild loop on healthy linked worktree)"
+    );
+    assert_eq!(
+        manifest_mtime_before, manifest_mtime_after,
+        "AC16(a): index.skfiles mtime must be unchanged on the second call \
+         (no rebuild loop on healthy linked worktree)"
+    );
+}
+
+// ============================================================================
+// AC16(c) — Advisory fires on unresolvable HEAD + temporal.db present;
+//            temporal.db is NOT rebuilt (no loop)
+// ============================================================================
+
+/// AC16(c) — After a successful index build, if the repo HEAD becomes
+/// unresolvable (e.g. `git symbolic-ref HEAD refs/heads/gone`), two consecutive
+/// `check_staleness` calls must both return `Current` (no rebuild loop) and
+/// `warn_if_temporal_unverifiable` must fire without error.
+///
+/// This exercises the AC24 advisory gate on the NEGATIVE/advisory side: HEAD is
+/// `Unresolved`, `temporal.db` exists, and `META_GIT_HEAD` is recorded —
+/// so `warn_if_temporal_unverifiable` DOES proceed past the first two guards and
+/// reads the `meta.git_head` row.  The advisory is printed to stderr; `temporal.db`
+/// is not modified.
+///
+/// Discriminating:
+///   - A wrong fix that rebuilds on Unresolved live HEAD would change the
+///     `temporal.db` length and the mtime-equality assertion fails.
+///   - A wrong fix that treats Unresolved as NotARepo would suppress the advisory;
+///     but since the advisory goes to stderr (not testable here without subprocess),
+///     this unit test focuses on the no-rebuild contract.
+#[test]
+fn test_ac16c_unresolvable_head_no_rebuild_loop_temporal_stable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    let git_dir = root.join(".git");
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(git_dir.join("refs/heads")).unwrap();
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(root.join("a.rs"), "fn a(){}\n").unwrap();
+
+    // Build a valid git repo with a commit so `temporal.db` has a recorded HEAD.
+    let recorded_sha = create_real_git_repo(&root, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    build_temporal_for_test(&root, &cache_dir, &recorded_sha);
+    assert!(
+        cache_dir.join("temporal.db").exists(),
+        "precondition: temporal.db must exist after the build"
+    );
+
+    // Build a real lexical+AST index so the manifest has actual file entries.
+    // Using write_manifest_with_head+stubs would produce an empty manifest,
+    // causing scan_working_tree to see a.rs as "added" → dirty → WorkingTreeChanged,
+    // masking the no-rebuild-loop contract this test asserts (#413 Fix 1).
+    build_index_in(&root, &cache_dir);
+
+    // Make HEAD unresolvable: point to a non-existent ref.
+    // We overwrite the HEAD file so the symbolic-ref points somewhere that has no file.
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/gone\n").unwrap();
+    assert!(
+        read_git_head(&root).is_none(),
+        "AC16(c) precondition: live HEAD must be None after the ref is broken"
+    );
+    assert_eq!(
+        git_head_state(&root),
+        HeadState::Unresolved,
+        "AC16(c) precondition: git_head_state must be Unresolved"
+    );
+
+    // First staleness check: (Some(stored), None) arm → Current (no rebuild loop).
+    let (verdict1, _) = check_staleness(&cache_dir, &root);
+    assert!(
+        matches!(verdict1, StalenessCheck::Current),
+        "AC16(c): first check_staleness must be Current when live HEAD is Unresolved; \
+         got {verdict1:?}"
+    );
+
+    // AC24 advisory path: HEAD is Unresolved + temporal.db + recorded git_head →
+    // warn_if_temporal_unverifiable reads the meta row and prints to stderr.
+    // We verify it completes without panic (the advisory output is on stderr).
+    let db_len_before = fs::metadata(cache_dir.join("temporal.db")).unwrap().len();
+    super::warn_if_temporal_unverifiable(&cache_dir, &HeadState::Unresolved);
+    let db_len_after = fs::metadata(cache_dir.join("temporal.db")).unwrap().len();
+    assert_eq!(
+        db_len_before, db_len_after,
+        "AC16(c): temporal.db must not be modified by warn_if_temporal_unverifiable"
+    );
+
+    // Second staleness check: still Current (no rebuild triggered).
+    let (verdict2, _) = check_staleness(&cache_dir, &root);
+    assert!(
+        matches!(verdict2, StalenessCheck::Current),
+        "AC16(c): second check_staleness must also be Current (no rebuild loop); \
+         got {verdict2:?}"
+    );
 }
