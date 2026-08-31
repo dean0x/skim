@@ -1640,9 +1640,13 @@ fn test_both_gitdir_resolvers_agree() {
     use std::path::PathBuf;
 
     let dir = tempfile::tempdir().unwrap();
+    // macOS: /var is a symlink to /private/var; tempdir() returns the uncanonicalized
+    // path but git resolves paths canonically.  Canonicalize once so all expected paths
+    // match what the resolver produces (#413 Fix 4).
+    let base = dir.path().canonicalize().unwrap();
 
     // Case 1: plain git repo — index is at <root>/.git/index.
-    let plain = dir.path().join("plain");
+    let plain = base.join("plain");
     fs::create_dir_all(&plain).unwrap();
     create_real_git_repo(&plain, &[("init", &[("a.rs", "fn a(){}\n")])]);
 
@@ -1655,8 +1659,8 @@ fn test_both_gitdir_resolvers_agree() {
 
     // Case 2: linked worktree — index is at the per-worktree gitdir
     // (<primary>/.git/worktrees/<name>/index), NOT the common .git/index.
-    let primary = dir.path().join("primary");
-    let worktree = dir.path().join("wt1");
+    let primary = base.join("primary");
+    let worktree = base.join("wt1");
     fs::create_dir_all(&primary).unwrap();
     create_real_git_repo(&primary, &[("init", &[("a.rs", "fn a(){}\n")])]);
     create_real_git_worktree(&primary, &worktree, "b1");
@@ -1676,7 +1680,7 @@ fn test_both_gitdir_resolvers_agree() {
     );
 
     // Case 3: non-git directory — resolver returns None.
-    let non_git = dir.path().join("non_git");
+    let non_git = base.join("non_git");
     fs::create_dir_all(&non_git).unwrap();
 
     let walk_ng: Option<PathBuf> = super::resolve_git_index_path(&non_git);
