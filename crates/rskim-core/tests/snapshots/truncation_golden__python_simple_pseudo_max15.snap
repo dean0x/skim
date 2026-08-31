@@ -1,6 +1,5 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 269
 expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(15))"
 ---
 """
@@ -17,5 +16,4 @@ def greet_user(name) -> str:
     """Greet a user by name"""
     message = f"Hello, {name}!"
     return message
-
-# ... (6 lines truncated)
+# ... (7 lines truncated)

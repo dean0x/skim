@@ -6,5 +6,4 @@ expression: "snap(MD_SIMPLE, Language::Markdown,\nTransformConfig::with_mode(Mod
 
 This is some introductory content that should not appear in structure mode.
 
-## Section One
-<!-- ... (32 lines truncated) -->
+<!-- ... (33 lines truncated) -->

@@ -1,11 +1,9 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 640
 expression: "snap(TS_COMMENTS, Language::TypeScript,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(5))"
 ---
 /**
  * This is a JSDoc comment (KEEP)
  * @param x - first number
  * @param y - second number
- * @returns the sum
-// ... (49 lines truncated)
+// ... (50 lines truncated)

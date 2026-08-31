@@ -1,11 +1,9 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 193
 expression: "snap(RUST_COMMENTS, Language::Rust,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(5))"
 ---
 //! Module-level doc comment (KEEP)
 //! This describes the module (KEEP)
 
 
-/// Function doc comment (KEEP)
-// ... (46 lines truncated)
+// ... (47 lines truncated)

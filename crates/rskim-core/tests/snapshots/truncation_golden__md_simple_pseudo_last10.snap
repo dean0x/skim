@@ -2,8 +2,7 @@
 source: crates/rskim-core/tests/truncation_golden.rs
 expression: "snap(MD_SIMPLE, Language::Markdown,\nTransformConfig::with_mode(Mode::Pseudo).with_last_lines(10))"
 ---
-<!-- ... (27 lines above) -->
-
+<!-- ... (28 lines above) -->
 Setext Style H1
 ===============
 

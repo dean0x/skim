@@ -1,13 +1,12 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 409
 expression: "snap(GO_SIMPLE, Language::Go,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(15))"
 ---
 // ... (7 lines truncated)
 func Add(a int, b int) int  {...}
-// ... (1 lines truncated)
+// ... (1 line truncated)
 func Greet(name string) string  {...}
-// ... (1 lines truncated)
+// ... (1 line truncated)
 type Calculator struct {
     value int
 }
@@ -15,6 +14,6 @@ type Calculator struct {
 type Computer interface {
     Compute(x int) int
 }
-// ... (1 lines truncated)
+// ... (1 line truncated)
 type Status int
 // ... (6 lines truncated)

@@ -2,8 +2,7 @@
 source: crates/rskim-core/tests/truncation_golden.rs
 expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Pseudo).with_last_lines(10))"
 ---
-# ... (11 lines above)
-    """Greet a user by name"""
+# ... (12 lines above)
     message = f"Hello, {name}!"
     return message
 

@@ -1,11 +1,9 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 305
 expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(5))"
 ---
 """
 FIXTURE: Simple Python functions
 TESTS: Basic function signature extraction
 """
-
-# ... (16 lines truncated)
+# ... (17 lines truncated)

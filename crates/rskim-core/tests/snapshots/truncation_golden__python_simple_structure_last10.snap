@@ -2,8 +2,7 @@
 source: crates/rskim-core/tests/truncation_golden.rs
 expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Structure).with_last_lines(10))"
 ---
-# ... (7 lines above)
-
+# ... (8 lines above)
 def greet_user(name: str) -> str:
      {...}
 

@@ -269,7 +269,9 @@ pub(crate) fn truncate_to_lines(
 
         // Add lines from this span. Reserve 1 slot for the trailing marker so that
         // content + trailing marker never exceeds max_lines (#317 / ADR-002).
-        let remaining_budget = max_lines.saturating_sub(result_lines.len()).saturating_sub(1);
+        let remaining_budget = max_lines
+            .saturating_sub(result_lines.len())
+            .saturating_sub(1);
         let span_end = end.min(start + remaining_budget);
 
         for line_idx in start..span_end {
@@ -347,8 +349,19 @@ pub(crate) fn simple_line_truncate(
     // Reserve 1 slot for the marker so that `--max-lines N` ≡ `head -N`:
     // at most N total lines (#317 / ADR-002).  content_lines = N-1; the marker
     // occupies the Nth slot.
+    //
+    // N=1 is the one irreconcilable case, and it resolves in favour of BOTH
+    // obligations at the cost of one line. Reserving the slot would leave zero
+    // content (a bare marker is useless as a code view); dropping the marker
+    // would be silent loss, which #317 forbids and ADR-011 class 1 makes
+    // unconditional. So N=1 alone emits 1 content line + 1 marker = 2 lines.
+    // Every N > 1 holds the bound exactly: N-1 content + 1 marker = N.
     // E3: use source-space line count when provided; fall back to output-space.
-    let content_lines = max_lines.saturating_sub(1);
+    let content_lines = if max_lines > 1 {
+        max_lines - 1
+    } else {
+        max_lines
+    };
     let total = source_line_count.unwrap_or(lines.len());
     let omitted = total.saturating_sub(content_lines);
     let line_s = if omitted == 1 { "line" } else { "lines" };
@@ -357,7 +370,8 @@ pub(crate) fn simple_line_truncate(
         hint,
     );
 
-    // Take first content_lines lines, then append marker (total = max_lines).
+    // Take first content_lines lines, then append marker (total = max_lines,
+    // except the documented N=1 case which yields 2).
     let mut result: Vec<&str> = lines[..content_lines].to_vec();
     result.push(&marker);
 
@@ -512,7 +526,11 @@ where
     let suffix = get_comment_suffix(language);
     // B5: elision_hint must be captured by the closure to append the remedy clause.
     let make_marker = |truncated_count: usize| {
-        let line_s = if truncated_count == 1 { "line" } else { "lines" };
+        let line_s = if truncated_count == 1 {
+            "line"
+        } else {
+            "lines"
+        };
         append_hint(
             format!("{prefix} ... ({truncated_count} {line_s} truncated){suffix}"),
             elision_hint,
@@ -771,7 +789,9 @@ mod tests {
         );
     }
 
-    /// E4.2 regression: N=1 emits 1 content line + 1 marker.
+    /// `--max-lines N` = at most N lines TOTAL, marker included (b5507ad).
+    /// N=1 is the documented exception: a bare marker is useless as a code view
+    /// and dropping the marker would be silent loss, so N=1 yields both.
     #[test]
     fn test_simple_line_truncate_n1() {
         let text = "line 1\nline 2\nline 3\n";
@@ -780,18 +800,19 @@ mod tests {
         assert_eq!(
             result_lines.len(),
             2,
-            "N=1: 1 content line + 1 marker = 2 total, got {:?}",
+            "N=1 exception: 1 content line + 1 marker, got {:?}",
             result_lines
         );
-        assert_eq!(result_lines[0], "line 1");
+        assert_eq!(result_lines[0], "line 1", "N=1 must serve a content line");
         assert!(
             result_lines[1].contains("// ... (2 lines truncated)"),
-            "marker line count wrong, got: {:?}",
+            "N=1 must still disclose the 2 elided lines, got: {:?}",
             result_lines[1]
         );
     }
 
-    /// E4.2 regression: N=20 emits 20 content lines + 1 marker.
+    /// `--max-lines N` = at most N lines TOTAL, marker included (b5507ad).
+    /// N=20 over a 25-line input: 19 content lines + 1 marker covering 6.
     #[test]
     fn test_simple_line_truncate_n20() {
         let lines_25: String = (1..=25).map(|i| format!("line {i}\n")).collect();
@@ -799,16 +820,16 @@ mod tests {
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
-            21,
-            "N=20: 20 content lines + 1 marker = 21 total, got {:?}",
+            20,
+            "N=20: 19 content lines + 1 marker = 20 total, got {:?}",
             result_lines.len()
         );
         assert_eq!(result_lines[0], "line 1");
-        assert_eq!(result_lines[19], "line 20");
+        assert_eq!(result_lines[18], "line 19");
         assert!(
-            result_lines[20].contains("// ... (5 lines truncated)"),
-            "marker must say 5 lines truncated (25-20), got: {:?}",
-            result_lines[20]
+            result_lines[19].contains("// ... (6 lines truncated)"),
+            "marker must say 6 lines truncated (25-19), got: {:?}",
+            result_lines[19]
         );
     }
 
@@ -830,22 +851,20 @@ mod tests {
 
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 1, None, None).unwrap();
         let line_count = result.lines().count();
-        // E4: N content + 1 trailing marker = N+1 total. For max_lines=1 the
-        // no-content fallback triggers simple_line_truncate → 2 lines max.
+        // `--max-lines N` = at most N lines TOTAL, marker included (b5507ad).
+        // N=1 is the documented exception: a bare marker is useless as a code
+        // view, and dropping the marker would be silent loss (#317 / ADR-011
+        // class 1), so N=1 alone yields 1 content line + 1 marker.
         assert!(
             line_count <= 2,
-            "Expected at most 2 lines (1 content + 1 trailing marker), got {}: {:?}",
+            "N=1 exception: at most 1 content line + 1 marker, got {}: {:?}",
             line_count,
             result
         );
-        // Must have at least one content line.
-        let content = result
-            .lines()
-            .filter(|l| !l.contains("lines truncated"))
-            .count();
+        let content = result.lines().filter(|l| !l.contains("truncated")).count();
         assert!(
             content >= 1,
-            "Expected at least 1 content line, got only markers: {:?}",
+            "N=1 must serve a content line, not a bare marker: {:?}",
             result
         );
     }
@@ -1091,11 +1110,12 @@ mod tests {
         let result = truncate_to_lines(text, &spans, Language::TypeScript, 5, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
 
-        // E4: N content + 1 trailing marker = N+1 total.  With trim_limit=N+1=6 the
-        // trim stops earlier, so 3 content + 3 markers (2 gaps + 1 trailing) = 6 all fit.
+        // `--max-lines N` = at most N lines TOTAL, marker included (b5507ad).
+        // Markers count against the budget, so trimming stops at 2 content + 2
+        // markers = 4 ≤ 5 — exactly the behaviour documented above.
         assert!(
-            result_lines.len() <= 6,
-            "Output should not exceed 6 lines (5 content budget + 1 trailing marker), got {}: {:?}",
+            result_lines.len() <= 5,
+            "Output should not exceed the --max-lines=5 budget, got {}: {:?}",
             result_lines.len(),
             result
         );
@@ -1110,10 +1130,12 @@ mod tests {
             "Should contain type B (priority 5): {:?}",
             result
         );
-        // With E4, fn foo (priority 4) ALSO fits: 3 content + 3 markers = 6 = N+1.
+        // fn foo (priority 4) is the lowest-priority span and is trimmed first:
+        // under N-total the two type declarations plus their gap markers already
+        // consume 4 of the 5 available lines.
         assert!(
-            result.contains("fn foo()"),
-            "With E4 trim_limit=6, fn foo (prio 4) should be retained: {:?}",
+            !result.contains("fn foo()"),
+            "fn foo (prio 4) should be trimmed before the type declarations: {:?}",
             result
         );
         // Elision markers must be present for the content gaps.
@@ -1570,12 +1592,13 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_markdown_marker() {
-        // E4.2: n=2, total=4. Omitted = 4-2 = 2.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // n=2, total=4 → content_lines = n-1 = 1, omitted = 4-1 = 3.
         let text = "# H1\n## H2\n## H3\n## H4\n";
         let result = simple_last_line_truncate(text, Language::Markdown, 2, None, None).unwrap();
         assert!(
-            result.contains("<!-- ... (2 lines above) -->"),
-            "Markdown should use HTML comment for marker, omit=2: {:?}",
+            result.contains("<!-- ... (3 lines above) -->"),
+            "Markdown should use HTML comment for marker, omit=3: {:?}",
             result
         );
     }

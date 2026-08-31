@@ -441,11 +441,16 @@ impl Language {
                     let count = truncated.lines().count();
                     Some((1..=count).collect::<Vec<usize>>())
                 } else {
-                    // Truncation occurred: 1 marker line + n content tail lines.
-                    // E4.2: the marker does not consume one of the N requested lines;
-                    // n_content = n (not n-1). start_line is the first content source
-                    // line (1-indexed): source_line_count - n + 1.
-                    let n_content = n; // all N requested lines are content
+                    // Truncation occurred: 1 marker line + (n-1) content tail lines.
+                    // N-total semantics (b5507ad / ADR-002): `--last-lines N` yields at
+                    // most N lines TOTAL, so the marker consumes one of the N slots and
+                    // n_content = n-1. start_line is the first retained content source
+                    // line (1-indexed): source_line_count - n_content + 1.
+                    //
+                    // PF-019: this map is the ONLY source of the `-n` annotations, so an
+                    // n_content that disagrees with simple_last_line_truncate's own
+                    // `content_lines = n-1` silently mislabels every retained line.
+                    let n_content = n.saturating_sub(1);
                     let start_line = source_line_count - n_content + 1; // 1-indexed
                     let mut map = Vec::with_capacity(1 + n_content);
                     map.push(0_usize); // marker line has no annotation

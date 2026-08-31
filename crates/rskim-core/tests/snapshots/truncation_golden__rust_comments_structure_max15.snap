@@ -1,6 +1,5 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 184
 expression: "snap(RUST_COMMENTS, Language::Rust,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(15))"
 ---
 // ... (11 lines truncated)
@@ -10,12 +9,4 @@ pub struct Calculator {
     /// Field doc comment (KEEP)
     value: i32,
 }
-// ... (4 lines truncated)
-impl Calculator {
-    /// Constructor doc (KEEP)
-    pub fn new(value: i32) -> Self  {...}
-
-    /// Add method doc (KEEP)
-    pub fn add(&self, x: i32) -> i32  {...}
-}
-// ... (11 lines truncated)
+// ... (22 lines truncated)

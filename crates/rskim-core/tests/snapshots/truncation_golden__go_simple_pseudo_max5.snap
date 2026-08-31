@@ -1,11 +1,9 @@
 ---
 source: crates/rskim-core/tests/truncation_golden.rs
-assertion_line: 454
 expression: "snap(GO_SIMPLE, Language::Go,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(5))"
 ---
 package main
 
 import "fmt"
 
-func Add(a int, b int) int {
-// ... (29 lines truncated)
+// ... (30 lines truncated)
