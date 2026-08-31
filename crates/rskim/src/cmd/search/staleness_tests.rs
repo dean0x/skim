@@ -3632,17 +3632,40 @@ fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
     // so the escape guard rejects it and read_git_head returns None (live HEAD unresolvable).
     let parent = tempdir().unwrap();
     let project_root = parent.path().join("repo");
-    let git_dir = project_root.join(".git");
     let cache_dir = parent.path().join("cache");
-    fs::create_dir_all(git_dir.join("refs")).unwrap();
+    fs::create_dir_all(&project_root).unwrap();
     fs::create_dir_all(&cache_dir).unwrap();
-    // Add one .rs file so the index build produces a non-empty manifest.
-    fs::write(project_root.join("a.rs"), "fn a(){}\n").unwrap();
+
+    // Build a real git repo with a.rs committed, then build a real lexical+AST index so
+    // the manifest reflects the on-disk tree before switching HEAD to the escape ref.
+    // Using write_manifest_with_head+stubs would produce an empty manifest, causing
+    // scan_working_tree to see a.rs as "added" → dirty → WorkingTreeChanged, masking
+    // the no-rebuild-loop contract this test asserts (same root cause as AC16c Fix 1).
+    create_real_git_repo(&project_root, &[("init", &[("a.rs", "fn a(){}\n")])]);
 
     let escape_sha = "2".repeat(40);
     let escape_target = parent.path().join("outside-sha");
     fs::write(&escape_target, format!("{escape_sha}\n")).unwrap();
     let ref_path = "refs/../../../outside-sha";
+
+    // Build the index while HEAD is still valid so the manifest records a.rs.
+    build_index_in(&project_root, &cache_dir);
+
+    // Patch the manifest's git_head to the poisoned escape-derived SHA.
+    // This simulates the state S10 reuses: S9 wrote 2222… into the manifest when the
+    // escape guard first fired; we reproduce that stored value without disturbing the
+    // file entries that make the working-tree scan come back clean.
+    let poisoned = escape_sha.clone();
+    {
+        use crate::cmd::search::manifest::FileManifest;
+        let mut manifest = FileManifest::load(project_root.clone(), cache_dir.clone())
+            .expect("manifest must load after build_index_in");
+        manifest.set_git_head(Some(poisoned.clone()));
+        manifest.save().unwrap();
+    }
+
+    // Now switch HEAD to the escape ref to make read_git_head return None.
+    let git_dir = project_root.join(".git");
 
     // MANDATORY PRECONDITION: the escape target is reachable (pre-fix would resolve it).
     assert!(
@@ -3663,14 +3686,10 @@ fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
         "AC10(a): git_head_state must be Unresolved when HEAD exists but ref escapes"
     );
 
-    // Plant the poisoned stored HEAD (escape-derived SHA) into the manifest.
-    let poisoned = escape_sha.clone();
-    write_manifest_with_head(&project_root, &cache_dir, Some(&poisoned));
-    write_lexical_index_stub(&cache_dir);
-    write_ast_index_stub(&cache_dir);
-
     // AC10(b): verdict must be Current (not HeadChanged, not NoStoredHead).
     // The `(Some(stored), None)` arm in check_staleness returns current_or_working_tree.
+    // With a real index that reflects the on-disk tree, the working-tree scan is clean,
+    // so current_or_working_tree returns Current — not WorkingTreeChanged.
     let (verdict1, _) = check_staleness(&cache_dir, &project_root);
     assert!(
         matches!(verdict1, StalenessCheck::Current),
@@ -3678,8 +3697,8 @@ fn test_git_head_state_poisoned_stored_head_is_inert_no_rebuild_loop() {
     );
 
     // AC10(c): run auto_refresh_if_stale twice and capture index.skfiles mtime.
-    // The working-tree scan may see a.rs as modified, but without working-tree changes
-    // between the two calls the second run must be mtime-stable.
+    // The working-tree is clean (manifest reflects the on-disk tree), so both calls
+    // return early without rebuilding; the second run must be mtime-stable.
     auto_refresh_if_stale(
         &project_root,
         &cache_dir,
