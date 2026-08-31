@@ -606,15 +606,22 @@ pub fn find_by_name(name: &Name) -> Option<User> { None }\n";
     fs::write(&file, src).unwrap();
 
     // --tokens=20: structure mode ~100 tokens, signatures ~60 tokens, types ~36 tokens
-    // All > 20, so fallback_line_truncate fires and emits the B5 elision marker.
+    // All > 20, so fallback_line_truncate fires and emits the elision marker.
+    //
+    // Disclosure and remedy live on different streams. The full marker
+    // ("… — SKIM_PASSTHROUGH=1 for full output") costs ~17 tokens on its own, so
+    // at a 20-token budget it cannot fit on stdout without either busting the
+    // budget or suppressing the marker entirely — and suppression would be silent
+    // loss (#317). So stdout carries the *disclosure* (the count), kept short
+    // enough to fit, and stderr carries the *remedy* as an unconditional
+    // ADR-011 class-1 notice. Both obligations are met, neither budget is broken.
     skim()
         .arg(&file)
         .arg("--tokens=20")
         .assert()
         .success()
-        // fallback_line_truncate uses truncate_to_token_budget which emits:
-        // "// ... (N lines truncated) — SKIM_PASSTHROUGH=1 for full output"
-        .stdout(predicate::str::contains("SKIM_PASSTHROUGH=1"));
+        .stdout(predicate::str::contains("truncated"))
+        .stderr(predicate::str::contains("SKIM_PASSTHROUGH=1"));
 }
 
 /// rskim-core markers carry NO CLI hint when the library is used without CLI

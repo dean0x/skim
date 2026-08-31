@@ -288,9 +288,27 @@ fn test_max_lines_python_class_priority_over_functions() {
         .unwrap();
 
     let stdout = String::from_utf8(output.stdout).unwrap();
+    // ADR-001 outranks priority selection on inputs this small. The bounded
+    // structure view needs two elision markers to show the class, and those
+    // markers cost more than the raw source they replace — so the net-savings
+    // guard serves raw, and raw truncated to 5 lines is the head of the file.
+    //
+    // This is a real consequence of making elision markers honest: a marker has
+    // a byte cost, and on a short file that cost tips ADR-001 toward raw, which
+    // has no notion of node priority. The bound still holds and the elision is
+    // still disclosed — what is lost is compression, not fidelity.
+    //
+    // PF-027: the fixture is deliberately NOT enlarged to make compression pay.
+    // Resizing an input until a guard agrees is a silent revert of the guard.
+    assert_eq!(
+        stdout.lines().count(),
+        5,
+        "--max-lines 5 must hold regardless of which view the guard selects: {:?}",
+        stdout,
+    );
     assert!(
-        stdout.contains("class"),
-        "Python class should be kept over standalone function with tight budget: {:?}",
+        stdout.contains("truncated"),
+        "elision must be disclosed even when the guard serves raw: {:?}",
         stdout,
     );
 }

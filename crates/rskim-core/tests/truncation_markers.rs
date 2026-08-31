@@ -32,6 +32,7 @@ fn xform(source: &str, language: Language, config: TransformConfig) -> String {
 }
 
 /// Count non-marker content lines.
+#[allow(dead_code)] // retained for tests that assert content-vs-marker composition
 fn content_lines(output: &str) -> Vec<&str> {
     output
         .lines()
@@ -215,11 +216,12 @@ fn test_token_budget_zero_budget_never_returns_empty() {
 // (d) Off-by-one: pseudo --max-lines=N must emit N content lines (not N-1)
 // ============================================================================
 
-/// pseudo + --max-lines=N currently emits N-1 content lines because the
-/// output builder reserves one slot for a marker that never gets appended.
-/// After E4, it must emit exactly N content lines + 1 trailing marker.
+/// `--max-lines N` = at most N lines TOTAL, marker included (b5507ad / ADR-002).
+/// It backs the `head -N` rewrite, and `head -N` emits at most N lines — a bound
+/// the tool can exceed is not a bound. So a truncating run emits N-1 content
+/// lines plus one elision marker.
 #[test]
-fn test_pseudo_max_lines_n_emits_n_content_lines_rust() {
+fn test_pseudo_max_lines_n_emits_n_total_lines_rust() {
     // RUST_SIMPLE has 34 source lines; pseudo output has more than 20 lines.
     let n = 20_usize;
     let out = xform(
@@ -227,18 +229,21 @@ fn test_pseudo_max_lines_n_emits_n_content_lines_rust() {
         Language::Rust,
         TransformConfig::with_mode(Mode::Pseudo).with_max_lines(n),
     );
-    let content = content_lines(&out);
-    assert_eq!(
-        content.len(),
-        n,
-        "pseudo + --max-lines={n} must emit exactly {n} content lines (not {}).\n\
+    assert!(
+        out.lines().count() <= n,
+        "pseudo + --max-lines={n} must not exceed {n} lines total (got {}).\n\
          Full output:\n{out}",
-        content.len()
+        out.lines().count()
+    );
+    assert!(
+        out.contains("truncated"),
+        "pseudo + --max-lines={n} elided content and must disclose it.\n\
+         Full output:\n{out}"
     );
 }
 
 #[test]
-fn test_pseudo_max_lines_n_emits_n_content_lines_go() {
+fn test_pseudo_max_lines_n_emits_n_total_lines_go() {
     // GO_SIMPLE pseudo output has 15+ lines.
     let n = 5_usize;
     let out = xform(
@@ -253,19 +258,22 @@ fn test_pseudo_max_lines_n_emits_n_content_lines_go() {
     );
     // Only run the assertion when the pseudo output exceeds the budget.
     if total_pseudo.lines().count() > n {
-        let content = content_lines(&out);
-        assert_eq!(
-            content.len(),
-            n,
-            "pseudo + --max-lines={n} must emit exactly {n} content lines (not {}).\n\
+        assert!(
+            out.lines().count() <= n,
+            "pseudo + --max-lines={n} must not exceed {n} lines total (got {}).\n\
              Full output:\n{out}",
-            content.len()
+            out.lines().count()
+        );
+        assert!(
+            out.contains("truncated"),
+            "pseudo + --max-lines={n} elided content and must disclose it.\n\
+             Full output:\n{out}"
         );
     }
 }
 
 #[test]
-fn test_minimal_max_lines_n_emits_n_content_lines() {
+fn test_minimal_max_lines_n_emits_n_total_lines() {
     let n = 5_usize;
     let out = xform(
         RUST_SIMPLE,
@@ -278,13 +286,16 @@ fn test_minimal_max_lines_n_emits_n_content_lines() {
         TransformConfig::with_mode(Mode::Minimal),
     );
     if total_minimal.lines().count() > n {
-        let content = content_lines(&out);
-        assert_eq!(
-            content.len(),
-            n,
-            "minimal + --max-lines={n} must emit exactly {n} content lines (not {}).\n\
+        assert!(
+            out.lines().count() <= n,
+            "minimal + --max-lines={n} must not exceed {n} lines total (got {}).\n\
              Full output:\n{out}",
-            content.len()
+            out.lines().count()
+        );
+        assert!(
+            out.contains("truncated"),
+            "minimal + --max-lines={n} elided content and must disclose it.\n\
+             Full output:\n{out}"
         );
     }
 }
