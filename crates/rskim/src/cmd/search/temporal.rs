@@ -378,7 +378,7 @@ pub(super) fn resolve_blast_radius_paths(
 ///
 /// Algorithm:
 /// 1. If `blast_radius` is `None`, return `Ok(None)` immediately.
-/// 2. Open `temporal.db` at `db_path`.  If absent/corrupt, emit the
+/// 2. Open `temporal.db` under `cache_dir`.  If absent/corrupt, emit the
 ///    "no temporal data" warning (JSON-aware when `json=true`) and return `Ok(None)`.
 /// 3. Normalize the raw path to repo-relative form.
 /// 4. Look up co-change partners, add the target file itself.
