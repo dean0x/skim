@@ -659,3 +659,126 @@ fn test_install_hooks_refuses_subdirectory_root() {
         "has_search_hooks must return false for a subdirectory root"
     );
 }
+
+/// Submodule case — AC34(b) correctness (Findings 3+4 of the #413 review):
+///
+/// A git submodule's `.git` is a file whose `gitdir:` pointer resolves to
+/// `<superproject>/.git/modules/<name>`.  That gitdir is a self-contained private
+/// ref store with no `commondir` file, so the hooks directory is NOT shared across
+/// worktrees.
+///
+/// (a) `install_search_hooks` must return `shared: false` — the "shared by every
+///     worktree of this clone" disclosure must NOT fire for a submodule root.
+///     The pre-fix path-inequality gate (`hooks_dir != root/.git/hooks`) fired
+///     for submodules because their resolved dir differs from the hand-built path.
+///
+/// (b) The hooks are installed into the submodule's private gitdir, not the
+///     superproject's hooks directory.
+///
+/// (b2) After `canonicalize()` (the display-site normalization), the path contains
+///      no `..` components.  The raw pointer written by git is relative
+///      (`gitdir: ../.git/modules/sub`), so `resolve_git_dir` returns a joined,
+///      non-normalized path without the display-site fix.
+///
+/// Uses a real `git submodule add` fixture — a fake `.git` file would not exercise
+/// the relative-pointer code path in `resolve_git_dir`.
+#[test]
+fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+    let super_root = dir.path().join("superproject");
+    let sub_origin = dir.path().join("sub_origin");
+
+    // Build the sub-repository that will be added as a submodule.
+    fs::create_dir_all(&sub_origin).unwrap();
+    super::super::staleness::create_real_git_repo(
+        &sub_origin,
+        &[("init", &[("lib.rs", "fn f(){}\n")])],
+    );
+
+    // Build the superproject.
+    fs::create_dir_all(&super_root).unwrap();
+    super::super::staleness::create_real_git_repo(
+        &super_root,
+        &[("init", &[("README.md", "readme\n")])],
+    );
+
+    // Add sub_origin as a submodule named "sub" inside the superproject.
+    // `protocol.file.allow=always` is required when adding a local-path submodule
+    // from within git 2.38+ (file protocol is restricted by default since CVE-2022-39253).
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "--name",
+            "sub",
+            sub_origin.to_str().unwrap(),
+            "sub",
+        ])
+        .current_dir(&super_root)
+        .output()
+        .expect("git submodule add (spawn)");
+    if !out.status.success() {
+        // git submodule may be unavailable in CI — skip gracefully.
+        eprintln!(
+            "test_install_hooks_submodule: git submodule add failed ({}); skipping.\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+
+    let sub_root = super_root.join("sub");
+
+    // Precondition: the submodule checkout must have a `.git` FILE (not a directory).
+    assert!(
+        sub_root.join(".git").is_file(),
+        "submodule .git must be a file, not a directory (precondition)"
+    );
+
+    // (a) install_search_hooks must return shared: false — submodule gitdir has no
+    // commondir, so the hooks dir is private, not clone-wide-shared.
+    let outcome = install_search_hooks(&sub_root)
+        .expect("install_search_hooks must succeed on a submodule root");
+    assert!(
+        !outcome.shared,
+        "submodule hooks dir is private (no commondir); \
+         outcome.shared must be false, not 'shared by every worktree'"
+    );
+
+    // (b) Hooks must be installed in the submodule's private gitdir, not the
+    // superproject's hooks directory.
+    let super_hooks = super_root.join(".git").join("hooks");
+    assert!(
+        !outcome.dir.starts_with(&super_hooks),
+        "submodule hooks must NOT be in the superproject hooks dir ({super_hooks:?}); \
+         got: {:?}",
+        outcome.dir
+    );
+    for name in ["post-commit", "post-merge", "post-checkout"] {
+        assert!(
+            outcome.dir.join(name).exists(),
+            "hook {name} must be installed in the submodule gitdir {:?}",
+            outcome.dir
+        );
+    }
+
+    // (b2) The canonicalized display path must not contain `..`.
+    // `resolve_git_dir` joins the relative pointer as-is (e.g.
+    // `sub_root.join("../.git/modules/sub")`).  The display-site
+    // `canonicalize()` normalizes this before printing.
+    let display_dir = outcome
+        .dir
+        .canonicalize()
+        .expect("submodule hooks dir must exist after install (for canonicalize)");
+    let display_str = display_dir.to_string_lossy();
+    assert!(
+        !display_str.contains(".."),
+        "canonicalized display path must not contain '..'; got: {display_str}"
+    );
+}

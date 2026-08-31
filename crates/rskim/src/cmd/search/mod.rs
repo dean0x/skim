@@ -1206,7 +1206,13 @@ fn run_install_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode
     // the AC34(b) shared-scope notice automatically; the returned `dir` names
     // what was actually touched (may differ from `<root>/.git/hooks`).
     let outcome = hooks::install_search_hooks(&root)?;
-    eprintln!("skim search: git hooks installed in {:?}", outcome.dir);
+    // Normalize to remove any `..` components that arise from a relative `gitdir:`
+    // pointer (submodules write e.g. `gitdir: ../.git/modules/sub`).
+    let display_dir = outcome
+        .dir
+        .canonicalize()
+        .unwrap_or_else(|_| outcome.dir.clone());
+    eprintln!("skim search: git hooks installed in {:?}", display_dir);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1218,7 +1224,12 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
     // removed (`outcome.changed`).
     let outcome = hooks::remove_search_hooks(&root)?;
     if outcome.changed {
-        eprintln!("skim search: git hooks removed from {:?}", outcome.dir);
+        // Normalize to remove any `..` components (submodule gitdir pointers).
+        let display_dir = outcome
+            .dir
+            .canonicalize()
+            .unwrap_or_else(|_| outcome.dir.clone());
+        eprintln!("skim search: git hooks removed from {:?}", display_dir);
     }
     Ok(ExitCode::SUCCESS)
 }

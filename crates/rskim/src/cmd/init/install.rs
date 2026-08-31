@@ -341,16 +341,30 @@ fn install_search_integration() {
         Ok(outcome) => {
             println!("  {} Search hooks installed", check_mark(true));
             // AC34(b): when `resolve_hooks_dir` routes to `<commondir>/hooks`
-            // rather than the local `<root>/.git/hooks`, print the resolved path
-            // in the skim init stdout stream.  `install_search_hooks` already
-            // emits SHARED_HOOKS_SCOPE_MSG to stderr for all callers; this line
-            // adds the absolute path disclosure in the `skim init` output itself,
-            // matching the parity that `skim search --install-hooks` provides via
-            // `run_install_hooks` (which always prints the resolved dir).
-            if outcome.dir != project_root.join(".git").join("hooks") {
+            // (a linked worktree), print the resolved path in the skim init stdout
+            // stream.  `install_search_hooks` already emits SHARED_HOOKS_SCOPE_MSG
+            // to stderr for all callers; this line adds the absolute path disclosure
+            // in the `skim init` output itself.
+            //
+            // Gate on `outcome.shared` (the `is_shared_hooks_dir` predicate carried
+            // in the result), NOT on path inequality.  Path inequality fired for git
+            // submodules too — their gitdir is `<super>/.git/modules/<name>`, which
+            // differs from `<root>/.git/hooks` even though no clone-wide sharing
+            // is occurring (the submodule gitdir has no `commondir` file).
+            //
+            // Normalize the path before printing: `resolve_git_dir` returns the
+            // joined raw pointer for `.git`-file repos, which for a submodule contains
+            // `..` components (e.g. `/repo/sub/../.git/modules/sub/hooks`).  Canonical
+            // form is cleaner to read.  Fall back to the raw path if the directory
+            // has not been created yet (should not happen — create_dir_all ran above).
+            if outcome.shared {
+                let display_dir = outcome
+                    .dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| outcome.dir.clone());
                 println!(
                     "    note: hooks installed in {} (shared by every worktree of this clone)",
-                    outcome.dir.display()
+                    display_dir.display()
                 );
             }
         }

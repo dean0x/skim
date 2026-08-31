@@ -71,6 +71,18 @@ pub(crate) struct HooksOutcome {
     /// For `remove_search_hooks`: `true` means at least one marker block was
     /// found and removed.  `false` means no block was present.
     pub changed: bool,
+    /// `true` when the resolved hooks directory is the shared `<commondir>/hooks`
+    /// of a linked-worktree clone — every worktree of this clone shares it.
+    ///
+    /// `false` for plain repos, submodules, and true non-repos: their hooks
+    /// directory is private and clone-wide sharing does NOT apply.
+    ///
+    /// Callers use this flag (not a path-inequality heuristic) to gate the
+    /// AC34(b) scope-disclosure line so that submodule roots — whose gitdir
+    /// is `<super>/.git/modules/<name>` and therefore differs from the
+    /// hand-built `<root>/.git/hooks` even though nothing is shared — do not
+    /// incorrectly receive the "shared by every worktree" notice.
+    pub shared: bool,
 }
 
 // ============================================================================
@@ -307,13 +319,15 @@ pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<HooksO
 
     // AC34(b): disclose the clone-wide scope from inside this function so every
     // caller (including `skim init`) inherits the notice automatically.
-    if is_shared_hooks_dir(project_root, &hooks_dir) {
+    let shared = is_shared_hooks_dir(project_root, &hooks_dir);
+    if shared {
         eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
     }
 
     Ok(HooksOutcome {
         dir: hooks_dir,
         changed: any_changed,
+        shared,
     })
 }
 
@@ -369,12 +383,14 @@ pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOu
     }
     // AC34(b): disclose the clone-wide scope only when something was actually
     // removed — mirrors the conditional disclosure in `run_remove_hooks`.
-    if any_removed && is_shared_hooks_dir(project_root, &hooks_dir) {
+    let shared = is_shared_hooks_dir(project_root, &hooks_dir);
+    if any_removed && shared {
         eprintln!("{SHARED_HOOKS_SCOPE_MSG}");
     }
     Ok(HooksOutcome {
         dir: hooks_dir,
         changed: any_removed,
+        shared,
     })
 }
 
