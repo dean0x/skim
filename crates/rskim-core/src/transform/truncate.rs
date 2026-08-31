@@ -165,17 +165,16 @@ pub(crate) fn truncate_to_lines(
     let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
     let mut markers = count_markers(&selected_spans, lines.len());
 
-    // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines + 1.
+    // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines.
     //
-    // E4: the trailing marker occupies slot N+1 (beyond the content budget), so we allow
-    // one extra line here.  Leading and gap markers still count against the N budget, so
-    // the sum of content + ALL markers may be at most max_lines + 1.
+    // The marker occupies one of the N lines (#317 / ADR-002: `--max-lines N` ≡
+    // `head -N`).  All markers (leading, gap, trailing) count against the N budget.
     //
     // Performance note: This loop is O(n^2) where n = number of selected spans.
     // Vec::remove() is O(n) and count_markers() rescans the selection each iteration.
     // This is acceptable because n is bounded by the number of top-level AST nodes,
     // which is typically tens to low hundreds even for large files.
-    let trim_limit = max_lines.saturating_add(1);
+    let trim_limit = max_lines;
     while lines_used + markers > trim_limit && selected.len() > 1 {
         // Find the span with lowest priority (tie-break: drop highest position first)
         let Some(drop_idx) = selected
@@ -220,8 +219,9 @@ pub(crate) fn truncate_to_lines(
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
     let make_marker = |omitted: usize| -> String {
+        let line_s = if omitted == 1 { "line" } else { "lines" };
         append_hint(
-            format!("{prefix} ... ({omitted} lines truncated){suffix}"),
+            format!("{prefix} ... ({omitted} {line_s} truncated){suffix}"),
             hint,
         )
     };
@@ -243,15 +243,19 @@ pub(crate) fn truncate_to_lines(
 
         // Gap marker between spans — count the skipped output lines.
         //
-        // Fold rule (ADR-011 class 1): if adding the gap marker would leave 0 budget
-        // for content from the span that follows, fold the gap + the span's own lines
-        // into a SINGLE combined marker and skip the span.  Without this, the build
-        // emits gap_marker + trailing_marker with no content in between — two
+        // Fold rule (ADR-011 class 1): if adding the gap marker would leave no budget
+        // for both span content AND the trailing marker, fold the gap + the span's own
+        // lines into a SINGLE combined marker and skip the span.  Without this, the
+        // build emits gap_marker + trailing_marker with no content in between — two
         // consecutive elision markers that confuse agents.  The fold keeps it to one
         // marker and still discloses every omitted line.
+        //
+        // With N-total semantics (marker counts against budget), after the gap marker
+        // we need ≥2 remaining slots: at least 1 for content and 1 for the trailing
+        // marker.  Fold when remaining_after_gap <= 1 (0 or 1 slot left).
         let remaining_after_gap = max_lines.saturating_sub(result_lines.len() + 1);
         if start > last_end && last_end > 0 {
-            if remaining_after_gap == 0 {
+            if remaining_after_gap <= 1 {
                 // Fold: a single marker covers the gap AND the full span content.
                 let omitted = end.saturating_sub(last_end); // gap lines + span lines
                 result_lines.push(Cow::Owned(make_marker(omitted)));
@@ -263,9 +267,9 @@ pub(crate) fn truncate_to_lines(
             result_lines.push(Cow::Owned(make_marker(omitted)));
         }
 
-        // Add lines from this span. E4: the trailing marker occupies slot N+1, so the
-        // content budget is the full remaining capacity (no -1 reservation).
-        let remaining_budget = max_lines.saturating_sub(result_lines.len());
+        // Add lines from this span. Reserve 1 slot for the trailing marker so that
+        // content + trailing marker never exceeds max_lines (#317 / ADR-002).
+        let remaining_budget = max_lines.saturating_sub(result_lines.len()).saturating_sub(1);
         let span_end = end.min(start + remaining_budget);
 
         for line_idx in start..span_end {
@@ -294,10 +298,10 @@ pub(crate) fn truncate_to_lines(
         result_lines.push(Cow::Owned(make_marker(omitted)));
     }
 
-    // E4: cap at max_lines + 1 — N content lines plus 1 trailing elision marker.
-    // The trailing marker is the only line allowed beyond the content budget; leading
-    // and gap markers already count against max_lines in the trim step above.
-    result_lines.truncate(max_lines.saturating_add(1));
+    // Safety cap: total output (content + all markers) must not exceed max_lines
+    // (#317 / ADR-002: `--max-lines N` ≡ `head -N`).  The trim step above is the
+    // primary enforcement; this truncate is the last-resort guard.
+    result_lines.truncate(max_lines);
 
     let mut output = result_lines.join("\n");
     // Preserve trailing newline if original had one
@@ -310,17 +314,18 @@ pub(crate) fn truncate_to_lines(
 
 /// Simple line truncation for serde-based languages (JSON, YAML) or fallback
 ///
-/// Emits the first N content lines then appends an omission marker as line N+1.
-/// The marker is extra — it does not consume one of the N requested lines (#317).
+/// Emits the first `max_lines - 1` content lines then appends an omission marker
+/// as the `max_lines`-th line.  Total output is at most `max_lines` lines, keeping
+/// `--max-lines N` equivalent to `head -N` (#317 / ADR-002).
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
 ///
 /// # Source-space counts (E3)
 ///
-/// When `source_line_count` is `Some(k)`, the marker reports `k - max_lines` lines
+/// When `source_line_count` is `Some(k)`, the marker reports `k - (max_lines - 1)` lines
 /// omitted — the count in **source** space (how many original source lines the agent
 /// cannot see), regardless of how many lines the transformed output contains.
-/// `None` falls back to `text.lines().count() - max_lines` (output-space count).
+/// `None` falls back to `text.lines().count() - (max_lines - 1)` (output-space count).
 /// For serde paths, the caller (E5) passes `Some(source.lines().count())` because
 /// the serde transform restructures text so the output has far fewer lines than
 /// the source.
@@ -339,17 +344,21 @@ pub(crate) fn simple_line_truncate(
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
+    // Reserve 1 slot for the marker so that `--max-lines N` ≡ `head -N`:
+    // at most N total lines (#317 / ADR-002).  content_lines = N-1; the marker
+    // occupies the Nth slot.
     // E3: use source-space line count when provided; fall back to output-space.
-    // E4.2: marker is line N+1 — it does not consume one of the N requested lines.
+    let content_lines = max_lines.saturating_sub(1);
     let total = source_line_count.unwrap_or(lines.len());
-    let omitted = total.saturating_sub(max_lines);
+    let omitted = total.saturating_sub(content_lines);
+    let line_s = if omitted == 1 { "line" } else { "lines" };
     let marker = append_hint(
-        format!("{prefix} ... ({omitted} lines truncated){suffix}"),
+        format!("{prefix} ... ({omitted} {line_s} truncated){suffix}"),
         hint,
     );
 
-    // Take first max_lines lines, then append marker
-    let mut result: Vec<&str> = lines[..max_lines].to_vec();
+    // Take first content_lines lines, then append marker (total = max_lines).
+    let mut result: Vec<&str> = lines[..content_lines].to_vec();
     result.push(&marker);
 
     let mut output = result.join("\n");
@@ -362,16 +371,18 @@ pub(crate) fn simple_line_truncate(
 
 /// Simple last-line truncation: keeps only the last N lines of output
 ///
-/// Emits a truncation marker followed by the last N content lines.
-/// The marker is extra — it does not consume one of the N requested lines (#317).
+/// Emits a truncation marker followed by the last `n - 1` content lines.
+/// Total output is at most `n` lines, keeping `--max-lines N` equivalent to
+/// `head -N` (#317 / ADR-002).
 /// Uses language-appropriate comment syntax.
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
 ///
 /// # Source-space counts (E3)
 ///
-/// When `source_line_count` is `Some(k)`, the marker reports `k - n` lines above —
-/// the count in **source** space. `None` falls back to `text.lines().count() - n`.
+/// When `source_line_count` is `Some(k)`, the marker reports `k - (n - 1)` lines
+/// above — the count in **source** space. `None` falls back to
+/// `text.lines().count() - (n - 1)`.
 pub(crate) fn simple_last_line_truncate(
     text: &str,
     language: Language,
@@ -387,19 +398,22 @@ pub(crate) fn simple_last_line_truncate(
 
     let prefix = get_comment_prefix(language);
     let suffix = get_comment_suffix(language);
+    // Reserve 1 slot for the marker so total output = n lines (#317 / ADR-002:
+    // `--max-lines N` ≡ `head -N`).  content_lines = n-1; the marker is the first slot.
     // E3: use source-space line count when provided; fall back to output-space.
-    // E4.2: marker is an extra header line — not one of the N requested content lines.
+    let content_lines = n.saturating_sub(1);
     let source_total = source_line_count.unwrap_or(total);
-    let omitted = source_total.saturating_sub(n);
+    let omitted = source_total.saturating_sub(content_lines);
+    let line_s = if omitted == 1 { "line" } else { "lines" };
     let marker = append_hint(
-        format!("{prefix} ... ({omitted} lines above){suffix}"),
+        format!("{prefix} ... ({omitted} {line_s} above){suffix}"),
         hint,
     );
 
     // Skip to the tail without collecting all lines into a Vec
     let mut result: Vec<&str> = Vec::with_capacity(n + 1);
     result.push(&marker);
-    result.extend(text.lines().skip(total - n));
+    result.extend(text.lines().skip(total - content_lines));
 
     let mut output = result.join("\n");
     if text.ends_with('\n') {
@@ -498,8 +512,9 @@ where
     let suffix = get_comment_suffix(language);
     // B5: elision_hint must be captured by the closure to append the remedy clause.
     let make_marker = |truncated_count: usize| {
+        let line_s = if truncated_count == 1 { "line" } else { "lines" };
         append_hint(
-            format!("{prefix} ... ({truncated_count} lines truncated){suffix}"),
+            format!("{prefix} ... ({truncated_count} {line_s} truncated){suffix}"),
             elision_hint,
         )
     };
