@@ -295,11 +295,15 @@ mod tests {
 
         // Should use the most aggressive mode that produced output
         assert_eq!(mode_used, Mode::Types);
-        // Output should contain truncation marker or be within budget
+        // ADR-011 class 1 / #317: when no content fits within budget even after
+        // line truncation, the compact elision marker is still emitted (never empty).
+        // The marker alone may exceed budget=5; that is acceptable — disclosure beats
+        // the budget. Old assertion `output.is_empty()` encoded the pre-ADR-011 silent-
+        // loss behavior and is now wrong.
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
         assert!(
-            token_count <= 5 || output.is_empty(),
-            "Final output should be within budget or empty, got {} tokens: {:?}",
+            token_count <= 5 || output.contains("truncated"),
+            "Final output should be within budget or contain elision marker, got {} tokens: {:?}",
             token_count,
             output
         );
@@ -392,10 +396,12 @@ mod tests {
             cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
+        // ADR-011 class 1 / #317: compact elision marker always emitted when no content
+        // fits; may exceed budget=5. Old `output.is_empty()` encoded silent-loss behavior.
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
         assert!(
-            token_count <= 5 || output.is_empty(),
-            "Expected within budget or empty after truncation, got {} tokens: {:?}",
+            token_count <= 5 || output.contains("truncated"),
+            "Expected within budget or elision marker, got {} tokens: {:?}",
             token_count,
             output
         );
@@ -415,10 +421,12 @@ mod tests {
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
+        // ADR-011 class 1 / #317: compact elision marker always emitted when no content
+        // fits; may exceed budget=5. Old `output.is_empty()` encoded silent-loss behavior.
         let token_count = tokens::count_tokens(&output).unwrap_or(usize::MAX);
         assert!(
-            token_count <= 5 || output.is_empty(),
-            "Expected within budget or empty after truncation, got {} tokens: {:?}",
+            token_count <= 5 || output.contains("truncated"),
+            "Expected within budget or elision marker, got {} tokens: {:?}",
             token_count,
             output
         );

@@ -565,8 +565,13 @@ where
     // ADR-011 class 1 / #317: elision markers are unconditional — never suppress them
     // even when the marker alone exceeds the token budget. Returning an empty string
     // here would be silent total data loss. The token budget is advisory; the marker
-    // always wins. When best==0 and the marker is over budget, only the marker is emitted.
-
+    // always wins.
+    //
+    // When best==0 (no content fits even with the full marker included), use the
+    // compact marker form — drop the `— SKIM_PASSTHROUGH=1 for full output` hint to
+    // minimise token cost. The disclosure obligation is still met: the reader sees
+    // that content was elided and the exact count of truncated lines. The hint is a
+    // remedy clause, not the disclosure itself (ADR-011 / #317).
     let mut output = if best > 0 {
         let content_slice = &joined[..byte_end[best - 1]];
         let mut s = String::with_capacity(content_slice.len() + 1 + marker.len() + 1);
@@ -575,7 +580,8 @@ where
         s.push_str(&marker);
         s
     } else {
-        marker
+        let line_s = if lines.len() == 1 { "line" } else { "lines" };
+        format!("{prefix} ... ({} {line_s} truncated){suffix}", lines.len())
     };
 
     if text.ends_with('\n') {
@@ -743,25 +749,25 @@ mod tests {
 
     #[test]
     fn test_simple_line_truncate() {
-        // E4.2: marker is line N+1 (does not consume a content slot).
-        // Input 5 lines, max_lines=3 → 3 content + 1 marker = 4 lines total.
-        // Omitted = 5 - 3 = 2 lines.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // Old comment said "N+1 (marker was extra)." The correct tally:
+        // N-1 content + 1 marker = N total.
+        // Input 5 lines, max_lines=3 → content_lines=2, omitted=5-2=3, total=3.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
 
         let result = simple_line_truncate(text, Language::TypeScript, 3, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
-            4,
-            "Expected 3 content lines + 1 marker = 4 lines, got {:?}",
+            3,
+            "Expected 2 content lines + 1 marker = 3 lines total, got {:?}",
             result_lines
         );
         assert!(result.contains("line 1"));
         assert!(result.contains("line 2"));
-        assert!(result.contains("line 3"));
         assert!(
-            result.contains("// ... (2 lines truncated)"),
-            "marker must count omitted lines correctly, got: {result}"
+            result.contains("// ... (3 lines truncated)"),
+            "marker must count omitted lines correctly (5-2=3), got: {result}"
         );
     }
 
@@ -1504,25 +1510,26 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_keeps_last_lines() {
-        // E4.2: marker is an extra header line (N+1 total). n=3, total=5.
-        // Omitted = 5-3 = 2. Shows lines 3,4,5 (n=3 content lines) + marker.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // Old comment said "N+1 (marker was extra)." The correct tally:
+        // 1 marker + (N-1) content = N total.
+        // n=3, total=5 → content_lines=2, omitted=5-2=3. Shows lines 4,5 + marker.
         let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
         let result = simple_last_line_truncate(text, Language::TypeScript, 3, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
-            4,
-            "3 content + 1 marker = 4, got {:?}",
+            3,
+            "1 marker + 2 content = 3 total, got {:?}",
             result_lines
         );
         assert!(
-            result_lines[0].contains("... (2 lines above)"),
+            result_lines[0].contains("... (3 lines above)"),
             "got {:?}",
             result_lines[0]
         );
-        assert_eq!(result_lines[1], "line 3");
-        assert_eq!(result_lines[2], "line 4");
-        assert_eq!(result_lines[3], "line 5");
+        assert_eq!(result_lines[1], "line 4");
+        assert_eq!(result_lines[2], "line 5");
     }
 
     #[test]
@@ -1549,12 +1556,14 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_python_marker() {
-        // E4.2: n=2, total=3. Omitted = 3-2 = 1.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // Old comment said "Omitted = 3-2 = 1." The correct tally:
+        // content_lines = n-1 = 1, omitted = total - content_lines = 3-1 = 2.
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
         let result = simple_last_line_truncate(text, Language::Python, 2, None, None).unwrap();
         assert!(
-            result.contains("# ... (1 lines above)"),
-            "Python should use # for marker, omit=1: {:?}",
+            result.contains("# ... (2 lines above)"),
+            "Python should use # for marker, omit=2: {:?}",
             result
         );
     }
@@ -1573,21 +1582,23 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_single_line_budget() {
-        // E4.2: n=1, total=3. Omitted = 3-1 = 2. Shows 1 content + 1 marker = 2 total.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // Old comment said "1 content + 1 marker = 2 total." The correct tally:
+        // content_lines = n-1 = 0, omitted = total - content_lines = 3-0 = 3.
+        // With n=1, the only slot is the marker itself (no content fits).
         let text = "line 1\nline 2\nline 3\n";
         let result = simple_last_line_truncate(text, Language::TypeScript, 1, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
-            2,
-            "1 content + 1 marker = 2 total, got {:?}",
+            1,
+            "Only marker fits (n=1, N-total): 1 total, got {:?}",
             result_lines
         );
         assert!(
-            result_lines[0].contains("... (2 lines above)"),
+            result_lines[0].contains("... (3 lines above)"),
             "got {:?}",
             result_lines[0]
         );
-        assert_eq!(result_lines[1], "line 3");
     }
 }

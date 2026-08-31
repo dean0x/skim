@@ -373,8 +373,10 @@ fn test_max_lines_noncontiguous_spans_contain_markers() {
     // The full structure output of mixed_priority.ts is ~17 lines (with blank
     // lines). With budget=10, truncation must drop some spans and insert
     // omission markers in the gaps.
+    // Markers include counts: "// ... (N lines truncated)" or
+    // "// ... (1 line truncated)". The word "truncated" is always present.
     assert!(
-        stdout.contains("// ... (truncated)"),
+        stdout.contains("truncated"),
         "Non-contiguous truncation should produce omission markers:\n{}",
         stdout,
     );

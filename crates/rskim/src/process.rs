@@ -767,6 +767,27 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         (result, false)
     };
 
+    // Post-guardrail max-lines enforcement (#317 / ADR-002).
+    //
+    // The guardrail may return raw `contents` when the compressed output (with
+    // elision markers) exceeded raw in tokens — e.g. when a tight max_lines budget
+    // produces large markers relative to a short source file.  Raw contents are
+    // still subject to `--max-lines` / `--last-lines`; apply truncation here so the
+    // hard line cap holds regardless of whether the guardrail fired.
+    //
+    // When the guardrail did NOT fire (compressed output selected), the tree-sitter
+    // path already applied truncation; passthrough_with_truncation is a no-op
+    // (returns text unchanged when line count is already within the budget).
+    let final_output = if options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some() {
+        passthrough_with_truncation(
+            &final_output,
+            options.trunc.max_lines,
+            options.trunc.last_lines,
+        )
+    } else {
+        final_output
+    };
+
     // Transparency marker: did transformation produce a different view than raw bytes?
     // Compare pre-line-numbers output to raw contents. When guardrail fired,
     // final_output == contents so view_differs will be false (correct — raw was served).
