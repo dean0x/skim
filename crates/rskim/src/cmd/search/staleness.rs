@@ -419,22 +419,12 @@ pub(super) fn check_staleness(
         (None, None) => current_or_working_tree(&manifest),
         // Git repo appeared since last build — rebuild to record HEAD.
         (None, Some(_)) => StalenessCheck::NoStoredHead,
-        // Git is unreadable.  Two sub-cases:
-        // • HeadState::Unresolved — still a valid git repo but the ref target
-        //   is absent (dangling symref, e.g. branch deleted while HEAD points
-        //   to it).  Rebuilding cannot help because the live HEAD is still
-        //   unresolvable; return Current to avoid a pointless rebuild loop
-        //   (AC16(c)).
-        // • Anything else — the project was a git repo at build time but git
-        //   is now unreadable; trust is broken, so scan the working tree and
-        //   rebuild on any edit to recover (AD-379-6).
-        (Some(_), None) => {
-            if matches!(git_head_state(project_root), HeadState::Unresolved) {
-                StalenessCheck::Current
-            } else {
-                current_or_working_tree(&manifest)
-            }
-        }
+        // Git is unreadable (AD-379-6): the project was a git repo at build time
+        // but git HEAD is now unreadable; trust is broken, so scan the working tree
+        // and rebuild on any edit to recover.  Includes the Unresolved sub-case
+        // (dangling symref, deleted branch) — the working-tree scan is still correct
+        // there; an unchanged tree returns Current, avoiding a rebuild loop.
+        (Some(_), None) => current_or_working_tree(&manifest),
         // Both present — compare HEADs first, then the working tree on a match.
         (Some(s), Some(c)) => {
             if s == c {

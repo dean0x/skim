@@ -4442,10 +4442,11 @@ fn test_ac16c_unresolvable_head_no_rebuild_loop_temporal_stable() {
         "precondition: temporal.db must exist after the build"
     );
 
-    // Write lexical/AST stubs and manifest with the recorded HEAD.
-    write_manifest_with_head(&root, &cache_dir, Some(&recorded_sha));
-    write_lexical_index_stub(&cache_dir);
-    write_ast_index_stub(&cache_dir);
+    // Build a real lexical+AST index so the manifest has actual file entries.
+    // Using write_manifest_with_head+stubs would produce an empty manifest,
+    // causing scan_working_tree to see a.rs as "added" → dirty → WorkingTreeChanged,
+    // masking the no-rebuild-loop contract this test asserts (#413 Fix 1).
+    build_index_in(&root, &cache_dir);
 
     // Make HEAD unresolvable: point to a non-existent ref.
     // We overwrite the HEAD file so the symbolic-ref points somewhere that has no file.
