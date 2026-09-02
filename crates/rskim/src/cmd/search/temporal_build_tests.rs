@@ -3106,3 +3106,473 @@ fn test_check3_shallow_to_full_transition_detected_as_stale() {
          even when git_dir/shallow is absent (META_IS_SHALLOW='0' does not trigger Check 3)"
     );
 }
+
+// ============================================================================
+// AC-35(c) — Check 3 linked-worktree commondir shallow probe (regression guard)
+//
+// Regression guard for the linked-worktree shallow bug fixed in commit 007ccf3:
+// `resolve_git_dir` returns the PER-WORKTREE gitdir (.git/worktrees/<name>),
+// but the `shallow` file lives in the COMMONDIR (.git/).  Checking
+// `git_dir/shallow` directly caused an unbounded rebuild loop on every query
+// for linked worktrees of shallow clones.  The fix uses `resolve_common_dir` to
+// land on the commondir before probing.  This test pins that fix so a revert to
+// `gd.join("shallow")` would be caught immediately.
+// ============================================================================
+
+/// AC-35(c): linked-worktree `commondir` pointer is followed when probing for
+/// the `shallow` file; the per-worktree gitdir is NOT used as the probe root.
+///
+/// Two discriminating assertions:
+///
+/// 1. `shallow` in COMMONDIR only → `temporal_db_is_stale` returns `false`
+///    (the fix works: `resolve_common_dir` navigates to the commondir and finds
+///    the file).
+///
+/// 2. `shallow` removed from COMMONDIR, placed ONLY in the PER-WORKTREE gitdir →
+///    `temporal_db_is_stale` returns `true` (stale detected via commondir, not
+///    per-worktree gitdir).
+///
+/// Assertion 2 is the load-bearing regression guard: if the production code
+/// reverted to `gd.join("shallow")`, it would read the per-worktree gitdir and
+/// incorrectly return `false` (not stale) — failing this assertion.
+///
+/// Structure of the fake linked-worktree gitdir created by this test:
+///
+/// ```text
+/// fake_main_git/                      ← commondir (has HEAD to satisfy sanity gate)
+/// fake_main_git/worktrees/
+/// fake_main_git/worktrees/linked/     ← per-worktree gitdir (what resolve_git_dir returns)
+/// fake_main_git/worktrees/linked/commondir   ← content: "../.." (relative to linked/)
+/// ```
+///
+/// `resolve_common_dir(fake_main_git/worktrees/linked)` reads `commondir`,
+/// resolves `"../.."` relative to `linked/` → `fake_main_git/` (after canonicalize).
+#[test]
+fn test_check3_linked_worktree_commondir_shallow_probe() {
+    use super::super::staleness::temporal_db_is_stale;
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build temporal.db with META_IS_SHALLOW = "1" so Check 3 activates.
+    let history = HistoryResult {
+        commits: vec![make_commit(
+            "kkkk0001",
+            1_000_000,
+            "feat: initial (shallow)",
+            &[],
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 1,
+        },
+    };
+    let src = FixedSource { history };
+    let fake_head = "kkkk1111kkkk1111kkkk1111kkkk1111kkkk1111";
+    let now = super::current_epoch_secs();
+
+    rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("linked-worktree Check 3 setup: rebuild must succeed");
+
+    // Verify META_IS_SHALLOW = "1" so Check 3 will activate on subsequent calls.
+    {
+        let db = rskim_search::TemporalDb::open(&cache_dir.join("temporal.db"))
+            .expect("linked-worktree Check 3: temporal.db must be openable");
+        let stored = db
+            .get_meta(rskim_search::META_IS_SHALLOW)
+            .expect("linked-worktree Check 3: get_meta must succeed")
+            .expect("linked-worktree Check 3: META_IS_SHALLOW must be present");
+        assert_eq!(
+            stored, "1",
+            "linked-worktree Check 3: META_IS_SHALLOW must be '1' after shallow build"
+        );
+    }
+
+    // Build fake linked-worktree gitdir structure.
+    //   fake_main_git/           ← the commondir
+    //   fake_main_git/HEAD       ← sanity gate for resolve_common_dir
+    //   fake_main_git/worktrees/linked/            ← per-worktree gitdir
+    //   fake_main_git/worktrees/linked/commondir   ← "../.." (relative to linked/)
+    let main_git = dir.path().join("fake_main_git");
+    let per_worktree_git = main_git.join("worktrees").join("linked");
+    std::fs::create_dir_all(&per_worktree_git)
+        .expect("linked-worktree Check 3: create per-worktree gitdir");
+
+    // HEAD file required by resolve_common_dir's sanity gate
+    // (canonical.join("HEAD").is_file() must be true for the commondir target).
+    std::fs::write(main_git.join("HEAD"), b"ref: refs/heads/main\n")
+        .expect("linked-worktree Check 3: write HEAD sentinel");
+
+    // commondir file: "../.." is the relative path from `linked/` to `fake_main_git/`.
+    std::fs::write(per_worktree_git.join("commondir"), b"../..\n")
+        .expect("linked-worktree Check 3: write commondir");
+
+    // ── Assertion 1: shallow file in COMMONDIR only → NOT stale ──────────────
+    // resolve_common_dir(per_worktree_git) → main_git; main_git/shallow exists.
+    std::fs::write(main_git.join("shallow"), b"kkkk0001 (shallow sentinel)\n")
+        .expect("linked-worktree Check 3: write commondir shallow file");
+
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, Some(&per_worktree_git)),
+        "AC-35(c): temporal_db_is_stale must return false when META_IS_SHALLOW='1' \
+         and the COMMONDIR contains a non-empty shallow file — \
+         resolve_common_dir must follow the commondir pointer, not check the \
+         per-worktree gitdir directly"
+    );
+
+    // ── Assertion 2: remove commondir shallow → stale (unshallow detected) ───
+    std::fs::remove_file(main_git.join("shallow"))
+        .expect("linked-worktree Check 3: remove commondir shallow file");
+
+    assert!(
+        temporal_db_is_stale(&cache_dir, fake_head, Some(&per_worktree_git)),
+        "AC-35(c): temporal_db_is_stale must return true when META_IS_SHALLOW='1' \
+         and the commondir has no shallow file (unshallow transition)"
+    );
+
+    // ── Assertion 3 (regression guard): shallow ONLY in per-worktree gitdir ──
+    // If the code reverted to `gd.join("shallow")`, this would wrongly return
+    // false (not stale), because `per_worktree_git/shallow` would exist.
+    // The fix uses resolve_common_dir which returns main_git, so
+    // `main_git/shallow` is checked — and it's absent → correctly stale.
+    std::fs::write(
+        per_worktree_git.join("shallow"),
+        b"wrong location sentinel\n",
+    )
+    .expect("linked-worktree Check 3: write per-worktree shallow (wrong location)");
+
+    assert!(
+        temporal_db_is_stale(&cache_dir, fake_head, Some(&per_worktree_git)),
+        "AC-35(c) REGRESSION GUARD: temporal_db_is_stale must return true when \
+         `shallow` exists only in the per-worktree gitdir (wrong location) but NOT \
+         in the commondir — the fix probes via resolve_common_dir, so the per-worktree \
+         shallow file must NOT satisfy the check; a revert to gd.join('shallow') \
+         would incorrectly return false here"
+    );
+}
+
+// ============================================================================
+// AC-16 — zero_row_notice text contract (direct unit tests)
+//
+// These tests call zero_row_notice() directly to pin the AC-16 text contract:
+//   - Case (i):  no commits → notice must NOT contain "shallow"/"unshallow"
+//   - Case (ii): shallow + 0 pre_ghost_hotspot → notice MUST contain "shallow"
+//   - Case (iii): pre_ghost_hotspot > 0 → notice must NOT contain "shallow"/"unshallow"
+//   - All cases: notice is a single line (no embedded newlines)
+//
+// Without these tests, all three existing T-16 tests pass unchanged if
+// zero_row_notice() is deleted or all cases emit the same wrong attribution.
+// ============================================================================
+
+/// AC-16 text contract — Case (i): zero commits → notice has no "shallow" wording.
+///
+/// `zero_row_notice` with an empty commit list must route through
+/// `DegradedReason::Empty` with no shallow detail, producing text that
+/// does NOT contain "shallow" or "unshallow".
+#[test]
+fn test_zero_row_notice_case_i_no_shallow_text() {
+    let history = HistoryResult {
+        commits: vec![],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 0,
+        },
+    };
+    let notice = super::zero_row_notice(&history, 0, false);
+
+    assert!(
+        !notice.to_ascii_lowercase().contains("shallow"),
+        "AC-16(i): zero_row_notice for zero-commit history must NOT contain 'shallow'; \
+         got: {notice:?}"
+    );
+    assert!(
+        !notice.to_ascii_lowercase().contains("unshallow"),
+        "AC-16(i): zero_row_notice for zero-commit history must NOT contain 'unshallow'; \
+         got: {notice:?}"
+    );
+    // Notice must be non-empty — a deleted zero_row_notice would produce "".
+    assert!(
+        !notice.is_empty(),
+        "AC-16(i): zero_row_notice must return a non-empty string for zero-commit history"
+    );
+}
+
+/// AC-16 text contract — Case (ii): shallow + 0 pre_ghost_hotspot → notice
+/// contains "shallow" wording.
+///
+/// When `is_shallow == true` AND `pre_ghost_hotspot == 0`, `zero_row_notice`
+/// must produce text that names shallow clones as the attribution — the caller
+/// (the user) needs to know the cause is the shallow state, not missing history.
+#[test]
+fn test_zero_row_notice_case_ii_has_shallow_text() {
+    let history = HistoryResult {
+        commits: vec![make_commit(
+            "llll0001",
+            1_000_000,
+            "feat: initial (shallow)",
+            &[], // no changed files — typical in shallow-fetch scenarios
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 1,
+        },
+    };
+    let notice = super::zero_row_notice(&history, 0, true);
+
+    assert!(
+        notice.to_ascii_lowercase().contains("shallow"),
+        "AC-16(ii): zero_row_notice for shallow + 0 pre_ghost_hotspot must contain 'shallow'; \
+         got: {notice:?}"
+    );
+    assert!(
+        !notice.is_empty(),
+        "AC-16(ii): zero_row_notice must return a non-empty string"
+    );
+}
+
+/// AC-16 text contract — Case (iii): pre_ghost_hotspot > 0 → notice has no
+/// "shallow" wording.
+///
+/// When rows were computed but the ghost filter dropped all of them, the
+/// attribution is the ghost filter, NOT the shallow state.  The notice must
+/// NOT contain "shallow" or "unshallow" even when `is_shallow` happens to be
+/// true (ghost filter is the proximate cause).
+#[test]
+fn test_zero_row_notice_case_iii_no_shallow_text() {
+    let history = HistoryResult {
+        commits: vec![
+            make_commit("mmmm0001", 1_000_000, "feat: initial", &["phantom.rs"]),
+            make_commit("mmmm0002", 1_000_001, "feat: update", &["phantom.rs"]),
+        ],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 2,
+        },
+    };
+    // pre_ghost_hotspot = 1 → case (iii) fires regardless of is_shallow.
+    let notice = super::zero_row_notice(&history, 1, false);
+
+    assert!(
+        !notice.to_ascii_lowercase().contains("shallow"),
+        "AC-16(iii): zero_row_notice for ghost-filter-zero must NOT contain 'shallow'; \
+         got: {notice:?}"
+    );
+    assert!(
+        !notice.to_ascii_lowercase().contains("unshallow"),
+        "AC-16(iii): zero_row_notice for ghost-filter-zero must NOT contain 'unshallow'; \
+         got: {notice:?}"
+    );
+    assert!(
+        !notice.is_empty(),
+        "AC-16(iii): zero_row_notice must return a non-empty string"
+    );
+}
+
+/// AC-16 single-line contract: all three cases must produce exactly one line
+/// (no embedded newlines).
+///
+/// A multi-line notice (or a notice containing '\n') would violate the
+/// "exactly one stderr line" contract of AC-16.
+#[test]
+fn test_zero_row_notice_all_cases_single_line() {
+    // Case (i): zero commits
+    let history_i = HistoryResult {
+        commits: vec![],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 0,
+        },
+    };
+    let notice_i = super::zero_row_notice(&history_i, 0, false);
+    assert!(
+        !notice_i.contains('\n'),
+        "AC-16(i): zero_row_notice must be a single line (no '\\n'); got: {notice_i:?}"
+    );
+
+    // Case (ii): shallow, no changed files
+    let history_ii = HistoryResult {
+        commits: vec![make_commit("nnnn0001", 1_000_000, "feat: shallow", &[])],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 1,
+        },
+    };
+    let notice_ii = super::zero_row_notice(&history_ii, 0, true);
+    assert!(
+        !notice_ii.contains('\n'),
+        "AC-16(ii): zero_row_notice must be a single line (no '\\n'); got: {notice_ii:?}"
+    );
+
+    // Case (iii): ghost filter drops all
+    let history_iii = HistoryResult {
+        commits: vec![make_commit(
+            "oooo0001",
+            1_000_000,
+            "feat: phantom",
+            &["phantom.rs"],
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 1,
+        },
+    };
+    let notice_iii = super::zero_row_notice(&history_iii, 1, false);
+    assert!(
+        !notice_iii.contains('\n'),
+        "AC-16(iii): zero_row_notice must be a single line (no '\\n'); got: {notice_iii:?}"
+    );
+}
+
+/// AC-16 case (ii) FX-SHALLOW integration cross-check: a real `git clone
+/// --depth 1` produces a shallow repo where `META_IS_SHALLOW = "1"` and
+/// `top_hotspots` returns zero rows (case (ii) state confirmed at the DB level).
+///
+/// This is the "CLI cross-check of (ii) on FX-SHALLOW" that the plan requires
+/// (T-16 row): it drives `rebuild_temporal` with a real shallow clone to confirm
+/// the `is_shallow` metadata survives the full `parse_history` → `sync()` path,
+/// not just the `FixedSource` shim.  The stderr text is pinned separately by
+/// `test_zero_row_notice_case_ii_has_shallow_text` (above).
+///
+/// Skipped automatically when `git` is not available on PATH.
+#[test]
+fn test_t16_case_ii_fx_shallow_integration() {
+    // Guard: git must be available.
+    let git_check = Command::new("git").arg("--version").output();
+    if git_check.map(|o| !o.status.success()).unwrap_or(true) {
+        eprintln!("SKIP test_t16_case_ii_fx_shallow_integration: git not available");
+        return;
+    }
+
+    // Create a real source git repo with at least one commit.
+    let source_dir = tempdir().unwrap();
+    let source_head = create_real_git_repo(
+        source_dir.path(),
+        &[
+            ("feat: first", &[("src/lib.rs", "pub fn a() {}")]),
+            ("feat: second", &[("src/lib.rs", "pub fn b() {}")]),
+        ],
+    );
+    if source_head.is_empty() {
+        eprintln!(
+            "SKIP test_t16_case_ii_fx_shallow_integration: git commit failed \
+             (no identity configured?)"
+        );
+        return;
+    }
+
+    // Shallow-clone the source repo with depth=1 (FX-SHALLOW fixture).
+    let clone_dir = tempdir().unwrap();
+    let clone_path = clone_dir.path().join("clone");
+    let clone_status = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            // file:// URL disables local-clone optimisation so git writes .git/shallow.
+            &format!("file://{}", source_dir.path().display()),
+            clone_path.to_str().expect("clone path must be valid UTF-8"),
+        ])
+        .status();
+    match clone_status {
+        Ok(s) if !s.success() => {
+            eprintln!(
+                "SKIP test_t16_case_ii_fx_shallow_integration: \
+                 git clone --depth 1 failed (exit {s})"
+            );
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "SKIP test_t16_case_ii_fx_shallow_integration: \
+                 git clone --depth 1 could not be executed ({e})"
+            );
+            return;
+        }
+        Ok(_) => {}
+    }
+
+    // Verify .git/shallow exists (confirms this is a genuine shallow clone).
+    let shallow_file = clone_path.join(".git").join("shallow");
+    if !shallow_file.exists() {
+        eprintln!(
+            "SKIP test_t16_case_ii_fx_shallow_integration: \
+             .git/shallow not created by clone (unexpected git behaviour)"
+        );
+        return;
+    }
+
+    // Read the HEAD of the shallow clone.
+    let head_out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&clone_path)
+        .output()
+        .expect("FX-SHALLOW: git rev-parse HEAD must succeed");
+    assert!(
+        head_out.status.success(),
+        "FX-SHALLOW: git rev-parse HEAD failed"
+    );
+    let clone_head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    assert_eq!(
+        clone_head.len(),
+        40,
+        "FX-SHALLOW: HEAD must be a 40-char SHA"
+    );
+
+    // Run rebuild_temporal on the FX-SHALLOW clone.
+    let cache_dir = clone_dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let now = super::current_epoch_secs();
+    let result = rebuild_temporal(&clone_path, &cache_dir, &clone_head, now);
+    assert!(
+        result.is_ok(),
+        "FX-SHALLOW: rebuild_temporal must return Ok(()) on a shallow clone; got {result:?}"
+    );
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path)
+        .expect("FX-SHALLOW: temporal.db must be openable after rebuild");
+
+    // Discriminating: META_IS_SHALLOW must be "1" (gix detects the shallow state).
+    let stored_shallow = db
+        .get_meta(rskim_search::META_IS_SHALLOW)
+        .expect("FX-SHALLOW: get_meta(META_IS_SHALLOW) must succeed")
+        .expect("FX-SHALLOW: META_IS_SHALLOW must be present after rebuild on shallow clone");
+    assert_eq!(
+        stored_shallow, "1",
+        "FX-SHALLOW: META_IS_SHALLOW must be '1' for a git clone --depth 1 shallow clone \
+         (gix must detect is_shallow=true via .git/shallow)"
+    );
+
+    // META_GIT_HEAD must be set (prevents retry loop).
+    let stored_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .expect("FX-SHALLOW: get_meta(META_GIT_HEAD) must succeed")
+        .expect("FX-SHALLOW: META_GIT_HEAD must be present");
+    assert_eq!(
+        stored_head, clone_head,
+        "FX-SHALLOW: META_GIT_HEAD must equal the clone HEAD"
+    );
+
+    // Zero hotspot rows: the single commit in a depth-1 clone has no accessible
+    // parent, so changed_files == [] for all commits (case (ii) condition).
+    let hotspots = db
+        .top_hotspots(20)
+        .expect("FX-SHALLOW: top_hotspots must succeed");
+    assert!(
+        hotspots.is_empty(),
+        "FX-SHALLOW: temporal.db must have zero hotspot rows for a depth-1 shallow clone \
+         (changed_files is empty because the parent commit is not in the shallow history); \
+         got {} rows",
+        hotspots.len()
+    );
+}
