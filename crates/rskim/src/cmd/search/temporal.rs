@@ -339,8 +339,9 @@ pub(super) struct DegradedJson {
     pub subsystem: &'static str,
     /// Machine-readable reason code (`DegradedReason::as_json_str`).
     pub reason: &'static str,
-    /// The user flag that requested temporal ranking (e.g. `"--hot"`).
-    /// Empty for composite arms that do not map to a single flag.
+    /// The user flag that requested temporal ranking, in bare form (e.g. `"hot"`,
+    /// `"blast-radius"`).  No `--` prefix — use [`TemporalSort::json_name`] to
+    /// obtain the correct value; `flag_name()` is for human-readable message text.
     pub requested: String,
     /// The ranking actually served (e.g. `"lexical"`, `"ast"`).
     pub applied: &'static str,

@@ -156,12 +156,28 @@ pub(super) enum TemporalSort {
 }
 
 impl TemporalSort {
-    /// Human-readable flag name for use in error messages.
+    /// Human-readable flag name for use in error messages and `degraded_notice` calls.
+    ///
+    /// Returns the `--`-prefixed form (e.g. `"--hot"`).  Use [`Self::json_name`]
+    /// for `DegradedJson.requested` where the plan contract (AC-4/AC-7) requires
+    /// the bare form.
     pub(super) fn flag_name(self) -> &'static str {
         match self {
             Self::Hot => "--hot",
             Self::Cold => "--cold",
             Self::Risky => "--risky",
+        }
+    }
+
+    /// Bare name for `DegradedJson.requested` (AC-4 / AC-7: no `--` prefix).
+    ///
+    /// `flag_name()` keeps the `--`-prefixed form for message text and
+    /// `degraded_notice` calls where the dashed form is correct.
+    pub(super) fn json_name(self) -> &'static str {
+        match self {
+            Self::Hot => "hot",
+            Self::Cold => "cold",
+            Self::Risky => "risky",
         }
     }
 }

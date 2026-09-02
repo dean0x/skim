@@ -1596,12 +1596,14 @@ fn run_query(
         if let Some(ref u) = maybe_unavail {
             // degraded_notice is the SSOT for all stderr degradation messages (AD-414-1).
             // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
+            // flag_name() keeps the --prefixed form for the human-readable notice;
+            // json_name() returns the bare form required by DegradedJson.requested (AC-4).
             let msg = temporal::degraded_notice(u, sort.flag_name(), temporal::Fallback::Lexical);
             eprintln!("skim search: {msg}");
             output.degraded.push(temporal::DegradedJson {
                 subsystem: "temporal",
                 reason: u.reason.as_json_str(),
-                requested: sort.flag_name().to_string(),
+                requested: sort.json_name().to_string(),
                 applied: "lexical",
                 message: msg,
                 remediation: u.reason.remediation(),
@@ -1631,7 +1633,19 @@ fn run_query(
     // readable counterpart.  Blast-radius degradation is independent of temporal-
     // sort degradation: both can be present simultaneously (two entries in the vec).
     if let Some(u) = blast_degraded {
-        let msg = temporal::degraded_notice(&u, "--blast-radius", temporal::Fallback::Lexical);
+        // AC-7 / AC-19(b): NotGitRepo keeps the legacy composition format
+        // byte-identical to the string emitted to stderr by resolve_blast_radius_paths
+        // so DegradedJson.message agrees with what was printed (audit #414-6).
+        // All other reasons use degraded_notice with flag="--blast-radius" and
+        // Fallback::Lexical (same formula as resolve_blast_radius_paths).
+        let msg = if u.reason == temporal::DegradedReason::NotGitRepo {
+            format!(
+                "no temporal data for --blast-radius — {}",
+                NO_TEMPORAL_DATA_MSG
+            )
+        } else {
+            temporal::degraded_notice(&u, "--blast-radius", temporal::Fallback::Lexical)
+        };
         output.degraded.push(temporal::DegradedJson {
             subsystem: "temporal",
             reason: u.reason.as_json_str(),
@@ -1804,7 +1818,7 @@ fn run_temporal_standalone(
             let dj = temporal::DegradedJson {
                 subsystem: "temporal",
                 reason: u.reason.as_json_str(),
-                requested: sort.flag_name().to_string(),
+                requested: sort.json_name().to_string(),
                 applied: "none",
                 message: msg_str,
                 remediation: u.reason.remediation(),
@@ -2022,6 +2036,15 @@ fn print_help() {
 /// AD-395-6: `skipped` / `skipped_by_reason` are additive keys; all nine pre-existing
 /// keys are unchanged (AC11 back-compat).  `skipped_by_reason` uses `BTreeMap` for
 /// byte-stable key order consistent with the text-mode path (PF-012).
+///
+/// **Snapshot asymmetry (AD-414-10 / audit #414-7):** `git_head` and `temporal_state`
+/// are captured from the PRE-self-heal state (before `auto_refresh_if_stale` runs).
+/// All other fields — `file_count`, `skipped`, `ast_coverage`, and the manifest-derived
+/// counts — are read from the post-heal state (after the repair, if any).  This means
+/// `--stats --json` can show a `temporal_state` of `"missing"` or `"corrupt"` alongside
+/// a freshly-healed `file_count`, which is the intended observable contract (AC-15 /
+/// AC-22): the report tells you what was wrong when the command was invoked, while also
+/// reflecting the post-heal index state.
 fn build_stats_json(
     cache_dir: &std::path::Path,
     root: &std::path::Path,

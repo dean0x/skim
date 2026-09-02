@@ -592,25 +592,41 @@ pub(super) fn auto_refresh_if_stale(
 
     match staleness {
         StalenessCheck::HeadChanged { stored, current } => {
+            // #379 non-debug notice restored (audit #414-4): 771f632 demoted this to
+            // debug-only during the staleness.rs refactor; no AC backs the demotion.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: index stale — HEAD changed ({}…→{}…); rebuilding",
                     stored.get(..8).unwrap_or(&stored),
                     current.get(..8).unwrap_or(&current),
                 );
+            } else {
+                eprintln!("skim search: index stale (HEAD changed), refreshing…");
             }
             build_index(&config)?;
         }
         StalenessCheck::NoStoredHead => {
+            // #379 non-debug notice restored (audit #414-4): 771f632 demoted this to
+            // debug-only; no AC backs the demotion.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: index stale — no stored HEAD or format upgrade; rebuilding",
                 );
+            } else {
+                eprintln!("skim search: refreshing index (no HEAD recorded)…");
             }
             build_index(&config)?;
         }
         StalenessCheck::NoIndex => {
-            build_index(&config)?;
+            // #379 build-progress notices restored (audit #414-4): 771f632 deleted
+            // "building index…" and "indexed N files in X.Ys"; no AC backs the removal.
+            eprintln!("skim search: building index…");
+            let result = build_index(&config)?;
+            eprintln!(
+                "skim search: indexed {} files in {:.1}s",
+                result.file_count,
+                result.duration.as_secs_f64(),
+            );
         }
         StalenessCheck::WorkingTreeChanged {
             changed,
@@ -619,19 +635,12 @@ pub(super) fn auto_refresh_if_stale(
         } => {
             // Non-debug notice: visible to callers that check stderr for the
             // working-tree-changed signal (AC8 / AC7 acceptance criterion).
-            // The debug arm is kept as an additional [debug]-prefixed message;
-            // the test assertion checks for the base "working tree changed" token
-            // which is present in both.
+            // The redundant [debug]-prefixed duplicate is removed (audit #414-5:
+            // double-print under SKIM_DEBUG=1); the plain notice is sufficient.
             eprintln!(
                 "skim search: index stale (working tree changed: \
                  {changed} modified, {added} added, {removed} removed), refreshing…"
             );
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search [debug]: index stale — working tree changed \
-                     ({changed} modified, {added} added, {removed} removed); rebuilding",
-                );
-            }
             // AD-379-8: a concurrent peer may have already rebuilt the index.
             // `build_index_rechecked` re-runs check_staleness under the build lock
             // and skips the rebuild if the index is now current.
