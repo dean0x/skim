@@ -629,6 +629,43 @@ impl FileManifest {
         })
     }
 
+    /// Read the stored git HEAD from `{cache_dir}/index.skfiles` without
+    /// materialising the entry table (header-only decode).
+    ///
+    /// Used by `gather_stats` to snapshot the pre-refresh HEAD before
+    /// `auto_refresh_if_stale` runs, avoiding the second full manifest decode
+    /// that `check_staleness` already performs inside `auto_refresh_if_stale`
+    /// (Finding [medium/performance] / AD-414-10).
+    ///
+    /// The file bytes are still read in one `std::fs::read` (the same size-guarded
+    /// read `load` performs); what this probe avoids is the *decode* — the entry
+    /// table is never parsed, so none of the per-entry `String`/`BTreeMap`
+    /// allocations that dominate `load` on a large index are made.
+    ///
+    /// Returns `None` on any I/O failure, parse error, version mismatch, or
+    /// root mismatch — semantically identical to
+    /// `Self::load(…).ok().and_then(|m| m.stored_git_head().map(str::to_string))`
+    /// but reads only up to the fixed header block.
+    pub(super) fn load_git_head(project_root: &Path, cache_dir: &Path) -> Option<String> {
+        let manifest_path = cache_dir.join(Self::MANIFEST_FILENAME);
+        // Size guard: same bound as `load` — reject suspiciously large files
+        // before reading into memory (AD-380-3 / AC-3).
+        let size = std::fs::metadata(&manifest_path).ok()?.len();
+        if size > MAX_MANIFEST_FILE_BYTES {
+            return None;
+        }
+        let buf = std::fs::read(&manifest_path).ok()?;
+        let header = decode_header(&buf)?;
+        // Root mismatch → wrong manifest for this project root.
+        let canonical_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        if canonical_root.as_path() != Path::new(&header.root) {
+            return None;
+        }
+        header.git_head
+    }
+
     /// Check if an on-disk manifest file exists and has the current FORMAT_VERSION.
     ///
     /// Returns:

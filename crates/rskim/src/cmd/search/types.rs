@@ -156,12 +156,28 @@ pub(super) enum TemporalSort {
 }
 
 impl TemporalSort {
-    /// Human-readable flag name for use in error messages.
+    /// Human-readable flag name for use in error messages and `degraded_notice` calls.
+    ///
+    /// Returns the `--`-prefixed form (e.g. `"--hot"`).  Use [`Self::json_name`]
+    /// for `DegradedJson.requested` where the plan contract (AC-4/AC-7) requires
+    /// the bare form.
     pub(super) fn flag_name(self) -> &'static str {
         match self {
             Self::Hot => "--hot",
             Self::Cold => "--cold",
             Self::Risky => "--risky",
+        }
+    }
+
+    /// Bare name for `DegradedJson.requested` (AC-4 / AC-7: no `--` prefix).
+    ///
+    /// `flag_name()` keeps the `--`-prefixed form for message text and
+    /// `degraded_notice` calls where the dashed form is correct.
+    pub(super) fn json_name(self) -> &'static str {
+        match self {
+            Self::Hot => "hot",
+            Self::Cold => "cold",
+            Self::Risky => "risky",
         }
     }
 }
@@ -384,6 +400,18 @@ pub(super) struct QueryOutput {
     /// `is_clean()` the field is set to `None` (omit from JSON entirely).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ast_coverage: Option<rskim_search::AstCoverage>,
+    /// AD-414-5 / AD-414-12: degradation signals emitted on this query.
+    ///
+    /// An array of objects — one per subsystem that could not deliver the
+    /// requested ranking.  **Absent from JSON when empty** (additive,
+    /// back-compat; `#[serde(skip_serializing_if)]`).  Consumers that check
+    /// for the key can detect degraded queries without parsing stderr.
+    ///
+    /// The array is `pub` so callers outside `query.rs` (e.g. `mod.rs`
+    /// enrichment arms) can push signals after `execute_query_with_manifest`
+    /// returns.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<super::temporal::DegradedJson>,
 }
 
 // ============================================================================

@@ -21,8 +21,8 @@ referencedFiles:
   - crates/rskim/src/cmd/search/gitdir.rs
   - crates/rskim/src/cmd/search/temporal_state.rs
 created: 2026-06-21
-updated: 2026-08-30
-version: 6
+updated: 2026-09-02
+version: 7
 ---
 
 # Search CLI (skim search subcommand)
@@ -308,10 +308,13 @@ follow-up ticket.
 
 **Temporal staleness (AD-TMP-2/AD-TMP-3)**:
 
-`temporal_db_is_stale(cache_dir, current_head) -> bool` checks whether
-`temporal.db` is missing or its stored `META_GIT_HEAD` does not match
-`current_head`. Uses a minimal read-only SQLite open (no WAL pragma, no
-migrations) to read just the one `meta` row.
+`temporal_db_is_stale(cache_dir, current_head, git_dir: Option<&Path>) -> bool`
+performs three checks against a single read-only SQLite open (no WAL pragma, no
+migrations): Check 1 — `META_GIT_HEAD` absent or mismatched; Check 2 (AD-408-4)
+— stored `data_version` absent or less than `TEMPORAL_DATA_VERSION`; Check 3
+(AD-414-14) — `meta.is_shallow == "1"` but the common-dir `shallow` file is gone
+(shallow→full unshallow detection). `git_dir` is the resolved commondir path, used
+only for Check 3 to locate the correct `shallow` file in linked worktrees.
 
 **AD-TMP-2**: temporal.db staleness is INDEPENDENT of lexical staleness (#357
 BUG B). The old code's `Current` early-return in `auto_refresh_if_stale` skipped
@@ -403,10 +406,12 @@ separate read-only SQLite connection). Used when no live DB handle is available.
 
 `anchor_state_on_db(db, root) -> AnchorState`: same check against an **already-open**
 `TemporalDb` — avoids a second SQLite open when the caller already holds the handle
-(used by `open_temporal_db_for` in `temporal.rs` to enforce the anchor-refusal guard
+(used by `open_temporal_state` in `temporal.rs` to enforce the anchor-refusal guard
 in one funnel, AD-413-16 Finding 4).
 
-Query arms (`open_temporal_db_for`) refuse on `Differs` — exit 0 with no rows served.
+Query arms (`open_temporal_state` / `open_temporal_state_for`) refuse on `Differs`,
+returning `TemporalOpen::Unavailable { reason: DegradedReason::RepositoryMismatch }` —
+exit 0 with no rows served.
 Explicit build arms (`--build`/`--rebuild`/`--update`) pass `ReanchorPolicy::Allow` and
 re-anchor loudly on `Differs`.
 
@@ -415,6 +420,75 @@ self-heal arms). Passed as `reanchor` into `auto_refresh_if_stale` and
 `try_rebuild_temporal_nonfatal` to gate the `record_temporal_anchor` write in
 `temporal_build.rs` (PF-017: a plain lexical query must NEVER silently retarget
 `temporal.db`).
+
+## Degraded-State Vocabulary (degraded.rs / temporal.rs)
+
+This is the central contract of `skim search` temporal flags (AD-414-1, OD-A).
+All types live in `crates/rskim/src/cmd/search/degraded.rs`; `temporal.rs`
+re-exports them so existing callers in `mod.rs`, `ast.rs`, and `temporal_build.rs`
+are unaffected.
+
+**`DegradedReason`** (enum, `pub(super)`) — the state the user or agent recognises.
+JSON values from `as_json_str()` are fixed contract strings (OD-A); never rename.
+Variants (in §2.3 precedence order):
+
+| Variant | JSON key | Meaning |
+|---|---|---|
+| `NotGitRepo` | `not_git_repo` | No ancestor `.git` |
+| `HeadUnresolved` | `head_unresolved` | git dir found but HEAD not resolvable |
+| `RepositoryMismatch` | `repository_mismatch` | DB anchored to a different repo (AD-413-16) |
+| `Missing` | `missing` | git repo + HEAD ok, but `temporal.db` absent |
+| `Corrupt` | `corrupt` | Structurally corrupt DB |
+| `UnsupportedVersion` | `unsupported_version` | DB schema newer than this build supports |
+| `Unreadable` | `unreadable` | Open failed for any other reason |
+| `Empty` | `empty` | DB open but zero rows for the requested dimension |
+| `NoRankedRows` | `no_ranked_rows` | Rows exist but none matched results carry a score |
+| `GhostFilter` | `ghost_filter` | All rows excluded by the on-disk ghost filter |
+
+**`TemporalUnavailable`** (struct) — pairs a `DegradedReason` with a `detail: String`
+carrying reason-specific context (path pair for `RepositoryMismatch`, count for
+`NoRankedRows`/`GhostFilter`, error text for `Unreadable`, `"shallow"` for
+`Empty` on a shallow clone, empty string otherwise).
+
+**`TemporalOpen`** (enum, `pub(super)`, in `temporal.rs`) — the return type of the
+query-arm DB-open funnel:
+- `Open(TemporalDb)` — DB is open and anchored; ready to serve rows.
+- `Unavailable(TemporalUnavailable)` — cannot serve; callers construct a
+  `DegradedJson` and continue with the lexical fallback (or return no rows on the
+  standalone temporal arm).
+
+**`open_temporal_state(root, cache_dir, head) -> TemporalOpen`** and
+**`open_temporal_state_for(root, cache_dir, head, sort) -> TemporalOpen`** — the single
+funnel for all temporal DB access at query time (AD-414-1 / AD-414-15). `_for` adds an
+emptiness probe for the requested `sort` dimension, promoting `Open` to
+`Unavailable { Empty }` when the DB has no rows for that dimension.
+
+**`DegradedJson`** (struct, `pub(super)`, serde `Serialize`) — the per-element shape
+inside the `degraded` JSON array (OD-A). Fields:
+- `subsystem` — always `"temporal"` in this ticket.
+- `reason` — `DegradedReason::as_json_str()` value.
+- `requested` — bare flag name (e.g. `"hot"`, `"blast-radius"`); no `--` prefix.
+  Use `TemporalSort::json_name()`, NOT `flag_name()` (RD-5 / AC-4 / AC-7).
+- `applied` — ranking served instead (`"lexical"`, `"ast"`, `"none"`).
+- `message` — identical to the stderr notice (SSOT via `degraded_notice`).
+- `remediation` — machine-readable advice string.
+
+The `degraded` JSON key (`Vec<DegradedJson>`, `skip_serializing_if = "Vec::is_empty"`)
+is absent on healthy queries and present with one element per degraded arm
+(AD-414-12). Callers emit it via `SearchOutput.degraded` in `types.rs`.
+
+**`Fallback`** (enum) — passed to `degraded_notice` to select the fallback tail:
+`Lexical` (BM25F order served), `Ast` (raw AST order served), `NoResults` (standalone
+temporal arm — no results returned).
+
+**`degraded_notice(u, flag, fallback) -> String`** — the ONLY builder of degraded-state
+notice text (AD-414-1). Every emit site prints or stores the string it returns.
+`flag` is the `--`-prefixed flag for the tail; pass `""` for the standalone temporal
+arm to return the base message verbatim (preserves byte-identical legacy assertions).
+
+**PF-016 caution**: do not pre-populate `reason` fields with default/empty values before
+classification — the key-absence guard in query arms depends on the field being absent
+on a clean result.
 
 ## Temporal Index Build (temporal_build.rs)
 
@@ -849,9 +923,10 @@ Files:
   produce `RiskRow.risk_score`. The bare ratio saturates on tiny samples (#378).
 
 - **Reading `temporal.db` staleness by opening `TemporalDb::open` on the hot path**:
-  use `temporal_db_is_stale(cache_dir, current_head)` which opens a minimal
-  read-only SQLite connection to read just the one `meta` row. The full
-  `TemporalDb::open` runs WAL pragma + two metadata syscalls + migration check.
+  use `temporal_db_is_stale(cache_dir, current_head, git_dir)` which opens a minimal
+  read-only SQLite connection for three lightweight checks (HEAD match, data_version
+  gate, shallow→full probe — AD-414-14). The full `TemporalDb::open` runs WAL pragma
+  + two metadata syscalls + migration check.
 
 ## Gotchas
 

@@ -103,6 +103,39 @@ impl std::fmt::Debug for AstIndexReader {
 // The A6 test in reader_tests.rs verifies Send + Sync at compile time via
 // a generic bound: `fn assert_send_sync<T: Send + Sync>() {}`.
 
+/// Compute the expected `ast_index.skidx` file size in bytes from a decoded header.
+///
+/// Used by both [`AstIndexReader::open`] (after mmap) and
+/// [`AstIndexReader::index_integrity`] (before mmap, using `file.metadata()`).
+/// Single source of truth so the two size-validation paths cannot drift
+/// (mirrors the `expected_idx_size` helper in `index/reader.rs`).
+///
+/// Returns `Err(IndexCorrupted)` on any checked-arithmetic overflow.
+fn expected_ast_idx_size(header: &super::format::AstSkidxHeader) -> crate::Result<usize> {
+    let bigram_bytes = (header.bigram_count as usize)
+        .checked_mul(BIGRAM_ENTRY_SIZE)
+        .ok_or_else(|| {
+            crate::SearchError::IndexCorrupted("bigram_count * BIGRAM_ENTRY_SIZE overflow".into())
+        })?;
+    let trigram_bytes = (header.trigram_count as usize)
+        .checked_mul(TRIGRAM_ENTRY_SIZE)
+        .ok_or_else(|| {
+            crate::SearchError::IndexCorrupted("trigram_count * TRIGRAM_ENTRY_SIZE overflow".into())
+        })?;
+    let meta_bytes = (header.file_count as usize)
+        .checked_mul(FILE_META_SIZE)
+        .ok_or_else(|| {
+            crate::SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
+        })?;
+    HEADER_SIZE
+        .checked_add(bigram_bytes)
+        .and_then(|s| s.checked_add(trigram_bytes))
+        .and_then(|s| s.checked_add(meta_bytes))
+        .ok_or_else(|| {
+            crate::SearchError::IndexCorrupted("expected ast_index.skidx size overflow".into())
+        })
+}
+
 impl AstIndexReader {
     // -----------------------------------------------------------------------
     // Private layout helpers — single source of truth for section offsets.
@@ -160,27 +193,8 @@ impl AstIndexReader {
 
         let header = decode_header(&idx_mmap)?;
 
-        // ── Size validation (checked arithmetic) ────────────────────────────
-        let bigram_bytes = (header.bigram_count as usize)
-            .checked_mul(BIGRAM_ENTRY_SIZE)
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted("bigram_count * BIGRAM_ENTRY_SIZE overflow".into())
-            })?;
-        let trigram_bytes = (header.trigram_count as usize)
-            .checked_mul(TRIGRAM_ENTRY_SIZE)
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted("trigram_count * TRIGRAM_ENTRY_SIZE overflow".into())
-            })?;
-        let meta_bytes = (header.file_count as usize)
-            .checked_mul(FILE_META_SIZE)
-            .ok_or_else(|| {
-                SearchError::IndexCorrupted("file_count * FILE_META_SIZE overflow".into())
-            })?;
-        let expected_idx_size = HEADER_SIZE
-            .checked_add(bigram_bytes)
-            .and_then(|s| s.checked_add(trigram_bytes))
-            .and_then(|s| s.checked_add(meta_bytes))
-            .ok_or_else(|| SearchError::IndexCorrupted("expected_idx_size overflow".into()))?;
+        // ── Size validation (via shared SSOT helper) ─────────────────────────
+        let expected_idx_size = expected_ast_idx_size(&header)?;
 
         if idx_mmap.len() != expected_idx_size {
             return Err(SearchError::IndexCorrupted(format!(
@@ -293,6 +307,125 @@ impl AstIndexReader {
             )));
         }
         let version = u16::from_le_bytes([buf[4], buf[5]]);
+        Ok(version)
+    }
+
+    /// Probe the format version and structural integrity of an on-disk AST index
+    /// without fully opening it.
+    ///
+    /// Reads up to [`HEADER_SIZE`] bytes from `ast_index.skidx` and checks
+    /// magic, version, and — for current-version files — the header-encoded size
+    /// against the actual on-disk length of `ast_index.skidx` and (when
+    /// `postings_file_size > 0`) of `ast_index.skpost`.
+    /// No mmap, no CRC, no full-file read: at most one bounded read + two
+    /// `metadata()` calls.
+    ///
+    /// The legitimate `postings_file_size == 0` case (an AST index built over
+    /// files that produced no structural nodes) skips the `.skpost` size check
+    /// entirely (E-9).  This is an **intentional asymmetry** with
+    /// [`crate::NgramIndexReader::lexical_index_integrity`]: the lexical builder
+    /// always writes `index.skpost` (even when empty), so a missing `.skpost` on
+    /// the lexical arm is always a corruption signal; the AST builder omits
+    /// `ast_index.skpost` when there are no postings, so the zero check here is
+    /// correct.
+    ///
+    /// When the version does not match `FORMAT_VERSION`, returns `Ok(version)`
+    /// immediately without size validation — the layout of a foreign header is
+    /// unknown, so size validation must not proceed (AD-414-6).
+    ///
+    /// Used by `check_staleness` in place of the version-only [`Self::index_version`]
+    /// probe.  The structural check ensures that a truncated or size-inconsistent
+    /// AST index triggers a rebuild via the `Err(_) => true` staleness arm.
+    ///
+    /// **Keep [`Self::index_version`]** — it has callers in `ast_tests.rs`
+    /// (`self_heal_below_format_version_reports_stale`, the two gate-query
+    /// round-trip tests `run_ast_standalone_no_format_change_ac10_374` and
+    /// `run_ast_standalone_synthetic_pattern_no_format_change_ac12_394`) and in
+    /// `reader_tests.rs` (`f9_index_version_returns_3_for_v3_index`,
+    /// `f9_index_version_surfaces_v1_fixture`), plus a doc reference at the
+    /// [`AST_INDEX_FORMAT_VERSION`] item in `lib.rs`.  This function is additive
+    /// and does not subsume those uses.
+    ///
+    /// # Errors
+    ///
+    /// - [`SearchError::Io`] if `ast_index.skidx` cannot be opened, or
+    ///   `ast_index.skpost` cannot be stat'd due to a non–file-not-found I/O
+    ///   error (e.g. `EACCES`).
+    /// - [`SearchError::IndexCorrupted`] if the header is too short, has wrong
+    ///   magic bytes, `ast_index.skpost` is absent when a non-zero size is
+    ///   expected, or the file lengths disagree with the header-encoded sizes.
+    pub fn index_integrity(dir: &Path) -> Result<u16> {
+        use super::format::FORMAT_VERSION;
+
+        let idx_path = dir.join("ast_index.skidx");
+        let mut buf = [0u8; HEADER_SIZE];
+
+        // Steps 1–4: open, fill, magic check, version decode (shared with
+        // lexical_index_integrity via crate::io_util::probe_index_header).
+        let (file, version, n) =
+            crate::io_util::probe_index_header(&idx_path, &mut buf, "ast_index.skidx", SKAX_MAGIC)?;
+
+        // AD-414-6: foreign layout unknown — size checks must not proceed.
+        if version != FORMAT_VERSION {
+            return Ok(version);
+        }
+
+        // Step 5: full-header check — need HEADER_SIZE bytes.
+        if n < HEADER_SIZE {
+            return Err(SearchError::IndexCorrupted(format!(
+                "ast_index.skidx header truncated: need {HEADER_SIZE} bytes, got {n}"
+            )));
+        }
+
+        // Step 6: decode header and check .skidx size via the shared SSOT helper.
+        //
+        // Use `file.metadata()` (the already-open handle) rather than a fresh
+        // `fs::metadata(&idx_path)`: reusing the handle closes the TOCTOU gap
+        // between the open() above and the stat, and surfaces a real I/O error
+        // (e.g. ENFILE, racing unlink) instead of silently substituting 0 and
+        // mis-classifying the file as corrupt.
+        let header = decode_header(&buf[..HEADER_SIZE])?;
+        let expected_idx = expected_ast_idx_size(&header)?;
+        let actual_idx = file.metadata()?.len() as usize;
+        if actual_idx != expected_idx {
+            return Err(SearchError::IndexCorrupted(format!(
+                "ast_index.skidx size mismatch: expected {expected_idx}, got {actual_idx}"
+            )));
+        }
+
+        // Step 7: validate .skpost size.
+        //
+        // postings_file_size == 0 is legitimate (E-9): an AST index built over
+        // files that produced no structural nodes has no .skpost file on disk.
+        // See the intentional asymmetry note in the doc comment above.
+        let expected_post = header.postings_file_size;
+        if expected_post == 0 {
+            return Ok(version);
+        }
+        let post_path = dir.join("ast_index.skpost");
+        let expected_post_usize = usize::try_from(expected_post).map_err(|_| {
+            SearchError::IndexCorrupted(format!(
+                "postings_file_size {expected_post} exceeds platform usize"
+            ))
+        })?;
+        match std::fs::metadata(&post_path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SearchError::IndexCorrupted(format!(
+                    "ast_index.skpost missing (expected {expected_post} bytes) at {}",
+                    dir.display()
+                )));
+            }
+            Err(e) => return Err(SearchError::Io(e)),
+            Ok(m) => {
+                let actual_post = m.len() as usize;
+                if actual_post != expected_post_usize {
+                    return Err(SearchError::IndexCorrupted(format!(
+                        "ast_index.skpost size mismatch: expected {expected_post}, got {actual_post}"
+                    )));
+                }
+            }
+        }
+
         Ok(version)
     }
 

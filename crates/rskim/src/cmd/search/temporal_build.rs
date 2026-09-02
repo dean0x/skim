@@ -28,8 +28,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
     COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, HistoryResult, HotspotRow,
-    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb, TemporalMetadata,
+    MIN_COCHANGE_JACCARD, RiskRow, SearchError, TemporalDb, TemporalMetadata,
 };
+
+use super::degraded::{DegradedReason, Fallback, TemporalUnavailable, degraded_notice};
 
 // ============================================================================
 // Constants
@@ -39,6 +41,32 @@ use rskim_search::{
 // single source of truth lives in:
 //   - COUPLING_MAX_FILES  → rskim_search::cochange::builder (pub)
 //   - MIN_COCHANGE_JACCARD → rskim_search::temporal::storage (pub)
+
+// ============================================================================
+// BuildLoudness
+// ============================================================================
+
+/// Whether the temporal build was requested explicitly by the user or triggered
+/// as a background auto-refresh from a lexical/AST query.
+///
+/// SE-1: Only explicit build/rebuild/update invocations emit an open-failure
+/// notice on stderr.  Query-path auto-refreshes demote the same failure to a
+/// debug-gated message so that a plain `skim search foo` does not permanently
+/// grow a stderr line.
+///
+/// This is a separate axis from [`super::staleness::ReanchorPolicy`], which
+/// governs whether `temporal.db` may be re-anchored to a different repository
+/// toplevel.  The two happen to correlate for current callers, but they are
+/// independent concerns: a future caller could need Allow without loudness, or
+/// Refuse with it.  Keeping them separate in the function signature makes that
+/// extension straightforward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BuildLoudness {
+    /// Explicit `--build`, `--rebuild`, or `--update` invocation — emit notices.
+    Loud,
+    /// Background auto-refresh triggered by a lexical or AST query — stay quiet.
+    Silent,
+}
 
 // ============================================================================
 // Co-change pair builder (D2 / AC10)
@@ -350,6 +378,7 @@ pub(super) fn rebuild_temporal(
         head,
         now_epoch,
         super::staleness::ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     )
 }
 
@@ -520,6 +549,7 @@ pub(super) fn rebuild_temporal_with_source(
     head: &str,
     now_epoch: u64,
     reanchor: super::staleness::ReanchorPolicy,
+    loudness: BuildLoudness,
 ) -> anyhow::Result<()> {
     // ── Build-backoff sentinel (Finding 2 / D5) ──────────────────────────────
     // Written when TemporalDb::open fails or a fallback empty sync fails (the
@@ -604,6 +634,12 @@ pub(super) fn rebuild_temporal_with_source(
         )
     };
 
+    // AD-414-9: capture pre-ghost-filter row counts so the zero-row notice (below,
+    // at the sync success arm) can name the STAGE that zeroed the data.
+    // hotspot_rows is the representative slice (hotspot and risk are computed from
+    // the same source and reach zero together; cochange can independently be zero).
+    let pre_ghost_hotspot = hotspot_rows.len();
+
     // ── Build-time ghost filter (AD-408-1 / AD-408-5) ────────────────────────
     // Applied on freshly-computed rows *before* `db.sync` persists them so the
     // prior DB survives on failure and the self-heal invariant holds (ADR-006).
@@ -682,25 +718,19 @@ pub(super) fn rebuild_temporal_with_source(
     // the same poll interval, and the same deadline (applies ADR-006).
     let _lock = super::build_lock::acquire("skim search", cache_dir)?;
 
+    // SE-1: the open-failure loud notice fires only on explicit build/rebuild/update.
+    // `loudness` is passed explicitly by the caller (never inferred from `reanchor`)
+    // so the two axes remain independently controllable (see BuildLoudness doc).
+    let is_loud = loudness == BuildLoudness::Loud;
+
     let db_path = cache_dir.join("temporal.db");
-    let db = match TemporalDb::open(&db_path) {
-        Ok(d) => d,
-        Err(e) => {
-            // D5 + Finding 2 backoff: TemporalDb::open failed — write a sentinel
-            // so subsequent queries skip the rebuild for this HEAD.  Without this,
-            // temporal_db_is_stale returns true forever (no temporal.db → stale →
-            // rebuild → open fails again → loop).  The sentinel is best-effort; if
-            // the cache directory is also unwritable the loop continues until HEAD
-            // advances, which is acceptable degradation (D5).
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search [debug]: failed to open temporal.db: {e} — \
-                     writing build-backoff sentinel to prevent retry loop",
-                );
-            }
-            let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
-            return Ok(());
-        }
+    // AD-414-3 + SE-1: open with discard-on-corrupt semantics; SE-1 loudness
+    // controlled by the BuildLoudness parameter.  Returns None when the open
+    // fails non-fatally (caller returns Ok(()) — D5 isolation).
+    let Some(db) =
+        open_or_discard_temporal_db(&db_path, cache_dir, is_loud, &backoff_sentinel, head)
+    else {
+        return Ok(());
     };
 
     // Helper: called on any successful sync (full-rows or fallback empty-rows).
@@ -713,7 +743,11 @@ pub(super) fn rebuild_temporal_with_source(
         record_temporal_anchor(db, root, &ghost_root, reanchor);
     };
 
-    match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head) {
+    // is_shallow from parse_history metadata (AD-414-14): recorded via sync() so
+    // Check 3 in temporal_db_is_stale can detect a shallow→full transition.
+    let is_shallow = risk_history.metadata.is_shallow;
+
+    match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head, is_shallow) {
         Ok(()) => {
             on_sync_ok(&db);
             if crate::debug::is_debug_enabled() {
@@ -725,8 +759,19 @@ pub(super) fn rebuild_temporal_with_source(
                     head.get(..8).unwrap_or(head),
                 );
             }
+            // AD-414-9: zero-row build notice — one stderr line, NOT debug-gated,
+            // naming the STAGE that produced zero data.  Derived from captured
+            // pre-/post-ghost-filter counts plus risk_history.metadata.is_shallow.
+            // AC-18 guard (E-13): a healthy 1-commit repo always has hotspot rows,
+            // so this fires only in genuinely degraded states.
+            if hotspot_rows.is_empty() && risk_rows.is_empty() && cochange_rows.is_empty() {
+                // AD-414-9: delegate stage classification to the pure helper
+                // so this arm stays a single readable expression (Finding 4).
+                let notice = zero_row_notice(&risk_history, pre_ghost_hotspot, is_shallow);
+                eprintln!("skim search: {notice}");
+            }
         }
-        Err(rskim_search::SearchError::CapacityExceeded(msg)) => {
+        Err(SearchError::CapacityExceeded(msg)) => {
             // Too many rows (>500k) — degrade gracefully (D5).
             // Finding 2 backoff: try an empty-row sync so META_GIT_HEAD is written
             // and temporal_db_is_stale returns false on subsequent queries.
@@ -739,7 +784,7 @@ pub(super) fn rebuild_temporal_with_source(
                      attempting empty-row fallback sync to prevent retry loop",
                 );
             }
-            if db.sync(&[], &[], &[], head).is_ok() {
+            if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
                 let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
@@ -756,7 +801,7 @@ pub(super) fn rebuild_temporal_with_source(
                      attempting empty-row fallback sync to prevent retry loop",
                 );
             }
-            if db.sync(&[], &[], &[], head).is_ok() {
+            if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
                 let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
@@ -765,6 +810,172 @@ pub(super) fn rebuild_temporal_with_source(
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Extracted helpers (Finding 4 — complexity reduction)
+// ============================================================================
+
+/// Open `temporal.db`, discarding and retrying once on `DatabaseCorrupt`.
+///
+/// Implements the AD-414-3 "exactly one retry — never a loop" invariant.
+/// On success returns `Some(db)`.  On any non-fatal failure, writes the
+/// backoff sentinel (when safe to do so), prints a diagnostic, and returns
+/// `None` so the caller can immediately `return Ok(())` (temporal failure is
+/// non-fatal per ADR-006/D5).
+///
+/// `is_loud` gates the open-failure notice for the `Err(other)` arm (SE-1).
+fn open_or_discard_temporal_db(
+    db_path: &std::path::Path,
+    cache_dir: &std::path::Path,
+    is_loud: bool,
+    backoff_sentinel: &std::path::Path,
+    head: &str,
+) -> Option<TemporalDb> {
+    match TemporalDb::open(db_path) {
+        Ok(d) => Some(d),
+        // AD-414-3: DatabaseCorrupt is the ONLY variant that licenses deleting
+        // on-disk state.  Discard, then exactly ONE re-open attempt — never a loop.
+        Err(SearchError::DatabaseCorrupt(m)) => {
+            eprintln!("skim search: temporal.db was corrupt ({m}) — discarding and rebuilding it");
+            match std::fs::remove_file(db_path) {
+                Ok(()) => {
+                    // SE-3: sidecars only after a SUCCESSFUL main unlink.  Removing
+                    // them after a failed unlink can strip a still-valid DB's WAL
+                    // under a concurrent reader (.skim-build.lock serialises writers).
+                    for sidecar in ["temporal.db-wal", "temporal.db-shm"] {
+                        let _ = std::fs::remove_file(cache_dir.join(sidecar));
+                    }
+                }
+                Err(e) => {
+                    // AC-29: loud, non-debug-gated; names the absolute path and
+                    // gives an actionable manual-deletion instruction.
+                    eprintln!(
+                        "skim search: could not delete the corrupt temporal.db at {} ({e}) — \
+                         delete this file manually, then re-run 'skim search --rebuild'",
+                        db_path.display()
+                    );
+                    // D5 backoff: the corrupt DB remains on disk (unlink failed), so
+                    // `temporal_db_is_stale` will open it read-only, find no META_GIT_HEAD,
+                    // return stale, and re-run the full parse_history walk — producing an
+                    // unbounded retry loop that prints two stderr lines per invocation.
+                    // The sentinel bounds it to once per HEAD, matching both sibling arms
+                    // (recreate-failed and Err(other)).  SE-3 is not violated: no sidecar
+                    // removal is attempted here (the main unlink itself failed).
+                    let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+                    return None;
+                }
+            }
+            // EXACTLY ONE retry (AD-414-3) — never a loop.
+            match TemporalDb::open(db_path) {
+                Ok(d) => Some(d),
+                Err(e2) => {
+                    eprintln!(
+                        "skim search: temporal.db could not be recreated after discard ({e2}) \
+                         — delete {} manually",
+                        db_path.display()
+                    );
+                    // D5 backoff: the discard SUCCEEDED, so temporal.db is now absent;
+                    // the sentinel prevents the per-query rebuild loop.
+                    let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+                    None
+                }
+            }
+        }
+        Err(other) => {
+            // SE-1: loud ONLY on explicit build/rebuild/update; debug-gated otherwise.
+            // The loud text is built by `degraded_notice` from the CLASSIFIED reason
+            // (UnsupportedSchemaVersion → UnsupportedVersion, everything else →
+            // Unreadable), NEVER from `{other}` alone.  AD-414-11: the
+            // UnsupportedSchemaVersion case is invisible to temporal_db_is_stale,
+            // so this arm is the only path that can tell --build/--rebuild which
+            // version was found, which is supported, and that upgrading (not
+            // deleting) is the remedy.  AC-19(b) forbids cause substrings outside
+            // the degraded_notice builder.
+            let (reason, detail) = match other {
+                SearchError::UnsupportedSchemaVersion { found, supported } => (
+                    DegradedReason::UnsupportedVersion,
+                    DegradedReason::unsupported_version_detail(found, supported),
+                ),
+                ref e => (DegradedReason::Unreadable, e.to_string()),
+            };
+            let u = TemporalUnavailable { reason, detail };
+            let notice = degraded_notice(&u, "", Fallback::NoResults);
+            if is_loud {
+                eprintln!("skim search: {notice}");
+            } else if crate::debug::is_debug_enabled() {
+                eprintln!("skim search [debug]: temporal open failed — {notice}");
+            }
+            // D5 + backoff: write the sentinel so subsequent queries skip the
+            // rebuild for this HEAD.  Best-effort — if the cache dir is also
+            // unwritable the retry continues until HEAD advances (D5).
+            // UnsupportedSchemaVersion leaves temporal.db byte-for-byte unchanged
+            // (R1 contract); the sentinel prevents an infinite retry without touching
+            // the DB.
+            let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+            None
+        }
+    }
+}
+
+/// Compute the zero-row build notice string (AD-414-9, pure, DB-free).
+///
+/// Called from within the `Ok(())` arm of `db.sync(...)` after a sync that
+/// wrote zero rows.  Classifies the stage that produced zero data and routes
+/// through [`degraded_notice`] (AD-414-1 SSOT) in every branch.
+///
+/// Returns the notice string to pass to `eprintln!("skim search: {notice}")`.
+///
+/// # Classification
+///
+/// - Case (i): no commits at all → `Empty` (no shallow suffix per T-16/AC-16).
+/// - Case (ii): commits present, `pre_ghost == 0`, `is_shallow` → `Empty` with
+///   shallow detail (permitted only when `is_shallow`).
+/// - Case (iii): rows computed, ghost filter zeroed them → `GhostFilter` with
+///   count detail.  Routes through `degraded_notice` so the SSOT guard catches
+///   any future drift (AD-414-1, `t19b_no_cause_substring_outside_the_builder`).
+/// - Fallback: commits present, no extractable diffs, not shallow → treat as
+///   case (i).
+fn zero_row_notice(
+    risk_history: &HistoryResult,
+    pre_ghost_hotspot: usize,
+    is_shallow: bool,
+) -> String {
+    if risk_history.commits.is_empty() {
+        // Case (i): no commits at all — empty history.
+        // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
+        let u = TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: String::new(),
+        };
+        degraded_notice(&u, "", Fallback::NoResults)
+    } else if pre_ghost_hotspot == 0 && is_shallow {
+        // Case (ii): commits present but all diffs failed under a shallow clone
+        // (changed_files == [] for every commit).  Shallow wording is permitted
+        // only when is_shallow is true.
+        let u = TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: "shallow".to_string(),
+        };
+        degraded_notice(&u, "", Fallback::NoResults)
+    } else if pre_ghost_hotspot > 0 {
+        // Case (iii): rows were computed but the ghost filter dropped all of them.
+        // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
+        // Routes through degraded_notice (AD-414-1 SSOT) via GhostFilter variant.
+        let u = TemporalUnavailable {
+            reason: DegradedReason::GhostFilter,
+            detail: pre_ghost_hotspot.to_string(),
+        };
+        degraded_notice(&u, "", Fallback::NoResults)
+    } else {
+        // Fallback: commits present but no diffs extractable and not shallow —
+        // treat as case (i) (no useful history).
+        let u = TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: String::new(),
+        };
+        degraded_notice(&u, "", Fallback::NoResults)
+    }
 }
 
 /// Write the git repository toplevel anchor into an open [`TemporalDb`] after a

@@ -359,6 +359,38 @@ pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<St
 }
 
 // ============================================================================
+// Lexical index opener (AD-414-7)
+// ============================================================================
+
+/// AD-414-7: lexical open failures become actionable, mirroring `open_ast_engine`
+/// in `ast.rs` — name the artifact path and include the `--rebuild` hint.
+///
+/// Built with `anyhow::anyhow!` (NO `.context`), so the io source is not printed
+/// twice when the caller formats with `{e:#}`.
+///
+/// Used at BOTH bare-`?` sites that open the lexical index: the query path
+/// (`execute_query_with_manifest`) and `gather_stats` (mod.rs), which serves both
+/// `--stats` and `--stats --json` from one snapshot.  The `--stats` site runs
+/// AFTER the `auto_refresh_if_stale` self-heal, so an error here means the index
+/// could not be opened even after a rebuild attempt — exactly the state a stuck
+/// user is in, and the one AC-13/AC-14 require to name the artifact and the
+/// `--rebuild` remedy.
+///
+/// # Errors
+///
+/// Returns `Err` with the artifact path and rebuild guidance when the index
+/// cannot be opened.
+pub(super) fn open_lexical_reader(cache_dir: &Path) -> anyhow::Result<NgramIndexReader> {
+    NgramIndexReader::open(cache_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open lexical index at {}: {e}\n\
+             Run `skim search --rebuild` to rebuild from scratch.",
+            cache_dir.display()
+        )
+    })
+}
+
+// ============================================================================
 // Query execution
 // ============================================================================
 
@@ -412,6 +444,7 @@ pub(super) fn execute_query_with_manifest(
             duration_ms: start.elapsed().as_millis() as u64,
             index_stats: None,
             ast_coverage: None,
+            degraded: vec![],
         });
     }
     // Compute the verify-mode label once for all QueryOutput sites in this function.
@@ -448,7 +481,7 @@ pub(super) fn execute_query_with_manifest(
         Some(m) => m,
         None => {
             let (outcome, m, _head_state) =
-                auto_refresh_if_stale(root, cache_dir, analytics, ReanchorPolicy::Refuse)?;
+                auto_refresh_if_stale(root, cache_dir, analytics, ReanchorPolicy::Refuse, None)?;
             // AC-405-7 / AC-405-8: emit AST coverage notice ONLY when a first-time
             // (NoIndex) build fires on the pure-lexical query path (D-4 cadence).
             // Incremental self-heals (HeadChanged / WorkingTreeChanged) must be
@@ -462,8 +495,8 @@ pub(super) fn execute_query_with_manifest(
         }
     };
 
-    // Open the reader.
-    let reader = NgramIndexReader::open(cache_dir)?;
+    // Open the reader — actionable error (AD-414-7).
+    let reader = open_lexical_reader(cache_dir)?;
     let stats = reader.stats();
     let engine = QueryEngine::new(Box::new(reader));
 
@@ -682,6 +715,7 @@ pub(super) fn execute_query_with_manifest(
         duration_ms,
         index_stats: Some(stats),
         ast_coverage: None,
+        degraded: vec![],
     })
 }
 
@@ -746,6 +780,7 @@ fn run_compound_query(
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
             ast_coverage: None,
+            degraded: vec![],
         });
     }
 
@@ -784,6 +819,7 @@ fn run_compound_query(
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
             ast_coverage: None,
+            degraded: vec![],
         });
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
@@ -902,6 +938,7 @@ fn run_compound_query(
         duration_ms,
         index_stats: Some(ctx.stats),
         ast_coverage: None,
+        degraded: vec![],
     })
 }
 
@@ -962,6 +999,7 @@ fn run_blast_radius_composite_query(
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
             ast_coverage: None,
+            degraded: vec![],
         });
     }
 
@@ -1175,6 +1213,7 @@ fn run_blast_radius_composite_query(
         duration_ms,
         index_stats: Some(ctx.stats),
         ast_coverage: None,
+        degraded: vec![],
     })
 }
 

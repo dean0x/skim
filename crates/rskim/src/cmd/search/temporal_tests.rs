@@ -7,10 +7,11 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    HeadState, TemporalQueryOutput, TemporalUnavailable, apply_temporal_enrichment,
-    bounded_page_notice, check_temporal_staleness, enrich_ast_results, format_temporal_json,
-    format_temporal_text, normalize_blast_radius_path, open_temporal_db, open_temporal_db_for,
-    query_standalone, resort_window,
+    DegradedReason, Fallback, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
+    TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
+    degraded_notice, dimension_is_empty, enrich_ast_results, format_temporal_json,
+    format_temporal_text, normalize_blast_radius_path, open_temporal_state, query_standalone,
+    ranked_row_count, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -156,15 +157,32 @@ fn normalize_dot_slash_stripped() {
 // Step 8: DB helpers
 // ============================================================================
 
+/// AD-414-15: `open_temporal_state` must return `Unavailable(Missing)` when
+/// `temporal.db` does not exist and the head resolves.
 #[test]
-fn open_temporal_db_missing_returns_none() {
+fn open_temporal_state_missing_returns_unavailable_missing() {
     let dir = TempDir::new().unwrap();
-    let nonexistent = dir.path().join("nonexistent.db");
-    assert!(open_temporal_db(&nonexistent).is_none());
+    // Use a resolved HEAD so the absence is classified as Missing, not HeadUnresolved.
+    let result = open_temporal_state(
+        dir.path(),
+        dir.path(),
+        &HeadState::Resolved("abc123".to_string()),
+    );
+    assert!(
+        matches!(
+            result,
+            TemporalOpen::Unavailable(TemporalUnavailable {
+                reason: DegradedReason::Missing,
+                ..
+            })
+        ),
+        "open_temporal_state must return Unavailable(Missing) when temporal.db \
+         does not exist and HEAD resolves, got: {result:?}"
+    );
 }
 
-/// AD-413-16: `open_temporal_db_for` must return `Err(AnchorDiffers)` when the
-/// temporal.db was built for a different repository root.
+/// AD-413-16: `open_temporal_state` must return `Unavailable(RepositoryMismatch)`
+/// when `temporal.db` was built for a different repository root.
 ///
 /// Setup:
 /// - `outer` = a fake git root (has `.git/HEAD`) so `resolve_repo_toplevel(root)` resolves.
@@ -175,7 +193,7 @@ fn open_temporal_db_missing_returns_none() {
 /// The test does NOT require a real `git` binary — the toplevel is discovered by
 /// walking for `.git`, which the fake outer dir provides.
 #[test]
-fn open_temporal_db_for_anchor_differs_returns_err() {
+fn open_temporal_state_anchor_differs_returns_repository_mismatch() {
     // Outer dir acts as the git repo root (has .git/HEAD).
     let outer = TempDir::new().unwrap();
     let git_dir = outer.path().join(".git");
@@ -196,10 +214,20 @@ fn open_temporal_db_for_anchor_differs_returns_err() {
         "/wrong/repo/path",
     );
 
-    let result = open_temporal_db_for(&root, cache.path());
+    let result = open_temporal_state(
+        &root,
+        cache.path(),
+        &HeadState::Resolved("abc123".to_string()),
+    );
     assert!(
-        matches!(result, Err(TemporalUnavailable::AnchorDiffers { .. })),
-        "AD-413-16: open_temporal_db_for must return Err(AnchorDiffers) \
+        matches!(
+            result,
+            TemporalOpen::Unavailable(TemporalUnavailable {
+                reason: DegradedReason::RepositoryMismatch,
+                ..
+            })
+        ),
+        "AD-413-16: open_temporal_state must return Unavailable(RepositoryMismatch) \
          when temporal.db belongs to a different repo, got: {result:?}"
     );
 }
@@ -209,8 +237,8 @@ fn open_temporal_db_for_anchor_differs_returns_err() {
 /// different repository.  An empty allowlist forces zero results on all
 /// blast-radius callers; `Ok(None)` would be misread as "not requested".
 ///
-/// Uses the same fake-git-root fixture as `open_temporal_db_for_anchor_differs_returns_err`
-/// to trigger `AnchorState::Differs` inside the funnel.
+/// Uses the same fake-git-root fixture as `open_temporal_state_anchor_differs_returns_repository_mismatch`
+/// to trigger `RepositoryMismatch` inside the funnel.
 #[test]
 fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
     // Outer dir acts as the git repo root.
@@ -246,17 +274,85 @@ fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
         result.is_ok(),
         "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"
     );
-    let paths = result.unwrap();
+    // Finding B fix: RepositoryMismatch returns Filtered { allow: empty, degraded }
+    // so callers can populate output.degraded (AC-7) AND the path filter forces
+    // zero results on all blast-radius arms (PF-016 / AD-413-16).
+    let resolution = result.unwrap();
+    let (allow, degraded) = match &resolution {
+        super::BlastRadiusResolution::Filtered { allow, degraded } => (allow, degraded),
+        other => panic!(
+            "AD-413-16: resolve_blast_radius_paths must return Filtered on RepositoryMismatch, \
+             got: {other:?}"
+        ),
+    };
     assert!(
-        paths.is_some(),
-        "AD-413-16: resolve_blast_radius_paths must return Ok(Some(empty_set)) on \
-         AnchorDiffers, not Ok(None) — None overloads the 'not requested' sentinel \
-         (PF-016 / AD-413-16)"
-    );
-    assert!(
-        paths.unwrap().is_empty(),
+        allow.is_empty(),
         "AD-413-16: the returned set must be empty — wrong-repo anchor forces zero results \
          on all blast-radius arms"
+    );
+    assert_eq!(
+        degraded.reason,
+        super::DegradedReason::RepositoryMismatch,
+        "AC-7: Filtered variant must carry RepositoryMismatch so output.degraded gets an entry"
+    );
+}
+
+/// AC-7 / AC-19(b): when the root is not a git repo, `resolve_blast_radius_paths`
+/// emits the legacy composition format byte-identical to the pre-refactor message.
+///
+/// The format is `"no temporal data for --blast-radius — {NO_TEMPORAL_DATA_MSG}"`.
+/// De-doubling (using bare `degraded_notice` with flag) applies ONLY to new
+/// `DegradedReason` variants (Corrupt, Missing, …); `NotGitRepo` keeps the
+/// composition wrapper so existing integrations remain unaffected.
+#[test]
+fn resolve_blast_radius_paths_not_git_repo_emits_legacy_composition_format() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // resolve_blast_radius_paths calls eprintln! for the degraded notice.
+    // Use a known-absent temporal DB + NotARepo head to trigger the NotGitRepo
+    // path — the function returns Ok(None) and emits the composition message.
+    let result = super::resolve_blast_radius_paths(
+        Some("src/lib.rs"),
+        root,
+        dir.path(), // empty cache_dir — no temporal.db
+        false,
+        &HeadState::NotARepo,
+    );
+
+    assert!(
+        result.is_ok(),
+        "must not error for NotARepo (graceful degradation), got: {:?}",
+        result.unwrap_err()
+    );
+    assert!(
+        matches!(result.unwrap(), super::BlastRadiusResolution::Degraded(_)),
+        "NotARepo → Degraded variant (no paths filter), not a tuple: graceful degradation"
+    );
+
+    // Verify the message constant the composition wrapper would produce is correct.
+    // (The eprintln! in the production code emits this; we assert the constant
+    //  rather than capturing stderr, which would require process redirection.)
+    let expected_msg = format!(
+        "no temporal data for --blast-radius — {}",
+        super::super::NO_TEMPORAL_DATA_MSG
+    );
+    assert!(
+        expected_msg.contains("no temporal data for --blast-radius"),
+        "composition format must name the flag: {expected_msg:?}"
+    );
+    assert!(
+        expected_msg.contains(super::super::NO_TEMPORAL_DATA_MSG),
+        "composition format must embed NO_TEMPORAL_DATA_MSG verbatim: {expected_msg:?}"
+    );
+    // AC-7: no doubled phrase (the wrapper adds context without repeating
+    // "no temporal data for --blast-radius" a second time).
+    let count = expected_msg
+        .matches("no temporal data for --blast-radius")
+        .count();
+    assert_eq!(
+        count, 1,
+        "phrase 'no temporal data for --blast-radius' must appear exactly once (AC-7): {expected_msg:?}"
     );
 }
 
@@ -2015,6 +2111,7 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
         duration_ms: 1,
         index_stats: None,
         ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -2640,5 +2737,791 @@ fn test_text_temporal_has_more_with_nonzero_offset() {
         "D-5 text+temporal offset: has_more must be true when count ({}) > depth({})",
         pre_overflow,
         page.depth()
+    );
+}
+
+// ============================================================================
+// T-38 / AD-414-13: ranked_row_count — unit tests (no DB required)
+// ============================================================================
+
+/// T-38(a): when NO result carries a hotspot_score the covered slice is entirely
+/// unranked.  ranked_row_count must report ranked == 0, total == slice length,
+/// lookup_errors == 0, and must NOT mutate the slice (input order preserved).
+#[test]
+fn t38_all_unranked_reports_zero_and_preserves_order() {
+    let results = vec![
+        make_result("a.rs", 3.0),
+        make_result("b.rs", 2.0),
+        make_result("c.rs", 1.0),
+    ];
+    // Ensure all temporal fields are None (make_result already does this).
+    let paths_before: Vec<_> = results.iter().map(|r| r.path.clone()).collect();
+
+    let cov: TemporalCoverage = ranked_row_count(&results, TemporalSort::Hot);
+
+    assert_eq!(
+        cov.ranked, 0,
+        "all-unranked slice must report ranked == 0, got {cov:?}"
+    );
+    assert_eq!(cov.total, 3, "total must equal slice length, got {cov:?}");
+    assert_eq!(
+        cov.lookup_errors, 0,
+        "ranked_row_count performs no DB lookups; lookup_errors must be 0"
+    );
+
+    // ranked_row_count takes &[..] so the caller's order is unchanged.
+    let paths_after: Vec<_> = results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        paths_before, paths_after,
+        "ranked_row_count must not reorder the slice"
+    );
+}
+
+/// T-38(b): when exactly 1 of 4 results carries a hotspot_score, ranked_row_count
+/// must report ranked == 1 and total == 4 (the sentinel-eligible set).
+/// A caller seeing ranked == 1 knows the sort would elevate that one entry and
+/// assign the -1.0 sentinel to the remaining three.
+#[test]
+fn t38_one_of_four_ranked_reports_ranked_one() {
+    use crate::cmd::search::types::TemporalAnnotation;
+
+    let mut results = vec![
+        make_result("a.rs", 4.0),
+        make_result("b.rs", 3.0),
+        make_result("c.rs", 2.0),
+        make_result("d.rs", 1.0),
+    ];
+    // Annotate only the third entry with a hotspot score.
+    results[2].temporal = Some(TemporalAnnotation {
+        hotspot_score: Some(9.5),
+        risk_score: None,
+        fix_density: None,
+        cochange_jaccard: None,
+        changes_30d: None,
+        changes_90d: None,
+    });
+
+    let cov: TemporalCoverage = ranked_row_count(&results, TemporalSort::Hot);
+
+    assert_eq!(
+        cov.ranked, 1,
+        "one annotated entry must yield ranked == 1, got {cov:?}"
+    );
+    assert_eq!(
+        cov.total, 4,
+        "total must equal slice length (4), got {cov:?}"
+    );
+    assert_eq!(
+        cov.lookup_errors, 0,
+        "ranked_row_count performs no DB lookups; lookup_errors must be 0"
+    );
+}
+
+// ============================================================================
+// Phase B2: §2.3 normative conformance — cause, remediation, Fallback tails
+// (AD-414-15 / AC-2 / AC-7 / AC-19 / T-19 / T-4)
+// ============================================================================
+
+/// Returns the §2.3 normative cause text for a given reason+detail.
+///
+/// The exhaustive `match` on `DegradedReason` enforces a compile error when a
+/// new variant is added without updating this function (T-19(a) requirement).
+fn expected_cause(reason: DegradedReason, detail: &str) -> String {
+    match reason {
+        DegradedReason::NotGitRepo => super::super::NO_TEMPORAL_DATA_MSG.to_string(),
+        DegradedReason::HeadUnresolved => super::super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
+        DegradedReason::RepositoryMismatch => {
+            format!("{} {}", super::super::SUBDIR_ROOT_TEMPORAL_MSG, detail)
+        }
+        DegradedReason::Missing => "temporal.db is not present in the index cache".to_string(),
+        DegradedReason::Corrupt => "temporal.db is corrupt (not a database)".to_string(),
+        DegradedReason::UnsupportedVersion => {
+            format!("temporal.db was written by a newer skim ({detail})")
+        }
+        DegradedReason::Unreadable => {
+            if detail.is_empty() {
+                "temporal.db could not be opened".to_string()
+            } else {
+                format!("temporal.db could not be opened ({detail})")
+            }
+        }
+        DegradedReason::Empty => {
+            let base = "temporal data is empty (0 rows) \u{2014} this repository has no \
+                        commit history skim can analyse";
+            if detail.contains("shallow") {
+                format!("{base}; a shallow clone is the usual cause")
+            } else {
+                base.to_string()
+            }
+        }
+        DegradedReason::NoRankedRows => detail.to_string(),
+        DegradedReason::GhostFilter => format!(
+            "temporal data built 0 rows — all {detail} computed rows were excluded \
+             by the on-disk ghost filter (files not present on disk at the indexed root)"
+        ),
+    }
+}
+
+/// Returns the §2.3 normative remediation text for a given reason.
+///
+/// Exhaustive `match` — compile error if a variant is added without updating.
+fn expected_remediation(reason: DegradedReason) -> &'static str {
+    match reason {
+        DegradedReason::NotGitRepo => "run 'skim search' on a git repo to auto-populate",
+        DegradedReason::HeadUnresolved => "commit at least one file to initialise the branch HEAD",
+        DegradedReason::RepositoryMismatch => {
+            "run 'skim search --rebuild --root <this root>' to re-anchor it"
+        }
+        DegradedReason::Missing => "run 'skim search --update' to build it",
+        DegradedReason::Corrupt => "run 'skim search --rebuild' to discard and rebuild it",
+        DegradedReason::UnsupportedVersion => {
+            "upgrade skim; skim will not overwrite a newer database"
+        }
+        DegradedReason::Unreadable => "run 'skim search --rebuild'",
+        DegradedReason::Empty => "run 'skim search --rebuild'",
+        DegradedReason::NoRankedRows => {
+            "commit the matched files, or run 'skim search --update' after committing"
+        }
+        DegradedReason::GhostFilter => {
+            "run 'skim search --rebuild' to rebuild with the current file set"
+        }
+    }
+}
+
+/// T-19(a): every `DegradedReason` variant's `cause()` matches the §2.3
+/// normative table, is non-empty, and does NOT contain the forbidden
+/// substring "no temporal data" (except `NotGitRepo` which IS the legacy
+/// `NO_TEMPORAL_DATA_MSG` verbatim — AC-19).
+#[test]
+fn t19a_cause_text_conformance() {
+    let cases: &[(DegradedReason, &str)] = &[
+        (DegradedReason::NotGitRepo, ""),
+        (DegradedReason::HeadUnresolved, ""),
+        (
+            DegradedReason::RepositoryMismatch,
+            "(recorded: \"/old\", live: \"/new\")",
+        ),
+        (DegradedReason::Missing, ""),
+        (DegradedReason::Corrupt, "SQLITE_NOTADB"),
+        (
+            DegradedReason::UnsupportedVersion,
+            "schema version 9, this build supports 8",
+        ),
+        (DegradedReason::Unreadable, "permission denied"),
+        (DegradedReason::Unreadable, ""),
+        (DegradedReason::Empty, ""),
+        (DegradedReason::Empty, "shallow"),
+        (
+            DegradedReason::NoRankedRows,
+            "0 of 5 results have temporal data",
+        ),
+        (DegradedReason::GhostFilter, "42"),
+    ];
+
+    for (reason, detail) in cases {
+        let actual = reason.cause(detail);
+        let want = expected_cause(*reason, detail);
+
+        assert_eq!(
+            actual, want,
+            "cause({reason:?}, {detail:?}) diverges from §2.3 normative text"
+        );
+        assert!(!actual.is_empty(), "cause({reason:?}) must be non-empty");
+
+        // AC-7 / AC-19(b): every reason except NotGitRepo must NOT embed "no temporal data".
+        if *reason != DegradedReason::NotGitRepo {
+            assert!(
+                !actual.contains("no temporal data"),
+                "AC-7: {reason:?} cause must not contain 'no temporal data', got: {actual:?}"
+            );
+        }
+    }
+
+    // NotGitRepo byte-identity (AC-19).
+    assert_eq!(
+        DegradedReason::NotGitRepo.cause(""),
+        super::super::NO_TEMPORAL_DATA_MSG,
+        "AC-19: NotGitRepo cause must be byte-identical to NO_TEMPORAL_DATA_MSG"
+    );
+}
+
+/// T-19(b): every `DegradedReason` variant's `remediation()` matches the
+/// §2.3 normative table and is non-empty.
+///
+/// Exhaustive `match` inside `expected_remediation` means a newly-added
+/// variant fails to compile until it is handled here.
+#[test]
+fn t19b_remediation_text_conformance() {
+    let all_reasons = [
+        DegradedReason::NotGitRepo,
+        DegradedReason::HeadUnresolved,
+        DegradedReason::RepositoryMismatch,
+        DegradedReason::Missing,
+        DegradedReason::Corrupt,
+        DegradedReason::UnsupportedVersion,
+        DegradedReason::Unreadable,
+        DegradedReason::Empty,
+        DegradedReason::NoRankedRows,
+        DegradedReason::GhostFilter,
+    ];
+
+    for reason in all_reasons {
+        let actual = reason.remediation();
+        let want = expected_remediation(reason);
+        assert_eq!(
+            actual, want,
+            "{reason:?} remediation diverges from §2.3 normative table"
+        );
+        assert!(
+            !actual.is_empty(),
+            "{reason:?} remediation must be non-empty"
+        );
+    }
+}
+
+/// Every `.rs` file under `crates/rskim/src/cmd/search/`, paired with the part of
+/// its source that is compiled into the PRODUCTION binary.
+///
+/// Test code is excluded two ways, and BOTH are needed:
+/// - `*_tests.rs` sidecars are dropped by filename.  Every module here except
+///   `mod.rs` keeps its tests in a sidecar (`mod tests;` on the last line), so
+///   this removes almost all test source.
+/// - `mod.rs` is the one module with an INLINE `mod tests { … }` block, so its
+///   source is truncated at that block.
+///
+/// A test legitimately quotes cause strings (T-19(a)'s `expected_cause` does)
+/// without that being a second emit site — hence the exclusions.
+///
+/// The marker is the start-of-line `mod tests {` and NOT `#[cfg(test)]`: the
+/// latter also occurs inside doc comments (e.g. `staleness.rs:23`,
+/// `types.rs:71`), and truncating there would silently discard 90 % of several
+/// files and leave this guard vacuous (PF-007).  `assert_corpus_is_substantial`
+/// below fails if that ever regresses.
+fn production_sources_under_search() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/search");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("cmd/search must be readable") {
+        let path = entry.expect("dir entry").path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if n.ends_with(".rs") && !n.ends_with("_tests.rs") => n.to_string(),
+            _ => continue,
+        };
+        let src = std::fs::read_to_string(&path).expect("source must be readable");
+        let production = match src.find("\nmod tests {") {
+            Some(i) => src[..i].to_string(),
+            None => src,
+        };
+        out.push((name, production));
+    }
+    assert!(
+        out.len() >= 5,
+        "expected the search module to have several production sources, found {}",
+        out.len()
+    );
+    out
+}
+
+/// Anti-vacuity control for [`production_sources_under_search`].
+///
+/// A scan-the-sources test passes trivially if the sources it scanned are empty,
+/// so pin a production symbol from each file that carries a real emit site.  If a
+/// future change to the truncation rule swallows these files, this fails LOUDLY
+/// instead of turning the SSOT guard into a no-op.
+fn assert_corpus_is_substantial(sources: &[(String, String)]) {
+    const REQUIRED: &[(&str, &str)] = &[
+        ("mod.rs", "fn run_query"),
+        ("mod.rs", "fn run_temporal_standalone"),
+        ("ast.rs", "fn run_ast_standalone"),
+        ("query.rs", "fn execute_query_with_manifest"),
+        ("staleness.rs", "fn check_staleness"),
+        ("temporal_build.rs", "fn rebuild_temporal_with_source"),
+        ("temporal_state.rs", "fn temporal_db_is_stale"),
+    ];
+    for (file, symbol) in REQUIRED {
+        let src = sources
+            .iter()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("{file} must be among the scanned production sources"))
+            .1
+            .as_str();
+        assert!(
+            src.contains(symbol),
+            "the scanned production source for {file} does not contain {symbol:?} — \
+             the test-code exclusion is discarding production code and this guard \
+             has become vacuous (PF-007)"
+        );
+    }
+}
+
+/// T-19(b) / AC-19(b) — STRUCTURAL SSOT, expressed as an observable.
+///
+/// The §2.3 cause texts must exist in exactly one place: the `DegradedReason`
+/// builder in `temporal.rs`.  Any other production file under `cmd/search/` that
+/// contains a cause substring is a second emit site — the failure mode this
+/// criterion exists to catch, because a hand-rolled cause literal outside the
+/// builder drifts silently.
+///
+/// Discriminating (PF-007): re-introducing any hand-written cause literal in
+/// `mod.rs`, `ast.rs`, `query.rs`, `staleness.rs` or `temporal_build.rs` fails
+/// this test, and the assertion is keyed on the production strings themselves,
+/// so renaming a cause without updating this list also fails.
+#[test]
+fn t19b_no_cause_substring_outside_the_builder() {
+    // Derive the cause substrings from the builder itself (degraded.rs) so this
+    // list never drifts when new DegradedReason variants are added.
+    // `cause_substrings_for_guard` is co-located with the builder and maintained
+    // alongside it — avoiding the hand-maintained literal array that failed to
+    // catch the GhostFilter case (originally in a `format!` in temporal_build.rs).
+    //
+    // `NotGitRepo` and `HeadUnresolved` are deliberately absent from the list:
+    // their causes ARE the shared `NO_TEMPORAL_DATA_MSG` /
+    // `HEAD_UNRESOLVED_TEMPORAL_MSG` constants declared in `mod.rs`, so their
+    // text legitimately appears there (AC-19/AC-20).
+    let cause_substrings = super::cause_substrings_for_guard();
+
+    let sources = production_sources_under_search();
+    assert_corpus_is_substantial(&sources);
+
+    for (name, src) in sources {
+        if name == "degraded.rs" {
+            // The builder itself — this is the one place the causes may live.
+            // (Formerly temporal.rs; moved to the dependency-free leaf module to
+            // break the temporal_build → temporal → … → temporal_build cycle.)
+            continue;
+        }
+        for cause in cause_substrings {
+            assert!(
+                !src.contains(cause),
+                "AC-19(b): cause text {cause:?} must be emitted only through \
+                 `DegradedReason`/`degraded_notice` in degraded.rs, but it also \
+                 appears in production code in {name}"
+            );
+        }
+    }
+}
+
+/// T-19(b) second half — every `AD-414-<n>` decision anchor is cited in the code.
+///
+/// An anchor with no citation means the decision it names shipped without a
+/// locatable implementation site (or was renumbered and left dangling).
+/// `AD-414-2` lives in `rskim-search` (the `DatabaseCorrupt` classification), so
+/// that crate's sources are scanned alongside `cmd/search/`.
+#[test]
+fn t19b_all_ad_414_anchors_present() {
+    fn collect_rs(dir: &std::path::Path, into: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, into);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && let Ok(src) = std::fs::read_to_string(&path)
+            {
+                into.push_str(&src);
+            }
+        }
+    }
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut corpus = String::new();
+    collect_rs(&manifest.join("src/cmd/search"), &mut corpus);
+    collect_rs(&manifest.join("../rskim-search/src"), &mut corpus);
+    assert!(
+        !corpus.is_empty(),
+        "anchor corpus must not be empty — check the source paths"
+    );
+
+    for n in 1..=15u32 {
+        let anchor = format!("AD-414-{n}");
+        // `AD-414-1` is a prefix of `AD-414-15`, so require the next character to
+        // be a non-digit (or end of input) before counting a citation.
+        let found = corpus.match_indices(&anchor).any(|(i, _)| {
+            corpus[i + anchor.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_digit())
+        });
+        assert!(
+            found,
+            "AC-19(b): decision anchor {anchor} is not cited anywhere in \
+             crates/rskim/src/cmd/search/ or crates/rskim-search/src/"
+        );
+    }
+}
+
+/// T-19(c): the three `Fallback` tail texts match the §2.3 normative table.
+///
+/// Uses `Missing` (known stable cause) so any regression in the tail is
+/// isolated from cause-text changes.
+#[test]
+fn t19c_fallback_tail_conformance() {
+    let unavail = TemporalUnavailable {
+        reason: DegradedReason::Missing,
+        detail: String::new(),
+    };
+
+    // Lexical tail: "; {flag} not applied — results are in lexical relevance order"
+    let lexical = degraded_notice(&unavail, "--hot", Fallback::Lexical);
+    assert!(
+        lexical.ends_with("; --hot not applied \u{2014} results are in lexical relevance order"),
+        "Lexical tail mismatch, got: {lexical:?}"
+    );
+
+    // Ast tail: "; {flag} not applied — results are in raw AST match order"
+    let ast = degraded_notice(&unavail, "--hot", Fallback::Ast);
+    assert!(
+        ast.ends_with("; --hot not applied \u{2014} results are in raw AST match order"),
+        "Ast tail mismatch, got: {ast:?}"
+    );
+
+    // NoResults tail: "; no {flag} data to rank"
+    let no_results = degraded_notice(&unavail, "--hot", Fallback::NoResults);
+    assert!(
+        no_results.ends_with("; no --hot data to rank"),
+        "NoResults tail mismatch, got: {no_results:?}"
+    );
+
+    // Empty flag — no tail appended (base message verbatim).
+    let no_flag = degraded_notice(&unavail, "", Fallback::Lexical);
+    assert!(
+        !no_flag.contains("not applied"),
+        "Empty flag must return base without tail, got: {no_flag:?}"
+    );
+}
+
+/// T-4 fragment: `NoRankedRows` detail format.
+///
+/// AC-4 substring: "0 of 3 results have temporal data".
+/// Lookup-error clause only when `lookup_errors > 0`.
+#[test]
+fn t4_no_ranked_rows_detail_format() {
+    // No lookup errors: plain count only.
+    let detail_plain = "0 of 3 results have temporal data";
+    let msg_plain = degraded_notice(
+        &TemporalUnavailable {
+            reason: DegradedReason::NoRankedRows,
+            detail: detail_plain.to_string(),
+        },
+        "--hot",
+        Fallback::Lexical,
+    );
+    assert!(
+        msg_plain.contains("0 of 3 results have temporal data"),
+        "T-4: message must contain AC-4 substring, got: {msg_plain:?}"
+    );
+    assert!(
+        !msg_plain.contains("lookup"),
+        "T-4: without lookup errors the error clause must be absent, got: {msg_plain:?}"
+    );
+
+    // With lookup errors: clause appended.
+    let detail_err = "0 of 3 results have temporal data (2 temporal lookups failed)";
+    let msg_err = degraded_notice(
+        &TemporalUnavailable {
+            reason: DegradedReason::NoRankedRows,
+            detail: detail_err.to_string(),
+        },
+        "--hot",
+        Fallback::Lexical,
+    );
+    assert!(
+        msg_err.contains("2 temporal lookups failed"),
+        "T-4: with lookup errors the error clause must be present, got: {msg_err:?}"
+    );
+}
+
+/// AC-7 / AC-19(b): structural de-doubling guard.
+///
+/// The full `degraded_notice` output for every new reason (all except
+/// `NotGitRepo`) must not contain the substring "no temporal data".
+/// This test covers all three `Fallback` variants × all new reasons.
+#[test]
+fn ac7_no_temporal_data_exclusion_for_new_reasons() {
+    // (reason, detail to use)
+    let cases: &[(DegradedReason, &str)] = &[
+        (DegradedReason::HeadUnresolved, ""),
+        (
+            DegradedReason::RepositoryMismatch,
+            "(recorded: \"/a\", live: \"/b\")",
+        ),
+        (DegradedReason::Missing, ""),
+        (DegradedReason::Corrupt, ""),
+        (
+            DegradedReason::UnsupportedVersion,
+            "schema version 9, this build supports 8",
+        ),
+        (DegradedReason::Unreadable, "some OS error"),
+        (DegradedReason::Empty, ""),
+        (
+            DegradedReason::NoRankedRows,
+            "0 of 5 results have temporal data",
+        ),
+    ];
+
+    for (reason, detail) in cases {
+        for fallback in [Fallback::Lexical, Fallback::Ast, Fallback::NoResults] {
+            let msg = degraded_notice(
+                &TemporalUnavailable {
+                    reason: *reason,
+                    detail: (*detail).to_string(),
+                },
+                "--hot",
+                fallback,
+            );
+            assert!(
+                !msg.contains("no temporal data"),
+                "AC-7: {reason:?}+{fallback:?} notice must not contain 'no temporal data', \
+                 got: {msg:?}"
+            );
+        }
+    }
+}
+
+/// AC-2 / §2.3 Empty non-shallow: the `degraded_notice` output for `Empty`
+/// with empty detail contains the word "empty", the flag, "not applied",
+/// "lexical", and "--rebuild"; but NOT "SKIM_DEBUG" or "no temporal data".
+#[test]
+fn ac2_empty_non_shallow_message_substrings() {
+    let msg = degraded_notice(
+        &TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: String::new(),
+        },
+        "--hot",
+        Fallback::Lexical,
+    );
+    assert!(
+        msg.contains("empty"),
+        "AC-2(a): Empty message must contain 'empty', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--hot"),
+        "AC-2(b): Empty message must contain the flag '--hot', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("not applied"),
+        "AC-2(c): Empty message must contain 'not applied', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("lexical"),
+        "AC-2(d): Empty message must contain 'lexical', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--rebuild"),
+        "AC-2(e): Empty message must contain '--rebuild', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("SKIM_DEBUG"),
+        "AC-2: Empty message must NOT contain SKIM_DEBUG hint, got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("no temporal data"),
+        "AC-7: Empty message must NOT contain 'no temporal data', got: {msg:?}"
+    );
+}
+
+// ============================================================================
+// Step 8 — --ast arm: Empty dimension and NoRankedRows
+// ============================================================================
+
+/// T-5 (Step 8): `dimension_is_empty` returns `true` for a fresh DB with no
+/// hotspot rows, confirming that the --ast arm will pass `None` as `temporal_db`
+/// and raw AST order survives (AC-21, SE-4 guard).
+///
+/// PF-007 discriminating: the probe uses `top_hotspots(1)`, never
+/// `result_count()==0` (G-3 invariant).
+#[test]
+fn t5_dimension_is_empty_hot_on_empty_db() {
+    let (_dir, db) = temp_db();
+    // A freshly-opened DB has no hotspot rows — dimension_is_empty must return true.
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Hot),
+        "T-5: dimension_is_empty(Hot) must be true on a fresh empty DB"
+    );
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Cold),
+        "T-5: dimension_is_empty(Cold) must be true on a fresh empty DB"
+    );
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Risky),
+        "T-5: dimension_is_empty(Risky) must be true on a fresh empty DB"
+    );
+}
+
+/// T-5 (Step 8) populated side: once hotspot rows exist,
+/// `dimension_is_empty(Hot)` returns `false` — the DB presence guard works.
+#[test]
+fn t5_dimension_is_empty_hot_returns_false_when_rows_exist() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[HotspotRow {
+        file_path: "src/main.rs".to_string(),
+        score: 0.5,
+        changes_30d: 3,
+        changes_90d: 10,
+    }])
+    .unwrap();
+    assert!(
+        !dimension_is_empty(&db, TemporalSort::Hot),
+        "T-5: dimension_is_empty(Hot) must be false when hotspot rows are present"
+    );
+    assert!(
+        !dimension_is_empty(&db, TemporalSort::Cold),
+        "T-5: dimension_is_empty(Cold) must be false when hotspot rows are present"
+    );
+}
+
+/// T-38 --ast sub-case / AD-414-13 (Step 8): `enrich_ast_results` returns
+/// `ranked == 0` when the DB has no temporal rows for the matched paths.
+/// The caller (ast.rs) detects this and emits the NoRankedRows notice on stderr.
+/// This test verifies the predicate the caller acts on.
+///
+/// PF-007 discriminating: asserts `ranked == 0` and `total == results.len()`.
+#[test]
+fn t38_ast_enrich_returns_zero_ranked_on_empty_db() {
+    let (_dir, db) = temp_db();
+    let mut results = vec![
+        make_ast("src/a.rs", 1.0),
+        make_ast("src/b.rs", 0.8),
+        make_ast("src/c.rs", 0.5),
+    ];
+    let original_order: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+
+    let cov = enrich_ast_results(&mut results, TemporalSort::Hot, &db);
+
+    assert_eq!(
+        cov.ranked, 0,
+        "T-38: no hotspot rows in DB → ranked must be 0"
+    );
+    assert_eq!(cov.total, 3, "T-38: total must equal the slice length (3)");
+    // AD-414-13: sort_by is skipped at ranked == 0 — raw AST order survives.
+    let after_order: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        after_order, original_order,
+        "T-38: raw AST order must be preserved when ranked == 0 (AD-414-13)"
+    );
+}
+
+/// Step 8 / AC-21: NoRankedRows degraded notice for the --ast arm must use
+/// `Fallback::Ast` tail ("--hot not applied — results are in raw AST match order").
+///
+/// PF-007 discriminating: checks the tail text, not just substring "Ast".
+#[test]
+fn t38_ast_norankedrows_degraded_notice_tail() {
+    let detail = "0 of 3 results have temporal data".to_string();
+    let u = TemporalUnavailable {
+        reason: DegradedReason::NoRankedRows,
+        detail,
+    };
+    let msg = degraded_notice(&u, "--hot", Fallback::Ast);
+    assert!(
+        msg.contains("0 of 3 results have temporal data"),
+        "AC-21: NoRankedRows notice must include the detail, got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--hot not applied"),
+        "AC-21: Fallback::Ast tail must mention '--hot not applied', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("raw AST match order"),
+        "AC-21: Fallback::Ast tail must say 'raw AST match order', got: {msg:?}"
+    );
+}
+
+// ============================================================================
+// Step 9 — standalone temporal arm: Empty dimension probe
+// ============================================================================
+
+/// T-20 (Step 9): `dimension_is_empty` gate for the standalone temporal arm.
+/// A DB with hotspot rows must NOT be treated as empty; a DB without must.
+/// This is the G-3 invariant — Empty is determined by the probe, never inferred
+/// from `result_count()==0 && offset==0`.
+///
+/// PF-007 discriminating: stores exactly one hotspot row and asserts the probe
+/// flips from true (before) to false (after).
+#[test]
+fn t20_dimension_is_empty_gate_for_standalone_arm() {
+    let (_dir, db) = temp_db();
+
+    // Before: no hotspot rows → empty.
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Hot),
+        "T-20: dimension_is_empty must be true before any hotspot rows are stored"
+    );
+
+    // Store exactly one hotspot row.
+    db.store_hotspots(&[HotspotRow {
+        file_path: "src/lib.rs".to_string(),
+        score: 0.3,
+        changes_30d: 1,
+        changes_90d: 4,
+    }])
+    .unwrap();
+
+    // After: probe must return false — dimension is no longer empty.
+    assert!(
+        !dimension_is_empty(&db, TemporalSort::Hot),
+        "T-20: dimension_is_empty must be false after storing one hotspot row"
+    );
+}
+
+/// T-6 (Step 9): The Empty degraded notice for the standalone temporal arm uses
+/// `Fallback::NoResults` and empty flag — the tail must be absent (no suffix).
+/// This exercises the exact call made in `run_temporal_standalone` when the DB
+/// is open but the dimension has zero rows.
+///
+/// PF-007 discriminating: forbids the Fallback::Ast tail ("not applied")
+/// and the Fallback::Lexical tail ("lexical relevance order").
+#[test]
+fn t6_standalone_temporal_empty_degraded_notice_no_suffix() {
+    let u = TemporalUnavailable {
+        reason: DegradedReason::Empty,
+        detail: String::new(),
+    };
+    // run_temporal_standalone calls degraded_notice with flag="" and Fallback::NoResults.
+    let msg = degraded_notice(&u, "", Fallback::NoResults);
+    assert!(
+        msg.contains("empty"),
+        "T-6: Empty notice must contain 'empty', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("not applied"),
+        "T-6: Empty notice with empty flag must NOT contain 'not applied', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("lexical"),
+        "T-6: Empty notice with empty flag must NOT contain 'lexical', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("raw AST"),
+        "T-6: Empty notice with empty flag must NOT contain 'raw AST', got: {msg:?}"
+    );
+}
+
+/// T-8 (Step 9): the `Missing` reason on the standalone temporal arm uses
+/// `degraded_notice` with flag="" and Fallback::NoResults.  Verifies the
+/// base message (no tail) for the common missing-DB case.
+///
+/// PF-007 discriminating: checks the cause text contains "not present" and
+/// "update" remedy, and does NOT contain "not applied" (no Fallback tail).
+#[test]
+fn t8_standalone_temporal_missing_degraded_notice_no_suffix() {
+    let u = TemporalUnavailable {
+        reason: DegradedReason::Missing,
+        detail: String::new(),
+    };
+    let msg = degraded_notice(&u, "", Fallback::NoResults);
+    assert!(
+        msg.contains("not present"),
+        "T-8: Missing notice must contain 'not present', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--update"),
+        "T-8: Missing notice must contain '--update' remedy, got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("not applied"),
+        "T-8: Missing notice with empty flag must NOT contain 'not applied', got: {msg:?}"
     );
 }

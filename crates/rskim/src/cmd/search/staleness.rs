@@ -298,9 +298,9 @@ fn scan_working_tree(
 /// When the lexical index is CURRENT but the AST index is ABSENT or has a
 /// FORMAT_VERSION below the current version (post-upgrade / crash-between-builds),
 /// this function reports `NoStoredHead` so the next query triggers a full rebuild.
-/// The version check uses [`rskim_search::AstIndexReader::index_version`] which
-/// reads only the first 6 bytes of `ast_index.skidx` (magic + version) — cheap,
-/// no mmap, no CRC verification.
+/// The version check uses [`rskim_search::AstIndexReader::index_integrity`] which
+/// validates the header size, magic bytes, and (for the current FORMAT_VERSION)
+/// the .skidx and .skpost file sizes — cheap, no mmap, no CRC verification.
 ///
 /// # Lexical self-heal (ADR-006, #355 Finding 9)
 ///
@@ -324,8 +324,10 @@ pub(super) fn check_staleness(
     // Lexical self-heal: if the on-disk FORMAT_VERSION is older than the current
     // version, return NoStoredHead to trigger a full rebuild so the user does not
     // see a hard error from NgramIndexReader::open (ADR-006, #355 Finding 9).
-    // This is the exact mirror of the AST index_version check below.
-    let lexical_stale = match rskim_search::NgramIndexReader::lexical_index_version(cache_dir) {
+    // This is the exact mirror of the AST `index_integrity` check below; both probe
+    // format version AND structural size consistency, so a truncated or size-inconsistent
+    // artifact also reports stale.
+    let lexical_stale = match rskim_search::NgramIndexReader::lexical_index_integrity(cache_dir) {
         Ok(v) => v < rskim_search::LEXICAL_INDEX_FORMAT_VERSION,
         Err(_) => true, // Corrupt / unreadable → rebuild.
     };
@@ -344,7 +346,7 @@ pub(super) fn check_staleness(
     let ast_stale = if !ast_index_path.exists() {
         true
     } else {
-        match rskim_search::AstIndexReader::index_version(cache_dir) {
+        match rskim_search::AstIndexReader::index_integrity(cache_dir) {
             Ok(v) => v < rskim_search::AST_INDEX_FORMAT_VERSION,
             Err(_) => true, // Corrupt / unreadable → rebuild.
         }
@@ -525,6 +527,12 @@ pub(super) fn auto_refresh_if_stale(
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
     reanchor: ReanchorPolicy,
+    // Pre-resolved HeadState from the caller, or None to resolve here.
+    // When Some, the resolution syscall is skipped so callers that have
+    // already called git_head_state do not incur a second HEAD-ladder
+    // traversal (Finding [low/performance] fix).  None preserves the
+    // previous behaviour.
+    pre_resolved_head: Option<HeadState>,
 ) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
@@ -533,7 +541,8 @@ pub(super) fn auto_refresh_if_stale(
     // the same SHA that will be in the manifest after build_index runs.
     // Step 6 (AD-413-7): use the three-state HeadState rather than Option<String>
     // so the same read feeds both the temporal rebuild and the anchor check.
-    let head_state = git_head_state(root);
+    // Finding [low/performance] fix: use the caller-supplied value when present.
+    let head_state = pre_resolved_head.unwrap_or_else(|| git_head_state(root));
     let current_head: Option<&str> = head_state.sha();
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);
@@ -558,8 +567,12 @@ pub(super) fn auto_refresh_if_stale(
         // FIRST (short-circuits on non-git dirs where current_head=None BEFORE the
         // temporal_db_is_stale() call, avoiding a wasted DB open).
         // `temporal_db_is_stale` only runs when HEAD is readable.
+        // AD-414-14: pass the git_dir so Check 3 (shallow→full) can probe the
+        // `.git/shallow` file. Stored in a local so the PathBuf lifetime extends
+        // across the condition expression.
+        let git_dir_for_stale = resolve_git_dir(root);
         if let Some(head) = current_head
-            && temporal_db_is_stale(cache_dir, head)
+            && temporal_db_is_stale(cache_dir, head, git_dir_for_stale.as_deref())
         {
             try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal", reanchor);
         }
@@ -588,37 +601,55 @@ pub(super) fn auto_refresh_if_stale(
 
     match staleness {
         StalenessCheck::HeadChanged { stored, current } => {
+            // #379 non-debug notice restored (audit #414-4): 771f632 demoted this to
+            // debug-only during the staleness.rs refactor; no AC backs the demotion.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: index stale — HEAD changed ({}…→{}…); rebuilding",
                     stored.get(..8).unwrap_or(&stored),
                     current.get(..8).unwrap_or(&current),
                 );
+            } else {
+                eprintln!("skim search: index stale (HEAD changed), refreshing…");
             }
             build_index(&config)?;
         }
         StalenessCheck::NoStoredHead => {
+            // #379 non-debug notice restored (audit #414-4): 771f632 demoted this to
+            // debug-only; no AC backs the demotion.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: index stale — no stored HEAD or format upgrade; rebuilding",
                 );
+            } else {
+                eprintln!("skim search: refreshing index (no HEAD recorded)…");
             }
             build_index(&config)?;
         }
         StalenessCheck::NoIndex => {
-            build_index(&config)?;
+            // #379 build-progress notices restored (audit #414-4): 771f632 deleted
+            // "building index…" and "indexed N files in X.Ys"; no AC backs the removal.
+            eprintln!("skim search: building index…");
+            let result = build_index(&config)?;
+            eprintln!(
+                "skim search: indexed {} files in {:.1}s",
+                result.file_count,
+                result.duration.as_secs_f64(),
+            );
         }
         StalenessCheck::WorkingTreeChanged {
             changed,
             added,
             removed,
         } => {
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search [debug]: index stale — working tree changed \
-                     ({changed} modified, {added} added, {removed} removed); rebuilding",
-                );
-            }
+            // Non-debug notice: visible to callers that check stderr for the
+            // working-tree-changed signal (AC8 / AC7 acceptance criterion).
+            // The redundant [debug]-prefixed duplicate is removed (audit #414-5:
+            // double-print under SKIM_DEBUG=1); the plain notice is sufficient.
+            eprintln!(
+                "skim search: index stale (working tree changed: \
+                 {changed} modified, {added} added, {removed} removed), refreshing…"
+            );
             // AD-379-8: a concurrent peer may have already rebuilt the index.
             // `build_index_rechecked` re-runs check_staleness under the build lock
             // and skips the rebuild if the index is now current.

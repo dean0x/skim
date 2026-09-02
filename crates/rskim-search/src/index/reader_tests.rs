@@ -2043,8 +2043,10 @@ fn test_ac8_v4_format_compat_exact_symbol_no_rebuild() {
         builder.build().unwrap();
     }
 
-    // Verify the on-disk format version matches current FORMAT_VERSION (currently v7).
-    let version = NgramIndexReader::lexical_index_version(dir.path()).unwrap();
+    // Verify the on-disk format version via the integrity probe (replaces
+    // `lexical_index_version` which was deleted in #414 Step 2; retargeted per C7).
+    // A healthy freshly-built index must return Ok(FORMAT_VERSION) — no error.
+    let version = NgramIndexReader::lexical_index_integrity(dir.path()).unwrap();
     assert_eq!(
         version, FORMAT_VERSION,
         "AC#8: format version must be {} (unchanged by #372); got {version}",
@@ -3257,5 +3259,235 @@ fn test_align_whole_token_set_dedup_recurring_seed_at_same_position() {
         byte_pos_vec[0].start, 0,
         "AD-411-2 set-dedup: byte position must come from the first seed posting \
          (position=0); got {byte_pos_vec:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-3..T-6  (#414 Step 2): lexical_index_integrity probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// T-3 (#414): a healthy freshly-built index must pass the integrity probe with
+/// `Ok(FORMAT_VERSION)`.  This is the same assertion as AC#8 but as a named
+/// scenario so the T-N label is present in the test suite.
+#[test]
+fn t3_integrity_probe_healthy_index_returns_ok() {
+    use crate::index::format::FORMAT_VERSION;
+    let dir = tmp_dir();
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "pub fn check_integrity() {}",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    let version = NgramIndexReader::lexical_index_integrity(dir.path()).unwrap();
+    assert_eq!(
+        version, FORMAT_VERSION,
+        "T-3: healthy index must return FORMAT_VERSION from integrity probe"
+    );
+}
+
+/// T-4 (#414): a file with bad magic bytes must be detected as `IndexCorrupted`.
+///
+/// FX-BODY-B analogue: a short / garbage `index.skidx` triggers the magic-check
+/// branch.  The error text must NOT say `search index --rebuild` (T-34 / Step 3).
+#[test]
+fn t4_integrity_probe_bad_magic_returns_corrupted() {
+    let dir = tmp_dir();
+    // Write 62 bytes of 0xFF — wrong magic, clearly corrupt.
+    std::fs::write(dir.path().join("index.skidx"), vec![0xFFu8; 62]).unwrap();
+    let err = NgramIndexReader::lexical_index_integrity(dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, crate::SearchError::IndexCorrupted(_)),
+        "T-4: bad magic must yield IndexCorrupted, got {msg}"
+    );
+    assert!(
+        msg.contains("bad magic"),
+        "T-4: error must name bad magic, got {msg}"
+    );
+    // T-34 / Step 3: must NOT contain the stale 'search index --rebuild' advice.
+    assert!(
+        !msg.contains("search index"),
+        "T-4/T-34: error must not contain 'search index --rebuild', got {msg}"
+    );
+}
+
+/// T-5 (#414 FX-BODY-A analogue): truncated `index.skpost` must be detected by
+/// the integrity probe as `IndexCorrupted` naming the skpost size mismatch.
+///
+/// Build a healthy index, then truncate `index.skpost` to half its size.
+/// The probe must return `Err(IndexCorrupted("skpost size mismatch …"))`.
+#[test]
+fn t5_integrity_probe_truncated_skpost_returns_corrupted() {
+    let dir = tmp_dir();
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "pub fn alpha_widget() {} pub fn beta_gadget() {}",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    // Truncate index.skpost to half its size.
+    let post_path = dir.path().join("index.skpost");
+    let full_len = std::fs::metadata(&post_path).unwrap().len();
+    let half_len = full_len / 2;
+    if half_len < full_len {
+        let data = std::fs::read(&post_path).unwrap();
+        std::fs::write(&post_path, &data[..half_len as usize]).unwrap();
+    }
+    let err = NgramIndexReader::lexical_index_integrity(dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, crate::SearchError::IndexCorrupted(_)),
+        "T-5: truncated skpost must yield IndexCorrupted, got {msg}"
+    );
+    assert!(
+        msg.contains("skpost"),
+        "T-5: error must mention skpost, got {msg}"
+    );
+}
+
+/// T-6 (#414 FX-BODY-C analogue): a missing `index.skpost` must be detected by
+/// the integrity probe as `IndexCorrupted` naming the absent file.
+#[test]
+fn t6_integrity_probe_missing_skpost_returns_corrupted() {
+    let dir = tmp_dir();
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "pub fn gamma_thingamajig() {}",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    // Remove index.skpost entirely.
+    std::fs::remove_file(dir.path().join("index.skpost")).unwrap();
+    let err = NgramIndexReader::lexical_index_integrity(dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, crate::SearchError::IndexCorrupted(_)),
+        "T-6: absent skpost must yield IndexCorrupted, got {msg}"
+    );
+    assert!(
+        msg.contains("missing"),
+        "T-6: error must mention 'missing', got {msg}"
+    );
+    assert!(
+        msg.contains("index.skpost"),
+        "T-6: error must name the absent file, got {msg}"
+    );
+}
+
+/// T-7 / AC-12 (AD-414-6 guard, #414): `lexical_index_integrity` must return
+/// `Ok(future_version)` for a **foreign-format** index file — i.e. one whose
+/// version field does not equal `FORMAT_VERSION` — WITHOUT performing any size
+/// validation against it, **even when `index.skpost` is simultaneously truncated**.
+///
+/// The simultaneous truncation is load-bearing (AC-12 discriminator): without it
+/// the test cannot distinguish "the probe skipped size validation for a foreign
+/// version" from "the sizes happened to agree".  A truncated `.skpost` would
+/// cause an `IndexCorrupted` error if the size check ran; returning `Ok` despite
+/// the truncation proves the early-return fires before any size check.
+///
+/// AC-12 also requires that the artifacts' bytes and modification times are
+/// unchanged after the probe (E-8): the probe must be truly read-only.  Mtime
+/// equality is checked on both artifacts immediately after the call.
+///
+/// Rationale: future-format files have an unknown header layout, so size checks
+/// calibrated against the *current* header encoding would be meaningless and
+/// could produce false `IndexCorrupted` errors that block `check_staleness`
+/// from triggering the expected automatic rebuild.  The caller
+/// (`check_staleness`) is responsible for treating a version mismatch as a
+/// rebuild signal; see `t12_ac12_future_version_check_staleness_not_stale` for
+/// the complementary clause-2 guard.
+#[test]
+fn t7_integrity_probe_future_version_returns_ok_without_size_check() {
+    use crate::index::format::{FORMAT_VERSION, SKIDX_MAGIC};
+
+    let dir = tmp_dir();
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "pub fn delta_probe_marker() {}",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+
+    // Rewrite the version field in index.skidx to a future version.
+    let idx_path = dir.path().join("index.skidx");
+    let post_path = dir.path().join("index.skpost");
+    let mut data = std::fs::read(&idx_path).unwrap();
+    // Sanity: the first 4 bytes must be the magic we expect.
+    assert_eq!(&data[0..4], SKIDX_MAGIC, "magic mismatch in test setup");
+    // Sanity: current version must be FORMAT_VERSION.
+    let cur = u16::from_le_bytes([data[4], data[5]]);
+    assert_eq!(cur, FORMAT_VERSION, "version mismatch in test setup");
+
+    let future_version: u16 = FORMAT_VERSION + 1;
+    let future_bytes = future_version.to_le_bytes();
+    data[4] = future_bytes[0];
+    data[5] = future_bytes[1];
+    std::fs::write(&idx_path, &data).unwrap();
+
+    // AC-12 discriminator: truncate index.skpost to 0 bytes so that any code
+    // path that reached the .skpost size check would return IndexCorrupted.
+    // A healthy FORMAT_VERSION build always writes a non-empty .skpost, so
+    // truncating it guarantees the size check would fail if it ran.
+    std::fs::write(&post_path, b"").unwrap();
+
+    // Record sizes and modification times BEFORE the probe (E-8: read-only).
+    let idx_len_before = std::fs::metadata(&idx_path).unwrap().len();
+    let post_len_before = std::fs::metadata(&post_path).unwrap().len();
+    let idx_mtime_before = std::fs::metadata(&idx_path).unwrap().modified().unwrap();
+    let post_mtime_before = std::fs::metadata(&post_path).unwrap().modified().unwrap();
+
+    // AD-414-6: must return Ok(future_version) — not Err — even though the
+    // rest of the header encoding is calibrated for FORMAT_VERSION, not
+    // future_version, AND even though index.skpost is truncated.
+    // (Size-check code is only reached for files whose version == FORMAT_VERSION.)
+    let result = NgramIndexReader::lexical_index_integrity(dir.path());
+    assert!(
+        matches!(result, Ok(v) if v == future_version),
+        "T-7/AC-12/AD-414-6: foreign-version file must yield Ok({future_version}) \
+         even with truncated .skpost, got {:?}",
+        result
+    );
+
+    // E-8 (unit-level): the probe must not modify either artifact.
+    let idx_len_after = std::fs::metadata(&idx_path).unwrap().len();
+    let post_len_after = std::fs::metadata(&post_path).unwrap().len();
+    let idx_mtime_after = std::fs::metadata(&idx_path).unwrap().modified().unwrap();
+    let post_mtime_after = std::fs::metadata(&post_path).unwrap().modified().unwrap();
+    assert_eq!(
+        idx_len_before, idx_len_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skidx (size changed)"
+    );
+    assert_eq!(
+        post_len_before, post_len_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skpost (size changed)"
+    );
+    assert_eq!(
+        idx_mtime_before, idx_mtime_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skidx (mtime changed)"
+    );
+    assert_eq!(
+        post_mtime_before, post_mtime_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skpost (mtime changed)"
     );
 }

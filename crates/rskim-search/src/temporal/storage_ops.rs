@@ -12,7 +12,8 @@ use crate::types::{Result, SearchError};
 
 use super::storage_types::{CochangeRow, HotspotRow, RiskRow};
 use super::{
-    META_DATA_VERSION, META_GIT_HEAD, META_LAST_UPDATED, TEMPORAL_DATA_VERSION, TemporalDb, db_err,
+    META_DATA_VERSION, META_GIT_HEAD, META_IS_SHALLOW, META_LAST_UPDATED, TEMPORAL_DATA_VERSION,
+    TemporalDb, db_err,
 };
 
 /// Maximum rows accepted per table in a single store or sync call.
@@ -621,11 +622,18 @@ impl TemporalDb {
     /// Atomically replace all temporal data in a single transaction.
     ///
     /// Writes `hotspots`, `risks`, and `cochanges` via DELETE + INSERT and
-    /// updates the `meta` table with three keys: `git_head` under
+    /// updates the `meta` table with four keys: `git_head` under
     /// [`META_GIT_HEAD`], the current UTC timestamp under [`META_LAST_UPDATED`],
-    /// and the current [`TEMPORAL_DATA_VERSION`] under [`META_DATA_VERSION`]
-    /// (AD-408-3). All operations are wrapped in one transaction: either all
+    /// the current [`TEMPORAL_DATA_VERSION`] under [`META_DATA_VERSION`]
+    /// (AD-408-3), and the shallow-clone flag under [`META_IS_SHALLOW`]
+    /// (AD-414-14). All operations are wrapped in one transaction: either all
     /// succeed or none are committed.
+    ///
+    /// **AD-414-14**: `is_shallow` is written as the [`META_IS_SHALLOW`] key/value
+    /// meta row inside this transaction (no schema bump; `CURRENT_VERSION` stays 2).
+    /// When `is_shallow` is `true`, `check_staleness` Check 3 treats a subsequently
+    /// absent `.git/shallow` file as a staleness trigger so a `git fetch --unshallow`
+    /// is detected on the next query without manual `--rebuild`.
     ///
     /// # Parameters
     ///
@@ -634,6 +642,8 @@ impl TemporalDb {
     /// - `cochanges`: Rows to store in the `cochange` table.
     /// - `git_head`: The git HEAD SHA (or any string identifier) to record in
     ///   the `meta` table under [`META_GIT_HEAD`].
+    /// - `is_shallow`: Whether `.git/shallow` existed when these rows were
+    ///   computed; recorded under [`META_IS_SHALLOW`] as `"1"` / `"0"`.
     ///
     /// # Errors
     ///
@@ -646,6 +656,7 @@ impl TemporalDb {
         risks: &[RiskRow],
         cochanges: &[CochangeRow],
         git_head: &str,
+        is_shallow: bool,
     ) -> Result<()> {
         for (name, len) in [
             ("hotspots", hotspots.len()),
@@ -680,6 +691,15 @@ impl TemporalDb {
         tx.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
             .map_err(db_err)?
             .execute(params![META_LAST_UPDATED, now_secs])
+            .map_err(db_err)?;
+
+        // AD-414-14: record is_shallow so Check 3 in `temporal_db_is_stale` can
+        // detect a shallow→full transition (git fetch --unshallow) on the next query.
+        // "1" = shallow clone; "0" = full history.  No schema bump: key/value meta.
+        let is_shallow_val = if is_shallow { "1" } else { "0" };
+        tx.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
+            .map_err(db_err)?
+            .execute(params![META_IS_SHALLOW, is_shallow_val])
             .map_err(db_err)?;
 
         tx.commit().map_err(db_err)

@@ -1,12 +1,13 @@
-//! Unit tests for the `Page` value type (AD-404-1/2/3).
+//! Unit tests for `Page` (AD-404-1/2/3) and `TemporalSort` name methods.
 //!
-//! These tests exercise `Page` directly — not transitively through higher-level
-//! query or AST plumbing.  Each test maps to a named behaviour from the doc
-//! comment on `Page` so the coverage story is easy to audit.
+//! These tests exercise `Page` and `TemporalSort` directly — not transitively
+//! through higher-level query or AST plumbing.  Each test maps to a named
+//! behaviour from the doc comment on the type so the coverage story is easy to
+//! audit.
 
 #![allow(clippy::unwrap_used)]
 
-use super::Page;
+use super::{Page, TemporalSort};
 
 // ============================================================================
 // Page::new — None-to-0 defaulting (AD-404-1)
@@ -138,4 +139,45 @@ fn apply_empty_vec_is_noop() {
     let mut rows: Vec<u32> = vec![];
     Page::new(5, Some(3)).apply(&mut rows);
     assert!(rows.is_empty());
+}
+
+// ============================================================================
+// TemporalSort::json_name / flag_name — RD-5, AC-4, AC-7
+// ============================================================================
+
+/// `json_name()` must return the bare form (no `--` prefix) for every variant.
+///
+/// The bare form is required by `DegradedJson.requested` (AC-4 / AC-7 / RD-5).
+/// A one-token regression at either call site in mod.rs (using `flag_name()`
+/// instead of `json_name()`) would emit `"--hot"` instead of `"hot"` and the
+/// integration tests that do NOT assert `requested` would not catch it.
+#[test]
+fn temporal_sort_json_name_is_bare_no_dashes() {
+    assert_eq!(TemporalSort::Hot.json_name(), "hot");
+    assert_eq!(TemporalSort::Cold.json_name(), "cold");
+    assert_eq!(TemporalSort::Risky.json_name(), "risky");
+}
+
+/// `flag_name()` must return the `--`-prefixed form for every variant.
+///
+/// Human-readable notices and stderr messages use the dashed form.  A
+/// regression here would emit `"hot"` in the message text instead of `"--hot"`.
+#[test]
+fn temporal_sort_flag_name_has_double_dash_prefix() {
+    assert_eq!(TemporalSort::Hot.flag_name(), "--hot");
+    assert_eq!(TemporalSort::Cold.flag_name(), "--cold");
+    assert_eq!(TemporalSort::Risky.flag_name(), "--risky");
+}
+
+/// `json_name()` and `flag_name()` must never return the same string for any
+/// variant — the two forms are deliberately distinct.
+#[test]
+fn temporal_sort_json_name_differs_from_flag_name() {
+    for sort in [TemporalSort::Hot, TemporalSort::Cold, TemporalSort::Risky] {
+        assert_ne!(
+            sort.json_name(),
+            sort.flag_name(),
+            "json_name and flag_name must be distinct for {sort:?}"
+        );
+    }
 }
