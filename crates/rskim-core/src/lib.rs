@@ -44,6 +44,10 @@ pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, Tran
 
 pub use ast_walk::{AstWalkConfig, AstWalkIter, AstWalkNode};
 
+/// Elision-marker vocabulary shared with the CLI so every truncation path
+/// spells the marker the same way (ADR-011 class 1).
+pub use transform::utils::{ElidedSide, elision_marker_line, get_comment_prefix};
+
 /// Return the structural priority of a tree-sitter node kind (1–5).
 ///
 /// Used by the BM25F classifier to map node kinds to [`SearchField`] variants.

@@ -5,23 +5,10 @@
 //! Types and signatures are kept over imports, which are kept over bodies.
 //! Omission markers are inserted between gaps using language-appropriate comment syntax.
 
-use crate::transform::utils::{get_comment_prefix, get_comment_suffix, score_node_kind};
+use crate::transform::utils::{ElidedSide, elision_marker_line, score_node_kind};
 use crate::{Language, Result};
 use std::borrow::Cow;
 use std::ops::Range;
-
-/// Append an optional remedy hint to an elision marker.
-///
-/// When `hint` is `Some(s)`, produces `"<marker> — <s>"`.
-/// When `None`, returns the marker unchanged.
-/// The separator ` — ` matches the existing `elision_marker` convention (ADR-011).
-#[inline]
-fn append_hint(marker: String, hint: Option<&str>) -> String {
-    match hint {
-        Some(h) => format!("{marker} \u{2014} {h}"),
-        None => marker,
-    }
-}
 
 // ============================================================================
 // NodeSpan: Maps transformed output line ranges to AST node kinds
@@ -216,15 +203,8 @@ pub(crate) fn truncate_to_lines(
     // Build output with omission markers between gaps.
     // Each marker carries an exact count of omitted lines (ADR-011 class 1).
     // Hint (B5) is appended to every marker when present.
-    let prefix = get_comment_prefix(language);
-    let suffix = get_comment_suffix(language);
-    let make_marker = |omitted: usize| -> String {
-        let line_s = if omitted == 1 { "line" } else { "lines" };
-        append_hint(
-            format!("{prefix} ... ({omitted} {line_s} truncated){suffix}"),
-            hint,
-        )
-    };
+    let make_marker =
+        |omitted: usize| elision_marker_line(Some(language), omitted, ElidedSide::Truncated, hint);
 
     // Cow: content lines borrow from `lines`, markers are owned Strings.
     let mut result_lines: Vec<Cow<'_, str>> = Vec::with_capacity(max_lines + 1);
@@ -344,8 +324,6 @@ pub(crate) fn simple_line_truncate(
         return Ok(text.to_string());
     }
 
-    let prefix = get_comment_prefix(language);
-    let suffix = get_comment_suffix(language);
     // Reserve 1 slot for the marker so that `--max-lines N` ≡ `head -N`:
     // at most N total lines (#317 / ADR-002).  content_lines = N-1; the marker
     // occupies the Nth slot.
@@ -364,11 +342,7 @@ pub(crate) fn simple_line_truncate(
     };
     let total = source_line_count.unwrap_or(lines.len());
     let omitted = total.saturating_sub(content_lines);
-    let line_s = if omitted == 1 { "line" } else { "lines" };
-    let marker = append_hint(
-        format!("{prefix} ... ({omitted} {line_s} truncated){suffix}"),
-        hint,
-    );
+    let marker = elision_marker_line(Some(language), omitted, ElidedSide::Truncated, hint);
 
     // Take first content_lines lines, then append marker (total = max_lines,
     // except the documented N=1 case which yields 2).
@@ -410,19 +384,13 @@ pub(crate) fn simple_last_line_truncate(
         return Ok(text.to_string());
     }
 
-    let prefix = get_comment_prefix(language);
-    let suffix = get_comment_suffix(language);
     // Reserve 1 slot for the marker so total output = n lines (#317 / ADR-002:
     // `--max-lines N` ≡ `head -N`).  content_lines = n-1; the marker is the first slot.
     // E3: use source-space line count when provided; fall back to output-space.
     let content_lines = n.saturating_sub(1);
     let source_total = source_line_count.unwrap_or(total);
     let omitted = source_total.saturating_sub(content_lines);
-    let line_s = if omitted == 1 { "line" } else { "lines" };
-    let marker = append_hint(
-        format!("{prefix} ... ({omitted} {line_s} above){suffix}"),
-        hint,
-    );
+    let marker = elision_marker_line(Some(language), omitted, ElidedSide::Above, hint);
 
     // Skip to the tail without collecting all lines into a Vec
     let mut result: Vec<&str> = Vec::with_capacity(n + 1);
@@ -522,17 +490,12 @@ where
         return Ok(String::new());
     }
 
-    let prefix = get_comment_prefix(language);
-    let suffix = get_comment_suffix(language);
     // B5: elision_hint must be captured by the closure to append the remedy clause.
     let make_marker = |truncated_count: usize| {
-        let line_s = if truncated_count == 1 {
-            "line"
-        } else {
-            "lines"
-        };
-        append_hint(
-            format!("{prefix} ... ({truncated_count} {line_s} truncated){suffix}"),
+        elision_marker_line(
+            Some(language),
+            truncated_count,
+            ElidedSide::Truncated,
             elision_hint,
         )
     };
@@ -598,8 +561,7 @@ where
         s.push_str(&marker);
         s
     } else {
-        let line_s = if lines.len() == 1 { "line" } else { "lines" };
-        format!("{prefix} ... ({} {line_s} truncated){suffix}", lines.len())
+        elision_marker_line(Some(language), lines.len(), ElidedSide::Truncated, None)
     };
 
     if text.ends_with('\n') {
@@ -1622,6 +1584,79 @@ mod tests {
             result_lines[0].contains("... (3 lines above)"),
             "got {:?}",
             result_lines[0]
+        );
+    }
+
+    // ========================================================================
+    // Marker text: where the remedy hint sits relative to the comment suffix
+    // ========================================================================
+
+    /// The CLI's remedy clause (`TransformConfig::elision_hint`).
+    const HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
+
+    /// Markdown is the only language whose comment has a closing suffix, so the
+    /// remedy hint must render INSIDE the HTML comment. Spelling it
+    /// `<!-- ... --> — <hint>` leaks the hint into the rendered document as
+    /// visible prose.
+    ///
+    /// Pairs with `test_last_line_truncation_markdown_marker`, which pins the
+    /// hint-less spelling byte-identically.
+    #[test]
+    fn test_markdown_hint_renders_inside_html_comment() {
+        // 5 lines, budget 3 -> content_lines = 2, elided = 5 - 2 = 3.
+        let text = "# H1\n## H2\n## H3\n## H4\n## H5\n";
+
+        let tail =
+            simple_last_line_truncate(text, Language::Markdown, 3, Some(HINT), None).unwrap();
+        let tail_marker = tail.lines().next().unwrap();
+        assert_eq!(
+            tail_marker,
+            "<!-- ... (3 lines above) \u{2014} SKIM_PASSTHROUGH=1 for full output -->"
+        );
+
+        let head = simple_line_truncate(text, Language::Markdown, 3, Some(HINT), None).unwrap();
+        let head_marker = head.lines().next_back().unwrap();
+        assert_eq!(
+            head_marker,
+            "<!-- ... (3 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output -->"
+        );
+
+        for marker in [tail_marker, head_marker] {
+            assert!(
+                marker.ends_with(" -->"),
+                "the HTML comment must close last: {marker:?}"
+            );
+            assert!(
+                !marker.contains("--> \u{2014}"),
+                "the hint must not escape the HTML comment: {marker:?}"
+            );
+        }
+    }
+
+    /// Control: every non-Markdown language has an empty comment suffix, so moving
+    /// the hint inside the suffix must not move a single byte. Green before and
+    /// after the refactor.
+    #[test]
+    fn test_non_markdown_marker_bytes_unchanged_by_hint_placement() {
+        // 5 lines, budget 3 -> content_lines = 2, elided = 5 - 2 = 3.
+        let text = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+
+        let ts = simple_line_truncate(text, Language::TypeScript, 3, Some(HINT), None).unwrap();
+        assert_eq!(
+            ts.lines().next_back().unwrap(),
+            "// ... (3 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+
+        let py = simple_line_truncate(text, Language::Python, 3, Some(HINT), None).unwrap();
+        assert_eq!(
+            py.lines().next_back().unwrap(),
+            "# ... (3 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+
+        let yaml = simple_line_truncate(text, Language::Yaml, 3, Some(HINT), None).unwrap();
+        assert_eq!(
+            yaml.lines().next_back().unwrap(),
+            "# ... (3 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output"
         );
     }
 }

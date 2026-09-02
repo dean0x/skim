@@ -241,7 +241,8 @@ pub(crate) fn score_node_kind(kind: &str) -> u8 {
 /// Get the single-line comment prefix for a language
 ///
 /// Used to generate omission markers in the correct comment syntax.
-pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
+#[must_use]
+pub fn get_comment_prefix(language: Language) -> &'static str {
     match language {
         Language::TypeScript
         | Language::JavaScript
@@ -267,6 +268,53 @@ pub(crate) fn get_comment_suffix(language: Language) -> &'static str {
     match language {
         Language::Markdown => " -->",
         _ => "",
+    }
+}
+
+/// Which side of the retained window an elision marker accounts for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElidedSide {
+    /// Lines dropped *after* the retained window (`--max-lines`): `(N lines truncated)`.
+    Truncated,
+    /// Lines dropped *before* the retained window (`--last-lines`): `(N lines above)`.
+    Above,
+}
+
+/// Build the canonical elision marker line for `language`.
+///
+/// Shape: `<prefix> ... (N lines truncated)<suffix>`, with the optional remedy
+/// clause inserted as ` — <hint>` (ADR-011 class 1) *inside* the comment, before
+/// the closing suffix. Markdown is the only language with a non-empty suffix, and
+/// the rule exists for it: the marker reads
+/// `<!-- ... (N lines truncated) — <hint> -->`, one self-contained HTML comment,
+/// never `--> — <hint>` which would leak the hint into the rendered document as
+/// visible prose. Every other suffix is empty, so their bytes are unaffected.
+///
+/// `language` is `None` only where detection failed: an extension-less or
+/// unknown-extension file, or stdin without `--filename`. Those inputs are
+/// shell/config scripts in practice, so the marker falls back to the `#` prefix
+/// and an empty suffix. [`get_comment_prefix`] has no such arm because it is
+/// only reached once a language is known.
+#[must_use]
+pub fn elision_marker_line(
+    language: Option<Language>,
+    elided: usize,
+    side: ElidedSide,
+    hint: Option<&str>,
+) -> String {
+    let (prefix, suffix) = match language {
+        Some(lang) => (get_comment_prefix(lang), get_comment_suffix(lang)),
+        None => ("#", ""),
+    };
+    let unit = if elided == 1 { "line" } else { "lines" };
+    let side_word = match side {
+        ElidedSide::Truncated => "truncated",
+        ElidedSide::Above => "above",
+    };
+    let body = format!("... ({elided} {unit} {side_word})");
+    match hint {
+        Some(h) => format!("{prefix} {body} \u{2014} {h}{suffix}"),
+        None => format!("{prefix} {body}{suffix}"),
     }
 }
 

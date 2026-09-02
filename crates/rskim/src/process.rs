@@ -8,14 +8,19 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
 use rskim_core::{
-    Language, Mode, TransformConfig, detect_language_from_path, transform_auto_with_config,
-    transform_with_config, transform_with_line_map,
+    ElidedSide, Language, Mode, TransformConfig, detect_language_from_path, elision_marker_line,
+    transform_auto_with_config, transform_with_config, transform_with_line_map,
 };
 
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
+
+/// Remedy clause appended to every elision marker this module emits
+/// (ADR-011 class 1). Matches the hint `cascade::build_config_with_opts`
+/// wires into rskim-core, so both truncation paths read identically.
+const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
 /// Options for processing a single file
 #[derive(Debug, Clone, Copy)]
@@ -369,6 +374,7 @@ fn run_transform(
                 // this returns.
                 let output = passthrough_with_truncation(
                     contents,
+                    None,
                     options.trunc.max_lines,
                     options.trunc.last_lines,
                 );
@@ -432,6 +438,7 @@ fn run_transform(
                 // process_file (which also checks degraded and emits one notice).
                 let output = passthrough_with_truncation(
                     contents,
+                    None,
                     options.trunc.max_lines,
                     options.trunc.last_lines,
                 );
@@ -450,17 +457,22 @@ fn detect_language_from_shebang(text: &str) -> Option<Language> {
     text.lines().next().and_then(Language::from_shebang)
 }
 
-/// Apply optional line-count truncation for unknown-language passthrough.
+/// Apply optional line-count truncation to a raw view.
 ///
-/// Used when language detection fails and we fall back to a lossless raw
-/// passthrough (ADR-002). Uses `#` as the elision-marker prefix — the most
-/// neutral choice for shell/config files (the primary use case for
-/// extension-less files). Both the head-truncation marker
-/// (`# ... N lines truncated…`) and the tail marker (`# ... N lines above…`)
-/// state exact omission counts and carry a `SKIM_PASSTHROUGH=1` hint, matching
-/// ADR-001 elision-marker semantics.
+/// Used for the unknown-language lossless passthrough (ADR-002) and for the
+/// post-guardrail `--max-lines` / `--last-lines` bound enforcement, which fires
+/// for any language once the guardrail elects to serve raw.
+///
+/// Markers are built by [`elision_marker_line`] so the head form
+/// (`… N lines truncated`) and the tail form (`… N lines above`) are spelled
+/// exactly as rskim-core spells them: the language's own comment syntax, exact
+/// omission counts, and the `SKIM_PASSTHROUGH=1` remedy clause (ADR-011 class 1).
+/// `language` is `None` only when detection failed, in which case the core
+/// falls back to the `#` prefix — the neutral choice for the shell/config
+/// scripts that dominate extension-less input.
 fn passthrough_with_truncation(
     text: &str,
+    language: Option<Language>,
     max_lines: Option<usize>,
     last_lines: Option<usize>,
 ) -> String {
@@ -476,7 +488,7 @@ fn passthrough_with_truncation(
         let keep = n.saturating_sub(1);
         let omitted = segs.len() - keep;
         let marker =
-            format!("# ... ({omitted} lines truncated; use SKIM_PASSTHROUGH=1 to see all)");
+            elision_marker_line(language, omitted, ElidedSide::Truncated, Some(ELISION_HINT));
         // Retained segments already carry their terminators; segs[keep-1] is
         // not the last segment (total > n), so it is guaranteed to end with \n.
         let mut out: String = segs[..keep].concat();
@@ -490,7 +502,7 @@ fn passthrough_with_truncation(
         }
         let keep = n.saturating_sub(1);
         let omitted = segs.len() - keep;
-        let marker = format!("# ... ({omitted} lines above; use SKIM_PASSTHROUGH=1 to see all)");
+        let marker = elision_marker_line(language, omitted, ElidedSide::Above, Some(ELISION_HINT));
         // Tail segments carry their original terminators (including \r\n).
         let tail_start = segs.len().saturating_sub(keep);
         let mut out = marker;
@@ -522,8 +534,12 @@ fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> Process
         "[skim] notice: unknown language for stdin — degraded to lossless passthrough. \
          Use --language to specify, or SKIM_PASSTHROUGH=1 to bypass."
     );
-    let output =
-        passthrough_with_truncation(&buffer, options.trunc.max_lines, options.trunc.last_lines);
+    let output = passthrough_with_truncation(
+        &buffer,
+        None,
+        options.trunc.max_lines,
+        options.trunc.last_lines,
+    );
     let stdin_raw = if !options.show_stats {
         Some(buffer)
     } else {
@@ -730,14 +746,20 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let (result, mode_used, has_errors, line_map, degraded) =
         run_transform(&contents, path, &options)?;
 
+    // Effective language, resolved exactly as run_transform resolves it: explicit
+    // override, then extension, then a shebang sniff.  `None` means detection
+    // failed, which drives both the degrade notice below and the comment prefix
+    // of the post-guardrail elision marker.
+    let language = options
+        .explicit_lang
+        .or_else(|| detect_language_from_path(path))
+        .or_else(|| detect_language_from_shebang(&contents));
+
     // Emit notice when debug output is enabled and the transform degraded to passthrough.
     // Two distinct degrade reasons: unknown language (no extension/shebang match)
     // or file too large to compress (structural safety cap exceeded).
     if degraded {
-        let lang_detected = options.explicit_lang.is_some()
-            || detect_language_from_path(path).is_some()
-            || detect_language_from_shebang(&contents).is_some();
-        if lang_detected {
+        if language.is_some() {
             crate::debug_log!(
                 "[skim] notice: file too large to compress in {:?} mode \
                  (structural cap exceeded) — degraded to passthrough",
@@ -781,6 +803,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     let final_output = if options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some() {
         passthrough_with_truncation(
             &final_output,
+            language,
             options.trunc.max_lines,
             options.trunc.last_lines,
         )
@@ -829,20 +852,15 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         });
     }
 
-    // Effective language for analytics: explicit override wins, else detect from path,
-    // then shebang. For unknown-language passthrough the language is None (zero-savings row).
-    let effective_lang = options
-        .explicit_lang
-        .or_else(|| detect_language_from_path(path))
-        .or_else(|| detect_language_from_shebang(&contents));
-
+    // `language` doubles as the analytics language: for unknown-language
+    // passthrough it is None (zero-savings row).
     Ok(ProcessResult {
         output: final_output,
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
         parse_tier,
-        language: effective_lang,
+        language,
         stdin_raw: None,
         view_differs,
     })
@@ -1082,8 +1100,10 @@ mod tests {
         let result = stdin_passthrough_result(src.to_string(), &opts);
 
         assert!(
-            result.output.contains("use SKIM_PASSTHROUGH=1 to see all"),
-            "truncated passthrough must carry the hint: {:?}",
+            result
+                .output
+                .contains("# ... (3 lines truncated) — SKIM_PASSTHROUGH=1 for full output"),
+            "truncated passthrough must carry the canonical hinted marker: {:?}",
             result.output
         );
         // Buffer retention is unaffected by truncation.
@@ -1103,7 +1123,7 @@ mod tests {
 
         // max_lines: first retained line must keep \r\n.
         // n=2 → keep=1 → retain "line1\r\n", omit 3 lines.
-        let out = passthrough_with_truncation(crlf, Some(2), None);
+        let out = passthrough_with_truncation(crlf, None, Some(2), None);
         assert!(
             out.starts_with("line1\r\n"),
             "max_lines: \\r\\n must be preserved in retained line; got: {out:?}"
@@ -1115,7 +1135,7 @@ mod tests {
 
         // last_lines: last retained tail line must keep \r\n.
         // n=2 → keep=1 → retain "line4\r\n", omit 3 lines above.
-        let out2 = passthrough_with_truncation(crlf, None, Some(2));
+        let out2 = passthrough_with_truncation(crlf, None, None, Some(2));
         assert!(
             out2.ends_with("line4\r\n"),
             "last_lines: \\r\\n must be preserved in tail line; got: {out2:?}"
@@ -1126,7 +1146,7 @@ mod tests {
         );
 
         // No truncation: entire content returned byte-for-byte.
-        let out3 = passthrough_with_truncation(crlf, None, None);
+        let out3 = passthrough_with_truncation(crlf, None, None, None);
         assert_eq!(out3, crlf, "no truncation must be byte-faithful");
     }
 
@@ -1135,18 +1155,52 @@ mod tests {
     fn passthrough_with_truncation_lf_unaffected() {
         let lf = "alpha\nbeta\ngamma\ndelta\n";
 
-        let out = passthrough_with_truncation(lf, Some(2), None);
+        let out = passthrough_with_truncation(lf, None, Some(2), None);
         assert!(
             out.starts_with("alpha\n"),
             "LF: first line must end with \\n: {out:?}"
         );
         assert!(out.contains("lines truncated"), "{out:?}");
 
-        let out2 = passthrough_with_truncation(lf, None, Some(2));
+        let out2 = passthrough_with_truncation(lf, None, None, Some(2));
         assert!(
             out2.ends_with("delta\n"),
             "LF: last line must end with \\n: {out2:?}"
         );
         assert!(out2.contains("lines above"), "{out2:?}");
+    }
+
+    /// The elision marker adopts the file's own comment syntax and the canonical
+    /// A-form phrasing, matching what rskim-core emits on the compressed path.
+    /// `None` (detection failed) keeps the neutral `#` prefix.
+    #[test]
+    fn passthrough_with_truncation_uses_language_comment_prefix() {
+        let src = "one\ntwo\nthree\nfour\n";
+
+        let ts = passthrough_with_truncation(src, Some(Language::TypeScript), Some(2), None);
+        assert!(
+            ts.ends_with(&format!("// ... (3 lines truncated) — {ELISION_HINT}\n")),
+            "TypeScript head marker: {ts:?}"
+        );
+
+        let md = passthrough_with_truncation(src, Some(Language::Markdown), Some(2), None);
+        assert!(
+            md.ends_with(&format!(
+                "<!-- ... (3 lines truncated) — {ELISION_HINT} -->\n"
+            )),
+            "Markdown head marker: {md:?}"
+        );
+
+        let py = passthrough_with_truncation(src, Some(Language::Python), None, Some(2));
+        assert!(
+            py.starts_with(&format!("# ... (3 lines above) — {ELISION_HINT}\n")),
+            "Python tail marker: {py:?}"
+        );
+
+        let unknown = passthrough_with_truncation(src, None, Some(2), None);
+        assert!(
+            unknown.ends_with(&format!("# ... (3 lines truncated) — {ELISION_HINT}\n")),
+            "unknown language falls back to the neutral `#` prefix: {unknown:?}"
+        );
     }
 }
