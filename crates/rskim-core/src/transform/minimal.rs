@@ -816,6 +816,61 @@ mod tests {
         panic!("could not find comment #{n} in root named children");
     }
 
+    // Helper: parse Go source into a tree-sitter Tree.
+    fn parse_go(source: &str) -> Tree {
+        let mut parser = crate::Parser::new(Language::Go).unwrap();
+        parser.parse(source).unwrap()
+    }
+
+    /// Total AST node count, derived independently of the walkers under test.
+    ///
+    /// Explicit stack + `Node::children`, so the count never depends on the
+    /// traversal the walker performs. That independence is the whole point: it is
+    /// what lets `node_count == count_all_nodes(root)` detect a walker that visits
+    /// the same node twice, which is invisible in the output.
+    fn count_all_nodes(root: Node) -> usize {
+        let mut n = 0usize;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            n += 1;
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                stack.push(ch);
+            }
+        }
+        n
+    }
+
+    /// Drive the production comment walker directly, composing `CommentWalkContext`
+    /// exactly the way `transform_minimal` does.
+    ///
+    /// Returns the raw (unadjusted) removal ranges and the number of nodes the
+    /// walker visited. The visit count is the instrument a re-walk regression trips:
+    /// descending twice leaves the ranges — and therefore the output — unchanged
+    /// while doubling the count.
+    fn collect_minimal_ranges(
+        source: &str,
+        tree: &Tree,
+        language: Language,
+    ) -> (Vec<(usize, usize)>, usize) {
+        let root = tree.root_node();
+        let header_end_byte = compute_header_end_byte(root, source, language);
+        let go_doc_comment_starts = compute_go_doc_comment_starts(root, source, language);
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut node_count: usize = 0;
+        let mut ctx = CommentWalkContext {
+            ranges: &mut ranges,
+            node_count: &mut node_count,
+            classification: CommentClassification {
+                header_end_byte,
+                go_doc_comment_starts: &go_doc_comment_starts,
+            },
+        };
+        collect_removable_comments(root, source, language, &mut ctx, 0, false)
+            .expect("comment walk must succeed on these fixtures");
+        (ranges, node_count)
+    }
+
     // ── compute_header_end_byte correctness ─────────────────────────────────
 
     #[test]
@@ -1014,48 +1069,38 @@ mod tests {
         );
     }
 
-    // ── Performance regression guard ─────────────────────────────────────────
+    // ── Large header block, end to end ───────────────────────────────────────
 
+    /// A large contiguous header block survives `transform_minimal` intact, and the
+    /// comment walker visits every AST node exactly once.
+    ///
+    /// WHAT THIS PINS: the artifact — which comments survive, that nothing is
+    /// collected for removal, and that the walk is single-visit.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity. It cannot discriminate O(N) from O(N²);
+    /// every historical defect here was *output-preserving* (the cost lived in
+    /// tree-sitter's C code, not in the Rust statement count), so no behavioural
+    /// assertion can see one. That job belongs to
+    /// `contract_transform_walkers_use_no_root_descending_node_apis` in
+    /// `transform/mod.rs`.
     #[test]
-    fn test_large_header_block_linear_time() {
-        // CUBIC SMOKE TEST for the O(N³) defect in the old backward-walk
-        // implementation of is_module_header_comment.
-        //
-        // WHAT THIS TEST PROVES: that N=500 comments complete within 200 ms.
-        // The old O(N³) code took ~3 s at N=500 in a DEBUG build — well beyond
-        // 200 ms. The fixed O(N) code completes in < 10 ms.
-        //
-        // WHAT THIS TEST DOES NOT PROVE: linear vs quadratic scaling. An O(N²)
-        // regression at N=500 would complete in ~31 ms and pass this test. For
-        // the doubling-ratio guard that discriminates O(N) from O(N²), see
-        // test_quadratic_scaling_guard.
-        //
-        // Empirical measurement (fix/init-pin-wrappers-header-comments, DEBUG build):
-        //   O(N³) unfixed: N=200 → 213ms, N=400 → 1736ms, N=1000 → 23920ms
-        //   O(N)  fixed:   N=500 → < 10ms
-        //
-        // Budget tightened from 2000ms to 200ms: the O(N³) code reliably exceeds
-        // 200ms (extrapolated ~3 s at N=500), while the fixed code runs in < 10ms,
-        // leaving ~20× CI headroom. 2000ms gave a 222× margin and asserted almost
-        // nothing about scaling.
-        let n = 500usize;
+    fn test_python_large_header_block_survives_transform() {
+        let n = 512usize;
         let mut source = String::with_capacity(n * 25);
         for i in 0..n {
             source.push_str(&format!("# Header comment {i}\n"));
         }
         source.push_str("x = 1\n");
 
-        let start = std::time::Instant::now();
         let mut parser = crate::Parser::new(Language::Python).unwrap();
         let tree = parser.parse(&source).unwrap();
         let config = TransformConfig::default();
         let result = transform_minimal(&source, &tree, Language::Python, &config);
-        let elapsed = start.elapsed();
 
         assert!(result.is_ok(), "transform must succeed: {:?}", result.err());
         let output = result.unwrap();
 
-        // All 500 header comments must be preserved (they form a contiguous leading block).
+        // All header comments must be preserved (they form a contiguous leading block).
         assert!(
             output.contains("# Header comment 0"),
             "first header comment must be preserved; got:\n{output}"
@@ -1065,11 +1110,15 @@ mod tests {
             "last header comment must be preserved; got:\n{output}"
         );
 
+        let (ranges, node_count) = collect_minimal_ranges(&source, &tree, Language::Python);
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "{n} leading comments must process in < 200ms (got {elapsed:?}); \
-             old O(N³) code took ~3 s at N={n} in DEBUG — this indicates a cubic regression. \
-             For quadratic regressions, see test_quadratic_scaling_guard."
+            ranges.is_empty(),
+            "the whole block is a module header, so nothing is removable; got {ranges:?}"
+        );
+        assert_eq!(
+            node_count,
+            count_all_nodes(tree.root_node()),
+            "collect_removable_comments must visit each AST node exactly once"
         );
     }
 
@@ -1333,126 +1382,95 @@ mod tests {
     // hypothetical malicious grammars or future grammar changes.
 
     // ========================================================================
-    // Scaling regression guard — catches regression to O(N²)
+    // Module-header precompute — exact artifact, not elapsed time
     // ========================================================================
     //
-    // The single-point timing tests above catch catastrophic regressions but cannot
-    // reliably detect a reintroduced O(N²) path if the constant is small.
-    // This doubling-ratio test makes the complexity class directly observable:
+    // `compute_header_end_byte` and `collect_removable_comments` are pinned by the
+    // exact values they produce and the number of node visits they make.
     //
-    //   O(N):  doubling N doubles time → ratio ≈ 2.0
-    //   O(N²): doubling N quadruples time → ratio ≈ 4.0
-    //
-    // Design choice: wall-clock ratio over a deterministic step counter.
-    // A per-iteration step counter at the outer loop level would count the same
-    // N+1 iterations for BOTH O(N) and O(N²) implementations — the cost difference
-    // is internal to tree-sitter's C code (ts_node_parent re-walks from the root,
-    // ts_node_named_child re-scans the child list from position 0). These are
-    // invisible from Rust without modifying tree-sitter. The ratio test at
-    // large-enough N (where signal exceeds scheduling noise) is the practical
-    // discriminator.
-    //
-    // NOTE: transform_minimal is called directly here, not via the CLI binary, so
-    // the skim file-level disk cache (which would mask the defect by serving a cached
-    // result instead of running the transform) is not involved. The measurements
-    // reflect the transform cost directly.
-    //
-    // Empirical basis (debug build, fix/init-pin-wrappers-header-comments):
-    //   O(N²) unfixed: N=1000 → 125.5ms, N=2000 → 508.0ms, ratio = 4.05
-    //   O(N)  fixed:   N=2000 → ~12.7ms,  N=8000 → ~30.4ms
-    //                  N=4000 → ~18.6ms (linear interpolation from the two points above)
-    //   N=4000 vs N=8000 ratio on fixed code:         ~30.4 / ~18.6 ≈ 1.63×
-    //   N=4000 vs N=8000 ratio on O(N²) unfixed code: ~8032ms / ~2008ms ≈ 4.0×
-    //   Threshold 2.5× sits midway: ≥ 0.9 margin from linear upper (1.6×),
-    //                               ≥ 1.3 margin below quadratic lower (3.8×).
-    //
-    // N sizes chosen so that t1 (N=4000) reliably exceeds 2 ms even on fast debug
-    // hardware (~18 ms measured), keeping the noise floor assertion below the expected
-    // measurement by ~9×.
+    // Neither this nor any other behavioural assertion can discriminate O(N) from
+    // O(N²) here: the historical defect (a per-node backward `parent()` /
+    // `named_child(i)` walk) executed the SAME Rust statements and produced
+    // BYTE-IDENTICAL output — the extra cost was entirely inside tree-sitter's C
+    // code, where a `TSNode` has no parent pointer and every such call re-descends
+    // from the root. The construct itself is therefore forbidden at the source level
+    // by `contract_transform_walkers_use_no_root_descending_node_apis` in
+    // `transform/mod.rs`, and the measured series that motivated the fix lives in
+    // the production rustdoc on `compute_header_end_byte` and `is_go_doc_comment`.
 
-    #[test]
-    fn test_quadratic_scaling_guard() {
-        // WHAT THIS TEST PROVES: that the doubling ratio (N=4000 → N=8000) stays
-        // below 2.5×. An O(N) implementation produces ~1.3–1.6×; O(N²) produces
-        // ~4.0×. The 2.5 threshold sits midway between them.
-        //
-        // WHAT THIS TEST DOES NOT PROVE: absolute throughput or strict O(N) vs
-        // O(N log N). It discriminates linear from quadratic, no finer.
-        //
-        // Build N=4000 and N=8000 contiguous-leading-comment Python files.
-        // (The same "gap-then-body-function" fixture as the other timing tests.)
-        let make_source = |n: usize| {
-            let mut s = String::with_capacity(n * 25 + 16);
-            for i in 0..n {
-                s.push_str(&format!("# Header comment {i}\n"));
-            }
-            s.push_str("def f(x): return x\n");
-            s
-        };
-        let source_4k = make_source(4000);
-        let source_8k = make_source(8000);
+    /// Tail appended after the synthetic header block. A constant because the
+    /// expected `header_end_byte` is derived from its length.
+    const PY_HEADER_TAIL: &str = "def f(x): return x\n";
 
-        let mut parser = crate::Parser::new(Language::Python).unwrap();
-        let config = TransformConfig::default();
-
-        // Warm up (parse once before measuring; avoids one-time tree-sitter
-        // initialisation costs skewing the N=4000 sample).
-        {
-            let tree = parser.parse(&source_4k).unwrap();
-            let _ = transform_minimal(&source_4k, &tree, Language::Python, &config);
+    /// `n` contiguous leading comments followed by [`PY_HEADER_TAIL`].
+    fn python_header_source(n: usize) -> String {
+        let mut s = String::with_capacity(n * 25 + PY_HEADER_TAIL.len());
+        for i in 0..n {
+            s.push_str(&format!("# Header comment {i}\n"));
         }
+        s.push_str(PY_HEADER_TAIL);
+        s
+    }
 
-        // Measure N=4000
-        let t1 = {
-            let tree = parser.parse(&source_4k).unwrap();
-            let start = std::time::Instant::now();
-            let r = transform_minimal(&source_4k, &tree, Language::Python, &config);
-            let elapsed = start.elapsed();
-            assert!(r.is_ok(), "N=4000 transform must succeed: {:?}", r.err());
-            elapsed
-        };
+    /// The module-header precompute lands on an exact byte, classifies the whole
+    /// block as KEEP, and is reached in a single visit per AST node.
+    ///
+    /// WHAT THIS PINS:
+    /// 1. `compute_header_end_byte` returns the end byte of the last leading
+    ///    comment — computed from the fixture's shape, not from a recorded run.
+    /// 2. `collect_removable_comments` collects nothing (every comment is a header)
+    ///    and visits each node exactly once — the assertion a re-walk regression
+    ///    trips while leaving the output untouched.
+    /// 3. The production entry point still composes the two (source-corpus PF-014:
+    ///    driving the pieces directly proves the counters; driving
+    ///    `transform_minimal` proves production still wires them together).
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity. It does NOT discriminate O(N) from
+    /// O(N²) — the defect was output-preserving. See the section note above and
+    /// the contract test in `transform/mod.rs`.
+    #[test]
+    fn test_python_module_header_precompute_is_exact_and_single_visit() {
+        for n in [256usize, 512] {
+            let source = python_header_source(n);
+            let tree = parse_python(&source);
+            let root = tree.root_node();
 
-        // Measure N=8000
-        let t2 = {
-            let tree = parser.parse(&source_8k).unwrap();
-            let start = std::time::Instant::now();
-            let r = transform_minimal(&source_8k, &tree, Language::Python, &config);
-            let elapsed = start.elapsed();
-            assert!(r.is_ok(), "N=8000 transform must succeed: {:?}", r.err());
-            elapsed
-        };
+            // The last comment ends just before the newline that precedes the tail.
+            let expected_header_end = source.len() - PY_HEADER_TAIL.len() - 1;
+            assert_eq!(
+                compute_header_end_byte(root, &source, Language::Python),
+                expected_header_end,
+                "n={n}: header_end_byte must be the end byte of the last leading comment"
+            );
 
-        let t1_ms = t1.as_secs_f64() * 1000.0;
-        let t2_ms = t2.as_secs_f64() * 1000.0;
+            let (ranges, node_count) = collect_minimal_ranges(&source, &tree, Language::Python);
+            assert!(
+                ranges.is_empty(),
+                "n={n}: a fully contiguous header block yields no removable comments; \
+                 got {ranges:?}"
+            );
+            assert_eq!(
+                node_count,
+                count_all_nodes(root),
+                "n={n}: collect_removable_comments must visit each AST node exactly once"
+            );
 
-        // N=4000 must produce a measurable result above the OS noise floor.
-        // In debug builds this is ~18 ms; 2 ms is the floor — if it completes
-        // faster than that, either the transform is being cached/skipped or N
-        // needs to be raised further.
-        //
-        // We FAIL rather than skip: a silently-passing ratio guard is worse than
-        // no guard at all. This assertion is the tripwire against that failure mode.
-        assert!(
-            t1_ms >= 2.0,
-            "N=4000 transform completed in {t1_ms:.3}ms — too fast to measure reliably \
-             (expected ≥ 2ms; ~18ms measured on debug builds). Either the transform is \
-             being cached/skipped or N should be raised further. \
-             DO NOT convert this to a skip — a silently-passing guard provides no protection."
-        );
-
-        // The doubling ratio must stay below 2.5 (O(N²) produces ~4.0×, O(N) ~1.3–1.6×).
-        // Threshold 2.5 is midway: ≥ 0.9 margin from linear upper bound, ≥ 1.3 below quadratic.
-        let ratio = t2_ms / t1_ms;
-        assert!(
-            ratio < 2.5,
-            "Doubling N from 4000 to 8000 must produce a ratio below 2.5 (got {ratio:.2}×). \
-             O(N) → ~1.3–1.6×; O(N²) → ~4.0× (empirically measured). \
-             This indicates a regression to super-linear scaling. Check that \
-             compute_header_end_byte uses a TreeCursor (not next_named_sibling), \
-             is_module_header_comment uses depth (not parent() calls), and \
-             collect_removable_comments threads in_function_body (not is_inside_function_body). \
-             N=4000 took {t1_ms:.1}ms, N=8000 took {t2_ms:.1}ms."
-        );
+            let config = TransformConfig::default();
+            let out = transform_minimal(&source, &tree, Language::Python, &config).unwrap();
+            assert!(
+                out.contains("# Header comment 0"),
+                "n={n}: first header comment must survive; got:\n{out}"
+            );
+            assert!(
+                out.contains(&format!("# Header comment {}", n - 1)),
+                "n={n}: last header comment must survive; got:\n{out}"
+            );
+            assert_eq!(
+                out.lines().count(),
+                source.lines().count(),
+                "n={n}: nothing is removed, so the line count must be preserved"
+            );
+        }
     }
 
     // ── build_newline_table correctness ─────────────────────────────────────
@@ -1868,55 +1886,26 @@ mod tests {
     }
 
     // ========================================================================
-    // Go comment-classification scaling guards
+    // Go comment classification — exact artifacts, not elapsed time
     // ========================================================================
     //
-    // All three pre-existing perf guards in this file are PYTHON-only, so a Go
-    // regression had no coverage whatsoever: an O(N²) Go regression at N=500
-    // finishes in ~31 ms and passes silently.
+    // These pin what `compute_go_doc_comment_starts` and the two walkers PRODUCE,
+    // and how many node visits it takes them.
     //
-    // MEASURED SERIES (DEBUG build, this branch, best-of-1 pre-fix / best-of-3
-    // post-fix; `transform_minimal` / `transform_pseudo_*` called directly, so
-    // the skim file-level disk cache is NOT involved — a warm parser cache
-    // hides exactly this defect class, PF-020).
-    //
-    //   Go leading comment run before `package main`, minimal:
-    //     BEFORE (Θ(M³/3)):  N=250 → 665.43 ms | N=500 → 5231.39 ms | N=1000 → 41615.57 ms
-    //                        ratios 7.86×, 7.95×   →   α = 2.98
-    //     AFTER  (linear):   N=250 →   0.38 ms | N=500 →    0.77 ms | N=1000 →     1.48 ms
-    //                        ratios 2.00×, 1.94×   →   α = 0.98        (28118× at N=1000)
-    //
-    //   Go leading comment run before `package main`, pseudo:
-    //     BEFORE:            N=250 → 656.58 ms | N=500 → 5212.06 ms | N=1000 → 41571.69 ms
-    //                        ratios 7.94×, 7.98×   →   α = 2.99
-    //     AFTER:             N=250 →   0.44 ms | N=500 →    0.85 ms | N=1000 →     1.66 ms
-    //                        ratios 1.93×, 1.95×   →   α = 0.96        (25043× at N=1000)
-    //
-    //   Go 3-line doc blocks each followed by a declaration, minimal:
-    //     BEFORE:            n=500 →  21.42 ms | n=1000 →   45.29 ms | n=2000 →   96.01 ms
-    //                        ratios 2.11×, 2.12×   →   α = 1.08
-    //     AFTER:             n=500 →  12.92 ms | n=1000 →   25.28 ms | n=2000 →   50.32 ms
-    //                        ratios 1.96×, 1.99×   →   α = 0.98
-    //
-    // NOTE, recorded deliberately: the doc-block shape was ALREADY LINEAR
-    // before the fix (α = 1.08, not the α ≈ 2 that was predicted). Short runs
-    // bound the forward walk to ~3 sibling steps, so the cubic term never
-    // develops. Its guard below is therefore a REGRESSION guard, not evidence
-    // of the fix. The leading-run shape is the one that demonstrates the defect.
-    //
-    // AFTER, at the guard sizes used below (best-of-3):
-    //   leading-run/minimal: N=2000 → 4.62 ms | N=4000 → 6.48 ms | N=8000 → 11.91 ms
-    //   leading-run/pseudo : N=2000 → 3.26 ms | N=4000 → 6.58 ms | N=8000 → 13.27 ms
-    //
-    // THRESHOLD RATIONALE — the ratio guards use 2.8, not the 2.5 used by the
-    // Python `test_quadratic_scaling_guard`. A doubling ratio of 2.8 ≈ 2^1.5 is
-    // the exponent-space midpoint between linear (2.0×) and quadratic (4.0×).
-    // The Python guard can afford 2.5 because its measured ratio is ~1.63 —
-    // fixed overhead pulls it well below 2.0. The Go guards measure ~1.84–2.02,
-    // so 2.5 would leave only ~25 % headroom and flake on a loaded machine.
+    // They do NOT discriminate O(N) from O(N²)/Θ(M³), and no behavioural assertion
+    // can: the Θ(M³/3) per-node `next_named_sibling()` walk executed the SAME Rust
+    // statements as the precompute and produced BYTE-IDENTICAL output. The whole
+    // cost difference lived in tree-sitter's C code, where a `TSNode` has no parent
+    // pointer and every sibling step rescans the parent's child list from 0. The
+    // construct is therefore forbidden at the source level by
+    // `contract_transform_walkers_use_no_root_descending_node_apis` in
+    // `transform/mod.rs`; the measured before/after series that motivated the fix
+    // lives in the production rustdoc on `is_go_doc_comment`.
 
     /// N contiguous comments at the very top, then `package main`.
-    /// Worst case for the old walk: every comment walked the whole remaining run.
+    ///
+    /// `package_clause` is not an `is_go_declaration` kind, so the entire run is
+    /// STRIP — not one comment in it is a doc comment.
     fn go_leading_run_source(n: usize) -> String {
         let mut s = String::with_capacity(n * 26 + 64);
         for i in 0..n {
@@ -1927,6 +1916,9 @@ mod tests {
     }
 
     /// `n` doc blocks of 3 comment lines, each immediately followed by a func.
+    ///
+    /// Every comment is a doc comment (KEEP): each run terminates on a
+    /// `function_declaration`, which IS an `is_go_declaration` kind.
     fn go_doc_blocks_source(n: usize) -> String {
         let mut s = String::with_capacity(n * 120 + 64);
         s.push_str("package main\n\n");
@@ -1941,151 +1933,223 @@ mod tests {
         s
     }
 
-    fn time_go_minimal(source: &str) -> f64 {
-        let mut parser = crate::Parser::new(Language::Go).unwrap();
-        let tree = parser.parse(source).unwrap();
-        let config = TransformConfig::default();
-        let start = std::time::Instant::now();
-        let r = transform_minimal(source, &tree, Language::Go, &config);
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "minimal transform must succeed: {:?}", r.err());
-        ms
+    /// Byte offsets of every `//` in `source` — the comment start bytes derived
+    /// from the TEXT, independently of the AST walk under test.
+    ///
+    /// Both Go fixtures above put exactly one `//` at the start of each comment
+    /// line and none anywhere else, so this is an exact expectation, not a proxy.
+    fn go_comment_start_bytes(source: &str) -> Vec<usize> {
+        source.match_indices("//").map(|(i, _)| i).collect()
     }
 
-    fn time_go_pseudo(source: &str) -> f64 {
-        let mut parser = crate::Parser::new(Language::Go).unwrap();
-        let tree = parser.parse(source).unwrap();
-        let config = TransformConfig::default();
-        let start = std::time::Instant::now();
-        let r = crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
-            source,
-            &tree,
-            Language::Go,
-            &config,
-        );
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-        ms
+    /// The comment nodes' `(start, end)` byte ranges, derived from the text: each
+    /// synthetic comment runs from its `//` to the end of its line.
+    fn go_comment_ranges(source: &str) -> Vec<(usize, usize)> {
+        go_comment_start_bytes(source)
+            .into_iter()
+            .map(|start| {
+                let len = source[start..]
+                    .find('\n')
+                    .expect("every synthetic comment line ends in a newline");
+                (start, start + len)
+            })
+            .collect()
     }
 
-    /// Cheap cubic tripwire. Runs FIRST inside each ratio guard so that a
-    /// reintroduced Θ(M³) implementation fails in ~40 s at N=1000 instead of
-    /// letting the N=8000 measurement grind for hours.
-    fn assert_no_cubic_regression(timer: fn(&str) -> f64, mode: &str) {
-        let probe = timer(&go_leading_run_source(1000));
-        assert!(
-            probe < 200.0,
-            "[{mode}] N=1000 Go leading comment run took {probe:.1}ms (budget 200ms). \
-             The Θ(M³/3) per-node next_named_sibling() walk took 41616ms here; the \
-             linear precompute takes ~1.5ms. This is a CUBIC regression — check that \
-             is_go_doc_comment does a binary_search over compute_go_doc_comment_starts \
-             and does NOT walk siblings (PF-020)."
-        );
-    }
-
+    /// A leading comment run terminated by `package main` yields no doc comments
+    /// and is stripped in full by minimal mode.
+    ///
+    /// WHAT THIS PINS: the artifact — an empty doc-comment table, one removal range
+    /// per comment, a single visit per AST node, and the stripped output.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity. It does not discriminate O(N) from
+    /// Θ(M³) — the defect was output-preserving. See the section note above.
     #[test]
-    fn test_go_leading_comment_run_linear_time() {
-        // CUBIC SMOKE TEST. Pre-fix: 41616 ms at N=1000. Post-fix: 1.48 ms.
-        // Budget 200 ms leaves ~135× headroom over the fixed code while the
-        // cubic code exceeds it by ~208×.
-        let n = 1000usize;
+    fn test_go_leading_comment_run_is_stripped_entirely() {
+        let n = 256usize;
         let source = go_leading_run_source(n);
-        let elapsed = time_go_minimal(&source);
+        let tree = parse_go(&source);
 
-        // Behaviour assertion alongside the timing: the whole run precedes
-        // `package main`, which is NOT an is_go_declaration kind, so every one
-        // of the N comments must be stripped.
+        // The whole run precedes `package main`, which is NOT an is_go_declaration
+        // kind, so NO comment in it is a doc comment.
+        let starts = compute_go_doc_comment_starts(tree.root_node(), &source, Language::Go);
+        assert!(
+            starts.is_empty(),
+            "a run terminated by package_clause contains no doc comments; got {starts:?}"
+        );
+
         let out = transform_go(&source, true);
         assert!(
             !out.contains("// leading run line"),
             "a leading comment run terminated by package_clause must be stripped entirely"
         );
 
-        assert!(
-            elapsed < 200.0,
-            "{n} leading Go comments must process in < 200ms (got {elapsed:.1}ms); \
-             the old Θ(M³/3) walk took 41616ms at N={n}."
+        let (ranges, node_count) = collect_minimal_ranges(&source, &tree, Language::Go);
+        assert_eq!(
+            ranges.len(),
+            n,
+            "every comment in the run must be collected for removal"
+        );
+        assert_eq!(
+            node_count,
+            count_all_nodes(tree.root_node()),
+            "collect_removable_comments must visit each AST node exactly once"
         );
     }
 
+    /// The removal ranges for a leading comment run are byte-exact, and the walk is
+    /// single-visit, at two sizes.
+    ///
+    /// WHAT THIS PINS: `collect_removable_comments` emits exactly one range per
+    /// comment node, at the byte offsets derived from the source text, and descends
+    /// once per AST node.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity — the defect was output-preserving. See
+    /// the section note above and the contract test in `transform/mod.rs`.
     #[test]
-    fn test_go_leading_comment_run_scaling_guard() {
-        assert_no_cubic_regression(time_go_minimal, "minimal");
+    fn test_go_leading_comment_run_ranges_are_exact_and_single_visit() {
+        for n in [128usize, 256] {
+            let source = go_leading_run_source(n);
+            let tree = parse_go(&source);
+            let root = tree.root_node();
 
-        let t1 = time_go_minimal(&go_leading_run_source(4000));
-        let t2 = time_go_minimal(&go_leading_run_source(8000));
+            let starts = compute_go_doc_comment_starts(root, &source, Language::Go);
+            assert!(
+                starts.is_empty(),
+                "n={n}: a run terminated by package_clause contains no doc comments; \
+                 got {starts:?}"
+            );
 
-        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
-        // in this work went vacuous when a fix made it too fast to measure, and
-        // a silently-passing scaling guard provides no protection at all.
-        assert!(
-            t1 >= 1.5,
-            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 1.5ms; ~6.5ms measured on debug builds). Either the \
-             transform is being cached/skipped or N must be raised. \
-             DO NOT convert this to a skip."
-        );
+            let (mut ranges, node_count) = collect_minimal_ranges(&source, &tree, Language::Go);
+            ranges.sort_unstable();
+            assert_eq!(
+                ranges,
+                go_comment_ranges(&source),
+                "n={n}: one removal range per comment, at the exact comment byte offsets"
+            );
+            assert_eq!(
+                node_count,
+                count_all_nodes(root),
+                "n={n}: collect_removable_comments must visit each AST node exactly once"
+            );
 
-        let ratio = t2 / t1;
-        assert!(
-            ratio < 2.8,
-            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 1.84× on the linear implementation). \
-             O(N) → ~2.0×; O(N²) → ~4.0×; 2.8 ≈ 2^1.5 is the exponent-space \
-             midpoint. N=4000 took {t1:.2}ms, N=8000 took {t2:.2}ms."
-        );
+            // The production entry point still composes the precompute and the walk.
+            let out = transform_go(&source, true);
+            assert!(
+                !out.contains("// leading run line"),
+                "n={n}: the whole run must be stripped; got:\n{out}"
+            );
+            assert!(
+                out.contains("package main"),
+                "n={n}: the terminator must survive; got:\n{out}"
+            );
+        }
     }
 
+    /// The Go doc-comment precompute is byte-exact, strictly ascending, and reached
+    /// in a single visit per AST node.
+    ///
+    /// WHAT THIS PINS:
+    /// 1. `compute_go_doc_comment_starts` equals the `//` offsets derived from the
+    ///    text, `3 * n` of them, strictly ascending (`binary_search` depends on it).
+    /// 2. `collect_removable_comments` collects nothing — every comment is a doc
+    ///    comment — and visits each node exactly once.
+    /// 3. `transform_minimal` still composes the two.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity — the defect was output-preserving.
     #[test]
-    fn test_go_doc_block_scaling_guard() {
-        // n is capped at 2000: each block is ~17 AST nodes, so n=4000 would
-        // approach MAX_AST_NODES (100_000) and silently turn this guard into an
-        // Err(ComplexityLimit) assertion instead of a timing assertion.
-        //
-        // This shape was already linear before the fix (α = 1.08) — it is a
-        // REGRESSION guard, not evidence of the fix. See the series above.
-        let t1 = time_go_minimal(&go_doc_blocks_source(1000));
-        let t2 = time_go_minimal(&go_doc_blocks_source(2000));
+    fn test_go_doc_comment_precompute_is_exact_and_single_visit() {
+        for n in [128usize, 256] {
+            let source = go_doc_blocks_source(n);
+            let tree = parse_go(&source);
+            let root = tree.root_node();
 
-        assert!(
-            t1 >= 3.0,
-            "n=1000 doc blocks completed in {t1:.3}ms — too fast to measure \
-             reliably (expected ≥ 3ms; ~25ms measured). DO NOT convert to a skip."
-        );
+            let starts = compute_go_doc_comment_starts(root, &source, Language::Go);
+            assert_eq!(
+                starts,
+                go_comment_start_bytes(&source),
+                "n={n}: every `//` in this fixture begins a doc comment"
+            );
+            assert_eq!(
+                starts.len(),
+                3 * n,
+                "n={n}: three doc-comment lines per block"
+            );
+            assert!(
+                starts.windows(2).all(|w| w[0] < w[1]),
+                "n={n}: binary_search requires strictly ascending start bytes; got {starts:?}"
+            );
 
-        let ratio = t2 / t1;
-        assert!(
-            ratio < 2.8,
-            "Doubling doc-block count from 1000 to 2000 must produce a ratio \
-             below 2.8 (got {ratio:.2}×; measured 1.99×). \
-             n=1000 took {t1:.2}ms, n=2000 took {t2:.2}ms."
-        );
+            let (ranges, node_count) = collect_minimal_ranges(&source, &tree, Language::Go);
+            assert!(
+                ranges.is_empty(),
+                "n={n}: every comment is a doc comment (KEEP); got {ranges:?}"
+            );
+            assert_eq!(
+                node_count,
+                count_all_nodes(root),
+                "n={n}: collect_removable_comments must visit each AST node exactly once"
+            );
+
+            let out = transform_go(&source, true);
+            assert!(
+                out.contains("// Fn0 does a thing."),
+                "n={n}: first doc comment must survive; got:\n{out}"
+            );
+            assert!(
+                out.contains(&format!("// Even more detail about Fn{}.", n - 1)),
+                "n={n}: last doc comment must survive; got:\n{out}"
+            );
+            assert_eq!(
+                out.lines().count(),
+                source.lines().count(),
+                "n={n}: nothing is removed, so the line count must be preserved"
+            );
+        }
     }
 
+    /// The same leading-run classification through the PSEUDO path.
+    ///
+    /// pseudo is the production path: the cat/head/tail rewrite selects
+    /// `--mode=pseudo` for regular code files (ADR-008), so this is the mode an
+    /// agent actually reads Go through. Go's pseudo rules strip no node kinds, no
+    /// keywords and no semicolons, so the comment classification is the only thing
+    /// that can change the output.
+    ///
+    /// WHAT THIS PINS: the shared precompute is empty for this shape, and the
+    /// pseudo entry point strips the whole run while leaving the code intact.
+    ///
+    /// The pseudo walker's own single-visit counter is asserted in `pseudo.rs`,
+    /// where `collect_noise_ranges` and `NoiseWalkContext` are in scope.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity — the defect was output-preserving.
     #[test]
-    fn test_go_pseudo_leading_comment_run_scaling_guard() {
-        // pseudo is the PRODUCTION path: the cat/head/tail rewrite selects
-        // --mode=pseudo for regular code files (ADR-008), so this is the mode an
-        // agent actually reads Go through. Go's pseudo rules strip no node kinds
-        // and no keywords, so this measures the comment walk almost in isolation.
-        assert_no_cubic_regression(time_go_pseudo, "pseudo");
+    fn test_go_pseudo_leading_comment_run_is_stripped_entirely() {
+        for n in [128usize, 256] {
+            let source = go_leading_run_source(n);
+            let tree = parse_go(&source);
 
-        let t1 = time_go_pseudo(&go_leading_run_source(4000));
-        let t2 = time_go_pseudo(&go_leading_run_source(8000));
+            let starts = compute_go_doc_comment_starts(tree.root_node(), &source, Language::Go);
+            assert!(
+                starts.is_empty(),
+                "n={n}: a run terminated by package_clause contains no doc comments; \
+                 got {starts:?}"
+            );
 
-        assert!(
-            t1 >= 1.5,
-            "N=4000 pseudo completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 1.5ms; ~6.6ms measured). DO NOT convert this to a skip."
-        );
-
-        let ratio = t2 / t1;
-        assert!(
-            ratio < 2.8,
-            "Doubling N from 4000 to 8000 in pseudo mode must produce a ratio \
-             below 2.8 (got {ratio:.2}×; measured 2.02×). \
-             N=4000 took {t1:.2}ms, N=8000 took {t2:.2}ms."
-        );
+            let out = transform_go(&source, false);
+            assert!(
+                !out.contains("// leading run line"),
+                "n={n}: pseudo must strip the whole run; got:\n{out}"
+            );
+            assert!(
+                out.contains("package main"),
+                "n={n}: pseudo must preserve the package clause; got:\n{out}"
+            );
+            assert!(
+                out.contains("func f()"),
+                "n={n}: pseudo must preserve the function; got:\n{out}"
+            );
+        }
     }
 
     #[test]
