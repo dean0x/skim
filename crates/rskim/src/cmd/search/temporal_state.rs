@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use rskim_search::TemporalDb;
 
-use super::gitdir::{HeadState, resolve_repo_toplevel};
+use super::gitdir::{HeadState, resolve_common_dir, resolve_repo_toplevel};
 
 // ============================================================================
 // ReanchorPolicy
@@ -121,23 +121,39 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
 // Staleness gates
 // ============================================================================
 
-/// Return `true` when `temporal.db` is missing or its stored `META_GIT_HEAD`
-/// does not match `current_head`.
+/// Returns `true` when `temporal.db` is missing or its stored metadata is out
+/// of date with respect to `current_head` or the current binary.
 ///
 /// `current_head` is the HEAD SHA already read by the caller (non-optional —
 /// callers must check `current_head.is_some()` BEFORE calling this helper; on
 /// non-git dirs the guard short-circuits before reaching this function).
 ///
+/// # Checks performed (in order)
+///
+/// 1. **HEAD match** (`META_GIT_HEAD`): absent row or SHA mismatch → stale.
+/// 2. **Data-version** (`META_DATA_VERSION`, AD-408-4): stored version absent or
+///    numerically less than [`rskim_search::TEMPORAL_DATA_VERSION`] → stale.
+///    Uses `stored < current` (not `!=`) so a DB written by a newer binary is
+///    not needlessly rebuilt by an older binary (no downgrade loop).
+/// 3. **Shallow→full transition** (AD-414-14, `META_IS_SHALLOW`): if the stored
+///    `is_shallow` flag is `"1"` but the common-dir `shallow` file no longer
+///    exists, a `git fetch --unshallow` ran since the last build and the
+///    now-reachable history should be ingested.  Probed via the common dir
+///    (not the per-worktree gitdir) so linked worktrees are handled correctly.
+///    Only probed when `git_dir` is `Some`; absent `is_shallow` row
+///    (pre-AD-414-14 DBs) skips the check.
+///
 /// # Performance (ADR-003)
 ///
 /// Opens ONE lightweight read-only SQLite connection (no WAL pragma, no
-/// permission reset, no migrations) and reads BOTH `META_GIT_HEAD` and
-/// `META_DATA_VERSION` against it via [`read_meta_on`].  A single open avoids
-/// the extra `db_path.exists()` stat + `Connection::open_with_flags` +
-/// `sqlite_master` schema parse that a second call to `read_temporal_meta`
-/// would incur — zero new overhead on the steady-state Current path where
-/// both checks are needed (AC32).  The full `TemporalDb::open` cost is
-/// deferred to the dispatch arm that actually queries the DB.
+/// permission reset, no migrations) and reads `META_GIT_HEAD`,
+/// `META_DATA_VERSION`, and `META_IS_SHALLOW` against it via [`read_meta_on`].
+/// A single open avoids the extra `db_path.exists()` stat +
+/// `Connection::open_with_flags` + `sqlite_master` schema parse that a second
+/// call to `read_temporal_meta` would incur — zero new overhead on the
+/// steady-state Current path where all three checks are needed (AC32).
+/// The full `TemporalDb::open` cost is deferred to the dispatch arm that
+/// actually queries the DB.
 ///
 /// # AD-TMP-2 / AD-TMP-3
 ///
@@ -157,24 +173,6 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
 /// the single HEAD read already performed at `auto_refresh_if_stale` entry;
 /// passing it here avoids a second HEAD read and keeps one HEAD-reading
 /// authority per call.
-/// Returns `true` when `temporal.db` is missing or its stored metadata is out
-/// of date with respect to `current_head` or the current binary.
-///
-/// # Checks performed (in order)
-///
-/// 1. **HEAD match** (`META_GIT_HEAD`): absent row or SHA mismatch → stale.
-/// 2. **Data-version** (`META_DATA_VERSION`, AD-408-4): stored version absent or
-///    numerically less than [`rskim_search::TEMPORAL_DATA_VERSION`] → stale.
-///    Uses `stored < current` (not `!=`) so a DB written by a newer binary is
-///    not needlessly rebuilt by an older binary (no downgrade loop).
-/// 3. **Shallow→full transition** (AD-414-14, `META_IS_SHALLOW`): if the stored
-///    `is_shallow` flag is `"1"` but `.git/shallow` no longer exists, a
-///    `git fetch --unshallow` ran since the last build and the now-reachable
-///    history should be ingested.  Only probed when `git_dir` is `Some`;
-///    absent `is_shallow` row (pre-AD-414-14 DBs) skips the check.
-///
-/// Opens ONE read-only SQLite connection and issues all key reads against it
-/// (ADR-003 / AC32 — avoids a second stat+open on the steady-state Current path).
 pub(super) fn temporal_db_is_stale(
     cache_dir: &Path,
     current_head: &str,
@@ -228,15 +226,37 @@ pub(super) fn temporal_db_is_stale(
     }
 
     // AD-414-14: Check 3: shallow→full transition.
-    // If the stored is_shallow flag is "1" but .git/shallow no longer exists,
-    // a `git fetch --unshallow` ran since the last temporal build and the
-    // empty/partial history is now reachable — trigger a self-heal rebuild.
+    // If the stored is_shallow flag is "1" but the common-dir `shallow` file no
+    // longer exists, a `git fetch --unshallow` ran since the last temporal build
+    // and the empty/partial history is now reachable — trigger a self-heal rebuild.
     // Absent is_shallow row (pre-AD-414-14 DBs) → check skipped (false negative
     // is safe: we simply don't notice the unshallow until the next HEAD change).
+    //
+    // BUG FIX: `shallow` is a COMMON-DIR file. For a linked worktree, `git_dir`
+    // resolves to `<common>/.git/worktrees/<name>` (not the common dir), so
+    // `gd.join("shallow")` never exists — the stored "1" would mismatch on EVERY
+    // query, triggering an unbounded full `parse_history` rebuild per query with
+    // no convergence bound (`sync` re-writes is_shallow="1" each time and
+    // `on_sync_ok` clears the backoff sentinel). Fix: probe via
+    // `resolve_common_dir`, which reads the `commondir` pointer when present
+    // (linked worktree) and returns `None` for plain repos (fallback to `gd`).
     if let Some(gd) = git_dir {
         let stored_shallow: Option<String> = read_meta_on(&conn, rskim_search::META_IS_SHALLOW);
-        if stored_shallow.as_deref() == Some("1") && !gd.join("shallow").exists() {
-            return true;
+        if stored_shallow.as_deref() == Some("1") {
+            // Resolve common dir so linked-worktree probes land on the shared
+            // `shallow` file rather than the per-worktree gitdir.
+            let shallow_dir = resolve_common_dir(gd).unwrap_or_else(|| gd.to_path_buf());
+            // Match gix's own predicate (gix-0.72.1/src/repository/shallow.rs:30):
+            // a zero-length shallow file is treated as absent, keeping the stored
+            // flag in sync with the gix writer that produced it.
+            let shallow_exists = shallow_dir
+                .join("shallow")
+                .metadata()
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false);
+            if !shallow_exists {
+                return true;
+            }
         }
     }
 
