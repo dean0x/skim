@@ -495,14 +495,12 @@ pub(super) fn run_ast_standalone(
             // requested dimension (e.g. all matched files are untracked/newly added).
             // Emit degraded notice on stderr only — format_ast_json cannot carry
             // `degraded` in this ticket (#483).
-            let detail = if cov.lookup_errors > 0 {
-                format!(
-                    "0 of {} results have temporal data ({} temporal lookups failed)",
-                    cov.total, cov.lookup_errors
-                )
-            } else {
-                format!("0 of {} results have temporal data", cov.total)
-            };
+            // DegradedReason::no_ranked_rows_detail is the SSOT for this text
+            // (Finding [medium/consistency]).
+            let detail = super::temporal::DegradedReason::no_ranked_rows_detail(
+                cov.total,
+                cov.lookup_errors,
+            );
             let u = super::temporal::TemporalUnavailable {
                 reason: super::temporal::DegradedReason::NoRankedRows,
                 detail,

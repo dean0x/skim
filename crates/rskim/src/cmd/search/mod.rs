@@ -233,35 +233,14 @@ pub(crate) fn run(
             // Open the temporal DB only when a sort is requested.  Absent DB or empty
             // dimension → degrade: emit notice on stderr, pass None so temporal_active
             // falls to false and raw AST order is preserved (AC-A3).
-            // AD-414-1 / AD-414-15: open_temporal_state is the single funnel for all
-            // temporal DB access on this arm.  Step 8: handles Empty (dimension_is_empty
-            // probe per G-3) as well as Unavailable — both pass None so temporal_active
-            // falls to false and the deliberate SE-4 pool/has_more shift is the result.
+            // open_temporal_state_for folds the emptiness probe (Finding [medium/complexity]):
+            // it returns Unavailable(Empty) when the dimension has no rows, collapsing the
+            // former three-way shape (Open-non-empty / Open-empty / Unavailable) into
+            // a two-way dispatch so all degradation flows through a single Unavailable arm.
             let temporal_db = if let Some(sort) = flags.temporal_sort {
-                match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
-                    temporal::TemporalOpen::Open(db)
-                        if !temporal::dimension_is_empty(&db, sort) =>
-                    {
-                        Some(db)
-                    }
-                    temporal::TemporalOpen::Open(_) => {
-                        // DB open but the requested temporal dimension has zero rows.
-                        // Never inferred from result_count (G-3); always from the
-                        // per-table probe.
-                        let u = temporal::TemporalUnavailable {
-                            reason: temporal::DegradedReason::Empty,
-                            detail: String::new(),
-                        };
-                        eprintln!(
-                            "skim search: {}",
-                            temporal::degraded_notice(
-                                &u,
-                                sort.flag_name(),
-                                temporal::Fallback::Ast
-                            )
-                        );
-                        None
-                    }
+                match temporal::open_temporal_state_for(&root, &cache_dir, &head_state, Some(sort))
+                {
+                    temporal::TemporalOpen::Open(db) => Some(db),
                     temporal::TemporalOpen::Unavailable(u) => {
                         eprintln!(
                             "skim search: {}",
@@ -1680,18 +1659,19 @@ fn run_query(
     // pagination out of the DB-presence branch so it runs unconditionally on temporal arms.
     let page = types::Page::new(flags.limit, flags.offset);
     if let Some(sort) = flags.temporal_sort {
-        // AD-414-1: three-way match on open_temporal_state.  The arms are:
-        //   Open(db) where dimension is non-empty → enrich + check coverage
-        //   Open(_) where dimension is empty      → DB present but no rows
-        //   Unavailable(u)                         → DB missing / corrupt / etc.
+        // AD-414-1: two-way match via open_temporal_state_for.  The arms are:
+        //   Open(db)        → dimension is non-empty; enrich + check coverage
+        //   Unavailable(u)  → DB missing / corrupt / empty / etc.
+        // open_temporal_state_for folds the emptiness probe so the former third
+        // arm (Open+empty) is now Unavailable(Empty) inside the funnel.
         // Produces a TemporalUnavailable when enrichment cannot be applied so
         // the fallback path (degraded_notice + DegradedJson) is shared.
         let head = refresh_head_state
             .as_ref()
             .unwrap_or(&staleness::HeadState::NotARepo);
         let maybe_unavail: Option<temporal::TemporalUnavailable> =
-            match temporal::open_temporal_state(&root, &cache_dir, head) {
-                temporal::TemporalOpen::Open(db) if !temporal::dimension_is_empty(&db, sort) => {
+            match temporal::open_temporal_state_for(&root, &cache_dir, head, Some(sort)) {
+                temporal::TemporalOpen::Open(db) => {
                     let cov = temporal::apply_temporal_enrichment(&mut output.results, sort, &db)?;
                     // `cov.total > 0` is load-bearing (AC-8 / AC-17(b)): a query that
                     // matched NOTHING has no ranking to degrade, so a zero-result query
@@ -1703,16 +1683,12 @@ fn run_query(
                         // AD-414-13 zero-coverage: enrichment ran but no result received a
                         // temporal score (e.g. all files are untracked or newly added).
                         // Skip the re-sort; preserve lexical order; emit degraded signal.
-                        // §2.3 normative table: "{n} of {total} results have temporal data"
-                        // with the optional lookup-error clause (T-4, AC-4).
-                        let detail = if cov.lookup_errors > 0 {
-                            format!(
-                                "0 of {} results have temporal data ({} temporal lookups failed)",
-                                cov.total, cov.lookup_errors,
-                            )
-                        } else {
-                            format!("0 of {} results have temporal data", cov.total)
-                        };
+                        // DegradedReason::no_ranked_rows_detail is the SSOT for this text
+                        // (Finding [medium/consistency]).
+                        let detail = temporal::DegradedReason::no_ranked_rows_detail(
+                            cov.total,
+                            cov.lookup_errors,
+                        );
                         Some(temporal::TemporalUnavailable {
                             reason: temporal::DegradedReason::NoRankedRows,
                             detail,
@@ -1720,13 +1696,6 @@ fn run_query(
                     } else {
                         None
                     }
-                }
-                temporal::TemporalOpen::Open(_) => {
-                    // DB open but the requested dimension has zero rows — run --build.
-                    Some(temporal::TemporalUnavailable {
-                        reason: temporal::DegradedReason::Empty,
-                        detail: String::new(),
-                    })
                 }
                 temporal::TemporalOpen::Unavailable(u) => Some(u),
             };
@@ -1875,8 +1844,9 @@ fn run_temporal_standalone(
     // Finding 2 fix: use head_state from auto_refresh_if_stale above.
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
-    // AD-414-1: open_temporal_state is the single funnel; it returns a typed
-    // TemporalOpen so the caller matches on Open/Unavailable instead of Ok/Err.
+    // open_temporal_state_for is the single funnel with emptiness probe folded in
+    // (Finding [medium/complexity]); it returns a typed TemporalOpen so the caller
+    // matches on Open/Unavailable instead of Ok/Err.
     // RepositoryMismatch → wrong-repo rows rejected; Missing/Empty/Corrupt → no data.
     // Both arms degrade gracefully (exit 0, AC-F3).
     // degraded_notice is the SSOT for all stderr/JSON degradation messages.
@@ -1892,18 +1862,24 @@ fn run_temporal_standalone(
     // whose `requested` names no flag at all, so a machine consumer could not tell WHICH
     // request was not honoured.  The sort wins when both are supplied (it selects the
     // ranking; blast-radius only filters).
-    let requested_flag = match (temporal_sort, blast_radius) {
+    let requested_flag: &'static str = match (temporal_sort, blast_radius) {
         (Some(s), _) => s.json_name(),
         (None, Some(_)) => "blast-radius",
         (None, None) => "",
-    }
-    .to_string();
-    let db = match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
+    };
+    // open_temporal_state_for folds the G-3 emptiness probe (Finding [medium/complexity]):
+    // when temporal_sort is Some(s) and the dimension has no rows, returns
+    // Unavailable(Empty) so the existing Unavailable arm handles it uniformly.
+    // When temporal_sort is None (blast-radius only), passes None — no empty probe,
+    // since cochange emptiness never borrows the shallow/empty wording (G-3).
+    let db = match temporal::open_temporal_state_for(&root, &cache_dir, &head_state, temporal_sort)
+    {
         temporal::TemporalOpen::Open(db) => db,
         temporal::TemporalOpen::Unavailable(u) => {
             // DegradedJson::new is the single constructor (Finding [medium/architecture]):
             // it calls degraded_notice internally so DegradedJson.message always
             // matches what is printed to stderr (AD-414-1 SSOT).
+            // Covers all reasons including Empty (folded from the former separate probe).
             let dj = temporal::DegradedJson::new(
                 &u,
                 requested_flag,
@@ -1927,8 +1903,8 @@ fn run_temporal_standalone(
                     eprintln!("skim search: {}", dj.message);
                 }
             } else {
-                // All other reasons: notice to stderr; in --json mode emit one parseable
-                // object on stdout so the caller always gets a valid JSON envelope (SE-6).
+                // All other reasons (including Empty): notice to stderr; in --json mode
+                // emit one parseable object on stdout (SE-6).
                 eprintln!("skim search: {}", dj.message);
                 if json {
                     let msg = DegradedOnlyJson { degraded: vec![dj] };
@@ -1938,36 +1914,6 @@ fn run_temporal_standalone(
             return Ok(ExitCode::SUCCESS);
         }
     };
-
-    // G-3: probe for Empty via the per-table dimension_is_empty probe for temporal
-    // sort arms.  Never inferred from result_count()==0 && offset==0 — a healthy
-    // 1-commit repo measures hotspot≥1, and standalone --blast-radius legitimately
-    // returns 0 results even on a populated DB.
-    // Cochange emptiness never borrows the shallow/empty wording (G-3).
-    if let Some(sort) = temporal_sort
-        && temporal::dimension_is_empty(&db, sort)
-    {
-        let u = temporal::TemporalUnavailable {
-            reason: temporal::DegradedReason::Empty,
-            detail: String::new(),
-        };
-        // DegradedJson::new is the single constructor (Finding [medium/architecture]):
-        // it calls degraded_notice internally so DegradedJson.message always matches
-        // what is printed to stderr (AD-414-1 SSOT).
-        let dj = temporal::DegradedJson::new(
-            &u,
-            sort.json_name(),
-            "none",
-            "",
-            temporal::Fallback::NoResults,
-        );
-        eprintln!("skim search: {}", dj.message);
-        if json {
-            let msg = DegradedOnlyJson { degraded: vec![dj] };
-            println!("{}", serde_json::to_string(&msg)?);
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
 
     let (output, has_more) =
         temporal::query_standalone(temporal_sort, blast_radius, page, &db, &root)?;

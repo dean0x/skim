@@ -855,7 +855,15 @@ fn open_or_discard_temporal_db(
                          delete this file manually, then re-run 'skim search --rebuild'",
                         db_path.display()
                     );
-                    return None; // file left byte-unchanged; no sentinel (DB still intact)
+                    // D5 backoff: the corrupt DB remains on disk (unlink failed), so
+                    // `temporal_db_is_stale` will open it read-only, find no META_GIT_HEAD,
+                    // return stale, and re-run the full parse_history walk — producing an
+                    // unbounded retry loop that prints two stderr lines per invocation.
+                    // The sentinel bounds it to once per HEAD, matching both sibling arms
+                    // (recreate-failed and Err(other)).  SE-3 is not violated: no sidecar
+                    // removal is attempted here (the main unlink itself failed).
+                    let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+                    return None;
                 }
             }
             // EXACTLY ONE retry (AD-414-3) — never a loop.
@@ -887,7 +895,7 @@ fn open_or_discard_temporal_db(
             let (reason, detail) = match other {
                 SearchError::UnsupportedSchemaVersion { found, supported } => (
                     DegradedReason::UnsupportedVersion,
-                    format!("schema version {found}, this build supports {supported}"),
+                    DegradedReason::unsupported_version_detail(found, supported),
                 ),
                 ref e => (DegradedReason::Unreadable, e.to_string()),
             };

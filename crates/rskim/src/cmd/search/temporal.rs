@@ -169,7 +169,7 @@ impl DegradedJson {
     /// * `fallback` — controls the tail description in [`degraded_notice`].
     pub(super) fn new(
         u: &TemporalUnavailable,
-        requested: impl Into<String>,
+        requested: &'static str,
         applied: &'static str,
         flag: &str,
         fallback: Fallback,
@@ -178,7 +178,7 @@ impl DegradedJson {
         DegradedJson {
             subsystem: "temporal",
             reason: u.reason.as_json_str(),
-            requested: requested.into(),
+            requested,
             applied,
             message,
             remediation: u.reason.remediation(),
@@ -199,7 +199,7 @@ impl DegradedJson {
         DegradedJson {
             subsystem: "temporal",
             reason: u.reason.as_json_str(),
-            requested: "blast-radius".to_string(),
+            requested: "blast-radius",
             applied: "lexical",
             message,
             remediation: u.reason.remediation(),
@@ -267,8 +267,7 @@ pub(super) fn open_temporal_state(root: &Path, cache_dir: &Path, head: &HeadStat
         Err(SearchError::UnsupportedSchemaVersion { found, supported }) => {
             TemporalOpen::Unavailable(TemporalUnavailable {
                 reason: DegradedReason::UnsupportedVersion,
-                // §2.3 normative table: "schema version {found}, this build supports {supported}"
-                detail: format!("schema version {found}, this build supports {supported}"),
+                detail: DegradedReason::unsupported_version_detail(found, supported),
             })
         }
         Err(other) => TemporalOpen::Unavailable(TemporalUnavailable {
@@ -290,6 +289,41 @@ pub(super) fn dimension_is_empty(db: &TemporalDb, sort: TemporalSort) -> bool {
             db.top_hotspots(1).map_or(true, |rows| rows.is_empty())
         }
         TemporalSort::Risky => db.top_risks(1).map_or(true, |rows| rows.is_empty()),
+    }
+}
+
+/// Variant of [`open_temporal_state`] that folds the emptiness probe for a
+/// temporal-sort dimension (Finding [medium/complexity]).
+///
+/// When `sort` is `Some(s)`, opens the DB and additionally calls
+/// [`dimension_is_empty`].  An open-but-empty DB is returned as
+/// `Unavailable { reason: DegradedReason::Empty, detail: "" }`, so every
+/// caller sees a two-way enum (Open-and-ready / Unavailable) rather than the
+/// three-way shape (Open-non-empty / Open-empty / Unavailable) that was
+/// formerly duplicated across all temporal call sites.
+///
+/// When `sort` is `None`, the call is identical to [`open_temporal_state`]:
+/// no emptiness probe is made.  This is correct for blast-radius-only paths —
+/// cochange emptiness never borrows the shallow/empty wording (G-3).
+pub(super) fn open_temporal_state_for(
+    root: &Path,
+    cache_dir: &Path,
+    head: &HeadState,
+    sort: Option<TemporalSort>,
+) -> TemporalOpen {
+    match open_temporal_state(root, cache_dir, head) {
+        TemporalOpen::Open(db) => {
+            if let Some(s) = sort {
+                if dimension_is_empty(&db, s) {
+                    return TemporalOpen::Unavailable(TemporalUnavailable {
+                        reason: DegradedReason::Empty,
+                        detail: String::new(),
+                    });
+                }
+            }
+            TemporalOpen::Open(db)
+        }
+        unavail => unavail,
     }
 }
 

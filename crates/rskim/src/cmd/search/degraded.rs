@@ -27,9 +27,13 @@ use serde::Serialize;
 // DegradedReason
 // ============================================================================
 
-/// AD-414-15: classification order is NORMATIVE:
-/// not_git_repo → head_unresolved → repository_mismatch → missing
-/// → corrupt/unsupported_version/unreadable → empty → no_ranked_rows.
+/// AD-414-15: the ordering below is the **§2.3 spec precedence** — the
+/// conceptual priority a machine consumer assigns to each state when reporting.
+/// The probe order inside [`super::temporal::open_temporal_state`] differs:
+/// `RepositoryMismatch` is checked after `TemporalDb::open` succeeds (it must
+/// read `meta.git_toplevel`), even though it ranks before `missing`/`empty` in
+/// this table.  See that function's doc for the implementation order and the
+/// reason it differs.
 ///
 /// Each variant represents the **state** a user or agent can recognise, never
 /// the mechanism that detected it.  The reason string is part of the `degraded`
@@ -80,7 +84,8 @@ impl DegradedReason {
         }
     }
 
-    /// Cause substring for the degraded-state notice and `DegradedJson`.
+    /// The §2.3 normative cause text in isolation; [`Self::full_message`] delegates
+    /// to this method to build the production notice.
     ///
     /// `detail` carries reason-specific context set by [`super::temporal::open_temporal_state`]
     /// or the zero-coverage path (e.g. path pair for `RepositoryMismatch`,
@@ -131,6 +136,34 @@ impl DegradedReason {
                  by the on-disk ghost filter (files not present on disk at the indexed root)"
             ),
         }
+    }
+
+    /// Build the `NoRankedRows` detail string from coverage counters.
+    ///
+    /// SSOT for the "0 of N results have temporal data" text (Finding [medium/consistency]).
+    /// Callers set this as `TemporalUnavailable { reason: NoRankedRows, detail }`;
+    /// `cause()` returns `detail` verbatim for `NoRankedRows`, making this constructor
+    /// the single composer of that string.  Enforced by the `"0 of "` entry in
+    /// `cause_substrings_for_guard` (t19b guard).
+    pub(super) fn no_ranked_rows_detail(total: usize, lookup_errors: usize) -> String {
+        if lookup_errors > 0 {
+            format!(
+                "0 of {total} results have temporal data \
+                 ({lookup_errors} temporal lookups failed)"
+            )
+        } else {
+            format!("0 of {total} results have temporal data")
+        }
+    }
+
+    /// SSOT for the `"schema version {found}, this build supports {supported}"` detail
+    /// string (§2.3 normative table, RD-4).
+    ///
+    /// Both open paths (`temporal::open_temporal_state` and
+    /// `temporal_build::open_or_discard_temporal_db`) call this instead of formatting
+    /// the literal independently, so the two sites cannot drift from each other.
+    pub(super) fn unsupported_version_detail(found: i64, supported: i64) -> String {
+        format!("schema version {found}, this build supports {supported}")
     }
 
     /// Actionable remediation advice for `DegradedJson.remediation`.
@@ -224,7 +257,7 @@ pub(super) struct DegradedJson {
     /// The user flag that requested temporal ranking, in bare form (e.g. `"hot"`,
     /// `"blast-radius"`).  No `--` prefix — use [`super::types::TemporalSort::json_name`]
     /// to obtain the correct value; `flag_name()` is for human-readable message text.
-    pub requested: String,
+    pub requested: &'static str,
     /// The ranking actually served (e.g. `"lexical"`, `"ast"`).
     pub applied: &'static str,
     /// Human-readable notice (identical to what was printed to stderr).
@@ -333,5 +366,8 @@ pub(super) fn cause_substrings_for_guard() -> &'static [&'static str] {
         "temporal.db could not be opened",
         "temporal data is empty (0 rows)",
         "temporal data built 0 rows",
+        // NoRankedRows: "0 of N results have temporal data …"
+        // no_ranked_rows_detail() is the single builder; "0 of " is the distinctive prefix.
+        "0 of ",
     ]
 }
