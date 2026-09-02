@@ -1091,7 +1091,7 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             } else {
                 snapshot.pre_refresh_temporal_state
             };
-            writeln!(out, "  temporal state : {ts_text}")?;
+            writeln!(out, "  temporal state: {ts_text}")?;
         }
         if let Some(ts) = snapshot.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
@@ -1344,11 +1344,16 @@ fn gather_stats(
         Some(head_state),
     )?;
 
-    // staleness_status is always Current after auto_refresh_if_stale — the function
-    // guarantees the index is current (rebuilt if it was stale). Derived from
-    // `outcome` to avoid a compile-time literal in the pure-reporting functions.
-    let _ = &outcome; // outcome consumed; all RefreshOutcome variants → Current
-    let staleness_status = staleness::StalenessCheck::Current;
+    // Post-heal staleness: auto_refresh_if_stale guarantees the index is current
+    // after it returns (rebuilt when stale, unchanged when already current).
+    // Derived from `outcome` rather than a compile-time literal so the compiler
+    // enforces exhaustiveness — a future RefreshOutcome variant that does NOT
+    // guarantee a current index would surface here as a compile error.
+    let staleness_status = match outcome {
+        staleness::RefreshOutcome::UpToDate
+        | staleness::RefreshOutcome::FirstBuild
+        | staleness::RefreshOutcome::Incremental => staleness::StalenessCheck::Current,
+    };
 
     // AD-414-7: opens successfully for F-Body-A/B/C after the self-heal above.
     // Only CRC-level corruption not detectable by the structural probe propagates
@@ -4379,115 +4384,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // Step 9 — standalone temporal arm: degraded JSON back-compat and SE-6
-    // ========================================================================
-
-    /// T-23 (Step 9): `run()` with `--json --hot` on a non-git dir still exits 0
-    /// (AC9 degradation contract) — verifies the new Step 9 code path (NotGitRepo)
-    /// does not regress the exit code.
-    ///
-    /// Back-compat proof: this is the same call the old code served.  If the new
-    /// WarningWithDegradedJson path panics or returns a non-zero ExitCode the AC9
-    /// contract is broken.
-    #[test]
-    fn t23_standalone_temporal_not_git_repo_json_exit_0_step9() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_string_lossy().to_string();
-        let result = run(
-            &[
-                "--json".to_string(),
-                "--hot".to_string(),
-                "--root".to_string(),
-                root,
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-23: --json --hot on non-git dir must exit 0 (Step 9 AC9 back-compat)"
-        );
-    }
-
-    /// T-6 (Step 9): `run()` with `--hot` (non-json) on a non-git dir exits 0.
-    /// Verifies the non-json path of the new Step 9 NotGitRepo arm.
-    #[test]
-    fn t6_standalone_temporal_not_git_repo_text_exit_0_step9() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_string_lossy().to_string();
-        let result = run(
-            &["--hot".to_string(), "--root".to_string(), root],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-6: --hot on non-git dir must exit 0 (Step 9 non-json NotGitRepo)"
-        );
-    }
-
-    /// T-8 (Step 9): `run()` with `--json --hot --root <git-repo-without-temporal-db>`
-    /// exits 0 on the Missing path.  Verifies the non-NotGitRepo "other reasons" branch
-    /// (Missing) of the new Step 9 differentiation code.
-    ///
-    /// Uses a fresh git repo (so head_state is Resolved, not NotARepo) but no temporal.db.
-    /// This hits DegradedReason::Missing, which takes the "other reasons → stderr + JSON"
-    /// branch (SE-6), verifying exit 0.
-    #[test]
-    fn t8_standalone_temporal_missing_db_git_repo_exit_0_step9() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // Initialise a bare git repo so head_state won't be NotARepo.
-        // This makes open_temporal_state return Missing (not NotGitRepo).
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir.path())
-            .status()
-            .expect("git init must succeed");
-        assert!(status.success(), "git init must succeed");
-
-        let root = dir.path().to_string_lossy().to_string();
-        let result = run(
-            &[
-                "--json".to_string(),
-                "--hot".to_string(),
-                "--root".to_string(),
-                root,
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-8: --json --hot on a git repo with no temporal.db must exit 0 (Missing path, SE-6)"
-        );
-    }
-
-    /// Step 9 / AC-30: a plain text query with no temporal flag must never emit
-    /// an extra stderr line from the temporal degraded path.
-    ///
-    /// run() does not control stderr in-process, but we can verify exit 0 on a
-    /// directory with no index and no temporal DB — the key invariant is that it
-    /// does not panic or error.
-    #[test]
-    fn t_ac30_plain_text_query_no_temporal_flag_exit_0() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path().to_string_lossy().to_string();
-        let result = run(
-            &["something".to_string(), "--root".to_string(), root],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "AC-30: plain text query with no temporal flag must exit 0"
-        );
-    }
-
     // =========================================================================
     // Step 11: T-13/T-14/T-15 — actionable lexical error, stats self-heal,
     // and temporal_state key (AD-414-7, AD-414-10, AC-13, AC-14, AC-15)
@@ -4505,6 +4401,10 @@ mod tests {
     /// PF-007: asserts observable error message content, not just exit code.
     /// PF-018: byte-flip preserves file length so the structural size probe passes;
     ///         only the full CRC32 detects the corruption.
+    /// SKIM_CACHE_DIR isolation: #[serial] prevents concurrent env-var mutations
+    /// from other in-process tests flipping the resolved cache dir between the
+    /// --rebuild call and the subsequent resolve_search_cache_dir probe.
+    #[serial_test::serial]
     #[test]
     fn t13_crc_mismatch_names_artifact_and_rebuild_hint() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4608,6 +4508,9 @@ mod tests {
     /// and `--stats` always exited 1 with no JSON on stdout.
     ///
     /// PF-007: asserts observable output, not just exit code.
+    /// SKIM_CACHE_DIR isolation: #[serial] prevents concurrent env-var mutations
+    /// from other in-process tests racing the resolve_search_cache_dir call.
+    #[serial_test::serial]
     #[test]
     fn t14_stats_json_self_heals_on_fbody_a_truncated_skpost() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4674,6 +4577,9 @@ mod tests {
 
     /// T-14(b) / AC-14: `--stats` text mode on F-Body-C (removed `index.skpost`)
     /// must exit 0 after self-healing (same route as T-14 but text mode).
+    /// SKIM_CACHE_DIR isolation: #[serial] prevents concurrent env-var mutations
+    /// from other in-process tests racing the resolve_search_cache_dir call.
+    #[serial_test::serial]
     #[test]
     fn t14b_stats_text_self_heals_on_fbody_c_removed_skpost() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4733,6 +4639,9 @@ mod tests {
     /// `temporal_state` key is present in the additive set alongside `git_head_state`.
     ///
     /// PF-012: temporal.db corruption fixture uses 0xAB×1024 (deterministic).
+    /// SKIM_CACHE_DIR isolation: #[serial] prevents concurrent env-var mutations
+    /// from other in-process tests racing the resolve_search_cache_dir call.
+    #[serial_test::serial]
     #[test]
     fn t15_temporal_state_five_distinct_values() {
         let dir = tempfile::TempDir::new().unwrap();

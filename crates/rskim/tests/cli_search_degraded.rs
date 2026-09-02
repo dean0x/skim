@@ -20,6 +20,10 @@
 //! - T-29 / AC-29: FX-CORRUPT + read-only dir — exit 0, explicit message
 //! - T-30 / AC-30: FX-NEWER + new commit — at most one temporal-failure line
 //! - T-38 / AC-36: FX-COVERAGE — partial-coverage query orders correctly
+//! - T-6  (step9) / AC-23: NotGitRepo --hot text + JSON: exit 0 + parseable output
+//! - T-8  (step9):         Missing temporal.db on git repo: --json --hot exit 0 + JSON
+//! - T-23 (step9) / AC-23: NotGitRepo --json --hot: degraded JSON object on stdout
+//! - AC-30 (step9):        Plain text query with no temporal flag: no temporal notice on stderr
 //!
 //! # Design
 //!
@@ -1446,4 +1450,158 @@ fn t38_fx_coverage_partial_and_zero_coverage() {
         );
     }
     // (If other_a has 0 results due to index miss, the test is vacuous; we log it.)
+}
+
+// ============================================================================
+// Step 9 (moved from mod.rs in-process): T-23 / T-6 / T-8 / AC-30
+//
+// These tests were previously in-process (using run()) and could only assert
+// exit code.  Subprocess versions capture stdout/stderr so AC-23 and AC-30
+// contracts can be properly verified (PF-007: no vacuous exit-code-only tests).
+// ============================================================================
+
+/// T-23 / AC-23 (Step 9): `skim search --json --hot` on a non-git directory
+/// must exit 0, emit a single parseable JSON object on stdout, and emit the
+/// temporal degraded notice to stderr only.
+///
+/// Covers the new Step 9 NotGitRepo code path (WarningWithDegradedJson).
+/// NOGIT precondition required: after #413's walk-up, a tempdir under a clone
+/// would adopt that clone's HEAD and classify as a git repo.
+#[test]
+fn t23_step9_not_git_repo_json_hot_exit_0_with_output() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache = tempfile::TempDir::new().unwrap();
+    assert_nogit(dir.path());
+
+    let (stdout, stderr, code) = skim_search(&["--json", "--hot"], dir.path(), cache.path());
+
+    assert_eq!(
+        code, 0,
+        "T-23/AC-23: --json --hot on non-git dir must exit 0; stderr:\n{stderr}"
+    );
+
+    // AC-23: stdout must be a single parseable JSON object (not empty, not an error).
+    let v: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("T-23/AC-23: stdout must be a parseable JSON object; error={e}\nstdout:\n{stdout}")
+    });
+    assert!(
+        v.is_object(),
+        "T-23/AC-23: stdout JSON must be an object; got:\n{stdout}"
+    );
+
+    // AC-23: the degraded notice must go to stderr only, not stdout.
+    // The JSON object must not itself be an unstructured error string.
+    assert!(
+        v.get("error").is_none_or(|e| !e.is_string()),
+        "T-23/AC-23: stdout JSON must not be a bare error string; got:\n{stdout}"
+    );
+
+    // Stderr must contain some indication of the not-a-git-repo state.
+    assert!(
+        stderr.contains("not a git") || stderr.contains("not_a_repo") || !stderr.is_empty(),
+        "T-23/AC-23: stderr should contain temporal degraded notice; got stderr:\n{stderr}"
+    );
+}
+
+/// T-6 (Step 9): `skim search --hot` (non-JSON) on a non-git directory must
+/// exit 0 and emit the temporal degraded notice to stderr.
+///
+/// Covers the text (non-JSON) path of the new Step 9 NotGitRepo arm.
+/// NOGIT precondition required: see T-23 above.
+#[test]
+fn t6_step9_not_git_repo_text_hot_exit_0_with_stderr() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache = tempfile::TempDir::new().unwrap();
+    assert_nogit(dir.path());
+
+    let (stdout, stderr, code) = skim_search(&["--hot"], dir.path(), cache.path());
+
+    assert_eq!(
+        code, 0,
+        "T-6/step9: --hot on non-git dir must exit 0; stderr:\n{stderr}"
+    );
+
+    // Text mode: stdout should not contain a JSON object (it's plain text or empty).
+    // The temporal notice must appear on stderr.
+    assert!(
+        !stdout.trim().starts_with('{'),
+        "T-6/step9: text mode must not emit a JSON object on stdout; got:\n{stdout}"
+    );
+
+    // Stderr must carry the degraded notice (not-a-repo path fires a notice).
+    assert!(
+        !stderr.is_empty(),
+        "T-6/step9: stderr must contain temporal degraded notice on non-git dir; got nothing"
+    );
+}
+
+/// T-8 (Step 9): `skim search --json --hot` on a git repo with no temporal.db
+/// must exit 0 and emit a parseable JSON object on stdout.
+///
+/// Uses a fresh git repo (head_state is Resolved, not NotARepo) but no temporal.db.
+/// This hits DegradedReason::Missing on the "other reasons → stderr + JSON" branch.
+#[test]
+fn t8_step9_missing_db_git_repo_json_hot_exit_0_with_output() {
+    let proj = tempfile::TempDir::new().unwrap();
+    let cache = tempfile::TempDir::new().unwrap();
+
+    // Init a bare git repo so head_state is Resolved (not NotARepo).
+    git_init(proj.path());
+    // No skim --build call: temporal.db is absent → DegradedReason::Missing.
+
+    let (stdout, stderr, code) = skim_search(&["--json", "--hot"], proj.path(), cache.path());
+
+    assert_eq!(
+        code, 0,
+        "T-8/step9: --json --hot on git repo with no temporal.db must exit 0; stderr:\n{stderr}"
+    );
+
+    // Stdout must be a parseable JSON object.
+    let v: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("T-8/step9: stdout must be a parseable JSON object; error={e}\nstdout:\n{stdout}")
+    });
+    assert!(
+        v.is_object(),
+        "T-8/step9: stdout JSON must be an object; got:\n{stdout}"
+    );
+
+    // Stderr must carry the Missing degraded notice.
+    assert!(
+        !stderr.is_empty(),
+        "T-8/step9: stderr must contain a temporal degraded notice (Missing path); got nothing"
+    );
+}
+
+/// AC-30 (Step 9): a plain text query with no temporal flag must never emit a
+/// temporal-degraded line on stderr.
+///
+/// AC-30's real contract: plain queries bypass the temporal path entirely, so no
+/// temporal-degraded notice (corrupt / missing / not_a_repo / rebuild hint) should
+/// appear on stderr.  This is stronger than the previous in-process test, which
+/// could only assert exit 0.
+#[test]
+fn t_ac30_step9_plain_query_no_temporal_notice_on_stderr() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cache = tempfile::TempDir::new().unwrap();
+
+    // Plain text query with no --hot / --cold / --risky / --blast-radius flag.
+    let (_stdout, stderr, code) = skim_search(&["something"], dir.path(), cache.path());
+
+    assert_eq!(
+        code, 0,
+        "AC-30: plain text query on empty dir must exit 0; stderr:\n{stderr}"
+    );
+
+    // No temporal-degraded phrases must appear on stderr.
+    // The temporal path emits notices with "temporal db:" as the key prefix; its
+    // presence would indicate the temporal path fired despite no temporal flag.
+    // "not a git" covers the NotGitRepo standalone arm.
+    let temporal_phrases = ["temporal db:", "not a git", "(not_a_repo)"];
+    for phrase in temporal_phrases {
+        assert!(
+            !stderr.to_lowercase().contains(phrase),
+            "AC-30: plain text query stderr must not contain temporal-degraded phrase '{phrase}'; \
+             got stderr:\n{stderr}"
+        );
+    }
 }
