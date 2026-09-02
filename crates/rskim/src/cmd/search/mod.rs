@@ -1770,28 +1770,28 @@ fn run_temporal_standalone(
     // 1-commit repo measures hotspot≥1, and standalone --blast-radius legitimately
     // returns 0 results even on a populated DB.
     // Cochange emptiness never borrows the shallow/empty wording (G-3).
-    if let Some(sort) = temporal_sort {
-        if temporal::dimension_is_empty(&db, sort) {
-            let u = temporal::TemporalUnavailable {
-                reason: temporal::DegradedReason::Empty,
-                detail: String::new(),
+    if let Some(sort) = temporal_sort
+        && temporal::dimension_is_empty(&db, sort)
+    {
+        let u = temporal::TemporalUnavailable {
+            reason: temporal::DegradedReason::Empty,
+            detail: String::new(),
+        };
+        let msg_str = temporal::degraded_notice(&u, "", temporal::Fallback::NoResults);
+        eprintln!("skim search: {msg_str}");
+        if json {
+            let dj = temporal::DegradedJson {
+                subsystem: "temporal",
+                reason: u.reason.as_json_str(),
+                requested: sort.flag_name().to_string(),
+                applied: "none",
+                message: msg_str,
+                remediation: u.reason.remediation(),
             };
-            let msg_str = temporal::degraded_notice(&u, "", temporal::Fallback::NoResults);
-            eprintln!("skim search: {msg_str}");
-            if json {
-                let dj = temporal::DegradedJson {
-                    subsystem: "temporal",
-                    reason: u.reason.as_json_str(),
-                    requested: sort.flag_name().to_string(),
-                    applied: "none",
-                    message: msg_str,
-                    remediation: u.reason.remediation(),
-                };
-                let msg = DegradedOnlyJson { degraded: vec![dj] };
-                println!("{}", serde_json::to_string(&msg)?);
-            }
-            return Ok(ExitCode::SUCCESS);
+            let msg = DegradedOnlyJson { degraded: vec![dj] };
+            println!("{}", serde_json::to_string(&msg)?);
         }
+        return Ok(ExitCode::SUCCESS);
     }
 
     let (output, has_more) =

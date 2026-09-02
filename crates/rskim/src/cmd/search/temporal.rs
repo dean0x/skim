@@ -1368,7 +1368,7 @@ pub(super) fn ranked_row_count(results: &[ResolvedResult], sort: TemporalSort) -
 /// - For `Hot`: annotate with hotspot scores, sort descending. Files absent
 ///   from temporal DB sort last (by path for determinism).
 /// - For `Cold`: annotate with hotspot scores, sort ascending. Files absent
-///   sort first (score 0.0).
+///   sort first (score `-1.0` sentinel).
 /// - For `Risky`: annotate with risk scores, sort descending. Files absent
 ///   sort last.
 ///
@@ -1504,6 +1504,8 @@ fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) -> usize {
 /// ordering contract — absent files sort last (score sentinel `-1.0`) and equal
 /// temporal scores tie-break by `path.cmp` — so the two query paths expose one
 /// observable sort behaviour (design decision 4 / AC-A2).
+/// This sentinel ordering governs when `ranked >= 1`; at zero coverage both arms
+/// skip the re-sort entirely, leaving the upstream order intact (AD-414-13).
 ///
 /// It operates on [`rskim_search::AstResult`] and writes the library-side
 /// [`rskim_search::TemporalAnnotation`].  The small mirror (rather than a shared

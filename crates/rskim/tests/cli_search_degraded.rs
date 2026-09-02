@@ -276,7 +276,7 @@ fn assert_no_temporal_key(json_str: &str) {
     let results = v["results"].as_array().cloned().unwrap_or_default();
     for (i, r) in results.iter().enumerate() {
         assert!(
-            r.get("temporal").map_or(true, |t| t.is_null()),
+            r.get("temporal").is_none_or(|t| t.is_null()),
             "result[{i}] must not have a 'temporal' key in degraded mode; got:\n{json_str}"
         );
     }
@@ -1367,7 +1367,7 @@ fn t38_fx_coverage_partial_and_zero_coverage() {
     let results_hot = v_hot["results"].as_array().cloned().unwrap_or_default();
     for r in &results_hot {
         let path = r["path"].as_str().unwrap_or("");
-        let has_temporal = r.get("temporal").map_or(false, |t| !t.is_null());
+        let has_temporal = r.get("temporal").is_some_and(|t| !t.is_null());
         if path.contains("bb_hot") {
             assert!(
                 has_temporal,
