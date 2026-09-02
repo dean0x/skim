@@ -1032,6 +1032,7 @@ fn v1_database_migrates_to_v2_on_reopen() {
 /// distinguish "safe to discard and recreate" from "transient lock/I/O failure"
 /// (AD-414-2).
 #[test]
+#[allow(clippy::panic)]
 fn t1_corrupt_file_returns_database_corrupt() {
     use crate::types::SearchError;
 
@@ -1061,6 +1062,7 @@ fn t1_corrupt_file_returns_database_corrupt() {
 /// The typed variant allows callers to emit an actionable message naming the
 /// exact versions without string-matching the error text (G-5 / AD-414-11).
 #[test]
+#[allow(clippy::panic)]
 fn t2_future_schema_returns_unsupported_schema_version() {
     use crate::types::SearchError;
 

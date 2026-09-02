@@ -617,6 +617,15 @@ pub(super) fn auto_refresh_if_stale(
             added,
             removed,
         } => {
+            // Non-debug notice: visible to callers that check stderr for the
+            // working-tree-changed signal (AC8 / AC7 acceptance criterion).
+            // The debug arm is kept as an additional [debug]-prefixed message;
+            // the test assertion checks for the base "working tree changed" token
+            // which is present in both.
+            eprintln!(
+                "skim search: index stale (working tree changed: \
+                 {changed} modified, {added} added, {removed} removed), refreshing…"
+            );
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: index stale — working tree changed \
