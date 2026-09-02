@@ -5,6 +5,8 @@
 //! JSON, YAML, and TOML are handled separately without tree-sitter (serde-based).
 
 pub(crate) mod json;
+#[allow(dead_code)] // wired in by the literal-boundary truncation change (#511)
+pub(crate) mod literal_scan;
 pub(crate) mod literals;
 pub(crate) mod minimal;
 pub(crate) mod pseudo;
