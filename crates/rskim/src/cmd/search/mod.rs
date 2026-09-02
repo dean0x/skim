@@ -1265,12 +1265,12 @@ struct StatsGathered {
     pre_refresh_temporal_state: &'static str,
     /// Live git HEAD resolution state for the `git_head_state` JSON key (AC-20).
     git_head_state_str: &'static str,
-    /// Staleness classification — always `Current` after the self-heal.
-    ///
-    /// Derived from [`staleness::RefreshOutcome`] in [`gather_stats`] rather than
-    /// a compile-time literal in the reporting functions (Finding [medium/architecture]
-    /// CQS fix: a reporting function must not contain a magic constant whose
-    /// "computation" is always the same value).
+    /// Staleness classification at INVOCATION TIME — the verdict from
+    /// [`staleness::check_staleness`] run before `auto_refresh_if_stale` so
+    /// `--stats --json` `.staleness` and the text `staleness` line report whether
+    /// the index was stale when the user ran the command (AC-11 /
+    /// Finding [medium/regression]: the post-heal value is always `Current` and
+    /// therefore non-informative).
     staleness_status: staleness::StalenessCheck,
     // --- Index stats from the lexical reader (post-heal) ---
     file_count: u32,
@@ -1336,24 +1336,22 @@ fn gather_stats(
         input_cost_per_mtok: None,
         session_id: None,
     };
-    let (outcome, loaded_manifest, _) = staleness::auto_refresh_if_stale(
+    // Pre-heal staleness: snapshot the invocation-time verdict BEFORE
+    // auto_refresh_if_stale runs, so --stats --json `.staleness` and the text
+    // `staleness` line reflect whether the index WAS stale when the user ran the
+    // command (AC-11 / Finding [medium/regression]).  auto_refresh_if_stale calls
+    // check_staleness internally; the extra call here is acceptable for the
+    // infrequent --stats path.  The Option<FileManifest> returned by check_staleness
+    // is discarded — auto_refresh_if_stale loads the authoritative post-heal manifest.
+    let (staleness_status, _pre_check_manifest) = staleness::check_staleness(cache_dir, root);
+
+    let (_, loaded_manifest, _) = staleness::auto_refresh_if_stale(
         root,
         cache_dir,
         &noop_analytics,
         staleness::ReanchorPolicy::Refuse,
         Some(head_state),
     )?;
-
-    // Post-heal staleness: auto_refresh_if_stale guarantees the index is current
-    // after it returns (rebuilt when stale, unchanged when already current).
-    // Derived from `outcome` rather than a compile-time literal so the compiler
-    // enforces exhaustiveness — a future RefreshOutcome variant that does NOT
-    // guarantee a current index would surface here as a compile error.
-    let staleness_status = match outcome {
-        staleness::RefreshOutcome::UpToDate
-        | staleness::RefreshOutcome::FirstBuild
-        | staleness::RefreshOutcome::Incremental => staleness::StalenessCheck::Current,
-    };
 
     // AD-414-7: opens successfully for F-Body-A/B/C after the self-heal above.
     // Only CRC-level corruption not detectable by the structural probe propagates
