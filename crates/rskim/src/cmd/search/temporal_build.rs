@@ -28,8 +28,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
     COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, HistoryResult, HotspotRow,
-    MIN_COCHANGE_JACCARD, RiskRow, TemporalDb, TemporalMetadata,
+    MIN_COCHANGE_JACCARD, RiskRow, SearchError, TemporalDb, TemporalMetadata,
 };
+
+use super::temporal::{DegradedReason, Fallback, TemporalUnavailable, degraded_notice};
 
 // ============================================================================
 // Constants
@@ -604,6 +606,12 @@ pub(super) fn rebuild_temporal_with_source(
         )
     };
 
+    // AD-414-9: capture pre-ghost-filter row counts so the zero-row notice (below,
+    // at the sync success arm) can name the STAGE that zeroed the data.
+    // hotspot_rows is the representative slice (hotspot and risk are computed from
+    // the same source and reach zero together; cochange can independently be zero).
+    let pre_ghost_hotspot = hotspot_rows.len();
+
     // ── Build-time ghost filter (AD-408-1 / AD-408-5) ────────────────────────
     // Applied on freshly-computed rows *before* `db.sync` persists them so the
     // prior DB survives on failure and the self-heal invariant holds (ADR-006).
@@ -682,24 +690,89 @@ pub(super) fn rebuild_temporal_with_source(
     // the same poll interval, and the same deadline (applies ADR-006).
     let _lock = super::build_lock::acquire("skim search", cache_dir)?;
 
+    // SE-1: the open-failure loud notice fires only on explicit build/rebuild/update
+    // (reanchor == Allow) — never on a plain lexical query's background refresh.
+    // Explicit build arms always pass ReanchorPolicy::Allow; query-triggered
+    // auto-refreshes pass Refuse.  This is the correct SE-1 proxy because the
+    // UnsupportedSchemaVersion case (the primary consumer of loudness) is invisible
+    // to temporal_db_is_stale and therefore only reachable via explicit build arms.
+    let is_loud = reanchor == super::staleness::ReanchorPolicy::Allow;
+
     let db_path = cache_dir.join("temporal.db");
     let db = match TemporalDb::open(&db_path) {
         Ok(d) => d,
-        Err(e) => {
-            // D5 + Finding 2 backoff: TemporalDb::open failed — write a sentinel
-            // so subsequent queries skip the rebuild for this HEAD.  Without this,
-            // temporal_db_is_stale returns true forever (no temporal.db → stale →
-            // rebuild → open fails again → loop).  The sentinel is best-effort; if
-            // the cache directory is also unwritable the loop continues until HEAD
-            // advances, which is acceptable degradation (D5).
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search [debug]: failed to open temporal.db: {e} — \
-                     writing build-backoff sentinel to prevent retry loop",
-                );
+        // AD-414-3: DatabaseCorrupt is the ONLY variant that licenses deleting
+        // on-disk state.  Discard, then exactly ONE re-open attempt — never a loop.
+        Err(SearchError::DatabaseCorrupt(m)) => {
+            eprintln!("skim search: temporal.db was corrupt ({m}) — discarding and rebuilding it");
+            match std::fs::remove_file(&db_path) {
+                Ok(()) => {
+                    // SE-3: sidecars only after a SUCCESSFUL main unlink.  Removing
+                    // them after a failed unlink can strip a still-valid DB's WAL
+                    // under a concurrent reader (.skim-build.lock serialises writers).
+                    for sidecar in ["temporal.db-wal", "temporal.db-shm"] {
+                        let _ = std::fs::remove_file(cache_dir.join(sidecar));
+                    }
+                }
+                Err(e) => {
+                    // AC-29: loud, non-debug-gated; names the absolute path and
+                    // gives an actionable manual-deletion instruction.
+                    eprintln!(
+                        "skim search: could not delete the corrupt temporal.db at {} ({e}) — \
+                         delete this file manually, then re-run 'skim search --rebuild'",
+                        db_path.display()
+                    );
+                    return Ok(()); // file left byte-unchanged
+                }
             }
+            match TemporalDb::open(&db_path) {
+                // EXACTLY ONE retry (AD-414-3) — never a loop.
+                Ok(d) => d,
+                Err(e2) => {
+                    eprintln!(
+                        "skim search: temporal.db could not be recreated after discard ({e2}) \
+                         — delete {} manually",
+                        db_path.display()
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        Err(other) => {
+            // SE-1: loud ONLY on temporal-consuming or explicit build/stats
+            // invocations; otherwise debug-gated so a plain lexical query does not
+            // grow a permanent stderr line.
+            //
+            // The loud text is built by `degraded_notice` from the CLASSIFIED reason
+            // (UnsupportedSchemaVersion → UnsupportedVersion, everything else →
+            // Unreadable), NEVER from `{other}` alone.  AD-414-11: the
+            // UnsupportedSchemaVersion case is invisible to temporal_db_is_stale,
+            // so this arm is the only path that can tell --build/--rebuild which
+            // version was found, which is supported, and that upgrading (not
+            // deleting) is the remedy.  AC-19(b) forbids cause substrings outside
+            // the degraded_notice builder.
+            let (reason, detail) = match other {
+                SearchError::UnsupportedSchemaVersion { found, supported } => (
+                    DegradedReason::UnsupportedVersion,
+                    format!("schema version {found}, supported {supported}"),
+                ),
+                ref e => (DegradedReason::Unreadable, e.to_string()),
+            };
+            let u = TemporalUnavailable { reason, detail };
+            let notice = degraded_notice(&u, "", Fallback::NoResults);
+            if is_loud {
+                eprintln!("skim search: {notice}");
+            } else if crate::debug::is_debug_enabled() {
+                eprintln!("skim search [debug]: temporal open failed — {notice}");
+            }
+            // D5 + Finding 2 backoff: write the sentinel so subsequent queries
+            // skip the rebuild for this HEAD on Unreadable errors.  Best-effort;
+            // if the cache dir is also unwritable the loop continues until HEAD
+            // advances (D5).  UnsupportedSchemaVersion leaves temporal.db
+            // byte-for-byte unchanged (R1 contract); the sentinel prevents an
+            // infinite retry without touching the DB.
             let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
-            return Ok(());
+            return Ok(()); // temporal.db left untouched
         }
     };
 
@@ -713,7 +786,11 @@ pub(super) fn rebuild_temporal_with_source(
         record_temporal_anchor(db, root, &ghost_root, reanchor);
     };
 
-    match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head) {
+    // is_shallow from parse_history metadata (AD-414-14): recorded via sync() so
+    // Check 3 in temporal_db_is_stale can detect a shallow→full transition.
+    let is_shallow = risk_history.metadata.is_shallow;
+
+    match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head, is_shallow) {
         Ok(()) => {
             on_sync_ok(&db);
             if crate::debug::is_debug_enabled() {
@@ -725,8 +802,52 @@ pub(super) fn rebuild_temporal_with_source(
                     head.get(..8).unwrap_or(head),
                 );
             }
+            // AD-414-9: zero-row build notice — one stderr line, NOT debug-gated,
+            // naming the STAGE that produced zero data.  Derived from captured
+            // pre-/post-ghost-filter counts plus risk_history.metadata.is_shallow.
+            // AC-18 guard (E-13): a healthy 1-commit repo always has hotspot rows,
+            // so this fires only in genuinely degraded states.
+            if hotspot_rows.is_empty() && risk_rows.is_empty() && cochange_rows.is_empty() {
+                let notice = if risk_history.commits.is_empty() {
+                    // Case (i): no commits at all — empty history.
+                    // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
+                    let u = TemporalUnavailable {
+                        reason: DegradedReason::Empty,
+                        detail: String::new(),
+                    };
+                    degraded_notice(&u, "", Fallback::NoResults)
+                } else if pre_ghost_hotspot == 0 && is_shallow {
+                    // Case (ii): commits present but all diffs failed under a
+                    // shallow clone (changed_files == [] for every commit).
+                    // Shallow wording is permitted only when is_shallow is true.
+                    let u = TemporalUnavailable {
+                        reason: DegradedReason::Empty,
+                        detail: "shallow".to_string(),
+                    };
+                    degraded_notice(&u, "", Fallback::NoResults)
+                } else if pre_ghost_hotspot > 0 {
+                    // Case (iii): rows were computed but the ghost filter dropped
+                    // all of them (files no longer on disk at the indexed root).
+                    // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
+                    format!(
+                        "temporal data built 0 rows — all {pre_ghost_hotspot} computed \
+                         rows were excluded by the on-disk ghost filter (files not \
+                         present on disk at the indexed root); \
+                         run 'skim search --rebuild'"
+                    )
+                } else {
+                    // Fallback: commits present but no diffs extractable and
+                    // is_shallow is false — treat as case (i) (no useful history).
+                    let u = TemporalUnavailable {
+                        reason: DegradedReason::Empty,
+                        detail: String::new(),
+                    };
+                    degraded_notice(&u, "", Fallback::NoResults)
+                };
+                eprintln!("skim search: {notice}");
+            }
         }
-        Err(rskim_search::SearchError::CapacityExceeded(msg)) => {
+        Err(SearchError::CapacityExceeded(msg)) => {
             // Too many rows (>500k) — degrade gracefully (D5).
             // Finding 2 backoff: try an empty-row sync so META_GIT_HEAD is written
             // and temporal_db_is_stale returns false on subsequent queries.
@@ -739,7 +860,7 @@ pub(super) fn rebuild_temporal_with_source(
                      attempting empty-row fallback sync to prevent retry loop",
                 );
             }
-            if db.sync(&[], &[], &[], head).is_ok() {
+            if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
                 let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
@@ -756,7 +877,7 @@ pub(super) fn rebuild_temporal_with_source(
                      attempting empty-row fallback sync to prevent retry loop",
                 );
             }
-            if db.sync(&[], &[], &[], head).is_ok() {
+            if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
                 let _ = std::fs::write(&backoff_sentinel, head.as_bytes());

@@ -371,7 +371,7 @@ fn sync_rejects_over_capacity() {
             changes_90d: 0,
         })
         .collect();
-    let err = db.sync(&big, &[], &[], "head").unwrap_err();
+    let err = db.sync(&big, &[], &[], "head", false).unwrap_err();
     assert!(matches!(err, SearchError::CapacityExceeded(_)));
 }
 

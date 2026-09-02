@@ -2376,3 +2376,715 @@ fn test_toplevel_root_rows_are_byte_identical_to_pre_change() {
         foo_partners
     );
 }
+
+// ============================================================================
+// T-9 — Corrupt DB: discard + exactly-one-retry → rebuilt and populated
+// ============================================================================
+
+/// T-9 (AD-414-3): When `temporal.db` is structurally corrupt (SQLITE_NOTADB),
+/// `rebuild_temporal_with_source` must:
+/// 1. Print a non-debug-gated notice (AC-14).
+/// 2. Delete the corrupt file (SE-3 main-first rule).
+/// 3. Attempt exactly ONE re-open (never a loop) to create a fresh DB.
+/// 4. Populate the new DB with the computed rows.
+/// 5. Return `Ok(())`.
+///
+/// Discriminating: the rebuilt temporal.db is openable and contains hotspot rows
+/// for the source files; the backoff sentinel is NOT written (recovery succeeded).
+///
+/// PF-012: corrupt fixture = `0xAB × 1024` bytes (deterministic, not /dev/urandom).
+#[test]
+fn test_corrupt_db_discarded_and_rebuilt() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // PF-012: deterministic corrupt fixture (SQLITE_NOTADB when opened).
+    let corrupt_bytes = vec![0xABu8; 1024];
+    std::fs::write(cache_dir.join("temporal.db"), &corrupt_bytes)
+        .expect("write corrupt temporal.db");
+
+    // Create "a.rs" on disk at the root so the ghost filter does not drop the row.
+    std::fs::write(dir.path().join("a.rs"), b"fn a() {}")
+        .expect("write a.rs for ghost-filter anchor");
+
+    // FixedSource: two commits each touching a.rs → produces a hotspot row.
+    let history = HistoryResult {
+        commits: vec![
+            make_commit("aaa00001", 1_000_000, "feat: initial", &["a.rs"]),
+            make_commit("aaa00002", 1_000_001, "feat: update", &["a.rs"]),
+        ],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 2,
+        },
+    };
+    let src = FixedSource { history };
+
+    let fake_head = "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "T-9: rebuild_temporal_with_source must return Ok(()) after corrupt DB discard; \
+         got {result:?}"
+    );
+
+    // Discriminating: temporal.db must be openable (fresh DB, not still corrupt).
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path)
+        .expect("T-9: temporal.db must be openable after corrupt-discard rebuild");
+
+    // Discriminating: the rebuilt DB must contain the computed rows.
+    let hotspots = db.top_hotspots(20).expect("T-9: top_hotspots must succeed");
+    assert!(
+        hotspots.iter().any(|r| r.file_path == "a.rs"),
+        "T-9: rebuilt temporal.db must contain a hotspot row for a.rs; \
+         got rows: {:?}",
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // Backoff sentinel must NOT be written (recovery succeeded, no unread failure).
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "T-9: backoff sentinel must not be written when corrupt DB recovery succeeds"
+    );
+}
+
+// ============================================================================
+// T-10 — Future-schema DB: byte-unchanged + backoff sentinel written
+// ============================================================================
+
+/// T-10 (AD-414-11): When `temporal.db` has `user_version > CURRENT_VERSION`
+/// (written by a future binary), `rebuild_temporal_with_source` must:
+/// 1. Leave `temporal.db` byte-for-byte unchanged (R1 contract).
+/// 2. Classify the error as `UnsupportedVersion` (not `DatabaseCorrupt`).
+/// 3. Write the backoff sentinel so subsequent queries skip the retry.
+/// 4. Return `Ok(())`.
+///
+/// Discriminating: the sentinel is present with the expected HEAD, and the DB
+/// still has `user_version = 99` — the file was not modified.
+#[test]
+fn test_future_schema_db_byte_unchanged_and_backoff_written() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a well-formed SQLite file with user_version = 99 (> CURRENT_VERSION 2).
+    // TemporalDb::open reads user_version first, so any valid SQLite header triggers
+    // the UnsupportedSchemaVersion path without needing a full schema.
+    let db_path = cache_dir.join("temporal.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)
+            .expect("T-10: create sqlite file for future-schema fixture");
+        conn.execute_batch("PRAGMA user_version = 99;")
+            .expect("T-10: set user_version = 99");
+    } // connection dropped here (file flushed)
+
+    let fake_head = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &CountingSource::new_empty(),
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow, // explicit build: SE-1 loud
+    );
+    assert!(
+        result.is_ok(),
+        "T-10: rebuild_temporal_with_source must return Ok(()) on future-schema DB; \
+         got {result:?}"
+    );
+
+    // Discriminating: temporal.db must still have user_version = 99 (byte-unchanged).
+    {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("T-10: open future-schema DB for version verification");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("T-10: read user_version");
+        assert_eq!(
+            version, 99,
+            "T-10: temporal.db must retain user_version = 99 (R1: byte-unchanged)"
+        );
+    }
+
+    // Discriminating: backoff sentinel must be written with the expected HEAD.
+    let sentinel_path = cache_dir.join("temporal.db.build_backoff");
+    assert!(
+        sentinel_path.exists(),
+        "T-10: backoff sentinel must be written after UnsupportedSchemaVersion"
+    );
+    let sentinel_content = std::fs::read(&sentinel_path).expect("T-10: read sentinel");
+    assert_eq!(
+        sentinel_content,
+        fake_head.as_bytes(),
+        "T-10: backoff sentinel must contain the current HEAD bytes"
+    );
+}
+
+// ============================================================================
+// T-16 — FX-FAKE-SOURCE: zero-row build notice for all three causes
+// ============================================================================
+
+/// T-16(i): FX-FAKE-SOURCE with zero commits → zero-row notice, Case (i).
+///
+/// When `parse_history` returns zero commits (empty history), the rebuilt
+/// `temporal.db` must have `META_GIT_HEAD` set so `temporal_db_is_stale` returns
+/// false on the next query (LOCKED DECISION 2026-06-24 / Finding 2).
+///
+/// AC-16 guard: the zero-row notice for Case (i) must NOT contain "shallow" or
+/// "unshallow" — it fires because there are no commits, not because of shallow
+/// clone state.  DB state is the discriminating assertion; stderr text is
+/// indirectly constrained by the `degraded_notice` builder used (DegradedReason::Empty,
+/// detail = "").
+///
+/// Note: all three T-16 variants exercise `sync(is_shallow=false/true)` and
+/// confirm that META_IS_SHALLOW is written correctly.
+#[test]
+fn test_t16_case_i_zero_commits_writes_head_not_shallow() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Case (i): zero commits, is_shallow = false.
+    let history = HistoryResult {
+        commits: vec![],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 0,
+        },
+    };
+    let src = FixedSource { history };
+
+    let fake_head = "cccc3333cccc3333cccc3333cccc3333cccc3333";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "T-16(i): rebuild must return Ok(()) on zero-commit history; got {result:?}"
+    );
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path)
+        .expect("T-16(i): temporal.db must be openable after zero-commit rebuild");
+
+    // META_GIT_HEAD must be set (prevents retry loop).
+    let stored_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .expect("T-16(i): get_meta must not fail")
+        .expect("T-16(i): META_GIT_HEAD must be present");
+    assert_eq!(
+        stored_head, fake_head,
+        "T-16(i): META_GIT_HEAD must equal the passed head"
+    );
+
+    // META_IS_SHALLOW must be "0" (is_shallow was false).
+    let stored_shallow = db
+        .get_meta(rskim_search::META_IS_SHALLOW)
+        .expect("T-16(i): get_meta(META_IS_SHALLOW) must not fail")
+        .expect("T-16(i): META_IS_SHALLOW must be present after sync");
+    assert_eq!(
+        stored_shallow, "0",
+        "T-16(i): META_IS_SHALLOW must be '0' when history is not shallow"
+    );
+
+    // No hotspot rows (zero commits).
+    let hotspots = db
+        .top_hotspots(20)
+        .expect("T-16(i): top_hotspots must succeed");
+    assert!(
+        hotspots.is_empty(),
+        "T-16(i): temporal.db must have zero hotspot rows on zero-commit history; \
+         got {} rows",
+        hotspots.len()
+    );
+}
+
+/// T-16(ii): FX-FAKE-SOURCE with `is_shallow=true` + no changed files → Case (ii).
+///
+/// When parse_history reports a shallow clone with commits that have no
+/// changed_files (common in shallow-fetch scenarios where diff extraction fails),
+/// `pre_ghost_hotspot == 0` and the shallow-wording notice fires.
+///
+/// Discriminating: `META_IS_SHALLOW = "1"` is written by `sync()` (AD-414-14),
+/// confirming the shallow state was correctly threaded from metadata through to
+/// the DB.  This is also the data that Check 3 in `temporal_db_is_stale` uses.
+#[test]
+fn test_t16_case_ii_shallow_no_changed_files_writes_shallow_meta() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Case (ii): one commit present but changed_files is empty (shallow-fetch).
+    // pre_ghost_hotspot == 0 and is_shallow == true → Case (ii) fires.
+    let history = HistoryResult {
+        commits: vec![make_commit(
+            "dddd0001",
+            1_000_000,
+            "feat: initial (shallow)",
+            &[], // no changed files — typical in shallow fetches where diff extraction fails
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 1,
+        },
+    };
+    let src = FixedSource { history };
+
+    let fake_head = "dddd4444dddd4444dddd4444dddd4444dddd4444";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "T-16(ii): rebuild must return Ok(()) on shallow history with no diffs; got {result:?}"
+    );
+
+    let db_path = cache_dir.join("temporal.db");
+    let db =
+        rskim_search::TemporalDb::open(&db_path).expect("T-16(ii): temporal.db must be openable");
+
+    // Discriminating: META_IS_SHALLOW must be "1" (AD-414-14, sync() writes it).
+    let stored_shallow = db
+        .get_meta(rskim_search::META_IS_SHALLOW)
+        .expect("T-16(ii): get_meta(META_IS_SHALLOW) must not fail")
+        .expect("T-16(ii): META_IS_SHALLOW must be present");
+    assert_eq!(
+        stored_shallow, "1",
+        "T-16(ii): META_IS_SHALLOW must be '1' when history is shallow (AD-414-14)"
+    );
+
+    // No hotspot rows (no changed files in any commit).
+    let hotspots = db
+        .top_hotspots(20)
+        .expect("T-16(ii): top_hotspots must succeed");
+    assert!(
+        hotspots.is_empty(),
+        "T-16(ii): temporal.db must have zero hotspot rows when all commits have no diffs"
+    );
+
+    // META_GIT_HEAD must be set (prevents retry loop).
+    let stored_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .expect("T-16(ii): get_meta must not fail")
+        .expect("T-16(ii): META_GIT_HEAD must be present");
+    assert_eq!(
+        stored_head, fake_head,
+        "T-16(ii): META_GIT_HEAD must equal the passed head"
+    );
+}
+
+/// T-16(iii): FX-FAKE-SOURCE with phantom paths → ghost filter drops all → Case (iii).
+///
+/// When parse_history returns commits that touch files NOT present on disk at the
+/// indexed root, `pre_ghost_hotspot > 0` (rows were computed) but the ghost filter
+/// drops all of them. The Case (iii) notice fires.
+///
+/// Discriminating: temporal.db has zero hotspot rows (all dropped by ghost filter)
+/// but META_GIT_HEAD is set (LOCKED DECISION prevents retry loop), and the
+/// backoff sentinel is NOT written (sync succeeded — the zero-rows DB is written
+/// successfully, which is the correct outcome for an empty ghost-filter result).
+#[test]
+fn test_t16_case_iii_ghost_filter_drops_all_rows_writes_head() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Case (iii): commit touches "phantom.rs" which does NOT exist on disk.
+    // pre_ghost_hotspot == 1 (one hotspot row computed), but ghost filter drops it.
+    let history = HistoryResult {
+        commits: vec![
+            make_commit("eeee0001", 1_000_000, "feat: initial", &["phantom.rs"]),
+            make_commit("eeee0002", 1_000_001, "feat: update", &["phantom.rs"]),
+        ],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 2,
+        },
+    };
+    let src = FixedSource { history };
+
+    // "phantom.rs" is NOT created on disk — ghost filter will drop the row.
+
+    let fake_head = "eeee5555eeee5555eeee5555eeee5555eeee5555";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "T-16(iii): rebuild must return Ok(()) when ghost filter drops all rows; got {result:?}"
+    );
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path)
+        .expect("T-16(iii): temporal.db must be openable after ghost-filter-zero rebuild");
+
+    // META_GIT_HEAD must be set (LOCKED DECISION — prevents retry loop).
+    let stored_head = db
+        .get_meta(rskim_search::META_GIT_HEAD)
+        .expect("T-16(iii): get_meta must not fail")
+        .expect("T-16(iii): META_GIT_HEAD must be present");
+    assert_eq!(
+        stored_head, fake_head,
+        "T-16(iii): META_GIT_HEAD must equal the passed head"
+    );
+
+    // Discriminating: zero hotspot rows (ghost filter dropped all).
+    let hotspots = db
+        .top_hotspots(20)
+        .expect("T-16(iii): top_hotspots must succeed");
+    assert!(
+        hotspots.is_empty(),
+        "T-16(iii): ghost filter must drop all rows when no source files exist on disk; \
+         got {} rows: {:?}",
+        hotspots.len(),
+        hotspots.iter().map(|r| &r.file_path).collect::<Vec<_>>()
+    );
+
+    // Backoff sentinel must NOT be written (sync succeeded with zero rows — not a failure).
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "T-16(iii): backoff sentinel must not be written when sync succeeds with zero rows"
+    );
+}
+
+// ============================================================================
+// T-22 / T-29 — Corrupt DB + chmod 500: Ok(()), sidecars preserved (SE-3)
+// ============================================================================
+
+/// T-22 (AD-414-3 bounded retry) / T-29 (AC-29 / SE-3 sidecar preservation):
+/// When `temporal.db` is corrupt AND the cache directory is not writable (chmod 500),
+/// `remove_file` fails (EACCES). The function must:
+/// 1. Print the non-debug-gated AC-29 notice (actionable manual-deletion message).
+/// 2. Return `Ok(())` — never panic or propagate the permission error.
+/// 3. Leave `temporal.db` byte-unchanged (SE-3 main-first rule — no partial delete).
+/// 4. Leave `temporal.db-wal` and `temporal.db-shm` byte-unchanged (SE-3 sidecar
+///    rule: sidecars are removed ONLY after a SUCCESSFUL main unlink).
+///
+/// The "bounded retry" property (T-22): the function CANNOT attempt a second
+/// `TemporalDb::open` because it returned early in the unlink-failure arm —
+/// there is exactly zero additional opens after the failed unlink.
+///
+/// Discriminating: all three files are present after the call; the backoff
+/// sentinel is NOT written (the corrupt-undelete arm returns before the sentinel
+/// write that lives in the `Err(other)` arm).
+///
+/// Unix-only (chmod 500 is a POSIX concept; Windows ACLs work differently).
+#[test]
+#[cfg(unix)]
+fn test_corrupt_db_undelete_fails_returns_ok_sidecars_preserved() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Pre-create .skim-build.lock so lock acquisition succeeds even with chmod 500.
+    // On POSIX, opening an EXISTING file for write (O_CREAT|O_WRONLY on an existing
+    // path) does NOT require directory write permission — only directory search (x)
+    // permission is needed, which chmod 500 retains.
+    std::fs::write(cache_dir.join(".skim-build.lock"), b"")
+        .expect("T-22/T-29: pre-create .skim-build.lock");
+
+    // PF-012: deterministic corrupt fixture.
+    let corrupt_bytes = vec![0xABu8; 1024];
+    std::fs::write(cache_dir.join("temporal.db"), &corrupt_bytes)
+        .expect("T-22/T-29: write corrupt temporal.db");
+
+    // Sidecar files — must NOT be removed when main unlink fails (SE-3).
+    std::fs::write(cache_dir.join("temporal.db-wal"), b"wal-sentinel-data")
+        .expect("T-22/T-29: write temporal.db-wal");
+    std::fs::write(cache_dir.join("temporal.db-shm"), b"shm-sentinel-data")
+        .expect("T-22/T-29: write temporal.db-shm");
+
+    // chmod 500 (r-x------): directory is readable and searchable, but not writable.
+    // Attempts to create new files or delete existing files will fail with EACCES.
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("T-22/T-29: chmod 500 cache_dir");
+
+    let result = rebuild_temporal_with_source(
+        &CountingSource::new_empty(),
+        dir.path(),
+        &cache_dir,
+        "ffff6666ffff6666ffff6666ffff6666ffff6666",
+        super::current_epoch_secs(),
+        ReanchorPolicy::Allow,
+    );
+
+    // Restore permissions BEFORE any assertions so tempdir cleanup can succeed
+    // regardless of assertion failures.
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("T-22/T-29: restore cache_dir permissions");
+
+    // T-22: returns Ok(()) — bounded retry (zero re-opens after failed unlink).
+    assert!(
+        result.is_ok(),
+        "T-22: rebuild_temporal_with_source must return Ok(()) when corrupt DB unlink fails; \
+         got {result:?}"
+    );
+
+    // AC-29 / T-29: corrupt temporal.db must still be present (SE-3 main-first rule).
+    assert!(
+        cache_dir.join("temporal.db").exists(),
+        "T-29/AC-29: temporal.db must be byte-unchanged when unlink fails (SE-3)"
+    );
+    let remaining_bytes =
+        std::fs::read(cache_dir.join("temporal.db")).expect("T-29: read temporal.db");
+    assert_eq!(
+        remaining_bytes,
+        vec![0xABu8; 1024],
+        "T-29/AC-29: temporal.db content must be the original corrupt bytes (byte-unchanged)"
+    );
+
+    // SE-3: sidecars must still be present (never removed when main unlink fails).
+    assert!(
+        cache_dir.join("temporal.db-wal").exists(),
+        "T-29/SE-3: temporal.db-wal must be preserved when main unlink fails"
+    );
+    assert!(
+        cache_dir.join("temporal.db-shm").exists(),
+        "T-29/SE-3: temporal.db-shm must be preserved when main unlink fails"
+    );
+
+    // Backoff sentinel must NOT be written (corrupt-undelete arm returns before
+    // the sentinel write in the Err(other) arm).
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "T-22/T-29: backoff sentinel must not be written in the corrupt-undelete arm"
+    );
+}
+
+// ============================================================================
+// T-26 — LOCKED DECISION: empty DB with valid HEAD is not stale
+// ============================================================================
+
+/// T-26 (LOCKED DECISION 2026-06-24): After `rebuild_temporal_with_source` on a
+/// repo with zero commits, the resulting `temporal.db` must be non-stale — i.e.,
+/// `temporal_db_is_stale` returns `false` on the next call.
+///
+/// This is the regression guard for the LOCKED DECISION: the empty-row DB with
+/// `META_GIT_HEAD` set prevents the per-query rebuild loop.  Without the decision,
+/// an early-return before `TemporalDb::open` would leave `temporal.db` absent or
+/// without `META_GIT_HEAD`, causing `temporal_db_is_stale` to return `true` on
+/// every subsequent query — a rebuild loop.
+///
+/// Discriminating: `temporal_db_is_stale(cache_dir, head, None)` returns `false`
+/// after the call.  This is the first test in `temporal_build_tests.rs` that
+/// directly asserts the staleness check (vs. the comment in
+/// `test_rebuild_temporal_empty_history_writes_head_and_data_version`).
+#[test]
+fn test_t26_empty_db_with_head_is_not_stale() {
+    use super::super::staleness::temporal_db_is_stale;
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = CountingSource::new_empty(); // zero commits
+    let fake_head = "gggg7777gggg7777gggg7777gggg7777gggg7777";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "T-26: rebuild must return Ok(()) on zero-commit source; got {result:?}"
+    );
+
+    // Discriminating: temporal_db_is_stale must return false (LOCKED DECISION guard).
+    // If this assertion fails, the rebuild loop from Finding 2 has been reintroduced.
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, None),
+        "T-26 (LOCKED DECISION): temporal_db_is_stale must return false after a rebuild \
+         that produced zero rows — if it returns true, the per-query rebuild loop is back"
+    );
+
+    // Sanity: same HEAD, different call — still non-stale (idempotent).
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, None),
+        "T-26: temporal_db_is_stale must be stable across two calls with the same HEAD"
+    );
+
+    // Sanity: different HEAD is stale (new commits arrived).
+    let different_head = "hhhh8888hhhh8888hhhh8888hhhh8888hhhh8888";
+    assert!(
+        temporal_db_is_stale(&cache_dir, different_head, None),
+        "T-26: temporal_db_is_stale must return true when HEAD differs"
+    );
+}
+
+// ============================================================================
+// Check 3 live test — shallow→full transition detected as stale (AD-414-14)
+// ============================================================================
+
+/// Check 3 live test (AD-414-14): After `sync()` writes `META_IS_SHALLOW = "1"`,
+/// `temporal_db_is_stale` with a `git_dir` that has no `shallow` file returns
+/// `true` (stale — a `git fetch --unshallow` has run since the last build).
+///
+/// This makes the AD-414-14 Check 3 path "live" by driving it through the full
+/// `rebuild_temporal_with_source` → `sync()` → `temporal_db_is_stale` chain
+/// rather than directly planting meta rows.
+///
+/// Two discriminating assertions:
+/// 1. With `git_dir/shallow` ABSENT → stale (shallow clone became full).
+/// 2. With `git_dir/shallow` PRESENT → not stale (still shallow, no rebuild needed).
+///
+/// The test also confirms that `META_IS_SHALLOW` is absent on a non-shallow build,
+/// so Check 3 is skipped entirely (the absent-row path is safe: false-negative
+/// means we simply don't trigger the self-heal until the next HEAD change).
+#[test]
+fn test_check3_shallow_to_full_transition_detected_as_stale() {
+    use super::super::staleness::temporal_db_is_stale;
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Simulate a shallow clone: one commit, no changed files, is_shallow = true.
+    let history = HistoryResult {
+        commits: vec![make_commit(
+            "iiii0001",
+            1_000_000,
+            "feat: initial (shallow)",
+            &[],
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 1,
+        },
+    };
+    let src = FixedSource { history };
+
+    let fake_head = "iiii9999iiii9999iiii9999iiii9999iiii9999";
+    let now = super::current_epoch_secs();
+
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+    );
+    assert!(
+        result.is_ok(),
+        "Check 3 setup: rebuild must succeed; got {result:?}"
+    );
+
+    // Verify META_IS_SHALLOW = "1" was written by sync() (AD-414-14).
+    {
+        let db_path = cache_dir.join("temporal.db");
+        let db = rskim_search::TemporalDb::open(&db_path)
+            .expect("Check 3: temporal.db must be openable");
+        let stored_shallow = db
+            .get_meta(rskim_search::META_IS_SHALLOW)
+            .expect("Check 3: get_meta must not fail")
+            .expect("Check 3: META_IS_SHALLOW must be present after shallow rebuild");
+        assert_eq!(
+            stored_shallow, "1",
+            "Check 3: META_IS_SHALLOW must be '1' for a shallow clone"
+        );
+    }
+
+    // Simulate a fake .git directory (no `shallow` file — unshallow has run).
+    let fake_git_dir = dir.path().join("fake_git");
+    std::fs::create_dir_all(&fake_git_dir).expect("Check 3: create fake_git_dir");
+
+    // Discriminating assertion 1: no `shallow` file → stale (Check 3 fires).
+    assert!(
+        temporal_db_is_stale(&cache_dir, fake_head, Some(&fake_git_dir)),
+        "Check 3 (AD-414-14): temporal_db_is_stale must return true when META_IS_SHALLOW='1' \
+         and git_dir/shallow is absent (shallow→full transition detected)"
+    );
+
+    // Discriminating assertion 2: `shallow` file exists → not stale (still shallow).
+    let shallow_file = fake_git_dir.join("shallow");
+    std::fs::write(&shallow_file, b"").expect("Check 3: create shallow sentinel");
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, Some(&fake_git_dir)),
+        "Check 3 (AD-414-14): temporal_db_is_stale must return false when META_IS_SHALLOW='1' \
+         and git_dir/shallow is present (clone is still shallow — no rebuild needed)"
+    );
+
+    // Discriminating assertion 3: when git_dir is None, Check 3 is skipped entirely
+    // (safe false-negative — the absent-row path until the next HEAD change).
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, None),
+        "Check 3 (AD-414-14): temporal_db_is_stale must return false when git_dir is None \
+         (Check 3 skipped — safe false-negative)"
+    );
+
+    // Discriminating assertion 4: a non-shallow rebuild writes META_IS_SHALLOW = "0"
+    // and Check 3 does NOT fire even when git_dir/shallow is absent.
+    let dir2 = tempdir().unwrap();
+    let cache_dir2 = dir2.path().join("cache");
+    std::fs::create_dir_all(&cache_dir2).unwrap();
+
+    let non_shallow_history = make_history(vec![]); // is_shallow = false (from make_history)
+    let src2 = FixedSource {
+        history: non_shallow_history,
+    };
+    let head2 = "jjjj0000jjjj0000jjjj0000jjjj0000jjjj0000";
+
+    rebuild_temporal_with_source(
+        &src2,
+        dir2.path(),
+        &cache_dir2,
+        head2,
+        now,
+        ReanchorPolicy::Allow,
+    )
+    .expect("Check 3 non-shallow setup: rebuild must succeed");
+
+    // META_IS_SHALLOW = "0" → Check 3 does not fire even with git_dir pointing to
+    // a dir with no shallow file.
+    let fake_git_dir2 = dir2.path().join("fake_git2");
+    std::fs::create_dir_all(&fake_git_dir2).expect("Check 3: create fake_git_dir2");
+    assert!(
+        !temporal_db_is_stale(&cache_dir2, head2, Some(&fake_git_dir2)),
+        "Check 3 (AD-414-14): temporal_db_is_stale must return false for a non-shallow DB \
+         even when git_dir/shallow is absent (META_IS_SHALLOW='0' does not trigger Check 3)"
+    );
+}
