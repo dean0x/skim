@@ -1090,11 +1090,8 @@ pub(crate) fn dispatch(
         "gradle" | "gradlew" | "make" | "mvn" | "mvnw" | "tsc" => {
             build::run(&prepend(subcommand, args), analytics)
         }
-        // "golangci" kept for backward compat with old wrapper installs; canonical name is now
-        // "golangci-lint" (matches the real binary). The rewrite surface rewrites to
-        // `skim golangci-lint` after the D1 fix; old wrappers still dispatch "golangci".
-        "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci" | "golangci-lint"
-        | "mypy" | "oxlint" | "prettier" | "rubocop" | "ruff" | "rustfmt" | "swiftlint" => {
+        "biome" | "black" | "dprint" | "eslint" | "gofmt" | "golangci-lint" | "mypy" | "oxlint"
+        | "prettier" | "rubocop" | "ruff" | "rustfmt" | "swiftlint" => {
             lint::run(&prepend(subcommand, args), analytics)
         }
         "npm" | "pip" | "pnpm" | "yarn" => pkg::run(&prepend(subcommand, args), analytics),

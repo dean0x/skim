@@ -1,7 +1,7 @@
 //! Lint handler — dispatches to linter parsers (#104, #116, #118, #133)
 //!
 //! Called via flat dispatch: `skim <linter> [args...]`. Supported linters:
-//! `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci`, `mypy`,
+//! `biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci-lint`, `mypy`,
 //! `oxlint`, `prettier`, `rubocop`, `ruff`, `rustfmt`, `swiftlint`.
 
 pub(crate) mod biome;
@@ -31,8 +31,7 @@ const KNOWN_LINTERS: &[&str] = &[
     "dprint",
     "eslint",
     "gofmt",
-    "golangci",      // backward-compat alias for old wrapper installs
-    "golangci-lint", // canonical name (D1: matches real binary and KNOWN_SUBCOMMANDS)
+    "golangci-lint",
     "mypy",
     "oxlint",
     "prettier",
@@ -77,9 +76,7 @@ pub(crate) fn run(
         "dprint" => dprint::run(linter_args, &ctx),
         "eslint" => eslint::run(linter_args, &ctx),
         "gofmt" => gofmt::run(linter_args, &ctx),
-        // "golangci" kept for backward compat with old `~/.skim/bin/golangci` installs.
-        // New installations use "golangci-lint" (canonical binary name; D1 fix).
-        "golangci" | "golangci-lint" => golangci::run(linter_args, &ctx),
+        "golangci-lint" => golangci::run(linter_args, &ctx),
         "mypy" => mypy::run(linter_args, &ctx),
         "oxlint" => oxlint::run(linter_args, &ctx),
         "prettier" => prettier::run(linter_args, &ctx),
@@ -120,7 +117,7 @@ fn print_help() {
     println!("  skim dprint check .       Run dprint check");
     println!("  skim eslint .             Run eslint");
     println!("  skim gofmt ./...          Run gofmt -l");
-    println!("  skim golangci run ./...   Run golangci-lint");
+    println!("  skim golangci-lint run ./...   Run golangci-lint");
     println!("  skim mypy src/            Run mypy");
     println!("  skim oxlint src/          Run oxlint");
     println!("  skim prettier .           Run prettier --check");
