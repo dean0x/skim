@@ -275,7 +275,8 @@ enum PipelineSelection {
 /// This is a pure function so that tests can assert the selection logic
 /// without constructing stages, spawning threads, or reading env vars.
 ///
-/// `passthrough_env` is `true` when `SKIM_PASSTHROUGH == "1"`.
+/// `passthrough_env` is `true` when `SKIM_PASSTHROUGH` is set to a truthy value
+/// (`1`, `true`, or `yes`, case-insensitive) — see [`crate::cmd::is_passthrough_mode`].
 /// `no_cache_align` is `true` when `--no-cache-align` was passed.
 ///
 /// `passthrough_env` takes priority: if it is `true`, the result is always
@@ -409,10 +410,12 @@ pub(crate) fn run(
     let align_handle: Option<std::thread::JoinHandle<()>>;
     let align_done_rx: Option<crossbeam_channel::Receiver<()>>;
 
-    let selection = select_pipeline(
-        std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1"),
-        parsed.no_cache_align,
-    );
+    // Use the shared `is_passthrough_mode()` helper rather than a literal
+    // `SKIM_PASSTHROUGH == "1"` comparison: every other passthrough gate in the CLI
+    // (dispatch, file, execution, test runners, hook) routes through it, and a bare
+    // equality check silently ignores the `true` / `yes` spellings the helper accepts —
+    // so `SKIM_PASSTHROUGH=true` would bypass compression everywhere but the proxy.
+    let selection = select_pipeline(super::is_passthrough_mode(), parsed.no_cache_align);
     let pipeline = match selection {
         PipelineSelection::Identity | PipelineSelection::BlockRouterOnly => {
             // Identity: SKIM_PASSTHROUGH=1 → no compression.
