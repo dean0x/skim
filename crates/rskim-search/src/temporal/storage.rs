@@ -272,13 +272,14 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// - [`SearchError::Database`] if the file cannot be opened, the WAL pragma
-    ///   fails, or the migrations encounter an unexpected SQLite error.
     /// - [`SearchError::DatabaseCorrupt`] if the file is not a valid SQLite
     ///   database or its pages are internally inconsistent (`SQLITE_NOTADB` /
-    ///   `SQLITE_CORRUPT`).
+    ///   `SQLITE_CORRUPT`); the caller may safely discard and recreate the file.
     /// - [`SearchError::UnsupportedSchemaVersion`] if the stored
-    ///   `PRAGMA user_version` is newer than this build supports (AD-414-11).
+    ///   `PRAGMA user_version` is newer than this build supports (forward-compat
+    ///   guard, AD-414-11); the file must **not** be overwritten — upgrade skim.
+    /// - [`SearchError::Database`] for everything else, including WAL-pragma
+    ///   failure, lock-contention, and unexpected migration errors.
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path).map_err(|e| classify_sqlite_err(&e))?;
 
