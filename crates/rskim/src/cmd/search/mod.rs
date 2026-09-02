@@ -1635,7 +1635,7 @@ fn run_query(
         output.degraded.push(temporal::DegradedJson {
             subsystem: "temporal",
             reason: u.reason.as_json_str(),
-            requested: "--blast-radius".to_string(),
+            requested: "blast-radius".to_string(),
             applied: "lexical",
             message: msg,
             remediation: u.reason.remediation(),
@@ -4720,6 +4720,14 @@ mod tests {
 
         // ---- (5) Empty: temporal_state == "empty" ---------------------------
         // Restore DB then clear all rows (zero hotspot rows).
+        //
+        // Step 4 left user_version=99 in temporal.db; rebuild_temporal_with_source
+        // correctly refuses to overwrite a newer-schema DB (R1 / AD-414-11).  Delete
+        // the file (and the backoff sentinel written by that refusal) BEFORE calling
+        // --rebuild so the explicit rebuild creates a fresh schema-2 DB rather than
+        // short-circuiting on the sentinel and leaving the version-99 file in place.
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(cache_dir.join("temporal.db.build_backoff"));
         let result = run(
             &[
                 "--rebuild".to_string(),

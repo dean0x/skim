@@ -623,24 +623,29 @@ pub(super) fn resolve_blast_radius_paths(
         }
     };
 
-    // T-7/AC-7: detect an empty temporal DB (valid schema, zero hotspot rows).
-    // A valid-but-empty DB reaches this arm because open_temporal_state returns
-    // Open(db) — the Empty classification is a derived state checked here via
-    // dimension_is_empty, matching the pattern used by the temporal-sort arm in
-    // run_query and the standalone arm in run_temporal_standalone (AD-414-4).
-    if dimension_is_empty(&db, TemporalSort::Hot) {
-        let u = TemporalUnavailable {
-            reason: DegradedReason::Empty,
-            detail: String::new(),
-        };
-        let msg = degraded_notice(&u, "--blast-radius", Fallback::Lexical);
-        eprintln!("skim search: {msg}");
-        return Ok((None, Some(u)));
-    }
-
     let normalized = normalize_blast_radius_path(raw_path, root)?;
     let partners = db.cochanges_for_file(&normalized)?;
     if partners.is_empty() {
+        // T-7/AC-7: distinguish "DB is entirely empty" from "DB has data but not for
+        // this file".  Only emit the Empty degraded notice when the hotspot table is
+        // also empty — confirming the DB truly has no temporal data at all.  When the
+        // DB has hotspot rows but no co-change for this specific file, emit the
+        // non-degraded "no co-change data" message instead and proceed (blast-radius
+        // still applies the {target_file}-only filter rather than disappearing).
+        //
+        // PF-006 guard: a DB with co-change data but empty hotspot (possible in tests)
+        // reaches this branch only when the queried file has no co-change rows — the
+        // non-empty-partners path above handles it correctly without any emptiness
+        // check.
+        if dimension_is_empty(&db, TemporalSort::Hot) {
+            let u = TemporalUnavailable {
+                reason: DegradedReason::Empty,
+                detail: String::new(),
+            };
+            let msg = degraded_notice(&u, "--blast-radius", Fallback::Lexical);
+            eprintln!("skim search: {msg}");
+            return Ok((None, Some(u)));
+        }
         eprintln!("skim search: no co-change data for {raw_path:?}");
     }
     let mut allowed_paths = cochange_partner_paths(&partners, &normalized);

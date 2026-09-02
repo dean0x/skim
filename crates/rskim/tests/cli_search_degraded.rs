@@ -715,8 +715,25 @@ fn t7_blast_radius_degraded_on_empty_and_corrupt() {
     let head = git_head(&root);
     make_empty_temporal(&db_dir_empty, &head);
 
+    // FX-CORRUPT: a separate git repo with NO commits so the corrupt temporal.db
+    // cannot be auto-healed.  auto_refresh_if_stale calls try_rebuild_temporal_nonfatal
+    // which returns early on `let Some(head) = head else { return };` (no HEAD → no
+    // commits → sha() == None), leaving the corrupt file on disk.  Using the 1-commit
+    // `root` would cause auto-heal to discard and rebuild the DB from the commit history
+    // before blast-radius runs, hiding the Corrupt state the test asserts (PF-018).
+    let corrupt_dir = TempDir::new().expect("corrupt TempDir");
+    let corrupt_root = corrupt_dir.path().join("repo");
+    fs::create_dir_all(corrupt_root.join("src")).unwrap();
+    fs::write(
+        corrupt_root.join("src/zebra.rs"),
+        "fn zebra_widget() { let x = 1; }\n",
+    )
+    .unwrap();
+    git_init(&corrupt_root);
+    // Deliberately NO git_add_commit: no HEAD → no temporal rebuild possible.
+
     let cache_corrupt = TempDir::new().expect("cache TempDir");
-    build_index(&root, cache_corrupt.path());
+    build_index(&corrupt_root, cache_corrupt.path());
     let db_dir_corrupt = find_search_cache(cache_corrupt.path());
     let db_path_corrupt = db_dir_corrupt.join("temporal.db");
     make_corrupt_temporal(&db_path_corrupt);
@@ -728,7 +745,7 @@ fn t7_blast_radius_degraded_on_empty_and_corrupt() {
 
     let checks: &[(&str, &Path, &Path)] = &[
         ("empty", root.as_path(), cache_empty.path()),
-        ("corrupt", root.as_path(), cache_corrupt.path()),
+        ("corrupt", corrupt_root.as_path(), cache_corrupt.path()),
     ];
 
     for (label, proj_root, cache_path) in checks {
