@@ -59,23 +59,6 @@ pub(super) const NO_TEMPORAL_DATA_MSG: &str =
 pub(super) const HEAD_UNRESOLVED_TEMPORAL_MSG: &str = "git HEAD could not be resolved to a SHA (unborn branch, or unsupported ref \
      backend such as reftable — tracked in #481); temporal data unavailable";
 
-/// Emitted by [`temporal::degraded_notice`] for any [`staleness::HeadState::Resolved`]
-/// root that has no usable temporal data and no [`staleness::AnchorState::Differs`]
-/// mismatch.  The three covered cases are:
-///
-/// 1. **Absent DB** — `temporal.db` was never built (first run, or after
-///    `--rebuild`); `temporal::open_temporal_state` returns `Unavailable(Missing)`.
-/// 2. **Unopenable DB** — the file exists but is corrupt, schema-gated, or at an
-///    incompatible `PRAGMA user_version`; `TemporalDb::open` returns `Err`.
-/// 3. **Empty build** — `rebuild_temporal` ran successfully but the git log for
-///    the root produced zero entries (e.g. a brand-new repo with one commit and
-///    no file-change history, or a root whose entire history was ghost-filtered
-///    by AD-413-17).  Re-running with `SKIM_DEBUG=1` surfaces the internal count.
-///
-/// AD-413-8.
-pub(super) const TEMPORAL_BUILD_EMPTY_MSG: &str = "git HEAD resolved but the temporal build produced no data; \
-     re-run with `SKIM_DEBUG=1`";
-
 /// Anchor refusal prefix — temporal data on disk was built from a different
 /// repository than the one this root now resolves to.
 ///
@@ -1476,12 +1459,16 @@ fn run_query(
                         // AD-414-13 zero-coverage: enrichment ran but no result received a
                         // temporal score (e.g. all files are untracked or newly added).
                         // Skip the re-sort; preserve lexical order; emit degraded signal.
-                        let detail = format!(
-                            "0 of {} result(s) have {} data ({} lookup error(s))",
-                            cov.total,
-                            sort.flag_name(),
-                            cov.lookup_errors,
-                        );
+                        // §2.3 normative table: "{n} of {total} results have temporal data"
+                        // with the optional lookup-error clause (T-4, AC-4).
+                        let detail = if cov.lookup_errors > 0 {
+                            format!(
+                                "0 of {} results have temporal data ({} temporal lookups failed)",
+                                cov.total, cov.lookup_errors,
+                            )
+                        } else {
+                            format!("0 of {} results have temporal data", cov.total)
+                        };
                         Some(temporal::TemporalUnavailable {
                             reason: temporal::DegradedReason::NoRankedRows,
                             detail,
@@ -1516,6 +1503,10 @@ fn run_query(
         }
 
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
+        //
+        // AD-414-8: page.apply, output.total, and output.has_more remain OUTSIDE the
+        // DB-presence match arm so the widened resort_window pool is truncated on
+        // every arm including NoRankedRows, preventing S4 regression.
         //
         // AD-404-11 / D-5: capture pre-page count BEFORE page.apply so we can emit
         // the sound `has_more` terminator — replaces the unsound `len < limit`
@@ -3060,13 +3051,17 @@ mod tests {
         );
     }
 
-    /// `degraded_notice` Resolved+other branch returns TEMPORAL_BUILD_EMPTY_MSG
-    /// when the HEAD resolves and AnchorState is NOT Differs (AD-414-1).
+    /// `degraded_notice` for Empty (non-shallow, no flag) returns the §2.3
+    /// normative text — NOT the old TEMPORAL_BUILD_EMPTY_MSG (AC-2).
     ///
-    /// Finding 1/3 fix: the function is pure, so the test passes states directly.
+    /// The old assertion pinned `TEMPORAL_BUILD_EMPTY_MSG` (contained a SKIM_DEBUG
+    /// hint, not "--rebuild"), which failed AC-2.  Replaced with the §2.3 text.
     #[test]
-    fn test_degraded_notice_resolved_other_returns_build_empty() {
-        // NotAdopted → no Differs branch → TEMPORAL_BUILD_EMPTY_MSG.
+    fn test_degraded_notice_empty_non_shallow_ac2() {
+        const EMPTY_CAUSE_PREFIX: &str = "temporal data is empty (0 rows) - this repository has no commit history skim can analyse";
+        const EMPTY_REMEDY: &str = "run 'skim search --rebuild'";
+
+        // Standalone call (no flag) — returns just cause + remediation.
         let msg = temporal::degraded_notice(
             &temporal::TemporalUnavailable {
                 reason: temporal::DegradedReason::Empty,
@@ -3075,35 +3070,39 @@ mod tests {
             "",
             temporal::Fallback::Lexical,
         );
-        assert_eq!(
-            msg, TEMPORAL_BUILD_EMPTY_MSG,
-            "Resolved+NotAdopted branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg:?}"
+        assert!(
+            msg.contains(EMPTY_CAUSE_PREFIX),
+            "AC-2: Empty must contain the §2.3 cause prefix, got: {msg:?}"
         );
-        // Absent anchor also falls through to TEMPORAL_BUILD_EMPTY_MSG.
-        let msg2 = temporal::degraded_notice(
+        assert!(
+            msg.contains(EMPTY_REMEDY),
+            "AC-2: Empty must contain the --rebuild remedy, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("SKIM_DEBUG"),
+            "AC-2: Empty must NOT contain the old SKIM_DEBUG hint, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("no temporal data"),
+            "AC-7/AC-2: Empty cause must NOT contain the forbidden 'no temporal data' substring, got: {msg:?}"
+        );
+
+        // With flag — the Lexical tail is appended.
+        let msg_with_flag = temporal::degraded_notice(
             &temporal::TemporalUnavailable {
                 reason: temporal::DegradedReason::Empty,
                 detail: String::new(),
             },
-            "",
+            "--hot",
             temporal::Fallback::Lexical,
         );
-        assert_eq!(
-            msg2, TEMPORAL_BUILD_EMPTY_MSG,
-            "Resolved+Absent branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg2:?}"
+        assert!(
+            msg_with_flag.contains("--hot not applied"),
+            "AC-2(c): Empty with flag must carry 'not applied' tail, got: {msg_with_flag:?}"
         );
-        // Agrees anchor also falls through to TEMPORAL_BUILD_EMPTY_MSG.
-        let msg3 = temporal::degraded_notice(
-            &temporal::TemporalUnavailable {
-                reason: temporal::DegradedReason::Empty,
-                detail: String::new(),
-            },
-            "",
-            temporal::Fallback::Lexical,
-        );
-        assert_eq!(
-            msg3, TEMPORAL_BUILD_EMPTY_MSG,
-            "Resolved+Agrees branch must return TEMPORAL_BUILD_EMPTY_MSG, got: {msg3:?}"
+        assert!(
+            msg_with_flag.contains("lexical relevance order"),
+            "AC-2(d): Empty with flag must contain 'lexical', got: {msg_with_flag:?}"
         );
     }
 

@@ -182,7 +182,11 @@ impl DegradedReason {
     ///
     /// `detail` carries reason-specific context set by [`open_temporal_state`]
     /// or the zero-coverage path (e.g. path pair for `RepositoryMismatch`,
-    /// formatted count for `NoRankedRows`, error text for `Corrupt`/`Unreadable`).
+    /// formatted count for `NoRankedRows`, error text for `Unreadable`).
+    ///
+    /// For `Empty`, `detail == "shallow"` signals that `meta.is_shallow` is set
+    /// (written by Step 10 / Phase C2); absent row → `detail` is empty → no
+    /// shallow suffix.
     ///
     /// Reserved for Phase C1 `DegradedJson` wiring — not yet used at call sites.
     #[allow(dead_code)]
@@ -191,19 +195,15 @@ impl DegradedReason {
             // Legacy constants used verbatim (AC-19 byte-identical guards).
             Self::NotGitRepo => super::NO_TEMPORAL_DATA_MSG.to_string(),
             Self::HeadUnresolved => super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
-            Self::Empty => super::TEMPORAL_BUILD_EMPTY_MSG.to_string(),
             Self::RepositoryMismatch => {
                 format!("{} {}", super::SUBDIR_ROOT_TEMPORAL_MSG, detail)
             }
-            Self::Missing => "no temporal data".to_string(),
-            Self::Corrupt => {
-                if detail.is_empty() {
-                    "temporal.db is corrupt".to_string()
-                } else {
-                    format!("temporal.db is corrupt ({detail})")
-                }
+            // §2.3 normative table (AD-414-15 / AC-2).
+            Self::Missing => "temporal.db is not present in the index cache".to_string(),
+            Self::Corrupt => "temporal.db is corrupt (not a database)".to_string(),
+            Self::UnsupportedVersion => {
+                format!("temporal.db was written by a newer skim ({detail})")
             }
-            Self::UnsupportedVersion => detail.to_string(),
             Self::Unreadable => {
                 if detail.is_empty() {
                     "temporal.db could not be opened".to_string()
@@ -211,25 +211,37 @@ impl DegradedReason {
                     format!("temporal.db could not be opened ({detail})")
                 }
             }
+            Self::Empty => {
+                let base = "temporal data is empty (0 rows) - this repository has no \
+                            commit history skim can analyse";
+                if detail.contains("shallow") {
+                    format!("{base}; a shallow clone is the usual cause")
+                } else {
+                    base.to_string()
+                }
+            }
             Self::NoRankedRows => detail.to_string(),
         }
     }
 
     /// Actionable remediation advice for `DegradedJson.remediation`.
+    ///
+    /// For `Empty` the is_shallow variant ("run 'git fetch --unshallow'…") is
+    /// wired by Phase C1 via `DegradedJson`; this returns the non-shallow
+    /// default, which is sufficient for the Phase B2 notice path.
     pub(super) fn remediation(self) -> &'static str {
         match self {
             // Embedded in NO_TEMPORAL_DATA_MSG; repeated separately for JSON consumers.
             Self::NotGitRepo => "run 'skim search' on a git repo to auto-populate",
             Self::HeadUnresolved => "commit at least one file to initialise the branch HEAD",
             Self::RepositoryMismatch => {
-                "run `skim search --rebuild --root <this root>` to re-anchor"
+                "run 'skim search --rebuild --root <this root>' to re-anchor it"
             }
-            Self::Missing => "run 'skim search --build' to index this repository",
-            Self::Corrupt => "run 'skim search --rebuild' to discard and recreate it",
-            Self::UnsupportedVersion => "upgrade skim to read this database",
+            Self::Missing => "run 'skim search --update' to build it",
+            Self::Corrupt => "run 'skim search --rebuild' to discard and rebuild it",
+            Self::UnsupportedVersion => "upgrade skim; skim will not overwrite a newer database",
             Self::Unreadable => "run 'skim search --rebuild'",
-            // Embedded in TEMPORAL_BUILD_EMPTY_MSG; repeated separately for JSON.
-            Self::Empty => "re-run with `SKIM_DEBUG=1`",
+            Self::Empty => "run 'skim search --rebuild'",
             Self::NoRankedRows => {
                 "commit the matched files, or run 'skim search --update' after committing"
             }
@@ -238,37 +250,29 @@ impl DegradedReason {
 
     /// Complete human-readable message (cause + embedded remediation).
     ///
-    /// Used by [`degraded_notice`].  For `NotGitRepo`, `HeadUnresolved`, and
-    /// `Empty` this returns the legacy constant verbatim so AC-19 byte-identical
-    /// assertions continue to pass.
+    /// Used by [`degraded_notice`].  `NotGitRepo` and `HeadUnresolved` return
+    /// the legacy constant verbatim so AC-19 byte-identical assertions pass.
+    /// `Empty` implements the §2.3 is_shallow conditional via `detail == "shallow"`
+    /// (written by Phase C2); absent → non-shallow path (AC-2).
     fn full_message(self, detail: &str) -> String {
         match self {
             Self::NotGitRepo => super::NO_TEMPORAL_DATA_MSG.to_string(),
             Self::HeadUnresolved => super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
-            Self::Empty => super::TEMPORAL_BUILD_EMPTY_MSG.to_string(),
             Self::RepositoryMismatch => format!(
-                "{} {}; run `skim search --rebuild --root <this root>` to re-anchor",
+                "{} {}; run 'skim search --rebuild --root <this root>' to re-anchor it",
                 super::SUBDIR_ROOT_TEMPORAL_MSG,
                 detail,
             ),
-            Self::Missing => {
-                "no temporal data; run 'skim search --build' to index this repository".to_string()
-            }
-            Self::Corrupt => {
-                if detail.is_empty() {
-                    "temporal.db is corrupt; \
-                     run 'skim search --rebuild' to discard and recreate it"
-                        .to_string()
-                } else {
-                    format!(
-                        "temporal.db is corrupt ({detail}); \
-                         run 'skim search --rebuild' to discard and recreate it"
-                    )
-                }
-            }
-            Self::UnsupportedVersion => {
-                format!("{detail}; upgrade skim to read this database")
-            }
+            Self::Missing => "temporal.db is not present in the index cache; \
+                 run 'skim search --update' to build it"
+                .to_string(),
+            Self::Corrupt => "temporal.db is corrupt (not a database); \
+                 run 'skim search --rebuild' to discard and rebuild it"
+                .to_string(),
+            Self::UnsupportedVersion => format!(
+                "temporal.db was written by a newer skim ({detail}); \
+                 upgrade skim; skim will not overwrite a newer database"
+            ),
             Self::Unreadable => {
                 if detail.is_empty() {
                     "temporal.db could not be opened; run 'skim search --rebuild'".to_string()
@@ -277,6 +281,19 @@ impl DegradedReason {
                         "temporal.db could not be opened ({detail}); \
                          run 'skim search --rebuild'"
                     )
+                }
+            }
+            Self::Empty => {
+                let base = "temporal data is empty (0 rows) - this repository has no \
+                            commit history skim can analyse";
+                if detail.contains("shallow") {
+                    format!(
+                        "{base}; a shallow clone is the usual cause; \
+                         run 'git fetch --unshallow' (or use a full clone), \
+                         then 'skim search --rebuild'"
+                    )
+                } else {
+                    format!("{base}; run 'skim search --rebuild'")
                 }
             }
             Self::NoRankedRows => format!(
@@ -437,7 +454,8 @@ pub(super) fn open_temporal_state(root: &Path, cache_dir: &Path, head: &HeadStat
         Err(SearchError::UnsupportedSchemaVersion { found, supported }) => {
             TemporalOpen::Unavailable(TemporalUnavailable {
                 reason: DegradedReason::UnsupportedVersion,
-                detail: format!("schema version {found}, supported {supported}"),
+                // §2.3 normative table: "schema version {found}, this build supports {supported}"
+                detail: format!("schema version {found}, this build supports {supported}"),
             })
         }
         Err(other) => TemporalOpen::Unavailable(TemporalUnavailable {

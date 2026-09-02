@@ -7,10 +7,11 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    DegradedReason, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
+    DegradedReason, Fallback, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
     TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
-    enrich_ast_results, format_temporal_json, format_temporal_text, normalize_blast_radius_path,
-    open_temporal_state, query_standalone, ranked_row_count, resort_window,
+    degraded_notice, enrich_ast_results, format_temporal_json, format_temporal_text,
+    normalize_blast_radius_path, open_temporal_state, query_standalone, ranked_row_count,
+    resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -2805,5 +2806,329 @@ fn t38_one_of_four_ranked_reports_ranked_one() {
     assert_eq!(
         cov.lookup_errors, 0,
         "ranked_row_count performs no DB lookups; lookup_errors must be 0"
+    );
+}
+
+// ============================================================================
+// Phase B2: §2.3 normative conformance — cause, remediation, Fallback tails
+// (AD-414-15 / AC-2 / AC-7 / AC-19 / T-19 / T-4)
+// ============================================================================
+
+/// Returns the §2.3 normative cause text for a given reason+detail.
+///
+/// The exhaustive `match` on `DegradedReason` enforces a compile error when a
+/// new variant is added without updating this function (T-19(a) requirement).
+fn expected_cause(reason: DegradedReason, detail: &str) -> String {
+    match reason {
+        DegradedReason::NotGitRepo => super::super::NO_TEMPORAL_DATA_MSG.to_string(),
+        DegradedReason::HeadUnresolved => super::super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
+        DegradedReason::RepositoryMismatch => {
+            format!("{} {}", super::super::SUBDIR_ROOT_TEMPORAL_MSG, detail)
+        }
+        DegradedReason::Missing => "temporal.db is not present in the index cache".to_string(),
+        DegradedReason::Corrupt => "temporal.db is corrupt (not a database)".to_string(),
+        DegradedReason::UnsupportedVersion => {
+            format!("temporal.db was written by a newer skim ({detail})")
+        }
+        DegradedReason::Unreadable => {
+            if detail.is_empty() {
+                "temporal.db could not be opened".to_string()
+            } else {
+                format!("temporal.db could not be opened ({detail})")
+            }
+        }
+        DegradedReason::Empty => {
+            let base = "temporal data is empty (0 rows) - this repository has no \
+                        commit history skim can analyse";
+            if detail.contains("shallow") {
+                format!("{base}; a shallow clone is the usual cause")
+            } else {
+                base.to_string()
+            }
+        }
+        DegradedReason::NoRankedRows => detail.to_string(),
+    }
+}
+
+/// Returns the §2.3 normative remediation text for a given reason.
+///
+/// Exhaustive `match` — compile error if a variant is added without updating.
+fn expected_remediation(reason: DegradedReason) -> &'static str {
+    match reason {
+        DegradedReason::NotGitRepo => "run 'skim search' on a git repo to auto-populate",
+        DegradedReason::HeadUnresolved => "commit at least one file to initialise the branch HEAD",
+        DegradedReason::RepositoryMismatch => {
+            "run 'skim search --rebuild --root <this root>' to re-anchor it"
+        }
+        DegradedReason::Missing => "run 'skim search --update' to build it",
+        DegradedReason::Corrupt => "run 'skim search --rebuild' to discard and rebuild it",
+        DegradedReason::UnsupportedVersion => {
+            "upgrade skim; skim will not overwrite a newer database"
+        }
+        DegradedReason::Unreadable => "run 'skim search --rebuild'",
+        DegradedReason::Empty => "run 'skim search --rebuild'",
+        DegradedReason::NoRankedRows => {
+            "commit the matched files, or run 'skim search --update' after committing"
+        }
+    }
+}
+
+/// T-19(a): every `DegradedReason` variant's `cause()` matches the §2.3
+/// normative table, is non-empty, and does NOT contain the forbidden
+/// substring "no temporal data" (except `NotGitRepo` which IS the legacy
+/// `NO_TEMPORAL_DATA_MSG` verbatim — AC-19).
+#[test]
+fn t19a_cause_text_conformance() {
+    let cases: &[(DegradedReason, &str)] = &[
+        (DegradedReason::NotGitRepo, ""),
+        (DegradedReason::HeadUnresolved, ""),
+        (
+            DegradedReason::RepositoryMismatch,
+            "(recorded: \"/old\", live: \"/new\")",
+        ),
+        (DegradedReason::Missing, ""),
+        (DegradedReason::Corrupt, "SQLITE_NOTADB"),
+        (
+            DegradedReason::UnsupportedVersion,
+            "schema version 9, this build supports 8",
+        ),
+        (DegradedReason::Unreadable, "permission denied"),
+        (DegradedReason::Unreadable, ""),
+        (DegradedReason::Empty, ""),
+        (DegradedReason::Empty, "shallow"),
+        (
+            DegradedReason::NoRankedRows,
+            "0 of 5 results have temporal data",
+        ),
+    ];
+
+    for (reason, detail) in cases {
+        let actual = reason.cause(detail);
+        let want = expected_cause(*reason, detail);
+
+        assert_eq!(
+            actual, want,
+            "cause({reason:?}, {detail:?}) diverges from §2.3 normative text"
+        );
+        assert!(!actual.is_empty(), "cause({reason:?}) must be non-empty");
+
+        // AC-7 / AC-19(b): every reason except NotGitRepo must NOT embed "no temporal data".
+        if *reason != DegradedReason::NotGitRepo {
+            assert!(
+                !actual.contains("no temporal data"),
+                "AC-7: {reason:?} cause must not contain 'no temporal data', got: {actual:?}"
+            );
+        }
+    }
+
+    // NotGitRepo byte-identity (AC-19).
+    assert_eq!(
+        DegradedReason::NotGitRepo.cause(""),
+        super::super::NO_TEMPORAL_DATA_MSG,
+        "AC-19: NotGitRepo cause must be byte-identical to NO_TEMPORAL_DATA_MSG"
+    );
+}
+
+/// T-19(b): every `DegradedReason` variant's `remediation()` matches the
+/// §2.3 normative table and is non-empty.
+///
+/// Exhaustive `match` inside `expected_remediation` means a newly-added
+/// variant fails to compile until it is handled here.
+#[test]
+fn t19b_remediation_text_conformance() {
+    let all_reasons = [
+        DegradedReason::NotGitRepo,
+        DegradedReason::HeadUnresolved,
+        DegradedReason::RepositoryMismatch,
+        DegradedReason::Missing,
+        DegradedReason::Corrupt,
+        DegradedReason::UnsupportedVersion,
+        DegradedReason::Unreadable,
+        DegradedReason::Empty,
+        DegradedReason::NoRankedRows,
+    ];
+
+    for reason in all_reasons {
+        let actual = reason.remediation();
+        let want = expected_remediation(reason);
+        assert_eq!(
+            actual, want,
+            "{reason:?} remediation diverges from §2.3 normative table"
+        );
+        assert!(
+            !actual.is_empty(),
+            "{reason:?} remediation must be non-empty"
+        );
+    }
+}
+
+/// T-19(c): the three `Fallback` tail texts match the §2.3 normative table.
+///
+/// Uses `Missing` (known stable cause) so any regression in the tail is
+/// isolated from cause-text changes.
+#[test]
+fn t19c_fallback_tail_conformance() {
+    let unavail = TemporalUnavailable {
+        reason: DegradedReason::Missing,
+        detail: String::new(),
+    };
+
+    // Lexical tail: "; {flag} not applied — results are in lexical relevance order"
+    let lexical = degraded_notice(&unavail, "--hot", Fallback::Lexical);
+    assert!(
+        lexical.ends_with("; --hot not applied \u{2014} results are in lexical relevance order"),
+        "Lexical tail mismatch, got: {lexical:?}"
+    );
+
+    // Ast tail: "; {flag} not applied — results are in raw AST match order"
+    let ast = degraded_notice(&unavail, "--hot", Fallback::Ast);
+    assert!(
+        ast.ends_with("; --hot not applied \u{2014} results are in raw AST match order"),
+        "Ast tail mismatch, got: {ast:?}"
+    );
+
+    // NoResults tail: "; no {flag} data to rank"
+    let no_results = degraded_notice(&unavail, "--hot", Fallback::NoResults);
+    assert!(
+        no_results.ends_with("; no --hot data to rank"),
+        "NoResults tail mismatch, got: {no_results:?}"
+    );
+
+    // Empty flag — no tail appended (base message verbatim).
+    let no_flag = degraded_notice(&unavail, "", Fallback::Lexical);
+    assert!(
+        !no_flag.contains("not applied"),
+        "Empty flag must return base without tail, got: {no_flag:?}"
+    );
+}
+
+/// T-4 fragment: `NoRankedRows` detail format.
+///
+/// AC-4 substring: "0 of 3 results have temporal data".
+/// Lookup-error clause only when `lookup_errors > 0`.
+#[test]
+fn t4_no_ranked_rows_detail_format() {
+    // No lookup errors: plain count only.
+    let detail_plain = "0 of 3 results have temporal data";
+    let msg_plain = degraded_notice(
+        &TemporalUnavailable {
+            reason: DegradedReason::NoRankedRows,
+            detail: detail_plain.to_string(),
+        },
+        "--hot",
+        Fallback::Lexical,
+    );
+    assert!(
+        msg_plain.contains("0 of 3 results have temporal data"),
+        "T-4: message must contain AC-4 substring, got: {msg_plain:?}"
+    );
+    assert!(
+        !msg_plain.contains("lookup"),
+        "T-4: without lookup errors the error clause must be absent, got: {msg_plain:?}"
+    );
+
+    // With lookup errors: clause appended.
+    let detail_err = "0 of 3 results have temporal data (2 temporal lookups failed)";
+    let msg_err = degraded_notice(
+        &TemporalUnavailable {
+            reason: DegradedReason::NoRankedRows,
+            detail: detail_err.to_string(),
+        },
+        "--hot",
+        Fallback::Lexical,
+    );
+    assert!(
+        msg_err.contains("2 temporal lookups failed"),
+        "T-4: with lookup errors the error clause must be present, got: {msg_err:?}"
+    );
+}
+
+/// AC-7 / AC-19(b): structural de-doubling guard.
+///
+/// The full `degraded_notice` output for every new reason (all except
+/// `NotGitRepo`) must not contain the substring "no temporal data".
+/// This test covers all three `Fallback` variants × all new reasons.
+#[test]
+fn ac7_no_temporal_data_exclusion_for_new_reasons() {
+    // (reason, detail to use)
+    let cases: &[(DegradedReason, &str)] = &[
+        (DegradedReason::HeadUnresolved, ""),
+        (
+            DegradedReason::RepositoryMismatch,
+            "(recorded: \"/a\", live: \"/b\")",
+        ),
+        (DegradedReason::Missing, ""),
+        (DegradedReason::Corrupt, ""),
+        (
+            DegradedReason::UnsupportedVersion,
+            "schema version 9, this build supports 8",
+        ),
+        (DegradedReason::Unreadable, "some OS error"),
+        (DegradedReason::Empty, ""),
+        (
+            DegradedReason::NoRankedRows,
+            "0 of 5 results have temporal data",
+        ),
+    ];
+
+    for (reason, detail) in cases {
+        for fallback in [Fallback::Lexical, Fallback::Ast, Fallback::NoResults] {
+            let msg = degraded_notice(
+                &TemporalUnavailable {
+                    reason: *reason,
+                    detail: (*detail).to_string(),
+                },
+                "--hot",
+                fallback,
+            );
+            assert!(
+                !msg.contains("no temporal data"),
+                "AC-7: {reason:?}+{fallback:?} notice must not contain 'no temporal data', \
+                 got: {msg:?}"
+            );
+        }
+    }
+}
+
+/// AC-2 / §2.3 Empty non-shallow: the `degraded_notice` output for `Empty`
+/// with empty detail contains the word "empty", the flag, "not applied",
+/// "lexical", and "--rebuild"; but NOT "SKIM_DEBUG" or "no temporal data".
+#[test]
+fn ac2_empty_non_shallow_message_substrings() {
+    let msg = degraded_notice(
+        &TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: String::new(),
+        },
+        "--hot",
+        Fallback::Lexical,
+    );
+    assert!(
+        msg.contains("empty"),
+        "AC-2(a): Empty message must contain 'empty', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--hot"),
+        "AC-2(b): Empty message must contain the flag '--hot', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("not applied"),
+        "AC-2(c): Empty message must contain 'not applied', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("lexical"),
+        "AC-2(d): Empty message must contain 'lexical', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--rebuild"),
+        "AC-2(e): Empty message must contain '--rebuild', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("SKIM_DEBUG"),
+        "AC-2: Empty message must NOT contain SKIM_DEBUG hint, got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("no temporal data"),
+        "AC-7: Empty message must NOT contain 'no temporal data', got: {msg:?}"
     );
 }
