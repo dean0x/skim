@@ -20,6 +20,10 @@ use std::fs;
 use tempfile::TempDir;
 mod common;
 
+/// `(label, before-flag git args, after-flag git args, raw-git args)` for the
+/// skim-flag × git-subcommand matrix in `git_flag_stripping_passthrough`.
+type SubcommandCell<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
+
 fn skim() -> assert_cmd::Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
@@ -822,4 +826,112 @@ fn test_passthrough_flag_parity_with_env_var() {
          C2 regression: set_passthrough_flag() must activate the same convergence gate \
          as the env var"
     );
+}
+
+// ============================================================================
+// C1/C2 extended: table-driven — 8 skim-only flags × 3 git subcommands (24 cells)
+// ============================================================================
+
+/// Table-driven byte-identity sweep: 8 skim-only flags × 3 git subcommands = 24 cells.
+///
+/// For every `(flag, sub)` pair, asserts:
+/// - `/usr/bin/git <sub-args>` exits 0 (precondition — verified once per subcommand)
+/// - `SKIM_PASSTHROUGH=1 skim git <sub> <flag> [git-args]` exits 0
+/// - stdout is byte-identical to the raw baseline
+///
+/// Flags: `--json`, `--mode=structure`, `--show-stats`, `--passthrough`,
+/// `--max-lines 5`, `--tokens 50`, `--line-numbers`, `--debug`.
+/// (`--debug` emits an 88-byte provenance banner on stderr only; stdout equality
+/// still holds because the banner never touches fd 1.)
+///
+/// Subcommands: `diff` (unstaged change), `show HEAD:src.rs`, `log -n 1`.
+/// Flag injection point: between the subcommand token and any git-native tail args,
+/// consistent with the placement used in the individual C1 tests above.
+#[cfg(unix)]
+#[test]
+fn test_passthrough_strips_every_skim_flag_for_git_diff_show_log() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    // Produce an unstaged change so `git diff` generates non-empty output.
+    fs::write(
+        dir.path().join("src.rs"),
+        "fn main() {\n    println!(\"world\");\n}\n",
+    )
+    .unwrap();
+
+    // 8 skim-only flags.  Two-token forms for --max-lines and --tokens.
+    let flags: &[(&str, &[&str])] = &[
+        ("--json", &["--json"]),
+        ("--mode=structure", &["--mode=structure"]),
+        ("--show-stats", &["--show-stats"]),
+        ("--passthrough", &["--passthrough"]),
+        ("--max-lines 5", &["--max-lines", "5"]),
+        ("--tokens 50", &["--tokens", "50"]),
+        ("--line-numbers", &["--line-numbers"]),
+        ("--debug", &["--debug"]),
+    ];
+
+    // 3 subcommands: (label, before-flag args, after-flag args, raw-git args).
+    // skim invocation = `skim git <before> <flag_args…> <after>`
+    // raw invocation  = `/usr/bin/git <raw_git_args>`
+    let subs: &[SubcommandCell<'_>] = &[
+        ("diff", &["diff"], &[], &["diff"]),
+        (
+            "show",
+            &["show"],
+            &["HEAD:src.rs"],
+            &["show", "HEAD:src.rs"],
+        ),
+        ("log", &["log", "-n", "1"], &[], &["log", "-n", "1"]),
+    ];
+
+    for &(sub_label, before, after, raw_git_args) in subs {
+        // Compute the raw baseline once per subcommand and assert its exit code.
+        let raw_output = std::process::Command::new("/usr/bin/git")
+            .args(raw_git_args)
+            .current_dir(dir.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("/usr/bin/git {raw_git_args:?} failed to spawn: {e}"));
+        assert!(
+            raw_output.status.success(),
+            "precondition: /usr/bin/git {raw_git_args:?} must exit 0"
+        );
+        if sub_label == "diff" {
+            assert!(
+                !raw_output.stdout.is_empty(),
+                "precondition: /usr/bin/git diff must produce output \
+                 (unstaged change required)"
+            );
+        }
+        let raw = raw_output.stdout;
+
+        for &(flag_label, flag_args) in flags {
+            let cell = format!("{flag_label} \u{d7} git {sub_label}");
+
+            // Build: skim git <before> <flag_args…> <after>
+            let mut skim_args: Vec<&str> = vec!["git"];
+            skim_args.extend_from_slice(before);
+            skim_args.extend_from_slice(flag_args);
+            skim_args.extend_from_slice(after);
+
+            let out = passthrough_skim()
+                .current_dir(dir.path())
+                .args(&skim_args)
+                .output()
+                .unwrap();
+
+            assert!(
+                out.status.success(),
+                "cell [{cell}]: skim must exit 0; got {:?}\nstderr: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                out.stdout, raw,
+                "cell [{cell}]: stdout must be byte-identical to \
+                 /usr/bin/git {raw_git_args:?}"
+            );
+        }
+    }
 }
