@@ -25,6 +25,32 @@ pub(crate) struct TruncationOptions {
 const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produced output. \
     Ensure the file is in a supported language or specify --language.";
 
+/// Remedy clause wired into every `TransformConfig` via `with_elision_hint` and
+/// passed to `truncate_to_token_budget`.  Kept as a single literal so that
+/// `compact_marker_without_hint` can test for its absence without duplicating
+/// the string.
+const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
+
+/// Returns `true` when `output` carries a compact elision marker (the bare
+/// `… (N lines truncated)` form) *without* the remedy `hint` appended to it.
+///
+/// When the token budget is too tight to include the hint inline on stdout,
+/// `truncate_to_token_budget` drops it and emits only the line count.  The
+/// caller must then emit the hint on stderr (ADR-016 channel split;
+/// ADR-011 class 1 — unconditional).
+///
+/// | scenario                        | return  |
+/// |--------------------------------|---------|
+/// | bare marker — hint absent      | `true`  |
+/// | full marker — hint appended    | `false` |
+/// | no marker at all               | `false` |
+/// | empty string                   | `false` |
+pub(crate) fn compact_marker_without_hint(output: &str, hint: &str) -> bool {
+    let has_marker = output.contains("lines truncated)") || output.contains("line truncated)");
+    let has_hint = !hint.is_empty() && output.contains(hint);
+    has_marker && !has_hint
+}
+
 /// Build a `TransformConfig` from mode, truncation options, and line number flag.
 ///
 /// The `line_numbers` parameter controls whether the config requests a source line
@@ -47,7 +73,7 @@ pub(crate) fn build_config_with_opts(
 ) -> TransformConfig {
     let mut config = TransformConfig::with_mode(mode)
         .with_line_numbers(line_numbers)
-        .with_elision_hint("SKIM_PASSTHROUGH=1 for full output");
+        .with_elision_hint(ELISION_HINT);
     if let Some(n) = trunc.max_lines {
         config = config.with_max_lines(n);
     }
@@ -80,15 +106,22 @@ fn fallback_line_truncate(
         mode.name(),
     );
     // B5: pass the CLI-level remedy hint so the token-budget truncation marker
-    // carries "SKIM_PASSTHROUGH=1 for full output" (ADR-011 class 1).
+    // carries the SKIM_PASSTHROUGH=1 remedy clause (ADR-011 class 1).
     let truncated = truncate_to_token_budget(
         output,
         language,
         token_budget,
         count_tokens_or_max,
         known_token_count,
-        Some("SKIM_PASSTHROUGH=1 for full output"),
+        Some(ELISION_HINT),
     )?;
+    // ADR-016 / ADR-011 class 1: when the budget is too tight to include the
+    // remedy hint inline on stdout (compact marker form), emit it on stderr so
+    // the reader always sees SKIM_PASSTHROUGH=1 regardless of how tight the
+    // budget is.  Unconditional — not gated by SKIM_DEBUG.
+    if compact_marker_without_hint(&truncated, ELISION_HINT) {
+        eprintln!("[skim] output truncated to the --tokens budget — {ELISION_HINT}");
+    }
     Ok((truncated, mode))
 }
 
@@ -119,6 +152,10 @@ where
     let mut last_output: Option<String> = None;
     let mut last_mode = starting_mode;
     let mut last_token_count: Option<usize> = None;
+    // Set to true when at least one mode returned Ok(Some("")) — an empty string is
+    // distinct from Ok(None): it means the transform ran and produced no structural
+    // content (e.g. a comment-only file, or an empty source file).
+    let mut saw_empty_output = false;
 
     for &mode in cascade {
         let config = build_config(mode, trunc);
@@ -126,6 +163,14 @@ where
         let Some(output) = transform_fn(&config)? else {
             continue;
         };
+
+        // Treat empty output the same as Ok(None): the mode produced no usable content.
+        // A 0-token empty string would satisfy any budget ceiling and silently suppress
+        // the fallback truncation path — that violates #317 (compress-never-truncate).
+        if output.trim().is_empty() {
+            saw_empty_output = true;
+            continue;
+        }
 
         let token_count = count_tokens_or_max(&output);
 
@@ -146,8 +191,25 @@ where
         last_token_count = Some(token_count);
     }
 
-    // Guard: no mode produced output (defensive; transform_fn currently always
-    // returns Ok(Some(...)), but protects against future callers returning Ok(None)).
+    // At least one mode returned Some("") but none returned non-empty content.
+    // Recover the raw source via Mode::Full so we can either return empty success
+    // (for an empty/whitespace-only source) or line-truncate the raw content
+    // (for a source that transforms to nothing, e.g. a comment-only file).
+    if last_output.is_none() && saw_empty_output {
+        let full_config = build_config(Mode::Full, trunc);
+        let raw = transform_fn(&full_config)?.unwrap_or_default();
+        if raw.trim().is_empty() {
+            // Empty or whitespace-only source: return an empty result with no marker —
+            // nothing was elided (#317: never truncate, and there is nothing to truncate).
+            return Ok((String::new(), starting_mode));
+        }
+        // Non-empty source where every structural mode produced empty output
+        // (e.g. a Rust file containing only comments, no fn/type declarations):
+        // line-truncate the raw source so the reader gets content.
+        return fallback_line_truncate(&raw, language, token_budget, starting_mode, None);
+    }
+
+    // Guard: no mode produced output at all (all returned Ok(None)).
     let last_output = last_output.ok_or_else(|| anyhow::anyhow!(NO_OUTPUT_MSG))?;
 
     fallback_line_truncate(
@@ -448,5 +510,138 @@ mod tests {
                 .to_string()
                 .contains("no transformation mode produced output"),
         );
+    }
+
+    // ── compact_marker_without_hint unit tests ──────────────────────────────────
+
+    #[test]
+    fn compact_marker_without_hint_bare_marker_is_true() {
+        // A bare compact marker (no hint) → true; the caller must emit the hint on stderr.
+        assert!(compact_marker_without_hint(
+            "// ... (12 lines truncated)",
+            ELISION_HINT
+        ));
+        assert!(compact_marker_without_hint(
+            "// ... (1 line truncated)",
+            ELISION_HINT
+        ));
+    }
+
+    #[test]
+    fn compact_marker_without_hint_full_marker_is_false() {
+        // Full marker already carries the hint → no need to emit it again on stderr.
+        let full = format!("fn foo() {{}}\n// ... (3 lines truncated) — {ELISION_HINT}");
+        assert!(!compact_marker_without_hint(&full, ELISION_HINT));
+    }
+
+    #[test]
+    fn compact_marker_without_hint_no_marker_is_false() {
+        // No elision marker at all → not a compact-form case.
+        assert!(!compact_marker_without_hint("fn foo() {}", ELISION_HINT));
+    }
+
+    #[test]
+    fn compact_marker_without_hint_empty_is_false() {
+        // Empty output → false; no marker to classify.
+        assert!(!compact_marker_without_hint("", ELISION_HINT));
+    }
+
+    // ── Empty-output skip tests (RED fixture regression) ────────────────────
+
+    #[test]
+    fn test_cascade_empty_escalated_mode_falls_to_truncation() {
+        // Mirrors the RED CLI fixture: structure mode is over-budget and every
+        // escalated mode (Signatures, Types) returns Ok(Some("")) — e.g. a Rust
+        // file that has fn items but no type declarations.  The empty modes must
+        // be skipped; the non-empty structure output is line-truncated instead.
+        let long_output = "a b c d e f g h i j k l m n o p q r s t u v w x y z";
+        let transform = move |config: &TransformConfig| -> anyhow::Result<Option<String>> {
+            match config.mode {
+                Mode::Structure => Ok(Some(long_output.to_string())),
+                // Escalated modes produce empty output (no type/signature nodes).
+                Mode::Signatures | Mode::Types => Ok(Some(String::new())),
+                _ => Ok(None),
+            }
+        };
+
+        let trunc = TruncationOptions::default();
+
+        let (output, _mode_used) =
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, transform)
+                .unwrap();
+
+        // #317 / ADR-011: result must be non-empty and carry the elision marker.
+        assert!(
+            !output.is_empty(),
+            "Output must not be empty when empty modes are skipped and fallback truncates",
+        );
+        assert!(
+            output.contains("truncated"),
+            "Elision marker must be present; got: {:?}",
+            output,
+        );
+    }
+
+    #[test]
+    fn test_cascade_all_modes_empty_output_falls_back_to_raw_source() {
+        // All structural modes (Structure, Signatures, Types) return Ok(Some(""))
+        // for a non-empty source (e.g. a comment-only file). The cascade must
+        // recover via Mode::Full and line-truncate the raw source.
+        let raw_source = "// line 1\n// line 2\n// line 3\n// line 4\n// line 5\n\
+                          // line 6\n// line 7\n// line 8\n// line 9\n// line 10\n";
+        let transform = move |config: &TransformConfig| -> anyhow::Result<Option<String>> {
+            match config.mode {
+                // Structural modes produce nothing (all comments, no declarations).
+                Mode::Structure | Mode::Signatures | Mode::Types => Ok(Some(String::new())),
+                // Full mode returns the raw source (as the real transform would).
+                Mode::Full => Ok(Some(raw_source.to_string())),
+                _ => Ok(None),
+            }
+        };
+
+        let trunc = TruncationOptions::default();
+
+        // Budget of 5 tokens — the raw source exceeds it, so line-truncation applies.
+        let result =
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, transform);
+
+        let (output, _mode_used) = result.expect("should not error when raw source is available");
+        assert!(
+            !output.is_empty(),
+            "output must be non-empty when raw source is used as fallback; got: {output:?}",
+        );
+    }
+
+    #[test]
+    fn test_cascade_empty_intermediate_mode_uses_later_non_empty_mode() {
+        // Signatures returns Ok(Some("")) (empty intermediate), but Types is
+        // non-empty and within budget — the cascade must skip the empty mode and
+        // return the Types output.
+        let long_output = "a b c d e f g h i j k l m n o p q r s t";
+        let transform = move |config: &TransformConfig| -> anyhow::Result<Option<String>> {
+            match config.mode {
+                Mode::Structure => Ok(Some(long_output.to_string())),
+                // Empty intermediate — must be skipped.
+                Mode::Signatures => Ok(Some(String::new())),
+                // Later mode is non-empty and within budget.
+                Mode::Types => Ok(Some("type Foo = u32;".to_string())),
+                _ => Ok(None),
+            }
+        };
+
+        let trunc = TruncationOptions::default();
+
+        // Budget of 10 tokens: Structure exceeds it, Signatures is empty (skipped),
+        // Types ("type Foo = u32;" ≈ 6 tokens) fits.
+        let (output, mode_used) =
+            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::Rust, transform)
+                .unwrap();
+
+        assert_eq!(
+            mode_used,
+            Mode::Types,
+            "Should have escalated to Types mode"
+        );
+        assert_eq!(output, "type Foo = u32;");
     }
 }
