@@ -3339,7 +3339,7 @@ fn t5_integrity_probe_truncated_skpost_returns_corrupted() {
     // Truncate index.skpost to half its size.
     let post_path = dir.path().join("index.skpost");
     let full_len = std::fs::metadata(&post_path).unwrap().len();
-    let half_len = (full_len / 2).max(0);
+    let half_len = full_len / 2;
     if half_len < full_len {
         let data = std::fs::read(&post_path).unwrap();
         std::fs::write(&post_path, &data[..half_len as usize]).unwrap();
