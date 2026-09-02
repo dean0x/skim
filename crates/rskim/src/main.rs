@@ -305,7 +305,8 @@ struct Args {
     #[arg(
         long,
         value_name = "N",
-        help = "Truncate output to at most N lines (AST-aware)"
+        help = "Emit at most N lines in total, including the elision marker \
+                (N=1 emits one content line plus the marker); equivalent to `head -N` with disclosure"
     )]
     max_lines: Option<usize>,
 
@@ -314,7 +315,12 @@ struct Args {
     /// Keeps the last N lines of output, prepending a language-appropriate
     /// truncation marker indicating how many lines were omitted above.
     /// Mutually exclusive with --max-lines.
-    #[arg(long, value_name = "N", help = "Keep only the last N lines of output")]
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Emit at most N lines in total from the tail, including the elision marker \
+                (N=1 emits one content line plus the marker); equivalent to `tail -N` with disclosure"
+    )]
     last_lines: Option<usize>,
 
     /// Token budget - cascade through modes until output fits within N tokens
@@ -326,7 +332,9 @@ struct Args {
     #[arg(
         long,
         value_name = "N",
-        help = "Cascade through modes until output fits within N tokens"
+        help = "Fit the output within N tokens by escalating modes, then line-truncating \
+                with a marker; on very small budgets the count stays on stdout and the \
+                SKIM_PASSTHROUGH=1 remedy is printed to stderr"
     )]
     tokens: Option<usize>,
 
@@ -1010,7 +1018,9 @@ fn main() -> ExitCode {
             Ok(Invocation::FileOperation) => {
                 run_file_operation(&analytics).map(|()| ExitCode::SUCCESS)
             }
-            Ok(Invocation::Subcommand { name, args }) => cmd::dispatch(&name, &args, &analytics),
+            Ok(Invocation::Subcommand { name, args }) => {
+                cmd::dispatch_explicit(&name, &args, &analytics)
+            }
             Err(e) => Err(e),
         }
     };

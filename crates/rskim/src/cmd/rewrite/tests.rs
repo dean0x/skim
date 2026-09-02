@@ -924,3 +924,83 @@ fn test_gh_api_steering_after_separator_still_rewrites() {
         "rewritten command must preserve --json as a positional arg, got: {rewritten}"
     );
 }
+
+// ============================================================================
+// require_flags_for_tool — D5 wrapper-surface gate (dispatch_for_wrapper)
+// ============================================================================
+
+/// `psql` must declare the require-flags `["-c", "--command"]`.
+///
+/// Pinned so that removing or renaming the psql `require_flag` entry in the
+/// rule table is caught here before it silently breaks the D5 wrapper gate.
+#[test]
+fn test_require_flags_for_tool_psql_returns_expected_flags() {
+    let flags = require_flags_for_tool("psql")
+        .expect("psql must have require_flags (interactive-session guard)");
+    assert!(
+        flags.contains(&"-c"),
+        "psql require_flags must include '-c'; got: {flags:?}"
+    );
+    assert!(
+        flags.contains(&"--command"),
+        "psql require_flags must include '--command'; got: {flags:?}"
+    );
+}
+
+/// `mysql` must declare the require-flags `["-e", "--execute"]`.
+///
+/// Drift-guard: keeps the wrapper D5 gate in sync with the rewrite rule table.
+#[test]
+fn test_require_flags_for_tool_mysql_returns_expected_flags() {
+    let flags = require_flags_for_tool("mysql")
+        .expect("mysql must have require_flags (interactive-session guard)");
+    assert!(
+        flags.contains(&"-e"),
+        "mysql require_flags must include '-e'; got: {flags:?}"
+    );
+    assert!(
+        flags.contains(&"--execute"),
+        "mysql require_flags must include '--execute'; got: {flags:?}"
+    );
+}
+
+/// `git` has no `require_flag` entries — `require_flags_for_tool` must return
+/// `None` so the D5 gate is a no-op for git and does not block normal dispatch.
+#[test]
+fn test_require_flags_for_tool_git_returns_none() {
+    assert!(
+        require_flags_for_tool("git").is_none(),
+        "git must have no require_flags (D5 gate must be a no-op for git)"
+    );
+}
+
+/// Drift guard: the values returned by `require_flags_for_tool` must equal the
+/// `require_flag` slices declared in the rule table for psql and mysql.
+///
+/// This assertion makes any rule-table edit that silently breaks the D5 wrapper
+/// gate a compile-time-adjacent failure (caught at test time, not at runtime in
+/// a wrapper invocation).
+#[test]
+fn test_require_flags_for_tool_drift_guard() {
+    // psql: rule table declares &["-c", "--command"]
+    let psql = require_flags_for_tool("psql").expect("psql must have require_flags");
+    let mut psql_sorted = psql.clone();
+    psql_sorted.sort_unstable();
+    let mut expected_psql = vec!["-c", "--command"];
+    expected_psql.sort_unstable();
+    assert_eq!(
+        psql_sorted, expected_psql,
+        "psql require_flags must exactly match the rule-table declaration"
+    );
+
+    // mysql: rule table declares &["-e", "--execute"]
+    let mysql = require_flags_for_tool("mysql").expect("mysql must have require_flags");
+    let mut mysql_sorted = mysql.clone();
+    mysql_sorted.sort_unstable();
+    let mut expected_mysql = vec!["-e", "--execute"];
+    expected_mysql.sort_unstable();
+    assert_eq!(
+        mysql_sorted, expected_mysql,
+        "mysql require_flags must exactly match the rule-table declaration"
+    );
+}

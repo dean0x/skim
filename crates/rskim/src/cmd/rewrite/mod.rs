@@ -145,6 +145,30 @@ pub(crate) fn skip_flags_for_tool(tool_name: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// Return the `require_flag` entries for a tool from its rewrite rules.
+///
+/// Used by `dispatch_for_wrapper` (D5) to enforce the require-flag passthrough
+/// on the wrapper surface — mirroring `require_flag` in the rewrite engine.
+/// For example, `psql` requires `-c`/`--command` and `mysql` requires
+/// `-e`/`--execute`; without those flags the tool opens an interactive session
+/// that must not be intercepted by skim.
+///
+/// Returns `None` when no rules for `tool_name` declare any required flags (the
+/// tool does not gate on a required flag and the D5 check is a no-op). Returns
+/// `Some(flags)` when at least one rule does; the D5 gate falls back to raw
+/// passthrough when NONE of those flags appears in the argument list.
+///
+/// Reads the same [`rules::all_rules`] table as [`skip_flags_for_tool`] so the
+/// two surfaces cannot drift independently.
+#[must_use]
+pub(crate) fn require_flags_for_tool(tool_name: &str) -> Option<Vec<&'static str>> {
+    let flags: Vec<&'static str> = rules::all_rules()
+        .filter(|r| r.prefix.first().copied() == Some(tool_name))
+        .flat_map(|r| r.require_flag.iter().copied())
+        .collect();
+    if flags.is_empty() { None } else { Some(flags) }
+}
+
 // Kept for backward-compatibility; primary callers are tests in discover.rs.
 #[allow(dead_code)]
 pub(crate) fn would_rewrite(command: &str) -> Option<String> {

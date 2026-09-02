@@ -11,13 +11,15 @@
 //!
 //! Commands that appear as the *source* side of a pipe (e.g. `ls | head`,
 //! `git diff | head`, `rg pat | head`) are NEVER rewritten.  This is enforced
-//! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks
-//! `has_pipe_operator` on the full segment list and returns `None` immediately
-//! if any pipe operator is present, so the entire pipeline passes through
-//! untouched (enforced by the `has_pipe_operator` short-circuit in
-//! `try_rewrite_compound`, compound.rs).  No per-rule flag is needed or
-//! used — git diff/log/show as pipe sources are protected by this global
-//! short-circuit, not by any field on `RewriteRule`.  SEE: AD-RW-2.
+//! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks each pipeline
+//! segment via `has_pipe_operator`; most shapes (including all examples above)
+//! pass through untouched.  Exception: a two-stage `<cmd> | cat` where bare
+//! `cat` is the sole consumer IS rewritten when `command_needs_exact_bytes` is
+//! clear (force-raw sidecar absent) — all other pipe shapes still pass through
+//! (enforced by the `has_pipe_operator` short-circuit in `try_rewrite_compound`,
+//! compound.rs).  No per-rule flag is needed or used — git diff/log/show as
+//! pipe sources are protected by this global short-circuit, not by any field on
+//! `RewriteRule`.  SEE: AD-RW-2.
 
 use std::sync::LazyLock;
 
@@ -1814,7 +1816,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     //
     // Pipe-source passthrough (`ls | head`) is handled GLOBALLY by
     // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
-    // — not by any per-rule field.  SEE: AD-RW-2.
+    // — not by any per-rule field.  Exception: `ls | cat` (bare cat sole
+    // consumer) is rewritten.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["ls"],
         rewrite_to: &["skim", "ls"],
@@ -1831,7 +1834,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     //
     // Pipe-source passthrough (`grep pat | head`) is handled GLOBALLY by
     // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
-    // — not by any per-rule field.  SEE: AD-RW-2.
+    // — not by any per-rule field.  Exception: `grep pat | cat` (bare cat sole
+    // consumer) is rewritten.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["grep"],
         rewrite_to: &["skim", "grep"],

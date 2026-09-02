@@ -246,6 +246,21 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
     }
 }
 
+/// Whether [`strip_skim_flags`] removes a bare `--json` token for `subcommand`.
+///
+/// This is the single predicate that decides whether the legacy
+/// `SKIM_PASSTHROUGH=1` remedy is *literally true* on a `--json` invocation
+/// (`crate::output::fidelity::remedy_for`).  `--json` is skim-only for `git`
+/// alone; for every other tool it is a tool-owned form
+/// (`gh pr list --json title`) that must survive the strip, so the passthrough
+/// exec would hand `--json` to a tool that rejects it.
+///
+/// Kept adjacent to `strip_skim_flags` — and pinned by
+/// `passthrough_strips_json_matches_strip_set` — so the two cannot drift.
+pub(crate) fn passthrough_strips_json(subcommand: &str) -> bool {
+    subcommand == "git"
+}
+
 // ============================================================================
 // Private argument helpers
 // ============================================================================
@@ -889,6 +904,43 @@ fn handler_visible_args<'a>(subcommand: &str, args: &'a [String]) -> &'a [String
     args
 }
 
+/// Which interception surface routed a command into the shared dispatch core.
+///
+/// Skim intercepts sub-agent shell commands through two independent mechanisms
+/// (see CLAUDE.md §"Two interception surfaces"):
+///
+/// - **`Explicit`** — the user (or the rewrite hook) typed `skim <tool> …`
+///   explicitly.  The rewrite engine's `try_rewrite()` transforms the raw
+///   command string and the hook injects the result; `main.rs` then parses
+///   the resulting `Invocation::Subcommand` and calls `dispatch_explicit`.
+///
+/// - **`Wrapper`** — `~/.skim/bin/<tool>` is a symlink whose `argv[0]` is the
+///   tool name.  The OS runs the skim binary directly; `main.rs` detects the
+///   non-`skim` `argv[0]` via `detect_argv0_dispatch()` and calls
+///   `dispatch_for_wrapper`, which applies D3/D4/D5 wrapper gates before
+///   delegating to the private `dispatch_inner`.
+///
+/// The distinction is compile-time enforced: `dispatch_inner` requires a
+/// `Surface` argument, making it impossible to call the shared core without
+/// declaring which surface the call is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// Explicit `skim <tool> …` typed by a user or injected by the rewrite hook.
+    Explicit,
+    /// PATH-wrapper surface — `argv[0]` is the tool name, not `skim`.
+    Wrapper,
+}
+
+impl Surface {
+    /// Short lowercase label used in debug banners.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Surface::Explicit => "explicit",
+            Surface::Wrapper => "wrapper",
+        }
+    }
+}
+
 /// Dispatch for the PATH-wrapper surface (D3).
 ///
 /// When skim is invoked via a symlink (`~/.skim/bin/grep`), informational flags
@@ -900,14 +952,14 @@ fn handler_visible_args<'a>(subcommand: &str, args: &'a [String]) -> &'a [String
 /// Meta/management subcommands (`doctor`, `stats`, `init`, …) are excluded: they
 /// have no external binary counterpart, so their `--help` is always skim's own.
 ///
-/// For all other flags and subcommands, delegates to [`dispatch`].
+/// For all other flags and subcommands, delegates to [`dispatch_inner`].
 pub(crate) fn dispatch_for_wrapper(
     name: &str,
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     use crate::cmd::registry::is_meta_subcommand;
-    use crate::cmd::rewrite::skip_flags_for_tool;
+    use crate::cmd::rewrite::{require_flags_for_tool, skip_flags_for_tool};
 
     // D3: universal help/version passthrough for non-meta tool wrappers.
     // Equivalent to skip_if_flag_prefix on the rewrite surface: when `grep --help`
@@ -942,7 +994,41 @@ pub(crate) fn dispatch_for_wrapper(
         }
     }
 
-    dispatch(name, args, analytics)
+    // D5: require-flag passthrough — wrapper-surface mirror of the rewrite
+    // engine's `require_flag` predicate.
+    //
+    // Tools such as `psql` (requires `-c`/`--command`) and `mysql` (requires
+    // `-e`/`--execute`) gate their rewrite rule on a required flag to
+    // distinguish batch invocations (safe to intercept) from interactive
+    // sessions (must pass through unmodified). The rewrite surface declines to
+    // rewrite when the flag is absent; this gate mirrors that behaviour on the
+    // wrapper surface.
+    //
+    // `require_flags_for_tool` reads the same rule table as `skip_flags_for_tool`
+    // so the two surfaces cannot drift independently. If `name` has no required
+    // flags (returns `None`), this gate is a no-op. If it has required flags and
+    // none appear in `args`, fall back to raw passthrough — the tool is about to
+    // open an interactive session that skim must not intercept.
+    //
+    // Matching semantics mirror D4: exact token (`-c`) and `--flag=value` long
+    // forms (`--command=SELECT 1`) are both accepted.
+    let required_flags = if is_meta_subcommand(name) {
+        None
+    } else {
+        require_flags_for_tool(name)
+    };
+    if let Some(required) = required_flags {
+        let has_required = args.iter().any(|arg| {
+            required
+                .iter()
+                .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+        });
+        if !has_required {
+            return run_raw_passthrough(name, args, &[]);
+        }
+    }
+
+    dispatch_inner(Surface::Wrapper, name, args, analytics)
 }
 
 /// Dispatch a subcommand by name. Returns the process exit code.
@@ -950,7 +1036,8 @@ pub(crate) fn dispatch_for_wrapper(
 /// v2.8.0: Flat dispatch — tool names are top-level subcommands.
 /// `cargo` and `go` use multi-category dispatchers; other tools route
 /// directly to their category handler with the tool name prepended.
-pub(crate) fn dispatch(
+fn dispatch_inner(
+    surface: Surface,
     subcommand: &str,
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -1109,11 +1196,27 @@ pub(crate) fn dispatch(
             // what the native tool would produce).
             let safe = sanitize_for_display(subcommand);
             crate::debug_log!(
-                "skim: unrecognized command '{safe}' — passing through to system binary"
+                "skim [{}]: unrecognized command '{safe}' — passing through to system binary",
+                surface.as_str()
             );
             run_raw_passthrough(subcommand, args, &[])
         }
     }
+}
+
+/// Dispatch for the explicit surface — `skim <tool> …` typed by a user or injected
+/// by the rewrite hook.
+///
+/// This is the public entry point for `main.rs`'s `Invocation::Subcommand` arm.
+/// It tags the call as [`Surface::Explicit`] and delegates to the private
+/// `dispatch_inner` core, which enforces `SKIM_PASSTHROUGH`, the daemon guard,
+/// and the per-tool match table.
+pub(crate) fn dispatch_explicit(
+    subcommand: &str,
+    args: &[String],
+    analytics: &crate::analytics::AnalyticsConfig,
+) -> anyhow::Result<ExitCode> {
+    dispatch_inner(Surface::Explicit, subcommand, args, analytics)
 }
 
 // ============================================================================
@@ -1486,6 +1589,32 @@ mod tests {
         }
     }
 
+    /// Drift guard (D1): `passthrough_strips_json` must agree with what
+    /// `strip_skim_flags` actually does to a bare `--json` token, for every tool.
+    ///
+    /// The predicate feeds `fidelity::remedy_for`, which prints
+    /// `SKIM_PASSTHROUGH=1 for full output` on stderr only when the hatch really
+    /// reproduces the user's argv.  If someone widens (or narrows) the `--json`
+    /// strip in `strip_skim_flags` without updating the predicate, skim starts
+    /// printing a remedy that cannot work — exactly the ADR-011 class-1 defect
+    /// the split exists to close.
+    #[test]
+    fn passthrough_strips_json_matches_strip_set() {
+        for tool in ["git", "npm", "cargo", "psql", "eslint", "env"] {
+            let args = sv(&["--json"]);
+            let actually_strips = strip_skim_flags(tool, &args)
+                .is_some_and(|stripped| !stripped.iter().any(|a| a == "--json"));
+            assert_eq!(
+                passthrough_strips_json(tool),
+                actually_strips,
+                "drift: passthrough_strips_json({tool:?}) = {} but strip_skim_flags \
+                 {} strip bare --json — fidelity::remedy_for would print a false remedy",
+                passthrough_strips_json(tool),
+                if actually_strips { "does" } else { "does NOT" }
+            );
+        }
+    }
+
     // ========================================================================
     // Unit tests for new flags (C1 Step 5 — --max-lines, --tokens,
     // --line-numbers, --debug)
@@ -1721,7 +1850,7 @@ mod tests {
                     session_id: None,
                     input_cost_per_mtok: None,
                 };
-                dispatch(subcommand, &args, &a)
+                dispatch_explicit(subcommand, &args, &a)
             });
 
             if let Err(ref payload) = result {
@@ -1752,11 +1881,32 @@ mod tests {
             session_id: None,
             input_cost_per_mtok: None,
         };
-        let unknown_result = dispatch("__unknown_xyz__", &[], &analytics);
+        let unknown_result = dispatch_explicit("__unknown_xyz__", &[], &analytics);
         assert!(
             unknown_result.is_err(),
-            "dispatch() should return Err for non-existent binary (SpawnFailed)"
+            "dispatch_explicit() should return Err for non-existent binary (SpawnFailed)"
         );
+    }
+
+    // ========================================================================
+    // dispatch_inner — Surface type-hygiene pin
+    // ========================================================================
+
+    /// Pin the private core's signature so that adding, removing, or reordering
+    /// parameters causes a compile error rather than a silent behaviour change.
+    ///
+    /// The fn-pointer coercion is a zero-cost, zero-runtime check: the compiler
+    /// resolves the cast at type-check time and the value is immediately
+    /// discarded.  It makes it unrepresentable to call the shared dispatch core
+    /// without explicitly declaring which interception surface the call is on.
+    #[test]
+    fn dispatch_core_requires_a_surface() {
+        let _: fn(
+            Surface,
+            &str,
+            &[String],
+            &crate::analytics::AnalyticsConfig,
+        ) -> anyhow::Result<std::process::ExitCode> = dispatch_inner;
     }
 
     // ========================================================================
