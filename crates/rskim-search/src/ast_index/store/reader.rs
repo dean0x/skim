@@ -346,9 +346,11 @@ impl AstIndexReader {
     /// # Errors
     ///
     /// - [`SearchError::Io`] if `ast_index.skidx` cannot be opened, or
-    ///   `ast_index.skpost` is absent when a non-zero size is expected.
+    ///   `ast_index.skpost` cannot be stat'd due to a non–file-not-found I/O
+    ///   error (e.g. `EACCES`).
     /// - [`SearchError::IndexCorrupted`] if the header is too short, has wrong
-    ///   magic bytes, or the file lengths disagree with the header-encoded sizes.
+    ///   magic bytes, `ast_index.skpost` is absent when a non-zero size is
+    ///   expected, or the file lengths disagree with the header-encoded sizes.
     pub fn index_integrity(dir: &Path) -> Result<u16> {
         use super::format::FORMAT_VERSION;
 
@@ -404,12 +406,13 @@ impl AstIndexReader {
             ))
         })?;
         match std::fs::metadata(&post_path) {
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(SearchError::IndexCorrupted(format!(
                     "ast_index.skpost missing (expected {expected_post} bytes) at {}",
                     dir.display()
                 )));
             }
+            Err(e) => return Err(SearchError::Io(e)),
             Ok(m) => {
                 let actual_post = m.len() as usize;
                 if actual_post != expected_post_usize {

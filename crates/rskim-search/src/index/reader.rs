@@ -644,10 +644,12 @@ impl NgramIndexReader {
     ///
     /// # Errors
     ///
-    /// - [`SearchError::Io`] if `index.skidx` cannot be opened or `index.skpost`
-    ///   is absent and the version matches `FORMAT_VERSION`.
+    /// - [`SearchError::Io`] if `index.skidx` cannot be opened, or
+    ///   `index.skpost` cannot be stat'd due to a non–file-not-found I/O error
+    ///   (e.g. `EACCES`).
     /// - [`SearchError::IndexCorrupted`] if the header is too short, has wrong
-    ///   magic bytes, or the file lengths disagree with the header-encoded sizes.
+    ///   magic bytes, `index.skpost` is absent, or the file lengths disagree
+    ///   with the header-encoded sizes.
     pub fn lexical_index_integrity(dir: &Path) -> Result<u16> {
         use super::format::{FORMAT_VERSION, SKIDX_MAGIC};
 
@@ -702,12 +704,13 @@ impl NgramIndexReader {
             ))
         })?;
         match std::fs::metadata(&post_path) {
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(SearchError::IndexCorrupted(format!(
                     "index.skpost missing (expected {expected_post} bytes) at {}",
                     dir.display()
                 )));
             }
+            Err(e) => return Err(SearchError::Io(e)),
             Ok(m) => {
                 let actual_post = m.len() as usize;
                 if actual_post != expected_post {

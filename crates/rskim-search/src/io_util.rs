@@ -71,7 +71,9 @@ pub(crate) fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
 ///
 /// # Errors
 ///
-/// - [`crate::SearchError::Io`] if the file at `path` cannot be opened.
+/// - [`crate::SearchError::Io`] if the file at `path` cannot be opened, or
+///   a non-interrupted read error occurs while filling the header buffer
+///   (`EINTR` / `ErrorKind::Interrupted` is retried automatically).
 /// - [`crate::SearchError::IndexCorrupted`] if fewer than 6 bytes could be
 ///   read from the file, or the first 4 bytes do not equal `expected_magic`.
 pub(crate) fn probe_index_header(
@@ -93,9 +95,15 @@ pub(crate) fn probe_index_header(
     let mut file = std::fs::File::open(path)?;
     let mut n = 0usize;
     while n < buf.len() {
-        match file.read(&mut buf[n..])? {
-            0 => break,
-            k => n += k,
+        match file.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            // EINTR is a transient kernel interrupt, not a real I/O failure.
+            // Retrying here matches what `read_exact` does internally and
+            // prevents `check_staleness`'s `Err(_) => true` arm from
+            // reclassifying a healthy index as corrupt on a spurious EINTR.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(crate::SearchError::Io(e)),
         }
     }
 

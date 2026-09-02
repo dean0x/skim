@@ -324,7 +324,9 @@ pub(super) fn check_staleness(
     // Lexical self-heal: if the on-disk FORMAT_VERSION is older than the current
     // version, return NoStoredHead to trigger a full rebuild so the user does not
     // see a hard error from NgramIndexReader::open (ADR-006, #355 Finding 9).
-    // This is the exact mirror of the AST index_version check below.
+    // This is the exact mirror of the AST `index_integrity` check below; both probe
+    // format version AND structural size consistency, so a truncated or size-inconsistent
+    // artifact also reports stale.
     let lexical_stale = match rskim_search::NgramIndexReader::lexical_index_integrity(cache_dir) {
         Ok(v) => v < rskim_search::LEXICAL_INDEX_FORMAT_VERSION,
         Err(_) => true, // Corrupt / unreadable → rebuild.

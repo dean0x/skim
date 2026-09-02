@@ -1931,6 +1931,74 @@ fn test_temporal_db_check3_skipped_when_git_dir_none() {
     );
 }
 
+/// T-8d (AD-414-14 regression guard): Check 3 in a LINKED WORKTREE must probe
+/// the COMMON-DIR `shallow` file, not the per-worktree gitdir.
+///
+/// Regression scenario: `temporal_db_is_stale` receives `git_dir` =
+/// `<primary>/.git/worktrees/wt1` (a per-worktree directory that never contains
+/// `shallow`).  If the probe used `git_dir.join("shallow")` directly it would
+/// always find the file absent → permanent false-positive stale → unbounded
+/// rebuild loop.  The fix (`resolve_common_dir`) reads the `commondir` pointer
+/// inside the worktree gitdir and resolves to `<primary>/.git` where `shallow`
+/// actually lives.
+///
+/// Sub-cases:
+/// - shallow file present in commondir → NOT stale (repo still shallow, correct)
+/// - shallow file absent from commondir → stale (shallow→full transition, correct)
+#[test]
+fn test_temporal_db_check3_linked_worktree_probes_commondir() {
+    // Build a real primary repo + linked worktree so git populates the
+    // per-worktree `commondir` pointer file automatically.
+    let (_dir, primary, worktree, head) = worktree_fixture("wt-check3-shallow");
+
+    // Resolve the linked worktree's gitdir  (<primary>/.git/worktrees/wt-check3-shallow).
+    // This is what staleness.rs passes into temporal_db_is_stale via resolve_git_dir().
+    let linked_gitdir = resolve_git_dir(&worktree)
+        .expect("linked worktree must have a resolvable gitdir (test setup invariant)");
+    // Verify this is a per-worktree path (sanity: must end with worktrees/<name>)
+    assert!(
+        linked_gitdir
+            .components()
+            .any(|c| c.as_os_str() == "worktrees"),
+        "test setup: linked gitdir must contain a 'worktrees' component: {linked_gitdir:?}"
+    );
+
+    // Set up a temporal.db in a cache dir.
+    let cache_dir = _dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], &head, false).unwrap();
+    drop(db);
+    // Plant is_shallow="1" — simulates a DB built on a shallow clone.
+    super::plant_meta_raw(&db_path, rskim_search::META_IS_SHALLOW, "1");
+
+    // Write a non-empty `shallow` file into the PRIMARY .git (the commondir).
+    // resolve_common_dir(linked_gitdir) → <primary>/.git, so the probe must
+    // look there, NOT inside linked_gitdir itself.
+    let primary_git = primary.join(".git");
+    let shallow_path = primary_git.join("shallow");
+    fs::write(&shallow_path, b"abc1234\n").unwrap();
+
+    // T-8d-1: shallow file present in commondir → NOT stale.
+    assert!(
+        !temporal_db_is_stale(&cache_dir, &head, Some(&linked_gitdir)),
+        "T-8d-1: is_shallow=1 + shallow present in commondir (linked worktree) must NOT \
+         be stale — Check 3 must resolve commondir, not probe the per-worktree gitdir \
+         (AD-414-14 regression guard)"
+    );
+
+    // Remove the shallow file — simulates `git fetch --unshallow`.
+    fs::remove_file(&shallow_path).unwrap();
+
+    // T-8d-2: shallow file gone from commondir → stale (shallow→full transition).
+    assert!(
+        temporal_db_is_stale(&cache_dir, &head, Some(&linked_gitdir)),
+        "T-8d-2: is_shallow=1 + shallow absent from commondir (linked worktree) MUST be \
+         stale — unshallow must be detected via commondir probe (AD-414-14 regression guard)"
+    );
+}
+
 // ============================================================================
 // #357 BUG B — auto_refresh_if_stale self-heals stale temporal.db when
 // lexical index is Current (AD-TMP-2)
