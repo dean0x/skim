@@ -3403,7 +3403,7 @@ fn t6_integrity_probe_missing_skpost_returns_corrupted() {
 /// rebuild signal.
 #[test]
 fn t7_integrity_probe_future_version_returns_ok_without_size_check() {
-    use super::format::{FORMAT_VERSION, SKIDX_MAGIC};
+    use crate::index::format::{FORMAT_VERSION, SKIDX_MAGIC};
 
     let dir = tmp_dir();
     {
