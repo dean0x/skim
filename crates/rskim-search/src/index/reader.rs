@@ -655,9 +655,22 @@ impl NgramIndexReader {
         let idx_path = dir.join("index.skidx");
 
         // Step 1: open and read up to SKIDX_HEADER_SIZE bytes.
+        //
+        // `Read::read` is permitted to return fewer bytes than requested even when
+        // more are available, so a single call cannot distinguish "short file" from
+        // "short read".  Getting that wrong reports a HEALTHY index as corrupt and
+        // costs the user a full rebuild, so fill the buffer explicitly.  Bounded by
+        // construction: every iteration either breaks on EOF or advances `n` by at
+        // least one byte toward `buf.len()` (62).
         let mut file = std::fs::File::open(&idx_path)?;
         let mut buf = [0u8; SKIDX_HEADER_SIZE];
-        let n = file.read(&mut buf)?;
+        let mut n = 0usize;
+        while n < buf.len() {
+            match file.read(&mut buf[n..])? {
+                0 => break,
+                k => n += k,
+            }
+        }
 
         // Step 2: need at least 6 bytes for magic + version.
         if n < 6 {

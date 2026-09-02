@@ -734,6 +734,13 @@ pub(super) fn rebuild_temporal_with_source(
                          — delete {} manually",
                         db_path.display()
                     );
+                    // D5 backoff: the discard SUCCEEDED, so temporal.db is now absent and
+                    // `temporal_db_is_stale` would report stale on every subsequent query —
+                    // re-running the full history parse before failing at this same open.
+                    // Record the sentinel so the retry is bounded to once per HEAD (the
+                    // same contract the `Err(other)` arm below honours).  Best-effort:
+                    // if the cache dir is unwritable the retry continues until HEAD moves.
+                    let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
                     return Ok(());
                 }
             }

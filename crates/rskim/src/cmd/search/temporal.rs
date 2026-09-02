@@ -184,11 +184,14 @@ impl DegradedReason {
     /// or the zero-coverage path (e.g. path pair for `RepositoryMismatch`,
     /// formatted count for `NoRankedRows`, error text for `Unreadable`).
     ///
-    /// For `Empty`, `detail == "shallow"` signals that `meta.is_shallow` is set
-    /// (written by Step 10 / Phase C2); absent row → `detail` is empty → no
-    /// shallow suffix.
+    /// For `Empty`, `detail == "shallow"` signals that `meta.is_shallow` is set;
+    /// absent row → `detail` is empty → no shallow suffix.
     ///
-    /// Reserved for Phase C1 `DegradedJson` wiring — not yet used at call sites.
+    /// This is the §2.3 normative cause table in isolation.  Production emits
+    /// through [`Self::full_message`] (cause + remediation in one string) via
+    /// [`degraded_notice`], so `cause` itself has no production call site; it is
+    /// retained as the addressable half of the contract that AC-19(a)/T-19(a)
+    /// pins variant-by-variant.
     #[allow(dead_code)]
     pub(super) fn cause(self, detail: &str) -> String {
         match self {
@@ -226,9 +229,13 @@ impl DegradedReason {
 
     /// Actionable remediation advice for `DegradedJson.remediation`.
     ///
-    /// For `Empty` the is_shallow variant ("run 'git fetch --unshallow'…") is
-    /// wired by Phase C1 via `DegradedJson`; this returns the non-shallow
-    /// default, which is sufficient for the Phase B2 notice path.
+    /// Detail-independent by design (`&'static str`), so `Empty` returns the
+    /// non-shallow default.  The shallow-specific advice ("run 'git fetch
+    /// --unshallow'…") lives only in the human-readable [`Self::full_message`],
+    /// and the sole producer of `Empty` with `detail == "shallow"` is the
+    /// build-time zero-row notice in `temporal_build.rs`, which emits stderr text
+    /// and never a `DegradedJson`.  No live `DegradedJson` can therefore disagree
+    /// with its own `message`.
     pub(super) fn remediation(self) -> &'static str {
         match self {
             // Embedded in NO_TEMPORAL_DATA_MSG; repeated separately for JSON consumers.
@@ -318,8 +325,9 @@ pub(super) struct TemporalUnavailable {
 
 /// Result of attempting to open the temporal database for a query.
 ///
-/// Returned by [`open_temporal_state`]; replaces the old `open_temporal_db_for`
-/// `Result<TemporalDb, TemporalUnavailable>` pair.
+/// Returned by [`open_temporal_state`].  A dedicated enum rather than a
+/// `Result`: "cannot serve temporal ranking" is an ordinary, exit-0 outcome that
+/// every arm must handle, not an error to propagate with `?`.
 #[derive(Debug)]
 pub(super) enum TemporalOpen {
     /// DB is open and anchored to the same repository — ready to serve.
@@ -380,9 +388,9 @@ pub(super) enum Fallback {
 /// AD-414-1: single source of truth for every degraded-state notice,
 /// generalising the documented `--ast` contract (warn on stderr, keep the
 /// upstream order, exit 0).  Loud when skim cannot self-fix, cause-specific,
-/// and always carries a remediation.  Subsumes #413's interim
-/// `mod.rs::temporal_unavailable_msg`, which this PR deletes: one selector,
-/// one line, no duplicate SSOT survives the wave.
+/// and always carries a remediation.  This is the ONLY builder of degraded-state
+/// notice text: every emit site formats the string it returns rather than
+/// composing its own (enforced by `t19b_no_cause_substring_outside_the_builder`).
 ///
 /// When `flag` is non-empty, appends a fallback-specific tail explaining which
 /// flag was not applied and what order was served instead.  When `flag` is

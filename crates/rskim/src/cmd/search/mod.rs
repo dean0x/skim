@@ -1077,6 +1077,13 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             }
         }
     } else {
+        // AD-414-10 / AC-15: snapshot temporal_state BEFORE the self-heal, exactly as
+        // build_stats_json does for `--stats --json`.  auto_refresh_if_stale rebuilds a
+        // missing temporal.db and discards a corrupt one, so computing this AFTER the
+        // refresh would report "ready" for the very states AC-15 names ("missing",
+        // "corrupt") — and would make the text surface disagree with the JSON surface
+        // about the same field on the same invocation.
+        let pre_refresh_temporal_state = temporal_state_json_str(&root, &cache_dir, &head_state);
         // Text mode: self-heal structural corruption before opening the reader
         // (AC-14: same check_staleness → rebuild route as the query arms).
         // analytics is unused by auto_refresh_if_stale (_analytics param);
@@ -1133,13 +1140,13 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         writeln!(out, "  total on disk : {total_on_disk} bytes")?;
         // AD-380-5: temporal DB reported separately (scales with git history).
         writeln!(out, "  temporal db   : {temporal_db_bytes} bytes")?;
-        // AD-414-10: temporal DB state — one of 5 values (AC-15).
+        // AD-414-10: temporal DB state — one of 5 values (AC-15).  Uses the
+        // PRE-REFRESH snapshot taken above so text and `--json` agree.
         {
-            let ts_json = temporal_state_json_str(&root, &cache_dir, &head_state);
-            let ts_text = if ts_json == "empty" {
+            let ts_text = if pre_refresh_temporal_state == "empty" {
                 "empty (0 rows)"
             } else {
-                ts_json
+                pre_refresh_temporal_state
             };
             writeln!(out, "  temporal state : {ts_text}")?;
         }
@@ -1270,10 +1277,21 @@ fn temporal_state_json_str(
                 "ready"
             }
         }
+        // Exhaustive on purpose (no `_` arm): a newly added DegradedReason must be
+        // classified deliberately here rather than silently collapsing to "missing"
+        // and quietly widening what AC-15's five values mean.
         TemporalOpen::Unavailable(u) => match u.reason {
             DegradedReason::Corrupt => "corrupt",
             DegradedReason::UnsupportedVersion => "newer-schema",
-            _ => "missing",
+            // The DB is effectively inaccessible in these states — report "missing".
+            DegradedReason::NotGitRepo
+            | DegradedReason::HeadUnresolved
+            | DegradedReason::RepositoryMismatch
+            | DegradedReason::Missing
+            | DegradedReason::Unreadable => "missing",
+            // Not reachable from open_temporal_state (both are post-open
+            // classifications), but enumerated so the match stays exhaustive.
+            DegradedReason::Empty | DegradedReason::NoRankedRows => "empty",
         },
     }
 }
@@ -1561,7 +1579,13 @@ fn run_query(
             match temporal::open_temporal_state(&root, &cache_dir, head) {
                 temporal::TemporalOpen::Open(db) if !temporal::dimension_is_empty(&db, sort) => {
                     let cov = temporal::apply_temporal_enrichment(&mut output.results, sort, &db)?;
-                    if cov.ranked == 0 {
+                    // `cov.total > 0` is load-bearing (AC-8 / AC-17(b)): a query that
+                    // matched NOTHING has no ranking to degrade, so a zero-result query
+                    // on a healthy DB must stay silent and must not gain a `degraded`
+                    // key.  Without this clause a no-match query emits
+                    // "0 of 0 results have temporal data".  Mirrors the identical guard
+                    // on the standalone --ast arm (ast.rs, `run_ast_standalone`).
+                    if cov.ranked == 0 && cov.total > 0 {
                         // AD-414-13 zero-coverage: enrichment ran but no result received a
                         // temporal score (e.g. all files are untracked or newly added).
                         // Skip the re-sort; preserve lexical order; emit degraded signal.
@@ -1741,7 +1765,7 @@ fn run_temporal_standalone(
     // Finding 2 fix: use head_state from auto_refresh_if_stale above.
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
-    // AD-414-1: open_temporal_state replaces open_temporal_db_for; returns a typed
+    // AD-414-1: open_temporal_state is the single funnel; it returns a typed
     // TemporalOpen so the caller matches on Open/Unavailable instead of Ok/Err.
     // RepositoryMismatch → wrong-repo rows rejected; Missing/Empty/Corrupt → no data.
     // Both arms degrade gracefully (exit 0, AC-F3).
@@ -1752,10 +1776,18 @@ fn run_temporal_standalone(
     //   All other reasons → notice on stderr; in --json mode emit one JSON on stdout (SE-6).
     // json_name() returns the bare form (e.g. "hot") required by DegradedJson.requested (AC-4).
     // flag_name() (e.g. "--hot") is kept only for human-readable message text.
-    let requested_flag = temporal_sort
-        .map(|s| s.json_name())
-        .unwrap_or("")
-        .to_string();
+    //
+    // AC-7: on the standalone arm `--blast-radius FILE` may be the ONLY temporal flag
+    // (temporal_sort is None).  Falling back to "" there would ship a degraded element
+    // whose `requested` names no flag at all, so a machine consumer could not tell WHICH
+    // request was not honoured.  The sort wins when both are supplied (it selects the
+    // ranking; blast-radius only filters).
+    let requested_flag = match (temporal_sort, blast_radius) {
+        (Some(s), _) => s.json_name(),
+        (None, Some(_)) => "blast-radius",
+        (None, None) => "",
+    }
+    .to_string();
     let db = match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
         temporal::TemporalOpen::Open(db) => db,
         temporal::TemporalOpen::Unavailable(u) => {

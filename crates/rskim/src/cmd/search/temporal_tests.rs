@@ -2967,6 +2967,177 @@ fn t19b_remediation_text_conformance() {
     }
 }
 
+/// Every `.rs` file under `crates/rskim/src/cmd/search/`, paired with the part of
+/// its source that is compiled into the PRODUCTION binary.
+///
+/// Test code is excluded two ways, and BOTH are needed:
+/// - `*_tests.rs` sidecars are dropped by filename.  Every module here except
+///   `mod.rs` keeps its tests in a sidecar (`mod tests;` on the last line), so
+///   this removes almost all test source.
+/// - `mod.rs` is the one module with an INLINE `mod tests { … }` block, so its
+///   source is truncated at that block.
+///
+/// A test legitimately quotes cause strings (T-19(a)'s `expected_cause` does)
+/// without that being a second emit site — hence the exclusions.
+///
+/// The marker is the start-of-line `mod tests {` and NOT `#[cfg(test)]`: the
+/// latter also occurs inside doc comments (e.g. `staleness.rs:23`,
+/// `types.rs:71`), and truncating there would silently discard 90 % of several
+/// files and leave this guard vacuous (PF-007).  `assert_corpus_is_substantial`
+/// below fails if that ever regresses.
+fn production_sources_under_search() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/search");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("cmd/search must be readable") {
+        let path = entry.expect("dir entry").path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) if n.ends_with(".rs") && !n.ends_with("_tests.rs") => n.to_string(),
+            _ => continue,
+        };
+        let src = std::fs::read_to_string(&path).expect("source must be readable");
+        let production = match src.find("\nmod tests {") {
+            Some(i) => src[..i].to_string(),
+            None => src,
+        };
+        out.push((name, production));
+    }
+    assert!(
+        out.len() >= 5,
+        "expected the search module to have several production sources, found {}",
+        out.len()
+    );
+    out
+}
+
+/// Anti-vacuity control for [`production_sources_under_search`].
+///
+/// A scan-the-sources test passes trivially if the sources it scanned are empty,
+/// so pin a production symbol from each file that carries a real emit site.  If a
+/// future change to the truncation rule swallows these files, this fails LOUDLY
+/// instead of turning the SSOT guard into a no-op.
+fn assert_corpus_is_substantial(sources: &[(String, String)]) {
+    const REQUIRED: &[(&str, &str)] = &[
+        ("mod.rs", "fn run_query"),
+        ("mod.rs", "fn run_temporal_standalone"),
+        ("ast.rs", "fn run_ast_standalone"),
+        ("query.rs", "fn execute_query_with_manifest"),
+        ("staleness.rs", "fn check_staleness"),
+        ("temporal_build.rs", "fn rebuild_temporal_with_source"),
+        ("temporal_state.rs", "fn temporal_db_is_stale"),
+    ];
+    for (file, symbol) in REQUIRED {
+        let src = sources
+            .iter()
+            .find(|(name, _)| name == file)
+            .unwrap_or_else(|| panic!("{file} must be among the scanned production sources"))
+            .1
+            .as_str();
+        assert!(
+            src.contains(symbol),
+            "the scanned production source for {file} does not contain {symbol:?} — \
+             the test-code exclusion is discarding production code and this guard \
+             has become vacuous (PF-007)"
+        );
+    }
+}
+
+/// T-19(b) / AC-19(b) — STRUCTURAL SSOT, expressed as an observable.
+///
+/// The §2.3 cause texts must exist in exactly one place: the `DegradedReason`
+/// builder in `temporal.rs`.  Any other production file under `cmd/search/` that
+/// contains a cause substring is a second emit site — the failure mode this
+/// criterion exists to catch, because a hand-rolled `eprintln!` drifts from the
+/// builder silently (that is exactly how #413's `temporal_unavailable_msg`
+/// duplicate arose).
+///
+/// Discriminating (PF-007): re-introducing any hand-written cause literal in
+/// `mod.rs`, `ast.rs`, `query.rs`, `staleness.rs` or `temporal_build.rs` fails
+/// this test, and the assertion is keyed on the production strings themselves,
+/// so renaming a cause without updating this list also fails.
+#[test]
+fn t19b_no_cause_substring_outside_the_builder() {
+    // The §2.3 cause substrings that are unique to the builder.  `NotGitRepo` and
+    // `HeadUnresolved` are deliberately absent: their causes ARE the shared
+    // `NO_TEMPORAL_DATA_MSG` / `HEAD_UNRESOLVED_TEMPORAL_MSG` constants declared
+    // in `mod.rs`, so their text legitimately appears there (AC-19/AC-20).
+    const CAUSE_SUBSTRINGS: &[&str] = &[
+        "temporal.db is not present in the index cache",
+        "temporal.db is corrupt (not a database)",
+        "temporal.db was written by a newer skim",
+        "temporal.db could not be opened",
+        "temporal data is empty (0 rows)",
+    ];
+
+    let sources = production_sources_under_search();
+    assert_corpus_is_substantial(&sources);
+
+    for (name, src) in sources {
+        if name == "temporal.rs" {
+            // The builder itself — this is the one place the causes may live.
+            continue;
+        }
+        for cause in CAUSE_SUBSTRINGS {
+            assert!(
+                !src.contains(cause),
+                "AC-19(b): cause text {cause:?} must be emitted only through \
+                 `DegradedReason`/`degraded_notice` in temporal.rs, but it also \
+                 appears in production code in {name}"
+            );
+        }
+    }
+}
+
+/// T-19(b) second half — every `AD-414-<n>` decision anchor is cited in the code.
+///
+/// An anchor with no citation means the decision it names shipped without a
+/// locatable implementation site (or was renumbered and left dangling).
+/// `AD-414-2` lives in `rskim-search` (the `DatabaseCorrupt` classification), so
+/// that crate's sources are scanned alongside `cmd/search/`.
+#[test]
+fn t19b_all_ad_414_anchors_present() {
+    fn collect_rs(dir: &std::path::Path, into: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, into);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && let Ok(src) = std::fs::read_to_string(&path)
+            {
+                into.push_str(&src);
+            }
+        }
+    }
+
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut corpus = String::new();
+    collect_rs(&manifest.join("src/cmd/search"), &mut corpus);
+    collect_rs(&manifest.join("../rskim-search/src"), &mut corpus);
+    assert!(
+        !corpus.is_empty(),
+        "anchor corpus must not be empty — check the source paths"
+    );
+
+    for n in 1..=15u32 {
+        let anchor = format!("AD-414-{n}");
+        // `AD-414-1` is a prefix of `AD-414-15`, so require the next character to
+        // be a non-digit (or end of input) before counting a citation.
+        let found = corpus.match_indices(&anchor).any(|(i, _)| {
+            corpus[i + anchor.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_digit())
+        });
+        assert!(
+            found,
+            "AC-19(b): decision anchor {anchor} is not cited anywhere in \
+             crates/rskim/src/cmd/search/ or crates/rskim-search/src/"
+        );
+    }
+}
+
 /// T-19(c): the three `Fallback` tail texts match the §2.3 normative table.
 ///
 /// Uses `Missing` (known stable cause) so any regression in the tail is

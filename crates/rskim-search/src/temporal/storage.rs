@@ -336,9 +336,9 @@ impl TemporalDb {
     /// Returns `None` when the key is absent or the query fails.
     ///
     /// Currently used by `rskim::cmd::search::temporal_state::anchor_state_on_db`
-    /// to read `META_GIT_TOPLEVEL` through the connection that
-    /// `open_temporal_db_for` already returned, eliminating the extra read-only
-    /// open that the pre-fix code performed (Finding 4 / AD-413-16).
+    /// to read `META_GIT_TOPLEVEL` through the connection the caller already
+    /// holds, avoiding a second read-only open of the same file
+    /// (Finding 4 / AD-413-16).
     pub fn read_meta(&self, key: &str) -> Option<String> {
         self.conn
             .query_row(

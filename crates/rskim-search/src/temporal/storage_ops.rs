@@ -622,11 +622,18 @@ impl TemporalDb {
     /// Atomically replace all temporal data in a single transaction.
     ///
     /// Writes `hotspots`, `risks`, and `cochanges` via DELETE + INSERT and
-    /// updates the `meta` table with three keys: `git_head` under
+    /// updates the `meta` table with four keys: `git_head` under
     /// [`META_GIT_HEAD`], the current UTC timestamp under [`META_LAST_UPDATED`],
-    /// and the current [`TEMPORAL_DATA_VERSION`] under [`META_DATA_VERSION`]
-    /// (AD-408-3). All operations are wrapped in one transaction: either all
+    /// the current [`TEMPORAL_DATA_VERSION`] under [`META_DATA_VERSION`]
+    /// (AD-408-3), and the shallow-clone flag under [`META_IS_SHALLOW`]
+    /// (AD-414-14). All operations are wrapped in one transaction: either all
     /// succeed or none are committed.
+    ///
+    /// **AD-414-14**: `is_shallow` is written as the [`META_IS_SHALLOW`] key/value
+    /// meta row inside this transaction (no schema bump; `CURRENT_VERSION` stays 2).
+    /// When `is_shallow` is `true`, `check_staleness` Check 3 treats a subsequently
+    /// absent `.git/shallow` file as a staleness trigger so a `git fetch --unshallow`
+    /// is detected on the next query without manual `--rebuild`.
     ///
     /// # Parameters
     ///
@@ -635,19 +642,14 @@ impl TemporalDb {
     /// - `cochanges`: Rows to store in the `cochange` table.
     /// - `git_head`: The git HEAD SHA (or any string identifier) to record in
     ///   the `meta` table under [`META_GIT_HEAD`].
+    /// - `is_shallow`: Whether `.git/shallow` existed when these rows were
+    ///   computed; recorded under [`META_IS_SHALLOW`] as `"1"` / `"0"`.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure. On error the
     /// transaction is rolled back and the database is left unchanged.
     /// Returns [`SearchError::CapacityExceeded`] if any slice exceeds 500_000 rows.
-    /// Write all three data tables atomically and update meta.
-    ///
-    /// **AD-414-14**: `is_shallow` is written as the `META_IS_SHALLOW` key/value
-    /// meta row inside this transaction (no schema bump; `CURRENT_VERSION` stays 2).
-    /// When `is_shallow` is `true`, `check_staleness` Check 3 treats a subsequently
-    /// absent `.git/shallow` file as a staleness trigger so a `git fetch --unshallow`
-    /// is detected on the next query without manual `--rebuild`.
     pub fn sync(
         &self,
         hotspots: &[HotspotRow],
