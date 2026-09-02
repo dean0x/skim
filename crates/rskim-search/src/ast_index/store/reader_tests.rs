@@ -1555,19 +1555,23 @@ fn t12_ast_integrity_probe_future_version_returns_ok_without_size_check() {
     );
 }
 
-/// T-13 (#414 E-9 guard): an AST index with `postings_file_size == 0` (empty
-/// corpus — no structural nodes produced) must pass the integrity probe even
-/// when `ast_index.skpost` is absent, because the probe must skip the post-file
-/// check for the zero case.
+/// T-13 (#414 E-9 guard): an AST index with `postings_file_size == 0` in the
+/// header must pass the integrity probe even when `ast_index.skpost` is absent,
+/// because the probe must skip the post-file check for the zero case.
 ///
 /// This covers the `if expected_post == 0 { return Ok(version); }` branch that
 /// is intentionally absent from `lexical_index_integrity`.
+///
+/// The precondition is constructed directly: build a no-ngram index (header
+/// records postings_file_size == 0) then remove the .skpost file that the
+/// builder wrote, so the probe sees the header-says-zero / file-absent state
+/// that E-9 must handle without touching what the builder always writes.
 #[test]
 fn t13_ast_integrity_probe_zero_postings_skips_post_check() {
     use crate::ast_index::store::format::FORMAT_VERSION;
 
     let dir = tempdir().unwrap();
-    // Build an index with NO ngrams — results in postings_file_size == 0.
+    // Build an index with NO ngrams — header records postings_file_size == 0.
     {
         let builder =
             crate::ast_index::store::builder::AstIndexBuilder::new(dir.path().to_path_buf())
@@ -1575,16 +1579,17 @@ fn t13_ast_integrity_probe_zero_postings_skips_post_check() {
         builder.build().unwrap();
     }
 
-    // Confirm that ast_index.skpost is absent (empty-corpus builder omits it).
-    assert!(
-        !dir.path().join("ast_index.skpost").exists(),
-        "T-13 precondition: empty-corpus builder must not write ast_index.skpost"
-    );
+    // Construct the E-9 precondition directly: remove the .skpost the builder
+    // wrote so the on-disk state is header-says-zero / file-absent, which is
+    // exactly the state E-9 must handle.
+    let post_path = dir.path().join("ast_index.skpost");
+    std::fs::remove_file(&post_path)
+        .expect("T-13 setup: builder must have written ast_index.skpost");
 
     // The probe must succeed (E-9: postings_file_size == 0 skips post-file check).
     let version = AstIndexReader::index_integrity(dir.path()).unwrap();
     assert_eq!(
         version, FORMAT_VERSION,
-        "T-13/E-9: empty-corpus AST index must return FORMAT_VERSION from integrity probe"
+        "T-13/E-9: AST index with postings_file_size==0 and absent .skpost must return FORMAT_VERSION"
     );
 }

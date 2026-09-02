@@ -501,19 +501,7 @@ impl AstIndexBuilder {
         crate::validity::unlink_marker_best_effort(&self.output_dir.join("ast_index.skverify"));
 
         // Atomic writes: .skpost first, .skidx second (commit point).
-        //
-        // E-9: when `postings_buf` is empty (no structural nodes extracted —
-        // empty corpus or all-empty files), `postings_file_size == 0` in the
-        // header and no `.skpost` file is written.  A best-effort unlink
-        // removes any stale `.skpost` left by a prior non-empty build so the
-        // on-disk state matches the header.  The integrity probe's early-return
-        // at `postings_file_size == 0` means a stale file would be harmless,
-        // but removing it keeps the tree consistent and satisfies T-13.
-        if postings_buf.is_empty() {
-            let _ = std::fs::remove_file(&post_path); // best-effort; ignore NotFound
-        } else {
-            atomic_write(&self.output_dir, &post_path, &postings_buf)?;
-        }
+        atomic_write(&self.output_dir, &post_path, &postings_buf)?;
         atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
         // Verify-back open re-validates and stamps ast_index.skverify (AC8).
