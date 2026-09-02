@@ -3261,6 +3261,157 @@ fn test_check3_linked_worktree_commondir_shallow_probe() {
 }
 
 // ============================================================================
+// AC-35(c) no-loop end-to-end: rebuild triggered by Check 3 resolves the stale
+// state in exactly one rebuild, not an infinite loop.
+// ============================================================================
+
+/// AC-35(c) no-loop end-to-end: Check 3 triggers exactly one rebuild.
+///
+/// This test runs two `rebuild_temporal_with_source` calls on the SAME cache
+/// directory and verifies that after the second call (the one Check 3 would
+/// trigger), `temporal_db_is_stale` returns `false` — confirming no further
+/// rebuild is triggered ("exactly one rebuild, no loop").
+///
+/// Sequence:
+/// 1. Build 1: shallow source → `META_IS_SHALLOW = "1"` stored in `temporal.db`.
+/// 2. Staleness check with no `shallow` file in `git_dir` → `true` (stale;
+///    Check 3 detected the unshallow transition and asks for a rebuild).
+/// 3. Build 2 (the Check 3 self-heal): non-shallow source, same HEAD, same
+///    `cache_dir` → `META_IS_SHALLOW = "0"` stored in `temporal.db`.
+/// 4. Staleness check with no `shallow` file present → `false` (not stale;
+///    Check 3 does NOT fire because `META_IS_SHALLOW = "0"`).
+/// 5. Staleness check again → `false` (idempotent; no loop).
+///
+/// This is the missing end-to-end assertion for AC-35(c): it exercises "the
+/// rebuild that Check 3 triggers" and re-checks staleness after that rebuild to
+/// prove the "exactly one rebuild, no loop" contract.  Prior tests in this file
+/// only exercise `temporal_db_is_stale` directly; this test proves the full
+/// Build-1 → stale → Build-2 → not-stale cycle that pins the loop invariant.
+#[test]
+fn test_check3_self_heal_no_loop() {
+    use super::super::staleness::temporal_db_is_stale;
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // ── Build 1: shallow clone (META_IS_SHALLOW = "1") ────────────────────
+    let shallow_history = HistoryResult {
+        commits: vec![make_commit(
+            "pppp0001",
+            1_000_000,
+            "feat: initial (shallow)",
+            &[],
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 1,
+        },
+    };
+    let src1 = FixedSource {
+        history: shallow_history,
+    };
+    let fake_head = "pppp9999pppp9999pppp9999pppp9999pppp9999";
+    let now = super::current_epoch_secs();
+
+    rebuild_temporal_with_source(
+        &src1,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("Check 3 no-loop: Build 1 (shallow) must succeed");
+
+    // Sanity: META_IS_SHALLOW = "1" written by Build 1.
+    {
+        let db = rskim_search::TemporalDb::open(&cache_dir.join("temporal.db"))
+            .expect("Check 3 no-loop: temporal.db must be openable after Build 1");
+        let stored = db
+            .get_meta(rskim_search::META_IS_SHALLOW)
+            .expect("Check 3 no-loop: get_meta must succeed")
+            .expect("Check 3 no-loop: META_IS_SHALLOW must be present after Build 1");
+        assert_eq!(
+            stored, "1",
+            "Check 3 no-loop: META_IS_SHALLOW must be '1' after Build 1 (shallow source)"
+        );
+    }
+
+    // ── Step 2: staleness check — Check 3 fires (no shallow file) ─────────
+    // Fake git dir with no shallow file simulates the unshallow transition.
+    let fake_git_dir = dir.path().join("fake_git");
+    std::fs::create_dir_all(&fake_git_dir).expect("Check 3 no-loop: create fake_git_dir");
+
+    assert!(
+        temporal_db_is_stale(&cache_dir, fake_head, Some(&fake_git_dir)),
+        "AC-35(c) no-loop: temporal_db_is_stale must return true after Build 1 with \
+         META_IS_SHALLOW='1' and no shallow file (Check 3 fires — stale detected)"
+    );
+
+    // ── Build 2: the self-heal triggered by Check 3 (non-shallow source) ──
+    // Same HEAD, same cache_dir as Build 1. After this rebuild, META_IS_SHALLOW = "0".
+    let full_history = HistoryResult {
+        commits: vec![make_commit(
+            "pppp0001",
+            1_000_000,
+            "feat: initial (full clone)",
+            &["src/lib.rs"],
+        )],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: false,
+            commit_count: 1,
+        },
+    };
+    let src2 = FixedSource {
+        history: full_history,
+    };
+
+    rebuild_temporal_with_source(
+        &src2,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("Check 3 no-loop: Build 2 (non-shallow self-heal) must succeed");
+
+    // Sanity: META_IS_SHALLOW = "0" written by Build 2.
+    {
+        let db = rskim_search::TemporalDb::open(&cache_dir.join("temporal.db"))
+            .expect("Check 3 no-loop: temporal.db must be openable after Build 2");
+        let stored = db
+            .get_meta(rskim_search::META_IS_SHALLOW)
+            .expect("Check 3 no-loop: get_meta must succeed after Build 2")
+            .expect("Check 3 no-loop: META_IS_SHALLOW must be present after Build 2");
+        assert_eq!(
+            stored, "0",
+            "Check 3 no-loop: META_IS_SHALLOW must be '0' after Build 2 (non-shallow self-heal)"
+        );
+    }
+
+    // ── Step 4: staleness check — Check 3 must NOT fire ───────────────────
+    // fake_git_dir still has no shallow file. But META_IS_SHALLOW = "0", so
+    // Check 3 is skipped — temporal_db_is_stale must return false.
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, Some(&fake_git_dir)),
+        "AC-35(c) no-loop: temporal_db_is_stale must return false after Build 2 \
+         (META_IS_SHALLOW='0') even with no shallow file in fake_git_dir — Check 3 \
+         does not fire when META_IS_SHALLOW is not '1'; this is the core no-loop assertion"
+    );
+
+    // ── Step 5: idempotent — second staleness check must also return false ─
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, Some(&fake_git_dir)),
+        "AC-35(c) no-loop: temporal_db_is_stale must return false on a second consecutive \
+         call (idempotent — the 'no loop' guarantee: no further rebuild is triggered)"
+    );
+}
+
+// ============================================================================
 // AC-16 — zero_row_notice text contract (direct unit tests)
 //
 // These tests call zero_row_notice() directly to pin the AC-16 text contract:
