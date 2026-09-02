@@ -3390,17 +3390,28 @@ fn t6_integrity_probe_missing_skpost_returns_corrupted() {
     );
 }
 
-/// T-7 (AD-414-6 guard, #414): `lexical_index_integrity` must return
+/// T-7 / AC-12 (AD-414-6 guard, #414): `lexical_index_integrity` must return
 /// `Ok(future_version)` for a **foreign-format** index file — i.e. one whose
 /// version field does not equal `FORMAT_VERSION` — WITHOUT performing any size
-/// validation against it.
+/// validation against it, **even when `index.skpost` is simultaneously truncated**.
+///
+/// The simultaneous truncation is load-bearing (AC-12 discriminator): without it
+/// the test cannot distinguish "the probe skipped size validation for a foreign
+/// version" from "the sizes happened to agree".  A truncated `.skpost` would
+/// cause an `IndexCorrupted` error if the size check ran; returning `Ok` despite
+/// the truncation proves the early-return fires before any size check.
+///
+/// AC-12 also requires that the artifacts' bytes and modification times are
+/// unchanged after the probe (E-8): the probe must be truly read-only.  Mtime
+/// equality is checked on both artifacts immediately after the call.
 ///
 /// Rationale: future-format files have an unknown header layout, so size checks
 /// calibrated against the *current* header encoding would be meaningless and
 /// could produce false `IndexCorrupted` errors that block `check_staleness`
 /// from triggering the expected automatic rebuild.  The caller
 /// (`check_staleness`) is responsible for treating a version mismatch as a
-/// rebuild signal.
+/// rebuild signal; see `t12_ac12_future_version_check_staleness_not_stale` for
+/// the complementary clause-2 guard.
 #[test]
 fn t7_integrity_probe_future_version_returns_ok_without_size_check() {
     use crate::index::format::{FORMAT_VERSION, SKIDX_MAGIC};
@@ -3420,6 +3431,7 @@ fn t7_integrity_probe_future_version_returns_ok_without_size_check() {
 
     // Rewrite the version field in index.skidx to a future version.
     let idx_path = dir.path().join("index.skidx");
+    let post_path = dir.path().join("index.skpost");
     let mut data = std::fs::read(&idx_path).unwrap();
     // Sanity: the first 4 bytes must be the magic we expect.
     assert_eq!(&data[0..4], SKIDX_MAGIC, "magic mismatch in test setup");
@@ -3433,14 +3445,49 @@ fn t7_integrity_probe_future_version_returns_ok_without_size_check() {
     data[5] = future_bytes[1];
     std::fs::write(&idx_path, &data).unwrap();
 
+    // AC-12 discriminator: truncate index.skpost to 0 bytes so that any code
+    // path that reached the .skpost size check would return IndexCorrupted.
+    // A healthy FORMAT_VERSION build always writes a non-empty .skpost, so
+    // truncating it guarantees the size check would fail if it ran.
+    std::fs::write(&post_path, b"").unwrap();
+
+    // Record sizes and modification times BEFORE the probe (E-8: read-only).
+    let idx_len_before = std::fs::metadata(&idx_path).unwrap().len();
+    let post_len_before = std::fs::metadata(&post_path).unwrap().len();
+    let idx_mtime_before = std::fs::metadata(&idx_path).unwrap().modified().unwrap();
+    let post_mtime_before = std::fs::metadata(&post_path).unwrap().modified().unwrap();
+
     // AD-414-6: must return Ok(future_version) — not Err — even though the
     // rest of the header encoding is calibrated for FORMAT_VERSION, not
-    // future_version.  (Size-check code is only reached for files whose
-    // version == FORMAT_VERSION.)
+    // future_version, AND even though index.skpost is truncated.
+    // (Size-check code is only reached for files whose version == FORMAT_VERSION.)
     let result = NgramIndexReader::lexical_index_integrity(dir.path());
     assert!(
         matches!(result, Ok(v) if v == future_version),
-        "T-7/AD-414-6: foreign-version file must yield Ok({future_version}), got {:?}",
+        "T-7/AC-12/AD-414-6: foreign-version file must yield Ok({future_version}) \
+         even with truncated .skpost, got {:?}",
         result
+    );
+
+    // E-8 (unit-level): the probe must not modify either artifact.
+    let idx_len_after = std::fs::metadata(&idx_path).unwrap().len();
+    let post_len_after = std::fs::metadata(&post_path).unwrap().len();
+    let idx_mtime_after = std::fs::metadata(&idx_path).unwrap().modified().unwrap();
+    let post_mtime_after = std::fs::metadata(&post_path).unwrap().modified().unwrap();
+    assert_eq!(
+        idx_len_before, idx_len_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skidx (size changed)"
+    );
+    assert_eq!(
+        post_len_before, post_len_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skpost (size changed)"
+    );
+    assert_eq!(
+        idx_mtime_before, idx_mtime_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skidx (mtime changed)"
+    );
+    assert_eq!(
+        post_mtime_before, post_mtime_after,
+        "AC-12/E-8: lexical_index_integrity must not modify index.skpost (mtime changed)"
     );
 }

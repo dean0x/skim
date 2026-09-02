@@ -4945,3 +4945,56 @@ fn test_ac16c_unresolvable_head_no_rebuild_loop_temporal_stable() {
          got {verdict2:?}"
     );
 }
+
+/// AC-12 clause 2 (NEGATIVE, #414): `check_staleness` must **not** report the
+/// lexical index stale when `index.skidx` has a future format version
+/// (`FORMAT_VERSION + 1`).
+///
+/// `check_staleness` computes `lexical_stale` as
+/// `Ok(v) => v < LEXICAL_INDEX_FORMAT_VERSION`.  For `v = FORMAT_VERSION + 1`
+/// the comparison is false, so the lexical dimension does NOT trigger a rebuild.
+/// This is the second of the three AC-12 clauses (the first — `Ok(future_version)`
+/// from the probe — is guarded by `t7_integrity_probe_future_version_returns_ok_without_size_check`
+/// in `reader_tests.rs`; the third — bytes/mtimes unchanged — is also guarded
+/// there).
+///
+/// Discriminating: if the `v < LEXICAL_INDEX_FORMAT_VERSION` comparison were
+/// accidentally inverted (`v > …`) or replaced with `v != …`, this test would
+/// fail because `StalenessCheck::NoStoredHead` would be returned instead of
+/// `Current`.  The `.skpost` truncation mirrors the AC-12 discriminator: a
+/// size-check regression that reaches the `.skpost` probe would return
+/// `NoStoredHead` (corrupted → rebuild), not `Current`.
+#[test]
+fn t12_ac12_future_version_check_staleness_not_stale() {
+    use rskim_search::LEXICAL_INDEX_FORMAT_VERSION;
+
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+    let sha = "1234abcd1234abcd1234abcd1234abcd1234abcd";
+    create_fake_git_repo(dir.path(), &format!("{sha}\n"));
+
+    write_manifest_with_head(dir.path(), &cache_dir, Some(sha));
+    // Write a stub with a FUTURE lexical version (FORMAT_VERSION + 1).
+    // The version is strictly above LEXICAL_INDEX_FORMAT_VERSION, so the
+    // `v < LEXICAL_INDEX_FORMAT_VERSION` guard in check_staleness must be false.
+    let future_version: u16 = LEXICAL_INDEX_FORMAT_VERSION + 1;
+    let mut header = [0u8; 62];
+    header[0..4].copy_from_slice(b"SKIX");
+    header[4..6].copy_from_slice(&future_version.to_le_bytes());
+    fs::write(cache_dir.join("index.skidx"), header).unwrap();
+    // AC-12 discriminator: truncate .skpost so a size-check regression returns
+    // IndexCorrupted (→ rebuild) rather than silently passing.
+    fs::write(cache_dir.join("index.skpost"), b"").unwrap();
+    write_ast_index_stub(&cache_dir);
+
+    let (result, _manifest) = check_staleness(&cache_dir, dir.path());
+
+    // AC-12 clause 2: a future-version lexical index must NOT trigger a rebuild.
+    // The probe returns Ok(future_version); Ok(v) => v < FORMAT_VERSION is false
+    // for v > FORMAT_VERSION, so lexical_stale is false.
+    assert!(
+        matches!(result, StalenessCheck::Current),
+        "AC-12 clause 2: check_staleness must return Current for a future-version \
+         lexical index (v={future_version} > FORMAT_VERSION); got {result:?}"
+    );
+}
