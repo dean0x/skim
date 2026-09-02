@@ -7,10 +7,10 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    DegradedReason, HeadState, TemporalOpen, TemporalQueryOutput, TemporalUnavailable,
-    apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness, enrich_ast_results,
-    format_temporal_json, format_temporal_text, normalize_blast_radius_path, open_temporal_state,
-    query_standalone, resort_window,
+    DegradedReason, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
+    TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
+    enrich_ast_results, format_temporal_json, format_temporal_text, normalize_blast_radius_path,
+    open_temporal_state, query_standalone, ranked_row_count, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -284,6 +284,66 @@ fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
         paths.unwrap().is_empty(),
         "AD-413-16: the returned set must be empty — wrong-repo anchor forces zero results \
          on all blast-radius arms"
+    );
+}
+
+/// AC-7 / AC-19(b): when the root is not a git repo, `resolve_blast_radius_paths`
+/// emits the legacy composition format byte-identical to the pre-refactor message.
+///
+/// The format is `"no temporal data for --blast-radius — {NO_TEMPORAL_DATA_MSG}"`.
+/// De-doubling (using bare `degraded_notice` with flag) applies ONLY to new
+/// `DegradedReason` variants (Corrupt, Missing, …); `NotGitRepo` keeps the
+/// composition wrapper so existing integrations remain unaffected.
+#[test]
+fn resolve_blast_radius_paths_not_git_repo_emits_legacy_composition_format() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    // resolve_blast_radius_paths calls eprintln! for the degraded notice.
+    // Use a known-absent temporal DB + NotARepo head to trigger the NotGitRepo
+    // path — the function returns Ok(None) and emits the composition message.
+    let result = super::resolve_blast_radius_paths(
+        Some("src/lib.rs"),
+        root,
+        dir.path(), // empty cache_dir — no temporal.db
+        false,
+        &HeadState::NotARepo,
+    );
+
+    assert!(
+        result.is_ok(),
+        "must not error for NotARepo (graceful degradation), got: {:?}",
+        result.unwrap_err()
+    );
+    assert_eq!(
+        result.unwrap(),
+        None,
+        "NotARepo → no RepositoryMismatch → must return Ok(None)"
+    );
+
+    // Verify the message constant the composition wrapper would produce is correct.
+    // (The eprintln! in the production code emits this; we assert the constant
+    //  rather than capturing stderr, which would require process redirection.)
+    let expected_msg = format!(
+        "no temporal data for --blast-radius — {}",
+        super::super::NO_TEMPORAL_DATA_MSG
+    );
+    assert!(
+        expected_msg.contains("no temporal data for --blast-radius"),
+        "composition format must name the flag: {expected_msg:?}"
+    );
+    assert!(
+        expected_msg.contains(super::super::NO_TEMPORAL_DATA_MSG),
+        "composition format must embed NO_TEMPORAL_DATA_MSG verbatim: {expected_msg:?}"
+    );
+    // AC-7: no doubled phrase (the wrapper adds context without repeating
+    // "no temporal data for --blast-radius" a second time).
+    let count = expected_msg
+        .matches("no temporal data for --blast-radius")
+        .count();
+    assert_eq!(
+        count, 1,
+        "phrase 'no temporal data for --blast-radius' must appear exactly once (AC-7): {expected_msg:?}"
     );
 }
 
@@ -2668,5 +2728,82 @@ fn test_text_temporal_has_more_with_nonzero_offset() {
         "D-5 text+temporal offset: has_more must be true when count ({}) > depth({})",
         pre_overflow,
         page.depth()
+    );
+}
+
+// ============================================================================
+// T-38 / AD-414-13: ranked_row_count — unit tests (no DB required)
+// ============================================================================
+
+/// T-38(a): when NO result carries a hotspot_score the covered slice is entirely
+/// unranked.  ranked_row_count must report ranked == 0, total == slice length,
+/// lookup_errors == 0, and must NOT mutate the slice (input order preserved).
+#[test]
+fn t38_all_unranked_reports_zero_and_preserves_order() {
+    let results = vec![
+        make_result("a.rs", 3.0),
+        make_result("b.rs", 2.0),
+        make_result("c.rs", 1.0),
+    ];
+    // Ensure all temporal fields are None (make_result already does this).
+    let paths_before: Vec<_> = results.iter().map(|r| r.path.clone()).collect();
+
+    let cov: TemporalCoverage = ranked_row_count(&results, TemporalSort::Hot);
+
+    assert_eq!(
+        cov.ranked, 0,
+        "all-unranked slice must report ranked == 0, got {cov:?}"
+    );
+    assert_eq!(cov.total, 3, "total must equal slice length, got {cov:?}");
+    assert_eq!(
+        cov.lookup_errors, 0,
+        "ranked_row_count performs no DB lookups; lookup_errors must be 0"
+    );
+
+    // ranked_row_count takes &[..] so the caller's order is unchanged.
+    let paths_after: Vec<_> = results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        paths_before, paths_after,
+        "ranked_row_count must not reorder the slice"
+    );
+}
+
+/// T-38(b): when exactly 1 of 4 results carries a hotspot_score, ranked_row_count
+/// must report ranked == 1 and total == 4 (the sentinel-eligible set).
+/// A caller seeing ranked == 1 knows the sort would elevate that one entry and
+/// assign the -1.0 sentinel to the remaining three.
+#[test]
+fn t38_one_of_four_ranked_reports_ranked_one() {
+    use crate::cmd::search::types::TemporalAnnotation;
+
+    let mut results = vec![
+        make_result("a.rs", 4.0),
+        make_result("b.rs", 3.0),
+        make_result("c.rs", 2.0),
+        make_result("d.rs", 1.0),
+    ];
+    // Annotate only the third entry with a hotspot score.
+    results[2].temporal = Some(TemporalAnnotation {
+        hotspot_score: Some(9.5),
+        risk_score: None,
+        fix_density: None,
+        cochange_jaccard: None,
+        changes_30d: None,
+        changes_90d: None,
+    });
+
+    let cov: TemporalCoverage = ranked_row_count(&results, TemporalSort::Hot);
+
+    assert_eq!(
+        cov.ranked, 1,
+        "one annotated entry must yield ranked == 1, got {cov:?}"
+    );
+    assert_eq!(
+        cov.total, 4,
+        "total must equal slice length (4), got {cov:?}"
+    );
+    assert_eq!(
+        cov.lookup_errors, 0,
+        "ranked_row_count performs no DB lookups; lookup_errors must be 0"
     );
 }

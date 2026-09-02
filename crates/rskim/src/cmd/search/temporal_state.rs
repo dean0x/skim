@@ -340,7 +340,7 @@ pub(super) fn temporal_anchor_state(cache_dir: &Path, root: &Path) -> AnchorStat
 ///
 /// Mirrors `temporal_anchor_state` but reads `META_GIT_TOPLEVEL` from `db`
 /// instead of opening a separate read-only connection — avoids the double SQLite
-/// open that the pre-fix `open_temporal_db_for` performed (Finding 4):
+/// open that would occur if the caller opened a second connection (Finding 4):
 /// the caller already paid to open `temporal.db` as a `TemporalDb`, so we
 /// must not open it a second time just to read one meta row.
 ///
@@ -350,7 +350,7 @@ pub(super) fn temporal_anchor_state(cache_dir: &Path, root: &Path) -> AnchorStat
 ///
 /// # When to use
 ///
-/// Call this when `db` is the `TemporalDb` that `open_temporal_db_for` just
+/// Call this when `db` is the `TemporalDb` that [`open_temporal_state`] just
 /// opened (i.e. the same handle used to serve the query).  Use the standalone
 /// `temporal_anchor_state` only when no live connection is available.
 pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {

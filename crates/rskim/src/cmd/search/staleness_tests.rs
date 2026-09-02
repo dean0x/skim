@@ -70,7 +70,7 @@ fn write_ast_index_stub(cache_dir: &std::path::Path) {
     header[4..6].copy_from_slice(&version.to_le_bytes());
     // Remaining fields (bigram_count, trigram_count, file_count,
     // postings_file_size, avg_bigram/trigram/node/max_depth, checksum) stay 0.
-    fs::write(cache_dir.join("ast_index.skidx"), &header).unwrap();
+    fs::write(cache_dir.join("ast_index.skidx"), header).unwrap();
     // No ast_index.skpost created: E-9 early-return skips the .skpost probe.
 }
 
@@ -105,7 +105,7 @@ fn write_lexical_index_stub(cache_dir: &std::path::Path) {
     header[4..6].copy_from_slice(&version.to_le_bytes());
     // Remaining fields (ngram_count, file_count, postings_file_size,
     // avg_doc_length, avg_field_lengths[8], checksum) stay 0.
-    fs::write(cache_dir.join("index.skidx"), &header).unwrap();
+    fs::write(cache_dir.join("index.skidx"), header).unwrap();
     // Empty .skpost: postings_file_size = 0 in header → expected 0 bytes.
     fs::write(cache_dir.join("index.skpost"), b"").unwrap();
 }

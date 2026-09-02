@@ -183,6 +183,9 @@ impl DegradedReason {
     /// `detail` carries reason-specific context set by [`open_temporal_state`]
     /// or the zero-coverage path (e.g. path pair for `RepositoryMismatch`,
     /// formatted count for `NoRankedRows`, error text for `Corrupt`/`Unreadable`).
+    ///
+    /// Reserved for Phase C1 `DegradedJson` wiring — not yet used at call sites.
+    #[allow(dead_code)]
     pub(super) fn cause(self, detail: &str) -> String {
         match self {
             // Legacy constants used verbatim (AC-19 byte-identical guards).
@@ -365,8 +368,9 @@ pub(super) enum Fallback {
 ///
 /// When `flag` is non-empty, appends a fallback-specific tail explaining which
 /// flag was not applied and what order was served instead.  When `flag` is
-/// empty (text+temporal arm), returns the base message verbatim so the
-/// legacy byte-identical assertions remain valid.
+/// empty (standalone temporal arm, `--hot`/`--cold`/`--risky` without a text
+/// query), returns the base message verbatim so legacy byte-identical
+/// assertions remain valid.
 pub(super) fn degraded_notice(u: &TemporalUnavailable, flag: &str, fallback: Fallback) -> String {
     let base = u.reason.full_message(&u.detail);
     if flag.is_empty() {
@@ -561,7 +565,19 @@ pub(super) fn resolve_blast_radius_paths(
     let db = match open_temporal_state(root, cache_dir, head) {
         TemporalOpen::Open(db) => db,
         TemporalOpen::Unavailable(u) => {
-            let msg = degraded_notice(&u, "--blast-radius", Fallback::NoResults);
+            // AC-7 / AC-19(b): NotGitRepo keeps the legacy composition format
+            // byte-identical to the pre-refactor message.  All other reasons
+            // route through degraded_notice with flag="--blast-radius" so their
+            // cause is specific and no doubled phrase is produced (de-doubling
+            // applies ONLY to the new reasons).
+            let msg = if u.reason == DegradedReason::NotGitRepo {
+                format!(
+                    "no temporal data for --blast-radius — {}",
+                    super::NO_TEMPORAL_DATA_MSG
+                )
+            } else {
+                degraded_notice(&u, "--blast-radius", Fallback::NoResults)
+            };
             if json {
                 let envelope = serde_json::json!({ "warning": msg });
                 eprintln!("{}", serde_json::to_string(&envelope)?);
@@ -1482,8 +1498,9 @@ fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) -> usize {
 ///
 /// **AD-414-13 zero-coverage skip**: when `ranked == 0` after annotation the
 /// `sort_by` is NOT applied — raw-AST order is preserved rather than re-sorting
-/// every result onto the `-1.0` sentinel.  The caller (`ast.rs`) checks
-/// `cov.ranked == 0` to emit the `NoRankedRows` degraded notice (Step 8).
+/// every result onto the `-1.0` sentinel.  The caller receives a
+/// `TemporalCoverage` with `ranked == 0` and may act on it (e.g. emit a
+/// degraded notice); the specific caller action is determined at call sites.
 pub(super) fn enrich_ast_results(
     results: &mut [rskim_search::AstResult],
     sort: TemporalSort,

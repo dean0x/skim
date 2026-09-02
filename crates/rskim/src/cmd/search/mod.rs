@@ -59,12 +59,12 @@ pub(super) const NO_TEMPORAL_DATA_MSG: &str =
 pub(super) const HEAD_UNRESOLVED_TEMPORAL_MSG: &str = "git HEAD could not be resolved to a SHA (unborn branch, or unsupported ref \
      backend such as reftable — tracked in #481); temporal data unavailable";
 
-/// Emitted by [`temporal_unavailable_msg`] for any [`staleness::HeadState::Resolved`]
+/// Emitted by [`temporal::degraded_notice`] for any [`staleness::HeadState::Resolved`]
 /// root that has no usable temporal data and no [`staleness::AnchorState::Differs`]
 /// mismatch.  The three covered cases are:
 ///
 /// 1. **Absent DB** — `temporal.db` was never built (first run, or after
-///    `--rebuild`); `open_temporal_db` returns `None`.
+///    `--rebuild`); `temporal::open_temporal_state` returns `Unavailable(Missing)`.
 /// 2. **Unopenable DB** — the file exists but is corrupt, schema-gated, or at an
 ///    incompatible `PRAGMA user_version`; `TemporalDb::open` returns `Err`.
 /// 3. **Empty build** — `rebuild_temporal` ran successfully but the git log for
@@ -1246,8 +1246,8 @@ fn run_query(
     // MUST run BEFORE opening temporal.db or resolving blast-radius paths, so that
     // a missing or HEAD-divergent temporal.db is rebuilt before we attempt to open
     // it.  This mirrors the ordering used by the two standalone arms:
-    //   - run_temporal_standalone: refresh first, then open_temporal_db
-    //   - standalone --ast arm:    refresh first, then open_temporal_db
+    //   - run_temporal_standalone: refresh first, then open_temporal_state
+    //   - standalone --ast arm:    refresh first, then open_temporal_state
     //
     // Previously, temporal_db was opened at the top of this function BEFORE
     // auto_refresh_if_stale fired, so a lexical-Current but temporal-stale DB was
@@ -2820,7 +2820,7 @@ mod tests {
     fn test_resolve_blast_radius_filter_no_db_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        // cache_dir has no temporal.db — open_temporal_db_for returns Err(Absent)
+        // cache_dir has no temporal.db — open_temporal_state returns Unavailable(Missing)
         // and the function degrades gracefully to Ok(None).
         let result = temporal::resolve_blast_radius_paths(
             Some("src/auth.rs"),
