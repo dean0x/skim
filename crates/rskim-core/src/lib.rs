@@ -370,10 +370,12 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// # Returns
 /// Text fitting within the token budget, with omission marker if truncated.
-/// If `token_budget` is 0 or smaller than the omission marker itself (~5-7
-/// tokens), an empty string is returned rather than violating the budget
-/// invariant. Callers should validate the budget upstream or handle the
-/// empty-string edge case.
+/// Output fits the budget whenever at least one content line fits together
+/// with the marker. If no content line fits, the compact omission marker
+/// line (no hint) is returned on its own — this may exceed a budget smaller
+/// than the marker itself. An empty string is never returned for non-empty
+/// input (ADR-011 class 1 / #317, ADR-016). Callers that must never exceed
+/// the budget should treat "output is exactly the marker line" as the signal.
 ///
 /// # Examples
 ///
