@@ -1633,19 +1633,10 @@ fn run_query(
     // readable counterpart.  Blast-radius degradation is independent of temporal-
     // sort degradation: both can be present simultaneously (two entries in the vec).
     if let Some(u) = blast_degraded {
-        // AC-7 / AC-19(b): NotGitRepo keeps the legacy composition format
-        // byte-identical to the string emitted to stderr by resolve_blast_radius_paths
-        // so DegradedJson.message agrees with what was printed (audit #414-6).
-        // All other reasons use degraded_notice with flag="--blast-radius" and
-        // Fallback::Lexical (same formula as resolve_blast_radius_paths).
-        let msg = if u.reason == temporal::DegradedReason::NotGitRepo {
-            format!(
-                "no temporal data for --blast-radius — {}",
-                NO_TEMPORAL_DATA_MSG
-            )
-        } else {
-            temporal::degraded_notice(&u, "--blast-radius", temporal::Fallback::Lexical)
-        };
+        // AC-7 / AC-19(b): blast_radius_degraded_msg is the SSOT for this
+        // message — it agrees with what resolve_blast_radius_paths printed to
+        // stderr (audit #414-6), so DegradedJson.message matches.
+        let msg = temporal::blast_radius_degraded_msg(&u);
         output.degraded.push(temporal::DegradedJson {
             subsystem: "temporal",
             reason: u.reason.as_json_str(),

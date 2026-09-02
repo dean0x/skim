@@ -407,6 +407,27 @@ pub(super) fn degraded_notice(u: &TemporalUnavailable, flag: &str, fallback: Fal
     }
 }
 
+/// AC-7 / AC-19(b): compute the human-readable message for a `--blast-radius`
+/// degradation notice.
+///
+/// `NotGitRepo` keeps the legacy composition format byte-identical to the
+/// pre-refactor message (AC-19 byte-identical guard).  All other reasons use
+/// [`degraded_notice`] with `flag = "--blast-radius"` and [`Fallback::Lexical`].
+///
+/// Shared by two call sites that must emit the same string:
+/// - [`resolve_blast_radius_paths`] — prints to stderr.
+/// - `mod.rs::run_query` — writes to `DegradedJson.message` (must match stderr).
+pub(super) fn blast_radius_degraded_msg(u: &TemporalUnavailable) -> String {
+    if u.reason == DegradedReason::NotGitRepo {
+        format!(
+            "no temporal data for --blast-radius — {}",
+            super::NO_TEMPORAL_DATA_MSG
+        )
+    } else {
+        degraded_notice(u, "--blast-radius", Fallback::Lexical)
+    }
+}
+
 // ============================================================================
 // DB open / state resolution
 // ============================================================================
@@ -590,19 +611,9 @@ pub(super) fn resolve_blast_radius_paths(
     let db = match open_temporal_state(root, cache_dir, head) {
         TemporalOpen::Open(db) => db,
         TemporalOpen::Unavailable(u) => {
-            // AC-7 / AC-19(b): NotGitRepo keeps the legacy composition format
-            // byte-identical to the pre-refactor message.  All other reasons
-            // route through degraded_notice with flag="--blast-radius" and
-            // Fallback::Lexical so the notice reads "--blast-radius not applied"
-            // (T-7/AC-7 requirement) and no doubled phrase is produced.
-            let msg = if u.reason == DegradedReason::NotGitRepo {
-                format!(
-                    "no temporal data for --blast-radius — {}",
-                    super::NO_TEMPORAL_DATA_MSG
-                )
-            } else {
-                degraded_notice(&u, "--blast-radius", Fallback::Lexical)
-            };
+            // AC-7 / AC-19(b): see blast_radius_degraded_msg for the
+            // NotGitRepo legacy-format contract and the two-site agreement.
+            let msg = blast_radius_degraded_msg(&u);
             if json {
                 let envelope = serde_json::json!({ "warning": msg });
                 eprintln!("{}", serde_json::to_string(&envelope)?);
