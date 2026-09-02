@@ -1759,8 +1759,10 @@ fn run_temporal_standalone(
     // Step 9 differentiation:
     //   NotGitRepo → AC9-byte-identical `warning` key on stdout + `degraded` sibling.
     //   All other reasons → notice on stderr; in --json mode emit one JSON on stdout (SE-6).
+    // json_name() returns the bare form (e.g. "hot") required by DegradedJson.requested (AC-4).
+    // flag_name() (e.g. "--hot") is kept only for human-readable message text.
     let requested_flag = temporal_sort
-        .map(|s| s.flag_name())
+        .map(|s| s.json_name())
         .unwrap_or("")
         .to_string();
     let db = match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
