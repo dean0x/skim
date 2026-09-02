@@ -412,6 +412,7 @@ pub(super) fn execute_query_with_manifest(
             duration_ms: start.elapsed().as_millis() as u64,
             index_stats: None,
             ast_coverage: None,
+            degraded: vec![],
         });
     }
     // Compute the verify-mode label once for all QueryOutput sites in this function.
@@ -682,6 +683,7 @@ pub(super) fn execute_query_with_manifest(
         duration_ms,
         index_stats: Some(stats),
         ast_coverage: None,
+        degraded: vec![],
     })
 }
 
@@ -746,6 +748,7 @@ fn run_compound_query(
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
             ast_coverage: None,
+            degraded: vec![],
         });
     }
 
@@ -784,6 +787,7 @@ fn run_compound_query(
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
             ast_coverage: None,
+            degraded: vec![],
         });
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
@@ -902,6 +906,7 @@ fn run_compound_query(
         duration_ms,
         index_stats: Some(ctx.stats),
         ast_coverage: None,
+        degraded: vec![],
     })
 }
 
@@ -962,6 +967,7 @@ fn run_blast_radius_composite_query(
             duration_ms: ctx.start.elapsed().as_millis() as u64,
             index_stats: Some(ctx.stats),
             ast_coverage: None,
+            degraded: vec![],
         });
     }
 
@@ -1175,6 +1181,7 @@ fn run_blast_radius_composite_query(
         duration_ms,
         index_stats: Some(ctx.stats),
         ast_coverage: None,
+        degraded: vec![],
     })
 }
 

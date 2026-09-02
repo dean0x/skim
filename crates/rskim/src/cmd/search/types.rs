@@ -384,6 +384,18 @@ pub(super) struct QueryOutput {
     /// `is_clean()` the field is set to `None` (omit from JSON entirely).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ast_coverage: Option<rskim_search::AstCoverage>,
+    /// AD-414-5 / AD-414-12: degradation signals emitted on this query.
+    ///
+    /// An array of objects — one per subsystem that could not deliver the
+    /// requested ranking.  **Absent from JSON when empty** (additive,
+    /// back-compat; `#[serde(skip_serializing_if)]`).  Consumers that check
+    /// for the key can detect degraded queries without parsing stderr.
+    ///
+    /// The array is `pub` so callers outside `query.rs` (e.g. `mod.rs`
+    /// enrichment arms) can push signals after `execute_query_with_manifest`
+    /// returns.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<super::temporal::DegradedJson>,
 }
 
 // ============================================================================

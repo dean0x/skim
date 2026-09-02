@@ -248,24 +248,15 @@ pub(crate) fn run(
             // Open the temporal DB only when a sort is requested.  Absent DB →
             // graceful degradation: warn on stderr and run unsorted (exit 0, AC-A3),
             // mirroring run_temporal_standalone's missing-data message.
-            // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
-            // place (the funnel) — replaces the four-site manual AnchorState::Differs
-            // pre-check pattern (Finding 1).
-            // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so
-            // degraded_notice is called with pre-resolved states (no I/O).
+            // AD-414-1 / AD-414-15: open_temporal_state is the single funnel for all
+            // temporal DB access on this arm.
             let temporal_db = if flags.temporal_sort.is_some() {
-                match temporal::open_temporal_db_for(&root, &cache_dir) {
-                    Ok(db) => Some(db),
-                    Err(ref reason) => {
-                        let anchor = reason.to_anchor_state();
+                match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
+                    temporal::TemporalOpen::Open(db) => Some(db),
+                    temporal::TemporalOpen::Unavailable(u) => {
                         eprintln!(
                             "skim search: {}; returning unsorted --ast results",
-                            temporal::degraded_notice(
-                                &head_state,
-                                &anchor,
-                                "--ast",
-                                temporal::Fallback::Ast,
-                            )
+                            temporal::degraded_notice(&u, "--ast", temporal::Fallback::Ast,)
                         );
                         None
                     }
@@ -1302,22 +1293,11 @@ fn run_query(
         staleness::warn_if_temporal_unverifiable(&cache_dir, hs);
     }
 
-    // Open the temporal DB once (AFTER refresh above). Used for both
-    // blast-radius filtering (before the query, so LIMIT applies to the filtered
-    // set) and temporal enrichment (after the query, to annotate/sort results).
-    // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
-    // place — replaces the manual AnchorState::Differs pre-check (Finding 1).
-    // Finding 1/3 fix: store the TemporalUnavailable reason so the degraded path
-    // can pass it to temporal_unavailable_msg without re-deriving from disk.
-    let (temporal_db, temporal_unavail_reason) =
-        if flags.temporal_sort.is_some() || flags.blast_radius.is_some() {
-            match temporal::open_temporal_db_for(&root, &cache_dir) {
-                Ok(db) => (Some(db), None),
-                Err(reason) => (None, Some(reason)),
-            }
-        } else {
-            (None, None)
-        };
+    // blast-radius and temporal enrichment each call open_temporal_state independently
+    // so no shared temporal_db handle is needed here.  resolve_blast_radius_paths
+    // (below) uses open_temporal_state internally; the enrichment arm (below the query
+    // execution) opens it again to get fresh state post-refresh.  Two SQLite opens are
+    // cheap and keep the two concerns separate (AD-414-1).
 
     // Resolve blast-radius partner paths BEFORE querying so the file_filter
     // is applied inside the search engine (before LIMIT). This ensures the
@@ -1479,27 +1459,65 @@ fn run_query(
     // pagination out of the DB-presence branch so it runs unconditionally on temporal arms.
     let page = types::Page::new(flags.limit, flags.offset);
     if let Some(sort) = flags.temporal_sort {
-        if let Some(ref db) = temporal_db {
-            temporal::apply_temporal_enrichment(&mut output.results, sort, db)?;
-        } else {
-            // AD-404-6 degraded path: temporal DB absent or refused (anchor mismatch).
-            // degraded_notice (AD-414-1) dispatches to the reason-specific constant
-            // (NO_TEMPORAL_DATA_MSG / HEAD_UNRESOLVED_TEMPORAL_MSG /
-            //  SUBDIR_ROOT_TEMPORAL_MSG / TEMPORAL_BUILD_EMPTY_MSG).
+        // AD-414-1: three-way match on open_temporal_state.  The arms are:
+        //   Open(db) where dimension is non-empty → enrich + check coverage
+        //   Open(_) where dimension is empty      → DB present but no rows
+        //   Unavailable(u)                         → DB missing / corrupt / etc.
+        // Produces a TemporalUnavailable when enrichment cannot be applied so
+        // the fallback path (degraded_notice + DegradedJson) is shared.
+        let head = refresh_head_state
+            .as_ref()
+            .unwrap_or(&staleness::HeadState::NotARepo);
+        let maybe_unavail: Option<temporal::TemporalUnavailable> =
+            match temporal::open_temporal_state(&root, &cache_dir, head) {
+                temporal::TemporalOpen::Open(db)
+                    if !temporal::dimension_is_empty(&db, sort) =>
+                {
+                    let cov =
+                        temporal::apply_temporal_enrichment(&mut output.results, sort, &db)?;
+                    if cov.ranked == 0 {
+                        // AD-414-13 zero-coverage: enrichment ran but no result received a
+                        // temporal score (e.g. all files are untracked or newly added).
+                        // Skip the re-sort; preserve lexical order; emit degraded signal.
+                        let detail = format!(
+                            "0 of {} result(s) have {} data ({} lookup error(s))",
+                            cov.total,
+                            sort.flag_name(),
+                            cov.lookup_errors,
+                        );
+                        Some(temporal::TemporalUnavailable {
+                            reason: temporal::DegradedReason::NoRankedRows,
+                            detail,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                temporal::TemporalOpen::Open(_) => {
+                    // DB open but the requested dimension has zero rows — run --build.
+                    Some(temporal::TemporalUnavailable {
+                        reason: temporal::DegradedReason::Empty,
+                        detail: String::new(),
+                    })
+                }
+                temporal::TemporalOpen::Unavailable(u) => Some(u),
+            };
+
+        if let Some(ref u) = maybe_unavail {
+            // degraded_notice is the SSOT for all stderr degradation messages (AD-414-1).
             // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
-            // Finding 1/3 fix: use pre-resolved head+anchor from refresh_head_state and
-            // temporal_unavail_reason to avoid I/O inside degraded_notice.
-            let hs = refresh_head_state
-                .as_ref()
-                .unwrap_or(&staleness::HeadState::NotARepo);
-            let anchor = temporal_unavail_reason
-                .as_ref()
-                .map_or(staleness::AnchorState::Absent, |r| r.to_anchor_state());
-            eprintln!(
-                "skim search: {}",
-                temporal::degraded_notice(hs, &anchor, "", temporal::Fallback::Lexical)
-            );
+            let msg = temporal::degraded_notice(u, sort.flag_name(), temporal::Fallback::Lexical);
+            eprintln!("skim search: {msg}");
+            output.degraded.push(temporal::DegradedJson {
+                subsystem: "temporal",
+                reason: u.reason.as_json_str(),
+                requested: sort.flag_name().to_string(),
+                applied: "lexical",
+                message: msg,
+                remediation: u.reason.remediation(),
+            });
         }
+
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
         //
         // AD-404-11 / D-5: capture pre-page count BEFORE page.apply so we can emit
@@ -1596,20 +1614,15 @@ fn run_temporal_standalone(
     // Finding 2 fix: use head_state from auto_refresh_if_stale above.
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
-    // AD-413-16: open_temporal_db_for enforces the anchor-refusal guard in one
-    // place — replaces the two-step manual AnchorState::Differs pre-check + open
-    // pattern (Finding 1).  AnchorDiffers → wrong-repo rows; Absent → no data.
+    // AD-414-1: open_temporal_state replaces open_temporal_db_for; returns a typed
+    // TemporalOpen so the caller matches on Open/Unavailable instead of Ok/Err.
+    // RepositoryMismatch → wrong-repo rows rejected; Missing/Empty/Corrupt → no data.
     // Both arms degrade gracefully (exit 0, AC-F3).
-    // degraded_notice (AD-414-1) dispatches to the correct constant
-    // (SUBDIR_ROOT_TEMPORAL_MSG for Differs, NO_TEMPORAL_DATA_MSG / etc. otherwise).
-    // Finding 1/3 fix: convert TemporalUnavailable reason to AnchorState so
-    // degraded_notice is called with pre-resolved states (no I/O).
-    let db = match temporal::open_temporal_db_for(&root, &cache_dir) {
-        Ok(db) => db,
-        Err(ref reason) => {
-            let anchor = reason.to_anchor_state();
-            let msg_str =
-                temporal::degraded_notice(&head_state, &anchor, "", temporal::Fallback::NoResults);
+    // degraded_notice is the SSOT for all stderr/JSON degradation messages.
+    let db = match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
+        temporal::TemporalOpen::Open(db) => db,
+        temporal::TemporalOpen::Unavailable(ref u) => {
+            let msg_str = temporal::degraded_notice(u, "", temporal::Fallback::NoResults);
             if json {
                 let msg = WarningJson { warning: &msg_str };
                 println!("{}", serde_json::to_string(&msg)?);

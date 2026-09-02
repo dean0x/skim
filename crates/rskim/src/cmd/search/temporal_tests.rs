@@ -7,10 +7,11 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    HeadState, TemporalQueryOutput, TemporalUnavailable, apply_temporal_enrichment,
-    bounded_page_notice, check_temporal_staleness, enrich_ast_results, format_temporal_json,
-    format_temporal_text, normalize_blast_radius_path, open_temporal_db, open_temporal_db_for,
-    query_standalone, resort_window,
+    DegradedReason, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
+    TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice,
+    check_temporal_staleness, enrich_ast_results, format_temporal_json, format_temporal_text,
+    normalize_blast_radius_path, open_temporal_state, query_standalone, ranked_row_count,
+    resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -156,15 +157,29 @@ fn normalize_dot_slash_stripped() {
 // Step 8: DB helpers
 // ============================================================================
 
+/// AD-414-15: `open_temporal_state` must return `Unavailable(Missing)` when
+/// `temporal.db` does not exist and the head resolves.
 #[test]
-fn open_temporal_db_missing_returns_none() {
+fn open_temporal_state_missing_returns_unavailable_missing() {
     let dir = TempDir::new().unwrap();
-    let nonexistent = dir.path().join("nonexistent.db");
-    assert!(open_temporal_db(&nonexistent).is_none());
+    // Use a resolved HEAD so the absence is classified as Missing, not HeadUnresolved.
+    let result =
+        open_temporal_state(dir.path(), dir.path(), &HeadState::Resolved("abc123".to_string()));
+    assert!(
+        matches!(
+            result,
+            TemporalOpen::Unavailable(TemporalUnavailable {
+                reason: DegradedReason::Missing,
+                ..
+            })
+        ),
+        "open_temporal_state must return Unavailable(Missing) when temporal.db \
+         does not exist and HEAD resolves, got: {result:?}"
+    );
 }
 
-/// AD-413-16: `open_temporal_db_for` must return `Err(AnchorDiffers)` when the
-/// temporal.db was built for a different repository root.
+/// AD-413-16: `open_temporal_state` must return `Unavailable(RepositoryMismatch)`
+/// when `temporal.db` was built for a different repository root.
 ///
 /// Setup:
 /// - `outer` = a fake git root (has `.git/HEAD`) so `resolve_repo_toplevel(root)` resolves.
@@ -175,7 +190,7 @@ fn open_temporal_db_missing_returns_none() {
 /// The test does NOT require a real `git` binary — the toplevel is discovered by
 /// walking for `.git`, which the fake outer dir provides.
 #[test]
-fn open_temporal_db_for_anchor_differs_returns_err() {
+fn open_temporal_state_anchor_differs_returns_repository_mismatch() {
     // Outer dir acts as the git repo root (has .git/HEAD).
     let outer = TempDir::new().unwrap();
     let git_dir = outer.path().join(".git");
@@ -196,10 +211,16 @@ fn open_temporal_db_for_anchor_differs_returns_err() {
         "/wrong/repo/path",
     );
 
-    let result = open_temporal_db_for(&root, cache.path());
+    let result = open_temporal_state(&root, cache.path(), &HeadState::Resolved("abc123".to_string()));
     assert!(
-        matches!(result, Err(TemporalUnavailable::AnchorDiffers { .. })),
-        "AD-413-16: open_temporal_db_for must return Err(AnchorDiffers) \
+        matches!(
+            result,
+            TemporalOpen::Unavailable(TemporalUnavailable {
+                reason: DegradedReason::RepositoryMismatch,
+                ..
+            })
+        ),
+        "AD-413-16: open_temporal_state must return Unavailable(RepositoryMismatch) \
          when temporal.db belongs to a different repo, got: {result:?}"
     );
 }
@@ -209,8 +230,8 @@ fn open_temporal_db_for_anchor_differs_returns_err() {
 /// different repository.  An empty allowlist forces zero results on all
 /// blast-radius callers; `Ok(None)` would be misread as "not requested".
 ///
-/// Uses the same fake-git-root fixture as `open_temporal_db_for_anchor_differs_returns_err`
-/// to trigger `AnchorState::Differs` inside the funnel.
+/// Uses the same fake-git-root fixture as `open_temporal_state_anchor_differs_returns_repository_mismatch`
+/// to trigger `RepositoryMismatch` inside the funnel.
 #[test]
 fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
     // Outer dir acts as the git repo root.
