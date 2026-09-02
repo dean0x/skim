@@ -412,7 +412,7 @@ pub(crate) fn reconcile_line_map_after_truncation(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in tests
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // acceptable in tests
 mod tests {
     use super::*;
     use crate::transform::minimal::trim_and_normalize;
@@ -767,5 +767,424 @@ mod tests {
             "Joining two lines by removing only the newline must map output line to source line 1, got {:?}",
             map
         );
+    }
+
+    // ========================================================================
+    // Source-level complexity contract for the transform walkers
+    // ========================================================================
+
+    /// Root-descending / index-scanning `tree_sitter` node APIs, each paired with
+    /// the reason it is banned from the transform walkers.
+    ///
+    /// Each entry is matched as a plain substring against the *production* region
+    /// of the policed file with comments and string literals blanked out. The
+    /// leading `.` and the trailing `(` are load-bearing:
+    ///
+    /// - `.child(` does not match `.child_by_field_name(` or `.child_count(`
+    /// - `.named_child(` does not match `.named_children(`
+    /// - `.next_sibling(` does not match `TreeCursor::goto_next_sibling(`
+    /// - `.next_named_sibling(` does not match `goto_next_named_sibling(`
+    ///
+    /// The genuinely O(1) traversal set — `Node::walk`,
+    /// `TreeCursor::goto_first_child` / `goto_next_sibling`, `Node::children`,
+    /// `Node::named_children`, `Node::child_count`, `child_by_field_name` on a node
+    /// already in hand — is deliberately absent and must stay absent: those are the
+    /// APIs the walkers are *supposed* to use, and `blank_comments_and_strings_self_test`
+    /// pins that none of them trips an entry here.
+    const FORBIDDEN_NODE_APIS: &[(&str, &str)] = &[
+        (
+            ".parent()",
+            "re-descends from the tree root; thread WalkPosition / depth instead",
+        ),
+        (
+            ".prev_sibling(",
+            "O(index-in-parent): scans the parent's child list from 0; use WalkPosition",
+        ),
+        (
+            ".next_sibling(",
+            "O(index-in-parent): scans the parent's child list from 0; use a TreeCursor",
+        ),
+        (
+            ".prev_named_sibling(",
+            "O(index) plus a parent() root descent",
+        ),
+        (
+            ".next_named_sibling(",
+            "O(index) plus a parent() root descent; this is the Theta(M^3/3) Go defect",
+        ),
+        (
+            ".named_child(",
+            "O(i) rescan from position 0; use root.named_children(&mut cursor)",
+        ),
+        (".child(", "O(i) rescan from position 0; use a TreeCursor"),
+        (
+            ".rfind(",
+            "O(start) backward byte scan; use build_newline_table + binary_search",
+        ),
+    ];
+
+    /// Blank every `//` line comment, `/* */` block comment (nesting-aware) and
+    /// `"`-delimited string literal, replacing their bytes with ASCII spaces.
+    ///
+    /// Single forward pass, **byte-length preserving** and **newline preserving**,
+    /// so byte offsets and line numbers in the result still address the original
+    /// file. Backslash escapes inside string literals are honoured, which also
+    /// makes multi-line `"… \` continuations (used heavily in this crate's assert
+    /// messages) come out intact.
+    ///
+    /// Char literals (`'…'`) are deliberately NOT tracked. In Rust the single quote
+    /// is shared with lifetimes and loop labels (`&'a str`, `'outer:`), so a naive
+    /// char-literal state machine mis-parses ordinary code far more often than it
+    /// helps. The only inputs this omission would corrupt are a `'"'` literal and a
+    /// raw string; the contract test asserts neither policed file contains one, so
+    /// the simplification stays honest rather than becoming a silent blind spot.
+    ///
+    /// Blanking exists because both policed files *document* the forbidden APIs in
+    /// rustdoc (`WalkPosition`'s fields are specified as "equivalent to
+    /// `node.parent()`…"), and because `is_doc_comment` holds `"/**"`, `"/*!"` and
+    /// `"///"` as string literals — an unsanitised text scan would both false-positive
+    /// on the prose and let `"/**"` open a comment that swallows real code
+    /// (source-corpus PF-018: sanitize before scanning source text).
+    fn blank_comments_and_strings(src: &str) -> String {
+        let bytes = src.as_bytes();
+        let n = bytes.len();
+        let mut out = bytes.to_vec();
+        let mut i = 0usize;
+
+        // Bounded by construction: every branch advances `i` by at least 1.
+        while i < n {
+            if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'/' {
+                // Line comment — blank through to (but not including) the newline.
+                while i < n && bytes[i] != b'\n' {
+                    out[i] = b' ';
+                    i += 1;
+                }
+            } else if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                // Block comment — Rust nests them, so track depth.
+                let mut depth = 0usize;
+                while i < n {
+                    if bytes[i] == b'/' && i + 1 < n && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'/' {
+                        depth = depth.saturating_sub(1);
+                        out[i] = b' ';
+                        out[i + 1] = b' ';
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if bytes[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+            } else if bytes[i] == b'"' {
+                out[i] = b' ';
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        out[i] = b' ';
+                        i += 1;
+                        if i < n {
+                            if bytes[i] != b'\n' {
+                                out[i] = b' ';
+                            }
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        out[i] = b' ';
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] != b'\n' {
+                        out[i] = b' ';
+                    }
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+
+        String::from_utf8(out).expect("blanking only ever substitutes ASCII spaces")
+    }
+
+    /// A Rust char literal holding a double quote, spelled without embedding one
+    /// literally so this constant does not itself become the thing it detects.
+    const DOUBLE_QUOTE_CHAR_LITERAL: &str = "'\u{22}'";
+
+    /// Does `src` open a raw string (`r"…"` / `r#"…"#`)?
+    ///
+    /// A bare `contains("r\"")` is useless here: any ordinary message ending in the
+    /// letter `r` matches it (`"… must be a module header"`). An `r` is a raw-string
+    /// prefix only when it does not continue an identifier and is followed by zero or
+    /// more `#` and then a quote.
+    fn contains_raw_string_opener(src: &str) -> bool {
+        let bytes = src.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b != b'r' {
+                continue;
+            }
+            if i > 0 && (bytes[i - 1] == b'_' || bytes[i - 1].is_ascii_alphanumeric()) {
+                continue;
+            }
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] == b'#' {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'"') {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The production region of `name`: everything before the `#[cfg(test)]` that
+    /// gates the file's `mod tests`, with comments and string literals blanked.
+    ///
+    /// The cut uses the **last** `\n#[cfg(test)]` in the file, not the first:
+    /// `pseudo.rs` carries an earlier `#[cfg(test)]` on `transform_pseudo`, a
+    /// test-only *production* helper that must stay inside the policed region.
+    /// `minimal.rs` has only one marker, so the two agree there.
+    fn production_region(name: &str, src: &str) -> String {
+        const MARKER: &str = "\n#[cfg(test)]";
+
+        let blanked = blank_comments_and_strings(src);
+        let Some(cut) = blanked.rfind(MARKER) else {
+            panic!(
+                "{name}: no `{}` marker found, so the production region cannot be \
+                 delimited and this contract would police either everything or nothing. \
+                 A guard with no region is a vacuous guard (source-corpus PF-007 / PF-014).",
+                MARKER.trim_start()
+            );
+        };
+        let (head, tail) = blanked.split_at(cut);
+
+        assert!(
+            tail.contains("\nmod tests {"),
+            "{name}: nothing after the last `#[cfg(test)]` declares `mod tests` — \
+             the contract would police the wrong region (source-corpus PF-007 / PF-014: \
+             a guard aimed at the wrong text asserts nothing)."
+        );
+        // Stronger form of the same check, and the one that actually pins `rfind`:
+        // the marker we cut at must be the one *immediately* gating `mod tests`
+        // (attribute lines may sit between). With `find` instead of `rfind`,
+        // `pseudo.rs` cuts at `transform_pseudo` — whose tail still *contains*
+        // `\nmod tests {` further down, so the containment check alone passes and
+        // ~440 lines of production code silently leave the policed region.
+        let gated = tail[MARKER.len()..]
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("#["));
+        assert_eq!(
+            gated,
+            Some("mod tests {"),
+            "{name}: the last `#[cfg(test)]` does not gate `mod tests` (next item is \
+             {gated:?}) — the contract would police the wrong region \
+             (source-corpus PF-007 / PF-014)."
+        );
+
+        head.to_string()
+    }
+
+    /// The transform walkers must never reach for a relational fact about a node by
+    /// asking tree-sitter for it again.
+    ///
+    /// # Why a source-text guard and not an instrumented counter
+    ///
+    /// An operation counter cannot discriminate here. The quadratic term lives in
+    /// tree-sitter's C code, not in ours: a `TSNode` carries no parent pointer, so
+    /// `parent()`, `prev_sibling()`, `next_sibling()`, `next_named_sibling()` and
+    /// `named_child(i)` each re-descend from the tree root and rescan the parent's
+    /// child list from position 0 (source-corpus PF-020 — a `TSNode` walk is never
+    /// O(1)). The defective and the fixed walker execute the **same number of Rust
+    /// statements** and produce **byte-identical output**; the only thing that
+    /// differs is the C-side cost per call. Any counter that could tell them apart
+    /// would have to live inside the very code a regression replaces. See the
+    /// measured series in `minimal.rs` (`is_go_doc_comment`,
+    /// `compute_header_end_byte`) for the empirical form of that fact.
+    ///
+    /// So the checkable invariant is not "how many operations ran" but "which API
+    /// the source calls" — a property of the text, available before anything runs.
+    ///
+    /// # Why comments and string literals are blanked first
+    ///
+    /// Both policed files document the forbidden APIs in rustdoc — `WalkPosition`'s
+    /// fields are specified as "equivalent to `node.parent()`" — and `is_doc_comment`
+    /// holds `"/**"`, `"/*!"` and `"///"` as string literals. Scanning raw text would
+    /// therefore fail on prose that is *explaining* the ban, and `"/**"` would open a
+    /// block comment that swallowed live code (source-corpus PF-018).
+    ///
+    /// # Why the O(1) traversal set is excluded
+    ///
+    /// `Node::walk`, `TreeCursor::goto_first_child` / `goto_next_sibling`,
+    /// `Node::children`, `Node::named_children`, `Node::child_count` and
+    /// `child_by_field_name` on a node already in hand are the APIs the walkers are
+    /// *supposed* to use — a `TreeCursor` keeps an explicit ancestor stack, so each
+    /// step is genuinely O(1). Banning them would leave no legal way to traverse.
+    ///
+    /// # What this is not
+    ///
+    /// This is a **lint, not a proof**. It pins the construct, not the complexity:
+    /// a novel super-linear pattern that avoids all eight tokens would pass. The
+    /// stronger follow-up is a type-level facade — a `WalkNode` wrapper that exposes
+    /// only the O(1) set, making the forbidden construct unrepresentable rather than
+    /// merely detectable. That is tracked separately.
+    ///
+    /// It also does not discriminate O(N) from O(N²) on its own, and neither do the
+    /// per-walker artifact tests in `minimal.rs` / `pseudo.rs`: the defect was
+    /// output-preserving, which is exactly why the discriminating job lands here, on
+    /// the source text.
+    ///
+    /// Housed in `transform/mod.rs`, beside the code it polices, rather than in a
+    /// standalone lint crate (source-corpus PF-017).
+    ///
+    /// # A note on the PF citations above
+    ///
+    /// Every `PF-NNN` in this module refers to the **source-corpus** pitfall
+    /// numbering, which is a different sequence from the decisions-ledger numbering
+    /// in `.devflow/learning/pitfalls.md` (PF-023). The two collide: the ledger's
+    /// PF-020 is an unrelated entry. Read these IDs as source-corpus only.
+    #[test]
+    fn contract_transform_walkers_use_no_root_descending_node_apis() {
+        const POLICED: &[(&str, &str)] = &[
+            ("minimal.rs", include_str!("minimal.rs")),
+            ("pseudo.rs", include_str!("pseudo.rs")),
+        ];
+
+        for (name, src) in POLICED {
+            // `blank_comments_and_strings` does not model char literals or raw
+            // strings. Assert the assumption instead of hoping for it — an
+            // unmodelled double-quote char literal would open a phantom string and
+            // blank out live code, turning this contract vacuous
+            // (source-corpus PF-007 / PF-014).
+            assert!(
+                !src.contains(DOUBLE_QUOTE_CHAR_LITERAL),
+                "{name}: contains a double-quote char literal, which \
+                 `blank_comments_and_strings` does not model. Teach the blanker about \
+                 char literals before adding one, or this contract silently stops seeing \
+                 the code after it."
+            );
+            assert!(
+                !contains_raw_string_opener(src),
+                "{name}: contains a raw string literal, which \
+                 `blank_comments_and_strings` does not model (no backslash escapes, \
+                 `#` delimiters). Teach the blanker about raw strings before adding one."
+            );
+
+            let region = production_region(name, src);
+
+            for (token, reason) in FORBIDDEN_NODE_APIS {
+                let Some(idx) = region.find(token) else {
+                    continue;
+                };
+                let line = region[..idx].matches('\n').count() + 1;
+                panic!(
+                    "COMPLEXITY CONTRACT VIOLATION\n\
+                     \x20 file:   crates/rskim-core/src/transform/{name}:{line}\n\
+                     \x20 token:  `{token}`\n\
+                     \x20 reason: {reason}\n\
+                     \n\
+                     The transform walkers must obtain every relational fact about a node \
+                     (parent kind, previous sibling, index in parent, line start) from the \
+                     walk itself — a threaded `WalkPosition` / `depth`, a `TreeCursor`, or a \
+                     precomputed per-file table — never by asking tree-sitter for it again. \
+                     A `TSNode` carries no parent pointer, so each of these calls re-descends \
+                     from the tree root or rescans the parent's child list from position 0 \
+                     (source-corpus PF-020: a TSNode walk is never O(1)).\n\
+                     \n\
+                     Every historical quadratic/cubic defect in these two files used one of \
+                     these calls, and NONE of them changed the output by a single byte — so \
+                     no behavioural test and no operation counter can see them. This contract \
+                     is the only gate that can.\n\
+                     \n\
+                     If the call is provably O(1) at this site, add an explicit exception \
+                     here together with the measurement that proves it."
+                );
+            }
+        }
+    }
+
+    /// `blank_comments_and_strings` must be offset-faithful, must blank what it
+    /// claims to blank, must not blank live code, and must not let the legitimate
+    /// O(1) traversal APIs trip a `FORBIDDEN_NODE_APIS` entry.
+    ///
+    /// Without this the contract test above could pass by blanking everything
+    /// (source-corpus PF-007 / PF-014: reading a guard is not evidence it guards).
+    #[test]
+    fn blank_comments_and_strings_self_test() {
+        const SRC: &str = concat!(
+            "let k = node.parent();\n",
+            "// a comment naming node.parent() must not count\n",
+            "/* block /* nested */ still-blanked */\n",
+            "let jsdoc = \"/**\";\n",
+            "let after_string = 1;\n",
+        );
+
+        let blanked = blank_comments_and_strings(SRC);
+
+        // Offset fidelity: byte offsets and line numbers still address the original.
+        assert_eq!(
+            blanked.len(),
+            SRC.len(),
+            "blanking must preserve byte length so reported line numbers stay valid"
+        );
+        assert_eq!(
+            blanked.lines().count(),
+            SRC.lines().count(),
+            "blanking must preserve newlines so reported line numbers stay valid"
+        );
+
+        // A real call survives; the one inside a line comment does not.
+        assert!(
+            blanked.contains("node.parent();"),
+            "a live `.parent()` call must survive blanking, got:\n{blanked}"
+        );
+        assert_eq!(
+            blanked.matches(".parent()").count(),
+            1,
+            "exactly one `.parent()` must survive (the live one); the commented one \
+             must be blanked. Got:\n{blanked}"
+        );
+
+        // Block-comment content is blanked, nesting included.
+        assert!(
+            !blanked.contains("nested") && !blanked.contains("still-blanked"),
+            "block comment content (including nested comments) must be blanked, got:\n{blanked}"
+        );
+
+        // The string literal `"/**"` must NOT open a block comment — if it did, the
+        // rest of the file would be swallowed and the contract would see nothing.
+        assert!(
+            blanked.contains("let after_string = 1;"),
+            "the string literal \"/**\" must not open a block comment; code after it \
+             must survive. Got:\n{blanked}"
+        );
+
+        // The legitimate O(1) traversal set must not trip any forbidden token.
+        const LOOKALIKES: &str = concat!(
+            "cursor.goto_next_sibling();\n",
+            "n.child_count();\n",
+            "n.children(&mut c);\n",
+            "p.child_by_field_name(\"x\");\n",
+            "root.named_children(&mut c);\n",
+        );
+        let lookalikes = blank_comments_and_strings(LOOKALIKES);
+        for (token, _) in FORBIDDEN_NODE_APIS {
+            assert!(
+                !lookalikes.contains(token),
+                "legitimate O(1) traversal must not match forbidden token `{token}`; \
+                 the `.`/`(` anchoring is what keeps them apart. Got:\n{lookalikes}"
+            );
+        }
     }
 }

@@ -2254,82 +2254,76 @@ mod tests {
     }
 
     // ========================================================================
-    // pseudo-walker scaling guards  (B2 / #494)
+    // pseudo-walker artifact pins  (B2 / #494)
     // ========================================================================
     //
     // pseudo is the PRODUCTION path: the cat/head/tail rewrite selects
     // --mode=pseudo for regular code files (ADR-008), so this walker is the
-    // hottest agent-facing transform in the product. Every pre-existing perf
-    // guard in this workspace is PYTHON-minimal-only or GO-only, so a
-    // TypeScript / C++ / Java / C# pseudo regression had no coverage at all.
+    // hottest agent-facing transform in the product. Every other walker pin in
+    // this workspace is Python-minimal-only or Go-only, so a TypeScript / Python /
+    // C++ pseudo regression had no coverage at all.
     //
-    // MEASURED SERIES (DEBUG build, this branch, best-of-3; the transform is
-    // called directly so the skim file-level disk cache is NOT involved — a warm
-    // parser cache hides exactly this defect class, PF-020).
+    // What these tests pin is the exact set of byte ranges the walker collects and
+    // the number of AST nodes it visits — both computable from the fixture's text,
+    // neither dependent on a clock.
     //
-    //   TS, N top-level `const vI = I;` statements — one `;` site per statement:
-    //     BEFORE: N=1000 → 10.42 ms | N=2000 → 21.46 ms | N=4000 → 43.30 ms
-    //             ratios 2.06×, 2.02×   →   α = 1.03
-    //     AFTER:  N=1000 →  8.72 ms | N=2000 → 18.13 ms | N=4000 → 37.66 ms
-    //             ratios 2.08×, 2.08×   →   α = 1.06        (1.15× faster at 4N)
-    //     BEFORE (XL): N=3000 → 32.40 ms | N=6000 → 66.43 ms | N=12000 → 143.47 ms  α = 1.07
-    //     AFTER  (XL): N=3000 → 26.92 ms | N=6000 → 57.78 ms | N=12000 → 117.62 ms  α = 1.06  (1.22×)
-    //
-    //   Python, N `def fI(a: int, b: int) -> int` — two return-type-field tests each:
-    //     BEFORE: N=500 → 15.74 ms | N=1000 → 32.65 ms | N=2000 → 68.33 ms   α = 1.06
-    //     AFTER:  N=500 → 13.55 ms | N=1000 → 28.43 ms | N=2000 → 57.78 ms   α = 1.05  (1.18×)
-    //
-    //   TypeScript, same shape via `type_annotation`:
-    //     BEFORE: N=500 → 14.72 ms | N=1000 → 30.34 ms | N=2000 → 60.80 ms   α = 1.02
-    //     AFTER:  N=500 → 12.21 ms | N=1000 → 24.95 ms | N=2000 → 51.11 ms   α = 1.03  (1.19×)
-    //
-    //   C++, N `template<typename T> T fI(T a, T b)` — one `prev_sibling()` site each:
-    //     BEFORE: N=500 → 13.28 ms | N=1000 → 27.26 ms | N=2000 → 55.24 ms   α = 1.03
-    //     AFTER:  N=500 → 12.20 ms | N=1000 → 24.83 ms | N=2000 → 50.09 ms   α = 1.02  (1.10×)
-    //
-    // ⚠ CORRECTION TO THE PLAN — these sites were NEVER Θ(N²), and the guards
-    // below are REGRESSION guards, not evidence of the fix. α is ~1.02–1.07 both
-    // before and after; the win is a constant factor of 1.10×–1.22×.
-    //
-    // Why the Θ(N²) prediction failed, measured rather than reasoned. Isolating
-    // the primitive on the exact `;` population (debug build, per call):
-    //
-    //     n=2000  parent() 1.655 µs   prev_sibling() 1.910 µs
-    //     n=4000  parent() 1.752 µs   prev_sibling() 2.009 µs
-    //     n=8000  parent() 1.885 µs   prev_sibling() 2.152 µs
-    //
-    // Per-call cost grows ~14 % while n quadruples — that is O(log N), not
-    // O(index). `ts_parser__balance_subtree` (tree-sitter 0.25.10 parser.c)
-    // rotates `repeat` subtrees so their depth stays logarithmic, and
-    // `ts_node_parent` descends that balanced structure.
-    //
-    // So PF-020's cost model needs splitting, not discarding. The O(index) half
-    // is the SIBLING scan — `ts_node__prev_sibling` / `ts_node__next_sibling`
-    // iterate the parent's child list from the start looking for `self` — and
-    // B1 measured that half directly (α = 2.98 for a per-node forward sibling
-    // walk over one large sibling group, 41 616 ms at N=1000). The `parent()`
-    // half does NOT scale that way, which is why the same pitfall produced a
-    // 28118× win in `minimal.rs` and a ~1.2× win here.
-    //
-    // Consequence for these guards, stated plainly: a ratio guard CANNOT detect
-    // re-introduction of `parent()` here, because `parent()` is O(log N). What
-    // they do cover is the gap B1 identified — a future super-linear regression
-    // in this walker (e.g. someone adding a per-node sibling walk, the Go bug's
-    // shape) would otherwise pass silently on every language except Python.
-    //
-    // THRESHOLD RATIONALE — 2.8 ≈ 2^1.5 is the exponent-space midpoint between
-    // linear (2.0×) and quadratic (4.0×), matching the Go guards in minimal.rs.
-    // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
+    // What they deliberately do NOT pin is complexity. A walker that re-derived
+    // `parent()` / `prev_sibling()` per node instead of threading `WalkPosition`
+    // would produce EXACTLY these ranges and EXACTLY this visit count: the extra
+    // cost is inside tree-sitter's C code, where a `TSNode` has no parent pointer.
+    // That construct is forbidden at the source level by
+    // `contract_transform_walkers_use_no_root_descending_node_apis` in
+    // `transform/mod.rs`, which is the only gate that can see it.
 
-    fn time_pseudo(source: &str, language: Language) -> f64 {
-        let mut parser = Parser::new(language).unwrap();
-        let tree = parser.parse(source).unwrap();
-        let config = TransformConfig::with_mode(Mode::Pseudo);
-        let start = std::time::Instant::now();
-        let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-        ms
+    /// Total AST node count, derived independently of the walker under test.
+    ///
+    /// Explicit stack + `Node::children`, so the count never depends on the
+    /// traversal `collect_noise_ranges` performs — that independence is what lets
+    /// it catch a walker that descends into the same node twice, which leaves the
+    /// output byte-identical.
+    fn count_all_nodes(root: Node) -> usize {
+        let mut n = 0usize;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            n += 1;
+            let mut c = node.walk();
+            for ch in node.children(&mut c) {
+                stack.push(ch);
+            }
+        }
+        n
+    }
+
+    /// Drive the production noise walker directly, composing `NoiseWalkContext` the
+    /// way `transform_pseudo_with_spans_and_line_map` does.
+    ///
+    /// Returns the raw (unadjusted, unsorted) removal ranges and the number of
+    /// nodes visited.
+    fn collect_pseudo_ranges(
+        source: &str,
+        tree: &Tree,
+        language: Language,
+    ) -> (Vec<(usize, usize)>, usize) {
+        let rules = get_pseudo_rules(language);
+        let root = tree.root_node();
+        let header_end_byte = compute_header_end_byte(root, source, language);
+        let go_doc_comment_starts = compute_go_doc_comment_starts(root, source, language);
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut node_count: usize = 0;
+        let mut ctx = NoiseWalkContext {
+            source,
+            source_bytes: source.as_bytes(),
+            language,
+            ranges: &mut ranges,
+            node_count: &mut node_count,
+            classification: CommentClassification {
+                header_end_byte,
+                go_doc_comment_starts: &go_doc_comment_starts,
+            },
+        };
+        collect_noise_ranges(root, &mut ctx, &rules, 0, false, WalkPosition::default())
+            .expect("noise walk must succeed on these fixtures");
+        (ranges, node_count)
     }
 
     /// N top-level statements, each terminated by a `;` — the site-1 population.
@@ -2341,8 +2335,9 @@ mod tests {
         s
     }
 
-    /// N annotated defs — two `is_return_field_child` calls each (both params and
-    /// the return annotation are `type` nodes reaching the site-2 guard).
+    /// N annotated defs. Two parameter annotations each (both stripped) plus one
+    /// return annotation each (preserved — ADR-007), all `type` nodes reaching the
+    /// site-2 guard.
     fn python_return_type_source(n: usize) -> String {
         let mut s = String::with_capacity(n * 48 + 32);
         for i in 0..n {
@@ -2353,7 +2348,7 @@ mod tests {
         s
     }
 
-    /// N template functions — the site-3 `prev_sibling()` population.
+    /// N template functions — the site-3 previous-sibling population.
     fn cpp_template_source(n: usize) -> String {
         let mut s = String::with_capacity(n * 64 + 32);
         for i in 0..n {
@@ -2364,47 +2359,83 @@ mod tests {
         s
     }
 
+    /// The parameter annotation stripped from every `python_return_type_source`
+    /// def. `adjust_type_start` extends the `type` node backward over the `: `
+    /// separator, so the collected range covers this whole string.
+    const PY_PARAM_ANNOTATION: &str = ": int";
+
+    /// The C++ template prefix consumed as one range: the `template` keyword, its
+    /// parameter list, and the single trailing space that
+    /// `consume_trailing_whitespace` eats before the return type.
+    const CPP_TEMPLATE_PREFIX: &str = "template<typename T> ";
+
+    /// The TypeScript semicolon ranges are byte-exact and the walk is single-visit.
+    ///
+    /// WHAT THIS PINS: `collect_noise_ranges` emits exactly one 1-byte range per
+    /// source `;` and nothing else (`const vI = I;` carries no type annotation,
+    /// decorator or stripped keyword), and never descends into a node twice.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity. A walker that called `node.parent()` per
+    /// `;` instead of reading `pos.parent_kind` would produce these exact ranges and
+    /// this exact visit count — the defect is output-preserving. See the section
+    /// note above and the contract test in `transform/mod.rs`.
     #[test]
-    fn test_typescript_pseudo_semicolon_walk_scaling_guard() {
-        // Behaviour alongside the timing: these `;` are statement terminators,
-        // not for-loop separators, so all of them must be stripped.
+    fn test_typescript_pseudo_semicolon_ranges_are_exact_and_single_visit() {
+        // Behaviour pin: these `;` are statement terminators, not for-loop
+        // separators, so all of them must be stripped.
         let out = transform(&ts_semicolon_source(4), Language::TypeScript);
         assert!(
             !out.contains(';'),
             "top-level statement semicolons must be stripped, got: {out}"
         );
 
-        // N=8000 is ~56 k AST nodes, comfortably under MAX_AST_NODES (100 k);
-        // above it this would silently become an Err(ComplexityLimit) assertion.
-        let t1 = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
-        let t2 = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
+        for n in [256usize, 512] {
+            let source = ts_semicolon_source(n);
+            let mut parser = Parser::new(Language::TypeScript).unwrap();
+            let tree = parser.parse(&source).unwrap();
+            let root = tree.root_node();
+            let total_nodes = count_all_nodes(root);
 
-        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
-        // in this work went vacuous when a fix made it too fast to measure, and
-        // a silently-passing scaling guard provides no protection at all.
-        assert!(
-            t1 >= 8.0,
-            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 8ms; ~36.0ms measured on debug builds). Either the \
-             transform is being cached/skipped or N must be raised. \
-             DO NOT convert this to a skip."
-        );
+            let (mut ranges, node_count) =
+                collect_pseudo_ranges(&source, &tree, Language::TypeScript);
+            ranges.sort_unstable();
 
-        let ratio = t2 / t1;
-        assert!(
-            ratio < 2.8,
-            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.07×). O(N) → ~2.0×; O(N²) → ~4.0×; \
-             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 took {t1:.2}ms, \
-             N=8000 took {t2:.2}ms. Check that the walker threads WalkPosition \
-             and does not walk siblings per node (PF-020)."
-        );
+            let expected: Vec<(usize, usize)> =
+                source.match_indices(';').map(|(i, _)| (i, i + 1)).collect();
+            assert_eq!(
+                expected.len(),
+                n,
+                "n={n}: the fixture must contain exactly one `;` per statement"
+            );
+            assert_eq!(
+                ranges, expected,
+                "n={n}: exactly one 1-byte removal range per source `;`, and nothing else"
+            );
+
+            // `<=`, not `==`: collect_noise_ranges returns early on stripped kinds,
+            // so it legitimately visits fewer nodes than the tree holds. Visiting
+            // MORE is the regression this catches.
+            assert!(
+                node_count <= total_nodes,
+                "n={n}: collect_noise_ranges must not visit a node twice \
+                 (visited {node_count}, tree has {total_nodes})"
+            );
+        }
     }
 
+    /// The Python parameter-annotation ranges are byte-exact and the walk is
+    /// single-visit.
+    ///
+    /// WHAT THIS PINS: exactly the two `: int` parameter annotations per def are
+    /// collected — the `-> int` return annotation is preserved wholesale (ADR-007)
+    /// — at the exact byte offsets, including the `: ` separator that
+    /// `adjust_type_start` folds in. And the walk never descends twice.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity — the defect was output-preserving.
     #[test]
-    fn test_python_pseudo_return_type_walk_scaling_guard() {
-        // ADR-007: pseudo PRESERVES function return types. Pin it here so the
-        // guard cannot pass on a walker that stopped classifying return types.
+    fn test_python_pseudo_return_type_ranges_are_exact_and_single_visit() {
+        // ADR-007: pseudo PRESERVES function return types. Pin it here so the test
+        // cannot pass on a walker that stopped classifying return types.
         let out = transform(&python_return_type_source(2), Language::Python);
         assert!(
             out.contains("-> int"),
@@ -2415,49 +2446,95 @@ mod tests {
             "pseudo must still strip Python parameter annotations, got: {out}"
         );
 
-        let t1 = time_pseudo(&python_return_type_source(1000), Language::Python);
-        let t2 = time_pseudo(&python_return_type_source(2000), Language::Python);
+        for n in [256usize, 512] {
+            let source = python_return_type_source(n);
+            let mut parser = Parser::new(Language::Python).unwrap();
+            let tree = parser.parse(&source).unwrap();
+            let root = tree.root_node();
+            let total_nodes = count_all_nodes(root);
 
-        assert!(
-            t1 >= 6.0,
-            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 6ms; ~27.3ms measured). DO NOT convert this to a skip."
-        );
+            let (mut ranges, node_count) = collect_pseudo_ranges(&source, &tree, Language::Python);
+            ranges.sort_unstable();
 
-        let ratio = t2 / t1;
-        assert!(
-            ratio < 2.8,
-            "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.04×). N=1000 took {t1:.2}ms, \
-             N=2000 took {t2:.2}ms."
-        );
+            let expected: Vec<(usize, usize)> = source
+                .match_indices(PY_PARAM_ANNOTATION)
+                .map(|(i, _)| (i, i + PY_PARAM_ANNOTATION.len()))
+                .collect();
+            assert_eq!(
+                expected.len(),
+                2 * n,
+                "n={n}: two parameter annotations per def; `-> int` must not match"
+            );
+            assert_eq!(
+                ranges, expected,
+                "n={n}: exactly the two parameter annotations per def are collected, \
+                 each covering its `: ` separator; the return annotation is preserved"
+            );
+
+            assert!(
+                node_count <= total_nodes,
+                "n={n}: collect_noise_ranges must not visit a node twice \
+                 (visited {node_count}, tree has {total_nodes})"
+            );
+        }
     }
 
+    /// The C++ template ranges are byte-exact and the walk is single-visit.
+    ///
+    /// WHAT THIS PINS: the `template_parameter_list` special case reaches BACK over
+    /// its previous sibling, so each collected range starts at the `template`
+    /// keyword — not at `<` — and ends after the single trailing space. `template`
+    /// is NOT in the C++ `strip_keywords` list, so a walker that loses the
+    /// previous-sibling reach leaves the keyword orphaned in the output and fails
+    /// both this and the `!out.contains("template")` pin.
+    ///
+    /// WHAT THIS DOES NOT PIN: complexity. Reading the previous sibling back via
+    /// `node.prev_sibling()` instead of `pos.prev_sibling_kind` yields the identical
+    /// ranges — see the section note above and the contract test in
+    /// `transform/mod.rs`.
     #[test]
-    fn test_cpp_pseudo_template_walk_scaling_guard() {
-        // Behaviour alongside the timing: the `template` keyword must be
-        // consumed along with its parameter list, leaving no orphan.
+    fn test_cpp_pseudo_template_ranges_are_exact_and_single_visit() {
+        // Behaviour pin: the `template` keyword must be consumed along with its
+        // parameter list, leaving no orphan.
         let out = transform(&cpp_template_source(2), Language::Cpp);
         assert!(
             !out.contains("template"),
             "the `template` keyword must be consumed with its parameter list, got: {out}"
         );
 
-        let t1 = time_pseudo(&cpp_template_source(1000), Language::Cpp);
-        let t2 = time_pseudo(&cpp_template_source(2000), Language::Cpp);
+        for n in [128usize, 256] {
+            let source = cpp_template_source(n);
+            let mut parser = Parser::new(Language::Cpp).unwrap();
+            let tree = parser.parse(&source).unwrap();
+            let root = tree.root_node();
+            let total_nodes = count_all_nodes(root);
 
-        assert!(
-            t1 >= 5.0,
-            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 5ms; ~24.2ms measured). DO NOT convert this to a skip."
-        );
+            let (mut ranges, node_count) = collect_pseudo_ranges(&source, &tree, Language::Cpp);
+            ranges.sort_unstable();
 
-        let ratio = t2 / t1;
-        assert!(
-            ratio < 2.8,
-            "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.01×). N=1000 took {t1:.2}ms, \
-             N=2000 took {t2:.2}ms."
-        );
+            // The fixture also yields one `;` range per function body; isolate the
+            // template ranges by the text they start on.
+            let template_ranges: Vec<(usize, usize)> = ranges
+                .iter()
+                .copied()
+                .filter(|&(start, _)| source[start..].starts_with("template"))
+                .collect();
+            let expected: Vec<(usize, usize)> = source
+                .match_indices(CPP_TEMPLATE_PREFIX)
+                .map(|(i, _)| (i, i + CPP_TEMPLATE_PREFIX.len()))
+                .collect();
+            assert_eq!(expected.len(), n, "n={n}: one template prefix per function");
+            assert_eq!(
+                template_ranges, expected,
+                "n={n}: each template range must start at the `template` keyword and end \
+                 after its single trailing space"
+            );
+
+            assert!(
+                node_count <= total_nodes,
+                "n={n}: collect_noise_ranges must not visit a node twice \
+                 (visited {node_count}, tree has {total_nodes})"
+            );
+        }
     }
 }
