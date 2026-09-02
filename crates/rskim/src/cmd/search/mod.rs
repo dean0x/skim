@@ -3358,7 +3358,7 @@ mod tests {
     /// hint, not "--rebuild"), which failed AC-2.  Replaced with the §2.3 text.
     #[test]
     fn test_degraded_notice_empty_non_shallow_ac2() {
-        const EMPTY_CAUSE_PREFIX: &str = "temporal data is empty (0 rows) - this repository has no commit history skim can analyse";
+        const EMPTY_CAUSE_PREFIX: &str = "temporal data is empty (0 rows) \u{2014} this repository has no commit history skim can analyse";
         const EMPTY_REMEDY: &str = "run 'skim search --rebuild'";
 
         // Standalone call (no flag) — returns just cause + remediation.
@@ -4532,6 +4532,112 @@ mod tests {
     // Step 11: T-13/T-14/T-15 — actionable lexical error, stats self-heal,
     // and temporal_state key (AD-414-7, AD-414-10, AC-13, AC-14, AC-15)
     // =========================================================================
+
+    /// T-13 / AC-13: a size-preserving byte flip in `index.skpost` (with
+    /// `index.skverify` deleted to force the full CRC32 path) MUST cause a query
+    /// to exit 1 with an error message that:
+    ///
+    /// (1) names the artifact directory (the cache-dir path),
+    /// (2) names the failing artifact (`index.skpost`),
+    /// (3) contains `skim search --rebuild`,
+    /// (4) contains `No such file or directory` at most once.
+    ///
+    /// PF-007: asserts observable error message content, not just exit code.
+    /// PF-018: byte-flip preserves file length so the structural size probe passes;
+    ///         only the full CRC32 detects the corruption.
+    #[test]
+    fn t13_crc_mismatch_names_artifact_and_rebuild_hint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: alpha", &[("src/alpha.rs", "fn alpha() {}")]),
+                ("feat: beta", &[("src/beta.rs", "fn beta() {}")]),
+            ],
+        );
+
+        // Build a full index so index.skpost exists with a valid CRC.
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-13 setup: --rebuild must succeed before byte-flip"
+        );
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let post_path = cache_dir.join("index.skpost");
+        let verify_path = cache_dir.join("index.skverify");
+
+        // Byte-flip the last byte of index.skpost, preserving file length (PF-018).
+        // The structural size probe compares lengths only, so it passes; the full
+        // CRC32 (which covers post_mmap + idx_mmap body) detects the corruption.
+        {
+            let mut bytes = std::fs::read(&post_path).expect("T-13: index.skpost must exist");
+            assert!(
+                !bytes.is_empty(),
+                "T-13: index.skpost must be non-empty to flip a byte"
+            );
+            let last = bytes.last_mut().unwrap();
+            *last = last.wrapping_add(1);
+            std::fs::write(&post_path, &bytes).expect("T-13: rewriting index.skpost must succeed");
+        }
+
+        // Delete index.skverify so the fast-path (cached CRC signature) is bypassed
+        // and the full CRC32 computation runs.
+        let _ = std::fs::remove_file(&verify_path);
+
+        let cache_dir_display = cache_dir.display().to_string();
+
+        // A query must fail with an actionable error (AC-13).
+        let result = run(
+            &[
+                "zebra_widget".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+                "--limit".to_string(),
+                "2".to_string(),
+            ],
+            &TEST_ANALYTICS,
+        );
+
+        // AC-13: exit 1 (run() returns Err for unrecoverable open failures).
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+
+        // AC-13 clause 1: error names the artifact directory.
+        assert!(
+            msg.contains(&cache_dir_display),
+            "T-13/AC-13 clause 1: error must name the artifact directory; got: {msg:?}"
+        );
+        // AC-13 clause 2: error names the failing artifact.
+        assert!(
+            msg.contains("index.skpost"),
+            "T-13/AC-13 clause 2: error must name the failing artifact (index.skpost); got: {msg:?}"
+        );
+        // AC-13 clause 3: error contains the rebuild hint.
+        assert!(
+            msg.contains("skim search --rebuild"),
+            "T-13/AC-13 clause 3: error must contain 'skim search --rebuild'; got: {msg:?}"
+        );
+        // AC-13 clause 4: OS error phrase is not duplicated.
+        let no_such_file_count = msg.matches("No such file or directory").count();
+        assert!(
+            no_such_file_count <= 1,
+            "T-13/AC-13 clause 4: 'No such file or directory' must appear at most once; \
+             got {no_such_file_count} times in: {msg:?}"
+        );
+    }
 
     /// T-14 / AC-14: `--stats --json` on F-Body-A (truncated `index.skpost`) MUST
     /// exit 0 after self-healing through `auto_refresh_if_stale` → rebuild, and the

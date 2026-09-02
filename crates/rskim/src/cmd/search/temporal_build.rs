@@ -761,7 +761,7 @@ pub(super) fn rebuild_temporal_with_source(
             let (reason, detail) = match other {
                 SearchError::UnsupportedSchemaVersion { found, supported } => (
                     DegradedReason::UnsupportedVersion,
-                    format!("schema version {found}, supported {supported}"),
+                    format!("schema version {found}, this build supports {supported}"),
                 ),
                 ref e => (DegradedReason::Unreadable, e.to_string()),
             };

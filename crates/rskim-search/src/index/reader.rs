@@ -601,7 +601,7 @@ impl NgramIndexReader {
             let actual_checksum = hasher.finalize();
             if actual_checksum != header.checksum {
                 return Err(SearchError::IndexCorrupted(format!(
-                    "checksum mismatch: expected {:#010x}, got {:#010x}. \
+                    "checksum mismatch in index.skpost: expected {:#010x}, got {:#010x}. \
                      The index may be corrupt; rebuild with `skim search --rebuild`.",
                     header.checksum, actual_checksum
                 )));

@@ -215,7 +215,7 @@ impl DegradedReason {
                 }
             }
             Self::Empty => {
-                let base = "temporal data is empty (0 rows) - this repository has no \
+                let base = "temporal data is empty (0 rows) \u{2014} this repository has no \
                             commit history skim can analyse";
                 if detail.contains("shallow") {
                     format!("{base}; a shallow clone is the usual cause")
@@ -291,7 +291,7 @@ impl DegradedReason {
                 }
             }
             Self::Empty => {
-                let base = "temporal data is empty (0 rows) - this repository has no \
+                let base = "temporal data is empty (0 rows) \u{2014} this repository has no \
                             commit history skim can analyse";
                 if detail.contains("shallow") {
                     format!(
