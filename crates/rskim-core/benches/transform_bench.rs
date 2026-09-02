@@ -5,7 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Unwrapping/expect is acceptable in benchmarks
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use rskim_core::{Language, Mode, transform, truncate_to_token_budget};
+use rskim_core::{
+    Language, Mode, TransformConfig, transform, transform_with_config, truncate_to_token_budget,
+};
 
 // ============================================================================
 // Benchmark Fixtures
@@ -183,6 +185,63 @@ fn bench_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_scaling_minimal(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scaling_minimal");
+
+    for size in [10, 50, 100, 500, 1000] {
+        let large_ts = generate_large_typescript(size);
+
+        group.bench_with_input(
+            BenchmarkId::new("functions", size),
+            &large_ts,
+            |b, input| {
+                b.iter(|| transform(black_box(input), Language::TypeScript, Mode::Minimal).unwrap())
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_scaling_pseudo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scaling_pseudo");
+
+    for size in [10, 50, 100, 500, 1000] {
+        let large_ts = generate_large_typescript(size);
+
+        group.bench_with_input(
+            BenchmarkId::new("functions", size),
+            &large_ts,
+            |b, input| {
+                b.iter(|| transform(black_box(input), Language::TypeScript, Mode::Pseudo).unwrap())
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_scaling_bounded(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scaling_bounded");
+
+    for size in [100, 500, 1000] {
+        let large_ts = generate_large_typescript(size);
+        let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(40);
+
+        group.bench_with_input(
+            BenchmarkId::new("functions", size),
+            &large_ts,
+            |b, input| {
+                b.iter(|| {
+                    transform_with_config(black_box(input), Language::TypeScript, &config).unwrap()
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 // ============================================================================
 // Mode Comparison Benchmarks
 // ============================================================================
@@ -327,6 +386,9 @@ criterion_group!(
     bench_signatures_mode,
     bench_types_mode,
     bench_scaling,
+    bench_scaling_minimal,
+    bench_scaling_pseudo,
+    bench_scaling_bounded,
     bench_mode_comparison,
     bench_language_comparison,
     bench_bash_large,
