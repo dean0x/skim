@@ -5,8 +5,8 @@
 //!
 //! Before D3, `skim git diff <range> --json` produced a JSON envelope that
 //! contained only per-file metadata (path, status, changed_regions).  All
-//! actual patch content was silently dropped: a 2 827-byte raw diff became a
-//! 166-byte JSON response — 94% content loss, exit 0, no stderr marker.
+//! actual patch content was silently dropped: a 6 674-byte raw diff became a
+//! 166-byte JSON response — 97% content loss, exit 0, no stderr marker.
 //!
 //! # Red-before-green requirement
 //!
@@ -26,9 +26,11 @@ use std::process::Command;
 /// Pick a commit that has ≥1 000 bytes of real diff content and is reachable
 /// in every checkout of this repository.
 ///
-/// `08a7892^..08a7892` touches one file (render.rs) with 2 827 raw bytes.
-/// It is a revert commit so it will stay in the history permanently.
-const TEST_RANGE: &str = "08a7892^..08a7892";
+/// `b79f6e3^..b79f6e3` touches one file (helpers.rs) with 6 674 raw bytes
+/// (`git diff b79f6e3^..b79f6e3 | wc -c`). The pinned commit MUST be
+/// reachable from `main` (verify with `git merge-base --is-ancestor <sha>
+/// origin/main`), because branch-only commits disappear after a squash-merge.
+const TEST_RANGE: &str = "b79f6e3^..b79f6e3";
 
 // ============================================================================
 // Helper
@@ -79,9 +81,9 @@ fn skim_diff_json_bytes() -> Vec<u8> {
 /// # Pre-fix failure (quoted for the implementation report)
 ///
 /// ```text
-/// raw bytes:  2827
-/// json bytes: 166   (94.1% content loss — only file metadata, no hunks)
-/// assertion:  json_len (166) < raw_len*0.9 (2544) → FAILS as expected
+/// raw bytes:  6674
+/// json bytes: 166   (97.5% content loss — only file metadata, no hunks)
+/// assertion:  json_len (166) < raw_len*0.9 (6006) → FAILS as expected
 /// ```
 #[test]
 fn d3_json_output_carries_patch_content_not_just_metadata() {
