@@ -21,6 +21,15 @@
 //! population shift by one with every new commit, which turned window drift into
 //! apparent code changes across measurement runs.
 //!
+//! The fixture is pinned to 200 commits reachable from `main` — regenerate with
+//! `git log origin/main --format=%H -200`.  Branch-only SHAs vanish after a
+//! squash-merge, so every SHA in the file must be an ancestor of `main`.  CI
+//! must check out full history (`fetch-depth: 0`) for this reason; see
+//! `.github/workflows/ci.yml` job `test`.  Baseline fallback-rate numbers are
+//! not inlined here — see the PR description for the most recent measurement
+//! (baseline re-measured after the fixture was regenerated — see the PR
+//! description).
+//!
 //! # Mode breakdown rationale
 //!
 //! - Phase B2 (default-mode breadcrumb routing) is validated by a DECREASE in
@@ -611,6 +620,43 @@ fn git_diff_corpus_harness_sanity() {
     // We do this by showing that raw_diff distinguishes the two cases.
     // For a known-good SHA in the corpus, raw_diff must return Ok.
     let sha = &corpus[0];
+
+    // Guard: detect a shallow clone — history-dependent checks cannot run
+    // without full history.  CI must use `fetch-depth: 0` (see ci.yml job
+    // `test`).  In a shallow clone we emit a clear notice and return early,
+    // preserving all fixture-format and plumbing assertions above.
+    let shallow_out = Command::new(&git)
+        .args(["rev-parse", "--is-shallow-repository"])
+        .current_dir(&root)
+        .output()
+        .expect("git rev-parse --is-shallow-repository must run");
+    let is_shallow = String::from_utf8_lossy(&shallow_out.stdout).trim() == "true";
+    if is_shallow {
+        eprintln!(
+            "corpus sanity: shallow clone — history-dependent check skipped; \
+             CI must use fetch-depth: 0"
+        );
+        return;
+    }
+
+    // Guard: verify corpus[0] is actually present in this repository.
+    // If the fixture contains branch-only SHAs that were squash-merged away,
+    // the SHA will be missing and raw_diff will produce a misleading NoParent
+    // error.  Detect the missing-object case first so the panic message is
+    // actionable.
+    let cat_file_status = Command::new(&git)
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .current_dir(&root)
+        .status()
+        .expect("git cat-file -e must run");
+    if !cat_file_status.success() {
+        panic!(
+            "corpus[0] {sha} is not in this repository — \
+             regenerate fixtures/corpus_shas.txt from \
+             `git log origin/main --format=%H -200`"
+        );
+    }
+
     // Most recent commit is almost certainly not the root commit.
     match raw_diff(&git, &root, sha) {
         Ok(s) => {
