@@ -1462,7 +1462,10 @@ fn t21_degraded_pagination_disjoint_pages() {
 ///   limit=1  → 1, limit=2  → 2, limit=5  → 5, limit=7  → 7,
 ///   limit=20 → 18, limit=100 → 18.
 /// The test asserts `len(results) <= limit` — it does NOT pin the exact count so
-/// it remains valid if the fixture size changes.
+/// it remains valid if the fixture size changes.  PF-007: `<= limit` alone is
+/// satisfied by an all-empty sweep, so a separate post-loop assertion requires at
+/// least one invocation to have returned a result; without it a regression that
+/// served ZERO results on the degraded path would pass this guard silently.
 #[test]
 fn t22_limit_sweep_degraded_corrupt_never_exceeds_limit() {
     // FX-CORRUPT-18: 18 files, no commits (no HEAD → auto-heal cannot fire).
@@ -1488,6 +1491,11 @@ fn t22_limit_sweep_degraded_corrupt_never_exceeds_limit() {
     let limits: &[usize] = &[1, 2, 5, 7, 20, 100];
     let arms: &[&[&str]] = &[&["grid_widget", "--hot"], &["grid_widget", "--risky"]];
 
+    // PF-007 vacuity guard: `result_count <= limit` is trivially true when the
+    // degraded path returns nothing at all.  Track whether ANY invocation in the
+    // sweep produced a result so the guard cannot pass on an empty corpus.
+    let mut max_seen = 0usize;
+
     for &limit in limits {
         let limit_str = limit.to_string();
         for base_args in arms {
@@ -1508,8 +1516,21 @@ fn t22_limit_sweep_degraded_corrupt_never_exceeds_limit() {
                  (EXCEEDS LIMIT) — the degraded lexical-fallback path must honour --limit; \
                  got JSON:\n{json_out}"
             );
+            max_seen = max_seen.max(result_count);
         }
     }
+
+    // PF-007: the sweep above must have exercised a non-empty result set on the
+    // degraded path.  Asserted as `> 0` rather than an exact count so the guard
+    // stays valid if FILE_COUNT or the retrieval ranking changes, while still
+    // failing loudly if the degraded arm ever serves nothing.
+    assert!(
+        max_seen > 0,
+        "T-22/AC-22: every invocation in the limit sweep returned ZERO results — \
+         the `result_count <= limit` assertions above are vacuous (PF-007). \
+         The FX-CORRUPT-18 fixture has {FILE_COUNT} files matching `grid_widget`, \
+         so the degraded lexical fallback must serve at least one of them."
+    );
 }
 
 // ============================================================================

@@ -1303,10 +1303,10 @@ fn gather_stats(
     // Finding [medium/performance] fix: header-only probe for the pre-refresh HEAD.
     // `auto_refresh_if_stale` internally calls `check_staleness → FileManifest::load`
     // which fully decodes the manifest (60 k-node BTreeMap + 60 k String allocations
-    // for a max-size index). Loading a second full copy here — as the previous code did
-    // at mod.rs:2100-2103 — doubles that cost for one header field. The header-only
-    // probe reads only up to the fixed header block via `decode_header` and returns
-    // just the git_head string; the entry table is never materialised.
+    // for a max-size index). Decoding a second full copy here — as the previous code
+    // did in `build_stats_json` — doubles that cost for one header field. The probe
+    // reads the same bytes but decodes only the fixed header block via `decode_header`
+    // and returns just the git_head string; the entry table is never materialised.
     let pre_refresh_git_head = manifest::FileManifest::load_git_head(root, cache_dir);
 
     // Pre-refresh temporal state: must be snapshotted BEFORE `auto_refresh_if_stale`
@@ -2098,15 +2098,20 @@ fn print_help() {
 
 /// Build the `--stats --json` value used by both [`run_stats`] and the test helper.
 ///
+/// Pure serialiser (Finding [medium/architecture] CQS fix): all data is pre-gathered
+/// by [`gather_stats`], which performs the self-heal and takes the pre-refresh
+/// snapshots.  This function has **no I/O side effects**.
+///
 /// Shared so that AC11 back-compat tests guard the actual production code path
 /// rather than a hand-duplicated reimplementation.  `run_stats` calls this in its
-/// JSON branch; `stats_json_for_test` delegates to it directly.
+/// JSON branch; `stats_json_for_test` runs the same `gather_stats` + serialise pair.
 ///
-/// AD-413-13: `git_head` is the manifest's stored HEAD ("HEAD-at-last-build" from
-/// Pure serialiser for `--stats --json` output (Finding [medium/architecture] CQS fix).
-///
-/// All data is pre-gathered by [`gather_stats`], which performs the self-heal and
-/// collects the pre-refresh snapshots.  This function has **no I/O side effects**.
+/// AD-413-13: `git_head` is the manifest's stored HEAD ("HEAD-at-last-build", read
+/// by [`manifest::FileManifest::load_git_head`]) while `git_head_state` is the live
+/// HEAD state resolved at invocation time.  The two keys can legitimately diverge —
+/// a frozen linked worktree before its first post-fix rebuild produces
+/// `{"git_head": null, "git_head_state": "resolved"}`, which is a legal transient
+/// state, not a contradiction.
 ///
 /// AD-395-6: `skipped` / `skipped_by_reason` are additive keys (AC11 back-compat).
 /// `skipped_by_reason` uses `BTreeMap` for byte-stable key order (PF-012).

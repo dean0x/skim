@@ -630,12 +630,17 @@ impl FileManifest {
     }
 
     /// Read the stored git HEAD from `{cache_dir}/index.skfiles` without
-    /// materialising the entry table (header-only probe).
+    /// materialising the entry table (header-only decode).
     ///
     /// Used by `gather_stats` to snapshot the pre-refresh HEAD before
     /// `auto_refresh_if_stale` runs, avoiding the second full manifest decode
     /// that `check_staleness` already performs inside `auto_refresh_if_stale`
     /// (Finding [medium/performance] / AD-414-10).
+    ///
+    /// The file bytes are still read in one `std::fs::read` (the same size-guarded
+    /// read `load` performs); what this probe avoids is the *decode* — the entry
+    /// table is never parsed, so none of the per-entry `String`/`BTreeMap`
+    /// allocations that dominate `load` on a large index are made.
     ///
     /// Returns `None` on any I/O failure, parse error, version mismatch, or
     /// root mismatch — semantically identical to

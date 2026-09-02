@@ -368,10 +368,13 @@ pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<St
 /// Built with `anyhow::anyhow!` (NO `.context`), so the io source is not printed
 /// twice when the caller formats with `{e:#}`.
 ///
-/// Used at ALL THREE bare-`?` sites: the query path (`execute_query_with_manifest`),
-/// `run_stats` (mod.rs, text mode) and `build_stats_json` (mod.rs, JSON mode) —
-/// both `--stats` sites run BEFORE `check_staleness`, so they are exactly the
-/// path a stuck user reaches when the index is broken.
+/// Used at BOTH bare-`?` sites that open the lexical index: the query path
+/// (`execute_query_with_manifest`) and `gather_stats` (mod.rs), which serves both
+/// `--stats` and `--stats --json` from one snapshot.  The `--stats` site runs
+/// AFTER the `auto_refresh_if_stale` self-heal, so an error here means the index
+/// could not be opened even after a rebuild attempt — exactly the state a stuck
+/// user is in, and the one AC-13/AC-14 require to name the artifact and the
+/// `--rebuild` remedy.
 ///
 /// # Errors
 ///

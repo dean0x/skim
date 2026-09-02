@@ -49,6 +49,17 @@ pub(crate) fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Maximum number of `ErrorKind::Interrupted` (EINTR) retries tolerated while
+/// filling an index header buffer.
+///
+/// A header read is at most 62 bytes, so a healthy system needs zero retries and
+/// a heavily-signalled one needs a handful.  The cap exists so the retry arm —
+/// which by definition makes no progress — cannot spin indefinitely under a
+/// signal storm (every retry must have a fixed upper bound).  Exhausting the
+/// budget surfaces the last `Interrupted` error as [`crate::SearchError::Io`],
+/// which `check_staleness` treats as "rebuild", never as silent success.
+pub(crate) const MAX_EINTR_RETRIES: usize = 16;
+
 /// Steps 1–4 shared by both index integrity probes:
 /// open the `.skidx` file, fill `buf` with up to `buf.len()` bytes, validate
 /// that at least 6 bytes were read, validate the magic bytes, and return the
@@ -72,8 +83,10 @@ pub(crate) fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// - [`crate::SearchError::Io`] if the file at `path` cannot be opened, or
-///   a non-interrupted read error occurs while filling the header buffer
-///   (`EINTR` / `ErrorKind::Interrupted` is retried automatically).
+///   a non-interrupted read error occurs while filling the header buffer.
+///   `EINTR` / `ErrorKind::Interrupted` is retried up to
+///   [`MAX_EINTR_RETRIES`] times; the last one is surfaced as `Io` rather
+///   than retried forever.
 /// - [`crate::SearchError::IndexCorrupted`] if fewer than 6 bytes could be
 ///   read from the file, or the first 4 bytes do not equal `expected_magic`.
 pub(crate) fn probe_index_header(
@@ -89,11 +102,17 @@ pub(crate) fn probe_index_header(
     // `Read::read` may return fewer bytes than requested even when more are
     // available, so a single call cannot distinguish "short file" from "short
     // read" — treating the latter as corruption costs the user a full rebuild
-    // of a healthy index.  Fill the buffer explicitly; bounded by construction:
-    // every iteration either breaks on EOF (0-byte read) or advances `n` by at
-    // least one byte toward `buf.len()`.
+    // of a healthy index.  Fill the buffer explicitly.
+    //
+    // Bounded by construction: every iteration either breaks on EOF (0-byte
+    // read), advances `n` by at least one byte toward `buf.len()`, or consumes
+    // one of the `MAX_EINTR_RETRIES` interrupt retries — so the loop performs at
+    // most `buf.len() + MAX_EINTR_RETRIES` iterations.  The retry budget is what
+    // keeps the `Interrupted` arm (which does NOT advance `n`) from spinning
+    // forever under a pathological signal storm.
     let mut file = std::fs::File::open(path)?;
     let mut n = 0usize;
+    let mut eintr_retries = 0usize;
     while n < buf.len() {
         match file.read(&mut buf[n..]) {
             Ok(0) => break,
@@ -102,7 +121,13 @@ pub(crate) fn probe_index_header(
             // Retrying here matches what `read_exact` does internally and
             // prevents `check_staleness`'s `Err(_) => true` arm from
             // reclassifying a healthy index as corrupt on a spurious EINTR.
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // Unlike `read_exact`, the retry budget is explicit and finite.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                eintr_retries += 1;
+                if eintr_retries > MAX_EINTR_RETRIES {
+                    return Err(crate::SearchError::Io(e));
+                }
+            }
             Err(e) => return Err(crate::SearchError::Io(e)),
         }
     }
