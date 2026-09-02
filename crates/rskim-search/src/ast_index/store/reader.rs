@@ -337,11 +337,14 @@ impl AstIndexReader {
     /// probe.  The structural check ensures that a truncated or size-inconsistent
     /// AST index triggers a rebuild via the `Err(_) => true` staleness arm.
     ///
-    /// **Keep [`Self::index_version`]** — it has two live callers outside
-    /// `check_staleness` (`f9_index_version_returns_3_for_v3_index` and
-    /// `f9_index_version_surfaces_v1_fixture` in `reader_tests.rs`) and doc
-    /// references at `staleness.rs` and `lib.rs`.  This function is additive and
-    /// does not subsume those uses.
+    /// **Keep [`Self::index_version`]** — it has callers in `ast_tests.rs`
+    /// (`self_heal_below_format_version_reports_stale`, the two gate-query
+    /// round-trip tests `run_ast_standalone_no_format_change_ac10_374` and
+    /// `run_ast_standalone_synthetic_pattern_no_format_change_ac12_394`) and in
+    /// `reader_tests.rs` (`f9_index_version_returns_3_for_v3_index`,
+    /// `f9_index_version_surfaces_v1_fixture`), plus a doc reference at the
+    /// [`AST_INDEX_FORMAT_VERSION`] item in `lib.rs`.  This function is additive
+    /// and does not subsume those uses.
     ///
     /// # Errors
     ///
