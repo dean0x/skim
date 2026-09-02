@@ -1084,15 +1084,13 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
             "  temporal db   : {} bytes",
             snapshot.temporal_db_bytes
         )?;
-        {
-            // AC-15: "empty" is shown as "empty (0 rows)" in text mode for clarity.
-            let ts_text = if snapshot.pre_refresh_temporal_state == "empty" {
-                "empty (0 rows)"
-            } else {
-                snapshot.pre_refresh_temporal_state
-            };
-            writeln!(out, "  temporal state: {ts_text}")?;
-        }
+        // AC-15: "empty" is shown as "empty (0 rows)" in text mode for clarity.
+        let ts_text = if snapshot.pre_refresh_temporal_state == "empty" {
+            "empty (0 rows)"
+        } else {
+            snapshot.pre_refresh_temporal_state
+        };
+        writeln!(out, "  temporal state: {ts_text}")?;
         if let Some(ts) = snapshot.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
@@ -1125,26 +1123,24 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         // AD-405-7 / AC-405-9 / AC-405-15: AST size-coverage section (D-4 cadence).
         // Omit when clean (is_clean() == true) — byte-identical to the pre-fix binary
         // on a corpus with zero excluded / zero undetermined files (AC-405-15).
-        {
+        if !snapshot.ast_coverage.is_clean() {
             let coverage = &snapshot.ast_coverage;
-            if !coverage.is_clean() {
-                writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
-                if coverage.size_excluded_files > 0 {
-                    writeln!(
-                        out,
-                        "  ast excluded  : {} (exceed 1 MiB cap)",
-                        coverage.size_excluded_files
-                    )?;
-                    // PF-012: excluded_by_lang is a BTreeMap — already sorted.
-                    for (lang, count) in &coverage.excluded_by_lang {
-                        writeln!(out, "    {lang}: {count}")?;
-                    }
+            writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
+            if coverage.size_excluded_files > 0 {
+                writeln!(
+                    out,
+                    "  ast excluded  : {} (exceed 1 MiB cap)",
+                    coverage.size_excluded_files
+                )?;
+                // PF-012: excluded_by_lang is a BTreeMap — already sorted.
+                for (lang, count) in &coverage.excluded_by_lang {
+                    writeln!(out, "    {lang}: {count}")?;
                 }
-                if coverage.undetermined_files > 0 {
-                    // "ast no-size" (11 chars) + 3 spaces = 14-char label field;
-                    // colon at column 16 — aligned with all other stats lines.
-                    writeln!(out, "  ast no-size   : {}", coverage.undetermined_files)?;
-                }
+            }
+            if coverage.undetermined_files > 0 {
+                // "ast no-size" (11 chars) + 3 spaces = 14-char label field;
+                // colon at column 16 — aligned with all other stats lines.
+                writeln!(out, "  ast no-size   : {}", coverage.undetermined_files)?;
             }
         }
     }
@@ -1637,11 +1633,6 @@ fn run_query(
         lang: flags.lang,
     };
 
-    // AD-405-7 / AC-405-17: AST coverage was already computed once in the block
-    // above (carried in `cached_ast_coverage`) — no second manifest pass needed.
-    // Pure-lexical paths carry None → ast_coverage key absent from JSON (D-5).
-    let compound_ast_coverage = cached_ast_coverage;
-
     // Pass the already-refreshed manifest to execute_query_with_manifest.  When
     // pre_loaded_manifest is Some (temporal or AST flag active — refresh happened
     // above), execute_query skips its own auto_refresh_if_stale.  When None
@@ -1757,12 +1748,13 @@ fn run_query(
 
     // AD-405-7 / AC-405-17: emit AST coverage notice on compound --ast paths (D-4
     // cadence).  Notice goes to stderr so --json stdout stays byte-identical.
+    // Pure-lexical paths carry None → ast_coverage key absent from JSON (D-5).
     // Wire coverage into output for the JSON key (D-5): omit when clean so the
     // key is absent on healthy repos (avoids noise for well-maintained codebases).
-    if let Some(ref cov) = compound_ast_coverage {
+    if let Some(ref cov) = cached_ast_coverage {
         query::emit_ast_coverage_notice(cov);
     }
-    output.ast_coverage = compound_ast_coverage.filter(|c| !c.is_clean());
+    output.ast_coverage = cached_ast_coverage.filter(|c| !c.is_clean());
 
     let mut stdout = BufWriter::new(std::io::stdout());
     if flags.json {
