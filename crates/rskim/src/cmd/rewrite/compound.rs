@@ -893,23 +893,85 @@ pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
         .any(|s| s.trailing_operator == Some(CompoundOp::Pipe))
 }
 
+/// Rebuild the command text from a split segment list: each segment's tokens,
+/// the redirects [`strip_segment_redirects`] lifted out of it, and the operator
+/// that follows it.
+///
+/// [`try_rewrite_compound`] is handed segments alone, but the destination
+/// predicates ([`command_needs_exact_bytes`]) read *syntax*, which only exists
+/// in the joined form. Runs of whitespace are not preserved — commands whose
+/// tokenisation is lossy are already refused upstream by
+/// [`rewrite_would_corrupt`].
+fn rejoin_segments(segments: &[CommandSegment]) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in segments {
+        parts.extend(seg.tokens.iter().map(String::as_str));
+        parts.extend(seg.stripped_redirects.iter().map(String::as_str));
+        if let Some(op) = seg.trailing_operator {
+            parts.push(op.as_str());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Return `true` for the one pipeline shape AD-RW-2 permits: `<source> | cat`,
+/// with bare `cat` as the sole consumer.
+///
+/// `| cat` is a **reader render** — an agent defeating a pager, not persisting
+/// bytes — and compressing what an agent is about to read is skim's entire
+/// purpose. So this shape rewrites while every other pipeline still bails: only
+/// the far end of the pipe separates `| cat` from `| tee out.txt`, and reading
+/// it wrong costs the user data. The hook's [`command_needs_exact_bytes`]
+/// verdict for such a command is `false`, so no force-raw marker is set — which
+/// is consistent, because the explicit-subcommand path the rewrite emits
+/// compresses into the FIFO on purpose.
+///
+/// The shape is deliberately exact — exactly two segments joined by a single
+/// `|`, the source carrying no redirects, the consumer being the single token
+/// `cat` with no arguments and no operator of its own. `cat -n`, `cat -`,
+/// `cat file`, a third stage, and any interleaved `&&`/`||`/`;` all fall
+/// outside it.
+///
+/// [`command_needs_exact_bytes`] over the rejoined text is then the safety
+/// gate, and it is what keeps `… | cat > f` (rule R, whose `>`/target tokens
+/// stay inside the consumer segment) and `… | cat | tee f` (rule T) raw.
+fn is_bare_cat_pipeline(segments: &[CommandSegment]) -> bool {
+    let [source, consumer] = segments else {
+        return false;
+    };
+    if source.trailing_operator != Some(CompoundOp::Pipe) || !source.stripped_redirects.is_empty() {
+        return false;
+    }
+    if consumer.trailing_operator.is_some()
+        || !consumer.stripped_redirects.is_empty()
+        || consumer.tokens != ["cat"]
+    {
+        return false;
+    }
+    !command_needs_exact_bytes(&rejoin_segments(segments))
+}
+
 /// Attempt to rewrite a compound command expression.
 ///
 /// For `&&`/`||`/`;`: tries `try_rewrite()` on each segment independently.
-/// For `|`: NEVER rewrites (#317, user-approved): compressing a pipe
-/// producer silently changes what downstream `grep`/`wc`/`head` consume —
-/// the whole pipeline passes through untouched.
+/// For `|`: bails (#317, user-approved) — compressing a pipe producer silently
+/// changes what downstream `grep`/`wc`/`head` consume, so the whole pipeline
+/// passes through untouched. The single exception is
+/// [`is_bare_cat_pipeline`]: `<source> | cat` rewrites its source, because
+/// bare `cat` renders the stream for a reader rather than consuming its bytes.
 /// Returns `Some(RewriteResult)` if ANY segment was rewritten, `None` otherwise.
 pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<RewriteResult> {
     if segments.is_empty() {
         return None;
     }
 
-    if has_pipe_operator(segments) {
+    if has_pipe_operator(segments) && !is_bare_cat_pipeline(segments) {
         return None;
     }
 
-    // For &&/||/; — try rewriting each segment independently
+    // For &&/||/; (and the bare-`| cat` shape) — try rewriting each segment
+    // independently. `try_rewrite` declines bare `cat`, so the consumer stage
+    // of a `| cat` pipeline is re-emitted verbatim.
     let mut any_rewritten = false;
     let mut first_category: Option<RewriteCategory> = None;
     let mut parts: Vec<String> = Vec::new();
@@ -2036,5 +2098,265 @@ mod tests {
             !command_needs_passthrough("cargo test && cargo build"),
             "compound clean command must not need passthrough"
         );
+    }
+
+    // ========================================================================
+    // AD-RW-2 reversal — narrow `<rewritable command> | cat` shape
+    //
+    // AD-RW-2 currently bails on EVERY pipeline via `has_pipe_operator`.  The
+    // reversal allows the narrow shape `<source> | cat` (bare `cat`, no args,
+    // single downstream stage) because `| cat` is a reader render whose sole
+    // purpose is to defeat pagers — compressing what an agent is about to read
+    // is skim's core value.
+    //
+    // RED tests (1–3): fail today (has_pipe_operator returns None); pass after
+    //   the reversal.
+    // CONTROL tests (4–9): pass today AND after the reversal — pin the safety
+    //   gate so the reversal cannot silently escape its narrow shape.
+    // ========================================================================
+
+    /// Binary verdict: `skim rewrite 'git log -n 3 | cat'` → exit 1 (no rewrite).
+    ///
+    /// After the AD-RW-2 reversal the pure 2-stage pipeline `<source> | cat`
+    /// must be rewritten: the source segment is compressed, `| cat` is
+    /// preserved verbatim.
+    ///
+    /// RED: fails today because `has_pipe_operator` short-circuits to None for
+    /// every pipeline; passes after the reversal.
+    #[test]
+    fn pipe_to_bare_cat_rewrites_the_source() {
+        match split_compound("git log -n 3 | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                let joined = result
+                    .expect("git log -n 3 | cat must be rewritten after AD-RW-2 reversal")
+                    .tokens
+                    .join(" ");
+                assert_eq!(
+                    joined, "skim git log -n 3 | cat",
+                    "source must be rewritten; downstream `| cat` preserved verbatim"
+                );
+            }
+            other => panic!("Expected Compound for `git log -n 3 | cat`, got {other:?}"),
+        }
+    }
+
+    /// Binary verdict: `skim rewrite 'cat README.md'` → exit 0,
+    /// stdout = `SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo`.
+    ///
+    /// `cat <file>` is rewritten standalone, so when it appears as the pipe
+    /// source in `cat README.md | cat` the source segment must be rewritten
+    /// exactly as the standalone form with ` | cat` appended.
+    ///
+    /// RED: fails today (has_pipe_operator bails); passes after the reversal.
+    #[test]
+    fn pipe_to_bare_cat_rewrites_file_read_source() {
+        match split_compound("cat README.md | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                let joined = result
+                    .expect("cat README.md | cat must be rewritten after AD-RW-2 reversal")
+                    .tokens
+                    .join(" ");
+                assert_eq!(
+                    joined, "SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo | cat",
+                    "source rewritten as standalone form; | cat appended verbatim"
+                );
+            }
+            other => panic!("Expected Compound for `cat README.md | cat`, got {other:?}"),
+        }
+    }
+
+    /// Binary verdict: `skim rewrite 'grep -rn foo src'` → exit 0,
+    /// stdout = `skim grep -rn foo src`.
+    /// Binary verdict: `skim rewrite 'grep -rn foo src | cat'` → exit 1 (no rewrite).
+    ///
+    /// `grep -rn foo src` is rewritten standalone; when piped to bare `cat` the
+    /// source must be rewritten as the standalone form with ` | cat` appended.
+    ///
+    /// Note: `grep foo file | head` is separately pinned as NOT rewritten by
+    /// `test_pipe_catch_all_grep_not_rewritten` (non-cat downstream, outside
+    /// the narrow shape).
+    ///
+    /// RED: fails today (has_pipe_operator bails); passes after the reversal.
+    #[test]
+    fn pipe_to_bare_cat_rewrites_grep_source() {
+        match split_compound("grep -rn foo src | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                let joined = result
+                    .expect("grep -rn foo src | cat must be rewritten after AD-RW-2 reversal")
+                    .tokens
+                    .join(" ");
+                assert_eq!(
+                    joined, "skim grep -rn foo src | cat",
+                    "source rewritten as standalone form; | cat appended verbatim"
+                );
+            }
+            other => {
+                panic!("Expected Compound for `grep -rn foo src | cat`, got {other:?}")
+            }
+        }
+    }
+
+    /// `git log -n 3 | cat > /tmp/x.txt`: the stdout redirect on the `cat`
+    /// stage routes the pipeline output to a file.  Rule R fires →
+    /// `command_needs_exact_bytes` is true → the rewrite must be refused.
+    ///
+    /// Binary verdict: exit 1 (not rewritten — `rewrite_would_corrupt` bails
+    /// on the stdout redirect before `try_rewrite_compound` is called).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (safety: the `cat` segment has a stripped redirect — not bare `cat` —
+    /// so the narrow shape check must refuse it).
+    #[test]
+    fn pipe_to_cat_then_redirect_is_not_rewritten() {
+        assert!(
+            command_needs_exact_bytes("git log -n 3 | cat > /tmp/x.txt"),
+            "safety gate precondition: Rule R must arm for the stdout redirect"
+        );
+        match split_compound("git log -n 3 | cat > /tmp/x.txt") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 | cat > /tmp/x.txt must not be rewritten \
+                     (cat segment carries a stripped stdout redirect)"
+                );
+            }
+            other => panic!("Expected Compound, got {other:?}"),
+        }
+    }
+
+    /// `git log -n 3 | cat | tee /tmp/x.txt`: `tee` is a byte-exact consumer
+    /// (Rule T); the downstream is not bare `cat` (it is a 3-stage pipeline).
+    ///
+    /// Binary verdict: exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (safety: 3 pipeline stages → not the narrow 2-stage `<source> | cat`
+    /// shape; Rule T also arms `command_needs_exact_bytes`).
+    #[test]
+    fn pipe_to_cat_then_tee_is_not_rewritten() {
+        assert!(
+            command_needs_exact_bytes("git log -n 3 | cat | tee /tmp/x.txt"),
+            "safety gate precondition: Rule T must arm for tee"
+        );
+        match split_compound("git log -n 3 | cat | tee /tmp/x.txt") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 | cat | tee /tmp/x.txt must not be rewritten \
+                     (3-stage pipeline, tee downstream)"
+                );
+            }
+            other => panic!("Expected Compound, got {other:?}"),
+        }
+    }
+
+    /// `git log -n 3 | cat -n`: downstream `cat` carries the `-n` flag
+    /// (number lines).  The narrow shape requires bare `cat` with NO arguments.
+    ///
+    /// Binary verdict: exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (safety: `cat` with any argument is not bare `cat` → shape rejected).
+    #[test]
+    fn pipe_to_cat_with_args_is_not_rewritten() {
+        match split_compound("git log -n 3 | cat -n") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 | cat -n must not be rewritten (`cat -n` has args)"
+                );
+            }
+            other => panic!("Expected Compound for `git log -n 3 | cat -n`, got {other:?}"),
+        }
+    }
+
+    /// Non-cat reader consumers (`head`, `wc`, `grep`) are outside the narrow
+    /// `| cat` shape and must never trigger the reversal.
+    ///
+    /// Binary verdict: all three exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (only bare `cat` with no args qualifies as the downstream stage).
+    #[test]
+    fn pipe_to_non_cat_reader_is_not_rewritten() {
+        for cmd in [
+            "git log -n 3 | head -5",
+            "git log -n 3 | wc -l",
+            "git log -n 3 | grep fix",
+        ] {
+            match split_compound(cmd) {
+                CompoundSplitResult::Compound(segments) => {
+                    assert!(
+                        try_rewrite_compound(&segments).is_none(),
+                        "`{cmd}` must not be rewritten (non-cat downstream)"
+                    );
+                }
+                other => panic!("Expected Compound for `{cmd}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// `echo $(git log -n 3 | cat)`: command substitution wraps the pipeline
+    /// in `$(…)`.  Rule S fires in `command_needs_exact_bytes`; the outer
+    /// command also bails via `rewrite_would_corrupt` (and `split_compound`
+    /// returns Bail on `$(`).  The `| cat` inside the capture is never
+    /// visible to the reversal.
+    ///
+    /// Binary verdict: exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today and after the reversal — the outer guards fire
+    /// before `try_rewrite_compound` is ever reached.
+    #[test]
+    fn pipe_to_cat_inside_capture_is_not_rewritten() {
+        assert!(
+            rewrite_would_corrupt("echo $(git log -n 3 | cat)"),
+            "Rule S: $( triggers the corruption guard"
+        );
+        assert!(
+            command_needs_exact_bytes("echo $(git log -n 3 | cat)"),
+            "Rule S: command substitution arms exact-bytes"
+        );
+        match split_compound("echo $(git log -n 3 | cat)") {
+            CompoundSplitResult::Bail => {}
+            other => panic!("Expected Bail for capture shape, got {other:?}"),
+        }
+    }
+
+    /// `git log -n 3 && git status | cat`: 3-segment compound mixing `&&` and
+    /// `|` operators.
+    ///
+    /// Binary verdict: exit 1 (not rewritten today).
+    ///
+    /// After the reversal this must STILL not be rewritten.  The narrow
+    /// AD-RW-2 reversal applies only to pure 2-stage pipelines `<source> | cat`
+    /// where the ENTIRE command is that shape (no interleaved `&&`/`||`/`;`).
+    /// `&&` sequences ARE rewritten segment-by-segment today, but that
+    /// existing path only fires on non-pipe compounds; introducing a mixed
+    /// `&&` + `|` rewrite path would require new multi-operator logic that is
+    /// out of scope for the narrow reversal.  Pinned as a safety invariant to
+    /// prevent the reversal from silently growing beyond its approved shape.
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (narrow shape check: more than 2 segments, and a non-Pipe operator
+    /// precedes the `|`, so the shape is rejected).
+    #[test]
+    fn pipe_to_cat_after_and_sequence() {
+        match split_compound("git log -n 3 && git status | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 && git status | cat must not be rewritten: \
+                     the narrow AD-RW-2 reversal applies only to pure 2-stage \
+                     `<source> | cat` pipelines; this 3-segment mixed-operator \
+                     compound is outside the approved shape"
+                );
+            }
+            other => {
+                panic!("Expected Compound for `git log -n 3 && git status | cat`, got {other:?}")
+            }
+        }
     }
 }

@@ -20,19 +20,25 @@
 //!   the PreToolUse hook performs), whose emitted command is then executed with
 //!   NO wrapper on `PATH`. This is the hook-only deployment.
 //!
-//! ## Two documented, structural divergences
+//! ## Where the surfaces agree, and the one structural divergence
 //!
-//! 1. **`| cat` on the rewrite surface serves raw.** Pipe expressions are never
-//!    rewritten (#317 / AD-RW-2, user-approved: compressing a pipe producer
-//!    changes what the downstream consumer sees). With wrappers installed — the
-//!    deployed configuration — the wrapper compresses it, which is the outcome
-//!    that must not regress and is pinned here.
-//! 2. **An AF_UNIX socket on fd 1 compresses on the rewrite surface.** The
-//!    parent installed that fd; no redirect syntax exists for the text scan to
-//!    see. Only `fstat` can observe it, and it does — on the wrapper surface.
+//! **`| cat` — agreement.** `<cmd> | cat` (bare `cat`, sole consumer) IS
+//! rewritten: the source segment becomes `skim <cmd>` and `| cat` is preserved
+//! verbatim, so the rewrite surface now serves the COMPRESSED view the wrapper
+//! surface already served. `| cat` is a reader render — an agent defeating a
+//! pager — and compressing what an agent is about to read is skim's purpose.
+//! Every other pipe shape still makes the engine decline (#317 / AD-RW-2:
+//! compressing a pipe producer changes what the downstream consumer sees), so
+//! `| tee f`, `| cat -n`, `| cat > f`, a third stage and an interleaved
+//! `&&`/`||`/`;` all pass through untouched.
 //!
-//! Both are inherent to what each surface can observe, not defects to paper
-//! over. See `stdout_should_serve_raw` in `main.rs` for the division of labour.
+//! **Divergence: an AF_UNIX socket on fd 1 compresses on the rewrite surface.**
+//! The parent installed that fd; no redirect syntax exists for the text scan to
+//! see, and the explicit-subcommand path is deliberately not `fstat`-gated.
+//! Only `fstat` can observe the socket, and it does — on the wrapper surface.
+//!
+//! It is inherent to what each surface can observe, not a defect to paper over.
+//! See `stdout_should_serve_raw` in `main.rs` for the division of labour.
 //!
 //! ## Why `git log -n 5`
 //!
@@ -752,6 +758,53 @@ mod destination {
                  needs the tool's exact bytes"
             );
         }
+    }
+
+    /// `| cat` → rewritten, and the emitted command compresses.
+    ///
+    /// The narrow AD-RW-2 reversal: bare `cat` as the sole pipe consumer is a
+    /// reader render, so the engine rewrites the SOURCE stage and leaves
+    /// `| cat` verbatim. Both surfaces now compress this shape — the wrapper
+    /// via `fstat` (`wrapper_pipe_cat_compresses`), the rewrite engine via the
+    /// `skim …` it emits.
+    #[test]
+    fn rewrite_pipe_cat_is_rewritten_and_compresses() {
+        let sb = Sandbox::new();
+        let script = "git log -n 5 | cat";
+        let emitted = sb
+            .rewrite_verdict(script)
+            .expect("`<cmd> | cat` must be rewritten on the rewrite surface");
+        assert!(
+            emitted.contains("skim git log"),
+            "the pipe SOURCE is the stage that gets rewritten; got `{emitted}`"
+        );
+        let out = sb.bare_sh(&emitted).output().expect("run emitted command");
+        assert_eq!(
+            classify(&out.stdout),
+            Served::Compressed,
+            "`{emitted}` must land the compressed view at the far end of the pipe"
+        );
+    }
+
+    /// AF_UNIX socket on fd 1 → COMPRESSED on the rewrite surface.
+    ///
+    /// The documented divergence, pinned. The parent installed this fd, so no
+    /// redirect syntax exists for the text scan to see; and the
+    /// explicit-subcommand path is deliberately not `fstat`-gated, because it
+    /// cannot tell a user-authored `skim …` from a hook-injected one. The
+    /// wrapper surface, which sees the socket, serves raw
+    /// (`wrapper_socket_serves_raw`).
+    #[test]
+    fn rewrite_socket_compresses_on_explicit_subcommand_path() {
+        let sb = Sandbox::new();
+        let (ours, theirs) = open_socketpair();
+        let bytes = run_with_stdout(sb.bare_sh("skim git log -n 5"), theirs, ours);
+        assert_eq!(
+            classify(&bytes),
+            Served::Compressed,
+            "the explicit-subcommand path is not fstat-gated: a socket on fd 1 \
+             still receives the compressed view"
+        );
     }
 
     /// End-to-end on the rewrite surface (hook-only, no wrappers): every
