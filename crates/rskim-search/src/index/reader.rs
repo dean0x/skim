@@ -650,47 +650,16 @@ impl NgramIndexReader {
     ///   magic bytes, or the file lengths disagree with the header-encoded sizes.
     pub fn lexical_index_integrity(dir: &Path) -> Result<u16> {
         use super::format::{FORMAT_VERSION, SKIDX_MAGIC};
-        use std::io::Read;
 
         let idx_path = dir.join("index.skidx");
-
-        // Step 1: open and read up to SKIDX_HEADER_SIZE bytes.
-        //
-        // `Read::read` is permitted to return fewer bytes than requested even when
-        // more are available, so a single call cannot distinguish "short file" from
-        // "short read".  Getting that wrong reports a HEALTHY index as corrupt and
-        // costs the user a full rebuild, so fill the buffer explicitly.  Bounded by
-        // construction: every iteration either breaks on EOF or advances `n` by at
-        // least one byte toward `buf.len()` (62).
-        let mut file = std::fs::File::open(&idx_path)?;
         let mut buf = [0u8; SKIDX_HEADER_SIZE];
-        let mut n = 0usize;
-        while n < buf.len() {
-            match file.read(&mut buf[n..])? {
-                0 => break,
-                k => n += k,
-            }
-        }
 
-        // Step 2: need at least 6 bytes for magic + version.
-        if n < 6 {
-            return Err(SearchError::IndexCorrupted(format!(
-                "index.skidx too short: need 6 bytes for magic+version, got {n}"
-            )));
-        }
+        // Steps 1–4: open, fill, magic check, version decode (shared with
+        // AstIndexReader::index_integrity via crate::io_util::probe_index_header).
+        let (file, version, n) =
+            crate::io_util::probe_index_header(&idx_path, &mut buf, "index.skidx", SKIDX_MAGIC)?;
 
-        // Step 3: validate magic.
-        let magic = &buf[0..4];
-        if magic != SKIDX_MAGIC.as_ref() {
-            return Err(SearchError::IndexCorrupted(format!(
-                "index.skidx bad magic: expected {:?}, got {:?}",
-                SKIDX_MAGIC, magic
-            )));
-        }
-
-        // Step 4: read version; if it doesn't match FORMAT_VERSION, return
-        // immediately — do NOT validate size (AD-414-6: foreign layout).
-        let version = u16::from_le_bytes([buf[4], buf[5]]);
+        // AD-414-6: foreign layout unknown — size checks must not proceed.
         if version != FORMAT_VERSION {
             return Ok(version);
         }
@@ -703,11 +672,21 @@ impl NgramIndexReader {
         }
 
         // Step 6: decode header and check .skidx size.
+        //
+        // Use `file.metadata()` (the already-open handle) rather than a fresh
+        // `fs::metadata(&idx_path)`: reusing the handle closes the TOCTOU gap
+        // between the open() above and the stat, and surfaces a real I/O error
+        // (e.g. ENFILE, racing unlink) instead of silently substituting 0 and
+        // mis-classifying the file as corrupt.
+        //
+        // Note: unlike the AST integrity probe, there is no postings_file_size == 0
+        // early exit here — the lexical builder always writes index.skpost (even
+        // for an empty corpus), so a missing .skpost is always a corruption signal
+        // on the lexical arm.  This asymmetry is intentional; see
+        // AstIndexReader::index_integrity (E-9) for the AST side's rationale.
         let header = decode_header(&buf[..SKIDX_HEADER_SIZE])?;
         let expected_idx = expected_idx_size(&header)?;
-        let actual_idx = std::fs::metadata(&idx_path)
-            .map(|m| m.len() as usize)
-            .unwrap_or(0);
+        let actual_idx = file.metadata()?.len() as usize;
         if actual_idx != expected_idx {
             return Err(SearchError::IndexCorrupted(format!(
                 "index.skidx size mismatch: expected {expected_idx}, got {actual_idx}"
