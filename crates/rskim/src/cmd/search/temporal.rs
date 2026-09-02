@@ -332,13 +332,13 @@ pub(super) fn open_temporal_state_for(
 ) -> TemporalOpen {
     match open_temporal_state(root, cache_dir, head) {
         TemporalOpen::Open(db) => {
-            if let Some(s) = sort {
-                if dimension_is_empty(&db, s) {
-                    return TemporalOpen::Unavailable(TemporalUnavailable {
-                        reason: DegradedReason::Empty,
-                        detail: String::new(),
-                    });
-                }
+            if let Some(s) = sort
+                && dimension_is_empty(&db, s)
+            {
+                return TemporalOpen::Unavailable(TemporalUnavailable {
+                    reason: DegradedReason::Empty,
+                    detail: String::new(),
+                });
             }
             TemporalOpen::Open(db)
         }

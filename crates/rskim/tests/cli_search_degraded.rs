@@ -36,8 +36,10 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command as StdCommand;
+use std::time::SystemTime;
 
 use assert_cmd::cargo::cargo_bin;
+use rskim_search::TemporalDb;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -169,6 +171,11 @@ fn git_add_commit(dir: &Path, msg: &str) {
 /// Create FX-EMPTY: build the index on a repo, then replace `temporal.db` with
 /// an empty (schema-only, zero-row) database carrying the repo's current HEAD.
 ///
+/// Uses the production writer (`TemporalDb::open` + `sync(&[], &[], &[], head, false)`)
+/// so the schema stays in sync with `storage::CURRENT_VERSION` automatically.
+/// This avoids silent fixture drift when CURRENT_VERSION bumps or a table gains a
+/// column — the FX-EMPTY tests exercise the empty-DB path, not the migration path.
+///
 /// Returns the path to the replaced `temporal.db`.
 fn make_empty_temporal(db_dir: &Path, head: &str) -> std::path::PathBuf {
     let db_path = db_dir.join("temporal.db");
@@ -176,29 +183,11 @@ fn make_empty_temporal(db_dir: &Path, head: &str) -> std::path::PathBuf {
     for suffix in &["temporal.db", "temporal.db-wal", "temporal.db-shm"] {
         let _ = fs::remove_file(db_dir.join(suffix));
     }
-    // Create an empty schema via sqlite3.
-    let sql = format!(
-        "PRAGMA user_version=2;\
-         CREATE TABLE hotspot (file_path TEXT PRIMARY KEY, score REAL NOT NULL, \
-           changes_30d INTEGER NOT NULL, changes_90d INTEGER NOT NULL);\
-         CREATE TABLE risk (file_path TEXT PRIMARY KEY, risk_score REAL NOT NULL, \
-           total_commits INTEGER NOT NULL, fix_commits INTEGER NOT NULL, fix_density REAL NOT NULL);\
-         CREATE TABLE cochange (file_a TEXT NOT NULL, file_b TEXT NOT NULL, count INTEGER NOT NULL, \
-           jaccard REAL NOT NULL, PRIMARY KEY (file_a,file_b));\
-         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
-         INSERT INTO meta VALUES \
-           ('git_head','{head}'),('data_version','1'),('last_updated','1'),('is_shallow','0');",
-    );
-    let out = StdCommand::new("sqlite3")
-        .arg(&db_path)
-        .arg(&sql)
-        .output()
-        .expect("sqlite3 empty schema");
-    assert!(
-        out.status.success(),
-        "sqlite3 empty schema failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // Create schema and sync empty rows via the production writer so the schema
+    // version tracked in storage::CURRENT_VERSION governs the fixture automatically.
+    let db = TemporalDb::open(&db_path).expect("make_empty_temporal: TemporalDb::open");
+    db.sync(&[], &[], &[], head, false)
+        .expect("make_empty_temporal: sync empty rows");
     db_path
 }
 
@@ -312,6 +301,15 @@ fn sqlite_user_version(db_path: &Path) -> i64 {
 /// Get the file size of `path` in bytes, or 0 if it doesn't exist.
 fn file_size(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Get the modification time of `path`.
+///
+/// Panics if the file does not exist or mtime is unavailable.
+fn file_mtime(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("file_mtime({path:?}): {e}"))
 }
 
 /// Assert that a degraded element carries the expected `requested` and `applied` fields.
@@ -1067,6 +1065,10 @@ fn t10_fx_newer_schema_preserved_on_query_and_rebuild() {
 
     let version_before = sqlite_user_version(&db_path);
     let size_before = file_size(&db_path);
+    // AC-10: record mtime before the --hot query to verify the DB is not written.
+    // With HEAD unchanged, the DB must be untouched — the notice comes from classification
+    // at open, not from an attempted rebuild.
+    let mtime_before = file_mtime(&db_path);
     assert_eq!(
         version_before, 99,
         "T-10: user_version must be 99 before first query"
@@ -1079,13 +1081,18 @@ fn t10_fx_newer_schema_preserved_on_query_and_rebuild() {
         cache.path(),
     );
     assert_eq!(code1, 0, "T-10/AC-10: FX-NEWER query must exit 0");
+    // AC-10 requires stderr to name the FOUND version (99) and contain the RD-4
+    // cause format ('schema version {found}, this build supports {supported}').
+    // Both substrings are invariant per the SSOT builder (degraded.rs:unsupported_version_detail).
     assert!(
-        stderr1.contains("newer") || stderr1.contains("newer skim") || stderr1.contains("upgrade"),
-        "T-10/AC-10: stderr must mention newer version; got:\n{stderr1}"
+        stderr1.contains("schema version") && stderr1.contains("99"),
+        "T-10/AC-10: stderr must contain 'schema version' and the found version 99 per RD-4; \
+         got:\n{stderr1}"
     );
 
     let version_after_q = sqlite_user_version(&db_path);
     let size_after_q = file_size(&db_path);
+    let mtime_after_q = file_mtime(&db_path);
     assert_eq!(
         version_after_q, 99,
         "T-10/AC-10: user_version must still be 99 after query"
@@ -1094,11 +1101,24 @@ fn t10_fx_newer_schema_preserved_on_query_and_rebuild() {
         size_after_q, size_before,
         "T-10/AC-10: temporal.db size must not change on query with newer-schema"
     );
+    assert_eq!(
+        mtime_after_q, mtime_before,
+        "T-10/AC-10: temporal.db mtime must not change after --hot query with unchanged HEAD \
+         (open must classify, not rebuild)"
+    );
 
     // --rebuild: must also preserve user_version=99 (refuses to overwrite a future DB).
+    // AC-10 requires the notice on BOTH the initial query AND the --rebuild invocation.
     let (_, stderr2, code2) = skim_search(&["--rebuild"], &root, cache.path());
     assert_eq!(code2, 0, "T-10/AC-10: --rebuild on FX-NEWER must exit 0");
-    let _ = stderr2; // Rebuild may or may not emit the notice; presence not required.
+    // The --rebuild path uses BuildLoudness::Loud so the UnsupportedVersion notice
+    // is always printed (SE-1 / open_or_discard_temporal_db with is_loud=true).
+    assert!(
+        stderr2.contains("schema version") && stderr2.contains("99"),
+        "T-10/AC-10: --rebuild stderr must contain 'schema version' and found version 99 per \
+         RD-4 (AC-10 requires the notice on both the --hot query and the --rebuild); \
+         got:\n{stderr2}"
+    );
 
     let version_after_rebuild = sqlite_user_version(&db_path);
     let size_after_rebuild = file_size(&db_path);
@@ -1122,19 +1142,35 @@ fn t10_fx_newer_schema_preserved_on_query_and_rebuild() {
 
 /// T-30 / AC-30 — FX-NEWER + new commit: at most one temporal-failure line across
 /// two queries (no infinite noise).
+///
+/// Uses two separate caches built from the same repo:
+/// - `cache_healthy`: healthy temporal DB → captures the baseline stderr at the same
+///   staleness conditions (HeadChanged auto-rebuild notices etc. cancel out).
+/// - `cache_fx`: FX-NEWER temporal DB (user_version=99) → any extra stderr line vs.
+///   the healthy baseline is a temporal-failure indicator.
+///
+/// The baseline comparison is resilient to message-text drift: ANY extra line in the
+/// FX-NEWER runs that is absent from the healthy baseline counts against the AC-30
+/// limit, regardless of exact wording.
 #[test]
 fn t30_fx_newer_new_commit_at_most_one_failure_line() {
     let dir = TempDir::new().expect("TempDir");
     let root = dir.path().join("repo");
     fs::create_dir_all(&root).unwrap();
     make_repo2(&root);
-    let cache = TempDir::new().expect("cache TempDir");
-    build_index(&root, cache.path());
-    let db_dir = find_search_cache(cache.path());
-    let db_path = db_dir.join("temporal.db");
-    make_newer_temporal(&db_path);
 
-    // Add a new commit so temporal_db_is_stale returns true.
+    // Build BOTH caches at the SAME HEAD (H1) so they start with identical temporal DBs.
+    let cache_healthy = TempDir::new().expect("healthy cache TempDir");
+    let cache_fx = TempDir::new().expect("FX-NEWER cache TempDir");
+    build_index(&root, cache_healthy.path());
+    build_index(&root, cache_fx.path());
+
+    // Bump user_version to 99 in the FX-NEWER cache only.
+    let db_dir_fx = find_search_cache(cache_fx.path());
+    let db_path_fx = db_dir_fx.join("temporal.db");
+    make_newer_temporal(&db_path_fx);
+
+    // Add a new commit → HEAD=H2. Both caches have temporal DB git_head=H1 → both stale.
     fs::write(
         root.join("src/alpha.rs"),
         "fn alpha_widget() { let y = 99; }\n// modified\n",
@@ -1142,23 +1178,53 @@ fn t30_fx_newer_new_commit_at_most_one_failure_line() {
     .unwrap();
     git_add_commit(&root, "fix: modify alpha");
 
-    // Two queries without a temporal flag (plain text query, no --hot etc.).
-    let (_, stderr1, code1) = skim_search(&["zebra_widget", "--limit", "2"], &root, cache.path());
-    let (_, stderr2, code2) = skim_search(&["zebra_widget", "--limit", "2"], &root, cache.path());
-    assert_eq!(code1, 0, "T-30/AC-30: run1 must exit 0");
-    assert_eq!(code2, 0, "T-30/AC-30: run2 must exit 0");
+    // Healthy baseline: run the same query twice on the healthy cache.
+    // Run 1: HeadChanged → auto-rebuild (lexical + temporal). Emits staleness notice.
+    // Run 2: Index is now current. Emits nothing.
+    let (_, baseline1, baseline_code1) = skim_search(
+        &["zebra_widget", "--limit", "2"],
+        &root,
+        cache_healthy.path(),
+    );
+    let (_, baseline2, _) = skim_search(
+        &["zebra_widget", "--limit", "2"],
+        &root,
+        cache_healthy.path(),
+    );
+    assert_eq!(baseline_code1, 0, "T-30 healthy baseline run1 must exit 0");
 
-    // Count lines containing a temporal-failure indicator across both runs.
-    let combined = format!("{stderr1}{stderr2}");
-    let failure_lines = combined
+    // FX-NEWER under test: run the same query twice.
+    // Run 1: HeadChanged → auto-rebuild lexical; temporal rebuild fails silently
+    //        (version 99); sentinel written. No temporal-state notice for a plain-text query.
+    // Run 2: Lexical is current; AD-TMP-2 fires but sentinel blocks retry. Emits nothing.
+    let (_, stderr1, code1) =
+        skim_search(&["zebra_widget", "--limit", "2"], &root, cache_fx.path());
+    let (_, stderr2, code2) =
+        skim_search(&["zebra_widget", "--limit", "2"], &root, cache_fx.path());
+    assert_eq!(code1, 0, "T-30/AC-30: FX-NEWER run1 must exit 0");
+    assert_eq!(code2, 0, "T-30/AC-30: FX-NEWER run2 must exit 0");
+
+    // AC-30: the combined stderr of the two FX-NEWER queries must be byte-identical to the
+    // healthy baseline, or differ by at most one extra line (one permitted temporal-failure
+    // occurrence).
+    //
+    // Staleness-detection notices (HeadChanged, WorkingTreeChanged, etc.) cancel out against
+    // the healthy baseline because both caches start in identical staleness conditions.
+    // Extra lines in the FX-NEWER runs that do not appear in the healthy baseline are temporal-
+    // failure indicators; AC-30 permits at most one such line across both FX-NEWER runs combined.
+    let baseline_combined = format!("{baseline1}\n{baseline2}");
+    let fx_combined = format!("{stderr1}\n{stderr2}");
+    let baseline_lines: std::collections::HashSet<&str> = baseline_combined.lines().collect();
+    let extra_count = fx_combined
         .lines()
-        .filter(|l| {
-            l.contains("newer") || l.contains("unsupported_version") || l.contains("upgrade skim")
-        })
+        .filter(|l| !l.is_empty() && !baseline_lines.contains(*l))
         .count();
     assert!(
-        failure_lines <= 1,
-        "T-30/AC-30: at most one temporal-failure line across two queries; got {failure_lines}:\n{combined}"
+        extra_count <= 1,
+        "T-30/AC-30: combined FX-NEWER stderr must differ from healthy baseline by at most one \
+         extra line across two queries; got {extra_count} extra line(s).\n\
+         FX-NEWER combined:\n{fx_combined}\n\
+         Healthy baseline:\n{baseline_combined}"
     );
 }
 
