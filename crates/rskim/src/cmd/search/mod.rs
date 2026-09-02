@@ -1393,7 +1393,10 @@ fn run_query(
     // and the AD-413-16 guard is enforced inside resolve_blast_radius_paths
     // (Finding 2).
     // Finding 1/3 fix: pass head_state so the resolver does not re-derive it.
-    let blast_radius_paths = temporal::resolve_blast_radius_paths(
+    // T-7/AC-7: resolve_blast_radius_paths now returns (paths, degraded_reason) so
+    // the caller can push a DegradedJson entry to output.degraded when blast-radius
+    // could not be applied (empty / corrupt / missing temporal DB — AD-414-12).
+    let (blast_radius_paths, blast_degraded) = temporal::resolve_blast_radius_paths(
         flags.blast_radius.as_deref(),
         &root,
         &cache_dir,
@@ -1619,6 +1622,24 @@ fn run_query(
         page.apply(&mut output.results);
         output.total = output.results.len();
         output.has_more = pre_page_len > page.depth();
+    }
+
+    // T-7/AC-7: if blast-radius was requested but temporal data was unavailable
+    // (empty / corrupt / missing DB), push a DegradedJson entry so the JSON output
+    // carries the reason in output.degraded (AD-414-12).  The stderr notice was
+    // already emitted inside resolve_blast_radius_paths; this wires the machine-
+    // readable counterpart.  Blast-radius degradation is independent of temporal-
+    // sort degradation: both can be present simultaneously (two entries in the vec).
+    if let Some(u) = blast_degraded {
+        let msg = temporal::degraded_notice(&u, "--blast-radius", temporal::Fallback::Lexical);
+        output.degraded.push(temporal::DegradedJson {
+            subsystem: "temporal",
+            reason: u.reason.as_json_str(),
+            requested: "--blast-radius".to_string(),
+            applied: "lexical",
+            message: msg,
+            remediation: u.reason.remediation(),
+        });
     }
 
     // AD-404-11 / D-5: emit bounded-page notice on all text-query paths when
@@ -2014,6 +2035,31 @@ fn build_stats_json(
             "cache_dir": cache_dir.display().to_string(),
         }));
     }
+    // T-15 / test_ac22 / AD-414-10: snapshot pre-refresh state BEFORE calling
+    // auto_refresh_if_stale so the reported git_head and temporal_state reflect
+    // what the index held at the moment --stats was invoked, not the post-heal
+    // state.  The self-heal is still performed (AC-14: structural corruption is
+    // fixed for the reader that follows), but what is REPORTED is the pre-heal
+    // snapshot.
+    //
+    // git_head: auto_refresh_if_stale may update the manifest's stored HEAD (e.g.
+    // NoStoredHead → rebuild → manifest now has the live SHA). Reading git_head from
+    // the loaded_manifest returned by auto_refresh would always show the post-heal
+    // SHA, hiding the "frozen manifest" state that AC22 relies on to detect a
+    // linked-worktree that predated the HEAD-recording fix.  Load the manifest once
+    // here to capture the PRE-refresh snapshot; fall back to None on load failure
+    // (corrupt manifest — treated the same as "no stored head").
+    let pre_refresh_git_head =
+        manifest::FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())
+            .ok()
+            .and_then(|m| m.stored_git_head().map(str::to_string));
+    //
+    // temporal_state: auto_refresh_if_stale calls try_rebuild_temporal_nonfatal
+    // when temporal.db is missing or HEAD-divergent, so the post-heal state may
+    // be "ready" even when the DB was "missing" at invocation time.  Computing
+    // temporal_state here (before the heal) records what the user actually saw.
+    let pre_refresh_temporal_state = temporal_state_json_str(root, cache_dir, head_state);
+    //
     // AC-14: self-heal structural corruption before opening the reader (same route
     // as query arms).  analytics is unused by auto_refresh_if_stale (_analytics);
     // a disabled instance avoids threading the parameter through build_stats_json.
@@ -2036,10 +2082,12 @@ fn build_stats_json(
     let stats = reader.stats();
     let total_on_disk = total_on_disk_bytes(cache_dir);
     let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
-    // Use manifest from auto_refresh_if_stale — avoids a second check_staleness
-    // (full working-tree metadata walk).  After self-heal the index is current.
-    let git_head = loaded_manifest.stored_git_head().map(str::to_string);
+    // Use PRE-REFRESH git_head (snapshotted above) — avoids the post-heal SHA
+    // overwriting the "frozen manifest" state that AC22 / T-15 assertions rely on.
+    let git_head = pre_refresh_git_head;
     let staleness_status = staleness::StalenessCheck::Current;
+    // loaded_manifest (from auto_refresh_if_stale) is used for file-level data
+    // (skipped entries, ast_coverage) which always reflects the current index state.
     let skip_entries: Vec<_> = loaded_manifest.skipped().collect::<Vec<_>>();
     let skipped_arr: Vec<serde_json::Value> = skip_entries
         .iter()
@@ -2087,7 +2135,9 @@ fn build_stats_json(
     };
     // AD-414-10: additive `temporal_state` key, one of five values (AC-15).
     // Not in the error objects (consistent with git_head_state / AC21 scope).
-    let temporal_state = temporal_state_json_str(root, cache_dir, head_state);
+    // Use the PRE-REFRESH snapshot computed above — auto_refresh_if_stale may
+    // have rebuilt temporal.db, changing the state from "missing" to "ready".
+    let temporal_state = pre_refresh_temporal_state;
     let mut result = serde_json::json!({
         "file_count": stats.file_count,
         "total_ngrams": stats.total_ngrams,
@@ -2998,14 +3048,14 @@ mod tests {
     // ============================================================================
 
     /// When blast_radius is Some but temporal.db is absent (temporal data not yet
-    /// auto-populated), the function must return Ok(None) without panicking.
-    /// A stderr warning is expected but the caller handles the degradation.
+    /// auto-populated), the function must return Ok((None, Some(u))) without panicking.
+    /// A stderr warning is expected; the caller uses `u` to push a DegradedJson entry.
     #[test]
     fn test_resolve_blast_radius_filter_no_db_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         // cache_dir has no temporal.db — open_temporal_state returns Unavailable(Missing)
-        // and the function degrades gracefully to Ok(None).
+        // and the function degrades gracefully to (None, Some(u)).
         let result = temporal::resolve_blast_radius_paths(
             Some("src/auth.rs"),
             root,
@@ -3018,10 +3068,14 @@ mod tests {
             "must not error when temporal.db is absent, got: {:?}",
             result.unwrap_err()
         );
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "must return None (graceful degradation) when temporal.db is absent"
+        let (paths, degraded) = result.unwrap();
+        assert!(
+            paths.is_none(),
+            "must return paths=None (graceful degradation) when temporal.db is absent"
+        );
+        assert!(
+            degraded.is_some(),
+            "must return degraded=Some(u) so caller can push DegradedJson entry"
         );
     }
 
@@ -3082,7 +3136,7 @@ mod tests {
             "must not return Err on AnchorDiffers, got: {:?}",
             result.unwrap_err()
         );
-        let paths = result.unwrap();
+        let (paths, degraded) = result.unwrap();
         assert!(
             paths.is_some(),
             "must return Some(empty_set) on AnchorDiffers, not None \
@@ -3091,6 +3145,11 @@ mod tests {
         assert!(
             paths.unwrap().is_empty(),
             "empty allowlist forces zero results on all blast-radius arms"
+        );
+        assert!(
+            degraded.is_none(),
+            "RepositoryMismatch returns empty allowlist, not a degraded reason \
+             (callers must see it as a filtered — not degraded — result)"
         );
     }
 

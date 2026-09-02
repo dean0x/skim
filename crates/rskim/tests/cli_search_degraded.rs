@@ -598,30 +598,45 @@ fn t5_fx_empty_ast_try_catch_hot_ordered_equal() {
     let root = dir.path().join("repo");
     fs::create_dir_all(root.join("src")).unwrap();
 
-    // A Rust match-expression that skim classifies as try-catch.
+    // TypeScript files with actual try/catch so the AST try-catch pattern fires.
+    // The try-catch pattern is TypeScript/JavaScript-specific (try_statement >
+    // catch_clause); Rust match expressions are NOT matched by it (PF-007 / PF-018).
     fs::write(
-        root.join("src/zebra.rs"),
-        "fn zebra_widget() { let x = 1; }\n\
-         fn f(x: Result<i32, &str>) {\n\
-             match x { Ok(_) => {}, Err(_) => {} }\n\
+        root.join("src/zebra.ts"),
+        "function zebraWidget() {\n\
+           try {\n\
+             const x = fetchData();\n\
+             return x;\n\
+           } catch (e) {\n\
+             console.error(e);\n\
+           }\n\
          }\n",
     )
     .unwrap();
     fs::write(
-        root.join("src/alpha.rs"),
-        "fn alpha_widget() { let y = 2; }\n\
-         fn g(x: Result<i32, &str>) {\n\
-             match x { Ok(v) => println!(\"{v}\"), Err(e) => eprintln!(\"{e}\") }\n\
+        root.join("src/alpha.ts"),
+        "function alphaWidget() {\n\
+           try {\n\
+             const y = fetchOther();\n\
+             return y;\n\
+           } catch (err) {\n\
+             console.warn(err);\n\
+           }\n\
          }\n",
     )
     .unwrap();
     git_init(&root);
     git_add_commit(&root, "c1: add widgets");
     fs::write(
-        root.join("src/zebra.rs"),
-        "fn zebra_widget() { let x = 3; }\n// touched\n\
-         fn f(x: Result<i32, &str>) {\n\
-             match x { Ok(_) => {}, Err(_) => {} }\n\
+        root.join("src/zebra.ts"),
+        "function zebraWidget() {\n\
+           // touched in fix commit\n\
+           try {\n\
+             const x = fetchData();\n\
+             return x;\n\
+           } catch (e) {\n\
+             console.error(e);\n\
+           }\n\
          }\n",
     )
     .unwrap();
@@ -762,7 +777,11 @@ fn t7_blast_radius_degraded_on_empty_and_corrupt() {
         );
     }
 
-    // Non-git control: the `warning` key must still appear in --json (AC-9).
+    // Non-git control (text+blast-radius path through run_query, not the standalone
+    // run_temporal_standalone arm): the degraded array must contain a blast-radius
+    // entry.  The `warning` key belongs only to the standalone temporal arm (AC-9
+    // byte-identity for --hot/--cold/--risky); on the text+blast-radius path the
+    // machine-readable signal is in output.degraded (AD-414-12).
     let (nogit_json, _, _) = skim_search(
         &[
             "zebra_widget",
@@ -776,9 +795,14 @@ fn t7_blast_radius_degraded_on_empty_and_corrupt() {
         cache_nogit.path(),
     );
     let nogit_v: Value = serde_json::from_str(&nogit_json).unwrap_or(Value::Null);
+    let nogit_degraded = nogit_v["degraded"].as_array().cloned().unwrap_or_default();
+    let nogit_blast_deg = nogit_degraded
+        .iter()
+        .find(|d| d["requested"] == "blast-radius");
     assert!(
-        nogit_v.get("warning").is_some(),
-        "T-7/AC-7 control: non-git dir blast-radius --json must have 'warning' key; got:\n{nogit_json}"
+        nogit_blast_deg.is_some(),
+        "T-7/AC-7 control: non-git dir blast-radius --json must have \
+         degraded[requested='blast-radius']; got:\n{nogit_json}"
     );
 }
 

@@ -547,20 +547,23 @@ pub(super) fn paths_to_file_ids(
 /// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path) and
 /// `resolve_blast_radius_filter` (text-query path in `mod.rs`).  Returns the set of
 /// repo-relative path strings that the blast-radius filter should allow, including
-/// the target file itself.  JSON-aware warning emitted when the temporal DB is absent.
+/// the target file itself, plus an optional [`TemporalUnavailable`] when blast-radius
+/// could not be applied so the caller can push a `DegradedJson` entry (AD-414-12).
 ///
 /// `head` is the [`HeadState`] already resolved by the caller (Finding 2 fix:
 /// returned by `auto_refresh_if_stale` so it need not be re-derived here).
 /// It is passed to [`open_temporal_state`] to classify DB-absent cases (AD-414-15).
 ///
 /// Returns:
-/// - `Ok(None)` when `blast_radius` is `None` (not requested) or temporal data is
-///   absent/unreadable (any reason other than `RepositoryMismatch`).
-/// - `Ok(Some(empty_set))` when the DB belongs to a different repository
+/// - `Ok((None, None))` when `blast_radius` is `None` (not requested).
+/// - `Ok((None, Some(u)))` when temporal data is absent/unreadable/empty.
+///   The caller uses `u` to push a `DegradedJson` entry to `output.degraded`.
+/// - `Ok((Some(empty_set), None))` when the DB belongs to a different repository
 ///   (`RepositoryMismatch`).  The empty allowlist forces zero results on all three
 ///   blast-radius call sites, matching the standalone arm which also serves zero rows
-///   on a mismatch.  Returning `Ok(None)` would overload the "not requested" sentinel
+///   on a mismatch.  Returning `(None, _)` would overload the "not requested" sentinel
 ///   (PF-016 absence-overloading class, AD-413-16).
+/// - `Ok((Some(paths), None))` when blast-radius resolved successfully.
 ///
 /// # Errors
 ///
@@ -571,9 +574,12 @@ pub(super) fn resolve_blast_radius_paths(
     cache_dir: &Path,
     json: bool,
     head: &HeadState,
-) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+) -> anyhow::Result<(
+    Option<std::collections::HashSet<String>>,
+    Option<TemporalUnavailable>,
+)> {
     let Some(raw_path) = blast_radius else {
-        return Ok(None);
+        return Ok((None, None));
     };
 
     // AD-414-1 / AD-414-15: open_temporal_state is the single funnel for all temporal
@@ -585,16 +591,16 @@ pub(super) fn resolve_blast_radius_paths(
         TemporalOpen::Unavailable(u) => {
             // AC-7 / AC-19(b): NotGitRepo keeps the legacy composition format
             // byte-identical to the pre-refactor message.  All other reasons
-            // route through degraded_notice with flag="--blast-radius" so their
-            // cause is specific and no doubled phrase is produced (de-doubling
-            // applies ONLY to the new reasons).
+            // route through degraded_notice with flag="--blast-radius" and
+            // Fallback::Lexical so the notice reads "--blast-radius not applied"
+            // (T-7/AC-7 requirement) and no doubled phrase is produced.
             let msg = if u.reason == DegradedReason::NotGitRepo {
                 format!(
                     "no temporal data for --blast-radius — {}",
                     super::NO_TEMPORAL_DATA_MSG
                 )
             } else {
-                degraded_notice(&u, "--blast-radius", Fallback::NoResults)
+                degraded_notice(&u, "--blast-radius", Fallback::Lexical)
             };
             if json {
                 let envelope = serde_json::json!({ "warning": msg });
@@ -603,18 +609,34 @@ pub(super) fn resolve_blast_radius_paths(
                 eprintln!("skim search: {msg}");
             }
             // AD-413-16 / PF-016: RepositoryMismatch means the DB belongs to a
-            // different repository.  Returning Ok(None) would overload the
+            // different repository.  Returning (None, _) would overload the
             // "not requested" sentinel — callers' .map() would yield None,
             // bypassing the file filter entirely and serving the full unfiltered
             // index.  Return an empty allowlist instead so every blast-radius
             // call site (AST arm, lexical arm, standalone arm) agrees: wrong
             // repo → zero results, not all results.
             if u.reason == DegradedReason::RepositoryMismatch {
-                return Ok(Some(std::collections::HashSet::new()));
+                return Ok((Some(std::collections::HashSet::new()), None));
             }
-            return Ok(None);
+            // Return the unavailable reason so the caller can push DegradedJson.
+            return Ok((None, Some(u)));
         }
     };
+
+    // T-7/AC-7: detect an empty temporal DB (valid schema, zero hotspot rows).
+    // A valid-but-empty DB reaches this arm because open_temporal_state returns
+    // Open(db) — the Empty classification is a derived state checked here via
+    // dimension_is_empty, matching the pattern used by the temporal-sort arm in
+    // run_query and the standalone arm in run_temporal_standalone (AD-414-4).
+    if dimension_is_empty(&db, TemporalSort::Hot) {
+        let u = TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: String::new(),
+        };
+        let msg = degraded_notice(&u, "--blast-radius", Fallback::Lexical);
+        eprintln!("skim search: {msg}");
+        return Ok((None, Some(u)));
+    }
 
     let normalized = normalize_blast_radius_path(raw_path, root)?;
     let partners = db.cochanges_for_file(&normalized)?;
@@ -625,7 +647,7 @@ pub(super) fn resolve_blast_radius_paths(
     // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
     // surface matches within the target file in addition to its co-change partners.
     allowed_paths.insert(normalized);
-    Ok(Some(allowed_paths))
+    Ok((Some(allowed_paths), None))
 }
 
 /// Resolve a `--blast-radius` raw path to the set of matching `FileId`s.
@@ -637,8 +659,8 @@ pub(super) fn resolve_blast_radius_paths(
 ///
 /// Algorithm:
 /// 1. If `blast_radius` is `None`, return `Ok(None)` immediately.
-/// 2. Open `temporal.db` under `cache_dir`.  If absent/corrupt, emit the
-///    "no temporal data" warning (JSON-aware when `json=true`) and return `Ok(None)`.
+/// 2. Open `temporal.db` under `cache_dir`.  If absent/corrupt/empty, emit the
+///    degraded notice and return `Ok(None)`.
 /// 3. Normalize the raw path to repo-relative form.
 /// 4. Look up co-change partners, add the target file itself.
 /// 5. Convert the path set to `FileId`s via `paths_to_file_ids`.
@@ -655,9 +677,9 @@ pub(super) fn resolve_blast_radius_file_ids(
     json: bool,
     head: &HeadState,
 ) -> anyhow::Result<Option<HashSet<FileId>>> {
-    let Some(allowed_paths) =
-        resolve_blast_radius_paths(blast_radius, root, cache_dir, json, head)?
-    else {
+    let (allowed_paths_opt, _degraded) =
+        resolve_blast_radius_paths(blast_radius, root, cache_dir, json, head)?;
+    let Some(allowed_paths) = allowed_paths_opt else {
         return Ok(None);
     };
     let file_ids = paths_to_file_ids(sorted_paths, &allowed_paths);

@@ -274,7 +274,7 @@ fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
         result.is_ok(),
         "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"
     );
-    let paths = result.unwrap();
+    let (paths, degraded) = result.unwrap();
     assert!(
         paths.is_some(),
         "AD-413-16: resolve_blast_radius_paths must return Ok(Some(empty_set)) on \
@@ -285,6 +285,11 @@ fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
         paths.unwrap().is_empty(),
         "AD-413-16: the returned set must be empty — wrong-repo anchor forces zero results \
          on all blast-radius arms"
+    );
+    assert!(
+        degraded.is_none(),
+        "RepositoryMismatch returns empty allowlist (not a degraded reason) — callers \
+         treat it as a filtered result, not a degraded state"
     );
 }
 
@@ -316,10 +321,10 @@ fn resolve_blast_radius_paths_not_git_repo_emits_legacy_composition_format() {
         "must not error for NotARepo (graceful degradation), got: {:?}",
         result.unwrap_err()
     );
-    assert_eq!(
-        result.unwrap(),
-        None,
-        "NotARepo → no RepositoryMismatch → must return Ok(None)"
+    let (paths, _degraded) = result.unwrap();
+    assert!(
+        paths.is_none(),
+        "NotARepo → no RepositoryMismatch → must return paths=None (graceful degradation)"
     );
 
     // Verify the message constant the composition wrapper would produce is correct.
