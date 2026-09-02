@@ -419,7 +419,7 @@ pub(super) fn try_rebuild_temporal_nonfatal(
     debug_label: &str,
     reanchor: ReanchorPolicy,
 ) {
-    use super::temporal_build::{current_epoch_secs, rebuild_temporal_with_source};
+    use super::temporal_build::{BuildLoudness, current_epoch_secs, rebuild_temporal_with_source};
 
     let Some(head) = head else { return };
     // PF-017: a changed `--root` toplevel also changes the adopted HEAD, so without
@@ -455,6 +455,13 @@ pub(super) fn try_rebuild_temporal_nonfatal(
             recorded, live,
         );
     }
+    // SE-1: derive loudness from reanchor at the call site so
+    // rebuild_temporal_with_source receives independent axes (BuildLoudness doc).
+    let loudness = if reanchor == ReanchorPolicy::Allow {
+        BuildLoudness::Loud
+    } else {
+        BuildLoudness::Silent
+    };
     if let Err(e) = rebuild_temporal_with_source(
         &rskim_search::GixSource,
         root,
@@ -462,6 +469,7 @@ pub(super) fn try_rebuild_temporal_nonfatal(
         head,
         current_epoch_secs(),
         reanchor,
+        loudness,
     ) {
         // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
         if crate::debug::is_debug_enabled() {

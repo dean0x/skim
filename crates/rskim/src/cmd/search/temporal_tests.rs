@@ -274,22 +274,26 @@ fn resolve_blast_radius_paths_anchor_differs_returns_empty_allowlist() {
         result.is_ok(),
         "resolve_blast_radius_paths must not Err on AnchorDiffers, got: {result:?}"
     );
-    let (paths, degraded) = result.unwrap();
+    // Finding B fix: RepositoryMismatch returns Filtered { allow: empty, degraded }
+    // so callers can populate output.degraded (AC-7) AND the path filter forces
+    // zero results on all blast-radius arms (PF-016 / AD-413-16).
+    let resolution = result.unwrap();
+    let (allow, degraded) = match &resolution {
+        super::BlastRadiusResolution::Filtered { allow, degraded } => (allow, degraded),
+        other => panic!(
+            "AD-413-16: resolve_blast_radius_paths must return Filtered on RepositoryMismatch, \
+             got: {other:?}"
+        ),
+    };
     assert!(
-        paths.is_some(),
-        "AD-413-16: resolve_blast_radius_paths must return Ok(Some(empty_set)) on \
-         AnchorDiffers, not Ok(None) — None overloads the 'not requested' sentinel \
-         (PF-016 / AD-413-16)"
-    );
-    assert!(
-        paths.unwrap().is_empty(),
+        allow.is_empty(),
         "AD-413-16: the returned set must be empty — wrong-repo anchor forces zero results \
          on all blast-radius arms"
     );
-    assert!(
-        degraded.is_none(),
-        "RepositoryMismatch returns empty allowlist (not a degraded reason) — callers \
-         treat it as a filtered result, not a degraded state"
+    assert_eq!(
+        degraded.reason,
+        super::DegradedReason::RepositoryMismatch,
+        "AC-7: Filtered variant must carry RepositoryMismatch so output.degraded gets an entry"
     );
 }
 
@@ -321,10 +325,9 @@ fn resolve_blast_radius_paths_not_git_repo_emits_legacy_composition_format() {
         "must not error for NotARepo (graceful degradation), got: {:?}",
         result.unwrap_err()
     );
-    let (paths, _degraded) = result.unwrap();
     assert!(
-        paths.is_none(),
-        "NotARepo → no RepositoryMismatch → must return paths=None (graceful degradation)"
+        matches!(result.unwrap(), super::BlastRadiusResolution::Degraded(_)),
+        "NotARepo → Degraded variant (no paths filter), not a tuple: graceful degradation"
     );
 
     // Verify the message constant the composition wrapper would produce is correct.
@@ -2852,6 +2855,10 @@ fn expected_cause(reason: DegradedReason, detail: &str) -> String {
             }
         }
         DegradedReason::NoRankedRows => detail.to_string(),
+        DegradedReason::GhostFilter => format!(
+            "temporal data built 0 rows — all {detail} computed rows were excluded \
+             by the on-disk ghost filter (files not present on disk at the indexed root)"
+        ),
     }
 }
 
@@ -2874,6 +2881,9 @@ fn expected_remediation(reason: DegradedReason) -> &'static str {
         DegradedReason::Empty => "run 'skim search --rebuild'",
         DegradedReason::NoRankedRows => {
             "commit the matched files, or run 'skim search --update' after committing"
+        }
+        DegradedReason::GhostFilter => {
+            "run 'skim search --rebuild' to rebuild with the current file set"
         }
     }
 }
@@ -2905,6 +2915,7 @@ fn t19a_cause_text_conformance() {
             DegradedReason::NoRankedRows,
             "0 of 5 results have temporal data",
         ),
+        (DegradedReason::GhostFilter, "42"),
     ];
 
     for (reason, detail) in cases {
@@ -2951,6 +2962,7 @@ fn t19b_remediation_text_conformance() {
         DegradedReason::Unreadable,
         DegradedReason::Empty,
         DegradedReason::NoRankedRows,
+        DegradedReason::GhostFilter,
     ];
 
     for reason in all_reasons {
@@ -3056,31 +3068,33 @@ fn assert_corpus_is_substantial(sources: &[(String, String)]) {
 /// so renaming a cause without updating this list also fails.
 #[test]
 fn t19b_no_cause_substring_outside_the_builder() {
-    // The §2.3 cause substrings that are unique to the builder.  `NotGitRepo` and
-    // `HeadUnresolved` are deliberately absent: their causes ARE the shared
-    // `NO_TEMPORAL_DATA_MSG` / `HEAD_UNRESOLVED_TEMPORAL_MSG` constants declared
-    // in `mod.rs`, so their text legitimately appears there (AC-19/AC-20).
-    const CAUSE_SUBSTRINGS: &[&str] = &[
-        "temporal.db is not present in the index cache",
-        "temporal.db is corrupt (not a database)",
-        "temporal.db was written by a newer skim",
-        "temporal.db could not be opened",
-        "temporal data is empty (0 rows)",
-    ];
+    // Derive the cause substrings from the builder itself (degraded.rs) so this
+    // list never drifts when new DegradedReason variants are added.
+    // `cause_substrings_for_guard` is co-located with the builder and maintained
+    // alongside it — avoiding the hand-maintained literal array that failed to
+    // catch the GhostFilter case (originally in a `format!` in temporal_build.rs).
+    //
+    // `NotGitRepo` and `HeadUnresolved` are deliberately absent from the list:
+    // their causes ARE the shared `NO_TEMPORAL_DATA_MSG` /
+    // `HEAD_UNRESOLVED_TEMPORAL_MSG` constants declared in `mod.rs`, so their
+    // text legitimately appears there (AC-19/AC-20).
+    let cause_substrings = super::cause_substrings_for_guard();
 
     let sources = production_sources_under_search();
     assert_corpus_is_substantial(&sources);
 
     for (name, src) in sources {
-        if name == "temporal.rs" {
+        if name == "degraded.rs" {
             // The builder itself — this is the one place the causes may live.
+            // (Formerly temporal.rs; moved to the dependency-free leaf module to
+            // break the temporal_build → temporal → … → temporal_build cycle.)
             continue;
         }
-        for cause in CAUSE_SUBSTRINGS {
+        for cause in cause_substrings {
             assert!(
                 !src.contains(cause),
                 "AC-19(b): cause text {cause:?} must be emitted only through \
-                 `DegradedReason`/`degraded_notice` in temporal.rs, but it also \
+                 `DegradedReason`/`degraded_notice` in degraded.rs, but it also \
                  appears in production code in {name}"
             );
         }

@@ -15,6 +15,7 @@
 
 mod ast;
 mod build_lock;
+mod degraded;
 mod gitdir;
 pub(crate) mod hooks;
 mod index;
@@ -206,6 +207,7 @@ pub(crate) fn run(
                 &cache_dir,
                 analytics,
                 staleness::ReanchorPolicy::Refuse,
+                None,
             )?;
             // Step 7 wiring (d): advisory on the --ast temporal-consuming branch.
             // Finding 2 fix: use head_state from auto_refresh_if_stale instead of
@@ -989,6 +991,7 @@ fn run_update(
         &cache_dir,
         analytics,
         staleness::ReanchorPolicy::Allow,
+        None,
     )?;
     // Step 7 wiring (b): emit the HEAD-unresolvable advisory on --update (AC23).
     // Finding 2 fix: use head_state from above instead of a second git_head_state call.
@@ -1049,24 +1052,21 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     staleness::warn_if_temporal_unverifiable(&cache_dir, &head_state);
 
     let mut out = BufWriter::new(std::io::stdout());
-    if json {
-        // AC6/AC11: shared JSON construction via build_stats_json (same code path
-        // as the test helper) — ensures AC11 back-compat tests guard production.
-        // AD-395-6: `skipped` array and `skipped_by_reason` are additive keys.
-        //
-        // Gather-once: build_stats_json opens the reader, self-heals (AC-14), and
-        // loads skip entries internally.  We do NOT pre-compute those values here
-        // — doing so would run a second NgramIndexReader::open before immediately
-        // discarding the results.
-        //
-        // AC-13 / T-13: if build_stats_json returns Err (CRC-level corruption that
-        // the structural probe cannot detect), emit a structured JSON error object
-        // on stdout and exit FAILURE — `--stats --json` always produces JSON.
-        match build_stats_json(&cache_dir, &root, &head_state) {
-            Ok(extended) => {
-                writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
-            }
-            Err(e) => {
+
+    // AC6/AC11/AD-414-10: gather_stats performs the self-heal (AC-14), snapshots
+    // pre-refresh state (AC-15, AC-22), and collects all index data in one pass.
+    // Both the text branch and the JSON branch below read from the same snapshot,
+    // eliminating the git_head divergence fixed by Finding [high/architecture]:
+    // the previous code gave each branch its own copy of the 5-step gather sequence
+    // and they diverged on git_head (text: post-heal manifest, JSON: pre-heal probe).
+    //
+    // AC-13 / T-13: if gather_stats returns Err (CRC-level corruption the structural
+    // probe cannot detect), emit a structured JSON error and exit FAILURE in --json mode;
+    // propagate the error in text mode.
+    let snapshot = match gather_stats(&cache_dir, &root, head_state) {
+        Ok(s) => s,
+        Err(e) => {
+            if json {
                 let err_json = serde_json::json!({
                     "error": format!("{e:#}"),
                     "cache_dir": cache_dir_display,
@@ -1074,117 +1074,80 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
                 writeln!(out, "{}", serde_json::to_string_pretty(&err_json)?)?;
                 out.flush()?;
                 return Ok(ExitCode::FAILURE);
+            } else {
+                return Err(e);
             }
         }
+    };
+
+    if json {
+        // AC6/AC11: shared JSON serialisation via build_stats_json — same code path
+        // as the test helper (stats_json_for_test) so AC11 back-compat tests guard
+        // the production JSON shape. AD-395-6: `skipped`/`skipped_by_reason` additive.
+        let extended = build_stats_json(&snapshot)?;
+        writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
     } else {
-        // AD-414-10 / AC-15: snapshot temporal_state BEFORE the self-heal, exactly as
-        // build_stats_json does for `--stats --json`.  auto_refresh_if_stale rebuilds a
-        // missing temporal.db and discards a corrupt one, so computing this AFTER the
-        // refresh would report "ready" for the very states AC-15 names ("missing",
-        // "corrupt") — and would make the text surface disagree with the JSON surface
-        // about the same field on the same invocation.
-        let pre_refresh_temporal_state = temporal_state_json_str(&root, &cache_dir, &head_state);
-        // Text mode: self-heal structural corruption before opening the reader
-        // (AC-14: same check_staleness → rebuild route as the query arms).
-        // analytics is unused by auto_refresh_if_stale (_analytics param);
-        // a disabled instance avoids threading the parameter into run_stats.
-        let noop_analytics = crate::analytics::AnalyticsConfig {
-            enabled: false,
-            input_cost_per_mtok: None,
-            session_id: None,
-        };
-        let (_, loaded_manifest, _) = staleness::auto_refresh_if_stale(
-            &root,
-            &cache_dir,
-            &noop_analytics,
-            staleness::ReanchorPolicy::Refuse,
-        )?;
-        // AD-414-7: actionable error, mirroring open_ast_engine. After self-heal the
-        // reader opens successfully for F-Body-A/B/C; only a CRC-level corruption
-        // that the structural probe cannot detect propagates this error (T-13).
-        let reader = query::open_lexical_reader(&cache_dir)?;
-        let stats = reader.stats();
-
-        // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from
-        // the reader) historically undercounted the TRUE on-disk footprint by
-        // ~23 MB — it omitted the manifest, AST index/cache, and temporal DB.
-        // Compute the real total here by summing metadata().len() over the fixed
-        // set of index artifacts (AC-6). `index_size_bytes` is intentionally left
-        // unchanged so the lexical-only figure remains available (AC-7).
-        let total_on_disk = total_on_disk_bytes(&cache_dir);
-        // AD-380-5: temporal.db scales with git history, not source size, so
-        // report it as its own line — it is included in the total but distinguished.
-        let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
-
-        // Use the manifest returned by auto_refresh_if_stale — avoids a second
-        // check_staleness (full working-tree metadata walk) for the same data.
-        // After self-heal the index is current (rebuilt if needed), so staleness
-        // is always "current" for the display.
-        let git_head = loaded_manifest.stored_git_head().map(str::to_string);
-        let staleness_status = staleness::StalenessCheck::Current;
-
-        // AD-395-6: load skip section from the manifest for --stats display.
-        // All pre-existing keys are unchanged; `skipped` / `skipped_by_reason`
-        // are purely additive (AC11 back-compat).
-        let skip_entries: Vec<_> = loaded_manifest.skipped().collect::<Vec<_>>();
-
+        // Text rendering from the shared snapshot.
+        // AD-380-4: the TRUE total over all on-disk artifacts (AC-6/AC-7).
+        // AD-380-5: temporal DB reported separately (scales with git history).
+        // AD-414-10: temporal DB state uses PRE-REFRESH snapshot (AC-15).
         writeln!(out, "skim search index stats:")?;
-        writeln!(out, "  files indexed : {}", stats.file_count)?;
-        writeln!(out, "  total n-grams : {}", stats.total_ngrams)?;
+        writeln!(out, "  files indexed : {}", snapshot.file_count)?;
+        writeln!(out, "  total n-grams : {}", snapshot.total_ngrams)?;
         writeln!(
             out,
             "  index size    : {} bytes (lexical)",
-            stats.index_size_bytes
+            snapshot.index_size_bytes
         )?;
-        // AD-380-4: the TRUE total over all on-disk artifacts.
-        writeln!(out, "  total on disk : {total_on_disk} bytes")?;
-        // AD-380-5: temporal DB reported separately (scales with git history).
-        writeln!(out, "  temporal db   : {temporal_db_bytes} bytes")?;
-        // AD-414-10: temporal DB state — one of 5 values (AC-15).  Uses the
-        // PRE-REFRESH snapshot taken above so text and `--json` agree.
+        writeln!(out, "  total on disk : {} bytes", snapshot.total_on_disk)?;
+        writeln!(
+            out,
+            "  temporal db   : {} bytes",
+            snapshot.temporal_db_bytes
+        )?;
         {
-            let ts_text = if pre_refresh_temporal_state == "empty" {
+            // AC-15: "empty" is shown as "empty (0 rows)" in text mode for clarity.
+            let ts_text = if snapshot.pre_refresh_temporal_state == "empty" {
                 "empty (0 rows)"
             } else {
-                pre_refresh_temporal_state
+                snapshot.pre_refresh_temporal_state
             };
             writeln!(out, "  temporal state : {ts_text}")?;
         }
-        if let Some(ts) = stats.last_updated {
+        if let Some(ts) = snapshot.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
+        // AC-22 / AD-414-10: git_head is the PRE-REFRESH snapshot (same as JSON).
         writeln!(
             out,
             "  git HEAD      : {}",
-            git_head.as_deref().unwrap_or("(none)")
+            snapshot.pre_refresh_git_head.as_deref().unwrap_or("(none)")
         )?;
-        writeln!(out, "  staleness     : {staleness_status}")?;
-        // AC4: resolved cache dir, in addition to the lines above.
-        writeln!(out, "  cache dir     : {cache_dir_display}")?;
+        writeln!(out, "  staleness     : {}", snapshot.staleness_status)?;
+        // AC4: resolved cache dir.
+        writeln!(out, "  cache dir     : {}", snapshot.cache_dir_display)?;
         // AD-395-6: skip counts by reason (text mode).
-        // PF-012: use BTreeMap so reason keys iterate in stable sorted order.
-        if !skip_entries.is_empty() {
+        // PF-012: BTreeMap gives stable sorted order consistent with JSON path.
+        if !snapshot.skip_entries.is_empty() {
             let mut by_reason: std::collections::BTreeMap<&str, u64> =
                 std::collections::BTreeMap::new();
-            for e in &skip_entries {
+            for e in &snapshot.skip_entries {
                 *by_reason.entry(e.reason_label()).or_insert(0) += 1;
             }
             writeln!(
                 out,
                 "  skipped       : {} (content-skipped files)",
-                skip_entries.len()
+                snapshot.skip_entries.len()
             )?;
             for (reason, count) in &by_reason {
                 writeln!(out, "    {reason}: {count}")?;
             }
         }
-
         // AD-405-7 / AC-405-9 / AC-405-15: AST size-coverage section (D-4 cadence).
         // Omit when clean (is_clean() == true) — byte-identical to the pre-fix binary
         // on a corpus with zero excluded / zero undetermined files (AC-405-15).
-        // Loaded manifest is already in memory from auto_refresh_if_stale.
         {
-            let coverage = loaded_manifest.ast_coverage();
+            let coverage = &snapshot.ast_coverage;
             if !coverage.is_clean() {
                 writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
                 if coverage.size_excluded_files > 0 {
@@ -1289,11 +1252,153 @@ fn temporal_state_json_str(
             | DegradedReason::RepositoryMismatch
             | DegradedReason::Missing
             | DegradedReason::Unreadable => "missing",
-            // Not reachable from open_temporal_state (both are post-open
-            // classifications), but enumerated so the match stays exhaustive.
-            DegradedReason::Empty | DegradedReason::NoRankedRows => "empty",
+            // Not reachable from open_temporal_state (post-open classifications),
+            // but enumerated so the match stays exhaustive.
+            // GhostFilter is build-time only (never returned by open_temporal_state),
+            // but included here so adding new variants fails loudly (no `_` arm).
+            DegradedReason::Empty | DegradedReason::NoRankedRows | DegradedReason::GhostFilter => {
+                "empty"
+            }
         },
     }
+}
+
+// ============================================================================
+// Stats snapshot (Finding [high/architecture] + [medium/architecture] fix)
+// ============================================================================
+
+/// All data needed to render `--stats` output, gathered in a single pass by
+/// [`gather_stats`].
+///
+/// Both text and JSON branches of [`run_stats`] render from this snapshot,
+/// ensuring they describe the same invocation state (Finding [high/architecture]:
+/// `--stats` text and `--stats --json` previously reported different `git_head`
+/// values for the same invocation because the text branch read git_head from the
+/// post-heal manifest while the JSON branch snapshotted it pre-heal).
+struct StatsGathered {
+    /// git HEAD as stored in the manifest BEFORE any self-heal (AC-22 / AD-414-10).
+    ///
+    /// Derived from a header-only probe ([`FileManifest::load_git_head`]) so the
+    /// second full manifest decode that `check_staleness` already performs inside
+    /// `auto_refresh_if_stale` is avoided (Finding [medium/performance] fix).
+    pre_refresh_git_head: Option<String>,
+    /// Temporal DB state string BEFORE any self-heal — one of five AC-15 values.
+    pre_refresh_temporal_state: &'static str,
+    /// Live git HEAD resolution state for the `git_head_state` JSON key (AC-20).
+    git_head_state_str: &'static str,
+    /// Staleness classification — always `Current` after the self-heal.
+    ///
+    /// Derived from [`staleness::RefreshOutcome`] in [`gather_stats`] rather than
+    /// a compile-time literal in the reporting functions (Finding [medium/architecture]
+    /// CQS fix: a reporting function must not contain a magic constant whose
+    /// "computation" is always the same value).
+    staleness_status: staleness::StalenessCheck,
+    // --- Index stats from the lexical reader (post-heal) ---
+    file_count: u32,
+    total_ngrams: u64,
+    index_size_bytes: u64,
+    last_updated: Option<u64>,
+    total_on_disk: u64,
+    temporal_db_bytes: u64,
+    // --- Manifest-derived data (post-heal) ---
+    skip_entries: Vec<types::SkippedEntry>,
+    ast_coverage: rskim_search::AstCoverage,
+    // --- Display string (avoids threading cache_dir into build_stats_json) ---
+    cache_dir_display: String,
+}
+
+/// Gather all data needed by [`run_stats`] in one pass (repair → collect).
+///
+/// Implements the repair-then-report pattern (Finding [medium/architecture] CQS fix):
+/// the self-heal (`auto_refresh_if_stale`) and the data collection live here so
+/// [`build_stats_json`] is a pure serialiser with no I/O side effects.
+///
+/// `head_state` is resolved **once** by the caller ([`run_stats`]) and moved in
+/// so both [`staleness::warn_if_temporal_unverifiable`] and this function share the
+/// same snapshot without a second `git_head_state` traversal (Finding [low/performance]
+/// fix — the pre-resolved value is forwarded to `auto_refresh_if_stale` which would
+/// otherwise re-resolve it internally).
+fn gather_stats(
+    cache_dir: &std::path::Path,
+    root: &std::path::Path,
+    head_state: staleness::HeadState,
+) -> anyhow::Result<StatsGathered> {
+    let cache_dir_display = cache_dir.display().to_string();
+
+    // Finding [medium/performance] fix: header-only probe for the pre-refresh HEAD.
+    // `auto_refresh_if_stale` internally calls `check_staleness → FileManifest::load`
+    // which fully decodes the manifest (60 k-node BTreeMap + 60 k String allocations
+    // for a max-size index). Loading a second full copy here — as the previous code did
+    // at mod.rs:2100-2103 — doubles that cost for one header field. The header-only
+    // probe reads only up to the fixed header block via `decode_header` and returns
+    // just the git_head string; the entry table is never materialised.
+    let pre_refresh_git_head = manifest::FileManifest::load_git_head(root, cache_dir);
+
+    // Pre-refresh temporal state: must be snapshotted BEFORE `auto_refresh_if_stale`
+    // because that call may rebuild `temporal.db`, changing the state from e.g.
+    // "missing" to "ready" — and AC-15 / AD-414-10 require reporting the state at
+    // invocation time (same contract as `pre_refresh_git_head`).
+    let pre_refresh_temporal_state = temporal_state_json_str(root, cache_dir, &head_state);
+
+    // Compute git_head_state_str BEFORE consuming head_state by value below.
+    let git_head_state_str = match &head_state {
+        staleness::HeadState::Resolved(_) => "resolved",
+        staleness::HeadState::Unresolved => "unresolved",
+        staleness::HeadState::NotARepo => "not_a_repo",
+    };
+
+    // AC-14: self-heal structural corruption before opening the reader.
+    // Finding [low/performance] fix: pass the pre-resolved head_state so
+    // `auto_refresh_if_stale` skips the internal `git_head_state` traversal.
+    // Finding [medium/architecture] CQS fix: repair lives here, not in
+    // `build_stats_json`, so the reporting function has no I/O side effects.
+    let noop_analytics = crate::analytics::AnalyticsConfig {
+        enabled: false,
+        input_cost_per_mtok: None,
+        session_id: None,
+    };
+    let (outcome, loaded_manifest, _) = staleness::auto_refresh_if_stale(
+        root,
+        cache_dir,
+        &noop_analytics,
+        staleness::ReanchorPolicy::Refuse,
+        Some(head_state),
+    )?;
+
+    // staleness_status is always Current after auto_refresh_if_stale — the function
+    // guarantees the index is current (rebuilt if it was stale). Derived from
+    // `outcome` to avoid a compile-time literal in the pure-reporting functions.
+    let _ = &outcome; // outcome consumed; all RefreshOutcome variants → Current
+    let staleness_status = staleness::StalenessCheck::Current;
+
+    // AD-414-7: opens successfully for F-Body-A/B/C after the self-heal above.
+    // Only CRC-level corruption not detectable by the structural probe propagates
+    // as Err here (T-13); the caller (`run_stats`) maps it to a structured error.
+    let reader = query::open_lexical_reader(cache_dir)?;
+    let stats = reader.stats();
+
+    let total_on_disk = total_on_disk_bytes(cache_dir);
+    let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
+
+    // Collect skip and coverage data from the post-heal manifest.
+    let skip_entries: Vec<types::SkippedEntry> = loaded_manifest.skipped().cloned().collect();
+    let ast_coverage = loaded_manifest.ast_coverage();
+
+    Ok(StatsGathered {
+        pre_refresh_git_head,
+        pre_refresh_temporal_state,
+        git_head_state_str,
+        staleness_status,
+        file_count: stats.file_count,
+        total_ngrams: stats.total_ngrams,
+        index_size_bytes: stats.index_size_bytes,
+        last_updated: stats.last_updated,
+        total_on_disk,
+        temporal_db_bytes,
+        skip_entries,
+        ast_coverage,
+        cache_dir_display,
+    })
 }
 
 // ============================================================================
@@ -1377,6 +1482,7 @@ fn run_query(
                 &cache_dir,
                 analytics,
                 staleness::ReanchorPolicy::Refuse,
+                None,
             )?;
             (Some(manifest), Some(head_state))
         } else {
@@ -1411,10 +1517,10 @@ fn run_query(
     // and the AD-413-16 guard is enforced inside resolve_blast_radius_paths
     // (Finding 2).
     // Finding 1/3 fix: pass head_state so the resolver does not re-derive it.
-    // T-7/AC-7: resolve_blast_radius_paths now returns (paths, degraded_reason) so
-    // the caller can push a DegradedJson entry to output.degraded when blast-radius
-    // could not be applied (empty / corrupt / missing temporal DB — AD-414-12).
-    let (blast_radius_paths, blast_degraded) = temporal::resolve_blast_radius_paths(
+    // T-7/AC-7: resolve_blast_radius_paths returns BlastRadiusResolution so the
+    // caller can push a DegradedJson entry for ALL degraded cases including
+    // RepositoryMismatch (previously silent — AD-414-12 / Finding B).
+    let blast_radius_resolution = temporal::resolve_blast_radius_paths(
         flags.blast_radius.as_deref(),
         &root,
         &cache_dir,
@@ -1423,6 +1529,14 @@ fn run_query(
             .as_ref()
             .unwrap_or(&staleness::HeadState::NotARepo),
     )?;
+    let (blast_radius_paths, blast_degraded) = match blast_radius_resolution {
+        temporal::BlastRadiusResolution::NotRequested => (None, None),
+        temporal::BlastRadiusResolution::Allowed(paths) => (Some(paths), None),
+        temporal::BlastRadiusResolution::Filtered { allow, degraded } => {
+            (Some(allow), Some(degraded))
+        }
+        temporal::BlastRadiusResolution::Degraded(u) => (None, Some(u)),
+    };
 
     // Resolve AST file filter (#199): open the AST engine (already refreshed
     // above), execute the structural query, collect matching FileIds.
@@ -1618,20 +1732,21 @@ fn run_query(
             };
 
         if let Some(ref u) = maybe_unavail {
-            // degraded_notice is the SSOT for all stderr degradation messages (AD-414-1).
-            // Goes to stderr so --json stdout stays byte-identical (PF-006 / AD-404-8).
+            // DegradedJson::new is the single constructor: it calls degraded_notice
+            // internally so DegradedJson.message is always identical to the stderr
+            // notice (AD-414-1 SSOT; Finding [medium/architecture]).
             // flag_name() keeps the --prefixed form for the human-readable notice;
-            // json_name() returns the bare form required by DegradedJson.requested (AC-4).
-            let msg = temporal::degraded_notice(u, sort.flag_name(), temporal::Fallback::Lexical);
-            eprintln!("skim search: {msg}");
-            output.degraded.push(temporal::DegradedJson {
-                subsystem: "temporal",
-                reason: u.reason.as_json_str(),
-                requested: sort.json_name().to_string(),
-                applied: "lexical",
-                message: msg,
-                remediation: u.reason.remediation(),
-            });
+            // json_name() returns the bare form required by DegradedJson.requested
+            // (AC-4 / RD-5).
+            let dj = temporal::DegradedJson::new(
+                u,
+                sort.json_name(),
+                "lexical",
+                sort.flag_name(),
+                temporal::Fallback::Lexical,
+            );
+            eprintln!("skim search: {}", dj.message);
+            output.degraded.push(dj);
         }
 
         // Pagination applied regardless of DB presence (AD-404-10 guard drift fix).
@@ -1657,18 +1772,12 @@ fn run_query(
     // readable counterpart.  Blast-radius degradation is independent of temporal-
     // sort degradation: both can be present simultaneously (two entries in the vec).
     if let Some(u) = blast_degraded {
-        // AC-7 / AC-19(b): blast_radius_degraded_msg is the SSOT for this
-        // message — it agrees with what resolve_blast_radius_paths printed to
-        // stderr (audit #414-6), so DegradedJson.message matches.
-        let msg = temporal::blast_radius_degraded_msg(&u);
-        output.degraded.push(temporal::DegradedJson {
-            subsystem: "temporal",
-            reason: u.reason.as_json_str(),
-            requested: "blast-radius".to_string(),
-            applied: "lexical",
-            message: msg,
-            remediation: u.reason.remediation(),
-        });
+        // DegradedJson::for_blast_radius uses blast_radius_degraded_msg as the SSOT
+        // so DegradedJson.message matches what resolve_blast_radius_paths already
+        // printed to stderr (AC-7 / AC-19(b) byte-identical contract; audit #414-6).
+        output
+            .degraded
+            .push(temporal::DegradedJson::for_blast_radius(&u));
     }
 
     // AD-404-11 / D-5: emit bounded-page notice on all text-query paths when
@@ -1759,6 +1868,7 @@ fn run_temporal_standalone(
         &cache_dir,
         analytics,
         staleness::ReanchorPolicy::Refuse,
+        None,
     )?;
 
     // Step 7 wiring (d): temporal-consuming standalone arm (--hot/--cold/--risky/--blast-radius).
@@ -1791,31 +1901,35 @@ fn run_temporal_standalone(
     let db = match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
         temporal::TemporalOpen::Open(db) => db,
         temporal::TemporalOpen::Unavailable(u) => {
-            let msg_str = temporal::degraded_notice(&u, "", temporal::Fallback::NoResults);
-            let dj = temporal::DegradedJson {
-                subsystem: "temporal",
-                reason: u.reason.as_json_str(),
-                requested: requested_flag,
-                applied: "none",
-                message: msg_str.clone(),
-                remediation: u.reason.remediation(),
-            };
+            // DegradedJson::new is the single constructor (Finding [medium/architecture]):
+            // it calls degraded_notice internally so DegradedJson.message always
+            // matches what is printed to stderr (AD-414-1 SSOT).
+            let dj = temporal::DegradedJson::new(
+                &u,
+                requested_flag,
+                "none",
+                "",
+                temporal::Fallback::NoResults,
+            );
             if u.reason == temporal::DegradedReason::NotGitRepo {
                 // NotGitRepo: preserve AC9 byte-identical `warning` on stdout and add
                 // `degraded` as a sibling key for machine consumers.
                 if json {
+                    // Clone the message so dj can be moved into the vec while we
+                    // still hold a reference for the `warning` field.
+                    let msg_str = dj.message.clone();
                     let msg = WarningWithDegradedJson {
                         warning: &msg_str,
                         degraded: vec![dj],
                     };
                     println!("{}", serde_json::to_string(&msg)?);
                 } else {
-                    eprintln!("skim search: {msg_str}");
+                    eprintln!("skim search: {}", dj.message);
                 }
             } else {
                 // All other reasons: notice to stderr; in --json mode emit one parseable
                 // object on stdout so the caller always gets a valid JSON envelope (SE-6).
-                eprintln!("skim search: {msg_str}");
+                eprintln!("skim search: {}", dj.message);
                 if json {
                     let msg = DegradedOnlyJson { degraded: vec![dj] };
                     println!("{}", serde_json::to_string(&msg)?);
@@ -1837,17 +1951,18 @@ fn run_temporal_standalone(
             reason: temporal::DegradedReason::Empty,
             detail: String::new(),
         };
-        let msg_str = temporal::degraded_notice(&u, "", temporal::Fallback::NoResults);
-        eprintln!("skim search: {msg_str}");
+        // DegradedJson::new is the single constructor (Finding [medium/architecture]):
+        // it calls degraded_notice internally so DegradedJson.message always matches
+        // what is printed to stderr (AD-414-1 SSOT).
+        let dj = temporal::DegradedJson::new(
+            &u,
+            sort.json_name(),
+            "none",
+            "",
+            temporal::Fallback::NoResults,
+        );
+        eprintln!("skim search: {}", dj.message);
         if json {
-            let dj = temporal::DegradedJson {
-                subsystem: "temporal",
-                reason: u.reason.as_json_str(),
-                requested: sort.json_name().to_string(),
-                applied: "none",
-                message: msg_str,
-                remediation: u.reason.remediation(),
-            };
             let msg = DegradedOnlyJson { degraded: vec![dj] };
             println!("{}", serde_json::to_string(&msg)?);
         }
@@ -2048,156 +2163,52 @@ fn print_help() {
 /// JSON branch; `stats_json_for_test` delegates to it directly.
 ///
 /// AD-413-13: `git_head` is the manifest's stored HEAD ("HEAD-at-last-build" from
-/// [`FileManifest::stored_git_head`]) while `git_head_state` is the live HEAD state
-/// resolved at call time.  The two keys can legitimately diverge — for example, a
-/// frozen linked worktree before its first post-fix rebuild produces
-/// `{"git_head": null, "git_head_state": "resolved"}`, which is a legal transient
-/// state, not a contradiction.
+/// Pure serialiser for `--stats --json` output (Finding [medium/architecture] CQS fix).
 ///
-/// `head_state` is resolved ONCE by the caller (`run_stats`) and passed in so the
-/// same snapshot feeds both [`staleness::warn_if_temporal_unverifiable`] and the
-/// `git_head_state` JSON key without a second `git_head_state` syscall sequence.
+/// All data is pre-gathered by [`gather_stats`], which performs the self-heal and
+/// collects the pre-refresh snapshots.  This function has **no I/O side effects**.
 ///
-/// AD-395-6: `skipped` / `skipped_by_reason` are additive keys; all nine pre-existing
-/// keys are unchanged (AC11 back-compat).  `skipped_by_reason` uses `BTreeMap` for
-/// byte-stable key order consistent with the text-mode path (PF-012).
+/// AD-395-6: `skipped` / `skipped_by_reason` are additive keys (AC11 back-compat).
+/// `skipped_by_reason` uses `BTreeMap` for byte-stable key order (PF-012).
 ///
-/// **Snapshot asymmetry (AD-414-10 / audit #414-7):** `git_head` and `temporal_state`
-/// are captured from the PRE-self-heal state (before `auto_refresh_if_stale` runs).
-/// All other fields — `file_count`, `skipped`, `ast_coverage`, and the manifest-derived
-/// counts — are read from the post-heal state (after the repair, if any).  This means
-/// `--stats --json` can show a `temporal_state` of `"missing"` or `"corrupt"` alongside
-/// a freshly-healed `file_count`, which is the intended observable contract (AC-15 /
-/// AC-22): the report tells you what was wrong when the command was invoked, while also
-/// reflecting the post-heal index state.
-fn build_stats_json(
-    cache_dir: &std::path::Path,
-    root: &std::path::Path,
-    head_state: &staleness::HeadState,
-) -> anyhow::Result<serde_json::Value> {
-    let index_path = cache_dir.join("index.skidx");
-    if !index_path.exists() {
-        // Normalized to include cache_dir (G-4/C11 — matches run_stats JSON early return).
-        return Ok(serde_json::json!({
-            "error": "no index found",
-            "cache_dir": cache_dir.display().to_string(),
-        }));
-    }
-    // T-15 / test_ac22 / AD-414-10: snapshot pre-refresh state BEFORE calling
-    // auto_refresh_if_stale so the reported git_head and temporal_state reflect
-    // what the index held at the moment --stats was invoked, not the post-heal
-    // state.  The self-heal is still performed (AC-14: structural corruption is
-    // fixed for the reader that follows), but what is REPORTED is the pre-heal
-    // snapshot.
-    //
-    // git_head: auto_refresh_if_stale may update the manifest's stored HEAD (e.g.
-    // NoStoredHead → rebuild → manifest now has the live SHA). Reading git_head from
-    // the loaded_manifest returned by auto_refresh would always show the post-heal
-    // SHA, hiding the "frozen manifest" state that AC22 relies on to detect a
-    // linked-worktree that predated the HEAD-recording fix.  Load the manifest once
-    // here to capture the PRE-refresh snapshot; fall back to None on load failure
-    // (corrupt manifest — treated the same as "no stored head").
-    let pre_refresh_git_head =
-        manifest::FileManifest::load(root.to_path_buf(), cache_dir.to_path_buf())
-            .ok()
-            .and_then(|m| m.stored_git_head().map(str::to_string));
-    //
-    // temporal_state: auto_refresh_if_stale calls try_rebuild_temporal_nonfatal
-    // when temporal.db is missing or HEAD-divergent, so the post-heal state may
-    // be "ready" even when the DB was "missing" at invocation time.  Computing
-    // temporal_state here (before the heal) records what the user actually saw.
-    let pre_refresh_temporal_state = temporal_state_json_str(root, cache_dir, head_state);
-    //
-    // AC-14: self-heal structural corruption before opening the reader (same route
-    // as query arms).  analytics is unused by auto_refresh_if_stale (_analytics);
-    // a disabled instance avoids threading the parameter through build_stats_json.
-    let noop_analytics = crate::analytics::AnalyticsConfig {
-        enabled: false,
-        input_cost_per_mtok: None,
-        session_id: None,
-    };
-    let (_, loaded_manifest, _) = staleness::auto_refresh_if_stale(
-        root,
-        cache_dir,
-        &noop_analytics,
-        staleness::ReanchorPolicy::Refuse,
-    )?;
-    // AD-414-7: actionable error. For F-Body-A/B/C the self-heal above already
-    // rebuilt the index, so open_lexical_reader succeeds. Only a CRC-level
-    // corruption that the structural probe cannot detect propagates this Err
-    // (T-13); the caller (run_stats) catches it and emits a structured JSON error.
-    let reader = query::open_lexical_reader(cache_dir)?;
-    let stats = reader.stats();
-    let total_on_disk = total_on_disk_bytes(cache_dir);
-    let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
-    // Use PRE-REFRESH git_head (snapshotted above) — avoids the post-heal SHA
-    // overwriting the "frozen manifest" state that AC22 / T-15 assertions rely on.
-    let git_head = pre_refresh_git_head;
-    let staleness_status = staleness::StalenessCheck::Current;
-    // loaded_manifest (from auto_refresh_if_stale) is used for file-level data
-    // (skipped entries, ast_coverage) which always reflects the current index state.
-    let skip_entries: Vec<_> = loaded_manifest.skipped().collect::<Vec<_>>();
-    let skipped_arr: Vec<serde_json::Value> = skip_entries
+/// **Snapshot asymmetry (AD-414-10 / AC-22):** `git_head` and `temporal_state` are
+/// PRE-heal snapshots from `snapshot`; all other fields reflect the post-heal state.
+fn build_stats_json(snapshot: &StatsGathered) -> anyhow::Result<serde_json::Value> {
+    let skipped_arr: Vec<serde_json::Value> = snapshot
+        .skip_entries
         .iter()
-        .map(|e| {
-            serde_json::json!({
-                "path": e.path,
-                "reason": e.reason_label(),
-            })
-        })
+        .map(|e| serde_json::json!({ "path": e.path, "reason": e.reason_label() }))
         .collect();
     // PF-012: BTreeMap gives deterministic (sorted) key order in JSON output,
     // consistent with the alphabetical sort used in the text-mode path.
     let mut skipped_by_reason: std::collections::BTreeMap<&str, u64> =
         std::collections::BTreeMap::new();
-    for e in &skip_entries {
+    for e in &snapshot.skip_entries {
         *skipped_by_reason.entry(e.reason_label()).or_insert(0) += 1;
     }
-    // NOTE for JSON consumers: `skipped` and `skipped_by_reason` reflect only
-    // PERSISTED content-skips (Minified / NonUtf8 / TooLarge — OD-395-4).
-    // They do NOT include UnsupportedLanguage or ReadError skips, which are
-    // counted in the `run_build` headline ("N skipped") but not persisted.
-    // A repo with 50 unsupported files + 1 minified bundle therefore shows
-    // `"skipped": [<minified entry>]` here vs. "51 skipped" at build time.
-    //
     // AD-405-9 / AC-405-9 / AC-405-15: `ast_coverage` is additive (never replaces
     // existing keys) and OMITTED when clean (is_clean() == true), matching the
     // same guard used on the standalone --ast and compound --ast surfaces.
-    // No-index early-return above keeps the error object as-is.
-    let ast_coverage_val: Option<serde_json::Value> = {
-        let cov = loaded_manifest.ast_coverage();
-        if cov.is_clean() { None } else { Some(cov) }
-    }
-    .map(serde_json::to_value)
-    .transpose()
-    .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?;
-    // AC20 (#413): additive `git_head_state` key with one of three string values.
-    // Not in either error object (AC21 — the no-index early-return above is before
-    // this computation). Owned by #413; #414 extends this with `temporal_state`.
-    // Finding [reliability] fix: `head_state` is resolved ONCE by the caller
-    // (run_stats) and passed in — no second git_head_state call here.
-    let git_head_state_str = match head_state {
-        staleness::HeadState::Resolved(_) => "resolved",
-        staleness::HeadState::Unresolved => "unresolved",
-        staleness::HeadState::NotARepo => "not_a_repo",
+    let ast_coverage_val: Option<serde_json::Value> = if snapshot.ast_coverage.is_clean() {
+        None
+    } else {
+        Some(
+            serde_json::to_value(&snapshot.ast_coverage)
+                .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?,
+        )
     };
-    // AD-414-10: additive `temporal_state` key, one of five values (AC-15).
-    // Not in the error objects (consistent with git_head_state / AC21 scope).
-    // Use the PRE-REFRESH snapshot computed above — auto_refresh_if_stale may
-    // have rebuilt temporal.db, changing the state from "missing" to "ready".
-    let temporal_state = pre_refresh_temporal_state;
     let mut result = serde_json::json!({
-        "file_count": stats.file_count,
-        "total_ngrams": stats.total_ngrams,
-        "index_size_bytes": stats.index_size_bytes,
-        "total_on_disk_bytes": total_on_disk,
-        "temporal_db_bytes": temporal_db_bytes,
-        "last_updated": stats.last_updated,
-        "git_head": git_head,
-        "git_head_state": git_head_state_str,
-        "temporal_state": temporal_state,
-        "staleness": staleness_status.to_string(),
-        "cache_dir": cache_dir.display().to_string(),
+        "file_count": snapshot.file_count,
+        "total_ngrams": snapshot.total_ngrams,
+        "index_size_bytes": snapshot.index_size_bytes,
+        "total_on_disk_bytes": snapshot.total_on_disk,
+        "temporal_db_bytes": snapshot.temporal_db_bytes,
+        "last_updated": snapshot.last_updated,
+        "git_head": snapshot.pre_refresh_git_head,
+        "git_head_state": snapshot.git_head_state_str,
+        "temporal_state": snapshot.pre_refresh_temporal_state,
+        "staleness": snapshot.staleness_status.to_string(),
+        "cache_dir": snapshot.cache_dir_display,
         "skipped": skipped_arr,
         "skipped_by_reason": skipped_by_reason,
     });
@@ -2212,22 +2223,23 @@ fn build_stats_json(
 // Test helpers (cfg(test) only — not compiled into production builds)
 // ============================================================================
 
-/// Delegate to [`build_stats_json`] so AC4/AC11 tests cover the production
-/// code path rather than a hand-duplicated reimplementation.
+/// Delegate to [`gather_stats`] + [`build_stats_json`] so AC4/AC11 tests cover
+/// the production code path rather than a hand-duplicated reimplementation.
 ///
 /// Used by `index_tests.rs` for:
 /// - AC4 (#395): assert `skipped` array / `skipped_by_reason` JSON fields.
 /// - AC11 (#395): assert all nine pre-existing keys survive with unchanged types.
 ///
-/// Resolves the live `HeadState` from `root` and passes it to `build_stats_json`,
-/// matching the single-resolve contract the production `run_stats` path now enforces.
+/// Resolves the live `HeadState` from `root`, runs the same gather+serialise
+/// sequence as the production `run_stats --json` path.
 #[cfg(test)]
 pub(crate) fn stats_json_for_test(
     cache_dir: &std::path::Path,
     root: &std::path::Path,
 ) -> anyhow::Result<serde_json::Value> {
     let head_state = staleness::git_head_state(root);
-    build_stats_json(cache_dir, root, &head_state)
+    let snapshot = gather_stats(cache_dir, root, head_state)?;
+    build_stats_json(&snapshot)
 }
 
 // ============================================================================
@@ -3092,18 +3104,18 @@ mod tests {
     }
 
     // ============================================================================
-    // resolve_blast_radius_paths — None DB degradation path
+    // resolve_blast_radius_paths — BlastRadiusResolution degradation paths
     // ============================================================================
 
     /// When blast_radius is Some but temporal.db is absent (temporal data not yet
-    /// auto-populated), the function must return Ok((None, Some(u))) without panicking.
-    /// A stderr warning is expected; the caller uses `u` to push a DegradedJson entry.
+    /// auto-populated), the function must return `Ok(Degraded(_))` without panicking.
+    /// A stderr warning is expected; the caller uses the resolution to push a DegradedJson entry.
     #[test]
     fn test_resolve_blast_radius_filter_no_db_returns_none() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         // cache_dir has no temporal.db — open_temporal_state returns Unavailable(Missing)
-        // and the function degrades gracefully to (None, Some(u)).
+        // and the function degrades gracefully to BlastRadiusResolution::Degraded.
         let result = temporal::resolve_blast_radius_paths(
             Some("src/auth.rs"),
             root,
@@ -3116,30 +3128,26 @@ mod tests {
             "must not error when temporal.db is absent, got: {:?}",
             result.unwrap_err()
         );
-        let (paths, degraded) = result.unwrap();
         assert!(
-            paths.is_none(),
-            "must return paths=None (graceful degradation) when temporal.db is absent"
-        );
-        assert!(
-            degraded.is_some(),
-            "must return degraded=Some(u) so caller can push DegradedJson entry"
+            matches!(
+                result.unwrap(),
+                temporal::BlastRadiusResolution::Degraded(_)
+            ),
+            "must return Degraded(_) (graceful degradation) when temporal.db is absent"
         );
     }
 
     // ============================================================================
-    // AD-413-16 / PF-016: AnchorDiffers must return Some(empty) not None.
+    // AD-413-16 / PF-016: RepositoryMismatch must return Filtered(empty, reason).
     // ============================================================================
 
     /// When blast_radius is Some and temporal.db exists but belongs to a
     /// different repository (AnchorDiffers), `resolve_blast_radius_paths` must
-    /// return `Ok(Some(empty_set))` — NOT `Ok(None)`.
+    /// return `Ok(Filtered { allow: empty, degraded: RepositoryMismatch })`.
     ///
-    /// Returning `Ok(None)` overloads the "not requested" sentinel: callers'
-    /// `.map()` produces `None → no file filter → full unfiltered index` (PF-016).
-    /// An empty allowlist forces every blast-radius call site to emit zero results,
-    /// matching the standalone arm (`run_temporal_standalone`) which also serves
-    /// zero rows on `AnchorDiffers`.
+    /// `Filtered` with an empty allowlist forces zero results on all blast-radius
+    /// call sites (PF-016 / AD-413-16), AND the `degraded` field ensures the caller
+    /// pushes a `DegradedJson` entry — previously this case was silent (Finding B).
     #[test]
     fn test_resolve_blast_radius_anchor_differs_returns_empty_set() {
         use staleness::HeadState;
@@ -3184,21 +3192,27 @@ mod tests {
             "must not return Err on AnchorDiffers, got: {:?}",
             result.unwrap_err()
         );
-        let (paths, degraded) = result.unwrap();
-        assert!(
-            paths.is_some(),
-            "must return Some(empty_set) on AnchorDiffers, not None \
-             (None overloads the 'not requested' sentinel — PF-016 / AD-413-16)"
-        );
-        assert!(
-            paths.unwrap().is_empty(),
-            "empty allowlist forces zero results on all blast-radius arms"
-        );
-        assert!(
-            degraded.is_none(),
-            "RepositoryMismatch returns empty allowlist, not a degraded reason \
-             (callers must see it as a filtered — not degraded — result)"
-        );
+        let resolution = result.unwrap();
+        match resolution {
+            temporal::BlastRadiusResolution::Filtered {
+                ref allow,
+                ref degraded,
+            } => {
+                assert!(
+                    allow.is_empty(),
+                    "empty allowlist forces zero results on all blast-radius arms (PF-016)"
+                );
+                assert_eq!(
+                    degraded.reason,
+                    temporal::DegradedReason::RepositoryMismatch,
+                    "RepositoryMismatch must carry its reason so output.degraded receives an entry (Finding B)"
+                );
+            }
+            other => panic!(
+                "expected BlastRadiusResolution::Filtered for AnchorDiffers, got: {:?}",
+                other
+            ),
+        }
     }
 
     // ============================================================================

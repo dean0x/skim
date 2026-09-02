@@ -12,8 +12,21 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
-use rskim_search::{FileId, HotspotRow, RiskRow, SearchError, TemporalDb};
 use serde::Serialize;
+
+use rskim_search::{FileId, HotspotRow, RiskRow, SearchError, TemporalDb};
+
+// Re-export the degraded-state vocabulary from the dependency-free leaf module.
+// This keeps `temporal::DegradedReason` etc. accessible to mod.rs / ast.rs while
+// breaking the temporal_build → temporal → staleness → temporal_state → temporal_build
+// cycle (temporal_build now imports directly from super::degraded).
+pub(super) use super::degraded::{
+    DegradedJson, DegradedReason, Fallback, TemporalUnavailable, blast_radius_degraded_msg,
+    degraded_notice,
+};
+
+#[cfg(test)]
+pub(super) use super::degraded::cause_substrings_for_guard;
 
 use super::staleness::{AnchorState, HeadState};
 use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
@@ -126,203 +139,6 @@ pub(super) fn normalize_blast_radius_path(
     Ok(normalized)
 }
 
-// ============================================================================
-// Degraded-state vocabulary (AD-414-15, AD-414-1)
-// ============================================================================
-
-/// AD-414-15: classification order is NORMATIVE:
-/// not_git_repo → head_unresolved → repository_mismatch → missing
-/// → corrupt/unsupported_version/unreadable → empty → no_ranked_rows.
-///
-/// Each variant represents the **state** a user or agent can recognise, never
-/// the mechanism that detected it.  The reason string is part of the `degraded`
-/// JSON contract (OD-A) and is fixed before implementation to avoid breaking
-/// adopters on rename.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum DegradedReason {
-    /// Directory is not tracked by git (no ancestor `.git`).
-    NotGitRepo,
-    /// git dir found but HEAD could not be resolved to a commit SHA
-    /// (unborn branch, unsupported ref backend — #481).
-    HeadUnresolved,
-    /// DB was built for a different repository root (AD-413-16).
-    RepositoryMismatch,
-    /// git repo present and HEAD resolves, but `temporal.db` does not exist.
-    Missing,
-    /// `temporal.db` exists but is structurally corrupt (SQLITE_NOTADB/CORRUPT).
-    Corrupt,
-    /// `temporal.db` was written by a newer schema version than supported.
-    UnsupportedVersion,
-    /// `temporal.db` exists but could not be opened for any other reason.
-    Unreadable,
-    /// DB open and readable but zero rows match the requested dimension.
-    Empty,
-    /// DB readable and rows exist, but none of the matched results carries a
-    /// temporal score for the requested dimension (all new/uncommitted files).
-    NoRankedRows,
-}
-
-impl DegradedReason {
-    /// Machine-readable reason code for JSON output (OD-A).
-    pub(super) fn as_json_str(self) -> &'static str {
-        match self {
-            Self::NotGitRepo => "not_git_repo",
-            Self::HeadUnresolved => "head_unresolved",
-            Self::RepositoryMismatch => "repository_mismatch",
-            Self::Missing => "missing",
-            Self::Corrupt => "corrupt",
-            Self::UnsupportedVersion => "unsupported_version",
-            Self::Unreadable => "unreadable",
-            Self::Empty => "empty",
-            Self::NoRankedRows => "no_ranked_rows",
-        }
-    }
-
-    /// Cause substring for the degraded-state notice and `DegradedJson`.
-    ///
-    /// `detail` carries reason-specific context set by [`open_temporal_state`]
-    /// or the zero-coverage path (e.g. path pair for `RepositoryMismatch`,
-    /// formatted count for `NoRankedRows`, error text for `Unreadable`).
-    ///
-    /// For `Empty`, `detail == "shallow"` signals that `meta.is_shallow` is set;
-    /// absent row → `detail` is empty → no shallow suffix.
-    ///
-    /// This is the §2.3 normative cause table in isolation.  Production emits
-    /// through [`Self::full_message`] (cause + remediation in one string) via
-    /// [`degraded_notice`], so `cause` itself has no production call site; it is
-    /// retained as the addressable half of the contract that AC-19(a)/T-19(a)
-    /// pins variant-by-variant.
-    #[allow(dead_code)]
-    pub(super) fn cause(self, detail: &str) -> String {
-        match self {
-            // Legacy constants used verbatim (AC-19 byte-identical guards).
-            Self::NotGitRepo => super::NO_TEMPORAL_DATA_MSG.to_string(),
-            Self::HeadUnresolved => super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
-            Self::RepositoryMismatch => {
-                format!("{} {}", super::SUBDIR_ROOT_TEMPORAL_MSG, detail)
-            }
-            // §2.3 normative table (AD-414-15 / AC-2).
-            Self::Missing => "temporal.db is not present in the index cache".to_string(),
-            Self::Corrupt => "temporal.db is corrupt (not a database)".to_string(),
-            Self::UnsupportedVersion => {
-                format!("temporal.db was written by a newer skim ({detail})")
-            }
-            Self::Unreadable => {
-                if detail.is_empty() {
-                    "temporal.db could not be opened".to_string()
-                } else {
-                    format!("temporal.db could not be opened ({detail})")
-                }
-            }
-            Self::Empty => {
-                let base = "temporal data is empty (0 rows) \u{2014} this repository has no \
-                            commit history skim can analyse";
-                if detail.contains("shallow") {
-                    format!("{base}; a shallow clone is the usual cause")
-                } else {
-                    base.to_string()
-                }
-            }
-            Self::NoRankedRows => detail.to_string(),
-        }
-    }
-
-    /// Actionable remediation advice for `DegradedJson.remediation`.
-    ///
-    /// Detail-independent by design (`&'static str`), so `Empty` returns the
-    /// non-shallow default.  The shallow-specific advice ("run 'git fetch
-    /// --unshallow'…") lives only in the human-readable [`Self::full_message`],
-    /// and the sole producer of `Empty` with `detail == "shallow"` is the
-    /// build-time zero-row notice in `temporal_build.rs`, which emits stderr text
-    /// and never a `DegradedJson`.  No live `DegradedJson` can therefore disagree
-    /// with its own `message`.
-    pub(super) fn remediation(self) -> &'static str {
-        match self {
-            // Embedded in NO_TEMPORAL_DATA_MSG; repeated separately for JSON consumers.
-            Self::NotGitRepo => "run 'skim search' on a git repo to auto-populate",
-            Self::HeadUnresolved => "commit at least one file to initialise the branch HEAD",
-            Self::RepositoryMismatch => {
-                "run 'skim search --rebuild --root <this root>' to re-anchor it"
-            }
-            Self::Missing => "run 'skim search --update' to build it",
-            Self::Corrupt => "run 'skim search --rebuild' to discard and rebuild it",
-            Self::UnsupportedVersion => "upgrade skim; skim will not overwrite a newer database",
-            Self::Unreadable => "run 'skim search --rebuild'",
-            Self::Empty => "run 'skim search --rebuild'",
-            Self::NoRankedRows => {
-                "commit the matched files, or run 'skim search --update' after committing"
-            }
-        }
-    }
-
-    /// Complete human-readable message (cause + embedded remediation).
-    ///
-    /// Used by [`degraded_notice`].  `NotGitRepo` and `HeadUnresolved` return
-    /// the legacy constant verbatim so AC-19 byte-identical assertions pass.
-    /// `Empty` implements the §2.3 is_shallow conditional via `detail == "shallow"`
-    /// (written by Phase C2); absent → non-shallow path (AC-2).
-    fn full_message(self, detail: &str) -> String {
-        match self {
-            Self::NotGitRepo => super::NO_TEMPORAL_DATA_MSG.to_string(),
-            Self::HeadUnresolved => super::HEAD_UNRESOLVED_TEMPORAL_MSG.to_string(),
-            Self::RepositoryMismatch => format!(
-                "{} {}; run 'skim search --rebuild --root <this root>' to re-anchor it",
-                super::SUBDIR_ROOT_TEMPORAL_MSG,
-                detail,
-            ),
-            Self::Missing => "temporal.db is not present in the index cache; \
-                 run 'skim search --update' to build it"
-                .to_string(),
-            Self::Corrupt => "temporal.db is corrupt (not a database); \
-                 run 'skim search --rebuild' to discard and rebuild it"
-                .to_string(),
-            Self::UnsupportedVersion => format!(
-                "temporal.db was written by a newer skim ({detail}); \
-                 upgrade skim; skim will not overwrite a newer database"
-            ),
-            Self::Unreadable => {
-                if detail.is_empty() {
-                    "temporal.db could not be opened; run 'skim search --rebuild'".to_string()
-                } else {
-                    format!(
-                        "temporal.db could not be opened ({detail}); \
-                         run 'skim search --rebuild'"
-                    )
-                }
-            }
-            Self::Empty => {
-                let base = "temporal data is empty (0 rows) \u{2014} this repository has no \
-                            commit history skim can analyse";
-                if detail.contains("shallow") {
-                    format!(
-                        "{base}; a shallow clone is the usual cause; \
-                         run 'git fetch --unshallow' (or use a full clone), \
-                         then 'skim search --rebuild'"
-                    )
-                } else {
-                    format!("{base}; run 'skim search --rebuild'")
-                }
-            }
-            Self::NoRankedRows => format!(
-                "{detail}; commit the matched files, \
-                 or run 'skim search --update' after committing"
-            ),
-        }
-    }
-}
-
-/// Why the temporal database is not available for a query.
-///
-/// Returned by [`open_temporal_state`] (the new single funnel).  Carries
-/// `reason` (the typed classification, AD-414-15) and `detail` (reason-specific
-/// context — path pair for `RepositoryMismatch`, error text for `Corrupt`, etc.).
-#[derive(Debug)]
-pub(super) struct TemporalUnavailable {
-    pub(super) reason: DegradedReason,
-    /// Reason-specific context string; may be empty for stateless variants.
-    pub(super) detail: String,
-}
-
 /// Result of attempting to open the temporal database for a query.
 ///
 /// Returned by [`open_temporal_state`].  A dedicated enum rather than a
@@ -336,27 +152,59 @@ pub(super) enum TemporalOpen {
     Unavailable(TemporalUnavailable),
 }
 
-/// Machine-readable representation of a single degradation signal (OD-A).
-///
-/// Serialised as an element of `QueryOutput.degraded` (a `Vec<DegradedJson>`
-/// with `skip_serializing_if = "Vec::is_empty"`) so the JSON key is absent on
-/// healthy queries (AD-414-12).
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct DegradedJson {
-    /// Subsystem that emits this signal (always `"temporal"` in this ticket).
-    pub subsystem: &'static str,
-    /// Machine-readable reason code (`DegradedReason::as_json_str`).
-    pub reason: &'static str,
-    /// The user flag that requested temporal ranking, in bare form (e.g. `"hot"`,
-    /// `"blast-radius"`).  No `--` prefix — use [`TemporalSort::json_name`] to
-    /// obtain the correct value; `flag_name()` is for human-readable message text.
-    pub requested: String,
-    /// The ranking actually served (e.g. `"lexical"`, `"ast"`).
-    pub applied: &'static str,
-    /// Human-readable notice (identical to what was printed to stderr).
-    pub message: String,
-    /// Machine-readable remediation advice.
-    pub remediation: &'static str,
+impl DegradedJson {
+    /// Construct a `DegradedJson` whose `message` is produced by [`degraded_notice`].
+    ///
+    /// This is the single constructor for all standard degraded-state JSON elements,
+    /// ensuring `DegradedJson.message` is always identical to what is printed to
+    /// stderr via the same `degraded_notice` call (AD-414-1 SSOT enforcement,
+    /// Finding [medium/architecture]).
+    ///
+    /// * `requested` — bare flag name (e.g. `"hot"`, `"blast-radius"`) per AC-4 /
+    ///   RD-5 (use [`TemporalSort::json_name`], not [`TemporalSort::flag_name`]).
+    /// * `applied` — ranking actually served (`"lexical"`, `"ast"`, `"none"`).
+    /// * `flag` — `--`-prefixed flag for the human-readable tail (passed to
+    ///   [`degraded_notice`]); pass `""` for the standalone temporal arm so
+    ///   `degraded_notice` returns the base message without a tail.
+    /// * `fallback` — controls the tail description in [`degraded_notice`].
+    pub(super) fn new(
+        u: &TemporalUnavailable,
+        requested: impl Into<String>,
+        applied: &'static str,
+        flag: &str,
+        fallback: Fallback,
+    ) -> Self {
+        let message = degraded_notice(u, flag, fallback);
+        DegradedJson {
+            subsystem: "temporal",
+            reason: u.reason.as_json_str(),
+            requested: requested.into(),
+            applied,
+            message,
+            remediation: u.reason.remediation(),
+        }
+    }
+
+    /// Construct a `DegradedJson` for blast-radius degradation.
+    ///
+    /// Uses [`blast_radius_degraded_msg`] as the message source so the JSON
+    /// element matches the stderr notice emitted by [`resolve_blast_radius_paths`]
+    /// (AC-7 / AC-19(b) byte-identical contract for `NotGitRepo`).
+    ///
+    /// All non-`NotGitRepo` reasons delegate to `degraded_notice` with
+    /// `flag = "--blast-radius"` and [`Fallback::Lexical`], same as a
+    /// `DegradedJson::new` call with those arguments would.
+    pub(super) fn for_blast_radius(u: &TemporalUnavailable) -> Self {
+        let message = blast_radius_degraded_msg(u);
+        DegradedJson {
+            subsystem: "temporal",
+            reason: u.reason.as_json_str(),
+            requested: "blast-radius".to_string(),
+            applied: "lexical",
+            message,
+            remediation: u.reason.remediation(),
+        }
+    }
 }
 
 /// Coverage counters returned by [`apply_temporal_enrichment`] and
@@ -369,71 +217,6 @@ pub(super) struct TemporalCoverage {
     pub total: usize,
     /// Per-file DB lookup failures during the annotate pass (E-16).
     pub lookup_errors: usize,
-}
-
-/// How the search degrades when temporal data is unavailable (AD-414-1).
-///
-/// Passed to [`degraded_notice`] to communicate which ranking was served
-/// instead and to tailor remediation advice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Fallback {
-    /// Pure-lexical BM25F order is served.
-    Lexical,
-    /// Raw AST structural ranking is served without temporal enrichment.
-    Ast,
-    /// No fallback is possible (standalone temporal arm — no results served).
-    NoResults,
-}
-
-/// AD-414-1: single source of truth for every degraded-state notice,
-/// generalising the documented `--ast` contract (warn on stderr, keep the
-/// upstream order, exit 0).  Loud when skim cannot self-fix, cause-specific,
-/// and always carries a remediation.  This is the ONLY builder of degraded-state
-/// notice text: every emit site formats the string it returns rather than
-/// composing its own (enforced by `t19b_no_cause_substring_outside_the_builder`).
-///
-/// When `flag` is non-empty, appends a fallback-specific tail explaining which
-/// flag was not applied and what order was served instead.  When `flag` is
-/// empty (standalone temporal arm, `--hot`/`--cold`/`--risky` without a text
-/// query), returns the base message verbatim so legacy byte-identical
-/// assertions remain valid.
-pub(super) fn degraded_notice(u: &TemporalUnavailable, flag: &str, fallback: Fallback) -> String {
-    let base = u.reason.full_message(&u.detail);
-    if flag.is_empty() {
-        base
-    } else {
-        let tail = match fallback {
-            Fallback::Lexical => {
-                format!("; {flag} not applied — results are in lexical relevance order")
-            }
-            Fallback::Ast => {
-                format!("; {flag} not applied — results are in raw AST match order")
-            }
-            Fallback::NoResults => format!("; no {flag} data to rank"),
-        };
-        format!("{base}{tail}")
-    }
-}
-
-/// AC-7 / AC-19(b): compute the human-readable message for a `--blast-radius`
-/// degradation notice.
-///
-/// `NotGitRepo` keeps the legacy composition format byte-identical to the
-/// pre-refactor message (AC-19 byte-identical guard).  All other reasons use
-/// [`degraded_notice`] with `flag = "--blast-radius"` and [`Fallback::Lexical`].
-///
-/// Shared by two call sites that must emit the same string:
-/// - [`resolve_blast_radius_paths`] — prints to stderr.
-/// - `mod.rs::run_query` — writes to `DegradedJson.message` (must match stderr).
-pub(super) fn blast_radius_degraded_msg(u: &TemporalUnavailable) -> String {
-    if u.reason == DegradedReason::NotGitRepo {
-        format!(
-            "no temporal data for --blast-radius — {}",
-            super::NO_TEMPORAL_DATA_MSG
-        )
-    } else {
-        degraded_notice(u, "--blast-radius", Fallback::Lexical)
-    }
 }
 
 // ============================================================================
@@ -572,28 +355,48 @@ pub(super) fn paths_to_file_ids(
     file_ids
 }
 
+/// Resolution of a `--blast-radius` request.
+///
+/// Replaces the former `(Option<HashSet<String>>, Option<TemporalUnavailable>)` tuple
+/// to make illegal states unrepresentable (the old `(Some, Some)` was unreachable but
+/// representable) and to give `RepositoryMismatch` a machine-readable signal (AC-7):
+/// it previously returned `(Some(empty), None)` so callers' `output.degraded` never
+/// received an entry, producing the silent-degradation class #414 exists to eliminate.
+///
+/// Variants map to the former tuple encoding as follows, for callers that need both
+/// the path filter and the degraded signal:
+/// - `NotRequested`          → paths = None,        degraded = None
+/// - `Allowed(paths)`        → paths = Some(paths), degraded = None
+/// - `Filtered { allow, .. }`→ paths = Some(allow), degraded = Some(...)
+/// - `Degraded(u)`           → paths = None,        degraded = Some(u)
+#[derive(Debug)]
+pub(super) enum BlastRadiusResolution {
+    /// `--blast-radius` was not requested; skip filter entirely.
+    NotRequested,
+    /// Resolved successfully; `allow` is the full co-change partner set.
+    Allowed(std::collections::HashSet<String>),
+    /// Resolved but the DB is degraded: `allow` is the effective path filter
+    /// (empty for `RepositoryMismatch`) and `degraded` carries the reason so
+    /// callers can push a `DegradedJson` entry to `output.degraded` (AC-7).
+    Filtered {
+        allow: std::collections::HashSet<String>,
+        degraded: TemporalUnavailable,
+    },
+    /// Fully degraded: temporal DB is unavailable; blast-radius cannot be applied.
+    Degraded(TemporalUnavailable),
+}
+
 /// Resolve a `--blast-radius` raw path to the set of co-change partner paths.
 ///
 /// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path) and
-/// `resolve_blast_radius_filter` (text-query path in `mod.rs`).  Returns the set of
-/// repo-relative path strings that the blast-radius filter should allow, including
-/// the target file itself, plus an optional [`TemporalUnavailable`] when blast-radius
-/// could not be applied so the caller can push a `DegradedJson` entry (AD-414-12).
+/// `resolve_blast_radius_filter` (text-query path in `mod.rs`).  Returns a
+/// [`BlastRadiusResolution`] that encodes whether blast-radius was requested, resolved
+/// successfully, or degraded — and in the `RepositoryMismatch` case, carries BOTH an
+/// empty allowlist (zero results) AND the degraded reason for `output.degraded`.
 ///
 /// `head` is the [`HeadState`] already resolved by the caller (Finding 2 fix:
 /// returned by `auto_refresh_if_stale` so it need not be re-derived here).
 /// It is passed to [`open_temporal_state`] to classify DB-absent cases (AD-414-15).
-///
-/// Returns:
-/// - `Ok((None, None))` when `blast_radius` is `None` (not requested).
-/// - `Ok((None, Some(u)))` when temporal data is absent/unreadable/empty.
-///   The caller uses `u` to push a `DegradedJson` entry to `output.degraded`.
-/// - `Ok((Some(empty_set), None))` when the DB belongs to a different repository
-///   (`RepositoryMismatch`).  The empty allowlist forces zero results on all three
-///   blast-radius call sites, matching the standalone arm which also serves zero rows
-///   on a mismatch.  Returning `(None, _)` would overload the "not requested" sentinel
-///   (PF-016 absence-overloading class, AD-413-16).
-/// - `Ok((Some(paths), None))` when blast-radius resolved successfully.
 ///
 /// # Errors
 ///
@@ -604,12 +407,9 @@ pub(super) fn resolve_blast_radius_paths(
     cache_dir: &Path,
     json: bool,
     head: &HeadState,
-) -> anyhow::Result<(
-    Option<std::collections::HashSet<String>>,
-    Option<TemporalUnavailable>,
-)> {
+) -> anyhow::Result<BlastRadiusResolution> {
     let Some(raw_path) = blast_radius else {
-        return Ok((None, None));
+        return Ok(BlastRadiusResolution::NotRequested);
     };
 
     // AD-414-1 / AD-414-15: open_temporal_state is the single funnel for all temporal
@@ -629,17 +429,20 @@ pub(super) fn resolve_blast_radius_paths(
                 eprintln!("skim search: {msg}");
             }
             // AD-413-16 / PF-016: RepositoryMismatch means the DB belongs to a
-            // different repository.  Returning (None, _) would overload the
-            // "not requested" sentinel — callers' .map() would yield None,
+            // different repository.  Returning None for the allowlist would overload
+            // the "not requested" sentinel — callers' .map() would yield None,
             // bypassing the file filter entirely and serving the full unfiltered
-            // index.  Return an empty allowlist instead so every blast-radius
-            // call site (AST arm, lexical arm, standalone arm) agrees: wrong
-            // repo → zero results, not all results.
+            // index.  Filtered with an empty allowlist forces zero results on all three
+            // blast-radius call sites (AC-7: also carries the degraded reason so
+            // output.degraded receives an entry — previously silent).
             if u.reason == DegradedReason::RepositoryMismatch {
-                return Ok((Some(std::collections::HashSet::new()), None));
+                return Ok(BlastRadiusResolution::Filtered {
+                    allow: std::collections::HashSet::new(),
+                    degraded: u,
+                });
             }
             // Return the unavailable reason so the caller can push DegradedJson.
-            return Ok((None, Some(u)));
+            return Ok(BlastRadiusResolution::Degraded(u));
         }
     };
 
@@ -664,7 +467,7 @@ pub(super) fn resolve_blast_radius_paths(
             };
             let msg = degraded_notice(&u, "--blast-radius", Fallback::Lexical);
             eprintln!("skim search: {msg}");
-            return Ok((None, Some(u)));
+            return Ok(BlastRadiusResolution::Degraded(u));
         }
         eprintln!("skim search: no co-change data for {raw_path:?}");
     }
@@ -672,7 +475,7 @@ pub(super) fn resolve_blast_radius_paths(
     // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
     // surface matches within the target file in addition to its co-change partners.
     allowed_paths.insert(normalized);
-    Ok((Some(allowed_paths), None))
+    Ok(BlastRadiusResolution::Allowed(allowed_paths))
 }
 
 /// Resolve a `--blast-radius` raw path to the set of matching `FileId`s.
@@ -702,10 +505,12 @@ pub(super) fn resolve_blast_radius_file_ids(
     json: bool,
     head: &HeadState,
 ) -> anyhow::Result<Option<HashSet<FileId>>> {
-    let (allowed_paths_opt, _degraded) =
-        resolve_blast_radius_paths(blast_radius, root, cache_dir, json, head)?;
-    let Some(allowed_paths) = allowed_paths_opt else {
-        return Ok(None);
+    let allowed_paths = match resolve_blast_radius_paths(blast_radius, root, cache_dir, json, head)?
+    {
+        BlastRadiusResolution::NotRequested => return Ok(None),
+        BlastRadiusResolution::Allowed(paths) => paths,
+        BlastRadiusResolution::Filtered { allow, .. } => allow,
+        BlastRadiusResolution::Degraded(_) => return Ok(None),
     };
     let file_ids = paths_to_file_ids(sorted_paths, &allowed_paths);
     Ok(Some(file_ids))
@@ -1410,6 +1215,184 @@ pub(super) fn ranked_row_count(results: &[ResolvedResult], sort: TemporalSort) -
     }
 }
 
+// ============================================================================
+// TemporalTarget trait — generic enrichment over ResolvedResult and AstResult
+// ============================================================================
+
+/// Common accessor/mutator interface for types that can receive temporal enrichment.
+///
+/// Implemented by [`ResolvedResult`] (lexical path) and [`rskim_search::AstResult`]
+/// (AST path), enabling one generic implementation of the annotate loop and sort —
+/// eliminating the four near-identical `annotate_*` functions and the duplicated
+/// score-closure + `sort_by` pair (Finding C / AD-414).
+///
+/// The trait is private to this module; public callers use the typed wrappers
+/// [`apply_temporal_enrichment`] and [`enrich_ast_results`].
+trait TemporalTarget {
+    fn path(&self) -> &str;
+    fn hotspot_score(&self) -> Option<f64>;
+    fn risk_score(&self) -> Option<f64>;
+    fn set_hotspot(&mut self, score: f64, changes_30d: u32, changes_90d: u32);
+    fn set_risk(&mut self, risk_score: f64, fix_density: f64);
+}
+
+impl TemporalTarget for ResolvedResult {
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn hotspot_score(&self) -> Option<f64> {
+        self.temporal.as_ref().and_then(|t| t.hotspot_score)
+    }
+    fn risk_score(&self) -> Option<f64> {
+        self.temporal.as_ref().and_then(|t| t.risk_score)
+    }
+    fn set_hotspot(&mut self, score: f64, changes_30d: u32, changes_90d: u32) {
+        self.temporal = Some(TemporalAnnotation {
+            hotspot_score: Some(score),
+            changes_30d: Some(changes_30d),
+            changes_90d: Some(changes_90d),
+            ..Default::default()
+        });
+    }
+    fn set_risk(&mut self, risk_score: f64, fix_density: f64) {
+        self.temporal = Some(TemporalAnnotation {
+            risk_score: Some(risk_score),
+            fix_density: Some(fix_density),
+            ..Default::default()
+        });
+    }
+}
+
+impl TemporalTarget for rskim_search::AstResult {
+    fn path(&self) -> &str {
+        &self.path
+    }
+    fn hotspot_score(&self) -> Option<f64> {
+        self.temporal.as_ref().and_then(|t| t.hotspot_score)
+    }
+    fn risk_score(&self) -> Option<f64> {
+        self.temporal.as_ref().and_then(|t| t.risk_score)
+    }
+    fn set_hotspot(&mut self, score: f64, changes_30d: u32, changes_90d: u32) {
+        self.temporal = Some(rskim_search::TemporalAnnotation {
+            hotspot_score: Some(score),
+            changes_30d: Some(changes_30d),
+            changes_90d: Some(changes_90d),
+            ..Default::default()
+        });
+    }
+    fn set_risk(&mut self, risk_score: f64, fix_density: f64) {
+        self.temporal = Some(rskim_search::TemporalAnnotation {
+            risk_score: Some(risk_score),
+            fix_density: Some(fix_density),
+            ..Default::default()
+        });
+    }
+}
+
+/// Generic annotate pass: one DB query per result (O(N)).
+///
+/// On lookup failure emits a warning and leaves the row unannotated.
+/// Returns the number of per-file lookup failures (E-16).
+/// The default `--limit` of 20 keeps the O(N) cost negligible; at
+/// `--limit 1000` this is 1000 queries — acceptable for an interactive CLI.
+fn annotate_hotspots_generic<T: TemporalTarget>(results: &mut [T], db: &TemporalDb) -> usize {
+    let mut lookup_errors: usize = 0;
+    for result in results.iter_mut() {
+        match db.hotspot_for_file(result.path()) {
+            Ok(Some(row)) => result.set_hotspot(row.score, row.changes_30d, row.changes_90d),
+            Ok(None) => {} // File not in temporal DB — leave unannotated.
+            Err(e) => {
+                eprintln!("skim search: temporal enrichment warning: {e}");
+                lookup_errors += 1;
+            }
+        }
+    }
+    lookup_errors
+}
+
+/// Generic annotate pass for risk scores; see [`annotate_hotspots_generic`].
+fn annotate_risks_generic<T: TemporalTarget>(results: &mut [T], db: &TemporalDb) -> usize {
+    let mut lookup_errors: usize = 0;
+    for result in results.iter_mut() {
+        match db.risk_for_file(result.path()) {
+            Ok(Some(row)) => result.set_risk(row.risk_score, row.fix_density),
+            Ok(None) => {} // File not in temporal DB — leave unannotated.
+            Err(e) => {
+                eprintln!("skim search: temporal enrichment warning: {e}");
+                lookup_errors += 1;
+            }
+        }
+    }
+    lookup_errors
+}
+
+/// Sort `results` by the requested temporal dimension (AD-414-13 contract).
+///
+/// Tiebreak: score DESC (Hot) / ASC (Cold) / DESC (Risky), then `path` ASC —
+/// unified total order matching SQL (resolution 8).
+fn sort_by_temporal<T: TemporalTarget>(results: &mut [T], sort: TemporalSort) {
+    match sort {
+        TemporalSort::Hot | TemporalSort::Cold => {
+            results.sort_by(|a, b| {
+                hotcold_score_cmp(
+                    a.hotspot_score().unwrap_or(-1.0),
+                    b.hotspot_score().unwrap_or(-1.0),
+                    sort,
+                )
+                .then_with(|| a.path().cmp(b.path()))
+            });
+        }
+        TemporalSort::Risky => {
+            results.sort_by(|a, b| {
+                b.risk_score()
+                    .unwrap_or(-1.0)
+                    .partial_cmp(&a.risk_score().unwrap_or(-1.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.path().cmp(b.path()))
+            });
+        }
+    }
+}
+
+/// Generic annotate + sort pass shared by both query paths.
+///
+/// - Annotates `results` with hotspot or risk data from `db`.
+/// - AD-414-13: skips the `sort_by` when `ranked == 0` — preserves upstream order.
+/// - Returns `TemporalCoverage { ranked, total, lookup_errors }`.
+fn enrich_temporal_generic<T: TemporalTarget>(
+    results: &mut [T],
+    sort: TemporalSort,
+    db: &TemporalDb,
+) -> TemporalCoverage {
+    let lookup_errors = match sort {
+        TemporalSort::Hot | TemporalSort::Cold => annotate_hotspots_generic(results, db),
+        TemporalSort::Risky => annotate_risks_generic(results, db),
+    };
+    let ranked = results
+        .iter()
+        .filter(|r| match sort {
+            TemporalSort::Hot | TemporalSort::Cold => r.hotspot_score().is_some(),
+            TemporalSort::Risky => r.risk_score().is_some(),
+        })
+        .count();
+    // AD-414-13: skip the re-sort when zero matched files carry a row for the
+    // requested dimension — degenerate sort onto the -1.0 sentinel carries no
+    // information; leave results in upstream order instead.
+    if ranked > 0 {
+        sort_by_temporal(results, sort);
+    }
+    TemporalCoverage {
+        ranked,
+        total: results.len(),
+        lookup_errors,
+    }
+}
+
+// ============================================================================
+// Combined text+temporal enrichment (Step 10)
+// ============================================================================
+
 /// Annotate and re-sort text search results with temporal data.
 ///
 /// - For `Hot`: annotate with hotspot scores, sort descending. Files absent
@@ -1437,108 +1420,7 @@ pub(super) fn apply_temporal_enrichment(
     sort: TemporalSort,
     db: &TemporalDb,
 ) -> anyhow::Result<TemporalCoverage> {
-    let lookup_errors = match sort {
-        TemporalSort::Hot | TemporalSort::Cold => annotate_hotspots(results, db),
-        TemporalSort::Risky => annotate_risks(results, db),
-    };
-    let mut cov = ranked_row_count(results, sort);
-    cov.lookup_errors = lookup_errors;
-
-    // AD-414-13: skip the re-sort when zero matched files carry a row for the
-    // requested dimension.  With all comparator keys at the `-1.0` sentinel the
-    // sort degenerates to path-ASC and carries no information from the dimension
-    // the user asked for.  Leave results in upstream lexical order instead.
-    if cov.ranked > 0 {
-        match sort {
-            TemporalSort::Hot | TemporalSort::Cold => {
-                let hotspot_score = |r: &ResolvedResult| {
-                    r.temporal
-                        .as_ref()
-                        .and_then(|t| t.hotspot_score)
-                        .unwrap_or(-1.0)
-                };
-                // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
-                // unconditionally — unified total order matching SQL (resolution 8).
-                results.sort_by(|a, b| {
-                    hotcold_score_cmp(hotspot_score(a), hotspot_score(b), sort)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
-            }
-            TemporalSort::Risky => {
-                let risk_score = |r: &ResolvedResult| {
-                    r.temporal
-                        .as_ref()
-                        .and_then(|t| t.risk_score)
-                        .unwrap_or(-1.0)
-                };
-                results.sort_by(|a, b| {
-                    risk_score(b)
-                        .partial_cmp(&risk_score(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
-            }
-        }
-    }
-    Ok(cov)
-}
-
-/// Annotate results with hotspot data using per-file lookups.
-///
-/// Performs one DB query per result (O(N)). The default `--limit` of 20 keeps
-/// this negligible. At `--limit 1000` this becomes 1000 queries — acceptable
-/// for an interactive CLI but not for batch workloads.
-///
-/// On lookup failure, emits a warning and leaves that result unannotated.
-/// Returns the number of per-file lookup failures (E-16).
-fn annotate_hotspots(results: &mut [ResolvedResult], db: &TemporalDb) -> usize {
-    let mut lookup_errors: usize = 0;
-    for result in results.iter_mut() {
-        match db.hotspot_for_file(&result.path) {
-            Ok(Some(row)) => {
-                result.temporal = Some(TemporalAnnotation {
-                    hotspot_score: Some(row.score),
-                    changes_30d: Some(row.changes_30d),
-                    changes_90d: Some(row.changes_90d),
-                    ..Default::default()
-                });
-            }
-            Ok(None) => {} // File not in temporal DB — leave unannotated.
-            Err(e) => {
-                eprintln!("skim search: temporal enrichment warning: {e}");
-                lookup_errors += 1;
-            }
-        }
-    }
-    lookup_errors
-}
-
-/// Annotate results with risk data using per-file lookups.
-///
-/// Performs one DB query per result (O(N)). See [`annotate_hotspots`] for the
-/// complexity note.
-///
-/// On lookup failure, emits a warning and leaves that result unannotated.
-/// Returns the number of per-file lookup failures (E-16).
-fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) -> usize {
-    let mut lookup_errors: usize = 0;
-    for result in results.iter_mut() {
-        match db.risk_for_file(&result.path) {
-            Ok(Some(row)) => {
-                result.temporal = Some(TemporalAnnotation {
-                    risk_score: Some(row.risk_score),
-                    fix_density: Some(row.fix_density),
-                    ..Default::default()
-                });
-            }
-            Ok(None) => {} // File not in temporal DB — leave unannotated.
-            Err(e) => {
-                eprintln!("skim search: temporal enrichment warning: {e}");
-                lookup_errors += 1;
-            }
-        }
-    }
-    lookup_errors
+    Ok(enrich_temporal_generic(results, sort, db))
 }
 
 // ============================================================================
@@ -1547,134 +1429,21 @@ fn annotate_risks(results: &mut [ResolvedResult], db: &TemporalDb) -> usize {
 
 /// Annotate and re-sort standalone `--ast` results with temporal data.
 ///
-/// The AST analogue of [`apply_temporal_enrichment`]: it applies the **identical**
-/// ordering contract — absent files sort last (score sentinel `-1.0`) and equal
-/// temporal scores tie-break by `path.cmp` — so the two query paths expose one
-/// observable sort behaviour (design decision 4 / AC-A2).
-/// This sentinel ordering governs when `ranked >= 1`; at zero coverage both arms
-/// skip the re-sort entirely, leaving the upstream order intact (AD-414-13).
-///
-/// It operates on [`rskim_search::AstResult`] and writes the library-side
-/// [`rskim_search::TemporalAnnotation`].  The small mirror (rather than a shared
-/// generic) is deliberate: the two row types carry different annotation structs,
-/// and a trait abstraction would add more indirection than the duplication saves.
+/// The AST analogue of [`apply_temporal_enrichment`]: applies the **identical**
+/// ordering contract (via [`enrich_temporal_generic`]) — absent files sort last
+/// (score sentinel `-1.0`) and equal temporal scores tie-break by `path.cmp` —
+/// so the two query paths expose one observable sort behaviour (design decision 4
+/// / AC-A2).  AD-414-13 zero-coverage skip applies: `ranked == 0` → sort skipped.
 ///
 /// Callers MUST pre-truncate `results` to the bounded re-sort window
 /// ([`resort_window`]) before calling so per-file DB lookups stay bounded (AC-P1).
 /// Returns `TemporalCoverage { ranked, total, lookup_errors }`.
-///
-/// **AD-414-13 zero-coverage skip**: when `ranked == 0` after annotation the
-/// `sort_by` is NOT applied — raw-AST order is preserved rather than re-sorting
-/// every result onto the `-1.0` sentinel.  The caller receives a
-/// `TemporalCoverage` with `ranked == 0` and may act on it (e.g. emit a
-/// degraded notice); the specific caller action is determined at call sites.
 pub(super) fn enrich_ast_results(
     results: &mut [rskim_search::AstResult],
     sort: TemporalSort,
     db: &TemporalDb,
 ) -> TemporalCoverage {
-    let total = results.len();
-    let lookup_errors = match sort {
-        TemporalSort::Hot | TemporalSort::Cold => annotate_ast_hotspots(results, db),
-        TemporalSort::Risky => annotate_ast_risks(results, db),
-    };
-    // Count ranked entries with the same predicate as ranked_row_count (AD-414-13).
-    let ranked = results
-        .iter()
-        .filter(|r| match sort {
-            TemporalSort::Hot | TemporalSort::Cold => {
-                r.temporal.as_ref().and_then(|t| t.hotspot_score).is_some()
-            }
-            TemporalSort::Risky => r.temporal.as_ref().and_then(|t| t.risk_score).is_some(),
-        })
-        .count();
-    // AD-414-13: only sort when at least one file carries a row for this dimension.
-    if ranked > 0 {
-        match sort {
-            TemporalSort::Hot | TemporalSort::Cold => {
-                let hotspot_score = |r: &rskim_search::AstResult| {
-                    r.temporal
-                        .as_ref()
-                        .and_then(|t| t.hotspot_score)
-                        .unwrap_or(-1.0)
-                };
-                // Tiebreak: score DESC (Hot) or ASC (Cold), then file_path ASC
-                // unconditionally — unified total order matching SQL (resolution 8, AD-7).
-                results.sort_by(|a, b| {
-                    hotcold_score_cmp(hotspot_score(a), hotspot_score(b), sort)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
-            }
-            TemporalSort::Risky => {
-                let risk_score = |r: &rskim_search::AstResult| {
-                    r.temporal
-                        .as_ref()
-                        .and_then(|t| t.risk_score)
-                        .unwrap_or(-1.0)
-                };
-                results.sort_by(|a, b| {
-                    risk_score(b)
-                        .partial_cmp(&risk_score(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.path.cmp(&b.path))
-                });
-            }
-        }
-    }
-    TemporalCoverage {
-        ranked,
-        total,
-        lookup_errors,
-    }
-}
-
-/// Annotate `AstResult`s with hotspot data via per-file lookups (one DB query
-/// per result). On lookup failure, emits a warning and leaves the row unannotated.
-/// Returns the number of per-file lookup failures (E-16).
-fn annotate_ast_hotspots(results: &mut [rskim_search::AstResult], db: &TemporalDb) -> usize {
-    let mut lookup_errors: usize = 0;
-    for result in results.iter_mut() {
-        match db.hotspot_for_file(&result.path) {
-            Ok(Some(row)) => {
-                result.temporal = Some(rskim_search::TemporalAnnotation {
-                    hotspot_score: Some(row.score),
-                    changes_30d: Some(row.changes_30d),
-                    changes_90d: Some(row.changes_90d),
-                    ..Default::default()
-                });
-            }
-            Ok(None) => {} // File not in temporal DB — leave unannotated.
-            Err(e) => {
-                eprintln!("skim search: temporal enrichment warning: {e}");
-                lookup_errors += 1;
-            }
-        }
-    }
-    lookup_errors
-}
-
-/// Annotate `AstResult`s with risk data via per-file lookups (one DB query per
-/// result). On lookup failure, emits a warning and leaves the row unannotated.
-/// Returns the number of per-file lookup failures (E-16).
-fn annotate_ast_risks(results: &mut [rskim_search::AstResult], db: &TemporalDb) -> usize {
-    let mut lookup_errors: usize = 0;
-    for result in results.iter_mut() {
-        match db.risk_for_file(&result.path) {
-            Ok(Some(row)) => {
-                result.temporal = Some(rskim_search::TemporalAnnotation {
-                    risk_score: Some(row.risk_score),
-                    fix_density: Some(row.fix_density),
-                    ..Default::default()
-                });
-            }
-            Ok(None) => {} // File not in temporal DB — leave unannotated.
-            Err(e) => {
-                eprintln!("skim search: temporal enrichment warning: {e}");
-                lookup_errors += 1;
-            }
-        }
-    }
-    lookup_errors
+    enrich_temporal_generic(results, sort, db)
 }
 
 // ============================================================================

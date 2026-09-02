@@ -525,6 +525,12 @@ pub(super) fn auto_refresh_if_stale(
     cache_dir: &Path,
     _analytics: &crate::analytics::AnalyticsConfig,
     reanchor: ReanchorPolicy,
+    // Pre-resolved HeadState from the caller, or None to resolve here.
+    // When Some, the resolution syscall is skipped so callers that have
+    // already called git_head_state do not incur a second HEAD-ladder
+    // traversal (Finding [low/performance] fix).  None preserves the
+    // previous behaviour.
+    pre_resolved_head: Option<HeadState>,
 ) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)> {
     use super::index::{build_index, build_index_rechecked};
     use super::types::IndexConfig;
@@ -533,7 +539,8 @@ pub(super) fn auto_refresh_if_stale(
     // the same SHA that will be in the manifest after build_index runs.
     // Step 6 (AD-413-7): use the three-state HeadState rather than Option<String>
     // so the same read feeds both the temporal rebuild and the anchor check.
-    let head_state = git_head_state(root);
+    // Finding [low/performance] fix: use the caller-supplied value when present.
+    let head_state = pre_resolved_head.unwrap_or_else(|| git_head_state(root));
     let current_head: Option<&str> = head_state.sha();
 
     let (staleness, existing_manifest) = check_staleness(cache_dir, root);

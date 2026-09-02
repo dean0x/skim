@@ -15,7 +15,7 @@ use tempfile::tempdir;
 
 use super::super::staleness::ReanchorPolicy;
 use super::{
-    build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
+    BuildLoudness, build_cochange_rows, build_hotspot_rows, build_risk_rows, rebuild_temporal,
     rebuild_temporal_with_source, rel_is_regular_file,
 };
 
@@ -1163,6 +1163,7 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result1.is_ok(),
@@ -1206,6 +1207,7 @@ fn test_degenerate_repo_empty_history_writes_empty_temporal_db() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result2.is_ok(),
@@ -1344,6 +1346,7 @@ fn test_parse_history_failure_writes_meta_head_to_prevent_retry_loop() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -1389,6 +1392,7 @@ fn test_parse_history_failure_writes_meta_head_to_prevent_retry_loop() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result2.is_ok(),
@@ -1462,6 +1466,7 @@ fn test_rebuild_temporal_parse_history_called_once() {
         &head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -1923,6 +1928,7 @@ fn test_pf017_refuse_policy_does_not_overwrite_anchor() {
         &head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(r1.is_ok(), "Allow rebuild must succeed: {r1:?}");
 
@@ -1953,6 +1959,7 @@ fn test_pf017_refuse_policy_does_not_overwrite_anchor() {
         &head,
         now,
         ReanchorPolicy::Refuse,
+        BuildLoudness::Silent,
     );
     assert!(r2.is_ok(), "Refuse rebuild must succeed: {r2:?}");
 
@@ -2098,6 +2105,7 @@ fn test_temporal_rows_are_scoped_and_reanchored_to_subdir_root() {
         &head,
         now_epoch,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     )
     .expect("rebuild_temporal_with_source must succeed for subdir root");
 
@@ -2299,6 +2307,7 @@ fn test_toplevel_root_rows_are_byte_identical_to_pre_change() {
         &head,
         now_epoch,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     )
     .expect("rebuild_temporal_with_source must succeed for toplevel root");
 
@@ -2431,6 +2440,7 @@ fn test_corrupt_db_discarded_and_rebuilt() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -2499,6 +2509,7 @@ fn test_future_schema_db_byte_unchanged_and_backoff_written() {
         fake_head,
         now,
         ReanchorPolicy::Allow, // explicit build: SE-1 loud
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -2580,6 +2591,7 @@ fn test_t16_case_i_zero_commits_writes_head_not_shallow() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -2663,6 +2675,7 @@ fn test_t16_case_ii_shallow_no_changed_files_writes_shallow_meta() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -2745,6 +2758,7 @@ fn test_t16_case_iii_ghost_filter_drops_all_rows_writes_head() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -2845,6 +2859,7 @@ fn test_corrupt_db_undelete_fails_returns_ok_sidecars_preserved() {
         "ffff6666ffff6666ffff6666ffff6666ffff6666",
         super::current_epoch_secs(),
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
 
     // Restore permissions BEFORE any assertions so tempdir cleanup can succeed
@@ -2927,6 +2942,7 @@ fn test_t26_empty_db_with_head_is_not_stale() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -3007,6 +3023,7 @@ fn test_check3_shallow_to_full_transition_detected_as_stale() {
         fake_head,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     );
     assert!(
         result.is_ok(),
@@ -3075,6 +3092,7 @@ fn test_check3_shallow_to_full_transition_detected_as_stale() {
         head2,
         now,
         ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
     )
     .expect("Check 3 non-shallow setup: rebuild must succeed");
 
