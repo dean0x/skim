@@ -162,6 +162,12 @@ pub(super) fn run_status(
         super::ParsedCommandOptions {
             combine_stderr: false,
             raw_override: user_raw_override,
+            // ADR-015 / D1 declaration — `Lossy`.  The handler injects
+            // `--porcelain=v2` and `parse_status` folds those records into
+            // counted groups, so the envelope is a summary of what the user's
+            // literal `git status` would have printed.  No 1:1 unit to count
+            // against the raw output, so `elided` = None.
+            completeness: crate::output::fidelity::Completeness::Lossy,
         },
         parse_status,
     )

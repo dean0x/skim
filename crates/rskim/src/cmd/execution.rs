@@ -12,6 +12,7 @@ use crate::cmd::stream_pump::{
     PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child, write_tail,
 };
 use crate::output::ParseResult;
+use crate::output::fidelity::{Completeness, RemedyCtx, remedy_for};
 use crate::runner::{CommandOutput, CommandRunner};
 
 // ============================================================================
@@ -260,6 +261,83 @@ pub(crate) fn write_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
 pub(crate) fn write_line_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stderr().lock();
     Ok(classify_write(write_line_and_flush(&mut handle, s))?)
+}
+
+// ============================================================================
+// JSON disclosure sink (D1 / ADR-015)
+// ============================================================================
+
+/// Whether a JSON envelope is written with a trailing newline.
+///
+/// Load-bearing, not cosmetic: the `--json` exits do **not** agree on this
+/// today, and routing them through one sink must not move a single stdout byte.
+/// `render_output` writes its envelope through [`write_to_stdout`], which
+/// appends nothing; every other JSON exit uses `println!` semantics.  Making the
+/// choice an explicit parameter is what keeps both contracts intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineTermination {
+    /// Append exactly one `\n` after the envelope (`println!` byte contract).
+    Newline,
+    /// Write the envelope verbatim, appending nothing.
+    None,
+}
+
+/// The single exit for every `--json` envelope: write it to stdout, then
+/// disclose on stderr when the caller declared the view [`Completeness::Lossy`].
+///
+/// # Why `completeness` is a required parameter
+///
+/// [`Completeness`] has no `Default`, so a new `--json` handler cannot reach
+/// this sink without choosing a value.  That is the type-level enforcement:
+/// "does this envelope contain everything the tool produced?" is a question the
+/// handler must answer, because a re-encoded envelope always differs textually
+/// from raw and `fidelity::view_differs` cannot answer it.
+///
+/// # What each declaration means
+///
+/// - [`Completeness::Complete`] / [`Completeness::Reencoded`] — nothing is
+///   written to stderr.  Not even an ADR-011 class-2 banner: the reader asked
+///   for JSON and got 100% of the content, so there is no unexpected internal
+///   decision to report.
+/// - [`Completeness::Lossy`] — an unconditional class-1 marker
+///   ([`crate::output::lossy_json_view_marker`]) naming the tool, the elided
+///   count when one exists, and the narrowest remedy that is actually true for
+///   this invocation ([`remedy_for`]).
+///
+/// `elided = Some((kept, total, unit))` renders the countable wording; `None`
+/// (or `kept >= total`) renders "summarised, not the full tool output".
+///
+/// A [`StdoutStatus::PipeClosed`] result suppresses the marker — the reader is
+/// gone, so there is nobody to disclose to — and callers must stop producing
+/// output and return [`pipe_closed_exit`].
+pub(crate) fn emit_json_envelope(
+    json: &str,
+    completeness: Completeness,
+    tool: &str,
+    elided: Option<(usize, usize, &str)>,
+    terminate: LineTermination,
+) -> anyhow::Result<StdoutStatus> {
+    let status = match terminate {
+        LineTermination::Newline => write_line_to_stdout(json)?,
+        LineTermination::None => write_to_stdout(json)?,
+    };
+
+    if status == StdoutStatus::Written && completeness == Completeness::Lossy {
+        let remedy = remedy_for(&RemedyCtx {
+            tool,
+            output_format: OutputFormat::Json,
+            passthrough_reproduces_argv: super::dispatch::passthrough_strips_json(tool),
+        });
+        // ADR-011 class 1 — unconditional, never `debug_log!`, and `eprintln!`
+        // rather than `write_line_to_stderr`: this is one of skim's own short
+        // notices, not forwarded tool stderr (see the module note in cmd/mod.rs).
+        eprintln!(
+            "{}",
+            crate::output::lossy_json_view_marker(tool, elided, &remedy)
+        );
+    }
+
+    Ok(status)
 }
 
 use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
@@ -540,15 +618,36 @@ where
 
 /// Render parsed result to stdout, returning the output string for analytics
 /// and whether the reader was still attached.
+///
+/// `tool` is the program name, needed only on the JSON path so the disclosure
+/// marker can name the tool and resolve the narrowest true remedy.
+///
+/// # Byte contract (D1 / R1)
+///
+/// This sink has always written its JSON envelope through [`write_to_stdout`],
+/// which appends **nothing** — unlike every other `--json` exit, which uses
+/// `println!` semantics.  Routing through [`emit_json_envelope`] preserves that
+/// by passing [`LineTermination::None`]; changing it would move stdout bytes on
+/// every parsed-command `--json` invocation.
 fn render_output<T>(
     result: &ParseResult<T>,
     output_format: OutputFormat,
+    tool: &str,
 ) -> anyhow::Result<(String, StdoutStatus)>
 where
     T: AsRef<str> + serde::Serialize,
 {
     let s = serialize_output(result, output_format)?;
-    let status = write_to_stdout(&s)?;
+    let status = match output_format {
+        // ADR-015 / D1 declaration — derived, not hand-written: the tier already
+        // answers it.  `Passthrough(raw)` re-encodes the tool's bytes verbatim
+        // (`Reencoded`); `Full`/`Degraded` carry a parser's summary of them
+        // (`Lossy`).  See `ParseResult::completeness`.
+        OutputFormat::Json => {
+            emit_json_envelope(&s, result.completeness(), tool, None, LineTermination::None)?
+        }
+        OutputFormat::Text => write_to_stdout(&s)?,
+    };
     Ok((s, status))
 }
 
@@ -1055,12 +1154,25 @@ where
         if output_format == OutputFormat::Json {
             let val = serde_json::json!({"tier": "passthrough", "raw": &output.stdout});
             let mut json_str = serde_json::to_string(&val)?;
-            if !json_str.ends_with('\n') {
-                json_str.push('\n');
-            }
-            if write_to_stdout(&json_str)? == StdoutStatus::PipeClosed {
+            // ADR-015 / D1 declaration — `Reencoded`.  The envelope embeds
+            // `output.stdout` verbatim as a JSON string, so every byte the tool
+            // produced reaches the reader; only the framing differs.
+            //
+            // `LineTermination::Newline` reproduces the manual `push('\n')` this
+            // site used to do before writing: `serde_json::to_string` never ends
+            // in a newline, so exactly one was always appended.
+            if emit_json_envelope(
+                &json_str,
+                Completeness::Reencoded,
+                program,
+                None,
+                LineTermination::Newline,
+            )? == StdoutStatus::PipeClosed
+            {
                 return Ok(pipe_closed_exit());
             }
+            // The analytics string must still carry the newline that was written.
+            json_str.push('\n');
             (json_str, tier_name)
         } else {
             let (tier, status) = emit_raw_passthrough(&output.stdout)?;
@@ -1106,7 +1218,7 @@ where
         }
     } else {
         // JSON or Passthrough(String): write normally, no guard needed.
-        let (s, status) = render_output(&result, output_format)?;
+        let (s, status) = render_output(&result, output_format, program)?;
         if status == StdoutStatus::PipeClosed {
             return Ok(pipe_closed_exit());
         }
@@ -1368,6 +1480,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concrete fn-pointer type for [`emit_json_envelope`]; named here to keep
+    /// the coercion in the signature-pin test readable and to satisfy the
+    /// `clippy::type_complexity` lint.
+    type JsonSink = fn(
+        &str,
+        Completeness,
+        &str,
+        Option<(usize, usize, &str)>,
+        LineTermination,
+    ) -> anyhow::Result<StdoutStatus>;
+
+    // ========================================================================
+    // D1 — the JSON disclosure sink's signature is the enforcement
+    //
+    // `rskim` is bin-only (no `src/lib.rs`), so doctests never run and
+    // `trybuild` cannot link against `pub(crate)` items.  A coercion to a
+    // concrete `fn` pointer is therefore the available compile-level pin: it
+    // fails to build if `emit_json_envelope` is deleted (E0425), if the
+    // `Completeness` parameter is dropped or defaulted away, or if the
+    // line-termination parameter is removed.
+    // ========================================================================
+
+    /// Pins the exact signature of [`emit_json_envelope`].
+    ///
+    /// The `Completeness` parameter is the whole point of D1: it has no
+    /// `Default`, so it cannot be elided at a call site, and this coercion means
+    /// it cannot be elided from the signature either without a compile error.
+    #[test]
+    fn emit_json_envelope_signature_requires_completeness_and_termination() {
+        // The coercion is the compile-level assertion: it is a type error unless
+        // `emit_json_envelope` has exactly this shape.
+        let sink: JsonSink = emit_json_envelope;
+
+        // Exercise the coercion on the zero-byte, nothing-to-disclose path:
+        // an empty envelope with `LineTermination::None` writes no stdout bytes,
+        // and `Reencoded` writes no stderr marker.
+        let status = sink(
+            "",
+            Completeness::Reencoded,
+            "git",
+            None,
+            LineTermination::None,
+        )
+        .expect("empty Reencoded envelope must not fail");
+        assert_eq!(status, StdoutStatus::Written);
+    }
+
+    /// `LineTermination` must keep both arms distinct — collapsing them would
+    /// silently add or remove a trailing newline on one of the JSON exits.
+    #[test]
+    fn line_termination_arms_are_distinct() {
+        assert_ne!(LineTermination::Newline, LineTermination::None);
+    }
 
     // ========================================================================
     // Closed-downstream-pipe contract (A0)

@@ -23,6 +23,7 @@ use rayon::prelude::*;
 use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
+use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
 use super::{finalize_git_output_owned, map_exit_code, run_passthrough};
@@ -202,9 +203,9 @@ fn render_and_format<'a>(
         // full patch body.  Reconstruct each hunk header from the parsed fields
         // (old/new start + count) and append the original patch lines verbatim.
         //
-        // This makes the JSON envelope `Completeness::Reencoded` — all content
-        // is faithfully represented in a different encoding.  ADR-011 class-1
-        // disclosure is not owed when Reencoded is declared.
+        // This is what lets the emit site below declare
+        // [`Completeness::Reencoded`] — all hunk content is faithfully carried
+        // in a different encoding, so ADR-011 class-1 disclosure is not owed.
         let patch = {
             use std::fmt::Write as _;
             let mut buf = String::new();
@@ -225,7 +226,7 @@ fn render_and_format<'a>(
             path: file_diff.path.clone(),
             status: file_diff.status.clone(),
             changed_regions: file_diff.hunks.len(),
-            patch, // Completeness::Reencoded — all hunk content preserved
+            patch,
         };
         (rendered, entry)
     };
@@ -257,7 +258,24 @@ fn render_and_format<'a>(
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-            let status = exec::write_line_to_stdout(&json)?;
+            // ADR-015 / D1 declaration — `Reencoded`, not `Complete`.
+            //
+            // Every hunk body is carried verbatim in `DiffFileEntry::patch`
+            // (D3 / #510), so no disclosure is owed.  What this envelope does
+            // NOT reproduce is git's *extended* header lines — `index
+            // abc..def 100644`, `old mode` / `new mode`, `similarity index` —
+            // which the unified-diff parser consumes into structured fields
+            // (`path`, `status`) rather than carrying as text.  That is a
+            // re-encoding of the same information, which is why this stays
+            // `Reencoded`; if a future parser change drops information instead
+            // of restructuring it, this declaration must become `Lossy`.
+            let status = exec::emit_json_envelope(
+                &json,
+                Completeness::Reencoded,
+                "git",
+                None,
+                exec::LineTermination::Newline,
+            )?;
             return Ok((json, status));
         }
         OutputFormat::Text => {

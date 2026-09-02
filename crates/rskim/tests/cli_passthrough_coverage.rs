@@ -779,6 +779,56 @@ fn test_passthrough_git_log_json_strips_flag() {
     );
 }
 
+/// `SKIM_PASSTHROUGH=1 skim git status --json` must produce byte-identical
+/// output to `/usr/bin/git status`.
+///
+/// `git status --json` is the exit whose disclosure marker carries the legacy
+/// `SKIM_PASSTHROUGH=1 for full output` remedy (D1 / ADR-011 class 1).  That
+/// remedy is only true if the hatch actually reproduces the user's argv, which
+/// requires `strip_skim_flags("git", …)` to remove `--json` before the exec —
+/// otherwise git exits 129 with "error: invalid option: --json" and the marker
+/// is pointing at a dead end.  This test is what keeps the printed remedy
+/// honest for the status path, alongside the `diff`, `show` and `log` siblings
+/// above.
+#[cfg(unix)]
+#[test]
+fn test_passthrough_git_status_json_strips_flag() {
+    let dir = TempDir::new().unwrap();
+    git_repo(dir.path());
+    // Modify the file without staging so status has something to report.
+    fs::write(
+        dir.path().join("src.rs"),
+        "fn main() {\n    println!(\"world\");\n}\n",
+    )
+    .unwrap();
+
+    // Raw baseline: /usr/bin/git status (absolute path per PF-026).
+    let raw = raw_stdout("/usr/bin/git", &["status"], dir.path());
+    assert!(
+        !raw.is_empty(),
+        "precondition: git status must produce output"
+    );
+
+    let out = passthrough_skim()
+        .current_dir(dir.path())
+        .args(["git", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "SKIM_PASSTHROUGH=1 skim git status --json must succeed \
+         (C1 strips --json before passthrough exec); got exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, raw,
+        "byte-comparison FAILED: SKIM_PASSTHROUGH=1 skim git status --json \
+         vs /usr/bin/git status must be byte-identical;\n\
+         C1 regression: strip_skim_flags must remove --json before passthrough exec"
+    );
+}
+
 // ============================================================================
 // C2: --passthrough CLI flag parity with SKIM_PASSTHROUGH=1
 // ============================================================================

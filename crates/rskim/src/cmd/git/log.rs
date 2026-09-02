@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::GitResult;
+use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
 use super::run_passthrough;
@@ -117,7 +118,26 @@ pub(super) fn run_log(
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed
+            // ADR-015 / D1 declaration — `Lossy`.
+            //
+            // Two independent drops, neither recoverable from the envelope:
+            //   1. The handler injects `--format=%h %s (%cr) <%an>`, so every
+            //      commit *body* below the subject line is gone before parsing.
+            //   2. `parse_log` keeps only `is_commit_line` matches, so a
+            //      `git log -p` patch body is filtered out entirely.
+            //
+            // Drop (2) is what the count measures: `details.len()` commit lines
+            // kept out of `raw.lines().count()` lines git produced.  When the
+            // two are equal (`git log` without `-p`) the marker falls back to
+            // the countless wording, which still discloses drop (1).
+            let elided = Some((result.details.len(), raw.lines().count(), "lines"));
+            if exec::emit_json_envelope(
+                &json,
+                Completeness::Lossy,
+                "git",
+                elided,
+                exec::LineTermination::Newline,
+            )? == exec::StdoutStatus::PipeClosed
                 || emit_elision(elision.as_ref())? == exec::StdoutStatus::PipeClosed
             {
                 return Ok(exec::pipe_closed_exit());

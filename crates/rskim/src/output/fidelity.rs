@@ -38,8 +38,12 @@
 //! deliberate differences (per-unit byte-only gate, no tokeniser, no floor)
 //! and is tracked for migration in #325.  This module does not touch it.
 
+use std::borrow::Cow;
+
+use crate::cmd::execution::OutputFormat;
+
 // ============================================================================
-// Completeness / ViewClass — disclosure-gate types (ADR-015 / D1)
+// Completeness — disclosure-gate type (ADR-015 / D1)
 // ============================================================================
 
 /// Whether the served view contains all content that was in the raw output.
@@ -71,22 +75,6 @@ pub(crate) enum Completeness {
     Lossy,
 }
 
-/// What kind of view is being served to the reader.
-///
-/// [`decide`] applies only to [`ViewClass::TextSubstitution`]; a
-/// [`ViewClass::JsonEnvelope`] never substitutes raw text — it always differs
-/// textually from raw, so substitution-gate semantics are meaningless for it.
-/// Only [`Completeness`] determines whether disclosure is owed on that path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ViewClass {
-    /// Compressed text substituted for raw text.  [`decide`] determines
-    /// whether the substitution is cost-effective.
-    TextSubstitution,
-    /// Structured JSON wrapping the content.  [`decide`] is inapplicable;
-    /// only [`Completeness`] determines whether disclosure is owed.
-    JsonEnvelope,
-}
-
 /// Returns `true` when the served view differs byte-for-byte from raw
 /// (ignoring trailing whitespace, consistent with [`decide`]).
 ///
@@ -98,40 +86,48 @@ pub(crate) fn view_differs(raw: &str, served: &str) -> bool {
     raw.trim() != served.trim()
 }
 
-/// Context for [`remedy_for`].
-///
-/// Currently empty: every invocation returns the same default remedy because
-/// skim-only flags (`--json`, `--mode`) are stripped before the passthrough
-/// exec (Phase C), making `SKIM_PASSTHROUGH=1` universally reachable.
-///
-/// Add fields here when narrower, invocation-specific remedies become possible.
-pub(crate) struct RemedyCtx {
-    _priv: (),
-}
-
-impl RemedyCtx {
-    /// Construct a new [`RemedyCtx`].
-    pub(crate) fn new() -> Self {
-        Self { _priv: () }
-    }
+/// Context for [`remedy_for`] — everything that decides whether the legacy
+/// `SKIM_PASSTHROUGH=1` hint is *literally true* for this invocation.
+pub(crate) struct RemedyCtx<'a> {
+    /// The tool whose output is being served (`"git"`, `"psql"`, `"eslint"`, …).
+    /// Always a closed-vocabulary handler name, never user-supplied text.
+    pub(crate) tool: &'a str,
+    /// The format the reader asked for.  Only [`OutputFormat::Json`] can make
+    /// the legacy hint false, because `--json` is the one skim-only flag that
+    /// is not stripped for every tool before the passthrough exec.
+    pub(crate) output_format: OutputFormat,
+    /// `true` when `SKIM_PASSTHROUGH=1 skim <tool> <argv>` re-executes the real
+    /// tool with an argv it accepts — i.e. every skim-only flag in `argv` is
+    /// removed by `cmd::dispatch::strip_skim_flags` before exec.  Callers on the
+    /// JSON path derive this from `cmd::dispatch::passthrough_strips_json`.
+    pub(crate) passthrough_reproduces_argv: bool,
 }
 
 /// Resolve the narrowest escape-hatch remedy that is **actually true** for the
 /// current invocation.
 ///
-/// The default branch — and currently the only branch — returns the legacy
-/// `"SKIM_PASSTHROUGH=1 for full output"` literal.  Because skim-only flags
-/// are stripped before passthrough exec (Phase C, ADR-015), this remedy is
-/// reachable from every invocation path, including `--json` and `--mode`.
+/// # The narrow arm — `(Json, false)`
 ///
-/// The `_ctx` parameter is reserved for future narrower remedies; the default
-/// branch ensures the pinned test assertions that check for `"SKIM_PASSTHROUGH=1"`
-/// in marker text remain green.
-pub(crate) fn remedy_for(_ctx: &RemedyCtx) -> &'static str {
-    // ADR-011 class-1: the remedy string must be literally reachable from the
-    // invocation that prints it.  Phase C flag-stripping makes SKIM_PASSTHROUGH=1
-    // universally true, so this default is no longer false for any path.
-    "SKIM_PASSTHROUGH=1 for full output"
+/// `strip_skim_flags` only removes bare `--json` for `git`; for every other tool
+/// `--json` is a *tool-owned* form (`gh pr list --json title`) that must survive
+/// the strip.  So `SKIM_PASSTHROUGH=1 skim psql --json` forwards `--json` to the
+/// real `psql`, which rejects it — the legacy hint would be a false remedy.  On
+/// that path the only true remedy is running the tool directly.
+///
+/// # The default arm
+///
+/// Everything else returns the legacy `"SKIM_PASSTHROUGH=1 for full output"`
+/// literal, which keeps the pinned marker assertions across the suite green.
+pub(crate) fn remedy_for(ctx: &RemedyCtx<'_>) -> Cow<'static, str> {
+    match (ctx.output_format, ctx.passthrough_reproduces_argv) {
+        // ADR-011 class-1: the remedy must be literally reachable from the
+        // invocation that prints it.  `--json` survives the strip for this tool,
+        // so the passthrough exec would fail — name the only true remedy.
+        (OutputFormat::Json, false) => {
+            Cow::Owned(format!("run '{}' directly for the full output", ctx.tool))
+        }
+        _ => Cow::Borrowed("SKIM_PASSTHROUGH=1 for full output"),
+    }
 }
 
 // ============================================================================
@@ -348,7 +344,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // D1: Completeness / ViewClass / view_differs / remedy_for (ADR-015)
+    // D1: Completeness / view_differs / remedy_for (ADR-015)
     // -----------------------------------------------------------------------
 
     /// Completeness has no Default impl; constructing one requires an explicit
@@ -359,14 +355,6 @@ mod tests {
         assert_ne!(Completeness::Complete, Completeness::Lossy);
         assert_ne!(Completeness::Reencoded, Completeness::Lossy);
         assert_ne!(Completeness::Complete, Completeness::Reencoded);
-    }
-
-    /// The JSON path must be declared `Reencoded` when all content is present,
-    /// `Lossy` when content is dropped.  The test also verifies `ViewClass`
-    /// discriminates the two surfaces.
-    #[test]
-    fn view_class_separates_text_from_json() {
-        assert_ne!(ViewClass::TextSubstitution, ViewClass::JsonEnvelope);
     }
 
     /// `view_differs` returns false when the strings are byte-identical (modulo
@@ -389,7 +377,11 @@ mod tests {
     /// the ~N pinned test assertions across the test suite stay green.
     #[test]
     fn remedy_for_contains_passthrough_hint() {
-        let ctx = RemedyCtx::new();
+        let ctx = RemedyCtx {
+            tool: "git",
+            output_format: OutputFormat::Text,
+            passthrough_reproduces_argv: true,
+        };
         let remedy = remedy_for(&ctx);
         assert!(
             remedy.contains("SKIM_PASSTHROUGH=1"),
@@ -401,11 +393,53 @@ mod tests {
     /// test assertions are not broken by the new dispatch function.
     #[test]
     fn remedy_for_default_is_legacy_literal() {
-        let ctx = RemedyCtx::new();
+        let ctx = RemedyCtx {
+            tool: "npm",
+            output_format: OutputFormat::Text,
+            passthrough_reproduces_argv: false,
+        };
         assert_eq!(
             remedy_for(&ctx),
             "SKIM_PASSTHROUGH=1 for full output",
             "default remedy must match legacy literal to preserve pinned test assertions"
+        );
+    }
+
+    /// `git --json` keeps the legacy hint: `strip_skim_flags` removes bare
+    /// `--json` for git, so `SKIM_PASSTHROUGH=1 skim git log --json` really does
+    /// re-exec `git log` with an argv git accepts.
+    #[test]
+    fn remedy_for_git_json_keeps_legacy_hint() {
+        let ctx = RemedyCtx {
+            tool: "git",
+            output_format: OutputFormat::Json,
+            passthrough_reproduces_argv: true,
+        };
+        assert_eq!(
+            remedy_for(&ctx),
+            "SKIM_PASSTHROUGH=1 for full output",
+            "git strips --json before the passthrough exec, so the legacy hint is true"
+        );
+    }
+
+    /// `psql --json` takes the narrow arm: `--json` is NOT stripped for psql, so
+    /// the passthrough exec would hand `--json` to the real psql and fail.  The
+    /// only true remedy is running the tool directly.
+    #[test]
+    fn remedy_for_psql_json_narrows_to_direct_run() {
+        let ctx = RemedyCtx {
+            tool: "psql",
+            output_format: OutputFormat::Json,
+            passthrough_reproduces_argv: false,
+        };
+        let remedy = remedy_for(&ctx);
+        assert_eq!(
+            remedy, "run 'psql' directly for the full output",
+            "the (Json, false) arm must name the tool, not the unreachable hatch"
+        );
+        assert!(
+            !remedy.contains("SKIM_PASSTHROUGH=1"),
+            "the narrow arm must NOT print a remedy that cannot work; got: {remedy:?}"
         );
     }
 }

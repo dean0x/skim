@@ -17,6 +17,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
+use crate::cmd::execution as exec;
 use crate::output::ParseResult;
 use crate::output::canonical::LogResult;
 
@@ -111,23 +112,29 @@ pub(crate) fn run(
     let parse_tier = result.tier_name();
     let (compressed, effective_tier) = if !flags.json_output && parse_tier != "passthrough" {
         let compressed_str = result.content().to_string();
-        match crate::cmd::execution::savings_decision(raw_input, &compressed_str) {
-            crate::cmd::execution::SavingsDecision::Keep => {
+        match exec::savings_decision(raw_input, &compressed_str) {
+            exec::SavingsDecision::Keep => {
                 // Emit compressed normally.
-                let s = emit_result(&result, &flags)?;
+                let (s, status) = emit_result(&result, &flags)?;
+                if status == exec::StdoutStatus::PipeClosed {
+                    return Ok(exec::pipe_closed_exit());
+                }
                 (s, parse_tier)
             }
-            crate::cmd::execution::SavingsDecision::Passthrough => {
+            exec::SavingsDecision::Passthrough => {
                 // Emit raw verbatim to stdout.
-                let (tier, status) = crate::cmd::execution::emit_raw_passthrough(raw_input)?;
-                if status == crate::cmd::execution::StdoutStatus::PipeClosed {
-                    return Ok(crate::cmd::execution::pipe_closed_exit());
+                let (tier, status) = exec::emit_raw_passthrough(raw_input)?;
+                if status == exec::StdoutStatus::PipeClosed {
+                    return Ok(exec::pipe_closed_exit());
                 }
                 (raw_input.to_string(), tier)
             }
         }
     } else {
-        let s = emit_result(&result, &flags)?;
+        let (s, status) = emit_result(&result, &flags)?;
+        if status == exec::StdoutStatus::PipeClosed {
+            return Ok(exec::pipe_closed_exit());
+        }
         (s, parse_tier)
     };
 
@@ -304,26 +311,53 @@ fn convert_log_result(r: rskim_compress::log::LogResult) -> LogResult {
 // Output emission
 // ============================================================================
 
-#[allow(clippy::disallowed_methods)] // Log result emission; streaming handle for potentially large log output
-fn emit_result(result: &ParseResult<LogResult>, flags: &LogFlags) -> anyhow::Result<String> {
-    let mut stdout = io::stdout().lock();
-
-    let content = if flags.json_output {
+/// Emit the compressed log result and return `(analytics string, stdout status)`.
+///
+/// Both formats route through the `cmd::execution` sinks, so this module no
+/// longer acquires a raw `io::stdout()` handle for result emission (the
+/// `clippy::disallowed_methods` allow this function used to carry is gone).
+/// The byte contract is unchanged:
+///
+/// - **JSON** — envelope plus exactly one newline (`println!` semantics).
+/// - **Text** — content verbatim, with a single newline appended only when the
+///   content is non-empty and does not already end in one.
+fn emit_result(
+    result: &ParseResult<LogResult>,
+    flags: &LogFlags,
+) -> anyhow::Result<(String, exec::StdoutStatus)> {
+    if flags.json_output {
         let json_str = result.to_json_envelope()?;
-        writeln!(stdout, "{json_str}")?;
-        stdout.flush()?;
-        json_str
-    } else {
-        let text = result.content();
-        write!(stdout, "{text}")?;
-        if !text.is_empty() && !text.ends_with('\n') {
-            writeln!(stdout)?;
-        }
-        stdout.flush()?;
-        text.to_string()
-    };
+        // ADR-015 / D1 declaration — derived from the tier
+        // (`ParseResult::completeness`): `Passthrough` re-encodes the raw input
+        // verbatim (`Reencoded`), while `Full`/`Degraded` carry a compressed
+        // view (`Lossy`) — dedup collapses repeats, `--keep-debug`-less runs
+        // drop DEBUG lines, and stack traces keep only their last 3 frames.
+        //
+        // The count is exact when a `LogResult` exists: `entries.len()` emitted
+        // entries against `total_lines` input lines.
+        let elided = match result {
+            ParseResult::Full(r) | ParseResult::Degraded(r, _) => {
+                Some((r.entries.len(), r.total_lines, "lines"))
+            }
+            ParseResult::Passthrough(_) | ParseResult::RawPassthrough => None,
+        };
+        let status = exec::emit_json_envelope(
+            &json_str,
+            result.completeness(),
+            "log",
+            elided,
+            exec::LineTermination::Newline,
+        )?;
+        return Ok((json_str, status));
+    }
 
-    Ok(content)
+    let text = result.content();
+    let status = if text.is_empty() || text.ends_with('\n') {
+        exec::write_to_stdout(text)?
+    } else {
+        exec::write_line_to_stdout(text)?
+    };
+    Ok((text.to_string(), status))
 }
 
 // ============================================================================

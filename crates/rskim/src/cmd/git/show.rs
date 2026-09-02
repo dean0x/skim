@@ -51,6 +51,7 @@ use rskim_core::{Language, Mode, TransformConfig};
 use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
+use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
 use rayon::prelude::*;
@@ -497,9 +498,10 @@ fn render_show_diff(
             true, // is_show: source must be read from the commit, not the working tree
         );
         // D3 (issue #510): carry raw hunk content so --json consumers get the
-        // full patch body, mirroring render_and_format in diff/mod.rs.
-        // Completeness::Reencoded — all content is faithfully represented in a
-        // different encoding.  ADR-011 class-1 disclosure is not owed.
+        // full patch body, mirroring render_and_format in diff/mod.rs.  This is
+        // what lets `emit_show_commit` declare [`Completeness::Reencoded`] — all
+        // content is faithfully represented in a different encoding, so ADR-011
+        // class-1 disclosure is not owed.
         let patch = {
             use std::fmt::Write as _;
             let mut buf = String::new();
@@ -586,7 +588,25 @@ fn emit_show_commit(
             // could spuriously emit `[skim:guardrail]` to stderr.
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
-            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed {
+            // ADR-015 / D1 declaration — `Reencoded`, not `Complete`.
+            //
+            // Header fields (hash, author, date, subject, body, parents) and
+            // every hunk body (`DiffFileEntry::patch`, D3 / #510) are carried,
+            // so no disclosure is owed.  What this envelope does NOT reproduce
+            // is the raw header lines the parser does not model — `Notes:`
+            // blocks, `gpg:` / `gpgsig` signature lines, `mergetag` — plus the
+            // extended diff headers noted in `diff/mod.rs`.  Those are dropped
+            // as implementation artefacts rather than user content, which is
+            // the judgement this declaration records; a parser change that
+            // starts dropping user content must flip this to `Lossy`.
+            if exec::emit_json_envelope(
+                &json,
+                Completeness::Reencoded,
+                "git",
+                None,
+                exec::LineTermination::Newline,
+            )? == exec::StdoutStatus::PipeClosed
+            {
                 return Ok(exec::StdoutStatus::PipeClosed);
             }
             finalize_git_output_owned(raw, json, label, show_stats, rec_full, duration);

@@ -77,6 +77,29 @@ impl<T> ParseResult<T> {
             ParseResult::Passthrough(_) | ParseResult::RawPassthrough => "passthrough",
         }
     }
+
+    /// The [`Completeness`] of this result's **JSON envelope** (ADR-015 / D1).
+    ///
+    /// Derived, not declared, because the tier already carries the answer:
+    ///
+    /// - `Passthrough(raw)` / `RawPassthrough` — the envelope embeds the tool's
+    ///   bytes verbatim as `{"tier":"passthrough","raw":…}`.  Every byte is
+    ///   present in a different encoding: [`Completeness::Reencoded`].
+    /// - `Full(inner)` / `Degraded(inner, _)` — a parser summarised the tool's
+    ///   output into a typed struct; the un-modelled remainder (unrecognised
+    ///   lines, formatting, ordering detail) is gone: [`Completeness::Lossy`].
+    ///
+    /// The text path must NOT use this — it has `fidelity::view_differs` for a
+    /// byte-level answer.  This is the JSON path's substitute for that
+    /// comparison, which a re-encoded envelope makes meaningless.
+    pub(crate) fn completeness(&self) -> fidelity::Completeness {
+        match self {
+            ParseResult::Passthrough(_) | ParseResult::RawPassthrough => {
+                fidelity::Completeness::Reencoded
+            }
+            ParseResult::Full(_) | ParseResult::Degraded(_, _) => fidelity::Completeness::Lossy,
+        }
+    }
 }
 
 impl<T: AsRef<str>> ParseResult<T> {
@@ -678,6 +701,127 @@ pub(crate) fn lossy_view_marker(
         (None, _) => format!("[skim] {class}: {differing}/{total} files{suffix}"),
     };
     Some(marker)
+}
+
+/// Lossy-view marker for `--json` command output (D1 / ADR-011 class 1 —
+/// unconditional).
+///
+/// The JSON sibling of [`lossy_view_marker`].  A JSON envelope always differs
+/// textually from raw, so the byte comparison that drives the file-read marker
+/// cannot decide anything here; the caller declares
+/// [`fidelity::Completeness::Lossy`] instead and this function renders the
+/// disclosure.
+///
+/// # Why this is a class-1 marker, not a class-2 banner
+///
+/// It fires exactly when the reader is served *less* than the tool produced.
+/// ADR-011 class 1 is unconditional and NOT gated by `SKIM_DEBUG`; class 2
+/// (`debug_log!`) is for lossless internal decisions.  Do not re-conflate them.
+///
+/// # Format
+///
+/// Countable — `elided = Some((kept, total, unit))` with `kept < total`:
+/// ```text
+/// [skim] json view of 'git': 41 lines omitted (3 of 44 shown) — SKIM_PASSTHROUGH=1 for full output
+/// ```
+///
+/// Countless — `elided = None`, or a `(kept, total, _)` pair with no loss to
+/// report (`kept >= total`), which is what a summarising parser with no 1:1 unit
+/// produces:
+/// ```text
+/// [skim] json view of 'git': summarised, not the full tool output — SKIM_PASSTHROUGH=1 for full output
+/// ```
+///
+/// `remedy` comes from [`fidelity::remedy_for`] so the hint is only printed when
+/// it is literally reachable from the invocation that printed it.
+pub(crate) fn lossy_json_view_marker(
+    tool: &str,
+    elided: Option<(usize, usize, &str)>,
+    remedy: &str,
+) -> String {
+    let body = match elided {
+        Some((kept, total, unit)) if kept < total => {
+            format!("{} {unit} omitted ({kept} of {total} shown)", total - kept)
+        }
+        _ => "summarised, not the full tool output".to_string(),
+    };
+    format!("[skim] json view of '{tool}': {body} \u{2014} {remedy}")
+}
+
+#[cfg(test)]
+mod lossy_json_view_marker_tests {
+    use super::*;
+
+    /// Countable arm: the marker names the exact number of omitted units and the
+    /// kept/total pair, so the reader can size what they are missing.
+    #[test]
+    fn test_lossy_json_view_marker_countable() {
+        let m = lossy_json_view_marker(
+            "git",
+            Some((3, 44, "lines")),
+            "SKIM_PASSTHROUGH=1 for full output",
+        );
+        assert!(m.starts_with("[skim] json view of 'git':"), "got: {m:?}");
+        assert!(
+            m.contains("41 lines omitted"),
+            "must name the delta; got: {m:?}"
+        );
+        assert!(
+            m.contains("(3 of 44 shown)"),
+            "must name kept/total; got: {m:?}"
+        );
+        assert!(
+            m.contains("SKIM_PASSTHROUGH=1 for full output"),
+            "must carry the remedy"
+        );
+    }
+
+    /// Countless arm: a summarising parser has no 1:1 unit to count, so the
+    /// marker still discloses, it just cannot quantify.
+    #[test]
+    fn test_lossy_json_view_marker_countless() {
+        let m = lossy_json_view_marker("git", None, "SKIM_PASSTHROUGH=1 for full output");
+        assert_eq!(
+            m,
+            "[skim] json view of 'git': summarised, not the full tool output \u{2014} \
+             SKIM_PASSTHROUGH=1 for full output"
+        );
+    }
+
+    /// `kept >= total` is not a countable loss — the marker must fall back to the
+    /// countless wording rather than print "0 lines omitted" or underflow.
+    #[test]
+    fn test_lossy_json_view_marker_kept_ge_total_falls_back() {
+        for pair in [(5usize, 5usize), (7, 2)] {
+            let m = lossy_json_view_marker(
+                "psql",
+                Some((pair.0, pair.1, "rows")),
+                "run 'psql' directly for the full output",
+            );
+            assert!(
+                m.contains("summarised, not the full tool output"),
+                "kept={} total={} must use the countless wording; got: {m:?}",
+                pair.0,
+                pair.1
+            );
+            assert!(!m.contains("omitted"), "must not claim a count; got: {m:?}");
+        }
+    }
+
+    /// The remedy is a parameter, not a literal: the narrow `remedy_for` arm must
+    /// reach stderr verbatim, with no `SKIM_PASSTHROUGH=1` leaking in.
+    #[test]
+    fn test_lossy_json_view_marker_carries_narrow_remedy() {
+        let m = lossy_json_view_marker("psql", None, "run 'psql' directly for the full output");
+        assert!(
+            m.ends_with("run 'psql' directly for the full output"),
+            "got: {m:?}"
+        );
+        assert!(
+            !m.contains("SKIM_PASSTHROUGH=1"),
+            "the narrow remedy must not be padded with the unreachable hatch; got: {m:?}"
+        );
+    }
 }
 
 #[cfg(test)]
