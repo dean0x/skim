@@ -1679,9 +1679,10 @@ fn run_query(
                     // `cov.total > 0` is load-bearing (AC-8 / AC-17(b)): a query that
                     // matched NOTHING has no ranking to degrade, so a zero-result query
                     // on a healthy DB must stay silent and must not gain a `degraded`
-                    // key.  Without this clause a zero-match query would emit the
-                    // NoRankedRows notice for "0 of 0".  Mirrors the identical guard
-                    // on the standalone --ast arm (ast.rs, `run_ast_standalone`).
+                    // key.  Without this clause a zero-result query would emit a
+                    // spurious NoRankedRows notice (cause text lives in degraded.rs).
+                    // Mirrors the identical guard on the standalone --ast arm
+                    // (ast.rs, `run_ast_standalone`).
                     if cov.ranked == 0 && cov.total > 0 {
                         // AD-414-13 zero-coverage: enrichment ran but no result received a
                         // temporal score (e.g. all files are untracked or newly added).
@@ -1875,10 +1876,16 @@ fn run_temporal_standalone(
             // it calls degraded_notice internally so DegradedJson.message always
             // matches what is printed to stderr (AD-414-1 SSOT).
             // Covers all reasons including Empty (folded from the former separate probe).
+            // `applied` is "lexical" — the ranking that would be served for any
+            // text results; consistent with the text+temporal arm (OD-B) and the
+            // plan's normative `applied == "lexical"` for Empty / NoRankedRows.
+            // `Fallback::NoResults` only affects the human-readable tail, which
+            // is suppressed here (flag = "") so the choice has no effect on the
+            // message; `applied` is the JSON-only contract field (AC-6 / RD-5).
             let dj = temporal::DegradedJson::new(
                 &u,
                 requested_flag,
-                "none",
+                "lexical",
                 "",
                 temporal::Fallback::NoResults,
             );

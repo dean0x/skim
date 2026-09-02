@@ -3056,9 +3056,14 @@ fn test_check3_shallow_to_full_transition_detected_as_stale() {
          and git_dir/shallow is absent (shallow→full transition detected)"
     );
 
-    // Discriminating assertion 2: `shallow` file exists → not stale (still shallow).
+    // Discriminating assertion 2: `shallow` file exists with content → not stale (still shallow).
+    // The file must be non-empty: gix treats a zero-length `shallow` file as absent
+    // (fully unshallowed), so the production code applies the same predicate
+    // (`m.is_file() && m.len() > 0`).  Write a single fake SHA entry so the file
+    // is recognised as a live shallow-boundary list.
     let shallow_file = fake_git_dir.join("shallow");
-    std::fs::write(&shallow_file, b"").expect("Check 3: create shallow sentinel");
+    std::fs::write(&shallow_file, b"iiii9999iiii9999iiii9999iiii9999iiii9999\n")
+        .expect("Check 3: create shallow sentinel");
     assert!(
         !temporal_db_is_stale(&cache_dir, fake_head, Some(&fake_git_dir)),
         "Check 3 (AD-414-14): temporal_db_is_stale must return false when META_IS_SHALLOW='1' \
