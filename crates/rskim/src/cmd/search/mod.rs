@@ -1681,23 +1681,15 @@ fn run_query(
                     // `cov.total > 0` is load-bearing (AC-8 / AC-17(b)): a query that
                     // matched NOTHING has no ranking to degrade, so a zero-result query
                     // on a healthy DB must stay silent and must not gain a `degraded`
-                    // key.  Without this clause a no-match query emits
-                    // "0 of 0 results have temporal data".  Mirrors the identical guard
+                    // key.  Without this clause a zero-match query would emit the
+                    // NoRankedRows notice for "0 of 0".  Mirrors the identical guard
                     // on the standalone --ast arm (ast.rs, `run_ast_standalone`).
                     if cov.ranked == 0 && cov.total > 0 {
                         // AD-414-13 zero-coverage: enrichment ran but no result received a
                         // temporal score (e.g. all files are untracked or newly added).
                         // Skip the re-sort; preserve lexical order; emit degraded signal.
-                        // DegradedReason::no_ranked_rows_detail is the SSOT for this text
-                        // (Finding [medium/consistency]).
-                        let detail = temporal::DegradedReason::no_ranked_rows_detail(
-                            cov.total,
-                            cov.lookup_errors,
-                        );
-                        Some(temporal::TemporalUnavailable {
-                            reason: temporal::DegradedReason::NoRankedRows,
-                            detail,
-                        })
+                        // DegradedReason::no_ranked_rows is the SSOT builder (Finding [medium/complexity]).
+                        Some(temporal::DegradedReason::no_ranked_rows(cov))
                     } else {
                         None
                     }

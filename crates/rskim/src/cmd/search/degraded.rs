@@ -140,10 +140,11 @@ impl DegradedReason {
 
     /// Build the `NoRankedRows` detail string from coverage counters.
     ///
-    /// SSOT for the "0 of N results have temporal data" text (Finding [medium/consistency]).
-    /// Callers set this as `TemporalUnavailable { reason: NoRankedRows, detail }`;
-    /// `cause()` returns `detail` verbatim for `NoRankedRows`, making this constructor
-    /// the single composer of that string.  Enforced by the `"0 of "` entry in
+    /// Low-level SSOT for the "0 of N results have temporal data" text; called by
+    /// [`super::temporal::DegradedReason::no_ranked_rows`], the higher-level builder
+    /// that constructs the full [`TemporalUnavailable`] (Finding [medium/complexity]).
+    /// `cause()` returns `detail` verbatim for `NoRankedRows`.
+    /// Enforced by the `"0 of "` and `"results have temporal data"` entries in
     /// `cause_substrings_for_guard` (t19b guard).
     pub(super) fn no_ranked_rows_detail(total: usize, lookup_errors: usize) -> String {
         if lookup_errors > 0 {
@@ -367,7 +368,9 @@ pub(super) fn cause_substrings_for_guard() -> &'static [&'static str] {
         "temporal data is empty (0 rows)",
         "temporal data built 0 rows",
         // NoRankedRows: "0 of N results have temporal data …"
-        // no_ranked_rows_detail() is the single builder; "0 of " is the distinctive prefix.
+        // Two overlapping substrings guard the full phrase so renaming one part
+        // fails the t19b test even if the other is coincidentally preserved.
         "0 of ",
+        "results have temporal data",
     ]
 }

@@ -219,6 +219,25 @@ pub(super) struct TemporalCoverage {
     pub lookup_errors: usize,
 }
 
+impl DegradedReason {
+    /// Single builder for a `NoRankedRows` [`TemporalUnavailable`].
+    ///
+    /// Consolidates the `detail`-build + struct-construction that were duplicated
+    /// at `ast.rs` (`run_ast_standalone`) and `mod.rs` (`run_query`) into one SSOT,
+    /// so changing the wording of the zero-coverage notice requires editing one call
+    /// chain only (Finding [medium/complexity]).
+    ///
+    /// `TemporalCoverage` is defined in this module; the low-level string builder
+    /// `no_ranked_rows_detail` stays in `degraded.rs` (leaf module) and is called
+    /// here rather than at the two former call sites.
+    pub(super) fn no_ranked_rows(cov: TemporalCoverage) -> TemporalUnavailable {
+        TemporalUnavailable {
+            reason: Self::NoRankedRows,
+            detail: Self::no_ranked_rows_detail(cov.total, cov.lookup_errors),
+        }
+    }
+}
+
 // ============================================================================
 // DB open / state resolution
 // ============================================================================
