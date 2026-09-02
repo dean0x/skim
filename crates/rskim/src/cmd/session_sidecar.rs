@@ -661,7 +661,7 @@ mod tests {
     }
 
     /// Clearing when nothing is there is a no-op, not an error — the hook calls
-    /// it on every command, most of which never set a marker.
+    /// it for every command that reaches extraction, most of which never set a marker.
     #[test]
     fn test_set_force_raw_clear_is_idempotent() {
         let tmp = TempDir::new().unwrap();
@@ -818,8 +818,8 @@ mod tests {
     }
 
     /// `sessions/` is bounded without depending on session attribution being
-    /// configured: `set_force_raw` runs on every hook invocation and reaps
-    /// markers on the marker's own clock.
+    /// configured: `set_force_raw` runs on every hook invocation that reaches
+    /// command extraction and reaps markers on the marker's own clock.
     #[test]
     fn test_set_force_raw_reaps_stale_markers() {
         let tmp = TempDir::new().unwrap();

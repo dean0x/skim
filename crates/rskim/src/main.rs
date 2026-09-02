@@ -844,7 +844,10 @@ fn stdout_should_serve_raw() -> bool {
 /// hook sees `| tee out.txt`, `$(…)`, or a redirect onto a file/named FIFO, it
 /// records a force-raw marker in the PID-keyed sidecar; this wrapper invocation
 /// discovers it by walking its process ancestry. The marker is re-evaluated —
-/// set *or cleared* — on every hook invocation, so it never outlives one command.
+/// set *or cleared* — by every hook invocation that reaches command extraction,
+/// so it never outlives a command the hook actually processed; five early exits
+/// (passthrough mode, AwarenessOnly agents, stdin read error, JSON parse error,
+/// missing command field) skip the write.
 ///
 /// # Why the tool name is part of the key
 ///
@@ -866,8 +869,11 @@ fn stdout_should_serve_raw() -> bool {
 /// would require the wrapper to inspect its sibling processes, which is neither
 /// portable nor reliable. Skim does not pretend otherwise.
 ///
-/// Failure direction is deliberate: a stale or missing marker costs compression
-/// (lossless), never bytes.
+/// Failure direction: a stale or missing marker makes a FIFO compress. For
+/// `| cat` that is lossless; for a byte-exact consumer (`| tee f`,
+/// `| sha256sum`) it is byte loss — measured 304 bytes served instead of 6803,
+/// with nothing on stderr. See `session_sidecar.rs` on the same-tool clear
+/// (#514) and `no_hook_means_fstat_only_behaviour` for the hook-less case.
 fn force_raw_requested(tool: &str) -> bool {
     cmd::resolve_cache_dir()
         .as_deref()

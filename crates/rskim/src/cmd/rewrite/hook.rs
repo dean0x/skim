@@ -421,8 +421,9 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
     // stdout-destination verdict. `| tee out.txt`, `$(…)` and a named-FIFO
     // redirect all present the wrapper with a FIFO on fd 1, indistinguishable
     // from `| cat` — only here, where the pipeline shape is visible, can they be
-    // told apart. `set_force_raw` is called unconditionally with the verdict, so
-    // a `false` CLEARS any previous marker and it never outlives one command.
+    // told apart. `set_force_raw` is called with the verdict, so a `false`
+    // CLEARS any previous marker, so it never outlives a command this call
+    // processed (the early returns above this point do not reach it).
     //
     // The verdict is scoped to `command_heads` — the tools this command names —
     // because PPID alone is not a command identity: every command an agent runs
