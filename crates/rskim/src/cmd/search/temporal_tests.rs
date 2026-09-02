@@ -3058,9 +3058,8 @@ fn assert_corpus_is_substantial(sources: &[(String, String)]) {
 /// The §2.3 cause texts must exist in exactly one place: the `DegradedReason`
 /// builder in `temporal.rs`.  Any other production file under `cmd/search/` that
 /// contains a cause substring is a second emit site — the failure mode this
-/// criterion exists to catch, because a hand-rolled `eprintln!` drifts from the
-/// builder silently (that is exactly how #413's `temporal_unavailable_msg`
-/// duplicate arose).
+/// criterion exists to catch, because a hand-rolled cause literal outside the
+/// builder drifts silently.
 ///
 /// Discriminating (PF-007): re-introducing any hand-written cause literal in
 /// `mod.rs`, `ast.rs`, `query.rs`, `staleness.rs` or `temporal_build.rs` fails

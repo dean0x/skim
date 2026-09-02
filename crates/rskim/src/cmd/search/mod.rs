@@ -3317,10 +3317,10 @@ mod tests {
     }
 
     /// `degraded_notice` for Empty (non-shallow, no flag) returns the §2.3
-    /// normative text — NOT the old TEMPORAL_BUILD_EMPTY_MSG (AC-2).
+    /// normative text (AC-2).
     ///
-    /// The old assertion pinned `TEMPORAL_BUILD_EMPTY_MSG` (contained a SKIM_DEBUG
-    /// hint, not "--rebuild"), which failed AC-2.  Replaced with the §2.3 text.
+    /// A hand-written cause literal outside the builder drifts silently;
+    /// this test pins the §2.3 text directly so any drift fails at the assertion site.
     #[test]
     fn test_degraded_notice_empty_non_shallow_ac2() {
         const EMPTY_CAUSE_PREFIX: &str = "temporal data is empty (0 rows) \u{2014} this repository has no commit history skim can analyse";
@@ -4778,5 +4778,102 @@ mod tests {
             "T-15(5): zero-row DB must report 'empty'; got: {:?}",
             stats["temporal_state"]
         );
+    }
+
+    // ========================================================================
+    // T-17 / AC-17(a) — healthy-state silence via production reason-table iteration
+    // ========================================================================
+
+    /// T-17 / AC-17(a) — healthy-state silence: no cause substring on stderr.
+    ///
+    /// Iterates the production `DegradedReason` table via `cause_substrings_for_guard`
+    /// and asserts that NONE of the cause substrings appear on stderr across the six
+    /// healthy invocations listed in §AC-17:
+    ///   1. `skim search TERM`
+    ///   2. `skim search TERM --json`
+    ///   3. `skim search TERM --hot --json`
+    ///   4. `skim search --hot --json`  (standalone temporal, no text query)
+    ///   5. `skim search --stats`
+    ///   6. `skim search --stats --json`
+    ///
+    /// The production table is the source of truth (AC-17(a): "iterate the production
+    /// reason table, not hand-written literals"), so a newly added `DegradedReason`
+    /// variant that fires on healthy state will automatically fail this test.
+    ///
+    /// Driven as a subprocess so real stderr is captured (an in-process call captures
+    /// nothing on its own for `eprintln!` output).
+    #[test]
+    fn t17_ac17a_healthy_state_no_degraded_cause_on_stderr() {
+        let bin = skim_bin_path();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+        let cache = tempfile::TempDir::new().unwrap();
+        let cache_str = cache.path().to_string_lossy().to_string();
+
+        // Build a real git repo with ≥2 commits so temporal.db is populated.
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: add auth", &[("src/auth.rs", "fn authenticate() {}")]),
+                ("feat: add parser", &[("src/parser.rs", "fn parse() {}")]),
+                (
+                    "fix: fix auth",
+                    &[("src/auth.rs", "fn authenticate() { /* fixed */ }")],
+                ),
+            ],
+        );
+
+        // Build the lexical + AST + temporal index.
+        let build_status = std::process::Command::new(&bin)
+            .args(["search", "--build", "--root", &root_str])
+            .env("SKIM_CACHE_DIR", &cache_str)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .status()
+            .expect("T-17 setup: failed to spawn skim --build");
+        assert!(
+            build_status.success(),
+            "T-17 setup: skim search --build must succeed"
+        );
+
+        // Cause substrings from the production DegradedReason table — never hand-written.
+        // AC-17(a): the production table is authoritative; a new variant that fires on
+        // healthy state fails this test automatically.
+        let cause_subs = temporal::cause_substrings_for_guard();
+
+        // Six healthy invocations in §AC-17 order.
+        let invocations: &[(&str, &[&str])] = &[
+            ("skim search TERM", &["auth"]),
+            ("skim search TERM --json", &["auth", "--json"]),
+            (
+                "skim search TERM --hot --json",
+                &["auth", "--hot", "--json"],
+            ),
+            ("skim search --hot --json", &["--hot", "--json"]),
+            ("skim search --stats", &["--stats"]),
+            ("skim search --stats --json", &["--stats", "--json"]),
+        ];
+
+        for (label, args) in invocations {
+            let out = std::process::Command::new(&bin)
+                .arg("search")
+                .args(*args)
+                .args(["--root", &root_str])
+                .env("SKIM_CACHE_DIR", &cache_str)
+                .env("SKIM_DISABLE_ANALYTICS", "1")
+                .env("NO_COLOR", "1")
+                .output()
+                .unwrap_or_else(|e| panic!("T-17 '{label}': failed to spawn skim: {e}"));
+
+            let stderr = String::from_utf8_lossy(&out.stderr);
+
+            for cause in cause_subs {
+                assert!(
+                    !stderr.contains(cause),
+                    "T-17/AC-17(a): healthy-state stderr must not contain cause substring \
+                     '{cause}' on invocation '{label}'; got stderr:\n{stderr}"
+                );
+            }
+        }
     }
 }

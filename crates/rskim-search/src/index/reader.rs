@@ -636,8 +636,8 @@ impl NgramIndexReader {
     /// already treats any version below `FORMAT_VERSION` as stale and triggers a
     /// rebuild; a version above it is a future format that must not be touched.
     ///
-    /// Used by `check_staleness` in place of the now-deleted `lexical_index_version`.
-    /// The structural check ensures that a truncated or otherwise size-inconsistent
+    /// Used by `check_staleness` to verify structural consistency of the on-disk
+    /// lexical index.  The structural check ensures that a truncated or otherwise size-inconsistent
     /// lexical index triggers a rebuild via the `Err(_) => true` staleness arm
     /// (S3 self-heal, AC-11).  A foreign-format file still triggers a rebuild via
     /// the `v < FORMAT_VERSION` arm.
