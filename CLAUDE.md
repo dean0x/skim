@@ -74,6 +74,10 @@ A machine-global `~/.cargo/config.toml` caps every cargo invocation at `jobs = 4
 
 Modes are set via `--mode` only (no config file): `structure` (default), `signatures`, `types`, `minimal`, `pseudo`, `full`.
 
+### Bounded output (`--max-lines`, `--last-lines`, `--tokens`)
+
+`--max-lines N` emits at most N lines total, elision marker included — this is what the rewrite hook turns `head -N` into, so a bound the tool can exceed is not a bound (ADR-016). The sole exception is N=1: one content line plus the marker (2 lines), because spending the only slot on the marker returns a view with no code, and silently dropping the marker is the defect this flag exists to prevent. `--last-lines N` is the tail mirror: at most N lines total including the leading marker. For `--tokens N`, the cascade escalates modes until the output fits; on tight budgets the exact elided count appears on stdout (compact marker) and `SKIM_PASSTHROUGH=1` remedy is printed unconditionally to stderr per ADR-011 class 1.
+
 ### Subcommands
 
 Most subcommands wrap a dev tool (cargo, git, npm, pytest, eslint, docker, psql, grep, …) and compress its output — run `skim --help` for the full catalog. The ones with non-obvious behavior:
