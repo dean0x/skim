@@ -1197,6 +1197,10 @@ fn hotcold_score_cmp(score_a: f64, score_b: f64, sort: TemporalSort) -> std::cmp
 /// comparator) and do NOT count as ranked.
 ///
 /// Unit-testable without a DB: supply pre-annotated results and a sort direction.
+///
+/// Only called from tests (the production path uses the inline counter inside
+/// [`enrich_temporal_generic`] to avoid a second pass).
+#[cfg(test)]
 pub(super) fn ranked_row_count(results: &[ResolvedResult], sort: TemporalSort) -> TemporalCoverage {
     let total = results.len();
     let ranked = results
