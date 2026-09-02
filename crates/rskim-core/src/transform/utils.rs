@@ -278,6 +278,30 @@ pub enum ElidedSide {
     Truncated,
     /// Lines dropped *before* the retained window (`--last-lines`): `(N lines above)`.
     Above,
+    /// [`ElidedSide::Truncated`], for the degenerate cut where the retained
+    /// window could not be pulled back out of a multi-line string literal
+    /// because the literal opens on the first retained line (#511):
+    /// `(N lines truncated; cut inside a string literal)`.
+    ///
+    /// The clause is part of the disclosure (ADR-011 class 1): the reader is
+    /// told not just how much is missing but that what remains is the head of
+    /// a literal, so its trailing delimiter is absent by construction.
+    TruncatedInsideLiteral,
+    /// [`ElidedSide::TruncatedInsideLiteral`] for a Markdown fenced code block:
+    /// `(N lines truncated; cut inside a code fence)`.
+    TruncatedInsideFence,
+    /// [`ElidedSide::Above`], for the degenerate `--last-lines` window that
+    /// could not be moved forward out of a multi-line string literal because
+    /// the literal has no closing delimiter before end of file (#511):
+    /// `(N lines above; cut inside a string literal)`.
+    ///
+    /// The head window pulls *back* and the tail window moves *forward*, but
+    /// the disclosure obligation is identical: what remains is the middle of a
+    /// literal, so its opening delimiter is absent by construction.
+    AboveInsideLiteral,
+    /// [`ElidedSide::AboveInsideLiteral`] for a Markdown fenced code block:
+    /// `(N lines above; cut inside a code fence)`.
+    AboveInsideFence,
 }
 
 /// Build the canonical elision marker line for `language`.
@@ -307,11 +331,15 @@ pub fn elision_marker_line(
         None => ("#", ""),
     };
     let unit = if elided == 1 { "line" } else { "lines" };
-    let side_word = match side {
+    let side_text = match side {
         ElidedSide::Truncated => "truncated",
         ElidedSide::Above => "above",
+        ElidedSide::TruncatedInsideLiteral => "truncated; cut inside a string literal",
+        ElidedSide::TruncatedInsideFence => "truncated; cut inside a code fence",
+        ElidedSide::AboveInsideLiteral => "above; cut inside a string literal",
+        ElidedSide::AboveInsideFence => "above; cut inside a code fence",
     };
-    let body = format!("... ({elided} {unit} {side_word})");
+    let body = format!("... ({elided} {unit} {side_text})");
     match hint {
         Some(h) => format!("{prefix} {body} \u{2014} {h}{suffix}"),
         None => format!("{prefix} {body}{suffix}"),

@@ -337,3 +337,90 @@ fn test_pseudo_max_lines_marker_count_is_positive_and_plausible() {
          marker: {marker:?}"
     );
 }
+// ============================================================================
+// (e) Literal boundaries — the cut must not land inside a string literal (#511)
+// ============================================================================
+
+/// 200 lines of filler around two template literals: lines 38-44 (in reach of a
+/// `--max-lines` cut) and lines 160-167 (in reach of a `--last-lines` window).
+const TS_MULTILINE_LITERAL: &str =
+    include_str!("../../../tests/fixtures/typescript/multiline_literal.ts");
+
+/// End-to-end through `transform_with_config`: `--max-lines 40` used to keep
+/// line 38's opening backtick with no closer, so the elision marker — and every
+/// line an agent read after it — was the tail of a template literal.
+///
+/// Measured at e48f977 (`skim … --mode full --max-lines 40`): 40 lines,
+/// 1 backtick, `// ... (161 lines truncated)`. Required: the window pulls back
+/// to line 37, so the output is 38 lines with balanced backticks and a marker
+/// counting the 163 source lines the agent cannot see.
+#[test]
+fn test_max_lines_does_not_cut_inside_template_literal() {
+    let out = xform(
+        TS_MULTILINE_LITERAL,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Full).with_max_lines(40),
+    );
+
+    let backticks = out.bytes().filter(|byte| *byte == b'`').count();
+    assert_eq!(
+        backticks % 2,
+        0,
+        "--max-lines must not leave a template literal open ({backticks} backticks):\n{out}"
+    );
+    assert!(
+        out.lines().count() <= 40,
+        "--max-lines 40 is a bound; got {} lines",
+        out.lines().count()
+    );
+    assert_eq!(
+        out.lines().next_back().unwrap(),
+        "// ... (163 lines truncated)",
+        "the marker counts from the pulled-back window:\n{out}"
+    );
+}
+
+/// PF-019 / #511: the `-n` labels come from a line map that
+/// `transform_passthrough_with_line_map` rebuilt arithmetically from `n`
+/// (`start_line = source_line_count - (n - 1) + 1`). Once #511 can move the
+/// `--last-lines` window forward — out of a multi-line literal — that
+/// arithmetic no longer describes the window the truncator produced, and every
+/// retained line is labelled with the wrong source line. The map must be
+/// derived from the truncator's own start.
+///
+/// Measured at 9058273 (`skim … --mode full --last-lines 40 -n`): the window
+/// starts at source line 162, mid-literal, and is labelled `162` — self-
+/// consistent, but the window is wrong. Required: the window starts at source
+/// line 168 (past the literal's closer) and the labels follow it there.
+#[test]
+fn test_last_lines_line_map_follows_the_moved_window() {
+    let config = TransformConfig::with_mode(Mode::Full)
+        .with_last_lines(40)
+        .with_line_numbers(true);
+    let (out, _has_errors, line_map, _degraded) =
+        rskim_core::transform_with_line_map(TS_MULTILINE_LITERAL, Language::TypeScript, &config)
+            .expect("transform must succeed for fixture inputs");
+
+    let map = line_map.expect("line_numbers = true must yield a map");
+    let out_lines: Vec<&str> = out.lines().collect();
+    let source_lines: Vec<&str> = TS_MULTILINE_LITERAL.lines().collect();
+
+    assert_eq!(map.len(), out_lines.len(), "one label per output line");
+    assert_eq!(map[0], 0, "the marker line carries no annotation");
+
+    // The invariant, wherever the window ends up: a labelled line must BE the
+    // source line its label names.
+    for (output_line, label) in out_lines.iter().zip(&map).skip(1) {
+        let labelled = label.checked_sub(1).and_then(|i| source_lines.get(i));
+        assert_eq!(
+            labelled.copied(),
+            Some(*output_line),
+            "output line labelled {label} is not source line {label}"
+        );
+    }
+
+    // ...and the window is the one #511 produces: it begins after the tail
+    // literal's closer on line 167, not inside the literal on line 162.
+    assert_eq!(map[1], 168, "the window must begin at source line 168");
+    assert_eq!(map.last().copied(), Some(200));
+}

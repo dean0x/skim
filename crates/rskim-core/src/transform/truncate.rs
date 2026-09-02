@@ -5,6 +5,7 @@
 //! Types and signatures are kept over imports, which are kept over bodies.
 //! Omission markers are inserted between gaps using language-appropriate comment syntax.
 
+use crate::transform::literal_scan;
 use crate::transform::utils::{ElidedSide, elision_marker_line, score_node_kind};
 use crate::{Language, Result};
 use std::borrow::Cow;
@@ -154,7 +155,7 @@ pub(crate) fn truncate_to_lines(
 
     // Step 4: Trim — drop lowest-priority spans until content + markers <= max_lines.
     //
-    // The marker occupies one of the N lines (#317 / ADR-002: `--max-lines N` ≡
+    // The marker occupies one of the N lines (#317 / ADR-016: `--max-lines N` ≡
     // `head -N`).  All markers (leading, gap, trailing) count against the N budget.
     //
     // Performance note: This loop is O(n^2) where n = number of selected spans.
@@ -248,7 +249,7 @@ pub(crate) fn truncate_to_lines(
         }
 
         // Add lines from this span. Reserve 1 slot for the trailing marker so that
-        // content + trailing marker never exceeds max_lines (#317 / ADR-002).
+        // content + trailing marker never exceeds max_lines (#317 / ADR-016).
         let remaining_budget = max_lines
             .saturating_sub(result_lines.len())
             .saturating_sub(1);
@@ -281,7 +282,7 @@ pub(crate) fn truncate_to_lines(
     }
 
     // Safety cap: total output (content + all markers) must not exceed max_lines
-    // (#317 / ADR-002: `--max-lines N` ≡ `head -N`).  The trim step above is the
+    // (#317 / ADR-016: `--max-lines N` ≡ `head -N`).  The trim step above is the
     // primary enforcement; this truncate is the last-resort guard.
     result_lines.truncate(max_lines);
 
@@ -294,11 +295,32 @@ pub(crate) fn truncate_to_lines(
     Ok(output)
 }
 
+/// Marker spelling for a cut that could not be moved out of a multi-line
+/// construct (#511).
+///
+/// `base` picks the direction wording: [`ElidedSide::Truncated`] for the
+/// `--max-lines` head window, [`ElidedSide::Above`] for the `--last-lines` tail
+/// window. `language` picks the construct — Markdown's multi-line construct is
+/// a fenced code block, every other language's is a string literal.
+const fn cut_inside_side(base: ElidedSide, language: Language) -> ElidedSide {
+    match (base, language) {
+        (ElidedSide::Above, Language::Markdown) => ElidedSide::AboveInsideFence,
+        (ElidedSide::Above, _) => ElidedSide::AboveInsideLiteral,
+        (_, Language::Markdown) => ElidedSide::TruncatedInsideFence,
+        (_, _) => ElidedSide::TruncatedInsideLiteral,
+    }
+}
+
 /// Simple line truncation for serde-based languages (JSON, YAML) or fallback
 ///
 /// Emits the first `max_lines - 1` content lines then appends an omission marker
 /// as the `max_lines`-th line.  Total output is at most `max_lines` lines, keeping
-/// `--max-lines N` equivalent to `head -N` (#317 / ADR-002).
+/// `--max-lines N` equivalent to `head -N` (#317 / ADR-016).
+///
+/// ADR-016 owns this arithmetic: `--max-lines N` yields **N lines total, marker
+/// included**, with one documented exception at `N = 1` (below). ADR-002 owns
+/// the unrelated degrade-to-lossless-passthrough rule and was cited here by
+/// mistake.
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
 ///
@@ -311,6 +333,20 @@ pub(crate) fn truncate_to_lines(
 /// For serde paths, the caller (E5) passes `Some(source.lines().count())` because
 /// the serde transform restructures text so the output has far fewer lines than
 /// the source.
+///
+/// # Literal boundaries (#511)
+///
+/// The cut never lands *inside* a multi-line string literal (or a Markdown
+/// fenced code block). Text cut mid-literal stops being what it looks like: the
+/// tail of a template literal reads as code, and a half-emitted fence turns the
+/// rest of a document into a code block that swallows the marker itself.
+///
+/// The window is pulled **back** to just before the opening line — never forward
+/// past the closer, which would break the `--max-lines N` ≡ `head -N` bound
+/// (#317 / ADR-016). When the literal opens on the first retained line there is
+/// nothing to pull back to, and the output takes the degenerate shape: the
+/// marker FIRST (so it is outside the literal and still readable), then the raw
+/// cut, with the marker naming the cut it could not avoid.
 pub(crate) fn simple_line_truncate(
     text: &str,
     language: Language,
@@ -325,7 +361,7 @@ pub(crate) fn simple_line_truncate(
     }
 
     // Reserve 1 slot for the marker so that `--max-lines N` ≡ `head -N`:
-    // at most N total lines (#317 / ADR-002).  content_lines = N-1; the marker
+    // at most N total lines (#317 / ADR-016).  content_lines = N-1; the marker
     // occupies the Nth slot.
     //
     // N=1 is the one irreconcilable case, and it resolves in favour of BOTH
@@ -335,19 +371,52 @@ pub(crate) fn simple_line_truncate(
     // unconditional. So N=1 alone emits 1 content line + 1 marker = 2 lines.
     // Every N > 1 holds the bound exactly: N-1 content + 1 marker = N.
     // E3: use source-space line count when provided; fall back to output-space.
-    let content_lines = if max_lines > 1 {
+    let mut content_lines = if max_lines > 1 {
         max_lines - 1
     } else {
         max_lines
     };
+
+    // #511: pull the cut back out of a multi-line literal / Markdown fence.
+    //
+    // The scan is a single forward pass over `text`, run ONCE per truncation
+    // call. `content_lines == 0` (only reachable via `max_lines == 0`) has no
+    // last retained line to ask about, so it skips the scan entirely.
+    let mut side = ElidedSide::Truncated;
+    if let Some(last_retained) = content_lines.checked_sub(1) {
+        match literal_scan::scan(text, language).open_after(last_retained) {
+            // The cut lands inside a literal opened further down: retain up to
+            // the line before the opener. `open` is the opener's 0-based index,
+            // so it is also the count of lines before it. Backwards only — a
+            // forward cut would exceed the N bound (ADR-016).
+            Some(open) if open > 0 => content_lines = open,
+            // FAIL-SAFE: snapping back would leave zero content lines (the
+            // literal opens on line 1). A bare marker is not a code view, so
+            // keep the raw cut and switch to the degenerate shape below.
+            Some(_) => side = cut_inside_side(ElidedSide::Truncated, language),
+            None => {}
+        }
+    }
+    let degenerate = side != ElidedSide::Truncated;
+
     let total = source_line_count.unwrap_or(lines.len());
     let omitted = total.saturating_sub(content_lines);
-    let marker = elision_marker_line(Some(language), omitted, ElidedSide::Truncated, hint);
+    let marker = elision_marker_line(Some(language), omitted, side, hint);
 
     // Take first content_lines lines, then append marker (total = max_lines,
     // except the documented N=1 case which yields 2).
-    let mut result: Vec<&str> = lines[..content_lines].to_vec();
-    result.push(&marker);
+    //
+    // Degenerate case: the marker goes FIRST instead. Appended, it would land
+    // inside the unterminated literal it is reporting — commented out by the
+    // literal's own syntax, invisible to the reader who most needs it.
+    let mut result: Vec<&str> = Vec::with_capacity(content_lines + 1);
+    if degenerate {
+        result.push(&marker);
+    }
+    result.extend_from_slice(&lines[..content_lines]);
+    if !degenerate {
+        result.push(&marker);
+    }
 
     let mut output = result.join("\n");
     if text.ends_with('\n') {
@@ -360,17 +429,22 @@ pub(crate) fn simple_line_truncate(
 /// Simple last-line truncation: keeps only the last N lines of output
 ///
 /// Emits a truncation marker followed by the last `n - 1` content lines.
-/// Total output is at most `n` lines, keeping `--max-lines N` equivalent to
-/// `head -N` (#317 / ADR-002).
+/// Total output is at most `n` lines, so `--last-lines N` bounds the WHOLE
+/// output, marker included (#317 / ADR-016).
 /// Uses language-appropriate comment syntax.
 ///
 /// `hint` is appended to the marker when `Some` (B5 / ADR-011 class 1 remedy clause).
 ///
 /// # Source-space counts (E3)
 ///
-/// When `source_line_count` is `Some(k)`, the marker reports `k - (n - 1)` lines
-/// above — the count in **source** space. `None` falls back to
-/// `text.lines().count() - (n - 1)`.
+/// When `source_line_count` is `Some(k)`, the marker reports `k - content_lines`
+/// lines above — the count in **source** space. `None` falls back to
+/// `text.lines().count() - content_lines`.
+///
+/// # Literal boundaries (#511, E7.3)
+///
+/// See [`simple_last_line_truncate_with_start`]: the retained window never
+/// *begins* inside a multi-line string literal or a Markdown fenced code block.
 pub(crate) fn simple_last_line_truncate(
     text: &str,
     language: Language,
@@ -378,31 +452,106 @@ pub(crate) fn simple_last_line_truncate(
     hint: Option<&str>,
     source_line_count: Option<usize>,
 ) -> Result<String> {
+    simple_last_line_truncate_with_start(text, language, n, hint, source_line_count)
+        .map(|(output, _start)| output)
+}
+
+/// [`simple_last_line_truncate`], also returning the 0-based index of the first
+/// retained line of `text`.
+///
+/// # Why the start is returned
+///
+/// PF-019: `Language::transform_passthrough_with_line_map` labels every
+/// retained line for `-n` by rebuilding the window arithmetically. Once the
+/// window can *move* (below), a start recomputed independently there silently
+/// mislabels every line of the output. The truncator is the single authority
+/// on where the window begins, so it hands the index to the map builder rather
+/// than leaving two sites to agree by coincidence.
+///
+/// The index is in `text`'s own line space ([`str::lines`] semantics), and is
+/// `0` whenever no truncation happened (`total <= n`).
+///
+/// # Literal boundaries (#511, E7.3)
+///
+/// The mirror of [`simple_line_truncate`]'s pull-back. A tail window that
+/// *begins* inside a multi-line string literal (or a Markdown fenced code
+/// block) shows the reader literal body dressed as code, and — for Markdown —
+/// leaves an orphan closing fence that turns the rest of the document into one
+/// runaway code block.
+///
+/// The window moves **forward**, past the construct's closer, so it only ever
+/// shrinks; moving backward would grow it past the `N` bound (#317 / ADR-016).
+/// The boundary tested is `open_after(start - 1)`: the window starts clean iff
+/// the line before it ended clean, which also drops a closing delimiter left
+/// orphaned on the first retained line.
+///
+/// When the construct has no closer before end of file, or moving forward would
+/// leave zero content lines, the raw cut stays and the (already leading) marker
+/// names the cut it could not avoid — the same fail-safe as the head window, so
+/// a scanner bug can never breach the `N` bound or empty a content-bearing
+/// output.
+pub(crate) fn simple_last_line_truncate_with_start(
+    text: &str,
+    language: Language,
+    n: usize,
+    hint: Option<&str>,
+    source_line_count: Option<usize>,
+) -> Result<(String, usize)> {
     let total = text.lines().count();
 
     if total <= n {
-        return Ok(text.to_string());
+        return Ok((text.to_string(), 0));
     }
 
-    // Reserve 1 slot for the marker so total output = n lines (#317 / ADR-002:
-    // `--max-lines N` ≡ `head -N`).  content_lines = n-1; the marker is the first slot.
-    // E3: use source-space line count when provided; fall back to output-space.
-    let content_lines = n.saturating_sub(1);
+    // Reserve 1 slot for the marker so total output = n lines (#317 / ADR-016:
+    // `--last-lines N` bounds the whole output).  content_lines = n-1; the
+    // marker is the first slot.
+    let mut start = total.saturating_sub(n.saturating_sub(1));
+    let mut side = ElidedSide::Above;
+
+    // #511: one forward pass over `text`, run ONCE per truncation call.
+    // `start == total` (n <= 1) retains no content line, so there is no window
+    // boundary to ask about and the scan is skipped entirely.
+    let boundary = start.checked_sub(1).filter(|_| start < total);
+    if let Some(previous) = boundary {
+        let scan = literal_scan::scan(text, language);
+        if scan.open_after(previous).is_some() {
+            // `close_line(previous)`, not `close_line(start)`. close_line(i)
+            // is documented as the first line AFTER `i` that ends clean, and
+            // is meaningful whether or not line `i` is itself inside a
+            // literal.  Asked from `previous` it names the construct's closing
+            // line; asked from `start` it would skip a closer sitting on the
+            // first retained line and drop one more line than necessary.
+            match scan.close_line(previous) {
+                // Forward, past the closer. Only ever shrinks the window, so
+                // the N bound holds without re-checking it.
+                Some(close) if close + 1 < total => start = close + 1,
+                // FAIL-SAFE: no closer before EOF, or moving forward would
+                // leave zero content lines. Keep the raw cut and disclose it.
+                _ => side = cut_inside_side(ElidedSide::Above, language),
+            }
+        }
+    }
+
+    // Recomputed from the (possibly moved) start, in the counting spaces the
+    // pre-#511 code used: content in output space, `omitted` against the
+    // source-space total when the caller supplied one (E3/E5).
+    let content_lines = total.saturating_sub(start);
     let source_total = source_line_count.unwrap_or(total);
     let omitted = source_total.saturating_sub(content_lines);
-    let marker = elision_marker_line(Some(language), omitted, ElidedSide::Above, hint);
+    let marker = elision_marker_line(Some(language), omitted, side, hint);
 
     // Skip to the tail without collecting all lines into a Vec
-    let mut result: Vec<&str> = Vec::with_capacity(n + 1);
+    let mut result: Vec<&str> = Vec::with_capacity(content_lines + 1);
     result.push(&marker);
-    result.extend(text.lines().skip(total - content_lines));
+    result.extend(text.lines().skip(start));
 
     let mut output = result.join("\n");
     if text.ends_with('\n') {
         output.push('\n');
     }
 
-    Ok(output)
+    Ok((output, start))
 }
 
 /// Count the number of omission markers needed for a position-sorted selection
@@ -458,6 +607,15 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 ///
 /// `elision_hint` is appended to the truncation marker when `Some`
 /// (B5 / ADR-011 class 1 remedy clause). `None` keeps the library CLI-agnostic.
+///
+/// # Literal boundaries (#511)
+///
+/// The binary search converges on a line count, not on a syntactic boundary, so
+/// the converged cut is afterwards pulled **back** out of any multi-line string
+/// literal (or Markdown fenced code block) it landed in — the same rule
+/// [`simple_line_truncate`] applies to `--max-lines`. The pull-back only ever
+/// removes content lines, so the budget the search established still holds and
+/// no candidate is re-counted. The public signature is unchanged.
 pub(crate) fn truncate_to_token_budget<F>(
     text: &str,
     language: Language,
@@ -513,6 +671,11 @@ where
         byte_end.push(pos);
     }
 
+    // #511: one forward pass over `text`, run ONCE — before the search, never
+    // per candidate. The binary search is free to probe cuts that land inside a
+    // literal; only the converged `best` is snapped, below.
+    let scan = literal_scan::scan(text, language);
+
     // Binary search for max content lines that fit within budget (including marker).
     // Invariant: best is the largest number of content lines whose candidate
     // (content + omission marker) fits within token_budget.
@@ -540,6 +703,23 @@ where
         }
     }
 
+    // #511: pull the converged cut back out of a multi-line literal / Markdown
+    // fence, exactly as `simple_line_truncate` does for `--max-lines`.  `open`
+    // is the opener's 0-based index and therefore also the count of lines
+    // before it, so `best` only ever DECREASES — the candidate shrinks and the
+    // budget invariant established by the search still holds, with no
+    // re-counting.
+    //
+    // Snapping to 0 (the literal opens on line 1) hands the compact branch
+    // below a cut it could not avoid, which the marker must say.
+    let open_at_cut = best
+        .checked_sub(1)
+        .and_then(|last_retained| scan.open_after(last_retained));
+    let snapped_to_zero = open_at_cut == Some(0);
+    if let Some(open) = open_at_cut {
+        best = open;
+    }
+
     // Build final output from pre-joined string
     let marker = make_marker(lines.len() - best);
 
@@ -553,6 +733,16 @@ where
     // minimise token cost. The disclosure obligation is still met: the reader sees
     // that content was elided and the exact count of truncated lines. The hint is a
     // remedy clause, not the disclosure itself (ADR-011 / #317).
+    //
+    // #511: when best==0 is the *result of snapping* (rather than a budget too
+    // small for any content at all), the reader is also being told the cut it
+    // could not avoid — the compact marker carries the `; cut inside …` clause.
+    // The hint stays dropped: the clause is disclosure, the hint is remedy.
+    let compact_side = if snapped_to_zero {
+        cut_inside_side(ElidedSide::Truncated, language)
+    } else {
+        ElidedSide::Truncated
+    };
     let mut output = if best > 0 {
         let content_slice = &joined[..byte_end[best - 1]];
         let mut s = String::with_capacity(content_slice.len() + 1 + marker.len() + 1);
@@ -561,7 +751,7 @@ where
         s.push_str(&marker);
         s
     } else {
-        elision_marker_line(Some(language), lines.len(), ElidedSide::Truncated, None)
+        elision_marker_line(Some(language), lines.len(), compact_side, None)
     };
 
     if text.ends_with('\n') {
@@ -729,7 +919,8 @@ mod tests {
 
     #[test]
     fn test_simple_line_truncate() {
-        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // #511: fixture has no string literal — exact counts unchanged by literal snapping.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-016).
         // Old comment said "N+1 (marker was extra)." The correct tally:
         // N-1 content + 1 marker = N total.
         // Input 5 lines, max_lines=3 → content_lines=2, omitted=5-2=3, total=3.
@@ -756,6 +947,7 @@ mod tests {
     /// and dropping the marker would be silent loss, so N=1 yields both.
     #[test]
     fn test_simple_line_truncate_n1() {
+        // #511: fixture has no string literal — exact counts unchanged by literal snapping.
         let text = "line 1\nline 2\nline 3\n";
         let result = simple_line_truncate(text, Language::TypeScript, 1, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
@@ -777,6 +969,7 @@ mod tests {
     /// N=20 over a 25-line input: 19 content lines + 1 marker covering 6.
     #[test]
     fn test_simple_line_truncate_n20() {
+        // #511: fixture has no string literal — exact counts unchanged by literal snapping.
         let lines_25: String = (1..=25).map(|i| format!("line {i}\n")).collect();
         let result = simple_line_truncate(&lines_25, Language::TypeScript, 20, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
@@ -805,6 +998,7 @@ mod tests {
 
     #[test]
     fn test_max_lines_1_returns_one_line() {
+        // #511: fixture has no string literal — exact counts unchanged by literal snapping.
         let text = "type A = string\nfunction foo() {}\n";
         let spans = vec![
             NodeSpan::new(0..1, "type_alias_declaration"),
@@ -1494,7 +1688,10 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_keeps_last_lines() {
-        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // #511: quote-free, fence-free fixture — the retained window never begins
+        // inside a literal, so the `--last-lines` mirror leaves these exact
+        // positions and counts unchanged.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-016).
         // Old comment said "N+1 (marker was extra)." The correct tally:
         // 1 marker + (N-1) content = N total.
         // n=3, total=5 → content_lines=2, omitted=5-2=3. Shows lines 4,5 + marker.
@@ -1540,7 +1737,10 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_python_marker() {
-        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // #511: quote-free, fence-free fixture — the retained window never begins
+        // inside a literal, so the `--last-lines` mirror leaves these exact
+        // positions and counts unchanged.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-016).
         // Old comment said "Omitted = 3-2 = 1." The correct tally:
         // content_lines = n-1 = 1, omitted = total - content_lines = 3-1 = 2.
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
@@ -1554,7 +1754,10 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_markdown_marker() {
-        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // #511: quote-free, fence-free fixture — the retained window never begins
+        // inside a literal, so the `--last-lines` mirror leaves these exact
+        // positions and counts unchanged.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-016).
         // n=2, total=4 → content_lines = n-1 = 1, omitted = 4-1 = 3.
         let text = "# H1\n## H2\n## H3\n## H4\n";
         let result = simple_last_line_truncate(text, Language::Markdown, 2, None, None).unwrap();
@@ -1567,7 +1770,10 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_single_line_budget() {
-        // N-total semantics: marker counts against the N budget (b5507ad / ADR-002).
+        // #511: quote-free, fence-free fixture — the retained window never begins
+        // inside a literal, so the `--last-lines` mirror leaves these exact
+        // positions and counts unchanged.
+        // N-total semantics: marker counts against the N budget (b5507ad / ADR-016).
         // Old comment said "1 content + 1 marker = 2 total." The correct tally:
         // content_lines = n-1 = 0, omitted = total - content_lines = 3-0 = 3.
         // With n=1, the only slot is the marker itself (no content fits).
@@ -1657,6 +1863,550 @@ mod tests {
         assert_eq!(
             yaml.lines().next_back().unwrap(),
             "# ... (3 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+    }
+
+    // ========================================================================
+    // #511 — the cut never lands inside a multi-line literal or Markdown fence
+    // ========================================================================
+
+    /// 200 lines of `const v{i} = {i};` filler around two template literals:
+    /// one opening on line 38 and closing on line 44 (in reach of a `--max-lines`
+    /// cut) and one opening on line 160 and closing on line 167 (in reach of a
+    /// `--last-lines` window).
+    const TS_MULTILINE_LITERAL: &str =
+        include_str!("../../../../tests/fixtures/typescript/multiline_literal.ts");
+
+    /// 45 lines whose module docstring occupies lines 1-40, so a small
+    /// `--max-lines` budget cuts inside a literal with no earlier opener to
+    /// retreat to.
+    const PY_DEGENERATE_LITERAL: &str =
+        include_str!("../../../../tests/fixtures/python/degenerate_literal.py");
+
+    /// 60 lines with a fenced code block spanning lines 33-40 — the README
+    /// shape that `--max-lines 34` used to cut open.
+    const MD_FENCED: &str = include_str!("../../../../tests/fixtures/markdown/fenced.md");
+
+    /// Backticks in `text`. An odd count means a template literal was cut open.
+    fn backtick_count(text: &str) -> usize {
+        text.bytes().filter(|byte| *byte == b'`').count()
+    }
+
+    /// Lines opening or closing a Markdown fence. An odd count means the
+    /// document below the cut renders as one runaway code block.
+    fn fence_line_count(text: &str) -> usize {
+        text.lines()
+            .filter(|line| line.trim_start().starts_with("```"))
+            .count()
+    }
+
+    /// #511: `--max-lines 40` over a fixture whose template literal opens on
+    /// line 38 kept lines 1-39 — the opening backtick with no closer, so the
+    /// marker and everything after it read as literal text.
+    ///
+    /// Measured at e48f977 (`skim … --mode full --max-lines 40`): 40 lines,
+    /// 1 backtick, `// ... (161 lines truncated)`. Required: the window pulls
+    /// back to line 37, giving 37 content lines + marker = 38 lines, 0
+    /// backticks, `// ... (163 lines truncated)`.
+    ///
+    /// 60/80/120 are controls — their cuts fall past the literal's closer, so
+    /// they keep the full N-line budget and the literal's two backticks pair up.
+    #[test]
+    fn test_max_lines_never_cuts_inside_template_literal() {
+        // (max_lines, expected total output lines, expected omitted count)
+        let cases = [
+            (40_usize, 38_usize, 163_usize),
+            (60, 60, 141),
+            (80, 80, 121),
+            (120, 120, 81),
+        ];
+
+        for (max_lines, expected_total, expected_omitted) in cases {
+            let out = simple_line_truncate(
+                TS_MULTILINE_LITERAL,
+                Language::TypeScript,
+                max_lines,
+                None,
+                None,
+            )
+            .unwrap();
+
+            assert!(
+                out.lines().count() <= max_lines,
+                "--max-lines {max_lines} is a bound; got {} lines",
+                out.lines().count()
+            );
+            assert_eq!(
+                out.lines().count(),
+                expected_total,
+                "--max-lines {max_lines} must yield {expected_total} lines"
+            );
+            assert_eq!(
+                backtick_count(&out) % 2,
+                0,
+                "--max-lines {max_lines} left an unbalanced template literal:\n{out}"
+            );
+            assert_eq!(
+                out.lines().next_back().unwrap(),
+                format!("// ... ({expected_omitted} lines truncated)"),
+                "--max-lines {max_lines} must count from the retained window"
+            );
+        }
+
+        // N=40 is the cut that moves: it stops on the line before the opener.
+        let out = simple_line_truncate(TS_MULTILINE_LITERAL, Language::TypeScript, 40, None, None)
+            .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[lines.len() - 2],
+            "const v37 = 37;",
+            "the last content line must precede the literal's opener (line 38)"
+        );
+        assert_eq!(
+            backtick_count(&out),
+            0,
+            "no backtick survives the cut:\n{out}"
+        );
+    }
+
+    /// Python's `"""` docstring is multi-line: a cut inside it leaves the head
+    /// of a string, and the marker appended after it is swallowed by the string.
+    ///
+    /// Measured at e48f977 for this input: 9 content lines ending
+    /// `docstring line 9`, one unclosed `"""`, `# ... (11 lines truncated)`.
+    #[test]
+    fn test_max_lines_python_triple_quote() {
+        let mut src = String::new();
+        for i in 1..=5 {
+            src.push_str(&format!("x{i} = {i}\n"));
+        }
+        src.push_str("DOC = \"\"\"\n"); // line 6 opens
+        for i in 7..=10 {
+            src.push_str(&format!("docstring line {i}\n"));
+        }
+        src.push_str("\"\"\"\n"); // line 11 closes
+        for i in 12..=20 {
+            src.push_str(&format!("y{i} = {i}\n"));
+        }
+        assert_eq!(src.lines().count(), 20, "fixture shape");
+
+        let out = simple_line_truncate(&src, Language::Python, 10, None, None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 6, "5 content lines + marker:\n{out}");
+        assert_eq!(lines[4], "x5 = 5", "cut moves back before line 6's opener");
+        assert_eq!(lines[5], "# ... (15 lines truncated)");
+        assert_eq!(
+            out.matches("\"\"\"").count(),
+            0,
+            "no half-open docstring:\n{out}"
+        );
+    }
+
+    /// Rust raw strings close on `"` followed by the opener's hash run, so a
+    /// mid-literal cut leaves `r#"` dangling.
+    ///
+    /// Measured at e48f977 for this input: 9 content lines ending `select 9
+    /// from t;`, one unclosed `r#"`, `// ... (11 lines truncated)`.
+    #[test]
+    fn test_max_lines_rust_raw_string() {
+        let mut src = String::new();
+        for i in 1..=5 {
+            src.push_str(&format!("const X{i}: usize = {i};\n"));
+        }
+        src.push_str("const SQL: &str = r#\"\n"); // line 6 opens
+        for i in 7..=10 {
+            src.push_str(&format!("select {i} from t;\n"));
+        }
+        src.push_str("\"#;\n"); // line 11 closes
+        for i in 12..=20 {
+            src.push_str(&format!("const Y{i}: usize = {i};\n"));
+        }
+        assert_eq!(src.lines().count(), 20, "fixture shape");
+
+        let out = simple_line_truncate(&src, Language::Rust, 10, None, None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 6, "5 content lines + marker:\n{out}");
+        assert_eq!(lines[4], "const X5: usize = 5;");
+        assert_eq!(lines[5], "// ... (15 lines truncated)");
+        assert!(!out.contains("r#\""), "no half-open raw string:\n{out}");
+    }
+
+    /// Degenerate case: the literal opens on line 1, so there is no earlier
+    /// line to pull back to. The window stays where the budget put it and the
+    /// marker moves to the FRONT — appended, it would sit inside the very
+    /// literal it reports and never reach the reader.
+    ///
+    /// Measured at e48f977 (`--mode full --max-lines 5`): lines 1-4 of the
+    /// docstring followed by `# ... (41 lines truncated) — …`, the marker
+    /// inside the string.
+    #[test]
+    fn test_degenerate_literal_emits_marker_first_then_raw_cut() {
+        let out =
+            simple_line_truncate(PY_DEGENERATE_LITERAL, Language::Python, 5, None, None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(
+            lines.len(),
+            5,
+            "exactly N lines: marker + N-1 content:\n{out}"
+        );
+        assert!(
+            lines[0].starts_with("# ..."),
+            "the marker must come first:\n{out}"
+        );
+        assert!(
+            lines[0].contains("(41 lines truncated"),
+            "count is source total minus the 4 retained lines: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("cut inside a string literal"),
+            "the marker must name the cut it could not avoid: {:?}",
+            lines[0]
+        );
+
+        let source: Vec<&str> = PY_DEGENERATE_LITERAL.lines().collect();
+        assert_eq!(
+            &lines[1..],
+            &source[..4],
+            "content is the raw head of the file, unmodified"
+        );
+    }
+
+    /// JSON's scanner row is empty: RFC 8259 forbids a raw newline inside a
+    /// string, so no JSON cut can land in one. The cut stays exactly where the
+    /// budget puts it even on a line whose quotes look unbalanced to a naive
+    /// counter (`"quote": "\""` reads as five quotes).
+    #[test]
+    fn test_json_literal_scan_is_noop() {
+        let text = concat!(
+            "{\n",
+            r#"  "one": 1,"#,
+            "\n",
+            r#"  "quote": "\"","#,
+            "\n",
+            r#"  "three": 3,"#,
+            "\n",
+            r#"  "four": 4,"#,
+            "\n",
+            r#"  "five": 5"#,
+            "\n",
+            "}\n",
+        );
+        assert_eq!(text.lines().count(), 7, "fixture shape");
+
+        let out = simple_line_truncate(text, Language::Json, 4, None, None).unwrap();
+        assert_eq!(
+            out,
+            concat!(
+                "{\n",
+                r#"  "one": 1,"#,
+                "\n",
+                r#"  "quote": "\"","#,
+                "\n",
+                "// ... (4 lines truncated)\n",
+            ),
+            "JSON output must be byte-identical to the pre-#511 cut"
+        );
+    }
+
+    /// YAML block scalars (`|`, `>`) are deliberately NOT modelled: they close
+    /// by dedent, so a column-0 marker legally ends the scalar and the document
+    /// stays valid YAML. This pins the non-fix — the cut inside `script: |` is
+    /// left exactly where the budget put it.
+    #[test]
+    fn test_yaml_block_scalar_cut_is_not_backed_up() {
+        let text =
+            "name: demo\nscript: |\n  line one\n  line two\n  line three\nafter: 1\ntail: 2\n";
+        assert_eq!(text.lines().count(), 7, "fixture shape");
+
+        let out = simple_line_truncate(text, Language::Yaml, 4, None, None).unwrap();
+        assert_eq!(
+            out, "name: demo\nscript: |\n  line one\n# ... (4 lines truncated)\n",
+            "a block scalar must not pull the cut back"
+        );
+    }
+
+    /// E7 (#511, Markdown): a fence opening on line 33 used to be cut open by
+    /// `--max-lines 34`, turning every line after the marker into code-block
+    /// content — including the marker itself.
+    ///
+    /// Measured at e48f977 (`skim … --mode full --max-lines 34`): 34 lines,
+    /// 1 fence line, `<!-- ... (27 lines truncated) — … -->`. Required: 32
+    /// content lines + marker = 33, 0 fence lines, `(28 lines truncated)`.
+    #[test]
+    fn test_markdown_max_lines_34_does_not_cut_inside_fence() {
+        let out =
+            simple_line_truncate(MD_FENCED, Language::Markdown, 34, Some(HINT), None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(
+            lines.len() <= 34,
+            "--max-lines 34 is a bound: {}",
+            lines.len()
+        );
+        assert_eq!(lines.len(), 33, "32 content lines + marker:\n{out}");
+        assert_eq!(
+            fence_line_count(&out) % 2,
+            0,
+            "an odd fence count leaves a runaway code block:\n{out}"
+        );
+        assert_eq!(
+            lines[31], "Prose line 32 with `inline code` that is not a fence.",
+            "the last content line must precede the fence opener (line 33)"
+        );
+        assert_eq!(
+            lines[32],
+            "<!-- ... (28 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output -->",
+            "the hint stays inside the HTML comment"
+        );
+    }
+
+    /// Degenerate fence: the block opens on line 1, so the marker leads. It is
+    /// the only line of the output that is *not* inside the fence, which is
+    /// exactly why it cannot be appended.
+    #[test]
+    fn test_markdown_degenerate_fence_marker_first() {
+        let text = "```rust\nfn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\nfn f() {}\nfn g() {}\n```\ntail\n";
+        assert_eq!(text.lines().count(), 10, "fixture shape");
+
+        let out = simple_line_truncate(text, Language::Markdown, 5, None, None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(
+            lines.len(),
+            5,
+            "exactly N lines: marker + N-1 content:\n{out}"
+        );
+        assert_eq!(
+            lines[0],
+            "<!-- ... (6 lines truncated; cut inside a code fence) -->"
+        );
+        assert_eq!(
+            &lines[1..],
+            &["```rust", "fn a() {}", "fn b() {}", "fn c() {}"][..]
+        );
+    }
+
+    /// Control: `--max-lines 20` over the same fixture cuts at line 19, far
+    /// above the fence, so #511 must not move a single byte.
+    #[test]
+    fn test_markdown_max_lines_20_is_unchanged() {
+        let out =
+            simple_line_truncate(MD_FENCED, Language::Markdown, 20, Some(HINT), None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(lines.len(), 20, "19 content lines + marker:\n{out}");
+        assert_eq!(fence_line_count(&out), 0, "the cut is above the fence");
+        assert_eq!(
+            lines[18],
+            "Prose line 19 with `inline code` that is not a fence."
+        );
+        assert_eq!(
+            lines[19],
+            "<!-- ... (41 lines truncated) \u{2014} SKIM_PASSTHROUGH=1 for full output -->"
+        );
+    }
+
+    // ========================================================================
+    // #511 / E7.3 — the `--last-lines` window never BEGINS inside a literal
+    // ========================================================================
+
+    /// Mirror of the `--max-lines` pull-back. A tail window that begins inside
+    /// a template literal hands the reader literal body dressed as code, with
+    /// an orphan backtick where the opener should be.
+    ///
+    /// Measured at 9058273 (`skim … --mode full --last-lines 40`, against this
+    /// fixture's tail literal at lines 160-167): 40 lines, 1 backtick, first
+    /// content line `  A --last-lines window that opens in here must move
+    /// FORWARD, past` — source line 162, the middle of the literal.
+    ///
+    /// Required: the window moves FORWARD past the closer on line 167 and so
+    /// SHRINKS to 33 content lines + marker = 34.  Forward only: pulling back
+    /// would grow the window past the N bound (ADR-016).
+    #[test]
+    fn test_last_lines_never_starts_inside_literal() {
+        let out =
+            simple_last_line_truncate(TS_MULTILINE_LITERAL, Language::TypeScript, 40, None, None)
+                .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(
+            lines.len() <= 40,
+            "--last-lines 40 is a bound; got {} lines",
+            lines.len()
+        );
+        assert_eq!(lines.len(), 34, "marker + 33 content lines:\n{out}");
+        assert_eq!(
+            backtick_count(&out),
+            0,
+            "no orphan backtick may survive the cut:\n{out}"
+        );
+        assert_eq!(
+            lines[1], "const v168 = 168;",
+            "the window must begin after the literal's closer (line 167)"
+        );
+        assert_eq!(lines.last().copied(), Some("const v200 = 200;"));
+        assert_eq!(
+            lines[0],
+            format!("// ... ({} lines above)", 200 - (lines.len() - 1)),
+            "the count must be recomputed from the moved start"
+        );
+    }
+
+    /// Degenerate `--last-lines`: the literal has no closing delimiter before
+    /// end of file, so there is nothing to move forward past — and moving
+    /// forward at all would empty the window. The raw cut stays and the
+    /// (already leading) marker names the cut it could not avoid.
+    ///
+    /// Measured at 9058273 (`--mode full --last-lines 5` on this shape):
+    /// `// ... (16 lines above) — …` then four lines of literal body presented
+    /// as code, with nothing telling the reader they are inside a string.
+    #[test]
+    fn test_last_lines_degenerate_literal_to_eof_keeps_raw_cut_with_clause() {
+        let mut src = String::new();
+        for i in 1..=14 {
+            src.push_str(&format!("const a{i} = {i};\n"));
+        }
+        src.push_str("const unterminated = `\n"); // line 15 opens, never closes
+        for i in 16..=20 {
+            src.push_str(&format!("  literal line {i}\n"));
+        }
+        assert_eq!(src.lines().count(), 20, "fixture shape");
+
+        let out = simple_last_line_truncate(&src, Language::TypeScript, 5, None, None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(
+            lines.len(),
+            5,
+            "the raw cut is kept: marker + 4 content:\n{out}"
+        );
+        assert_eq!(
+            lines[0], "// ... (16 lines above; cut inside a string literal)",
+            "the marker must name the cut it could not avoid"
+        );
+        assert_eq!(
+            &lines[1..],
+            &[
+                "  literal line 17",
+                "  literal line 18",
+                "  literal line 19",
+                "  literal line 20",
+            ][..],
+            "content is the raw tail of the file, unmodified"
+        );
+    }
+
+    /// E7.3 (Markdown): a tail window opening inside a fenced block leaves the
+    /// block's CLOSING fence with no opener, so every line after it — the rest
+    /// of the document — renders as one runaway code block.
+    ///
+    /// Measured at 9058273 (`skim … --mode full --last-lines 28`): 28 lines,
+    /// 1 fence line, first content line `export function fenced(): void {`
+    /// (source line 34, inside the block). Required: the window moves forward
+    /// past the closer on line 40, giving 20 content lines + marker = 21 and no
+    /// fence line at all.
+    #[test]
+    fn test_markdown_last_lines_does_not_start_inside_fence() {
+        let out =
+            simple_last_line_truncate(MD_FENCED, Language::Markdown, 28, Some(HINT), None).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert!(
+            lines.len() <= 28,
+            "--last-lines 28 is a bound; got {} lines",
+            lines.len()
+        );
+        assert_eq!(lines.len(), 21, "marker + 20 content lines:\n{out}");
+        assert_eq!(
+            fence_line_count(&out),
+            0,
+            "an orphan closing fence swallows the rest of the document:\n{out}"
+        );
+        assert_eq!(
+            lines[0], "<!-- ... (40 lines above) \u{2014} SKIM_PASSTHROUGH=1 for full output -->",
+            "the count must be recomputed from the moved start"
+        );
+        assert_eq!(
+            lines[3], "## Tail section 43",
+            "the window must begin after the fence's closer (line 40)"
+        );
+    }
+
+    // ========================================================================
+    // #511 / E6.5 — `--tokens` snaps the converged cut out of a literal
+    // ========================================================================
+
+    /// The token binary search converges on a line count, not on a syntactic
+    /// boundary, so it happily stops in the middle of a template literal. The
+    /// converged `best` is snapped back to the opener afterwards; because that
+    /// only ever DECREASES `best`, the budget the search established still
+    /// holds without re-counting a single candidate.
+    ///
+    /// The whole fixture is 15 words, so the budget has to sit below that or the
+    /// `full_count <= token_budget` fast path returns the text untouched and
+    /// there is no cut to snap. At budget 14 the search picks `best = 3` — two
+    /// prose lines, the literal's opening line and the marker
+    /// "... (4 lines truncated)", 13 words — leaving one unbalanced backtick with
+    /// the marker itself reading as literal text. The snap pulls `best` back to
+    /// the opener's index, 2.
+    #[test]
+    fn test_token_budget_snaps_best_back_out_of_literal() {
+        let text = "alpha one\nbeta two\nconst s = `\ninside one\ninside two\n`;\ngamma three\n";
+        let budget = 14;
+
+        let out =
+            truncate_to_token_budget(text, Language::TypeScript, budget, word_count, None, None)
+                .unwrap();
+
+        assert_eq!(
+            backtick_count(&out),
+            0,
+            "the cut must not leave a template literal open:\n{out}"
+        );
+        assert!(
+            word_count(&out) <= budget,
+            "snapping only shrinks the output, so the budget still holds: {} > {budget}\n{out}",
+            word_count(&out)
+        );
+        assert_eq!(
+            out, "alpha one\nbeta two\n// ... (5 lines truncated)\n",
+            "the window stops on the line before the literal's opener"
+        );
+    }
+
+    /// The literal opens on line 1, so the snap has nowhere to retreat to:
+    /// `best` reaches 0 and the compact branch fires. The compact marker still
+    /// drops the remedy hint to save tokens (ADR-011: the hint is remedy, not
+    /// disclosure), but it must carry the `; cut inside …` clause — this
+    /// `best == 0` is the result of a cut, not of a budget too small for any
+    /// content at all.
+    ///
+    /// At budget 14 the search picks `best = 1`: the literal's opening line (4
+    /// words) plus the hinted marker "... (5 lines truncated) —
+    /// SKIM_PASSTHROUGH=1 for full output" (10 words) is exactly 14, while the
+    /// two-line candidate costs 17. That marker would sit inside the literal it
+    /// reports, so the snap drives `best` to 0. The literal's body carries three
+    /// words a line because the hinted marker alone costs 10: with a one-word
+    /// body the whole fixture (9 words) is cheaper than the opener-plus-marker
+    /// candidate (14), so no budget can both defeat the fast path and leave the
+    /// search a line to retain — the branch would be unreachable.
+    #[test]
+    fn test_token_budget_snap_to_zero_uses_compact_marker_with_clause() {
+        let text = "const banner = `\nalpha one two\nbeta three four\ngamma five six\ndelta seven eight\n`;\n";
+
+        let out =
+            truncate_to_token_budget(text, Language::TypeScript, 14, word_count, None, Some(HINT))
+                .unwrap();
+
+        assert_eq!(
+            out, "// ... (6 lines truncated; cut inside a string literal)\n",
+            "the compact marker must name the cut"
+        );
+        assert!(
+            !out.contains(HINT),
+            "the compact form drops the remedy hint:\n{out}"
         );
     }
 }

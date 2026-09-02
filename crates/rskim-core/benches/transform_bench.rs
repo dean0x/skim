@@ -239,6 +239,25 @@ fn bench_scaling_bounded(c: &mut Criterion) {
         );
     }
 
+    // #511: the literal scanner is a full forward pass over the input, and it
+    // runs on the tail path too (`simple_last_line_truncate`). Full mode keeps
+    // the passthrough branch, so this measures scan + tail slice with no
+    // tree-sitter work in the way.
+    for size in [500, 1000] {
+        let large_ts = generate_large_typescript(size);
+        let config = TransformConfig::with_mode(Mode::Full).with_last_lines(40);
+
+        group.bench_with_input(
+            BenchmarkId::new("last_lines", size),
+            &large_ts,
+            |b, input| {
+                b.iter(|| {
+                    transform_with_config(black_box(input), Language::TypeScript, &config).unwrap()
+                })
+            },
+        );
+    }
+
     group.finish();
 }
 

@@ -405,7 +405,9 @@ impl Language {
     ///
     /// Line maps are built arithmetically from source line counts rather than via
     /// content-based matching to avoid duplicate-line mis-attribution (e.g. `}` matching
-    /// its first occurrence instead of the tail occurrence).
+    /// its first occurrence instead of the tail occurrence). The one input the
+    /// arithmetic does not own is where the `--last-lines` window begins: that comes
+    /// back from the truncator, which may move it forward (#511).
     fn transform_passthrough_with_line_map(
         self,
         source: &str,
@@ -418,40 +420,45 @@ impl Language {
             // forward scanning which matches duplicate lines (e.g. `}`) to their
             // FIRST occurrence rather than the correct tail occurrence.
             //
-            // simple_last_line_truncate produces (E4.2: marker does not consume a slot):
+            // simple_last_line_truncate produces:
             //   - If total <= n: unchanged (identity map)
-            //   - If total > n: 1 marker line + n content lines from the tail
+            //   - If total > n: 1 marker line + the tail from `start` (below)
             //
             // Marker line gets source_line = 0 (no annotation).
-            // Content line i (0-indexed within content) gets source_line:
-            //   source_line_count - n + 1 + i  (1-indexed)
+            // Content line i (0-indexed within content) gets source_line
+            // `start + 1 + i` (1-indexed).
             let source_line_count = source.lines().count();
             // E3: source_line_count=None is correct here — `source` IS the original
             // text, so lines.len() == source_line_count. Pass None to avoid recomputing.
-            let truncated = crate::transform::truncate::simple_last_line_truncate(
-                source,
-                self,
-                n,
-                config.elision_hint.as_deref(),
-                None,
-            )?;
+            //
+            // PF-019 / #511: take the retained start FROM the truncator. This map is
+            // the ONLY source of the `-n` annotations, and the window is no longer at
+            // a fixed offset: #511 moves it forward when it would otherwise begin
+            // inside a multi-line string literal or a Markdown code fence. A start
+            // recomputed here would disagree with the truncator's and silently
+            // mislabel every retained line.
+            let (truncated, start) =
+                crate::transform::truncate::simple_last_line_truncate_with_start(
+                    source,
+                    self,
+                    n,
+                    config.elision_hint.as_deref(),
+                    None,
+                )?;
             let line_map = if config.line_numbers {
                 if source_line_count <= n {
                     // No truncation occurred: identity map
                     let count = truncated.lines().count();
                     Some((1..=count).collect::<Vec<usize>>())
                 } else {
-                    // Truncation occurred: 1 marker line + (n-1) content tail lines.
-                    // N-total semantics (b5507ad / ADR-002): `--last-lines N` yields at
-                    // most N lines TOTAL, so the marker consumes one of the N slots and
-                    // n_content = n-1. start_line is the first retained content source
-                    // line (1-indexed): source_line_count - n_content + 1.
-                    //
-                    // PF-019: this map is the ONLY source of the `-n` annotations, so an
-                    // n_content that disagrees with simple_last_line_truncate's own
-                    // `content_lines = n-1` silently mislabels every retained line.
-                    let n_content = n.saturating_sub(1);
-                    let start_line = source_line_count - n_content + 1; // 1-indexed
+                    // Truncation occurred: 1 marker line + the retained tail.
+                    // N-total semantics (b5507ad / ADR-016): `--last-lines N` yields at
+                    // most N lines TOTAL, so the marker consumes one of the N slots.
+                    // `start` is the truncator's own 0-based first retained line, so
+                    // n_content is whatever is left after it — n-1 in the common case,
+                    // fewer when #511 moved the window forward.
+                    let n_content = source_line_count.saturating_sub(start);
+                    let start_line = start + 1; // 1-indexed
                     let mut map = Vec::with_capacity(1 + n_content);
                     map.push(0_usize); // marker line has no annotation
                     for i in 0..n_content {
