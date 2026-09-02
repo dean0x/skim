@@ -3389,3 +3389,58 @@ fn t6_integrity_probe_missing_skpost_returns_corrupted() {
         "T-6: error must name the absent file, got {msg}"
     );
 }
+
+/// T-7 (AD-414-6 guard, #414): `lexical_index_integrity` must return
+/// `Ok(future_version)` for a **foreign-format** index file — i.e. one whose
+/// version field does not equal `FORMAT_VERSION` — WITHOUT performing any size
+/// validation against it.
+///
+/// Rationale: future-format files have an unknown header layout, so size checks
+/// calibrated against the *current* header encoding would be meaningless and
+/// could produce false `IndexCorrupted` errors that block `check_staleness`
+/// from triggering the expected automatic rebuild.  The caller
+/// (`check_staleness`) is responsible for treating a version mismatch as a
+/// rebuild signal.
+#[test]
+fn t7_integrity_probe_future_version_returns_ok_without_size_check() {
+    use super::format::{FORMAT_VERSION, SKIDX_MAGIC};
+
+    let dir = tmp_dir();
+    {
+        let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        builder
+            .add_file(
+                FileId(0),
+                "pub fn delta_probe_marker() {}",
+                rskim_core::Language::Rust,
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+
+    // Rewrite the version field in index.skidx to a future version.
+    let idx_path = dir.path().join("index.skidx");
+    let mut data = std::fs::read(&idx_path).unwrap();
+    // Sanity: the first 4 bytes must be the magic we expect.
+    assert_eq!(&data[0..4], SKIDX_MAGIC, "magic mismatch in test setup");
+    // Sanity: current version must be FORMAT_VERSION.
+    let cur = u16::from_le_bytes([data[4], data[5]]);
+    assert_eq!(cur, FORMAT_VERSION, "version mismatch in test setup");
+
+    let future_version: u16 = FORMAT_VERSION + 1;
+    let future_bytes = future_version.to_le_bytes();
+    data[4] = future_bytes[0];
+    data[5] = future_bytes[1];
+    std::fs::write(&idx_path, &data).unwrap();
+
+    // AD-414-6: must return Ok(future_version) — not Err — even though the
+    // rest of the header encoding is calibrated for FORMAT_VERSION, not
+    // future_version.  (Size-check code is only reached for files whose
+    // version == FORMAT_VERSION.)
+    let result = NgramIndexReader::lexical_index_integrity(dir.path());
+    assert!(
+        matches!(result, Ok(v) if v == future_version),
+        "T-7/AD-414-6: foreign-version file must yield Ok({future_version}), got {:?}",
+        result
+    );
+}
