@@ -9,9 +9,9 @@ use tempfile::TempDir;
 use super::{
     DegradedReason, Fallback, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
     TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness,
-    degraded_notice, enrich_ast_results, format_temporal_json, format_temporal_text,
-    normalize_blast_radius_path, open_temporal_state, query_standalone, ranked_row_count,
-    resort_window,
+    degraded_notice, dimension_is_empty, enrich_ast_results, format_temporal_json,
+    format_temporal_text, normalize_blast_radius_path, open_temporal_state, query_standalone,
+    ranked_row_count, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -3130,5 +3130,209 @@ fn ac2_empty_non_shallow_message_substrings() {
     assert!(
         !msg.contains("no temporal data"),
         "AC-7: Empty message must NOT contain 'no temporal data', got: {msg:?}"
+    );
+}
+
+// ============================================================================
+// Step 8 — --ast arm: Empty dimension and NoRankedRows
+// ============================================================================
+
+/// T-5 (Step 8): `dimension_is_empty` returns `true` for a fresh DB with no
+/// hotspot rows, confirming that the --ast arm will pass `None` as `temporal_db`
+/// and raw AST order survives (AC-21, SE-4 guard).
+///
+/// PF-007 discriminating: the probe uses `top_hotspots(1)`, never
+/// `result_count()==0` (G-3 invariant).
+#[test]
+fn t5_dimension_is_empty_hot_on_empty_db() {
+    let (_dir, db) = temp_db();
+    // A freshly-opened DB has no hotspot rows — dimension_is_empty must return true.
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Hot),
+        "T-5: dimension_is_empty(Hot) must be true on a fresh empty DB"
+    );
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Cold),
+        "T-5: dimension_is_empty(Cold) must be true on a fresh empty DB"
+    );
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Risky),
+        "T-5: dimension_is_empty(Risky) must be true on a fresh empty DB"
+    );
+}
+
+/// T-5 (Step 8) populated side: once hotspot rows exist,
+/// `dimension_is_empty(Hot)` returns `false` — the DB presence guard works.
+#[test]
+fn t5_dimension_is_empty_hot_returns_false_when_rows_exist() {
+    let (_dir, db) = temp_db();
+    db.store_hotspots(&[HotspotRow {
+        file_path: "src/main.rs".to_string(),
+        score: 0.5,
+        changes_30d: 3,
+        changes_90d: 10,
+    }])
+    .unwrap();
+    assert!(
+        !dimension_is_empty(&db, TemporalSort::Hot),
+        "T-5: dimension_is_empty(Hot) must be false when hotspot rows are present"
+    );
+    assert!(
+        !dimension_is_empty(&db, TemporalSort::Cold),
+        "T-5: dimension_is_empty(Cold) must be false when hotspot rows are present"
+    );
+}
+
+/// T-38 --ast sub-case / AD-414-13 (Step 8): `enrich_ast_results` returns
+/// `ranked == 0` when the DB has no temporal rows for the matched paths.
+/// The caller (ast.rs) detects this and emits the NoRankedRows notice on stderr.
+/// This test verifies the predicate the caller acts on.
+///
+/// PF-007 discriminating: asserts `ranked == 0` and `total == results.len()`.
+#[test]
+fn t38_ast_enrich_returns_zero_ranked_on_empty_db() {
+    let (_dir, db) = temp_db();
+    let mut results = vec![
+        make_ast("src/a.rs", 1.0),
+        make_ast("src/b.rs", 0.8),
+        make_ast("src/c.rs", 0.5),
+    ];
+    let original_order: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+
+    let cov = enrich_ast_results(&mut results, TemporalSort::Hot, &db);
+
+    assert_eq!(
+        cov.ranked, 0,
+        "T-38: no hotspot rows in DB → ranked must be 0"
+    );
+    assert_eq!(cov.total, 3, "T-38: total must equal the slice length (3)");
+    // AD-414-13: sort_by is skipped at ranked == 0 — raw AST order survives.
+    let after_order: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        after_order, original_order,
+        "T-38: raw AST order must be preserved when ranked == 0 (AD-414-13)"
+    );
+}
+
+/// Step 8 / AC-21: NoRankedRows degraded notice for the --ast arm must use
+/// `Fallback::Ast` tail ("--hot not applied — results are in raw AST match order").
+///
+/// PF-007 discriminating: checks the tail text, not just substring "Ast".
+#[test]
+fn t38_ast_norankedrows_degraded_notice_tail() {
+    let detail = "0 of 3 results have temporal data".to_string();
+    let u = TemporalUnavailable {
+        reason: DegradedReason::NoRankedRows,
+        detail,
+    };
+    let msg = degraded_notice(&u, "--hot", Fallback::Ast);
+    assert!(
+        msg.contains("0 of 3 results have temporal data"),
+        "AC-21: NoRankedRows notice must include the detail, got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--hot not applied"),
+        "AC-21: Fallback::Ast tail must mention '--hot not applied', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("raw AST match order"),
+        "AC-21: Fallback::Ast tail must say 'raw AST match order', got: {msg:?}"
+    );
+}
+
+// ============================================================================
+// Step 9 — standalone temporal arm: Empty dimension probe
+// ============================================================================
+
+/// T-20 (Step 9): `dimension_is_empty` gate for the standalone temporal arm.
+/// A DB with hotspot rows must NOT be treated as empty; a DB without must.
+/// This is the G-3 invariant — Empty is determined by the probe, never inferred
+/// from `result_count()==0 && offset==0`.
+///
+/// PF-007 discriminating: stores exactly one hotspot row and asserts the probe
+/// flips from true (before) to false (after).
+#[test]
+fn t20_dimension_is_empty_gate_for_standalone_arm() {
+    let (_dir, db) = temp_db();
+
+    // Before: no hotspot rows → empty.
+    assert!(
+        dimension_is_empty(&db, TemporalSort::Hot),
+        "T-20: dimension_is_empty must be true before any hotspot rows are stored"
+    );
+
+    // Store exactly one hotspot row.
+    db.store_hotspots(&[HotspotRow {
+        file_path: "src/lib.rs".to_string(),
+        score: 0.3,
+        changes_30d: 1,
+        changes_90d: 4,
+    }])
+    .unwrap();
+
+    // After: probe must return false — dimension is no longer empty.
+    assert!(
+        !dimension_is_empty(&db, TemporalSort::Hot),
+        "T-20: dimension_is_empty must be false after storing one hotspot row"
+    );
+}
+
+/// T-6 (Step 9): The Empty degraded notice for the standalone temporal arm uses
+/// `Fallback::NoResults` and empty flag — the tail must be absent (no suffix).
+/// This exercises the exact call made in `run_temporal_standalone` when the DB
+/// is open but the dimension has zero rows.
+///
+/// PF-007 discriminating: forbids the Fallback::Ast tail ("not applied")
+/// and the Fallback::Lexical tail ("lexical relevance order").
+#[test]
+fn t6_standalone_temporal_empty_degraded_notice_no_suffix() {
+    let u = TemporalUnavailable {
+        reason: DegradedReason::Empty,
+        detail: String::new(),
+    };
+    // run_temporal_standalone calls degraded_notice with flag="" and Fallback::NoResults.
+    let msg = degraded_notice(&u, "", Fallback::NoResults);
+    assert!(
+        msg.contains("empty"),
+        "T-6: Empty notice must contain 'empty', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("not applied"),
+        "T-6: Empty notice with empty flag must NOT contain 'not applied', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("lexical"),
+        "T-6: Empty notice with empty flag must NOT contain 'lexical', got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("raw AST"),
+        "T-6: Empty notice with empty flag must NOT contain 'raw AST', got: {msg:?}"
+    );
+}
+
+/// T-8 (Step 9): the `Missing` reason on the standalone temporal arm uses
+/// `degraded_notice` with flag="" and Fallback::NoResults.  Verifies the
+/// base message (no tail) for the common missing-DB case.
+///
+/// PF-007 discriminating: checks the cause text contains "not present" and
+/// "update" remedy, and does NOT contain "not applied" (no Fallback tail).
+#[test]
+fn t8_standalone_temporal_missing_degraded_notice_no_suffix() {
+    let u = TemporalUnavailable {
+        reason: DegradedReason::Missing,
+        detail: String::new(),
+    };
+    let msg = degraded_notice(&u, "", Fallback::NoResults);
+    assert!(
+        msg.contains("not present"),
+        "T-8: Missing notice must contain 'not present', got: {msg:?}"
+    );
+    assert!(
+        msg.contains("--update"),
+        "T-8: Missing notice must contain '--update' remedy, got: {msg:?}"
+    );
+    assert!(
+        !msg.contains("not applied"),
+        "T-8: Missing notice with empty flag must NOT contain 'not applied', got: {msg:?}"
     );
 }

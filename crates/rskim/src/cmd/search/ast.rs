@@ -485,8 +485,37 @@ pub(super) fn run_ast_standalone(
     }
     // Temporal enrichment + re-sort before the paginate step (AC-F4).
     // When absent, results stay in raw AST order (graceful degradation — AC-A3).
+    // Step 8 / AD-414-13: bind TemporalCoverage so we can detect zero-coverage
+    // (NoRankedRows) and emit the degraded notice on stderr.  enrich_ast_results
+    // already skips the sort_by at ranked == 0, so raw AST order is preserved.
     if let (Some(sort), Some(db)) = (temporal_sort, temporal_db) {
-        super::temporal::enrich_ast_results(&mut resolved, sort, db);
+        let cov = super::temporal::enrich_ast_results(&mut resolved, sort, db);
+        if cov.ranked == 0 && cov.total > 0 {
+            // AD-414-13 zero-coverage: no result received a temporal score for the
+            // requested dimension (e.g. all matched files are untracked/newly added).
+            // Emit degraded notice on stderr only — format_ast_json cannot carry
+            // `degraded` in this ticket (#483).
+            let detail = if cov.lookup_errors > 0 {
+                format!(
+                    "0 of {} results have temporal data ({} temporal lookups failed)",
+                    cov.total, cov.lookup_errors
+                )
+            } else {
+                format!("0 of {} results have temporal data", cov.total)
+            };
+            let u = super::temporal::TemporalUnavailable {
+                reason: super::temporal::DegradedReason::NoRankedRows,
+                detail,
+            };
+            eprintln!(
+                "skim search: {}",
+                super::temporal::degraded_notice(
+                    &u,
+                    sort.flag_name(),
+                    super::temporal::Fallback::Ast
+                )
+            );
+        }
     }
 
     // AD-405-7 / AC-405-17: compute coverage from the already-loaded manifest

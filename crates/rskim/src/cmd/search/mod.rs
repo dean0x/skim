@@ -228,18 +228,46 @@ pub(crate) fn run(
                 flags.json,
                 &head_state,
             )?;
-            // Open the temporal DB only when a sort is requested.  Absent DB →
-            // graceful degradation: warn on stderr and run unsorted (exit 0, AC-A3),
-            // mirroring run_temporal_standalone's missing-data message.
+            // Open the temporal DB only when a sort is requested.  Absent DB or empty
+            // dimension → degrade: emit notice on stderr, pass None so temporal_active
+            // falls to false and raw AST order is preserved (AC-A3).
             // AD-414-1 / AD-414-15: open_temporal_state is the single funnel for all
-            // temporal DB access on this arm.
-            let temporal_db = if flags.temporal_sort.is_some() {
+            // temporal DB access on this arm.  Step 8: handles Empty (dimension_is_empty
+            // probe per G-3) as well as Unavailable — both pass None so temporal_active
+            // falls to false and the deliberate SE-4 pool/has_more shift is the result.
+            let temporal_db = if let Some(sort) = flags.temporal_sort {
                 match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
-                    temporal::TemporalOpen::Open(db) => Some(db),
+                    temporal::TemporalOpen::Open(db)
+                        if !temporal::dimension_is_empty(&db, sort) =>
+                    {
+                        Some(db)
+                    }
+                    temporal::TemporalOpen::Open(_) => {
+                        // DB open but the requested temporal dimension has zero rows.
+                        // Never inferred from result_count (G-3); always from the
+                        // per-table probe.
+                        let u = temporal::TemporalUnavailable {
+                            reason: temporal::DegradedReason::Empty,
+                            detail: String::new(),
+                        };
+                        eprintln!(
+                            "skim search: {}",
+                            temporal::degraded_notice(
+                                &u,
+                                sort.flag_name(),
+                                temporal::Fallback::Ast
+                            )
+                        );
+                        None
+                    }
                     temporal::TemporalOpen::Unavailable(u) => {
                         eprintln!(
-                            "skim search: {}; returning unsorted --ast results",
-                            temporal::degraded_notice(&u, "--ast", temporal::Fallback::Ast,)
+                            "skim search: {}",
+                            temporal::degraded_notice(
+                                &u,
+                                sort.flag_name(),
+                                temporal::Fallback::Ast
+                            )
                         );
                         None
                     }
@@ -1548,10 +1576,20 @@ fn run_query(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Typed JSON envelope for a warning-only response (no temporal data available).
+/// Step 9: `NotGitRepo` JSON — preserves AC9 `warning` key byte-for-byte and
+/// adds the new `degraded` sibling so machine consumers can parse the reason.
 #[derive(Serialize)]
-struct WarningJson<'a> {
+struct WarningWithDegradedJson<'a> {
     warning: &'a str,
+    degraded: Vec<temporal::DegradedJson>,
+}
+
+/// Step 9: JSON object emitted on stdout for non-`NotGitRepo` degraded reasons
+/// on the standalone temporal arm (`--hot`/`--cold`/`--risky`/`--blast-radius`).
+/// Every `--json` invocation emits exactly one parseable object (SE-6).
+#[derive(Serialize)]
+struct DegradedOnlyJson {
+    degraded: Vec<temporal::DegradedJson>,
 }
 
 /// Execute a standalone temporal query (no text search term provided).
@@ -1607,19 +1645,79 @@ fn run_temporal_standalone(
     // RepositoryMismatch → wrong-repo rows rejected; Missing/Empty/Corrupt → no data.
     // Both arms degrade gracefully (exit 0, AC-F3).
     // degraded_notice is the SSOT for all stderr/JSON degradation messages.
+    //
+    // Step 9 differentiation:
+    //   NotGitRepo → AC9-byte-identical `warning` key on stdout + `degraded` sibling.
+    //   All other reasons → notice on stderr; in --json mode emit one JSON on stdout (SE-6).
+    let requested_flag = temporal_sort
+        .map(|s| s.flag_name())
+        .unwrap_or("")
+        .to_string();
     let db = match temporal::open_temporal_state(&root, &cache_dir, &head_state) {
         temporal::TemporalOpen::Open(db) => db,
-        temporal::TemporalOpen::Unavailable(ref u) => {
-            let msg_str = temporal::degraded_notice(u, "", temporal::Fallback::NoResults);
-            if json {
-                let msg = WarningJson { warning: &msg_str };
-                println!("{}", serde_json::to_string(&msg)?);
+        temporal::TemporalOpen::Unavailable(u) => {
+            let msg_str = temporal::degraded_notice(&u, "", temporal::Fallback::NoResults);
+            let dj = temporal::DegradedJson {
+                subsystem: "temporal",
+                reason: u.reason.as_json_str(),
+                requested: requested_flag,
+                applied: "none",
+                message: msg_str.clone(),
+                remediation: u.reason.remediation(),
+            };
+            if u.reason == temporal::DegradedReason::NotGitRepo {
+                // NotGitRepo: preserve AC9 byte-identical `warning` on stdout and add
+                // `degraded` as a sibling key for machine consumers.
+                if json {
+                    let msg = WarningWithDegradedJson {
+                        warning: &msg_str,
+                        degraded: vec![dj],
+                    };
+                    println!("{}", serde_json::to_string(&msg)?);
+                } else {
+                    eprintln!("skim search: {msg_str}");
+                }
             } else {
+                // All other reasons: notice to stderr; in --json mode emit one parseable
+                // object on stdout so the caller always gets a valid JSON envelope (SE-6).
                 eprintln!("skim search: {msg_str}");
+                if json {
+                    let msg = DegradedOnlyJson { degraded: vec![dj] };
+                    println!("{}", serde_json::to_string(&msg)?);
+                }
             }
             return Ok(ExitCode::SUCCESS);
         }
     };
+
+    // G-3: probe for Empty via the per-table dimension_is_empty probe for temporal
+    // sort arms.  Never inferred from result_count()==0 && offset==0 — a healthy
+    // 1-commit repo measures hotspot≥1, and standalone --blast-radius legitimately
+    // returns 0 results even on a populated DB.
+    // Cochange emptiness never borrows the shallow/empty wording (G-3).
+    if let Some(sort) = temporal_sort {
+        if temporal::dimension_is_empty(&db, sort) {
+            let u = temporal::TemporalUnavailable {
+                reason: temporal::DegradedReason::Empty,
+                detail: String::new(),
+            };
+            let msg_str = temporal::degraded_notice(&u, "", temporal::Fallback::NoResults);
+            eprintln!("skim search: {msg_str}");
+            if json {
+                let dj = temporal::DegradedJson {
+                    subsystem: "temporal",
+                    reason: u.reason.as_json_str(),
+                    requested: sort.flag_name().to_string(),
+                    applied: "none",
+                    message: msg_str,
+                    remediation: u.reason.remediation(),
+                };
+                let msg = DegradedOnlyJson { degraded: vec![dj] };
+                println!("{}", serde_json::to_string(&msg)?);
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
 
     let (output, has_more) =
         temporal::query_standalone(temporal_sort, blast_radius, page, &db, &root)?;
@@ -4116,6 +4214,115 @@ mod tests {
         assert!(
             !weighted_stdout.contains("note: --weights"),
             "AC9: the inert-weights notice must NOT leak into stdout JSON"
+        );
+    }
+
+    // ========================================================================
+    // Step 9 — standalone temporal arm: degraded JSON back-compat and SE-6
+    // ========================================================================
+
+    /// T-23 (Step 9): `run()` with `--json --hot` on a non-git dir still exits 0
+    /// (AC9 degradation contract) — verifies the new Step 9 code path (NotGitRepo)
+    /// does not regress the exit code.
+    ///
+    /// Back-compat proof: this is the same call the old code served.  If the new
+    /// WarningWithDegradedJson path panics or returns a non-zero ExitCode the AC9
+    /// contract is broken.
+    #[test]
+    fn t23_standalone_temporal_not_git_repo_json_exit_0_step9() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let result = run(
+            &[
+                "--json".to_string(),
+                "--hot".to_string(),
+                "--root".to_string(),
+                root,
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-23: --json --hot on non-git dir must exit 0 (Step 9 AC9 back-compat)"
+        );
+    }
+
+    /// T-6 (Step 9): `run()` with `--hot` (non-json) on a non-git dir exits 0.
+    /// Verifies the non-json path of the new Step 9 NotGitRepo arm.
+    #[test]
+    fn t6_standalone_temporal_not_git_repo_text_exit_0_step9() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let result = run(
+            &["--hot".to_string(), "--root".to_string(), root],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-6: --hot on non-git dir must exit 0 (Step 9 non-json NotGitRepo)"
+        );
+    }
+
+    /// T-8 (Step 9): `run()` with `--json --hot --root <git-repo-without-temporal-db>`
+    /// exits 0 on the Missing path.  Verifies the non-NotGitRepo "other reasons" branch
+    /// (Missing) of the new Step 9 differentiation code.
+    ///
+    /// Uses a fresh git repo (so head_state is Resolved, not NotARepo) but no temporal.db.
+    /// This hits DegradedReason::Missing, which takes the "other reasons → stderr + JSON"
+    /// branch (SE-6), verifying exit 0.
+    #[test]
+    fn t8_standalone_temporal_missing_db_git_repo_exit_0_step9() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Initialise a bare git repo so head_state won't be NotARepo.
+        // This makes open_temporal_state return Missing (not NotGitRepo).
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init must succeed");
+        assert!(status.success(), "git init must succeed");
+
+        let root = dir.path().to_string_lossy().to_string();
+        let result = run(
+            &[
+                "--json".to_string(),
+                "--hot".to_string(),
+                "--root".to_string(),
+                root,
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-8: --json --hot on a git repo with no temporal.db must exit 0 (Missing path, SE-6)"
+        );
+    }
+
+    /// Step 9 / AC-30: a plain text query with no temporal flag must never emit
+    /// an extra stderr line from the temporal degraded path.
+    ///
+    /// run() does not control stderr in-process, but we can verify exit 0 on a
+    /// directory with no index and no temporal DB — the key invariant is that it
+    /// does not panic or error.
+    #[test]
+    fn t_ac30_plain_text_query_no_temporal_flag_exit_0() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let result = run(
+            &["something".to_string(), "--root".to_string(), root],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "AC-30: plain text query with no temporal flag must exit 0"
         );
     }
 }
