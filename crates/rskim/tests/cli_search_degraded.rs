@@ -17,6 +17,7 @@
 //! - T-10 / AC-10: FX-NEWER — user_version=99 preserved, degraded notice
 //! - T-18 / AC-18: FX-1COMMIT — --build + plain query + --hot: no false notices
 //! - T-21 / AC-21: FX-CORRUPT/FX-EMPTY — pagination (--offset) on degraded
+//! - T-22 / AC-22: FX-CORRUPT — limit sweep: no arm returns > --limit results
 //! - T-29 / AC-29: FX-CORRUPT + read-only dir — exit 0, explicit message
 //! - T-30 / AC-30: FX-NEWER + new commit — at most one temporal-failure line
 //! - T-38 / AC-36: FX-COVERAGE — partial-coverage query orders correctly
@@ -313,6 +314,41 @@ fn file_size(path: &Path) -> u64 {
     fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// Assert that a degraded element carries the expected `requested` and `applied` fields.
+///
+/// Used to verify `DegradedJson.requested` uses the bare form (e.g. `"hot"`) and
+/// `DegradedJson.applied` names the fallback strategy (e.g. `"lexical"`).
+/// Failure here means `flag_name()` was used instead of `json_name()` at a call
+/// site — a one-token regression that no `reason`-only assertion would catch (RD-5).
+fn assert_degraded_requested_applied(json_str: &str, requested: &str, applied: &str) {
+    let v: Value = serde_json::from_str(json_str)
+        .unwrap_or_else(|e| panic!("JSON parse error: {e}\nInput:\n{json_str}"));
+    let degraded = v["degraded"].as_array().cloned().unwrap_or_default();
+    let found = degraded.iter().any(|d| {
+        d["requested"].as_str() == Some(requested) && d["applied"].as_str() == Some(applied)
+    });
+    assert!(
+        found,
+        "expected degraded element with requested='{requested}', applied='{applied}'; \
+         got degraded:\n{:?}\nFull JSON:\n{json_str}",
+        degraded
+    );
+}
+
+/// Extract the `co_change` (co-change) partner count for a file from `temporal.db`
+/// via sqlite3.  Returns 0 when the file has no co-change partners.
+fn sqlite_cochange_count(db_path: &Path, file_path: &str) -> i64 {
+    let out = StdCommand::new("sqlite3")
+        .arg(db_path)
+        .arg(format!(
+            "SELECT COUNT(*) FROM cochange WHERE file_a='{file_path}' OR file_b='{file_path}';"
+        ))
+        .output()
+        .unwrap_or_else(|e| panic!("sqlite3 cochange count: {e}"));
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<i64>().unwrap_or(-1)
+}
+
 // ============================================================================
 // Group 1: FX-EMPTY — T-1 / T-2 / T-3 / T-6
 // ============================================================================
@@ -488,6 +524,11 @@ fn t6_fx_empty_standalone_temporal_degraded_json() {
             "T-6/AC-6: {flag} --json output must be a JSON object"
         );
         assert_degraded_reason(&json_out, "empty");
+
+        // DegradedJson.requested must use the BARE form (AC-6 / RD-5).
+        // "hot" / "cold" / "risky" — no "--" prefix.  applied must be "lexical".
+        let bare_flag = flag.trim_start_matches('-');
+        assert_degraded_requested_applied(&json_out, bare_flag, "lexical");
     }
 }
 
@@ -566,6 +607,11 @@ fn t4_fx_absent_rows_no_ranked_rows_ordered_equal_to_plain() {
 
         // Degraded JSON must have reason=no_ranked_rows.
         assert_degraded_reason(&flag_json, "no_ranked_rows");
+
+        // DegradedJson.requested must use the BARE form (AC-4 / RD-5).
+        // "hot" / "cold" / "risky" — no "--" prefix.  applied must be "lexical".
+        let bare_flag = flag.trim_start_matches('-');
+        assert_degraded_requested_applied(&flag_json, bare_flag, "lexical");
 
         // Stderr must mention the row count ("0 of"), the flag, "not applied", "lexical".
         for needle in &["0 of", flag, "not applied", "lexical"] {
@@ -827,24 +873,58 @@ fn t7_blast_radius_degraded_on_empty_and_corrupt() {
     );
 }
 
-/// T-8 / AC-8 — FX-REPO2 healthy blast-radius with zero partners + FX-1COMMIT.
+/// T-8 / AC-8 — healthy blast-radius with zero co-change partners + FX-1COMMIT.
 ///
 /// Neither scenario should emit the degraded notice or shallow/no-history messages.
+///
+/// The blast-radius fixture uses separate commits for alpha.rs and zebra.rs so
+/// the two files never co-occur in a single commit → co-change count for alpha.rs
+/// is 0.  This is verified via sqlite3 before the query so a fixture drift that
+/// reintroduces a co-change row surfaces as a clear failure rather than a silent
+/// false-positive on the stderr !contains assertions (AC-8 / PF-007).
 #[test]
 fn t8_healthy_blast_radius_and_one_commit_no_false_notices() {
-    // FX-REPO2: healthy build, blast-radius on alpha.rs which has 0 co-change partners.
+    // FX-SOLO-ALPHA: 3 commits, alpha.rs and zebra.rs in separate commits so
+    // they never co-occur → alpha.rs has 0 co-change partners.
     let dir2 = TempDir::new().expect("TempDir");
     let root2 = dir2.path().join("repo");
-    fs::create_dir_all(&root2).unwrap();
-    make_repo2(&root2);
+    fs::create_dir_all(root2.join("src")).unwrap();
+    fs::write(
+        root2.join("src/alpha.rs"),
+        "fn alpha_widget() { let y = 2; }\n",
+    )
+    .unwrap();
+    git_init(&root2);
+    git_add_commit(&root2, "c1: add alpha only");
+    // Separate commit for zebra.rs so no co-change pair is formed with alpha.rs.
+    fs::write(
+        root2.join("src/zebra.rs"),
+        "fn zebra_widget() { let x = 1; }\n",
+    )
+    .unwrap();
+    git_add_commit(&root2, "c2: add zebra only");
+    // Fix commit touches only zebra.rs — generates hotspot row without co-change with alpha.
+    fs::write(
+        root2.join("src/zebra.rs"),
+        "fn zebra_widget() { let x = 3; }\n// touched\n",
+    )
+    .unwrap();
+    git_add_commit(&root2, "fix: bug in zebra widget");
+
     let cache2 = TempDir::new().expect("cache TempDir");
     build_index(&root2, cache2.path());
 
     let db_dir2 = find_search_cache(cache2.path());
-    let cochange_count = sqlite_count(&db_dir2.join("temporal.db"), "cochange");
-    // A 2-file repo with only 2 commits may have cochange=0 or cochange>0 depending
-    // on the overlap; we verify the test exercises the 0-partners case via sqlite.
-    let _ = cochange_count; // Logged for clarity; alpha.rs with 0 partners is the intent.
+    // Verify premise: alpha.rs must have exactly 0 co-change partners.
+    // If this fails, the fixture no longer guarantees the 0-partner state and
+    // the !contains assertions below may be vacuous (AC-8 / PF-007).
+    let cochange_count = sqlite_cochange_count(&db_dir2.join("temporal.db"), "src/alpha.rs");
+    assert_eq!(
+        cochange_count, 0,
+        "T-8/AC-8 premise: alpha.rs must have 0 co-change partners in the temporal DB; \
+         a co-change row means the fixture commits were restructured — alpha.rs and \
+         zebra.rs must live in separate commits so they never co-occur"
+    );
 
     let (_, stderr_br, code_br) = skim_search(
         &["--blast-radius", "src/alpha.rs", "--limit", "5"],
@@ -1127,22 +1207,41 @@ fn t18_fx_1commit_no_false_degraded_notices() {
 // Group 8: pagination on degraded — T-21
 // ============================================================================
 
-/// T-21 / AC-21 — FX-CORRUPT and FX-EMPTY: pagination (--offset) on degraded.
+/// T-21 / AC-21 — FX-EMPTY and FX-CORRUPT: pagination (--offset) on degraded.
 ///
-/// For each of text+--hot, text+--cold, text+--risky, and standalone --hot,
-/// at --limit 5: page 0 and page 1 must be disjoint.  `has_more` must be true
-/// iff the next page is non-empty.  `total == len(results)`.
+/// Arms: text+--hot, text+--cold, text+--risky, text+--ast rust-nested-loop --hot.
+/// At --limit 5 with 10 matching files:
+/// - page 0 must contain exactly `limit` results (non-emptiness premise — PF-007)
+/// - page 0 and page 1 must be disjoint
+/// - `has_more` must be true on page 0 (iff page 1 is non-empty)
+/// - `total == len(results)` for each page
+///
+/// Standalone --hot is NOT included: in both FX-EMPTY and FX-CORRUPT the
+/// temporal DB is unusable, so the standalone arm produces 0 results
+/// (no hotspot rows to rank; lexical fallback only applies to text+temporal
+/// combinations).  Pagination of a 0-result set is trivially correct.
+///
+/// FX-EMPTY is the primary fixture (temporal DB present but empty).
+/// FX-CORRUPT is the secondary fixture (temporal DB corrupted, no-commit repo
+/// so auto-heal cannot fire — same corrupt state persists through both pages).
 #[test]
 fn t21_degraded_pagination_disjoint_pages() {
-    // Use FX-REPO2 with many files so there are enough results to page.
+    // -----------------------------------------------------------------------
+    // Build shared FX-EMPTY fixture: 10 files, 2 commits, empty temporal.db.
+    // Files include nested loops so --ast rust-nested-loop also matches them.
+    // -----------------------------------------------------------------------
     let dir = TempDir::new().expect("TempDir");
     let root = dir.path().join("repo");
     fs::create_dir_all(root.join("src")).unwrap();
-    // Create enough files to have >5 results.
+    // Create 10 files with nested loops so pagination has >5 results.
     for i in 0..10_u32 {
         fs::write(
             root.join(format!("src/w{i:02}.rs")),
-            format!("fn widget_{i}() {{ let x = {i}; }}\n// zebra_widget marker\n"),
+            format!(
+                "fn widget_{i}() {{\n    \
+                 for _a in 0..2 {{ for _b in 0..2 {{ let _ = (_a, _b); }} }}\n\
+                 }}\n// zebra_widget marker\n"
+            ),
         )
         .unwrap();
     }
@@ -1151,55 +1250,197 @@ fn t21_degraded_pagination_disjoint_pages() {
     for i in 0..10_u32 {
         fs::write(
             root.join(format!("src/w{i:02}.rs")),
-            format!("fn widget_{i}() {{ let x = {i}u32 + 1; }}\n// zebra_widget marker\n"),
+            format!(
+                "fn widget_{i}() {{\n    \
+                 for _a in 0..3 {{ for _b in 0..2 {{ let _ = ({i}u32, _a, _b); }} }}\n\
+                 }}\n// zebra_widget marker\n"
+            ),
         )
         .unwrap();
     }
     git_add_commit(&root, "fix: update all");
 
-    let cache = TempDir::new().expect("cache TempDir");
-    build_index(&root, cache.path());
+    let cache_empty = TempDir::new().expect("cache TempDir");
+    build_index(&root, cache_empty.path());
 
     // FX-EMPTY: replace temporal.db with empty schema.
-    let db_dir = find_search_cache(cache.path());
+    let db_dir_empty = find_search_cache(cache_empty.path());
     let head = git_head(&root);
-    make_empty_temporal(&db_dir, &head);
+    make_empty_temporal(&db_dir_empty, &head);
 
-    let arms: &[&[&str]] = &[
+    // -----------------------------------------------------------------------
+    // Build FX-CORRUPT fixture: separate no-commit repo so auto-heal can't fire.
+    // -----------------------------------------------------------------------
+    let corrupt_dir = TempDir::new().expect("corrupt TempDir");
+    let corrupt_root = corrupt_dir.path().join("repo");
+    fs::create_dir_all(corrupt_root.join("src")).unwrap();
+    for i in 0..10_u32 {
+        fs::write(
+            corrupt_root.join(format!("src/w{i:02}.rs")),
+            format!(
+                "fn widget_{i}() {{\n    \
+                 for _a in 0..3 {{ for _b in 0..2 {{ let _ = ({i}u32, _a, _b); }} }}\n\
+                 }}\n// zebra_widget marker\n"
+            ),
+        )
+        .unwrap();
+    }
+    git_init(&corrupt_root);
+    // Deliberately NO commit: no HEAD → no temporal rebuild possible (see T-7).
+
+    let cache_corrupt = TempDir::new().expect("cache TempDir");
+    build_index(&corrupt_root, cache_corrupt.path());
+    let db_dir_corrupt = find_search_cache(cache_corrupt.path());
+    let db_path_corrupt = db_dir_corrupt.join("temporal.db");
+    make_corrupt_temporal(&db_path_corrupt);
+
+    // -----------------------------------------------------------------------
+    // Helper: verify pagination for one (root, cache, arm) triple.
+    // -----------------------------------------------------------------------
+    let check_pagination =
+        |label: &str, base_args: &[&str], proj_root: &std::path::Path, cache: &std::path::Path| {
+            let mut p0_args: Vec<&str> = base_args.to_vec();
+            p0_args.extend_from_slice(&["--limit", "5", "--offset", "0", "--json"]);
+            let mut p1_args: Vec<&str> = base_args.to_vec();
+            p1_args.extend_from_slice(&["--limit", "5", "--offset", "5", "--json"]);
+
+            let (p0_json, _, c0) = skim_search(&p0_args, proj_root, cache);
+            let (p1_json, _, c1) = skim_search(&p1_args, proj_root, cache);
+            assert_eq!(c0, 0, "T-21: {label} page 0 must exit 0");
+            assert_eq!(c1, 0, "T-21: {label} page 1 must exit 0");
+
+            let paths0 = extract_paths(&p0_json);
+            let paths1 = extract_paths(&p1_json);
+            let v0: Value = serde_json::from_str(&p0_json).unwrap_or(Value::Null);
+
+            // Non-emptiness: page 0 must contain exactly `limit` results (PF-007).
+            // If page 0 is empty the disjoint and has_more assertions are trivially true.
+            assert_eq!(
+                paths0.len(),
+                5,
+                "T-21/AC-21: {label} page 0 must contain exactly 5 results (limit=5); \
+             got {} — check that the fixture has ≥5 matching files",
+                paths0.len()
+            );
+
+            // Disjoint pages.
+            let overlap: Vec<_> = paths0.iter().filter(|p| paths1.contains(p)).collect();
+            assert!(
+                overlap.is_empty(),
+                "T-21/AC-21: {label} pages must be disjoint; overlap={overlap:?}"
+            );
+
+            // has_more on page 0 must be true iff page 1 is non-empty.
+            let has_more_p0 = v0["has_more"].as_bool().unwrap_or(false);
+            let p1_non_empty = !paths1.is_empty();
+            assert_eq!(
+                has_more_p0, p1_non_empty,
+                "T-21/AC-21: {label} page 0 has_more={has_more_p0} but page 1 is \
+             non_empty={p1_non_empty} — has_more must equal whether the next page exists"
+            );
+
+            // total == len(results) for each page.
+            for (page_n, page_json) in [(0usize, &p0_json), (1usize, &p1_json)] {
+                let pv: Value = serde_json::from_str(page_json).unwrap_or(Value::Null);
+                let results_len = pv["results"].as_array().map(|a| a.len()).unwrap_or(0);
+                let total = pv["total"].as_u64().unwrap_or(999) as usize;
+                assert_eq!(
+                    total, results_len,
+                    "T-21/AC-21: {label} page {page_n}: total must equal results length; \
+                 total={total} results_len={results_len}\nJSON:\n{page_json}"
+                );
+            }
+        };
+
+    // -----------------------------------------------------------------------
+    // FX-EMPTY arms: text+temporal and text+ast+temporal.
+    // Files have nested loops so --ast rust-nested-loop matches all 10.
+    // -----------------------------------------------------------------------
+    let empty_arms: &[&[&str]] = &[
         &["zebra_widget", "--hot"],
         &["zebra_widget", "--cold"],
         &["zebra_widget", "--risky"],
+        // SE-4 arm: text+AST+temporal; AST pool bounds the result set.
+        &["zebra_widget", "--ast", "rust-nested-loop", "--hot"],
     ];
-    for base_args in arms {
-        let label = base_args.join(" ");
-        let mut p0_args: Vec<&str> = base_args.to_vec();
-        p0_args.extend_from_slice(&["--limit", "5", "--offset", "0", "--json"]);
-        let mut p1_args: Vec<&str> = base_args.to_vec();
-        p1_args.extend_from_slice(&["--limit", "5", "--offset", "5", "--json"]);
+    for base_args in empty_arms {
+        let label = format!("FX-EMPTY {}", base_args.join(" "));
+        check_pagination(&label, base_args, &root, cache_empty.path());
+    }
 
-        let (p0_json, _, c0) = skim_search(&p0_args, &root, cache.path());
-        let (p1_json, _, c1) = skim_search(&p1_args, &root, cache.path());
-        assert_eq!(c0, 0, "T-21: {label} page 0 must exit 0");
-        assert_eq!(c1, 0, "T-21: {label} page 1 must exit 0");
+    // -----------------------------------------------------------------------
+    // FX-CORRUPT arms: text+--hot and text+--cold.
+    // auto-heal cannot fire (no HEAD) → corrupt state persists through both pages.
+    // -----------------------------------------------------------------------
+    let corrupt_arms: &[&[&str]] = &[&["zebra_widget", "--hot"], &["zebra_widget", "--cold"]];
+    for base_args in corrupt_arms {
+        let label = format!("FX-CORRUPT {}", base_args.join(" "));
+        check_pagination(&label, base_args, &corrupt_root, cache_corrupt.path());
+    }
+}
 
-        let paths0 = extract_paths(&p0_json);
-        let paths1 = extract_paths(&p1_json);
+// ============================================================================
+// Group 8b: limit sweep on degraded — T-22 / AC-22
+// ============================================================================
 
-        // Pages must not overlap.
-        let overlap: Vec<_> = paths0.iter().filter(|p| paths1.contains(p)).collect();
-        assert!(
-            overlap.is_empty(),
-            "T-21/AC-21: {label} pages must be disjoint; overlap={overlap:?}"
-        );
+/// T-22 / AC-22 — FX-CORRUPT: no invocation returns more results than --limit.
+///
+/// This is one of #414's three headline symptoms ("--limit violated").
+/// Without the fix the degraded lexical-fallback path could return an untruncated
+/// full result set, ignoring the caller-supplied limit.
+///
+/// Fixture: 18 files all matching the query `grid_widget`.  The temporal DB is
+/// corrupted (no-commit repo so auto-heal cannot fire).  For each limit value in
+/// `{1, 2, 5, 7, 20, 100}` the arms `text+--hot` and `text+--risky` are verified.
+/// Expected baseline for a 18-file corpus:
+///   limit=1  → 1, limit=2  → 2, limit=5  → 5, limit=7  → 7,
+///   limit=20 → 18, limit=100 → 18.
+/// The test asserts `len(results) <= limit` — it does NOT pin the exact count so
+/// it remains valid if the fixture size changes.
+#[test]
+fn t22_limit_sweep_degraded_corrupt_never_exceeds_limit() {
+    // FX-CORRUPT-18: 18 files, no commits (no HEAD → auto-heal cannot fire).
+    const FILE_COUNT: u32 = 18;
+    let dir = TempDir::new().expect("TempDir");
+    let root = dir.path().join("repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    for i in 0..FILE_COUNT {
+        fs::write(
+            root.join(format!("src/g{i:02}.rs")),
+            format!("fn grid_widget_{i}() {{ let g = {i}; let _ = g; }}\n// grid_widget\n"),
+        )
+        .unwrap();
+    }
+    git_init(&root);
+    // Deliberately NO commit: no HEAD → temporal DB cannot be rebuilt by auto-heal.
 
-        // total == len(results) for each page.
-        for (page_n, page_json) in &[(0, &p0_json), (1, &p1_json)] {
-            let v: Value = serde_json::from_str(page_json).unwrap_or(Value::Null);
-            let results_len = v["results"].as_array().map(|a| a.len()).unwrap_or(0);
-            let total = v["total"].as_u64().unwrap_or(999) as usize;
+    let cache = TempDir::new().expect("cache TempDir");
+    build_index(&root, cache.path());
+    let db_dir = find_search_cache(cache.path());
+    make_corrupt_temporal(&db_dir.join("temporal.db"));
+
+    let limits: &[usize] = &[1, 2, 5, 7, 20, 100];
+    let arms: &[&[&str]] = &[&["grid_widget", "--hot"], &["grid_widget", "--risky"]];
+
+    for &limit in limits {
+        let limit_str = limit.to_string();
+        for base_args in arms {
+            let arm_label = base_args.join(" ");
+            let mut args: Vec<&str> = base_args.to_vec();
+            args.extend_from_slice(&["--limit", &limit_str, "--json"]);
+            let (json_out, _, code) = skim_search(&args, &root, cache.path());
             assert_eq!(
-                total, results_len,
-                "T-21/AC-21: {label} page {page_n}: total must equal results length"
+                code, 0,
+                "T-22/AC-22: '{arm_label}' --limit {limit} must exit 0"
+            );
+            let v: Value = serde_json::from_str(&json_out)
+                .unwrap_or_else(|e| panic!("T-22: JSON parse error: {e}\n{json_out}"));
+            let result_count = v["results"].as_array().map(|a| a.len()).unwrap_or(0);
+            assert!(
+                result_count <= limit,
+                "T-22/AC-22: '{arm_label}' --limit {limit} returned {result_count} results \
+                 (EXCEEDS LIMIT) — the degraded lexical-fallback path must honour --limit; \
+                 got JSON:\n{json_out}"
             );
         }
     }
@@ -1284,13 +1525,20 @@ fn t29_fx_corrupt_readonly_dir_exit_0_explicit_message() {
 
 /// Build the FX-COVERAGE fixture.
 ///
-/// FX-ABSENT-ROWS (uncommitted `zz_new.rs`, `aa_new.rs`, `mm_new.rs`) PLUS
+/// FX-ABSENT-ROWS (uncommitted `zz_new.rs`, `aa_new.rs`, `mm_new.rs`, `zz_zero.rs`) PLUS
 /// one committed file `src/bb_hot.rs` that also matches `thing_marker`.
-/// The committed file gets a hotspot row; the three uncommitted files do not.
+/// The committed file gets a hotspot row; the uncommitted files do not.
 ///
 /// Two queries:
-/// - Zero-coverage query: `other_a` (only in `aa_new.rs`) → only uncommitted
-/// - Partial-coverage query: `thing_marker` → all four files
+/// - Zero-coverage query: `other_a` (in `aa_new.rs` and `zz_zero.rs`) → only uncommitted.
+///   `zz_zero.rs` has higher TF for `other_a` (4 occurrences) than `aa_new.rs` (1).
+///   BM25F ranks `zz_zero.rs` first; path-ASC would rank `aa_new.rs` first — a
+///   measurable discriminant for AC-36(a): the degraded result must match BM25F
+///   (lexical fallback), not path-ASC (sentinel-sort artefact).
+/// - Partial-coverage query: `thing_marker` → all four original files (not `zz_zero.rs`)
+///
+/// `aa_new.rs` contains a nested loop so `--ast rust-nested-loop` matches it
+/// in the zero-coverage arm (AC-36(a) --ast sub-case).
 fn make_fx_coverage() -> (TempDir, std::path::PathBuf, TempDir) {
     let dir = TempDir::new().expect("TempDir");
     let root = dir.path().join("repo");
@@ -1327,10 +1575,20 @@ fn make_fx_coverage() -> (TempDir, std::path::PathBuf, TempDir) {
     let cache = TempDir::new().expect("cache TempDir");
     build_index(&root, cache.path());
 
-    // Now add three uncommitted files (FX-ABSENT-ROWS shape).
+    // Now add four uncommitted files (FX-ABSENT-ROWS shape + discriminant file).
+    //
+    // aa_new.rs: 1 occurrence of `other_a` (function def) + a nested-for loop so
+    // `--ast rust-nested-loop` matches it.
     fs::write(
         root.join("src/aa_new.rs"),
-        "// thing_marker mentioned in a comment only\nfn other_a() { }\n",
+        "// thing_marker mentioned in a comment only\n\
+         fn other_a() {\n\
+             for i in 0..3 {\n\
+                 for j in 0..2 {\n\
+                     let _ = (i, j);\n\
+                 }\n\
+             }\n\
+         }\n",
     )
     .unwrap();
     fs::write(
@@ -1339,23 +1597,42 @@ fn make_fx_coverage() -> (TempDir, std::path::PathBuf, TempDir) {
     )
     .unwrap();
     fs::write(root.join("src/zz_new.rs"), "fn thing_marker() { }\n").unwrap();
+    // zz_zero.rs: 4 occurrences of `other_a` (1 def + 3 calls) → higher BM25F TF
+    // than aa_new.rs (1 occurrence).  Alphabetically AFTER aa_new.rs (z > a), so
+    // BM25F order (zz_zero first) != path-ASC order (aa_new first) → discriminant.
+    fs::write(
+        root.join("src/zz_zero.rs"),
+        "fn other_a() { let zero = 0; let _ = zero; }\n\
+         fn call_other_a() {\n\
+             other_a();\n\
+             other_a();\n\
+             other_a();\n\
+         }\n",
+    )
+    .unwrap();
 
     (dir, root, cache)
 }
 
 /// T-38 / AC-36 — FX-COVERAGE: partial-coverage query ordering.
 ///
-/// Partial-coverage query (`thing_marker`): matches all four files.
-/// - `bb_hot.rs` is committed and has a hotspot row → ranked first by `--hot`
-/// - The three uncommitted files have no rows → NoRankedRows path NOT triggered
-///   because at least one file IS ranked → partial coverage
-/// - `--hot`: bb_hot.rs first, then the three unranked in some order
-/// - `--cold`: the three unranked first, then bb_hot.rs last
-/// - Only `bb_hot.rs` carries `temporal`; the three unranked have no `temporal`
-/// - No `degraded` element in the partial-coverage case
+/// # AC-36(b) — partial-coverage (`thing_marker` matches all files incl. bb_hot.rs)
 ///
-/// Zero-coverage query (`other_a`): only in aa_new.rs (uncommitted).
-/// - --hot on aa_new.rs alone: ranked==0, so NoRankedRows degraded notice fires
+/// - `--hot`: `bb_hot.rs` must appear FIRST (highest hotspot score as a committed
+///   file touched in two commits); the three unranked uncommitted files follow.
+/// - `--cold`: the three unranked files appear FIRST; `bb_hot.rs` is LAST.
+/// - Only `bb_hot.rs` carries a `temporal` key; uncommitted files must not.
+/// - No `degraded` element in either case.
+///
+/// # AC-36(a) — zero-coverage (`other_a` only in uncommitted files)
+///
+/// - All matched files have no temporal rows → NoRankedRows degraded notice fires.
+/// - The degraded fallback is lexical (BM25F), NOT path-ASC (sentinel-sort artefact).
+/// - Discriminant: `zz_zero.rs` has higher TF than `aa_new.rs` for `other_a`
+///   (4 vs 1 occurrences) → BM25F ranks `zz_zero.rs` first; path-ASC would rank
+///   `aa_new.rs` first.  Asserting `hot_paths[0].contains("zz_zero")` is the
+///   measurable proof that lexical fallback was applied, not sentinel sorting.
+/// - Arms: `--hot`, `--cold`, `--risky`, `--ast rust-nested-loop --hot`.
 #[test]
 fn t38_fx_coverage_partial_and_zero_coverage() {
     let (_dir, root, cache) = make_fx_coverage();
@@ -1377,7 +1654,11 @@ fn t38_fx_coverage_partial_and_zero_coverage() {
         "T-38/AC-36: premise check — bb_hot.rs must have 1 hotspot row (PF-007)"
     );
 
-    // PARTIAL COVERAGE: thing_marker matches all four files.
+    // -----------------------------------------------------------------------
+    // AC-36(b): PARTIAL COVERAGE — thing_marker matches all four original files.
+    // -----------------------------------------------------------------------
+
+    // --hot: bb_hot.rs must be FIRST (ranked by hotspot score).
     let (hot_json, _, code_hot) = skim_search(
         &["thing_marker", "--hot", "--limit", "5", "--json"],
         &root,
@@ -1385,19 +1666,23 @@ fn t38_fx_coverage_partial_and_zero_coverage() {
     );
     assert_eq!(
         code_hot, 0,
-        "T-38/AC-36: --hot partial coverage must exit 0"
+        "T-38/AC-36(b): --hot partial coverage must exit 0"
     );
 
     let hot_paths = extract_paths(&hot_json);
     assert!(
         !hot_paths.is_empty(),
-        "T-38/AC-36: --hot must return results (PF-007)"
+        "T-38/AC-36(b): --hot must return results (PF-007)"
     );
 
-    // bb_hot.rs must appear in the results.
+    // AC-36(b) ordering: bb_hot.rs must appear FIRST under --hot.
     assert!(
-        hot_paths.iter().any(|p| p.contains("bb_hot")),
-        "T-38/AC-36: --hot results must include bb_hot.rs; got paths={hot_paths:?}"
+        hot_paths
+            .first()
+            .map(|p| p.contains("bb_hot"))
+            .unwrap_or(false),
+        "T-38/AC-36(b): --hot must rank bb_hot.rs FIRST (highest hotspot score); \
+         got paths={hot_paths:?}"
     );
 
     // No degraded element in partial-coverage case.
@@ -1405,51 +1690,136 @@ fn t38_fx_coverage_partial_and_zero_coverage() {
     let degraded_hot = v_hot["degraded"].as_array().cloned().unwrap_or_default();
     assert!(
         degraded_hot.is_empty(),
-        "T-38/AC-36: --hot partial coverage must have no degraded elements; got:\n{hot_json}"
+        "T-38/AC-36(b): --hot partial coverage must have no degraded elements; got:\n{hot_json}"
     );
 
-    // Only bb_hot.rs should carry temporal data.
+    // AC-36(b) temporal annotation: only bb_hot.rs must carry a real hotspot_score.
+    // Uncommitted files have no temporal rows so their hotspot_score must be absent.
+    // We check hotspot_score specifically (not the outer temporal key) to avoid
+    // brittleness around empty-object serialisation of all-None TemporalAnnotations.
     let results_hot = v_hot["results"].as_array().cloned().unwrap_or_default();
     for r in &results_hot {
         let path = r["path"].as_str().unwrap_or("");
-        let has_temporal = r.get("temporal").is_some_and(|t| !t.is_null());
+        let has_score = r["temporal"]["hotspot_score"].as_f64().is_some();
         if path.contains("bb_hot") {
             assert!(
-                has_temporal,
-                "T-38/AC-36: bb_hot.rs must carry temporal data in --hot; got:\n{r}"
+                has_score,
+                "T-38/AC-36(b): bb_hot.rs must carry temporal.hotspot_score in --hot; got:\n{r}"
+            );
+        } else {
+            assert!(
+                !has_score,
+                "T-38/AC-36(b): uncommitted file '{path}' must NOT carry a hotspot_score \
+                 (no temporal rows → score absent); got:\n{r}"
             );
         }
-        // Uncommitted files may or may not carry temporal depending on -1.0 sentinel handling;
-        // we don't assert the absence here to avoid being brittle.
     }
 
-    // ZERO COVERAGE: other_a is only in aa_new.rs (uncommitted).
-    let (zero_json, zero_stderr, code_zero) = skim_search(
-        &["other_a", "--hot", "--limit", "5", "--json"],
+    // --cold: bb_hot.rs must be LAST (lowest hotspot score → coldest).
+    let (cold_json, _, code_cold) = skim_search(
+        &["thing_marker", "--cold", "--limit", "5", "--json"],
         &root,
         cache.path(),
     );
-    assert_eq!(code_zero, 0, "T-38/AC-36: zero-coverage --hot must exit 0");
+    assert_eq!(
+        code_cold, 0,
+        "T-38/AC-36(b): --cold partial coverage must exit 0"
+    );
 
-    // For zero-coverage: plain query paths must equal --hot paths (NoRankedRows fallback).
+    let cold_paths = extract_paths(&cold_json);
+    assert!(
+        !cold_paths.is_empty(),
+        "T-38/AC-36(b): --cold must return results (PF-007)"
+    );
+
+    // AC-36(b) ordering: bb_hot.rs must appear LAST under --cold.
+    assert!(
+        cold_paths
+            .last()
+            .map(|p| p.contains("bb_hot"))
+            .unwrap_or(false),
+        "T-38/AC-36(b): --cold must rank bb_hot.rs LAST (highest hotspot → coldest last); \
+         got paths={cold_paths:?}"
+    );
+
+    // No degraded element under --cold either.
+    let v_cold: Value = serde_json::from_str(&cold_json).unwrap_or(Value::Null);
+    let degraded_cold = v_cold["degraded"].as_array().cloned().unwrap_or_default();
+    assert!(
+        degraded_cold.is_empty(),
+        "T-38/AC-36(b): --cold partial coverage must have no degraded elements; got:\n{cold_json}"
+    );
+
+    // -----------------------------------------------------------------------
+    // AC-36(a): ZERO COVERAGE — other_a matches only uncommitted files.
+    // Discriminant: zz_zero.rs has higher TF (4 occurrences) than aa_new.rs (1).
+    // BM25F order: zz_zero.rs first.  Path-ASC order: aa_new.rs first.
+    // Asserting zz_zero.rs first proves the degraded fallback is BM25F, not
+    // path-ASC (the sentinel-sort artefact that the pre-fix code would produce).
+    // -----------------------------------------------------------------------
+
     let (plain_zero_json, _, _) =
         skim_search(&["other_a", "--limit", "5", "--json"], &root, cache.path());
     let plain_zero_paths = extract_paths(&plain_zero_json);
-    let hot_zero_paths = extract_paths(&zero_json);
 
-    if !plain_zero_paths.is_empty() {
-        assert_eq!(
-            plain_zero_paths, hot_zero_paths,
-            "T-38/AC-36: zero-coverage --hot must produce same order as plain query"
-        );
-        // No ranked rows → degraded notice fires.
-        assert_degraded_reason(&zero_json, "no_ranked_rows");
+    // Non-vacuousness: the plain query must return ≥1 result.
+    // If it returns 0, the fixture or the index is broken — fail loudly (PF-007).
+    assert!(
+        !plain_zero_paths.is_empty(),
+        "T-38/AC-36(a) premise: plain query for 'other_a' must return ≥1 result; \
+         aa_new.rs and zz_zero.rs both contain it — check fixture or index"
+    );
+
+    // AC-36(a) discriminant: zz_zero.rs (TF=4) must rank before aa_new.rs (TF=1).
+    // If aa_new.rs is first, the sort key is path-ASC (broken sentinel), not BM25F.
+    let plain_first = plain_zero_paths.first().map(|s| s.as_str()).unwrap_or("");
+    assert!(
+        plain_first.contains("zz_zero"),
+        "T-38/AC-36(a) discriminant: BM25F must rank zz_zero.rs (TF=4) before \
+         aa_new.rs (TF=1) for query 'other_a'; got first={plain_first:?}\n\
+         all plain paths={plain_zero_paths:?}"
+    );
+
+    // Zero-coverage arms: --hot, --cold, --risky, --ast rust-nested-loop --hot.
+    // Each must degrade to lexical (NoRankedRows) and match the plain query order.
+    let zero_cov_arms: &[&[&str]] = &[
+        &["other_a", "--hot"],
+        &["other_a", "--cold"],
+        &["other_a", "--risky"],
+        &["other_a", "--ast", "rust-nested-loop", "--hot"],
+    ];
+    for arm in zero_cov_arms {
+        let arm_label = arm.join(" ");
+        let mut args: Vec<&str> = arm.to_vec();
+        args.extend_from_slice(&["--limit", "5", "--json"]);
+        let (arm_json, arm_stderr, arm_code) = skim_search(&args, &root, cache.path());
+        assert_eq!(arm_code, 0, "T-38/AC-36(a): '{arm_label}' must exit 0");
+
+        let arm_paths = extract_paths(&arm_json);
         assert!(
-            zero_stderr.contains("not applied") || zero_stderr.contains("0 of"),
-            "T-38/AC-36: zero-coverage --hot stderr must mention degradation; got:\n{zero_stderr}"
+            !arm_paths.is_empty(),
+            "T-38/AC-36(a): '{arm_label}' must return ≥1 result (PF-007)"
+        );
+
+        // For text-based arms: paths must match the plain query's BM25F order.
+        // The --ast arm may return a subset (only aa_new.rs has nested loops), so
+        // we only check that the degraded notice fires, not the exact path set.
+        let is_ast_arm = arm.contains(&"--ast");
+        if !is_ast_arm {
+            assert_eq!(
+                plain_zero_paths, arm_paths,
+                "T-38/AC-36(a): '{arm_label}' degraded paths must match plain query \
+                 (BM25F fallback, not path-ASC sentinel)"
+            );
+        }
+
+        // NoRankedRows degraded notice must fire for every arm.
+        assert_degraded_reason(&arm_json, "no_ranked_rows");
+        assert!(
+            arm_stderr.contains("not applied") || arm_stderr.contains("0 of"),
+            "T-38/AC-36(a): '{arm_label}' stderr must mention degradation; got:\n{arm_stderr}"
         );
     }
-    // (If other_a has 0 results due to index miss, the test is vacuous; we log it.)
 }
 
 // ============================================================================
