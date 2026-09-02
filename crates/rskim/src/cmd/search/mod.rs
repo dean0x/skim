@@ -1054,16 +1054,48 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         // as the test helper) — ensures AC11 back-compat tests guard production.
         // AD-395-6: `skipped` array and `skipped_by_reason` are additive keys.
         //
-        // Gather-once: build_stats_json opens the reader, checks staleness, and
+        // Gather-once: build_stats_json opens the reader, self-heals (AC-14), and
         // loads skip entries internally.  We do NOT pre-compute those values here
-        // — doing so would run a second NgramIndexReader::open and a second
-        // check_staleness (full working-tree metadata walk) before immediately
+        // — doing so would run a second NgramIndexReader::open before immediately
         // discarding the results.
-        let extended = build_stats_json(&cache_dir, &root, &head_state)?;
-        writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
+        //
+        // AC-13 / T-13: if build_stats_json returns Err (CRC-level corruption that
+        // the structural probe cannot detect), emit a structured JSON error object
+        // on stdout and exit FAILURE — `--stats --json` always produces JSON.
+        match build_stats_json(&cache_dir, &root, &head_state) {
+            Ok(extended) => {
+                writeln!(out, "{}", serde_json::to_string_pretty(&extended)?)?;
+            }
+            Err(e) => {
+                let err_json = serde_json::json!({
+                    "error": format!("{e:#}"),
+                    "cache_dir": cache_dir_display,
+                });
+                writeln!(out, "{}", serde_json::to_string_pretty(&err_json)?)?;
+                out.flush()?;
+                return Ok(ExitCode::FAILURE);
+            }
+        }
     } else {
-        // Text mode: gather stats once here (not needed by the JSON path above).
-        let reader = rskim_search::NgramIndexReader::open(&cache_dir)?;
+        // Text mode: self-heal structural corruption before opening the reader
+        // (AC-14: same check_staleness → rebuild route as the query arms).
+        // analytics is unused by auto_refresh_if_stale (_analytics param);
+        // a disabled instance avoids threading the parameter into run_stats.
+        let noop_analytics = crate::analytics::AnalyticsConfig {
+            enabled: false,
+            input_cost_per_mtok: None,
+            session_id: None,
+        };
+        let (_, loaded_manifest, _) = staleness::auto_refresh_if_stale(
+            &root,
+            &cache_dir,
+            &noop_analytics,
+            staleness::ReanchorPolicy::Refuse,
+        )?;
+        // AD-414-7: actionable error, mirroring open_ast_engine. After self-heal the
+        // reader opens successfully for F-Body-A/B/C; only a CRC-level corruption
+        // that the structural probe cannot detect propagates this error (T-13).
+        let reader = query::open_lexical_reader(&cache_dir)?;
         let stats = reader.stats();
 
         // AD-380-4 (#380): the lexical-only `index_size_bytes` (skidx+skpost from
@@ -1077,20 +1109,17 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         // report it as its own line — it is included in the total but distinguished.
         let temporal_db_bytes = artifact_len(&cache_dir, "temporal.db");
 
-        // check_staleness returns the loaded manifest as part of its work.
-        // Reuse it here instead of loading the manifest a second time.
-        let (staleness_status, loaded_manifest) = staleness::check_staleness(&cache_dir, &root);
-        let git_head = loaded_manifest
-            .as_ref()
-            .and_then(|m| m.stored_git_head().map(str::to_string));
+        // Use the manifest returned by auto_refresh_if_stale — avoids a second
+        // check_staleness (full working-tree metadata walk) for the same data.
+        // After self-heal the index is current (rebuilt if needed), so staleness
+        // is always "current" for the display.
+        let git_head = loaded_manifest.stored_git_head().map(str::to_string);
+        let staleness_status = staleness::StalenessCheck::Current;
 
         // AD-395-6: load skip section from the manifest for --stats display.
         // All pre-existing keys are unchanged; `skipped` / `skipped_by_reason`
         // are purely additive (AC11 back-compat).
-        let skip_entries: Vec<_> = loaded_manifest
-            .as_ref()
-            .map(|m| m.skipped().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let skip_entries: Vec<_> = loaded_manifest.skipped().collect::<Vec<_>>();
 
         writeln!(out, "skim search index stats:")?;
         writeln!(out, "  files indexed : {}", stats.file_count)?;
@@ -1104,6 +1133,16 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         writeln!(out, "  total on disk : {total_on_disk} bytes")?;
         // AD-380-5: temporal DB reported separately (scales with git history).
         writeln!(out, "  temporal db   : {temporal_db_bytes} bytes")?;
+        // AD-414-10: temporal DB state — one of 5 values (AC-15).
+        {
+            let ts_json = temporal_state_json_str(&root, &cache_dir, &head_state);
+            let ts_text = if ts_json == "empty" {
+                "empty (0 rows)"
+            } else {
+                ts_json
+            };
+            writeln!(out, "  temporal state : {ts_text}")?;
+        }
         if let Some(ts) = stats.last_updated {
             writeln!(out, "  last updated  : {ts}")?;
         }
@@ -1136,9 +1175,9 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
         // AD-405-7 / AC-405-9 / AC-405-15: AST size-coverage section (D-4 cadence).
         // Omit when clean (is_clean() == true) — byte-identical to the pre-fix binary
         // on a corpus with zero excluded / zero undetermined files (AC-405-15).
-        // Loaded manifest is already in memory from check_staleness — zero extra I/O.
-        if let Some(ref m) = loaded_manifest {
-            let coverage = m.ast_coverage();
+        // Loaded manifest is already in memory from auto_refresh_if_stale.
+        {
+            let coverage = loaded_manifest.ast_coverage();
             if !coverage.is_clean() {
                 writeln!(out, "  ast eligible  : {}", coverage.size_eligible_files)?;
                 if coverage.size_excluded_files > 0 {
@@ -1201,6 +1240,42 @@ fn total_on_disk_bytes(cache_dir: &std::path::Path) -> u64 {
         .iter()
         .map(|name| artifact_len(cache_dir, name))
         .sum()
+}
+
+// ============================================================================
+// Temporal state helper (AD-414-10)
+// ============================================================================
+
+/// AD-414-10: compute the temporal DB state for `--stats` reporting.
+///
+/// Returns one of five JSON values: `"ready"` / `"empty"` / `"corrupt"` /
+/// `"newer-schema"` / `"missing"` — each maps to one of the five AC-15
+/// observable states.  Other `Unavailable` reasons (NotGitRepo,
+/// HeadUnresolved, RepositoryMismatch, Unreadable) collapse to `"missing"`
+/// because the DB is effectively inaccessible in those states.
+///
+/// For text output, the caller converts `"empty"` to `"empty (0 rows)"`.
+fn temporal_state_json_str(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    head_state: &staleness::HeadState,
+) -> &'static str {
+    use temporal::{DegradedReason, TemporalOpen, dimension_is_empty, open_temporal_state};
+    use types::TemporalSort;
+    match open_temporal_state(root, cache_dir, head_state) {
+        TemporalOpen::Open(db) => {
+            if dimension_is_empty(&db, TemporalSort::Hot) {
+                "empty"
+            } else {
+                "ready"
+            }
+        }
+        TemporalOpen::Unavailable(u) => match u.reason {
+            DegradedReason::Corrupt => "corrupt",
+            DegradedReason::UnsupportedVersion => "newer-schema",
+            _ => "missing",
+        },
+    }
 }
 
 // ============================================================================
@@ -1933,20 +2008,39 @@ fn build_stats_json(
 ) -> anyhow::Result<serde_json::Value> {
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
-        return Ok(serde_json::json!({ "error": "no index found" }));
+        // Normalized to include cache_dir (G-4/C11 — matches run_stats JSON early return).
+        return Ok(serde_json::json!({
+            "error": "no index found",
+            "cache_dir": cache_dir.display().to_string(),
+        }));
     }
-    let reader = rskim_search::NgramIndexReader::open(cache_dir)?;
+    // AC-14: self-heal structural corruption before opening the reader (same route
+    // as query arms).  analytics is unused by auto_refresh_if_stale (_analytics);
+    // a disabled instance avoids threading the parameter through build_stats_json.
+    let noop_analytics = crate::analytics::AnalyticsConfig {
+        enabled: false,
+        input_cost_per_mtok: None,
+        session_id: None,
+    };
+    let (_, loaded_manifest, _) = staleness::auto_refresh_if_stale(
+        root,
+        cache_dir,
+        &noop_analytics,
+        staleness::ReanchorPolicy::Refuse,
+    )?;
+    // AD-414-7: actionable error. For F-Body-A/B/C the self-heal above already
+    // rebuilt the index, so open_lexical_reader succeeds. Only a CRC-level
+    // corruption that the structural probe cannot detect propagates this Err
+    // (T-13); the caller (run_stats) catches it and emits a structured JSON error.
+    let reader = query::open_lexical_reader(cache_dir)?;
     let stats = reader.stats();
     let total_on_disk = total_on_disk_bytes(cache_dir);
     let temporal_db_bytes = artifact_len(cache_dir, "temporal.db");
-    let (staleness_status, loaded_manifest) = staleness::check_staleness(cache_dir, root);
-    let git_head = loaded_manifest
-        .as_ref()
-        .and_then(|m| m.stored_git_head().map(str::to_string));
-    let skip_entries: Vec<_> = loaded_manifest
-        .as_ref()
-        .map(|m| m.skipped().collect::<Vec<_>>())
-        .unwrap_or_default();
+    // Use manifest from auto_refresh_if_stale — avoids a second check_staleness
+    // (full working-tree metadata walk).  After self-heal the index is current.
+    let git_head = loaded_manifest.stored_git_head().map(str::to_string);
+    let staleness_status = staleness::StalenessCheck::Current;
+    let skip_entries: Vec<_> = loaded_manifest.skipped().collect::<Vec<_>>();
     let skipped_arr: Vec<serde_json::Value> = skip_entries
         .iter()
         .map(|e| {
@@ -1973,17 +2067,14 @@ fn build_stats_json(
     // AD-405-9 / AC-405-9 / AC-405-15: `ast_coverage` is additive (never replaces
     // existing keys) and OMITTED when clean (is_clean() == true), matching the
     // same guard used on the standalone --ast and compound --ast surfaces.
-    // Absent when no manifest is loaded OR when all files are within cap.
     // No-index early-return above keeps the error object as-is.
-    let ast_coverage_val: Option<serde_json::Value> = loaded_manifest
-        .as_ref()
-        .and_then(|m| {
-            let cov = m.ast_coverage();
-            if cov.is_clean() { None } else { Some(cov) }
-        })
-        .map(serde_json::to_value)
-        .transpose()
-        .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?;
+    let ast_coverage_val: Option<serde_json::Value> = {
+        let cov = loaded_manifest.ast_coverage();
+        if cov.is_clean() { None } else { Some(cov) }
+    }
+    .map(serde_json::to_value)
+    .transpose()
+    .map_err(|e| anyhow::anyhow!("ast_coverage serialization error: {e}"))?;
     // AC20 (#413): additive `git_head_state` key with one of three string values.
     // Not in either error object (AC21 — the no-index early-return above is before
     // this computation). Owned by #413; #414 extends this with `temporal_state`.
@@ -1994,6 +2085,9 @@ fn build_stats_json(
         staleness::HeadState::Unresolved => "unresolved",
         staleness::HeadState::NotARepo => "not_a_repo",
     };
+    // AD-414-10: additive `temporal_state` key, one of five values (AC-15).
+    // Not in the error objects (consistent with git_head_state / AC21 scope).
+    let temporal_state = temporal_state_json_str(root, cache_dir, head_state);
     let mut result = serde_json::json!({
         "file_count": stats.file_count,
         "total_ngrams": stats.total_ngrams,
@@ -2003,6 +2097,7 @@ fn build_stats_json(
         "last_updated": stats.last_updated,
         "git_head": git_head,
         "git_head_state": git_head_state_str,
+        "temporal_state": temporal_state,
         "staleness": staleness_status.to_string(),
         "cache_dir": cache_dir.display().to_string(),
         "skipped": skipped_arr,
@@ -4323,6 +4418,275 @@ mod tests {
             result,
             ExitCode::SUCCESS,
             "AC-30: plain text query with no temporal flag must exit 0"
+        );
+    }
+
+    // =========================================================================
+    // Step 11: T-13/T-14/T-15 — actionable lexical error, stats self-heal,
+    // and temporal_state key (AD-414-7, AD-414-10, AC-13, AC-14, AC-15)
+    // =========================================================================
+
+    /// T-14 / AC-14: `--stats --json` on F-Body-A (truncated `index.skpost`) MUST
+    /// exit 0 after self-healing through `auto_refresh_if_stale` → rebuild, and the
+    /// returned JSON must be a complete stats object (not an error object).
+    ///
+    /// Covers the G-4 fix: previously `build_stats_json` opened the reader BEFORE
+    /// `check_staleness`, so body-corrupt indexes never reached the self-heal path
+    /// and `--stats` always exited 1 with no JSON on stdout.
+    ///
+    /// PF-007: asserts observable output, not just exit code.
+    #[test]
+    fn t14_stats_json_self_heals_on_fbody_a_truncated_skpost() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Need a real git repo so temporal self-heal also works.
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: first", &[("src/a.rs", "fn alpha() {}")]),
+                ("feat: second", &[("src/b.rs", "fn beta() {}")]),
+            ],
+        );
+
+        // Build the index.
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root.to_string_lossy().to_string(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-14 setup: --rebuild must succeed"
+        );
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let skpost_path = cache_dir.join("index.skpost");
+
+        // Corrupt: truncate skpost to half its size (F-Body-A).
+        let original_len = std::fs::metadata(&skpost_path).unwrap().len();
+        let half_len = (original_len / 2).max(1);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&skpost_path)
+            .unwrap();
+        file.set_len(half_len).unwrap();
+
+        // --stats --json must self-heal and return a complete stats object.
+        let stats = stats_json_for_test(&cache_dir, root)
+            .expect("T-14: stats_json_for_test must succeed after self-heal on F-Body-A");
+
+        // Must NOT be an error object (PF-007).
+        assert!(
+            stats.get("error").is_none(),
+            "T-14: stats after self-heal must not contain 'error'; got: {stats:?}"
+        );
+        assert!(
+            stats.get("file_count").is_some(),
+            "T-14: stats after self-heal must contain 'file_count'; got: {stats:?}"
+        );
+
+        // index.skpost must be restored to a consistent length.
+        let restored_len = std::fs::metadata(&skpost_path).unwrap().len();
+        assert!(
+            restored_len != half_len,
+            "T-14: skpost must be restored (not still half-length) after self-heal"
+        );
+    }
+
+    /// T-14(b) / AC-14: `--stats` text mode on F-Body-C (removed `index.skpost`)
+    /// must exit 0 after self-healing (same route as T-14 but text mode).
+    #[test]
+    fn t14b_stats_text_self_heals_on_fbody_c_removed_skpost() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: x", &[("src/x.rs", "fn x() {}")]),
+                ("feat: y", &[("src/y.rs", "fn y() {}")]),
+            ],
+        );
+
+        let root_str = root.to_string_lossy().to_string();
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-14b setup: --rebuild must succeed"
+        );
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        // F-Body-C: remove skpost entirely.
+        std::fs::remove_file(cache_dir.join("index.skpost")).unwrap();
+
+        // --stats text mode: exit 0 after self-heal.
+        let result = run(
+            &["--stats".to_string(), "--root".to_string(), root_str],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-14b: --stats on F-Body-C (removed skpost) must exit 0 after self-heal (AC-14)"
+        );
+
+        // skpost must be restored.
+        assert!(
+            cache_dir.join("index.skpost").exists(),
+            "T-14b: index.skpost must be restored after self-heal"
+        );
+    }
+
+    /// T-15 / AC-15: `--stats --json` reports `temporal_state` with the five
+    /// distinct values: `ready` / `empty` / `corrupt` / `newer-schema` / `missing`.
+    ///
+    /// Also extends the #413/AC20 shared back-compat key-list test (C4): the
+    /// `temporal_state` key is present in the additive set alongside `git_head_state`.
+    ///
+    /// PF-012: temporal.db corruption fixture uses 0xAB×1024 (deterministic).
+    #[test]
+    fn t15_temporal_state_five_distinct_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: p", &[("src/p.rs", "fn p() {}")]),
+                ("feat: q", &[("src/q.rs", "fn q() {}")]),
+            ],
+        );
+        let root_str = root.to_string_lossy().to_string();
+
+        // Build index (includes temporal.db).
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-15 setup: --rebuild must succeed"
+        );
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        let db_path = cache_dir.join("temporal.db");
+
+        // ---- (1) Healthy: temporal_state == "ready" -------------------------
+        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 healthy: must succeed");
+        assert_eq!(
+            stats["temporal_state"].as_str().unwrap_or(""),
+            "ready",
+            "T-15(1): healthy DB must report temporal_state == 'ready'; got: {:?}",
+            stats["temporal_state"]
+        );
+        // Key-list contract (T-15/AC-15/AC20): temporal_state must be present.
+        assert!(
+            stats.get("temporal_state").is_some(),
+            "T-15: temporal_state key must be present in --stats --json"
+        );
+
+        // ---- (2) Missing: temporal_state == "missing" -----------------------
+        std::fs::remove_file(&db_path).unwrap();
+        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 missing: must succeed");
+        assert_eq!(
+            stats["temporal_state"].as_str().unwrap_or(""),
+            "missing",
+            "T-15(2): absent temporal.db must report 'missing'; got: {:?}",
+            stats["temporal_state"]
+        );
+
+        // ---- (3) Corrupt: temporal_state == "corrupt" -----------------------
+        // PF-012: deterministic fixture, never /dev/urandom.
+        {
+            let corrupt_bytes: Vec<u8> = vec![0xABu8; 1024];
+            std::fs::write(&db_path, &corrupt_bytes).unwrap();
+        }
+        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 corrupt: must succeed");
+        assert_eq!(
+            stats["temporal_state"].as_str().unwrap_or(""),
+            "corrupt",
+            "T-15(3): 0xAB×1024 corrupt DB must report 'corrupt'; got: {:?}",
+            stats["temporal_state"]
+        );
+
+        // ---- (4) Newer schema: temporal_state == "newer-schema" -------------
+        // Restore a valid DB then bump user_version to 99.
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-15 setup newer-schema: --rebuild must succeed"
+        );
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", 99i64).unwrap();
+        }
+        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 newer-schema: must succeed");
+        assert_eq!(
+            stats["temporal_state"].as_str().unwrap_or(""),
+            "newer-schema",
+            "T-15(4): user_version=99 DB must report 'newer-schema'; got: {:?}",
+            stats["temporal_state"]
+        );
+
+        // ---- (5) Empty: temporal_state == "empty" ---------------------------
+        // Restore DB then clear all rows (zero hotspot rows).
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-15 setup empty: --rebuild must succeed"
+        );
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute("DELETE FROM hotspot", []).unwrap();
+            conn.execute("DELETE FROM risk", []).unwrap();
+            conn.execute("DELETE FROM cochange", []).unwrap();
+        }
+        let stats = stats_json_for_test(&cache_dir, root).expect("T-15 empty: must succeed");
+        assert_eq!(
+            stats["temporal_state"].as_str().unwrap_or(""),
+            "empty",
+            "T-15(5): zero-row DB must report 'empty'; got: {:?}",
+            stats["temporal_state"]
         );
     }
 }

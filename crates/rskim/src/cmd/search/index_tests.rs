@@ -3914,6 +3914,8 @@ fn test_ac11_stats_json_back_compat_keys() {
         "total_on_disk_bytes",
         // #413 additive key (AC20)
         "git_head_state",
+        // #414 additive key (AC-15 / AD-414-10)
+        "temporal_state",
     ];
     let mut actual_keys: Vec<&str> = stats_json
         .as_object()

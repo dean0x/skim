@@ -359,6 +359,35 @@ pub(super) fn near_diagnostic_notice(near: Option<u32>, text: &str) -> Option<St
 }
 
 // ============================================================================
+// Lexical index opener (AD-414-7)
+// ============================================================================
+
+/// AD-414-7: lexical open failures become actionable, mirroring `open_ast_engine`
+/// in `ast.rs` — name the artifact path and include the `--rebuild` hint.
+///
+/// Built with `anyhow::anyhow!` (NO `.context`), so the io source is not printed
+/// twice when the caller formats with `{e:#}`.
+///
+/// Used at ALL THREE bare-`?` sites: the query path (`execute_query_with_manifest`),
+/// `run_stats` (mod.rs, text mode) and `build_stats_json` (mod.rs, JSON mode) —
+/// both `--stats` sites run BEFORE `check_staleness`, so they are exactly the
+/// path a stuck user reaches when the index is broken.
+///
+/// # Errors
+///
+/// Returns `Err` with the artifact path and rebuild guidance when the index
+/// cannot be opened.
+pub(super) fn open_lexical_reader(cache_dir: &Path) -> anyhow::Result<NgramIndexReader> {
+    NgramIndexReader::open(cache_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to open lexical index at {}: {e}\n\
+             Run `skim search --rebuild` to rebuild from scratch.",
+            cache_dir.display()
+        )
+    })
+}
+
+// ============================================================================
 // Query execution
 // ============================================================================
 
@@ -463,8 +492,8 @@ pub(super) fn execute_query_with_manifest(
         }
     };
 
-    // Open the reader.
-    let reader = NgramIndexReader::open(cache_dir)?;
+    // Open the reader — actionable error (AD-414-7).
+    let reader = open_lexical_reader(cache_dir)?;
     let stats = reader.stats();
     let engine = QueryEngine::new(Box::new(reader));
 
