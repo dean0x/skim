@@ -7,11 +7,10 @@ use rskim_search::{CochangeRow, HotspotRow, RiskRow, TemporalDb};
 use tempfile::TempDir;
 
 use super::{
-    DegradedReason, HeadState, TemporalCoverage, TemporalOpen, TemporalQueryOutput,
-    TemporalUnavailable, apply_temporal_enrichment, bounded_page_notice,
-    check_temporal_staleness, enrich_ast_results, format_temporal_json, format_temporal_text,
-    normalize_blast_radius_path, open_temporal_state, query_standalone, ranked_row_count,
-    resort_window,
+    DegradedReason, HeadState, TemporalOpen, TemporalQueryOutput, TemporalUnavailable,
+    apply_temporal_enrichment, bounded_page_notice, check_temporal_staleness, enrich_ast_results,
+    format_temporal_json, format_temporal_text, normalize_blast_radius_path, open_temporal_state,
+    query_standalone, resort_window,
 };
 use crate::cmd::search::types::{ResolvedResult, TemporalSort};
 
@@ -163,8 +162,11 @@ fn normalize_dot_slash_stripped() {
 fn open_temporal_state_missing_returns_unavailable_missing() {
     let dir = TempDir::new().unwrap();
     // Use a resolved HEAD so the absence is classified as Missing, not HeadUnresolved.
-    let result =
-        open_temporal_state(dir.path(), dir.path(), &HeadState::Resolved("abc123".to_string()));
+    let result = open_temporal_state(
+        dir.path(),
+        dir.path(),
+        &HeadState::Resolved("abc123".to_string()),
+    );
     assert!(
         matches!(
             result,
@@ -211,7 +213,11 @@ fn open_temporal_state_anchor_differs_returns_repository_mismatch() {
         "/wrong/repo/path",
     );
 
-    let result = open_temporal_state(&root, cache.path(), &HeadState::Resolved("abc123".to_string()));
+    let result = open_temporal_state(
+        &root,
+        cache.path(),
+        &HeadState::Resolved("abc123".to_string()),
+    );
     assert!(
         matches!(
             result,
@@ -2036,6 +2042,7 @@ fn format_text_output_includes_both_hotspot_and_risk_tags() {
         duration_ms: 1,
         index_stats: None,
         ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());

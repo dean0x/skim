@@ -10,7 +10,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rskim_search::{FileId, HotspotRow, RiskRow, SearchError, TemporalDb};
 use serde::Serialize;
@@ -217,9 +217,7 @@ impl DegradedReason {
         match self {
             // Embedded in NO_TEMPORAL_DATA_MSG; repeated separately for JSON consumers.
             Self::NotGitRepo => "run 'skim search' on a git repo to auto-populate",
-            Self::HeadUnresolved => {
-                "commit at least one file to initialise the branch HEAD"
-            }
+            Self::HeadUnresolved => "commit at least one file to initialise the branch HEAD",
             Self::RepositoryMismatch => {
                 "run `skim search --rebuild --root <this root>` to re-anchor"
             }
@@ -302,6 +300,7 @@ pub(super) struct TemporalUnavailable {
 ///
 /// Returned by [`open_temporal_state`]; replaces the old `open_temporal_db_for`
 /// `Result<TemporalDb, TemporalUnavailable>` pair.
+#[derive(Debug)]
 pub(super) enum TemporalOpen {
     /// DB is open and anchored to the same repository — ready to serve.
     Open(TemporalDb),
@@ -400,11 +399,7 @@ pub(super) fn degraded_notice(u: &TemporalUnavailable, flag: &str, fallback: Fal
 /// `meta.git_toplevel` row), so it is probed AFTER `TemporalDb::open` succeeds,
 /// even though it ranks BEFORE `missing`/`empty` in the §2.3 precedence table.
 /// An absent `git_toplevel` row is adopt-and-record, never a refusal (AD-413-16).
-pub(super) fn open_temporal_state(
-    root: &Path,
-    cache_dir: &Path,
-    head: &HeadState,
-) -> TemporalOpen {
+pub(super) fn open_temporal_state(root: &Path, cache_dir: &Path, head: &HeadState) -> TemporalOpen {
     let db_path = cache_dir.join("temporal.db");
     if !db_path.exists() {
         let reason = match head {
