@@ -1,7 +1,7 @@
 ---
 feature: ast-index
 name: AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
-description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, ScoringCtx, LiteMeta, file_lang_and_node_count, ast_query_to_ngram_set, score_ngram_set, CAPACITY_FLOOR, query submodule split, Wave 3f, Wave 3g, Wave 4, cmd-search, self-heal, auto-rebuild, validate_ast_pattern, ValidityMarker, validity, ast_index.skverify, CRC32 fast path, AD-376-5, AstNgramCache, CachedAstEntry, skcache, ast_cache, AST_CACHE_FILENAME, AST_CACHE_FORMAT_VERSION."
+description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, index_integrity, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, ScoringCtx, LiteMeta, file_lang_and_node_count, ast_query_to_ngram_set, score_ngram_set, CAPACITY_FLOOR, query submodule split, Wave 3f, Wave 3g, Wave 4, cmd-search, self-heal, auto-rebuild, validate_ast_pattern, ValidityMarker, validity, ast_index.skverify, CRC32 fast path, AD-376-5, AstNgramCache, CachedAstEntry, skcache, ast_cache, AST_CACHE_FILENAME, AST_CACHE_FORMAT_VERSION."
 category: architecture
 directories: [crates/rskim-search/src/ast_index/, crates/rskim-core/src/]
 referencedFiles:
@@ -569,10 +569,14 @@ zero. Every file — including those yielding zero n-grams — must receive exac
 non-sequential).
 
 **Version probing:** `AstIndexReader::index_version(dir)` reads only the first 6 bytes
-(magic + version) cheaply. The CLI self-heal path in `crates/rskim/src/cmd/search/`
-(Wave 3g, #199) uses this probe: if the stored version is absent or below
-`AST_INDEX_FORMAT_VERSION`, the CLI triggers an auto-rebuild before executing the query.
-See `cmd-search` feature knowledge for the consumer-side wiring.
+(magic + version) cheaply and remains available for callers that only need the version
+number. The CLI self-heal path in `crates/rskim/src/cmd/search/` (Wave 3g, #199) now
+calls `AstIndexReader::index_integrity(dir)` instead (AD-414-6): this probe reads the
+full header and validates both `.skidx` and `.skpost` file sizes, returning
+`SearchError::IndexCorrupted` on a structural mismatch or the version number on any
+version mismatch. If the returned version is absent or below `AST_INDEX_FORMAT_VERSION`,
+the CLI triggers an auto-rebuild before executing the query. See `cmd-search` feature
+knowledge for the consumer-side wiring.
 
 **Partial decode path (P1 #286):** `AstIndexReader::file_lang_and_node_count(file_index)` reads
 the same byte range as `file_meta` but calls `decode_lang_and_node_count` to decode only
@@ -806,9 +810,10 @@ AstQueryEngine::search_ast(q: &AstQuery)
   must not confuse `None` post_mmap with "not found" at the API level.
 
 - **v1 indexes are hard-rejected**: `decode_header` returns "unsupported format version: 1
-  (expected 2); please rebuild the AST index". The `index_version` probe lets callers detect
-  this before a full `open` call fails. The CLI self-heal path (Wave 3g, #199) uses this probe
-  in `crates/rskim/src/cmd/search/` — see the `cmd-search` feature knowledge for wiring details.
+  (expected 2); please rebuild the AST index". The `index_version` probe lets callers cheaply
+  detect this before a full `open` call fails. The CLI self-heal path (Wave 3g, #199) uses
+  `index_integrity` (AD-414-6) rather than the bare `index_version` probe, because it also
+  validates file sizes; see the `cmd-search` feature knowledge for wiring details.
 
 - **`COMMENT_KIND_IDS` and `PUNCTUATION_KIND_IDS` lazy init at first `is_counted_child` call**:
   the initialization is O(#kinds × log(vocab_len)), tiny but not zero. Benchmarks should
@@ -926,9 +931,9 @@ AstQueryEngine::search_ast(q: &AstQuery)
   and `Result<T>` alias pattern.
 - Feature: `cmd-search` — CLI command layer (`crates/rskim/src/cmd/search/`) that builds
   and queries this index. Owns the file manifest, FileId alignment between AST and lexical
-  indexes, the `--ast` flag, and the self-heal/auto-rebuild path using `AstIndexReader::index_version`
-  vs `AST_INDEX_FORMAT_VERSION`. Cross-link: the `cmd-search` feature knowledge documents
-  the consumer-side wiring for Wave 3g.
+  indexes, the `--ast` flag, and the self-heal/auto-rebuild path using
+  `AstIndexReader::index_integrity` (AD-414-6) vs `AST_INDEX_FORMAT_VERSION`. Cross-link:
+  the `cmd-search` feature knowledge documents the consumer-side wiring for Wave 3g.
 - Feature: `research-ast` — `rskim-research` crate that produces `ast_weights.rs` via
   `ast-codegen`; also uses `AstWalkIter` from `rskim-core`.
 - `crates/rskim-search/src/index/mod.rs` — lexical sibling; `lang_map` widened to `pub(crate)` here.
@@ -936,7 +941,8 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - Issue #197 (complete, Wave 3f): `AstQueryEngine`, `AstQuery`, `parse_ast_query`, BM25 scoring, `SearchLayer` adapter.
 - Issue #199 (shipped, Wave 3g, PR #291): CLI `--ast` flag, building the AST index alongside
   the lexical index with FileId alignment, and self-heal/auto-rebuild on absent-or-below-FORMAT_VERSION
-  via the `AstIndexReader::index_version` 6-byte probe. Consumer in `crates/rskim/src/cmd/search/`.
+  via the `AstIndexReader::index_integrity` probe (AD-414-6; also validates file sizes — supersedes
+  the bare `index_version` 6-byte probe for the CLI self-heal path). Consumer in `crates/rskim/src/cmd/search/`.
   Note: `run_ast_standalone` in `ast.rs` accepts `blast_file_ids: Option<HashSet<FileId>>` (pre-resolved
   by `mod.rs` via `temporal::resolve_blast_radius_file_ids`) — not raw path strings. The function is
   DB-free by design.

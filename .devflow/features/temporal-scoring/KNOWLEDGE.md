@@ -169,13 +169,21 @@ at the parser boundary. No gix types cross the module boundary.
 Wraps a single `rusqlite::Connection`. Not `Sync` — open separate instances
 per thread. Schema: WAL mode, `synchronous=NORMAL`, 5-second busy timeout.
 
-All rusqlite errors are converted to `SearchError::Database(String)` via the
-`db_err` helper so no rusqlite types leak into the public API.
+Rusqlite errors are converted to `SearchError` variants via two helpers —
+neither leaks rusqlite types into the public API:
+- `db_err` converts any rusqlite error into `SearchError::Database(String)`
+  for ordinary I/O, lock, and query failures.
+- `classify_sqlite_err` (AD-414-2) inspects the SQLite error code: it returns
+  `SearchError::DatabaseCorrupt` for `SQLITE_NOTADB` / `SQLITE_CORRUPT` (the
+  file is structurally invalid and safe to discard) and falls through to
+  `SearchError::Database` for all other codes, so transient errors are never
+  misclassified as corruption.
 
 **Schema version: 2** (current). Migrations are forward-only and idempotent
 (each migration block is guarded by `version < N`). A **forward-compat guard**
 rejects databases from future schema versions (`version > CURRENT_VERSION`)
-rather than silently corrupting the newer schema.
+by returning `SearchError::UnsupportedSchemaVersion { found, supported }`
+(AD-414-11) rather than silently corrupting the newer schema.
 
 Tables:
 - `hotspot (file_path TEXT PK, score REAL, changes_30d INT, changes_90d INT)`
@@ -196,14 +204,19 @@ File permissions: `0o600` on Unix (owner-only access).
 Opens or creates the database. Applies v1 and v2 migrations sequentially. Safe
 to call on a pre-existing database — idempotent.
 
-### `TemporalDb::sync(hotspots, risks, cochanges, git_head) -> Result<()>`
+### `TemporalDb::sync(hotspots, risks, cochanges, git_head, is_shallow) -> Result<()>`
 
-The only write entry point. Atomically replaces all four tables in a single
+The only write entry point. Atomically replaces all data in a single
 transaction so readers never see a partially-refreshed state:
 1. DELETE FROM hotspot / risk / cochange
 2. INSERT all rows
-3. SET meta `last_updated` and `git_head`
+3. SET meta `git_head`, `data_version`, `last_updated`, and `is_shallow`
 4. COMMIT
+
+`is_shallow: bool` records whether `.git/shallow` existed at build time
+(AD-414-14); `check_staleness` Check 3 later treats its disappearance (after
+`git fetch --unshallow`) as a staleness trigger so the now-reachable history
+is ingested on the next query without a manual `--rebuild`.
 
 The DELETE+INSERT batch is the canonical "replace-all" pattern. No partial
 updates; consistency across tables is guaranteed by the single transaction.
@@ -236,6 +249,17 @@ direction is in each row). The Jaccard filter is applied at the SQL level using
 
 - `META_LAST_UPDATED = "last_updated"` — Unix epoch seconds of last `sync`
 - `META_GIT_HEAD = "git_head"` — git HEAD SHA at last `sync`
+- `META_DATA_VERSION = "data_version"` — numeric value of `TEMPORAL_DATA_VERSION`
+  (currently `1`); written unconditionally by `sync` alongside `META_GIT_HEAD`
+  as a co-required pair (AD-408-3). A DB without this key is treated as stale
+  and triggers an automatic full rebuild.
+- `META_GIT_TOPLEVEL = "git_toplevel"` — canonical git repository root path
+  recorded after a successful `sync` for subdirectory-root re-anchor detection
+  (AD-413-16). Written in a second transaction after the main `sync` commit;
+  an absent row means "built before #413" and is adopted rather than refused.
+- `META_IS_SHALLOW = "is_shallow"` — `"1"` if `.git/shallow` existed at build
+  time, `"0"` otherwise (AD-414-14). An absent row (DB written before
+  AD-414-14) means the shallow check is skipped on that DB.
 
 These keys are checked by the CLI staleness layer to decide whether a rebuild
 is needed (including by `temporal_db_is_stale` in `staleness.rs`).
