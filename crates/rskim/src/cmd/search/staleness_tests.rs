@@ -4998,3 +4998,285 @@ fn t12_ac12_future_version_check_staleness_not_stale() {
          lexical index (v={future_version} > FORMAT_VERSION); got {result:?}"
     );
 }
+
+// ============================================================================
+// #407 — TEMPORAL_DATA_VERSION 1→2 staleness tests (AC-10, AC-12 data side)
+// ============================================================================
+
+/// T-13 (#407 AC-10): a `temporal.db` carrying `data_version = "1"` with a
+/// matching `git_head` MUST make `temporal_db_is_stale` return `true`.
+///
+/// AD-408-4 (Check 2): the gate uses `stored < current`.  After the #407 bump
+/// `TEMPORAL_DATA_VERSION == 2`, so any DB with `data_version = "1"` (written
+/// by a pre-#407 binary with first-parent-only walk) is stale.
+///
+/// Discriminating: if `temporal_db_is_stale` returned `false` for
+/// `data_version = "1"`, pre-#407 DBs would never be self-healed and hotspot/risk
+/// scores would remain undercounted (~3×) on branch-heavy repositories.
+#[test]
+fn test_pre_407_db_is_stale() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "cafe0001cafe0001cafe0001cafe0001cafe0001";
+
+    // Build a current-format DB via sync() — this writes data_version = "2".
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+
+    // Overwrite data_version with "1" to simulate a pre-#407 first-parent-only DB.
+    // Must use plant_meta_raw because TemporalDb::set_meta guards these keys (AD-408-3).
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+
+    assert!(
+        temporal_db_is_stale(dir.path(), head, None),
+        "T-13 (AC-10): data_version=\"1\" with matching HEAD must be stale — \
+         the #407 bump to TEMPORAL_DATA_VERSION=2 makes every pre-#407 DB stale \
+         so the full-DAG self-heal fires (AD-408-4 Check 2: stored < current)"
+    );
+}
+
+/// T-14 (#407 AC-10): after exactly one sync (the self-heal rebuild),
+/// `temporal_db_is_stale` MUST return `false` and `read_meta(META_DATA_VERSION)`
+/// MUST equal `Some("2")`.
+///
+/// AC-10 contract: the self-heal is one-shot.  `TemporalDb::sync` is the only
+/// version-attesting write path (AD-408-3); it writes `TEMPORAL_DATA_VERSION.to_string()`
+/// unconditionally alongside `git_head`.  One `sync` call is sufficient to
+/// advance `data_version` from "1" to "2".
+///
+/// See AD-407-5 for the ONE case where self-heal is NOT one-shot (build-backoff
+/// sentinel present for the current HEAD+shallow pair — AC-13).
+#[test]
+fn test_407_self_heal_is_one_shot() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "cafe0002cafe0002cafe0002cafe0002cafe0002";
+
+    // Set up a pre-#407 DB: correct schema (v2), HEAD recorded, data_version = "1".
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+
+    // Verify the pre-condition: stale.
+    assert!(
+        temporal_db_is_stale(dir.path(), head, None),
+        "T-14 pre-condition: data_version=\"1\" must be stale before self-heal"
+    );
+
+    // The self-heal: one sync call writes data_version = "2".
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+
+    // After exactly one rebuild, not stale.
+    assert!(
+        !temporal_db_is_stale(dir.path(), head, None),
+        "T-14 (AC-10): after one sync (self-heal), temporal_db_is_stale must return false"
+    );
+
+    // And the meta row carries "2".
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored = db.get_meta(rskim_search::META_DATA_VERSION).unwrap();
+    assert_eq!(
+        stored,
+        Some("2".to_string()),
+        "T-14 (AC-10): after one sync, read_meta(META_DATA_VERSION) must be Some(\"2\")"
+    );
+}
+
+/// AC-12 (downgrade-safety guard): a `temporal.db` carrying `data_version = "3"`
+/// (written by a hypothetical newer binary) MUST NOT be flagged stale by this build.
+///
+/// AD-408-4: the comparison is `stored < current` (not `stored != current`), so
+/// a DB written by a NEWER binary (data_version > TEMPORAL_DATA_VERSION) is not
+/// spuriously rebuilt by an older post-fix binary. This preserves downgrade safety:
+/// rolling back from a future skim binary to this one does not trigger an endless
+/// self-heal loop.
+///
+/// Discriminating: a `stored != current` gate (wrong) would fire for data_version "3"
+/// with TEMPORAL_DATA_VERSION == 2, causing a spurious rebuild.  The `<` gate
+/// (correct) returns false and leaves the DB untouched.
+#[test]
+fn test_temporal_data_version_3_not_stale_after_407_bump() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "cafe0003cafe0003cafe0003cafe0003cafe0003";
+
+    // Build a current-format DB and overwrite data_version with "3" (future version).
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "3");
+
+    assert!(
+        !temporal_db_is_stale(dir.path(), head, None),
+        "AC-12: data_version=\"3\" (newer binary) MUST NOT be flagged stale by \
+         TEMPORAL_DATA_VERSION=2 build — downgrade-safety guard (AD-408-4: stored < current)"
+    );
+}
+
+/// AC-18 (NEGATIVE): a `temporal.db` that starts stale (`data_version = "1"`)
+/// but is healed by one `sync` call must NOT leave the DB in any state that
+/// would produce a `degraded` entry.
+///
+/// A `degraded` entry is produced only when temporal data cannot be served at
+/// all: missing DB, corrupt DB, or newer-schema DB.  After the self-heal sync,
+/// the DB is schema-v2, opens without error, and reports a healthy head — none
+/// of the degraded conditions hold.  This test verifies the post-heal DB state
+/// is unconditionally healthy.
+#[test]
+fn test_stale_data_version_no_degraded_state_after_heal() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("temporal.db");
+    let head = "cafe0004cafe0004cafe0004cafe0004cafe0004";
+
+    // Pre-heal state: data_version = "1" (stale), but HEAD matches.
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+    assert!(
+        temporal_db_is_stale(dir.path(), head, None),
+        "pre-condition"
+    );
+
+    // Self-heal: one sync advances data_version to "2".
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+
+    // Post-heal: not stale (temporal_state would be "ready", no degraded entry).
+    assert!(
+        !temporal_db_is_stale(dir.path(), head, None),
+        "AC-18: after self-heal, temporal_db_is_stale must be false \
+         (temporal_state = 'ready', no degraded entry produced)"
+    );
+
+    // Post-heal: DB opens without error (rules out DatabaseCorrupt / UnsupportedSchemaVersion).
+    let db_result = rskim_search::TemporalDb::open(&db_path);
+    assert!(
+        db_result.is_ok(),
+        "AC-18: post-heal DB must open without error — an error here would produce \
+         a degraded entry; got: {:?}",
+        db_result.unwrap_err()
+    );
+
+    // Post-heal: schema version is still 2 (rules out UnsupportedSchemaVersion degraded reason).
+    let schema = db_result.unwrap().schema_version().unwrap();
+    assert_eq!(
+        schema, 2,
+        "AC-18: post-heal schema_version must be 2 (no spurious migration)"
+    );
+}
+
+/// AC-14 (PF-017 preserved): when `temporal.db` carries a stale `data_version`
+/// AND the stored `git_toplevel` differs from the current enclosing repository,
+/// a **query** (`ReanchorPolicy::Refuse`) MUST NOT modify `temporal.db` — bytes
+/// and file length unchanged.
+///
+/// Only an explicit build arm (`ReanchorPolicy::Allow`, i.e. `--rebuild`) may
+/// re-anchor.  This test verifies the anchor-mismatch guard is NOT weakened by
+/// the data-version staleness check — both conditions are present, and the
+/// refuse policy must win.
+///
+/// PF-017: the guard lives in `try_rebuild_temporal_nonfatal`, which calls
+/// `temporal_anchor_state` and returns early when the result is
+/// `AnchorState::Differs` + `ReanchorPolicy::Refuse`.  Only
+/// `--root <subdirectory>` roots (those that don't own their own `.git`) reach
+/// this guard; a root with `.git` gets `AnchorState::NotAdopted` and the
+/// anchor logic is skipped entirely.
+///
+/// To trigger `AnchorState::Differs` the test sets up:
+/// - `parent/.git/HEAD` — a minimal enclosing git repo so that
+///   `resolve_repo_toplevel(parent/sub)` succeeds and returns `parent`.
+/// - `parent/sub/` — a subdirectory without `.git` (the `--root` being tested).
+/// - `temporal.db` anchored to `"other_repo"` (a different path) and with
+///   `data_version = "1"` (stale).
+///
+/// After `try_rebuild_temporal_nonfatal` with `Refuse`, `temporal.db` must be
+/// byte-for-byte unchanged and both `git_toplevel` and `data_version` must
+/// retain their planted values.
+#[test]
+fn test_ac14_stale_data_version_anchor_mismatch_no_rebuild() {
+    let dir = tempdir().unwrap();
+
+    // Build a minimal enclosing git repo so resolve_repo_toplevel(sub) returns parent.
+    let parent = dir.path().join("parent_repo");
+    let git_dir = parent.join(".git");
+    fs::create_dir_all(&git_dir).unwrap();
+    // A readable HEAD file is required by resolve_repo_toplevel (F10).
+    fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main").unwrap();
+
+    // sub/ has no .git of its own — it's the "--root <subdirectory>" case.
+    let sub = parent.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+
+    // cache_dir is separate from both parent and sub.
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Build temporal.db anchored to "other_repo" (a different toplevel) and
+    // with data_version = "1" (stale — pre-#407).
+    let db_path = cache_dir.join("temporal.db");
+    let head_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0";
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head_a, false).unwrap();
+    drop(db);
+    super::plant_meta_raw(&db_path, rskim_search::META_GIT_TOPLEVEL, "/other_repo");
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+
+    // Record byte length before the attempted query-path rebuild.
+    let len_before = fs::metadata(&db_path).unwrap().len();
+
+    // Verify that temporal_anchor_state sees Differs (not NotAdopted or Absent)
+    // for the subdirectory root — this is the precondition for AC-14.
+    let anchor = super::temporal_anchor_state(&cache_dir, &sub);
+    assert!(
+        matches!(anchor, super::AnchorState::Differs { .. }),
+        "AC-14 precondition: temporal_anchor_state must be Differs for sub, got {anchor:?}"
+    );
+
+    // Call try_rebuild_temporal_nonfatal (the query-path orchestrator that owns
+    // the PF-017 guard) with Refuse policy.  The guard must fire and return
+    // before touching temporal.db.
+    let fake_head = super::HeadState::Resolved(head_a.to_string());
+    super::try_rebuild_temporal_nonfatal(
+        &sub,
+        &cache_dir,
+        &fake_head,
+        "test-ac14",
+        super::ReanchorPolicy::Refuse,
+    );
+
+    // temporal.db must be byte-length-unchanged (AC-14 file-bytes guard).
+    let len_after = fs::metadata(&db_path).unwrap().len();
+    assert_eq!(
+        len_after, len_before,
+        "AC-14 (PF-017): temporal.db must be byte-unchanged after a refused query \
+         (anchor mismatch + stale data_version — refuse policy wins)"
+    );
+
+    // git_toplevel must still point at other_repo (not re-anchored to parent).
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_toplevel = db
+        .get_meta(rskim_search::META_GIT_TOPLEVEL)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        stored_toplevel, "/other_repo",
+        "AC-14 (PF-017): git_toplevel must remain /other_repo after a refused query"
+    );
+
+    // data_version must still be "1" (no rebuild happened).
+    let stored_version = db
+        .get_meta(rskim_search::META_DATA_VERSION)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        stored_version, "1",
+        "AC-14: data_version must still be \"1\" — no rebuild happened on the \
+         refused query (anchor mismatch blocked before data-version self-heal)"
+    );
+}

@@ -1087,3 +1087,70 @@ fn t2_future_schema_returns_unsupported_schema_version() {
         other => panic!("T-2: expected SearchError::UnsupportedSchemaVersion, got {other:?}"),
     }
 }
+
+// ============================================================================
+// Group 14: #407 TEMPORAL_DATA_VERSION == 2 pins (AC-10, AC-11)
+// ============================================================================
+
+/// T-10 (#407 AC-10): pin `TEMPORAL_DATA_VERSION == 2`.
+///
+/// AD-407-5: version 2 attests that the temporal data was produced by a
+/// full-DAG walk (`.first_parent_only()` removed from `parse_history`).
+/// A DB carrying `data_version = "1"` (first-parent-only walk) is stale
+/// and triggers one self-heal rebuild on the next query via the AD-408-4
+/// mechanism.  Changing this to 1 here means the bump regressed.
+#[test]
+fn test_temporal_data_version_is_two() {
+    assert_eq!(
+        super::TEMPORAL_DATA_VERSION,
+        2,
+        "T-10 (AC-10): TEMPORAL_DATA_VERSION must be 2 after the #407 full-DAG bump \
+         (AD-407-5); a value of 1 means the bump regressed and pre-#407 DBs will \
+         not be self-healed"
+    );
+}
+
+/// T-11 (#407 AC-10): `sync` MUST write `data_version = "2"` unconditionally.
+///
+/// `write_version_meta_in_tx` encodes `TEMPORAL_DATA_VERSION.to_string()` as
+/// the `data_version` meta row alongside `git_head`.  After the #407 bump
+/// the encoded value must be `"2"` so that `temporal_db_is_stale`'s Check 2
+/// (AD-408-4, `stored < current`) reports stale for any DB written by a
+/// pre-#407 binary.
+#[test]
+fn test_sync_writes_data_version_two() {
+    let (_dir, db) = temp_db();
+    db.sync(
+        &[],
+        &[],
+        &[],
+        "deadbeef01deadbeef01deadbeef01deadbeef01",
+        false,
+    )
+    .unwrap();
+    let version = db.get_meta(super::META_DATA_VERSION).unwrap();
+    assert_eq!(
+        version,
+        Some("2".to_string()),
+        "T-11 (AC-10): sync must write data_version = \"2\" after the #407 bump \
+         (write_version_meta_in_tx encodes TEMPORAL_DATA_VERSION.to_string())"
+    );
+}
+
+/// T-12 (#407 AC-11 NEGATIVE): `schema_version()` MUST still return 2.
+///
+/// #407 uses the AD-408-4 data-version self-heal, NOT a PRAGMA user_version
+/// schema migration.  `CURRENT_VERSION` stays 2; `run_migrations` gains no
+/// v3 block.  A bump to 3 here would force every user's `temporal.db` to
+/// re-migrate on the next query, which is the wrong mechanism for a data-only
+/// population change.  Guards against accidentally adding a migration block.
+#[test]
+fn test_schema_version_unchanged_at_two() {
+    let (_dir, db) = temp_db();
+    assert_eq!(
+        db.schema_version().unwrap(),
+        2,
+        "T-12 (AC-11): schema_version must remain 2 — #407 uses the AD-408-4 \
+         data-version self-heal, not a PRAGMA user_version migration"
+    );
+}

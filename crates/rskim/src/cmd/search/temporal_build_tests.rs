@@ -4390,3 +4390,92 @@ fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
          temporal.db must be left untouched"
     );
 }
+
+// ============================================================================
+// AC-13 (#407) — build-backoff sentinel gates the data-version self-heal
+// ============================================================================
+
+/// AC-13 (#407): when `temporal.db.build_backoff` contains the current HEAD,
+/// the self-heal path MUST return `Ok(())` without invoking `parse_history`
+/// (call count 0 on an injected counting `TemporalSource`).
+///
+/// AD-407-5 documents the mechanism: a stale `data_version` normally triggers
+/// exactly one rebuild (`rebuild_temporal_with_source`) that writes
+/// `data_version = "2"` — this is the "one-shot" contract.  The build-backoff
+/// sentinel is the ONE exception: when the sentinel records the current
+/// HEAD+shallow pair (written by a prior `parse_history` failure), the rebuild
+/// is skipped to avoid retrying a known-failing parse on every query while HEAD
+/// is stationary.  The DB stays at the old `data_version` until the sentinel
+/// clears (HEAD advances, shallow state changes, or explicit `--rebuild`).
+///
+/// Discriminating: a call count of 1 would mean the sentinel gate does NOT
+/// fire, `parse_history` is called, and the AC-13 one-exception contract is
+/// violated.
+#[test]
+fn test_ac13_data_version_stale_backoff_gates_self_heal() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let fake_head = "ac130001ac130001ac130001ac130001ac130001";
+    let now = super::current_epoch_secs();
+
+    // Set up a pre-#407 temporal.db: current schema (v2), HEAD recorded,
+    // data_version = "1" (stale by the post-#407 check).
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], fake_head, false).unwrap();
+    drop(db);
+    // Plant data_version = "1" via raw SQL — set_meta guards it (AD-408-3).
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![rskim_search::META_DATA_VERSION, "1"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Write the build-backoff sentinel for the same HEAD (two-field format: "head\nshallow").
+    // Shallow = "0" (not shallow), so backoff_sentinel_matches fires when probed_shallow
+    // is None (unknown) or Some(false).  Because there is no .git in `dir`,
+    // probe_is_shallow_from_root returns None → backoff_sentinel_matches returns true.
+    let sentinel_path = cache_dir.join("temporal.db.build_backoff");
+    std::fs::write(&sentinel_path, format!("{fake_head}\n0")).unwrap();
+
+    // Attempt the silent data-version self-heal with a counting source.
+    let src = CountingSource::new_empty();
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Silent, // quiet path — sentinel must gate the rebuild
+    );
+    assert!(
+        result.is_ok(),
+        "AC-13: rebuild_temporal_with_source must return Ok(()) when sentinel is present; \
+         got: {result:?}"
+    );
+
+    // Sentinel gated the rebuild: parse_history must NOT have been called.
+    assert_eq!(
+        src.count(),
+        0,
+        "AC-13 (AD-407-5): build-backoff sentinel must block parse_history; \
+         call count must be 0 when sentinel matches HEAD+shallow"
+    );
+
+    // data_version must still be "1" — no rebuild happened (AD-407-5 one-exception).
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_version = db
+        .get_meta(rskim_search::META_DATA_VERSION)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        stored_version, "1",
+        "AC-13: data_version must remain \"1\" when sentinel gates the self-heal — \
+         the DB stays stale until sentinel clears (HEAD advance / unshallow / --rebuild)"
+    );
+}
