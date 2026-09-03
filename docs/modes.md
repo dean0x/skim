@@ -7,8 +7,8 @@ Skim offers six transformation modes, each with different levels of aggressivene
 | Mode       | Token Reduction | What's Kept                              | What's Removed              |
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
-| Minimal    | 15-30%          | All code, doc comments                   | Non-doc comments            |
-| Pseudo     | 30-50%          | Logic flow, names, values, visibility    | Types, decorators, semicolons             |
+| Minimal    | 15-30%          | All code, doc comments, Python/Ruby/SQL/Bash module header comments | Non-doc comments; module headers stripped in Rust, C, TypeScript, Go, and all other languages |
+| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types | Parameter type annotations (Python, TypeScript), generics (except inside preserved return types), decorators, semicolons |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
@@ -267,16 +267,17 @@ Pseudo mode strips syntactic noise (type annotations, decorators, semicolons) wh
 - String literals and values
 - Import statements
 - Visibility and export modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`, `fileprivate`, Swift `open`)
+- **Function return types** (`-> float`, `-> Result<T, E>`, `): Promise<User>`) — preserved as API surface
 
 ### What's Removed
 
-- Type annotations (`: number`, `: int`, `-> str`)
-- Type parameters and generics (`<T>`, `<'a>`)
+- Parameter type annotations (`: number`, `: int`, `: str`) — Python and TypeScript only; Rust preserves parameter types (see per-language table below). Return types are preserved in all languages (see above)
+- Type parameters and generics (`<T>`, `<'a>`) — except inside preserved return types (e.g., `-> Result<T, E>`, `): Promise<User>`)
 - Non-visibility keyword modifiers (`static`, `final`, `abstract`, Kotlin `open`)
 - Decorators and attributes (`@Override`, `#[derive(Debug)]`)
 - Statement-terminating semicolons (preserves for-loop semicolons)
 - Language-specific noise (lifetimes, where clauses, mutable specifiers)
-- Non-doc comments (same as Minimal mode)
+- Non-doc comments — same as Minimal mode; Python/Ruby/SQL/Bash module header comments (SPDX, `frozen_string_literal`, provenance lines) are preserved
 - Python `self`/`cls` first parameter
 
 ### Usage
@@ -300,7 +301,7 @@ export function processUser(id: string, options: ProcessOptions): Promise<User> 
 
 **Output:**
 ```
-export function processUser(id, options) {
+export function processUser(id, options): Promise<User> {
     const user = await db.find(id)
     if (!user) throw new NotFoundError()
     return transform(user, options)
@@ -317,7 +318,7 @@ def calculate(self, x: int, y: int) -> float:
 
 **Output:**
 ```python
-def calculate(x, y):
+def calculate(x, y) -> float:
     result = x * y / 100
     return result
 ```
@@ -326,10 +327,10 @@ def calculate(x, y):
 
 | Language   | What's Stripped                                                                 |
 |------------|--------------------------------------------------------------------------------|
-| TypeScript | Type annotations, type params, decorators, `readonly`, `abstract`, `;`         |
-| JavaScript | Decorators, `;`                                                                 |
-| Python     | Type annotations, return types, decorators, `self`/`cls` first param           |
-| Rust       | Lifetimes, type params, where clauses, attributes, `mut`, `;`                  |
+| TypeScript | Parameter type annotations, type params, decorators, `readonly`, `abstract`, `;` (return types preserved) |
+| JavaScript | Decorators, `;`                                                                   |
+| Python     | Parameter type annotations, decorators, `self`/`cls` first param (return types preserved) |
+| Rust       | Lifetimes, type params, where clauses, attributes, `mut`, `;` (return types preserved)    |
 | Go         | Conservative (no stripping) — Go types are integral to understanding           |
 | Java       | Annotations, type params, `throws`, `;`                                        |
 | C          | `static`/`extern`/`const`/`volatile`, `;`                                      |
@@ -425,6 +426,12 @@ Need structure + signatures? → Use Structure mode (default)
 | JSON       | ✅     | `.json`            | Structure extraction     |
 | YAML       | ✅     | `.yaml`, `.yml`    | Structure extraction     |
 | TOML       | ✅     | `.toml`            | Structure extraction     |
+| C#         | ✅     | `.cs`              | Full grammar, structs/interfaces |
+| Ruby       | ✅     | `.rb`              | Classes, modules, methods |
+| SQL        | ✅     | `.sql`             | DDL/DML via tree-sitter-sequel |
+| Kotlin     | ✅     | `.kt`, `.kts`      | Data classes, coroutines, sealed classes |
+| Swift      | ✅     | `.swift`           | Protocols, generics, SwiftUI structs |
+| Bash       | ✅     | `.sh`, `.bash`     | Functions + shebang auto-detect; also `#!/bin/sh`, `zsh`, `ksh` |
 
 ### Language-Specific Notes
 

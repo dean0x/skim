@@ -24,45 +24,17 @@ pub(crate) struct FunctionNodeTypes {
     pub(crate) extra_function_kinds: &'static [&'static str],
 }
 
-/// Check if a node is inside a function/method body
+/// Returns `true` if `kind` is a node kind that establishes a function scope
+/// for its descendants.
 ///
-/// Walks up the AST via parent nodes looking for body/block nodes or
-/// function definition nodes. Comments inside function bodies should be
-/// preserved in minimal mode.
-///
-/// NOTE: In tree-sitter-python, comments inside function bodies are children
-/// of `function_definition`, not of `block`. We must also check for function
-/// definition ancestors to handle this correctly.
-///
-/// # Arguments
-/// * `node` - The AST node to check
-/// * `language` - The language (determines which node types are "body" nodes)
-pub(crate) fn is_inside_function_body(node: Node, language: Language) -> bool {
-    let body_kinds = get_body_node_kinds(language);
-    let fn_kinds = get_function_node_kinds(language);
-    let mut current = node.parent();
-    let mut depth = 0;
-    const MAX_PARENT_WALK: usize = 500;
-
-    while let Some(parent) = current {
-        depth += 1;
-        if depth > MAX_PARENT_WALK {
-            return false;
-        }
-        let kind = parent.kind();
-        if body_kinds.contains(&kind) {
-            return true;
-        }
-        // In some grammars (Python), comments are children of the function
-        // definition itself, not of the body block node. Check if any
-        // ancestor is a function definition.
-        if fn_kinds.contains(&kind) {
-            return true;
-        }
-        current = parent.parent();
-    }
-
-    false
+/// Used by the top-down walkers in minimal.rs and pseudo.rs to carry an
+/// `in_function_body: bool` flag downward instead of calling `node.parent()`
+/// upward. A TSNode has no parent pointer — every `parent()` call re-walks
+/// the tree from the root, costing O(depth). Carrying the flag is O(1) per
+/// node regardless of tree depth.
+pub(crate) fn is_function_scope_kind(kind: &str, language: Language) -> bool {
+    get_body_node_kinds(language).contains(&kind)
+        || get_function_node_kinds(language).contains(&kind)
 }
 
 /// Get the node kinds that represent function/method bodies for a language
@@ -77,6 +49,7 @@ fn get_body_node_kinds(language: Language) -> &'static [&'static str] {
         Language::Sql => &[], // SQL has no function bodies
         Language::Kotlin => &["function_body", "block"],
         Language::Swift => &["function_body"],
+        Language::Bash => &["compound_statement"], // bash function body: name() { ... }
         Language::Markdown | Language::Json | Language::Yaml | Language::Toml => &[],
     }
 }
@@ -280,7 +253,7 @@ pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
         | Language::CSharp
         | Language::Kotlin
         | Language::Swift => "//",
-        Language::Python | Language::Ruby => "#",
+        Language::Python | Language::Ruby | Language::Bash => "#",
         Language::Sql => "--",
         Language::Markdown => "<!--",
         Language::Json => "//", // JSON has no comments; // is JSONC-compatible
@@ -474,6 +447,7 @@ mod tests {
         assert_eq!(get_comment_prefix(Language::Json), "//");
         assert_eq!(get_comment_prefix(Language::Yaml), "#");
         assert_eq!(get_comment_prefix(Language::Toml), "#");
+        assert_eq!(get_comment_prefix(Language::Bash), "#");
     }
 
     #[test]
@@ -495,5 +469,6 @@ mod tests {
         assert_eq!(get_comment_suffix(Language::Json), "");
         assert_eq!(get_comment_suffix(Language::Yaml), "");
         assert_eq!(get_comment_suffix(Language::Toml), "");
+        assert_eq!(get_comment_suffix(Language::Bash), "");
     }
 }

@@ -1,97 +1,52 @@
-//! df parser.
+//! df pass-through handler (ADR-009).
 //!
-//! Parses `df` output (disk filesystem usage) into structured `FileResult`.
+//! df output is byte-identical to native at typical filesystem counts; any
+//! structured re-encoding adds overhead rather than saving tokens:
 //!
-//! Tiers:
-//! - **Tier 1 (Full)**: Header row + data rows
-//! - **Tier 3 (Passthrough)**: Empty output or parse failure
-
-use std::process::ExitCode;
+//! - `df -h` (1294 B/14 L) and `df` (1476 B/14 L) are byte-identical to
+//!   native — entries were pushed verbatim so the compressed view was always
+//!   larger and the net-savings guard always rejected it.
+//! - The 100-entry cap is unreachable on any real system (filesystem counts
+//!   are typically <20), so the structured parser provided no protection.
+//! - The parser used a silent `break` past MAX_INPUT_LINES rather than
+//!   returning `None`, violating the lossless-degrade contract (ADR-009).
+//!
+//! We therefore emit native output byte-faithfully via [`super::passthrough_parse`].
 
 use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::analytics::CommandType;
-use crate::cmd::{ToolRunConfig, run_tool};
-
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "df",
-    env_overrides: &[],
-    install_hint: "df is typically pre-installed on Unix systems",
-    family: "file",
-    skip_ansi_strip: false,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    skip_net_savings_guard: false,
-};
-
 /// Run `skim df [args...]`.
-pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+pub(crate) fn run(
+    args: &[String],
+    ctx: &crate::cmd::RunContext,
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "df",
+            install_hint: "df is typically pre-installed on Unix systems",
+            expected_exit_codes: &[],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
 }
 
-/// Three-tier parse function for df output.
+/// Parse function: always native passthrough.
+///
+/// df's stdout is already in native column format — the header row plus one
+/// data row per mounted filesystem.  The structured parser re-emitted those
+/// rows verbatim (no text compression), so any positive token delta came
+/// entirely from the FileResult wrapper overhead.  The net-savings guard
+/// therefore rejected every invocation, making the structured parser dead
+/// code in practice.
+///
+/// Delegates to [`super::passthrough_parse`] so the byte-faithful contract
+/// (ADR-009) has a single implementation across all pure-passthrough handlers.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    if let Some(result) = try_parse_df(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
-}
-
-// ============================================================================
-// Tier 1: df output parsing
-// ============================================================================
-
-fn try_parse_df(stdout: &str) -> Option<FileResult> {
-    if stdout.trim().is_empty() {
-        return None;
-    }
-
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES + 1);
-    let mut filesystem_count = 0usize;
-    let mut header_found = false;
-
-    for (i, line) in stdout.lines().enumerate() {
-        if i >= MAX_INPUT_LINES {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if !header_found {
-            // First non-empty line is the header
-            entries.push(line.to_string());
-            header_found = true;
-            continue;
-        }
-
-        // Remaining lines are filesystem entries
-        filesystem_count += 1;
-        if entries.len() <= MAX_DISPLAY_ENTRIES {
-            entries.push(line.to_string());
-        }
-    }
-
-    if !header_found {
-        return None;
-    }
-
-    // entries includes the header, so shown_count = entries.len() - 1 (data rows)
-    let shown_count = entries.len().saturating_sub(1);
-    let footer = crate::output::elision_marker(shown_count, filesystem_count, "filesystems");
-
-    Some(FileResult::new(
-        "df".to_string(),
-        filesystem_count,
-        shown_count,
-        entries,
-        footer,
-    ))
+    super::passthrough_parse(output)
 }
 
 // ============================================================================
@@ -101,93 +56,70 @@ fn try_parse_df(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_utils::{load_fixture, make_output_full};
+    use crate::cmd::test_utils::make_output;
 
     #[test]
-    fn test_tier1_df_basic() {
-        let input = load_fixture("file", "df_basic.txt");
-        let result = try_parse_df(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 5, "5 filesystems in df_basic.txt");
-    }
-
-    #[test]
-    fn test_tier1_df_human() {
-        let input = load_fixture("file", "df_human.txt");
-        let result = try_parse_df(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 5, "5 filesystems in df_human.txt");
-    }
-
-    #[test]
-    fn test_tier1_df_preserves_header() {
-        let input = load_fixture("file", "df_basic.txt");
-        let result = try_parse_df(&input).unwrap();
-        // First entry should be the header line
-        assert!(
-            result.entries[0].contains("Filesystem"),
-            "First entry should be header, got: {}",
-            result.entries[0]
-        );
-    }
-
-    #[test]
-    fn test_tier3_empty_passthrough() {
-        let output = make_output_full("", "", Some(1));
+    fn test_parse_impl_is_passthrough() {
+        // parse_impl must always return RawPassthrough so that execution.rs
+        // serves output.stdout byte-faithfully (native header+data format).
+        let input = "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        50G   20G   30G  40% /\n";
+        let output = make_output(input);
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "Empty output should be passthrough, got {}",
+            "parse_impl must be Passthrough tier (native df output): got {}",
+            result.tier_name()
+        );
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough (zero-clone stdout pass-through): got {}",
             result.tier_name()
         );
     }
 
     #[test]
-    fn test_tier1_df_truncates_large() {
-        // Build a df output with 150+ filesystem lines, exceeding MAX_DISPLAY_ENTRIES (100).
-        let mut lines = String::new();
-        lines.push_str("Filesystem     1K-blocks      Used Available Use% Mounted on\n");
-        for i in 0..=MAX_DISPLAY_ENTRIES {
-            lines.push_str(&format!(
-                "/dev/sd{i}     103081248  45234120  52583660  47% /mnt/disk{i}\n"
-            ));
-        }
-        let result = try_parse_df(&lines).unwrap();
-        // More than MAX_DISPLAY_ENTRIES filesystem lines were fed in.
+    fn test_parse_impl_empty_is_passthrough() {
+        let output = make_output("");
+        let result = parse_impl(&output);
         assert!(
-            result.total_count > MAX_DISPLAY_ENTRIES,
-            "total_count should exceed MAX_DISPLAY_ENTRIES"
-        );
-        // shown_count is the number of data rows actually stored in entries (excluding header).
-        assert_eq!(
-            result.shown_count, MAX_DISPLAY_ENTRIES,
-            "shown_count should be capped at MAX_DISPLAY_ENTRIES"
-        );
-        assert!(
-            result.footer.is_some(),
-            "A footer indicating truncation should be present"
-        );
-        let footer = result.footer.as_ref().unwrap();
-        assert!(
-            footer.contains("filesystems omitted"),
-            "Footer should mention omitted filesystems count, got: {footer}"
-        );
-        assert!(
-            footer.contains("SKIM_PASSTHROUGH=1"),
-            "Footer should include SKIM_PASSTHROUGH=1 escape hatch, got: {footer}"
+            result.is_passthrough(),
+            "Empty df output should be Passthrough, got {}",
+            result.tier_name()
         );
     }
 
+    /// parse_impl returns RawPassthrough regardless of filesystem count —
+    /// confirming the caller serves output.stdout directly rather than
+    /// re-assembling a structured result that was always larger than native.
     #[test]
-    fn test_parse_impl_produces_full() {
-        let input = load_fixture("file", "df_basic.txt");
-        let output = make_output_full(&input, "", Some(0));
+    fn test_native_output_all_rows_pass_through() {
+        let input: String =
+            std::iter::once(
+                "Filesystem     1K-blocks      Used Available Use% Mounted on\n".to_string(),
+            )
+            .chain((1..=5).map(|i| {
+                format!("/dev/sd{i}     103081248  45234120  52583660  47% /mnt/disk{i}\n")
+            }))
+            .collect();
+        let output = make_output(&input);
         let result = parse_impl(&output);
         assert!(
-            result.is_full(),
-            "parse_impl with exit code 0 and valid df output should return Full, got {}",
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough for lossless stdout pass-through"
+        );
+    }
+
+    /// df -h output (human-readable sizes) reaches the caller verbatim.
+    /// The structured parser emitted these rows unchanged anyway, so
+    /// passthrough is the correct and cheaper implementation.
+    #[test]
+    fn test_human_readable_output_passes_through() {
+        let input = "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        50G   20G   30G  40% /\ntmpfs           7.8G  1.2G  6.6G  16% /dev/shm\n";
+        let output = make_output(input);
+        let result = parse_impl(&output);
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "human-readable df output must use RawPassthrough so stdout is served verbatim: {}",
             result.tier_name()
         );
     }

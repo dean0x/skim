@@ -13,6 +13,258 @@ use super::compound::{command_needs_passthrough, split_compound, try_rewrite_com
 use super::engine::try_rewrite;
 use super::types::CompoundSplitResult;
 
+// ============================================================================
+// B1 — Drift detection types and pure detector
+// ============================================================================
+
+/// A specific kind of binary-provenance drift detected between the hook script
+/// and the currently running binary.
+///
+/// Drift is detected and recorded to `hook.log`; `skim doctor` is the
+/// on-demand diagnostic. The hook response JSON never carries drift information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DriftKind {
+    /// SKIM_HOOK_BINARY is absent — hook script predates binary pinning.
+    ///
+    /// An unpinned hook script can resolve to any `skim` on $PATH, which on
+    /// this machine can be a stale or divergent-branch clone. This is the
+    /// dangerous state that ADR-004 addressed.
+    ///
+    /// Residual gap (accepted): a hook script predating SKIM_HOOK_VERSION goes
+    /// undetected in-band. `skim doctor` (separate task) covers it.
+    HookScriptUnpinned,
+    /// SKIM_HOOK_BINARY points to a different binary than current_exe.
+    BinaryPathMismatch,
+    /// SKIM_HOOK_VERSION differs from the compiled-in version string.
+    HookVersionMismatch,
+    /// SKIM_HOOK_COMMIT differs from the compiled-in SKIM_GIT_COMMIT.
+    CommitMismatch,
+}
+
+/// All environment values needed for drift detection.
+///
+/// Owned; NEVER reads process env in tests — tests construct `DriftEnv`
+/// directly with known values so `detect_drift` remains deterministic.
+///
+/// `from_process()` is the single call site that reads process env and
+/// resolves the current executable path.
+pub(super) struct DriftEnv {
+    /// Value of SKIM_HOOK_VERSION. `None` = not running under a skim hook script.
+    ///
+    /// When `None`, `detect_drift` emits nothing — this keeps all existing
+    /// tests that invoke the hook without SKIM_HOOK_VERSION green and unmodified.
+    pub(super) hook_version: Option<String>,
+    /// Value of SKIM_HOOK_BINARY. `None` = hook script predates binary pinning.
+    pub(super) hook_binary: Option<String>,
+    /// Value of SKIM_HOOK_COMMIT.
+    pub(super) hook_commit: Option<String>,
+    /// Canonicalized path of the running executable.
+    pub(super) current_exe: Option<std::path::PathBuf>,
+    /// Compiled-in version string (`CARGO_PKG_VERSION`).
+    pub(super) compiled_version: String,
+    /// Compiled-in git commit (`SKIM_GIT_COMMIT`, or `"unknown"` if unset).
+    pub(super) compiled_commit: String,
+}
+
+impl DriftEnv {
+    /// Read all drift-relevant values from the current process.
+    ///
+    /// The only call site that touches process env and filesystem for drift
+    /// purposes. `detect_drift` receives this struct and is a pure function
+    /// of its argument.
+    pub(super) fn from_process() -> Self {
+        DriftEnv {
+            hook_version: std::env::var("SKIM_HOOK_VERSION")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            hook_binary: std::env::var("SKIM_HOOK_BINARY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            hook_commit: std::env::var("SKIM_HOOK_COMMIT")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            current_exe: crate::cmd::init::resolve_skim_binary().ok(),
+            compiled_version: env!("CARGO_PKG_VERSION").to_string(),
+            compiled_commit: option_env!("SKIM_GIT_COMMIT")
+                .unwrap_or("unknown")
+                .to_string(),
+        }
+    }
+}
+
+/// Pure drift detector — no env reads, no hidden state.
+///
+/// Returns the set of drift kinds detected given the pre-built `DriftEnv`.
+/// All data needed for detection is stored in `env`; callers build it once
+/// via `DriftEnv::from_process()`.
+///
+/// ## Scoping rule (CRITICAL)
+///
+/// When `env.hook_version` is `None`, returns an empty `Vec` immediately.
+/// Both-unset means we are NOT running under a skim-generated hook script
+/// (manual invocation, test harness, third-party wrapper). This keeps all
+/// existing `cli_e2e_rewrite.rs` tests green **without modification** — any
+/// test that drives the hook surface without setting `SKIM_HOOK_VERSION` sees
+/// zero drift, which is correct for those invocations.
+///
+/// **If you find yourself editing an existing `cli_e2e_rewrite.rs` test, the
+/// scoping rule is implemented incorrectly.** Stop and reconsider.
+///
+/// ## Inversion fixes
+///
+/// **Inversion 1 (SKIM_HOOK_BINARY absent):** The original code skipped the
+/// binary check when SKIM_HOOK_BINARY was absent. An absent pin is actually the
+/// worst case — the hook can resolve to any skim on $PATH. Fix: `hook_binary = None`
+/// now emits `HookScriptUnpinned`.
+///
+/// **Inversion 2 (binary/commit check only on version match):** The original
+/// `check_hook_version_mismatch` called `check_hook_binary_mismatch` only when
+/// versions *matched*, then returned. This means on the reporting machine
+/// (hook=2.10.0, binary=2.11.0) the binary/commit check never fired. Fix: all
+/// checks run whenever `hook_version` is `Some`.
+pub(super) fn detect_drift(env: &DriftEnv) -> Vec<DriftKind> {
+    // Scoping rule: absent SKIM_HOOK_VERSION → not running under a skim hook.
+    let hook_version = match &env.hook_version {
+        Some(v) => v,
+        None => return vec![],
+    };
+
+    let mut drifts = Vec::new();
+
+    // Version check.
+    if hook_version != &env.compiled_version {
+        drifts.push(DriftKind::HookVersionMismatch);
+    }
+
+    // Binary path check — always runs when hook_version is set.
+    // Inversion 1 fix: absent hook_binary = HookScriptUnpinned (was: skip check).
+    match &env.hook_binary {
+        None => {
+            drifts.push(DriftKind::HookScriptUnpinned);
+        }
+        Some(hook_binary) => {
+            // Canonicalize hook_binary for reliable comparison (resolves symlinks).
+            // This is the only filesystem read in detect_drift; it only runs when
+            // hook_binary is Some AND hook_version is Some.
+            let hook_canon = std::fs::canonicalize(hook_binary)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| hook_binary.clone());
+
+            if let Some(current_exe) = &env.current_exe {
+                let current_str = current_exe.display().to_string();
+                if !current_str.is_empty() && current_str != hook_canon {
+                    drifts.push(DriftKind::BinaryPathMismatch);
+                }
+            }
+        }
+    }
+
+    // Commit check — always runs when hook_version is set.
+    // Inversion 2 fix: was only called when versions MATCHED, now always runs.
+    if let Some(hook_commit) = &env.hook_commit
+        && env.compiled_commit != "unknown"
+        && hook_commit != &env.compiled_commit
+    {
+        drifts.push(DriftKind::CommitMismatch);
+    }
+
+    drifts
+}
+
+// ============================================================================
+// Log channel helpers (hook.log)
+// ============================================================================
+
+/// Emit rate-limited log warnings for detected drifts to hook.log.
+///
+/// Uses `warn_once_daily` (daily rate-limit per kind per agent).
+fn log_drift_warnings(
+    drifts: &[DriftKind],
+    env: &DriftEnv,
+    agent_name: &str,
+    cache_dir: &std::path::Path,
+) {
+    let hook_version = env.hook_version.as_deref().unwrap_or("?");
+    let hook_binary = env.hook_binary.as_deref().unwrap_or("(absent)");
+    let hook_commit = env.hook_commit.as_deref().unwrap_or("?");
+    let current_str = env
+        .current_exe
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    for kind in drifts {
+        match kind {
+            DriftKind::HookVersionMismatch => {
+                warn_once_daily(
+                    cache_dir,
+                    "version",
+                    agent_name,
+                    &format!(
+                        "version mismatch: hook script v{hook_version}, binary v{} \
+                         (run `./target/release/skim init --yes` to update)",
+                        env.compiled_version
+                    ),
+                );
+            }
+            DriftKind::BinaryPathMismatch => {
+                warn_once_daily(
+                    cache_dir,
+                    "binary",
+                    agent_name,
+                    &format!(
+                        "binary path mismatch: hook was installed from {hook_binary}, \
+                         running from {current_str} (run `./target/release/skim init --yes` to update)"
+                    ),
+                );
+            }
+            DriftKind::CommitMismatch => {
+                warn_once_daily(
+                    cache_dir,
+                    "commit",
+                    agent_name,
+                    &format!(
+                        "binary rebuilt in-place: hook commit {hook_commit}, \
+                         running commit {} (run `./target/release/skim init --yes` to update)",
+                        env.compiled_commit
+                    ),
+                );
+            }
+            DriftKind::HookScriptUnpinned => {
+                warn_once_daily(
+                    cache_dir,
+                    "unpinned",
+                    agent_name,
+                    "hook script predates binary pinning (SKIM_HOOK_BINARY not set); \
+                     run `./target/release/skim init --yes` to upgrade the hook script",
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Response writing helper
+// ============================================================================
+
+/// Write a JSON hook response to stdout (locked, with explicit flush).
+///
+/// The watchdog thread may call `process::exit(0)` after the flush completes;
+/// `write_all + flush` before returning ensures the full JSON is on the wire.
+fn write_hook_response(response: &serde_json::Value) -> anyhow::Result<()> {
+    use std::io::Write;
+    let json_out = serde_json::to_string(response)?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(json_out.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
+}
+
+// ============================================================================
+// Parse agent flag
+// ============================================================================
+
 /// Parse the `--agent <name>` flag from rewrite args.
 ///
 /// Returns `None` if `--agent` is not present or the value is missing.
@@ -51,6 +303,9 @@ pub(super) const HOOK_TIMEOUT_SECS: u64 = 5;
 /// 5. On match: emit hook response JSON, exit 0
 /// 6. On no match: exit 0, empty stdout (passthrough)
 ///
+/// Drift is detected and logged to hook.log on every invocation. For diagnosis
+/// run `skim doctor`.
+///
 /// When `agent` is None or ClaudeCode, uses existing Claude Code logic.
 /// Other agents passthrough (exit 0) until Phase 2 adds implementations.
 ///
@@ -75,10 +330,10 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         // SAFETY: process::exit(0) is intentional here. In hook mode, timeout means
         // passthrough (the agent sees empty stdout and proceeds normally). No Drop-based
         // cleanup is relied upon. The only stdout write in the success path uses
-        // write_all + flush (see below) so the agent never receives a truncated JSON
-        // response: either flush completes before this timer fires, or the timer fires
-        // first and the agent sees empty stdout (passthrough). The watchdog only fires
-        // when processing has stalled beyond the timeout window.
+        // write_all + flush (see write_hook_response below) so the agent never receives
+        // a truncated JSON response: either flush completes before this timer fires, or
+        // the timer fires first and the agent sees empty stdout (passthrough). The
+        // watchdog only fires when processing has stalled beyond the timeout window.
         std::process::exit(0);
     });
 
@@ -90,15 +345,33 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
         return Ok(ExitCode::SUCCESS);
     }
 
-    // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
-    // Only run for Claude Code where we have the hook script infrastructure.
-    // TODO: Extend integrity checks to Cursor, Gemini, and Copilot once their
-    // hook script install paths are validated (they also report RealHook support).
+    // Drift detection — scoped to ClaudeCode (has the hook script provenance
+    // fields: SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).
+    // Findings are recorded to hook.log unconditionally (rate-limited per kind
+    // per agent per day). No in-band advisory is emitted; use `skim doctor`
+    // for on-demand diagnosis.
     if agent_kind == AgentKind::ClaudeCode {
+        // #57: Integrity check — log-only (NEVER stderr, GRANITE #361 Bug 3).
         let integrity_failed = check_hook_integrity(agent_kind);
-        if !integrity_failed {
-            // A2: Version mismatch check — rate-limited daily warning
-            check_hook_version_mismatch(agent_kind);
+
+        let de = DriftEnv::from_process();
+        // Drift detection reads env vars that the hook script itself exports
+        // (SKIM_HOOK_BINARY, SKIM_HOOK_VERSION, SKIM_HOOK_COMMIT).  When the
+        // hook is Tampered those exports come from the tampered script and
+        // cannot be trusted — so drift results would be unreliable.  Skip
+        // drift detection only on Tampered; an unreadable hook (which returns
+        // integrity_failed=false) still allows drift detection to run.
+        let drifts = if !integrity_failed {
+            detect_drift(&de)
+        } else {
+            vec![]
+        };
+
+        // Log channel: rate-limited daily warnings to hook.log.
+        if !drifts.is_empty()
+            && let Some(dir) = crate::cmd::resolve_cache_dir()
+        {
+            log_drift_warnings(&drifts, &de, agent_kind.cli_name(), &dir);
         }
     }
 
@@ -219,22 +492,8 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
             // ancestry walk (read_session_id) or SKIM_SESSION_ID env var.
             let final_cmd = result.tokens.join(" ");
             audit_hook(&command, true, &final_cmd);
-            // Use agent-specific response format
             let response = protocol.format_response(&final_cmd);
-            let json_out = serde_json::to_string(&response)?;
-            // SAFETY: write_all + flush before returning ensures the full JSON
-            // response is on the wire before the watchdog's process::exit(0) can
-            // fire. The watchdog is running concurrently on a detached thread; a
-            // bare `println!` only flushes when the BufWriter decides to, so it
-            // could be truncated if exit fires mid-buffer. Locking stdout and
-            // flushing explicitly makes the emit atomic relative to the timeout.
-            {
-                use std::io::Write;
-                let mut out = std::io::stdout().lock();
-                out.write_all(json_out.as_bytes())?;
-                out.write_all(b"\n")?;
-                out.flush()?;
-            }
+            write_hook_response(&response)?;
         }
         None => {
             audit_hook(&command, false, "");
@@ -246,10 +505,20 @@ pub(super) fn run_hook_mode(agent: Option<AgentKind>) -> anyhow::Result<ExitCode
 
 /// Resolve the hook config directory for the given agent.
 ///
-/// Delegates to the canonical `resolve_config_dir_for_agent` in `init/helpers.rs`
-/// which handles agent-specific env overrides and home-directory fallback.
+/// Delegates to `DetectionEnv::resolve()` — the single authoritative
+/// config-dir resolver — so per-agent env overrides (`CURSOR_CONFIG_DIR`,
+/// `GEMINI_CONFIG_DIR`, `COPILOT_CONFIG_DIR`, …) are honored in hook mode
+/// just as they are during install/uninstall.
+///
+/// Routes the resolved dir through `HookProtocol::hook_config_dir` so agents
+/// like Copilot CLI that store hook artifacts under a different root
+/// (e.g. `~/.copilot/`) are handled correctly.
 fn resolve_hook_config_dir(agent: AgentKind) -> Option<std::path::PathBuf> {
-    crate::cmd::init::resolve_config_dir_for_agent(false, agent).ok()
+    let env = crate::cmd::init::DetectionEnv::from_process();
+    let config_dir = env.resolve(agent, false).ok()?;
+    let protocol = crate::cmd::hooks::protocol_for_agent(agent);
+    let has_override = env.override_for(agent).is_some();
+    Some(protocol.hook_config_dir(&config_dir, false, has_override))
 }
 
 /// Check if a daily rate-limit stamp allows warning today.
@@ -265,6 +534,26 @@ pub(super) fn should_warn_today(stamp_path: &std::path::Path) -> bool {
     let _ = std::fs::create_dir_all(stamp_path.parent().unwrap_or(std::path::Path::new(".")));
     let _ = std::fs::write(stamp_path, &today);
     true
+}
+
+/// Emit a rate-limited warning to hook.log at most once per day per agent per kind.
+///
+/// `kind` is the stamp discriminator (e.g. "version", "binary", "commit") — it
+/// determines the stamp filename `.hook-{kind}-warned-{agent_name}` so that each
+/// warning category fires independently once per day.
+///
+/// All output goes to hook.log via `log_hook_warning` — NEVER to stderr
+/// (zero-stderr invariant in hook mode, #361 Bug 3).
+pub(super) fn warn_once_daily(
+    cache_dir: &std::path::Path,
+    kind: &str,
+    agent_name: &str,
+    msg: &str,
+) {
+    let stamp = cache_dir.join(format!(".hook-{kind}-warned-{agent_name}"));
+    if should_warn_today(&stamp) {
+        crate::cmd::hook_log::log_hook_warning(msg);
+    }
 }
 
 /// #57: Check hook script integrity.
@@ -309,38 +598,14 @@ fn check_hook_integrity(agent: AgentKind) -> bool {
             }
             true
         }
-        Err(_) => false, // Script unreadable — don't block the hook
-    }
-}
-
-/// A2: Check for version mismatch between hook script and binary.
-///
-/// If `SKIM_HOOK_VERSION` is set and differs from the compiled version,
-/// emit a daily warning to hook.log. Rate-limited via per-agent stamp file.
-fn check_hook_version_mismatch(agent: AgentKind) {
-    let hook_version = match std::env::var("SKIM_HOOK_VERSION") {
-        Ok(v) => v,
-        Err(_) => return, // not set — nothing to check
-    };
-
-    let compiled_version = env!("CARGO_PKG_VERSION");
-    if hook_version == compiled_version {
-        return; // versions match
-    }
-
-    let agent_name = agent.cli_name();
-
-    // Rate limit: per-agent, warn at most once per day
-    let stamp_path = match crate::cmd::resolve_cache_dir() {
-        Some(dir) => dir.join(format!(".hook-version-warned-{agent_name}")),
-        None => return,
-    };
-
-    if should_warn_today(&stamp_path) {
-        // Emit warning to hook log (NEVER stderr -- GRANITE #361 Bug 3)
-        crate::cmd::hook_log::log_hook_warning(&format!(
-            "version mismatch: hook script v{hook_version}, binary v{compiled_version} (run `skim init --yes` to update)"
-        ));
+        Err(_) => {
+            // Script unreadable: cannot compute hash, so cannot detect tampering.
+            // Return false (integrity check does NOT signal failure) so drift
+            // detection continues to run — the unreadable-script state will be
+            // visible via `skim doctor` without silencing drift on this channel.
+            // Only `Tampered` (above) returns true and suppresses drift.
+            false
+        }
     }
 }
 
@@ -513,6 +778,198 @@ mod tests {
     }
 
     // ========================================================================
+    // warn_once_daily — kind-stamped rate-limit helper
+    // ========================================================================
+
+    #[test]
+    fn test_warn_once_daily_creates_kind_stamped_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // First call: stamp must be created with the correct kind-qualified name.
+        warn_once_daily(dir.path(), "version", "claude-code", "test message");
+        let stamp = dir.path().join(".hook-version-warned-claude-code");
+        assert!(
+            stamp.exists(),
+            "warn_once_daily must create .hook-{{kind}}-warned-{{agent}} stamp"
+        );
+        // Second call same day: stamp already written for today, so suppressed.
+        assert!(
+            !should_warn_today(&stamp),
+            "stamp must suppress a repeat warn_once_daily call on the same day"
+        );
+    }
+
+    #[test]
+    fn test_warn_once_daily_distinct_kinds_use_distinct_stamps() {
+        let dir = tempfile::TempDir::new().unwrap();
+        warn_once_daily(dir.path(), "binary", "claude-code", "binary msg");
+        warn_once_daily(dir.path(), "commit", "claude-code", "commit msg");
+        // Each kind produces its own stamp file — they must be independent.
+        assert!(
+            dir.path().join(".hook-binary-warned-claude-code").exists(),
+            "binary kind must have its own stamp"
+        );
+        assert!(
+            dir.path().join(".hook-commit-warned-claude-code").exists(),
+            "commit kind must have its own stamp"
+        );
+    }
+
+    // ========================================================================
+    // detect_drift: scoping rule and inversion fixes
+    // ========================================================================
+
+    /// Scoping rule: when hook_version is None, detect_drift returns empty.
+    ///
+    /// This is the critical guard that keeps all existing cli_e2e_rewrite.rs
+    /// tests green without modification — tests that drive the hook surface
+    /// without setting SKIM_HOOK_VERSION are not running under a skim hook
+    /// script, so no drift is possible.
+    #[test]
+    fn test_detect_drift_no_hook_version_emits_nothing() {
+        let env = DriftEnv {
+            hook_version: None, // not running under a skim hook
+            hook_binary: Some("/wrong/path".to_string()),
+            hook_commit: Some("deadbeef".to_string()),
+            current_exe: Some(std::path::PathBuf::from("/right/path")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc12345".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            drifts.is_empty(),
+            "hook_version=None must yield no drifts: {drifts:?}"
+        );
+    }
+
+    /// Healthy env: all values match → no drift.
+    #[test]
+    fn test_detect_drift_healthy_no_drift() {
+        // For this test we use a path that exists on disk so canonicalize succeeds.
+        let current_exe = std::env::current_exe().unwrap();
+        let env = DriftEnv {
+            hook_version: Some("2.11.0".to_string()),
+            hook_binary: Some(current_exe.display().to_string()),
+            hook_commit: Some("abc1234f".to_string()),
+            current_exe: Some(current_exe),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            drifts.is_empty(),
+            "all-matching env must yield no drifts: {drifts:?}"
+        );
+    }
+
+    /// Inversion 1 fix: absent SKIM_HOOK_BINARY → HookScriptUnpinned (was: skip check).
+    ///
+    /// An unpinned hook script resolves to whatever `skim` is first on $PATH,
+    /// which on this machine can be a stale or divergent-branch clone.
+    #[test]
+    fn test_detect_drift_hook_script_unpinned_inversion1_fixed() {
+        let env = DriftEnv {
+            hook_version: Some("2.11.0".to_string()),
+            hook_binary: None, // absent = unpinned — the dangerous state
+            hook_commit: None,
+            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            drifts.contains(&DriftKind::HookScriptUnpinned),
+            "absent hook_binary must emit HookScriptUnpinned (inversion 1 fix): {drifts:?}"
+        );
+    }
+
+    /// Version mismatch → HookVersionMismatch.
+    #[test]
+    fn test_detect_drift_version_mismatch() {
+        let env = DriftEnv {
+            hook_version: Some("2.10.0".to_string()), // older hook
+            hook_binary: None,                        // also unpinned — both fire
+            hook_commit: None,
+            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            drifts.contains(&DriftKind::HookVersionMismatch),
+            "version mismatch must emit HookVersionMismatch: {drifts:?}"
+        );
+    }
+
+    /// Binary path mismatch → BinaryPathMismatch.
+    ///
+    /// Uses a path that definitely does not exist so canonicalize falls back to
+    /// the raw string, making the comparison deterministic.
+    #[test]
+    fn test_detect_drift_binary_path_mismatch() {
+        let env = DriftEnv {
+            hook_version: Some("2.11.0".to_string()),
+            hook_binary: Some("/tmp/skim-other-binary-nonexistent".to_string()),
+            hook_commit: Some("abc1234f".to_string()),
+            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            drifts.contains(&DriftKind::BinaryPathMismatch),
+            "path mismatch must emit BinaryPathMismatch: {drifts:?}"
+        );
+    }
+
+    /// Commit mismatch → CommitMismatch.
+    #[test]
+    fn test_detect_drift_commit_mismatch() {
+        let current_exe = std::env::current_exe().unwrap();
+        let env = DriftEnv {
+            hook_version: Some("2.11.0".to_string()),
+            hook_binary: Some(current_exe.display().to_string()),
+            hook_commit: Some("oldcommit".to_string()),
+            current_exe: Some(current_exe),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "newcommit".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            drifts.contains(&DriftKind::CommitMismatch),
+            "commit mismatch must emit CommitMismatch: {drifts:?}"
+        );
+    }
+
+    /// Inversion 2 fix: commit check runs even when versions DIFFER.
+    ///
+    /// The original code called check_hook_binary_mismatch only when versions
+    /// *matched*, then returned — so on the reporting machine (hook=2.10.0,
+    /// binary=2.11.0) the commit check never ran. This test proves the fix:
+    /// CommitMismatch is detected even when HookVersionMismatch is also present.
+    #[test]
+    fn test_detect_drift_commit_check_runs_regardless_of_version_inversion2_fixed() {
+        let current_exe = std::env::current_exe().unwrap();
+        let env = DriftEnv {
+            hook_version: Some("2.10.0".to_string()), // version DIFFERS
+            hook_binary: Some(current_exe.display().to_string()),
+            hook_commit: Some("old_commit_sha".to_string()),
+            current_exe: Some(current_exe),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "new_commit_sha".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        // Both version AND commit drift must be detected even though versions differ.
+        assert!(
+            drifts.contains(&DriftKind::HookVersionMismatch),
+            "version mismatch must be detected: {drifts:?}"
+        );
+        assert!(
+            drifts.contains(&DriftKind::CommitMismatch),
+            "commit mismatch must ALSO be detected when versions differ (inversion 2 fix): {drifts:?}"
+        );
+    }
+
+    // ========================================================================
     // Hook/rewrite surface: NO --session-id in rewritten commands (#1.1)
     //
     // The hook drops flag injection; attribution is out-of-band via sidecar.
@@ -621,5 +1078,82 @@ mod tests {
     fn test_hook_constants_unchanged() {
         assert_eq!(HOOK_TIMEOUT_SECS, 5);
         assert_eq!(HOOK_MAX_STDIN_BYTES, 64 * 1024);
+    }
+
+    // ========================================================================
+    // Drift logging invariants: drift is detected and recorded to hook.log
+    // only, never injected into the hook response JSON. The fix for drift is
+    // absolute-path pinning + `skim init` refresh + `skim doctor` on-demand.
+    // The hook-drift/ directory is never created — warn_once_daily stamps
+    // (e.g. .hook-version-warned-<agent>) are the per-day dedup mechanism.
+    // ========================================================================
+
+    /// Invariant: when drift is detected, the logging path fires
+    /// (warn_once_daily stamps written) but the hook response JSON carries no
+    /// drift information — no `systemMessage`, no `additionalContext`.
+    /// The `hook-drift/` directory is never created.
+    #[test]
+    fn test_drift_logs_to_hook_log_never_to_hook_response() {
+        use crate::cmd::hooks::HookProtocol;
+        use crate::cmd::hooks::claude::ClaudeCodeHook;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let hook_drift_dir = temp.path().join("hook-drift");
+
+        // Build a drift env with a clear version mismatch.
+        let env = DriftEnv {
+            hook_version: Some("2.10.0".to_string()),
+            hook_binary: None, // absent → HookScriptUnpinned
+            hook_commit: None,
+            current_exe: Some(std::path::PathBuf::from("/usr/local/bin/skim")),
+            compiled_version: "2.11.0".to_string(),
+            compiled_commit: "abc1234f".to_string(),
+        };
+        let drifts = detect_drift(&env);
+        assert!(
+            !drifts.is_empty(),
+            "test requires drift to be detected; got: {drifts:?}"
+        );
+
+        // Call log_drift_warnings — this is the only path drift now takes.
+        // It should write warn_once_daily stamps under temp, triggering log_hook_warning.
+        log_drift_warnings(&drifts, &env, "claude-code", temp.path());
+
+        // Stamp files must exist (warn_once_daily was triggered).
+        let version_stamp = temp.path().join(".hook-version-warned-claude-code");
+        let unpinned_stamp = temp.path().join(".hook-unpinned-warned-claude-code");
+        assert!(
+            version_stamp.exists() || unpinned_stamp.exists(),
+            "warn_once_daily must have created a per-kind stamp file — logging path was not triggered"
+        );
+
+        // The hook-drift/ directory must never be created.
+        assert!(
+            !hook_drift_dir.exists(),
+            "hook-drift/ directory must never be created: {hook_drift_dir:?}"
+        );
+
+        // The hook response JSON must contain no systemMessage or additionalContext.
+        let response = ClaudeCodeHook.format_response("skim git status");
+        let json_str = response.to_string();
+        assert!(
+            !json_str.contains("systemMessage"),
+            "hook response must not contain systemMessage: {json_str}"
+        );
+        assert!(
+            !json_str.contains("additionalContext"),
+            "hook response must not contain additionalContext: {json_str}"
+        );
+        // Verify the response only has updatedInput (the correct rewrite shape).
+        let updated = response
+            .get("hookSpecificOutput")
+            .and_then(|o| o.get("updatedInput"))
+            .and_then(|u| u.get("command"));
+        assert_eq!(
+            updated.and_then(|v| v.as_str()),
+            Some("skim git status"),
+            "hook response must contain updatedInput.command with rewritten command"
+        );
     }
 }

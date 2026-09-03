@@ -164,15 +164,16 @@ fn test_cli_stdin_with_language() {
 }
 
 #[test]
-fn test_cli_stdin_without_language_fails() {
+fn test_cli_stdin_without_language_passes_through() {
+    // ADR-002: shebang-less stdin without --language degrades to lossless passthrough
+    // (exit 0), consistent with the file path behaviour for unknown extensions.
+    // The input content is emitted verbatim (non-UTF-8 stdin still fails).
     common::skim()
         .arg("-")
         .write_stdin("function test() {}")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "requires --language or --filename",
-        ));
+        .success()
+        .stdout(predicate::str::contains("function test() {}"));
 }
 
 // ============================================================================
@@ -190,6 +191,9 @@ fn test_cli_nonexistent_file() {
 
 #[test]
 fn test_cli_unsupported_extension() {
+    // ADR-002: unknown extensions degrade to lossless passthrough (exit 0).
+    // The original error-on-unknown behavior was replaced by graceful degradation.
+    // SKIM_DEBUG=1 emits a notice; without it, the output is the file contents.
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.xyz");
     fs::write(&file_path, "some code").unwrap();
@@ -197,8 +201,8 @@ fn test_cli_unsupported_extension() {
     common::skim()
         .arg(&file_path)
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("Unsupported language"));
+        .success()
+        .stdout(predicate::str::contains("some code"));
 }
 
 #[test]
@@ -396,8 +400,8 @@ fn test_cli_minimal_mode_python_shebang() {
         .stdout(predicate::str::contains("#!/usr/bin/env python3"))
         // Code preserved
         .stdout(predicate::str::contains("def hello()"))
-        // Regular comment stripped
-        .stdout(predicate::str::contains("# regular comment").not());
+        // Module-header comment immediately after shebang (no blank line) preserved (#476)
+        .stdout(predicate::str::contains("# regular comment"));
 }
 
 #[test]
@@ -573,7 +577,9 @@ fn test_cli_filename_no_extension_fails() {
         .write_stdin("all: build")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unrecognized filename 'Makefile'"));
+        .stderr(predicate::str::contains(
+            "Unsupported language for file: Makefile",
+        ));
 }
 
 #[test]
@@ -584,7 +590,9 @@ fn test_cli_filename_unknown_ext_fails() {
         .write_stdin("some content")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unrecognized filename 'foo.xyz'"));
+        .stderr(predicate::str::contains(
+            "Unsupported language for file: foo.xyz",
+        ));
 }
 
 #[test]
@@ -783,8 +791,9 @@ fn test_cli_pseudo_mode() {
         .success()
         .stdout(predicate::str::contains("function add"))
         .stdout(predicate::str::contains("return a + b"))
-        // Type annotations should be stripped
-        .stdout(predicate::str::contains(": number").not())
+        // Param type annotations should be stripped; return type preserved (A4 contract)
+        .stdout(predicate::str::contains("function add(a, b)"))
+        .stdout(predicate::str::contains("): number"))
         // `export` is preserved as API surface (A4 contract)
         .stdout(predicate::str::contains("export"));
 }
@@ -805,9 +814,10 @@ fn test_cli_pseudo_mode_python() {
         .arg("pseudo")
         .assert()
         .success()
+        // Param type annotation stripped; return type preserved (A4 contract)
         .stdout(predicate::str::contains("def greet(name)"))
         .stdout(predicate::str::contains(": str").not())
-        .stdout(predicate::str::contains("-> str").not());
+        .stdout(predicate::str::contains("-> str"));
 }
 
 #[test]

@@ -23,6 +23,7 @@ mod state;
 mod uninstall;
 pub(super) mod wrappers;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use flags::parse_flags;
@@ -30,9 +31,110 @@ use helpers::print_help;
 use install::run_install;
 use uninstall::run_uninstall;
 
-pub(crate) use helpers::resolve_config_dir_for_agent;
+pub(crate) use flags::DetectionEnv;
+pub(crate) use flags::PermissionsTier;
+pub(crate) use helpers::atomic_write_settings;
+pub(crate) use helpers::backup_settings_file;
+pub(crate) use helpers::load_or_create_settings;
+pub(crate) use helpers::resolve_skim_binary;
 pub(crate) use state::MAX_SETTINGS_SIZE;
 pub(crate) use state::has_skim_hook_entry;
+
+// ============================================================================
+// B4: HookFacts DTO seam — cross-module hook state projection for `skim doctor`
+// ============================================================================
+
+/// Snapshot of hook installation facts for `skim doctor`.
+///
+/// This is a projection of [`state::DetectedState`] with only the fields that
+/// cross the `cmd::init` module boundary. Internal state structs stay private.
+pub(crate) struct HookFacts {
+    /// True when any skim hook entry is present in the agent's config.
+    pub(crate) hook_installed: bool,
+    /// Version string recorded in the hook script (`SKIM_HOOK_VERSION`).
+    pub(crate) hook_version: Option<String>,
+    /// Git commit recorded in the hook script (`SKIM_HOOK_COMMIT`).
+    pub(crate) hook_commit: Option<String>,
+    /// Absolute path that the hook script pins as the binary (`SKIM_HOOK_BINARY`).
+    pub(crate) hook_binary_pin: Option<String>,
+    /// Whether the hook uses the pinned-binary format (exports `SKIM_HOOK_BINARY`).
+    pub(crate) hook_uses_pinned_binary: bool,
+    /// Whether the hook is fully current (version + pinned binary + commit all match).
+    pub(crate) hook_is_current: bool,
+    /// Whether the hook's recorded binary pin points to the same canonical path
+    /// as the running binary.  `false` when the pin is absent.
+    ///
+    /// Separate from `hook_is_current` so `skim doctor` can display a specific
+    /// pin-mismatch cause when two clones share the same version and commit but
+    /// the hook still points to the wrong one (PF-015 display-without-gate).
+    pub(crate) pin_is_current: bool,
+    /// Path to the hook script file (`hook_config_dir/hooks/skim-rewrite.sh`).
+    pub(crate) hook_script_path: PathBuf,
+    /// Integrity classification of the hook script against its SHA-256 manifest.
+    ///
+    /// Derived from the manifest (an independent artefact), NOT from the hook
+    /// script bytes — which is exactly what a tamper modifies (PF-016).
+    pub(crate) script_integrity: crate::cmd::integrity::ScriptIntegrity,
+}
+
+/// Gather hook installation facts for a given agent — used by `skim doctor`.
+///
+/// Runs `detect_state` with the real process environment using global scope
+/// (`project: false`), which is the scope that fires for every session.
+/// Returns an error only if the config-dir resolver itself fails (e.g.,
+/// cannot determine home directory).
+pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Result<HookFacts> {
+    let init_flags = flags::InitFlags {
+        project: false,
+        yes: false,
+        dry_run: false,
+        uninstall: false,
+        force: false,
+        no_guidance: false,
+        agent: Some(agent),
+        wrappers: None,
+        permissions: None,
+        permissions_tier: flags::PermissionsTier::Seed,
+    };
+    let env = DetectionEnv::from_process();
+    let detected = state::detect_state(&init_flags, agent, &env)?;
+
+    // Evaluate hook_is_current() and pin_is_current() before partially moving
+    // out of `detected`. Both queries read struct fields, so they must be called
+    // before any field is moved.
+    let is_current = detected.hook_is_current();
+    let pin_current = detected.pin_is_current();
+    let hook_script_path = detected
+        .hook_config_dir
+        .join("hooks")
+        .join(helpers::HOOK_SCRIPT_NAME);
+
+    // Integrity is derived from the SHA-256 manifest (independent of the script
+    // bytes), so a tampered script cannot influence this verdict (PF-016).
+    //
+    // Verification: `detected.hook_config_dir` is the same directory that
+    // `create_hook_script` in `install.rs` passes to `write_hash_manifest`
+    // (`write_hash_manifest(&state.hook_config_dir, state.agent_cli_name, ...)`).
+    // This alignment holds for every agent — including Copilot, whose
+    // `hook_config_dir` redirects to `~/.copilot/` via `HookProtocol::hook_config_dir`.
+    let script_integrity = crate::cmd::integrity::classify_script_integrity(
+        &detected.hook_config_dir,
+        agent.cli_name(),
+        &hook_script_path,
+    );
+
+    Ok(HookFacts {
+        hook_installed: detected.hook_installed,
+        hook_version: detected.hook_version,
+        hook_commit: detected.hook_commit,
+        hook_binary_pin: detected.hook_binary_pin,
+        hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
+        hook_is_current: is_current,
+        pin_is_current: pin_current,
+        hook_script_path,
+        script_integrity,
+    })
+}
 
 /// Run the `init` subcommand.
 pub(crate) fn run(
@@ -61,6 +163,18 @@ pub(crate) fn run(
     }
 
     run_install(&flags)
+}
+
+/// Returns `true` when hook script `contents` exports `SKIM_HOOK_BINARY`,
+/// indicating the F6 pinned-binary format.
+///
+/// This is the single source of truth for the "has pinned binary marker" scan
+/// used by `uses_pinned_binary` in state detection, so a format change
+/// updates all detection sites in lockstep.
+pub(super) fn script_has_pinned_marker(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|l| l.trim_start().starts_with("export SKIM_HOOK_BINARY="))
 }
 
 /// Build the clap `Command` definition for shell completions.
@@ -129,5 +243,32 @@ pub(super) fn command() -> clap::Command {
                 .action(clap::ArgAction::SetTrue)
                 .conflicts_with("wrappers")
                 .help("Skip PATH wrapper installation (skip interactive prompt)"),
+        )
+        .arg(
+            clap::Arg::new("permissions")
+                .long("permissions")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("no-permissions")
+                .conflicts_with("project")
+                .help(
+                    "Seed agent-native allow-list entries for skim read-only tools \
+                     (user-scope only; incompatible with --project)",
+                ),
+        )
+        .arg(
+            clap::Arg::new("no-permissions")
+                .long("no-permissions")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("permissions")
+                .help("Skip seeding agent permission entries"),
+        )
+        .arg(
+            clap::Arg::new("permissions-tier")
+                .long("permissions-tier")
+                .value_name("TIER")
+                .help(
+                    "Which tier of permissions to seed: seed (default), mirror, blanket. \
+                     Effective only when --permissions is set.",
+                ),
         )
 }

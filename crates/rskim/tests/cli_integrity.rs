@@ -308,3 +308,75 @@ fn test_integrity_suppresses_version_mismatch() {
         // (integrity warning subsumes it)
         .stderr(predicate::str::contains("version mismatch").not());
 }
+
+// ============================================================================
+// Group 4 regression: `skim init` self-heals a missing manifest
+// ============================================================================
+
+/// Running `skim init` on an already-current install MUST restore a missing
+/// SHA-256 manifest — so that `skim doctor`'s advice ("run `skim init --agent
+/// {agent}` to add tamper detection") is actionable (Group 4 fix / #471).
+///
+/// Uses `common::skim_sandboxed` with a `TempDir` home so the test cannot
+/// touch the developer's real `~/.claude/hooks/` or `~/.gemini/`.
+#[test]
+fn test_init_self_heals_missing_manifest() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    // Create config dir (required by detect_installed_agents in override-mode).
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+
+    // First install: creates hook script + manifest.
+    common::skim_sandboxed(home)
+        .args([
+            "init",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+
+    let manifest = home.join(".claude/hooks/skim-claude-code.sha256");
+    assert!(
+        manifest.exists(),
+        "manifest must exist after initial install"
+    );
+
+    // Delete the manifest to simulate a pre-manifest install or a failed write.
+    fs::remove_file(&manifest).unwrap();
+    assert!(!manifest.exists(), "manifest must be absent before re-init");
+
+    // Re-run `skim init` with the same parameters — script is current, but
+    // manifest is absent.  The manifest-presence check in the outer fast path
+    // must prevent the "already up to date" short-circuit so the heal runs.
+    common::skim_sandboxed(home)
+        .args([
+            "init",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+
+    // Manifest must be restored.
+    assert!(
+        manifest.exists(),
+        "manifest must be restored by re-running `skim init` (Group 4 self-heal)"
+    );
+
+    // Validate manifest format: sha256:<hex>  skim-rewrite.sh
+    let content = fs::read_to_string(&manifest).unwrap();
+    assert!(
+        content.starts_with("sha256:"),
+        "restored manifest must start with sha256: prefix; got: {content}"
+    );
+    assert!(
+        content.contains("skim-rewrite.sh"),
+        "restored manifest must reference the script name; got: {content}"
+    );
+}

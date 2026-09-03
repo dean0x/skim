@@ -103,6 +103,12 @@ impl AgentKind {
 
     /// The dot-directory name (e.g., ".claude", ".gemini").
     /// Single source of truth for all agent directory names.
+    ///
+    /// For [`AgentKind::Cursor`], this returns `".cursor"`, which is the
+    /// *project-scope* directory only (e.g., `.cursor/rules/` in a project root).
+    /// Cursor's *global* config lives at `~/Library/Application Support/Cursor`
+    /// (macOS) or `~/.config/Cursor` (Linux) — never under `~/.cursor`. See
+    /// [`AgentKind::config_dir`] for the global path resolution.
     pub(crate) fn dot_dir_name(&self) -> &'static str {
         match self {
             AgentKind::ClaudeCode => ".claude",
@@ -115,9 +121,31 @@ impl AgentKind {
     }
 
     /// Global config directory (home-relative).
-    /// Does NOT handle env var overrides — callers add those.
-    /// Note: Cursor uses runtime `is_dir()` for macOS vs Linux detection,
-    /// matching existing behavior in agents.rs and init/helpers.rs.
+    ///
+    /// Does NOT handle env var overrides — callers (`DetectionEnv::resolve`) add
+    /// those via `CURSOR_CONFIG_DIR` / `CLAUDE_CONFIG_DIR` / etc.
+    ///
+    /// # Cursor — IDE-only integration (WS2B decision)
+    ///
+    /// skim integrates with Cursor exclusively via the Cursor IDE's PreToolUse-style
+    /// hook event and `.mdc` guidance rules. The Cursor CLI has no rewrite-capable
+    /// hook event, so skim cannot intercept commands run through `cursor` in a
+    /// terminal session. As a result, no permissions file is seeded for Cursor (the
+    /// permissions factory returns `None` for this variant).
+    ///
+    /// **Global config directories** (what this method selects at runtime):
+    /// - **macOS (winning path)**: `~/Library/Application Support/Cursor` —
+    ///   checked first via `is_dir()`; used when the directory exists.
+    /// - **Linux/other (losing path / fallback)**: `~/.config/Cursor` — used when
+    ///   the macOS App Support path is absent, whether because the machine is not
+    ///   macOS, Cursor IDE is not yet installed, or the directory was removed.
+    ///   This fallback is acceptable: `~/.config/Cursor` is the canonical global
+    ///   config location on Linux, and returning it even when the directory does
+    ///   not yet exist lets the installer create it in the right place.
+    ///
+    /// **`~/.cursor` is project-scope only** — it is the value returned by
+    /// [`dot_dir_name`] and is used for CWD-relative paths (e.g., `.cursor/rules/`).
+    /// It is never used as the global config root.
     pub(crate) fn config_dir(&self, home: &Path) -> PathBuf {
         match self {
             AgentKind::Cursor => {
@@ -174,7 +202,11 @@ impl AgentKind {
                 base.map(|d| d.join("CLAUDE.md"))
             }
             (AgentKind::GeminiCli, true) => {
-                env.home_dir.as_ref().map(|h| h.join(".gemini/GEMINI.md"))
+                let base = env
+                    .gemini_config_dir
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".gemini")));
+                base.map(|d| d.join("GEMINI.md"))
             }
             (AgentKind::CodexCli, true) => {
                 let base = env
@@ -183,10 +215,13 @@ impl AgentKind {
                     .or_else(|| env.home_dir.as_ref().map(|h| h.join(".codex")));
                 base.map(|d| d.join("AGENTS.md"))
             }
-            (AgentKind::CopilotCli, true) => env
-                .home_dir
-                .as_ref()
-                .map(|h| h.join(".copilot/copilot-instructions.md")),
+            (AgentKind::CopilotCli, true) => {
+                let base = env
+                    .copilot_config_dir
+                    .clone()
+                    .or_else(|| env.home_dir.as_ref().map(|h| h.join(".copilot")));
+                base.map(|d| d.join("copilot-instructions.md"))
+            }
             (AgentKind::Crush, true) => {
                 let base = env
                     .crush_config_dir
@@ -243,17 +278,24 @@ pub(crate) struct InstructionEnv {
     pub codex_home: Option<PathBuf>,
     /// `CRUSH_CONFIG_DIR` override
     pub crush_config_dir: Option<PathBuf>,
+    /// `GEMINI_CONFIG_DIR` override (defence-in-depth: mirrors `DetectionEnv`)
+    pub gemini_config_dir: Option<PathBuf>,
+    /// `COPILOT_CONFIG_DIR` override (defence-in-depth: mirrors `DetectionEnv`)
+    pub copilot_config_dir: Option<PathBuf>,
 }
 
 impl InstructionEnv {
     /// Read env once at the system boundary. Call this in `main`-adjacent code,
     /// then thread the struct down to callers — never call from within library functions.
     pub fn from_process() -> Self {
+        let read = |name: &str| std::env::var_os(name).map(PathBuf::from);
         Self {
             home_dir: dirs::home_dir(),
-            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-            codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
-            crush_config_dir: std::env::var_os("CRUSH_CONFIG_DIR").map(PathBuf::from),
+            claude_config_dir: read("CLAUDE_CONFIG_DIR"),
+            codex_home: read("CODEX_HOME"),
+            crush_config_dir: read("CRUSH_CONFIG_DIR"),
+            gemini_config_dir: read("GEMINI_CONFIG_DIR"),
+            copilot_config_dir: read("COPILOT_CONFIG_DIR"),
         }
     }
 }
@@ -555,6 +597,10 @@ mod tests {
     #[test]
     fn test_agent_kind_dot_dir_name() {
         assert_eq!(AgentKind::ClaudeCode.dot_dir_name(), ".claude");
+        // Cursor's dot_dir_name is ".cursor" — the *project-scope* directory
+        // (e.g., .cursor/rules/ inside a project). The global config dir lives at
+        // ~/Library/Application Support/Cursor (macOS) or ~/.config/Cursor (Linux);
+        // those are returned by config_dir(), not here.
         assert_eq!(AgentKind::Cursor.dot_dir_name(), ".cursor");
         assert_eq!(AgentKind::GeminiCli.dot_dir_name(), ".gemini");
         assert_eq!(AgentKind::CopilotCli.dot_dir_name(), ".github");
@@ -591,7 +637,12 @@ mod tests {
 
     #[test]
     fn test_agent_kind_config_dir_cursor_linux_fallback() {
-        // With a fake home, macOS path won't exist → falls back to Linux path
+        // Winning path: ~/Library/Application Support/Cursor (macOS) — selected by
+        // is_dir() when the directory exists on a real macOS machine with Cursor IDE.
+        // Losing path / fallback: ~/.config/Cursor — selected in all other cases:
+        //   Linux systems, macOS without Cursor installed, or a fake/test home dir.
+        // With a fake home, the macOS App Support path never exists, so the fallback
+        // is always returned here. This is the correct Linux global config location.
         let home = PathBuf::from("/fake/home");
         assert_eq!(
             AgentKind::Cursor.config_dir(&home),
@@ -747,6 +798,37 @@ mod tests {
         };
         let path = AgentKind::Crush.instruction_file(true, &env).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test-crush/AGENTS.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_gemini_env_override() {
+        // GEMINI_CONFIG_DIR overrides home-dir-based resolution for Gemini guidance.
+        // This is the defence-in-depth path: tests that set GEMINI_CONFIG_DIR will
+        // have InstructionEnv populated, so guidance removal cannot touch the real
+        // ~/.gemini/GEMINI.md (avoids PF-009 / PF-015).
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            gemini_config_dir: Some(PathBuf::from("/tmp/test-gemini")),
+            ..Default::default()
+        };
+        let path = AgentKind::GeminiCli.instruction_file(true, &env).unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test-gemini/GEMINI.md"));
+    }
+
+    #[test]
+    fn test_instruction_file_copilot_env_override() {
+        // COPILOT_CONFIG_DIR overrides home-dir-based resolution for Copilot guidance.
+        // Mirrors the GEMINI_CONFIG_DIR pattern — see test above for rationale.
+        let env = InstructionEnv {
+            home_dir: Some(fake_home()),
+            copilot_config_dir: Some(PathBuf::from("/tmp/test-copilot")),
+            ..Default::default()
+        };
+        let path = AgentKind::CopilotCli.instruction_file(true, &env).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/test-copilot/copilot-instructions.md")
+        );
     }
 
     #[test]

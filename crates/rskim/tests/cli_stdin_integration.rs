@@ -127,6 +127,83 @@ fn test_stdin_max_lines_and_stats() {
 }
 
 // ============================================================================
+// F4/AC-F4.4: stdin degrade tests (ADR-002 — shebang-less stdin passes through)
+// ============================================================================
+
+/// Batch: 3 extension-less files with `#!/bin/bash` shebangs → all render, exit 0.
+///
+/// AC-F4.4: unknown-ext files with a shebang must be detected as the shebang
+/// language, not fail with "All N file(s) failed".
+#[test]
+fn test_f4_bash_shebang_batch_exit_0_all_render() {
+    let dir = TempDir::new().unwrap();
+
+    // Create 3 extension-less bash scripts.
+    let script_content = "#!/bin/bash\nfunction setup() {\n  echo 'setup'\n}\nsetup";
+    for name in ["deploy", "build", "test"] {
+        let path = dir.path().join(name);
+        fs::write(&path, script_content).unwrap();
+    }
+
+    let deploy = dir.path().join("deploy");
+    let build = dir.path().join("build");
+    let test = dir.path().join("test");
+
+    let assert = common::skim()
+        .arg(&deploy)
+        .arg(&build)
+        .arg(&test)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+
+    // All three must contribute content — none must fail silently.
+    assert!(
+        stdout.contains("setup"),
+        "bash shebang scripts must render: got stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("All 3 file(s) failed"),
+        "must not report all-failed: {stdout}"
+    );
+}
+
+/// Unknown-ext, no-shebang stdin degrades to byte-identical passthrough (exit 0).
+///
+/// ADR-002: shebang-less stdin without --language passes through verbatim.
+/// SKIM_DEBUG=1 must emit a notice on stderr.
+#[test]
+fn test_f4_stdin_no_shebang_passthrough_exit_0() {
+    let content = "some unknown content here\nline two\n";
+
+    // Without SKIM_DEBUG — just exit 0 and byte-identical stdout.
+    common::skim()
+        .arg("-")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("some unknown content here"));
+}
+
+/// With SKIM_DEBUG=1, unknown-lang stdin must emit a stderr notice.
+#[test]
+fn test_f4_stdin_no_shebang_debug_notice() {
+    let content = "unknown content without shebang\n";
+
+    common::skim()
+        .arg("-")
+        .env("SKIM_DEBUG", "1")
+        .write_stdin(content)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unknown content without shebang"))
+        .stderr(predicate::str::contains("[skim] notice").and(
+            predicate::str::contains("unknown language").or(predicate::str::contains("degraded")),
+        ));
+}
+
+// ============================================================================
 // Single-file combination tests (exercises write_result_and_stats)
 // ============================================================================
 

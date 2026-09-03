@@ -66,6 +66,10 @@ where
 ///
 /// Used by [`run_test_runner`] to spawn the test process. Each field controls
 /// a specific aspect of how the command is launched.
+///
+/// Note: this struct deliberately omits a `synthesize_success_line` field.
+/// `go test` and `dotnet test` always emit structured output on success (JSON
+/// counters / TRX summary), so there is no blank-output-on-success gap to fill.
 pub(super) struct TestRunnerConfig<'a> {
     /// The binary name to invoke (e.g. `"vitest"`, `"swift"`, `"dotnet"`).
     pub program: &'a str,
@@ -168,17 +172,28 @@ where
             let decision = crate::cmd::execution::savings_decision(&raw_output, &compressed_str);
             match decision {
                 crate::cmd::execution::SavingsDecision::Keep => {
-                    println!("{test_result}");
+                    if crate::cmd::execution::write_line_to_stdout(&compressed_str)?
+                        == crate::cmd::execution::StdoutStatus::PipeClosed
+                    {
+                        return Ok(crate::cmd::execution::pipe_closed_exit());
+                    }
                 }
                 crate::cmd::execution::SavingsDecision::Passthrough => {
                     // Emit raw verbatim; drop the compressed summary.
                     // Record analytics under "passthrough" so the hint stays silent.
-                    effective_tier = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+                    let (tier, status) = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+                    if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                        return Ok(crate::cmd::execution::pipe_closed_exit());
+                    }
+                    effective_tier = tier;
                 }
             }
 
-            if ec != ExitCode::SUCCESS {
-                emit_failure_context(&raw_output, exit_code_byte(exit_source) as i32);
+            if ec != ExitCode::SUCCESS
+                && emit_failure_context(&raw_output, exit_code_byte(exit_source) as i32)?
+                    == crate::cmd::execution::StdoutStatus::PipeClosed
+            {
+                return Ok(crate::cmd::execution::pipe_closed_exit());
             }
             ec
         }
@@ -200,8 +215,23 @@ where
             // skim could not structurally parse — a far more common case.  A misbehaving
             // runner that lies about its exit code is outside skim's control; the raw
             // output is forwarded verbatim so the agent can inspect it directly.
-            println!("{raw}");
+            if crate::cmd::execution::write_line_to_stdout(raw)?
+                == crate::cmd::execution::StdoutStatus::PipeClosed
+            {
+                return Ok(crate::cmd::execution::pipe_closed_exit());
+            }
             let _ = result.emit_markers(&mut io::stderr().lock());
+            resolve_exit_code(0, exit_source)
+        }
+        ParseResult::RawPassthrough => {
+            // RawPassthrough: payload-less passthrough — serve raw_output byte-faithfully.
+            // Shared plumbing, behavior-preserving: mirrors execution.rs text-mode arm.
+            // effective_tier is already "passthrough" from result.tier_name() above.
+            let _ = result.emit_markers(&mut io::stderr().lock());
+            let (_, status) = crate::cmd::execution::emit_raw_passthrough(&raw_output)?;
+            if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                return Ok(crate::cmd::execution::pipe_closed_exit());
+            }
             resolve_exit_code(0, exit_source)
         }
     };
@@ -431,13 +461,21 @@ pub(super) fn run_passthrough(
     run_cmd: impl FnOnce(&[&str]) -> anyhow::Result<CommandOutput>,
 ) -> anyhow::Result<ExitCode> {
     if let Some(raw) = try_read_stdin(args)? {
-        print!("{raw}");
+        if crate::cmd::execution::write_to_stdout(&raw)?
+            == crate::cmd::execution::StdoutStatus::PipeClosed
+        {
+            return Ok(crate::cmd::execution::pipe_closed_exit());
+        }
         return Ok(ExitCode::FAILURE);
     }
     let final_args = prepare_args(args);
     let arg_refs: Vec<&str> = final_args.iter().map(String::as_str).collect();
     let output = run_cmd(&arg_refs)?;
-    print!("{}", crate::cmd::combine_output(&output));
+    if crate::cmd::execution::write_to_stdout(&crate::cmd::combine_output(&output))?
+        == crate::cmd::execution::StdoutStatus::PipeClosed
+    {
+        return Ok(crate::cmd::execution::pipe_closed_exit());
+    }
     let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
     Ok(ExitCode::from(code))
 }
@@ -577,12 +615,23 @@ pub(super) fn failure_context_body(raw_output: &str) -> Option<String> {
 /// - `exit_code`: the actual process exit code (e.g. `1` for test failures,
 ///   `2` for compilation errors in `go test`). Used in the stderr hint so the
 ///   caller knows the precise exit status to reproduce.
-pub(super) fn emit_failure_context(raw_output: &str, exit_code: i32) {
+pub(super) fn emit_failure_context(
+    raw_output: &str,
+    exit_code: i32,
+) -> anyhow::Result<crate::cmd::execution::StdoutStatus> {
     if let Some(body) = failure_context_body(raw_output) {
-        println!("\n--- failure context ---");
-        println!("{body}");
+        // Tool output (a slice of the runner's own bytes), so it takes the
+        // panic-free sink: `println!` here exits 101 when the reader is gone.
+        if crate::cmd::execution::write_line_to_stdout("\n--- failure context ---")?
+            == crate::cmd::execution::StdoutStatus::PipeClosed
+            || crate::cmd::execution::write_line_to_stdout(&body)?
+                == crate::cmd::execution::StdoutStatus::PipeClosed
+        {
+            return Ok(crate::cmd::execution::StdoutStatus::PipeClosed);
+        }
     }
     eprintln!("{}", crate::output::compressed_output_hint(exit_code));
+    Ok(crate::cmd::execution::StdoutStatus::Written)
 }
 
 /// Return the last `n` lines of `text` as a `&str` slice.

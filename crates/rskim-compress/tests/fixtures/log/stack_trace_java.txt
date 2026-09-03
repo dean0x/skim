@@ -1,0 +1,7 @@
+ERROR: NullPointerException in OrderService
+    at com.example.OrderService.process(OrderService.java:42)
+    at com.example.OrderService.handle(OrderService.java:87)
+    at com.example.OrderService.execute(OrderService.java:123)
+    at com.example.OrderService.run(OrderService.java:200)
+    at com.example.Main.main(Main.java:15)
+INFO: retrying request

@@ -660,8 +660,12 @@ fn test_json_token_reduction() {
 }
 
 #[test]
-fn test_json_large_keys_security() {
-    // SECURITY TEST: Ensure JSON with >10,000 keys is rejected
+fn test_json_large_keys_degrades_to_passthrough() {
+    // A legitimate but very large JSON (package-lock.json, an OpenAPI or i18n
+    // bundle) can exceed MAX_JSON_KEYS. Rather than failing the command, skim
+    // degrades to a lossless raw passthrough — the same policy applied to oversized
+    // tree-sitter files (#385). Safe because input size is already bounded by
+    // MAX_INPUT_SIZE before parsing, and the passthrough is a bounded copy.
     let mut json = String::from("{");
     for i in 0..10_001 {
         if i > 0 {
@@ -671,14 +675,11 @@ fn test_json_large_keys_security() {
     }
     json.push('}');
 
-    let result = transform(&json, Language::Json, Mode::Structure);
-
-    assert!(result.is_err(), "Expected error for excessive keys");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("key count exceeded"),
-        "Error message should mention key count limit, got: {}",
-        err_msg
+    let output = transform(&json, Language::Json, Mode::Structure)
+        .expect("large-key JSON should degrade to passthrough, not error");
+    assert_eq!(
+        output, json,
+        "degraded output must be the lossless raw source verbatim"
     );
 }
 
@@ -1000,21 +1001,21 @@ fn test_detect_language_yaml() {
 }
 
 #[test]
-fn test_yaml_large_keys_security() {
-    // SECURITY TEST: Ensure YAML with >10,000 keys is rejected
+fn test_yaml_large_keys_degrades_to_passthrough() {
+    // A legitimate but very large YAML can exceed MAX_YAML_KEYS. Rather than failing
+    // the command, skim degrades to a lossless raw passthrough — the same policy
+    // applied to oversized tree-sitter files (#385). Safe because input size is
+    // already bounded by MAX_INPUT_SIZE before parsing.
     let mut yaml = String::new();
     for i in 0..10_001 {
         yaml.push_str(&format!("key_{}: {}\n", i, i));
     }
 
-    let result = transform(&yaml, Language::Yaml, Mode::Structure);
-
-    assert!(result.is_err(), "Expected error for excessive keys");
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("key count exceeded"),
-        "Error message should mention key count limit, got: {}",
-        err_msg
+    let output = transform(&yaml, Language::Yaml, Mode::Structure)
+        .expect("large-key YAML should degrade to passthrough, not error");
+    assert_eq!(
+        output, yaml,
+        "degraded output must be the lossless raw source verbatim"
     );
 }
 
@@ -1605,12 +1606,14 @@ fn test_minimal_token_reduction() {
 
 #[test]
 fn test_python_minimal_nested_function_body_comments() {
-    let source = "# top-level comment\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
+    // Source starts with a code statement so the mid-file comment is NOT a module
+    // header and must be stripped. Comments inside function bodies are preserved.
+    let source = "x = 1\n# mid-file comment to strip\ndef outer():\n    # comment in outer body\n    def inner():\n        # comment in inner body\n        return 1\n    return inner()\n";
     let result = transform(source, Language::Python, Mode::Minimal).unwrap();
 
     assert!(
-        !result.contains("top-level comment"),
-        "top-level should be stripped"
+        !result.contains("mid-file comment"),
+        "mid-file comment should be stripped"
     );
     assert!(
         result.contains("comment in outer body"),
@@ -1634,6 +1637,98 @@ fn test_python_minimal_class_level_comments_stripped() {
     assert!(
         result.contains("body comment"),
         "method body comment should be preserved"
+    );
+}
+
+// ============================================================================
+// Large Header Block — O(N) regression guard
+// ============================================================================
+//
+// The fixture `large_header.py` contains 500 contiguous leading comments
+// followed by a blank-line-separated comment (to be stripped) and a function.
+// The old O(N³) backward-walk would take ~3 s on this fixture in DEBUG mode;
+// the O(N) forward-pass fix completes in < 5 ms.  The 3000 ms deadline is
+// intentionally generous to tolerate CI scheduling noise.
+
+const LARGE_HEADER_PY: &str = include_str!("../../../tests/fixtures/python/large_header.py");
+
+#[test]
+fn test_python_minimal_large_header_preserves_all_header_comments() {
+    // Correctness: all 500 contiguous leading comments must be preserved.
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("# Header comment 0"),
+        "first header comment must be preserved; result starts with: {:?}",
+        &result[..result.len().min(200)]
+    );
+    assert!(
+        result.contains("# Header comment 499"),
+        "last header comment must be preserved"
+    );
+    // The post-gap comment must be stripped.
+    assert!(
+        !result.contains("is NOT a header"),
+        "post-gap comment must be stripped; got:\n{result}"
+    );
+    // The sentinel function and its body comment must survive.
+    assert!(
+        result.contains("def sentinel_function"),
+        "sentinel function must be preserved"
+    );
+    assert!(
+        result.contains("# body comment"),
+        "in-body comment of sentinel function must be preserved"
+    );
+}
+
+#[test]
+fn test_python_pseudo_large_header_preserves_all_header_comments() {
+    // Same correctness guarantee through the pseudo-mode path (which also routes
+    // through compute_header_end_byte → is_module_header_comment).
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Pseudo).unwrap();
+
+    assert!(
+        result.contains("# Header comment 0"),
+        "first header comment must be preserved in pseudo mode"
+    );
+    assert!(
+        result.contains("# Header comment 499"),
+        "last header comment must be preserved in pseudo mode"
+    );
+    assert!(
+        !result.contains("is NOT a header"),
+        "post-gap comment must be stripped in pseudo mode"
+    );
+}
+
+#[test]
+fn test_python_minimal_large_header_linear_time() {
+    // CUBIC SMOKE TEST: 500 leading comments must process within 500 ms.
+    //
+    // WHAT THIS TEST PROVES: that N=500 comments complete within 500 ms through
+    // the full transform stack. The old O(N³) code took ~3–10 s at N=500; the
+    // fixed O(N) code completes in < 10 ms. The 500 ms budget gives ~50× CI
+    // headroom while being 6× below the O(N³) lower bound.
+    //
+    // WHAT THIS TEST DOES NOT PROVE: linear vs quadratic scaling. An O(N²)
+    // regression at N=500 would complete in ~31 ms and pass this test. For the
+    // doubling-ratio guard that discriminates O(N) from O(N²), see
+    // test_quadratic_scaling_guard in crates/rskim-core/src/transform/minimal.rs.
+    //
+    // Budget tightened from 3000 ms to 500 ms: the O(N³) code reliably exceeds
+    // 500 ms, while the fixed code runs in < 10 ms. 3000 ms gave a 333× margin
+    // and asserted almost nothing about scaling.
+    let start = std::time::Instant::now();
+    let result = transform(LARGE_HEADER_PY, Language::Python, Mode::Minimal);
+    let elapsed = start.elapsed();
+
+    assert!(result.is_ok(), "transform must succeed: {:?}", result.err());
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "500-comment file must process in < 500ms (got {elapsed:?}); \
+         old O(N³) code reliably exceeded this — cubic regression detected. \
+         For quadratic regressions, see test_quadratic_scaling_guard."
     );
 }
 
@@ -2370,8 +2465,11 @@ fn test_ruby_structure_reduces_tokens() {
 #[test]
 fn test_sql_minimal_reduces_tokens() {
     // SQL structure mode preserves all statements (no function bodies to strip).
-    // Minimal mode strips comments, verifying actual token reduction.
-    let source = include_str!("../../../tests/fixtures/sql/simple.sql");
+    // Minimal mode strips non-header comments, verifying actual token reduction.
+    // Uses comments.sql which has strippable standalone -- comments beyond the
+    // two-line module header (simple.sql only has header comments → no reduction
+    // after the module-header fix in #476).
+    let source = include_str!("../../../tests/fixtures/sql/comments.sql");
     let result = transform(source, Language::Sql, Mode::Minimal).unwrap();
     assert!(
         result.len() < source.len(),
@@ -2747,14 +2845,23 @@ fn test_typescript_pseudo() {
     let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
     let result = transform(source, Language::TypeScript, Mode::Pseudo).unwrap();
 
-    // Should strip type annotations
+    // Param type annotations should be stripped; return type preserved (A4 contract).
+    // Fixture: `add(a: number, b: number): number` — params stripped, return kept.
     assert!(
-        !result.contains(": number"),
-        "type annotations should be stripped"
+        result.contains("function add(a, b)"),
+        "param type annotations should be stripped, got: {result}"
     );
     assert!(
-        !result.contains(": string"),
-        "type annotations should be stripped"
+        result.contains("): number"),
+        "return type annotation must be preserved as API surface (A4), got: {result}"
+    );
+    assert!(
+        result.contains("function greet(name)"),
+        "param type annotation stripped in greet, got: {result}"
+    );
+    assert!(
+        result.contains("): string"),
+        "return type annotation preserved in greet (A4), got: {result}"
     );
 
     // `export` is now preserved as API surface (A4 contract)
@@ -2783,22 +2890,23 @@ fn test_python_pseudo() {
     let source = include_str!("../../../tests/fixtures/python/simple.py");
     let result = transform(source, Language::Python, Mode::Pseudo).unwrap();
 
-    // Should strip type annotations
+    // Param type annotations stripped; return types preserved (A4 contract).
     assert!(
         !result.contains(": int"),
-        "type annotations should be stripped"
+        "param type annotations should be stripped, got: {result}"
     );
     assert!(
         !result.contains(": str"),
-        "type annotations should be stripped"
+        "param type annotations should be stripped, got: {result}"
+    );
+    // Return types are now preserved as API surface (A4 contract).
+    assert!(
+        result.contains("-> int"),
+        "return type must be preserved as API surface (A4), got: {result}"
     );
     assert!(
-        !result.contains("-> int"),
-        "return types should be stripped"
-    );
-    assert!(
-        !result.contains("-> str"),
-        "return types should be stripped"
+        result.contains("-> str"),
+        "return type must be preserved as API surface (A4), got: {result}"
     );
 
     // Should strip self parameter
@@ -2941,9 +3049,14 @@ fn test_pseudo_with_config() {
         result.contains("export"),
         "export preserved as API surface via config API"
     );
+    // Param type annotations stripped; return type preserved (A4 contract).
     assert!(
-        !result.contains(": number"),
-        "type annotations stripped via config API"
+        result.contains("function add(a, b)"),
+        "param type annotations stripped via config API, got: {result}"
+    );
+    assert!(
+        result.contains("): number"),
+        "return type preserved as API surface via config API (A4), got: {result}"
     );
 }
 

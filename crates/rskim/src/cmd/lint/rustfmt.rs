@@ -41,6 +41,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[1],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 static RE_RUSTFMT_DIFF_HEADER: LazyLock<Regex> =

@@ -104,7 +104,7 @@ fn looks_like_file_or_glob(token: &str) -> bool {
 /// | Contains `*`, `?`, `[`, or `{`                  | FileOperation |
 /// | Is known subcommand                           | Subcommand    |
 /// | Everything else                               | FileOperation |
-fn resolve_invocation() -> Invocation {
+fn resolve_invocation() -> anyhow::Result<Invocation> {
     let raw_args: Vec<String> = std::env::args().collect();
     // Skip argv[0] (the binary name)
     let args = &raw_args[1..];
@@ -119,7 +119,7 @@ fn resolve_invocation() -> Invocation {
         // Without this, `skim -- test` would skip `--`, find `test`,
         // and incorrectly route to Subcommand.
         if arg == "--" {
-            return Invocation::FileOperation;
+            return Ok(Invocation::FileOperation);
         }
 
         if arg.starts_with('-') {
@@ -144,12 +144,12 @@ fn resolve_invocation() -> Invocation {
     }
 
     let Some((pos_idx, positional)) = first_positional else {
-        return Invocation::FileOperation;
+        return Ok(Invocation::FileOperation);
     };
 
     // File-like heuristics: if it looks like a file/path/glob, treat as file
     if looks_like_file_or_glob(positional) {
-        return Invocation::FileOperation;
+        return Ok(Invocation::FileOperation);
     }
 
     // Known subcommand check — subcommands always take priority.
@@ -157,14 +157,23 @@ fn resolve_invocation() -> Invocation {
     if cmd::is_known_subcommand(positional) {
         let name = positional.to_string();
         let remaining_args: Vec<String> = args[pos_idx + 1..].to_vec();
-        return Invocation::Subcommand {
+        return Ok(Invocation::Subcommand {
             name,
             args: remaining_args,
-        };
+        });
+    }
+
+    // #352: `proxy` is compiled out of default builds. Bare `skim proxy` must fail
+    // actionably instead of falling into the file-op path (which would error with
+    // "No such file or directory" — or silently skim a file named `proxy`). This
+    // also keeps subcommand-over-file shadowing identical across feature configs.
+    #[cfg(not(feature = "proxy"))]
+    if positional == "proxy" {
+        anyhow::bail!("'proxy' requires a build with --features proxy");
     }
 
     // Unknown word — fall through to FileOperation (clap handles errors)
-    Invocation::FileOperation
+    Ok(Invocation::FileOperation)
 }
 
 /// Maximum number of parallel jobs (threads) to prevent resource exhaustion
@@ -180,9 +189,17 @@ const MAX_TOKEN_BUDGET: usize = 10_000_000;
 ///
 /// Transform source code by stripping implementation details while
 /// preserving structure, signatures, and types.
+/// Version string: "X.Y.Z (shortsha)" — or "X.Y.Z (unknown)" for tarball builds.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("SKIM_GIT_COMMIT"),
+    ")"
+);
+
 #[derive(Parser, Debug)]
 #[command(name = "skim")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = VERSION, about, long_about = None)]
 #[command(after_help = "EXAMPLES:\n  \
     skim file.ts                             Read TypeScript with structure mode (cached)\n  \
     skim file.py --mode signatures           Extract Python signatures\n  \
@@ -211,9 +228,11 @@ SUBCOMMANDS:\n  \
     agents                                   Show detected AI agents\n  \
     completions <SHELL>                      Generate shell completions\n  \
     discover                                 Identify missed optimizations\n  \
+    doctor                                   Check skim installation health and report provenance drift\n  \
     init                                     Initialize skim configuration\n  \
     learn                                    Detect CLI error patterns\n  \
     rewrite <COMMAND>...                     Rewrite commands into skim equivalents\n  \
+    search                                   Code search over project index\n  \
     stats [--since N] [--format json]        Token analytics dashboard\n\n\
 For more info: https://github.com/dean0x/skim")]
 struct Args {
@@ -227,10 +246,10 @@ struct Args {
     #[arg(help = "Transformation mode: structure, signatures, types, full, minimal, or pseudo")]
     mode: ModeArg,
 
-    /// Override language detection (required for stdin unless --filename is given)
+    /// Override language detection; stdin without this flag, --filename, or a shebang degrades to lossless passthrough (exit 0)
     #[arg(short, long, alias = "lang", value_enum)]
     #[arg(
-        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
+        help = "Programming language: typescript, javascript, python, rust, go, java, c, cpp, csharp, ruby, sql, kotlin, swift, bash, markdown, json, yaml, toml (or use --filename for auto-detection from stdin)"
     )]
     language: Option<LanguageArg>,
 
@@ -411,6 +430,8 @@ enum LanguageArg {
     #[value(alias = "kt")]
     Kotlin,
     Swift,
+    #[value(alias = "sh")]
+    Bash,
 }
 
 impl From<LanguageArg> for Language {
@@ -433,6 +454,7 @@ impl From<LanguageArg> for Language {
             LanguageArg::Sql => Language::Sql,
             LanguageArg::Kotlin => Language::Kotlin,
             LanguageArg::Swift => Language::Swift,
+            LanguageArg::Bash => Language::Bash,
         }
     }
 }
@@ -691,6 +713,59 @@ fn strip_skim_wrappers_from_path() {
     }
 }
 
+// ============================================================================
+// D2b (#370): stdout-is-regular-file predicate for wrapper passthrough
+// ============================================================================
+
+/// Testable seam: return `true` when the `io::Result<Metadata>` describes a
+/// regular file. Used by [`stdout_is_regular_file`] so the check can be unit-
+/// tested with synthetic metadata without touching real file descriptors.
+#[cfg(unix)]
+fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
+    meta.map(|m| m.is_file()).unwrap_or(false)
+}
+
+/// Return `true` when the process's stdout (fd 1) is a regular file.
+///
+/// When a PATH-wrapper invocation is `~/.skim/bin/gh api … > out.json`, the
+/// shell sets fd 1 → the file BEFORE exec-ing the wrapper. No `>` appears in
+/// argv, so the rewrite-engine guard (D2-A) cannot catch it. Detecting the fd
+/// directly and running the real tool with inherited stdio ensures raw bytes
+/// reach the file unmodified (#370, #317). Pipes/ttys are not regular files
+/// and fall through to normal compression (skim's core use case).
+///
+/// **Shared invariant (cross-surface):** "stdout redirected to a regular file
+/// must receive the tool's raw bytes, never a skim summary." This invariant is
+/// enforced by two independent mechanisms — one per interception surface —
+/// because each surface observes the redirect at a different stage:
+/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` after the shell has
+///   already consumed `>` and opened the file; no `>` token remains in argv.
+/// - **Rewrite surface (static):** `stdout_redirected_to_file` in
+///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
+///
+/// Keep the two detectors in lockstep. If you widen or narrow the detection
+/// semantics here, audit `stdout_redirected_to_file` for the same forms
+/// (`>f`, `>>f`, `1>f`, `&>f`, `&>>f`).
+///
+/// Non-Unix: always returns `false` (compression proceeds normally).
+#[cfg(unix)]
+fn stdout_is_regular_file() -> bool {
+    use std::mem::ManuallyDrop;
+    use std::os::unix::io::FromRawFd;
+    // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
+    // SAFETY: ManuallyDrop suppresses File's Drop, so fd 1 is never closed
+    // (no double-close). If fd 1 is invalid (e.g. the process was started with
+    // stdout closed), f.metadata() returns Err; is_regular_file_stdout falls
+    // back to false and normal compression proceeds.
+    let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
+    is_regular_file_stdout(f.metadata())
+}
+
+#[cfg(not(unix))]
+fn stdout_is_regular_file() -> bool {
+    false
+}
+
 fn main() -> ExitCode {
     // Strip ~/.skim/bin from PATH FIRST — before any thread is spawned.
     // This prevents infinite recursion when invoked as a symlink (PF-003).
@@ -703,6 +778,42 @@ fn main() -> ExitCode {
     // Extract --debug before routing so it applies to all subcommands.
     if std::env::args().any(|a| a == "--debug") {
         debug::force_enable_debug();
+    }
+
+    // B4: hidden early-exit used by `skim doctor` to identify each binary on $PATH.
+    //
+    // Must fire before analytics setup and thread spawning — it exits immediately.
+    // Hidden from `--help` output (not a clap flag); handled here, before clap parsing.
+    // Old skim binaries without this flag return non-zero; doctor treats that as "unknown".
+    if std::env::args().skip(1).any(|a| a == "--commit") {
+        println!("{}", option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown"));
+        return ExitCode::SUCCESS;
+    }
+
+    // B5a: emit a structured startup line when debug is active.
+    //
+    // MUST be suppressed in hook mode: Claude Code treats any stderr output on
+    // exit 0 as an error (GRANITE #361). When `--hook` is present in argv we
+    // route the startup line to hook.log instead. The `SKIM_DEBUG=1` env var
+    // is a per-session global that could otherwise pollute every hook call.
+    //
+    // Zero-cost when off: `debug::is_debug_enabled()` is a single atomic load.
+    // `current_exe()` and `id()` are never evaluated when debug is disabled —
+    // they are inside the `if` branch, not eagerly computed before it.
+    if debug::is_debug_enabled() {
+        let in_hook_mode = std::env::args().any(|a| a == "--hook");
+        let pid = std::process::id();
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let msg = format!("[skim] {VERSION} exe={exe} pid={pid}");
+        if in_hook_mode {
+            // Route to hook.log — never stderr in hook mode (GRANITE #361).
+            cmd::hook_log::log_hook_warning(&msg);
+        } else {
+            eprintln!("{msg}");
+        }
     }
 
     // Read analytics config from env + CLI flag once at the system boundary.
@@ -739,19 +850,68 @@ fn main() -> ExitCode {
     // parsing and route directly to the appropriate handler. PATH stripping
     // above ensures the handler won't find the symlink again (no recursion).
     let result: anyhow::Result<ExitCode> = if let Some((name, args)) = detect_argv0_dispatch() {
-        cmd::dispatch(&name, &args, &analytics)
+        // D2b (#370): when stdout is a regular file the shell has already
+        // redirected fd 1 to the file before exec-ing us. Run the real tool
+        // with inherited stdio so its raw bytes reach the file unmodified (#317).
+        // Pipes/ttys are not regular files → still compress (normal path).
+        // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
+        // and FileOperation branches below are intentionally NOT guarded:
+        // `skim file.ts > out.txt` and `skim grep … > out.txt` are explicit skim
+        // invocations where the user wants skim's output saved — hoisting this
+        // guard above detect_argv0_dispatch() would break that workflow.
+        if stdout_is_regular_file() {
+            Ok(cmd::run_inherited_passthrough(&name, &args))
+        } else {
+            cmd::dispatch(&name, &args, &analytics)
+        }
     } else {
         match resolve_invocation() {
-            Invocation::FileOperation => run_file_operation(&analytics).map(|()| ExitCode::SUCCESS),
-            Invocation::Subcommand { name, args } => cmd::dispatch(&name, &args, &analytics),
+            Ok(Invocation::FileOperation) => {
+                run_file_operation(&analytics).map(|()| ExitCode::SUCCESS)
+            }
+            Ok(Invocation::Subcommand { name, args }) => cmd::dispatch(&name, &args, &analytics),
+            Err(e) => Err(e),
         }
     };
 
     let exit_code = match result {
         Ok(code) => code,
+        // A closed downstream pipe (`skim … | head -20`) is a normal
+        // end-of-consumption event, not a failure.  Three sinks in
+        // `cmd/execution.rs` return `StdoutStatus::PipeClosed` directly; this
+        // boundary catches every *other* buffered write site so no
+        // `Error: Broken pipe (os error 32)` can reach a user and, critically,
+        // so the process never exits `1` — for grep/rg/diff exit 1 means "no
+        // matches found", which would be a false negative.
+        //
+        // ADR-011 classification: nothing is lost here (the reader chose to stop
+        // reading), so any diagnostic is a class-(2) no-loss raw-fallback
+        // banner and is debug-gated.  It is emphatically NOT an elision marker:
+        // no `output::elision_marker`, no unconditional stderr line.  Raw grep
+        // is silent in this exact situation, so an unconditional notice would
+        // itself be a divergence from raw.
+        Err(e) if cmd::execution::is_broken_pipe_chain(&e) => {
+            crate::debug_log!(
+                "[skim] downstream pipe closed; exiting {}.",
+                cmd::execution::pipe_closed_code()
+            );
+            cmd::execution::pipe_closed_exit()
+        }
         Err(e) => {
             eprintln!("Error: {e:#}");
-            ExitCode::FAILURE
+            // Map known SkimError variants to documented exit codes:
+            //   exit 2 — parse error (grammar/syntax failure)
+            //   exit 3 — unsupported language / detection failure
+            //   exit 1 — all other errors (I/O, config, etc.)
+            if let Some(skim_err) = e.downcast_ref::<rskim_core::SkimError>() {
+                match skim_err {
+                    rskim_core::SkimError::ParseError(_) => ExitCode::from(2),
+                    rskim_core::SkimError::UnsupportedLanguage(_) => ExitCode::from(3),
+                    _ => ExitCode::FAILURE,
+                }
+            } else {
+                ExitCode::FAILURE
+            }
         }
     };
 
@@ -860,7 +1020,7 @@ fn process_single_arg(
 
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
-        process::write_result_and_stats(&result, args.show_stats)?;
+        process::write_result_and_stats(&result, args.show_stats, &mode_str)?;
         record_file_analytics(
             analytics.enabled,
             result,
@@ -884,7 +1044,7 @@ fn process_single_arg(
     }
 
     let result = process::process_file(&path, process_options)?;
-    process::write_result_and_stats(&result, args.show_stats)?;
+    process::write_result_and_stats(&result, args.show_stats, &mode_str)?;
     let cmd = format!("skim {file}");
     record_file_analytics(
         analytics.enabled,
@@ -965,6 +1125,43 @@ fn record_file_analytics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // D2b (#370): is_regular_file_stdout unit tests
+    // ========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_true_for_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let meta = tmp.as_file().metadata();
+        assert!(
+            is_regular_file_stdout(meta),
+            "metadata from a regular file must return true"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_false_for_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(tmp.path());
+        assert!(
+            !is_regular_file_stdout(meta),
+            "metadata from a directory must return false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_is_regular_file_stdout_false_for_err() {
+        let meta: std::io::Result<std::fs::Metadata> =
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(
+            !is_regular_file_stdout(meta),
+            "Err metadata must return false (defensive)"
+        );
+    }
 
     // ========================================================================
     // validate_bounded_arg unit tests (B3)
@@ -1706,5 +1903,34 @@ mod tests {
         // This test intentionally has no assertions — its purpose is to be a
         // discoverable marker in the test suite for this limitation.
         let _note = "syntactic-only PATH filter: symlink bypass is a known limitation (PF-003)";
+    }
+
+    // ========================================================================
+    // after_help drift guard
+    // ========================================================================
+
+    /// Every META_SUBCOMMAND (except `proxy`, which is cfg-gated and intentionally
+    /// excluded from the user-facing help text) must appear in the `--help` after_help
+    /// SUBCOMMANDS section.  This test fires whenever a meta subcommand is added to
+    /// the registry without also listing it in the `SUBCOMMANDS:` block in `main.rs`.
+    #[test]
+    fn test_meta_subcommands_in_after_help() {
+        let cmd = <Args as clap::CommandFactory>::command();
+        let after_help = cmd
+            .get_after_help()
+            .expect("after_help must be set on Args")
+            .to_string();
+        for &name in cmd::META_SUBCOMMANDS {
+            // `proxy` is #[cfg(feature = "proxy")]-gated and intentionally omitted
+            // from the user-facing help text — it is an internal/advanced capability.
+            if name == "proxy" {
+                continue;
+            }
+            assert!(
+                after_help.contains(name),
+                "META_SUBCOMMANDS entry '{name}' is missing from the after_help \
+                 SUBCOMMANDS section — add it to the SUBCOMMANDS list in main.rs"
+            );
+        }
     }
 }

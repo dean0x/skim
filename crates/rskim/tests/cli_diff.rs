@@ -509,3 +509,109 @@ fn test_diff_check_passthrough() {
     let assert = run_skim_diff(&dir, &["--check"]);
     assert.success();
 }
+
+// ============================================================================
+// git show uses commit revision, not working tree (#467)
+// ============================================================================
+
+/// `skim git show <sha>` must read source from the commit blob, not the
+/// working tree.  If it reads from disk the breadcrumbs are built from whatever
+/// the developer happened to have on disk, which is a content-correctness bug
+/// invisible to the ADR-001 size guard (a corrupt render is smaller than raw).
+///
+/// Fixture (PF-009 — hermetic: `git init --initial-branch=main`):
+///   commit 1 (sha1): main.rs contains `fn original() {}`
+///   commit 2 (sha2): main.rs adds `fn added_in_commit2() {}`
+///   working tree: main.rs replaced with `fn completely_different() {}`
+///
+/// Invariant: `skim git show sha2` output must NOT contain "completely_different"
+/// and MUST contain "added_in_commit2" (or fall through to raw hunks which also
+/// contain the diff lines from sha2).
+#[test]
+fn test_skim_git_show_uses_commit_revision_not_working_tree() {
+    let dir = TempDir::new().unwrap();
+    let repo_path = dir.path();
+
+    // PF-009: pin initial branch so HEAD is valid on all CI environments.
+    git(repo_path, &["init", "--initial-branch=main"]);
+    git(repo_path, &["config", "user.email", "test@test.com"]);
+    git(repo_path, &["config", "user.name", "Test"]);
+
+    // Commit 1: file with a single function.
+    let content1 = "fn original() {\n    // placeholder\n}\n";
+    fs::write(repo_path.join("main.rs"), content1).unwrap();
+    git(repo_path, &["add", "."]);
+    git(repo_path, &["commit", "-m", "commit 1: original"]);
+
+    // Commit 2: add a second function (exercises try_ast_render — two functions
+    // means the parser finds changed AST nodes and tries to render breadcrumbs).
+    let content2 =
+        "fn original() {\n    // placeholder\n}\n\nfn added_in_commit2() {\n    // new\n}\n";
+    fs::write(repo_path.join("main.rs"), content2).unwrap();
+    git(repo_path, &["add", "."]);
+    git(
+        repo_path,
+        &["commit", "-m", "commit 2: add second function"],
+    );
+
+    // Capture sha2 so we can pass it to `skim git show`.
+    let sha2_output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .unwrap();
+    assert!(
+        sha2_output.status.success(),
+        "git rev-parse HEAD failed: {}",
+        String::from_utf8_lossy(&sha2_output.stderr)
+    );
+    let sha2 = String::from_utf8(sha2_output.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(!sha2.is_empty(), "sha2 must not be empty");
+
+    // Precondition: working tree has content from commit 2 (nothing modified yet).
+    let working_tree = fs::read_to_string(repo_path.join("main.rs")).unwrap();
+    assert!(
+        working_tree.contains("added_in_commit2"),
+        "precondition: working tree should match commit 2 before modification"
+    );
+
+    // Diverge the working tree: replace the file with completely different content.
+    let content_working = "fn completely_different() {\n    // working tree only\n}\n";
+    fs::write(repo_path.join("main.rs"), content_working).unwrap();
+
+    // Precondition: working tree diverged.
+    let working_tree_after = fs::read_to_string(repo_path.join("main.rs")).unwrap();
+    assert!(
+        working_tree_after.contains("completely_different"),
+        "precondition: working tree should now contain 'completely_different'"
+    );
+    assert!(
+        !working_tree_after.contains("added_in_commit2"),
+        "precondition: working tree must NOT contain 'added_in_commit2' (it was overwritten)"
+    );
+
+    // Run `skim git show sha2` — must read from the commit, not the working tree.
+    let output = common::skim()
+        .current_dir(repo_path)
+        .args(["git", "show", &sha2])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // The output MUST NOT contain working-tree content.
+    assert!(
+        !stdout.contains("completely_different"),
+        "output must not contain working-tree content 'completely_different'; got:\n{stdout}"
+    );
+
+    // The output MUST contain the added function from commit 2 (either as a
+    // breadcrumb or as a raw diff '+' line — both are correct).
+    assert!(
+        stdout.contains("added_in_commit2"),
+        "output must contain 'added_in_commit2' from commit 2; got:\n{stdout}"
+    );
+}

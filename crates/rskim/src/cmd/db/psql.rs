@@ -35,6 +35,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[],
     forward_stderr: true,
     skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 /// Matches the psql row-count footer: `(N rows)` or `(1 row)`.
@@ -121,7 +123,8 @@ fn try_parse_tabular(text: &str) -> Option<DbResult> {
 
     // Find the row-count footer (last non-empty line matching `(N rows)`).
     let row_count_line = lines.iter().rev().find(|l| !l.trim().is_empty())?;
-    let caps = RE_ROW_COUNT.captures(row_count_line.trim())?; // Require footer for Tier 1
+    // Require footer for Tier 1
+    let caps = RE_ROW_COUNT.captures(row_count_line.trim())?;
     let row_count = caps[1].parse::<usize>().unwrap_or(0);
 
     // Rows are between separator and the footer line (exclusive).

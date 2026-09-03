@@ -1,0 +1,12 @@
+ERROR: Type error in calculation
+Traceback (most recent call last):
+  File "/app/calc.py", line 87, in compute
+    result = value + offset
+             ~~~~~~^~~~~~~~
+  File "/app/calc.py", line 45, in run
+    return compute(data)
+           ^^^^^^^^^^^^^
+  File "/app/main.py", line 12, in main
+    run(config)
+TypeError: unsupported operand type(s) for +: 'str' and 'int'
+INFO: retrying with defaults

@@ -5,7 +5,7 @@ use super::flags::{
 };
 use super::helpers::{
     HOOK_SCRIPT_NAME, atomic_write_settings, check_mark, confirm_proceed, load_or_create_settings,
-    resolve_config_dir_for_agent, resolve_real_settings_path,
+    resolve_real_settings_path,
 };
 use super::state::{has_skim_hook_entry, read_settings_json};
 use crate::cmd::hooks::protocol_for_agent;
@@ -34,15 +34,19 @@ fn remove_skim_from_settings(settings: &mut serde_json::Value, event_key: &str) 
 }
 
 pub(super) fn run_uninstall(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
+    let det_env = DetectionEnv::from_process();
     if resolve_single_agent(flags).is_none() {
-        return run_uninstall_auto_detect(flags);
+        return run_uninstall_auto_detect(flags, &det_env);
     }
-    run_uninstall_single(flags)
+    run_uninstall_single(flags, &det_env)
 }
 
 /// Uninstall skim from all detected agents when no explicit `--agent` was given.
-fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agents = detect_installed_agents(&DetectionEnv::from_process());
+fn run_uninstall_auto_detect(
+    flags: &InitFlags,
+    det_env: &DetectionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let agents = detect_installed_agents(det_env);
     if agents.is_empty() {
         println!("  No supported agents found. Nothing to uninstall.");
         return Ok(std::process::ExitCode::SUCCESS);
@@ -55,7 +59,7 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
             agent: Some(agents[0]),
             ..*flags
         };
-        return run_uninstall_for_agent(&agent_flags, agents[0]);
+        return run_uninstall_for_agent(&agent_flags, agents[0], det_env);
     }
 
     let mut any_failed = false;
@@ -64,7 +68,7 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
             agent: Some(agent),
             ..*flags
         };
-        match run_uninstall_for_agent(&agent_flags, agent) {
+        match run_uninstall_for_agent(&agent_flags, agent, det_env) {
             Ok(code) if code == std::process::ExitCode::SUCCESS => {}
             Ok(code) => {
                 any_failed = true;
@@ -89,33 +93,54 @@ fn run_uninstall_auto_detect(flags: &InitFlags) -> anyhow::Result<std::process::
 }
 
 /// Uninstall skim for a single explicit agent (dispatched by `run_uninstall`).
-fn run_uninstall_single(flags: &InitFlags) -> anyhow::Result<std::process::ExitCode> {
-    let agent = resolve_agent(flags, &DetectionEnv::from_process());
-    run_uninstall_for_agent(flags, agent)
+fn run_uninstall_single(
+    flags: &InitFlags,
+    det_env: &DetectionEnv,
+) -> anyhow::Result<std::process::ExitCode> {
+    let agent = resolve_agent(flags, det_env);
+    run_uninstall_for_agent(flags, agent, det_env)
 }
 
 fn run_uninstall_for_agent(
     flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
     let protocol = protocol_for_agent(agent);
-    let config_dir = resolve_config_dir_for_agent(flags.project, agent)?;
-    let settings_path = config_dir.join(protocol.config_filename());
-    let hook_script_path = config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+    let config_dir = det_env.resolve(agent, flags.project)?;
 
-    // Check if anything is installed
-    let settings_has_hook = read_settings_json(&settings_path)
-        .and_then(|json| {
-            json.get("hooks")?
-                .get(protocol.hook_event_key())?
-                .as_array()
-                .map(|arr| arr.iter().any(has_skim_hook_entry))
-        })
-        .unwrap_or(false);
+    // Resolve hook artifact directory via the protocol seam.
+    // For all agents except Copilot CLI this equals config_dir.
+    let hook_config_dir = protocol.hook_config_dir(
+        &config_dir,
+        flags.project,
+        det_env.override_for(agent).is_some(),
+    );
+
+    let settings_path = config_dir.join(protocol.config_filename());
+    let hook_script_path = hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
+
+    // Check if anything is installed — dispatch on hook file style.
+    let (registration_exists, settings_has_hook) = if protocol.uses_dedicated_hook_file() {
+        // Copilot: check hooks/skim.json; settings.json is not used.
+        let reg = protocol.detect_hook_registration(&hook_config_dir);
+        (reg, false)
+    } else {
+        // settings.json-based agents.
+        let has = read_settings_json(&settings_path)
+            .and_then(|json| {
+                json.get("hooks")?
+                    .get(protocol.hook_event_key())?
+                    .as_array()
+                    .map(|arr| arr.iter().any(has_skim_hook_entry))
+            })
+            .unwrap_or(false);
+        (has, has)
+    };
 
     let script_exists = hook_script_path.exists();
 
-    if !settings_has_hook && !script_exists {
+    if !registration_exists && !script_exists {
         println!("  skim hook not found. Nothing to uninstall.");
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -123,7 +148,7 @@ fn run_uninstall_for_agent(
     // Integrity check (#57): warn if hook script has been modified since install
     if script_exists
         && let Ok(false) = crate::cmd::integrity::verify_script_integrity(
-            &config_dir,
+            &hook_config_dir,
             agent.cli_name(),
             &hook_script_path,
         )
@@ -142,8 +167,13 @@ fn run_uninstall_for_agent(
         println!();
         println!("  skim init --uninstall");
         println!();
-        if settings_has_hook {
-            println!("    * Remove hook entry from {}", settings_path.display());
+        if registration_exists {
+            if protocol.uses_dedicated_hook_file() {
+                let skim_json = hook_config_dir.join("hooks").join("skim.json");
+                println!("    * Remove {}", skim_json.display());
+            } else {
+                println!("    * Remove hook entry from {}", settings_path.display());
+            }
         }
         if script_exists {
             println!("    * Delete {}", hook_script_path.display());
@@ -156,11 +186,16 @@ fn run_uninstall_for_agent(
     }
 
     if flags.dry_run {
-        if settings_has_hook {
-            println!(
-                "  [dry-run] Would remove hook entry from {}",
-                settings_path.display()
-            );
+        if registration_exists {
+            if protocol.uses_dedicated_hook_file() {
+                let skim_json = hook_config_dir.join("hooks").join("skim.json");
+                println!("  [dry-run] Would remove {}", skim_json.display());
+            } else {
+                println!(
+                    "  [dry-run] Would remove hook entry from {}",
+                    settings_path.display()
+                );
+            }
         }
         if script_exists {
             println!("  [dry-run] Would delete {}", hook_script_path.display());
@@ -168,8 +203,13 @@ fn run_uninstall_for_agent(
         return Ok(std::process::ExitCode::SUCCESS);
     }
 
-    // Remove from settings.json
-    if settings_has_hook {
+    // Remove hook registration — dispatch on style.
+    if protocol.uses_dedicated_hook_file() {
+        if protocol.remove_hook_registration(&hook_config_dir)? {
+            let skim_json = hook_config_dir.join("hooks").join("skim.json");
+            println!("  {} Removed: {}", check_mark(true), skim_json.display());
+        }
+    } else if settings_has_hook {
         let real_path = resolve_real_settings_path(&settings_path)?;
         let mut settings = load_or_create_settings(&real_path)?;
 
@@ -184,7 +224,7 @@ fn run_uninstall_for_agent(
         );
     }
 
-    // Delete hook script and hash manifest
+    // Delete hook script
     if script_exists {
         std::fs::remove_file(&hook_script_path)?;
         println!(
@@ -192,9 +232,48 @@ fn run_uninstall_for_agent(
             check_mark(true),
             hook_script_path.display()
         );
+    }
 
-        // Clean up hash manifest (#57)
-        let _ = crate::cmd::integrity::remove_hash_manifest(&config_dir, agent.cli_name());
+    // Clean up hash manifest (#57) — always attempt, even if the script was
+    // already absent.  This prevents an orphaned manifest from a previous failed
+    // uninstall from persisting and causing false tamper reports on re-install.
+    let _ = crate::cmd::integrity::remove_hash_manifest(&hook_config_dir, agent.cli_name());
+
+    // Remove permissions sidecar and seeded entries (non-fatal).
+    // Copilot CLI permissions live in hook_config_dir; all others in config_dir.
+    let perm_dir: &std::path::Path = if agent == crate::cmd::session::AgentKind::CopilotCli {
+        &hook_config_dir
+    } else {
+        &config_dir
+    };
+    if let Some(permissions_protocol) =
+        crate::cmd::permissions::permissions_protocol_for_agent(agent)
+    {
+        let sidecar_path = perm_dir.join("skim-permissions.json");
+        if sidecar_path.exists() {
+            match permissions_protocol.remove_seeded(perm_dir) {
+                Ok(crate::cmd::permissions::RemoveOutcome::Removed { entries_removed }) => {
+                    println!(
+                        "  {} Permissions: removed {} seeded entr{}",
+                        check_mark(true),
+                        entries_removed.len(),
+                        if entries_removed.len() == 1 {
+                            "y"
+                        } else {
+                            "ies"
+                        }
+                    );
+                }
+                Ok(crate::cmd::permissions::RemoveOutcome::NothingToRemove) => {
+                    // No-op: sidecar existed but no matching entries found.
+                }
+                Err(e) => {
+                    // Non-fatal: loud notice but continue uninstall.
+                    eprintln!("  Notice: could not remove seeded permissions (sidecar issue): {e}");
+                    eprintln!("  hint: permissions entries may need to be removed manually");
+                }
+            }
+        }
     }
 
     // Remove guidance from instruction file

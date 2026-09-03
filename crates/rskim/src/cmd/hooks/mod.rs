@@ -9,14 +9,23 @@
 //! Claude Code `settings.json` / `hooks.PreToolUse` format. Agents that use a
 //! different on-disk format override the relevant methods:
 //!
-//! | Agent       | Config file   | Event key    | Matcher           |
-//! |-------------|---------------|--------------|-------------------|
-//! | Claude Code | settings.json | PreToolUse   | Bash              |
-//! | Cursor      | hooks.json    | preToolUse   | Shell             |
-//! | Gemini CLI  | settings.json | BeforeTool   | run_shell_command |
-//! | Copilot CLI | settings.json | preToolUse   | bash              |
-//! | Crush       | crush.json    | PreToolUse   | Bash              |
-//! | Codex CLI   | (none)        | (none)       | (none)            |
+//! | Agent       | Config file          | Event key    | Matcher           | Hook artifacts dir | Response strategy     |
+//! |-------------|----------------------|--------------|-------------------|--------------------|-----------------------|
+//! | Claude Code | settings.json        | PreToolUse   | Bash              | ~/.claude          | hookSpecificOutput    |
+//! | Cursor      | hooks.json           | preToolUse   | Shell             | ~/.config/Cursor   | permission: allow     |
+//! | Gemini CLI  | settings.json        | BeforeTool   | run_shell_command | ~/.gemini          | decision: allow       |
+//! | Copilot CLI | hooks/skim.json      | preToolUse   | bash (detect only)| ~/.copilot         | modifiedArgs (no verb)|
+//! | Crush       | crush.json           | PreToolUse   | Bash              | ~/.crush           | permission: allow     |
+//! | Codex CLI   | (none)               | (none)       | (none)            | (none)             | AwarenessOnly         |
+//!
+//! **Copilot CLI** is special: hook artifacts (script, sidecar, `skim.json`) live
+//! under `~/.copilot/hooks/` while the agent's settings/rules remain at `~/.github/`.
+//! `dot_dir_name()` stays `".github"` for the rules-dir and project instructions;
+//! only `hook_config_dir()` redirects to `~/.copilot`.
+//!
+//! **No-verb doctrine**: skim emits a permission verb (`allow`/`deny`) only where the
+//! host protocol forces a decision field. Claude Code and Copilot CLI are in the
+//! no-verb column — they receive `modifiedArgs` or `hookSpecificOutput` only.
 
 pub(crate) mod claude;
 pub(crate) mod codex;
@@ -91,7 +100,93 @@ pub(crate) trait HookProtocol {
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value;
 
     #[allow(dead_code)] // Used in tests only
-    fn generate_script(&self, version: &str) -> String;
+    fn generate_script(&self, version: &str, binary_path: &str) -> String;
+
+    // -------------------------------------------------------------------------
+    // Hook artifact location seam
+    //
+    // `hook_config_dir` is the single point of indirection that decouples where
+    // hook scripts, SHA sidecars, and registration files (settings entry or
+    // skim.json) live from the agent's main config directory (`config_dir`).
+    // All call sites that derive hook artifact paths must route through this seam.
+    // -------------------------------------------------------------------------
+
+    /// Directory where hook artifacts (script, SHA sidecar, hook registration)
+    /// live for this agent.
+    ///
+    /// For all agents except Copilot CLI this equals `resolved_config_dir`
+    /// unchanged (passthrough default).
+    ///
+    /// Copilot CLI overrides to `~/.copilot` so that hook artifacts are stored
+    /// separately from the `~/.github` settings/rules dir.  Two conditions force
+    /// the override off so callers always stay sandboxable:
+    ///
+    /// - `project_scope = true` → caller requested a cwd-relative install; keep
+    ///   the path within the project tree.
+    /// - `has_override = true` → a `<AGENT>_CONFIG_DIR` env var is in effect;
+    ///   the caller-supplied path was explicitly chosen and must be honored.
+    fn hook_config_dir(
+        &self,
+        resolved_config_dir: &std::path::Path,
+        _project_scope: bool,
+        _has_override: bool,
+    ) -> std::path::PathBuf {
+        resolved_config_dir.to_path_buf()
+    }
+
+    /// Whether hook registration lives in a dedicated file inside the hooks
+    /// directory (`hooks/skim.json`) rather than as an entry in the agent's
+    /// main settings file.
+    ///
+    /// Default: `false` (Claude Code, Gemini CLI, Cursor, Crush — all use
+    /// settings.json / hooks.json / crush.json entries).
+    /// Copilot CLI override: `true` (uses `hook_config_dir/hooks/skim.json`).
+    fn uses_dedicated_hook_file(&self) -> bool {
+        false
+    }
+
+    /// Detect whether the skim hook is registered via the dedicated hook-file
+    /// mechanism.
+    ///
+    /// Called only when `uses_dedicated_hook_file()` is `true`.
+    /// Default: always `false` (settings.json agents use `detect_hook` instead).
+    /// Copilot CLI override: `true` when `hooks/skim.json` contains a skim entry.
+    fn detect_hook_registration(&self, _hook_config_dir: &std::path::Path) -> bool {
+        false
+    }
+
+    /// Write the hook registration to its agent-specific location.
+    ///
+    /// For settings.json-based agents: no-op; `patch_settings` in `install.rs`
+    /// handles the write (returns `Ok(false)`).
+    /// Copilot CLI: writes `hooks/skim.json` with the versioned envelope and
+    /// returns `Ok(true)`.
+    fn install_hook_registration(
+        &self,
+        _hook_config_dir: &std::path::Path,
+        _script_path: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Remove the hook registration from its agent-specific location.
+    ///
+    /// For settings.json-based agents: no-op, returns `Ok(false)`.
+    /// Copilot CLI: deletes `hooks/skim.json`, returns `Ok(true)` on success.
+    fn remove_hook_registration(&self, _hook_config_dir: &std::path::Path) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Scan for non-skim hooks at the agent-specific hook location.
+    ///
+    /// Default: delegates to `scan_other_hooks(hook_config_dir)` which reads
+    /// the settings.json / hooks.json / crush.json file.
+    /// Copilot CLI override: enumerates `*.json` files in
+    /// `hook_config_dir/hooks/`, returning command strings from any file that
+    /// is not `skim.json`.
+    fn scan_foreign_hooks(&self, hook_config_dir: &std::path::Path) -> Vec<String> {
+        self.scan_other_hooks(hook_config_dir)
+    }
 
     // -------------------------------------------------------------------------
     // Config lifecycle methods
@@ -105,7 +200,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default: `"settings.json"` (Claude Code, Gemini CLI, Copilot CLI).
     /// Override: Cursor → `"hooks.json"`, Crush → `"crush.json"`.
-    #[allow(dead_code)]
     fn config_filename(&self) -> &'static str {
         "settings.json"
     }
@@ -114,7 +208,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default: `"PreToolUse"` (Claude Code, Crush).
     /// Override: Gemini CLI → `"BeforeTool"`, Cursor → `"preToolUse"`, Copilot CLI → `"preToolUse"`.
-    #[allow(dead_code)]
     fn hook_event_key(&self) -> &'static str {
         "PreToolUse"
     }
@@ -122,7 +215,6 @@ pub(crate) trait HookProtocol {
     /// The tool matcher value used when inserting a hook entry.
     ///
     /// Default: `"Bash"`. Cursor overrides to `"Shell"`, Copilot CLI overrides to `"bash"`.
-    #[allow(dead_code)]
     fn tool_matcher(&self) -> &'static str {
         "Bash"
     }
@@ -130,7 +222,6 @@ pub(crate) trait HookProtocol {
     /// Timeout in seconds for the hook command.
     ///
     /// Default: 5 seconds (matches Claude Code defaults).
-    #[allow(dead_code)]
     fn hook_timeout(&self) -> u64 {
         5
     }
@@ -146,7 +237,6 @@ pub(crate) trait HookProtocol {
     /// ```
     ///
     /// Agents with different formats (Cursor, Copilot CLI) override this method.
-    #[allow(dead_code)]
     fn build_config_entry(&self, hook_script_path: &str) -> serde_json::Value {
         serde_json::json!({
             "matcher": self.tool_matcher(),
@@ -162,7 +252,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default checks for `"skim-rewrite"` substring in any nested `command` value
     /// (Claude Code / Gemini / Copilot / Crush). Cursor overrides this.
-    #[allow(dead_code)]
     fn is_skim_entry(&self, entry: &serde_json::Value) -> bool {
         entry
             .get("hooks")
@@ -183,7 +272,6 @@ pub(crate) trait HookProtocol {
     ///
     /// Default implementation handles the Claude Code / Gemini / Copilot /
     /// Crush array-of-objects format. Cursor overrides this.
-    #[allow(dead_code)]
     fn upsert_hook(
         &self,
         config: &mut serde_json::Value,
@@ -219,7 +307,7 @@ pub(crate) trait HookProtocol {
     /// Remove all skim hook entries from a parsed config JSON value in place.
     ///
     /// Returns `true` if any entries were removed, `false` if none found.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Default impl used by Codex (AwarenessOnly); called from test targets only
     fn remove_skim_entries(&self, config: &mut serde_json::Value) -> bool {
         let Some(hooks) = config.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
             return false;
@@ -244,7 +332,7 @@ pub(crate) trait HookProtocol {
     ///
     /// Returns `true` when the config file exists and contains a skim entry.
     /// Returns `false` on any I/O or parse error (non-fatal).
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Called from per-agent test targets only; not reachable from production binary
     fn detect_hook(&self, config_dir: &std::path::Path) -> bool {
         use crate::cmd::init::MAX_SETTINGS_SIZE;
 
@@ -275,7 +363,6 @@ pub(crate) trait HookProtocol {
     /// same event bucket. Returns the command strings of any such entries.
     ///
     /// Used for collision-detection warnings during install.
-    #[allow(dead_code)]
     fn scan_other_hooks(&self, config_dir: &std::path::Path) -> Vec<String> {
         use crate::cmd::init::MAX_SETTINGS_SIZE;
 
@@ -329,7 +416,7 @@ pub(crate) trait HookProtocol {
     }
 
     /// Default no-op install. Override for agents with real hook installation.
-    #[allow(dead_code)] // Used in tests only
+    #[allow(dead_code)] // Default impl used by Codex (AwarenessOnly); called from test targets only
     fn install(&self, _opts: &InstallOpts) -> anyhow::Result<InstallResult> {
         Ok(InstallResult {
             script_path: None,
@@ -338,7 +425,7 @@ pub(crate) trait HookProtocol {
     }
 
     /// Default no-op uninstall. Override for agents with real hook removal.
-    #[allow(dead_code)] // Used in tests only
+    #[allow(dead_code)] // Default impl used by Codex (AwarenessOnly); called from test targets only
     fn uninstall(&self, _opts: &UninstallOpts) -> anyhow::Result<()> {
         Ok(())
     }
@@ -417,20 +504,42 @@ pub(crate) fn upsert_hook_versioned(
     Ok(())
 }
 
+/// Shell-quote `s` using single quotes, escaping embedded single quotes.
+///
+/// Produces output suitable for embedding in a shell script.  For example:
+/// - `/usr/local/bin/skim` → `'/usr/local/bin/skim'`
+/// - `/path/with spaces/skim` → `'/path/with spaces/skim'`
+/// - `/path/with'quote` → `'/path/with'\''quote'`
+pub(crate) fn shell_single_quote(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
 /// Generate a standard hook script for an agent.
 ///
-/// Shared by all RealHook agents. The script sets `SKIM_HOOK_VERSION` and
-/// `exec`s PATH-resolved `skim` with `rewrite --hook --agent <agent_cli_name>`.
+/// Shared by all RealHook agents. The script pins the absolute, canonicalized
+/// path of the generating binary as the exec target, with a PATH fallback if
+/// the pinned file is later removed.
 ///
-/// SECURITY: Hook scripts use PATH-resolved `skim` (bare command, no absolute path)
-/// so users can upgrade skim without reinstalling hooks. An absolute binary path
-/// would pin the hook to the install-time location and silently break on upgrades.
+/// The script exports:
+/// - `SKIM_HOOK_VERSION` — semver of the generating binary (for version-skew checks)
+/// - `SKIM_HOOK_BINARY` — absolute path of the generating binary (for path-mismatch checks)
+/// - `SKIM_HOOK_COMMIT` — short git commit of the generating binary (for in-place rebuild detection)
+///
+/// The PATH fallback (`exec skim …`) is a safety net: if the pinned binary is
+/// removed or unavailable, the hook still runs using whatever `skim` is on PATH,
+/// and the binary-mismatch check in hook mode will log a warning to hook.log.
 ///
 /// # Panics
 ///
 /// Panics if `version` or `agent_cli_name` contain shell-unsafe characters.
+/// `binary_path` is single-quoted in the script, so it is safe for any path.
 #[allow(dead_code)] // Called by per-agent generate_script() impls, which are test-only
-pub(crate) fn generate_hook_script(version: &str, agent_cli_name: &str) -> String {
+pub(crate) fn generate_hook_script(
+    version: &str,
+    agent_cli_name: &str,
+    binary_path: &str,
+) -> String {
     assert!(
         version
             .bytes()
@@ -443,11 +552,34 @@ pub(crate) fn generate_hook_script(version: &str, agent_cli_name: &str) -> Strin
             .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
         "agent_cli_name contains unsafe characters for shell interpolation: {agent_cli_name}"
     );
+    // B5b: empty binary_path produces an unpinned hook script — the dangerous
+    // state that `skim init` exists to eliminate. Callers must resolve the path
+    // before calling this function (see `create_hook_script` in install.rs).
+    assert!(
+        !binary_path.is_empty(),
+        "binary_path is empty — cannot generate a pinned hook script; \
+         ensure current_exe() succeeded before calling generate_hook_script"
+    );
+    let git_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+    // Defense-in-depth: git_commit is embedded unquoted in the script, so it must be
+    // shell-safe. Hex SHAs (0-9, a-f) and "unknown" are both strictly alphanumeric.
+    // This assert fires at install time (skim init) if the build system ever embeds
+    // an unexpected format — catching the hazard before it reaches a user's hook file.
+    assert!(
+        git_commit.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "git_commit contains unsafe characters for shell interpolation: {git_commit}"
+    );
+    let quoted = shell_single_quote(binary_path);
     format!(
         "#!/usr/bin/env bash\n\
          # skim-hook v{version}\n\
          # Generated by: skim init --agent {agent_cli_name} -- do not edit manually\n\
          export SKIM_HOOK_VERSION=\"{version}\"\n\
+         export SKIM_HOOK_BINARY={quoted}\n\
+         export SKIM_HOOK_COMMIT={git_commit}\n\
+         if [ -x \"$SKIM_HOOK_BINARY\" ]; then\n\
+           exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent {agent_cli_name}\n\
+         fi\n\
          exec skim rewrite --hook --agent {agent_cli_name}\n"
     )
 }
@@ -512,12 +644,33 @@ mod tests {
 
     #[test]
     fn test_generate_hook_script_structure() {
-        let script = generate_hook_script("1.2.3", "test-agent");
+        let script = generate_hook_script("1.2.3", "test-agent", "/usr/local/bin/skim");
         assert!(script.starts_with("#!/usr/bin/env bash\n"));
         assert!(script.contains("# skim-hook v1.2.3"));
         assert!(script.contains("skim init --agent test-agent"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.2.3\""));
-        assert!(script.contains("exec skim rewrite --hook --agent test-agent"));
+        // Pinned format: SKIM_HOOK_BINARY, SKIM_HOOK_COMMIT, and PATH fallback.
+        assert!(
+            script.contains("export SKIM_HOOK_BINARY="),
+            "script must export SKIM_HOOK_BINARY"
+        );
+        assert!(
+            script.contains("export SKIM_HOOK_COMMIT="),
+            "script must export SKIM_HOOK_COMMIT"
+        );
+        assert!(
+            !script.contains("_SKIM_BIN="),
+            "script must not set the redundant _SKIM_BIN local variable (D5)"
+        );
+        assert!(
+            script.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent test-agent"),
+            "script must exec via $SKIM_HOOK_BINARY directly"
+        );
+        // PATH fallback for when pinned binary is unavailable.
+        assert!(
+            script.contains("exec skim rewrite --hook --agent test-agent"),
+            "script must have PATH fallback"
+        );
         // Hook script must NOT prepend ~/.skim/bin to PATH. The wrapper dir
         // contains tool-name symlinks (git, cargo, …) but no `skim` symlink,
         // so the prepend cannot help `exec skim` resolve the binary. The
@@ -530,15 +683,79 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_hook_script_path_with_spaces() {
+        let script = generate_hook_script("2.0.0", "claude", "/path/with spaces/skim");
+        // Single-quoted path must appear in the script.
+        assert!(
+            script.contains("'/path/with spaces/skim'"),
+            "path with spaces must be single-quoted"
+        );
+    }
+
+    #[test]
+    fn test_shell_single_quote_plain_path() {
+        assert_eq!(
+            shell_single_quote("/usr/local/bin/skim"),
+            "'/usr/local/bin/skim'"
+        );
+    }
+
+    #[test]
+    fn test_shell_single_quote_path_with_spaces() {
+        assert_eq!(
+            shell_single_quote("/path/with spaces/skim"),
+            "'/path/with spaces/skim'"
+        );
+    }
+
+    #[test]
+    fn test_shell_single_quote_embedded_single_quote() {
+        assert_eq!(
+            shell_single_quote("/path/with'quote"),
+            "'/path/with'\\''quote'"
+        );
+    }
+
+    #[test]
     #[should_panic(expected = "version contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_version() {
-        generate_hook_script("1.0.0$(evil)", "test-agent");
+        generate_hook_script("1.0.0$(evil)", "test-agent", "/usr/local/bin/skim");
     }
 
     #[test]
     #[should_panic(expected = "agent_cli_name contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_agent_name() {
-        generate_hook_script("1.0.0", "agent;rm -rf /");
+        generate_hook_script("1.0.0", "agent;rm -rf /", "/usr/local/bin/skim");
+    }
+
+    /// git_commit is embedded UNQUOTED in the hook script, so the safety predicate
+    /// (ascii-alphanumeric only) must accept valid values and reject dangerous ones.
+    ///
+    /// Note: `git_commit` is a compile-time constant from `option_env!`, so it cannot
+    /// be passed as a parameter to trigger the assert via `#[should_panic]`. This test
+    /// instead validates the predicate directly to pin the contract.
+    #[test]
+    fn test_git_commit_safety_predicate() {
+        // Valid: git short SHAs (hex) and the "unknown" fallback
+        for valid in [
+            "a9aa3e1",
+            "abc123def456",
+            "unknown",
+            "deadbeef",
+            "0123456789abcdef",
+        ] {
+            assert!(
+                valid.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "'{valid}' should be safe for shell interpolation (alphanumeric only)"
+            );
+        }
+        // Invalid: shell special chars that would break `export SKIM_HOOK_COMMIT=<value>`
+        for invalid in ["abc$def", "sha;evil", "a b", "abc\n", "abc`whoami`"] {
+            assert!(
+                !invalid.bytes().all(|b| b.is_ascii_alphanumeric()),
+                "'{invalid}' should be caught by the safety predicate"
+            );
+        }
     }
 
     // ========================================================================

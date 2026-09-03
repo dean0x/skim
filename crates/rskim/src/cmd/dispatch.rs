@@ -4,12 +4,17 @@
 //! by multi-category dispatchers: argument extraction, subcommand scaffolding,
 //! raw passthrough, and per-family help printers.
 
-use std::io::{self, Write};
+use std::io;
 use std::process::{Command, ExitCode};
 
+use super::execution::{is_broken_pipe, pipe_closed_exit};
+use super::stream_pump::{PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child, write_tail};
+
+#[cfg(feature = "proxy")]
+use super::proxy;
 use super::{
-    KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, file, git, heatmap, infra, init,
-    learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
+    KNOWN_SUBCOMMANDS, agents, build, completions, db, discover, doctor, file, git, heatmap, infra,
+    init, learn, lint, log, pkg, rewrite, sanitize_for_display, search, stats, test,
 };
 
 // ============================================================================
@@ -171,9 +176,10 @@ pub(crate) fn spawn_status_to_code(status: std::io::Result<std::process::ExitSta
 /// Run a daemon or streaming command with fully inherited stdio.
 ///
 /// Used for commands detected by [`rewrite::indefinite::is_indefinite_command`]
-/// in the direct / PATH-wrapper dispatch path. Unlike [`run_raw_passthrough`]
-/// (which captures stdout/stderr and re-prints them), this helper lets the child
-/// share the parent's file descriptors directly:
+/// in the direct / PATH-wrapper dispatch path, and for the D2b stdout-to-file
+/// passthrough guard in the argv[0] wrapper branch (#370). Unlike
+/// [`run_raw_passthrough`] (which captures stdout/stderr and re-prints them),
+/// this helper lets the child share the parent's file descriptors directly:
 ///
 /// - **stdin** is inherited — interactive prompts and `Ctrl-C` work.
 /// - **stdout / stderr** are inherited — live output streams to the terminal.
@@ -209,7 +215,7 @@ pub(crate) fn spawn_status_to_code(status: std::io::Result<std::process::ExitSta
 ///
 /// Diagnostics live here in the caller; the pure mapping is in
 /// [`spawn_status_to_code`], which is unit-tested independently.
-fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
+pub(crate) fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
     let result = Command::new(program).args(args).status();
     if let Err(ref e) = result {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -227,26 +233,117 @@ fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitCode {
 // Raw passthrough
 // ============================================================================
 
-/// Run a program with the given args and env vars, printing stdout/stderr and
+/// Run a program with the given args and env vars, streaming stdout/stderr and
 /// returning the process exit code. Used by passthrough dispatchers for unknown
 /// subcommands that skim does not compress.
+///
+/// # Why this streams (#495)
+///
+/// This is a **pure byte passthrough**: it returns only an [`ExitCode`], never
+/// the captured text, and no caller inspects the output — `gh` (output-steering
+/// gate), `yarn` (unknown subcommand), and [`passthrough_subcmd`] (`swift`,
+/// `dotnet`) all just forward the exit code.  Nothing downstream needs a
+/// complete buffer, so buffering bought nothing and cost the same three fidelity
+/// defects the streaming sinks in `cmd/file/passthrough_stream.rs` and
+/// `execution::stream_passthrough_raw` were built to close (PF-006: this was the
+/// missed sibling surface of that pair):
+///
+/// - **Total loss past 64 MiB.** [`crate::runner::read_pipe`] hard-errors at
+///   `MAX_OUTPUT_BYTES` and **discards the entire accumulated buffer**, so a
+///   70 MiB `yarn build` log produced `Error: output exceeded 67108864 byte
+///   limit`, exit 1, and zero bytes — measured, not theorised.  The pump has no
+///   ceiling on stdout (memory is O(chunk)), so ADR-002's "oversized input
+///   degrades losslessly rather than hard-erroring" is satisfied by construction.
+/// - **Lossy UTF-8.** `read_pipe` decodes with
+///   `String::from_utf8(..).unwrap_or_else(lossy)`, so non-UTF-8 tool bytes
+///   reached the reader as U+FFFD — skim showing something *different* from raw
+///   with no marker (#317).  The pump never decodes.
+/// - **Latency.** Nothing reached the reader until the child exited.
+///
+/// # Contract preserved exactly
+///
+/// - **Bytes**: stdout verbatim with **no trailing-newline guard**, then stderr
+///   verbatim only when non-empty — the same order and the same byte contract as
+///   the buffered form.
+/// - **Exit code**: the child's own code, `unwrap_or(1)` on a signal kill,
+///   clamped to `[0, 255]`.  Note this is *not* the file family's disposition
+///   matrix: it maps a signal kill to `1`, which is deliberate here and unchanged.
+/// - **Spawn failure**: the identical [`crate::runner::RunnerError::SpawnFailed`]
+///   error, so the `failed to execute '<program>': …` text and the resulting
+///   exit code do not move.
+/// - **stdin**: inherited, as `CommandRunner::run_with_env` left it.
+///
+/// The one deliberate change beyond the three fixes: a closed downstream reader
+/// now returns [`pipe_closed_exit`] (141 on unix, never 1) and kills the child,
+/// where before skim waited for the child to finish and then propagated the
+/// `BrokenPipe` error up to the `main.rs` boundary.
 pub(crate) fn run_raw_passthrough(
     program: &str,
     args: &[String],
     env: &[(&str, &str)],
 ) -> anyhow::Result<ExitCode> {
-    let runner = crate::runner::CommandRunner::new();
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = runner.run_with_env(program, &arg_refs, env)?;
-    let mut out = io::stdout().lock();
-    write!(out, "{}", output.stdout)?;
-    out.flush()?;
-    if !output.stderr.is_empty() {
+    let mut sink = io::BufWriter::with_capacity(PUMP_BUF_BYTES, io::stdout().lock());
+    let outcome = stream_child(
+        &StreamSpec {
+            program,
+            args,
+            env_overrides: env,
+        },
+        &mut sink,
+    )?;
+
+    let done = match outcome {
+        StreamOutcome::SpawnFailed(source) => {
+            // Rebuild the buffered runner's own error so the message a caller
+            // sees is unchanged.
+            return Err(crate::runner::RunnerError::SpawnFailed {
+                program: program.to_string(),
+                source,
+            }
+            .into());
+        }
+        StreamOutcome::PipeClosed => {
+            // ADR-011 class 2: nothing was lost — the *reader* stopped reading,
+            // and the raw tool is silent in exactly this situation.
+            crate::debug_log!(
+                "[skim] downstream reader closed the pipe; stopped streaming {program} output."
+            );
+            return Ok(pipe_closed_exit());
+        }
+        StreamOutcome::Completed(done) => done,
+    };
+
+    // Release the stdout lock (the pump flushes per chunk, so nothing is
+    // pending) before touching stderr, preserving stream ordering.
+    drop(sink);
+
+    if !done.stderr.is_empty() {
         let mut err = io::stderr().lock();
-        write!(err, "{}", output.stderr)?;
-        err.flush()?;
+        // `false`: byte-exact, matching the buffered form's `write!(err, …)`.
+        match write_tail(&mut err, &done.stderr, false) {
+            Ok(()) => {}
+            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
+            Err(e) => return Err(e.into()),
+        }
     }
-    let code = output.exit_code.unwrap_or(1).clamp(0, 255) as u8;
+    if done.stderr_discarded {
+        // ADR-011 class 1: the reader is seeing LESS child stderr than raw, so
+        // the marker is unconditional.  The remedy is NOT `SKIM_PASSTHROUGH=1`:
+        // this path is already an uncompressed passthrough, so that advice is
+        // circular.  Point at the raw tool, the only way to see more.  The
+        // buffered form hard-errored here and emitted nothing at all, so a
+        // marked partial is strictly more faithful (ADR-002).
+        eprintln!(
+            "{}",
+            crate::output::elision_marker_unbounded_with_remedy(
+                "the 64 MiB stderr capture ceiling",
+                "child stderr",
+                &format!("run '{program}' directly for the full stream"),
+            )
+        );
+    }
+
+    let code = done.exit_code.unwrap_or(1).clamp(0, 255) as u8;
     Ok(ExitCode::from(code))
 }
 
@@ -587,11 +684,21 @@ pub(crate) fn dispatch(
         "agents" => agents::run(args, analytics),
         "completions" => completions::run(args, analytics),
         "discover" => discover::run(args, analytics),
+        "doctor" => doctor::run(args, analytics),
         "git" => git::run(args, analytics),
         "heatmap" => heatmap::run(args, analytics),
         "init" => init::run(args, analytics),
         "learn" => learn::run(args, analytics),
         "log" => log::run(args, analytics),
+        // AD-PXY-01: proxy is a meta subcommand (server, not a tool to intercept).
+        // The indefinite-command guard MUST NOT route `skim proxy` to
+        // run_inherited_passthrough — `proxy` is not an indefinite streaming command
+        // (AC25 / AD-PXY-03). It is excluded from PATH-wrapper targets via
+        // META_SUBCOMMANDS in registry.rs.
+        // Routing guard in main.rs owns the default-build UX (#352): bare `skim proxy`
+        // on a non-proxy build emits a clear error before ever reaching dispatch.
+        #[cfg(feature = "proxy")]
+        "proxy" => proxy::run(args, analytics),
         "rewrite" => rewrite::run(args, analytics),
         "search" => search::run(args, analytics),
         "stats" => stats::run(args, analytics),
@@ -929,6 +1036,16 @@ mod tests {
         assert!(
             !is_indefinite_command(&["tsc"]),
             "bare tsc must be classified as finite (watch requires --watch/-w)"
+        );
+
+        // AC25: `skim proxy` is a meta subcommand (server), NOT an indefinite
+        // streaming command. The indefinite-guard must NOT route it to
+        // run_inherited_passthrough — that would bypass the proxy startup path.
+        // It is classified as finite by construction (it does not appear in the
+        // indefinite-command list) so the dispatch arm in proxy.rs is reached.
+        assert!(
+            !is_indefinite_command(&["proxy"]),
+            "proxy must be classified as finite (server startup, not a streaming tool)"
         );
     }
 

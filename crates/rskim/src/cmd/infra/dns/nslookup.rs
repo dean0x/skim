@@ -43,13 +43,16 @@ const CONFIG_DIG: ToolRunConfig<'static> = ToolRunConfig {
     install_hint: "Install via: apt install dnsutils / brew install bind",
     family: "infra",
     // dig uses TABs as field separators in ANSWER records (e.g. `name\tTTL\tIN\tA\tip`).
-    // strip_ansi_escapes treats \t as a control code and removes it, collapsing fields
-    // so RE_DIG_RECORD can no longer match. Skip stripping for dig and nslookup.
+    // Setting this flag prevents `strip_escape_sequences` from running at all,
+    // guaranteeing the `\t` field separators survive so RE_DIG_RECORD can match
+    // (PF-006).  Skip stripping for dig and nslookup.
     skip_ansi_strip: true,
     command_type: CommandType::Infra,
     expected_exit_codes: &[],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
@@ -64,6 +67,8 @@ const CONFIG_NSLOOKUP: ToolRunConfig<'static> = ToolRunConfig {
     expected_exit_codes: &[],
     forward_stderr: false,
     skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
 
 // ============================================================================

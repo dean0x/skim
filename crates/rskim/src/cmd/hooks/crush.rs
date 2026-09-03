@@ -34,8 +34,8 @@ impl HookProtocol for CrushHook {
         })
     }
 
-    fn generate_script(&self, version: &str) -> String {
-        super::generate_hook_script(version, "crush")
+    fn generate_script(&self, version: &str, binary_path: &str) -> String {
+        super::generate_hook_script(version, "crush", binary_path)
     }
 
     // -------------------------------------------------------------------------
@@ -124,17 +124,21 @@ mod tests {
     }
 
     #[test]
-    fn test_crush_generate_script_bare_command() {
-        let script = hook().generate_script("1.0.0");
+    fn test_crush_generate_script_pinned_binary() {
+        let script = hook().generate_script("1.0.0", "/usr/local/bin/skim");
         assert!(script.starts_with("#!/usr/bin/env bash\n"));
         assert!(script.contains("# skim-hook v1.0.0"));
         assert!(script.contains("SKIM_HOOK_VERSION=\"1.0.0\""));
+        assert!(script.contains("export SKIM_HOOK_BINARY="));
+        assert!(script.contains("export SKIM_HOOK_COMMIT="));
+        assert!(script.contains("exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent crush"));
+        // PATH fallback must still be present.
         assert!(script.contains("exec skim rewrite --hook --agent crush"));
     }
 
     #[test]
     fn test_crush_generate_script_init_comment() {
-        let script = hook().generate_script("1.0.0");
+        let script = hook().generate_script("1.0.0", "/usr/local/bin/skim");
         assert!(script.contains("skim init --agent crush"));
     }
 

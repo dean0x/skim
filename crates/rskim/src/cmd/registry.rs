@@ -35,6 +35,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "dig",         // infrastructure
     "discover",    // meta: skim management
     "docker",      // infrastructure
+    "doctor",      // meta: skim management
     "dotnet",      // test runner / passthrough
     "dprint",      // linter
     "du",          // file operations
@@ -69,6 +70,8 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "pnpm",        // package manager
     "prettier",    // linter
     "printenv",    // file operations
+    #[cfg(feature = "proxy")]
+    "proxy", // meta: skim Layer-3 HTTP reverse proxy (#303)
     "ps",          // file operations
     "psql",        // database
     "pytest",      // test runner
@@ -117,10 +120,13 @@ pub(crate) const META_SUBCOMMANDS: &[&str] = &[
     "agents",
     "completions",
     "discover",
+    "doctor",
     "heatmap",
     "init",
     "learn",
     "log",
+    #[cfg(feature = "proxy")]
+    "proxy", // meta: skim Layer-3 HTTP reverse proxy (server, not a tool to intercept)
     "rewrite",
     "search",
     "stats",
@@ -180,6 +186,32 @@ pub(crate) fn wrapper_targets() -> &'static [&'static str] {
 /// `test_known_subcommands_are_sorted` test enforces this.
 pub(crate) fn is_known_subcommand(name: &str) -> bool {
     KNOWN_SUBCOMMANDS.binary_search(&name).is_ok()
+}
+
+/// Read-only tool wrappers: subcommands that only inspect the filesystem or
+/// process state and never modify it.
+///
+/// Used at install time to annotate wrappers with their permission tier.
+/// INVARIANT: this registry is install-time-only — it must NOT be referenced
+/// from any rewrite/dispatch code path. (Enforced by
+/// `contract_read_only_subcommands_absent_from_rewrite_dispatch`.) A deliberate
+/// future addition must be accompanied by a test edit
+/// so drift is never silent.
+///
+/// INVARIANT: must remain in ascending lexicographic order so that
+/// `is_read_only` can use `binary_search`.
+/// The `test_read_only_subcommands_are_sorted` test enforces this.
+///
+/// INVARIANT: every entry must also be in `KNOWN_SUBCOMMANDS` and in
+/// `wrapper_targets()`. Tests enforce both.
+pub(crate) static READ_ONLY_SUBCOMMANDS: &[&str] =
+    &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"];
+
+/// Check whether `tool` is a read-only subcommand.
+///
+/// Uses binary search because [`READ_ONLY_SUBCOMMANDS`] is sorted — O(log n).
+pub(crate) fn is_read_only(tool: &str) -> bool {
+    READ_ONLY_SUBCOMMANDS.binary_search(&tool).is_ok()
 }
 
 // ============================================================================
@@ -283,6 +315,118 @@ mod tests {
             sorted.as_slice(),
             "KNOWN_SUBCOMMANDS is not sorted — binary_search in is_known_subcommand() requires \
              the array to be in ascending lexicographic order"
+        );
+    }
+
+    // ========================================================================
+    // READ_ONLY_SUBCOMMANDS tests
+    // ========================================================================
+
+    /// READ_ONLY_SUBCOMMANDS must remain sorted so that `is_read_only` can use
+    /// binary search instead of a linear scan.
+    #[test]
+    fn test_read_only_subcommands_are_sorted() {
+        let mut sorted = READ_ONLY_SUBCOMMANDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            READ_ONLY_SUBCOMMANDS,
+            sorted.as_slice(),
+            "READ_ONLY_SUBCOMMANDS is not sorted — binary_search in is_read_only() requires \
+             the array to be in ascending lexicographic order"
+        );
+    }
+
+    /// Every entry in READ_ONLY_SUBCOMMANDS must be in KNOWN_SUBCOMMANDS.
+    #[test]
+    fn test_read_only_subcommands_are_in_known_subcommands() {
+        for &name in READ_ONLY_SUBCOMMANDS {
+            assert!(
+                is_known_subcommand(name),
+                "READ_ONLY_SUBCOMMANDS entry '{name}' is not in KNOWN_SUBCOMMANDS — \
+                 every read-only entry must also be a known subcommand"
+            );
+        }
+    }
+
+    /// READ_ONLY_SUBCOMMANDS must be a subset of wrapper_targets(): read-only
+    /// tools must be real external-tool wrappers, not meta/management commands.
+    #[test]
+    fn test_read_only_subcommands_are_subset_of_wrapper_targets() {
+        let targets = wrapper_targets();
+        for &name in READ_ONLY_SUBCOMMANDS {
+            assert!(
+                targets.contains(&name),
+                "READ_ONLY_SUBCOMMANDS entry '{name}' is not in wrapper_targets() — \
+                 all read-only subcommands must be external-tool wrappers"
+            );
+        }
+    }
+
+    /// Pin test: READ_ONLY_SUBCOMMANDS must equal exactly these 8 tools.
+    ///
+    /// Any future addition must be accompanied by a deliberate test edit,
+    /// preventing silent formula drift.
+    #[test]
+    fn test_read_only_subcommands_exact_contents() {
+        assert_eq!(
+            READ_ONLY_SUBCOMMANDS,
+            &["df", "diff", "du", "grep", "ls", "rg", "tree", "wc"],
+            "READ_ONLY_SUBCOMMANDS must equal exactly the declared 8-tool set; \
+             update this test intentionally if adding a new read-only tool"
+        );
+    }
+
+    /// is_read_only returns true for each declared entry.
+    #[test]
+    fn test_is_read_only_true_for_declared_entries() {
+        for &name in READ_ONLY_SUBCOMMANDS {
+            assert!(
+                is_read_only(name),
+                "is_read_only('{name}') returned false — must return true for every declared entry"
+            );
+        }
+    }
+
+    /// is_read_only returns false for write-capable tools and meta subcommands.
+    #[test]
+    fn test_is_read_only_false_for_write_tools() {
+        for &name in &["git", "cargo", "npm", "init", "rewrite", "psql", "docker"] {
+            assert!(
+                !is_read_only(name),
+                "is_read_only('{name}') returned true — write-capable tools must return false"
+            );
+        }
+    }
+
+    // ========================================================================
+    // proxy feature-gate invariant test (#352)
+    // ========================================================================
+
+    /// `proxy` must be in KNOWN_SUBCOMMANDS and META_SUBCOMMANDS together, or in
+    /// neither. A META-only mis-gate would create a bogus `~/.skim/bin/proxy`
+    /// wrapper symlink at `skim init --wrappers` time (since wrapper_targets()
+    /// = KNOWN − META, a META-only entry would appear in KNOWN and therefore in
+    /// wrapper_targets). The assertion is meaningful in BOTH feature configs:
+    /// - proxy feature ON: both return true → equal.
+    /// - proxy feature OFF: both return false → equal.
+    ///
+    /// A mis-gate (one true, one false) fails immediately in either config.
+    ///
+    /// The second assertion guards against proxy ever becoming a PATH-wrapper
+    /// target, which would cause `skim init --wrappers` to create a confusing
+    /// recursive `~/.skim/bin/proxy` → skim symlink.
+    #[test]
+    fn test_proxy_registry_entries_gated_as_a_pair() {
+        assert_eq!(
+            is_known_subcommand("proxy"),
+            is_meta_subcommand("proxy"),
+            "proxy must be in KNOWN and META together (both under the `proxy` feature, or neither); \
+             a META-only mis-gate leaks proxy into wrapper_targets() and creates a bogus symlink"
+        );
+        assert!(
+            !wrapper_targets().contains(&"proxy"),
+            "proxy must never be a wrapper target — it is a meta/management subcommand, not an \
+             external tool"
         );
     }
 }

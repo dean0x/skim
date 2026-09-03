@@ -1,89 +1,50 @@
-//! find parser (#116).
+//! find pass-through handler (ADR-009).
 //!
-//! Parses `find` output (line-per-path) into structured `FileResult`.
+//! find output is byte-identical to native at small result sets; any
+//! structured re-encoding drops paths and breaks agent enumeration workflows:
 //!
-//! Tiers:
-//! - **Tier 1 (Full)**: Line-per-path counting with streaming truncation
-//! - **Tier 3 (Passthrough)**: Empty output on non-zero exit
-
-use std::process::ExitCode;
+//! - Byte-exact at n=1..80; entries were `trimmed.to_string()` (verbatim).
+//! - `find crates -name '*.rs'` lost 355 of 457 paths — the worst case for
+//!   an agent enumerating a codebase.
+//! - The parser used a silent `break` past MAX_INPUT_LINES rather than
+//!   returning `None`, violating the lossless-degrade contract (ADR-009).
+//!
+//! We therefore emit native output byte-faithfully via [`super::passthrough_parse`].
 
 use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::analytics::CommandType;
-use crate::cmd::{ToolRunConfig, run_tool};
-
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "find",
-    env_overrides: &[],
-    install_hint: "find is typically pre-installed on Unix systems",
-    family: "file",
-    skip_ansi_strip: false,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    skip_net_savings_guard: false,
-};
-
 /// Run `skim find [args...]`.
-pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    // find has no useful flag injections — its output format is always line-per-path
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+pub(crate) fn run(
+    args: &[String],
+    ctx: &crate::cmd::RunContext,
+) -> anyhow::Result<std::process::ExitCode> {
+    // find has no useful flag injections — its output format is always line-per-path.
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "find",
+            install_hint: "find is typically pre-installed on Unix systems",
+            expected_exit_codes: &[],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
 }
 
-/// Three-tier parse function for find output.
-fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    if let Some(result) = try_parse_lines(&output.stdout, output.exit_code) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
-}
-
-// ============================================================================
-// Tier 1: line-per-path parsing
-// ============================================================================
-
-/// Parse find output line-by-line: count total, keep first MAX_DISPLAY_ENTRIES.
+/// Parse function: always native passthrough.
 ///
-/// Returns None only when there is literally nothing to show (empty output
-/// on a successful run).
-fn try_parse_lines(stdout: &str, exit_code: Option<i32>) -> Option<FileResult> {
-    // Empty output on non-zero exit is passthrough (error condition)
-    if stdout.trim().is_empty() && exit_code != Some(0) {
-        return None;
-    }
-
-    let mut total_count = 0usize;
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
-
-    for (i, line) in stdout.lines().enumerate() {
-        if i >= MAX_INPUT_LINES {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        total_count += 1;
-        if entries.len() < MAX_DISPLAY_ENTRIES {
-            entries.push(trimmed.to_string());
-        }
-    }
-
-    let shown_count = entries.len();
-    let footer = crate::output::elision_marker(shown_count, total_count, "entries");
-
-    Some(FileResult::new(
-        "find".to_string(),
-        total_count,
-        shown_count,
-        entries,
-        footer,
-    ))
+/// find's stdout is already in native line-per-path format — structurally
+/// minimal and pipe-safe for `xargs`, `wc -l`, and downstream path consumers.
+/// The structured parser re-emitted paths verbatim and silently dropped any
+/// path past the 100-entry cap, losing the majority of results for large
+/// codebases (`find crates -name '*.rs'` lost 355 of 457 paths).
+///
+/// Delegates to [`super::passthrough_parse`] so the byte-faithful contract
+/// (ADR-009) has a single implementation across all pure-passthrough handlers.
+fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
+    super::passthrough_parse(output)
 }
 
 // ============================================================================
@@ -93,109 +54,64 @@ fn try_parse_lines(stdout: &str, exit_code: Option<i32>) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_utils::{load_fixture, make_output_full};
+    use crate::cmd::test_utils::make_output;
 
     #[test]
-    fn test_tier1_find_small() {
-        let input = load_fixture("file", "find_small.txt");
-        let result = try_parse_lines(&input, Some(0));
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert!(result.total_count > 0);
-        assert!(
-            result.total_count <= 10,
-            "Small fixture should have <=10 entries"
-        );
-        assert!(
-            result.footer.is_none(),
-            "Small fixture should not be truncated"
-        );
-    }
-
-    #[test]
-    fn test_tier1_find_large_truncates() {
-        let input = load_fixture("file", "find_large.txt");
-        let result = try_parse_lines(&input, Some(0));
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert!(
-            result.total_count > MAX_DISPLAY_ENTRIES,
-            "Large fixture should exceed cap"
-        );
-        assert_eq!(
-            result.shown_count, MAX_DISPLAY_ENTRIES,
-            "Shown should be capped at 100"
-        );
-        assert!(result.footer.is_some(), "Large fixture should have footer");
-        let footer = result.footer.unwrap();
-        assert!(
-            footer.contains("entries omitted"),
-            "Footer should mention omitted entry count, got: {footer}"
-        );
-        assert!(
-            footer.contains("SKIM_PASSTHROUGH=1"),
-            "Footer should include SKIM_PASSTHROUGH=1 escape hatch, got: {footer}"
-        );
-    }
-
-    #[test]
-    fn test_tier1_empty_on_success_returns_zero_result() {
-        let result = try_parse_lines("", Some(0));
-        // Empty output on exit code 0: return a zero-entry FileResult
-        assert!(result.is_some(), "Empty-on-success should produce a result");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 0);
-        assert_eq!(result.shown_count, 0);
-    }
-
-    #[test]
-    fn test_tier3_empty_on_error_is_passthrough() {
-        let output = make_output_full("", "", Some(1));
+    fn test_parse_impl_is_passthrough() {
+        // parse_impl must always return RawPassthrough so that execution.rs
+        // serves output.stdout byte-faithfully (native line-per-path format).
+        let input = "./src/main.rs\n./src/lib.rs\n./Cargo.toml\n";
+        let output = make_output(input);
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "Empty output on error should fall to passthrough, got {}",
+            "parse_impl must be Passthrough tier (native line-per-path): got {}",
+            result.tier_name()
+        );
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough (zero-clone stdout pass-through): got {}",
             result.tier_name()
         );
     }
 
     #[test]
-    fn test_parse_impl_full_on_small_input() {
-        let input = load_fixture("file", "find_small.txt");
-        let output = make_output_full(&input, "", Some(0));
+    fn test_parse_impl_empty_is_passthrough() {
+        let output = make_output("");
         let result = parse_impl(&output);
         assert!(
-            result.is_full(),
-            "Small find output should be Full, got {}",
+            result.is_passthrough(),
+            "Empty find output should be Passthrough, got {}",
             result.tier_name()
         );
     }
 
+    /// parse_impl returns RawPassthrough regardless of path count — confirming
+    /// execution.rs emits output.stdout directly so no paths are dropped.
     #[test]
-    fn test_display_format() {
-        let input = "./src/main.rs\n./src/lib.rs\n./Cargo.toml\n";
-        let result = try_parse_lines(input, Some(0)).unwrap();
-        let rendered = format!("{result}");
+    fn test_native_output_line_count_parity() {
+        let input: String = (1..=10)
+            .map(|i| format!("./crates/rskim/src/file{i}.rs\n"))
+            .collect();
+        let output = make_output(&input);
+        let result = parse_impl(&output);
         assert!(
-            rendered.contains("find "),
-            "Header should start with tool name"
-        );
-        assert!(
-            rendered.contains("./src/main.rs"),
-            "Entries should appear in output"
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough for lossless stdout pass-through"
         );
     }
 
+    /// find can exit non-zero when some paths are inaccessible but still
+    /// emit results for paths it could read.  RawPassthrough ensures those
+    /// partial results reach the caller verbatim regardless of exit code.
     #[test]
-    fn test_parse_impl_error_with_output_still_parses() {
-        // find returns non-zero exit when some paths are inaccessible but still outputs results
+    fn test_partial_results_on_error_pass_through() {
         let input = "./src/main.rs\n./src/lib.rs\n";
-        let output = make_output_full(input, "", Some(1));
+        let output = make_output(input);
         let result = parse_impl(&output);
-        // Has output, so should parse (not passthrough)
         assert!(
-            result.is_full(),
-            "Non-empty output even on error should produce Full result, got {}",
+            matches!(result, ParseResult::RawPassthrough),
+            "partial find results must use RawPassthrough so all found paths are served: {}",
             result.tier_name()
         );
     }

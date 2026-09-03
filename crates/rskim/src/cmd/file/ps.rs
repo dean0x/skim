@@ -1,98 +1,48 @@
-//! ps parser.
+//! ps pass-through handler (ADR-009).
 //!
-//! Parses `ps` output (process list) into structured `FileResult`.
+//! ps rows are verbatim — zero per-row text compression — so the structured
+//! parser's only effect was truncation; for the same 101 records skim emitted
+//! 30098 B vs native 29918 B (+180 bytes LARGER).  The apparent 81% saving
+//! for `ps aux` was entirely 705 dropped processes, never text compression.
+//! Callers that need fewer rows should pipe through `head`.
 //!
-//! Tiers:
-//! - **Tier 1 (Full)**: Header + process rows, truncated at MAX_DISPLAY_ENTRIES
-//! - **Tier 3 (Passthrough)**: Empty output or parse failure
-
-use std::process::ExitCode;
+//! The parser also used a silent `break` past MAX_INPUT_LINES rather than
+//! returning `None`, violating the lossless-degrade contract (ADR-009).
+//!
+//! We therefore emit native output byte-faithfully via [`super::passthrough_parse`].
 
 use crate::output::ParseResult;
 use crate::output::canonical::FileResult;
 use crate::runner::CommandOutput;
 
-use super::{MAX_DISPLAY_ENTRIES, MAX_INPUT_LINES};
-use crate::analytics::CommandType;
-use crate::cmd::{ToolRunConfig, run_tool};
-
-const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
-    program: "ps",
-    env_overrides: &[],
-    install_hint: "ps is typically pre-installed on Unix systems",
-    family: "file",
-    skip_ansi_strip: false,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    skip_net_savings_guard: false,
-};
-
 /// Run `skim ps [args...]`.
-pub(crate) fn run(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
-    run_tool(CONFIG, args, ctx, |_| {}, parse_impl)
+pub(crate) fn run(
+    args: &[String],
+    ctx: &crate::cmd::RunContext,
+) -> anyhow::Result<std::process::ExitCode> {
+    super::run_passthrough_tool(
+        super::PassthroughSpec {
+            program: "ps",
+            install_hint: "ps is typically pre-installed on Unix systems",
+            expected_exit_codes: &[],
+        },
+        args,
+        ctx,
+        parse_impl,
+    )
 }
 
-/// Three-tier parse function for ps output.
+/// Parse function: always native passthrough.
+///
+/// ps rows are copied verbatim by the structured parser (zero text reduction),
+/// so the compressed view was always larger than native output.  The only
+/// reduction came from dropping processes past the 100-row cap — truncation,
+/// not compression.  Callers wanting fewer rows should pipe through `head`.
+///
+/// Delegates to [`super::passthrough_parse`] so the byte-faithful contract
+/// (ADR-009) has a single implementation across all pure-passthrough handlers.
 fn parse_impl(output: &CommandOutput) -> ParseResult<FileResult> {
-    if let Some(result) = try_parse_ps(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
-}
-
-// ============================================================================
-// Tier 1: ps output parsing
-// ============================================================================
-
-fn try_parse_ps(stdout: &str) -> Option<FileResult> {
-    if stdout.trim().is_empty() {
-        return None;
-    }
-
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES + 1);
-    let mut process_count = 0usize;
-    let mut header_found = false;
-
-    for (i, line) in stdout.lines().enumerate() {
-        if i >= MAX_INPUT_LINES {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if !header_found {
-            // Find the header line containing "PID" (case-insensitive)
-            if line.to_uppercase().contains("PID") {
-                entries.push(line.to_string());
-                header_found = true;
-            }
-            continue;
-        }
-
-        // Remaining lines are process rows
-        process_count += 1;
-        if entries.len() <= MAX_DISPLAY_ENTRIES {
-            entries.push(line.to_string());
-        }
-    }
-
-    if !header_found || process_count == 0 {
-        return None;
-    }
-
-    let shown_count = entries.len().saturating_sub(1); // exclude header
-    let footer = crate::output::elision_marker(shown_count, process_count, "processes");
-
-    Some(FileResult::new(
-        "ps".to_string(),
-        process_count,
-        shown_count,
-        entries,
-        footer,
-    ))
+    super::passthrough_parse(output)
 }
 
 // ============================================================================
@@ -102,81 +52,68 @@ fn try_parse_ps(stdout: &str) -> Option<FileResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::test_utils::{load_fixture, make_output_full};
-
-    fn make_large_ps() -> String {
-        let mut lines = vec![
-            "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND".to_string(),
-        ];
-        for i in 1..=160 {
-            lines.push(format!(
-                "user     {i:>5}  0.0  0.0      0     0 ?        S    May01   0:00 process-{i}"
-            ));
-        }
-        lines.join("\n")
-    }
+    use crate::cmd::test_utils::make_output;
 
     #[test]
-    fn test_tier1_ps_small() {
-        let input = load_fixture("file", "ps_small.txt");
-        let result = try_parse_ps(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 11, "11 processes in ps_small.txt");
-        assert!(result.footer.is_none(), "Small fixture should not truncate");
-    }
-
-    #[test]
-    fn test_tier1_ps_large_truncates() {
-        let input = make_large_ps();
-        let result = try_parse_ps(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert!(
-            result.total_count > MAX_DISPLAY_ENTRIES,
-            "Large input should exceed cap"
-        );
-        assert!(result.footer.is_some(), "Should have footer when truncated");
-        let footer = result.footer.as_ref().unwrap();
-        assert!(
-            footer.contains("processes omitted"),
-            "Footer should mention omitted process count, got: {footer}"
-        );
-        assert!(
-            footer.contains("SKIM_PASSTHROUGH=1"),
-            "Footer should include SKIM_PASSTHROUGH=1 escape hatch, got: {footer}"
-        );
-    }
-
-    #[test]
-    fn test_tier1_ps_preserves_header() {
-        let input = load_fixture("file", "ps_small.txt");
-        let result = try_parse_ps(&input).unwrap();
-        // First entry should be the header line with PID
-        assert!(
-            result.entries[0].contains("PID"),
-            "First entry should be the header, got: {}",
-            result.entries[0]
-        );
-    }
-
-    #[test]
-    fn test_tier1_ps_minimal() {
-        let input = load_fixture("file", "ps_minimal.txt");
-        let result = try_parse_ps(&input);
-        assert!(result.is_some(), "Expected Tier 1 parse to succeed");
-        let result = result.unwrap();
-        assert_eq!(result.total_count, 2, "2 processes in ps_minimal.txt");
-        assert!(result.entries[0].contains("PID"), "Header preserved");
-    }
-
-    #[test]
-    fn test_tier3_empty_passthrough() {
-        let output = make_output_full("", "", Some(1));
+    fn test_parse_impl_is_passthrough() {
+        // parse_impl must always return RawPassthrough so that execution.rs
+        // serves output.stdout byte-faithfully (native header+process-row format).
+        let input = "USER       PID %CPU %MEM COMMAND\nroot         1  0.0  0.1 /sbin/init\nuser      1234  0.5  1.2 bash\n";
+        let output = make_output(input);
         let result = parse_impl(&output);
         assert!(
             result.is_passthrough(),
-            "Empty output should be passthrough, got {}",
+            "parse_impl must be Passthrough tier (native ps output): got {}",
+            result.tier_name()
+        );
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough (zero-clone stdout pass-through): got {}",
+            result.tier_name()
+        );
+    }
+
+    #[test]
+    fn test_parse_impl_empty_is_passthrough() {
+        let output = make_output("");
+        let result = parse_impl(&output);
+        assert!(
+            result.is_passthrough(),
+            "Empty ps output should be Passthrough, got {}",
+            result.tier_name()
+        );
+    }
+
+    /// parse_impl returns RawPassthrough regardless of process count — confirming
+    /// execution.rs emits output.stdout directly so no processes are dropped.
+    #[test]
+    fn test_native_output_all_processes_pass_through() {
+        let header = "USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n";
+        let input: String = std::iter::once(header.to_string())
+            .chain((1..=10).map(|i| {
+                format!(
+                    "user     {i:>5}  0.0  0.0      0     0 ?        S    00:00   0:00 proc-{i}\n"
+                )
+            }))
+            .collect();
+        let output = make_output(&input);
+        let result = parse_impl(&output);
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_impl must return RawPassthrough for lossless stdout pass-through"
+        );
+    }
+
+    /// ps rows are emitted verbatim — zero per-row compression — so RawPassthrough
+    /// is both correct and cheaper than the structured parser path.
+    #[test]
+    fn test_verbatim_rows_pass_through() {
+        let input = "USER       PID %CPU %MEM COMMAND\nroot         1  0.0  0.1 /sbin/init\n";
+        let output = make_output(input);
+        let result = parse_impl(&output);
+        assert!(
+            matches!(result, ParseResult::RawPassthrough),
+            "ps verbatim rows must use RawPassthrough so stdout is served unchanged: {}",
             result.tier_name()
         );
     }

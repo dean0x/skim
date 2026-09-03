@@ -205,10 +205,10 @@ fn a5_lang_recovery_unrecognised_lang_id_returns_none() {
         "unrecognised lang_id 255 should return None from .language()"
     );
 
-    // A value just past the current highest assigned ID (16 = Yaml) also
+    // A value just past the current highest assigned ID (17 = Bash) also
     // exercises the same None arm, guarding against a future off-by-one.
     let entry2 = AstFileMetaEntry {
-        lang_id: 17,
+        lang_id: 18,
         node_count: 0,
         max_depth: 0,
         max_block_stmts: 0,
@@ -218,7 +218,7 @@ fn a5_lang_recovery_unrecognised_lang_id_returns_none() {
     assert_eq!(
         entry2.language(),
         None,
-        "unrecognised lang_id 17 should return None from .language()"
+        "unrecognised lang_id 18 should return None from .language()"
     );
 }
 

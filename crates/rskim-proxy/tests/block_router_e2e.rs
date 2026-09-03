@@ -1,0 +1,700 @@
+// Joint e2e tests: #303 proxy × #304 BlockRouter (AC19 / Phase 4a / D4 / PF-007).
+//
+// These tests require the `testing` feature to access `rskim_proxy::testing::run_server_async`.
+// Run with:
+//   cargo nextest run -p rskim-proxy --features testing -j 4
+//   (or: cargo test -p rskim-proxy --all-targets --features testing)
+#![cfg(feature = "testing")]
+
+//! ## What these tests prove
+//!
+//! Four joint assertions (AC19 / D4 / PF-007):
+//!
+//! 1. **Compressible Anthropic live-zone fixture** — upstream-received body is
+//!    STRICTLY SMALLER than client-sent body (real compression through the running proxy).
+//!    Post-P0.1: fixture uses pretty-printed JSON (JSON minification is the compressible path;
+//!    code blocks are always Passthrough per ADR-007).
+//!    DISCRIMINATING: this test would FAIL if the router were the identity stage.
+//!
+//! 2. **Passthrough-only Anthropic fixture** — upstream-received bytes are BYTE-IDENTICAL
+//!    to client-sent (D4 — proves #303 AC19b byte-faithfulness holds under the REAL router,
+//!    not just IdentityContract). This fixture's live-zone blocks are all below the prefilter
+//!    floor or contain only Text class (passthrough-only engines).
+//!    DISCRIMINATING: this test would FAIL if `BlockRouter::serialize()` introduced any
+//!    spurious drift on an unmodified body.
+//!
+//! 3. **Subscription-auth request** — upstream-received bytes are BYTE-IDENTICAL to
+//!    client-sent (LosslessOnly policy → no compression regardless of content).
+//!    DISCRIMINATING: this test would FAIL if the Subscription auth_mode were incorrectly
+//!    mapped to Policy::Default.
+//!
+//! 4. **Code fence body byte-identical** — fenced Rust code block passes through
+//!    byte-identical (P0.1 / ADR-007 lossless-only egress).
+//!    DISCRIMINATING: this test would FAIL if the Code engine arm were restored
+//!    (upstream would receive fewer bytes from AST transform).
+//!
+//! ## Infrastructure
+//!
+//! These tests use a test-local `BlockRouterStage` that is structurally identical to the
+//! production adapter in `crates/rskim/src/cmd/proxy.rs`. The adapter lives here (in the
+//! test file) because the production adapter lives in the rskim binary, which cannot be
+//! imported as a library. The test-local adapter has identical logic — both are the
+//! bridge between `rskim_proxy::seam::TransformStage` and `rskim_compress::BlockRouter`.
+//!
+//! `FakeUpstream` and `ProxyHandle` are re-defined locally (same pattern as
+//! `conformance_and_determinism.rs`) because test crate infrastructure is not shared.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
+use rskim_compress::{BlockRouter, Policy};
+use rskim_contract::contract::Outcome;
+use rskim_contract::log::{DecisionRecord, DecisionSink, SinkFull};
+use rskim_proxy::analytics::NoopAnalyticsHook;
+use rskim_proxy::authmode::AuthMode;
+use rskim_proxy::config::ProxyConfig;
+use rskim_proxy::detect::ProxyProvider;
+use rskim_proxy::seam::{HeaderView, TransformContext, TransformPipeline, TransformStage};
+use tokio::net::TcpListener;
+
+// ============================================================================
+// Test-local BlockRouterStage adapter (mirrors production adapter in proxy.rs)
+// ============================================================================
+
+/// Null sink for the BlockRouter `Contract` bridge (not called on the `apply()` path).
+struct NullSink;
+
+impl DecisionSink for NullSink {
+    fn try_send(&self, _record: DecisionRecord) -> Result<(), SinkFull> {
+        Ok(())
+    }
+}
+
+/// `TransformStage` adapter wrapping `BlockRouter` — structurally identical to the
+/// production adapter in `crates/rskim/src/cmd/proxy.rs`.
+///
+/// Lives here (in test code) because the production adapter is in the rskim binary,
+/// which cannot be imported as a library. The logic is identical — this is the
+/// canonical test surface for verifying the proxy × router composition.
+///
+/// ## auth_mode → Policy mapping (D1 / AD-PXY-08)
+///
+/// | `AuthMode`     | `Policy`       | Rationale                                |
+/// |----------------|----------------|------------------------------------------|
+/// | `Subscription` | `LosslessOnly` | Conservative: no lossy compression       |
+/// | `ApiKey`       | `Default`      | Full compression allowed                 |
+/// | `Ambiguous`    | `Default`      | Conservative map toward ApiKey (D1)      |
+struct BlockRouterStage {
+    router: BlockRouter,
+}
+
+impl BlockRouterStage {
+    fn new(router: BlockRouter) -> Self {
+        Self { router }
+    }
+}
+
+impl TransformStage for BlockRouterStage {
+    fn name(&self) -> &'static str {
+        "block-router"
+    }
+
+    fn apply(&self, body: &[u8], ctx: &TransformContext<'_>, sink: &dyn DecisionSink) -> Outcome {
+        let policy = match ctx.auth_mode {
+            AuthMode::Subscription => Policy::LosslessOnly,
+            AuthMode::ApiKey => Policy::Default,
+            // Ambiguous → Default (D1: conservative toward ApiKey)
+            _ => Policy::Default,
+        };
+        self.router.route(body, policy, ctx.request_id, sink)
+    }
+}
+
+// ============================================================================
+// Fake upstream server (same pattern as conformance_and_determinism.rs)
+// ============================================================================
+
+type CapturedBody = Vec<u8>;
+
+struct FakeUpstream {
+    addr: SocketAddr,
+    captured: Arc<Mutex<Vec<CapturedBody>>>,
+}
+
+impl FakeUpstream {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake upstream bind");
+        let addr = listener.local_addr().expect("fake upstream local_addr");
+        let captured: Arc<Mutex<Vec<CapturedBody>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let captured_clone = Arc::clone(&captured);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let captured_inner = Arc::clone(&captured_clone);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let cap = Arc::clone(&captured_inner);
+                        async move {
+                            let body_bytes = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|b| b.to_bytes())
+                                .unwrap_or_else(|_| Bytes::new());
+                            let body_vec = body_bytes.to_vec();
+                            cap.lock().expect("captured lock").push(body_vec.clone());
+                            let response: Response<Full<Bytes>> = Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(Full::from(Bytes::from(body_vec)))
+                                .expect("echo response build");
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    });
+                    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                        let _ = e;
+                    }
+                });
+            }
+        });
+
+        Self { addr, captured }
+    }
+
+    fn upstream_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn drain_captured(&self) -> Vec<CapturedBody> {
+        self.captured
+            .lock()
+            .expect("captured lock")
+            .drain(..)
+            .collect()
+    }
+}
+
+// ============================================================================
+// Proxy test harness
+// ============================================================================
+
+struct ProxyHandle {
+    abort_handle: tokio::task::AbortHandle,
+    proxy_addr: SocketAddr,
+}
+
+/// Bind to an OS-assigned ephemeral port and return the listener.
+///
+/// Uses `TcpListener::bind("127.0.0.1:0")`: the OS assigns a free port and
+/// guarantees uniqueness across concurrent callers — even across separate
+/// nextest processes. With bind-to-0 each call gets a distinct OS-assigned
+/// port; inter-test collisions are impossible.
+///
+/// The caller passes the returned listener directly to
+/// `rskim_proxy::testing::run_server_with_listener` — no second bind occurs,
+/// so the race window is zero.
+async fn bind_test_listener() -> TcpListener {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to OS-assigned ephemeral port")
+}
+
+impl ProxyHandle {
+    /// Start a proxy with the BlockRouter pipeline (Phase 4a wiring).
+    ///
+    /// Binds via [`bind_test_listener`] (port 0) so each concurrent test gets
+    /// a guaranteed-unique port. The listener is handed directly to
+    /// `run_server_with_listener` — no second bind, zero TOCTOU race.
+    async fn start_with_router(upstream_url: &str) -> Self {
+        let listener = bind_test_listener().await;
+        let proxy_addr = listener.local_addr().expect("listener local_addr");
+
+        let config = ProxyConfig::builder()
+            .port(41001) // placeholder — run_server_with_listener ignores config.bind_addr
+            .upstream_default(upstream_url)
+            .build()
+            .expect("proxy config");
+
+        let router = BlockRouter::new(Arc::new(NullSink));
+        let stage = BlockRouterStage::new(router);
+        let pipeline = TransformPipeline::from_stages(vec![Box::new(stage)]);
+        let analytics = Arc::new(NoopAnalyticsHook);
+
+        let task = tokio::spawn(rskim_proxy::testing::run_server_with_listener(
+            listener, config, pipeline, analytics,
+        ));
+        let abort_handle = task.abort_handle();
+
+        // Allow the proxy to start accepting.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        Self {
+            abort_handle,
+            proxy_addr,
+        }
+    }
+
+    fn proxy_addr(&self) -> SocketAddr {
+        self.proxy_addr
+    }
+
+    fn stop(self) {
+        self.abort_handle.abort();
+    }
+}
+
+// ============================================================================
+// HTTP client helpers
+// ============================================================================
+
+/// POST `body` to `http://{addr}/v1/messages` with an API-key auth header.
+async fn post_with_api_key(proxy_addr: SocketAddr, body: &[u8]) -> Vec<u8> {
+    use hyper::Uri;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let url: Uri = format!("http://{}/v1/messages", proxy_addr)
+        .parse()
+        .expect("proxy URL parse");
+
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+
+    let request = Request::post(url)
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-api-key-not-real")
+        .body(Full::from(Bytes::from(body.to_vec())))
+        .expect("request build");
+
+    let response = client.request(request).await.expect("proxy request");
+    response
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default()
+}
+
+/// POST `body` to `http://{addr}/v1/messages` with a Bearer subscription auth header.
+async fn post_with_bearer(proxy_addr: SocketAddr, body: &[u8]) -> Vec<u8> {
+    use hyper::Uri;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let url: Uri = format!("http://{}/v1/messages", proxy_addr)
+        .parse()
+        .expect("proxy URL parse");
+
+    let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
+
+    let request = Request::post(url)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer eyJhbGciOiJSUzI1NiJ9.TEST-NOT-REAL")
+        .body(Full::from(Bytes::from(body.to_vec())))
+        .expect("request build");
+
+    let response = client.request(request).await.expect("proxy request");
+    response
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes().to_vec())
+        .unwrap_or_default()
+}
+
+// ============================================================================
+// Fixture builders
+// ============================================================================
+
+/// Build an Anthropic request body containing pretty-printed JSON as the message content.
+///
+/// The JSON content is > 64 bytes (above MIN_SIZE_FLOOR) and classifies as Class::Json.
+/// The JSON engine minifies whitespace → strictly smaller upstream body.
+///
+/// Post-P0.1 (ADR-007): code blocks always pass through byte-identical; this fixture
+/// uses JSON to remain the "compressible" discriminating fixture.
+///
+/// IMPORTANT: This fixture MUST produce strictly-smaller output through the router.
+/// Verified by test assertion. If this function changes, re-verify compression is > 0.
+fn compressible_anthropic_body() -> Vec<u8> {
+    // Pretty-printed JSON (~350 bytes) — classified as Class::Json by rskim_llm.
+    // The JSON engine minifies whitespace, producing strictly smaller output.
+    let pretty_json = "{\n  \"event\": \"api_response\",\n  \"status\": 200,\n  \"timestamp\": \"2026-07-11T10:00:00Z\",\n  \"data\": {\n    \"user\": \"alice\",\n    \"role\": \"admin\",\n    \"permissions\": [\"read\", \"write\", \"delete\"],\n    \"metadata\": {\n      \"last_login\": \"2026-07-10T08:00:00Z\",\n      \"session_count\": 42,\n      \"active\": true\n    }\n  },\n  \"errors\": [],\n  \"warnings\": [\"session_expiry_soon\"]\n}";
+
+    // JSON-escape the pretty JSON for embedding in the message content string.
+    let content_escaped = pretty_json
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+
+    format!(
+        r#"{{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{{"role":"user","content":"{content_escaped}"}}]}}"#
+    )
+    .into_bytes()
+}
+
+/// Build an Anthropic request body containing a fenced Rust code block.
+///
+/// Post-P0.1 (ADR-007): code blocks always pass through byte-identical regardless
+/// of size, language hint, or Policy. This fixture is used to assert byte-identity
+/// via `test_joint_code_fence_body_byte_identical_upstream`.
+fn code_fence_anthropic_body() -> Vec<u8> {
+    // ~600 bytes of Rust code in a fenced block with "rust" language hint.
+    // Pre-P0.1 this would have routed to the code engine; post-P0.1 it passes through.
+    let mut code = String::new();
+    for i in 0..12 {
+        code.push_str(&format!(
+            "fn compute_{i}(a: u32, b: u32, c: u32) -> u32 {{\n    let x = a + b;\n    let y = x * c;\n    let z = y - a;\n    z / (b + 1)\n}}\n\n"
+        ));
+    }
+
+    let escaped = code
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+
+    let content = format!("```rust\\n{escaped}\\n```");
+
+    format!(
+        r#"{{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{{"role":"user","content":"{content}"}}]}}"#
+    )
+    .into_bytes()
+}
+
+/// Build an Anthropic request body where all live-zone blocks are below the prefilter
+/// floor (< 64 bytes) or are Text class (passthrough engine).
+///
+/// The router will exit early (no block modified) without calling `serialize()`,
+/// ensuring byte-identical output. This proves the D4 serialize-fail-open path
+/// does NOT affect the no-op case.
+fn passthrough_only_anthropic_body() -> Vec<u8> {
+    // A tiny user message well below MIN_SIZE_FLOOR (64 bytes).
+    // The prefilter will skip it → no modification → serialize() never called
+    // → upstream receives the exact input bytes.
+    br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}"#.to_vec()
+}
+
+// ============================================================================
+// Joint e2e tests (AC19 / D4 / PF-007)
+// ============================================================================
+
+/// AC19 / D4 / PF-007 Joint Test 1:
+///
+/// COMPRESSIBLE Anthropic live-zone fixture → upstream-received body is STRICTLY
+/// SMALLER than client-sent body.
+///
+/// ## Discriminating property (PF-007)
+///
+/// This test FAILS if the router were identity (bytes would equal, not less).
+/// The compressible fixture (pretty-printed JSON) was chosen so that JSON minification
+/// produces a strictly smaller output. A router that is merely an identity stage
+/// cannot satisfy `upstream_len < client_len`.
+///
+/// Post-P0.1 (ADR-007): code blocks always pass through byte-identical; this test
+/// uses pretty-printed JSON as the compressible content type. JSON minification
+/// (whitespace removal) is the discriminating compression path.
+///
+/// ## Why Anthropic only?
+///
+/// OpenAI bodies are non-mutable (`list_blocks` returns empty, `mutate_block` →
+/// `BlockNotMutable` per #332). The router correctly passes OpenAI bodies through
+/// byte-identical. Only Anthropic bodies can be compressed today.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_joint_compressible_anthropic_produces_strictly_smaller_upstream_body() {
+    let upstream = FakeUpstream::start().await;
+    let proxy = ProxyHandle::start_with_router(&upstream.upstream_url()).await;
+
+    let client_body = compressible_anthropic_body();
+    let client_len = client_body.len();
+
+    // POST through the proxy with ApiKey auth → Policy::Default → compression enabled.
+    upstream.drain_captured();
+    let response = post_with_api_key(proxy.proxy_addr(), &client_body).await;
+
+    // Allow the upstream handler to finish recording.
+    // Use a longer wait (100ms) to reduce timing sensitivity under parallel load.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let captured = upstream.drain_captured();
+    assert!(
+        !captured.is_empty(),
+        "AC19/Joint-1: upstream must record the forwarded body \
+         (proxy response was {} bytes; a 502 body is typical if upstream was unreachable)",
+        response.len(),
+    );
+
+    let upstream_len = captured[0].len();
+
+    // DISCRIMINATING assertion (PF-007): upstream body must be STRICTLY SMALLER.
+    // If the router is identity, upstream_len == client_len → test FAILS.
+    // If compression actually runs, upstream_len < client_len → test PASSES.
+    assert!(
+        upstream_len < client_len,
+        "AC19/Joint-1 FAIL: upstream received {} bytes, client sent {} bytes — \
+         expected upstream < client (real compression must shrink the body). \
+         If this fails, check: (a) code block size >= MIN_SIZE_FLOOR, \
+         (b) BlockRouter is wired (not IdentityStage), \
+         (c) auth_mode=ApiKey → Policy::Default path is taken.",
+        upstream_len,
+        client_len,
+    );
+
+    proxy.stop();
+}
+
+/// AC19 / D4 / PF-007 Joint Test 2:
+///
+/// PASSTHROUGH-ONLY Anthropic fixture → upstream-received bytes are BYTE-IDENTICAL
+/// to client-sent bytes.
+///
+/// ## Why this is the D4 joint test
+///
+/// D4 extends AD-009: any `serialize()`/`parse()` failure → whole-request passthrough.
+/// But the critical compositional guarantee is that the router's NO-OP path (no block
+/// modified → `serialize()` never called) produces EXACT byte identity under the REAL
+/// proxy forward path — not just at the seam level.
+///
+/// This proves #303's AC19b byte-faithfulness holds under the REAL router (not just
+/// IdentityContract), and that BlockRouter's early-exit path (skip serialize() when
+/// no block modified) is byte-faithful through the running proxy's HTTP stack.
+///
+/// ## Discriminating property (PF-007)
+///
+/// This test FAILS if `BlockRouter::serialize()` introduces spurious drift on an
+/// unmodified body (e.g., if the no-modification path were incorrectly changed to
+/// call `serialize()` and serde round-trip changed whitespace or key order).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_joint_passthrough_only_anthropic_is_byte_identical_upstream() {
+    let upstream = FakeUpstream::start().await;
+    let proxy = ProxyHandle::start_with_router(&upstream.upstream_url()).await;
+
+    let client_body = passthrough_only_anthropic_body();
+
+    // POST through the proxy with ApiKey auth → Policy::Default → compression attempted,
+    // but all blocks are below prefilter floor → early exit → no serialize() call.
+    upstream.drain_captured();
+    let _response = post_with_api_key(proxy.proxy_addr(), &client_body).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let captured = upstream.drain_captured();
+    assert!(
+        !captured.is_empty(),
+        "AC19b/D4/Joint-2: upstream must record the forwarded body"
+    );
+
+    // DISCRIMINATING assertion (PF-007): upstream body must be BYTE-IDENTICAL.
+    // If serialize() were called on the unmodified path and introduced drift
+    // (e.g., serde re-emitting with different whitespace), bytes would differ → FAIL.
+    assert_eq!(
+        captured[0].as_slice(),
+        client_body.as_slice(),
+        "AC19b/D4/Joint-2 FAIL: upstream received different bytes than client sent. \
+         \n  client ({} bytes): {:?}\
+         \n  upstream ({} bytes): {:?}\
+         \nThis proves #303 byte-faithfulness breaks under the real router. \
+         Cause: serialize() must not be called when no block is modified.",
+        client_body.len(),
+        &client_body[..client_body.len().min(80)],
+        captured[0].len(),
+        &captured[0][..captured[0].len().min(80)],
+    );
+
+    proxy.stop();
+}
+
+/// AC19 / D4 / PF-007 Joint Test 3:
+///
+/// SUBSCRIPTION-AUTH request → upstream-received bytes are BYTE-IDENTICAL to
+/// client-sent bytes (LosslessOnly policy → no compression regardless of content).
+///
+/// ## Discriminating property (PF-007)
+///
+/// This test FAILS if the Subscription auth_mode were incorrectly mapped to
+/// Policy::Default. With a compressible body under Default policy, the router
+/// would modify blocks and the upstream would receive fewer bytes.
+/// With LosslessOnly, every candidate gets a PolicyPassthrough record and the
+/// body is forwarded byte-identical.
+///
+/// The body used here IS compressible (same fixture as Joint Test 1). This ensures
+/// that if Policy::Default were applied, the test would fail — making the auth_mode
+/// mapping the sole discriminating variable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_joint_subscription_auth_is_byte_identical_upstream() {
+    let upstream = FakeUpstream::start().await;
+    let proxy = ProxyHandle::start_with_router(&upstream.upstream_url()).await;
+
+    // Use the COMPRESSIBLE body — if Default policy ran, the upstream would
+    // receive fewer bytes. If LosslessOnly runs, bytes are identical.
+    // This makes the auth_mode → Policy mapping the discriminating variable.
+    let client_body = compressible_anthropic_body();
+
+    // POST through the proxy with Bearer subscription auth → Subscription auth_mode
+    // → Policy::LosslessOnly → no compression.
+    upstream.drain_captured();
+    let _response = post_with_bearer(proxy.proxy_addr(), &client_body).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let captured = upstream.drain_captured();
+    assert!(
+        !captured.is_empty(),
+        "AC19/Joint-3: upstream must record the forwarded body"
+    );
+
+    // DISCRIMINATING assertion (PF-007): upstream body must be BYTE-IDENTICAL.
+    // If Subscription were incorrectly mapped to Default, the upstream would
+    // receive compressed bytes (strictly smaller) → assertion fails.
+    assert_eq!(
+        captured[0].as_slice(),
+        client_body.as_slice(),
+        "AC19/Joint-3 FAIL: Subscription-auth body must be byte-identical at upstream. \
+         \n  client ({} bytes): {:?}\
+         \n  upstream ({} bytes): {:?}\
+         \nIf upstream is smaller: Subscription was incorrectly mapped to Default (not LosslessOnly). \
+         If upstream is larger: whole_request_check rejected a valid compressed body (impossible). \
+         Check the auth_mode → Policy mapping in BlockRouterStage::apply().",
+        client_body.len(),
+        &client_body[..client_body.len().min(80)],
+        captured[0].len(),
+        &captured[0][..captured[0].len().min(80)],
+    );
+
+    proxy.stop();
+}
+
+/// AC19 / P0.1 / PF-007 Joint Test 4:
+///
+/// CODE FENCE Anthropic fixture → upstream-received bytes are BYTE-IDENTICAL to
+/// client-sent bytes (P0.1 / ADR-007 lossless-only egress for code blocks).
+///
+/// ## Discriminating property (PF-007 / P0.1)
+///
+/// This test FAILS if the Code engine arm were restored in `engine_for_class`.
+/// With a code engine active (pre-P0.1), the Rust code fence would route to the
+/// rskim-core AST transform, producing fewer bytes. With P0.1 passthrough, the
+/// upstream receives the exact client bytes.
+///
+/// The fixture uses a `\`\`\`rust` code fence large enough (>64 bytes, >MIN_SIZE_FLOOR)
+/// to have been eligible for the old Code engine. If the code engine arm were
+/// accidentally re-introduced, compression would occur and this test would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_joint_code_fence_body_byte_identical_upstream() {
+    let upstream = FakeUpstream::start().await;
+    let proxy = ProxyHandle::start_with_router(&upstream.upstream_url()).await;
+
+    let client_body = code_fence_anthropic_body();
+
+    // POST through the proxy with ApiKey auth → Policy::Default.
+    // Despite Default policy, code blocks must pass through byte-identical (P0.1).
+    upstream.drain_captured();
+    let _response = post_with_api_key(proxy.proxy_addr(), &client_body).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let captured = upstream.drain_captured();
+    assert!(
+        !captured.is_empty(),
+        "P0.1/Joint-4: upstream must record the forwarded body"
+    );
+
+    // DISCRIMINATING assertion: upstream body must be BYTE-IDENTICAL.
+    // If the Code engine arm were active, AST transform would shrink the body → FAIL.
+    assert_eq!(
+        captured[0].as_slice(),
+        client_body.as_slice(),
+        "P0.1/ADR-007/Joint-4 FAIL: code fence body must be byte-identical at upstream. \
+         \n  client ({} bytes)\
+         \n  upstream ({} bytes)\
+         \nIf upstream is smaller: Code engine arm was re-introduced (violates ADR-007). \
+         Check engine_for_class in route.rs — Class::Code must return Passthrough.",
+        client_body.len(),
+        captured[0].len(),
+    );
+
+    proxy.stop();
+}
+
+// ============================================================================
+// Smoke test: verify the test-local BlockRouterStage applies D1 mapping correctly
+// (seam-level, no running proxy needed)
+// ============================================================================
+
+/// Seam-level sanity check: BlockRouterStage applies D1 auth_mode → Policy mapping.
+///
+/// This test drives the stage directly (no running proxy), verifying the adapter
+/// bridge logic before the full e2e tests. If the bridge is broken, this fails
+/// fast and clearly.
+#[test]
+fn test_block_router_stage_d1_auth_mode_to_policy_mapping() {
+    use rskim_contract::log::{MockSink, OutcomeReason};
+
+    // A tiny Anthropic body — has candidates (live-zone user message) but all
+    // below the prefilter floor. Under Default, they're Passthrough (prefilter).
+    // Under LosslessOnly, they're PolicyPassthrough.
+    let body = br#"{"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    let build_stage = || {
+        let router = BlockRouter::new(Arc::new(NullSink));
+        BlockRouterStage::new(router)
+    };
+
+    let call = |auth_mode: AuthMode| -> Vec<rskim_contract::log::DecisionRecord> {
+        let stage = build_stage();
+        let headers: Vec<(String, String)> = vec![];
+        let hv = HeaderView::new(&headers);
+        let ctx = TransformContext::new(ProxyProvider::Anthropic, auth_mode, "test-req", &hv);
+        let sink = MockSink::new();
+        let _outcome = stage.apply(body, &ctx, &sink);
+        sink.drain()
+    };
+
+    // Subscription → LosslessOnly: any records must be PolicyPassthrough (if candidates exist).
+    let records_sub = call(AuthMode::Subscription);
+    for r in &records_sub {
+        assert_eq!(
+            r.reason,
+            OutcomeReason::PolicyPassthrough,
+            "Subscription must produce PolicyPassthrough records, got {:?}",
+            r.reason
+        );
+    }
+
+    // ApiKey → Default: NO records must be PolicyPassthrough.
+    let records_api = call(AuthMode::ApiKey);
+    for r in &records_api {
+        assert_ne!(
+            r.reason,
+            OutcomeReason::PolicyPassthrough,
+            "ApiKey must NOT produce PolicyPassthrough records, got {:?}",
+            r.reason
+        );
+    }
+
+    // Ambiguous → Default: NO records must be PolicyPassthrough.
+    let records_amb = call(AuthMode::Ambiguous);
+    for r in &records_amb {
+        assert_ne!(
+            r.reason,
+            OutcomeReason::PolicyPassthrough,
+            "Ambiguous must NOT produce PolicyPassthrough records, got {:?}",
+            r.reason
+        );
+    }
+}

@@ -955,13 +955,14 @@ fn test_line_numbers_pseudo_mode_gaps() {
 #[test]
 fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
     // Four-line file: def lines are on source lines 1 and 3.
-    // Pseudo mode strips type annotations so the output `def` lines differ from
-    // source. Before the fix, source_line=0 suppressed their prefix.
+    // Pseudo mode strips param type annotations but preserves return types (A4 contract),
+    // so `def foo(a: int) -> str:` → `def foo(a) -> str:` (param stripped, return kept).
+    // Before the original fix, source_line=0 suppressed their prefix.
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.py");
-    // Line 1: def foo(a: int) -> str:   (annotations stripped → `def foo(a):`)
+    // Line 1: def foo(a: int) -> str:   (param stripped → `def foo(a) -> str:`)
     // Line 2:     return str(a)
-    // Line 3: def bar(b: str) -> int:   (annotations stripped → `def bar(b):`)
+    // Line 3: def bar(b: str) -> int:   (param stripped → `def bar(b) -> int:`)
     // Line 4:     return len(b)
     std::fs::write(
         &file,
@@ -988,7 +989,8 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
 
     let lines: Vec<&str> = stdout.lines().collect();
 
-    // Find the def lines in the output (pseudo output strips type annotations).
+    // Find the def lines in the output (pseudo output strips param type annotations,
+    // preserves return types — so the line contains `def foo(a)` as a substring).
     let foo_line = lines
         .iter()
         .find(|&&l| l.contains("def foo(a)"))
@@ -1005,15 +1007,15 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
 
     assert_eq!(
         foo_annotated,
-        Some((1, "def foo(a):".to_owned())),
-        "`def foo(a):` must carry source line 1 prefix. \
+        Some((1, "def foo(a) -> str:".to_owned())),
+        "`def foo(a) -> str:` must carry source line 1 prefix. \
          Before fix it had no prefix (source_line=0). Got: {:?}",
         foo_line
     );
     assert_eq!(
         bar_annotated,
-        Some((3, "def bar(b):".to_owned())),
-        "`def bar(b):` must carry source line 3 prefix. \
+        Some((3, "def bar(b) -> int:".to_owned())),
+        "`def bar(b) -> int:` must carry source line 3 prefix. \
          Before fix it had no prefix (source_line=0). Got: {:?}",
         bar_line
     );
@@ -1088,6 +1090,59 @@ fn test_line_numbers_minimal_mode_gaps() {
             "Gap between x and y should reflect stripped comment at line 3: x={x_num}, y={y_num}"
         );
     }
+}
+
+// ============================================================================
+// Fix 5: pseudo mode — leading blank lines must not corrupt source line numbers
+// ============================================================================
+
+#[test]
+fn test_line_numbers_pseudo_leading_blank_lines() {
+    // Regression test for normalize_line_map_blanks leading-blank desync (#476).
+    //
+    // When source has K leading blank lines before any code, trim_and_normalize
+    // drops them (pushing "" to an empty accumulator is a no-op).  Before the
+    // fix, normalize_line_map_blanks did NOT skip those blank map entries, so
+    // the first output line was assigned source line K+1 instead of the correct
+    // source line of the first non-blank content.
+    //
+    // K=1: "def foo():" is on source line 2, NOT line 1.
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("test.py");
+    std::fs::write(&file, "\ndef foo():\n    pass\n").unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--line-numbers")
+        .arg("--mode=pseudo")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let annotated: Vec<(usize, String)> = stdout
+        .lines()
+        .filter_map(|l| {
+            let (num_str, content) = l.split_once('\t')?;
+            let num = num_str.parse::<usize>().ok()?;
+            Some((num, content.to_owned()))
+        })
+        .collect();
+
+    // "def foo():" must be on source line 2 (the leading blank is line 1).
+    let foo_line = annotated.iter().find(|(_, c)| c.contains("def foo"));
+    assert!(
+        foo_line.is_some(),
+        "def foo should appear in pseudo output, got:\n{stdout}"
+    );
+    assert_eq!(
+        foo_line.unwrap().0,
+        2,
+        "def foo() must carry source line 2 (leading blank is line 1). \
+         Before fix it carried line 1. Got annotated lines: {:?}",
+        annotated
+    );
 }
 
 // ============================================================================

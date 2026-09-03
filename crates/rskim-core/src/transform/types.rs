@@ -99,13 +99,15 @@ pub(crate) fn transform_types_with_spans_and_line_map(
         0,
     )?;
 
-    // Check type definition count limit
+    // Type-def count over the cap: a legitimate but very large file, not an
+    // attack. Signal a complexity limit so the dispatcher degrades to a lossless
+    // raw passthrough instead of failing the command. (#317)
     if type_defs.len() > MAX_TYPE_DEFS {
-        return Err(SkimError::ParseError(format!(
-            "Too many type definitions: {} (max: {}). Possible malicious input.",
-            type_defs.len(),
-            MAX_TYPE_DEFS
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "type definitions",
+            count: type_defs.len(),
+            max: MAX_TYPE_DEFS,
+        });
     }
 
     // Build text, spans, and source line map
@@ -396,6 +398,16 @@ fn get_type_node_types(language: Language) -> Option<TypeNodeTypes> {
             interface: "protocol_declaration",
             enum_def: "class_declaration",
             class_decl: "class_declaration",
+            struct_def: "",
+        }),
+        // ARCHITECTURE: Bash has no type system. Types mode returns empty output
+        // (all fields empty → no nodes match → empty result). This is correct:
+        // asking for "types only" from a shell script yields nothing.
+        Language::Bash => Some(TypeNodeTypes {
+            type_alias: "",
+            interface: "",
+            enum_def: "",
+            class_decl: "",
             struct_def: "",
         }),
         Language::Json | Language::Yaml | Language::Toml => None,

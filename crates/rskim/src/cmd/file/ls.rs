@@ -1,12 +1,23 @@
-//! ls and tree parser with three-tier degradation (#116).
+//! `ls` pass-through and `tree` compression handler (#116, #317).
 //!
 //! Handles both `skim ls` and `skim tree`, dispatched from `mod.rs`
 //! via the `tool_name` parameter.
 //!
-//! **ls tiers:**
-//! - **Tier 1 (Full)**: Detect long-form `ls -la` output (permissions regex), count dirs/files
-//! - **Tier 2 (Degraded)**: Plain `ls` output — simple line counting
-//! - **Tier 3 (Passthrough)**: Raw output
+//! ## ls — native passthrough (ADR-009)
+//!
+//! `ls` and `ls -la` output is byte-identical to native for typical directory
+//! sizes (n=1..80 entries) — the net-savings guard rejects the parsed view, so
+//! the structured parser produced zero benefit in the common case.  At larger
+//! counts (≥202 entries) the prior structured parser silently dropped entries
+//! AND discarded the native `total N` block-count header, causing `| tail -1`
+//! and `| wc -l` to diverge from native output — a violation of the
+//! lossless-degrade contract.  We therefore emit native output byte-faithfully
+//! (ADR-009), exactly as grep and rg do.
+//!
+//! ## tree — structured compression
+//!
+//! `tree` genuinely compresses because its JSON / box-drawing output is large
+//! and reducible to a summary (dirs + files counts, depth-capped entry list).
 //!
 //! **tree tiers:**
 //! - **Tier 1 (Full)**: Parse `tree -J` JSON output
@@ -32,35 +43,28 @@ use crate::cmd::{ToolRunConfig, run_tool};
 /// preventing unbounded allocation on pathological or adversarial responses.
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
-const CONFIG_LS: ToolRunConfig<'static> = ToolRunConfig {
-    program: "ls",
-    env_overrides: &[],
-    install_hint: "ls is typically pre-installed on Unix systems",
-    family: "file",
-    skip_ansi_strip: false,
-    command_type: CommandType::FileOps,
-    expected_exit_codes: &[],
-    forward_stderr: true,
-    skip_net_savings_guard: false,
-};
-
 const CONFIG_TREE: ToolRunConfig<'static> = ToolRunConfig {
     program: "tree",
     env_overrides: &[],
     install_hint: "Install tree via your package manager (e.g., brew install tree)",
     family: "file",
+    // skip_ansi_strip: false — tree GENUINELY PARSES its output: RE_TREE_ENTRY
+    // matches box-drawing characters at the start of each line, and an ANSI
+    // prefix (`\x1b[...m`) ahead of the box-drawing character would prevent the
+    // regex from matching, silently dropping the line.  Keeping false is the
+    // correct trade-off here (unlike the ls passthrough arm in `run()`, where no parser runs).
+    // This asymmetry is DELIBERATE — do not change it to true without also
+    // confirming that try_parse_tree_text handles ANSI-prefixed box-drawing lines.
+    // The unit test below asserts CONFIG_TREE.skip_ansi_strip == false to make
+    // this asymmetry visible and prevent accidental homogenisation.
     skip_ansi_strip: false,
     command_type: CommandType::FileOps,
     expected_exit_codes: &[],
     forward_stderr: true,
     skip_net_savings_guard: false,
+    synthesize_success_line: None,
+    injected_format_flag: None,
 };
-
-/// Matches a long-form ls entry line: permissions + link count + owner + ...
-/// e.g. `drwxr-xr-x  2 user group  4096 Jan 01 ...`
-/// Includes setuid/setgid/sticky permission characters (s, S, t, T).
-static RE_LS_LONG: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[dl\-][rwxsStT\-]{9}").unwrap());
 
 /// Matches tree summary line: `N directories, M files`
 static RE_TREE_SUMMARY: LazyLock<Regex> =
@@ -81,8 +85,37 @@ pub(crate) fn run(
 ) -> anyhow::Result<std::process::ExitCode> {
     match tool_name {
         "tree" => run_tool(CONFIG_TREE, args, ctx, prepare_tree_args, parse_tree),
-        _ => run_tool(CONFIG_LS, args, ctx, |_| {}, parse_ls),
+        _ => super::run_passthrough_tool(
+            super::PassthroughSpec {
+                program: "ls",
+                install_hint: "ls is typically pre-installed on Unix systems",
+                // ls exits 0 on success and non-zero on errors (no benign non-zero codes).
+                expected_exit_codes: &[],
+            },
+            args,
+            ctx,
+            parse_ls_impl,
+        ),
     }
+}
+
+// ============================================================================
+// ls: parse (native passthrough)
+// ============================================================================
+
+/// Parse function: always native passthrough.
+///
+/// `ls` output is byte-faithful at native — the structured parser produced no
+/// net savings for typical directory sizes and silently dropped entries at
+/// large counts (≥202 entries), discarding the native `total N` block-count
+/// header and causing `| tail -1` / `| wc -l` to diverge from native output.
+/// We therefore emit native output byte-faithfully (ADR-009), exactly as grep
+/// and rg do.
+///
+/// Delegates to [`super::passthrough_parse`] so the byte-faithful contract
+/// (ADR-009) has a single implementation across all pure-passthrough handlers.
+fn parse_ls_impl(output: &CommandOutput) -> ParseResult<FileResult> {
+    super::passthrough_parse(output)
 }
 
 // ============================================================================
@@ -94,144 +127,6 @@ fn prepare_tree_args(cmd_args: &mut Vec<String>) {
     if !user_has_flag(cmd_args, &["--charset"]) {
         cmd_args.push("--charset=ascii".to_string());
     }
-}
-
-// ============================================================================
-// ls: parse
-// ============================================================================
-
-fn parse_ls(output: &CommandOutput) -> ParseResult<FileResult> {
-    if output.stdout.trim().is_empty() {
-        return ParseResult::Passthrough(output.stdout.clone());
-    }
-
-    if let Some(result) = try_parse_ls_long(&output.stdout) {
-        return ParseResult::Full(result);
-    }
-
-    if let Some(result) = try_parse_ls_plain(&output.stdout) {
-        return ParseResult::Degraded(
-            result,
-            vec!["ls: structured parse failed, using plain text".to_string()],
-        );
-    }
-
-    ParseResult::Passthrough(output.stdout.clone())
-}
-
-/// Tier 1: long-form `ls -la` output — detect permissions, count dirs vs files.
-///
-/// Skips `.` and `..` dotdir entries so they are excluded from counts and from
-/// the display list.  `-F`/`-p` append a trailing `/` to directory names; names
-/// are trimmed before the dot-dir comparison.
-///
-/// Dir/file counts are folded into the FOOTER rather than a prepended summary
-/// entry, eliminating the duplicate `ls N` + `LS: N entries` double-header that
-/// appeared on large directories (A3 contract: FileResult public shape unchanged).
-///
-/// Empty dirs (only `total`/`.`/`..` lines): returns a Full result with 0 entries
-/// rather than None, preventing Tier-2 from mis-tokenising the `total`/`.`/`..`
-/// lines as plain filenames.
-fn try_parse_ls_long(stdout: &str) -> Option<FileResult> {
-    let mut dirs = 0usize;
-    let mut files = 0usize;
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
-    let mut line_count = 0usize;
-    // Set when any permission-regex line is seen (including . and ..).
-    // Distinguishes "not ls -la output" (return None) from "empty dir whose
-    // only entries were . and .." (return Full with 0 real entries).
-    let mut saw_long_line = false;
-
-    for line in stdout.lines().take(MAX_INPUT_LINES) {
-        if !RE_LS_LONG.is_match(line) {
-            continue;
-        }
-        saw_long_line = true;
-
-        // Skip `.` and `..` dotdir entries.  For symlink rows (`name -> target`),
-        // split on " -> " first so we compare the NAME, not the target — a symlink
-        // named `cur -> .` must not be dropped because its target happens to be `.`.
-        // Trailing `/` (from `-F`/`-p` flags) is trimmed before the comparison.
-        let name_part = line.split(" -> ").next().unwrap_or(line);
-        if matches!(
-            name_part
-                .split_whitespace()
-                .last()
-                .map(|s| s.trim_end_matches('/')),
-            Some(".") | Some("..")
-        ) {
-            continue;
-        }
-
-        line_count += 1;
-        if line.starts_with('d') {
-            dirs += 1;
-        } else {
-            files += 1;
-        }
-        if entries.len() < MAX_DISPLAY_ENTRIES {
-            entries.push(line.to_string());
-        }
-    }
-
-    // Empty dir (only . and .. entries): return Full with 0 real entries rather
-    // than None so Tier-2 doesn't mis-tokenise `total`/`.`/`..` lines.
-    if !saw_long_line {
-        return None;
-    }
-
-    let shown_count = entries.len();
-
-    // Build footer: fold the dir/file breakdown into the elision marker (if any),
-    // or emit just "D dirs, F files" when everything fits.
-    let breakdown = format!("{dirs} dirs, {files} files");
-    let footer = match crate::output::elision_marker(shown_count, line_count, "entries") {
-        Some(elision) => Some(format!("{elision} — {breakdown}")),
-        None => Some(breakdown),
-    };
-
-    Some(FileResult::new(
-        "ls".to_string(),
-        line_count,
-        shown_count,
-        entries,
-        footer,
-    ))
-}
-
-/// Tier 2: plain `ls` output — one filename per line (or space-separated).
-fn try_parse_ls_plain(stdout: &str) -> Option<FileResult> {
-    let mut entries: Vec<String> = Vec::with_capacity(MAX_DISPLAY_ENTRIES);
-    let mut total_count = 0usize;
-
-    for line in stdout.lines().take(MAX_INPUT_LINES) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Plain ls can output multiple names per line (space-separated)
-        for name in trimmed.split_whitespace() {
-            total_count += 1;
-            if entries.len() < MAX_DISPLAY_ENTRIES {
-                entries.push(name.to_string());
-            }
-        }
-    }
-
-    if total_count == 0 {
-        return None;
-    }
-
-    let shown_count = entries.len();
-    let footer = crate::output::elision_marker(shown_count, total_count, "entries");
-
-    Some(FileResult::new(
-        "ls".to_string(),
-        total_count,
-        shown_count,
-        entries,
-        footer,
-    ))
 }
 
 // ============================================================================
@@ -396,203 +291,73 @@ mod tests {
     use super::*;
     use crate::cmd::test_utils::{load_fixture, make_output};
 
+    // ========================================================================
+    // Config asymmetry: ls passthrough arm vs CONFIG_TREE
+    // ========================================================================
+
+    /// CONFIG_TREE.skip_ansi_strip must stay false.
+    ///
+    /// tree genuinely parses its output via RE_TREE_ENTRY, which matches
+    /// box-drawing characters at line-start.  An ANSI prefix ahead of the
+    /// box-drawing character would prevent the regex from matching and silently
+    /// drop the line.  The strip (skip_ansi_strip: false) neutralises ANSI
+    /// before the regex runs, preserving parse correctness.
+    ///
+    /// The ls passthrough arm by contrast returns RawPassthrough (no parser), so its
+    /// bytes reach the reader after the strip step — the opposite situation.
+    ///
+    /// This test pins the asymmetry explicitly so it does not read as an
+    /// oversight and is not accidentally homogenised with the ls passthrough arm.
+    /// The assertion is intentionally on a constant: the test suite will fail
+    /// if someone changes CONFIG_TREE.skip_ansi_strip to true without
+    /// verifying that try_parse_tree_text handles ANSI-prefixed box-drawing lines.
     #[test]
-    fn test_tier1_ls_la() {
-        let input = load_fixture("file", "ls_la.txt");
-        let result = try_parse_ls_long(&input);
-        assert!(result.is_some(), "Expected Tier 1 ls -la parse to succeed");
-        let result = result.unwrap();
-        // The fixture has 10 permission-matching lines (`.`, `..` + 8 entries).
-        // After dotdir exclusion, total_count == 8 (2 dirs + 6 files).
-        assert_eq!(result.total_count, 8, "dotdirs excluded from count");
-        let rendered = format!("{result}");
-        // Footer must contain dir/file breakdown
+    #[allow(clippy::assertions_on_constants)]
+    fn test_config_tree_skip_ansi_strip_is_false() {
         assert!(
-            rendered.contains("dirs") && rendered.contains("files"),
-            "footer must include dir/file breakdown, got: {rendered}"
-        );
-        // The rendered output must NOT start with "LS: " (no double header)
-        assert!(
-            !rendered.contains("LS: "),
-            "no double header (LS: summary entry removed), got: {rendered}"
-        );
-        // The first line must be "ls N" (the FileResult header)
-        let first_line = rendered.lines().next().unwrap_or("");
-        assert!(
-            first_line.starts_with("ls "),
-            "first line must be 'ls N' header, got: {first_line}"
+            !CONFIG_TREE.skip_ansi_strip,
+            "CONFIG_TREE.skip_ansi_strip must stay false: tree genuinely parses \
+             its output via RE_TREE_ENTRY and requires ANSI stripping before the \
+             regex runs; see the CONFIG_TREE comment for the full rationale. \
+             If tree is ever made passthrough, flip this to true at that time."
         );
     }
 
-    #[test]
-    fn test_tier1_ls_la_excludes_dotdirs() {
-        // Regression test: ./ and ../ (from -F/-p) must be excluded from counts.
-        let input = "total 8\n\
-drwxr-xr-x  2 user group  64 Jan 01 .//\n\
-drwxr-xr-x  3 user group  96 Jan 01 ../\n\
--rw-r--r--  1 user group 100 Jan 01 file1.txt\n\
--rw-r--r--  1 user group 200 Jan 01 file2.txt\n\
-drwxr-xr-x  2 user group  64 Jan 01 subdir/\n";
-        // Note: the fixture uses names ending in / (the -F/-p suffix)
-        let fixed_input = "total 8\n\
-drwxr-xr-x  2 user group  64 Jan 01 .\n\
-drwxr-xr-x  3 user group  96 Jan 01 ..\n\
--rw-r--r--  1 user group 100 Jan 01 file1.txt\n\
--rw-r--r--  1 user group 200 Jan 01 file2.txt\n\
-drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
-        let result = try_parse_ls_long(fixed_input).expect("must parse");
-        // 3 real entries (file1.txt, file2.txt, subdir); . and .. excluded
-        assert_eq!(
-            result.total_count, 3,
-            "dotdirs excluded: got {}",
-            result.total_count
-        );
-        let rendered = format!("{result}");
-        assert!(
-            rendered.contains("1 dirs"),
-            "must count 1 dir (subdir), got: {rendered}"
-        );
-        assert!(
-            rendered.contains("2 files"),
-            "must count 2 files, got: {rendered}"
-        );
-        // Also verify the -F/-p slash-suffix form (including the .// edge case) gives
-        // the same counts — trim_end_matches('/') must collapse .// → . → skipped.
-        let result_f = try_parse_ls_long(input).expect("must parse -F suffix form");
-        assert_eq!(
-            result_f.total_count, 3,
-            "dotdirs excluded with -F suffix (.//): got {}",
-            result_f.total_count
-        );
-        let rendered_f = format!("{result_f}");
-        assert!(
-            rendered_f.contains("1 dirs"),
-            "must count 1 dir (subdir/) with -F suffix, got: {rendered_f}"
-        );
-        assert!(
-            rendered_f.contains("2 files"),
-            "must count 2 files with -F suffix, got: {rendered_f}"
-        );
-    }
+    // ========================================================================
+    // parse_ls_impl: always passthrough
+    // ========================================================================
 
     #[test]
-    fn test_tier1_ls_la_excludes_dotdirs_with_f_suffix() {
-        // -F/-p appends '/' to directories; trim before comparing names.
-        let input = "total 8\n\
-drwxr-xr-x  2 user group  64 Jan 01 ./\n\
-drwxr-xr-x  3 user group  96 Jan 01 ../\n\
--rw-r--r--  1 user group 100 Jan 01 file.txt\n";
-        let result = try_parse_ls_long(input).expect("must parse with -F suffix");
-        // Only file.txt counted; ./ and ../ excluded
-        assert_eq!(result.total_count, 1, "dotdirs with -F suffix excluded");
-    }
-
-    /// Regression: a symlink whose target is `.` or `..` must NOT be dropped from
-    /// counts.  The old code used `split_whitespace().last()` which returned the
-    /// TARGET for symlink rows (`name -> target`), so `cur -> .` was silently
-    /// treated as a dotdir entry and excluded.  The fix splits on ` -> ` first.
-    #[test]
-    fn test_tier1_ls_la_symlink_not_misrouted_as_dotdir() {
-        let input = "total 8\n\
-drwxr-xr-x  2 user group  64 Jan 01 .\n\
-drwxr-xr-x  3 user group  96 Jan 01 ..\n\
-lrwxrwxrwx  1 user group   1 Jan 01 cur -> .\n\
-lrwxrwxrwx  1 user group   2 Jan 01 parent -> ..\n\
--rw-r--r--  1 user group 100 Jan 01 file.txt\n\
-drwxr-xr-x  2 user group  64 Jan 01 subdir\n";
-        let result = try_parse_ls_long(input).expect("must parse");
-        // 4 real entries: cur, parent, file.txt, subdir
-        // `.` and `..` are genuine dotdirs and must be skipped;
-        // `cur -> .` and `parent -> ..` are symlinks whose NAMES are not `.`/`..`
-        // and must be counted.
-        assert_eq!(
-            result.total_count, 4,
-            "symlinks with dotdir targets must be counted, not dropped; got {}",
-            result.total_count
-        );
-        let rendered = format!("{result}");
-        // cur and parent start with 'l' (symlink), counted as files; subdir is a dir
+    fn test_parse_ls_impl_is_passthrough() {
+        // parse_ls_impl must always return RawPassthrough so that execution.rs
+        // serves output.stdout byte-faithfully (native ls format).
+        // ls output is byte-identical to native at typical sizes; at large counts
+        // the prior structured parser silently dropped entries and discarded the
+        // `total N` block-count header (ADR-009).
+        let input = "file1.txt\nfile2.txt\nsubdir\n";
+        let output = make_output(input);
+        let result = parse_ls_impl(&output);
         assert!(
-            rendered.contains("1 dirs"),
-            "must count 1 dir (subdir), got: {rendered}"
-        );
-        assert!(
-            rendered.contains("3 files"),
-            "must count 3 files (cur, parent, file.txt), got: {rendered}"
-        );
-    }
-
-    #[test]
-    fn test_tier1_ls_la_empty_dir() {
-        // An empty directory shows only total + . + .. lines.
-        // Must return a Full result (not None) to prevent Tier-2 mis-tokenising.
-        let input = "total 0\n\
-drwxr-xr-x  2 user group  64 Jan 01 .\n\
-drwxr-xr-x  3 user group  96 Jan 01 ..\n";
-        let result = try_parse_ls_long(input).expect("empty dir must return Full result");
-        assert_eq!(result.total_count, 0, "empty dir has 0 real entries");
-        let rendered = format!("{result}");
-        assert!(
-            rendered.contains("0 dirs") && rendered.contains("0 files"),
-            "empty dir footer must say '0 dirs, 0 files', got: {rendered}"
-        );
-    }
-
-    #[test]
-    fn test_tier1_ls_la_no_double_header() {
-        // The FileResult render emits "ls N" as the first line; we must NOT
-        // prepend an additional "LS: N entries …" entry (double header bug).
-        let input = load_fixture("file", "ls_la.txt");
-        let result = try_parse_ls_long(&input).expect("must parse");
-        let rendered = format!("{result}");
-        // Count occurrences of lines starting with "ls"
-        let ls_header_count = rendered.lines().filter(|l| l.starts_with("ls ")).count();
-        assert_eq!(
-            ls_header_count, 1,
-            "exactly one 'ls N' header, got {ls_header_count} in: {rendered}"
-        );
-        assert!(
-            !rendered.contains("LS: "),
-            "old double header 'LS: ' must not appear, got: {rendered}"
-        );
-    }
-
-    #[test]
-    fn test_tier2_ls_basic() {
-        let input = load_fixture("file", "ls_basic.txt");
-        let result = try_parse_ls_plain(&input);
-        assert!(
-            result.is_some(),
-            "Expected Tier 2 ls plain parse to succeed"
-        );
-        let result = result.unwrap();
-        assert!(result.total_count > 0);
-    }
-
-    #[test]
-    fn test_parse_ls_impl_long_form_is_full() {
-        let input = load_fixture("file", "ls_la.txt");
-        let output = make_output(&input);
-        let result = parse_ls(&output);
-        assert!(
-            result.is_full(),
-            "ls -la output should be Full tier, got {}",
+            matches!(result, ParseResult::RawPassthrough),
+            "parse_ls_impl must return RawPassthrough (byte-faithful stdout pass-through): got {}",
             result.tier_name()
         );
     }
 
     #[test]
-    fn test_parse_ls_impl_plain_is_degraded() {
-        let input = load_fixture("file", "ls_basic.txt");
-        let output = make_output(&input);
-        let result = parse_ls(&output);
-        // Plain ls doesn't match long form, falls to Tier 2
+    fn test_parse_ls_impl_empty_is_passthrough() {
+        let output = make_output("");
+        let result = parse_ls_impl(&output);
         assert!(
-            result.is_degraded() || result.is_full(),
-            "ls plain should be Degraded or Full, got {}",
+            matches!(result, ParseResult::RawPassthrough),
+            "Empty ls output must return RawPassthrough, got {}",
             result.tier_name()
         );
     }
+
+    // ========================================================================
+    // tree tests
+    // ========================================================================
 
     #[test]
     fn test_tier2_tree_basic() {
@@ -641,11 +406,6 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n";
     #[test]
     fn test_empty_output_passthrough() {
         let output = make_output("");
-        let ls_result = parse_ls(&output);
-        assert!(
-            ls_result.is_passthrough(),
-            "Empty ls output should be Passthrough"
-        );
         let tree_result = parse_tree(&output);
         assert!(
             tree_result.is_passthrough(),

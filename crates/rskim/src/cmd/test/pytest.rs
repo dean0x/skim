@@ -80,7 +80,9 @@ pub(crate) fn run(
     let cleaned = strip_ansi(&combined);
     let result = parse(&cleaned);
 
-    emit_result(&result, &output, &cleaned)?;
+    if emit_result(&result, &output, &cleaned)? == crate::cmd::execution::StdoutStatus::PipeClosed {
+        return Ok(crate::cmd::execution::pipe_closed_exit());
+    }
 
     if show_stats {
         let (orig, comp) = crate::process::count_token_pair(&cleaned, result.content());
@@ -111,6 +113,9 @@ pub(crate) fn run(
                     }
                 }
                 ParseResult::Passthrough(_) => ExitCode::FAILURE,
+                ParseResult::RawPassthrough => {
+                    unreachable!("pytest local parser never returns RawPassthrough")
+                }
             }
         }
     };
@@ -480,11 +485,15 @@ fn flush_failure(
 /// to append the last [`shared::MAX_FAILURE_CONTEXT_LINES`] lines of
 /// `cleaned_output` so the agent can read error details without re-running
 /// with `SKIM_PASSTHROUGH=1`.
+///
+/// Returns [`StdoutStatus::PipeClosed`] when the downstream reader went away, so
+/// the caller can stop and return `pipe_closed_exit()` instead of continuing to
+/// produce output.
 fn emit_result(
     result: &ParseResult<TestResult>,
     output: &CommandOutput,
     cleaned_output: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::cmd::execution::StdoutStatus> {
     use std::io::Write;
 
     let stdout = io::stdout();
@@ -498,12 +507,21 @@ fn emit_result(
             result.emit_markers(&mut err)?;
 
             if tr.summary.fail > 0 {
-                shared::emit_failure_context(cleaned_output, 1);
+                // `emit_failure_context` takes its own stdout lock; `Stdout` is
+                // backed by a reentrant lock, so nesting is safe.
+                if shared::emit_failure_context(cleaned_output, 1)?
+                    == crate::cmd::execution::StdoutStatus::PipeClosed
+                {
+                    return Ok(crate::cmd::execution::StdoutStatus::PipeClosed);
+                }
             }
         }
         ParseResult::Passthrough(raw) => {
             write!(out, "{raw}")?;
             result.emit_markers(&mut err)?;
+        }
+        ParseResult::RawPassthrough => {
+            unreachable!("pytest local parser never returns RawPassthrough")
         }
     }
 
@@ -512,7 +530,7 @@ fn emit_result(
         write!(err, "{}", output.stderr)?;
     }
 
-    Ok(())
+    Ok(crate::cmd::execution::StdoutStatus::Written)
 }
 
 // ============================================================================

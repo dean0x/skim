@@ -12,56 +12,21 @@
 //! stdout/stderr/exit without depending on real infra binaries.
 
 use std::fs;
-use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 mod common;
+
+// `make_stub` / `stub_path` live in `common` so `cli_e2e_pipe_fidelity.rs` can
+// reuse the exact same stub shape rather than keeping a second copy.
+#[cfg(unix)]
+use common::{make_stub, stub_path};
 
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
     cmd
-}
-
-/// Create a stub tool script that prints fixed stdout/stderr and exits `code`.
-///
-/// The payloads are written to sidecar files and `cat`-ed by the script, so no
-/// shell escaping of the content is needed.
-///
-/// Unix-only: the script uses `#!/bin/sh` and the executable bit requires
-/// `std::os::unix::fs::PermissionsExt`.
-#[cfg(unix)]
-fn make_stub(dir: &Path, name: &str, stdout: &str, stderr: &str, code: i32) {
-    let out_path = dir.join(format!("{name}.out"));
-    let err_path = dir.join(format!("{name}.err"));
-    fs::write(&out_path, stdout).unwrap();
-    fs::write(&err_path, stderr).unwrap();
-    let script = format!(
-        "#!/bin/sh\ncat '{}'\ncat '{}' >&2\nexit {code}\n",
-        out_path.display(),
-        err_path.display()
-    );
-    let script_path = dir.join(name);
-    fs::write(&script_path, script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
-/// PATH with the stub dir prepended so skim's spawned child resolves to it.
-///
-/// Unix-only: uses `:` as the PATH separator.
-#[cfg(unix)]
-fn stub_path(dir: &Path) -> String {
-    format!(
-        "{}:{}",
-        dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
 }
 
 // ============================================================================
@@ -90,6 +55,7 @@ fn test_grep_no_match_exits_1_silently() {
 #[test]
 fn test_grep_missing_file_forwards_error_raw() {
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .args(["grep", "pat", "/nonexistent/skim-317-test"])
         .assert()
         .code(2)
@@ -99,9 +65,11 @@ fn test_grep_missing_file_forwards_error_raw() {
 }
 
 // ============================================================================
-// grep: single-file attribution + every match emitted
+// grep: native path:line:content passthrough — every match emitted, line=match
 // ============================================================================
 
+/// Fix 3: grep emits native path:line:content (or lineno:content for single-file).
+/// Line count must equal match count — no header/footer lines inflating the count.
 #[test]
 fn test_grep_single_file_attributed_and_complete() {
     let dir = tempfile::tempdir().unwrap();
@@ -109,22 +77,204 @@ fn test_grep_single_file_attributed_and_complete() {
     let content: String = (1..=10).map(|i| format!("needle {i}\n")).collect();
     fs::write(&file, content).unwrap();
 
-    // The net-savings guard may passthrough small inputs rather than compressing.
-    // skim-format: includes "10 matches" summary and file-path attribution.
-    // raw form: grep -n outputs "LINE:content" without per-file summary for single-file.
-    // We verify: exit 0, all 10 needle lines present, no "<stdin>", no "showing" truncation.
-    let mut assert = skim_cmd()
+    // Native single-file grep output with -n is: `lineno:content` (no file prefix).
+    // Every match must appear; no header/footer lines.
+    let output = skim_cmd()
         .args(["grep", "-n", "needle", file.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "grep must exit 0; stderr: {stderr}"
+    );
+
+    // Fix 3: native passthrough — no grouped header or footer lines.
+    assert!(
+        !stdout.contains("grep 10"),
+        "must not contain old grouped header; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("1 file"),
+        "must not contain old grouped footer; stdout: {stdout}"
+    );
+
+    // Single-file grep -n emits `lineno:content` with no file prefix.
+    // (The previous `<stdin>` guard was vacuous post-Fix-3 — GrepArgs::fallback_label removed.)
+    assert!(
+        !stdout.contains("t.txt"),
+        "single-file grep -n must not emit file prefix; stdout: {stdout}"
+    );
+
+    // testing-07: line count must equal match count — no header/footer inflating the count.
+    let line_count = stdout.lines().count();
+    assert_eq!(
+        line_count, 10,
+        "line count must equal match count (10 needles); got {line_count}\nstdout: {stdout}"
+    );
+
+    // testing-07: native lineno:content format — every output line starts with a line number.
+    for line in stdout.lines() {
+        assert!(
+            line.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "native grep -n: each line must start with a line number; offending line: {line:?}\nfull stdout: {stdout}"
+        );
+    }
+
+    // Every match line must be present — no cap.
+    for i in 1..=10 {
+        assert!(
+            stdout.contains(&format!("needle {i}")),
+            "match needle {i} missing from stdout; stdout: {stdout}"
+        );
+    }
+}
+
+/// Fix 3: multi-file grep emits native `file:line:content` passthrough so that
+/// downstream pipes (`head -N`, `wc -l`, `sed -n`) get one line per match.
+/// No grouped header or footer — one output line per match.
+#[test]
+fn test_grep_small_multifile_emits_native_path_line_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "alpha MARK one\nplain\n").unwrap();
+    fs::write(&b, "plain\nbeta MARK two\n").unwrap();
+
+    skim_cmd()
+        .args([
+            "grep",
+            "-n",
+            "MARK",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+        ])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("<stdin>").not())
-        .stdout(predicate::str::contains("showing").not())
-        // skim-format adds "10 matches"; raw grep just has match lines — accept both
-        .stdout(predicate::str::contains("10 matches").or(predicate::str::contains("needle 10")));
-    // Every match line must be present in both raw and skim-format output — no per-file cap.
-    for i in 1..=10 {
-        assert = assert.stdout(predicate::str::contains(format!("needle {i}")));
+        // Fix 3: native path:line:content — no grouped header or footer.
+        .stdout(predicate::str::contains("grep 2").not())
+        .stdout(predicate::str::contains("2 files").not())
+        // Both files and both matches must appear.
+        .stdout(predicate::str::contains("a.txt"))
+        .stdout(predicate::str::contains("b.txt"))
+        .stdout(predicate::str::contains("alpha MARK one"))
+        .stdout(predicate::str::contains("beta MARK two"))
+        // Native format: `a.txt:1:alpha MARK one` (file:line:content, no indent).
+        .stdout(predicate::str::contains("a.txt:1:alpha MARK one"));
+}
+
+// ============================================================================
+// rg: native path:line:content passthrough (Fix 3 — rg half, PF-004 sibling)
+// ============================================================================
+
+/// Fix 3 (rg): rg emits native path:line:content passthrough so that downstream
+/// pipes (`head -N`, `wc -l`, `sed -n`) get one line per match.
+/// No grouped header or footer — one output line per match.
+///
+/// Gated on rg availability — skips gracefully when ripgrep is not installed.
+#[test]
+fn test_rg_small_multifile_emits_native_path_line_content() {
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!(
+            "skipping test_rg_small_multifile_emits_native_path_line_content: rg not installed"
+        );
+        return;
     }
+
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    fs::write(&a, "alpha MARK one\nplain\n").unwrap();
+    fs::write(&b, "plain\nbeta MARK two\n").unwrap();
+
+    skim_cmd()
+        .args(["rg", "-n", "MARK", a.to_str().unwrap(), b.to_str().unwrap()])
+        .assert()
+        .code(0)
+        // Fix 3: native path:line:content — no grouped header or footer.
+        .stdout(predicate::str::contains("rg 2").not())
+        .stdout(predicate::str::contains("2 files").not())
+        // Both files and both matches must appear.
+        .stdout(predicate::str::contains("a.txt"))
+        .stdout(predicate::str::contains("b.txt"))
+        .stdout(predicate::str::contains("alpha MARK one"))
+        .stdout(predicate::str::contains("beta MARK two"))
+        // regression-09: native path:line:content format assertion — a grouped or
+        // JSON renderer could satisfy the above; this pins the exact format.
+        .stdout(predicate::str::contains("a.txt:1:alpha MARK one"));
+}
+
+// ============================================================================
+// Over-cap file with --max-lines: exit 0 and bounded output (B4)
+// ============================================================================
+
+/// B4: `skim file --mode=pseudo --max-lines N` on a Rust source that overflows
+/// the AST node cap (MAX_AST_NODES = 100,000) must return exit 0 and at most
+/// ~N lines — never an error exit code.
+///
+/// Library-level tests in rskim-core cover the transform result. This test pins
+/// the CLI exit-disposition: the correct exit code and bounded stdout must survive
+/// any future wiring change between the dispatcher's degrade-to-passthrough path
+/// and the CLI layer.
+#[test]
+fn test_over_cap_rs_file_with_max_lines_exits_0_and_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("generated.rs");
+
+    // Generate a Rust file that exceeds MAX_AST_NODES (100,000).
+    // Strategy mirrors over_cap_python_source in rskim-core/src/types.rs:
+    // ~40+ AST nodes per `let` statement × 4500 statements ≈ 180,000 > cap.
+    let mut content = String::from("fn generated() {\n");
+    for i in 0usize..4500 {
+        content.push_str("    let _ = ");
+        for j in 0..20usize {
+            if j > 0 {
+                content.push_str(" + ");
+            }
+            content.push_str(&(i * 20 + j).to_string());
+        }
+        content.push_str(";\n");
+    }
+    content.push_str("}\n");
+    fs::write(&file, &content).unwrap();
+
+    const MAX_LINES: usize = 40;
+    let max_lines_str = MAX_LINES.to_string();
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--mode=pseudo")
+        .arg("--max-lines")
+        .arg(&max_lines_str)
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "over-cap Rust file with --max-lines must exit 0 (degrade to passthrough); \
+         got: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout_str = String::from_utf8(output.stdout).unwrap();
+    let line_count = stdout_str.lines().count();
+    // Small slack: the windowed passthrough may emit slightly fewer or more lines
+    // than exactly MAX_LINES depending on trailing newline handling. +2 is generous
+    // but bounded — a 4500-line passthrough would fail this immediately.
+    assert!(
+        line_count <= MAX_LINES + 2,
+        "stdout must be bounded to ~{MAX_LINES} lines after degrade, got {line_count} lines\n\
+         first 5 lines:\n{}",
+        stdout_str.lines().take(5).collect::<Vec<_>>().join("\n"),
+    );
 }
 
 // ============================================================================
@@ -144,6 +294,7 @@ fn test_kubectl_unexpected_failure_raw_forwards_everything() {
     );
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("PATH", stub_path(dir.path()))
         .args(["kubectl", "get", "pods"])
         .assert()
@@ -231,6 +382,7 @@ fn test_lint_unexpected_exit_code_goes_raw() {
     );
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .env("PATH", stub_path(dir.path()))
         .args(["eslint", "a.js"])
         .assert()

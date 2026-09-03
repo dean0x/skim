@@ -323,6 +323,239 @@ mod argv0_dispatch {
     }
 
     // ========================================================================
+    // Test: D2b (#370) — stdout-destination fidelity on the wrapper (argv0) surface
+    //
+    // These tests cover the WRAPPER surface.  The D2-A tests in cli_rewrite.rs
+    // cover the rewrite/hook surface.  Both surfaces are needed for full coverage.
+    //
+    // D2b paired-coverage contract (PF-004) — two tests, two tools:
+    //   • `argv0_wrapper_stdout_file_passes_raw_bytes` (tool: ls) — stdout →
+    //     regular file: fstat gate fires, raw bytes reach the file unmodified
+    //     (no skim header).  ls is byte-faithful passthrough (ADR-009); the fstat
+    //     test is valid independent of compression because the gate fires before
+    //     skim processes anything.
+    //   • `argv0_tree_wrapper_stdout_pipe_compresses` (tool: tree) — stdout →
+    //     pipe: fstat gate does NOT fire, skim's tree handler runs (Tier-2 text
+    //     parser strips depth-4+ entries, emits "tree N/M" header).  tree is used
+    //     because it genuinely compresses — unlike ls/grep/wc/find/ps/df/du which
+    //     became byte-faithful passthrough in this wave — so the two branches emit
+    //     DIFFERENT bytes, making the pair discriminating.
+    //
+    //   Together the pair proves fstat discriminates: file path → raw bytes,
+    //   pipe path → skim-compressed output.  A tool that passes through on the
+    //   pipe path too would collapse the pair to equivalent outputs and make
+    //   the pipe test vacuous (this is exactly what happened when ls was used
+    //   here before being converted to passthrough).
+    // ========================================================================
+
+    /// D2b (#370): when the wrapper's stdout (fd 1) is a regular file, the
+    /// wrapper must run the real tool with inherited stdio so its raw bytes
+    /// reach the file unmodified — NOT skim's compressed summary.
+    ///
+    /// We redirect stdout to a real temp file (`.stdout(File::create(tmp))`
+    /// instead of assert_cmd's default pipe), then assert the file holds raw
+    /// tool output with no `tool N` skim header or footer.
+    #[test]
+    fn argv0_wrapper_stdout_file_passes_raw_bytes() {
+        // Stub ls that emits a deterministic multi-line output.
+        let raw_output = "alpha.txt\nbeta.rs\ngamma.py\n";
+        let stub_dir = make_stub_dir("ls", raw_output, 0);
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+        assert!(skim.exists(), "skim binary must exist");
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let out_file = tmp_dir.path().join("out.txt");
+
+        // Invoke with fd 1 → regular file: this is the D2b scenario.
+        let status = std::process::Command::new(&skim)
+            .arg0("ls")
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            // Redirect stdout to a real file — NOT assert_cmd's default pipe.
+            .stdout(std::fs::File::create(&out_file).unwrap())
+            .status()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "wrapper dispatch to file must exit 0"
+        );
+
+        let file_contents = std::fs::read_to_string(&out_file).unwrap();
+
+        // Raw bytes must be in the file — no skim header or footer.
+        assert!(
+            file_contents.contains("alpha.txt"),
+            "raw output must be in file; got: {file_contents:?}"
+        );
+        assert!(
+            !file_contents.contains("ls "),
+            "skim 'ls N' header must NOT appear in file; got: {file_contents:?}"
+        );
+        // Exact round-trip: the file should equal the stub's raw output.
+        assert_eq!(
+            file_contents, raw_output,
+            "file must contain exactly the raw tool bytes"
+        );
+    }
+
+    /// D2b control: when stdout is a PIPE, the wrapper runs skim's handler normally —
+    /// the `stdout_is_regular_file()` fstat gate must NOT fire.
+    ///
+    /// Uses `tree` (Tier-2 text parser, structural compression) with a stub that
+    /// includes depth-4+ entries hidden by skim's MAX_DEPTH=3 cap.  Skim strips the
+    /// deep entries, appends a footer counting the hidden entries, and emits a
+    /// `tree N/M` ratio header — output structurally distinct from the raw bytes and
+    /// clearly shorter.
+    ///
+    /// Paired with `argv0_wrapper_stdout_file_passes_raw_bytes` (file-stdout side,
+    /// uses `ls`): that test proves fstat fires (raw bytes in file); this test proves
+    /// fstat does NOT fire on a pipe (skim processes and compresses).  If fstat
+    /// incorrectly fired on pipes too, stdout would equal raw bytes — no `tree `
+    /// header, deep entries present, same byte length — and at least one assertion
+    /// below fails.
+    ///
+    /// GUARD: this test relies on `tree` remaining a structurally-compressing wrapper
+    /// (Tier-2 text parser strips depth-capped entries, emits a ratio header).
+    /// If `tree` is ever converted to byte-faithful passthrough, both pipe and file
+    /// paths would emit identical raw bytes, making this test vacuous.
+    /// Retarget it to a tool that still compresses — see the D2b section comment above
+    /// for the discriminating-pair requirement.
+    #[test]
+    fn argv0_tree_wrapper_stdout_pipe_compresses() {
+        // Tree text stub: files at depth 0-3 (shown by skim) plus depth-4 entries
+        // (hidden by skim's MAX_DEPTH=3 cap in try_parse_tree_text).
+        //
+        // Depth counting: count_tree_depth counts leading chars matching
+        // ' '|'\t'|'|'|'+'|'\\' then divides by 4.  Each "level" is 4 chars of
+        // `|   ` (pipe + 3 spaces).
+        //   depth 0: 1  leading char  → `|-- name`
+        //   depth 1: 5  leading chars → `|   |-- name`
+        //   depth 2: 9  leading chars → `|   |   |-- name`
+        //   depth 3: 13 leading chars → `|   |   |   |-- name`
+        //   depth 4: 17 leading chars → `|   |   |   |   |-- name`  ← HIDDEN (> MAX_DEPTH)
+        //
+        // 12 depth-4 entries × ~25 bytes each = ~300 bytes removed from output.
+        // Skim adds header (~12 bytes) + footer (~50 bytes) = 62 bytes net overhead.
+        // Net savings ≈ 238 bytes → compressed.len() < raw.len() → net-savings guard
+        // returns Keep, so skim's compressed view reaches stdout (not raw fallback).
+        let mut raw_output = String::from(".\n");
+        // depth 0 — root-level files and dirs
+        raw_output.push_str("|-- README.md\n");
+        raw_output.push_str("|-- Cargo.lock\n");
+        raw_output.push_str("|-- Cargo.toml\n");
+        raw_output.push_str("|-- src\n");
+        // depth 1 — src children
+        raw_output.push_str("|   |-- main.rs\n");
+        raw_output.push_str("|   |-- lib.rs\n");
+        raw_output.push_str("|   |-- cmd\n");
+        // depth 2 — cmd children
+        raw_output.push_str("|   |   |-- mod.rs\n");
+        raw_output.push_str("|   |   |-- file\n");
+        // depth 3 — file/ children (13 leading chars → shown)
+        raw_output.push_str("|   |   |   |-- ls.rs\n");
+        raw_output.push_str("|   |   |   |-- env.rs\n");
+        raw_output.push_str("|   |   |   |-- find.rs\n");
+        raw_output.push_str("|   |   |   |-- du.rs\n");
+        raw_output.push_str("|   |   |   |-- df.rs\n");
+        raw_output.push_str("|   |   |   |-- ps.rs\n");
+        raw_output.push_str("|   |   |   |-- wc.rs\n");
+        raw_output.push_str("|   |   |   |-- mod.rs\n");
+        raw_output.push_str("|   |   |-- git\n");
+        // depth 3 — git/ children
+        raw_output.push_str("|   |   |   |-- mod.rs\n");
+        raw_output.push_str("|   |   |   |-- status.rs\n");
+        raw_output.push_str("|   |   |   |-- diff.rs\n");
+        raw_output.push_str("|   |   |   |-- log.rs\n");
+        raw_output.push_str("|   |   |   |-- blame.rs\n");
+        raw_output.push_str("|   |   |-- deep_nested\n");
+        // depth 3 — deep_nested child dir (shown; its children at depth 4 are hidden)
+        raw_output.push_str("|   |   |   |-- level4_dir\n");
+        // depth 4 — hidden by MAX_DEPTH=3 (17 leading chars → depth 4)
+        raw_output.push_str("|   |   |   |   |-- alpha.rs\n");
+        raw_output.push_str("|   |   |   |   |-- beta.rs\n");
+        raw_output.push_str("|   |   |   |   |-- gamma.rs\n");
+        raw_output.push_str("|   |   |   |   |-- delta.rs\n");
+        raw_output.push_str("|   |   |   |   |-- epsilon.rs\n");
+        raw_output.push_str("|   |   |   |   |-- zeta.rs\n");
+        raw_output.push_str("|   |   |   |   |-- eta.rs\n");
+        raw_output.push_str("|   |   |   |   |-- theta.rs\n");
+        raw_output.push_str("|   |   |   |   |-- iota.rs\n");
+        raw_output.push_str("|   |   |   |   |-- kappa.rs\n");
+        raw_output.push_str("|   |   |   |   |-- lambda.rs\n");
+        raw_output.push_str("|   |   |   |   |-- mu.rs\n");
+        // back to depth 1 — more src children
+        raw_output.push_str("|   |-- tests\n");
+        // depth 2 — tests children
+        raw_output.push_str("|   |   |-- cli_e2e.rs\n");
+        raw_output.push_str("|   |   |-- cli_wrapper.rs\n");
+        raw_output.push_str("|   |   |-- common.rs\n");
+        raw_output.push('\n');
+        raw_output.push_str("7 directories, 34 files\n");
+
+        let stub_dir = make_stub_dir("tree", &raw_output, 0);
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+        assert!(skim.exists(), "skim binary must exist");
+
+        // Default invocation — stdout is a pipe (.output()), NOT a regular file.
+        // The fstat gate must not intercept this path.
+        let output = std::process::Command::new(&skim)
+            .arg0("tree")
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(output.status.code(), Some(0), "must exit 0");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Skim header must appear: tree Tier-2 text parser ran and emitted "tree N/M".
+        // If fstat incorrectly fired, stdout == raw bytes → no skim header,
+        // "level4_dir" and depth-4 entries present, same byte length — at least one
+        // assertion below fails.
+        assert!(
+            stdout.starts_with("tree "),
+            "skim 'tree N/M' header must appear on pipe path \
+             (fstat gate must NOT fire on pipes); got: {stdout:?}"
+        );
+
+        // Depth-4 entries (17 leading pipe/space chars) must be hidden by skim's
+        // MAX_DEPTH=3 cap in try_parse_tree_text.  If raw passthrough occurred, these
+        // would be present.
+        assert!(
+            !stdout.contains("|   |   |   |   |-- alpha.rs"),
+            "depth-4 entries must be stripped by skim's tree parser on pipe path \
+             (MAX_DEPTH=3 cap); got: {stdout:?}"
+        );
+
+        // Footer must mention the hidden entries count (depth_hidden > 0).
+        assert!(
+            stdout.contains("deeper entries hidden"),
+            "skim footer must report hidden depth-4 entries; got: {stdout:?}"
+        );
+
+        // Compression: skim hid 12 depth-4 entries; output shorter than raw.
+        assert!(
+            stdout.len() < raw_output.len(),
+            "pipe stdout must be shorter than raw tree output \
+             (skim compressed and hid depth-4 entries); \
+             raw={} bytes, skim={} bytes\nskim_stdout={stdout:?}",
+            raw_output.len(),
+            stdout.len()
+        );
+    }
+
+    // ========================================================================
     // Test: argv[0]="skim" — normal invocation path is not broken
     // ========================================================================
 

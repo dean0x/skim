@@ -213,7 +213,7 @@ impl NodeKindVocabulary {
         //
         // We sort indices into old_kinds rather than cloning the whole vec, so each
         // String is moved exactly once (into self.id_to_kind) with no extra copies.
-        let old_kinds: Vec<String> = self.id_to_kind.drain(..).collect();
+        let old_kinds: Vec<String> = std::mem::take(&mut self.id_to_kind);
 
         // Sort indices by the corresponding kind string — no extra String allocation.
         let mut sorted_indices: Vec<usize> = (0..old_kinds.len()).collect();

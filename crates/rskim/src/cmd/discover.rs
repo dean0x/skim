@@ -713,7 +713,7 @@ mod tests {
         );
         assert_eq!(
             would_rewrite("cat file.rs"),
-            Some("skim file.rs --mode=pseudo".to_string())
+            Some("SKIM_REWRITTEN_FROM=cat skim file.rs --mode=pseudo".to_string())
         );
         // bare `ls` now matches the catch-all rule (B.1) added in v2.5.1
         assert_eq!(would_rewrite("ls"), Some("skim ls".to_string()));

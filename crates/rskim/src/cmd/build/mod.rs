@@ -203,20 +203,30 @@ pub(super) fn run_parsed_command(
     let effective_tier = if tier_name != "passthrough" {
         match crate::cmd::execution::savings_decision(raw_cow.as_ref(), content) {
             crate::cmd::execution::SavingsDecision::Keep => {
-                if !content.is_empty() {
-                    println!("{content}");
+                if !content.is_empty()
+                    && crate::cmd::execution::write_line_to_stdout(content)?
+                        == crate::cmd::execution::StdoutStatus::PipeClosed
+                {
+                    return Ok(crate::cmd::execution::pipe_closed_exit());
                 }
                 tier_name
             }
             crate::cmd::execution::SavingsDecision::Passthrough => {
                 // Emit raw verbatim (stdout+stderr combined, same as raw_cow).
-                crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?
+                let (tier, status) = crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?;
+                if status == crate::cmd::execution::StdoutStatus::PipeClosed {
+                    return Ok(crate::cmd::execution::pipe_closed_exit());
+                }
+                tier
             }
         }
     } else {
         // Already passthrough — print as-is and skip guard.
-        if !content.is_empty() {
-            println!("{content}");
+        if !content.is_empty()
+            && crate::cmd::execution::write_line_to_stdout(content)?
+                == crate::cmd::execution::StdoutStatus::PipeClosed
+        {
+            return Ok(crate::cmd::execution::pipe_closed_exit());
         }
         tier_name
     };
@@ -239,6 +249,15 @@ pub(super) fn run_parsed_command(
         }
         ParseResult::Passthrough(_) => {
             // Use the original process exit code
+            match output.exit_code {
+                Some(0) => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            }
+        }
+        ParseResult::RawPassthrough => {
+            // RawPassthrough: payload-less passthrough — use original process exit code,
+            // same semantics as Passthrough(_). Output was already emitted by the
+            // net-savings guard above (content() returns "" for this variant).
             match output.exit_code {
                 Some(0) => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,

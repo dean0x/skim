@@ -96,13 +96,16 @@ pub(crate) fn transform_structure_with_spans_and_line_map(
     let mut replacements: HashMap<(usize, usize), &'static str> = HashMap::new();
     collect_body_replacements(tree.root_node(), &node_types, &mut replacements, 0)?;
 
-    // Check node count limit to prevent memory exhaustion
+    // Node count over the cap: typically a legitimate but very large file (e.g.
+    // a machine-generated weight table), not an attack. Signal a complexity
+    // limit so the dispatcher degrades to a lossless raw passthrough instead of
+    // failing the command. (#317)
     if replacements.len() > MAX_AST_NODES {
-        return Err(SkimError::ParseError(format!(
-            "Too many AST nodes: {} (max: {}). Possible malicious input.",
-            replacements.len(),
-            MAX_AST_NODES
-        )));
+        return Err(SkimError::ComplexityLimit {
+            what: "AST nodes",
+            count: replacements.len(),
+            max: MAX_AST_NODES,
+        });
     }
 
     // Build output by replacing bodies, tracking byte offset changes
@@ -406,6 +409,15 @@ fn get_node_types_for_language(language: Language) -> Option<NodeTypes> {
             method: "function_declaration", // Swift methods are also function_declaration
             extra_function_kinds: &["init_declaration", "deinit_declaration"],
         }),
+        // ARCHITECTURE: Bash structure mode strips function bodies, keeping the
+        // function_definition signature plus ALL top-level commands/assignments
+        // verbatim (they have no body to strip). A zero-function deploy.sh therefore
+        // renders its full content, not an empty output.
+        Language::Bash => Some(NodeTypes {
+            function: "function_definition",
+            method: "function_definition",
+            extra_function_kinds: &[],
+        }),
         Language::Json | Language::Yaml | Language::Toml => None,
     }
 }
@@ -525,12 +537,14 @@ pub(crate) fn extract_markdown_headers_with_spans(
             )));
         }
 
+        // Markdown-header count over the cap: a legitimate but very large document.
+        // Signal a complexity limit so the dispatcher degrades to passthrough. (#317)
         if headers.len() > MAX_MARKDOWN_HEADERS {
-            return Err(SkimError::ParseError(format!(
-                "Too many markdown headers: {} (max: {}). Possible malicious input.",
-                headers.len(),
-                MAX_MARKDOWN_HEADERS
-            )));
+            return Err(SkimError::ComplexityLimit {
+                what: "markdown headers",
+                count: headers.len(),
+                max: MAX_MARKDOWN_HEADERS,
+            });
         }
 
         let node_type = node.kind();
