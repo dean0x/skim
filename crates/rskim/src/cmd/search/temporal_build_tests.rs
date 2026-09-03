@@ -476,12 +476,16 @@ fn test_rebuild_temporal_nongit_returns_ok() {
     // F3 / AD-414-17: the sentinel IS written so quiet-path retries are
     // bounded; META_GIT_HEAD is NOT written (parse did not succeed).
     let sentinel_path = cache_dir.join("temporal.db.build_backoff");
-    let sentinel_content = std::fs::read(&sentinel_path)
+    let sentinel_content = std::fs::read_to_string(&sentinel_path)
         .expect("backoff sentinel must be written when parse_history fails (F3/AD-414-17)");
-    assert_eq!(
-        sentinel_content,
-        fake_head.as_bytes(),
-        "sentinel must record the current HEAD so quiet-path Check 1 matches"
+    // New format (AD-414-21): "{head}\n{shallow_char}" — HEAD must be the first line.
+    assert!(
+        sentinel_content.starts_with(fake_head),
+        "sentinel must start with the HEAD so quiet-path Check 1 matches; got: {sentinel_content:?}"
+    );
+    assert!(
+        sentinel_content.contains('\n'),
+        "sentinel must use the two-field format (AD-414-21); got: {sentinel_content:?}"
     );
 
     // temporal.db must NOT be created — we did not sync, so META_GIT_HEAD is
@@ -515,11 +519,11 @@ fn test_rebuild_temporal_nongit_returns_ok() {
         result3.is_ok(),
         "rebuild on a different HEAD must clear the old sentinel: {result3:?}"
     );
-    let sentinel2 = std::fs::read(&sentinel_path).unwrap_or_default();
-    assert_eq!(
-        sentinel2,
-        different_head.as_bytes(),
-        "sentinel must be updated to the new HEAD after a different-HEAD build"
+    let sentinel2 = std::fs::read_to_string(&sentinel_path).unwrap_or_default();
+    // New format (AD-414-21): "{head}\n{shallow_char}".
+    assert!(
+        sentinel2.starts_with(different_head),
+        "sentinel must be updated to the new HEAD after a different-HEAD build; got: {sentinel2:?}"
     );
 }
 
