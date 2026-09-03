@@ -453,6 +453,10 @@ fn test_rebuild_temporal_head_full_sha_and_fresh() {
 /// parse_history failure falls through with empty rows so META_GIT_HEAD is
 /// written, preventing temporal_db_is_stale from returning true on every
 /// subsequent query and triggering an infinite rebuild retry loop).
+/// F3 / AD-414-17: on parse_history failure, the backoff sentinel is written
+/// and the function returns early without creating temporal.db or writing
+/// META_GIT_HEAD.  The sentinel bounds quiet-path retries to once per HEAD;
+/// explicit --rebuild (F1 / AD-414-16) clears the sentinel.
 #[test]
 fn test_rebuild_temporal_nongit_returns_ok() {
     let dir = tempdir().unwrap();
@@ -468,32 +472,54 @@ fn test_rebuild_temporal_nongit_returns_ok() {
         result.is_ok(),
         "rebuild_temporal must return Ok(()) on non-git directory (AC7), got: {result:?}"
     );
-    // temporal.db MUST be created even when parse_history fails: the empty-row
-    // fall-through writes META_GIT_HEAD so temporal_db_is_stale returns false
-    // on subsequent queries, breaking the per-query rebuild retry loop.
+
+    // F3 / AD-414-17: the sentinel IS written so quiet-path retries are
+    // bounded; META_GIT_HEAD is NOT written (parse did not succeed).
+    let sentinel_path = cache_dir.join("temporal.db.build_backoff");
+    let sentinel_content = std::fs::read(&sentinel_path)
+        .expect("backoff sentinel must be written when parse_history fails (F3/AD-414-17)");
+    assert_eq!(
+        sentinel_content,
+        fake_head.as_bytes(),
+        "sentinel must record the current HEAD so quiet-path Check 1 matches"
+    );
+
+    // temporal.db must NOT be created — we did not sync, so META_GIT_HEAD is
+    // absent and we do not fabricate a "history successfully read" claim.
     let db_path = cache_dir.join("temporal.db");
     assert!(
-        db_path.exists(),
-        "temporal.db must be created on non-git root to prevent retry loop (Finding 2)"
+        !db_path.exists(),
+        "temporal.db must NOT be created on non-git root when parse_history fails (F3/AD-414-17)"
     );
-    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    let stored = db
-        .get_meta(rskim_search::META_GIT_HEAD)
-        .unwrap()
-        .expect("META_GIT_HEAD must be set even when parse_history failed");
+
+    // A second quiet call with the same HEAD must also return Ok(()) without
+    // retrying parse_history (sentinel honoured).
+    let result2 = rebuild_temporal(dir.path(), &cache_dir, fake_head, now);
+    assert!(
+        result2.is_ok(),
+        "second rebuild on same HEAD must also be Ok(()): {result2:?}"
+    );
+    assert!(
+        !db_path.exists(),
+        "temporal.db must still not exist after sentinel short-circuit"
+    );
+
+    // An explicit rebuild (BuildLoudness::Loud / F1 / AD-414-16) clears the
+    // sentinel and re-runs parse_history.  On a non-git root this also returns
+    // Ok(()) and writes a fresh sentinel, but the key observable is that the
+    // sentinel was cleared before the call.  We verify that by checking
+    // rebuild_temporal_with_source directly.
+    let different_head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let result3 = rebuild_temporal(dir.path(), &cache_dir, different_head, now);
+    assert!(
+        result3.is_ok(),
+        "rebuild on a different HEAD must clear the old sentinel: {result3:?}"
+    );
+    let sentinel2 = std::fs::read(&sentinel_path).unwrap_or_default();
     assert_eq!(
-        stored, fake_head,
-        "META_GIT_HEAD must equal the passed head on non-git root"
-    );
-    assert!(
-        db.top_hotspots(20).unwrap().is_empty(),
-        "temporal.db on non-git root must have zero hotspot rows"
-    );
-    // The backoff sentinel must NOT be written — parse_history failure is handled
-    // via the empty-row fall-through, not the sentinel path.
-    assert!(
-        !cache_dir.join("temporal.db.build_backoff").exists(),
-        "backoff sentinel must not be written when parse_history fall-through succeeds"
+        sentinel2,
+        different_head.as_bytes(),
+        "sentinel must be updated to the new HEAD after a different-HEAD build"
     );
 }
 
@@ -3730,5 +3756,96 @@ fn test_t16_case_ii_fx_shallow_integration() {
          (changed_files is empty because the parent commit is not in the shallow history); \
          got {} rows",
         hotspots.len()
+    );
+}
+
+/// F1 / AD-414-16 — explicit `--rebuild` clears the backoff sentinel even when
+/// a matching sentinel is already present.
+///
+/// Positive: write a sentinel for HEAD X, then call the `Loud` build path;
+/// assert the sentinel is gone after the call and temporal.db was created.
+/// Negative: write a sentinel for HEAD X, call the `Quiet` path with the same
+/// HEAD; assert the sentinel is still present and temporal.db is NOT created.
+#[test]
+fn test_explicit_rebuild_clears_backoff_sentinel() {
+    use super::{BuildLoudness, rebuild_temporal_with_source};
+
+    // Build a real git repo so parse_history can succeed.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let run_git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("git command failed")
+    };
+    run_git(&["init"]);
+    run_git(&["config", "user.email", "t@t.com"]);
+    run_git(&["config", "user.name", "T"]);
+    std::fs::write(root.join("a.rs"), "fn main() {}").unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "--allow-empty-message", "-m", ""]);
+    let head_out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .expect("git rev-parse HEAD");
+    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+
+    let sentinel_path = cache_dir.join("temporal.db.build_backoff");
+    let db_path = cache_dir.join("temporal.db");
+    let now = super::current_epoch_secs();
+    let src = rskim_search::GixSource;
+
+    // --- NEGATIVE: silent (background) build with matching sentinel → no rebuild ---
+    std::fs::write(&sentinel_path, head.as_bytes()).unwrap();
+    rebuild_temporal_with_source(
+        &src,
+        root,
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Silent,
+    )
+    .unwrap();
+    assert!(
+        sentinel_path.exists(),
+        "F1/AD-414-16 NEGATIVE: silent build must leave sentinel intact"
+    );
+    assert!(
+        !db_path.exists(),
+        "F1/AD-414-16 NEGATIVE: silent build with sentinel must not create temporal.db"
+    );
+
+    // --- POSITIVE: loud (explicit) build with matching sentinel → clears it ---
+    // Re-write the sentinel to ensure it is present before the loud call.
+    std::fs::write(&sentinel_path, head.as_bytes()).unwrap();
+    rebuild_temporal_with_source(
+        &src,
+        root,
+        &cache_dir,
+        &head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .unwrap();
+    assert!(
+        !sentinel_path.exists(),
+        "F1/AD-414-16 POSITIVE: explicit rebuild must clear the sentinel"
+    );
+    assert!(
+        db_path.exists(),
+        "F1/AD-414-16 POSITIVE: temporal.db must be created after explicit rebuild"
+    );
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    assert!(
+        db.get_meta(rskim_search::META_GIT_HEAD).unwrap().is_some(),
+        "F1/AD-414-16 POSITIVE: META_GIT_HEAD must be present after explicit rebuild"
     );
 }

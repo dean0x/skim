@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rskim_search::{
     COUPLING_MAX_FILES, CochangeRow, DEFAULT_HALF_LIFE_DAYS, HistoryResult, HotspotRow,
-    MIN_COCHANGE_JACCARD, RiskRow, SearchError, TemporalDb, TemporalMetadata,
+    MIN_COCHANGE_JACCARD, RiskRow, SearchError, TemporalDb,
 };
 
 use super::degraded::{DegradedReason, Fallback, TemporalUnavailable, degraded_notice};
@@ -441,6 +441,31 @@ fn discover_git_workdir(root: &Path) -> Option<std::path::PathBuf> {
         .and_then(|repo| repo.workdir().map(|p| p.to_path_buf()))
 }
 
+/// Probe whether `root` sits in a shallow git clone by inspecting the
+/// `<commondir>/shallow` file directly.
+///
+/// Uses the same predicate as `temporal_state.rs` Check 3 (AD-414-14):
+/// a zero-length `shallow` file is treated as absent, matching the gix writer
+/// that produced it.  Returns `false` when no git repo is found, the file
+/// cannot be stat'd, or the file is empty.
+///
+/// This is the shared helper that replaces the former hardcoded `is_shallow:
+/// false` in the `parse_history`-failure fall-through path (F3 / AD-414-17).
+fn probe_is_shallow_from_root(root: &Path) -> bool {
+    let Some(git_dir) = super::staleness::resolve_git_dir(root).or_else(|| {
+        super::staleness::resolve_repo_toplevel(root)
+            .and_then(|top| super::staleness::resolve_git_dir(&top))
+    }) else {
+        return false;
+    };
+    let shallow_dir = super::staleness::resolve_common_dir(&git_dir).unwrap_or(git_dir);
+    shallow_dir
+        .join("shallow")
+        .metadata()
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
 /// Remove temporal rows whose backing files no longer exist on disk.
 ///
 /// This is the build-time ghost filter (AD-408-1). It runs on freshly-computed
@@ -552,15 +577,22 @@ pub(super) fn rebuild_temporal_with_source(
     loudness: BuildLoudness,
 ) -> anyhow::Result<()> {
     // ── Build-backoff sentinel (Finding 2 / D5) ──────────────────────────────
-    // Written when TemporalDb::open fails or a fallback empty sync fails (the
-    // only failure modes that cannot write META_GIT_HEAD directly). If the
-    // sentinel records the same HEAD as `head`, a prior non-transient failure
-    // already occurred for this HEAD; skip the expensive parse_history call and
-    // everything after it until HEAD advances.
-    // Note: the parse_history-failure path is handled differently (fall-through
-    // with empty HistoryResult), so the sentinel is NOT set for that case.
+    // Written when TemporalDb::open fails, a fallback empty sync fails, or
+    // parse_history fails (see F3 fix below). If the sentinel records the same
+    // HEAD as `head`, a prior non-transient failure already occurred for this
+    // HEAD; skip the expensive parse_history call until HEAD advances.
+    //
+    // AD-414-16: explicit --build/--rebuild/--update always clears the sentinel
+    // and proceeds so the user-documented recovery path ("run 'skim search
+    // --rebuild'") works even when a prior failure wrote the sentinel.  R1
+    // (never overwrite a newer-schema DB) is still enforced downstream by
+    // open_or_discard_temporal_db, which refuses without modifying the file.
     let backoff_sentinel = cache_dir.join("temporal.db.build_backoff");
-    if std::fs::read(&backoff_sentinel).ok().as_deref() == Some(head.as_bytes()) {
+    if loudness == BuildLoudness::Loud {
+        // Explicit rebuild: clear any stale sentinel so the recovery flows
+        // printed on stderr ("re-run 'skim search --rebuild'") work correctly.
+        let _ = std::fs::remove_file(&backoff_sentinel);
+    } else if std::fs::read(&backoff_sentinel).ok().as_deref() == Some(head.as_bytes()) {
         if crate::debug::is_debug_enabled() {
             eprintln!(
                 "skim search [debug]: temporal rebuild skipped — \
@@ -579,30 +611,54 @@ pub(super) fn rebuild_temporal_with_source(
     // (Decision O-B: the former 90-day hotspot walk was dead I/O; it was only
     // used for an is_empty() guard that risk_history already provides).
     //
-    // Finding 2 / D5 backoff: on parse_history failure, fall through with an
-    // empty HistoryResult (same path as the zero-commits case — LOCKED DECISION
-    // 2026-06-24) so the lock+open+sync block writes META_GIT_HEAD.  Without
-    // this, a bare warn_skip! left META_GIT_HEAD unwritten, causing
-    // temporal_db_is_stale to return true on every subsequent query, forever.
-    // This is the primary exposure widened by #413: resolve_repo_toplevel adopts
-    // roots that gix::discover refuses, so HEAD now resolves for roots whose
-    // parse_history cannot.
+    // F3 fix (AD-414-17): on parse_history failure write the build-backoff
+    // sentinel and return early.  This replaces the former LOCKED DECISION
+    // 2026-06-24 "fall through with empty HistoryResult to write META_GIT_HEAD".
+    // The sentinel now bounds quiet-path retries (once per HEAD) without
+    // asserting that the history was successfully read.  Consequences:
+    //
+    //   1. META_GIT_HEAD is NOT written, so the DB truthfully stays stale.
+    //      On the next quiet query Check 1 fires → sentinel matches → no retry.
+    //      When HEAD advances the sentinel no longer matches → rebuild retried.
+    //
+    //   2. is_shallow is probed from the filesystem rather than fabricated as
+    //      false, so an existing DB's META_IS_SHALLOW is updated correctly and
+    //      Check 3 (shallow→full transition, AD-414-14) can still fire after
+    //      git fetch --unshallow even when parse_history previously failed.
+    //
+    //   3. Explicit --rebuild (F1 / AD-414-16) clears the sentinel before
+    //      reaching this point, so the recovery instruction in our own stderr
+    //      output ("re-run 'skim search --rebuild'") always works.
     let risk_history = match src.parse_history(root, 0) {
         Ok(h) => h,
         Err(e) => {
+            // Probe actual is_shallow from the filesystem so we do not
+            // fabricate a false value (F3/AD-414-17).
+            let is_shallow = probe_is_shallow_from_root(root);
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: parse_history failed: {e} — \
-                     falling through with empty rows to prevent retry loop",
+                     writing sentinel for HEAD {}…; is_shallow={is_shallow}; \
+                     will retry when HEAD advances or on explicit --rebuild",
+                    head.get(..8).unwrap_or(head),
                 );
             }
-            HistoryResult {
-                commits: vec![],
-                metadata: TemporalMetadata {
-                    is_shallow: false,
-                    commit_count: 0,
-                },
+            // Bound quiet-path retries to once per HEAD.
+            let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            // If a DB exists from a prior successful build, update its
+            // META_IS_SHALLOW so Check 3 can still detect a shallow→full
+            // transition after git fetch --unshallow without advancing HEAD.
+            // Non-fatal: if the DB open fails we simply lose Check 3 for now.
+            let temporal_db_path = cache_dir.join("temporal.db");
+            if temporal_db_path.try_exists().unwrap_or(false)
+                && let Ok(db) = rskim_search::TemporalDb::open(&temporal_db_path)
+            {
+                let _ = db.set_meta(
+                    rskim_search::META_IS_SHALLOW,
+                    if is_shallow { "1" } else { "0" },
+                );
             }
+            return Ok(());
         }
     };
 
@@ -850,10 +906,11 @@ fn open_or_discard_temporal_db(
                 Err(e) => {
                     // AC-29: loud, non-debug-gated; names the absolute path and
                     // gives an actionable manual-deletion instruction.
+                    // F8: {:?} quotes ESC/CR/LF in cache-derived paths (ADR-008).
                     eprintln!(
-                        "skim search: could not delete the corrupt temporal.db at {} ({e}) — \
+                        "skim search: could not delete the corrupt temporal.db at {:?} ({e}) — \
                          delete this file manually, then re-run 'skim search --rebuild'",
-                        db_path.display()
+                        db_path
                     );
                     // D5 backoff: the corrupt DB remains on disk (unlink failed), so
                     // `temporal_db_is_stale` will open it read-only, find no META_GIT_HEAD,
@@ -870,10 +927,11 @@ fn open_or_discard_temporal_db(
             match TemporalDb::open(db_path) {
                 Ok(d) => Some(d),
                 Err(e2) => {
+                    // F8: {:?} quotes ESC/CR/LF in cache-derived paths (ADR-008).
                     eprintln!(
                         "skim search: temporal.db could not be recreated after discard ({e2}) \
-                         — delete {} manually",
-                        db_path.display()
+                         — delete {:?} manually",
+                        db_path
                     );
                     // D5 backoff: the discard SUCCEEDED, so temporal.db is now absent;
                     // the sentinel prevents the per-query rebuild loop.
@@ -1024,24 +1082,32 @@ fn record_temporal_anchor(
         .ok()
         .zip(ghost_root.canonicalize().ok())
         .is_some_and(|(r, g)| r != g);
-    // debug_assert: gix's ghost_root and the hand-rolled resolve_repo_toplevel
-    // must agree on the adopted repository toplevel so that the scope prefix
-    // derived from ghost_root stays consistent with temporal_anchor_state Gate 1.
-    // A mismatch here signals that gix::discover and the ancestor walk have
-    // drifted — catching it in tests prevents silent temporal data misattribution
-    // (finding F3a).
-    debug_assert_eq!(
-        super::gitdir::resolve_repo_toplevel(root)
+    // AD-414-18: `gix::discover` and the filesystem ancestor walk
+    // (`resolve_repo_toplevel`) use different mechanisms and can disagree when
+    // gix cannot open a repository format it doesn't support (e.g. reftable).
+    // In that case `ghost_root` falls back to `root` while `resolve_repo_toplevel`
+    // returns the enclosing toplevel, so a `debug_assert_eq!` here would abort
+    // debug builds and `cargo test` runs inside the D5-isolated path whose
+    // entire contract is "temporal failure must NOT fail the lexical query" —
+    // the worst possible place for a panic (applies ADR-006).  Downgraded to a
+    // debug-gated `eprintln!` using the module's own idiom so the disagreement
+    // is observable without crashing anything.
+    if crate::debug::is_debug_enabled() {
+        let walk = super::gitdir::resolve_repo_toplevel(root)
             .as_deref()
             .unwrap_or(root)
             .canonicalize()
-            .ok(),
-        ghost_root.canonicalize().ok(),
-        "record_temporal_anchor: ghost_root {:?} disagrees with hand-rolled \
-         resolve_repo_toplevel for root {:?}",
-        ghost_root,
-        root,
-    );
+            .ok();
+        let gix_top = ghost_root.canonicalize().ok();
+        if walk != gix_top {
+            eprintln!(
+                "skim search [debug]: record_temporal_anchor: ghost_root {:?} \
+                 disagrees with hand-rolled resolve_repo_toplevel for root {:?} \
+                 (walk={walk:?}, gix={gix_top:?}); gix may not support this repo format",
+                ghost_root, root,
+            );
+        }
+    }
     if !adopted {
         // Finding 5: remove any stale anchor from a previous invocation so it
         // cannot drive false refusals on the next query-path anchor check.
