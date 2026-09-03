@@ -574,6 +574,12 @@ fn test_risky_agrees_with_heatmap_on_same_tree() {
         "T-19: heatmap must return at least one file"
     );
 
+    // PF-007: the `continue` below skips a file heatmap did not report, so the
+    // loop can in principle assert nothing at all.  Count the files actually
+    // compared and require at least one, otherwise a join-key drift (heatmap and
+    // search disagreeing on path spelling) would leave this test silently green.
+    let mut compared = 0_usize;
+
     // For every file in the risky output, find its heatmap entry and compare.
     for risk_row in risky_results {
         let path = risk_row["path"].as_str().expect("risky row has path");
@@ -593,6 +599,8 @@ fn test_risky_agrees_with_heatmap_on_same_tree() {
                 continue;
             }
         };
+
+        compared += 1;
 
         let risky_total: u64 = risk_row["total_commits"]
             .as_u64()
@@ -621,6 +629,23 @@ fn test_risky_agrees_with_heatmap_on_same_tree() {
              must equal fix_density*100 ({expected_kw_pct})"
         );
     }
+
+    // PF-007: at least one file must have been compared, or the parity assertions
+    // above never ran.  The fixture commits both a.rs and b.rs inside heatmap's
+    // default window, so every risky row has a heatmap counterpart.
+    assert!(
+        compared > 0,
+        "AC-22: no file was compared — heatmap and --risky share no path key. \
+         risky paths: {:?}, heatmap paths: {:?}",
+        risky_results
+            .iter()
+            .map(|r| r["path"].as_str())
+            .collect::<Vec<_>>(),
+        heatmap_files
+            .iter()
+            .map(|f| f["path"].as_str())
+            .collect::<Vec<_>>(),
+    );
 }
 
 // ============================================================================

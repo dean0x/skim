@@ -20,7 +20,8 @@
 //!
 //! The walker visits the **full DAG** (not first-parent-only). Merge commits
 //! (commits with more than one parent, including octopus merges) are skipped
-//! **before** the tree diff so their subjects never enter the fix-risk classifier
+//! **before** the object decode and the tree diff, so their subjects never enter
+//! the fix-risk classifier and a merge costs nothing beyond one queue pop
 //! (AD-407-1, AD-407-2). This matches `git log --no-merges`, which is exactly
 //! what `skim heatmap` uses.
 //!
@@ -178,6 +179,12 @@ impl TemporalSource for GixSource {
     ///
     /// Consumers that rely on newest-first ordering (e.g. `rskim-bench::temporal_split`)
     /// may depend on this contract.
+    ///
+    /// # `lookback_days`
+    ///
+    /// Every production caller passes `0` (no cutoff), so the AD-407-3
+    /// `ByCommitTimeCutoff` path is currently exercised only by tests. Follow-up
+    /// #523 tracks wiring the parameter through or removing it (ADR-004).
     fn parse_history(&self, repo_path: &Path, lookback_days: u32) -> Result<HistoryResult> {
         parse_history_impl(repo_path, lookback_days)
     }
@@ -264,19 +271,23 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
             Err(e) => return Err(gix_err(e)),
         };
 
-        // Decode the full commit object for parent count / author / message.
-        let commit_obj = info.object().map_err(gix_err)?;
-        let commit_ref = commit_obj.decode().map_err(gix_err)?;
-
         // AD-407-2: Skip merge commits (>1 parent, including octopus merges).
         // Merge subjects (e.g. "merge(#NNN): …") never match FIX_REGEX, so
-        // letting them through would corrupt fix-risk classification. Skipping
-        // here — after decode but before the tree diff — is the earliest safe
-        // point; `debug_assert_eq!(commit_count, commits.len())` still holds
-        // because merges are never pushed.
+        // letting them through would corrupt fix-risk classification.
+        // `Info::parent_ids` is filled in by the walk itself, so this test needs
+        // no object-store access: the skip runs BEFORE the object load, the
+        // decode, and the tree diff, and a merge therefore costs one queue pop
+        // and nothing else. `debug_assert_eq!(commit_count, commits.len())`
+        // still holds because merges are never pushed.
         if info.parent_ids.len() > 1 {
             continue;
         }
+
+        // Decode the full commit object for author/message fields.
+        // The same object is reused in changed_files_for_commit below to avoid
+        // a second object-store lookup per commit.
+        let commit_obj = info.object().map_err(gix_err)?;
+        let commit_ref = commit_obj.decode().map_err(gix_err)?;
 
         // Author timestamp (i64 — can be negative for pre-epoch commits)
         let timestamp: i64 = match commit_ref.author().time().ok() {

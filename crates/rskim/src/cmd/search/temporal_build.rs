@@ -1115,9 +1115,11 @@ pub(super) fn build_empty_temporal_for_unborn_head(
     record_temporal_anchor(&db, root, &ghost_root, reanchor);
 
     // AC-16 case (i): exactly one non-debug-gated stderr line naming the stage
-    // that produced zero data.  `commits.is_empty()` selects the "no commits"
-    // branch of `zero_row_notice`, whose text must not mention `shallow` even
-    // when this unborn repository happens to be a shallow clone.
+    // that produced zero data.  With `commits` empty and `is_shallow == false`
+    // this selects the "no commits" branch of `zero_row_notice`, whose text must
+    // not mention `shallow`.  AD-407-7 reordered the arms, so an unborn HEAD on a
+    // repository that IS shallow now takes the shallow branch instead — the
+    // truthful attribution AC-15 requires, not a regression of T-16/AC-16.
     eprintln!("skim search: {}", zero_row_notice(&history, 0, is_shallow));
 
     Ok(())
