@@ -68,6 +68,13 @@ pub(super) enum StalenessCheck {
     /// (built by an older skim version, or a non-git project at build time).
     NoStoredHead,
     /// No index file found — treat as a cold start.
+    ///
+    /// AD-414-23: this variant drives [`auto_refresh_if_stale`]'s first-build
+    /// path, but its `Display` form `"no index"` is **not** reachable as a
+    /// `--stats` / `--stats --json` `staleness` value: `run_stats` answers that
+    /// same condition with `{"error":"no index found", …}` and exit 1 before any
+    /// stats are gathered (#413 AC21). Documented value sets for the `staleness`
+    /// key list the other four forms only.
     NoIndex,
     /// Git HEAD is unchanged (or absent) but the working tree has uncommitted
     /// edits, additions, or deletions relative to the manifest (#379).

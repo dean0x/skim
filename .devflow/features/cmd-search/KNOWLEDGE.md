@@ -310,20 +310,36 @@ follow-up ticket.
 `StalenessCheck` implements `Display`; its string form is reported as `.staleness`
 in `--stats --json` output. The field is captured PRE-self-heal (alongside
 `git_head` and `temporal_state`) so it reflects the condition that triggered any
-rebuild. Five possible values:
+rebuild. `StalenessCheck` has five variants, but only **four** are reportable
+here:
 
 | Display string | Variant |
 |---|---|
 | `"current"` | `StalenessCheck::Current` |
-| `"no index"` | `StalenessCheck::NoIndex` |
 | `"stale (no HEAD recorded)"` | `StalenessCheck::NoStoredHead` |
 | `"stale (HEAD changed: abc12345…→def67890…)"` | `StalenessCheck::HeadChanged` (embeds 8-char SHA prefixes + U+2026) |
 | `"stale (working tree changed: N modified, M added, K removed)"` | `StalenessCheck::WorkingTreeChanged` |
 
+**AD-414-23 — `"no index"` is NOT reachable from `--stats`.** `check_staleness`
+returns `NoIndex` on exactly one condition (`index.skidx` absent), and `run_stats`
+short-circuits that same condition *before* `gather_stats` runs, printing
+`{"error":"no index found","cache_dir":"<path>"}` (text mode: the two guidance
+lines) and exiting 1 — the #413 AC21 contract, which the #414 plan (Step 11 / C11)
+preserves as the shape `build_stats_json`'s early return was normalised *to*.
+`--stats` reports on an index; it never creates one. The AC-14 self-heal repairs a
+structurally broken index that already exists (F-Body-A/B/C); it is not a
+first-build path. Earlier revisions of CLAUDE.md, the CHANGELOG and this file
+claimed `"no index"` was observable — measured false at `dee5290` and corrected.
+A concurrent deleter racing between the `index.skidx` probe and `gather_stats`
+could still produce it; that is a TOCTOU window, not a contract.
+
 **AD-414-10 snapshot asymmetry (updated)**: `git_head`, `temporal_state`, AND
 `staleness` are captured from the PRE-self-heal state; all other fields
-(`file_count`, `skipped`, `ast_coverage`) are from the post-heal state.
-A `staleness` of `"no index"` can therefore coexist with a valid `file_count`.
+(`file_count`, `skipped`, `ast_coverage`) are from the post-heal state. Reachable
+demonstration through the CLI: delete `index.skpost` from a healthy cache (keeping
+`index.skidx`) and `--stats --json` reports
+`staleness: "stale (no HEAD recorded)"` next to a post-heal `file_count > 0`,
+exit 0.
 
 **Temporal staleness (AD-TMP-2/AD-TMP-3)**:
 

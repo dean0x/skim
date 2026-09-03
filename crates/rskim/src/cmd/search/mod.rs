@@ -1001,6 +1001,26 @@ fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<Exit
     // branch below, in both text and JSON modes.
     let cache_dir_display = cache_dir.display().to_string();
 
+    // AD-414-23: `--stats` REPORTS on an index; it never creates one.
+    //
+    // The AC-14 self-heal below repairs an index that exists but is structurally
+    // broken (F-Body-A/B/C) — a repair whose cost is bounded by work the user has
+    // already paid for once. A cold start is a different thing: building from
+    // scratch can take minutes on a large corpus, and doing it silently because
+    // someone asked "what is in my index?" is the opposite of "fail loud with
+    // actionable messages". So this arm keeps the #413 AC21 contract verbatim —
+    // `{"error":"no index found","cache_dir":"<path>"}` on stdout in JSON mode,
+    // the two guidance lines on stderr in text mode, exit 1 in both — which the
+    // #414 plan (Step 11 / C11) treats as the reference shape when it normalises
+    // `build_stats_json`'s own early return to include `cache_dir`.
+    //
+    // Consequence for the `.staleness` contract (F5): `check_staleness` returns
+    // `StalenessCheck::NoIndex` on exactly this condition (`staleness.rs`, "Cold
+    // start: no lexical index file"), so `--stats` can never report its `Display`
+    // form `"no index"` — the gather never runs. The reportable value set is the
+    // other four; CLAUDE.md and the CHANGELOG entry are corrected to match.
+    // (A concurrent deleter racing between this probe and `gather_stats` could
+    // still produce it; that is a TOCTOU window, not a contract.)
     let index_path = cache_dir.join("index.skidx");
     if !index_path.exists() {
         if json {
@@ -4782,26 +4802,57 @@ mod tests {
     }
 
     // ========================================================================
-    // T-16 / F5 — snapshot asymmetry: staleness captured pre-self-heal
+    // T-16 / F5 / AD-414-23 — the `--stats` staleness contract, via the CLI
     // ========================================================================
 
-    /// T-16 / F5: `--stats --json` `.staleness` is captured from the PRE-self-heal
-    /// state (AD-414-10), so `staleness == "no index"` can coexist with a valid
-    /// `file_count` (from the post-heal state) — this is the intended contract
-    /// (AC-15/AC-22 analogue for the lexical arm).
+    /// Run `skim search <args>` as a subprocess against an isolated cache dir.
     ///
-    /// Also validates the documented `staleness` value set: `"no index"` is one of
-    /// the five possible string values (F5 documentation contract, CLAUDE.md §search).
+    /// Returns `(exit_success, stdout, stderr)`. Driving the real binary is what
+    /// makes these tests CLI-entry tests: `--stats`' no-index early return lives
+    /// in `run_stats` and is invisible to the in-process `stats_json_for_test`
+    /// helper, which starts at `gather_stats` (PF-007 — the earlier revisions of
+    /// T-16/T-16b asserted a value that the CLI cannot produce precisely because
+    /// they entered below the arm that decides it).
+    fn run_skim_search_capture(bin: &str, cache: &str, args: &[&str]) -> (bool, String, String) {
+        let out = std::process::Command::new(bin)
+            .arg("search")
+            .args(args)
+            .env("SKIM_CACHE_DIR", cache)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn skim search {args:?}: {e}"));
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    /// T-16 / F5 / AD-414-10: `--stats --json` reports `staleness` from the
+    /// PRE-self-heal state while `file_count` comes from the POST-heal state.
     ///
-    /// `#[serial]` is required: the `run()` call inside resolves the cache dir via
-    /// `SKIM_CACHE_DIR` and a concurrent test that mutates that env var could cause
-    /// the `run()` and `resolve_search_cache_dir` calls to resolve to different dirs,
-    /// breaking this test's assumptions about where the index was written.
+    /// F-Body-C (remove `index.skpost`, keep `index.skidx`) is the reachable
+    /// demonstration of that asymmetry through the CLI: `check_staleness` sees a
+    /// size-inconsistent lexical index and returns `NoStoredHead`, the self-heal
+    /// rebuilds, and the reported `file_count` counts the rebuilt corpus.
+    ///
+    /// The expected string comes from `StalenessCheck`'s own `Display`, never a
+    /// hand-written literal, so a reworded variant fails here rather than drifting.
+    ///
+    /// `#[serial]` matches its T-13/T-14/T-15 siblings; the child process is given
+    /// an explicit `SKIM_CACHE_DIR`, so here it is defence in depth rather than a
+    /// strict requirement.
     #[serial_test::serial]
     #[test]
-    fn t16_f5_staleness_no_index_coexists_with_valid_file_count() {
+    fn t16_f5_stats_json_staleness_is_the_pre_heal_snapshot() {
+        let bin = skim_bin_path();
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+        let cache = tempfile::TempDir::new().unwrap();
+        let cache_str = cache.path().to_string_lossy().to_string();
 
         create_real_git_repo(
             root,
@@ -4810,115 +4861,208 @@ mod tests {
                 ("feat: add b", &[("src/b.rs", "fn beta() {}")]),
             ],
         );
-        let root_str = root.to_string_lossy().to_string();
 
-        // Build the full index (lexical + temporal).
-        let result = run(
-            &[
-                "--rebuild".to_string(),
-                "--root".to_string(),
-                root_str.clone(),
-            ],
-            &TEST_ANALYTICS,
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            ExitCode::SUCCESS,
-            "T-16 setup: --rebuild must succeed"
+        let (ok, _, stderr) =
+            run_skim_search_capture(&bin, &cache_str, &["--rebuild", "--root", &root_str]);
+        assert!(ok, "T-16 setup: --rebuild must succeed; stderr:\n{stderr}");
+
+        let search_cache = only_search_cache_dir(cache.path());
+
+        // Healthy precondition: staleness == "current".
+        let (ok, stdout, stderr) = run_skim_search_capture(
+            &bin,
+            &cache_str,
+            &["--stats", "--json", "--root", &root_str],
         );
-
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-
-        // Sanity: healthy state reports "current" for staleness.
-        let healthy = stats_json_for_test(&cache_dir, root)
-            .expect("T-16 setup: stats must succeed on healthy index");
+        assert!(
+            ok,
+            "T-16 setup: --stats --json must exit 0; stderr:\n{stderr}"
+        );
+        let healthy: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!("T-16 setup: stdout must be one JSON object ({e}): {stdout}")
+        });
         assert_eq!(
             healthy["staleness"].as_str().unwrap_or(""),
-            "current",
-            "T-16 pre-condition: healthy state must report staleness=='current'; got: {:?}",
-            healthy["staleness"]
+            staleness::StalenessCheck::Current.to_string(),
+            "T-16 pre-condition: a healthy index must report staleness == 'current'"
         );
 
-        // Remove the lexical index header to force StalenessCheck::NoIndex on next query.
-        std::fs::remove_file(cache_dir.join("index.skidx")).unwrap();
+        // F-Body-C: remove the posting body, keep the header.
+        let skpost = search_cache.join("index.skpost");
+        std::fs::remove_file(&skpost).unwrap();
 
-        // --stats --json: gather_stats captures staleness BEFORE self-heal
-        // (StalenessCheck::NoIndex → "no index"), then self-heal rebuilds the index
-        // so file_count reflects the post-heal state.
-        let stats = stats_json_for_test(&cache_dir, root)
-            .expect("T-16: stats_json_for_test must succeed with missing skidx");
-
-        // Staleness is the PRE-self-heal snapshot (AD-414-10 / F5).
+        let (ok, stdout, stderr) = run_skim_search_capture(
+            &bin,
+            &cache_str,
+            &["--stats", "--json", "--root", &root_str],
+        );
+        assert!(
+            ok,
+            "T-16/AC-14: --stats --json must exit 0 after self-healing; stderr:\n{stderr}"
+        );
+        let stats: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("T-16: stdout must be one JSON object ({e}): {stdout}"));
+        assert!(
+            stats.get("error").is_none(),
+            "T-16: a self-healed --stats must not return an error object; got {stats}"
+        );
         assert_eq!(
             stats["staleness"].as_str().unwrap_or(""),
-            "no index",
-            "T-16: staleness must be 'no index' (pre-heal snapshot); got: {:?}",
+            staleness::StalenessCheck::NoStoredHead.to_string(),
+            "T-16/AD-414-10: staleness is the PRE-heal verdict; got {}",
             stats["staleness"]
         );
-
-        // file_count is the POST-self-heal state — must reflect indexed files.
-        let file_count = stats["file_count"].as_u64().unwrap_or(0);
         assert!(
-            file_count > 0,
-            "T-16: file_count must be > 0 (post-heal state) even when staleness=='no index'; \
-             this is the snapshot asymmetry guaranteed by AD-414-10 (AC-15/AC-22 analogue)"
+            stats["file_count"].as_u64().unwrap_or(0) > 0,
+            "T-16/AD-414-10: file_count is the POST-heal state and must be > 0 even \
+             though staleness reports the pre-heal verdict; got {stats}"
         );
-
-        // The staleness key must be present in output (F5 contract).
         assert!(
-            stats.get("staleness").is_some(),
-            "T-16: 'staleness' key must be present in --stats --json output"
+            skpost.exists(),
+            "T-16/AC-14: index.skpost must be restored by the self-heal"
         );
     }
 
-    // ========================================================================
-    // T-16b / F5 — cold-start: stats on a never-indexed root
-    // ========================================================================
-
-    /// T-16b / F5 (missing test 8): `--stats --json` on a root that was **never**
-    /// indexed must report `staleness == "no index"` and `file_count == 0`.
+    /// T-16(b) / F5: the same pre-heal `staleness` verdict on the **text** arm.
     ///
-    /// This is the cold-start complement to T-16: T-16 tests the transition from a
-    /// healthy index (staleness = "current") to a removed header file (staleness = "no
-    /// index" coexisting with file_count > 0 post-heal). T-16b tests the case where no
-    /// prior build has ever run — there is nothing to self-heal, so file_count must be
-    /// exactly 0 and staleness must be "no index".
-    ///
-    /// Discriminating: `file_count == 0` (no post-heal state) AND `staleness == "no index"`.
+    /// `run_stats`' text branch renders from the same snapshot as the JSON branch;
+    /// this pins that they cannot diverge. The expected line is assembled from the
+    /// production `Display` impl, not a copied literal.
     #[serial_test::serial]
     #[test]
-    fn t16b_f5_cold_start_stats_reports_no_index_with_zero_file_count() {
+    fn t16b_f5_stats_text_staleness_line_is_the_pre_heal_snapshot() {
+        let bin = skim_bin_path();
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+        let cache = tempfile::TempDir::new().unwrap();
+        let cache_str = cache.path().to_string_lossy().to_string();
 
-        // Cold start: index was never built. resolve_search_cache_dir creates the
-        // cache dir but leaves it empty — no skidx, no skpost, no temporal.db.
-        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
-        std::fs::create_dir_all(&cache_dir).unwrap();
-
-        let stats = stats_json_for_test(&cache_dir, root)
-            .expect("T-16b: stats_json_for_test must succeed on a never-indexed root");
-
-        // Staleness must be "no index" (cold start, no skidx present).
-        assert_eq!(
-            stats["staleness"].as_str().unwrap_or(""),
-            "no index",
-            "T-16b: cold-start staleness must be 'no index'; got: {:?}",
-            stats["staleness"]
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: add x", &[("src/x.rs", "fn ex() {}")]),
+                ("feat: add y", &[("src/y.rs", "fn why() {}")]),
+            ],
         );
 
-        // file_count must be 0 — no prior build, nothing to self-heal from.
-        let file_count = stats["file_count"].as_u64().unwrap_or(u64::MAX);
-        assert_eq!(
-            file_count, 0,
-            "T-16b: cold-start file_count must be 0 (no prior build to self-heal from)"
-        );
+        let (ok, _, stderr) =
+            run_skim_search_capture(&bin, &cache_str, &["--rebuild", "--root", &root_str]);
+        assert!(ok, "T-16b setup: --rebuild must succeed; stderr:\n{stderr}");
 
-        // The staleness key must be present (F5 contract).
+        let search_cache = only_search_cache_dir(cache.path());
+        std::fs::remove_file(search_cache.join("index.skpost")).unwrap();
+
+        let (ok, stdout, stderr) =
+            run_skim_search_capture(&bin, &cache_str, &["--stats", "--root", &root_str]);
         assert!(
-            stats.get("staleness").is_some(),
-            "T-16b: 'staleness' key must be present in --stats --json output"
+            ok,
+            "T-16b/AC-14: --stats (text) must exit 0 after self-healing; stderr:\n{stderr}"
+        );
+        let expected = format!(
+            "staleness     : {}",
+            staleness::StalenessCheck::NoStoredHead
+        );
+        assert!(
+            stdout.contains(&expected),
+            "T-16b: --stats text output must carry {expected:?}; got stdout:\n{stdout}"
+        );
+    }
+
+    /// T-16(d) / AD-414-23: on a root that was **never** indexed, `--stats` does
+    /// not build one — it prints the `{error, cache_dir}` object and exits 1.
+    ///
+    /// This is #413's AC21 contract, unchanged by #414, and it is why
+    /// `StalenessCheck::NoIndex`'s `Display` form `"no index"` is not among the
+    /// values the `staleness` key can take: `run_stats` short-circuits the exact
+    /// condition that produces it. CLAUDE.md, the CHANGELOG and the cmd-search
+    /// knowledge base previously documented `"no index"` as observable here;
+    /// measured false and corrected alongside this test.
+    ///
+    /// Discriminating in both directions: if `--stats` ever starts building a
+    /// missing index, the exit code, the object shape and the "no index.skidx was
+    /// created" assertion all fail together.
+    #[serial_test::serial]
+    #[test]
+    fn t16d_ad414_23_cold_start_stats_reports_no_index_error_and_builds_nothing() {
+        let bin = skim_bin_path();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+        let cache = tempfile::TempDir::new().unwrap();
+        let cache_str = cache.path().to_string_lossy().to_string();
+
+        // A healthy repository — the ONLY thing missing is the index, so the
+        // no-index arm is the sole possible cause of the response.
+        create_real_git_repo(root, &[("feat: add a", &[("src/a.rs", "fn alpha() {}")])]);
+
+        // --- JSON mode ---
+        let (ok, stdout, stderr) = run_skim_search_capture(
+            &bin,
+            &cache_str,
+            &["--stats", "--json", "--root", &root_str],
+        );
+        assert!(
+            !ok,
+            "T-16d/#413 AC21: cold-start --stats --json must exit 1; stdout:\n{stdout}"
+        );
+        let obj: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("T-16d: stdout must be one JSON object ({e}): {stdout}"));
+        let map = obj
+            .as_object()
+            .expect("T-16d: stdout must be a JSON object");
+        assert_eq!(
+            map.len(),
+            2,
+            "T-16d/#413 AC21: the object is exactly {{error, cache_dir}}; got {obj}"
+        );
+        assert_eq!(
+            map.get("error").and_then(|v| v.as_str()),
+            Some("no index found"),
+            "T-16d: the error string is part of the pinned contract; got {obj}"
+        );
+        assert!(
+            map.contains_key("cache_dir"),
+            "T-16d: cache_dir answers 'where would it go?'; got {obj}"
+        );
+        assert!(
+            map.get("staleness").is_none() && map.get("file_count").is_none(),
+            "T-16d/AD-414-23: no stats are gathered on this arm, so neither \
+             'staleness' nor 'file_count' may appear; got {obj}"
+        );
+        assert!(
+            !stderr.contains("no index found"),
+            "T-16d/AC-23: in --json mode the single object carries the error on \
+             STDOUT; it must not be duplicated onto stderr. Got stderr:\n{stderr}"
+        );
+
+        // --- text mode ---
+        let (ok, _, stderr) =
+            run_skim_search_capture(&bin, &cache_str, &["--stats", "--root", &root_str]);
+        assert!(
+            !ok,
+            "T-16d/#413 AC21: cold-start --stats (text) must exit 1"
+        );
+        assert!(
+            stderr.contains("no index found") && stderr.contains("skim search --build"),
+            "T-16d: text mode must name the condition and the remedy; got stderr:\n{stderr}"
+        );
+
+        // AD-414-23: --stats reports on an index, it never creates one.
+        let search_dir = cache.path().join("search");
+        let built: Vec<std::path::PathBuf> = std::fs::read_dir(&search_dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten())
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| p.file_name().is_some_and(|n| n == "index.skidx"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            built.is_empty(),
+            "T-16d/AD-414-23: --stats must not build a missing index; found {built:?}"
         );
     }
 

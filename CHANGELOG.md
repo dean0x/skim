@@ -147,16 +147,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `"newer-schema"` (written by a newer binary; refused — upgrade skim to access it),
     `"missing"` (no `temporal.db` found).
   - `"staleness"` — lexical index staleness at query time.  Values: `"current"` (index
-    HEAD matches current HEAD and working tree is unchanged), `"no index"` (no lexical
-    index found — cold start or post-delete), `"stale (HEAD changed: <prev8>…→<cur8>…)"`
-    (HEAD changed since last build), `"stale (no HEAD recorded)"` (manifest has no stored
-    HEAD), `"stale (working tree changed: N modified, N added, N removed)"`.
+    HEAD matches current HEAD and working tree is unchanged),
+    `"stale (HEAD changed: <prev8>…→<cur8>…)"` (HEAD changed since last build),
+    `"stale (no HEAD recorded)"` (manifest has no stored HEAD, or an artifact is missing
+    or below its current format version), `"stale (working tree changed: N modified,
+    N added, N removed)"`.
+    `--stats` reports on an index and never creates one: with no `index.skidx` present it
+    still prints `{"error":"no index found","cache_dir":"<path>"}` and exits 1 (unchanged),
+    so the internal cold-start verdict `"no index"` is not among the values this key can
+    take.
   **Snapshot asymmetry (AD-414-10):** `git_head`, `temporal_state`, and `staleness` are
   captured from the PRE-self-heal state.  All other fields (`file_count`, `skipped`,
   `ast_coverage`) are from the POST-self-heal state.  A `temporal_state` of `"missing"`
-  or `"corrupt"` (or `staleness` of `"no index"`) can therefore coexist with a valid
-  `file_count` — this is the intended observable contract.  Additive — all pre-existing
-  keys are byte-identical on upgrade.
+  or `"corrupt"`, or a `staleness` of `"stale (no HEAD recorded)"`, can therefore coexist
+  with a valid `file_count` — this is the intended observable contract.  Additive — all
+  pre-existing keys are byte-identical on upgrade.
 
 - **`degraded` array in `skim search --json` when temporal ranking is unavailable** (#414) —
   when `--hot`, `--cold`, `--risky`, or `--blast-radius` is requested but temporal data
