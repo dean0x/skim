@@ -164,8 +164,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `--json` envelope now includes a `"degraded"` array.  Each element is an object
   with keys: `subsystem` (always `"temporal"` in this release), `reason` (`"missing"`,
   `"corrupt"`, `"newer-schema"`, `"empty"`, or `"mismatch"`), `requested` (the flag that
-  was requested), `applied` (`"lexical"` on text+temporal and blast-radius arms, `"none"`
-  on the standalone temporal arm — no results served there), `message` (human-readable),
+  was requested), `applied` (`"lexical"` on text-query arms including text +
+  `--blast-radius`; `"none"` on standalone temporal and standalone `--blast-radius`
+  arms — no results served there; `"ast"` reserved for #483, not emitted today),
+  `message` (human-readable),
   `remediation` (actionable hint).  The field is absent (`skip_serializing_if`) on
   healthy queries to keep byte-identity for existing callers.
 
@@ -197,9 +199,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when a temporal build fails for a given HEAD commit) was checked unconditionally, so
   an explicit `--rebuild` was silently short-circuited as if it were an automatic quiet
   retry.  Fixed: `BuildLoudness::Loud` (the `--rebuild`/`--build`/`--update` path) now
-  clears the sentinel before the staleness check, so an explicit rebuild always proceeds
-  regardless of prior failures.  Only the quiet automatic refresh path (`BuildLoudness::Quiet`)
-  still respects the sentinel to bound noisy retry loops.
+  clears the sentinel at the start of the temporal rebuild (before the backoff gate),
+  so an explicit rebuild always proceeds regardless of prior failures.  `--build` and
+  `--rebuild` reach the clear unconditionally; `--update` reaches it only when
+  `auto_refresh_if_stale` decides a rebuild is warranted.  Only the automatic quiet
+  refresh path (`BuildLoudness::Silent`) still respects the sentinel to bound noisy
+  retry loops.
 
 - **`temporal.db` not rebuilt after SQLite-level corruption** (#414) — when
   `temporal.db` contained SQLite-level corruption (`SQLITE_CORRUPT` or `SQLITE_NOTADB`),

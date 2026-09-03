@@ -162,10 +162,14 @@ impl DegradedJson {
     ///
     /// * `requested` — bare flag name (e.g. `"hot"`, `"blast-radius"`) per AC-4 /
     ///   RD-5 (use [`TemporalSort::json_name`], not [`TemporalSort::flag_name`]).
-    /// * `applied` — ranking actually served.  Per-arm values (F2 / AD-414-19):
-    ///   - `"lexical"` — text+temporal arm (`run_query`) and `--blast-radius`;
-    ///     lexical BM25F order was served (or would have been, for NoRankedRows).
-    ///   - `"ast"` — `--ast` arm; raw AST structural ranking was served.
+    /// * `applied` — ranking actually served.  Per-arm values (F2 / AD-414-19;
+    ///   corrected P3-2 / 2026-09-03):
+    ///   - `"lexical"` — text-query arms only: `run_query` (including text +
+    ///     `--blast-radius`); lexical BM25F order was served (or would have been,
+    ///     for NoRankedRows).  Standalone `--blast-radius` (no text query) reports
+    ///     `"none"`, not `"lexical"`, because no lexical ranking was computed.
+    ///   - `"ast"` — reserved for #483 (standalone `--ast` degraded path); not
+    ///     emitted by any call site in this release.
     ///   - `"none"` — standalone temporal arm (`run_temporal_standalone`); no
     ///     text query means no result set, so no ranking was served at all.
     /// * `flag` — `--`-prefixed flag for the human-readable tail (passed to
