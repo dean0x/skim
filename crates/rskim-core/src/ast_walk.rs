@@ -289,9 +289,14 @@ pub const AST_SIZE_LIMIT_DEFAULT: u64 = 1024 * 1024;
 ///
 /// ## AD-405-13: Value rationale
 ///
-/// See [`AST_SIZE_LIMIT_DEFAULT`].  All 14 tree-sitter languages share the same
+/// See [`AST_SIZE_LIMIT_DEFAULT`].  All 15 tree-sitter languages share the same
 /// cap; the old SQL-specific 1 MiB exception is dissolved.  JSON, YAML, and TOML
 /// have no tree-sitter grammar in this codebase and return `None`.
+///
+/// Returning `Some` means the language has a grammar, not that it is present in
+/// the AST index's `LANG_MAPS` node-kind vocabulary.  Bash has a grammar but no
+/// vocabulary entry, so `linearize_source` admits it past the size gate and then
+/// returns an empty result at the `LANG_MAPS` lookup (Guard 2).
 ///
 /// ## Anti-pattern avoided
 ///
@@ -316,7 +321,8 @@ pub fn ast_size_limit(lang: crate::Language) -> Option<u64> {
         | Language::Ruby
         | Language::Sql
         | Language::Kotlin
-        | Language::Swift => Some(AST_SIZE_LIMIT_DEFAULT),
+        | Language::Swift
+        | Language::Bash => Some(AST_SIZE_LIMIT_DEFAULT),
 
         // Data formats — no tree-sitter grammar; never AST-indexed.
         Language::Json | Language::Yaml | Language::Toml => None,
@@ -595,9 +601,9 @@ mod tests {
 
     // ── ast_size_limit contract (AD-405-1 / AD-405-13) ───────────────────────
 
-    /// All 14 tree-sitter languages must return `Some(AST_SIZE_LIMIT_DEFAULT)`.
+    /// All 15 tree-sitter languages must return `Some(AST_SIZE_LIMIT_DEFAULT)`.
     ///
-    /// The list is kept explicit (no wildcard) so that adding a 15th tree-sitter
+    /// The list is kept explicit (no wildcard) so that adding a 16th tree-sitter
     /// language without updating this test produces a compile-time error in
     /// `ast_size_limit`'s exhaustive match — not a silent miss here.
     #[test]
@@ -625,6 +631,7 @@ mod tests {
             Language::Sql,
             Language::Kotlin,
             Language::Swift,
+            Language::Bash,
         ];
 
         for lang in tree_sitter_langs {
