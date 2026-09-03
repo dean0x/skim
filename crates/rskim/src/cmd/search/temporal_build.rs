@@ -83,6 +83,16 @@ pub(super) enum BuildLoudness {
 /// 3. Filter to `jaccard >= MIN_COCHANGE_JACCARD` (0.10) at write time to match
 ///    `MIN_COCHANGE_JACCARD` used by the read query (AC4 / Decision O-D).
 ///
+/// # AD-407-9: co-change inputs walk the full DAG
+///
+/// Since ticket #407 removed `.first_parent_only()` (AD-407-1), `history.commits`
+/// now contains every non-merge commit reachable from HEAD, not just the
+/// first-parent spine.  As a consequence both the `file_counts` denominators and
+/// the pair-count numerators reflect the full commit population; Jaccard values
+/// and therefore `--blast-radius` peer **sets and ordering** may differ from
+/// pre-#407 databases.  Existing `temporal.db` files with `data_version = "1"`
+/// are rebuilt automatically by the `TEMPORAL_DATA_VERSION` self-heal (AD-407-5).
+///
 /// # Pair ordering invariant
 ///
 /// `file_a < file_b` lexically.  The `UNION ALL` query in
