@@ -79,7 +79,7 @@ pub const META_GIT_HEAD: &str = "git_head";
 pub const META_GIT_TOPLEVEL: &str = "git_toplevel";
 
 /// Version number attesting that the temporal data was written by a binary
-/// whose `rebuild_temporal` applies the ghost filter.
+/// whose `rebuild_temporal` walks the **full commit DAG** (not first-parent-only).
 ///
 /// AD-408-3: This const is the single source of truth for the self-heal
 /// contract: the data-version attests "written by a binary whose
@@ -89,11 +89,26 @@ pub const META_GIT_TOPLEVEL: &str = "git_toplevel";
 /// and the no-rebuild-loop invariant is preserved. Bump this const to force a
 /// future global rebuild of all `temporal.db` files on the next query.
 ///
+/// AD-407-5: Bumped from 1 to 2 by ticket #407 (full-DAG walk). This is the
+/// AD-408-4 data-version self-heal mechanism — **NOT a PRAGMA user_version
+/// schema migration**. `CURRENT_VERSION` stays 2; `run_migrations` gains no
+/// v3 block. A `temporal.db` carrying `data_version = "1"` (produced by the
+/// pre-#407 first-parent-only walk) is stale and triggers one self-heal rebuild
+/// on the next query that writes `data_version = "2"`.
+///
+/// **One case where the self-heal is not one-shot:** when
+/// `temporal.db.build_backoff` contains the current HEAD+shallow pair,
+/// `rebuild_temporal_with_source` returns `Ok(())` immediately without calling
+/// `parse_history`. The DB remains at `data_version = "1"` until the sentinel
+/// clears (HEAD advances, shallow state changes, or explicit `--rebuild`).
+/// This is intentional: the sentinel prevents retrying a known-failing parse
+/// on every query while HEAD is stationary.
+///
 /// Note: a future caller using `store_*` / `set_meta(git_head)` directly
 /// would produce a DB with a HEAD but no `data_version` row — perpetually
 /// flagged stale. [`TemporalDb::sync`] is the only version-attesting write
 /// path; do not bypass it.
-pub const TEMPORAL_DATA_VERSION: u16 = 1;
+pub const TEMPORAL_DATA_VERSION: u16 = 2;
 
 /// Meta table key storing the [`TEMPORAL_DATA_VERSION`] value.
 ///
