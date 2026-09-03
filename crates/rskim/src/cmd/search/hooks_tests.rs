@@ -621,7 +621,7 @@ fn test_install_hooks_refuses_subdirectory_root() {
     let subdir = repo.join("src");
     fs::create_dir_all(&subdir).unwrap();
 
-    // resolve_hooks_dir must return Err for a subdirectory of a git repo (F9/AD-414-20).
+    // resolve_hooks_dir must return Err for a subdirectory of a git repo (F9/AD-413-18).
     assert!(
         super::resolve_hooks_dir(&subdir).is_err(),
         "a subdirectory of a git repo must yield Err from resolve_hooks_dir; \
@@ -657,6 +657,43 @@ fn test_install_hooks_refuses_subdirectory_root() {
     assert!(
         !has_search_hooks(&subdir),
         "has_search_hooks must return false for a subdirectory root"
+    );
+}
+
+/// Missing test 6 / P2-3 / AD-413-18: `resolve_hooks_dir` on a subdirectory must
+/// return `Err(ancestor)` where `ancestor` is the canonical path of the enclosing
+/// repository, not merely `Err(_)`.
+///
+/// Discriminating: the `Err` payload equals the canonical enclosing repo path so
+/// callers can embed it in a human-readable hint ("re-run with `--root <payload>`").
+#[test]
+fn test_resolve_hooks_dir_subdirectory_err_payload_is_ancestor_canonical() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    super::super::staleness::create_real_git_repo(&repo, &[("init", &[("a.rs", "fn a(){}\n")])]);
+    let repo_canonical = repo.canonicalize().unwrap();
+
+    let subdir = repo.join("lib");
+    fs::create_dir_all(&subdir).unwrap();
+
+    // The Err payload must be the canonical ancestor path (P2-3 / AD-413-18).
+    let result = super::resolve_hooks_dir(&subdir);
+    assert_eq!(
+        result,
+        Err(repo_canonical.clone()),
+        "resolve_hooks_dir must return Err(enclosing_repo_canonical) for a subdirectory; \
+         callers embed this path in the '--root <path>' hint (P2-3)"
+    );
+
+    // The install error message must name the canonical repo path so the user can
+    // copy-paste the `--root` flag without quoting surprises (P3-4).
+    let err = install_search_hooks(&subdir).unwrap_err();
+    let msg = err.to_string();
+    let repo_display = repo_canonical.display().to_string();
+    assert!(
+        msg.contains(&repo_display),
+        "install error must contain the canonical repo path '{repo_display}'; got: {msg}"
     );
 }
 
@@ -781,4 +818,58 @@ fn test_install_hooks_submodule_no_shared_disclosure_and_normalized_path() {
         !display_str.contains(".."),
         "canonicalized display path must not contain '..'; got: {display_str}"
     );
+}
+
+// ============================================================================
+// Missing test 7 / F8 — control characters in gitdir pointer are not forwarded raw
+// ============================================================================
+
+/// Missing test 7 / F8 / AD-413-3 extension: a `gitdir:` pointer containing
+/// ASCII control characters (`\r`, `\n`, ESC, NUL) must not appear raw in any
+/// error or warning message emitted by `install_search_hooks` or
+/// `remove_search_hooks`.
+///
+/// The F8 fix uses `.display()` (not `{:?}`) for the `--root` hint and wraps the
+/// subdirectory path in `{:?}` for the body — neither form should emit raw ESC/CR
+/// bytes into the user's terminal (where they would be interpreted as ANSI escapes
+/// or CR-rewrite).
+///
+/// Discriminating: the emitted error message contains no byte in `0x01..=0x1F`
+/// other than `\t` (0x09) when a crafted `.git` file contains a control character
+/// in its `gitdir:` line.
+#[test]
+fn test_hooks_refusal_quotes_control_chars_in_gitdir() {
+    let dir = tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+
+    // Craft a .git FILE whose gitdir: line contains a CR+LF and an ESC byte.
+    // These are the most dangerous control characters for terminal output.
+    let evil_target = dir.path().join("evil\x1b[31mred\x1b[0m");
+    let gitdir_line = format!("gitdir: {}\r\n", evil_target.display());
+    fs::write(project.join(".git"), gitdir_line.as_bytes()).unwrap();
+
+    // install_search_hooks and remove_search_hooks may return Ok or Err; what
+    // matters is that no error message contains a raw control byte (excluding tab).
+    let install_err = install_search_hooks(&project)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    let remove_err = remove_search_hooks(&project)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+
+    for (label, msg) in [("install", &install_err), ("remove", &remove_err)] {
+        for (i, byte) in msg.bytes().enumerate() {
+            // Allow tab (0x09). Reject all other ASCII control characters.
+            if byte < 0x20 && byte != 0x09 {
+                panic!(
+                    "{label} error message must not contain raw control byte 0x{byte:02X} \
+                     at position {i}; message: {:?}",
+                    &msg[..msg.len().min(200)]
+                );
+            }
+        }
+    }
 }
