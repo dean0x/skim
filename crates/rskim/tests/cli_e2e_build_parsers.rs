@@ -22,29 +22,6 @@ fn skim_cmd() -> Command {
     cmd
 }
 
-/// Creates a TempDir containing a zero-dependency Cargo project used to
-/// exercise the cargo/clippy wrappers without triggering a cold compile of
-/// the entire skim workspace.
-///
-/// The crate compiles in ~1–2 s even on a cold runner, keeping the 120 s
-/// timeout a comfortable bound rather than a latency time-bomb.
-///
-/// `[workspace]` is included even though /tmp is outside the skim workspace
-/// tree — it makes workspace severance explicit and guards against any future
-/// cargo heuristic that might walk upward.
-///
-/// Mirrors the `test_build_make_real_execution_success` TempDir pattern.
-fn trivial_cargo_project() -> TempDir {
-    let dir = TempDir::new().expect("failed to create temp dir");
-    std::fs::write(
-        dir.path().join("Cargo.toml"),
-        "[package]\nname = \"skim_e2e_probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[[bin]]\nname = \"skim_e2e_probe\"\npath = \"main.rs\"\n\n[workspace]\n",
-    )
-    .expect("failed to write Cargo.toml");
-    std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").expect("failed to write main.rs");
-    dir
-}
-
 // ============================================================================
 // Cargo build: real execution
 // ============================================================================
@@ -55,7 +32,7 @@ fn test_build_cargo_success_exit_code() {
     // test is not cache-state-dependent. Verifies: skim spawns the real cargo,
     // the exit code propagates, and the parsed summary is rendered.
     // See: https://github.com/dean0x/skim/issues/447
-    let dir = trivial_cargo_project();
+    let dir = common::trivial_cargo_project();
     skim_cmd()
         .args(["cargo", "build"])
         .current_dir(dir.path())
@@ -75,7 +52,7 @@ fn test_build_clippy_success_exit_code() {
     // test is not cache-state-dependent. The trivial crate is warning-free and
     // outside the workspace, so no workspace lint denials apply.
     // See: https://github.com/dean0x/skim/issues/447
-    let dir = trivial_cargo_project();
+    let dir = common::trivial_cargo_project();
     skim_cmd()
         .args(["cargo", "clippy"])
         .current_dir(dir.path())

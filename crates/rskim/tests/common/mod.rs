@@ -186,3 +186,63 @@ pub fn stub_path(dir: &std::path::Path) -> String {
         std::env::var("PATH").unwrap_or_default()
     )
 }
+
+// ============================================================================
+// Trivial Cargo project fixture
+// ============================================================================
+
+/// Creates a `TempDir` containing a zero-dependency Cargo project used to
+/// exercise the cargo, clippy, and test wrappers without triggering a cold
+/// compile of the entire skim workspace.
+///
+/// The crate compiles in ~1–2 s even on a cold runner, keeping the 120 s
+/// timeout a comfortable bound rather than a latency time-bomb.
+///
+/// Workspace isolation: `TempDir::new()` places the directory under the system
+/// temp root (`/tmp` on Linux, `/var/folders/…` on macOS), which is already
+/// outside the skim workspace tree. The explicit `[workspace]` table in
+/// `Cargo.toml` additionally guards against any future cargo heuristic that
+/// might walk upward from an in-tree location.
+///
+/// `main.rs` includes one `#[test]` function (`probe`) so that both
+/// `cargo build` / `cargo clippy` exercises (which ignore tests) and
+/// `cargo test` exercises (which need at least one test) work with the same
+/// fixture. `cargo build` and `cargo clippy` are unaffected by the `#[cfg(test)]`
+/// block — it is compiled only when running `cargo test`.
+///
+/// Mirrors the `test_build_make_real_execution_success` `TempDir` pattern in
+/// `cli_e2e_build_parsers.rs`. Extracted from that file (issue #447) so every
+/// test binary that needs a real-cargo fixture can share it.
+pub fn trivial_cargo_project() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("failed to create temp dir");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        concat!(
+            "[package]\n",
+            "name = \"skim_e2e_probe\"\n",
+            "version = \"0.0.0\"\n",
+            "edition = \"2021\"\n",
+            "\n",
+            "[[bin]]\n",
+            "name = \"skim_e2e_probe\"\n",
+            "path = \"main.rs\"\n",
+            "\n",
+            "[workspace]\n",
+        ),
+    )
+    .expect("failed to write Cargo.toml");
+    std::fs::write(
+        dir.path().join("main.rs"),
+        concat!(
+            "fn main() {}\n",
+            "\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn probe() {}\n",
+            "}\n",
+        ),
+    )
+    .expect("failed to write main.rs");
+    dir
+}

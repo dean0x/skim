@@ -11,19 +11,46 @@ mod common;
 // Real cargo test execution
 // ============================================================================
 
+/// Run `skim cargo test` against a trivial zero-dependency temp crate.
+///
+/// # Why a temp crate (not `-p rskim-core` on this repo)
+///
+/// The previous version of this test ran `skim cargo test -p rskim-core`
+/// against skim's own workspace. That approach shared `target/` with the outer
+/// test run, relinked 10 test binaries after any rskim-core edit, ran 16
+/// doctests, and hit the 120 s timeout twice during a machine-wide stall on
+/// 2026-09-02 (measured 4.8–6.1 s warm locally, ~26 s on CI). A temp crate
+/// decouples from `target/` state and machine load — same precedent used by
+/// `test_build_cargo_success_exit_code` in `cli_e2e_build_parsers.rs` (issue
+/// #447). The crate compiles in ~1–2 s on a cold runner.
+///
+/// Workspace isolation: `common::trivial_cargo_project()` places the directory
+/// under the system temp root, outside the skim workspace tree. Its
+/// `Cargo.toml` also includes an explicit `[workspace]` table that severs any
+/// upward workspace walk cargo might attempt.
+///
+/// # What this still uniquely proves (four properties)
+///
+/// 1. Real cargo accepts `--message-format=json` injected by `build_cargo_args`
+///    + `inject_flag_before_separator` (`crates/rskim/src/cmd/test/cargo.rs`).
+/// 2. `RE_CARGO_SUMMARY` (tier-2 regex) matches genuine stable-toolchain
+///    libtest summary output (`test result: ok. 1 passed; 0 failed; 0 ignored;
+///    …`), rendering `pass: 1 fail: 0 skip: 0` on stdout.
+/// 3. Exit-code handling on a real passing `cargo test` (`expected_exit_codes =
+///    &[101]` path) plus the ADR-001 net-savings guard against a real baseline.
+/// 4. `should_read_stdin` declines stdin when args are present so cargo is
+///    actually spawned (no stdin path taken).
 #[test]
-fn test_skim_test_cargo_in_this_repo() {
-    // Run `skim cargo test -p rskim-core` on skim's own repo.
-    // This executes a real `cargo test` and parses the output.
-    // We use -p rskim-core to limit scope and speed up the test.
-    let assert = common::skim()
-        .args(["cargo", "test", "-p", "rskim-core"])
+fn test_skim_test_cargo_real_cargo_trivial_crate() {
+    let dir = common::trivial_cargo_project();
+    common::skim()
+        .args(["cargo", "test"])
+        .current_dir(dir.path())
         .env_remove("SKIM_PASSTHROUGH")
         .timeout(std::time::Duration::from_secs(120))
-        .assert();
-
-    // Should produce structured output with pass count (tier 2 regex)
-    assert.stdout(predicate::str::contains("pass:"));
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pass: 1"));
 }
 
 // ============================================================================
