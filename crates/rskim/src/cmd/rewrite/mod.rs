@@ -36,8 +36,8 @@ use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
 use compound::{
-    command_needs_passthrough, has_pipe_operator, rewrite_would_corrupt, splice_redirects_back,
-    split_compound, try_rewrite_compound,
+    command_needs_passthrough, has_pipe_operator, is_bare_cat_pipeline, rewrite_would_corrupt,
+    splice_redirects_back, split_compound, try_rewrite_compound,
 };
 use engine::try_rewrite;
 use hook::{parse_agent_flag, run_hook_mode};
@@ -331,14 +331,35 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
 
 /// Classify a pipe expression.
 ///
-/// Pipes are NEVER rewritten (#317, user-approved): compressing the producer
-/// silently changes what downstream consumers (`grep`, `wc`, `head`) see.
-/// The first segment is only inspected to distinguish "already optimal"
-/// (`AlreadyCompact`) from a genuine compression gap (`Unhandled`).
+/// Most pipe shapes are left unclassified (`Unhandled`) because compressing the
+/// producer silently changes what downstream consumers (`grep`, `wc`, `head`) see
+/// (#317, user-approved). The sole exception is the bare `| cat` shape (AD-RW-2):
+/// exactly two segments with bare `cat` as the consumer and no redirects anywhere.
+/// That shape is classified the same way `try_rewrite_compound` handles it — by
+/// reusing [`is_bare_cat_pipeline`] — so the two surfaces cannot drift.
+///
+/// For all other pipes the first segment is inspected only to distinguish
+/// "already optimal" (`AlreadyCompact`) from a genuine compression gap
+/// (`Unhandled`).
 fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification {
     let Some(first) = segments.first() else {
         return CommandClassification::Unhandled;
     };
+
+    // AD-RW-2: bare `| cat` is the one pipeline shape the rewrite engine handles.
+    // Delegate to `is_bare_cat_pipeline` (the same predicate `try_rewrite_compound`
+    // uses) so classify_command and the hook surface cannot drift independently.
+    if is_bare_cat_pipeline(segments) {
+        let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
+        return match classify_segment_fine(&token_refs) {
+            SegmentClassification::Rewritten(tokens) => {
+                // Reconstruct the full pipeline: <rewritten_source> | cat
+                CommandClassification::Rewritten(format!("{} | cat", tokens.join(" ")))
+            }
+            SegmentClassification::AlreadyCompact(_) => CommandClassification::AlreadyCompact,
+            SegmentClassification::NoMatch => CommandClassification::Unhandled,
+        };
+    }
 
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
     if is_segment_ack(&token_refs) {

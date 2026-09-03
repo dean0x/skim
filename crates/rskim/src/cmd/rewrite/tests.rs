@@ -89,14 +89,14 @@ fn test_classify_compound_any_nomatch() {
 }
 
 #[test]
-fn test_classify_pipe_never_rewritten() {
-    // #317 (user-approved): pipes are never rewritten — even when the first
-    // segment matches a rule, compressing the producer changes what the
-    // downstream consumer sees.
+fn test_classify_pipe_pager_not_rewritten() {
+    // #317 (user-approved): pipes are not rewritten when the consumer is a
+    // pager or any tool other than bare `cat` (AD-RW-2 exception). Compressing
+    // the producer changes what the downstream consumer sees.
     assert_eq!(
         classify_command("git show HEAD | less"),
         CommandClassification::Unhandled,
-        "pipe with rewritable first segment must NOT be rewritten"
+        "pipe to a pager must NOT be rewritten"
     );
 }
 
@@ -129,14 +129,15 @@ fn test_classify_compound_preserves_stripped_redirects() {
     }
 }
 
-/// #317: pipe expressions pass through untouched — redirects included,
-/// because the ORIGINAL command runs unchanged.
+/// #317: non-bare-cat pipe expressions pass through untouched — redirects
+/// included, because the ORIGINAL command runs unchanged.  The sole exception
+/// is the bare `| cat` shape (AD-RW-2); `| head` is not that shape.
 #[test]
-fn test_classify_compound_pipe_is_unhandled() {
+fn test_classify_compound_pipe_head_is_unhandled() {
     assert_eq!(
         classify_command("cargo test 2>&1 | head"),
         CommandClassification::Unhandled,
-        "pipe expressions must not be rewritten"
+        "pipe to head must not be rewritten (only bare `| cat` is the AD-RW-2 exception)"
     );
 }
 
@@ -1003,4 +1004,239 @@ fn test_require_flags_for_tool_drift_guard() {
         mysql_sorted, expected_mysql,
         "mysql require_flags must exactly match the rule-table declaration"
     );
+}
+
+// ========================================================================
+// AD-RW-2 reversal: classify_command agrees with try_rewrite_compound
+// for the `| cat` pipeline shape (RED before fix, GREEN after).
+// ========================================================================
+
+/// Helper: call the same engine path the hook uses, returning Some(rewritten)
+/// or None.  Mirrors the hook's `run_hook_mode` compound dispatch verbatim so
+/// the drift-guard test drives a code path independent of `classify_command`.
+fn engine_rewrite(shape: &str) -> Option<String> {
+    use super::compound::{split_compound, try_rewrite_compound};
+    use super::engine::try_rewrite;
+    use super::types::CompoundSplitResult;
+
+    let has_operator =
+        shape.contains("&&") || shape.contains("||") || shape.contains(';') || shape.contains('|');
+    if !has_operator {
+        let tokens: Vec<&str> = shape.split_whitespace().collect();
+        return try_rewrite(&tokens).map(|r| r.tokens.join(" "));
+    }
+    match split_compound(shape) {
+        CompoundSplitResult::Bail => None,
+        CompoundSplitResult::Simple(simple_tokens) => {
+            let refs: Vec<&str> = simple_tokens.iter().map(|s| s.as_str()).collect();
+            try_rewrite(&refs).map(|r| r.tokens.join(" "))
+        }
+        CompoundSplitResult::Compound(segments) => {
+            try_rewrite_compound(&segments).map(|r| r.tokens.join(" "))
+        }
+    }
+}
+
+/// `git log -n 3 | cat` must classify as `Rewritten` after AD-RW-2 reversal.
+///
+/// Current (before fix): `classify_command` returns `Unhandled` because
+/// `classify_compound_pipe` did not consult `is_bare_cat_pipeline`.
+/// Engine side (`skim rewrite "git log -n 3 | cat"`): exit 0, stdout =
+/// `skim git log -n 3 | cat`.
+/// Classify side (reasoned from code): after fix, `classify_compound_pipe` calls
+/// `is_bare_cat_pipeline` → true → `classify_segment_fine("git log -n 3")` →
+/// `Rewritten(["skim", "git", "log", "-n", "3"])` → `Rewritten("skim git log -n 3 | cat")`.
+///
+/// RED before fix; GREEN after.
+#[test]
+fn test_classify_pipe_bare_cat_git_log_rewritten() {
+    assert!(
+        matches!(
+            classify_command("git log -n 3"),
+            CommandClassification::Rewritten(_)
+        ),
+        "sanity: plain `git log -n 3` must be Rewritten"
+    );
+    assert_eq!(
+        classify_command("git log -n 3 | cat"),
+        CommandClassification::Rewritten("skim git log -n 3 | cat".to_string()),
+        "`git log -n 3 | cat` must be Rewritten with source rewritten and `| cat` preserved"
+    );
+}
+
+/// `cat README.md | cat` must classify as `Rewritten` after AD-RW-2 reversal.
+///
+/// Current (before fix): `classify_command` returns `Unhandled`.
+/// Engine side (`skim rewrite "cat README.md | cat"`): exit 0, stdout =
+/// `SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo | cat`.
+/// Classify side (reasoned from code): `classify_segment_fine("cat README.md")` →
+/// `Rewritten(["SKIM_REWRITTEN_FROM=cat", "skim", "README.md", "--mode=pseudo"])` →
+/// `Rewritten("SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo | cat")`.
+///
+/// RED before fix; GREEN after.
+#[test]
+fn test_classify_pipe_bare_cat_file_read_rewritten() {
+    assert!(
+        matches!(
+            classify_command("cat README.md"),
+            CommandClassification::Rewritten(_)
+        ),
+        "sanity: plain `cat README.md` must be Rewritten"
+    );
+    assert_eq!(
+        classify_command("cat README.md | cat"),
+        CommandClassification::Rewritten(
+            "SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo | cat".to_string()
+        ),
+        "`cat README.md | cat` must be Rewritten with source rewritten as standalone form"
+    );
+}
+
+/// `grep -rn foo src | cat` must classify as `Rewritten` after AD-RW-2 reversal.
+///
+/// Current (before fix): `classify_command` returns `Unhandled`.
+/// Engine side (`skim rewrite "grep -rn foo src | cat"`): exit 0, stdout =
+/// `skim grep -rn foo src | cat`.
+/// Classify side (reasoned from code): `classify_segment_fine("grep -rn foo src")` →
+/// `Rewritten(["skim", "grep", "-rn", "foo", "src"])` →
+/// `Rewritten("skim grep -rn foo src | cat")`.
+///
+/// RED before fix; GREEN after.
+#[test]
+fn test_classify_pipe_bare_cat_grep_rewritten() {
+    assert!(
+        matches!(
+            classify_command("grep -rn foo src"),
+            CommandClassification::Rewritten(_)
+        ),
+        "sanity: plain `grep -rn foo src` must be Rewritten"
+    );
+    assert_eq!(
+        classify_command("grep -rn foo src | cat"),
+        CommandClassification::Rewritten("skim grep -rn foo src | cat".to_string()),
+        "`grep -rn foo src | cat` must be Rewritten with source rewritten as standalone form"
+    );
+}
+
+// ========================================================================
+// Controls: shapes that must remain Unhandled (before AND after fix).
+// ========================================================================
+
+/// `git log | cat > out.txt` — stdout redirect on cat segment → not bare cat.
+///
+/// Current: `Unhandled`. Must stay `Unhandled` after fix.
+/// Engine side: exit 1 (not rewritten — Rule S arms `command_needs_exact_bytes`).
+#[test]
+fn test_classify_pipe_cat_redirect_stays_unhandled() {
+    assert_eq!(
+        classify_command("git log | cat > out.txt"),
+        CommandClassification::Unhandled,
+        "`git log | cat > out.txt` must stay Unhandled (stdout redirect on cat)"
+    );
+}
+
+/// `git log | cat | tee f` — three pipeline stages → not the 2-stage shape.
+///
+/// Current: `Unhandled`. Must stay `Unhandled` after fix.
+/// Engine side: exit 1 (not rewritten — Rule T arms `command_needs_exact_bytes`).
+#[test]
+fn test_classify_pipe_cat_tee_stays_unhandled() {
+    assert_eq!(
+        classify_command("git log | cat | tee f"),
+        CommandClassification::Unhandled,
+        "`git log | cat | tee f` must stay Unhandled (three stages, not bare `| cat`)"
+    );
+}
+
+/// `git log | cat -n` — cat has an argument → not bare cat.
+///
+/// Current: `Unhandled`. Must stay `Unhandled` after fix.
+/// Engine side: exit 1 (not rewritten — consumer tokens are ["cat", "-n"]).
+#[test]
+fn test_classify_pipe_cat_n_stays_unhandled() {
+    assert_eq!(
+        classify_command("git log | cat -n"),
+        CommandClassification::Unhandled,
+        "`git log | cat -n` must stay Unhandled (cat has arguments)"
+    );
+}
+
+/// `git log | less` — consumer is `less`, not `cat`.
+///
+/// Current: `Unhandled`. Must stay `Unhandled` after fix.
+/// Engine side: exit 1 (not rewritten).
+#[test]
+fn test_classify_pipe_less_stays_unhandled() {
+    assert_eq!(
+        classify_command("git log | less"),
+        CommandClassification::Unhandled,
+        "`git log | less` must stay Unhandled (pager, not bare cat)"
+    );
+}
+
+/// `ls | head` — consumer is `head`, not `cat`.
+///
+/// Current: `Unhandled`. Must stay `Unhandled` after fix.
+/// Engine side: exit 1 (not rewritten).
+#[test]
+fn test_classify_pipe_head_stays_unhandled() {
+    assert_eq!(
+        classify_command("ls | head"),
+        CommandClassification::Unhandled,
+        "`ls | head` must stay Unhandled (head is not bare cat)"
+    );
+}
+
+// ========================================================================
+// Drift guard: classify_command agrees with the hook's engine path
+// (RED for the three `| cat` shapes before fix; GREEN after).
+// ========================================================================
+
+/// For each shape, `classify_command` returns `Rewritten` IF AND ONLY IF the
+/// hook's engine path (the same `try_rewrite` / `try_rewrite_compound` the
+/// `run_hook_mode` dispatch calls) returns `Some`.
+///
+/// This test is the single place that catches a future drift between the two
+/// surfaces.  Adding a new rewritable pipe shape to the engine without updating
+/// `classify_compound_pipe` (or vice-versa) will break this test first.
+///
+/// Current engine verdicts (observed via `skim rewrite "<shape>"`):
+/// - `git log -n 3 | cat` → exit 0 (rewrites)          classify: currently Unhandled (bug)
+/// - `cat README.md | cat` → exit 0 (rewrites)          classify: currently Unhandled (bug)
+/// - `grep -rn foo src | cat` → exit 0 (rewrites)       classify: currently Unhandled (bug)
+/// - `git log | cat > out.txt` → exit 1 (no rewrite)    classify: Unhandled ✓
+/// - `git log | cat | tee f` → exit 1 (no rewrite)      classify: Unhandled ✓
+/// - `git log | cat -n` → exit 1 (no rewrite)           classify: Unhandled ✓
+/// - `git log | less` → exit 1 (no rewrite)             classify: Unhandled ✓
+/// - `ls | head` → exit 1 (no rewrite)                  classify: Unhandled ✓
+/// - `git status` → exit 0 (skim git status)             classify: Rewritten ✓
+/// - `cat file.rs` → exit 0 (skim ... --mode=pseudo)    classify: Rewritten ✓
+///
+/// RED for the first three shapes before fix; GREEN for all ten after.
+#[test]
+fn test_classify_vs_engine_drift_guard() {
+    // (shape, expected: classify_command returns Rewritten iff engine returns Some)
+    let shapes = [
+        "git log -n 3 | cat",
+        "cat README.md | cat",
+        "grep -rn foo src | cat",
+        "git log | cat > out.txt",
+        "git log | cat | tee f",
+        "git log | cat -n",
+        "git log | less",
+        "ls | head",
+        "git status",
+        "cat file.rs",
+    ];
+
+    for shape in shapes {
+        let classify_rewritten =
+            matches!(classify_command(shape), CommandClassification::Rewritten(_));
+        let engine_rewrites = engine_rewrite(shape).is_some();
+        assert_eq!(
+            classify_rewritten, engine_rewrites,
+            "classify_command / engine disagree on '{shape}': \
+             classify={classify_rewritten}, engine={engine_rewrites}"
+        );
+    }
 }

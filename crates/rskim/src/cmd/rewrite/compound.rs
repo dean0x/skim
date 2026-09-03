@@ -935,7 +935,7 @@ fn rejoin_segments(segments: &[CommandSegment]) -> String {
 /// [`command_needs_exact_bytes`] over the rejoined text is then the safety
 /// gate, and it is what keeps `… | cat > f` (rule R, whose `>`/target tokens
 /// stay inside the consumer segment) and `… | cat | tee f` (rule T) raw.
-fn is_bare_cat_pipeline(segments: &[CommandSegment]) -> bool {
+pub(super) fn is_bare_cat_pipeline(segments: &[CommandSegment]) -> bool {
     let [source, consumer] = segments else {
         return false;
     };
