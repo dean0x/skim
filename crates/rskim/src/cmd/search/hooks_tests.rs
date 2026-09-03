@@ -244,7 +244,7 @@ fn test_hooks_route_to_shared_commondir_in_linked_worktree() {
     };
 
     let resolved = super::resolve_hooks_dir(&worktree)
-        .expect("linked worktree has a .git FILE — resolve_hooks_dir must return Some");
+        .expect("linked worktree has a .git FILE — resolve_hooks_dir must return Ok");
     // `.git` is a FILE in a linked worktree — the pre-#413 path is not a directory.
     assert!(
         worktree.join(".git").is_file(),
@@ -324,7 +324,7 @@ fn test_resolve_hooks_dir_rejects_crafted_gitdir_with_no_git_structure() {
     fs::write(project.join(".git"), &gitdir_line).unwrap();
 
     let resolved = super::resolve_hooks_dir(&project)
-        .expect("project with .git FILE (invalid gitdir) — resolve_hooks_dir must return Some");
+        .expect("project with .git FILE (invalid gitdir) — resolve_hooks_dir must return Ok");
 
     // Must fall back to the safe local path, not the attacker's directory.
     assert_eq!(
@@ -621,10 +621,10 @@ fn test_install_hooks_refuses_subdirectory_root() {
     let subdir = repo.join("src");
     fs::create_dir_all(&subdir).unwrap();
 
-    // resolve_hooks_dir must return None for a subdirectory of a git repo.
+    // resolve_hooks_dir must return Err for a subdirectory of a git repo (F9/AD-414-20).
     assert!(
-        super::resolve_hooks_dir(&subdir).is_none(),
-        "a subdirectory of a git repo must yield None from resolve_hooks_dir; \
+        super::resolve_hooks_dir(&subdir).is_err(),
+        "a subdirectory of a git repo must yield Err from resolve_hooks_dir; \
          pre-fix: returned <subdir>/.git/hooks and let create_dir_all fabricate \
          a fake .git directory"
     );

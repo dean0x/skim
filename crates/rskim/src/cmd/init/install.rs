@@ -714,9 +714,11 @@ fn install_search_integration() {
                     .dir
                     .canonicalize()
                     .unwrap_or_else(|_| outcome.dir.clone());
+                // F8: use {:?} to quote ESC/CR/LF from repository-controlled
+                // gitdir pointers (AD-413-3 / ADR-008).
                 println!(
-                    "    note: hooks installed in {} (shared by every worktree of this clone)",
-                    display_dir.display()
+                    "    note: hooks installed in {:?} (shared by every worktree of this clone)",
+                    display_dir
                 );
             }
         }

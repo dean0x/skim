@@ -131,7 +131,19 @@ pub(crate) struct HooksOutcome {
 ///    pointer to an arbitrary directory — e.g. `~/Library/LaunchAgents` — has
 ///    no `objects/` or `refs/`, so it fails the gate and skim falls back to the
 ///    safe local `<root>/.git/hooks`.
-pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Option<PathBuf> {
+///
+/// F9 / AD-413-18: changed from `Option<PathBuf>` to `Result<PathBuf,
+/// Option<PathBuf>>` so the discovered enclosing ancestor is returned
+/// alongside the refusal, eliminating the redundant `resolve_repo_toplevel`
+/// re-walk in `install_search_hooks` and `remove_search_hooks`.
+///
+/// - `Ok(dir)` — a valid hooks directory; caller may use it.
+/// - `Err(Some(ancestor))` — `project_root` is a subdirectory of `ancestor`;
+///   caller must refuse with an error naming `ancestor`.
+/// - `Err(None)` — does not occur in practice (when there is no enclosing repo
+///   the function returns `Ok` with the fallback path), but callers must handle
+///   the variant for exhaustiveness.
+pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, Option<PathBuf>> {
     match super::staleness::resolve_git_dir(project_root) {
         Some(git_dir) => {
             let dot_git = project_root.join(".git");
@@ -146,7 +158,7 @@ pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Option<PathBuf> {
                 // A real linked worktree always has a commondir, so this is the
                 // expected fast path.
                 if let Some(common) = super::staleness::resolve_common_dir(&git_dir) {
-                    return Some(common.join("hooks"));
+                    return Ok(common.join("hooks"));
                 }
                 // Stage 2: no commondir (submodule gitdir, or an unusual
                 // configuration).  The gitdir itself must look like a complete
@@ -164,38 +176,39 @@ pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Option<PathBuf> {
                         );
                     }
                     // Safe fallback: contained inside the project root.
-                    return Some(project_root.join(".git").join("hooks"));
+                    return Ok(project_root.join(".git").join("hooks"));
                 }
-                Some(git_dir.join("hooks"))
+                Ok(git_dir.join("hooks"))
             } else {
                 // `.git` is a directory — already known to exist on disk and is
                 // therefore a trustworthy base path.  Follow the commondir if
                 // present (plain repos typically have none), otherwise use
                 // git_dir directly.
-                Some(
-                    super::staleness::resolve_common_dir(&git_dir)
-                        .unwrap_or(git_dir)
-                        .join("hooks"),
-                )
+                Ok(super::staleness::resolve_common_dir(&git_dir)
+                    .unwrap_or(git_dir)
+                    .join("hooks"))
             }
         }
         None => {
             // No `.git` at this root.  Check whether the root is a subdirectory
             // of an enclosing git repository.
             //
-            // If it IS inside a repo, return None.  The caller must refuse:
-            // creating `<root>/.git/hooks` here would permanently break ancestor
-            // adoption and make the temporal layer silently dead (PF-017 + the
-            // review finding that led to this change).
+            // If it IS inside a repo, return Err(Some(ancestor)).  The caller
+            // must refuse: creating `<root>/.git/hooks` here would permanently
+            // break ancestor adoption and make the temporal layer silently dead
+            // (PF-017 + the review finding that led to this change).
+            // F9 / AD-413-18: return the discovered ancestor so callers do not
+            // have to re-walk (eliminates a redundant resolve_repo_toplevel call
+            // on the install/remove refusal paths).
             //
             // If it is NOT inside any repo (true non-repo, e.g. the bare temp
             // dirs that hooks_tests creates), return the pre-#413 fallback —
             // creating an empty `.git/hooks` there is safe because no ancestor
             // adoption can be disrupted.
-            if super::staleness::resolve_repo_toplevel(project_root).is_some() {
-                return None;
+            if let Some(ancestor) = super::staleness::resolve_repo_toplevel(project_root) {
+                return Err(Some(ancestor));
             }
-            Some(project_root.join(".git").join("hooks"))
+            Ok(project_root.join(".git").join("hooks"))
         }
     }
 }
@@ -287,24 +300,25 @@ fn is_shared_hooks_dir(project_root: &Path, _hooks_dir: &Path) -> bool {
 /// `project_root` is a subdirectory of a git repository (see above).
 pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<HooksOutcome> {
     let hooks_dir = match resolve_hooks_dir(project_root) {
-        Some(d) => d,
-        None => {
-            // resolve_hooks_dir returns None only when resolve_git_dir found no
+        Ok(d) => d,
+        Err(ancestor) => {
+            // resolve_hooks_dir returns Err only when resolve_git_dir found no
             // `.git` at this root BUT resolve_repo_toplevel found an enclosing
             // repo.  Refuse loudly — installing here would create a fake `.git`
             // that permanently breaks ancestor adoption (PF-017).
-            let ancestor = super::staleness::resolve_repo_toplevel(project_root);
+            // F8: {:?} quotes ESC/CR/LF; F9: ancestor is already discovered,
+            // no re-walk needed (AD-413-18).
             let hint = ancestor
                 .map(|p| {
                     format!(
-                        "; re-run with `--root {}` to install hooks in the enclosing repository",
-                        p.display()
+                        "; re-run with `--root {:?}` to install hooks in the enclosing repository",
+                        p
                     )
                 })
                 .unwrap_or_default();
             anyhow::bail!(
-                "\"{}\" is a subdirectory of a git repository and cannot itself host git hooks{}",
-                project_root.display(),
+                "{:?} is a subdirectory of a git repository and cannot itself host git hooks{}",
+                project_root,
                 hint,
             );
         }
@@ -355,21 +369,21 @@ pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<HooksO
 /// `project_root` is a subdirectory of a git repository (see above).
 pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOutcome> {
     let hooks_dir = match resolve_hooks_dir(project_root) {
-        Some(d) => d,
-        None => {
+        Ok(d) => d,
+        Err(ancestor) => {
             // Symmetric refusal with install_search_hooks (see comment there).
-            let ancestor = super::staleness::resolve_repo_toplevel(project_root);
+            // F8: {:?} quotes ESC/CR/LF; F9: ancestor already discovered (AD-413-18).
             let hint = ancestor
                 .map(|p| {
                     format!(
-                        "; re-run with `--root {}` to remove hooks from the enclosing repository",
-                        p.display()
+                        "; re-run with `--root {:?}` to remove hooks from the enclosing repository",
+                        p
                     )
                 })
                 .unwrap_or_default();
             anyhow::bail!(
-                "\"{}\" is a subdirectory of a git repository and cannot itself host git hooks{}",
-                project_root.display(),
+                "{:?} is a subdirectory of a git repository and cannot itself host git hooks{}",
+                project_root,
                 hint,
             );
         }
@@ -403,7 +417,9 @@ pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOu
 /// Used in tests and by external callers that check hook installation state.
 #[allow(dead_code)]
 pub(crate) fn has_search_hooks(project_root: &Path) -> bool {
-    let Some(hooks_dir) = resolve_hooks_dir(project_root) else {
+    let Ok(hooks_dir) = resolve_hooks_dir(project_root) else {
+        // Err means project_root is a subdirectory of a git repo —
+        // no hooks can have been installed there (install_search_hooks refuses).
         return false;
     };
     HOOK_NAMES.iter().any(|name| {
