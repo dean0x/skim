@@ -574,7 +574,9 @@ pub(super) fn auto_refresh_if_stale(
         if let Some(head) = current_head
             && temporal_db_is_stale(cache_dir, head, git_dir_for_stale.as_deref())
         {
-            try_rebuild_temporal_nonfatal(root, cache_dir, Some(head), "self-heal", reanchor);
+            // `head` is `Some` here by construction, so `head_state` is
+            // `Resolved` and AD-414-22's unborn arm is unreachable from this gate.
+            try_rebuild_temporal_nonfatal(root, cache_dir, &head_state, "self-heal", reanchor);
         }
 
         return Ok((RefreshOutcome::UpToDate, manifest, head_state));
@@ -690,12 +692,14 @@ pub(super) fn auto_refresh_if_stale(
     // the parse+sync phase and degrades gracefully on non-git dirs, gix errors,
     // or CapacityExceeded — a temporal failure MUST NOT fail the lexical refresh.
     //
-    // `head` is the HEAD SHA read at function entry above. Passing `None` when
-    // the project is non-git: try_rebuild_temporal_nonfatal no-ops gracefully.
+    // `head_state` is the HEAD classification read at function entry above.
+    // try_rebuild_temporal_nonfatal no-ops gracefully on a non-git project
+    // (`NotARepo`); AD-414-22: an unborn HEAD (`Unresolved`) builds an empty
+    // temporal.db plus the AC-16 notice on the explicit arms only.
     // `reanchor` is threaded from the caller: only the explicit build arms
     // (`--build`, `--rebuild`, `--update`) pass `Allow`; query-triggered refreshes
     // pass `Refuse` so anchor mismatch leaves temporal.db untouched (PF-017).
-    try_rebuild_temporal_nonfatal(root, cache_dir, current_head, "post-rebuild", reanchor);
+    try_rebuild_temporal_nonfatal(root, cache_dir, &head_state, "post-rebuild", reanchor);
     // ─────────────────────────────────────────────────────────────────────────
 
     let outcome = if is_no_index {

@@ -325,10 +325,15 @@ pub(super) fn build_risk_rows(
 /// HEAD, and fs error — the linked-worktree route that previously caused `None` is fixed
 /// by #413.  With `current_head = None` for any of those reasons, both the BUG-B
 /// self-heal gate (`if let Some(ref head) = current_head && …` in `staleness.rs`) and
-/// `try_rebuild_temporal_nonfatal` (early `let Some(head) = head else { return }`)
-/// short-circuit before this function is ever invoked with a `Some(head)`.
+/// the `HeadState::Resolved` arm of `try_rebuild_temporal_nonfatal` short-circuit
+/// before this function is ever invoked.
 /// The no-rebuild-loop guarantee for zero-commit repos therefore derives from the
-/// `read_git_head = None` short-circuit, **not** from the empty-DB write.  The empty-DB
+/// `read_git_head = None` short-circuit, **not** from the empty-DB write.
+/// AD-414-22: the explicit build arms no longer stop there — they route an unborn
+/// HEAD to [`build_empty_temporal_for_unborn_head`], which writes a zero-row
+/// `temporal.db` with **no** `META_GIT_HEAD` and emits the AC-16 notice.  The quiet
+/// query path is unchanged, so the short-circuit above still supplies the loop bound.
+/// The empty-DB
 /// code path is also exercised from `auto_refresh_if_stale` when the subtree under a
 /// subdirectory root (OD-3/AD-413-14) has zero qualifying commits; the direct-call test
 /// (`rebuild_temporal_with_source` with a synthetic `fake_head`) exercises the same path
@@ -894,7 +899,7 @@ pub(super) fn rebuild_temporal_with_source(
         cache_dir,
         is_loud,
         cache_dir,
-        head,
+        Some(head),
         is_shallow_opt,
     ) else {
         return Ok(());
@@ -979,6 +984,135 @@ pub(super) fn rebuild_temporal_with_source(
     Ok(())
 }
 
+/// AD-414-22: build a present-but-EMPTY `temporal.db` for a repository whose
+/// HEAD is unborn — `git init` with files but no commits — and emit the AC-16
+/// zero-row notice.
+///
+/// # Why this exists
+///
+/// A repository with no commits is an **empty history**, not a build failure and
+/// not a non-repository.  Before this function the CLI could express neither:
+/// `HeadState::Unresolved.sha()` is `None`, so
+/// [`super::staleness::try_rebuild_temporal_nonfatal`] returned before
+/// [`rebuild_temporal_with_source`] was ever entered.  `skim search --build` on a
+/// no-commit repository therefore printed only the lexical "indexed N files"
+/// line, created no `temporal.db`, and emitted no temporal notice — AC-16's
+/// case (i) ("no commits") was unreachable from every CLI arm even though
+/// [`zero_row_notice`] has produced its text since #414 landed and
+/// `GixSource::parse_history` has returned `Ok(empty_result(is_shallow))` for an
+/// unborn HEAD since #408 (`git_parser.rs`, `is_unborn_error`).
+///
+/// # Contract
+///
+/// - **Explicit build arms only.**  Called from `try_rebuild_temporal_nonfatal`
+///   solely under [`super::staleness::ReanchorPolicy::Allow`] (`--build`,
+///   `--rebuild`, `--update`).  The quiet query path must stay silent
+///   (wave-wide loudness policy) and must not re-walk history per query.
+/// - **No fabricated HEAD.**  The DB is written through
+///   [`rskim_search::TemporalDb::sync_empty_unborn`], which *removes* the
+///   `git_head` / `data_version` attestation pair rather than recording a
+///   placeholder (avoids PF-016).  An absent `META_GIT_HEAD` is the state
+///   `warn_if_temporal_unverifiable` already documents as the "unborn-branch
+///   no-loop case", and it makes `temporal_db_is_stale` Check 1 report stale the
+///   moment the repository's first commit lands.
+/// - **`is_shallow` is probed, never fabricated** — it comes from
+///   `parse_history`'s own `HistoryResult::metadata`, the same source the
+///   resolved-HEAD path uses.
+/// - **No rebuild loop.**  On the quiet path `current_head` is `None` for an
+///   unborn HEAD, so neither the BUG-B self-heal gate nor the post-rebuild hook
+///   reaches any temporal rebuild; the loop guarantee still derives from that
+///   short-circuit, not from the DB's contents.
+///
+/// # Non-cases (deliberately left untouched)
+///
+/// `HeadState::Unresolved` also covers a corrupt `HEAD` file, an unsupported ref
+/// backend (reftable, #481) and fs errors on repositories that *do* have history.
+/// Two guards keep those out: a `parse_history` `Err` returns without touching
+/// `temporal.db` (F3 semantics — a failure to read history must not be reported
+/// as "no history"), and a successful parse that yields commits also returns
+/// without writing, because this function's notice would then be a lie.
+///
+/// # Failure isolation (D5)
+///
+/// Every failure mode returns `Ok(())` with a debug-gated diagnostic: a temporal
+/// failure must never fail the explicit build that triggered it (ADR-006/D5).
+pub(super) fn build_empty_temporal_for_unborn_head(
+    src: &dyn rskim_search::TemporalSource,
+    root: &Path,
+    cache_dir: &Path,
+    reanchor: super::staleness::ReanchorPolicy,
+    loudness: BuildLoudness,
+) -> anyhow::Result<()> {
+    // `parse_history` returns Ok(empty) for a genuinely unborn HEAD and Err for a
+    // repository whose history could not be read at all; only the former is ours.
+    let history = match src.parse_history(root, 0) {
+        Ok(h) => h,
+        Err(e) => {
+            if crate::debug::is_debug_enabled() {
+                eprintln!(
+                    "skim search [debug]: HEAD is unresolvable and parse_history failed: {e} — \
+                     leaving temporal.db untouched (no empty-history claim without evidence)",
+                );
+            }
+            return Ok(());
+        }
+    };
+    if !history.commits.is_empty() {
+        // HEAD is unresolvable for some reason OTHER than an unborn branch
+        // (corrupt HEAD, reftable backend) on a repository that does have
+        // history.  Recording zero rows and announcing "no commit history"
+        // would both be false; leave the DB as it is.
+        if crate::debug::is_debug_enabled() {
+            eprintln!(
+                "skim search [debug]: HEAD is unresolvable but {} commits are readable — \
+                 not an unborn branch; leaving temporal.db untouched",
+                history.commits.len(),
+            );
+        }
+        return Ok(());
+    }
+
+    // Lock ordering matches `rebuild_temporal_with_source`: acquired after the
+    // (pure) history read, around the open+sync phase only (D4).
+    let _lock = super::build_lock::acquire("skim search", cache_dir)?;
+
+    let db_path = cache_dir.join("temporal.db");
+    let is_shallow = history.metadata.is_shallow;
+    // AD-414-3 discard-on-corrupt semantics are shared with the resolved-HEAD
+    // path; `head = None` suppresses the sentinel write (see that fn's doc).
+    let Some(db) = open_or_discard_temporal_db(
+        &db_path,
+        cache_dir,
+        loudness == BuildLoudness::Loud,
+        cache_dir,
+        None,
+        Some(is_shallow),
+    ) else {
+        return Ok(());
+    };
+
+    if let Err(e) = db.sync_empty_unborn(is_shallow) {
+        if crate::debug::is_debug_enabled() {
+            eprintln!("skim search [debug]: empty-history sync failed (non-fatal): {e}");
+        }
+        return Ok(());
+    }
+
+    // Mirrors `on_sync_ok` on the resolved-HEAD path: record (or clear) the
+    // repository anchor in a second transaction (AD-413-16).  No sentinel is
+    // cleared here because none can have been written for an absent HEAD.
+    let ghost_root = discover_git_workdir(root).unwrap_or_else(|| root.to_path_buf());
+    record_temporal_anchor(&db, root, &ghost_root, reanchor);
+
+    // AC-16 case (i): exactly one non-debug-gated stderr line naming the stage
+    // that produced zero data.  `commits.is_empty()` selects the "no commits"
+    // branch of `zero_row_notice`, whose text must not mention `shallow` even
+    // when this unborn repository happens to be a shallow clone.
+    eprintln!("skim search: {}", zero_row_notice(&history, 0, is_shallow));
+
+    Ok(())
+}
+
 // ============================================================================
 // Extracted helpers (Finding 4 — complexity reduction)
 // ============================================================================
@@ -994,14 +1128,27 @@ pub(super) fn rebuild_temporal_with_source(
 /// `is_loud` gates the open-failure notice for the `Err(other)` arm (SE-1).
 /// `is_shallow` is passed to [`write_backoff_sentinel`] so the two-line
 /// format is written consistently from all failure arms (AD-414-21).
+///
+/// AD-414-22: `head` is `None` for the unborn-HEAD caller
+/// ([`build_empty_temporal_for_unborn_head`]).  The backoff sentinel is keyed on
+/// HEAD, so with no HEAD there is no key to bound retries with and no sentinel is
+/// written — which is sound because that caller is reachable only from the
+/// explicit build arms (one attempt per user-initiated invocation), never from
+/// the per-query quiet path.
 fn open_or_discard_temporal_db(
     db_path: &std::path::Path,
     cache_dir: &std::path::Path,
     is_loud: bool,
     _backoff_sentinel: &std::path::Path, // kept for caller compat; use cache_dir internally
-    head: &str,
+    head: Option<&str>,
     is_shallow: Option<bool>,
 ) -> Option<TemporalDb> {
+    // AD-414-22: no HEAD → no per-HEAD backoff key → no sentinel (see fn doc).
+    let bound_retry_for_this_head = || {
+        if let Some(head) = head {
+            write_backoff_sentinel(cache_dir, head, is_shallow);
+        }
+    };
     match TemporalDb::open(db_path) {
         Ok(d) => Some(d),
         // AD-414-3: DatabaseCorrupt is the ONLY variant that licenses deleting
@@ -1033,7 +1180,7 @@ fn open_or_discard_temporal_db(
                     // The sentinel bounds it to once per HEAD, matching both sibling arms
                     // (recreate-failed and Err(other)).  SE-3 is not violated: no sidecar
                     // removal is attempted here (the main unlink itself failed).
-                    write_backoff_sentinel(cache_dir, head, is_shallow);
+                    bound_retry_for_this_head();
                     return None;
                 }
             }
@@ -1049,7 +1196,7 @@ fn open_or_discard_temporal_db(
                     );
                     // D5 backoff: the discard SUCCEEDED, so temporal.db is now absent;
                     // the sentinel prevents the per-query rebuild loop.
-                    write_backoff_sentinel(cache_dir, head, is_shallow);
+                    bound_retry_for_this_head();
                     None
                 }
             }
@@ -1084,7 +1231,7 @@ fn open_or_discard_temporal_db(
             // UnsupportedSchemaVersion leaves temporal.db byte-for-byte unchanged
             // (R1 contract); the sentinel prevents an infinite retry without touching
             // the DB.
-            write_backoff_sentinel(cache_dir, head, is_shallow);
+            bound_retry_for_this_head();
             None
         }
     }

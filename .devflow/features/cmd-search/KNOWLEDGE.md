@@ -377,6 +377,34 @@ display consumers (e.g. `--stats`) show the real HEAD.
 - `not_a_repo` — no `.git` entry at `project_root` or within `MAX_ANCESTORS`.
 Exposed in `--stats --json` as `git_head_state` key (AD-413-13). Per-worktree ref namespaces (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/`) are never redirected to the commondir.
 
+**AD-414-22 — `unresolved` on an EXPLICIT build arm is an empty history.**
+`try_rebuild_temporal_nonfatal` takes `&HeadState` (not the `Option<&str>` SHA it
+took before): three states need three answers and `Option` could only express two.
+`NotARepo` returns; `Resolved(sha)` takes the normal rebuild; `Unresolved` under
+`ReanchorPolicy::Allow` (`--build`/`--rebuild`/`--update`) calls
+`temporal_build::build_empty_temporal_for_unborn_head`, which re-reads history
+through `parse_history` (which returns `Ok(empty_result(is_shallow))` for an
+unborn HEAD — `git_parser.rs`, `is_unborn_error`), writes a zero-row `temporal.db`
+via the new `TemporalDb::sync_empty_unborn`, and emits the AC-16 case-(i) notice.
+Three properties are load-bearing:
+1. **No fabricated HEAD.** `sync_empty_unborn` *removes* the co-required
+   `git_head`/`data_version` pair rather than writing a placeholder (avoids
+   PF-016). An absent `git_head` is what makes `warn_if_temporal_unverifiable`
+   stay silent (its documented "unborn-branch no-loop case") and what makes
+   `temporal_db_is_stale` Check 1 rebuild automatically after the first commit.
+2. **Explicit arms only.** The quiet query path keeps `current_head == None`, so
+   no temporal code runs — the wave-wide loudness policy holds and there is no
+   unbounded per-query history re-walk (the backoff sentinel is keyed on a HEAD
+   that does not exist, so it cannot bound anything here).
+3. **Two guards keep non-unborn `Unresolved` out** (corrupt HEAD, reftable
+   backend, fs error): a `parse_history` `Err` returns without touching
+   `temporal.db` (F3 semantics — failing to read history is not the same fact as
+   having none), and a successful parse that yields commits returns too.
+Before AD-414-22, `--build` on a no-commit repo printed only `indexed N files`,
+created no `temporal.db`, and emitted no temporal notice at all — AC-16 case (i)
+was unreachable from every CLI arm (measured at `dee5290`; identical code at
+`041b302`, so this was a long-standing gap, not a regression from the F1–F9 batch).
+
 **`read_git_head(project_root) -> Option<String>`**: reads current git HEAD SHA.
 Resolution order: `resolve_git_dir` OR `resolve_repo_toplevel` → read `HEAD` → if symbolic ref, 4-probe ladder (AD-413-4/5, including `commondir`); path traversal guard (AD-413-6, `is_repo_relative_safe`); 40/64-hex raw SHA (detached HEAD). Returns `None` for unborn branch, reftable, corrupt HEAD.
 

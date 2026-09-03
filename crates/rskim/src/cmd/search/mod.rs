@@ -946,7 +946,10 @@ fn run_build(
     staleness::try_rebuild_temporal_nonfatal(
         &root,
         &cache_dir,
-        head_state.sha(),
+        // AD-414-22: pass the classified state, not just its SHA — an unborn HEAD
+        // on this explicit arm must build a zero-row temporal.db and emit the
+        // AC-16 empty-history notice rather than silently doing nothing.
+        &head_state,
         "--rebuild hook",
         staleness::ReanchorPolicy::Allow, // explicit build arm re-anchors (PF-017)
     );
@@ -5014,5 +5017,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // T-16c / AC-16 case (i) — no-commit repository, driven through the CLI
+    // ========================================================================
+
+    /// `git init` with files but no commits, leaving HEAD unborn.
+    ///
+    /// Deliberately NOT `create_real_git_repo`, whose whole job is to produce
+    /// commits: the unborn state is the fixture under test.
+    fn init_git_repo_without_commits(dir: &std::path::Path) {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@t.com"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+            assert!(status.status.success(), "git {args:?} failed");
+        }
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn beta() {}\n").unwrap();
+        // Precondition: HEAD must NOT resolve, or the fixture is not unborn.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            !head.status.success(),
+            "fixture precondition: HEAD must be unborn (no commits)"
+        );
+    }
+
+    /// Locate the single per-root search cache directory beneath an isolated
+    /// `SKIM_CACHE_DIR`, without re-reading the env var in this process.
+    fn only_search_cache_dir(cache_root: &std::path::Path) -> std::path::PathBuf {
+        let search_dir = cache_root.join("search");
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&search_dir)
+            .unwrap_or_else(|e| panic!("no search cache dir at {search_dir:?}: {e}"))
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_dir())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one per-root cache dir under {search_dir:?}, got {entries:?}"
+        );
+        entries.pop().unwrap()
+    }
+
+    /// T-16c / AC-16 case (i) + AD-414-22: `skim search --build` on a repository
+    /// with **no commits** must exit 0, write a present-but-empty `temporal.db`,
+    /// and print exactly one non-debug-gated empty-history notice that does NOT
+    /// mention `shallow`.
+    ///
+    /// Regression pinned: before AD-414-22 this arm printed only the lexical
+    /// "indexed N files" line and created no `temporal.db` at all, because
+    /// `HeadState::Unresolved.sha()` is `None` and `try_rebuild_temporal_nonfatal`
+    /// returned before any temporal code ran — making AC-16's "no commits" case
+    /// unreachable from every CLI arm even though `zero_row_notice` had produced
+    /// its text since #414 landed.
+    ///
+    /// Driven as a subprocess so the real `run()` → `run_build()` entry point and
+    /// its real stderr are exercised (PF-007); an in-process call captures no
+    /// `eprintln!` output of its own.
+    ///
+    /// The expected notice text is taken from the production `DegradedReason`
+    /// table, never hand-written (AC-19: assert against production constants).
+    #[serial_test::serial]
+    #[test]
+    fn t16c_ac16_no_commit_repo_build_writes_empty_temporal_db_and_notice() {
+        let bin = skim_bin_path();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+        let cache = tempfile::TempDir::new().unwrap();
+        let cache_str = cache.path().to_string_lossy().to_string();
+
+        init_git_repo_without_commits(root);
+
+        let out = std::process::Command::new(&bin)
+            .args(["search", "--build", "--root", &root_str])
+            .env("SKIM_CACHE_DIR", &cache_str)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("T-16c: failed to spawn skim --build");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+        assert!(
+            out.status.success(),
+            "T-16c/AC-24: --build on a no-commit repo must exit 0; stderr:\n{stderr}"
+        );
+
+        // AC-16: one notice, WITHOUT SKIM_DEBUG, naming the stage that produced
+        // zero data. Text comes from the production SSOT.
+        let expected_cause = degraded::DegradedReason::Empty.cause("");
+        assert!(
+            stderr.contains(&expected_cause),
+            "T-16c/AC-16(i): stderr must carry the empty-history notice \
+             {expected_cause:?}; got stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.to_ascii_lowercase().contains("shallow"),
+            "T-16c/AC-16(i): the no-commits notice must not mention 'shallow' on a \
+             non-shallow repository; got stderr:\n{stderr}"
+        );
+
+        // The empty temporal.db itself.
+        let search_cache = only_search_cache_dir(cache.path());
+        let db_path = search_cache.join("temporal.db");
+        assert!(
+            db_path.exists(),
+            "T-16c/AD-414-22: --build must create temporal.db even with no commits; \
+             cache dir contents: {:?}",
+            std::fs::read_dir(&search_cache)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        let db = rskim_search::TemporalDb::open_existing(&db_path).unwrap();
+        assert!(
+            db.top_hotspots(1).unwrap().is_empty(),
+            "T-16c: the no-commit temporal.db must carry zero hotspot rows"
+        );
+        assert_eq!(
+            db.get_meta(rskim_search::META_GIT_HEAD).unwrap(),
+            None,
+            "T-16c/AD-414-22: there is no commit to record, so META_GIT_HEAD must be \
+             absent — this is the state warn_if_temporal_unverifiable relies on"
+        );
+    }
+
+    /// T-16c (negative) / AD-414-22: a plain text query on the same no-commit
+    /// repository must stay SILENT and must not create `temporal.db`.
+    ///
+    /// The empty-history build belongs to the explicit build arms only. The
+    /// wave-wide loudness policy forbids a temporal notice from a plain query,
+    /// and the quiet path has no per-HEAD backoff key to bound a history re-walk
+    /// with — so this test is the discriminating guard against wiring AD-414-22
+    /// into `ReanchorPolicy::Refuse` as well.
+    #[serial_test::serial]
+    #[test]
+    fn t16c_negative_no_commit_repo_plain_query_stays_silent() {
+        let bin = skim_bin_path();
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let root_str = root.to_string_lossy().to_string();
+        let cache = tempfile::TempDir::new().unwrap();
+        let cache_str = cache.path().to_string_lossy().to_string();
+
+        init_git_repo_without_commits(root);
+
+        let out = std::process::Command::new(&bin)
+            .args(["search", "alpha", "--root", &root_str])
+            .env("SKIM_CACHE_DIR", &cache_str)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("NO_COLOR", "1")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("T-16c negative: failed to spawn skim query");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+        assert!(
+            out.status.success(),
+            "T-16c negative: a plain query on a no-commit repo must exit 0; \
+             stderr:\n{stderr}"
+        );
+        let empty_cause = degraded::DegradedReason::Empty.cause("");
+        assert!(
+            !stderr.contains(&empty_cause),
+            "T-16c negative: a plain query must emit no temporal notice; got stderr:\n{stderr}"
+        );
+        let search_cache = only_search_cache_dir(cache.path());
+        assert!(
+            !search_cache.join("temporal.db").exists(),
+            "T-16c negative: the quiet query path must not build temporal.db for an \
+             unborn HEAD (AD-414-22 is an explicit-arm behaviour)"
+        );
     }
 }

@@ -172,6 +172,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy queries to keep byte-identity for existing callers.
 
 ### Fixed
+- **`skim search --build` on a repository with no commits now reports its empty
+  history** (#414) — `skim search --build` (and `--rebuild` / `--update`) in a freshly
+  `git init`-ed repository with files but no commits printed only the `indexed N files`
+  line: no `temporal.db` was created and no temporal notice was emitted at all.  An
+  unborn HEAD resolves to no SHA, and the temporal orchestrator returned on that absence
+  before any temporal code ran, so the "no commits" case of the zero-row build notice was
+  unreachable from every CLI arm.  A repository with no commits is an *empty history*,
+  not a build failure: the explicit build arms now write a present-but-empty
+  `temporal.db` and print one stderr line naming the cause
+  (`temporal data is empty (0 rows) — this repository has no commit history skim can
+  analyse`), which — correctly — does **not** mention `shallow` on a non-shallow
+  repository.  The empty database records no `git_head`, so the first query after the
+  repository's first commit rebuilds it automatically.  Plain queries are unaffected and
+  stay silent.
 - **`skim search` linked worktree HEAD resolution and temporal data** (#413) — in a
   repository with linked worktrees (`git worktree add`), `skim search` read HEAD from
   the per-worktree `.git` file and then attempted to resolve the symbolic ref in the same

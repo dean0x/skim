@@ -63,6 +63,29 @@ fn write_version_meta_in_tx(tx: &rusqlite::Transaction<'_>, git_head: &str) -> R
     Ok(())
 }
 
+/// Remove the version-attestation pair atomically within `tx` (AD-414-22).
+///
+/// The inverse of [`write_version_meta_in_tx`], and the only sanctioned way to
+/// leave a `temporal.db` with **no** recorded HEAD.  Both keys are removed
+/// together so the AD-408-3 co-requirement ("a DB that carries `git_head` must
+/// also carry `data_version`") holds in the negative direction too — a DB that
+/// attests to no snapshot attests to nothing at all.
+///
+/// Used by [`TemporalDb::sync_empty_unborn`] for a repository whose HEAD is
+/// unborn: there is no commit to record, and writing a placeholder would be a
+/// fabricated attestation (avoids PF-016).  Downstream, an absent `META_GIT_HEAD`
+/// makes `temporal_db_is_stale`'s Check 1 report stale the moment a real HEAD
+/// appears, and suppresses the "served from recorded commit …" advisory in
+/// `warn_if_temporal_unverifiable`.
+fn clear_version_meta_in_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut stmt = tx
+        .prepare_cached("DELETE FROM meta WHERE key = ?1")
+        .map_err(db_err)?;
+    stmt.execute(params![META_GIT_HEAD]).map_err(db_err)?;
+    stmt.execute(params![META_DATA_VERSION]).map_err(db_err)?;
+    Ok(())
+}
+
 fn insert_hotspots_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[HotspotRow]) -> Result<()> {
     tx.execute("DELETE FROM hotspot", []).map_err(db_err)?;
     let mut stmt = tx
@@ -658,6 +681,52 @@ impl TemporalDb {
         git_head: &str,
         is_shallow: bool,
     ) -> Result<()> {
+        self.sync_inner(hotspots, risks, cochanges, Some(git_head), is_shallow)
+    }
+
+    /// AD-414-22: atomically replace all temporal data with an **empty** result
+    /// set for a repository whose HEAD is unborn (`git init` with no commits).
+    ///
+    /// Identical to [`Self::sync`] except that no HEAD is recorded: the
+    /// `git_head` / `data_version` attestation pair is *removed* rather than
+    /// written (see `clear_version_meta_in_tx`).  An unborn branch has no commit
+    /// to name, and recording a placeholder would be a fabricated attestation
+    /// that `warn_if_temporal_unverifiable` would then report as "served from
+    /// recorded commit …" (avoids PF-016).
+    ///
+    /// The resulting file is a schema-current, zero-row `temporal.db` whose
+    /// `meta` table carries only [`META_LAST_UPDATED`] and [`META_IS_SHALLOW`].
+    /// `--stats` reports it as `temporal_state: "empty"`, and the first query
+    /// after the repository's first commit sees an absent [`META_GIT_HEAD`] and
+    /// rebuilds (`temporal_db_is_stale` Check 1).
+    ///
+    /// # Parameters
+    ///
+    /// - `is_shallow`: whether `.git/shallow` existed when the (empty) history
+    ///   was read; recorded under [`META_IS_SHALLOW`] as `"1"` / `"0"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::Database`] on any SQLite failure.  On error the
+    /// transaction is rolled back and the database is left unchanged.
+    pub fn sync_empty_unborn(&self, is_shallow: bool) -> Result<()> {
+        self.sync_inner(&[], &[], &[], None, is_shallow)
+    }
+
+    /// Shared transaction body for [`Self::sync`] and [`Self::sync_empty_unborn`].
+    ///
+    /// `git_head` is `Some(sha)` when the caller has a resolved HEAD to attest to
+    /// and `None` for the unborn-HEAD case; that is the *only* difference between
+    /// the two public entry points, so both go through one transaction and cannot
+    /// drift apart.
+    fn sync_inner(
+        &self,
+        hotspots: &[HotspotRow],
+        risks: &[RiskRow],
+        cochanges: &[CochangeRow],
+        git_head: Option<&str>,
+        is_shallow: bool,
+    ) -> Result<()> {
         for (name, len) in [
             ("hotspots", hotspots.len()),
             ("risks", risks.len()),
@@ -687,7 +756,12 @@ impl TemporalDb {
             .to_string();
         // Write git_head + data_version as a co-required pair through the
         // dedicated primitive so the invariant cannot be bypassed (AD-408-3).
-        write_version_meta_in_tx(&tx, git_head)?;
+        // AD-414-22: `None` (unborn HEAD) removes the pair instead of writing a
+        // placeholder, so the DB never attests to a snapshot it does not have.
+        match git_head {
+            Some(head) => write_version_meta_in_tx(&tx, head)?,
+            None => clear_version_meta_in_tx(&tx)?,
+        }
         tx.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")
             .map_err(db_err)?
             .execute(params![META_LAST_UPDATED, now_secs])

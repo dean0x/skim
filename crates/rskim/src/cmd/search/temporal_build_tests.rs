@@ -4206,3 +4206,187 @@ fn test_explicit_rebuild_clears_backoff_sentinel() {
         "F1/AD-414-16 POSITIVE: META_GIT_HEAD must be present after explicit rebuild"
     );
 }
+
+// ============================================================================
+// AD-414-22 / AC-16 case (i) — unborn HEAD is an EMPTY HISTORY, not a failure
+// ============================================================================
+
+/// A `TemporalSource` test double that returns an unborn-repository history:
+/// zero commits, with `is_shallow` supplied by the caller.
+///
+/// Mirrors what `GixSource::parse_history` actually returns for a `git init`
+/// with no commits (`git_parser.rs`: `is_unborn_error` → `empty_result`), so
+/// these tests pin the same shape production sees without needing gix.
+struct UnbornSource {
+    is_shallow: bool,
+    call_count: std::sync::atomic::AtomicUsize,
+}
+
+impl UnbornSource {
+    fn new(is_shallow: bool) -> Self {
+        Self {
+            is_shallow,
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.call_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl rskim_search::TemporalSource for UnbornSource {
+    fn parse_history(
+        &self,
+        _repo_path: &std::path::Path,
+        _lookback_days: u32,
+    ) -> rskim_search::Result<rskim_search::HistoryResult> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(rskim_search::HistoryResult {
+            commits: vec![],
+            metadata: rskim_search::TemporalMetadata {
+                is_shallow: self.is_shallow,
+                commit_count: 0,
+            },
+        })
+    }
+}
+
+/// AD-414-22 / AC-16 case (i): an unborn HEAD produces a present-but-EMPTY
+/// `temporal.db` whose `meta` table carries **no** `git_head` row.
+///
+/// The absent `META_GIT_HEAD` is load-bearing in two places, so it is asserted
+/// rather than assumed: `warn_if_temporal_unverifiable` suppresses its
+/// "served from recorded commit …" advisory only when the row is absent, and
+/// `temporal_db_is_stale` Check 1 reports stale (→ rebuild) the moment the
+/// repository's first commit gives it a real HEAD to compare against.
+///
+/// Discriminating: a fabricated placeholder HEAD (the PF-016 shape this decision
+/// exists to avoid) makes `get_meta(META_GIT_HEAD)` return `Some` and fails here.
+#[test]
+fn test_ad414_22_unborn_head_writes_empty_db_without_git_head() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = UnbornSource::new(false);
+    super::build_empty_temporal_for_unborn_head(
+        &src,
+        dir.path(),
+        &cache_dir,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("unborn-HEAD build must succeed");
+
+    let db_path = cache_dir.join("temporal.db");
+    assert!(
+        db_path.exists(),
+        "AD-414-22: an unborn HEAD must still produce a temporal.db"
+    );
+
+    let db = rskim_search::TemporalDb::open_existing(&db_path).unwrap();
+    assert!(
+        db.top_hotspots(1).unwrap().is_empty(),
+        "AD-414-22: the unborn-HEAD temporal.db must carry zero hotspot rows"
+    );
+    assert_eq!(
+        db.get_meta(rskim_search::META_GIT_HEAD).unwrap(),
+        None,
+        "AD-414-22: no HEAD exists, so none may be recorded (avoids PF-016)"
+    );
+    assert_eq!(
+        db.get_meta(rskim_search::META_DATA_VERSION).unwrap(),
+        None,
+        "AD-414-22: git_head and data_version are a co-required pair (AD-408-3) — \
+         with no HEAD recorded, neither may be present"
+    );
+    assert_eq!(
+        db.get_meta(rskim_search::META_IS_SHALLOW)
+            .unwrap()
+            .as_deref(),
+        Some("0"),
+        "AD-414-22: is_shallow comes from the probed HistoryResult metadata"
+    );
+    assert_eq!(
+        src.count(),
+        1,
+        "AD-414-22: exactly one history walk per explicit build"
+    );
+}
+
+/// AD-414-22 (negative): a `parse_history` FAILURE on an unresolvable HEAD keeps
+/// F3 semantics — no `temporal.db` is created and no empty-history claim is made.
+///
+/// "I could not read this repository's history" and "this repository has no
+/// history" are different facts; collapsing them would announce the second when
+/// only the first is known.
+#[test]
+fn test_ad414_22_parse_failure_creates_no_db_and_makes_no_claim() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    super::build_empty_temporal_for_unborn_head(
+        &FailingSource,
+        dir.path(),
+        &cache_dir,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("D5: a temporal failure must not fail the explicit build");
+
+    assert!(
+        !cache_dir.join("temporal.db").exists(),
+        "AD-414-22 negative: a parse_history failure must not create temporal.db"
+    );
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "AD-414-22 negative: the backoff sentinel is keyed on HEAD, so with no HEAD \
+         there is no key and no sentinel may be written"
+    );
+}
+
+/// AD-414-22 (negative): an unresolvable HEAD on a repository whose history IS
+/// readable (corrupt `HEAD` file, reftable backend — #481) must leave
+/// `temporal.db` untouched.
+///
+/// `HeadState::Unresolved` covers more than an unborn branch; only the
+/// zero-commit case is an empty history. Writing zero rows here would discard a
+/// readable history and print a notice that is simply false.
+#[test]
+fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = FixedSource {
+        history: HistoryResult {
+            commits: vec![make_commit(
+                "aaa111",
+                1_700_000_000,
+                "feat: x",
+                &["src/x.rs"],
+            )],
+            metadata: rskim_search::TemporalMetadata {
+                is_shallow: false,
+                commit_count: 1,
+            },
+        },
+    };
+    super::build_empty_temporal_for_unborn_head(
+        &src,
+        dir.path(),
+        &cache_dir,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("D5: must not fail the explicit build");
+
+    assert!(
+        !cache_dir.join("temporal.db").exists(),
+        "AD-414-22 negative: readable history is not an empty history — \
+         temporal.db must be left untouched"
+    );
+}

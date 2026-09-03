@@ -403,8 +403,10 @@ pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {
 ///
 /// # Contract (ADR-006/D5)
 ///
-/// - `rebuild_temporal` is always called when `head` is `Some`.
-/// - If `rebuild_temporal` returns `Err`, the error is SWALLOWED (never propagated).
+/// - `rebuild_temporal` is always called for [`HeadState::Resolved`]; AD-414-22:
+///   [`HeadState::Unresolved`] on an explicit build arm calls
+///   [`super::temporal_build::build_empty_temporal_for_unborn_head`] instead.
+/// - If either returns `Err`, the error is SWALLOWED (never propagated).
 /// - A debug-gated warning is emitted to stderr via `eprintln!` when the error
 ///   is swallowed and `SKIM_DEBUG=1` / `--debug` is set.
 /// - Callers never see a temporal failure — only lexical/AST failures propagate.
@@ -413,7 +415,14 @@ pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {
 ///
 /// - `root`: project root passed to `rebuild_temporal`.
 /// - `cache_dir`: cache directory containing `temporal.db`.
-/// - `head`: the git HEAD SHA to record; `None` skips the rebuild (non-git dir).
+/// - `head`: the classified git HEAD state.  AD-414-22: this is the three-state
+///   [`HeadState`] rather than the `Option<&str>` SHA it used to be, because the
+///   three states need three different answers and `Option` could only express
+///   two (the AD-413-7 rationale, applied one level up):
+///   [`HeadState::NotARepo`] has nothing temporal to record;
+///   [`HeadState::Unresolved`] on an explicit build arm is an EMPTY HISTORY that
+///   must produce a zero-row `temporal.db` plus the AC-16 notice; and
+///   [`HeadState::Resolved`] takes the normal rebuild.
 /// - `debug_label`: short label for the debug message (e.g. `"self-heal"`,
 ///   `"post-rebuild"`, `"--rebuild hook"`).
 /// - `reanchor`: when [`ReanchorPolicy::Refuse`], a `Differs` anchor state (PF-017)
@@ -435,13 +444,52 @@ pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {
 pub(super) fn try_rebuild_temporal_nonfatal(
     root: &Path,
     cache_dir: &Path,
-    head: Option<&str>,
+    head: &HeadState,
     debug_label: &str,
     reanchor: ReanchorPolicy,
 ) {
-    use super::temporal_build::{BuildLoudness, current_epoch_secs, rebuild_temporal_with_source};
+    use super::temporal_build::{
+        BuildLoudness, build_empty_temporal_for_unborn_head, current_epoch_secs,
+        rebuild_temporal_with_source,
+    };
 
-    let Some(head) = head else { return };
+    let head = match head {
+        // Not a git repository at all: there is no history, empty or otherwise,
+        // and no notice is owed.  Unchanged behaviour.
+        HeadState::NotARepo => return,
+        // AD-414-22: an unresolvable HEAD on an EXPLICIT build arm is the
+        // no-commit (`git init`, nothing committed) case.  It must produce a
+        // zero-row `temporal.db` and the AC-16 empty-history notice instead of
+        // silently doing nothing.  `build_empty_temporal_for_unborn_head`
+        // re-checks via `parse_history` and backs off if the repository turns
+        // out to have readable history (corrupt HEAD / reftable backend).
+        //
+        // The quiet query path (`ReanchorPolicy::Refuse`) is deliberately left
+        // alone: the wave-wide loudness policy forbids a temporal notice from a
+        // plain query, and re-walking history on every query has no bound here
+        // because the backoff sentinel is keyed on a HEAD that does not exist.
+        HeadState::Unresolved => {
+            if reanchor == ReanchorPolicy::Allow {
+                let outcome = build_empty_temporal_for_unborn_head(
+                    &rskim_search::GixSource,
+                    root,
+                    cache_dir,
+                    reanchor,
+                    BuildLoudness::Loud,
+                );
+                if let Err(e) = outcome
+                    && crate::debug::is_debug_enabled()
+                {
+                    eprintln!(
+                        "skim search [debug]: temporal {debug_label} empty-history build error \
+                         (non-fatal): {e}"
+                    );
+                }
+            }
+            return;
+        }
+        HeadState::Resolved(sha) => sha.as_str(),
+    };
     // PF-017: a changed `--root` toplevel also changes the adopted HEAD, so without
     // this gate `check_staleness` would report `HeadChanged`, `auto_refresh_if_stale`
     // would rebuild, and `record_temporal_anchor` would overwrite the anchor — on a
