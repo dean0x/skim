@@ -317,6 +317,44 @@ impl TemporalDb {
         Ok(Self { conn })
     }
 
+    /// Open an existing `temporal.db` for read-write WITHOUT creating a new file.
+    ///
+    /// Identical to [`Self::open`] except it uses
+    /// `SQLITE_OPEN_READ_WRITE` without `SQLITE_OPEN_CREATE`, so a file that
+    /// was deleted between the caller's existence check and this call is NOT
+    /// silently recreated as an empty schema-2 DB.  Returns `Err` if the file
+    /// does not exist or cannot be opened.
+    ///
+    /// Used by the parse-failure branch of `rebuild_temporal_with_source` to
+    /// update `META_IS_SHALLOW` in an existing DB without the TOCTOU side
+    /// effect of creating a phantom DB (P3-5 / 2026-09-03).
+    pub fn open_existing(db_path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| classify_sqlite_err(&e))?;
+
+        conn.busy_timeout(Duration::from_millis(5_000))
+            .map_err(|e| classify_sqlite_err(&e))?;
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(|e| classify_sqlite_err(&e))?;
+        if journal_mode.to_lowercase() != "wal" {
+            return Err(SearchError::Database(format!(
+                "failed to enable WAL mode; journal_mode is '{journal_mode}'"
+            )));
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
+            .map_err(|e| classify_sqlite_err(&e))?;
+
+        run_migrations(&conn)?;
+
+        Ok(Self { conn })
+    }
+
     // ========================================================================
     // Schema introspection
     // ========================================================================

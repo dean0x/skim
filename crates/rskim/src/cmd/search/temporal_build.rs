@@ -444,26 +444,107 @@ fn discover_git_workdir(root: &Path) -> Option<std::path::PathBuf> {
 /// Probe whether `root` sits in a shallow git clone by inspecting the
 /// `<commondir>/shallow` file directly.
 ///
-/// Uses the same predicate as `temporal_state.rs` Check 3 (AD-414-14):
-/// a zero-length `shallow` file is treated as absent, matching the gix writer
-/// that produced it.  Returns `false` when no git repo is found, the file
-/// cannot be stat'd, or the file is empty.
+/// Returns a tri-state (`Option<bool>`) so callers can distinguish three cases:
+/// - `Some(true)`  — the shallow file is present and non-empty → shallow clone.
+/// - `Some(false)` — the shallow file is absent or empty (an explicit `NotFound`
+///   or zero-length file) → definitively not shallow.
+/// - `None`        — the git dir cannot be resolved or an unexpected I/O error
+///   (`EACCES`, `EIO`, `ESTALE`, …) occurred → unknown; callers must NOT
+///   persist a concrete "0"/"1" value in this case.
+///
+/// **Directory resolution differs from Check 3** (`temporal_state.rs:243-262`).
+/// Check 3 receives the result of `resolve_git_dir(root)` directly (which
+/// returns `None` for an adopted subdirectory root, so Check 3 skips the whole
+/// block for such roots). This probe adds an `resolve_repo_toplevel` ancestor
+/// fallback so it also works for subdirectory roots — a distinction that matters
+/// for the parse-failure case where we want to record whatever we can.
 ///
 /// This is the shared helper that replaces the former hardcoded `is_shallow:
 /// false` in the `parse_history`-failure fall-through path (F3 / AD-414-17).
-fn probe_is_shallow_from_root(root: &Path) -> bool {
-    let Some(git_dir) = super::staleness::resolve_git_dir(root).or_else(|| {
+/// P2-1 (2026-09-03 review): changed from `bool` to `Option<bool>` so
+/// "unknown" is not silently written as an authoritative "0".
+fn probe_is_shallow_from_root(root: &Path) -> Option<bool> {
+    let git_dir = super::staleness::resolve_git_dir(root).or_else(|| {
         super::staleness::resolve_repo_toplevel(root)
             .and_then(|top| super::staleness::resolve_git_dir(&top))
-    }) else {
+    })?; // None → no git dir resolved → unknown
+    let shallow_dir = super::staleness::resolve_common_dir(&git_dir).unwrap_or(git_dir);
+    match shallow_dir.join("shallow").metadata() {
+        Ok(m) => Some(m.is_file() && m.len() > 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None, // EACCES / EIO / ESTALE / other → unknown
+    }
+}
+
+/// Write the two-line build-backoff sentinel file (A / AD-414-21).
+///
+/// Format: `<head>\n<shallow>` where `<shallow>` is `1`, `0`, or `?`.
+/// The `?` value is stored when the shallow state cannot be determined; see
+/// [`backoff_sentinel_matches`] for how it is treated on reads.
+///
+/// Old single-line sentinels (written before this format was introduced) contain
+/// no `\n` and therefore never match `backoff_sentinel_matches`, causing them to
+/// self-clear on the next explicit build or quiet rebuild attempt.
+fn write_backoff_sentinel(cache_dir: &Path, head: &str, shallow: Option<bool>) {
+    let shallow_char = match shallow {
+        Some(true) => '1',
+        Some(false) => '0',
+        None => '?',
+    };
+    let contents = format!("{head}\n{shallow_char}");
+    let _ = std::fs::write(
+        cache_dir.join("temporal.db.build_backoff"),
+        contents.as_bytes(),
+    );
+}
+
+/// Check whether the build-backoff sentinel gates the current HEAD (A / AD-414-21).
+///
+/// Returns `true` (honour the sentinel, skip the rebuild) when ALL of:
+/// 1. The sentinel file can be read.
+/// 2. Its first line equals `head`.
+/// 3. Either shallow flag (stored or probed) is unknown (`?` / `None`), OR
+///    the stored flag equals the probed flag.
+///
+/// Returns `false` (allow the rebuild, open the gate) when:
+/// - The file is absent or unreadable.
+/// - The sentinel is in the old single-line format (no `\n` separator) —
+///   these were written before the shallow flag was added and self-clear on
+///   the next invocation.
+/// - The stored HEAD does not match `head`.
+/// - The stored shallow flag is concrete (`0`/`1`) AND the probed flag is
+///   concrete but differs — e.g. `git fetch --unshallow` changed `1` → `0`.
+///
+/// "Do not reopen" for `?`/`None` means we conservatively keep the gate
+/// closed when we cannot determine whether the shallow state changed; false
+/// positives (staying closed when the state changed) are preferable to false
+/// negatives (reopening when nothing changed).
+fn backoff_sentinel_matches(cache_dir: &Path, head: &str, shallow: Option<bool>) -> bool {
+    let Ok(bytes) = std::fs::read(cache_dir.join("temporal.db.build_backoff")) else {
+        return false; // missing or unreadable
+    };
+    let Ok(stored) = std::str::from_utf8(&bytes) else {
+        return false; // garbled
+    };
+    // Old single-line format (no '\n') — self-clear.
+    let Some(nl_pos) = stored.find('\n') else {
         return false;
     };
-    let shallow_dir = super::staleness::resolve_common_dir(&git_dir).unwrap_or(git_dir);
-    shallow_dir
-        .join("shallow")
-        .metadata()
-        .map(|m| m.is_file() && m.len() > 0)
-        .unwrap_or(false)
+    let stored_head = &stored[..nl_pos];
+    let stored_shallow = stored[nl_pos + 1..].trim_end();
+    if stored_head != head {
+        return false;
+    }
+    // Both sides known and concrete — open the gate when they differ.
+    let current_shallow_char = match shallow {
+        Some(true) => "1",
+        Some(false) => "0",
+        None => return true, // current unknown → do not reopen
+    };
+    if stored_shallow == "?" {
+        return true; // stored unknown → do not reopen
+    }
+    stored_shallow == current_shallow_char
 }
 
 /// Remove temporal rows whose backing files no longer exist on disk.
@@ -579,25 +660,35 @@ pub(super) fn rebuild_temporal_with_source(
     // ── Build-backoff sentinel (Finding 2 / D5) ──────────────────────────────
     // Written when TemporalDb::open fails, a fallback empty sync fails, or
     // parse_history fails (see F3 fix below). If the sentinel records the same
-    // HEAD as `head`, a prior non-transient failure already occurred for this
-    // HEAD; skip the expensive parse_history call until HEAD advances.
+    // HEAD AND the same shallow state as the current invocation, a prior
+    // non-transient failure already occurred for this HEAD; skip the expensive
+    // parse_history call.  Probe is_shallow now so the gate can re-open after
+    // `git fetch --unshallow` without HEAD advancing.
     //
     // AD-414-16: explicit --build/--rebuild/--update always clears the sentinel
-    // and proceeds so the user-documented recovery path ("run 'skim search
-    // --rebuild'") works even when a prior failure wrote the sentinel.  R1
-    // (never overwrite a newer-schema DB) is still enforced downstream by
+    // at the START OF THE TEMPORAL REBUILD (here, before the backoff gate) so
+    // the user-documented recovery path ("run 'skim search --rebuild'") works
+    // even when a prior failure wrote the sentinel.  On --update the clear is
+    // reached only when auto_refresh_if_stale decides a rebuild is warranted.
+    // R1 (never overwrite a newer-schema DB) is still enforced downstream by
     // open_or_discard_temporal_db, which refuses without modifying the file.
+    //
+    // AD-414-21 (2026-09-03): sentinel format extended to `<head>\n<shallow>`
+    // where shallow is "1", "0", or "?" (unknown). Old single-line sentinels
+    // (no '\n') are treated as non-matching and self-clear on the next build.
+    // See write_backoff_sentinel / backoff_sentinel_matches for the protocol.
+    let probed_shallow = probe_is_shallow_from_root(root);
     let backoff_sentinel = cache_dir.join("temporal.db.build_backoff");
     if loudness == BuildLoudness::Loud {
         // Explicit rebuild: clear any stale sentinel so the recovery flows
         // printed on stderr ("re-run 'skim search --rebuild'") work correctly.
         let _ = std::fs::remove_file(&backoff_sentinel);
-    } else if std::fs::read(&backoff_sentinel).ok().as_deref() == Some(head.as_bytes()) {
+    } else if backoff_sentinel_matches(cache_dir, head, probed_shallow) {
         if crate::debug::is_debug_enabled() {
             eprintln!(
                 "skim search [debug]: temporal rebuild skipped — \
-                 build-backoff sentinel present for HEAD {}… \
-                 (prior open/sync failure); will retry when HEAD advances",
+                 build-backoff sentinel present for HEAD {}… is_shallow={probed_shallow:?} \
+                 (prior open/sync failure); will retry when HEAD advances or shallow state changes",
                 head.get(..8).unwrap_or(head),
             );
         }
@@ -614,44 +705,57 @@ pub(super) fn rebuild_temporal_with_source(
     // F3 fix (AD-414-17): on parse_history failure write the build-backoff
     // sentinel and return early.  This replaces the former LOCKED DECISION
     // 2026-06-24 "fall through with empty HistoryResult to write META_GIT_HEAD".
-    // The sentinel now bounds quiet-path retries (once per HEAD) without
-    // asserting that the history was successfully read.  Consequences:
+    // The sentinel now bounds quiet-path retries (once per HEAD AND per shallow
+    // state) without asserting that the history was successfully read.
+    // Consequences (corrected from the original comment, P1-1 / 2026-09-03):
     //
     //   1. META_GIT_HEAD is NOT written, so the DB truthfully stays stale.
-    //      On the next quiet query Check 1 fires → sentinel matches → no retry.
-    //      When HEAD advances the sentinel no longer matches → rebuild retried.
+    //      On the next quiet query, the sentinel matches the same HEAD+shallow
+    //      → no retry.  When HEAD advances the sentinel no longer matches.
+    //      When `git fetch --unshallow` removes the shallow file WITHOUT moving
+    //      HEAD, the probed shallow state changes (Some(true) → Some(false)),
+    //      so the stored "1" no longer matches the probed "0" → the gate opens
+    //      and parse_history is retried on the next silent query (AD-414-21).
     //
-    //   2. is_shallow is probed from the filesystem rather than fabricated as
-    //      false, so an existing DB's META_IS_SHALLOW is updated correctly and
-    //      Check 3 (shallow→full transition, AD-414-14) can still fire after
-    //      git fetch --unshallow even when parse_history previously failed.
+    //   2. is_shallow is probed from the filesystem (tri-state Option<bool>)
+    //      rather than fabricated as false.  Only a CONCLUSIVE probe (Some) is
+    //      written to META_IS_SHALLOW in an existing DB so a correct "1" is
+    //      never overwritten by an unknown "0" (P2-1 / 2026-09-03).
+    //      Check 3 (shallow→full transition, AD-414-14) relies on META_IS_SHALLOW
+    //      being truthful; it is correct when consulted, but while a sentinel is
+    //      set for the current HEAD+shallow pair, Check 3's rebuild is gated
+    //      further by backoff_sentinel_matches — the sentinel incorporating the
+    //      shallow flag (AD-414-21) is what makes the Check-3 self-heal work.
     //
-    //   3. Explicit --rebuild (F1 / AD-414-16) clears the sentinel before
-    //      reaching this point, so the recovery instruction in our own stderr
-    //      output ("re-run 'skim search --rebuild'") always works.
+    //   3. Explicit --rebuild (F1 / AD-414-16) clears the sentinel at the start
+    //      of the temporal rebuild (before this point), so the recovery
+    //      instruction in our own stderr output ("re-run 'skim search
+    //      --rebuild'") always works.
     let risk_history = match src.parse_history(root, 0) {
         Ok(h) => h,
         Err(e) => {
-            // Probe actual is_shallow from the filesystem so we do not
-            // fabricate a false value (F3/AD-414-17).
-            let is_shallow = probe_is_shallow_from_root(root);
+            // probed_shallow was computed above (before the gate) using the
+            // tri-state probe.  Use it for both the sentinel and the meta write.
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: parse_history failed: {e} — \
-                     writing sentinel for HEAD {}…; is_shallow={is_shallow}; \
-                     will retry when HEAD advances or on explicit --rebuild",
+                     writing sentinel for HEAD {}…; is_shallow={probed_shallow:?}; \
+                     will retry when HEAD advances, shallow state changes, or on explicit --rebuild",
                     head.get(..8).unwrap_or(head),
                 );
             }
-            // Bound quiet-path retries to once per HEAD.
-            let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+            // Bound quiet-path retries to once per HEAD+shallow pair.
+            write_backoff_sentinel(cache_dir, head, probed_shallow);
             // If a DB exists from a prior successful build, update its
-            // META_IS_SHALLOW so Check 3 can still detect a shallow→full
-            // transition after git fetch --unshallow without advancing HEAD.
-            // Non-fatal: if the DB open fails we simply lose Check 3 for now.
+            // META_IS_SHALLOW (only when the probe is conclusive) so Check 3
+            // can still detect a shallow→full transition.  Open WITHOUT
+            // SQLITE_OPEN_CREATE so a deleted file is not silently recreated
+            // as an empty schema-2 DB (P3-5 / 2026-09-03).
+            // Non-fatal: if the open fails we simply lose Check 3 for now.
             let temporal_db_path = cache_dir.join("temporal.db");
             if temporal_db_path.try_exists().unwrap_or(false)
-                && let Ok(db) = rskim_search::TemporalDb::open(&temporal_db_path)
+                && let Ok(db) = rskim_search::TemporalDb::open_existing(&temporal_db_path)
+                && let Some(is_shallow) = probed_shallow
             {
                 let _ = db.set_meta(
                     rskim_search::META_IS_SHALLOW,
@@ -783,9 +887,16 @@ pub(super) fn rebuild_temporal_with_source(
     // AD-414-3 + SE-1: open with discard-on-corrupt semantics; SE-1 loudness
     // controlled by the BuildLoudness parameter.  Returns None when the open
     // fails non-fatally (caller returns Ok(()) — D5 isolation).
-    let Some(db) =
-        open_or_discard_temporal_db(&db_path, cache_dir, is_loud, &backoff_sentinel, head)
-    else {
+    // parse_history succeeded → is_shallow is concrete from the metadata.
+    let is_shallow_opt = Some(risk_history.metadata.is_shallow);
+    let Some(db) = open_or_discard_temporal_db(
+        &db_path,
+        cache_dir,
+        is_loud,
+        cache_dir,
+        head,
+        is_shallow_opt,
+    ) else {
         return Ok(());
     };
 
@@ -843,7 +954,7 @@ pub(super) fn rebuild_temporal_with_source(
             if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
-                let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+                write_backoff_sentinel(cache_dir, head, is_shallow_opt);
             }
         }
         Err(e) => {
@@ -860,7 +971,7 @@ pub(super) fn rebuild_temporal_with_source(
             if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
-                let _ = std::fs::write(&backoff_sentinel, head.as_bytes());
+                write_backoff_sentinel(cache_dir, head, is_shallow_opt);
             }
         }
     }
@@ -881,12 +992,15 @@ pub(super) fn rebuild_temporal_with_source(
 /// non-fatal per ADR-006/D5).
 ///
 /// `is_loud` gates the open-failure notice for the `Err(other)` arm (SE-1).
+/// `is_shallow` is passed to [`write_backoff_sentinel`] so the two-line
+/// format is written consistently from all failure arms (AD-414-21).
 fn open_or_discard_temporal_db(
     db_path: &std::path::Path,
     cache_dir: &std::path::Path,
     is_loud: bool,
-    backoff_sentinel: &std::path::Path,
+    _backoff_sentinel: &std::path::Path, // kept for caller compat; use cache_dir internally
     head: &str,
+    is_shallow: Option<bool>,
 ) -> Option<TemporalDb> {
     match TemporalDb::open(db_path) {
         Ok(d) => Some(d),
@@ -919,7 +1033,7 @@ fn open_or_discard_temporal_db(
                     // The sentinel bounds it to once per HEAD, matching both sibling arms
                     // (recreate-failed and Err(other)).  SE-3 is not violated: no sidecar
                     // removal is attempted here (the main unlink itself failed).
-                    let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+                    write_backoff_sentinel(cache_dir, head, is_shallow);
                     return None;
                 }
             }
@@ -935,7 +1049,7 @@ fn open_or_discard_temporal_db(
                     );
                     // D5 backoff: the discard SUCCEEDED, so temporal.db is now absent;
                     // the sentinel prevents the per-query rebuild loop.
-                    let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+                    write_backoff_sentinel(cache_dir, head, is_shallow);
                     None
                 }
             }
@@ -970,7 +1084,7 @@ fn open_or_discard_temporal_db(
             // UnsupportedSchemaVersion leaves temporal.db byte-for-byte unchanged
             // (R1 contract); the sentinel prevents an infinite retry without touching
             // the DB.
-            let _ = std::fs::write(backoff_sentinel, head.as_bytes());
+            write_backoff_sentinel(cache_dir, head, is_shallow);
             None
         }
     }
