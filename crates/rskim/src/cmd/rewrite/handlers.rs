@@ -157,14 +157,9 @@ pub(super) fn parse_line_count_and_files<'a>(
             // -nN form: rest is the count
             count = Some(parse_unsigned_count(rest)?);
         } else if arg.starts_with('-') && arg != "-" {
-            // Check for -N (bare number) like -20
+            // Check for -N (bare number) like -20; an unknown -flag or a signed count: bail
             let potential_num = &arg[1..];
-            if let Some(n) = parse_unsigned_count(potential_num) {
-                count = Some(n);
-            } else {
-                // Unknown flag
-                return None;
-            }
+            count = Some(parse_unsigned_count(potential_num)?);
         } else {
             files.push(arg);
         }
