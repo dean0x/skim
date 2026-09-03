@@ -1868,16 +1868,21 @@ fn run_temporal_standalone(
             // it calls degraded_notice internally so DegradedJson.message always
             // matches what is printed to stderr (AD-414-1 SSOT).
             // Covers all reasons including Empty (folded from the former separate probe).
-            // `applied` is "lexical" — the ranking that would be served for any
-            // text results; consistent with the text+temporal arm (OD-B) and the
-            // plan's normative `applied == "lexical"` for Empty / NoRankedRows.
+            //
+            // F2 / AD-414-19: `applied` is `"none"` on the standalone arm (no
+            // text query, no results served).  The plan's AC-4 / OD-B value of
+            // `"lexical"` applies only to the text+temporal arm (mod.rs:1700),
+            // where lexical order genuinely is what gets served.  On the
+            // standalone arm there is no result set at all (DegradedOnlyJson has
+            // no `results` key), so `"lexical"` is a false claim to a machine
+            // consumer.  AC-6 pins only `reason == "empty"` for this arm.
             // `Fallback::NoResults` only affects the human-readable tail, which
             // is suppressed here (flag = "") so the choice has no effect on the
-            // message; `applied` is the JSON-only contract field (AC-6 / RD-5).
+            // message; `applied` is the JSON-only contract field.
             let dj = temporal::DegradedJson::new(
                 &u,
                 requested_flag,
-                "lexical",
+                "none",
                 "",
                 temporal::Fallback::NoResults,
             );
@@ -4740,11 +4745,10 @@ mod tests {
         //
         // Step 4 left user_version=99 in temporal.db; rebuild_temporal_with_source
         // correctly refuses to overwrite a newer-schema DB (R1 / AD-414-11).  Delete
-        // the file (and the backoff sentinel written by that refusal) BEFORE calling
-        // --rebuild so the explicit rebuild creates a fresh schema-2 DB rather than
-        // short-circuiting on the sentinel and leaving the version-99 file in place.
+        // the file BEFORE calling --rebuild so the explicit rebuild creates a fresh
+        // schema-2 DB.  The backoff sentinel (if any) is cleared automatically by
+        // BuildLoudness::Loud (F1 / AD-414-16) — no manual deletion needed.
         let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(cache_dir.join("temporal.db.build_backoff"));
         let result = run(
             &[
                 "--rebuild".to_string(),
@@ -4771,6 +4775,94 @@ mod tests {
             "empty",
             "T-15(5): zero-row DB must report 'empty'; got: {:?}",
             stats["temporal_state"]
+        );
+    }
+
+    // ========================================================================
+    // T-16 / F5 — snapshot asymmetry: staleness captured pre-self-heal
+    // ========================================================================
+
+    /// T-16 / F5: `--stats --json` `.staleness` is captured from the PRE-self-heal
+    /// state (AD-414-10), so `staleness == "no index"` can coexist with a valid
+    /// `file_count` (from the post-heal state) — this is the intended contract
+    /// (AC-15/AC-22 analogue for the lexical arm).
+    ///
+    /// Also validates the documented `staleness` value set: `"no index"` is one of
+    /// the five possible string values (F5 documentation contract, CLAUDE.md §search).
+    ///
+    /// SKIM_CACHE_DIR isolation: uses in-process stats_json_for_test with an explicit
+    /// cache_dir, so no env-var contention and #[serial] is not required.
+    #[test]
+    fn t16_f5_staleness_no_index_coexists_with_valid_file_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        create_real_git_repo(
+            root,
+            &[
+                ("feat: add a", &[("src/a.rs", "fn alpha() {}")]),
+                ("feat: add b", &[("src/b.rs", "fn beta() {}")]),
+            ],
+        );
+        let root_str = root.to_string_lossy().to_string();
+
+        // Build the full index (lexical + temporal).
+        let result = run(
+            &[
+                "--rebuild".to_string(),
+                "--root".to_string(),
+                root_str.clone(),
+            ],
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            ExitCode::SUCCESS,
+            "T-16 setup: --rebuild must succeed"
+        );
+
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+
+        // Sanity: healthy state reports "current" for staleness.
+        let healthy = stats_json_for_test(&cache_dir, root)
+            .expect("T-16 setup: stats must succeed on healthy index");
+        assert_eq!(
+            healthy["staleness"].as_str().unwrap_or(""),
+            "current",
+            "T-16 pre-condition: healthy state must report staleness=='current'; got: {:?}",
+            healthy["staleness"]
+        );
+
+        // Remove the lexical index header to force StalenessCheck::NoIndex on next query.
+        std::fs::remove_file(cache_dir.join("index.skidx")).unwrap();
+
+        // --stats --json: gather_stats captures staleness BEFORE self-heal
+        // (StalenessCheck::NoIndex → "no index"), then self-heal rebuilds the index
+        // so file_count reflects the post-heal state.
+        let stats = stats_json_for_test(&cache_dir, root)
+            .expect("T-16: stats_json_for_test must succeed with missing skidx");
+
+        // Staleness is the PRE-self-heal snapshot (AD-414-10 / F5).
+        assert_eq!(
+            stats["staleness"].as_str().unwrap_or(""),
+            "no index",
+            "T-16: staleness must be 'no index' (pre-heal snapshot); got: {:?}",
+            stats["staleness"]
+        );
+
+        // file_count is the POST-self-heal state — must reflect indexed files.
+        let file_count = stats["file_count"].as_u64().unwrap_or(0);
+        assert!(
+            file_count > 0,
+            "T-16: file_count must be > 0 (post-heal state) even when staleness=='no index'; \
+             this is the snapshot asymmetry guaranteed by AD-414-10 (AC-15/AC-22 analogue)"
+        );
+
+        // The staleness key must be present in output (F5 contract).
+        assert!(
+            stats.get("staleness").is_some(),
+            "T-16: 'staleness' key must be present in --stats --json output"
         );
     }
 

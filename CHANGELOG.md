@@ -139,6 +139,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"git_head_state": "resolved"`).  Additive — all pre-existing keys are byte-identical
   on upgrade; the key is absent from the `{"error": "no index found"}` object (AC21).
 
+- **`temporal_state` and `staleness` in `skim search --stats --json`** (#414) — the
+  `--stats --json` object now includes two additional keys:
+  - `"temporal_state"` — health of the temporal database at query time.  Values:
+    `"ready"` (populated and consistent), `"empty"` (present but zero hotspot rows),
+    `"corrupt"` (SQLite-level corruption; DB discarded and one rebuild attempt follows),
+    `"newer-schema"` (written by a newer binary; refused — upgrade skim to access it),
+    `"missing"` (no `temporal.db` found).
+  - `"staleness"` — lexical index staleness at query time.  Values: `"current"` (index
+    HEAD matches current HEAD and working tree is unchanged), `"no index"` (no lexical
+    index found — cold start or post-delete), `"stale (HEAD changed: <prev8>…→<cur8>…)"`
+    (HEAD changed since last build), `"stale (no HEAD recorded)"` (manifest has no stored
+    HEAD), `"stale (working tree changed: N modified, N added, N removed)"`.
+  **Snapshot asymmetry (AD-414-10):** `git_head`, `temporal_state`, and `staleness` are
+  captured from the PRE-self-heal state.  All other fields (`file_count`, `skipped`,
+  `ast_coverage`) are from the POST-self-heal state.  A `temporal_state` of `"missing"`
+  or `"corrupt"` (or `staleness` of `"no index"`) can therefore coexist with a valid
+  `file_count` — this is the intended observable contract.  Additive — all pre-existing
+  keys are byte-identical on upgrade.
+
+- **`degraded` array in `skim search --json` when temporal ranking is unavailable** (#414) —
+  when `--hot`, `--cold`, `--risky`, or `--blast-radius` is requested but temporal data
+  cannot be served (DB missing, corrupt, newer-schema, empty, or repository mismatch),
+  the `--json` envelope now includes a `"degraded"` array.  Each element is an object
+  with keys: `subsystem` (always `"temporal"` in this release), `reason` (`"missing"`,
+  `"corrupt"`, `"newer-schema"`, `"empty"`, or `"mismatch"`), `requested` (the flag that
+  was requested), `applied` (`"lexical"` on text+temporal and blast-radius arms, `"none"`
+  on the standalone temporal arm — no results served there), `message` (human-readable),
+  `remediation` (actionable hint).  The field is absent (`skip_serializing_if`) on
+  healthy queries to keep byte-identity for existing callers.
+
 ### Fixed
 - **`skim search` linked worktree HEAD resolution and temporal data** (#413) — in a
   repository with linked worktrees (`git worktree add`), `skim search` read HEAD from
@@ -161,6 +191,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical guard (`is_repo_relative_safe`) in addition to the existing `refs/` prefix
   check, so any symbolic-ref path containing `..`, an absolute root `/`, or a Windows
   prefix is rejected before the file is opened.
+
+- **`skim search --rebuild` was a silent no-op when `temporal.db.build_backoff` was set**
+  (#414, AD-414-16) — a per-HEAD backoff sentinel (`temporal.db.build_backoff`, written
+  when a temporal build fails for a given HEAD commit) was checked unconditionally, so
+  an explicit `--rebuild` was silently short-circuited as if it were an automatic quiet
+  retry.  Fixed: `BuildLoudness::Loud` (the `--rebuild`/`--build`/`--update` path) now
+  clears the sentinel before the staleness check, so an explicit rebuild always proceeds
+  regardless of prior failures.  Only the quiet automatic refresh path (`BuildLoudness::Quiet`)
+  still respects the sentinel to bound noisy retry loops.
+
+- **`temporal.db` not rebuilt after SQLite-level corruption** (#414) — when
+  `temporal.db` contained SQLite-level corruption (`SQLITE_CORRUPT` or `SQLITE_NOTADB`),
+  skim now discards the corrupt file and immediately performs one rebuild attempt.
+  Previously the corruption was reported in `temporal_state` but the file was left in
+  place and no rebuild was triggered, leaving the temporal arm permanently degraded.
+
+- **`--stats --json` emits a notice when `temporal.db` exists but has zero hotspot
+  rows** (#414) — an existing but empty temporal DB (all hotspot rows deleted or a
+  repo with only one commit) now reports `temporal_state: "empty"` and emits a
+  degraded notice so callers know why temporal ranking returned no results.
 - **`skim search --near` silently dropped when `--phrase` was also set** (#403):
   Two independent layers each had the same bug: reader.rs used `if want_phrase { phrase_alignments } else { near_match }`,
   and query.rs used `if phrase { Phrase } else if near { Near }`.  In both cases `--near N`
