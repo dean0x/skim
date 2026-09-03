@@ -1247,13 +1247,24 @@ mod tracked_union_402 {
     // -------------------------------------------------------------------------
     /// `CLAUDE.md` is tracked in git but listed in `.gitignore` (line 26), so it
     /// was silently excluded from `skim search` before #402.  After the union fix
-    /// it must appear when searching for a token that exists only in `CLAUDE.md`.
+    /// it must appear when searching for a phrase that exists only in `CLAUDE.md`.
     ///
-    /// Oracle: `git grep -l "byte-faithful contract"` → `CLAUDE.md`.
+    /// Oracle: `git grep -l "streaming code reader for AI agents"` → `CLAUDE.md`.
     /// Discriminating (PF-007): reverting the union removes CLAUDE.md from the
     /// ignore-walk results so it vanishes from the search output, failing this test.
+    ///
+    /// The probe phrase MUST stay unique to `CLAUDE.md`.  The original probe,
+    /// "byte-faithful contract", stopped being unique when the file-wrapper
+    /// fidelity work landed on main and spread that phrase to nine more files.
+    /// CLAUDE.md stayed indexed but fell to rank 31, dropping off the default
+    /// 20-result page.  This test asserts index membership, not rank, so the
+    /// probe phrase carries that requirement: if it starts failing, first
+    /// re-check uniqueness with `git grep -l` before suspecting the union.
     #[test]
-    fn ac1_real_repo_byte_faithful_contract() {
+    fn ac1_real_repo_tracked_union_surfaces_claude_md() {
+        // Phrase that must exist in `CLAUDE.md` and nowhere else in the repo.
+        const PROBE: &str = "streaming code reader for AI agents";
+
         // Resolve the workspace root from this crate's CARGO_MANIFEST_DIR.
         // Integration tests live in `crates/rskim/tests/`, so CARGO_MANIFEST_DIR
         // points to `.../crates/rskim`; two parent steps reach the workspace root.
@@ -1267,7 +1278,7 @@ mod tracked_union_402 {
                 .to_path_buf()
         };
 
-        // Guard: CLAUDE.md must exist and contain the oracle token, so the
+        // Guard: CLAUDE.md must exist and contain the probe phrase, so the
         // assertion below is non-vacuous.
         let claude_path = repo_root.join("CLAUDE.md");
         assert!(
@@ -1277,9 +1288,9 @@ mod tracked_union_402 {
         );
         let claude_content = fs::read_to_string(&claude_path).expect("read CLAUDE.md");
         assert!(
-            claude_content.contains("byte-faithful contract"),
-            "AC1 guard: CLAUDE.md must contain the token 'byte-faithful contract' \
-             (oracle: git grep -l \"byte-faithful contract\" → CLAUDE.md)"
+            claude_content.contains(PROBE),
+            "AC1 guard: CLAUDE.md must contain the probe phrase {PROBE:?} \
+             (oracle: git grep -l the phrase → CLAUDE.md)"
         );
 
         let cache = tempfile::tempdir().unwrap();
@@ -1287,13 +1298,13 @@ mod tracked_union_402 {
         // Build the index from the real repo (union must surface CLAUDE.md).
         build_index_402(&repo_root, cache.path());
 
-        // Query for the token — union must have indexed CLAUDE.md.
-        let json = query_json(&repo_root, cache.path(), "byte-faithful contract");
+        // Query for the probe phrase — union must have indexed CLAUDE.md.
+        let json = query_json(&repo_root, cache.path(), PROBE);
         let paths = result_paths(&json);
 
         assert!(
             paths.iter().any(|p| p.ends_with("CLAUDE.md")),
-            "AC1: CLAUDE.md must appear in results for 'byte-faithful contract'; \
+            "AC1: CLAUDE.md must appear in results for {PROBE:?}; \
              paths: {paths:?}\n\
              (CLAUDE.md is tracked-but-.gitignored; the union must surface it — AD-402-1)"
         );
