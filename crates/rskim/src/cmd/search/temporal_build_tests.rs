@@ -2917,10 +2917,14 @@ fn test_future_schema_db_byte_unchanged_and_backoff_written() {
         "T-10: backoff sentinel must be written after UnsupportedSchemaVersion"
     );
     let sentinel_content = std::fs::read(&sentinel_path).expect("T-10: read sentinel");
-    assert_eq!(
-        sentinel_content,
-        fake_head.as_bytes(),
-        "T-10: backoff sentinel must contain the current HEAD bytes"
+    // New sentinel format is "{head}\n{shallow_char}"; verify prefix then two-field shape.
+    assert!(
+        sentinel_content.starts_with(fake_head.as_bytes()),
+        "T-10: backoff sentinel must start with the current HEAD bytes"
+    );
+    assert!(
+        sentinel_content.contains(&b'\n'),
+        "T-10: backoff sentinel must use new two-field {{head}}\\n{{shallow_char}} format (AD-414-21)"
     );
 }
 
@@ -4153,7 +4157,9 @@ fn test_explicit_rebuild_clears_backoff_sentinel() {
     let src = rskim_search::GixSource;
 
     // --- NEGATIVE: silent (background) build with matching sentinel → no rebuild ---
-    std::fs::write(&sentinel_path, head.as_bytes()).unwrap();
+    // Write sentinel in new {head}\n{shallow} format so backoff_sentinel_matches
+    // treats it as a current-format sentinel (old single-line sentinels self-clear).
+    super::write_backoff_sentinel(&cache_dir, &head, None);
     rebuild_temporal_with_source(
         &src,
         root,
@@ -4174,8 +4180,8 @@ fn test_explicit_rebuild_clears_backoff_sentinel() {
     );
 
     // --- POSITIVE: loud (explicit) build with matching sentinel → clears it ---
-    // Re-write the sentinel to ensure it is present before the loud call.
-    std::fs::write(&sentinel_path, head.as_bytes()).unwrap();
+    // Re-write the sentinel in new format to ensure it is present before the loud call.
+    super::write_backoff_sentinel(&cache_dir, &head, None);
     rebuild_temporal_with_source(
         &src,
         root,
