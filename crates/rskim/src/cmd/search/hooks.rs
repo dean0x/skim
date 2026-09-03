@@ -137,13 +137,15 @@ pub(crate) struct HooksOutcome {
 /// alongside the refusal, eliminating the redundant `resolve_repo_toplevel`
 /// re-walk in `install_search_hooks` and `remove_search_hooks`.
 ///
+/// P2-3 (2026-09-03): further simplified from `Result<PathBuf, Option<PathBuf>>`
+/// to `Result<PathBuf, PathBuf>` — `Err(None)` was uninhabited by construction
+/// (the only `Err` site constructs `Err(ancestor)`, never `Err(None)`), so the
+/// `Option` wrapper only added a dead branch that callers had to handle.
+///
 /// - `Ok(dir)` — a valid hooks directory; caller may use it.
-/// - `Err(Some(ancestor))` — `project_root` is a subdirectory of `ancestor`;
+/// - `Err(ancestor)` — `project_root` is a subdirectory of `ancestor`;
 ///   caller must refuse with an error naming `ancestor`.
-/// - `Err(None)` — does not occur in practice (when there is no enclosing repo
-///   the function returns `Ok` with the fallback path), but callers must handle
-///   the variant for exhaustiveness.
-pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, Option<PathBuf>> {
+pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, PathBuf> {
     match super::staleness::resolve_git_dir(project_root) {
         Some(git_dir) => {
             let dot_git = project_root.join(".git");
@@ -193,20 +195,22 @@ pub(crate) fn resolve_hooks_dir(project_root: &Path) -> Result<PathBuf, Option<P
             // No `.git` at this root.  Check whether the root is a subdirectory
             // of an enclosing git repository.
             //
-            // If it IS inside a repo, return Err(Some(ancestor)).  The caller
-            // must refuse: creating `<root>/.git/hooks` here would permanently
-            // break ancestor adoption and make the temporal layer silently dead
+            // If it IS inside a repo, return Err(ancestor).  The caller must
+            // refuse: creating `<root>/.git/hooks` here would permanently break
+            // ancestor adoption and make the temporal layer silently dead
             // (PF-017 + the review finding that led to this change).
             // F9 / AD-413-18: return the discovered ancestor so callers do not
             // have to re-walk (eliminates a redundant resolve_repo_toplevel call
             // on the install/remove refusal paths).
+            // P2-3 (2026-09-03): changed from Err(Some(ancestor)) to Err(ancestor);
+            // the Option wrapper was uninhabited (Err(None) was never constructed).
             //
             // If it is NOT inside any repo (true non-repo, e.g. the bare temp
             // dirs that hooks_tests creates), return the pre-#413 fallback —
             // creating an empty `.git/hooks` there is safe because no ancestor
             // adoption can be disrupted.
             if let Some(ancestor) = super::staleness::resolve_repo_toplevel(project_root) {
-                return Err(Some(ancestor));
+                return Err(ancestor);
             }
             Ok(project_root.join(".git").join("hooks"))
         }
@@ -302,24 +306,19 @@ pub(crate) fn install_search_hooks(project_root: &Path) -> anyhow::Result<HooksO
     let hooks_dir = match resolve_hooks_dir(project_root) {
         Ok(d) => d,
         Err(ancestor) => {
-            // resolve_hooks_dir returns Err only when resolve_git_dir found no
-            // `.git` at this root BUT resolve_repo_toplevel found an enclosing
-            // repo.  Refuse loudly — installing here would create a fake `.git`
-            // that permanently breaks ancestor adoption (PF-017).
-            // F8: {:?} quotes ESC/CR/LF; F9: ancestor is already discovered,
-            // no re-walk needed (AD-413-18).
-            let hint = ancestor
-                .map(|p| {
-                    format!(
-                        "; re-run with `--root {:?}` to install hooks in the enclosing repository",
-                        p
-                    )
-                })
-                .unwrap_or_default();
+            // resolve_hooks_dir returns Err(ancestor) only when resolve_git_dir
+            // found no `.git` at this root BUT resolve_repo_toplevel found an
+            // enclosing repo.  Refuse loudly — installing here would create a
+            // fake `.git` that permanently breaks ancestor adoption (PF-017).
+            // F8: {:?} quotes ESC/CR/LF in the body; P2-3: `Err` payload is
+            // the ancestor directly (no Option wrapper); F9/AD-413-18.
+            // The pasteable --root hint uses .display() (valid path on all
+            // platforms, spaces preserved) while the body uses {:?} for safety.
             anyhow::bail!(
-                "{:?} is a subdirectory of a git repository and cannot itself host git hooks{}",
+                "{:?} is a subdirectory of a git repository and cannot itself host git hooks\
+                 ; re-run with `--root {}` to install hooks in the enclosing repository",
                 project_root,
-                hint,
+                ancestor.display(),
             );
         }
     };
@@ -372,19 +371,12 @@ pub(crate) fn remove_search_hooks(project_root: &Path) -> anyhow::Result<HooksOu
         Ok(d) => d,
         Err(ancestor) => {
             // Symmetric refusal with install_search_hooks (see comment there).
-            // F8: {:?} quotes ESC/CR/LF; F9: ancestor already discovered (AD-413-18).
-            let hint = ancestor
-                .map(|p| {
-                    format!(
-                        "; re-run with `--root {:?}` to remove hooks from the enclosing repository",
-                        p
-                    )
-                })
-                .unwrap_or_default();
+            // F8/P2-3/F9/AD-413-18: same pattern as install; .display() for hint.
             anyhow::bail!(
-                "{:?} is a subdirectory of a git repository and cannot itself host git hooks{}",
+                "{:?} is a subdirectory of a git repository and cannot itself host git hooks\
+                 ; re-run with `--root {}` to remove hooks from the enclosing repository",
                 project_root,
-                hint,
+                ancestor.display(),
             );
         }
     };
