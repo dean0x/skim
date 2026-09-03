@@ -2066,9 +2066,8 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
     let project;
     let project_root: &std::path::Path;
     let modified_file_path;
-    let original_content;
 
-    if fixtures_dir.exists() {
+    let original_content = if fixtures_dir.exists() {
         // Use the fixtures directory directly — it has multiple languages.
         // We'll index from a fresh copy in a tempdir to avoid mutating the real fixtures.
         let tmp_project = tempfile::tempdir().unwrap();
@@ -2106,17 +2105,17 @@ fn test_index_incremental_extraction_count_less_than_full_build() {
         project = tmp_project;
         project_root = project.path();
         modified_file_path = project_root.join("fixtures/rust/simple.rs");
-        original_content = if modified_file_path.exists() {
+        if modified_file_path.exists() {
             fs::read_to_string(&modified_file_path).unwrap()
         } else {
             "fn placeholder() {}\n".to_string()
-        };
+        }
     } else {
         project = make_project();
         project_root = project.path();
         modified_file_path = project_root.join("src/main.rs");
-        original_content = fs::read_to_string(&modified_file_path).unwrap();
-    }
+        fs::read_to_string(&modified_file_path).unwrap()
+    };
 
     let cache = tempfile::tempdir().unwrap();
     let config = IndexConfig {
