@@ -524,9 +524,12 @@ fn t6_fx_empty_standalone_temporal_degraded_json() {
         assert_degraded_reason(&json_out, "empty");
 
         // DegradedJson.requested must use the BARE form (AC-6 / RD-5).
-        // "hot" / "cold" / "risky" — no "--" prefix.  applied must be "lexical".
+        // "hot" / "cold" / "risky" — no "--" prefix.
+        // F2 / AD-414-19: applied must be "none" on the standalone arm — no
+        // text query means no results are served, so "lexical" would be a false
+        // claim.  The text+temporal arm (run_query) keeps "lexical" (AC-4).
         let bare_flag = flag.trim_start_matches('-');
-        assert_degraded_requested_applied(&json_out, bare_flag, "lexical");
+        assert_degraded_requested_applied(&json_out, bare_flag, "none");
     }
 }
 
