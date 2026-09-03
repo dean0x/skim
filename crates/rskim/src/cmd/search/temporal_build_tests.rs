@@ -4395,6 +4395,184 @@ fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
 // AC-13 (#407) — build-backoff sentinel gates the data-version self-heal
 // ============================================================================
 
+// ============================================================================
+// T-15 — zero_row_notice shallow-wins-over-empty-commits (AD-407-7)
+// ============================================================================
+
+/// T-15 (AD-407-7, AC-15): `zero_row_notice` MUST contain the substring
+/// "shallow" when `commits` is empty and `is_shallow` is true.
+///
+/// After #407 skips merge commits, a shallow clone whose HEAD is a merge
+/// commit yields ZERO commits in `HistoryResult` while `is_shallow` stays
+/// `true`.  The old arm order evaluated `commits.is_empty()` first, which
+/// emitted the untruthful "no commits" wording instead of the correct "shallow"
+/// attribution.  The reorder (AD-407-7) moves the shallow arm before the
+/// empty-commits arm so the user receives an actionable message.
+///
+/// Discriminating: before AD-407-7, calling `zero_row_notice` with an empty
+/// `commits` and `is_shallow = true` fell into case (i) and produced a notice
+/// WITHOUT "shallow".  After AD-407-7 it falls into case (ii) and the notice
+/// MUST contain "shallow".
+#[test]
+fn test_zero_row_notice_shallow_wins_over_zero_commits() {
+    // Empty commit list with is_shallow = true — the shape #407 creates for
+    // a shallow clone whose HEAD is a merge (all commits are merge commits,
+    // all are skipped, result is empty).
+    let history = HistoryResult {
+        commits: vec![],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 0,
+        },
+    };
+
+    // pre_ghost_hotspot = 0 because there were no commits to produce rows.
+    let notice = super::zero_row_notice(&history, 0, true);
+
+    assert!(
+        notice.to_ascii_lowercase().contains("shallow"),
+        "T-15 (AD-407-7, AC-15): zero_row_notice with empty commits + is_shallow=true \
+         must contain 'shallow'; the shallow arm must be evaluated before the \
+         empty-commits arm (arm-ordering regression); got: {notice:?}"
+    );
+    assert!(
+        !notice.is_empty(),
+        "T-15: zero_row_notice must return a non-empty string"
+    );
+}
+
+// ============================================================================
+// T-16 — classifier-parity: RiskRow fix_commits matches is_fix_commit
+// ============================================================================
+
+/// T-16 (AC-4): `RiskRow.fix_commits` and `RiskRow.total_commits` for a file
+/// MUST equal the count of commits where [`rskim_search::is_fix_commit`]
+/// returns `true` / `false` applied over the SAME `HistoryResult`.
+///
+/// This is the classifier-parity proof that #407 exists to establish.  Before
+/// #407, `parse_history` returned only first-parent commits and their messages
+/// were merge subjects (`merge(#NNN): …`) which never matched `FIX_REGEX`.
+/// After #407, branch commits with real fix subjects (`fix: …`, `bug: …`) flow
+/// into `sync_history_to_db` / `aggregate_file_stats`, and `fix_commits` in
+/// the DB must reflect the exact same classification that `is_fix_commit` gives
+/// when called directly on those subjects.
+///
+/// Discriminating: delete the `is_fix_commit` call in `scoring.rs` and replace
+/// it with `false` — `fix_commits` becomes 0 and this assertion fails.
+/// Delete the call and replace it with `true` — `fix_commits` equals
+/// `total_commits` and the second assertion fails.
+#[test]
+fn test_risk_rows_match_is_fix_commit_over_same_history() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a real git repo so discover_git_workdir resolves and the ghost
+    // filter passes.  The single seed commit writes "branch.rs" to disk;
+    // subsequent commit metadata is injected via FixedSource.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[("feat: seed branch.rs", &[("branch.rs", "pub fn x() {}")])],
+    );
+
+    // Hand-build a HistoryResult whose subjects are a mix of fix and non-fix
+    // messages.  All commits touch "branch.rs" (the file that exists on disk).
+    let now_epoch: u64 = 1_781_337_600; // 2026-06-13 08:00:00 UTC (pinned)
+    let commits = vec![
+        make_commit(
+            "t16a0001",
+            now_epoch as i64 - 86400,
+            "fix: bug one",
+            &["branch.rs"],
+        ),
+        make_commit(
+            "t16a0002",
+            now_epoch as i64 - 86400 * 2,
+            "fix: bug two",
+            &["branch.rs"],
+        ),
+        make_commit(
+            "t16a0003",
+            now_epoch as i64 - 86400 * 3,
+            "feat: new feature",
+            &["branch.rs"],
+        ),
+    ];
+
+    // Compute the expected counts from is_fix_commit applied to the SAME
+    // subjects — this is the ground truth that the DB must match.
+    let expected_total: u32 = commits.len() as u32;
+    let expected_fix: u32 = commits
+        .iter()
+        .filter(|c| rskim_search::is_fix_commit(&c.message))
+        .count() as u32;
+    assert_eq!(
+        expected_fix, 2,
+        "T-16 fixture sanity: 'fix: bug one' and 'fix: bug two' must match FIX_REGEX"
+    );
+    assert_eq!(
+        expected_total - expected_fix,
+        1,
+        "T-16 fixture sanity: 'feat: new feature' must NOT match FIX_REGEX"
+    );
+
+    let src = FixedSource {
+        history: rskim_search::HistoryResult {
+            commits,
+            metadata: rskim_search::TemporalMetadata {
+                is_shallow: false,
+                commit_count: expected_total as usize,
+            },
+        },
+    };
+
+    rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        &head,
+        now_epoch,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("T-16: rebuild_temporal_with_source must succeed");
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path)
+        .expect("T-16: temporal.db must be openable after rebuild");
+
+    let row = db
+        .risk_for_file("branch.rs")
+        .expect("T-16: risk_for_file must not return Err")
+        .expect("T-16: branch.rs must have a risk row after rebuild");
+
+    assert_eq!(
+        row.total_commits, expected_total,
+        "T-16 (AC-4): RiskRow.total_commits must equal the total commit count \
+         from the injected HistoryResult; got {} expected {}",
+        row.total_commits, expected_total
+    );
+    assert_eq!(
+        row.fix_commits, expected_fix,
+        "T-16 (AC-4): RiskRow.fix_commits must equal the count of commits \
+         where is_fix_commit returns true over the SAME history; got {} expected {}",
+        row.fix_commits, expected_fix
+    );
+
+    // fix_density is the raw ratio; assert it matches is_fix_commit parity.
+    let expected_density = f64::from(expected_fix) / f64::from(expected_total);
+    assert!(
+        (row.fix_density - expected_density).abs() < 1e-9,
+        "T-16: RiskRow.fix_density must be the raw fix ratio {expected_density}; \
+         got {}",
+        row.fix_density
+    );
+}
+
+// ============================================================================
+// AC-13 — data-version self-heal skipped when build-backoff sentinel matches
+// ============================================================================
+
 /// AC-13 (#407): when `temporal.db.build_backoff` contains the current HEAD,
 /// the self-heal path MUST return `Ok(())` without invoking `parse_history`
 /// (call count 0 on an injected counting `TemporalSource`).

@@ -1247,9 +1247,19 @@ fn open_or_discard_temporal_db(
 ///
 /// # Classification
 ///
-/// - Case (i): no commits at all → `Empty` (no shallow suffix per T-16/AC-16).
-/// - Case (ii): commits present, `pre_ghost == 0`, `is_shallow` → `Empty` with
-///   shallow detail (permitted only when `is_shallow`).
+/// Evaluation order (AD-407-7): the shallow arm (case ii) is evaluated BEFORE
+/// the empty-commits arm (case i).  After #407 skips merge commits, a shallow
+/// clone whose HEAD is a merge yields zero commits AND `is_shallow = true`.
+/// Evaluating case (i) first would emit the untruthful "no commits" wording
+/// instead of the truthful "shallow" explanation.  The shallow arm now subsumes
+/// both sub-cases: commits empty + is_shallow, and commits present but all diffs
+/// absent + is_shallow (the pre-#407 shape).  Case (i) is still reachable for
+/// a fresh `git init` where `is_shallow` is false.
+///
+/// - Case (ii): `pre_ghost_hotspot == 0 && is_shallow` → `Empty` with "shallow"
+///   detail (evaluated FIRST; shallow cause must not be masked by case i).
+/// - Case (i): commits empty AND `is_shallow` is false → `Empty` (no shallow
+///   suffix per T-16/AC-16).
 /// - Case (iii): rows computed, ghost filter zeroed them → `GhostFilter` with
 ///   count detail.  Routes through `degraded_notice` so the SSOT guard catches
 ///   any future drift (AD-414-1, `t19b_no_cause_substring_outside_the_builder`).
@@ -1260,21 +1270,22 @@ fn zero_row_notice(
     pre_ghost_hotspot: usize,
     is_shallow: bool,
 ) -> String {
-    if risk_history.commits.is_empty() {
-        // Case (i): no commits at all — empty history.
+    if pre_ghost_hotspot == 0 && is_shallow {
+        // Case (ii) — evaluated FIRST (AD-407-7).
+        // Covers both: commits empty + shallow clone, and commits present but
+        // all diffs failed under a shallow clone (changed_files == [] for every
+        // commit).  Shallow wording is permitted only when is_shallow is true.
+        let u = TemporalUnavailable {
+            reason: DegradedReason::Empty,
+            detail: "shallow".to_string(),
+        };
+        degraded_notice(&u, "", Fallback::NoResults)
+    } else if risk_history.commits.is_empty() {
+        // Case (i): no commits at all and not shallow — empty history.
         // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
         let u = TemporalUnavailable {
             reason: DegradedReason::Empty,
             detail: String::new(),
-        };
-        degraded_notice(&u, "", Fallback::NoResults)
-    } else if pre_ghost_hotspot == 0 && is_shallow {
-        // Case (ii): commits present but all diffs failed under a shallow clone
-        // (changed_files == [] for every commit).  Shallow wording is permitted
-        // only when is_shallow is true.
-        let u = TemporalUnavailable {
-            reason: DegradedReason::Empty,
-            detail: "shallow".to_string(),
         };
         degraded_notice(&u, "", Fallback::NoResults)
     } else if pre_ghost_hotspot > 0 {
