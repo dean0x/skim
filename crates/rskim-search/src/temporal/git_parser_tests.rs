@@ -690,3 +690,654 @@ fn test_commit_info_serialization_roundtrip() {
     assert_eq!(restored.changed_files[0].additions, 10);
     assert_eq!(restored.changed_files[0].deletions, 3);
 }
+
+// ============================================================================
+// Full-DAG walk — merge skip and budget (Test Plan items 1-9, #407)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Create a repo with a feature branch merged in (no-ff).
+///
+/// Layout (non-merge commits = 4, a.txt touched 2×, b.txt touched 2×):
+///   main:    A1 (a.txt, "chore: initial a") → A2 (a.txt, "chore: update a")
+///   feature: B1 (b.txt, "fix: bug one")    → B2 (b.txt, "fix: bug two")
+///   HEAD:    M (merge(#1): feature → main, 2 parents)
+///
+/// The merge commit's subject never matches FIX_REGEX. All four non-merge
+/// commits have deterministic dates so concurrent test runs are stable (PF-012).
+fn init_merge_fixture() -> Option<TempDir> {
+    let dir = init_git_repo()?;
+    let p = dir.path();
+
+    // Pinned base time so branches don't race (PF-012)
+    const T0: i64 = 1_700_000_000;
+
+    // A1: root commit on main
+    if !git_commit_file_at(p, "a.txt", "v1", "chore: initial a", T0, T0) {
+        return None;
+    }
+    // Branch off to feature
+    if !Command::new("git")
+        .args(["checkout", "-b", "feature"])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return None;
+    }
+    // B1, B2: two fix commits on feature
+    if !git_commit_file_at(p, "b.txt", "v1", "fix: bug one", T0 + 10, T0 + 10) {
+        return None;
+    }
+    if !git_commit_file_at(p, "b.txt", "v2", "fix: bug two", T0 + 20, T0 + 20) {
+        return None;
+    }
+    // Back to main
+    if !Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return None;
+    }
+    // A2: second commit on main
+    if !git_commit_file_at(p, "a.txt", "v2", "chore: update a", T0 + 30, T0 + 30) {
+        return None;
+    }
+    // Merge feature into main (--no-ff to guarantee a merge commit)
+    let merge_ok = Command::new("git")
+        .args([
+            "merge",
+            "--no-ff",
+            "-m",
+            "merge(#1): feature into main",
+            "feature",
+        ])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !merge_ok {
+        return None;
+    }
+
+    Some(dir)
+}
+
+/// Add a file and commit with explicit author + committer dates.
+/// `ts` is a Unix timestamp; both author and committer dates are set to it
+/// unless overridden via the two separate `author_ts` / `committer_ts` params.
+fn git_commit_file_at(
+    dir: &Path,
+    filename: &str,
+    content: &str,
+    message: &str,
+    author_ts: i64,
+    committer_ts: i64,
+) -> bool {
+    // Format as git's expected "seconds timezone" string
+    let author_date = format!("{} +0000", author_ts);
+    let committer_date = format!("{} +0000", committer_ts);
+    std::fs::write(dir.join(filename), content).is_ok()
+        && Command::new("git")
+            .args(["add", filename])
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success())
+        && Command::new("git")
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", &author_date)
+            .env("GIT_COMMITTER_DATE", &committer_date)
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+/// Run `git rev-list --count --no-merges HEAD` and return the count.
+fn git_rev_list_count_no_merges(dir: &Path) -> Option<usize> {
+    Command::new("git")
+        .args(["rev-list", "--count", "--no-merges", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Run `git rev-list --count --no-merges --full-history HEAD -- <path>`.
+fn git_rev_list_count_no_merges_for_path(dir: &Path, path: &str) -> Option<usize> {
+    Command::new("git")
+        .args([
+            "rev-list",
+            "--count",
+            "--no-merges",
+            "--full-history",
+            "HEAD",
+            "--",
+            path,
+        ])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Run `git rev-parse HEAD` and return the full SHA.
+fn git_rev_parse_head(dir: &Path) -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// T-1: total equals git rev-list --count --no-merges
+// ---------------------------------------------------------------------------
+
+/// AC-1: parse_history must return exactly git rev-list --count --no-merges HEAD
+/// commits on the merge fixture (derived in-test, never hardcoded — ADR-003).
+#[test]
+fn test_merge_repo_total_equals_git_rev_list_no_merges() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_merge_fixture() else {
+        return;
+    };
+    let Some(expected) = git_rev_list_count_no_merges(dir.path()) else {
+        eprintln!("SKIPPED: git rev-list failed");
+        return;
+    };
+
+    let src = GixSource;
+    let history = src.parse_history(dir.path(), 0).expect("parse_history");
+
+    assert_eq!(
+        history.commits.len(),
+        expected,
+        "parse_history must return exactly git rev-list --count --no-merges HEAD ({expected}) commits"
+    );
+    assert_eq!(history.metadata.commit_count, expected);
+}
+
+// ---------------------------------------------------------------------------
+// T-2: branch commit subjects appear verbatim
+// ---------------------------------------------------------------------------
+
+/// AC-4: branch commit messages ("fix: bug one", "fix: bug two") must appear
+/// verbatim in the returned CommitInfo.message, so is_fix_commit can classify
+/// them correctly rather than receiving merge subjects.
+#[test]
+fn test_branch_commits_present_with_real_subjects() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_merge_fixture() else {
+        return;
+    };
+
+    let src = GixSource;
+    let history = src.parse_history(dir.path(), 0).expect("parse_history");
+
+    let messages: Vec<&str> = history.commits.iter().map(|c| c.message.as_str()).collect();
+    assert!(
+        messages.contains(&"fix: bug one"),
+        "expected \"fix: bug one\" in messages: {messages:?}"
+    );
+    assert!(
+        messages.contains(&"fix: bug two"),
+        "expected \"fix: bug two\" in messages: {messages:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-3: merge commit absent from history
+// ---------------------------------------------------------------------------
+
+/// AC-3: no CommitInfo.hash must equal the merge commit's SHA (HEAD on the fixture).
+#[test]
+fn test_merge_commit_absent_from_history() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_merge_fixture() else {
+        return;
+    };
+    let Some(head_sha) = git_rev_parse_head(dir.path()) else {
+        eprintln!("SKIPPED: git rev-parse HEAD failed");
+        return;
+    };
+
+    let src = GixSource;
+    let history = src.parse_history(dir.path(), 0).expect("parse_history");
+
+    let merge_in_result = history.commits.iter().any(|c| c.hash == head_sha);
+    assert!(
+        !merge_in_result,
+        "merge commit {head_sha} must NOT appear in parse_history results"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-4: per-file counts match git rev-list --no-merges
+// ---------------------------------------------------------------------------
+
+/// AC-2: for each path the skim touch count must equal
+/// git rev-list --count --no-merges --full-history HEAD -- <path> (ADR-003).
+#[test]
+fn test_per_file_counts_match_git_log_no_merges() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_merge_fixture() else {
+        return;
+    };
+
+    let src = GixSource;
+    let history = src.parse_history(dir.path(), 0).expect("parse_history");
+
+    for path in &["a.txt", "b.txt"] {
+        let Some(expected) = git_rev_list_count_no_merges_for_path(dir.path(), path) else {
+            eprintln!("SKIPPED: git rev-list for {path} failed");
+            continue;
+        };
+        let skim_count = history
+            .commits
+            .iter()
+            .filter(|c| {
+                c.changed_files
+                    .iter()
+                    .any(|f| f.path.to_str() == Some(path))
+            })
+            .count();
+        assert_eq!(
+            skim_count, expected,
+            "skim touch count for {path} ({skim_count}) != git --no-merges count ({expected})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T-5: octopus merge is skipped
+// ---------------------------------------------------------------------------
+
+/// AC-3 (octopus): a 3-parent octopus merge must not appear in the history.
+/// All branch commits must be present.
+#[test]
+fn test_octopus_merge_is_skipped() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_git_repo() else {
+        return;
+    };
+    let p = dir.path();
+    const T0: i64 = 1_700_100_000;
+
+    // Root commit on main
+    if !git_commit_file_at(p, "shared.txt", "v1", "chore: init", T0, T0) {
+        return;
+    }
+
+    // Branch b1
+    if !Command::new("git")
+        .args(["checkout", "-b", "b1"])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    if !git_commit_file_at(p, "b1.txt", "x", "feat: b1 work", T0 + 10, T0 + 10) {
+        return;
+    }
+
+    // Branch b2 from main
+    if !Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    if !Command::new("git")
+        .args(["checkout", "-b", "b2"])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    if !git_commit_file_at(p, "b2.txt", "y", "feat: b2 work", T0 + 20, T0 + 20) {
+        return;
+    }
+
+    // Back to main, octopus merge of both branches
+    if !Command::new("git")
+        .args(["checkout", "main"])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    let octopus_ok = Command::new("git")
+        .args([
+            "merge",
+            "--no-ff",
+            "-m",
+            "merge(octopus): b1 b2",
+            "b1",
+            "b2",
+        ])
+        .current_dir(p)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !octopus_ok {
+        eprintln!("SKIPPED: octopus merge failed (git may not support it)");
+        return;
+    }
+
+    let Some(head_sha) = git_rev_parse_head(p) else {
+        return;
+    };
+
+    let src = GixSource;
+    let history = src.parse_history(p, 0).expect("parse_history");
+
+    // Octopus merge must be absent
+    assert!(
+        !history.commits.iter().any(|c| c.hash == head_sha),
+        "octopus merge {head_sha} must NOT appear in parse_history"
+    );
+
+    // All branch commits must be present
+    let messages: Vec<&str> = history.commits.iter().map(|c| c.message.as_str()).collect();
+    assert!(
+        messages.contains(&"feat: b1 work"),
+        "branch b1 commit must be present: {messages:?}"
+    );
+    assert!(
+        messages.contains(&"feat: b2 work"),
+        "branch b2 commit must be present: {messages:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-6: cutoff uses committer time, not author time (AD-407-3)
+// ---------------------------------------------------------------------------
+
+/// AC-7: a commit with old GIT_AUTHOR_DATE but recent GIT_COMMITTER_DATE must
+/// be included when lookback_days covers the committer date, and excluded when
+/// both dates are old. This verifies the manual author-date guard was removed.
+#[test]
+fn test_cutoff_uses_committer_time_not_author_time() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_git_repo() else {
+        return;
+    };
+    let p = dir.path();
+
+    // "Rebased" commit: very old author date, but committer date = now
+    let ancient_author_ts: i64 = 946_684_800; // 2000-01-01 UTC
+    // committer date = 5 days ago (well within a 30-day window)
+    let recent_committer_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - 5 * 86_400;
+
+    if !git_commit_file_at(
+        p,
+        "rebased.txt",
+        "content",
+        "feat: rebased commit",
+        ancient_author_ts,
+        recent_committer_ts,
+    ) {
+        return;
+    }
+
+    // With 30-day window: committer date is recent → commit MUST be returned
+    let src = GixSource;
+    let history_30d = src.parse_history(p, 30).expect("parse_history 30d");
+    assert!(
+        !history_30d.commits.is_empty(),
+        "commit with old author date but recent committer date must be returned with lookback_days=30"
+    );
+    assert!(
+        history_30d
+            .commits
+            .iter()
+            .any(|c| c.message == "feat: rebased commit"),
+        "rebased commit must appear in 30-day window"
+    );
+
+    // Now create a second repo where BOTH dates are ancient
+    let Some(dir2) = init_git_repo() else {
+        return;
+    };
+    if !git_commit_file_at(
+        dir2.path(),
+        "old.txt",
+        "content",
+        "chore: ancient commit",
+        ancient_author_ts,
+        ancient_author_ts, // committer date also old
+    ) {
+        return;
+    }
+
+    let history_both_old = src
+        .parse_history(dir2.path(), 30)
+        .expect("parse_history both old");
+    assert!(
+        history_both_old.commits.is_empty(),
+        "commit with old author AND committer dates must be excluded with lookback_days=30; \
+         got: {:?}",
+        history_both_old
+            .commits
+            .iter()
+            .map(|c| &c.message)
+            .collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-7: shallow clone whose HEAD is a merge yields no commits
+// ---------------------------------------------------------------------------
+
+/// After #407's merge skip, a --depth 1 clone whose HEAD is a merge commit
+/// yields 0 CommitInfos because the only visited commit is a merge.
+#[test]
+fn test_shallow_clone_with_merge_head_yields_no_commits() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(origin) = init_merge_fixture() else {
+        return;
+    };
+
+    let shallow_dir = tempfile::tempdir().expect("tempdir");
+    let clone_target = shallow_dir.path().join("repo");
+    let origin_url = format!("file://{}", origin.path().display());
+
+    let clone_ok = Command::new("git")
+        .args(["clone", "--depth", "1", &origin_url])
+        .arg(&clone_target)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !clone_ok {
+        eprintln!("SKIPPED: git clone --depth 1 failed");
+        return;
+    }
+
+    let src = GixSource;
+    let history = src
+        .parse_history(&clone_target, 0)
+        .expect("parse_history shallow");
+
+    assert!(
+        history.metadata.is_shallow,
+        "clone must be detected as shallow"
+    );
+    assert_eq!(
+        history.commits.len(),
+        0,
+        "shallow clone whose HEAD is a merge must yield 0 CommitInfos after merge skip"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-8: ordering contract — sort by author time, not committer time (AC-6)
+// ---------------------------------------------------------------------------
+
+/// AC-6: parse_history must stably sort by CommitInfo.timestamp (author time)
+/// descending, so commits with old author dates but recent committer dates
+/// sort LAST, not first (stable sort preserves traversal order for ties).
+#[test]
+fn test_ordering_contract_committer_time_not_author_time() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_git_repo() else {
+        return;
+    };
+    let p = dir.path();
+
+    // Commit A: newer AUTHOR date, older COMMITTER date
+    // Commit B: older AUTHOR date, newer COMMITTER date
+    // After stable sort by author time descending: A must come first.
+    const T_OLD_AUTHOR: i64 = 1_600_000_000;
+    const T_NEW_AUTHOR: i64 = 1_700_000_000;
+    const T_OLD_COMMITTER: i64 = 1_600_000_100;
+    const T_NEW_COMMITTER: i64 = 1_700_000_100;
+
+    // Commit A first so it's visited second by gix (gix visits newest committer first)
+    if !git_commit_file_at(
+        p,
+        "a.txt",
+        "a",
+        "feat: commit A (old committer, new author)",
+        T_NEW_AUTHOR,
+        T_OLD_COMMITTER,
+    ) {
+        return;
+    }
+    // Commit B: old author, new committer → gix visits this FIRST (newer committer)
+    if !git_commit_file_at(
+        p,
+        "b.txt",
+        "b",
+        "feat: commit B (new committer, old author)",
+        T_OLD_AUTHOR,
+        T_NEW_COMMITTER,
+    ) {
+        return;
+    }
+
+    let src = GixSource;
+    let history = src.parse_history(p, 0).expect("parse_history");
+    assert_eq!(history.commits.len(), 2, "expected 2 commits");
+
+    // After stable sort by author time (CommitInfo.timestamp) descending:
+    // commits[0] must be A (newer author time T_NEW_AUTHOR)
+    // commits[1] must be B (older author time T_OLD_AUTHOR)
+    assert_eq!(
+        history.commits[0].message,
+        "feat: commit A (old committer, new author)",
+        "commits[0] must be A (newer author time); actual ordering: {:?}",
+        history
+            .commits
+            .iter()
+            .map(|c| &c.message)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        history.commits[1].message, "feat: commit B (new committer, old author)",
+        "commits[1] must be B (older author time)"
+    );
+    assert!(
+        history.commits[0].timestamp > history.commits[1].timestamp,
+        "timestamps must be non-increasing (newest first): {} < {}",
+        history.commits[0].timestamp,
+        history.commits[1].timestamp
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T-9: walk budget bounds (AC-8)
+// ---------------------------------------------------------------------------
+
+/// AC-8: WalkBudget::charge_retain and charge_visit must trip at their
+/// respective caps. Both bounds are driven directly without constructing a
+/// large repository (unit-testable by design).
+#[test]
+fn test_walk_budget_bounds() {
+    use super::{MAX_COMMITS, MAX_VISITED_COMMITS, WalkBudget};
+
+    // Compile-time guard is already in production code via `const _: () = assert!(...)`.
+    // Verify the values in a const block so a regression is caught at compile time here too.
+    const { assert!(MAX_VISITED_COMMITS >= MAX_COMMITS) };
+    assert_eq!(
+        MAX_VISITED_COMMITS,
+        4 * MAX_COMMITS,
+        "MAX_VISITED_COMMITS must be 4× MAX_COMMITS per the plan decision"
+    );
+
+    // --- Retain bound ---
+    // charge_retain() should return false for the first MAX_COMMITS calls,
+    // then true on the (MAX_COMMITS+1)th call.
+    {
+        let mut budget = WalkBudget::new();
+        for i in 0..MAX_COMMITS {
+            assert!(
+                !budget.charge_retain(),
+                "charge_retain must return false on call {i} (below cap)"
+            );
+        }
+        assert!(
+            budget.charge_retain(),
+            "charge_retain must return true after {MAX_COMMITS} charges (cap reached)"
+        );
+    }
+
+    // --- Visit bound ---
+    // charge_visit() increments first, then checks. It fires when visited
+    // strictly exceeds MAX_VISITED_COMMITS, i.e. on the (MAX_VISITED_COMMITS+1)th call.
+    {
+        let mut budget = WalkBudget::new();
+        for i in 1..=MAX_VISITED_COMMITS {
+            assert!(
+                !budget.charge_visit(),
+                "charge_visit must return false on call {i} (below cap)"
+            );
+        }
+        assert!(
+            budget.charge_visit(),
+            "charge_visit must return true on call {} (cap exceeded)",
+            MAX_VISITED_COMMITS + 1
+        );
+    }
+}

@@ -2,7 +2,9 @@
 //!
 //! # Temporal split contract
 //!
-//! - [`GixSource`] returns commits in **newest-first** order.
+//! - [`GixSource::parse_history`] returns commits in **committer-time-descending**
+//!   (newest-first) order, stably re-sorted by `CommitInfo.timestamp` (author time)
+//!   descending so equal-timestamp commits preserve gix traversal order (AD-407-4).
 //! - We reverse to **chronological** order (oldest-first) before splitting so
 //!   that the training set contains the oldest commits and the test set
 //!   contains the most recent ones.
@@ -46,7 +48,8 @@ pub struct TemporalSplit {
 /// Split `commits` into chronological train and test sets.
 ///
 /// Takes ownership of `commits`, which is expected to be in **newest-first**
-/// order (as returned by [`GixSource::parse_history`]).  The function reverses
+/// order (as returned by [`GixSource::parse_history`], committer-time-descending,
+/// stably re-sorted by author time — AD-407-4).  The function reverses
 /// in-place and uses [`Vec::split_off`] for a zero-copy split.
 ///
 /// `train_fraction` must be in `(0.0, 1.0)`.  Values outside this range are
