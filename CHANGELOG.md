@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` temporal layer now walks the full commit DAG** (#407) — the
+  commit population for `--hot`, `--cold`, `--risky`, and `--blast-radius` changes
+  from first-parent-only traversal to a full DAG walk that skips merge commits, matching
+  `git log --no-merges` and skim heatmap's population.  The measured effect on this
+  repository: `crates/rskim/src/cmd/search/query.rs` moves from 21 first-parent commits
+  to 67 full-DAG commits, and fix density rises from 0.095 to 0.522.  Hot/risky scores
+  were previously undercounted by approximately 3× on branch-heavy workflows.
+
+  **Upgrade note (one slow query per root):** the first query after upgrading costs one
+  slow rebuild per project root while the `TEMPORAL_DATA_VERSION` self-heal (1 → 2)
+  replaces the stored data.  Subsequent queries are fast.
+
+  **Adopted-root caveat:** a `--root` whose `temporal.db` records a different
+  `git_toplevel` (e.g. the enclosing repository changed) is **refused** rather than
+  silently re-anchored — skim exits 0 with a typed notice.  The remedy is an explicit
+  `skim search --rebuild --root <path>` which re-anchors and writes the new toplevel
+  (PF-017 by design).
+
+  **`--blast-radius` consequence:** because Jaccard numerators and `file_counts`
+  denominators now reflect the full commit population, co-change peer **sets and ordering**
+  may differ from pre-#407 databases after the self-heal rebuild (AD-407-9).
+
 - **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
   single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
   and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior
