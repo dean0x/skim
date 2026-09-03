@@ -18,8 +18,8 @@ referencedFiles:
   - crates/rskim-search/src/types.rs
   - crates/rskim-search/src/lib.rs
 created: 2026-06-21
-updated: 2026-07-01
-version: 3
+updated: 2026-09-03
+version: 4
 ---
 
 # Temporal Risk Scoring
@@ -203,6 +203,16 @@ File permissions: `0o600` on Unix (owner-only access).
 
 Opens or creates the database. Applies v1 and v2 migrations sequentially. Safe
 to call on a pre-existing database — idempotent.
+
+### `TemporalDb::open_existing(db_path: &Path) -> Result<Self>`
+
+Like `open`, but opens with `SQLITE_OPEN_READ_WRITE` WITHOUT `SQLITE_OPEN_CREATE`.
+Returns `Err` if the file does not exist or cannot be opened; does NOT create a new
+database. Introduced by the F3 / AD-414-17 fix in `crates/rskim/src/cmd/search/temporal_build.rs`
+so that the `parse_history`-failure fall-through path can update `META_IS_SHALLOW` in an
+already-existing `temporal.db` without the TOCTOU risk of creating a new file (which
+would then have only the shallow meta row and no `META_GIT_HEAD`, putting the DB in a
+misleading state). Callers that need to create a DB should use `open`.
 
 ### `TemporalDb::sync(hotspots, risks, cochanges, git_head, is_shallow) -> Result<()>`
 

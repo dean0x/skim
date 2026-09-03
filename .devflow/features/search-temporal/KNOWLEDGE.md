@@ -14,7 +14,7 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage.rs
   - crates/rskim-search/src/lib.rs
 created: 2026-05-26
-updated: 2026-05-26
+updated: 2026-09-03
 ---
 
 # Search Temporal Integration
@@ -39,7 +39,12 @@ Temporal signals let developers answer questions like "which files in my search 
 
 **Graceful degradation:** Missing `temporal.db` is always a warning + exit 0, never an error. If the DB load or query fails after opening, `apply_temporal_enrichment` logs a warning to stderr and returns without modifying results.
 
-**Staleness warning:** When `temporal.db` exists but its stored git HEAD differs from the current repo HEAD, a warning is printed to stderr in standalone mode. The search continues with stale data rather than refusing to operate.
+**Staleness and degraded state:** When temporal data cannot be served (missing DB,
+corrupt DB, newer schema, repository anchor mismatch, or empty rows), the #414
+degraded-state vocabulary provides typed notices to both stderr and JSON output via
+the `degraded[]` array. `--stats --json` reports `temporal_state` and `staleness`
+from the PRE-self-heal state (AD-414-10). See the `cmd-search` feature knowledge entry
+for the full degraded-state contract.
 
 ## State Transitions
 
@@ -129,15 +134,22 @@ Combined mode (text + temporal): the existing `QueryOutput` JSON structure gains
 
 ## Error Handling and Recovery
 
+The degraded-state vocabulary is maintained in `cmd-search` (feature knowledge entry).
+The high-level behaviors:
+
 | Failure scenario | Behavior |
 |---|---|
-| `temporal.db` missing | Warning to stderr, exit 0 (both standalone and combined modes) |
-| `temporal.db` corrupt / unreadable | `open_temporal_db` returns `None` → same graceful path |
-| DB stale vs current HEAD | Warning to stderr, continue with stale data |
+| `temporal.db` missing / corrupt / newer-schema | `open_temporal_state` returns `TemporalOpen::Unavailable` with a typed `DegradedReason`; JSON output gains a `degraded[]` array; exit 0 |
+| Standalone temporal arm unavailable | `applied = "none"` in `degraded[0]`, no `results` key in JSON (AD-414-19) |
+| Text+temporal arm unavailable | `applied = "lexical"` in `degraded[0]`, BM25F results served (AD-414-19) |
+| Repository mismatch (`meta.git_toplevel` differs) | `DegradedReason::RepositoryMismatch`; no rows served; exit 0 |
 | `--blast-radius` path not found | Hard error: "blast-radius file not found: <path>" (exit 1) |
-| `--blast-radius` path outside repo | Hard error: "path is outside the project root" (exit 1) |
-| DB query fails after opening | `apply_temporal_enrichment` logs warning, returns without re-sorting |
-| No co-change data for target | Warning to stderr ("no co-change data for ..."), empty results, exit 0 |
+| DB query fails after opening | `apply_temporal_enrichment` warns to stderr, returns without re-sorting |
+| `parse_history` fails on rebuild | Build-backoff sentinel written (`temporal.db.build_backoff`); `META_GIT_HEAD` NOT written; retry bounded to one walk per HEAD (AD-414-17 / AD-414-21) |
+
+For the complete degraded-state type hierarchy (`DegradedReason`, `DegradedJson`,
+`TemporalOpen`, `Fallback`, `degraded_notice`) and the `applied` per-arm contract, see
+the `cmd-search` feature knowledge entry (Degraded-State Vocabulary section).
 
 ## Anti-Patterns
 
@@ -157,7 +169,10 @@ Combined mode (text + temporal): the existing `QueryOutput` JSON structure gains
 
 **`apply_temporal_enrichment` uses `load_hotspots()` / `load_risks()` (full table scan)**, not the paginated `top_hotspots()`. This is intentional: the text search already limited the result set to ≤ `limit` files, and we need all temporal scores to annotate them correctly. If the temporal DB grows very large, this may become a bottleneck.
 
-**Staleness check requires `git` on PATH**. `check_temporal_staleness` shells out to `git -C root rev-parse HEAD`. If git is absent or the directory is not a repo, `read_git_head` returns `None` and staleness checking is silently skipped (no warning, no error).
+**`check_temporal_staleness` is `#[cfg(test)]` only**. It is not used from any
+production query path (Decision O-B in `cmd-search`). Production temporal staleness
+uses `temporal_db_is_stale(cache_dir, current_head, git_dir)` in `staleness.rs`
+(three lightweight SQLite reads: HEAD match, data_version, shallow→full probe).
 
 ## Key Files
 

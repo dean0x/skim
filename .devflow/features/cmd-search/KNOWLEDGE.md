@@ -21,8 +21,8 @@ referencedFiles:
   - crates/rskim/src/cmd/search/gitdir.rs
   - crates/rskim/src/cmd/search/temporal_state.rs
 created: 2026-06-21
-updated: 2026-09-02
-version: 7
+updated: 2026-09-03
+version: 8
 ---
 
 # Search CLI (skim search subcommand)
@@ -306,6 +306,25 @@ AD-379-9: only aggregate counts are retained in `WorkingTreeDelta`, never a
 per-file path-set diff. Detailed per-path logging is a separate `--verbose`
 follow-up ticket.
 
+**`--stats --json` `.staleness` field (AD-414-10 / AD-414-16 extended)**:
+`StalenessCheck` implements `Display`; its string form is reported as `.staleness`
+in `--stats --json` output. The field is captured PRE-self-heal (alongside
+`git_head` and `temporal_state`) so it reflects the condition that triggered any
+rebuild. Five possible values:
+
+| Display string | Variant |
+|---|---|
+| `"current"` | `StalenessCheck::Current` |
+| `"no index"` | `StalenessCheck::NoIndex` |
+| `"stale (no HEAD recorded)"` | `StalenessCheck::NoStoredHead` |
+| `"stale (HEAD changed: abc12345…→def67890…)"` | `StalenessCheck::HeadChanged` (embeds 8-char SHA prefixes + U+2026) |
+| `"stale (working tree changed: N modified, M added, K removed)"` | `StalenessCheck::WorkingTreeChanged` |
+
+**AD-414-10 snapshot asymmetry (updated)**: `git_head`, `temporal_state`, AND
+`staleness` are captured from the PRE-self-heal state; all other fields
+(`file_count`, `skipped`, `ast_coverage`) are from the post-heal state.
+A `staleness` of `"no index"` can therefore coexist with a valid `file_count`.
+
 **Temporal staleness (AD-TMP-2/AD-TMP-3)**:
 
 `temporal_db_is_stale(cache_dir, current_head, git_dir: Option<&Path>) -> bool`
@@ -469,7 +488,16 @@ inside the `degraded` JSON array (OD-A). Fields:
 - `reason` — `DegradedReason::as_json_str()` value.
 - `requested` — bare flag name (e.g. `"hot"`, `"blast-radius"`); no `--` prefix.
   Use `TemporalSort::json_name()`, NOT `flag_name()` (RD-5 / AC-4 / AC-7).
-- `applied` — ranking served instead (`"lexical"`, `"ast"`, `"none"`).
+- `applied` — ranking actually served. Per-arm values (F2 / AD-414-19):
+  - `"lexical"` — text-query arms only: `run_query` (including text +
+    `--blast-radius` via `DegradedJson::for_blast_radius`); BM25F results
+    are served in lexical relevance order when temporal is unavailable.
+  - `"none"` — standalone temporal arm (`run_temporal_standalone`),
+    including standalone `--blast-radius FILE` without a text query; no
+    lexical ranking is computed and the JSON carries no `results` key,
+    so `"lexical"` is a false claim to a machine consumer on this arm.
+  - `"ast"` — reserved for #483 (standalone `--ast` degraded path); no
+    call site produces this value today.
 - `message` — identical to the stderr notice (SSOT via `degraded_notice`).
 - `remediation` — machine-readable advice string.
 
@@ -511,6 +539,40 @@ Called from `try_rebuild_temporal_nonfatal` when the lexical index was refreshed
    `record_temporal_anchor` (AD-413-16): writes `meta.git_toplevel` as a SECOND
    transaction; process death between sync and anchor leaves Absent (not Differs),
    so the next build adopts cleanly rather than refusing.
+
+**Build-backoff sentinel (`temporal.db.build_backoff`, AD-414-16 / AD-414-21)**:
+Guards against repeated `parse_history` failures re-walking git history on every
+silent query. Lifecycle:
+
+- **Explicit builds** (`BuildLoudness::Loud`: `--build`, `--rebuild`, and `--update`
+  when a rebuild is warranted) delete the sentinel at the START of the temporal
+  rebuild via `write_backoff_sentinel` / `backoff_sentinel_matches` (before the
+  backoff gate), so the user's explicit request always proceeds regardless of any
+  prior failure.
+- **Silent auto-refresh** (`BuildLoudness::Silent`) honours the sentinel:
+  `backoff_sentinel_matches(cache_dir, head, probed_shallow)` returns `true` when
+  the stored HEAD AND shallow state match the current invocation → rebuild skipped.
+- **Shallow-state change** (e.g. `git fetch --unshallow`): `probe_is_shallow_from_root`
+  returns `Option<bool>` (tri-state: `Some(true)`, `Some(false)`, `None` for unknown);
+  when the probed value differs from the stored value the gate reopens even when HEAD
+  has not moved.
+- Old single-line sentinels (no `\n` separator) never match `backoff_sentinel_matches`
+  and self-clear on the next explicit build (AD-414-21).
+
+**`parse_history` failure path (F3, AD-414-17)**:
+On `parse_history` failure the rebuild writes the build-backoff sentinel but does NOT
+write `META_GIT_HEAD` (no fabricated "fresh" state). If `temporal.db` already exists,
+`TemporalDb::open_existing(db_path)` (opens with `SQLITE_OPEN_READ_WRITE` without
+`SQLITE_OPEN_CREATE`) is used to update `META_IS_SHALLOW` using the probed tri-state
+value — only when the probe is conclusive (`Some(v)`). If the DB does not exist,
+`META_IS_SHALLOW` is not recorded (and Check 3 is not evaluable until the next
+successful sync).
+
+**`record_temporal_anchor` (F4, AD-414-18)**: the former `debug_assert_eq!` comparing
+`gix::discover` and `resolve_repo_toplevel` (two independent repo-discovery
+implementations) was replaced by a `crate::debug::is_debug_enabled()`-gated
+`eprintln!`, consistent with the module's own idiom. Release builds are unaffected; the
+assertion was compiled out in release and only enforced in debug/test.
 
 **`build_risk_rows` uses `risk_score_wilson_decay` (#378)**: computes
 `RiskRow.risk_score = risk_score_wilson_decay(scores[path].fix_density,
@@ -859,6 +921,13 @@ Files:
 - `ast_index.skverify` — AST validity marker (ValidityMarker sidecar, #376)
 - `ast_index.skcache` — AST n-gram extraction cache by content SHA
 - `temporal.db` — SQLite temporal data (hotspots, risks, co-changes, meta)
+- `temporal.db.build_backoff` — build-backoff sentinel; two-line format
+  `<head>\n<shallow>` where `<shallow>` is `1` (shallow clone), `0` (not
+  shallow), or `?` (probe inconclusive, AD-414-21); written by
+  `write_backoff_sentinel`; checked by `backoff_sentinel_matches`; deleted
+  at the start of any explicit `--build`/`--rebuild`/`--update` temporal
+  rebuild (`BuildLoudness::Loud`, AD-414-16); old single-line sentinels
+  never match and self-clear
 - `.skim-build.lock` — build mutex file (`build_lock.rs`)
 
 ## Anti-Patterns
@@ -979,6 +1048,19 @@ Files:
 - **`AstNgramCache` (`ast_index.skcache`)**: separate from the lexical manifest.
   A file can have a manifest cache hit (field_map reused) but an AST cache miss
   (new extraction) or vice versa.
+
+- **`resolve_hooks_dir` returns `Result<PathBuf, PathBuf>` not `Option`** (AD-413-18):
+  `Ok` carries the resolved hooks directory; `Err` carries the enclosing repository
+  path when the project root is a subdirectory of a repo but has no own `.git`
+  entry. The former `Result<PathBuf, Option<PathBuf>>` (with uninhabited `Err(None)`)
+  was removed. Repository-controlled paths emitted in error messages use `{:?}` to
+  escape control characters (AD-408 / F8).
+
+- **Build-backoff sentinel is a two-line file** (AD-414-21): `temporal.db.build_backoff`
+  stores `<head>\n<shallow>` (`0`/`1`/`?`). Old single-line sentinels (written before
+  the format change) contain no `\n` and never match `backoff_sentinel_matches`,
+  so they self-clear on the next explicit `--rebuild`. Do not read or write the file
+  directly — use `write_backoff_sentinel` / `backoff_sentinel_matches`.
 
 - **`resolve_git_dir` follows worktree `.git` files** (#413): if `.git` is a file
   (linked worktree), parses `gitdir: <path>` pointer and returns the resolved worktree
