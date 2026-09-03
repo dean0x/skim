@@ -4790,8 +4790,11 @@ mod tests {
     /// Also validates the documented `staleness` value set: `"no index"` is one of
     /// the five possible string values (F5 documentation contract, CLAUDE.md §search).
     ///
-    /// SKIM_CACHE_DIR isolation: uses in-process stats_json_for_test with an explicit
-    /// cache_dir, so no env-var contention and #[serial] is not required.
+    /// `#[serial]` is required: the `run()` call inside resolves the cache dir via
+    /// `SKIM_CACHE_DIR` and a concurrent test that mutates that env var could cause
+    /// the `run()` and `resolve_search_cache_dir` calls to resolve to different dirs,
+    /// breaking this test's assumptions about where the index was written.
+    #[serial_test::serial]
     #[test]
     fn t16_f5_staleness_no_index_coexists_with_valid_file_count() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4863,6 +4866,56 @@ mod tests {
         assert!(
             stats.get("staleness").is_some(),
             "T-16: 'staleness' key must be present in --stats --json output"
+        );
+    }
+
+    // ========================================================================
+    // T-16b / F5 — cold-start: stats on a never-indexed root
+    // ========================================================================
+
+    /// T-16b / F5 (missing test 8): `--stats --json` on a root that was **never**
+    /// indexed must report `staleness == "no index"` and `file_count == 0`.
+    ///
+    /// This is the cold-start complement to T-16: T-16 tests the transition from a
+    /// healthy index (staleness = "current") to a removed header file (staleness = "no
+    /// index" coexisting with file_count > 0 post-heal). T-16b tests the case where no
+    /// prior build has ever run — there is nothing to self-heal, so file_count must be
+    /// exactly 0 and staleness must be "no index".
+    ///
+    /// Discriminating: `file_count == 0` (no post-heal state) AND `staleness == "no index"`.
+    #[serial_test::serial]
+    #[test]
+    fn t16b_f5_cold_start_stats_reports_no_index_with_zero_file_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Cold start: index was never built. resolve_search_cache_dir creates the
+        // cache dir but leaves it empty — no skidx, no skpost, no temporal.db.
+        let cache_dir = index::resolve_search_cache_dir(root).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let stats = stats_json_for_test(&cache_dir, root)
+            .expect("T-16b: stats_json_for_test must succeed on a never-indexed root");
+
+        // Staleness must be "no index" (cold start, no skidx present).
+        assert_eq!(
+            stats["staleness"].as_str().unwrap_or(""),
+            "no index",
+            "T-16b: cold-start staleness must be 'no index'; got: {:?}",
+            stats["staleness"]
+        );
+
+        // file_count must be 0 — no prior build, nothing to self-heal from.
+        let file_count = stats["file_count"].as_u64().unwrap_or(u64::MAX);
+        assert_eq!(
+            file_count, 0,
+            "T-16b: cold-start file_count must be 0 (no prior build to self-heal from)"
+        );
+
+        // The staleness key must be present (F5 contract).
+        assert!(
+            stats.get("staleness").is_some(),
+            "T-16b: 'staleness' key must be present in --stats --json output"
         );
     }
 
