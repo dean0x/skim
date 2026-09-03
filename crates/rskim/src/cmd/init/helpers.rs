@@ -169,7 +169,9 @@ File reads (`cat`, `head`, `tail` on code files) are rewritten
 into direct skim reads (example: `cat file.ts` becomes
 `skim file.ts --mode=pseudo`), so the output is a structured view, not
 raw file contents; seeing `skim` run in place of the original command
-is expected.
+is expected. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20`
+(verbatim lines; one slot is used by the elision marker); `tail -5 file.ts`
+likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines.
 
 Compression changes how results are presented, and rewritten file reads
 show a structured view rather than exact file contents; skim prints a

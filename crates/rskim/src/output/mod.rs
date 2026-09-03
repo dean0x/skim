@@ -645,6 +645,10 @@ pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
         "structure" => "structure view: bodies removed",
         "signatures" => "signatures view: bodies removed",
         "types" => "types view: non-type declarations removed",
+        // `full` reaches this table only when a line bound elided part of the
+        // file (`head`/`tail` rewrites): the served lines are verbatim, so the
+        // class names the range, not a transformation.
+        "full" => "line-sliced view: content verbatim, lines outside the range omitted",
         _ => "transformed view",
     }
 }
@@ -915,6 +919,29 @@ mod lossy_view_marker_tests {
                 "B4: class label must be more descriptive than 'transformed view' for mode {mode}"
             );
         }
+    }
+
+    /// RED at 167e73f: `mode_class_label("full")` falls through to the generic
+    /// `"transformed view"` catch-all instead of a dedicated description.
+    ///
+    /// Today: `mode_class_label("full")` returns `"transformed view"`.
+    /// After fix: returns `"line-sliced view: content verbatim, lines outside the range omitted"`.
+    ///
+    /// This is a new `"full"` match arm in the `mode_class_label` match —
+    /// do NOT edit `test_mode_class_labels_cover_all_known_modes` (it covers the
+    /// five non-full modes and is intentionally separate from this test).
+    #[test]
+    fn test_mode_class_label_full_has_dedicated_arm() {
+        let label = super::mode_class_label("full");
+        let fallback = super::mode_class_label("__nonexistent__");
+        assert_eq!(
+            label, "line-sliced view: content verbatim, lines outside the range omitted",
+            "full mode must have a dedicated class label, got: {label:?}"
+        );
+        assert_ne!(
+            label, fallback,
+            "full mode label must differ from the default fallback ({fallback:?})"
+        );
     }
 }
 

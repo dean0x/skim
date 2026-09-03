@@ -212,10 +212,12 @@ fn test_transparency_marker_names_structure_mode() {
 // head tag with --max-lines
 // ============================================================================
 
-/// head tag with `--max-lines`: structure mode strips the function body (mirroring
-/// what the head rewrite actually emits: `SKIM_REWRITTEN_FROM=head skim <file>
-/// --mode=structure --max-lines N`).  Structure mode guarantees view differs from
-/// raw, so the marker must appear and must name `head`.
+/// head tag with `--max-lines`: the test drives `--mode=structure` explicitly via
+/// `SKIM_REWRITTEN_FROM=head` and the `--mode=structure` argument — it is
+/// independent of what the head rewrite handler actually emits (which has changed
+/// over time: pseudo → structure → full).  Structure mode strips the function body,
+/// guaranteeing the view differs from raw bytes, so the transparency marker must
+/// appear and must name `head`.
 #[test]
 fn test_transparency_marker_with_head_tag() {
     let dir = TempDir::new().unwrap();

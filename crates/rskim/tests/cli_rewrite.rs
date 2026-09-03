@@ -5,6 +5,8 @@
 //! git skip-flags, suggest mode, stdin mode, and cat/head/tail handlers.
 
 use predicates::prelude::*;
+use std::fs;
+use tempfile::TempDir;
 mod common;
 
 // ============================================================================
@@ -773,4 +775,249 @@ fn test_rewrite_ls_catch_all_matches() {
         .assert()
         .success()
         .stdout(predicate::str::contains("skim ls"));
+}
+
+// ============================================================================
+// D5 parity fix — head/tail full-mode and signed-count bail (RED at 167e73f)
+// ============================================================================
+
+/// Execute a rewritten skim command string and return stdout as a String.
+///
+/// Parses `SKIM_REWRITTEN_FROM=<tool> skim <args...>` and runs the cargo-built
+/// skim binary (never a bare `skim` on PATH).  The cache is redirected to the
+/// supplied `cache_dir` to avoid stale parser-cache interference.
+fn execute_rewrite(rewrite_str: &str, cache_dir: &std::path::Path) -> String {
+    let trimmed = rewrite_str.trim();
+    let mut words = trimmed.split_ascii_whitespace();
+    let env_pair = words
+        .next()
+        .expect("rewrite string must start with ENV=VAL");
+    let _skim_word = words.next().expect("rewrite string must contain 'skim'");
+    let args: Vec<&str> = words.collect();
+    let (env_key, env_val) = env_pair.split_once('=').expect("env pair must contain '='");
+
+    let out = std::process::Command::new(common::skim_bin())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env("SKIM_CACHE_DIR", cache_dir)
+        .env(env_key, env_val)
+        .env_remove("SKIM_PASSTHROUGH")
+        .args(&args)
+        .output()
+        .expect("skim binary must run");
+
+    String::from_utf8(out.stdout).expect("skim stdout must be UTF-8")
+}
+
+/// Tail fixture: 11-line Rust function with semicolon-terminated `let` bindings.
+///
+/// With `--mode=pseudo` the semicolons are stripped; with `--mode=full` the file
+/// is verbatim.  Lines 8–11 (the last 4 lines) contain `let g` and `let h` with
+/// trailing `;`, making the pseudo and full outputs byte-distinguishable.
+const TAIL_FIXTURE_RS: &str = "\
+fn compute(n: i32) -> i32 {\n\
+    let a = n * 2;\n\
+    let b = a + 1;\n\
+    let c = b - 3;\n\
+    let d = c * c;\n\
+    let e = d / 2;\n\
+    let f = e + 10;\n\
+    let g = f - 7;\n\
+    let h = g % 5;\n\
+    h\n\
+}\n\
+";
+
+/// Head fixture: 40-line Rust file (8 four-line functions separated by blank
+/// lines).  The first 19 lines are the content block produced by
+/// `--max-lines 20`; each function body has a semicolon-terminated `let`
+/// binding that pseudo mode strips, making the pseudo and full outputs
+/// byte-distinguishable.  No multi-line strings or fences (ADR-016 safe cut).
+const HEAD_FIXTURE_RS: &str = "\
+fn f01(x: i32) -> i32 {\n\
+    let a = x + 1;\n\
+    a\n\
+}\n\
+\n\
+fn f02(x: i32) -> i32 {\n\
+    let b = x + 2;\n\
+    b\n\
+}\n\
+\n\
+fn f03(x: i32) -> i32 {\n\
+    let c = x + 3;\n\
+    c\n\
+}\n\
+\n\
+fn f04(x: i32) -> i32 {\n\
+    let d = x + 4;\n\
+    d\n\
+}\n\
+\n\
+fn f05(x: i32) -> i32 {\n\
+    let e = x + 5;\n\
+    e\n\
+}\n\
+\n\
+fn f06(x: i32) -> i32 {\n\
+    let f = x + 6;\n\
+    f\n\
+}\n\
+\n\
+fn f07(x: i32) -> i32 {\n\
+    let g = x + 7;\n\
+    g\n\
+}\n\
+\n\
+fn f08(x: i32) -> i32 {\n\
+    let h = x + 8;\n\
+    h\n\
+}\n\
+";
+
+/// RED at 167e73f: `tail -5 <file>` currently rewrites to `--mode=pseudo`.
+///
+/// The rewritten command produces a content block (stdout minus the leading
+/// elision-marker line) that today does NOT match `/usr/bin/tail -4 <file>`
+/// because pseudo strips trailing `;` from Rust `let` bindings.
+///
+/// Today observed rewrite: `SKIM_REWRITTEN_FROM=tail skim <file> --mode=pseudo --last-lines 5`
+/// After fix:               `SKIM_REWRITTEN_FROM=tail skim <file> --mode=full  --last-lines 5`
+///
+/// With `--mode=full --last-lines 5` the output is 5 lines total (1 leading
+/// elision marker + 4 content lines verbatim), so the content block equals
+/// `/usr/bin/tail -4 <file>` byte-for-byte.
+#[test]
+fn test_rewrite_tail_full_mode_content_byte_identical_to_raw_tail() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("compute.rs");
+    fs::write(&file, TAIL_FIXTURE_RS).unwrap();
+    let file_str = file.to_str().unwrap();
+
+    // Obtain the rewritten command string.
+    let rewrite_out = common::skim()
+        .args(["rewrite", "tail", "-5", file_str])
+        .output()
+        .unwrap();
+    assert!(
+        rewrite_out.status.success(),
+        "skim rewrite tail -5 must succeed"
+    );
+    let rewrite_str = String::from_utf8(rewrite_out.stdout).unwrap();
+
+    // Execute the rewritten command via the cargo-built binary.
+    let cache_dir = dir.path().join("cache");
+    let skim_stdout = execute_rewrite(&rewrite_str, &cache_dir);
+
+    // Content block: drop the first (leading elision-marker) line.
+    let lines: Vec<&str> = skim_stdout.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "skim output must have at least 2 lines (marker + content); rewrite was: {rewrite_str}"
+    );
+    let content_block = lines[1..].join("\n") + "\n";
+
+    // Expected: the last 4 raw lines from the control binary.
+    let raw_out = std::process::Command::new("/usr/bin/tail")
+        .args(["-4", file_str])
+        .output()
+        .unwrap();
+    let expected = String::from_utf8(raw_out.stdout).unwrap();
+
+    assert_eq!(
+        content_block, expected,
+        "content block must be byte-identical to /usr/bin/tail -4 output\n\
+         rewrite was: {rewrite_str}\n\
+         content block: {content_block:?}\n\
+         expected:      {expected:?}"
+    );
+}
+
+/// RED at 167e73f: `head -20 <file>` currently rewrites to `--mode=pseudo`.
+///
+/// The rewritten command produces a content block (stdout minus the trailing
+/// elision-marker line) that today does NOT match `/usr/bin/head -19 <file>`
+/// because pseudo strips trailing `;` from Rust `let` bindings.
+///
+/// Today observed rewrite: `SKIM_REWRITTEN_FROM=head skim <file> --mode=pseudo --max-lines 20`
+/// After fix:               `SKIM_REWRITTEN_FROM=head skim <file> --mode=full  --max-lines 20`
+///
+/// With `--mode=full --max-lines 20` the output is 20 lines total (19 content
+/// lines verbatim + 1 trailing elision marker), so the content block equals
+/// `/usr/bin/head -19 <file>` byte-for-byte.
+#[test]
+fn test_rewrite_head_full_mode_content_byte_identical_to_raw_head() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("funcs.rs");
+    fs::write(&file, HEAD_FIXTURE_RS).unwrap();
+    let file_str = file.to_str().unwrap();
+
+    // Obtain the rewritten command string.
+    let rewrite_out = common::skim()
+        .args(["rewrite", "head", "-20", file_str])
+        .output()
+        .unwrap();
+    assert!(
+        rewrite_out.status.success(),
+        "skim rewrite head -20 must succeed"
+    );
+    let rewrite_str = String::from_utf8(rewrite_out.stdout).unwrap();
+
+    // Execute the rewritten command via the cargo-built binary.
+    let cache_dir = dir.path().join("cache");
+    let skim_stdout = execute_rewrite(&rewrite_str, &cache_dir);
+
+    // Content block: drop the last (trailing elision-marker) line.
+    let lines: Vec<&str> = skim_stdout.lines().collect();
+    assert!(
+        lines.len() >= 2,
+        "skim output must have at least 2 lines (content + marker); rewrite was: {rewrite_str}"
+    );
+    let content_block = lines[..lines.len() - 1].join("\n") + "\n";
+
+    // Expected: the first 19 raw lines from the control binary.
+    let raw_out = std::process::Command::new("/usr/bin/head")
+        .args(["-19", file_str])
+        .output()
+        .unwrap();
+    let expected = String::from_utf8(raw_out.stdout).unwrap();
+
+    assert_eq!(
+        content_block, expected,
+        "content block must be byte-identical to /usr/bin/head -19 output\n\
+         rewrite was: {rewrite_str}\n\
+         content block: {content_block:?}\n\
+         expected:      {expected:?}"
+    );
+}
+
+/// RED at 167e73f: `skim rewrite "tail -n +5 <file>"` exits 0 and prints a rewrite.
+///
+/// Today observed: `SKIM_REWRITTEN_FROM=tail skim <file> --mode=pseudo --last-lines 5`
+/// (meaning "+5" is silently parsed as 5, inverting the POSIX from-line semantics).
+///
+/// After fix: exits non-zero with empty stdout (bail), mirroring how
+/// `tail -f` and `head -c 100` already bail.
+#[test]
+fn test_rewrite_tail_signed_plus_count_exits_nonzero() {
+    // A real file is not required — is_code_file only checks the extension.
+    common::skim()
+        .args(["rewrite", "tail", "-n", "+5", "example.rs"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty());
+}
+
+/// RED at 167e73f: bare `skim rewrite "head <file>"` exits 0 but the output
+/// contains NO `--max-lines` bound, leaving the entire file exposed.
+///
+/// Today observed: `SKIM_REWRITTEN_FROM=head skim <file> --mode=pseudo`
+/// After fix: output contains `--max-lines 10` (POSIX default).
+#[test]
+fn test_rewrite_head_bare_no_count_contains_default_max_lines_10() {
+    common::skim()
+        .args(["rewrite", "head", "example.rs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--max-lines 10"));
 }

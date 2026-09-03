@@ -100,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   view differs from raw file bytes, skim emits a one-line stderr notice:
   `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`.
   Multi-file: one aggregate line (`2/3 files not raw bytes`). The marker is silent for
-  byte-identical outputs (guardrail passthrough, `--mode=full`), direct `skim` calls
+  byte-identical outputs (guardrail passthrough, unbounded `--mode=full`), direct `skim` calls
   (no tag), and unknown-value env vars (closed-vocabulary guard prevents injection).
   Cache hits also emit the marker when the cached view differs from raw.
 - **Agent guidance documents command wrapping** — The guidance injected by `skim init`
@@ -127,6 +127,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SKIM_DEBUG=1` notice; all 6 modes have explicit Bash arms.
 
 ### Fixed
+- **`head`/`tail` rewrite now uses `--mode=full` (verbatim lines)** — The rewrite hook
+  previously mapped `head -N file` / `tail -N file` on code files to `--mode=pseudo`,
+  mutating the shown lines (e.g. stripping trailing `;`). The hook now uses
+  `--mode=full --max-lines N` / `--mode=full --last-lines N`, so every shown line is
+  verbatim source. Per ADR-016 the elision marker occupies one of the N slots, and the
+  count in the marker is in source lines. Declaration files no longer get
+  `--mode=structure`; all code-file `head`/`tail` reads now use `--mode=full`.
+
+- **Bare `head`/`tail` now apply the POSIX default bound** — Previously, bare
+  `head file` / `tail file` (no count) were rewritten with no line bound, rendering the
+  whole file. They now produce `--mode=full --max-lines 10` / `--last-lines 10`,
+  matching POSIX default behaviour.
+
+- **Signed `head`/`tail` counts are no longer rewritten** — `tail -n +5` (skip-to-line
+  form) was previously inverted into "last 5 lines". Signed counts (`+N`, `-N` forms)
+  are now passed through raw alongside the already-excluded `tail -f` and `head -c`
+  forms.
+
 - **`skim doctor` exit-code contract changes (#488)** — Two user-visible changes
   to which conditions drive `skim doctor`'s exit 1:
 
