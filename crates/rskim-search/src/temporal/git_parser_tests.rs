@@ -767,9 +767,9 @@ fn init_merge_fixture() -> Option<TempDir> {
     Some(dir)
 }
 
-/// Add a file and commit with explicit author + committer dates.
-/// `ts` is a Unix timestamp; both author and committer dates are set to it
-/// unless overridden via the two separate `author_ts` / `committer_ts` params.
+/// Add a file and commit with pinned `author_ts` and `committer_ts` timestamps
+/// (Unix seconds). Both dates are set independently; pass equal values for a
+/// uniform timestamp.
 fn git_commit_file_at(
     dir: &Path,
     filename: &str,

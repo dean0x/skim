@@ -108,6 +108,7 @@ const _: () = assert!(
 ///
 /// Exposed as a public type so tests can drive both bounds directly without
 /// constructing a large repository (AC-8).
+#[derive(Default)]
 pub struct WalkBudget {
     visited: usize,
     retained: usize,
@@ -116,10 +117,7 @@ pub struct WalkBudget {
 impl WalkBudget {
     /// Create a new budget with both counters at zero.
     pub fn new() -> Self {
-        Self {
-            visited: 0,
-            retained: 0,
-        }
+        Self::default()
     }
 
     /// Charge one loop iteration. Returns `true` when the visit cap has fired
@@ -155,12 +153,6 @@ impl WalkBudget {
             self.retained += 1;
             false
         }
-    }
-}
-
-impl Default for WalkBudget {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
