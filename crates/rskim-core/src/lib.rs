@@ -377,6 +377,17 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 /// input (ADR-011 class 1 / #317, ADR-016). Callers that must never exceed
 /// the budget should treat "output is exactly the marker line" as the signal.
 ///
+/// # Literal boundaries (#511)
+///
+/// After the budget search converges, if the last retained line ends inside a
+/// multi-line string literal or a Markdown fenced code block, the cut is pulled
+/// back to that literal's opening line. The pull-back only removes content lines,
+/// so the token budget established by the search still holds and no line is
+/// re-counted. If pulling back would leave zero content lines (the literal opens
+/// on the first line of the text), the compact marker carries a
+/// "cut inside a string literal" or "cut inside a code fence" clause to disclose
+/// the unavoidable cut. The omitted-line count in the marker is in source lines.
+///
 /// # Examples
 ///
 /// ```
