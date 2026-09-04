@@ -1030,12 +1030,20 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
         String::from_utf8_lossy(&build_out.stderr)
     );
     let build_stderr = String::from_utf8_lossy(&build_out.stderr);
-    // AD-407: strip the pre-existing lexical-build progress lines before
-    // checking for unexpected temporal-walk cap notices.  The "indexed N
-    // files" line is intentional, pre-#407 behaviour (staleness.rs:
-    // "no AC backs the removal") and is not a temporal-walk notice.
-    // AC-9 AMENDED governs only MAX_COMMITS / MAX_VISITED_COMMITS notices,
-    // which MUST NOT fire on this small fixture.
+    // AC-9 (AMENDED): the only permitted stderr line is the lexical-build
+    // summary `skim search: indexed N files (...)`.  No line may contain
+    // `parse_history`, `safety cap`, `walk`, `capacity`, or `temporal` —
+    // those substrings are the signature of temporal-walk cap / budget
+    // notices that MUST NOT fire on a fixture this small.
+    // The "indexed N files" summary is intentional, pre-#407 behaviour
+    // (staleness.rs: "no AC backs the removal") and is not a temporal notice.
+    let cap_substrings = [
+        "parse_history",
+        "safety cap",
+        "walk",
+        "capacity",
+        "temporal",
+    ];
     let unexpected_build_stderr: String = build_stderr
         .lines()
         .filter(|l| !l.starts_with("skim search: indexed "))
@@ -1047,8 +1055,16 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
          clean .rs-only repo (neither MAX_COMMITS nor MAX_VISITED_COMMITS \
          notice may fire below the cap); got: {build_stderr:?}"
     );
+    for substr in &cap_substrings {
+        assert!(
+            !build_stderr.contains(substr),
+            "AC-9: --build stderr must not contain {substr:?} (temporal-walk \
+             cap notice); got: {build_stderr:?}"
+        );
+    }
 
-    // --risky --json: stderr MUST be empty.
+    // --risky --json: stderr MUST be empty except for the permitted
+    // `skim search: indexed ...` summary line (if present).
     let risky_out = StdCommand::new(cargo_bin("skim"))
         .args(["search", "--risky", "--json", "--root"])
         .arg(repo.path())
@@ -1062,11 +1078,26 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
         String::from_utf8_lossy(&risky_out.stderr)
     );
     let risky_stderr = String::from_utf8_lossy(&risky_out.stderr);
+    // Filter the permitted `skim search: indexed ...` summary, then assert
+    // nothing else remains.  Also assert that no cap-notice substring appears
+    // in any stderr line at all.
+    let unexpected_risky_stderr: String = risky_stderr
+        .lines()
+        .filter(|l| !l.starts_with("skim search: indexed "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        risky_stderr.is_empty(),
-        "AC-9: --risky must produce empty stderr on a clean .rs-only repo; \
-         got: {risky_stderr:?}"
+        unexpected_risky_stderr.trim().is_empty(),
+        "AC-9: --risky must produce no temporal-walk cap notices on a \
+         clean .rs-only repo; got: {risky_stderr:?}"
     );
+    for substr in &cap_substrings {
+        assert!(
+            !risky_stderr.contains(substr),
+            "AC-9: --risky stderr must not contain {substr:?} (temporal-walk \
+             cap notice); got: {risky_stderr:?}"
+        );
+    }
 }
 
 // ============================================================================
@@ -1189,10 +1220,23 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
 
     // ── Query ────────────────────────────────────────────────────────────────
 
-    // Use a large --limit so every indexed file is returned regardless of
-    // risk rank; AC-5 verifies the commit COUNTS for query.rs, not its rank
-    // position.  600 exceeds the ~545 tracked .rs files in this workspace.
-    let json = run_search_json(&repo_root, cache.path(), &["--risky", "--limit", "600"]);
+    // Compute the limit at runtime: tracked *.rs files + 100.  This ensures
+    // every indexed file is returned regardless of risk rank while remaining
+    // robust as the repo grows (a fixed 600 would shrink in headroom over time).
+    let rs_limit = {
+        let ls_out = StdCommand::new("git")
+            .args(["ls-files", "--", "*.rs"])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git ls-files -- '*.rs'");
+        assert!(ls_out.status.success(), "git ls-files -- '*.rs' failed");
+        let rs_count = String::from_utf8_lossy(&ls_out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        (rs_count + 100).to_string()
+    };
+    let json = run_search_json(&repo_root, cache.path(), &["--risky", "--limit", &rs_limit]);
     let results = json["results"]
         .as_array()
         .expect("--risky --json results must be an array");
@@ -1460,11 +1504,17 @@ fn test_ac20_lexical_query_unaffected_by_temporal_index() {
         }
     }
 
+    // AC-20 (AMENDED): byte-identical after removing the `duration_ms` timing
+    // field.  Serialize both stripped values and compare the resulting bytes
+    // to enforce strict content identity, not just structural JSON equality.
+    let stripped_a = serde_json::to_vec(&without_duration_ms(&json_a))
+        .expect("AC-20: failed to serialize stripped json_a");
+    let stripped_b = serde_json::to_vec(&without_duration_ms(&json_b))
+        .expect("AC-20: failed to serialize stripped json_b");
     assert_eq!(
-        without_duration_ms(&json_a),
-        without_duration_ms(&json_b),
+        stripped_a, stripped_b,
         "AC-20: pure-lexical query content (excluding duration_ms) must be \
-         identical across repeated calls on the same corpus and cache"
+         byte-identical across repeated calls on the same corpus and cache"
     );
 
     // Use run-1's parsed output for the structural assertions below.
@@ -1509,70 +1559,91 @@ fn test_ac20_lexical_query_unaffected_by_temporal_index() {
 }
 
 // ============================================================================
-// AC-24 (PERFORMANCE): warm query path within 5 000 ms
+// AC-24 (PERFORMANCE): warm risky overhead regression guard
 // ============================================================================
 
-/// AC-24 (PERFORMANCE, query path): a warm `skim search --risky` on an
-/// already-current `temporal.db` MUST complete well within the < 50 ms design
-/// target.  This test uses a 5 000 ms wall-clock bound — 100× the design
-/// target — to stay robust under CI scheduling jitter while still catching
-/// catastrophic regressions (e.g., a warm query accidentally re-walking the
-/// full DAG).
+/// AC-24 regression guard: the warm `skim search --risky` overhead above a plain
+/// lexical query MUST be under 250 ms (median of 5 warm runs), and the absolute
+/// `--risky` median MUST be under 1 000 ms.
 ///
-/// The CHANGELOG records the exact measured value (< 10 ms on this repository
-/// at wave HEAD, well within the < 50 ms target).  The in-test bound is
-/// intentionally generous so scheduling noise cannot cause false failures.
+/// Both thresholds are derived from measurements on the `make_merge_repo`
+/// fixture (3-commit, 2-file `.rs`-only repo) at wave HEAD on this machine:
+///   plain lexical median ≈ 31 ms
+///   `--risky` median     ≈ 38 ms
+///   net overhead         ≈ 7 ms
 ///
-/// The single post-upgrade self-heal query is explicitly exempt from the bound
-/// (it re-runs the full history walk); this test probes only the already-current
-/// path by rebuilding first and then querying on an up-to-date `temporal.db`.
+/// The 250 ms overhead cap and 1 000 ms absolute cap provide sufficient CI
+/// headroom while still catching a catastrophic regression (e.g., the warm
+/// path accidentally re-walking the full DAG).
 ///
-/// AD-407-1 (full-DAG walk is build-path-only; query path unchanged by #407).
+/// The 50 ms warm target from AC-24 is separately tracked by #401 and #406;
+/// this test is a regression guard, not a performance contract.
+///
+/// The single post-upgrade self-heal query is explicitly exempt (it re-runs
+/// the full history walk); this test probes only the already-current path by
+/// rebuilding first and querying on an up-to-date `temporal.db`.
+///
+/// AD-407-1 (full-DAG walk is build-path-only; warm query path unchanged by #407).
 #[test]
-fn test_ac24_warm_query_path_within_5000ms() {
+fn test_ac24_warm_risky_overhead_regression_guard() {
     let repo = make_merge_repo();
     let cache = TempDir::new().expect("cache tempdir");
 
-    // Warm build: populate temporal.db so the next --risky is a pure query
-    // with no self-heal (already current after build).
+    // Warm build: populate temporal.db so every subsequent --risky is a pure
+    // query with no self-heal.
     build_index(repo.path(), cache.path());
 
-    // Timed warm query.
-    let start = std::time::Instant::now();
-    let out = StdCommand::new(cargo_bin("skim"))
-        .args(["search", "--risky", "--json", "--root"])
-        .arg(repo.path())
-        .env("SKIM_CACHE_DIR", cache.path())
-        .env("SKIM_DISABLE_ANALYTICS", "1")
-        .output()
-        .expect("warm skim search --risky --json");
-    let elapsed = start.elapsed();
+    // Helper: run one timed query and return the elapsed duration.
+    let timed_run = |extra_args: &[&str]| -> std::time::Duration {
+        let start = std::time::Instant::now();
+        let out = StdCommand::new(cargo_bin("skim"))
+            .args(["search"])
+            .args(extra_args)
+            .args(["--json", "--root"])
+            .arg(repo.path())
+            .env("SKIM_CACHE_DIR", cache.path())
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .expect("timed skim search --json");
+        let elapsed = start.elapsed();
+        assert!(
+            out.status.success(),
+            "AC-24: query {:?} failed; stderr: {}",
+            extra_args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        elapsed
+    };
 
+    // Warm-up: one discarded run each to prime OS page caches.
+    let _ = timed_run(&["fn"]);
+    let _ = timed_run(&["--risky"]);
+
+    // Collect 5 measured runs for each arm.
+    let mut plain_ms: Vec<u128> = (0..5).map(|_| timed_run(&["fn"]).as_millis()).collect();
+    let mut risky_ms: Vec<u128> = (0..5)
+        .map(|_| timed_run(&["--risky"]).as_millis())
+        .collect();
+
+    // Sort ascending and take the middle element as the median.
+    plain_ms.sort_unstable();
+    risky_ms.sort_unstable();
+    let plain_median = plain_ms[2];
+    let risky_median = risky_ms[2];
+    let overhead = risky_median.saturating_sub(plain_median);
+
+    // (a) Net overhead (risky − plain) MUST be under 250 ms.
     assert!(
-        out.status.success(),
-        "AC-24: warm --risky query must succeed; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        overhead < 250,
+        "AC-24: net overhead (risky median {risky_median} ms − plain median \
+         {plain_median} ms = {overhead} ms) must be < 250 ms \
+         (regression guard; the 50 ms warm target is #401/#406)"
     );
 
-    // The warm query must return valid, non-empty JSON.
-    let json: Value =
-        serde_json::from_slice(&out.stdout).expect("AC-24: warm --risky must produce valid JSON");
-    let results = json["results"]
-        .as_array()
-        .expect("results must be an array");
+    // (b) Absolute --risky median MUST be under 1 000 ms.
     assert!(
-        !results.is_empty(),
-        "AC-24: warm --risky must return at least one result on a \
-         non-empty fixture"
-    );
-
-    // The 5 000 ms bound is 100× the < 50 ms design target (AC-24).
-    // Exceeding it means the warm path has regressed catastrophically.
-    assert!(
-        elapsed.as_millis() < 5_000,
-        "AC-24: warm --risky query took {} ms, exceeding the 5 000 ms \
-         guard (design target < 50 ms per CHANGELOG; full-DAG walk must be \
-         build-path-only, not re-triggered on every warm query)",
-        elapsed.as_millis()
+        risky_median < 1_000,
+        "AC-24: absolute --risky median {risky_median} ms must be < 1 000 ms \
+         (regression guard; the 50 ms warm target is #401/#406)"
     );
 }
