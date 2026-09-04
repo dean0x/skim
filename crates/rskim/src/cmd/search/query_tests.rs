@@ -3412,3 +3412,389 @@ fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
         "notice must carry the per-language breakdown: got {notice:?}"
     );
 }
+
+// ============================================================================
+// AC-409 unit tests — Jaccard-ranked temporal layer (#409)
+// ============================================================================
+
+/// Create a synthetic project for the AC-409 Jaccard-ranking unit tests.
+///
+/// The three files are named so that their byte-wise sort order INVERTS the
+/// Jaccard order when the defect is present:
+///   - aweak.rs (alphabetically first) → weak J
+///   - anchor.rs (alphabetically middle; the blast-radius seed) → SEED_STRENGTH
+///   - zstrong.rs (alphabetically last) → strong J
+///
+/// With the old uniform-1.0 / FileId-sort defect, aweak would rank first.
+/// After the fix, anchor (seed) ranks first, zstrong second, aweak third.
+fn create_ac409_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Content is irrelevant to the Jaccard-ranking tests — the temporal scores
+    // come from blast_radius_paths, not from file content.
+    fs::write(src.join("anchor.rs"), "// anchor — blast-radius seed\n").unwrap();
+    fs::write(
+        src.join("zstrong.rs"),
+        "// zstrong — strong co-change partner\n",
+    )
+    .unwrap();
+    fs::write(src.join("aweak.rs"), "// aweak — weak co-change partner\n").unwrap();
+}
+
+/// AC-1 — `--weights 0,0,1` ranks partners by Jaccard DESC, NOT by byte-wise
+/// path order.
+///
+/// The byte-wise order of the files is aweak < anchor < zstrong.  The Jaccard
+/// order is anchor (seed, 2.0) > zstrong (0.80) > aweak (0.30).  After the fix
+/// the output order must be [anchor, zstrong, aweak]; before the fix it would be
+/// [aweak, anchor, zstrong] (alphabetical = FileId-sort defect).
+///
+/// Expected scores (±1e-12):
+///   anchor: 1.0/61  (temporal rank 1, weight 1.0)
+///   zstrong: 1.0/62 (temporal rank 2)
+///   aweak:  1.0/63  (temporal rank 3)
+#[test]
+fn test_ad409_temporal_weight_only_ranks_by_jaccard_not_alphabetical() {
+    use rskim_search::compound::{CompositeWeights, RRF_K};
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_ac409_project(&root);
+
+    // blast_radius_paths: anchor is the seed (SEED_STRENGTH > 1.0 > any Jaccard).
+    // zstrong has a higher Jaccard than aweak so it must rank before aweak.
+    // Using a gibberish query to suppress lexical contributions completely.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/anchor.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/zstrong.rs".to_string(), 0.80);
+    allowed.insert("src/aweak.rs".to_string(), 0.30);
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp_ac409_unique".to_string(), // gibberish — zero lexical hits
+        limit: 10,
+        offset: None,
+        json: false,
+        root: root.clone(),
+        cache_dir: cache_dir.clone(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        // --weights 0,0,1: temporal only
+        composite_weights: Some(CompositeWeights {
+            lexical: 0.0,
+            ast: 0.0,
+            temporal: 1.0,
+            import_graph: 0.0,
+            dir_proximity: 0.0,
+            structural_coupling: 0.0,
+        }),
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Three co-change-only partners must appear (no lexical hits, but UNION mode
+    // surfaces them via their temporal scores).
+    assert_eq!(
+        output.results.len(),
+        3,
+        "AC-1: expected 3 results (anchor, zstrong, aweak); got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["src/anchor.rs", "src/zstrong.rs", "src/aweak.rs"],
+        "AC-1: results must be ordered by Jaccard DESC (anchor seed first, zstrong second, \
+         aweak third), NOT by byte-wise path order (aweak < anchor < zstrong)"
+    );
+
+    // Score check (±1e-12): temporal-only RRF gives w/(RRF_K + rank).
+    let eps = 1e-12_f64;
+    assert!(
+        (output.results[0].score - 1.0 / (RRF_K + 1.0)).abs() < eps,
+        "AC-1: anchor (rank 1) score must be 1/61 (±1e-12); got {}",
+        output.results[0].score
+    );
+    assert!(
+        (output.results[1].score - 1.0 / (RRF_K + 2.0)).abs() < eps,
+        "AC-1: zstrong (rank 2) score must be 1/62 (±1e-12); got {}",
+        output.results[1].score
+    );
+    assert!(
+        (output.results[2].score - 1.0 / (RRF_K + 3.0)).abs() < eps,
+        "AC-1: aweak (rank 3) score must be 1/63 (±1e-12); got {}",
+        output.results[2].score
+    );
+}
+
+/// AC-2 — the blast-radius seed file occupies temporal rank 1 with score
+/// exactly 1.0/61.0 under `--weights 0,0,1`.
+#[test]
+fn test_ad409_seed_file_ranks_first_in_temporal_layer() {
+    use rskim_search::compound::{CompositeWeights, RRF_K};
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_ac409_project(&root);
+
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/anchor.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/zstrong.rs".to_string(), 0.80);
+    allowed.insert("src/aweak.rs".to_string(), 0.30);
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp_ac409_seed".to_string(),
+        limit: 10,
+        offset: None,
+        json: false,
+        root,
+        cache_dir,
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: Some(CompositeWeights {
+            lexical: 0.0,
+            ast: 0.0,
+            temporal: 1.0,
+            import_graph: 0.0,
+            dir_proximity: 0.0,
+            structural_coupling: 0.0,
+        }),
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.results.is_empty(),
+        "AC-2: results must not be empty (seed must appear)"
+    );
+    assert_eq!(
+        output.results[0].path, "src/anchor.rs",
+        "AC-2: seed (anchor.rs) must occupy rank 1 of the temporal-only output"
+    );
+    let expected_score = 1.0 / (RRF_K + 1.0);
+    let eps = 1e-12_f64;
+    assert!(
+        (output.results[0].score - expected_score).abs() < eps,
+        "AC-2: seed score must equal 1.0/(RRF_K+1) = 1.0/61.0 (±1e-12); got {}",
+        output.results[0].score
+    );
+}
+
+/// AC-5 — at default weights (0.5, 0.3, 0.2), a file that matches BOTH layers
+/// accumulates both rank terms with the temporal rank derived from Jaccard:
+///
+/// - hit.rs: lexical rank 1 + temporal rank 2 (J=0.20, weaker than zpartner)
+///   → score = 0.5/61 + 0.2/62  (±1e-12)
+/// - zpartner.rs: co-change-only, temporal rank 1 (J=0.90)
+///   → score = 0.2/61           (±1e-12)
+///
+/// The temporal layer is sorted DESC by Jaccard: zpartner(0.9) rank 1,
+/// hit.rs(0.2) rank 2.  No seed in blast_radius_paths here — this unit test
+/// exercises the two-layer accumulation directly.
+#[test]
+fn test_ad409_both_layers_accumulate_with_temporal_rank_from_jaccard() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // hit.rs contains the unique query token; zpartner.rs does not.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("hit.rs"),
+        "pub fn xqzjvmblorp_ac409_ac5_hit() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zpartner.rs"),
+        "pub struct NoHitHere { count: u32 }\n",
+    )
+    .unwrap();
+
+    // blast_radius_paths: hit.rs(J=0.20), zpartner.rs(J=0.90) — no seed sentinel.
+    // Temporal layer sorted DESC: zpartner(0.9)→rank 1, hit.rs(0.2)→rank 2.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/hit.rs".to_string(), 0.20);
+    allowed.insert("src/zpartner.rs".to_string(), 0.90);
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp_ac409_ac5_hit".to_string(),
+        limit: 10,
+        offset: None,
+        json: false,
+        root,
+        cache_dir,
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None, // default: lexical=0.5, ast=0.3, temporal=0.2
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Both files must appear.
+    let hit_result = output
+        .results
+        .iter()
+        .find(|r| r.path == "src/hit.rs")
+        .expect("AC-5: hit.rs must appear in results");
+    let zpartner_result = output
+        .results
+        .iter()
+        .find(|r| r.path == "src/zpartner.rs")
+        .expect("AC-5: zpartner.rs must appear in results");
+
+    // Verify: hit.rs has a snippet (lexical match), zpartner.rs is co-change-only.
+    assert!(
+        hit_result.snippet.is_some(),
+        "AC-5: hit.rs lexically matches the query so snippet must be non-None"
+    );
+    assert!(
+        zpartner_result.snippet.is_none(),
+        "AC-5: zpartner.rs is a co-change-only partner — snippet must be None"
+    );
+
+    // Score assertions (±1e-12).
+    let eps = 1e-12_f64;
+    let expected_hit = 0.5 / (RRF_K + 1.0) + 0.2 / (RRF_K + 2.0);
+    assert!(
+        (hit_result.score - expected_hit).abs() < eps,
+        "AC-5: hit.rs score must be 0.5/61 + 0.2/62 = {expected_hit} (±1e-12); got {}",
+        hit_result.score
+    );
+    let expected_zpartner = 0.2 / (RRF_K + 1.0);
+    assert!(
+        (zpartner_result.score - expected_zpartner).abs() < eps,
+        "AC-5: zpartner.rs score must be 0.2/61 = {expected_zpartner} (±1e-12); got {}",
+        zpartner_result.score
+    );
+
+    // Ordering: zpartner.rs (higher temporal score) must rank above hit.rs
+    // because zpartner's temporal contribution 0.2/61 > hit.rs total 0.5/61+0.2/62
+    // is NOT guaranteed (hit.rs has lexical too), so just verify scores are correct.
+    // The actual ranking is determined by the fused score, not asserted here.
+    assert!(
+        hit_result.score.is_finite(),
+        "AC-5: hit.rs score must be finite"
+    );
+    assert!(
+        zpartner_result.score.is_finite(),
+        "AC-5: zpartner.rs score must be finite"
+    );
+}
+
+/// AC-15 — a co-change row whose stored Jaccard is NaN or ±∞ MUST NOT panic,
+/// MUST NOT propagate a non-finite value into the fused output score, and the
+/// file MUST still appear in results (ranked below every valid partner).
+#[test]
+fn test_ad409_non_finite_jaccard_does_not_panic_and_stays_finite() {
+    use rskim_search::compound::CompositeWeights;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("normal.rs"),
+        "// normal partner — finite Jaccard\n",
+    )
+    .unwrap();
+    fs::write(src.join("nan_file.rs"), "// partner with NaN Jaccard\n").unwrap();
+
+    // blast_radius_paths: normal_partner has finite J=0.8, nan_file has NaN J.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/normal.rs".to_string(), 0.80);
+    allowed.insert("src/nan_file.rs".to_string(), f64::NAN);
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp_ac409_ac15_unique".to_string(), // gibberish
+        limit: 10,
+        offset: None,
+        json: false,
+        root,
+        cache_dir,
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: Some(CompositeWeights {
+            lexical: 0.0,
+            ast: 0.0,
+            temporal: 1.0,
+            import_graph: 0.0,
+            dir_proximity: 0.0,
+            structural_coupling: 0.0,
+        }),
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    // MUST NOT panic.
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Both files must appear in results (the NaN-Jaccard file is still included;
+    // its score is mapped to NON_FINITE_JACCARD_FLOOR = 0.0 and it ranks last).
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    assert!(
+        paths.contains(&"src/normal.rs"),
+        "AC-15: normal.rs (finite Jaccard=0.8) must appear in results; got: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"src/nan_file.rs"),
+        "AC-15: nan_file.rs must still appear (no panic, not silently dropped); got: {paths:?}"
+    );
+
+    // All output scores must be finite.
+    for r in &output.results {
+        assert!(
+            r.score.is_finite(),
+            "AC-15: non-finite Jaccard must not propagate to the output score; \
+             path={}, score={}",
+            r.path,
+            r.score
+        );
+    }
+
+    // nan_file (floor score=0.0, temporal rank below normal.rs) must rank AFTER
+    // normal.rs which has finite Jaccard=0.8 (temporal rank 1).
+    let normal_idx = paths.iter().position(|&p| p == "src/normal.rs").unwrap();
+    let nan_idx = paths.iter().position(|&p| p == "src/nan_file.rs").unwrap();
+    assert!(
+        normal_idx < nan_idx,
+        "AC-15: normal.rs (finite J=0.8) must rank above nan_file.rs (floor score=0.0); \
+         normal at index {normal_idx}, nan at index {nan_idx}"
+    );
+}

@@ -444,6 +444,137 @@ fn seed_strength_exceeds_max_jaccard() {
     };
 }
 
+/// With multiple co-change rows, each partner maps to ITS OWN Jaccard score —
+/// not to the score of the other partner, not to a uniform value.
+///
+/// This verifies the bidirectional extraction: a target can appear as `file_a`
+/// in one row and `file_b` in another, and each peer must carry the score from
+/// ITS row, not from the other row.
+///
+/// AC-409: guards against a mapping error where partners share a score instead
+/// of each carrying the Jaccard from the row in which it appeared.
+#[test]
+fn cochange_partner_strengths_carries_jaccard_both_directions() {
+    // Row 1: target is file_a — partner "b.rs" carries jaccard=0.80.
+    // Row 2: target is file_b — partner "c.rs" carries jaccard=0.30.
+    // The two Jaccard values are distinct so a swap is detectable.
+    let rows = vec![
+        CochangeRow {
+            file_a: "target.rs".to_string(),
+            file_b: "b.rs".to_string(),
+            count: 4,
+            jaccard: 0.80,
+        },
+        CochangeRow {
+            file_a: "c.rs".to_string(),
+            file_b: "target.rs".to_string(),
+            count: 2,
+            jaccard: 0.30,
+        },
+    ];
+    let partners = super::cochange_partner_strengths(&rows, "target.rs");
+
+    // b.rs came from Row 1 where target was file_a — must carry 0.80, not 0.30.
+    assert_eq!(
+        partners.get("b.rs").copied(),
+        Some(0.80),
+        "b.rs (from file_b side of row 1) must carry the row-1 Jaccard 0.80, not 0.30"
+    );
+    // c.rs came from Row 2 where target was file_b — must carry 0.30, not 0.80.
+    assert_eq!(
+        partners.get("c.rs").copied(),
+        Some(0.30),
+        "c.rs (from file_a side of row 2) must carry the row-2 Jaccard 0.30, not 0.80"
+    );
+    // Target itself must not appear.
+    assert!(
+        !partners.contains_key("target.rs"),
+        "target itself must not appear in the partner map"
+    );
+    assert_eq!(
+        partners.len(),
+        2,
+        "partner map must contain exactly the two peers"
+    );
+}
+
+/// `paths_to_file_ids` must drop unindexed partner paths silently (returning
+/// only FileIds that exist in the manifest) and the AD-409-7 partial-drop count
+/// EXCLUDES the seed so it reports |partners_dropped| of |partners_total|, not
+/// |all_entries_dropped| of |all_entries_total|.
+///
+/// When zero paths are dropped the function must NOT emit the notice at all —
+/// verified here via the return-value cardinality (the full manifest membership
+/// check is the absence condition; the stderr text is verified by the CLI E2E
+/// test `ac409_4_unindexed_partner_omission_is_disclosed`).
+#[test]
+fn paths_to_file_ids_drops_unindexed_partners_and_excludes_seed_from_count() {
+    use rskim_search::FileId;
+    use std::collections::HashMap;
+
+    // ── Sub-case A: one partner not in manifest ──────────────────────────────
+    // Manifest: ["anchor.rs", "partner_a.rs"] — partner_b.rs is NOT indexed.
+    let sorted_paths: &[&str] = &["anchor.rs", "partner_a.rs"];
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    // seed (anchor) + two partners; partner_b is outside the manifest.
+    allowed.insert("anchor.rs".to_string(), super::SEED_STRENGTH);
+    allowed.insert("partner_a.rs".to_string(), 0.80);
+    allowed.insert("partner_b.rs".to_string(), 0.50); // NOT in sorted_paths
+
+    let file_ids = super::paths_to_file_ids(sorted_paths, &allowed);
+
+    // Only anchor.rs (FileId(0)) and partner_a.rs (FileId(1)) appear.
+    assert_eq!(
+        file_ids.len(),
+        2,
+        "sub-case A: two indexed paths must yield two FileIds"
+    );
+    assert!(
+        file_ids.contains(&FileId(0)),
+        "sub-case A: anchor.rs (FileId 0) must be in the returned set"
+    );
+    assert!(
+        file_ids.contains(&FileId(1)),
+        "sub-case A: partner_a.rs (FileId 1) must be in the returned set"
+    );
+    assert!(
+        !file_ids.contains(&FileId(2)),
+        "sub-case A: partner_b.rs has no FileId and must be absent"
+    );
+    // The AD-409-7 formula: dropped = allowed.len() - file_ids.len() = 3 - 2 = 1.
+    // partner_count = allowed.len() - 1 = 2 (seed excluded from total).
+    // This means the notice would read "1 of 2 co-change partners not found".
+    // That is verified by the CLI E2E test ac409_4_unindexed_partner_omission_is_disclosed.
+    let dropped = allowed.len().saturating_sub(file_ids.len());
+    let partner_count = allowed.len().saturating_sub(1); // seed excluded
+    assert_eq!(dropped, 1, "sub-case A: exactly one partner is dropped");
+    assert_eq!(
+        partner_count, 2,
+        "sub-case A: partner_count EXCLUDES the seed, so must be 2 not 3 (AD-409-7)"
+    );
+
+    // ── Sub-case B: no partners dropped ─────────────────────────────────────
+    // Manifest includes both seed and partner — dropped == 0 → no notice.
+    let sorted_paths_b: &[&str] = &["anchor.rs", "partner_a.rs"];
+    let mut allowed_b: HashMap<String, f64> = HashMap::new();
+    allowed_b.insert("anchor.rs".to_string(), super::SEED_STRENGTH);
+    allowed_b.insert("partner_a.rs".to_string(), 0.80);
+
+    let file_ids_b = super::paths_to_file_ids(sorted_paths_b, &allowed_b);
+
+    assert_eq!(
+        file_ids_b.len(),
+        2,
+        "sub-case B: all indexed paths must be present — no drop"
+    );
+    // dropped == 0: the notice MUST NOT fire (verified by return-value cardinality).
+    let dropped_b = allowed_b.len().saturating_sub(file_ids_b.len());
+    assert_eq!(
+        dropped_b, 0,
+        "sub-case B: zero paths dropped — AD-409-7 notice must NOT be emitted"
+    );
+}
+
 // ============================================================================
 // Step 9: Standalone temporal dispatch
 // ============================================================================
