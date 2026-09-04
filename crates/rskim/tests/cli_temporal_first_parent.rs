@@ -33,7 +33,9 @@
 //!
 //! All tests shell out to the skim binary via `assert_cmd::cargo::cargo_bin`.
 //! Each invocation carries an isolated `SKIM_CACHE_DIR` on a per-test
-//! `TempDir` and always passes an explicit `--root`.  Fixtures use pinned
+//! `TempDir`.  Every `skim search` invocation passes an explicit `--root`;
+//! `skim heatmap` has no `--root` flag and is instead run with its
+//! `current_dir` set to the fixture root.  Fixtures use pinned
 //! `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` so counts are deterministic.
 
 use std::fs;
@@ -465,27 +467,39 @@ fn test_risky_json_matches_git_ground_truth_on_merge_repo() {
     let a_row = find_result("a.txt");
     let b_row = find_result("b.txt");
 
-    // Required JSON keys on every row
+    // AC-16: every row MUST carry exactly the required keys — no extras, no
+    // missing.  `has_more` belongs on the envelope only and MUST NOT appear
+    // on a per-row object; the key-set equality check enforces this.
+    let required_row_keys: std::collections::HashSet<&str> = [
+        "path",
+        "risk_score",
+        "fix_density",
+        "fix_commits",
+        "total_commits",
+    ]
+    .iter()
+    .cloned()
+    .collect();
     for (row, name) in [(a_row, "a.txt"), (b_row, "b.txt")] {
-        assert!(row["path"].is_string(), "{name}: path must be string");
-        assert!(
-            row["risk_score"].is_number(),
-            "{name}: risk_score must be number"
+        let obj = row
+            .as_object()
+            .unwrap_or_else(|| panic!("{name}: result row must be a JSON object"));
+        let actual_keys: std::collections::HashSet<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            actual_keys, required_row_keys,
+            "{name}: row key set must be exactly \
+             {{path, risk_score, fix_density, fix_commits, total_commits}} (AC-16)"
         );
-        assert!(
-            row["fix_density"].is_number(),
-            "{name}: fix_density must be number"
-        );
-        assert!(
-            row["fix_commits"].is_number(),
-            "{name}: fix_commits must be number"
-        );
-        assert!(
-            row["total_commits"].is_number(),
-            "{name}: total_commits must be number"
-        );
-        // has_more must NOT appear on the per-row level (it lives on the envelope)
     }
+
+    // AC-16: `has_more` MUST NOT appear on the envelope when all results fit
+    // in one page.  The merge fixture has only 2 files — well within any page
+    // limit — so `has_more` must be absent here.
+    assert!(
+        json.get("has_more").is_none(),
+        "AC-16: has_more must not appear on the envelope when the page is \
+         complete; envelope: {json}"
+    );
 
     // b.txt: 2 commits, both fix
     assert_eq!(
@@ -542,6 +556,15 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
 
     // Build index scoped to the src/ subdirectory.
     let src_root = repo.path().join("src");
+
+    // AC-21: the src/ subtree contains exactly these two files.  Every
+    // temporal output path must be a member of this set (ADR-009).  A
+    // positive membership check catches regressions that a `!starts_with`
+    // guard misses: absolute paths, `../other/b.rs`, or a peer re-anchored
+    // to a different spelling all fail membership but pass the negative test.
+    let src_subtree_paths: std::collections::HashSet<&str> =
+        ["a.rs", "c.rs"].iter().cloned().collect();
+
     build_index(&src_root, cache.path());
 
     // --risky --json: only src/ paths may appear.
@@ -564,8 +587,9 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
     for row in results {
         let p = row["path"].as_str().unwrap_or("(no path)");
         assert!(
-            !p.starts_with("other/"),
-            "AC-21: --risky must not emit path outside src/ subtree: {p}"
+            src_subtree_paths.contains(p),
+            "AC-21: --risky path must be in the src/ subtree set \
+             {src_subtree_paths:?}; got: {p}"
         );
     }
 
@@ -587,8 +611,9 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
     for row in results {
         let p = row["path"].as_str().unwrap_or("(no path)");
         assert!(
-            !p.starts_with("other/"),
-            "AC-21: --hot must not emit path outside src/ subtree: {p}"
+            src_subtree_paths.contains(p),
+            "AC-21: --hot path must be in the src/ subtree set \
+             {src_subtree_paths:?}; got: {p}"
         );
     }
 
@@ -616,8 +641,9 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
     for row in results {
         let p = row["path"].as_str().unwrap_or("(no path)");
         assert!(
-            !p.starts_with("other/"),
-            "AC-21: --blast-radius must not emit path outside src/ subtree: {p}"
+            src_subtree_paths.contains(p),
+            "AC-21: --blast-radius a.rs peer must be in the src/ subtree set \
+             {src_subtree_paths:?}; got: {p}"
         );
     }
 }
