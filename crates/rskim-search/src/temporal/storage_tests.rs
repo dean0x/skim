@@ -375,6 +375,85 @@ fn sync_rejects_over_capacity() {
     assert!(matches!(err, SearchError::CapacityExceeded(_)));
 }
 
+/// AD-407-9 (capacity ripple): `sync` MUST degrade co-changes gracefully when
+/// the co-change slice exceeds `MAX_ROWS_PER_TABLE`, rather than returning
+/// `CapacityExceeded` and rolling back the whole transaction (which would also
+/// lose hotspot and risk data).
+///
+/// The fix sorts the co-change rows by Jaccard score descending and keeps only
+/// the top `MAX_ROWS_PER_TABLE` pairs.  This test verifies three things:
+/// 1. `sync` returns `Ok(())` on an over-capacity co-change slice.
+/// 2. The co-change table contains exactly `MAX_ROWS_PER_TABLE` rows afterwards.
+/// 3. The row with the highest Jaccard score is present; the absolute lowest
+///    (jaccard ≈ 0.0) is absent (it was the one dropped).
+#[test]
+fn sync_cochanges_degrades_gracefully_over_capacity() {
+    let (_dir, db) = temp_db();
+    // 500,001 rows with strictly increasing Jaccard scores.
+    // Row 0 (jaccard = 0/500001 ≈ 0.0) is the one that must be dropped;
+    // row 500,000 (jaccard = 500000/500001 ≈ 1.0) is the one that must be kept.
+    // file_a = "a{n:07}", file_b = "z{n:07}" satisfies the file_a < file_b invariant.
+    let total = 500_001_usize;
+    let cochanges: Vec<CochangeRow> = (0..total)
+        .map(|n| CochangeRow {
+            file_a: format!("a{n:07}"),
+            file_b: format!("z{n:07}"),
+            count: 1,
+            jaccard: (n as f64) / (total as f64),
+        })
+        .collect();
+    // (1) sync must succeed even though cochanges exceeds 500,000 rows.
+    db.sync(&[], &[], &cochanges, "deadbeef", false)
+        .expect("sync must not fail on an oversized co-change set (degrade, not error)");
+    // (2) Exactly MAX_ROWS_PER_TABLE rows must be in the table.
+    let stored = db.load_cochanges().unwrap();
+    assert_eq!(
+        stored.len(),
+        500_000,
+        "co-change table must contain exactly MAX_ROWS_PER_TABLE rows after degradation"
+    );
+    // (3) The highest-Jaccard row (n=500,000) must be present; the lowest (n=0)
+    //     must be absent — it was the one sacrificed during degradation.
+    assert!(
+        stored.iter().any(|r| r.file_a == "a0500000"),
+        "highest-Jaccard row must be retained"
+    );
+    assert!(
+        stored.iter().all(|r| r.file_a != "a0000000"),
+        "lowest-Jaccard row (jaccard≈0.0) must have been dropped"
+    );
+}
+
+/// AD-407-9 (capacity ripple): `store_cochanges` MUST degrade gracefully when
+/// the row slice exceeds `MAX_ROWS_PER_TABLE`, retaining the highest-Jaccard
+/// pairs rather than returning `CapacityExceeded`.
+#[test]
+fn store_cochanges_degrades_gracefully_over_capacity() {
+    let (_dir, db) = temp_db();
+    let total = 500_001_usize;
+    let rows: Vec<CochangeRow> = (0..total)
+        .map(|n| CochangeRow {
+            file_a: format!("a{n:07}"),
+            file_b: format!("z{n:07}"),
+            count: 1,
+            jaccard: (n as f64) / (total as f64),
+        })
+        .collect();
+    // store_cochanges must return Ok, not CapacityExceeded.
+    db.store_cochanges(&rows)
+        .expect("store_cochanges must not fail on an oversized slice");
+    let stored = db.load_cochanges().unwrap();
+    assert_eq!(
+        stored.len(),
+        500_000,
+        "co-change table must be capped at MAX_ROWS_PER_TABLE"
+    );
+    assert!(
+        stored.iter().all(|r| r.file_a != "a0000000"),
+        "lowest-Jaccard row must have been dropped"
+    );
+}
+
 // ============================================================================
 // Group 7: Per-file lookup methods (Step 1)
 // ============================================================================
