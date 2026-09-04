@@ -152,6 +152,20 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
     Ok(())
 }
 
+/// Sort `rows` by Jaccard score descending and truncate to at most
+/// [`MAX_ROWS_PER_TABLE`] entries.  Caller is responsible for deciding
+/// whether truncation is needed and for emitting the corresponding notice.
+fn cochange_top_n(rows: &[CochangeRow]) -> Vec<CochangeRow> {
+    let mut v = rows.to_vec();
+    v.sort_unstable_by(|a, b| {
+        b.jaccard
+            .partial_cmp(&a.jaccard)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    v.truncate(MAX_ROWS_PER_TABLE);
+    v
+}
+
 impl TemporalDb {
     // ========================================================================
     // Per-file lookup methods
@@ -452,14 +466,7 @@ impl TemporalDb {
                  (lowest-signal pairs dropped). See #522 for threshold re-derivation.",
                 rows.len()
             );
-            let mut v = rows.to_vec();
-            v.sort_unstable_by(|a, b| {
-                b.jaccard
-                    .partial_cmp(&a.jaccard)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            v.truncate(MAX_ROWS_PER_TABLE);
-            Some(v)
+            Some(cochange_top_n(rows))
         } else {
             None
         };
@@ -782,14 +789,7 @@ impl TemporalDb {
                  (lowest-signal pairs dropped). See #522 for threshold re-derivation.",
                 cochanges.len()
             );
-            let mut v = cochanges.to_vec();
-            v.sort_unstable_by(|a, b| {
-                b.jaccard
-                    .partial_cmp(&a.jaccard)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            v.truncate(MAX_ROWS_PER_TABLE);
-            Some(v)
+            Some(cochange_top_n(cochanges))
         } else {
             None
         };
