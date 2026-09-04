@@ -331,3 +331,45 @@ fn test_cargo_audit_passthrough() {
         .stdout(predicate::str::contains("completely unparseable"))
         .stderr(predicate::str::contains("[skim:notice]"));
 }
+
+// ============================================================================
+// yarn: unknown subcommand — ADR-011 class-2 banner gating (consistency-11)
+// ============================================================================
+
+/// consistency-11: `skim yarn <unknown>` must emit NOTHING to stderr when
+/// SKIM_DEBUG is off.  The banner is a class-2 (no-loss raw-fallback) notice
+/// and must be gated behind `SKIM_DEBUG` / `--debug` per ADR-011.
+#[cfg(unix)]
+#[test]
+fn test_yarn_unknown_subcommand_no_stderr_without_debug() {
+    let dir = tempfile::tempdir().unwrap();
+    // Stub yarn so it can be found on PATH without requiring the real binary.
+    common::make_stub(dir.path(), "yarn", "yarn build output\n", "", 0);
+
+    skim_cmd()
+        .env("PATH", common::stub_path(dir.path()))
+        .args(["yarn", "build"])
+        .assert()
+        .success()
+        // D2/ADR-011: a no-loss passthrough banner must never appear on stderr
+        // without SKIM_DEBUG.
+        .stderr(predicate::str::is_empty());
+}
+
+/// consistency-11: `skim yarn <unknown>` MUST emit the banner to stderr when
+/// SKIM_DEBUG is set (same as every other tool that has been converted).
+#[cfg(unix)]
+#[test]
+fn test_yarn_unknown_subcommand_stderr_with_debug() {
+    let dir = tempfile::tempdir().unwrap();
+    common::make_stub(dir.path(), "yarn", "yarn build output\n", "", 0);
+
+    skim_cmd()
+        .env("SKIM_DEBUG", "1")
+        .env("PATH", common::stub_path(dir.path()))
+        .args(["yarn", "build"])
+        .assert()
+        .success()
+        // With SKIM_DEBUG the class-2 banner must appear.
+        .stderr(predicate::str::contains("skim yarn: unknown subcommand 'build'"));
+}

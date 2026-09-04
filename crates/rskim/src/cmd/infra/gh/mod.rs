@@ -79,7 +79,16 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // not an error. Without this, exit 8 is raw-forwarded before parsing.
     expected_exit_codes: &[8],
     forward_stderr: false,
-    skip_net_savings_guard: false,
+    // PF-024 / regression-3: every `gh` handler injects `--json <fields>` in
+    // prepare_args, so the net-savings guard's raw-fallback path would emit the
+    // *injected* command's stdout (raw `--json` output) rather than what the
+    // user's original argv would have produced.  `raw_override` is `None` on
+    // every `gh` CONFIG — no handler arms it — so the guard cannot honour its
+    // "fallback must show what the user expected to see" contract.  Restoring
+    // `skip_net_savings_guard: true` keeps the pre-branch behaviour and closes
+    // the defect immediately.  Arming `raw_override` for all `gh` handlers is
+    // the full fix tracked by architecture-8 (separate ticket).
+    skip_net_savings_guard: true,
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,

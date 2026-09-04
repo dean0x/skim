@@ -41,7 +41,7 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
 static RE_GOLANGCI_LINE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(.+):(\d+)(?::\d+)?:\s+(.+)\s+\((\S+)\)$").unwrap());
 
-/// Run `skim golangci [args...]`.
+/// Run `skim golangci-lint [args...]`.
 pub(crate) fn run(
     args: &[String],
     ctx: &crate::cmd::RunContext,
@@ -139,7 +139,7 @@ fn try_parse_json(stdout: &str) -> Option<LintResult> {
         });
     }
 
-    Some(group_issues("golangci", issues))
+    Some(group_issues("golangci-lint", issues))
 }
 
 // ============================================================================
@@ -181,7 +181,7 @@ fn try_parse_regex(text: &str) -> Option<LintResult> {
         return None;
     }
 
-    Some(group_issues("golangci", issues))
+    Some(group_issues("golangci-lint", issues))
 }
 
 /// Infer `LintSeverity` from message text and linter name when no explicit

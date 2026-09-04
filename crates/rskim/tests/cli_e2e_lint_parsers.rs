@@ -248,7 +248,7 @@ fn test_golangci_tier1_json_fail() {
         .write_stdin(fixture)
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("golangci "))
+        .stdout(predicate::str::contains("golangci-lint "))
         .stdout(predicate::str::contains("1 error"))
         .stdout(predicate::str::contains("3 warning"));
 }
@@ -265,7 +265,7 @@ fn test_golangci_tier2_regex_degraded() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("golangci "))
+        .stdout(predicate::str::contains("golangci-lint "))
         .stderr(predicate::str::contains("[skim:warning]"));
 }
 
@@ -288,6 +288,27 @@ fn test_golangci_tier3_passthrough_garbage() {
 // golangci-lint: --json flag
 // ============================================================================
 
+/// consistency-9: `skim golangci-lint --json` must report `"tool":"golangci-lint"`.
+///
+/// After the golangci → golangci-lint rename, `group_issues("golangci", ...)` was
+/// not updated, so the serialized `LintResult.tool` field still said "golangci" —
+/// a name that no longer exists in the registry, the rewrite table, or the wrapper
+/// set.  This test pins the correct serialized name.
+#[test]
+fn test_golangci_json_tool_name_is_golangci_lint() {
+    let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
+    skim_cmd()
+        .args(["golangci-lint", "--json"])
+        .write_stdin(fixture)
+        .assert()
+        .success()
+        // consistency-9: serialized tool name must match the dispatch key.
+        .stdout(predicate::str::contains("\"tool\":\"golangci-lint\""))
+        // Regression: must NOT emit the old stale name.
+        .stdout(predicate::str::contains("\"tool\":\"golangci\"").not());
+}
+
+// Kept for backward compatibility; delegates to the canonical name test above.
 #[test]
 fn test_golangci_json_flag_full() {
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
@@ -296,7 +317,7 @@ fn test_golangci_json_flag_full() {
         .write_stdin(fixture)
         .assert()
         .success()
-        .stdout(predicate::str::contains("\"tool\":\"golangci\""));
+        .stdout(predicate::str::contains("\"tool\":\"golangci-lint\""));
 }
 
 // ============================================================================

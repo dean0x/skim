@@ -246,4 +246,58 @@ mod tests {
         assert_eq!(&*combined, "");
         assert!(matches!(combined, Cow::Borrowed(_)));
     }
+
+    // ========================================================================
+    // architecture-12: KNOWN_LINTERS drift guards
+    // ========================================================================
+
+    /// Every entry in `KNOWN_LINTERS` must also be registered in
+    /// `KNOWN_SUBCOMMANDS` (cmd/registry.rs).  A linter name absent from
+    /// `KNOWN_SUBCOMMANDS` would route to the generic passthrough at runtime —
+    /// failing with "No such file or directory" — rather than reaching the lint
+    /// handler.  This guard catches the drift at compile/test time.
+    #[test]
+    fn test_known_linters_are_subset_of_known_subcommands() {
+        for &linter in KNOWN_LINTERS {
+            assert!(
+                crate::cmd::is_known_subcommand(linter),
+                "KNOWN_LINTERS entry '{linter}' is not in KNOWN_SUBCOMMANDS — \
+                 add it to cmd/registry.rs so dispatch routes to the lint handler"
+            );
+        }
+    }
+
+    /// The `lint::run` dispatch match arms must stay in sync with
+    /// `KNOWN_LINTERS`.  Adding a linter to only one of the two causes silent
+    /// routing failures.  Update `LINT_DISPATCH_KEYS` below every time a new
+    /// linter is added or removed.
+    #[test]
+    fn test_lint_dispatch_keys_equal_known_linters() {
+        // Mirror of the match arms in `lint::run`. Keep this list sorted.
+        let dispatch_keys = &[
+            "biome",
+            "black",
+            "dprint",
+            "eslint",
+            "gofmt",
+            "golangci-lint",
+            "mypy",
+            "oxlint",
+            "prettier",
+            "rubocop",
+            "ruff",
+            "rustfmt",
+            "swiftlint",
+        ];
+        let mut sorted_dispatch = dispatch_keys.to_vec();
+        let mut sorted_known = KNOWN_LINTERS.to_vec();
+        sorted_dispatch.sort_unstable();
+        sorted_known.sort_unstable();
+        assert_eq!(
+            sorted_dispatch,
+            sorted_known,
+            "lint::run dispatch keys and KNOWN_LINTERS are out of sync — \
+             add the new linter to both the match statement and KNOWN_LINTERS"
+        );
+    }
 }
