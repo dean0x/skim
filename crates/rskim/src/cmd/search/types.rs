@@ -227,6 +227,15 @@ pub(super) struct SnippetContext {
 // Query types
 // ============================================================================
 
+/// Path-to-Jaccard map type used by [`QueryConfig::blast_radius_paths`].
+///
+/// AD-409-1: The map carries co-change partner path → Jaccard score. The
+/// blast-radius target (seed) is also present in this map, keyed to
+/// [`super::temporal::SEED_STRENGTH`] — a finite sentinel strictly greater than
+/// the Jaccard maximum of 1.0 — so it always ranks first in the temporal layer
+/// after the ranking fix in ticket #409.
+pub(super) type BlastRadiusStrengths = std::collections::HashMap<String, f64>;
+
 /// Configuration for a query execution run.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -246,17 +255,23 @@ pub(super) struct QueryConfig {
     pub root: PathBuf,
     /// Cache directory containing the index files.
     pub cache_dir: PathBuf,
-    /// Optional set of allowed file paths (blast-radius pre-filter).
+    /// Optional map of allowed file paths to co-change Jaccard strengths (blast-radius
+    /// pre-filter).
     ///
-    /// When `Some`, only files whose repo-relative path is in this set are
-    /// scored. The filter is applied inside the search engine (before LIMIT)
-    /// so that the limit applies to the filtered result set rather than being
-    /// wasted on files that would be discarded.
+    /// AD-409-1: When `Some`, keys are repo-relative paths; values are co-change
+    /// Jaccard scores for partner paths, or [`super::temporal::SEED_STRENGTH`] (2.0)
+    /// for the blast-radius target itself. The seed's score exceeds the Jaccard maximum
+    /// of 1.0, ensuring the target always ranks first in the temporal layer.
     ///
-    /// In the UNION composite path (#200), this set drives the temporal ranked
-    /// list: each path in the set is assigned a temporal Jaccard score and
+    /// When `Some`, only files whose repo-relative path is in this map are scored. The
+    /// filter is applied inside the search engine (before LIMIT) so that the limit
+    /// applies to the filtered result set rather than being wasted on files that would
+    /// be discarded.
+    ///
+    /// In the UNION composite path (#200), this map drives the temporal ranked list:
+    /// each path's Jaccard score (or the seed sentinel) is the raw temporal score,
     /// merged with the lexical results via weighted RRF (UNION semantics).
-    pub blast_radius_paths: Option<std::collections::HashSet<String>>,
+    pub blast_radius_paths: Option<BlastRadiusStrengths>,
     /// Optional scored AST results from a structural pattern query (#198).
     ///
     /// When `Some`, carries `Vec<(FileId, f64)>` sorted ASC by FileId (the

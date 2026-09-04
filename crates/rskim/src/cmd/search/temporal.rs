@@ -8,7 +8,7 @@
 //! - Combined text+temporal enrichment (`apply_temporal_enrichment`).
 //! - Output formatting for standalone temporal queries.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -30,6 +30,22 @@ pub(super) use super::degraded::cause_substrings_for_guard;
 
 use super::staleness::{AnchorState, HeadState};
 use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
+
+// ============================================================================
+// Blast-radius constants
+// ============================================================================
+
+/// Sentinel score for the blast-radius target file in the temporal layer.
+///
+/// AD-409-3: `SEED_STRENGTH = 2.0` is a **finite** sentinel strictly greater than the
+/// Jaccard maximum of 1.0. It is the resolved decision Option A from ticket #409:
+/// the blast-radius target (seed) always ranks **first** in the temporal layer.
+/// Phase C's `paths_to_scored_file_ids` sorts the temporal layer by score DESC,
+/// placing the seed at rank 1 because `2.0 > max_jaccard(1.0)`.
+///
+/// Options B (sentinel == 1.0, indistinguishable from a perfect Jaccard match) and
+/// C (seed excluded from the temporal layer entirely) were rejected.
+pub(super) const SEED_STRENGTH: f64 = 2.0;
 
 // ============================================================================
 // Path normalization
@@ -377,10 +393,19 @@ pub(super) fn resort_window(limit: usize) -> usize {
 // Blast-radius → FileId resolution (shared helper)
 // ============================================================================
 
-/// Convert a set of repo-relative path strings to the corresponding `FileId`s.
+/// Convert a blast-radius path-to-Jaccard map to the corresponding `FileId`s.
 ///
-/// Iterates the pre-computed `sorted_paths` slice once, collecting `FileId`s for
-/// every path in `allowed_paths`.  Applies PF-004 widening (`u32::try_from(idx)`)
+/// AD-409-7: When one or more co-change partner paths have no `FileId` in the
+/// manifest (e.g., they live outside the indexed subtree), emits **exactly one**
+/// stderr line naming the dropped count and the partner total. The count is
+/// `|allowlist| − |file_ids|` computed excluding the blast-radius target (seed),
+/// which carries `SEED_STRENGTH` and is expected to be present in the manifest.
+/// The notice MUST NOT be emitted when zero paths are dropped. Exit code stays 0.
+/// No `--json` key is added here (tracked in #526 / #483).
+///
+/// Tests membership via `contains_key` so the Jaccard value is not required at
+/// this call site (the `FileId`-to-score mapping is built by phase C's
+/// `paths_to_scored_file_ids`).  Applies PF-004 widening (`u32::try_from(idx)`)
 /// — never `as u32`.  Emits a one-line stderr warning when the result set is empty
 /// (the blast-radius paths are not indexed), so callers do not have to repeat the
 /// check.
@@ -393,11 +418,11 @@ pub(super) fn resort_window(limit: usize) -> usize {
 /// filter, and mod.rs resolve_blast_radius_filter).
 pub(super) fn paths_to_file_ids(
     sorted_paths: &[&str],
-    allowed_paths: &HashSet<String>,
+    allowed_paths: &super::types::BlastRadiusStrengths,
 ) -> HashSet<FileId> {
     let mut file_ids = HashSet::new();
     for (idx, path) in sorted_paths.iter().enumerate() {
-        if allowed_paths.contains(*path) {
+        if allowed_paths.contains_key(*path) {
             // PF-004: widen idx (usize) to u32 before constructing FileId.
             // The file cap (50 000) guarantees no overflow, but `try_from`
             // makes the widening explicit and safe by construction.
@@ -413,6 +438,21 @@ pub(super) fn paths_to_file_ids(
             allowed_paths.len(),
             sorted_paths.len()
         );
+    } else {
+        // AD-409-7: partial-drop notice — fires when some co-change partner paths have
+        // no FileId in the manifest. The count is |allowlist| − |file_ids|, which
+        // naturally excludes the seed (the seed is expected to be in the manifest, so
+        // it contributes one to both sides and cancels). The total reported is the
+        // partner count (|allowlist| − 1 for the seed). Stderr only; no --json key;
+        // no degraded element (tracked in #526/#483 follow-up work).
+        let dropped = allowed_paths.len().saturating_sub(file_ids.len());
+        if dropped > 0 {
+            let partner_count = allowed_paths.len().saturating_sub(1);
+            eprintln!(
+                "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
+                 not found in the indexed manifest (excluded from scoring)"
+            );
+        }
     }
     file_ids
 }
@@ -435,13 +475,20 @@ pub(super) fn paths_to_file_ids(
 pub(super) enum BlastRadiusResolution {
     /// `--blast-radius` was not requested; skip filter entirely.
     NotRequested,
-    /// Resolved successfully; `allow` is the full co-change partner set.
-    Allowed(std::collections::HashSet<String>),
+    /// Resolved successfully; `allow` maps each co-change partner path to its
+    /// Jaccard score, plus the blast-radius target keyed to [`SEED_STRENGTH`].
+    ///
+    /// AD-409-4: Retyped from `HashSet<String>` (membership only) to
+    /// `HashMap<String, f64>` (path → Jaccard strength) so downstream callers
+    /// can build the temporal RRF layer with per-partner scores instead of
+    /// uniform 1.0. The blast-radius target itself carries `SEED_STRENGTH = 2.0`
+    /// (> max Jaccard 1.0) so it always ranks first in the temporal layer.
+    Allowed(HashMap<String, f64>),
     /// Resolved but the DB is degraded: `allow` is the effective path filter
     /// (empty for `RepositoryMismatch`) and `degraded` carries the reason so
     /// callers can push a `DegradedJson` entry to `output.degraded` (AC-7).
     Filtered {
-        allow: std::collections::HashSet<String>,
+        allow: HashMap<String, f64>,
         degraded: TemporalUnavailable,
     },
     /// Fully degraded: temporal DB is unavailable; blast-radius cannot be applied.
@@ -499,7 +546,7 @@ pub(super) fn resolve_blast_radius_paths(
             // output.degraded receives an entry — previously silent).
             if u.reason == DegradedReason::RepositoryMismatch {
                 return Ok(BlastRadiusResolution::Filtered {
-                    allow: std::collections::HashSet::new(),
+                    allow: HashMap::new(),
                     degraded: u,
                 });
             }
@@ -533,10 +580,11 @@ pub(super) fn resolve_blast_radius_paths(
         }
         eprintln!("skim search: no co-change data for {raw_path:?}");
     }
-    let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
+    let mut allowed_paths = cochange_partner_strengths(&partners, &normalized);
     // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
     // surface matches within the target file in addition to its co-change partners.
-    allowed_paths.insert(normalized);
+    // SEED_STRENGTH (2.0 > max Jaccard 1.0) ensures the target ranks first in the temporal layer.
+    allowed_paths.insert(normalized, SEED_STRENGTH);
     Ok(BlastRadiusResolution::Allowed(allowed_paths))
 }
 
@@ -552,8 +600,8 @@ pub(super) fn resolve_blast_radius_paths(
 /// 2. Open `temporal.db` under `cache_dir`.  If absent/corrupt/empty, emit the
 ///    degraded notice and return `Ok(None)`.
 /// 3. Normalize the raw path to repo-relative form.
-/// 4. Look up co-change partners, add the target file itself.
-/// 5. Convert the path set to `FileId`s via `paths_to_file_ids`.
+/// 4. Look up co-change partners (with Jaccard scores), add the target with `SEED_STRENGTH`.
+/// 5. Convert the path map to `FileId`s via `paths_to_file_ids`.
 /// 6. Return `Ok(Some(file_ids))`.
 ///
 /// # Errors
@@ -687,17 +735,21 @@ fn cochange_partner<'a>(row: &'a rskim_search::CochangeRow, target: &str) -> &'a
     }
 }
 
-/// Extract the set of partner paths from a slice of co-change rows.
+/// Extract the map of partner paths to their co-change Jaccard scores from a slice of
+/// co-change rows.
 ///
-/// Uses `cochange_partner` to resolve both `file_a`/`file_b` directions. The
-/// `target` file itself is NOT included — callers add it separately when needed.
-pub(super) fn cochange_partner_paths(
+/// AD-409-1: Returns a `HashMap<String, f64>` mapping each partner path to its Jaccard
+/// score from the co-change row. Both `file_a`→`file_b` and `file_b`→`file_a`
+/// directions are resolved via `cochange_partner`, preserving the Jaccard value for
+/// each partner. The `target` file itself is NOT included — callers add it separately
+/// with [`SEED_STRENGTH`] when needed.
+pub(super) fn cochange_partner_strengths(
     partners: &[rskim_search::CochangeRow],
     target: &str,
-) -> std::collections::HashSet<String> {
+) -> HashMap<String, f64> {
     partners
         .iter()
-        .map(|p| cochange_partner(p, target).to_string())
+        .map(|p| (cochange_partner(p, target).to_string(), p.jaccard))
         .collect()
 }
 

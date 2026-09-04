@@ -493,7 +493,7 @@ fn test_resolved_result_line_range_none_serializes_null() {
 /// result set is restricted to it.
 #[test]
 fn test_execute_query_blast_radius_includes_only_allowed_paths() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -501,9 +501,9 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    // blast-radius set: src/auth.rs only.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
+    // blast-radius map: src/auth.rs only (uniform 1.0 strength — seed not set here).
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "authenticate".to_string(),
@@ -539,7 +539,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
 /// Regression for: combined mode was excluding the target file itself.
 #[test]
 fn test_execute_query_blast_radius_target_file_is_included() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -549,9 +549,9 @@ fn test_execute_query_blast_radius_target_file_is_included() {
 
     // Build an allowlist that includes src/auth.rs (the "target") plus a
     // partner that has no matching content for "authenticate".
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // target
-    allowed.insert("src/does_not_exist.rs".to_string()); // partner (not indexed)
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // target
+    allowed.insert("src/does_not_exist.rs".to_string(), 1.0); // partner (not indexed)
 
     let config = QueryConfig {
         text: "authenticate".to_string(),
@@ -591,7 +591,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
 
 #[test]
 fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -605,9 +605,9 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
     //
     // blast_radius_paths: include BOTH src/auth.rs (lexical match) AND
     // src/lib.rs (co-change partner that does NOT match the query).
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // lexically matches query
-    allowed.insert("src/lib.rs".to_string()); // co-change partner; does NOT match query
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexically matches query
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change partner; does NOT match query
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -663,7 +663,7 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
 
 #[test]
 fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -673,9 +673,9 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
 
     // blast_radius_paths with both indexed files so the union is the full index.
     // Both files are in the temporal list; auth.rs also matches the lexical query.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
-    allowed.insert("src/lib.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+    allowed.insert("src/lib.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -738,7 +738,7 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
 
 #[test]
 fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -747,9 +747,9 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
     create_union_test_project(&root);
 
     // Both indexed files in blast-radius; query matches only one.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // lexical match
-    allowed.insert("src/lib.rs".to_string()); // co-change-only
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexical match
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change-only
 
     // limit = 1: only the top-ranked result is returned.
     let config = QueryConfig {
@@ -796,7 +796,7 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
 
 #[test]
 fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -806,9 +806,9 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
     create_union_test_project(&root);
 
     // blast_radius_paths includes lib.rs (co-change-only: no "zqjxblip_check" match).
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
-    allowed.insert("src/lib.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+    allowed.insert("src/lib.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -872,7 +872,7 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
 
 #[test]
 fn test_positional_cochange_only_peer_is_dropped() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -882,9 +882,9 @@ fn test_positional_cochange_only_peer_is_dropped() {
     // lib.rs: does NOT contain "zqjxblip_check" — pure co-change-only partner.
     create_union_test_project(&root);
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // lexical hit + phrase match
-    allowed.insert("src/lib.rs".to_string()); // co-change-only: does NOT contain phrase
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexical hit + phrase match
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change-only: does NOT contain phrase
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -946,7 +946,7 @@ fn test_positional_cochange_only_peer_is_dropped() {
 /// return zero results, not the full unfiltered lexical result set.
 #[test]
 fn test_blast_radius_empty_allowlist_returns_zero_results() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -963,7 +963,7 @@ fn test_blast_radius_empty_allowlist_returns_zero_results() {
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
-        blast_radius_paths: Some(HashSet::new()), // empty allowlist → AnchorDiffers path
+        blast_radius_paths: Some(HashMap::new()), // empty allowlist → AnchorDiffers path
         ast_scored: None,
         composite_weights: None,
         phrase: false,
@@ -1427,7 +1427,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
 /// verify gate on the blast-radius path.
 #[test]
 fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -1435,8 +1435,8 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "xqzjvmblorp".to_string(),
@@ -1492,7 +1492,7 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
 /// so `snippet` is always `None` regardless of the verify decision).
 #[test]
 fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -1518,9 +1518,9 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
     )
     .unwrap();
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/match.rs".to_string());
-    allowed.insert("src/nomatch.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/match.rs".to_string(), 1.0);
+    allowed.insert("src/nomatch.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "zz".to_string(), // 2 bytes → AD-355-7 fallback

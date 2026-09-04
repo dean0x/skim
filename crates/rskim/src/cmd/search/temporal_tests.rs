@@ -371,57 +371,77 @@ fn staleness_returns_none_when_current() {
 }
 
 // ============================================================================
-// cochange_partner_paths — direct unit tests
+// cochange_partner_strengths — direct unit tests
 // ============================================================================
 
-/// When `target` matches `file_a`, the partner set contains `file_b`.
+/// When `target` matches `file_a`, the partner map contains `file_b` with the
+/// correct Jaccard score.
 #[test]
-fn cochange_partner_paths_target_is_file_a() {
+fn cochange_partner_strengths_target_is_file_a() {
     let rows = vec![CochangeRow {
         file_a: "src/auth.rs".to_string(),
         file_b: "src/middleware.rs".to_string(),
         count: 5,
         jaccard: 0.75,
     }];
-    let partners = super::cochange_partner_paths(&rows, "src/auth.rs");
-    assert!(
-        partners.contains("src/middleware.rs"),
-        "partner must be file_b when target is file_a"
+    let partners = super::cochange_partner_strengths(&rows, "src/auth.rs");
+    assert_eq!(
+        partners.get("src/middleware.rs").copied(),
+        Some(0.75),
+        "partner must be file_b with the row's Jaccard score when target is file_a"
     );
     assert!(
-        !partners.contains("src/auth.rs"),
-        "target itself must not appear in partner set"
+        !partners.contains_key("src/auth.rs"),
+        "target itself must not appear in partner map"
     );
 }
 
-/// When `target` matches `file_b`, the partner set contains `file_a`.
+/// When `target` matches `file_b`, the partner map contains `file_a` with the
+/// correct Jaccard score.
 #[test]
-fn cochange_partner_paths_target_is_file_b() {
+fn cochange_partner_strengths_target_is_file_b() {
     let rows = vec![CochangeRow {
         file_a: "src/auth.rs".to_string(),
         file_b: "src/middleware.rs".to_string(),
         count: 5,
         jaccard: 0.75,
     }];
-    let partners = super::cochange_partner_paths(&rows, "src/middleware.rs");
-    assert!(
-        partners.contains("src/auth.rs"),
-        "partner must be file_a when target is file_b"
+    let partners = super::cochange_partner_strengths(&rows, "src/middleware.rs");
+    assert_eq!(
+        partners.get("src/auth.rs").copied(),
+        Some(0.75),
+        "partner must be file_a with the row's Jaccard score when target is file_b"
     );
     assert!(
-        !partners.contains("src/middleware.rs"),
-        "target itself must not appear in partner set"
+        !partners.contains_key("src/middleware.rs"),
+        "target itself must not appear in partner map"
     );
 }
 
-/// Empty input produces an empty partner set.
+/// Empty input produces an empty partner map.
 #[test]
-fn cochange_partner_paths_empty_input() {
-    let partners = super::cochange_partner_paths(&[], "src/anything.rs");
+fn cochange_partner_strengths_empty_input() {
+    let partners = super::cochange_partner_strengths(&[], "src/anything.rs");
     assert!(
         partners.is_empty(),
-        "empty input must produce empty partner set"
+        "empty input must produce empty partner map"
     );
+}
+
+/// `SEED_STRENGTH` must be strictly greater than the Jaccard maximum of 1.0
+/// so the blast-radius target always ranks first in the temporal layer.
+///
+/// Verified as a compile-time constant assertion (resolved decision Option A).
+#[test]
+fn seed_strength_exceeds_max_jaccard() {
+    // const { assert!(…) } makes this a compile-time check rather than a runtime
+    // assertion on a known constant (clippy::assertions_on_constants).
+    const {
+        assert!(
+            super::SEED_STRENGTH > 1.0,
+            "SEED_STRENGTH must exceed the Jaccard maximum (1.0) — resolved decision Option A"
+        )
+    };
 }
 
 // ============================================================================
