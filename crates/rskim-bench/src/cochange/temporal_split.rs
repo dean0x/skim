@@ -2,9 +2,11 @@
 //!
 //! # Temporal split contract
 //!
-//! - [`GixSource::parse_history`] returns commits in **committer-time-descending**
-//!   (newest-first) order, stably re-sorted by `CommitInfo.timestamp` (author time)
-//!   descending (AD-407-4). For equal-author-timestamp commits on separate branches
+//! - [`GixSource::parse_history`] returns commits in **author-time-descending**
+//!   (newest-first) order — gix yields commits in committer-time-descending order and
+//!   the result is then **stably** re-sorted by `CommitInfo.timestamp` (author time)
+//!   descending, so committer order survives only as the tie-break for equal author
+//!   timestamps (AD-407-4). For equal-author-timestamp commits on separate branches
 //!   the relative order reflects gix's committer-time priority queue and is not
 //!   further specified; the splitter's correctness does not depend on tie-breaking.
 //! - We reverse to **approximately** chronological order (oldest-first) before
@@ -53,9 +55,11 @@ pub struct TemporalSplit {
 
 /// Split `commits` into chronological train and test sets.
 ///
-/// Takes ownership of `commits`, which is expected to be in **newest-first**
-/// order (as returned by [`GixSource::parse_history`], committer-time-descending,
-/// stably re-sorted by author time — AD-407-4).  The function reverses
+/// Takes ownership of `commits`, which is expected to be in **author-time-descending**
+/// (newest-first) order (as returned by [`GixSource::parse_history`]: gix yields
+/// committer-time-descending order and the result is **stably** re-sorted by
+/// `CommitInfo.timestamp` (author time) descending — committer order survives only as
+/// the tie-break for equal author timestamps; AD-407-4).  The function reverses
 /// in-place and uses [`Vec::split_off`] for a zero-copy split.
 ///
 /// `train_fraction` must be in `(0.0, 1.0)`.  Values outside this range are
