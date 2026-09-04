@@ -457,6 +457,62 @@ pub(super) fn paths_to_file_ids(
     file_ids
 }
 
+/// Convert a blast-radius path-to-Jaccard map to a scored `(FileId, f64)` layer
+/// for the temporal RRF pass inside `run_blast_radius_composite_query`.
+///
+/// AD-409-2: This is the scored twin of [`paths_to_file_ids`] — both agree on
+/// *membership* (every path that has a `FileId` in the manifest appears in both
+/// outputs) and differ only in what they return: a `HashSet<FileId>` for the
+/// membership-only filter path vs. a `Vec<(FileId, f64)>` scored layer for the
+/// composite ranking path.  The blast-radius target carries `SEED_STRENGTH = 2.0`
+/// (> max Jaccard of 1.0) so it always occupies temporal rank 1 after
+/// `merge_layer_scores`' per-layer total sort.  Each co-change partner carries
+/// its actual Jaccard co-change strength as read from `TemporalDb::cochanges_for_file`.
+///
+/// **AC-15 finiteness**: a partner whose stored Jaccard is NaN or ±∞ (the DB
+/// should not produce this, but is guarded defensively) is mapped to
+/// `NON_FINITE_JACCARD_FLOOR` (0.0), which is strictly below
+/// `rskim_search::MIN_COCHANGE_JACCARD` (0.10).  The file still appears in the
+/// output, ranked below every partner with a finite Jaccard ≥ 0.10, and the
+/// fallback neither panics nor propagates NaN into the RRF denominator.
+///
+/// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
+pub(super) fn paths_to_scored_file_ids(
+    sorted_paths: &[&str],
+    allowed_paths: &super::types::BlastRadiusStrengths,
+) -> Vec<(FileId, f64)> {
+    /// AC-15: fallback score for non-finite Jaccard values.  Strictly below
+    /// `rskim_search::MIN_COCHANGE_JACCARD` (0.10) so non-finite-jaccard files
+    /// rank after every valid co-change partner in the temporal layer.
+    const NON_FINITE_JACCARD_FLOOR: f64 = 0.0;
+
+    // AD-409-5: ONE bounded pass over the manifest slice.  Each path is looked
+    // up in the allowlist map exactly once; a `(FileId, score)` pair is emitted
+    // only when the path is present.  The pass is bounded by
+    // `sorted_paths.len()` — the indexed file count, which is capped by
+    // `COUPLING_MAX_FILES` at index-build time so no explicit per-loop bound
+    // is needed here.
+    let mut scored: Vec<(FileId, f64)> = Vec::with_capacity(allowed_paths.len());
+    for (idx, path) in sorted_paths.iter().enumerate() {
+        if let Some(&jaccard) = allowed_paths.get(*path) {
+            // PF-004: widen idx (usize) to u32 before constructing FileId.
+            // The file cap (50 000) guarantees no overflow, but `try_from`
+            // makes the widening explicit and safe by construction.
+            if let Ok(id) = u32::try_from(idx) {
+                // AC-15: map non-finite Jaccard to the floor so that NaN / ±∞
+                // cannot propagate into the RRF denominator or output score.
+                let safe_score = if jaccard.is_finite() {
+                    jaccard
+                } else {
+                    NON_FINITE_JACCARD_FLOOR
+                };
+                scored.push((FileId(id), safe_score));
+            }
+        }
+    }
+    scored
+}
+
 /// Resolution of a `--blast-radius` request.
 ///
 /// Replaces the former `(Option<HashSet<String>>, Option<TemporalUnavailable>)` tuple
@@ -478,10 +534,11 @@ pub(super) enum BlastRadiusResolution {
     /// Resolved successfully; `allow` maps each co-change partner path to its
     /// Jaccard score, plus the blast-radius target keyed to [`SEED_STRENGTH`].
     ///
-    /// AD-409-4: Retyped from `HashSet<String>` (membership only) to
-    /// `HashMap<String, f64>` (path → Jaccard strength) so downstream callers
-    /// can build the temporal RRF layer with per-partner scores instead of
-    /// uniform 1.0. The blast-radius target itself carries `SEED_STRENGTH = 2.0`
+    /// Retyped from `HashSet<String>` (membership only) to `HashMap<String, f64>`
+    /// (path → Jaccard strength) so downstream callers can build the temporal RRF
+    /// layer with per-partner scores instead of uniform 1.0 (see
+    /// [`super::query::run_blast_radius_composite_query`] and AD-409-2).
+    /// The blast-radius target itself carries `SEED_STRENGTH = 2.0`
     /// (> max Jaccard 1.0) so it always ranks first in the temporal layer.
     Allowed(HashMap<String, f64>),
     /// Resolved but the DB is degraded: `allow` is the effective path filter

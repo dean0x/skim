@@ -579,7 +579,6 @@ pub(super) fn execute_query_with_manifest(
     if config.blast_radius_paths.is_some() {
         return run_blast_radius_composite_query(
             config,
-            &blast_file_ids,
             QueryContext {
                 engine: &engine,
                 sorted: &sorted,
@@ -960,18 +959,18 @@ fn run_compound_query(
 ///
 /// # Temporal ranked list construction (AC11 source identity)
 ///
-/// The temporal ranked list is built from `blast_paths` (already resolved from
-/// `TemporalDb::cochanges_for_file` — the same SQLite source the CLI used
-/// before #200).  Each co-change partner path is assigned an equal score of
-/// `1.0` (uniform temporal rank input) and converted to `FileId` via the
-/// manifest's `sorted_paths`.  The Jaccard-value-aware ranking within the
-/// temporal list is not preserved here; the RRF framework uses rank, not
-/// magnitude, so the order within the temporal list only matters when there
-/// are many co-change partners.  Improvement tracked for follow-up: use the
-/// Jaccard score as the raw temporal score for better rank ordering (#200+).
+/// The temporal ranked list is built from `config.blast_radius_paths` (already
+/// resolved from `TemporalDb::cochanges_for_file` — the same SQLite source the
+/// CLI used before #200) via [`super::temporal::paths_to_scored_file_ids`].
+/// Each co-change partner carries its actual Jaccard co-change strength as the
+/// raw temporal score; the blast-radius target itself carries `SEED_STRENGTH`
+/// (2.0 > max Jaccard 1.0) so it always occupies temporal rank 1.
+/// `merge_layer_scores`' per-layer total comparator (score DESC, FileId ASC)
+/// then derives deterministic ranks from these values — the stronger the
+/// co-change relationship, the higher the temporal rank contribution to the
+/// fused RRF score.
 fn run_blast_radius_composite_query(
     config: &super::types::QueryConfig,
-    blast_file_ids: &Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
     // AD-403-7: compute once for all QueryOutput sites in this function.
@@ -989,7 +988,7 @@ fn run_blast_radius_composite_query(
     // lexical (UNION skips the empty temporal layer), returning all text matches
     // without the blast-radius filter — wrong repo data silently expanded, not
     // isolated.  Early-out mirrors run_compound_query's filter_set.is_empty() guard.
-    if matches!(blast_file_ids, Some(ids) if ids.is_empty()) {
+    if matches!(config.blast_radius_paths.as_ref(), Some(p) if p.is_empty()) {
         return Ok(QueryOutput {
             query: config.text.clone(),
             total: 0,
@@ -1052,18 +1051,24 @@ fn run_blast_radius_composite_query(
     // AD-393-12: select the verify predicate for the blast path.
     let blast_verify_mode = verify_mode_for(config.phrase, config.near);
 
-    // Step 2: build the temporal ranked list from blast_paths.
-    // Each co-change partner path → FileId (via sorted_paths index).
-    // Score = 1.0 (uniform; RRF uses rank not magnitude, so this suffices).
-    // The target file itself is included in blast_paths by resolve_blast_radius_paths.
-    // When blast_file_ids is None (temporal DB absent), degrades to lexical-only ranking.
-    let mut temporal_layer: Vec<(FileId, f64)> = blast_file_ids
+    // Step 2: build the temporal ranked list from Jaccard co-change strengths.
+    //
+    // AD-409-2: each partner receives its actual Jaccard score (not a uniform 1.0)
+    // so that merge_layer_scores' total comparator (score DESC, FileId ASC) assigns
+    // deterministic ranks proportional to co-change strength.  The blast-radius
+    // target itself carries SEED_STRENGTH (2.0 > max Jaccard 1.0) so it always
+    // occupies temporal rank 1.
+    //
+    // When blast_radius_paths is None (temporal DB absent or not requested),
+    // degrades to lexical-only ranking via the empty default.
+    let temporal_layer: Vec<(FileId, f64)> = config
+        .blast_radius_paths
         .as_ref()
-        .map(|ids| ids.iter().map(|&fid| (fid, 1.0)).collect())
+        .map(|allowed| super::temporal::paths_to_scored_file_ids(ctx.sorted, allowed))
         .unwrap_or_default();
-    // Sort by FileId for deterministic rank assignment within the layer.
-    // All have equal scores, so the sort order determines their temporal ranks.
-    temporal_layer.sort_unstable_by_key(|&(fid, _)| fid.0);
+    // AD-409-6: the sort_unstable_by_key on FileId is deleted.  Rank derivation
+    // moves entirely into merge_layer_scores, which applies a total comparator
+    // (score DESC, then FileId ASC) to each layer before accumulating RRF terms.
 
     // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();
