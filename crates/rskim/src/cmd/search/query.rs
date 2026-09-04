@@ -1066,9 +1066,9 @@ fn run_blast_radius_composite_query(
         .as_ref()
         .map(|allowed| super::temporal::paths_to_scored_file_ids(ctx.sorted, allowed))
         .unwrap_or_default();
-    // AD-409-6: the sort_unstable_by_key on FileId is deleted.  Rank derivation
-    // moves entirely into merge_layer_scores, which applies a total comparator
-    // (score DESC, then FileId ASC) to each layer before accumulating RRF terms.
+    // AD-409-6: rank derivation is delegated to merge_layer_scores, which
+    // applies a total comparator (score DESC, then FileId ASC) to each layer
+    // before accumulating RRF terms.
 
     // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();

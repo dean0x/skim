@@ -445,16 +445,32 @@ pub(super) fn paths_to_file_ids(
         // it contributes one to both sides and cancels). The total reported is the
         // partner count (|allowlist| − 1 for the seed). Stderr only; no --json key;
         // no degraded element (tracked in #526/#483 follow-up work).
-        let dropped = allowed_paths.len().saturating_sub(file_ids.len());
-        if dropped > 0 {
-            let partner_count = allowed_paths.len().saturating_sub(1);
-            eprintln!(
-                "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
-                 not found in the indexed manifest (excluded from scoring)"
-            );
-        }
+        emit_partial_drop_notice(allowed_paths.len(), file_ids.len());
     }
     file_ids
+}
+
+/// Emit a one-line stderr notice when co-change partner paths are absent from
+/// the indexed manifest.
+///
+/// Shared by [`paths_to_file_ids`] and [`paths_to_scored_file_ids`] to keep
+/// the message text identical in both call sites (AC `ac409_4_unindexed_partner_omission_is_disclosed`
+/// verifies the exact wording end-to-end).
+///
+/// `allowlist_len` is the total number of entries in `blast_radius_paths`
+/// (partners + the seed); `found` is the number that resolved to a `FileId`.
+/// The seed is excluded from both the dropped count and the partner total
+/// because it contributes one to each side and cancels.  The notice is
+/// suppressed when `dropped == 0`.
+fn emit_partial_drop_notice(allowlist_len: usize, found: usize) {
+    let dropped = allowlist_len.saturating_sub(found);
+    if dropped > 0 {
+        let partner_count = allowlist_len.saturating_sub(1);
+        eprintln!(
+            "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
+             not found in the indexed manifest (excluded from scoring)"
+        );
+    }
 }
 
 /// Convert a blast-radius path-to-Jaccard map to a scored `(FileId, f64)` layer
@@ -525,14 +541,7 @@ pub(super) fn paths_to_scored_file_ids(
     // so it contributes one to each side and cancels).  The total is the
     // partner count (|allowlist| − 1 for the seed).  Stderr only; no --json
     // key; no degraded element (tracked in #526/#483 follow-up work).
-    let dropped = allowed_paths.len().saturating_sub(scored.len());
-    if dropped > 0 {
-        let partner_count = allowed_paths.len().saturating_sub(1);
-        eprintln!(
-            "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
-             not found in the indexed manifest (excluded from scoring)"
-        );
-    }
+    emit_partial_drop_notice(allowed_paths.len(), scored.len());
     scored
 }
 
