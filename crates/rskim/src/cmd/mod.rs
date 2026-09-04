@@ -95,7 +95,8 @@ pub(crate) mod ux;
 
 mod dispatch;
 pub(crate) use dispatch::{
-    dispatch_explicit, dispatch_for_wrapper, run_inherited_passthrough, run_raw_passthrough,
+    dispatch_explicit, dispatch_for_wrapper, redaction_is_mandatory, run_inherited_passthrough,
+    run_raw_passthrough,
 };
 
 pub(crate) mod execution;

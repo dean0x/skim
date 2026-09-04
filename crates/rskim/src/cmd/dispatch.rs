@@ -917,12 +917,14 @@ fn handler_visible_args<'a>(subcommand: &str, args: &'a [String]) -> &'a [String
 /// - **`Wrapper`** — `~/.skim/bin/<tool>` is a symlink whose `argv[0]` is the
 ///   tool name.  The OS runs the skim binary directly; `main.rs` detects the
 ///   non-`skim` `argv[0]` via `detect_argv0_dispatch()` and calls
-///   `dispatch_for_wrapper`, which applies D3/D4/D5 wrapper gates before
-///   delegating to the private `dispatch_inner`.
+///   `dispatch_for_wrapper`, which is now a thin tag that delegates to the
+///   private `dispatch_inner` with `Surface::Wrapper`.
 ///
-/// The distinction is compile-time enforced: `dispatch_inner` requires a
-/// `Surface` argument, making it impossible to call the shared core without
-/// declaring which surface the call is on.
+/// The wrapper gates D3/D4/D5 are enforced **inside** `dispatch_inner` behind
+/// `if surface == Surface::Wrapper { … }`, making it structurally impossible
+/// to call the shared core on the wrapper surface without those gates running.
+/// A new call site that writes `dispatch_inner(Surface::Wrapper, …)` directly
+/// still receives all three gates — the invariant is structural, not social.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Surface {
     /// Explicit `skim <tool> …` typed by a user or injected by the rewrite hook.
@@ -941,93 +943,45 @@ impl Surface {
     }
 }
 
-/// Dispatch for the PATH-wrapper surface (D3).
+/// Return `true` when `name` identifies a tool that MUST NEVER serve raw output.
 ///
-/// When skim is invoked via a symlink (`~/.skim/bin/grep`), informational flags
-/// such as `--help`, `-h`, `--version`, and `-V` must be forwarded to the real
-/// tool — not intercepted by skim's internal help for that handler. This mirrors
-/// the behaviour of `skip_if_flag_prefix` on the rewrite surface (where `grep
-/// --help` is not rewritten, so the user sees grep's real help output).
+/// Credential redaction is a non-negotiable security control (PF-012).  Tools
+/// like `env` and `printenv` pipe the entire process environment — including
+/// `GITHUB_TOKEN`, `NPM_TOKEN`, and similar secrets — through skim's handler,
+/// which redacts sensitive values to `***`.  Any code path that serves the real
+/// tool's raw bytes (e.g. the D4 skip-flag gate, or `stdout_should_serve_raw`)
+/// bypasses that redaction entirely.
 ///
-/// Meta/management subcommands (`doctor`, `stats`, `init`, …) are excluded: they
-/// have no external binary counterpart, so their `--help` is always skim's own.
+/// This predicate is the single authoritative gate used by every raw-serve path
+/// to enforce the control.  It must be consulted by:
+/// - `main.rs` D2b — the `stdout_should_serve_raw() || force_raw_requested(…)`
+///   branch that execs `run_inherited_passthrough`.
+/// - `dispatch_inner` D4 — the skip-flag gate that calls `run_raw_passthrough`.
 ///
-/// For all other flags and subcommands, delegates to [`dispatch_inner`].
+/// The `never_passthrough: true` field in `cmd/file/env.rs` is the per-handler
+/// layer that guards `SKIM_PASSTHROUGH=1`; this predicate is the structural
+/// layer that guards every new raw-serve path added to the codebase.
+pub(crate) fn redaction_is_mandatory(name: &str) -> bool {
+    matches!(name, "env" | "printenv")
+}
+
+/// Dispatch for the PATH-wrapper surface.
+///
+/// When skim is invoked via a symlink (`~/.skim/bin/grep`), the OS calls the
+/// skim binary with `argv[0]` set to the tool name.  `main.rs` detects this
+/// via `detect_argv0_dispatch()` and routes here.
+///
+/// This function is now a **thin tag**: it stamps the call as
+/// [`Surface::Wrapper`] and delegates to [`dispatch_inner`], which applies the
+/// D3/D4/D5 wrapper gates internally.  The gates are structural — any future
+/// call site that writes `dispatch_inner(Surface::Wrapper, …)` directly still
+/// runs all three gates, because they live inside `dispatch_inner` behind
+/// `if surface == Surface::Wrapper { … }`.
 pub(crate) fn dispatch_for_wrapper(
     name: &str,
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
-    use crate::cmd::registry::is_meta_subcommand;
-    use crate::cmd::rewrite::{require_flags_for_tool, skip_flags_for_tool};
-
-    // D3: universal help/version passthrough for non-meta tool wrappers.
-    // Equivalent to skip_if_flag_prefix on the rewrite surface: when `grep --help`
-    // is not rewritten (rewrite surface), it also must not be compressed (wrapper
-    // surface). The reader should see the real tool's output in both cases.
-    if !is_meta_subcommand(name)
-        && args
-            .iter()
-            .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
-    {
-        return run_raw_passthrough(name, args, &[]);
-    }
-
-    // D4: tool-owned skip flags from rewrite rules.
-    // Some tools have flags that skim must never intercept — e.g., `rg --json` and
-    // `tree --json` enable the tool's own JSON output; they are distinct from skim's
-    // `--json` output-format flag. The rewrite surface handles this via
-    // `skip_if_flag_prefix`; the wrapper surface must honour the same set.
-    //
-    // `skip_flags_for_tool` returns the non-help/version skip flags for `name`'s
-    // rewrite rules. If any arg matches a skip flag, passthrough to the real tool.
-    if !is_meta_subcommand(name) {
-        let skip_flags = skip_flags_for_tool(name);
-        if !skip_flags.is_empty()
-            && args.iter().any(|arg| {
-                skip_flags
-                    .iter()
-                    .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-            })
-        {
-            return run_raw_passthrough(name, args, &[]);
-        }
-    }
-
-    // D5: require-flag passthrough — wrapper-surface mirror of the rewrite
-    // engine's `require_flag` predicate.
-    //
-    // Tools such as `psql` (requires `-c`/`--command`) and `mysql` (requires
-    // `-e`/`--execute`) gate their rewrite rule on a required flag to
-    // distinguish batch invocations (safe to intercept) from interactive
-    // sessions (must pass through unmodified). The rewrite surface declines to
-    // rewrite when the flag is absent; this gate mirrors that behaviour on the
-    // wrapper surface.
-    //
-    // `require_flags_for_tool` reads the same rule table as `skip_flags_for_tool`
-    // so the two surfaces cannot drift independently. If `name` has no required
-    // flags (returns `None`), this gate is a no-op. If it has required flags and
-    // none appear in `args`, fall back to raw passthrough — the tool is about to
-    // open an interactive session that skim must not intercept.
-    //
-    // Matching semantics mirror D4: exact token (`-c`) and `--flag=value` long
-    // forms (`--command=SELECT 1`) are both accepted.
-    let required_flags = if is_meta_subcommand(name) {
-        None
-    } else {
-        require_flags_for_tool(name)
-    };
-    if let Some(required) = required_flags {
-        let has_required = args.iter().any(|arg| {
-            required
-                .iter()
-                .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-        });
-        if !has_required {
-            return run_raw_passthrough(name, args, &[]);
-        }
-    }
-
     dispatch_inner(Surface::Wrapper, name, args, analytics)
 }
 
@@ -1042,6 +996,83 @@ fn dispatch_inner(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
+    use crate::cmd::registry::is_meta_subcommand;
+    use crate::cmd::rewrite::{require_flags_for_tool, skip_flags_for_tool};
+
+    // ── Wrapper-surface gates: D3 / D4 / D5 ──────────────────────────────────
+    //
+    // Moved inside dispatch_inner (architecture-10) so the gates apply to every
+    // wrapper-surface call, regardless of which code path assembled the call.
+    // A caller that writes `dispatch_inner(Surface::Wrapper, …)` directly still
+    // runs all three gates — the invariant is structural, not social.
+    if surface == Surface::Wrapper {
+        // D3: universal help/version passthrough for non-meta tool wrappers.
+        // Equivalent to skip_if_flag_prefix on the rewrite surface: when
+        // `grep --help` is not rewritten (rewrite surface), it must not be
+        // compressed on the wrapper surface either. The reader sees the real
+        // tool's output in both cases.
+        if !is_meta_subcommand(subcommand)
+            && args
+                .iter()
+                .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
+        {
+            return run_raw_passthrough(subcommand, args, &[]);
+        }
+
+        // D4: tool-owned skip flags from rewrite rules.
+        // Some tools have flags that skim must never intercept — e.g.,
+        // `rg --json` and `tree --json` enable the tool's own JSON output.
+        // The rewrite surface handles this via `skip_if_flag_prefix`; the
+        // wrapper surface honours the same set.
+        //
+        // SECURITY (PF-012 / security-1): `env` and `printenv` are excluded
+        // from this gate even though their rewrite rules list `-i`, `-u`, and
+        // `-S` as skip flags. Routing `env -u HOME` to `run_raw_passthrough`
+        // would dump the entire unredacted environment.  Those tools must
+        // always reach their handler, which enforces credential redaction.
+        if !is_meta_subcommand(subcommand) && !redaction_is_mandatory(subcommand) {
+            let skip_flags = skip_flags_for_tool(subcommand);
+            if !skip_flags.is_empty()
+                && args.iter().any(|arg| {
+                    skip_flags
+                        .iter()
+                        .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+                })
+            {
+                return run_raw_passthrough(subcommand, args, &[]);
+            }
+        }
+
+        // D5: require-flag passthrough — wrapper-surface mirror of the rewrite
+        // engine's `require_flag` predicate.
+        //
+        // Tools such as `psql` (requires `-c`/`--command`) and `mysql`
+        // (requires `-e`/`--execute`) gate their rewrite rule on a required
+        // flag to distinguish batch invocations (safe to intercept) from
+        // interactive sessions (must pass through unmodified).
+        //
+        // `require_flags_for_tool` reads the same rule table as
+        // `skip_flags_for_tool` so the two surfaces cannot drift
+        // independently.  If `name` has no required flags (returns `None`),
+        // this gate is a no-op.
+        let required_flags = if is_meta_subcommand(subcommand) {
+            None
+        } else {
+            require_flags_for_tool(subcommand)
+        };
+        if let Some(required) = required_flags {
+            let has_required = args.iter().any(|arg| {
+                required
+                    .iter()
+                    .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+            });
+            if !has_required {
+                return run_raw_passthrough(subcommand, args, &[]);
+            }
+        }
+    }
+    // ── End wrapper-surface gates ─────────────────────────────────────────────
+
     // Defense-in-depth (#1.1): strip any stray --session-id flag before routing.
     // The hook no longer injects this flag, but an OLD hook might. Without
     // stripping, the flag would reach the underlying tool and cause "unrecognised

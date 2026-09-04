@@ -1003,14 +1003,31 @@ fn main() -> ExitCode {
         // guard above detect_argv0_dispatch() would break that workflow. See the
         // case-8 rationale on `stdout_redirected_to_file` in cmd/rewrite/compound.rs.
         if stdout_should_serve_raw() || force_raw_requested(&name) {
-            // ADR-011 class 2: choosing raw loses nothing, so this is a
-            // debug-gated banner, never an unconditional marker.
-            crate::debug_log!("[skim] wrapper: stdout needs exact bytes; serving raw for '{name}'");
-            Ok(cmd::run_inherited_passthrough(&name, &args))
+            if cmd::redaction_is_mandatory(&name) {
+                // ADR-011 class 1: raw bytes were requested for a tool whose
+                // handler enforces credential redaction.  Serving the raw tool
+                // output here would expose secrets (`GITHUB_TOKEN`, etc.) that
+                // the compressed view would have redacted to `***` — a
+                // *different-bytes* path in ADR-011 terms.  Unconditional
+                // marker: block the raw serve and fall through to the handler.
+                // (PF-012 / security-1)
+                eprintln!(
+                    "[skim] {name}: raw output blocked — redaction is mandatory; \
+                     routing through handler to protect secrets"
+                );
+                cmd::dispatch_for_wrapper(&name, &args, &analytics)
+            } else {
+                // ADR-011 class 2: choosing raw loses nothing (no redaction
+                // control applies to this tool), so this is a debug-gated
+                // banner, never an unconditional marker.
+                crate::debug_log!(
+                    "[skim] wrapper: stdout needs exact bytes; serving raw for '{name}'"
+                );
+                Ok(cmd::run_inherited_passthrough(&name, &args))
+            }
         } else {
-            // D3: use dispatch_for_wrapper on the wrapper surface so that
-            // `grep --help`, `git --help`, etc. forward to the real tool
-            // rather than printing skim's internal handler help.
+            // D3/D4/D5 gates live inside dispatch_for_wrapper → dispatch_inner
+            // so `grep --help`, `git --help`, etc. forward to the real tool.
             cmd::dispatch_for_wrapper(&name, &args, &analytics)
         }
     } else {
