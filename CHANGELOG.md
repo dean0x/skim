@@ -19,7 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Upgrade note (one slow query per root):** the first query after upgrading costs one
   slow rebuild per project root while the `TEMPORAL_DATA_VERSION` self-heal (1 → 2)
-  replaces the stored data.  Subsequent queries are fast.
+  replaces the stored data.  Subsequent queries are fast until HEAD advances; the first
+  query after each new commit re-walks history.  (If a previous history walk failed for
+  the current HEAD, the retry backoff defers the heal until HEAD advances or you run an
+  explicit `skim search --rebuild`.)
 
   **Adopted-root caveat:** a `--root` whose `temporal.db` records a different
   `git_toplevel` (e.g. the enclosing repository changed) is **refused** rather than
