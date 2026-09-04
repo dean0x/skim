@@ -504,13 +504,6 @@ pub(super) fn execute_query_with_manifest(
     // file_filter construction and the path-resolution step below.
     let sorted = manifest.sorted_paths();
 
-    // Build the FileId allowlist from blast-radius paths.
-    // Used for blast-radius-only and blast+AST paths.
-    let blast_file_ids: Option<HashSet<FileId>> = config
-        .blast_radius_paths
-        .as_ref()
-        .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
-
     // ── Compound text+AST path (#198, #356) ──────────────────────────────────
     //
     // When `ast_scored` is Some, run the compound text+AST intersection:
@@ -534,6 +527,19 @@ pub(super) fn execute_query_with_manifest(
     // For 4a the structural lookup is a no-op; the RRF fusion of lexical+AST rank
     // alone replaces the old file_filter gate (#198).
     if let Some(ref ast_scored_vec) = config.ast_scored {
+        // AD-409-7: build the membership-only FileId allowlist HERE, not before the
+        // dispatch.  `paths_to_file_ids` has a stderr side effect (the partial-drop /
+        // zero-match notice), so hoisting it above the dispatch made the composite
+        // blast-radius arm emit that notice TWICE — once here and once from
+        // `paths_to_scored_file_ids` inside `run_blast_radius_composite_query`,
+        // violating AC-7 ("exactly one stderr line").  The compound (text+AST) arm is
+        // the only consumer of this set; the composite arm derives its own scored
+        // layer.  Computing it inside the branch also skips a wasted O(manifest) pass
+        // on the composite arm.
+        let blast_file_ids: Option<HashSet<FileId>> = config
+            .blast_radius_paths
+            .as_ref()
+            .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
         return run_compound_query(
             config,
             ast_scored_vec,
@@ -987,7 +993,11 @@ fn run_blast_radius_composite_query(
     // returns 0 rows on AnchorDiffers).  Falling through would collapse to pure
     // lexical (UNION skips the empty temporal layer), returning all text matches
     // without the blast-radius filter — wrong repo data silently expanded, not
-    // isolated.  Early-out mirrors run_compound_query's filter_set.is_empty() guard.
+    // isolated.  #409 retyped this guard from the resolved `HashSet<FileId>` to the
+    // source path map, so it now tests ONLY the "allowlist is intentionally empty"
+    // sentinel; the "allowlist non-empty but nothing indexed" case is caught by the
+    // companion `temporal_layer.is_empty()` guard after Step 2, which is the one that
+    // mirrors run_compound_query's `filter_set.is_empty()` early-out.
     if matches!(config.blast_radius_paths.as_ref(), Some(p) if p.is_empty()) {
         return Ok(QueryOutput {
             query: config.text.clone(),
@@ -1069,6 +1079,31 @@ fn run_blast_radius_composite_query(
     // AD-409-6: rank derivation is delegated to merge_layer_scores, which
     // applies a total comparator (score DESC, then FileId ASC) to each layer
     // before accumulating RRF terms.
+
+    // AD-413-16 (second half): the allowlist is non-empty but NOT ONE of its paths
+    // has a FileId in the manifest — e.g. every co-change partner (and the target)
+    // was deleted from disk while temporal.db still records them.  Before #409 this
+    // was caught by the `Some(ids) if ids.is_empty()` guard above, which tested the
+    // RESOLVED FileId set; #409 retyped that guard to test the SOURCE path map, so
+    // the resolved-empty case has to be re-asserted here to keep the pre-#409
+    // membership semantics and the documented parity with run_compound_query's
+    // `filter_set.is_empty()` early-out.  Falling through would return the plain
+    // lexical result list under a `--blast-radius` flag that contributed nothing —
+    // a confident ranking that is not a blast radius at all (ADR-009).
+    // `paths_to_scored_file_ids` has already disclosed the condition on stderr.
+    if temporal_layer.is_empty() {
+        return Ok(QueryOutput {
+            query: config.text.clone(),
+            total: 0,
+            has_more: false,
+            verify_mode: vm_label,
+            results: vec![],
+            duration_ms: ctx.start.elapsed().as_millis() as u64,
+            index_stats: Some(ctx.stats),
+            ast_coverage: None,
+            degraded: vec![],
+        });
+    }
 
     // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();

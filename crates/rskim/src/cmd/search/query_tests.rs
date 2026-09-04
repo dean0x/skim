@@ -994,6 +994,71 @@ fn test_blast_radius_empty_allowlist_returns_zero_results() {
     );
 }
 
+/// AD-413-16 companion regression (#409 container retype): a NON-empty allowlist
+/// whose paths are all absent from the lexical manifest must ALSO return zero
+/// results — the blast-radius signal contributed nothing, so returning the plain
+/// lexical hit list under a `--blast-radius` flag would be a confident ranking
+/// that is not a blast radius (ADR-009).
+///
+/// Before #409 this case was covered by the same guard as the empty allowlist,
+/// because that guard tested the RESOLVED `HashSet<FileId>`.  #409 retyped it to
+/// test the source path map, so this is the discriminating guard for the
+/// `temporal_layer.is_empty()` early-out that restores the pre-#409 semantics.
+#[test]
+fn test_blast_radius_allowlist_with_no_indexed_paths_returns_zero_results() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // "authenticate" DOES produce lexical results in this project — so a fall-through
+    // would be observable as a non-empty result set.
+    create_test_project(&root);
+
+    // Non-empty allowlist, but neither path exists in the manifest (seed included):
+    // every co-change partner was deleted from disk while temporal.db still lists them.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/deleted_seed.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/deleted_partner.rs".to_string(), 0.75);
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        output.results.is_empty(),
+        "an allowlist that resolves to zero FileIds must return zero results, not the \
+         unfiltered lexical set; got {} results: {:?}",
+        output.results.len(),
+        output
+            .results
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output.total, 0,
+        "total must be 0 when no allowlist path is indexed"
+    );
+}
+
 // ============================================================================
 // format_json_output
 // ============================================================================

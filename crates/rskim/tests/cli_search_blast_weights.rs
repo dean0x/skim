@@ -498,14 +498,44 @@ fn ac409_3_repeated_identical_query_is_byte_identical() {
         ],
     );
 
-    assert_eq!(
-        stdout1,
-        stdout2,
-        "AC-4: two consecutive identical queries must produce byte-identical stdout; \
-         run 1 len={}, run 2 len={} — HashMap iteration order is reaching the output",
-        stdout1.len(),
-        stdout2.len()
+    // `QueryOutput::duration_ms` is wall-clock milliseconds and is serialized into
+    // the JSON envelope, so a raw byte comparison of the two runs would be timing-
+    // dependent (0 ms vs 1 ms on a loaded machine) and flaky.  Every OTHER byte —
+    // result ordering, paths, score formatting, field labels, `total`, `has_more` —
+    // must match exactly; that is what AC-4 is actually asserting (no HashMap
+    // iteration order may reach stdout).  Drop only the duration line and compare
+    // the rest byte-for-byte.
+    fn without_duration(raw: &[u8]) -> String {
+        String::from_utf8_lossy(raw)
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("\"duration_ms\""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let normalized1 = without_duration(&stdout1);
+    let normalized2 = without_duration(&stdout2);
+
+    // Non-vacuous (PF-007): the comparison must be over real result rows, not two
+    // identically-empty envelopes.
+    assert!(
+        normalized1.contains("\"path\""),
+        "AC-4: the fixture query must return at least one result row; got: {normalized1}"
     );
+    assert_eq!(
+        normalized1, normalized2,
+        "AC-4: two consecutive identical queries must produce byte-identical stdout \
+         (duration_ms excluded) — HashMap iteration order is reaching the output"
+    );
+    // The duration line itself must still be present in both runs (guards against
+    // the filter above silently matching everything if the field is ever renamed).
+    for (n, raw) in [(1, &stdout1), (2, &stdout2)] {
+        assert!(
+            String::from_utf8_lossy(raw).contains("\"duration_ms\""),
+            "AC-4: run {n} must carry a duration_ms field — the normalizer above is \
+             keyed on it and would silently pass if the field were renamed"
+        );
+    }
 }
 
 /// AC-7 / AD-409-7 — when one or more co-change partner paths are not in the
@@ -637,6 +667,19 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
     assert!(
         stderr_text.contains("1 of 1"),
         "AC-7: dropped count must be '1 of 1' (seed excluded from total); got: {stderr_text:?}"
+    );
+    // AC-7 requires EXACTLY ONE such line.  The composite arm resolves the allowlist
+    // through `paths_to_scored_file_ids` only; if `paths_to_file_ids` is ever hoisted
+    // back above the compound/composite dispatch in `execute_query_with_manifest`,
+    // both helpers fire and the user sees the identical notice twice.
+    let notice_lines = stderr_text
+        .lines()
+        .filter(|l| l.contains("not found in the indexed manifest"))
+        .count();
+    assert_eq!(
+        notice_lines, 1,
+        "AC-7: the partial-drop notice must appear EXACTLY once, not {notice_lines} times; \
+         got: {stderr_text:?}"
     );
 
     // JSON stdout must not contain any new key for the dropped partners.

@@ -432,12 +432,7 @@ pub(super) fn paths_to_file_ids(
         }
     }
     if file_ids.is_empty() {
-        eprintln!(
-            "skim search: blast-radius filter matched 0 indexed files \
-             (allowed {} paths, index has {} files)",
-            allowed_paths.len(),
-            sorted_paths.len()
-        );
+        emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
     } else {
         // AD-409-7: partial-drop notice — fires when some co-change partner paths have
         // no FileId in the manifest. The count is |allowlist| − |file_ids|, which
@@ -450,6 +445,23 @@ pub(super) fn paths_to_file_ids(
     file_ids
 }
 
+/// Emit the one-line stderr notice for the "nothing resolved" case: the
+/// blast-radius allowlist is non-empty but not one of its paths has a `FileId`
+/// in the manifest.
+///
+/// Shared by [`paths_to_file_ids`] and [`paths_to_scored_file_ids`] so both
+/// blast-radius arms disclose the same condition with the same wording.  This
+/// case is reported separately from the partial-drop notice because the
+/// partial-drop arithmetic (`|allowlist| − |found|` of `|allowlist| − 1`) is
+/// only meaningful when the seed itself resolved; with `found == 0` it would
+/// read "N of N−1 partners not found", which is nonsense.
+fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize) {
+    eprintln!(
+        "skim search: blast-radius filter matched 0 indexed files \
+         (allowed {allowlist_len} paths, index has {indexed_file_count} files)"
+    );
+}
+
 /// Emit a one-line stderr notice when co-change partner paths are absent from
 /// the indexed manifest.
 ///
@@ -459,9 +471,17 @@ pub(super) fn paths_to_file_ids(
 ///
 /// `allowlist_len` is the total number of entries in `blast_radius_paths`
 /// (partners + the seed); `found` is the number that resolved to a `FileId`.
-/// The seed is excluded from both the dropped count and the partner total
-/// because it contributes one to each side and cancels.  The notice is
-/// suppressed when `dropped == 0`.
+/// In the expected case — the seed resolved, some partners did not — the seed is
+/// excluded from both the dropped count and the partner total because it
+/// contributes one to each side and cancels.  When the seed itself is missing
+/// from the manifest (its file was deleted from disk while `temporal.db` still
+/// records it) it is counted as one of the dropped partners; the numbers stay
+/// bounded and truthful about "how many allowlist entries were excluded from
+/// scoring", which is what the operator needs, but the seed/partner split is
+/// approximate in that case.  Callers report `found == 0` through
+/// [`emit_no_indexed_files_notice`] instead, so this function never has to
+/// render a `dropped > partner_count` line.  The notice is suppressed when
+/// `dropped == 0`.
 fn emit_partial_drop_notice(allowlist_len: usize, found: usize) {
     let dropped = allowlist_len.saturating_sub(found);
     if dropped > 0 {
@@ -492,11 +512,14 @@ fn emit_partial_drop_notice(allowlist_len: usize, found: usize) {
 /// output, ranked below every partner with a finite Jaccard ≥ 0.10, and the
 /// fallback neither panics nor propagates NaN into the RRF denominator.
 ///
-/// **AD-409-7 partial-drop notice**: after the manifest scan, emits a one-line
-/// stderr notice when `|allowed_paths| − |scored|` > 0 (i.e. some co-change
+/// **AD-409-7 partial-drop notice**: after the manifest scan, emits **at most
+/// one** stderr line — "matched 0 indexed files" when nothing resolved, else the
+/// partial-drop notice when `|allowed_paths| − |scored|` > 0 (i.e. some co-change
 /// partner paths are absent from the indexed manifest, e.g. files deleted from
-/// disk but still present in temporal.db via git history).  Mirrors the
-/// identical guard in [`paths_to_file_ids`].  Exit code stays 0; no `--json`
+/// disk but still present in temporal.db via git history), and nothing at all
+/// when every path resolved.  Mirrors the identical two-branch guard in
+/// [`paths_to_file_ids`]; exactly one of the two functions runs per query, so the
+/// composite arm never double-reports (AC-7).  Exit code stays 0; no `--json`
 /// key added (tracked in #526/#483 follow-up work).
 ///
 /// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
@@ -533,15 +556,20 @@ pub(super) fn paths_to_scored_file_ids(
             }
         }
     }
-    // AD-409-7: partial-drop notice — mirrors the identical guard in
-    // `paths_to_file_ids`.  Fires when some co-change partner paths have no
-    // FileId in the manifest (e.g. files deleted from disk but still in
-    // temporal.db from git history).  The count is |allowlist| − |scored|,
-    // which naturally excludes the seed (the seed is expected to be present,
-    // so it contributes one to each side and cancels).  The total is the
-    // partner count (|allowlist| − 1 for the seed).  Stderr only; no --json
-    // key; no degraded element (tracked in #526/#483 follow-up work).
-    emit_partial_drop_notice(allowed_paths.len(), scored.len());
+    // AD-409-7: partial-drop notice — mirrors the identical two-branch guard in
+    // `paths_to_file_ids`, so whichever blast-radius arm runs discloses the same
+    // condition with the same wording (and each arm emits at most ONE line —
+    // AC-7).  `scored.is_empty()` is reported as "matched 0 indexed files"
+    // because the partial-drop arithmetic is only meaningful once the seed has
+    // resolved.  Otherwise the count is |allowlist| − |scored|, which naturally
+    // excludes the seed (the seed contributes one to each side and cancels), and
+    // the total is the partner count (|allowlist| − 1 for the seed).  Stderr
+    // only; no --json key; no degraded element (tracked in #526/#483).
+    if scored.is_empty() {
+        emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
+    } else {
+        emit_partial_drop_notice(allowed_paths.len(), scored.len());
+    }
     scored
 }
 
