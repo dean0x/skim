@@ -59,6 +59,63 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
+/// Returns `true` when the repository at `repo_path` is a shallow clone;
+/// `false` on a full clone.
+///
+/// Real-history parity tests compare skim's temporal output against `git log`
+/// ground truth derived from *this repository*. On a shallow checkout, git
+/// sees only the fetched commits, so the ground-truth count would be trivially
+/// small and the parity assertions would vacuously pass — defeating the
+/// PF-007 non-vacuous guard they contain.
+///
+/// Detection uses two independent signals:
+/// 1. `git rev-parse --is-shallow-repository` (Git ≥ 2.15, prints `true`).
+/// 2. Presence of `.git/shallow` (works for all git versions; located via
+///    `git rev-parse --git-dir` to handle linked worktrees correctly).
+///
+/// CI note: the `Test Suite` job in `.github/workflows/ci.yml` sets
+/// `fetch-depth: 0` on its `actions/checkout@v5` step so this guard never
+/// fires there; all other jobs keep the default shallow fetch.
+///
+/// AD-407-11: shallow-checkout guard for real-history parity tests — root
+/// cause of CI run 33906188121 where `fetch-depth: 1` caused git_total=1,
+/// making the ≥ 67 non-vacuous guard assert instead of the parity assertions.
+fn is_shallow_checkout(repo_path: &Path) -> bool {
+    // Signal 1: `git rev-parse --is-shallow-repository` (Git ≥ 2.15).
+    if let Ok(out) = StdCommand::new("git")
+        .args([
+            "-C",
+            &repo_path.to_string_lossy(),
+            "rev-parse",
+            "--is-shallow-repository",
+        ])
+        .output()
+        && out.status.success()
+        && String::from_utf8_lossy(&out.stdout).trim() == "true"
+    {
+        return true;
+    }
+    // Signal 2: presence of `.git/shallow` (universally reliable).
+    // `--git-dir` resolves the real git directory for linked worktrees.
+    if let Ok(out) = StdCommand::new("git")
+        .args(["-C", &repo_path.to_string_lossy(), "rev-parse", "--git-dir"])
+        .output()
+        && out.status.success()
+    {
+        let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let shallow_rel = std::path::Path::new(&git_dir).join("shallow");
+        let shallow = if shallow_rel.is_absolute() {
+            shallow_rel
+        } else {
+            repo_path.join(shallow_rel)
+        };
+        if shallow.exists() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Initialise a git repository with hermetic, non-signing identity.
 fn git_init(dir: &Path) {
     for args in &[
@@ -1045,6 +1102,17 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
             .expect("workspace root")
             .to_path_buf()
     };
+
+    // Guard: skip on shallow checkouts — `git log` ground truth requires full
+    // history.  On a shallow clone, git_total would be 1 (or similarly tiny),
+    // causing the non-vacuous ≥ 67 assert below to fire instead of the parity
+    // assertions — which is what happened in CI run 33906188121.
+    // The `Test Suite` CI job now fetches full history (fetch-depth: 0); all
+    // other jobs keep the default shallow fetch (AD-407-11).
+    if is_shallow_checkout(&repo_root) {
+        eprintln!("skipped: shallow checkout, real-history parity test needs full history");
+        return;
+    }
 
     // File under test (path relative to repo root, as skim returns it).
     const TARGET: &str = "crates/rskim/src/cmd/search/query.rs";
