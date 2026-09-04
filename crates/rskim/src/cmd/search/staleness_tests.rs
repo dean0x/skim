@@ -5125,15 +5125,22 @@ fn test_temporal_data_version_3_not_stale_after_407_bump() {
     );
 }
 
-/// AC-18 (NEGATIVE): a `temporal.db` that starts stale (`data_version = "1"`)
-/// but is healed by one `sync` call must NOT leave the DB in any state that
-/// would produce a `degraded` entry.
+/// Library-layer health check: a `temporal.db` that starts stale
+/// (`data_version = "1"`) and is healed by one `sync` call MUST NOT enter
+/// a corrupt or schema-mismatch state.
 ///
-/// A `degraded` entry is produced only when temporal data cannot be served at
-/// all: missing DB, corrupt DB, or newer-schema DB.  After the self-heal sync,
-/// the DB is schema-v2, opens without error, and reports a healthy head — none
-/// of the degraded conditions hold.  This test verifies the post-heal DB state
-/// is unconditionally healthy.
+/// This test verifies internal DB state only — that `temporal_db_is_stale`
+/// returns false, that `TemporalDb::open` succeeds, and that `schema_version`
+/// is still 2.  These are preconditions for the CLI-level AC-18 guarantee,
+/// not the guarantee itself.
+///
+/// AC-18 as written in the plan is an observable-output criterion: no
+/// `degraded` key in query `--json`, and `--stats --json` reporting
+/// `temporal_state: "ready"`.  Those end-to-end assertions are exercised by
+/// `test_ac18_stale_data_version_heals_no_degraded_on_next_query` in
+/// `crates/rskim/tests/cli_temporal_first_parent.rs`, which drives the full
+/// CLI stack.  This unit test verifies the underlying library layer that
+/// makes the CLI guarantee possible.
 #[test]
 fn test_stale_data_version_no_degraded_state_after_heal() {
     let dir = tempdir().unwrap();
@@ -5143,7 +5150,7 @@ fn test_stale_data_version_no_degraded_state_after_heal() {
     let db_path = plant_db_at_data_version(dir.path(), head, "1");
     assert!(
         temporal_db_is_stale(dir.path(), head, None),
-        "pre-condition"
+        "pre-condition: data_version=\"1\" must be flagged stale"
     );
 
     // Self-heal: one sync advances data_version to "2".
@@ -5151,27 +5158,25 @@ fn test_stale_data_version_no_degraded_state_after_heal() {
     db.sync(&[], &[], &[], head, false).unwrap();
     drop(db);
 
-    // Post-heal: not stale (temporal_state would be "ready", no degraded entry).
+    // Post-heal: staleness flag is clear (DB is no longer a self-heal candidate).
     assert!(
         !temporal_db_is_stale(dir.path(), head, None),
-        "AC-18: after self-heal, temporal_db_is_stale must be false \
-         (temporal_state = 'ready', no degraded entry produced)"
+        "after self-heal sync, temporal_db_is_stale must be false"
     );
 
-    // Post-heal: DB opens without error (rules out DatabaseCorrupt / UnsupportedSchemaVersion).
+    // Post-heal: DB opens without error (no DatabaseCorrupt / UnsupportedSchemaVersion).
     let db_result = rskim_search::TemporalDb::open(&db_path);
     assert!(
         db_result.is_ok(),
-        "AC-18: post-heal DB must open without error — an error here would produce \
-         a degraded entry; got: {:?}",
+        "post-heal DB must open without error; got: {:?}",
         db_result.unwrap_err()
     );
 
-    // Post-heal: schema version is still 2 (rules out UnsupportedSchemaVersion degraded reason).
+    // Post-heal: schema version is still 2 (no spurious migration was triggered).
     let schema = db_result.unwrap().schema_version().unwrap();
     assert_eq!(
         schema, 2,
-        "AC-18: post-heal schema_version must be 2 (no spurious migration)"
+        "post-heal schema_version must remain 2 — self-heal must not trigger a schema migration"
     );
 }
 
