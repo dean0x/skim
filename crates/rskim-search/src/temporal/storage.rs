@@ -79,11 +79,13 @@ pub const META_GIT_HEAD: &str = "git_head";
 pub const META_GIT_TOPLEVEL: &str = "git_toplevel";
 
 /// Version number attesting that the temporal data was written by a binary
-/// whose `rebuild_temporal` walks the **full commit DAG** (not first-parent-only).
+/// whose `rebuild_temporal` applies the **ghost filter** (v1, #408) AND walks
+/// the **full commit DAG** (not first-parent-only) (v2, #407).
 ///
 /// AD-408-3: This const is the single source of truth for the self-heal
 /// contract: the data-version attests "written by a binary whose
-/// `rebuild_temporal` applies the ghost filter." Written **unconditionally**
+/// `rebuild_temporal` applies the ghost filter (v1, #408) AND walks the full
+/// commit DAG (v2, #407)." Written **unconditionally**
 /// in [`TemporalDb::sync`] — the only version-attesting write path (same
 /// choke point as `META_GIT_HEAD`), so the empty-history DB also carries it
 /// and the no-rebuild-loop invariant is preserved. Bump this const to force a
