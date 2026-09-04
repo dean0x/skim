@@ -117,8 +117,11 @@ pub(super) struct WalkBudget {
     /// Set to `true` by either [`WalkBudget::charge_visit`] or
     /// [`WalkBudget::charge_retain`] when their respective cap fires.
     /// Propagated to [`crate::types::TemporalMetadata::truncated`] so the
-    /// condition crosses the `rskim-search → rskim` boundary and is mapped into
-    /// the DegradedReason SSOT the same way `is_shallow` is (AD-414-14).
+    /// condition crosses the `rskim-search → rskim` boundary, where
+    /// `rebuild_temporal` persists it under `META_HISTORY_TRUNCATED`.  The
+    /// user-visible signal in this release is the `eprintln!` below; query-time
+    /// surfacing through the DegradedReason SSOT (the `is_shallow` pattern,
+    /// AD-414-14) is follow-up work, not part of #407.
     pub(super) truncated: bool,
     /// Latch: set to `true` the first time the visit cap fires so the
     /// eprintln! notice is edge-triggered — it fires exactly once on the
@@ -367,9 +370,9 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
     }
 
     // AD-407-4: Stable sort by author-time descending so the ordering contract
-    // is a real guarantee, not a fixture accident (PF-007). Equal-timestamp
-    // commits the relative order reflects gix's committer-time priority queue
-    // and is not further specified.
+    // is a real guarantee, not a fixture accident (PF-007). For commits with
+    // equal author timestamps the relative order reflects gix's committer-time
+    // priority queue and is not further specified.
     commits.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
     let commit_count = commits.len();

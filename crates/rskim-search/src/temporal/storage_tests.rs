@@ -424,6 +424,77 @@ fn sync_cochanges_degrades_gracefully_over_capacity() {
     );
 }
 
+/// AD-407-9 (capacity ripple): `cochange_top_n` MUST order rows by
+/// `(jaccard desc, file_a asc, file_b asc)` so the set of rows that survives
+/// truncation is a function of the data alone.
+///
+/// Why the tie-break matters: Jaccard is a ratio of small integers, so equal
+/// scores at the truncation boundary are common.  Ordering on score alone leaves
+/// the surviving rows at the mercy of `sort_unstable_by`'s arbitrary handling of
+/// equal elements, so two builds of the same repository could write different
+/// co-change tables — a nondeterministic cache artifact that ADR-007's dog-food
+/// pass compares against ground truth (PF-012: determinism via a stable key).
+///
+/// Discriminating: drop the two `.then_with(...)` clauses from `cochange_top_n`
+/// and the equal-jaccard block below is no longer guaranteed to come back in
+/// `file_a` order, so the `expected` comparison fails.  Feeding the same rows in
+/// reverse input order and requiring an identical result is what makes this a
+/// determinism assertion rather than a restatement of the sort call.
+#[test]
+fn cochange_top_n_orders_deterministically_on_jaccard_ties() {
+    let row = |a: &str, b: &str, j: f64| CochangeRow {
+        file_a: a.to_string(),
+        file_b: b.to_string(),
+        count: 1,
+        jaccard: j,
+    };
+
+    // Three rows share jaccard 0.5; one is strictly higher and one strictly lower,
+    // so the tie-break is exercised in the middle of a real score ordering.
+    let rows = vec![
+        row("m.rs", "z.rs", 0.5),
+        row("a.rs", "b.rs", 0.9),
+        row("c.rs", "d.rs", 0.5),
+        row("c.rs", "e.rs", 0.5),
+        row("y.rs", "z.rs", 0.1),
+    ];
+
+    let expected = [
+        ("a.rs", "b.rs"), // highest jaccard
+        ("c.rs", "d.rs"), // tie at 0.5 → file_a asc, then file_b asc
+        ("c.rs", "e.rs"),
+        ("m.rs", "z.rs"),
+        ("y.rs", "z.rs"), // lowest jaccard
+    ];
+
+    let actual: Vec<(String, String)> = super::storage_ops::cochange_top_n(&rows)
+        .into_iter()
+        .map(|r| (r.file_a, r.file_b))
+        .collect();
+    let actual_refs: Vec<(&str, &str)> = actual
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    assert_eq!(
+        actual_refs,
+        expected.as_slice(),
+        "cochange_top_n must order by (jaccard desc, file_a asc, file_b asc)"
+    );
+
+    // Same multiset, different input order → byte-identical output order.
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    let reversed_out: Vec<(String, String)> = super::storage_ops::cochange_top_n(&reversed)
+        .into_iter()
+        .map(|r| (r.file_a, r.file_b))
+        .collect();
+    assert_eq!(
+        reversed_out, actual,
+        "cochange_top_n output must not depend on input order — the surviving \
+         rows after truncation must be a function of the data alone (PF-012)"
+    );
+}
+
 /// AD-407-9 (capacity ripple): `store_cochanges` MUST degrade gracefully when
 /// the row slice exceeds `MAX_ROWS_PER_TABLE`, retaining the highest-Jaccard
 /// pairs rather than returning `CapacityExceeded`.

@@ -118,12 +118,26 @@ pub(super) enum BuildLoudness {
 ///
 /// # Pair accumulator cap
 ///
-/// Once `pair_counts` reaches [`MAX_COCHANGE_PAIRS`] distinct keys the inner
-/// enumeration loop breaks and one unconditional `eprintln!` notice is emitted
-/// to stderr, mirroring the `WalkBudget` notices in `git_parser.rs`.  The rows
-/// accumulated up to that point are still scored and returned; no data is
-/// discarded from commits already processed.  This cap bounds peak heap
-/// allocation even when `--root` is the repository toplevel.
+/// The moment `pair_counts` reaches [`MAX_COCHANGE_PAIRS`] distinct keys the
+/// **whole commit loop** stops and one unconditional `eprintln!` notice is
+/// emitted to stderr, mirroring the `WalkBudget` notices in `git_parser.rs`.
+/// Breaking the outer loop (not just the pair enumeration for the current
+/// commit) is load-bearing on two counts:
+///
+/// 1. `pair_counts.len() <= MAX_COCHANGE_PAIRS` becomes a hard bound.  Breaking
+///    only the inner loops would let every remaining commit insert one more key
+///    before re-testing the cap, so the real ceiling would be
+///    `MAX_COCHANGE_PAIRS + remaining_commits` — not a bound at all.
+/// 2. The notice fires exactly once.  Breaking only the inner loops would
+///    re-enter the (still over-cap) guard on every subsequent qualifying commit
+///    and emit one stderr line per commit — unbounded output on precisely the
+///    repositories the cap exists to protect.
+///
+/// Because `history.commits` is newest-first (AD-407-4), stopping the loop keeps
+/// the newest commits and discards the oldest — the same truncation semantics as
+/// `MAX_COMMITS` in `git_parser.rs`.  Both `file_counts` (Jaccard denominators)
+/// and `pair_counts` (numerators) stop at the same commit, so the ratio stays
+/// consistent rather than deflating as denominators keep growing.
 ///
 /// # Side effects
 ///
@@ -135,7 +149,9 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
     // canonical pair count: (smaller_path, larger_path) → count
     let mut pair_counts: HashMap<(String, String), u32> = HashMap::new();
 
-    for commit in &history.commits {
+    // The 'commits label lets the pair cap stop the ENTIRE walk, not just the
+    // pair enumeration for the current commit — see "Pair accumulator cap".
+    'commits: for commit in &history.commits {
         let n = commit.changed_files.len();
         if !(2..=COUPLING_MAX_FILES).contains(&n) {
             // Commits with 0 or 1 file produce no pairs.
@@ -173,21 +189,22 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
 
         // Enumerate canonical (a < b) pairs.
         // Ordering is guaranteed by the sorted-and-deduped paths slice.
-        // The 'pairs label lets the cap guard break both loops at once.
-        'pairs: for i in 0..n_dedup {
+        for i in 0..n_dedup {
             for j in (i + 1)..n_dedup {
                 *pair_counts
                     .entry((paths[i].clone(), paths[j].clone()))
                     .or_insert(0) += 1;
                 // AD-407-9 safety cap: bound peak pair_counts allocation.
-                // Fires at most once (the break exits both loops immediately).
+                // `break 'commits` (not merely the inner loops) is what makes
+                // this a real bound and keeps the notice single — see the
+                // "Pair accumulator cap" section on the function.
                 if pair_counts.len() >= MAX_COCHANGE_PAIRS {
                     eprintln!(
                         "skim: build_cochange_rows reached the {MAX_COCHANGE_PAIRS}-pair \
                          safety cap; co-change pairs truncated. \
                          Use --root <subdirectory> to scope the index."
                     );
-                    break 'pairs;
+                    break 'commits;
                 }
             }
         }
@@ -970,17 +987,20 @@ pub(super) fn rebuild_temporal_with_source(
 
     // truncated from parse_history metadata: crosses the rskim-search → rskim
     // boundary via TemporalMetadata.  Persisted to the meta table after sync()
-    // succeeds so the condition is visible at query time (DegradedReason SSOT
-    // mapping parallel to is_shallow / AD-414-14).
+    // succeeds so the condition survives the build and can be inspected in an
+    // existing temporal.db.  The user-visible signal is `WalkBudget`'s
+    // unconditional stderr notice at build time; nothing reads this row yet
+    // (see META_HISTORY_TRUNCATED's rustdoc for why query-time surfacing is
+    // deliberately out of #407's scope).
     let history_truncated = risk_history.metadata.truncated;
 
     match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head, is_shallow) {
         Ok(()) => {
             on_sync_ok(&db);
-            // Persist the truncation flag so query-time code and --stats --json can
-            // expose it.  `set_meta` is a best-effort write (non-version-attestation
-            // key); a failure here does not corrupt the DB — the sync already
-            // committed — so the error is swallowed after a debug notice.
+            // Persist the truncation flag.  `set_meta` is a best-effort write
+            // (non-version-attestation key); a failure here does not corrupt the
+            // DB — the sync already committed — so the error is swallowed after a
+            // debug notice.
             let trunc_val = if history_truncated { "1" } else { "0" };
             if let Err(e) = db.set_meta(rskim_search::META_HISTORY_TRUNCATED, trunc_val)
                 && crate::debug::is_debug_enabled()

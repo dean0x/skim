@@ -309,9 +309,13 @@ pub struct TemporalMetadata {
     /// history; hot/risky rankings may under-represent files that are active only
     /// in the capped portion of history.
     ///
-    /// Consumers (e.g. `rebuild_temporal`) MUST persist this flag so the
-    /// condition can be surfaced via the DegradedReason SSOT at query time —
-    /// the same pattern as `is_shallow` (AD-414-14).
+    /// The caps that set this flag also emit an unconditional `eprintln!` at
+    /// build time, so the fail-loud contract is satisfied on the build path.
+    /// `rebuild_temporal` additionally persists the flag to the `temporal.db`
+    /// meta table under `META_HISTORY_TRUNCATED`; nothing reads that row yet.
+    /// Surfacing it at query time via the DegradedReason SSOT, the way
+    /// `is_shallow` is surfaced (AD-414-14), is follow-up work and is out of
+    /// scope for #407 (AC-18/AC-20 pin `--stats --json` as unchanged).
     ///
     /// `#[serde(default)]` ensures deserialization of older serialised payloads
     /// (before this field existed) succeeds, treating absent as `false`.

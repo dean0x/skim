@@ -136,9 +136,19 @@ pub const META_IS_SHALLOW: &str = "is_shallow";
 /// Value is `"1"` when truncated, `"0"` otherwise.  Written by
 /// `rebuild_temporal` via [`crate::temporal::storage_ops::TemporalDb::set_meta`]
 /// after a successful [`crate::temporal::storage_ops::TemporalDb::sync`], mapping
-/// [`crate::types::TemporalMetadata::truncated`] into the persistent meta table
-/// so the condition is visible at query time and in `--stats --json`.
+/// [`crate::types::TemporalMetadata::truncated`] into the persistent meta table.
 /// Absent row means not truncated (builds before this field existed).
+///
+/// **Current scope — write-only.**  Nothing reads this key yet: the caps that
+/// set it are already announced by an unconditional `eprintln!` at build time
+/// (`WalkBudget` in `git_parser.rs`), so the fail-loud contract is met on the
+/// build path.  This row exists so the condition survives the build and can be
+/// inspected in an existing `temporal.db`.  Surfacing it at query time — a
+/// `DegradedReason` variant plus a `--stats --json` key, the way `is_shallow`
+/// is surfaced (AD-414-14) — is deliberately NOT part of #407: it would add a
+/// key to `--stats --json`, which AC-18/AC-20 pin as unchanged by this ticket.
+/// Tracked as follow-up work; do not document a query-time guarantee here until
+/// a reader exists.
 pub const META_HISTORY_TRUNCATED: &str = "history_truncated";
 
 // ============================================================================

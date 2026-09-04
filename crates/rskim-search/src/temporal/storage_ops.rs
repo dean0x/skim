@@ -155,12 +155,28 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
 /// Sort `rows` by Jaccard score descending and truncate to at most
 /// [`MAX_ROWS_PER_TABLE`] entries.  Caller is responsible for deciding
 /// whether truncation is needed and for emitting the corresponding notice.
-fn cochange_top_n(rows: &[CochangeRow]) -> Vec<CochangeRow> {
+///
+/// The sort key is `(jaccard desc, file_a asc, file_b asc)`.  The pair key
+/// tie-break is load-bearing, not cosmetic: Jaccard is a ratio of small
+/// integers, so ties at the truncation boundary are common, and ordering on
+/// score alone would let two builds of the same repository drop *different*
+/// rows.  `temporal.db` is a cache artifact that ADR-007's dog-food pass
+/// compares against ground truth, so which rows survive must be a function of
+/// the data only (PF-012: determinism via a stable key).  `(file_a, file_b)` is
+/// unique per row — the caller guarantees `file_a < file_b` and one row per
+/// canonical pair — so the key is total and `sort_unstable_by` is sufficient.
+///
+/// `pub(super)` so `storage_tests.rs` can drive the ordering directly with a
+/// handful of rows instead of only through a 500 001-row `sync` (the same
+/// rationale as `WalkBudget` in `git_parser.rs`).
+pub(super) fn cochange_top_n(rows: &[CochangeRow]) -> Vec<CochangeRow> {
     let mut v = rows.to_vec();
     v.sort_unstable_by(|a, b| {
         b.jaccard
             .partial_cmp(&a.jaccard)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_a.cmp(&b.file_a))
+            .then_with(|| a.file_b.cmp(&b.file_b))
     });
     v.truncate(MAX_ROWS_PER_TABLE);
     v
