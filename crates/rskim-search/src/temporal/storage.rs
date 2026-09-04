@@ -79,21 +79,38 @@ pub const META_GIT_HEAD: &str = "git_head";
 pub const META_GIT_TOPLEVEL: &str = "git_toplevel";
 
 /// Version number attesting that the temporal data was written by a binary
-/// whose `rebuild_temporal` applies the ghost filter.
+/// whose `rebuild_temporal` applies the **ghost filter** (v1, #408) AND walks
+/// the **full commit DAG** (not first-parent-only) (v2, #407).
 ///
 /// AD-408-3: This const is the single source of truth for the self-heal
 /// contract: the data-version attests "written by a binary whose
-/// `rebuild_temporal` applies the ghost filter." Written **unconditionally**
+/// `rebuild_temporal` applies the ghost filter (v1, #408) AND walks the full
+/// commit DAG (v2, #407)." Written **unconditionally**
 /// in [`TemporalDb::sync`] — the only version-attesting write path (same
 /// choke point as `META_GIT_HEAD`), so the empty-history DB also carries it
 /// and the no-rebuild-loop invariant is preserved. Bump this const to force a
 /// future global rebuild of all `temporal.db` files on the next query.
 ///
+/// AD-407-5: Bumped from 1 to 2 by ticket #407 (full-DAG walk). This is the
+/// AD-408-4 data-version self-heal mechanism — **NOT a PRAGMA user_version
+/// schema migration**. `CURRENT_VERSION` stays 2; `run_migrations` gains no
+/// v3 block. A `temporal.db` carrying `data_version = "1"` (produced by the
+/// pre-#407 first-parent-only walk) is stale and triggers one self-heal rebuild
+/// on the next query that writes `data_version = "2"`.
+///
+/// **One case where the self-heal is not one-shot:** when
+/// `temporal.db.build_backoff` contains the current HEAD+shallow pair,
+/// `rebuild_temporal_with_source` returns `Ok(())` immediately without calling
+/// `parse_history`. The DB remains at `data_version = "1"` until the sentinel
+/// clears (HEAD advances, shallow state changes, or explicit `--rebuild`).
+/// This is intentional: the sentinel prevents retrying a known-failing parse
+/// on every query while HEAD is stationary.
+///
 /// Note: a future caller using `store_*` / `set_meta(git_head)` directly
 /// would produce a DB with a HEAD but no `data_version` row — perpetually
 /// flagged stale. [`TemporalDb::sync`] is the only version-attesting write
 /// path; do not bypass it.
-pub const TEMPORAL_DATA_VERSION: u16 = 1;
+pub const TEMPORAL_DATA_VERSION: u16 = 2;
 
 /// Meta table key storing the [`TEMPORAL_DATA_VERSION`] value.
 ///
@@ -112,6 +129,27 @@ pub const META_DATA_VERSION: &str = "data_version";
 /// Absent row (DBs written before AD-414-14 was implemented) means the check
 /// is skipped — no spurious rebuilds on upgrade.
 pub const META_IS_SHALLOW: &str = "is_shallow";
+
+/// Meta key that records whether the last build's commit walk was truncated by
+/// a safety cap (`MAX_COMMITS` or `MAX_VISITED_COMMITS`).
+///
+/// Value is `"1"` when truncated, `"0"` otherwise.  Written by
+/// `rebuild_temporal` via [`crate::temporal::storage_ops::TemporalDb::set_meta`]
+/// after a successful [`crate::temporal::storage_ops::TemporalDb::sync`], mapping
+/// [`crate::types::TemporalMetadata::truncated`] into the persistent meta table.
+/// Absent row means not truncated (builds before this field existed).
+///
+/// **Current scope — write-only.**  Nothing reads this key yet: the caps that
+/// set it are already announced by an unconditional `eprintln!` at build time
+/// (`WalkBudget` in `git_parser.rs`), so the fail-loud contract is met on the
+/// build path.  This row exists so the condition survives the build and can be
+/// inspected in an existing `temporal.db`.  Surfacing it at query time — a
+/// `DegradedReason` variant plus a `--stats --json` key, the way `is_shallow`
+/// is surfaced (AD-414-14) — is deliberately NOT part of #407: it would add a
+/// key to `--stats --json`, which AC-18/AC-20 pin as unchanged by this ticket.
+/// Tracked as follow-up work; do not document a query-time guarantee here until
+/// a reader exists.
+pub const META_HISTORY_TRUNCATED: &str = "history_truncated";
 
 // ============================================================================
 // Error helper

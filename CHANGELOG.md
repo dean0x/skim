@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### BREAKING
 
+- **`skim search` temporal layer now walks the full commit DAG** (#407) — the
+  commit population for `--hot`, `--cold`, `--risky`, and `--blast-radius` changes
+  from first-parent-only traversal to a full DAG walk that skips merge commits, matching
+  `git log --no-merges` and skim heatmap's population.  The measured effect on this
+  repository: `crates/rskim/src/cmd/search/query.rs` moves from 21 first-parent commits
+  to 67 full-DAG commits, and fix density rises from 0.095 to 0.522.  Hot/risky scores
+  were previously undercounted by approximately 3× on branch-heavy workflows.
+
+  **Upgrade note (one slow query per root):** the first query after upgrading costs one
+  slow rebuild per project root while the `TEMPORAL_DATA_VERSION` self-heal (1 → 2)
+  replaces the stored data.  Subsequent queries are fast until HEAD advances; the first
+  query after each new commit re-walks history.  (If a previous history walk failed for
+  the current HEAD, the retry backoff defers the heal until HEAD advances or you run an
+  explicit `skim search --rebuild`.)
+
+  **Adopted-root caveat:** a `--root` whose `temporal.db` records a different
+  `git_toplevel` (e.g. the enclosing repository changed) is **refused** rather than
+  silently re-anchored — skim exits 0 with a typed notice.  The remedy is an explicit
+  `skim search --rebuild --root <path>` which re-anchors and writes the new toplevel
+  (PF-017 by design).
+
+  **`--blast-radius` consequence:** because Jaccard numerators and `file_counts`
+  denominators now reflect the full commit population, co-change peer **sets and ordering**
+  may differ from pre-#407 databases after the self-heal rebuild (AD-407-9).
+
+  **Build-time performance (AC-23):** `skim search --rebuild` on this repository with
+  a warm OS page cache: pre-#407 baseline (057ff42, first-parent-only) **7.95 s**;
+  post-#407 (full-DAG) **8.06 s** — ratio **1.01×**, well within the ≤ 3× guard.
+  The temporal history walk visits 2.5× more commits (264 first-parent → 662 full-DAG)
+  but its cost is small relative to file indexing; the per-commit gix committer-time
+  lookup adds no measurable overhead at this repository size.
+
+  **Warm query-path performance (AC-24):** a warm `skim search --risky` and a warm
+  `skim search <text>` on an already-current `temporal.db` both measured **< 10 ms**
+  on this repository (well within the < 50 ms target); the query path is unchanged
+  by #407 — only the build path (history walk) changes.  The single post-upgrade
+  self-heal query is explicitly exempt: it re-runs the full history walk and may take
+  several seconds; subsequent queries are fast.
+
 - **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
   single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
   and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior

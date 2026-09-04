@@ -48,6 +48,7 @@ fn make_history(commits: Vec<CommitInfo>) -> HistoryResult {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: count,
+            truncated: false,
         },
     }
 }
@@ -1319,6 +1320,7 @@ impl rskim_search::TemporalSource for CountingSource {
                 metadata: rskim_search::TemporalMetadata {
                     is_shallow: false,
                     commit_count: 0,
+                    truncated: false,
                 },
             })
         }
@@ -2803,6 +2805,7 @@ fn test_corrupt_db_discarded_and_rebuilt() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 2,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -2958,6 +2961,7 @@ fn test_t16_case_i_zero_commits_writes_head_not_shallow() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3042,6 +3046,7 @@ fn test_t16_case_ii_shallow_no_changed_files_writes_shallow_meta() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3123,6 +3128,7 @@ fn test_t16_case_iii_ghost_filter_drops_all_rows_writes_head() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 2,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3390,6 +3396,7 @@ fn test_check3_shallow_to_full_transition_detected_as_stale() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3552,6 +3559,7 @@ fn test_check3_linked_worktree_commondir_shallow_probe() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3692,6 +3700,7 @@ fn test_check3_self_heal_no_loop() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src1 = FixedSource {
@@ -3748,6 +3757,7 @@ fn test_check3_self_heal_no_loop() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src2 = FixedSource {
@@ -3822,6 +3832,7 @@ fn test_zero_row_notice_case_i_no_shallow_text() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     };
     let notice = super::zero_row_notice(&history, 0, false);
@@ -3861,6 +3872,7 @@ fn test_zero_row_notice_case_ii_has_shallow_text() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let notice = super::zero_row_notice(&history, 0, true);
@@ -3893,6 +3905,7 @@ fn test_zero_row_notice_case_iii_no_shallow_text() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 2,
+            truncated: false,
         },
     };
     // pre_ghost_hotspot = 1 → case (iii) fires regardless of is_shallow.
@@ -3927,6 +3940,7 @@ fn test_zero_row_notice_all_cases_single_line() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     };
     let notice_i = super::zero_row_notice(&history_i, 0, false);
@@ -3941,6 +3955,7 @@ fn test_zero_row_notice_all_cases_single_line() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let notice_ii = super::zero_row_notice(&history_ii, 0, true);
@@ -3960,6 +3975,7 @@ fn test_zero_row_notice_all_cases_single_line() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 1,
+            truncated: false,
         },
     };
     let notice_iii = super::zero_row_notice(&history_iii, 1, false);
@@ -4248,6 +4264,7 @@ impl rskim_search::TemporalSource for UnbornSource {
             metadata: rskim_search::TemporalMetadata {
                 is_shallow: self.is_shallow,
                 commit_count: 0,
+                truncated: false,
             },
         })
     }
@@ -4372,6 +4389,7 @@ fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
             metadata: rskim_search::TemporalMetadata {
                 is_shallow: false,
                 commit_count: 1,
+                truncated: false,
             },
         },
     };
@@ -4388,5 +4406,372 @@ fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
         !cache_dir.join("temporal.db").exists(),
         "AD-414-22 negative: readable history is not an empty history — \
          temporal.db must be left untouched"
+    );
+}
+
+// ============================================================================
+// T-407-15 — zero_row_notice shallow-wins-over-empty-commits (AD-407-7)
+// ============================================================================
+
+/// T-407-15 (AD-407-7, AC-15): `zero_row_notice` MUST contain the substring
+/// "shallow" when `commits` is empty and `is_shallow` is true.
+///
+/// After #407 skips merge commits, a shallow clone whose HEAD is a merge
+/// commit yields ZERO commits in `HistoryResult` while `is_shallow` stays
+/// `true`.  The old arm order evaluated `commits.is_empty()` first, which
+/// emitted the untruthful "no commits" wording instead of the correct "shallow"
+/// attribution.  The reorder (AD-407-7) moves the shallow arm before the
+/// empty-commits arm so the user receives an actionable message.
+///
+/// Discriminating: before AD-407-7, calling `zero_row_notice` with an empty
+/// `commits` and `is_shallow = true` fell into case (i) and produced a notice
+/// WITHOUT "shallow".  After AD-407-7 it falls into case (ii) and the notice
+/// MUST contain "shallow".
+#[test]
+fn test_zero_row_notice_shallow_wins_over_zero_commits() {
+    // Empty commit list with is_shallow = true — the shape #407 creates for
+    // a shallow clone whose HEAD is a merge (all commits are merge commits,
+    // all are skipped, result is empty).
+    let history = HistoryResult {
+        commits: vec![],
+        metadata: rskim_search::TemporalMetadata {
+            is_shallow: true,
+            commit_count: 0,
+            truncated: false,
+        },
+    };
+
+    // pre_ghost_hotspot = 0 because there were no commits to produce rows.
+    let notice = super::zero_row_notice(&history, 0, true);
+
+    assert!(
+        notice.to_ascii_lowercase().contains("shallow"),
+        "T-407-15 (AD-407-7, AC-15): zero_row_notice with empty commits + is_shallow=true \
+         must contain 'shallow'; the shallow arm must be evaluated before the \
+         empty-commits arm (arm-ordering regression); got: {notice:?}"
+    );
+    assert!(
+        !notice.is_empty(),
+        "T-407-15: zero_row_notice must return a non-empty string"
+    );
+}
+
+// ============================================================================
+// T-407-16 — classifier-parity: RiskRow fix_commits matches is_fix_commit
+// ============================================================================
+
+/// T-407-16 (AC-4): `RiskRow.fix_commits` and `RiskRow.total_commits` for a file
+/// MUST equal the count of commits where [`rskim_search::is_fix_commit`]
+/// returns `true` / `false` applied over the SAME `HistoryResult`.
+///
+/// This is the classifier-parity proof that #407 exists to establish.  Before
+/// #407, `parse_history` returned only first-parent commits and their messages
+/// were merge subjects (`merge(#NNN): …`) which never matched `FIX_REGEX`.
+/// After #407, branch commits with real fix subjects (`fix: …`, `bug: …`) flow
+/// into `sync_history_to_db` / `aggregate_file_stats`, and `fix_commits` in
+/// the DB must reflect the exact same classification that `is_fix_commit` gives
+/// when called directly on those subjects.
+///
+/// Discriminating: delete the `is_fix_commit` call in `scoring.rs` and replace
+/// it with `false` — `fix_commits` becomes 0 and this assertion fails.
+/// Delete the call and replace it with `true` — `fix_commits` equals
+/// `total_commits` and the second assertion fails.
+#[test]
+fn test_risk_rows_match_is_fix_commit_over_same_history() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Create a real git repo so discover_git_workdir resolves and the ghost
+    // filter passes.  The single seed commit writes "branch.rs" to disk;
+    // subsequent commit metadata is injected via FixedSource.
+    let head = create_real_git_repo(
+        dir.path(),
+        &[("feat: seed branch.rs", &[("branch.rs", "pub fn x() {}")])],
+    );
+
+    // Hand-build a HistoryResult whose subjects are a mix of fix and non-fix
+    // messages.  All commits touch "branch.rs" (the file that exists on disk).
+    let now_epoch: u64 = 1_781_337_600; // 2026-06-13 08:00:00 UTC (pinned)
+    let commits = vec![
+        make_commit(
+            "t16a0001",
+            now_epoch as i64 - 86400,
+            "fix: bug one",
+            &["branch.rs"],
+        ),
+        make_commit(
+            "t16a0002",
+            now_epoch as i64 - 86400 * 2,
+            "fix: bug two",
+            &["branch.rs"],
+        ),
+        make_commit(
+            "t16a0003",
+            now_epoch as i64 - 86400 * 3,
+            "feat: new feature",
+            &["branch.rs"],
+        ),
+    ];
+
+    // Compute the expected counts from is_fix_commit applied to the SAME
+    // subjects — this is the ground truth that the DB must match.
+    let expected_total: u32 = commits.len() as u32;
+    let expected_fix: u32 = commits
+        .iter()
+        .filter(|c| rskim_search::is_fix_commit(&c.message))
+        .count() as u32;
+    assert_eq!(
+        expected_fix, 2,
+        "T-407-16 fixture sanity: 'fix: bug one' and 'fix: bug two' must match FIX_REGEX"
+    );
+    assert_eq!(
+        expected_total - expected_fix,
+        1,
+        "T-407-16 fixture sanity: 'feat: new feature' must NOT match FIX_REGEX"
+    );
+
+    let src = FixedSource {
+        history: rskim_search::HistoryResult {
+            commits,
+            metadata: rskim_search::TemporalMetadata {
+                is_shallow: false,
+                commit_count: expected_total as usize,
+                truncated: false,
+            },
+        },
+    };
+
+    rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        &head,
+        now_epoch,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Loud,
+    )
+    .expect("T-407-16: rebuild_temporal_with_source must succeed");
+
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path)
+        .expect("T-407-16: temporal.db must be openable after rebuild");
+
+    let row = db
+        .risk_for_file("branch.rs")
+        .expect("T-407-16: risk_for_file must not return Err")
+        .expect("T-407-16: branch.rs must have a risk row after rebuild");
+
+    assert_eq!(
+        row.total_commits, expected_total,
+        "T-407-16 (AC-4): RiskRow.total_commits must equal the total commit count \
+         from the injected HistoryResult; got {} expected {}",
+        row.total_commits, expected_total
+    );
+    assert_eq!(
+        row.fix_commits, expected_fix,
+        "T-407-16 (AC-4): RiskRow.fix_commits must equal the count of commits \
+         where is_fix_commit returns true over the SAME history; got {} expected {}",
+        row.fix_commits, expected_fix
+    );
+
+    // fix_density is the raw ratio; assert it matches is_fix_commit parity.
+    let expected_density = f64::from(expected_fix) / f64::from(expected_total);
+    assert!(
+        (row.fix_density - expected_density).abs() < 1e-9,
+        "T-407-16: RiskRow.fix_density must be the raw fix ratio {expected_density}; \
+         got {}",
+        row.fix_density
+    );
+}
+
+// ============================================================================
+// AC-13 — data-version self-heal skipped when build-backoff sentinel matches
+// ============================================================================
+
+/// AC-13 (#407): when `temporal.db.build_backoff` contains the current HEAD,
+/// the self-heal path MUST return `Ok(())` without invoking `parse_history`
+/// (call count 0 on an injected counting `TemporalSource`).
+///
+/// AD-407-5 documents the mechanism: a stale `data_version` normally triggers
+/// exactly one rebuild (`rebuild_temporal_with_source`) that writes
+/// `data_version = "2"` — this is the "one-shot" contract.  The build-backoff
+/// sentinel is the ONE exception: when the sentinel records the current
+/// HEAD+shallow pair (written by a prior `parse_history` failure), the rebuild
+/// is skipped to avoid retrying a known-failing parse on every query while HEAD
+/// is stationary.  The DB stays at the old `data_version` until the sentinel
+/// clears (HEAD advances, shallow state changes, or explicit `--rebuild`).
+///
+/// Discriminating: a call count of 1 would mean the sentinel gate does NOT
+/// fire, `parse_history` is called, and the AC-13 one-exception contract is
+/// violated.
+#[test]
+fn test_ac13_data_version_stale_backoff_gates_self_heal() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let fake_head = "ac130001ac130001ac130001ac130001ac130001";
+    let now = super::current_epoch_secs();
+
+    // Set up a pre-#407 temporal.db: current schema (v2), HEAD recorded,
+    // data_version = "1" (stale by the post-#407 check).
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], fake_head, false).unwrap();
+    drop(db);
+    // Plant data_version = "1" via raw SQL — set_meta guards it (AD-408-3).
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![rskim_search::META_DATA_VERSION, "1"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Write the build-backoff sentinel for the same HEAD (two-field format: "head\nshallow").
+    // Shallow = "0" (not shallow), so backoff_sentinel_matches fires when probed_shallow
+    // is None (unknown) or Some(false).  Because there is no .git in `dir`,
+    // probe_is_shallow_from_root returns None → backoff_sentinel_matches returns true.
+    let sentinel_path = cache_dir.join("temporal.db.build_backoff");
+    std::fs::write(&sentinel_path, format!("{fake_head}\n0")).unwrap();
+
+    // Attempt the silent data-version self-heal with a counting source.
+    let src = CountingSource::new_empty();
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Silent, // quiet path — sentinel must gate the rebuild
+    );
+    assert!(
+        result.is_ok(),
+        "AC-13: rebuild_temporal_with_source must return Ok(()) when sentinel is present; \
+         got: {result:?}"
+    );
+
+    // Sentinel gated the rebuild: parse_history must NOT have been called.
+    assert_eq!(
+        src.count(),
+        0,
+        "AC-13 (AD-407-5): build-backoff sentinel must block parse_history; \
+         call count must be 0 when sentinel matches HEAD+shallow"
+    );
+
+    // data_version must still be "1" — no rebuild happened (AD-407-5 one-exception).
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_version = db
+        .get_meta(rskim_search::META_DATA_VERSION)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        stored_version, "1",
+        "AC-13: data_version must remain \"1\" when sentinel gates the self-heal — \
+         the DB stays stale until sentinel clears (HEAD advance / unshallow / --rebuild)"
+    );
+}
+
+// ============================================================================
+// AC-13 (positive control) — self-heal fires exactly once when no sentinel
+// ============================================================================
+
+/// AC-13 positive control (#407): when NO build-backoff sentinel is present and
+/// `data_version` is stale (`"1"`), `rebuild_temporal_with_source` MUST invoke
+/// `parse_history` exactly once and advance `data_version` to `"2"`.
+///
+/// This is the complement of `test_ac13_data_version_stale_backoff_gates_self_heal`:
+///
+/// | sentinel | data_version stale | expected count | data_version after |
+/// |----------|--------------------|----------------|--------------------|
+/// | present  | yes                | 0 (AC-13)      | "1" (unchanged)    |
+/// | absent   | yes                | 1 (this test)  | "2" (healed)       |
+///
+/// Without this test, both test variants stay green in a world where the
+/// #407 self-heal never fires at all — the perpetual-rebuild-loop failure mode
+/// AD-408-3 exists to prevent. A call count of 0 here would mean the heal
+/// silently skips, leaving hotspot/risk scores permanently undercounted.
+///
+/// After the self-heal, `temporal_db_is_stale` MUST return `false`: the
+/// rebuilt DB carries `data_version = "2"` and HEAD matches, so no further
+/// rebuild is triggered (one-shot contract, AD-407-5).
+///
+/// AD-407-1 (full-DAG walk), AD-407-5 (one-shot except sentinel), AD-408-3
+/// (data-version gate guards set_meta), AD-408-4 (Check 2: stored < current).
+#[test]
+fn test_ac13_positive_stale_no_sentinel_heals_in_one_shot() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let fake_head = "ac130002ac130002ac130002ac130002ac130002";
+    let now = super::current_epoch_secs();
+
+    // Set up a pre-#407 temporal.db: current schema (v2), HEAD recorded,
+    // data_version = "1" (stale by the post-#407 check).
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], fake_head, false).unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![rskim_search::META_DATA_VERSION, "1"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Verify precondition: NO sentinel — self-heal must proceed.
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "AC-13 positive precondition: no build-backoff sentinel must be present"
+    );
+
+    // Attempt the data-version self-heal with a counting source.
+    let src = CountingSource::new_empty();
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Silent,
+    );
+    assert!(
+        result.is_ok(),
+        "AC-13 positive: rebuild_temporal_with_source must return Ok(()) \
+         when no sentinel blocks the self-heal; got: {result:?}"
+    );
+
+    // Sentinel absent: parse_history must have been called exactly once.
+    assert_eq!(
+        src.count(),
+        1,
+        "AC-13 positive (AD-407-5): parse_history must be called exactly once \
+         when no backoff sentinel is present — the one-shot self-heal fires"
+    );
+
+    // data_version must now be \"2\" — the self-heal advanced it.
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_version = db
+        .get_meta(rskim_search::META_DATA_VERSION)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        stored_version, "2",
+        "AC-13 positive: data_version must be \"2\" after self-heal \
+         (AD-408-4 Check 2: stored \"1\" < TEMPORAL_DATA_VERSION \"2\")"
+    );
+    drop(db);
+
+    // After the self-heal, temporal_db_is_stale must be false (one-shot contract).
+    use super::super::staleness::temporal_db_is_stale;
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, None),
+        "AC-13 positive: temporal_db_is_stale must return false after \
+         the data-version self-heal completes (AD-407-5 one-shot contract)"
     );
 }

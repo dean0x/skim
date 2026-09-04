@@ -243,7 +243,13 @@ impl FileChangeInfo {
 pub struct CommitInfo {
     /// Full 40-character hex SHA of the commit.
     pub hash: String,
-    /// Unix timestamp (seconds since epoch, UTC).
+    /// Unix timestamp of the commit's **author** date (seconds since epoch, UTC).
+    ///
+    /// This is the author clock, NOT the committer clock.  Note that the
+    /// `lookback_days` cutoff in [`TemporalSource::parse_history`] filters on the
+    /// **committer** date (via `gix Sorting::ByCommitTimeCutoff`) — see AD-407-3
+    /// and AD-407-4.  Callers that implement the 30-day window (e.g. `changes_30d`)
+    /// compare this field against `now - 30 * 86400`.
     pub timestamp: i64,
     /// Author name (from git `author.name`).
     pub author: String,
@@ -298,12 +304,31 @@ pub struct TemporalMetadata {
     pub is_shallow: bool,
     /// Number of commits included in this result (equals `commits.len()`).
     pub commit_count: usize,
+    /// True when the commit walk was cut short by a safety cap (`MAX_COMMITS` or
+    /// `MAX_VISITED_COMMITS`).  Temporal scores are computed over a truncated
+    /// history; hot/risky rankings may under-represent files that are active only
+    /// in the capped portion of history.
+    ///
+    /// The caps that set this flag also emit an unconditional `eprintln!` at
+    /// build time, so the fail-loud contract is satisfied on the build path.
+    /// `rebuild_temporal` additionally persists the flag to the `temporal.db`
+    /// meta table under `META_HISTORY_TRUNCATED`; nothing reads that row yet.
+    /// Surfacing it at query time via the DegradedReason SSOT, the way
+    /// `is_shallow` is surfaced (AD-414-14), is follow-up work and is out of
+    /// scope for #407 (AC-18/AC-20 pin `--stats --json` as unchanged).
+    ///
+    /// `#[serde(default)]` ensures deserialization of older serialised payloads
+    /// (before this field existed) succeeds, treating absent as `false`.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Output of [`TemporalSource::parse_history`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryResult {
-    /// Commits ordered from newest to oldest.
+    /// Non-merge commits ordered from newest to oldest by **author** timestamp
+    /// (`CommitInfo::timestamp`).  Merge commits are excluded — see AD-407-1
+    /// and AD-407-2.
     pub commits: Vec<CommitInfo>,
     /// Summary metadata about the history traversal.
     pub metadata: TemporalMetadata,
@@ -316,9 +341,16 @@ pub struct HistoryResult {
 pub trait TemporalSource: Send + Sync {
     /// Parse git history for the repository at `repo_path`.
     ///
-    /// Returns commits ordered from newest to oldest, filtered to those whose
-    /// author timestamp falls within the last `lookback_days` days.
-    /// When `lookback_days` is `0`, all history is returned (no time filter).
+    /// Returns **non-merge commits** only (full-DAG walk, parity with
+    /// `git log --no-merges` — see AD-407-1, AD-407-2), ordered from newest to
+    /// oldest by **author** timestamp (`CommitInfo::timestamp`).
+    ///
+    /// When `lookback_days` is non-zero, commits whose **committer** date
+    /// (not author date) is older than `now - lookback_days * 86400` are
+    /// excluded.  This matches `git log --since` semantics as implemented by
+    /// `gix Sorting::ByCommitTimeCutoff` — see AD-407-3.  `CommitInfo::timestamp`
+    /// always carries the author date regardless of which clock drives the cutoff
+    /// (AD-407-4).  When `lookback_days` is `0`, all history is returned.
     ///
     /// # Errors
     /// Returns [`SearchError::Git`] on any git-level failure (not a repo,

@@ -152,6 +152,36 @@ fn insert_cochanges_in_tx(tx: &rusqlite::Transaction<'_>, rows: &[CochangeRow]) 
     Ok(())
 }
 
+/// Sort `rows` by Jaccard score descending and truncate to at most
+/// [`MAX_ROWS_PER_TABLE`] entries.  Caller is responsible for deciding
+/// whether truncation is needed and for emitting the corresponding notice.
+///
+/// The sort key is `(jaccard desc, file_a asc, file_b asc)`.  The pair key
+/// tie-break is load-bearing, not cosmetic: Jaccard is a ratio of small
+/// integers, so ties at the truncation boundary are common, and ordering on
+/// score alone would let two builds of the same repository drop *different*
+/// rows.  `temporal.db` is a cache artifact that ADR-007's dog-food pass
+/// compares against ground truth, so which rows survive must be a function of
+/// the data only (PF-012: determinism via a stable key).  `(file_a, file_b)` is
+/// unique per row — the caller guarantees `file_a < file_b` and one row per
+/// canonical pair — so the key is total and `sort_unstable_by` is sufficient.
+///
+/// `pub(super)` so `storage_tests.rs` can drive the ordering directly with a
+/// handful of rows instead of only through a 500 001-row `sync` (the same
+/// rationale as `WalkBudget` in `git_parser.rs`).
+pub(super) fn cochange_top_n(rows: &[CochangeRow]) -> Vec<CochangeRow> {
+    let mut v = rows.to_vec();
+    v.sort_unstable_by(|a, b| {
+        b.jaccard
+            .partial_cmp(&a.jaccard)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file_a.cmp(&b.file_a))
+            .then_with(|| a.file_b.cmp(&b.file_b))
+    });
+    v.truncate(MAX_ROWS_PER_TABLE);
+    v
+}
+
 impl TemporalDb {
     // ========================================================================
     // Per-file lookup methods
@@ -429,17 +459,34 @@ impl TemporalDb {
     ///
     /// Runs DELETE + batch INSERT in a single transaction.
     ///
+    /// When `rows.len() > MAX_ROWS_PER_TABLE`, the call degrades gracefully:
+    /// rows are sorted by Jaccard score descending and truncated to
+    /// `MAX_ROWS_PER_TABLE` (highest-signal pairs kept; lowest-signal dropped),
+    /// and a notice is printed to stderr. This avoids the caller losing the
+    /// entire write due to an oversized co-change set. Follow-up #522 tracks
+    /// re-derivation of the Jaccard threshold for the post-#407 commit
+    /// population.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure.
-    /// Returns [`SearchError::CapacityExceeded`] if `rows.len() > 500_000`.
     pub fn store_cochanges(&self, rows: &[CochangeRow]) -> Result<()> {
-        if rows.len() > MAX_ROWS_PER_TABLE {
-            return Err(SearchError::CapacityExceeded(format!(
-                "store_cochanges: {} rows exceeds limit of {MAX_ROWS_PER_TABLE}",
+        // AD-407-9 (capacity ripple): the full-DAG walk can inflate the
+        // co-change pair set ~2.5-3x.  Degrade gracefully — sort by Jaccard
+        // descending and keep the top MAX_ROWS_PER_TABLE pairs — rather than
+        // returning CapacityExceeded and losing the caller's write entirely.
+        let rows_buf: Option<Vec<CochangeRow>> = if rows.len() > MAX_ROWS_PER_TABLE {
+            eprintln!(
+                "skim: store_cochanges: {} rows exceeds {MAX_ROWS_PER_TABLE}-row \
+                 capacity; retaining top {MAX_ROWS_PER_TABLE} by Jaccard score \
+                 (lowest-signal pairs dropped). See #522 for threshold re-derivation.",
                 rows.len()
-            )));
-        }
+            );
+            Some(cochange_top_n(rows))
+        } else {
+            None
+        };
+        let rows: &[CochangeRow] = rows_buf.as_deref().unwrap_or(rows);
         // SAFETY: See store_hotspots.
         let tx = self.conn.unchecked_transaction().map_err(db_err)?;
         insert_cochanges_in_tx(&tx, rows)?;
@@ -672,7 +719,10 @@ impl TemporalDb {
     ///
     /// Returns [`SearchError::Database`] on any SQLite failure. On error the
     /// transaction is rolled back and the database is left unchanged.
-    /// Returns [`SearchError::CapacityExceeded`] if any slice exceeds 500_000 rows.
+    /// Returns [`SearchError::CapacityExceeded`] if the `hotspots` or `risks`
+    /// slice exceeds 500_000 rows. Co-change rows exceeding this limit are
+    /// degraded (lowest-Jaccard pairs dropped, notice to stderr) rather than
+    /// causing an error — see [`Self::store_cochanges`] for the rationale.
     pub fn sync(
         &self,
         hotspots: &[HotspotRow],
@@ -727,17 +777,39 @@ impl TemporalDb {
         git_head: Option<&str>,
         is_shallow: bool,
     ) -> Result<()> {
-        for (name, len) in [
-            ("hotspots", hotspots.len()),
-            ("risks", risks.len()),
-            ("cochanges", cochanges.len()),
-        ] {
+        // Hotspot and risk tables: hard cap (error if exceeded).
+        // These are per-file tables bounded by the walked file count and
+        // should never approach MAX_ROWS_PER_TABLE in practice.
+        for (name, len) in [("hotspots", hotspots.len()), ("risks", risks.len())] {
             if len > MAX_ROWS_PER_TABLE {
                 return Err(SearchError::CapacityExceeded(format!(
                     "sync: {name} has {len} rows, exceeds limit of {MAX_ROWS_PER_TABLE}"
                 )));
             }
         }
+
+        // Co-change table: degrade gracefully rather than failing the whole sync.
+        //
+        // AD-407-9 (capacity ripple): the full-DAG walk (#407) can inflate the
+        // co-change pair set ~2.5-3x relative to the pre-#407 first-parent walk,
+        // pushing large repos past MAX_ROWS_PER_TABLE.  Hard-failing here would
+        // abort the entire transaction and lose the hotspot and risk writes too.
+        // Instead, sort by Jaccard descending and keep only the top
+        // MAX_ROWS_PER_TABLE pairs (highest-signal retained; lowest-signal
+        // dropped).  A notice is printed to stderr.  Follow-up #522 tracks
+        // re-derivation of MIN_COCHANGE_JACCARD for the new commit population.
+        let cochanges_buf: Option<Vec<CochangeRow>> = if cochanges.len() > MAX_ROWS_PER_TABLE {
+            eprintln!(
+                "skim: co-change table has {} pairs, exceeds {MAX_ROWS_PER_TABLE}-pair \
+                 capacity; retaining top {MAX_ROWS_PER_TABLE} by Jaccard score \
+                 (lowest-signal pairs dropped). See #522 for threshold re-derivation.",
+                cochanges.len()
+            );
+            Some(cochange_top_n(cochanges))
+        } else {
+            None
+        };
+        let cochanges: &[CochangeRow] = cochanges_buf.as_deref().unwrap_or(cochanges);
 
         // SAFETY: `TemporalDb` is `Send` but not `Sync` — it can be moved to
         // another thread but cannot be shared. Since `&self` methods cannot be

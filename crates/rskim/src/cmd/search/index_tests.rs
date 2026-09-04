@@ -4208,28 +4208,34 @@ fn test_ac_405_text_stats_ast_section_column_alignment() {
 }
 
 // ============================================================================
-// #413 / AC26 — no on-disk format version is bumped by this wave
+// #413 / #407 / AC26 — wave-level format-version pin
 // ============================================================================
 
-/// AC26 (NEGATIVE, one shared wave-level pin) — #413 changes HEAD *resolution* and
-/// adds one key/value `meta` row (`git_toplevel`); it must not bump any on-disk
-/// format version.
+/// AC26 (NEGATIVE, one shared wave-level pin) — #413 changes HEAD *resolution*,
+/// #414 adds integrity probes and a bounded self-heal, and #407 bumps
+/// `TEMPORAL_DATA_VERSION` 1→2 via the AD-408-4 data-version self-heal.
+/// None of these changes touch the lexical/AST/manifest on-disk format versions.
 ///
-/// Why this is load-bearing: every one of these constants is a rebuild trigger in
-/// `check_staleness` / `staleness.rs`.  Bumping one forces a **full cold rebuild for
-/// every skim user on their next query**, not just for the previously-unresolvable
-/// roots #413 intends to repair (R4).  `meta` is a key/value table, so the new
-/// `META_GIT_TOPLEVEL` row needs no schema bump — this test is what keeps that
-/// claim honest.
+/// AD-407-6: `TEMPORAL_DATA_VERSION` moves from 1 to 2 in ticket #407 to
+/// trigger a global one-query self-heal for all pre-#407 `temporal.db` files
+/// that were built with the first-parent-only walk.  This is NOT a PRAGMA
+/// `user_version` schema migration — `CURRENT_VERSION` stays 2, no v3 block
+/// is added to `run_migrations`.  Only the data-version meta row changes.
 ///
-/// Discriminating: change any literal below (or bump the corresponding production
-/// constant) and this fails.
+/// Why this is load-bearing: every one of these constants is a rebuild trigger
+/// in `check_staleness` / `staleness.rs`.  Bumping `TEMPORAL_DATA_VERSION`
+/// forces exactly one quiet self-heal of `temporal.db` per root (one slow
+/// query), while bumping a FORMAT_VERSION forces a full cold rebuild of the
+/// lexical or AST index for every user on their next query (many seconds of
+/// I/O) — a far more disruptive event.  This test keeps both distinctions
+/// honest: the lexical/AST/manifest constants stay at their #413 values, and
+/// `TEMPORAL_DATA_VERSION` has moved from 1 to 2 exactly as #407 intends.
 ///
 /// Scope note: `rskim_search::temporal::storage::CURRENT_VERSION` (the SQLite
 /// `PRAGMA user_version` migration counter, currently 2) is **private** to
 /// `rskim-search`, so it cannot be asserted from this crate; it belongs to a
-/// companion pin inside `rskim-search`, and the pair is one logical test.
-/// #414 EXTENDS this test rather than adding a second one.
+/// companion pin inside `rskim-search` (`test_schema_version_unchanged_at_two`
+/// in `storage_tests.rs`), and the pair is one logical test.
 #[test]
 fn test_ac26_no_on_disk_format_version_is_bumped() {
     use super::super::manifest::FileManifest;
@@ -4255,10 +4261,16 @@ fn test_ac26_no_on_disk_format_version_is_bumped() {
         2,
         "AC26: AstNgramCache CACHE_FORMAT_VERSION must stay 2"
     );
+    // AD-407-6: TEMPORAL_DATA_VERSION moved from 1 (pre-#407, first-parent-only
+    // walk) to 2 (post-#407, full-DAG walk with merge-commit skip).  This is the
+    // AD-408-4 data-version self-heal mechanism — a global one-query rebuild for
+    // pre-#407 `temporal.db` files.  It is NOT a PRAGMA user_version migration
+    // (CURRENT_VERSION stays 2; run_migrations gains no v3 block).
     assert_eq!(
         rskim_search::TEMPORAL_DATA_VERSION,
-        1,
-        "AC26: TEMPORAL_DATA_VERSION must stay 1 — the additive `git_toplevel` meta row \
-         is a key/value insert and needs no data-version bump"
+        2,
+        "AC26: TEMPORAL_DATA_VERSION must be 2 — #407 bumped it from 1 to 2 via the \
+         AD-408-4 data-version self-heal to trigger a global rebuild of pre-#407 \
+         temporal.db files (AD-407-6)"
     );
 }

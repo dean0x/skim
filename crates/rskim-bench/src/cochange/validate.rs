@@ -677,6 +677,7 @@ fn build_and_evaluate(
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count,
+            truncated: false,
         },
     };
 
@@ -1138,6 +1139,7 @@ mod tests {
             metadata: TemporalMetadata {
                 is_shallow: false,
                 commit_count: 0,
+                truncated: false,
             },
         };
         let empty_path_map = HashMap::new();
@@ -1206,6 +1208,7 @@ mod tests {
             metadata: TemporalMetadata {
                 is_shallow: false,
                 commit_count: 1,
+                truncated: false,
             },
         };
         builder.build(&history, &path_map).expect("build matrix");
@@ -1272,6 +1275,7 @@ mod tests {
             metadata: TemporalMetadata {
                 is_shallow: false,
                 commit_count: 4,
+                truncated: false,
             },
         };
         builder.build(&history, &path_map).expect("build matrix");

@@ -375,6 +375,156 @@ fn sync_rejects_over_capacity() {
     assert!(matches!(err, SearchError::CapacityExceeded(_)));
 }
 
+/// AD-407-9 (capacity ripple): `sync` MUST degrade co-changes gracefully when
+/// the co-change slice exceeds `MAX_ROWS_PER_TABLE`, rather than returning
+/// `CapacityExceeded` and rolling back the whole transaction (which would also
+/// lose hotspot and risk data).
+///
+/// The fix sorts the co-change rows by Jaccard score descending and keeps only
+/// the top `MAX_ROWS_PER_TABLE` pairs.  This test verifies three things:
+/// 1. `sync` returns `Ok(())` on an over-capacity co-change slice.
+/// 2. The co-change table contains exactly `MAX_ROWS_PER_TABLE` rows afterwards.
+/// 3. The row with the highest Jaccard score is present; the absolute lowest
+///    (jaccard ≈ 0.0) is absent (it was the one dropped).
+#[test]
+fn sync_cochanges_degrades_gracefully_over_capacity() {
+    let (_dir, db) = temp_db();
+    // 500,001 rows with strictly increasing Jaccard scores.
+    // Row 0 (jaccard = 0/500001 ≈ 0.0) is the one that must be dropped;
+    // row 500,000 (jaccard = 500000/500001 ≈ 1.0) is the one that must be kept.
+    // file_a = "a{n:07}", file_b = "z{n:07}" satisfies the file_a < file_b invariant.
+    let total = 500_001_usize;
+    let cochanges: Vec<CochangeRow> = (0..total)
+        .map(|n| CochangeRow {
+            file_a: format!("a{n:07}"),
+            file_b: format!("z{n:07}"),
+            count: 1,
+            jaccard: (n as f64) / (total as f64),
+        })
+        .collect();
+    // (1) sync must succeed even though cochanges exceeds 500,000 rows.
+    db.sync(&[], &[], &cochanges, "deadbeef", false)
+        .expect("sync must not fail on an oversized co-change set (degrade, not error)");
+    // (2) Exactly MAX_ROWS_PER_TABLE rows must be in the table.
+    let stored = db.load_cochanges().unwrap();
+    assert_eq!(
+        stored.len(),
+        500_000,
+        "co-change table must contain exactly MAX_ROWS_PER_TABLE rows after degradation"
+    );
+    // (3) The highest-Jaccard row (n=500,000) must be present; the lowest (n=0)
+    //     must be absent — it was the one sacrificed during degradation.
+    assert!(
+        stored.iter().any(|r| r.file_a == "a0500000"),
+        "highest-Jaccard row must be retained"
+    );
+    assert!(
+        stored.iter().all(|r| r.file_a != "a0000000"),
+        "lowest-Jaccard row (jaccard≈0.0) must have been dropped"
+    );
+}
+
+/// AD-407-9 (capacity ripple): `cochange_top_n` MUST order rows by
+/// `(jaccard desc, file_a asc, file_b asc)` so the set of rows that survives
+/// truncation is a function of the data alone.
+///
+/// Why the tie-break matters: Jaccard is a ratio of small integers, so equal
+/// scores at the truncation boundary are common.  Ordering on score alone leaves
+/// the surviving rows at the mercy of `sort_unstable_by`'s arbitrary handling of
+/// equal elements, so two builds of the same repository could write different
+/// co-change tables — a nondeterministic cache artifact that ADR-007's dog-food
+/// pass compares against ground truth (PF-012: determinism via a stable key).
+///
+/// Discriminating: drop the two `.then_with(...)` clauses from `cochange_top_n`
+/// and the equal-jaccard block below is no longer guaranteed to come back in
+/// `file_a` order, so the `expected` comparison fails.  Feeding the same rows in
+/// reverse input order and requiring an identical result is what makes this a
+/// determinism assertion rather than a restatement of the sort call.
+#[test]
+fn cochange_top_n_orders_deterministically_on_jaccard_ties() {
+    let row = |a: &str, b: &str, j: f64| CochangeRow {
+        file_a: a.to_string(),
+        file_b: b.to_string(),
+        count: 1,
+        jaccard: j,
+    };
+
+    // Three rows share jaccard 0.5; one is strictly higher and one strictly lower,
+    // so the tie-break is exercised in the middle of a real score ordering.
+    let rows = vec![
+        row("m.rs", "z.rs", 0.5),
+        row("a.rs", "b.rs", 0.9),
+        row("c.rs", "d.rs", 0.5),
+        row("c.rs", "e.rs", 0.5),
+        row("y.rs", "z.rs", 0.1),
+    ];
+
+    let expected = [
+        ("a.rs", "b.rs"), // highest jaccard
+        ("c.rs", "d.rs"), // tie at 0.5 → file_a asc, then file_b asc
+        ("c.rs", "e.rs"),
+        ("m.rs", "z.rs"),
+        ("y.rs", "z.rs"), // lowest jaccard
+    ];
+
+    let actual: Vec<(String, String)> = super::storage_ops::cochange_top_n(&rows)
+        .into_iter()
+        .map(|r| (r.file_a, r.file_b))
+        .collect();
+    let actual_refs: Vec<(&str, &str)> = actual
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    assert_eq!(
+        actual_refs,
+        expected.as_slice(),
+        "cochange_top_n must order by (jaccard desc, file_a asc, file_b asc)"
+    );
+
+    // Same multiset, different input order → byte-identical output order.
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    let reversed_out: Vec<(String, String)> = super::storage_ops::cochange_top_n(&reversed)
+        .into_iter()
+        .map(|r| (r.file_a, r.file_b))
+        .collect();
+    assert_eq!(
+        reversed_out, actual,
+        "cochange_top_n output must not depend on input order — the surviving \
+         rows after truncation must be a function of the data alone (PF-012)"
+    );
+}
+
+/// AD-407-9 (capacity ripple): `store_cochanges` MUST degrade gracefully when
+/// the row slice exceeds `MAX_ROWS_PER_TABLE`, retaining the highest-Jaccard
+/// pairs rather than returning `CapacityExceeded`.
+#[test]
+fn store_cochanges_degrades_gracefully_over_capacity() {
+    let (_dir, db) = temp_db();
+    let total = 500_001_usize;
+    let rows: Vec<CochangeRow> = (0..total)
+        .map(|n| CochangeRow {
+            file_a: format!("a{n:07}"),
+            file_b: format!("z{n:07}"),
+            count: 1,
+            jaccard: (n as f64) / (total as f64),
+        })
+        .collect();
+    // store_cochanges must return Ok, not CapacityExceeded.
+    db.store_cochanges(&rows)
+        .expect("store_cochanges must not fail on an oversized slice");
+    let stored = db.load_cochanges().unwrap();
+    assert_eq!(
+        stored.len(),
+        500_000,
+        "co-change table must be capped at MAX_ROWS_PER_TABLE"
+    );
+    assert!(
+        stored.iter().all(|r| r.file_a != "a0000000"),
+        "lowest-Jaccard row must have been dropped"
+    );
+}
+
 // ============================================================================
 // Group 7: Per-file lookup methods (Step 1)
 // ============================================================================
@@ -1086,4 +1236,71 @@ fn t2_future_schema_returns_unsupported_schema_version() {
         }
         other => panic!("T-2: expected SearchError::UnsupportedSchemaVersion, got {other:?}"),
     }
+}
+
+// ============================================================================
+// Group 14: #407 TEMPORAL_DATA_VERSION == 2 pins (AC-10, AC-11)
+// ============================================================================
+
+/// T-10 (#407 AC-10): pin `TEMPORAL_DATA_VERSION == 2`.
+///
+/// AD-407-5: version 2 attests that the temporal data was produced by a
+/// full-DAG walk (`.first_parent_only()` removed from `parse_history`).
+/// A DB carrying `data_version = "1"` (first-parent-only walk) is stale
+/// and triggers one self-heal rebuild on the next query via the AD-408-4
+/// mechanism.  Changing this to 1 here means the bump regressed.
+#[test]
+fn test_temporal_data_version_is_two() {
+    assert_eq!(
+        super::TEMPORAL_DATA_VERSION,
+        2,
+        "T-10 (AC-10): TEMPORAL_DATA_VERSION must be 2 after the #407 full-DAG bump \
+         (AD-407-5); a value of 1 means the bump regressed and pre-#407 DBs will \
+         not be self-healed"
+    );
+}
+
+/// T-11 (#407 AC-10): `sync` MUST write `data_version = "2"` unconditionally.
+///
+/// `write_version_meta_in_tx` encodes `TEMPORAL_DATA_VERSION.to_string()` as
+/// the `data_version` meta row alongside `git_head`.  After the #407 bump
+/// the encoded value must be `"2"` so that `temporal_db_is_stale`'s Check 2
+/// (AD-408-4, `stored < current`) reports stale for any DB written by a
+/// pre-#407 binary.
+#[test]
+fn test_sync_writes_data_version_two() {
+    let (_dir, db) = temp_db();
+    db.sync(
+        &[],
+        &[],
+        &[],
+        "deadbeef01deadbeef01deadbeef01deadbeef01",
+        false,
+    )
+    .unwrap();
+    let version = db.get_meta(super::META_DATA_VERSION).unwrap();
+    assert_eq!(
+        version,
+        Some("2".to_string()),
+        "T-11 (AC-10): sync must write data_version = \"2\" after the #407 bump \
+         (write_version_meta_in_tx encodes TEMPORAL_DATA_VERSION.to_string())"
+    );
+}
+
+/// T-12 (#407 AC-11 NEGATIVE): `schema_version()` MUST still return 2.
+///
+/// #407 uses the AD-408-4 data-version self-heal, NOT a PRAGMA user_version
+/// schema migration.  `CURRENT_VERSION` stays 2; `run_migrations` gains no
+/// v3 block.  A bump to 3 here would force every user's `temporal.db` to
+/// re-migrate on the next query, which is the wrong mechanism for a data-only
+/// population change.  Guards against accidentally adding a migration block.
+#[test]
+fn test_schema_version_unchanged_at_two() {
+    let (_dir, db) = temp_db();
+    assert_eq!(
+        db.schema_version().unwrap(),
+        2,
+        "T-12 (AC-11): schema_version must remain 2 — #407 uses the AD-408-4 \
+         data-version self-heal, not a PRAGMA user_version migration"
+    );
 }
