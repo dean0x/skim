@@ -19,8 +19,9 @@
 //!
 //! A temporal rebuild failure (non-git directory, gix parse error, capacity
 //! exceeded) must NOT fail the lexical/AST query path.  `rebuild_temporal`
-//! returns `Ok(())` with a debug-gated warning on recoverable errors; only
-//! unexpected internal errors propagate.
+//! returns `Ok(())` on recoverable errors; `CapacityExceeded` emits an
+//! unconditional stderr notice (not debug-gated), other recoverable errors
+//! use debug-gated diagnostics; only unexpected internal errors propagate.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -41,6 +42,22 @@ use super::degraded::{DegradedReason, Fallback, TemporalUnavailable, degraded_no
 // single source of truth lives in:
 //   - COUPLING_MAX_FILES  → rskim_search::cochange::builder (pub)
 //   - MIN_COCHANGE_JACCARD → rskim_search::temporal::storage (pub)
+
+/// Maximum number of distinct `(file_a, file_b)` pair keys that
+/// [`build_cochange_rows`] will accumulate before truncating.
+///
+/// Mirrors `rskim_search::cochange::builder::MAX_PAIRS` (2 000 000) so both
+/// build paths share the same effective heap ceiling.
+///
+/// # AD-407-9 note
+///
+/// The full-DAG walk added by #407 visits ~2.5–3× more commits than the old
+/// first-parent walk.  Per-commit pairs are already capped by
+/// [`COUPLING_MAX_FILES`] (≤ 1 225 pairs/commit), but a large monorepo can
+/// still accumulate millions of distinct pairs before the Jaccard filter runs.
+/// This constant bounds peak `pair_counts` allocation regardless of repository
+/// size or `--root` scope.
+const MAX_COCHANGE_PAIRS: usize = 2_000_000;
 
 // ============================================================================
 // BuildLoudness
@@ -99,9 +116,19 @@ pub(super) enum BuildLoudness {
 /// `TemporalDb::cochanges_for_file` relies on strict ordering to avoid
 /// double-returning the same pair.
 ///
-/// # Pure function
+/// # Pair accumulator cap
 ///
-/// No I/O, no global state. Fully testable from a hand-built `HistoryResult`.
+/// Once `pair_counts` reaches [`MAX_COCHANGE_PAIRS`] distinct keys the inner
+/// enumeration loop breaks and one unconditional `eprintln!` notice is emitted
+/// to stderr, mirroring the `WalkBudget` notices in `git_parser.rs`.  The rows
+/// accumulated up to that point are still scored and returned; no data is
+/// discarded from commits already processed.  This cap bounds peak heap
+/// allocation even when `--root` is the repository toplevel.
+///
+/// # Side effects
+///
+/// Emits at most one `eprintln!` to stderr when the pair cap fires.  Otherwise
+/// no I/O or global state.
 pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
     // per-file commit count (for Jaccard denominator)
     let mut file_counts: HashMap<String, u32> = HashMap::new();
@@ -146,11 +173,22 @@ pub(super) fn build_cochange_rows(history: &HistoryResult) -> Vec<CochangeRow> {
 
         // Enumerate canonical (a < b) pairs.
         // Ordering is guaranteed by the sorted-and-deduped paths slice.
-        for i in 0..n_dedup {
+        // The 'pairs label lets the cap guard break both loops at once.
+        'pairs: for i in 0..n_dedup {
             for j in (i + 1)..n_dedup {
                 *pair_counts
                     .entry((paths[i].clone(), paths[j].clone()))
                     .or_insert(0) += 1;
+                // AD-407-9 safety cap: bound peak pair_counts allocation.
+                // Fires at most once (the break exits both loops immediately).
+                if pair_counts.len() >= MAX_COCHANGE_PAIRS {
+                    eprintln!(
+                        "skim: build_cochange_rows reached the {MAX_COCHANGE_PAIRS}-pair \
+                         safety cap; co-change pairs truncated. \
+                         Use --root <subdirectory> to scope the index."
+                    );
+                    break 'pairs;
+                }
             }
         }
     }
@@ -362,8 +400,9 @@ pub(super) fn build_risk_rows(
 /// # Failure isolation (D5)
 ///
 /// Returns `Ok(())` on recoverable errors (non-git directory, gix parse error,
-/// `CapacityExceeded`) with a debug-gated warning.  Only unexpected internal
-/// errors propagate as `Err`.
+/// `CapacityExceeded`).  `CapacityExceeded` emits an unconditional stderr notice
+/// (not debug-gated) so operators see why temporal ranking vanished.  Only
+/// unexpected internal errors propagate as `Err`.
 ///
 /// # HEAD threading (O-A)
 ///
@@ -976,12 +1015,16 @@ pub(super) fn rebuild_temporal_with_source(
             // CapacityExceeded is a pre-transaction check so the DB is clean;
             // db.sync(&[], ...) starts a fresh transaction.  If it also fails,
             // write the sentinel as a last resort.
-            if crate::debug::is_debug_enabled() {
-                eprintln!(
-                    "skim search [debug]: CapacityExceeded — {msg}. Consider a smaller repository — \
-                     attempting empty-row fallback sync to prevent retry loop",
-                );
-            }
+            //
+            // Unconditional notice (not debug-gated): an operator running an
+            // explicit --rebuild on an affected repo must see why temporal ranking
+            // vanished.  The message names the cap so the user can act on it.
+            eprintln!(
+                "skim search: CapacityExceeded — {msg}. \
+                 Temporal ranking will be unavailable. \
+                 Use --root <subdirectory> to scope the index, \
+                 or wait for a smaller commit window.",
+            );
             if db.sync(&[], &[], &[], head, is_shallow).is_ok() {
                 on_sync_ok(&db);
             } else {
@@ -1298,42 +1341,30 @@ fn zero_row_notice(
     pre_ghost_hotspot: usize,
     is_shallow: bool,
 ) -> String {
-    if pre_ghost_hotspot == 0 && is_shallow {
+    // Evaluation order is load-bearing (AD-407-7): case (ii) must shadow case (i)
+    // so a shallow clone's commits-present-but-all-diffs-absent shape is reported
+    // as "shallow" rather than the untruthful "no commits" wording.
+    let (reason, detail): (DegradedReason, String) = if pre_ghost_hotspot == 0 && is_shallow {
         // Case (ii) — evaluated FIRST (AD-407-7).
-        // Covers both: commits empty + shallow clone, and commits present but
-        // all diffs failed under a shallow clone (changed_files == [] for every
-        // commit).  Shallow wording is permitted only when is_shallow is true.
-        let u = TemporalUnavailable {
-            reason: DegradedReason::Empty,
-            detail: "shallow".to_string(),
-        };
-        degraded_notice(&u, "", Fallback::NoResults)
-    } else if risk_history.commits.is_empty() {
-        // Case (i): no commits at all and not shallow — empty history.
-        // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
-        let u = TemporalUnavailable {
-            reason: DegradedReason::Empty,
-            detail: String::new(),
-        };
-        degraded_notice(&u, "", Fallback::NoResults)
-    } else if pre_ghost_hotspot > 0 {
+        // Covers: commits empty + shallow, AND commits present but all diffs
+        // absent under a shallow clone.  "shallow" wording iff is_shallow.
+        (DegradedReason::Empty, "shallow".to_string())
+    } else if pre_ghost_hotspot > 0 && !risk_history.commits.is_empty() {
         // Case (iii): rows were computed but the ghost filter dropped all of them.
         // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
         // Routes through degraded_notice (AD-414-1 SSOT) via GhostFilter variant.
-        let u = TemporalUnavailable {
-            reason: DegradedReason::GhostFilter,
-            detail: pre_ghost_hotspot.to_string(),
-        };
-        degraded_notice(&u, "", Fallback::NoResults)
+        (DegradedReason::GhostFilter, pre_ghost_hotspot.to_string())
     } else {
-        // Fallback: commits present but no diffs extractable and not shallow —
-        // treat as case (i) (no useful history).
-        let u = TemporalUnavailable {
-            reason: DegradedReason::Empty,
-            detail: String::new(),
-        };
-        degraded_notice(&u, "", Fallback::NoResults)
-    }
+        // Case (i) + fallback: no commits, or commits present but no diffs
+        // extractable, and not shallow — empty history.
+        // Must NOT contain "shallow" or "unshallow" (T-16 AC-16).
+        (DegradedReason::Empty, String::new())
+    };
+    degraded_notice(
+        &TemporalUnavailable { reason, detail },
+        "",
+        Fallback::NoResults,
+    )
 }
 
 /// Write the git repository toplevel anchor into an open [`TemporalDb`] after a
