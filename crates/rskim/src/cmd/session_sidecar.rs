@@ -199,26 +199,75 @@ fn marker_path(sessions_dir: &Path, pid: u32, tool: Option<&str>) -> std::path::
 
 /// Write (`present == true`) or remove (`present == false`) a marker file.
 ///
-/// All failures are silently ignored — see [`set_force_raw`].
+/// Write failures are logged to `hook.log`; all operations are non-fatal.
+/// See [`set_force_raw`] for the cost model.
 fn write_or_remove_marker(path: &Path, present: bool) {
+    write_or_remove_marker_with_log(
+        path,
+        present,
+        &crate::cmd::hook_log::CacheEnv::from_process(),
+    );
+}
+
+/// Inner implementation of [`write_or_remove_marker`] with injected log env.
+///
+/// Separated so tests can supply an isolated cache directory for `hook.log`
+/// without mutating process-global env vars.
+///
+/// On Unix the marker file is opened with `O_NOFOLLOW` so a symlink planted
+/// by an attacker inside the sessions directory cannot redirect the write to
+/// an arbitrary file. `remove_file` is intentionally *not* guarded: it
+/// unlinks the directory entry (the symlink itself), not the symlink target,
+/// so no follow occurs.
+fn write_or_remove_marker_with_log(
+    path: &Path,
+    present: bool,
+    log_env: &crate::cmd::hook_log::CacheEnv,
+) {
     if !present {
         let _ = std::fs::remove_file(path);
         return;
     }
 
     // Mode 0o600 in the same syscall as create, matching write_session_id: the
-    // file is never briefly world-readable.
+    // file is never briefly world-readable. O_NOFOLLOW rejects a symlink on
+    // the final path component — TOCTOU protection for the file itself
+    // (the directory-level check in `set_force_raw` is the outer layer).
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)
         {
-            let _ = f.write_all(b"1");
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(b"1") {
+                    crate::cmd::hook_log::log_hook_warning_with_env(
+                        &format!(
+                            "force-raw: marker write failed for {:?}: {e} \
+                             — a byte-exact pipe consumer (| tee, | sha256sum) \
+                             may receive compressed output (#514)",
+                            path
+                        ),
+                        log_env,
+                    );
+                }
+            }
+            Err(e) => {
+                crate::cmd::hook_log::log_hook_warning_with_env(
+                    &format!(
+                        "force-raw: marker open failed for {:?}: {e} \
+                         — a byte-exact pipe consumer (| tee, | sha256sum) \
+                         may receive compressed output (#514)",
+                        path
+                    ),
+                    log_env,
+                );
+            }
         }
     }
 
@@ -274,9 +323,13 @@ fn write_or_remove_marker(path: &Path, present: bool) {
 /// outlive the command that set it. [`FORCE_RAW_MAX_AGE`] bounds the leftovers
 /// of a hook that crashed before it could clear.
 ///
-/// All failures are silently ignored: a marker that fails to write costs
-/// compression fidelity, and one that fails to clear costs compression. Both
-/// are recoverable; neither may break the pipeline.
+/// All failures are silently ignored because a hook must never break the
+/// pipeline. However, a marker that fails to write costs **bytes** for any
+/// byte-exact pipe consumer — measured 304 bytes instead of 6803 into
+/// `| tee f` (#514) — not merely lost compression. A failed `create_dir_all`
+/// or marker open puts the system in the same missing-marker state as the
+/// accepted same-tool key collision documented below; failures are logged to
+/// `hook.log` so the cost is visible without breaking the pipeline.
 ///
 /// # Accepted residual: same-tool key collision
 ///
@@ -286,11 +339,16 @@ fn write_or_remove_marker(path: &Path, present: bool) {
 /// to *remove* the marker. So a concurrent `git status` (verdict `false`)
 /// deletes the live marker set by `git log -n 5 | tee out.txt` (verdict
 /// `true`): the `git` wrapper then sees only a FIFO via `fstat` and
-/// compresses into the tee.
+/// compresses into the tee. This costs bytes, not merely compression.
 ///
-/// This is the one accepted marker limitation that costs bytes rather than
-/// failing toward lossless compression — noted in `force_raw_requested` in
-/// `main.rs`.
+/// # Accepted residual: PID reuse
+///
+/// A PID recycled inside the [`FORCE_RAW_MAX_AGE`] window (300 s) makes the
+/// wrapper for the new process find a stale marker and serve raw instead of
+/// compressing. Unlike the same-tool key collision, this fails toward
+/// **lossless** compression (extra raw bytes are served, none are lost), so
+/// it needs no code change — noted here for completeness alongside the two
+/// limitations that do cost bytes.
 pub(crate) fn set_force_raw(force_raw: bool, tools: &[String], cache_dir: &Path) {
     let Some(ppid) = get_ppid() else { return };
 
@@ -309,7 +367,32 @@ pub(crate) fn set_force_raw(force_raw: bool, tools: &[String], cache_dir: &Path)
     let wildcard = force_raw && safe.is_empty();
 
     if force_raw {
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            crate::debug_log!(
+                "[skim] force-raw: failed to create sessions dir {:?}: {e} \
+                 — marker suppressed; byte-exact pipe consumers may receive compressed output",
+                dir
+            );
+            return;
+        }
+
+        // Safety: reject a sessions/ directory that is itself a symlink or
+        // world-writable. An unprivileged attacker who controls a shared
+        // SKIM_CACHE_DIR can plant a symlink before our first invocation and
+        // receive arbitrary file overwrites via the marker write path. The
+        // O_NOFOLLOW flag on the file open is a second, narrower layer for
+        // the same race at the file level; this check closes the directory-
+        // level window where the race is widest. Bail silently — neither
+        // failure may break the pipeline, and both cost compression, not bytes.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::symlink_metadata(&dir) {
+                if meta.file_type().is_symlink() || (meta.mode() & 0o022) != 0 {
+                    return;
+                }
+            }
+        }
     }
 
     write_or_remove_marker(&marker_path(&dir, ppid, None), wildcard);
@@ -363,14 +446,23 @@ pub(crate) fn read_force_raw(cache_dir: &Path, tool: &str) -> bool {
 }
 
 /// Return `true` when `path` exists and its mtime is within `max_age`.
+///
+/// On the fidelity-critical **read** path a future mtime — `Err(_)` from
+/// `duration_since` — means the marker was written by a clock ahead of ours
+/// (NTP step correction, VM suspend/resume, NFS/SMB clock skew). The safe
+/// direction is to treat the marker as **fresh**: the alternative is to
+/// compress into a byte-exact consumer and lose bytes (#514). The **reap**
+/// path (`cleanup_stale`) correctly keeps `unwrap_or(Duration::MAX)` because
+/// a file that cannot predate itself is not yet due for removal.
 fn is_fresh(path: &Path, max_age: Duration) -> bool {
     let Ok(mtime) = std::fs::metadata(path).and_then(|m| m.modified()) else {
         return false;
     };
-    SystemTime::now()
-        .duration_since(mtime)
-        .unwrap_or(Duration::MAX)
-        <= max_age
+    match SystemTime::now().duration_since(mtime) {
+        Ok(age) => age <= max_age,
+        // Err(_) means mtime > now: clock skew; err on the side of raw.
+        Err(_) => true,
+    }
 }
 
 // ============================================================================
@@ -1158,6 +1250,115 @@ mod tests {
         assert!(
             !stale_path.exists(),
             "stale file must be removed when sentinel is older than CLEANUP_RATE_LIMIT"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // security-2: O_NOFOLLOW — symlink-planting attack
+    // -----------------------------------------------------------------------
+
+    /// A symlink planted inside `sessions/` must not cause the marker write to
+    /// follow it and overwrite an arbitrary file.
+    ///
+    /// Regression for security-2: `write_or_remove_marker` opens with
+    /// `O_NOFOLLOW`, so an attacker who pre-plants `{ppid}.{tool}.raw` as a
+    /// symlink cannot redirect the write to a file outside `sessions/`.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_in_sessions_dir_is_not_followed() {
+        let cache_tmp = TempDir::new().unwrap();
+        let sessions = cache_tmp.path().join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // Create a victim file outside sessions/ with known content.
+        let victim = cache_tmp.path().join("victim_file.txt");
+        std::fs::write(&victim, b"original content").unwrap();
+
+        // Plant a symlink at the path that set_force_raw would use for "git".
+        // Use a dummy PID so the marker name is deterministic.
+        let symlink_name = "99990.git.raw";
+        let symlink_path = sessions.join(symlink_name);
+        std::os::unix::fs::symlink(&victim, &symlink_path).unwrap();
+
+        // write_or_remove_marker must not truncate+overwrite victim via the symlink.
+        // Use cache_tmp itself as the log_env so that any hook.log stays inside
+        // the temp dir rather than leaking to the developer's ~/.cache/skim.
+        let log_env = crate::cmd::hook_log::CacheEnv {
+            cache_dir_override: Some(cache_tmp.path().to_path_buf()),
+        };
+        write_or_remove_marker_with_log(&symlink_path, true, &log_env);
+
+        let content = std::fs::read_to_string(&victim).unwrap();
+        assert_eq!(
+            content, "original content",
+            "write_or_remove_marker must not follow symlinks (O_NOFOLLOW): victim_file was modified"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reliability-7: future mtime is treated as fresh on the read path
+    // -----------------------------------------------------------------------
+
+    /// A marker whose mtime is in the future (NTP step, VM clock skew) must be
+    /// treated as fresh on the read path. Discarding it would mean compressing
+    /// into a byte-exact consumer — measured byte loss of 304 vs 6803 (#514).
+    #[test]
+    fn test_is_fresh_treats_future_mtime_as_fresh() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(SESSIONS_DIR);
+        let path = write_raw_marker(&sessions, std::process::id(), None);
+
+        // Set mtime 60 seconds into the future — simulates NTP step / clock skew.
+        use filetime::{FileTime, set_file_mtime};
+        let future = SystemTime::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        set_file_mtime(&path, FileTime::from_system_time(future)).unwrap();
+
+        assert!(
+            is_fresh(&path, FORCE_RAW_MAX_AGE),
+            "a marker with a future mtime (clock skew) must be treated as fresh \
+             — discarding it would compress into a byte-exact consumer (#514)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reliability-6: marker write failure is logged to hook.log
+    // -----------------------------------------------------------------------
+
+    /// When `O_NOFOLLOW` rejects a symlink path, the failure must be logged to
+    /// `hook.log` rather than discarded silently. A silent failure means a
+    /// byte-exact pipe consumer receives compressed output with no diagnostic.
+    #[cfg(unix)]
+    #[test]
+    fn test_marker_write_failure_is_logged_to_hook_log() {
+        let cache_tmp = TempDir::new().unwrap();
+        let sessions = cache_tmp.path().join(SESSIONS_DIR);
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        // Plant a symlink — O_NOFOLLOW causes ELOOP, triggering the log path.
+        let victim = cache_tmp.path().join("victim2.txt");
+        std::fs::write(&victim, b"safe").unwrap();
+        let symlink_path = sessions.join("99991.git.raw");
+        std::os::unix::fs::symlink(&victim, &symlink_path).unwrap();
+
+        // Inject a CacheEnv pointing at our temp dir so hook.log lands there.
+        let log_env = crate::cmd::hook_log::CacheEnv {
+            cache_dir_override: Some(cache_tmp.path().to_path_buf()),
+        };
+        write_or_remove_marker_with_log(&symlink_path, true, &log_env);
+
+        // hook.log must contain a warning mentioning the failure.
+        let hook_log = cache_tmp.path().join("hook.log");
+        assert!(hook_log.exists(), "hook.log must be created on marker failure");
+        let log_content = std::fs::read_to_string(&hook_log).unwrap();
+        assert!(
+            log_content.contains("force-raw:"),
+            "hook.log must contain a force-raw warning, got: {log_content}"
+        );
+        assert!(
+            log_content.contains("#514"),
+            "hook.log warning must reference issue #514, got: {log_content}"
         );
     }
 }
