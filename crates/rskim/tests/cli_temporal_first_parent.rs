@@ -223,6 +223,28 @@ fn run_search_json(root: &Path, cache: &Path, extra_args: &[&str]) -> Value {
         .unwrap_or_else(|e| panic!("skim search --json produced invalid JSON: {e}\n{stdout}"))
 }
 
+/// Run `skim search --stats --json --root <root>` and return parsed JSON.
+///
+/// Used by AC-18 to verify `temporal_state` and `git_head_state` after a
+/// data-version self-heal without invoking the search ranking layer.
+fn run_stats_json(root: &Path, cache: &Path) -> Value {
+    let out = StdCommand::new(cargo_bin("skim"))
+        .args(["search", "--stats", "--json", "--root"])
+        .arg(root)
+        .env("SKIM_CACHE_DIR", cache)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --stats --json");
+    assert!(
+        out.status.success(),
+        "skim search --stats --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).expect("skim --stats --json output utf-8");
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("skim --stats --json produced invalid JSON: {e}\n{stdout}"))
+}
+
 /// Run `skim heatmap --json` from `cwd` (heatmap does not have a `--root` flag).
 fn run_heatmap_json(cwd: &Path, cache: &Path) -> Value {
     let out = StdCommand::new(cargo_bin("skim"))
@@ -735,5 +757,93 @@ fn test_hot_30d_matches_author_date_window() {
     assert_eq!(
         b_30d, 0,
         "T-20: b.rs must have 0 commits within 30d (only commit is 45d ago)"
+    );
+}
+
+// ============================================================================
+// T-21 / AC-18 (observable): no `degraded` entry and temporal_state healthy
+// after a data-version self-heal
+// ============================================================================
+
+/// T-21 / AC-18 (observable): planting `data_version="1"` into a built
+/// `temporal.db` (simulating a pre-#407 binary's output) and then running a
+/// query MUST produce no `degraded` key in the `--hot --json` output, and a
+/// subsequent `--stats --json` call MUST report `temporal_state` as `"ready"`
+/// or `"empty"` (never `"corrupt"` or `"missing"`) with `git_head_state`
+/// unchanged at `"resolved"`.
+///
+/// Mechanism: skim's self-heal path detects `data_version = "1" < 2` on the
+/// first query after the plant, rebuilds `temporal.db`, and serves the result
+/// normally — no `DegradedReason` fires.
+///
+/// AC-18 is stated in observable, binary-level terms; this test drives it
+/// end-to-end through the actual skim binary rather than testing internal state
+/// only (devflow:testing Iron Law). The internal-state variant
+/// (`test_stale_data_version_no_degraded_state_after_heal` in
+/// `staleness_tests.rs`) verifies the library layer; this test verifies the
+/// full CLI stack.
+///
+/// AD-407-1 (full-DAG walk triggers data_version bump), AD-407-5 (one-shot
+/// self-heal), AD-408-4 (Check 2: stored < current triggers rebuild).
+#[test]
+fn test_ac18_stale_data_version_heals_no_degraded_on_next_query() {
+    let repo = make_merge_repo();
+    let cache = TempDir::new().expect("cache tempdir");
+
+    // Build the index so temporal.db is populated with real data.
+    build_index(repo.path(), cache.path());
+
+    // Locate temporal.db via --stats --json (canonical cache_dir path).
+    let stats_initial = run_stats_json(repo.path(), cache.path());
+    let cache_dir_str = stats_initial["cache_dir"]
+        .as_str()
+        .expect("cache_dir must be a string in --stats --json output");
+    let temporal_db = std::path::Path::new(cache_dir_str).join("temporal.db");
+    assert!(
+        temporal_db.exists(),
+        "temporal.db must exist after --build at {temporal_db:?}"
+    );
+
+    // Plant data_version="1" to simulate a pre-#407 DB (AD-408-4 Check 2).
+    // Use rusqlite directly — TemporalDb::set_meta guards this key (AD-408-3).
+    {
+        let conn = rusqlite::Connection::open(&temporal_db)
+            .expect("open temporal.db for data_version seeding");
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params!["data_version", "1"],
+        )
+        .expect("plant data_version=1 into temporal.db");
+    }
+
+    // Run a query with --hot --json.  The self-heal fires on this call (AD-408-4
+    // Check 2: stored "1" < TEMPORAL_DATA_VERSION "2"), rebuilds temporal.db,
+    // and serves the result normally.  No DegradedReason fires → no `degraded` key.
+    let query_json = run_search_json(repo.path(), cache.path(), &["--hot"]);
+    assert!(
+        query_json.get("degraded").is_none(),
+        "AC-18: --hot --json must carry no 'degraded' key after data-version \
+         self-heal (temporal data served normally post-heal); got: {query_json}"
+    );
+
+    // Verify --stats --json reports a healthy temporal state and unchanged HEAD state.
+    let stats_after = run_stats_json(repo.path(), cache.path());
+
+    let temporal_state = stats_after["temporal_state"]
+        .as_str()
+        .expect("temporal_state must be a string in --stats --json");
+    assert!(
+        temporal_state == "ready" || temporal_state == "empty",
+        "AC-18: temporal_state after self-heal must be 'ready' or 'empty' \
+         (not 'corrupt' or 'missing'); got: {temporal_state:?}"
+    );
+
+    let git_head_state = stats_after["git_head_state"]
+        .as_str()
+        .expect("git_head_state must be a string in --stats --json");
+    assert_eq!(
+        git_head_state, "resolved",
+        "AC-18: git_head_state must remain 'resolved' after data-version \
+         self-heal — the self-heal must not break HEAD resolution"
     );
 }

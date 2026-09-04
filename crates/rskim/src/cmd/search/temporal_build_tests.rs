@@ -4673,3 +4673,105 @@ fn test_ac13_data_version_stale_backoff_gates_self_heal() {
          the DB stays stale until sentinel clears (HEAD advance / unshallow / --rebuild)"
     );
 }
+
+// ============================================================================
+// AC-13 (positive control) — self-heal fires exactly once when no sentinel
+// ============================================================================
+
+/// AC-13 positive control (#407): when NO build-backoff sentinel is present and
+/// `data_version` is stale (`"1"`), `rebuild_temporal_with_source` MUST invoke
+/// `parse_history` exactly once and advance `data_version` to `"2"`.
+///
+/// This is the complement of `test_ac13_data_version_stale_backoff_gates_self_heal`:
+///
+/// | sentinel | data_version stale | expected count | data_version after |
+/// |----------|--------------------|----------------|--------------------|
+/// | present  | yes                | 0 (AC-13)      | "1" (unchanged)    |
+/// | absent   | yes                | 1 (this test)  | "2" (healed)       |
+///
+/// Without this test, both test variants stay green in a world where the
+/// #407 self-heal never fires at all — the perpetual-rebuild-loop failure mode
+/// AD-408-3 exists to prevent. A call count of 0 here would mean the heal
+/// silently skips, leaving hotspot/risk scores permanently undercounted.
+///
+/// After the self-heal, `temporal_db_is_stale` MUST return `false`: the
+/// rebuilt DB carries `data_version = "2"` and HEAD matches, so no further
+/// rebuild is triggered (one-shot contract, AD-407-5).
+///
+/// AD-407-1 (full-DAG walk), AD-407-5 (one-shot except sentinel), AD-408-3
+/// (data-version gate guards set_meta), AD-408-4 (Check 2: stored < current).
+#[test]
+fn test_ac13_positive_stale_no_sentinel_heals_in_one_shot() {
+    let dir = tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let fake_head = "ac130002ac130002ac130002ac130002ac130002";
+    let now = super::current_epoch_secs();
+
+    // Set up a pre-#407 temporal.db: current schema (v2), HEAD recorded,
+    // data_version = "1" (stale by the post-#407 check).
+    let db_path = cache_dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], fake_head, false).unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![rskim_search::META_DATA_VERSION, "1"],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Verify precondition: NO sentinel — self-heal must proceed.
+    assert!(
+        !cache_dir.join("temporal.db.build_backoff").exists(),
+        "AC-13 positive precondition: no build-backoff sentinel must be present"
+    );
+
+    // Attempt the data-version self-heal with a counting source.
+    let src = CountingSource::new_empty();
+    let result = rebuild_temporal_with_source(
+        &src,
+        dir.path(),
+        &cache_dir,
+        fake_head,
+        now,
+        ReanchorPolicy::Allow,
+        BuildLoudness::Silent,
+    );
+    assert!(
+        result.is_ok(),
+        "AC-13 positive: rebuild_temporal_with_source must return Ok(()) \
+         when no sentinel blocks the self-heal; got: {result:?}"
+    );
+
+    // Sentinel absent: parse_history must have been called exactly once.
+    assert_eq!(
+        src.count(),
+        1,
+        "AC-13 positive (AD-407-5): parse_history must be called exactly once \
+         when no backoff sentinel is present — the one-shot self-heal fires"
+    );
+
+    // data_version must now be \"2\" — the self-heal advanced it.
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    let stored_version = db
+        .get_meta(rskim_search::META_DATA_VERSION)
+        .unwrap()
+        .unwrap_or_default();
+    assert_eq!(
+        stored_version, "2",
+        "AC-13 positive: data_version must be \"2\" after self-heal \
+         (AD-408-4 Check 2: stored \"1\" < TEMPORAL_DATA_VERSION \"2\")"
+    );
+    drop(db);
+
+    // After the self-heal, temporal_db_is_stale must be false (one-shot contract).
+    use super::super::staleness::temporal_db_is_stale;
+    assert!(
+        !temporal_db_is_stale(&cache_dir, fake_head, None),
+        "AC-13 positive: temporal_db_is_stale must return false after \
+         the data-version self-heal completes (AD-407-5 one-shot contract)"
+    );
+}

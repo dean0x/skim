@@ -43,6 +43,29 @@ fn create_ref_file(dir: &std::path::Path, ref_path: &str, sha: &str) {
     fs::write(&full_path, format!("{sha}\n")).unwrap();
 }
 
+/// Build a `temporal.db` in `dir/temporal.db` with the given `head` and
+/// `data_version`.
+///
+/// Opens the DB, calls `sync()` with an empty history (simulating a
+/// freshly-initialised DB), then plants `data_version` directly using
+/// [`super::plant_meta_raw`] — bypassing the `TemporalDb::set_meta` guard
+/// that protects the key in production code (AD-408-3).
+///
+/// Returns the `PathBuf` of `dir/temporal.db` so callers that need to
+/// re-open or further modify the file can do so without re-deriving the path.
+fn plant_db_at_data_version(
+    dir: &std::path::Path,
+    head: &str,
+    version: &str,
+) -> std::path::PathBuf {
+    let db_path = dir.join("temporal.db");
+    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
+    db.sync(&[], &[], &[], head, false).unwrap();
+    drop(db);
+    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, version);
+    db_path
+}
+
 /// Write a minimal valid AST index stub file in `cache_dir`.
 ///
 /// `index_version` reads the first 6 bytes: magic `SKAX` + version u16 LE.
@@ -5016,17 +5039,10 @@ fn t12_ac12_future_version_check_staleness_not_stale() {
 #[test]
 fn test_pre_407_db_is_stale() {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("temporal.db");
     let head = "cafe0001cafe0001cafe0001cafe0001cafe0001";
 
-    // Build a current-format DB via sync() — this writes data_version = "2".
-    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    db.sync(&[], &[], &[], head, false).unwrap();
-    drop(db);
-
-    // Overwrite data_version with "1" to simulate a pre-#407 first-parent-only DB.
-    // Must use plant_meta_raw because TemporalDb::set_meta guards these keys (AD-408-3).
-    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+    // Build a pre-#407 DB: correct schema (v2), HEAD recorded, data_version = "1".
+    plant_db_at_data_version(dir.path(), head, "1");
 
     assert!(
         temporal_db_is_stale(dir.path(), head, None),
@@ -5037,7 +5053,7 @@ fn test_pre_407_db_is_stale() {
 }
 
 /// T-14 (#407 AC-10): after exactly one sync (the self-heal rebuild),
-/// `temporal_db_is_stale` MUST return `false` and `read_meta(META_DATA_VERSION)`
+/// `temporal_db_is_stale` MUST return `false` and `get_meta(META_DATA_VERSION)`
 /// MUST equal `Some("2")`.
 ///
 /// AC-10 contract: the self-heal is one-shot.  `TemporalDb::sync` is the only
@@ -5050,14 +5066,10 @@ fn test_pre_407_db_is_stale() {
 #[test]
 fn test_407_self_heal_is_one_shot() {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("temporal.db");
     let head = "cafe0002cafe0002cafe0002cafe0002cafe0002";
 
     // Set up a pre-#407 DB: correct schema (v2), HEAD recorded, data_version = "1".
-    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    db.sync(&[], &[], &[], head, false).unwrap();
-    drop(db);
-    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+    let db_path = plant_db_at_data_version(dir.path(), head, "1");
 
     // Verify the pre-condition: stale.
     assert!(
@@ -5082,7 +5094,7 @@ fn test_407_self_heal_is_one_shot() {
     assert_eq!(
         stored,
         Some("2".to_string()),
-        "T-14 (AC-10): after one sync, read_meta(META_DATA_VERSION) must be Some(\"2\")"
+        "T-14 (AC-10): after one sync, get_meta(META_DATA_VERSION) must be Some(\"2\")"
     );
 }
 
@@ -5101,14 +5113,10 @@ fn test_407_self_heal_is_one_shot() {
 #[test]
 fn test_temporal_data_version_3_not_stale_after_407_bump() {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("temporal.db");
     let head = "cafe0003cafe0003cafe0003cafe0003cafe0003";
 
-    // Build a current-format DB and overwrite data_version with "3" (future version).
-    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    db.sync(&[], &[], &[], head, false).unwrap();
-    drop(db);
-    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "3");
+    // Build a DB with data_version = "3" (future version — downgrade-safety guard).
+    plant_db_at_data_version(dir.path(), head, "3");
 
     assert!(
         !temporal_db_is_stale(dir.path(), head, None),
@@ -5129,14 +5137,10 @@ fn test_temporal_data_version_3_not_stale_after_407_bump() {
 #[test]
 fn test_stale_data_version_no_degraded_state_after_heal() {
     let dir = tempdir().unwrap();
-    let db_path = dir.path().join("temporal.db");
     let head = "cafe0004cafe0004cafe0004cafe0004cafe0004";
 
     // Pre-heal state: data_version = "1" (stale), but HEAD matches.
-    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    db.sync(&[], &[], &[], head, false).unwrap();
-    drop(db);
-    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
+    let db_path = plant_db_at_data_version(dir.path(), head, "1");
     assert!(
         temporal_db_is_stale(dir.path(), head, None),
         "pre-condition"
@@ -5219,16 +5223,14 @@ fn test_ac14_stale_data_version_anchor_mismatch_no_rebuild() {
 
     // Build temporal.db anchored to "other_repo" (a different toplevel) and
     // with data_version = "1" (stale — pre-#407).
-    let db_path = cache_dir.join("temporal.db");
     let head_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0";
-    let db = rskim_search::TemporalDb::open(&db_path).unwrap();
-    db.sync(&[], &[], &[], head_a, false).unwrap();
-    drop(db);
+    let db_path = plant_db_at_data_version(&cache_dir, head_a, "1");
     super::plant_meta_raw(&db_path, rskim_search::META_GIT_TOPLEVEL, "/other_repo");
-    super::plant_meta_raw(&db_path, rskim_search::META_DATA_VERSION, "1");
 
-    // Record byte length before the attempted query-path rebuild.
-    let len_before = fs::metadata(&db_path).unwrap().len();
+    // Capture the full byte contents before the attempted query-path rebuild.
+    // A same-length-but-different-content rewrite (e.g., a SQLite WAL checkpoint)
+    // would not be caught by a length-only check; compare actual bytes (AC-14).
+    let bytes_before = fs::read(&db_path).unwrap();
 
     // Verify that temporal_anchor_state sees Differs (not NotAdopted or Absent)
     // for the subdirectory root — this is the precondition for AC-14.
@@ -5250,12 +5252,15 @@ fn test_ac14_stale_data_version_anchor_mismatch_no_rebuild() {
         super::ReanchorPolicy::Refuse,
     );
 
-    // temporal.db must be byte-length-unchanged (AC-14 file-bytes guard).
-    let len_after = fs::metadata(&db_path).unwrap().len();
+    // temporal.db must be byte-for-byte unchanged (AC-14 file-bytes guard).
+    // Compare full contents rather than just file length: a SQLite WAL checkpoint
+    // could produce an identically-sized but content-modified file, which a
+    // length-only check would miss.
+    let bytes_after = fs::read(&db_path).unwrap();
     assert_eq!(
-        len_after, len_before,
-        "AC-14 (PF-017): temporal.db must be byte-unchanged after a refused query \
-         (anchor mismatch + stale data_version — refuse policy wins)"
+        bytes_after, bytes_before,
+        "AC-14 (PF-017): temporal.db must be byte-for-byte unchanged after a \
+         refused query (anchor mismatch + stale data_version — refuse policy wins)"
     );
 
     // git_toplevel must still point at other_repo (not re-anchored to parent).
