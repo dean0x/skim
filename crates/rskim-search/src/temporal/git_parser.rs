@@ -114,12 +114,20 @@ const _: () = assert!(
 pub(super) struct WalkBudget {
     visited: usize,
     retained: usize,
-    /// Set to `true` by either [`charge_visit`] or [`charge_retain`] when their
-    /// respective cap fires.  Propagated to
-    /// [`crate::types::TemporalMetadata::truncated`] so the condition crosses
-    /// the `rskim-search → rskim` boundary and is mapped into the DegradedReason
-    /// SSOT the same way `is_shallow` is (AD-414-14).
+    /// Set to `true` by either [`WalkBudget::charge_visit`] or
+    /// [`WalkBudget::charge_retain`] when their respective cap fires.
+    /// Propagated to [`crate::types::TemporalMetadata::truncated`] so the
+    /// condition crosses the `rskim-search → rskim` boundary and is mapped into
+    /// the DegradedReason SSOT the same way `is_shallow` is (AD-414-14).
     pub(super) truncated: bool,
+    /// Latch: set to `true` the first time the visit cap fires so the
+    /// eprintln! notice is edge-triggered — it fires exactly once on the
+    /// transition call and never again on subsequent above-cap calls.
+    visit_notice_emitted: bool,
+    /// Latch: set to `true` the first time the retain cap fires so the
+    /// eprintln! notice is edge-triggered — it fires exactly once on the
+    /// transition call and never again on subsequent above-cap calls.
+    retain_notice_emitted: bool,
 }
 
 impl WalkBudget {
@@ -131,19 +139,24 @@ impl WalkBudget {
     /// Charge one loop iteration. Returns `true` when the visit cap has fired
     /// and the loop should break.
     ///
-    /// Prints an eprintln! notice on every call that exceeds the cap; because
-    /// the caller breaks immediately on `true`, this fires at most once per walk.
+    /// Prints exactly one eprintln! notice on the first call that exceeds the
+    /// cap (edge-triggered: the `visit_notice_emitted` latch suppresses
+    /// re-emission on every subsequent above-cap call, making the behaviour
+    /// safe regardless of whether the caller breaks on `true`).
     /// Also sets `self.truncated = true` so the condition is visible to callers
     /// via [`TemporalMetadata::truncated`].
-    #[must_use]
+    #[must_use = "the return value is the walk bound; ignoring it removes the cap"]
     pub(super) fn charge_visit(&mut self) -> bool {
         self.visited += 1;
         if self.visited > MAX_VISITED_COMMITS {
+            if !self.visit_notice_emitted {
+                self.visit_notice_emitted = true;
+                eprintln!(
+                    "skim: parse_history reached the {MAX_VISITED_COMMITS}-visit safety cap; \
+                     truncating history. Pass lookback_days > 0 to scope the traversal."
+                );
+            }
             self.truncated = true;
-            eprintln!(
-                "skim: parse_history reached the {MAX_VISITED_COMMITS}-visit safety cap; \
-                 truncating history. Pass lookback_days > 0 to scope the traversal."
-            );
             true
         } else {
             false
@@ -153,19 +166,24 @@ impl WalkBudget {
     /// Charge one retained commit. Returns `true` when the retain cap has fired
     /// and the loop should break.
     ///
-    /// Prints an eprintln! notice on every call that exceeds the cap; because
-    /// the caller breaks immediately on `true`, this fires at most once per walk.
+    /// Prints exactly one eprintln! notice on the first call that exceeds the
+    /// cap (edge-triggered: the `retain_notice_emitted` latch suppresses
+    /// re-emission on every subsequent above-cap call, making the behaviour
+    /// safe regardless of whether the caller breaks on `true`).
     /// Also sets `self.truncated = true` so the condition is visible to callers
     /// via [`TemporalMetadata::truncated`].
-    #[must_use]
+    #[must_use = "the return value is the walk bound; ignoring it removes the cap"]
     pub(super) fn charge_retain(&mut self) -> bool {
         self.retained += 1;
         if self.retained > MAX_COMMITS {
+            if !self.retain_notice_emitted {
+                self.retain_notice_emitted = true;
+                eprintln!(
+                    "skim: parse_history reached the {MAX_COMMITS}-commit safety cap; \
+                     truncating history. Pass lookback_days > 0 to scope the traversal."
+                );
+            }
             self.truncated = true;
-            eprintln!(
-                "skim: parse_history reached the {MAX_COMMITS}-commit safety cap; \
-                 truncating history. Pass lookback_days > 0 to scope the traversal."
-            );
             true
         } else {
             false
