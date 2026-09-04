@@ -4,15 +4,21 @@
 //!
 //! - [`GixSource::parse_history`] returns commits in **committer-time-descending**
 //!   (newest-first) order, stably re-sorted by `CommitInfo.timestamp` (author time)
-//!   descending so equal-timestamp commits preserve gix traversal order (AD-407-4).
-//! - We reverse to **chronological** order (oldest-first) before splitting so
-//!   that the training set contains the oldest commits and the test set
-//!   contains the most recent ones.
+//!   descending (AD-407-4). For equal-author-timestamp commits on separate branches
+//!   the relative order reflects gix's committer-time priority queue and is not
+//!   further specified; the splitter's correctness does not depend on tie-breaking.
+//! - We reverse to **approximately** chronological order (oldest-first) before
+//!   splitting so that the training set contains the oldest commits and the test
+//!   set contains the most recent ones (the ordering assumption holds for commits
+//!   with distinct timestamps; equal-timestamp commits on separate branches are
+//!   treated as co-temporal and the split is still index-correct).
 //! - The split index is `floor(len * train_fraction)`.  All commits with index
 //!   `< split_index` are training commits; the rest are test commits.
-//! - This guarantees no temporal leakage: every training commit is strictly
-//!   older than every test commit (assuming monotonically increasing
-//!   timestamps, which is the common case for well-maintained repos).
+//! - This minimises temporal leakage: training commits are no newer than test
+//!   commits (`max_train_ts <= min_test_ts`). Strict separation requires
+//!   distinct timestamps, which is the common case for well-maintained repos;
+//!   equal-timestamp commits on separate branches may fall on either side of
+//!   the boundary in an unspecified order (consistent with AD-407-4).
 //!
 //! # Edge cases
 //!

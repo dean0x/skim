@@ -30,9 +30,10 @@
 //! (no parent) are diffed against the empty tree.
 //!
 //! Returned commits are sorted **stably** by `CommitInfo.timestamp` descending
-//! (author time, newest first) so equal-timestamp commits preserve gix traversal
-//! order. This is the documented ordering contract: consumers such as
-//! `rskim-bench::temporal_split` rely on it (AD-407-4).
+//! (author time, newest first) (AD-407-4). For commits with equal author
+//! timestamps the relative order reflects gix's committer-time priority queue
+//! and is not further specified. This is the documented ordering contract;
+//! consumers such as `rskim-bench::temporal_split` rely on it.
 //!
 //! # Walk bounds
 //!
@@ -189,8 +190,9 @@ impl TemporalSource for GixSource {
     ///
     /// Commits are yielded by gix in committer-time-descending order (newest
     /// first). After the walk, the result is **stably** re-sorted by
-    /// `CommitInfo.timestamp` (author time) descending so equal-timestamp
-    /// commits preserve gix traversal order (AD-407-4).
+    /// `CommitInfo.timestamp` (author time) descending (AD-407-4). For
+    /// equal-timestamp commits the relative order reflects gix's committer-time
+    /// priority queue and is not further specified.
     ///
     /// Consumers that rely on newest-first ordering (e.g. `rskim-bench::temporal_split`)
     /// may depend on this contract.
@@ -262,9 +264,9 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         None => Sorting::ByCommitTime(CommitTimeOrder::NewestFirst),
     };
 
-    // AD-407-1: Walk the FULL DAG (remove .first_parent_only()) so every commit
-    // on every merged branch is visible to the temporal layer. Merge commits are
-    // skipped inside the loop before the tree diff (AD-407-2).
+    // AD-407-1: Walk the FULL DAG so every commit on every merged branch is
+    // visible to the temporal layer. Merge commits are skipped inside the loop
+    // before the tree diff (AD-407-2).
     let walk = repo
         .rev_walk([head_id])
         .sorting(sorting)
@@ -348,7 +350,8 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
 
     // AD-407-4: Stable sort by author-time descending so the ordering contract
     // is a real guarantee, not a fixture accident (PF-007). Equal-timestamp
-    // commits preserve gix traversal order (committer-time descending).
+    // commits the relative order reflects gix's committer-time priority queue
+    // and is not further specified.
     commits.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
 
     let commit_count = commits.len();
