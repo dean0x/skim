@@ -2081,6 +2081,9 @@ Composite ranking options (#200, #377):
                        Active on TWO composite paths:
                          - --blast-radius (no --ast): all three weights apply
                            (lexical + ast + temporal).
+                           The temporal component ranks co-change partners by
+                           Jaccard co-change strength (AD-409-8): higher
+                           strength → higher temporal rank contribution.
                          - text + --ast (the intersection path): lexical and ast
                            apply. The temporal weight is INERT whenever --ast is
                            present, since the AST intersection fuses only the
