@@ -5,7 +5,7 @@
 //!
 //! Token reduction target: 15-30%
 
-use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output};
+use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges};
 use crate::transform::utils::is_function_scope_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -82,18 +82,20 @@ pub(crate) fn transform_minimal(
     // total from O(N²) to O(N log N) across N ranges.
     let newlines = build_newline_table(source);
 
-    // Adjust ranges for full-line removal, sort, and dedup
-    let mut final_ranges: Vec<(usize, usize)> = ctx
-        .ranges
-        .iter()
-        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
-        .collect();
-    final_ranges.sort_unstable_by_key(|&(start, _)| start);
-    final_ranges.dedup();
+    // Adjust ranges for full-line removal, then merge to produce a sorted,
+    // non-overlapping set.  merge_ranges handles overlaps that line-level
+    // adjustment introduces (adjacent AST nodes that expand to the same line)
+    // and exact duplicates — satisfying map_ranges_to_output's precondition.
+    let final_ranges: Vec<(usize, usize)> = merge_ranges(
+        ctx.ranges
+            .iter()
+            .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
+            .collect(),
+    );
 
     // Collect literal-fragment ranges from the source tree before removal so
     // trim_and_normalize can skip trailing-space trimming inside literals.
-    let literal_ranges = collect_literal_ranges(tree, language);
+    let literal_ranges = collect_literal_ranges(tree, language)?;
     let protected = map_ranges_to_output(&literal_ranges, &final_ranges);
 
     let after_removal = remove_ranges(source, &final_ranges)?;
@@ -719,11 +721,11 @@ pub(crate) fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<S
             )));
         }
 
-        // Skip overlapping ranges, extending the removal window if needed
-        if start < last_pos {
-            last_pos = last_pos.max(end);
-            continue;
-        }
+        // Callers must pass sorted, non-overlapping ranges (established by merge_ranges).
+        debug_assert!(
+            start >= last_pos,
+            "overlapping ranges are impossible after merge_ranges; start={start} last_pos={last_pos}"
+        );
 
         if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
             return Err(SkimError::ParseError(format!(

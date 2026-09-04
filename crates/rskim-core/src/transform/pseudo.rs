@@ -37,7 +37,7 @@
 //! called on a node you already hold descends *into* that node and is cheap; it is
 //! `parent()` in front of it that pays the root descent.
 
-use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output};
+use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges};
 use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -482,23 +482,21 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
         WalkPosition::default(),
     )?;
 
-    // Sort, dedup, and adjust ranges for full line removal
-    ctx.ranges.sort_unstable_by_key(|&(start, _)| start);
-    ctx.ranges.dedup();
-
     // Precompute the newline offset table so adjust_range_for_line_removal
     // resolves line boundaries in O(log N) (binary search) instead of O(start)
     // (rfind scan), reducing the total from O(N²) to O(N log N) across N ranges.
     let newlines = build_newline_table(source);
 
-    let mut final_ranges: Vec<(usize, usize)> = ctx
-        .ranges
-        .iter()
-        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
-        .collect();
-
-    // Re-sort after adjustment (line-level adjustments can change ordering)
-    final_ranges.sort_unstable_by_key(|&(start, _)| start);
+    // Adjust ranges for full-line removal, then merge to produce a sorted,
+    // non-overlapping set.  merge_ranges handles overlaps that line-level
+    // adjustment introduces (adjacent AST nodes that expand to the same line)
+    // and exact duplicates — satisfying map_ranges_to_output's precondition.
+    let final_ranges: Vec<(usize, usize)> = merge_ranges(
+        ctx.ranges
+            .iter()
+            .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
+            .collect(),
+    );
 
     // Compute the source line map from the byte-level removal ranges.
     // Must be done before remove_ranges, using the ranges themselves, so that
@@ -509,7 +507,7 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     // Collect literal-fragment ranges from the source tree before removal.
     // These are mapped to post-removal coordinates so that collapse_whitespace
     // and trim_and_normalize can skip whitespace normalisation inside literals.
-    let literal_ranges = collect_literal_ranges(tree, language);
+    let literal_ranges = collect_literal_ranges(tree, language)?;
     let protected_in_result = map_ranges_to_output(&literal_ranges, &final_ranges);
 
     let result = remove_ranges(source, &final_ranges)?;
@@ -638,7 +636,13 @@ fn collapse_whitespace(
 
             if lpc < protected.len() && protected[lpc].0 <= p {
                 // Inside a protected range: emit verbatim up to range end (or trim_end).
-                let range_end = protected[lpc].1.min(trim_end);
+                let mut range_end = protected[lpc].1.min(trim_end);
+                // Defence-in-depth: if a shifted range_end is not on a char boundary
+                // (possible if merge_ranges didn't fully normalise overlapping removed_ranges),
+                // clamp backward to the nearest valid boundary rather than panicking.
+                while range_end > p && !source.is_char_boundary(range_end) {
+                    range_end -= 1;
+                }
                 let out_start = result.len();
                 result.push_str(&source[p..range_end]);
                 let out_end = result.len();
@@ -658,9 +662,20 @@ fn collapse_whitespace(
                     }
                     prev_space = true;
                     p += 1;
+                } else if b < 0x80 {
+                    // performance-11: ASCII fast path.  `b < 0x80` guarantees a
+                    // single-byte codepoint, so no `is_char_boundary` check is
+                    // needed.  The guard preserves all multi-byte UTF-8 code paths
+                    // below — only confirmed-ASCII bytes take this branch.
+                    leading = false;
+                    result.push(b as char);
+                    p += 1;
+                    prev_space = false;
                 } else {
-                    // Non-space: decode entire UTF-8 char (tree-sitter boundaries
-                    // are always at char boundaries, so source[p..] is valid).
+                    // Non-ASCII: decode the full UTF-8 char.  tree-sitter guarantees
+                    // that protected-range boundaries lie on char boundaries, and the
+                    // char-boundary clamp above keeps range_end valid, so
+                    // `source[p..]` is always a valid UTF-8 string slice here.
                     let ch = source[p..].chars().next().unwrap_or('\0');
                     leading = false;
                     result.push(ch);
@@ -693,23 +708,6 @@ fn collapse_whitespace(
     // emitting consecutive per-line chunks.
     let new_protected = merge_ranges(new_protected);
     (result, new_protected)
-}
-
-/// Merge a sorted-or-unsorted list of byte ranges into a minimal sorted set,
-/// combining any adjacent or overlapping intervals.
-fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    if ranges.len() <= 1 {
-        return ranges;
-    }
-    ranges.sort_unstable_by_key(|&(s, _)| s);
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (s, e) in ranges {
-        match out.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(e),
-            _ => out.push((s, e)),
-        }
-    }
-    out
 }
 
 /// Handle language-specific AST patterns that require multi-node context.
@@ -2870,7 +2868,7 @@ mod tests {
         use crate::transform::literals::collect_literal_ranges;
         let mut parser = Parser::new(language).unwrap();
         let tree = parser.parse(source).unwrap();
-        let ranges = collect_literal_ranges(&tree, language);
+        let ranges = collect_literal_ranges(&tree, language).unwrap();
         for (ls, le) in ranges {
             let lit = &source[ls..le];
             if !result.contains(lit) {
@@ -3108,5 +3106,56 @@ mod tests {
             !new_prot.is_empty(),
             "protected range must survive CRLF normalisation"
         );
+    }
+
+    // --- performance-11: ASCII fast path does not corrupt multi-byte sequences ---
+
+    #[test]
+    fn test_collapse_whitespace_non_ascii_bytes_not_corrupted_by_ascii_fast_path() {
+        // The ASCII fast path (b < 0x80) must only fire for single-byte
+        // codepoints.  Multi-byte UTF-8 sequences must still travel the
+        // `source[p..].chars().next()` branch so their full codepoint is
+        // pushed and `p` advances by the correct byte length.
+        //
+        // Each test string contains a mix of ASCII and multi-byte codepoints;
+        // the assertion checks the output byte-for-byte.
+        let cases: &[(&str, &str)] = &[
+            // Japanese (3-byte UTF-8)
+            ("fn foo(日本語)  \n", "fn foo(日本語)\n"),
+            // Emoji (4-byte UTF-8)
+            ("x = 🦀  \n", "x = 🦀\n"),
+            // Combining characters (2-byte UTF-8)
+            ("ünïcödé  value\n", "ünïcödé value\n"),
+            // Mixed: ASCII opener, multi-byte middle, ASCII closer
+            ("fn f(x: u8, y: 日) -> 本\n", "fn f(x: u8, y: 日) -> 本\n"),
+            // Curly-quote characters (3-byte UTF-8) that look like ASCII quotes
+            ("\u{201c}hello\u{201d}  world\n", "\u{201c}hello\u{201d} world\n"),
+        ];
+
+        for &(input, expected) in cases {
+            let (result, _) = collapse_whitespace(input, &[]);
+            assert_eq!(
+                result, expected,
+                "non-ASCII input corrupted: input={input:?}"
+            );
+
+            // Verify the output is valid UTF-8 (would panic if not).
+            let _ = result.chars().count();
+        }
+    }
+
+    #[test]
+    fn test_collapse_whitespace_non_ascii_in_protected_range_survives() {
+        // A non-ASCII sequence that falls inside a protected range must be
+        // emitted verbatim (the protected-range path, not the fast path).
+        // "fn f(日本語)\n" — protect the Japanese chars.
+        // "fn f(" = 5 ASCII bytes; "日" (U+65E5) = 3 bytes, "本" (U+672C) = 3
+        // bytes, "語" (U+8A9E) = 3 bytes → protected range [5, 14).
+        let source = "fn f(\u{65E5}\u{672C}\u{8A9E})\n";
+        let protected = vec![(5, 14)];
+        let (result, _) = collapse_whitespace(source, &protected);
+        assert_eq!(result, "fn f(日本語)\n");
+        // Confirm the output is valid UTF-8.
+        let _ = result.chars().count();
     }
 }

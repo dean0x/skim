@@ -86,7 +86,17 @@ const C_BLOCK_COMMENT: Option<(&str, &str)> = Some(("/*", "*/"));
 pub(crate) struct LiteralScan {
     /// `open_after[i]` is `Some(open_idx)` iff line `i` ends inside a
     /// multi-line literal opened on line `open_idx` (`open_idx <= i`).
+    ///
+    /// May be shorter than `line_count` when the language has no multi-line
+    /// literal forms (performance-4 early-exit): in that case every logical
+    /// index returns `None` via the out-of-bounds path of `Vec::get`.
     open_after: Vec<Option<usize>>,
+    /// Total number of lines scanned (`str::lines` semantics).
+    ///
+    /// Stored separately so that early-exit paths (languages where
+    /// `can_open()` is false) can omit the full `open_after` vec while still
+    /// reporting the correct line count for callers and tests.
+    line_count: usize,
 }
 
 /// Scan `text` for per-line multi-line-literal state.
@@ -100,21 +110,33 @@ pub(crate) struct LiteralScan {
 /// line length.
 pub(crate) fn scan(text: &str, language: Language) -> LiteralScan {
     let syntax = literal_syntax(language);
-    let capacity = if text.is_empty() {
-        0
-    } else {
-        text.split('\n').count()
-    };
-    let mut open_after = Vec::with_capacity(capacity);
+    // reliability-12: use `lines()` count so the capacity matches the loop
+    // iterator exactly (split('\n') over-counted by 1 on trailing-newline
+    // input, the common case).
+    let line_count = text.lines().count();
+
+    // performance-4: languages with no multi-line literal forms never produce
+    // a non-None open_after entry.  Return an empty open_after vec — every
+    // caller query hits the out-of-bounds None path, which is the correct
+    // answer.  The scan itself is a no-op; only the line count is needed.
+    if !syntax.can_open() {
+        return LiteralScan {
+            open_after: Vec::new(),
+            line_count,
+        };
+    }
+
+    let candidate = build_candidate_bitmap(&syntax); // performance-10
+    let mut open_after = Vec::with_capacity(line_count);
     let mut state = State::Clean;
     let mut scratch = String::new();
 
     for (index, line) in text.lines().enumerate() {
-        state = scan_line(line, index, state, &syntax, &mut scratch);
+        state = scan_line(line, index, state, &syntax, &candidate, &mut scratch);
         open_after.push(state.open_line());
     }
 
-    LiteralScan { open_after }
+    LiteralScan { open_after, line_count }
 }
 
 impl LiteralScan {
@@ -144,7 +166,7 @@ impl LiteralScan {
 
     /// Number of lines scanned ([`str::lines`] semantics).
     pub(crate) fn line_count(&self) -> usize {
-        self.open_after.len()
+        self.line_count
     }
 }
 
@@ -216,6 +238,81 @@ impl LiteralSyntax {
         heredoc: false,
         markdown_fence: false,
     };
+
+    /// Whether any multi-line literal form is enabled for this language.
+    ///
+    /// When `false`, `scan()` can return immediately with all-`None` state.
+    /// Block comments are deliberately excluded: they report `None` (clean)
+    /// rather than an open-literal index, so their presence does not affect the
+    /// result of any `open_after` query.
+    ///
+    /// `line_terminated_delims` alone cannot span lines unless `escape_char`
+    /// is also set (backslash continuation), so the pair is checked together.
+    fn can_open(self) -> bool {
+        !self.multi_line_delims.is_empty()
+            || (!self.line_terminated_delims.is_empty() && self.escape_char)
+            || self.rust_raw
+            || self.cpp_raw
+            || self.csharp_verbatim
+            || self.percent_literal
+            || self.heredoc
+            || self.markdown_fence
+    }
+}
+
+/// Build a 256-entry first-byte bitmap for the `State::Clean` fast path.
+///
+/// `bitmap[b]` is `true` iff byte `b` is the first byte of at least one
+/// opener recognised by `scan_line`'s `State::Clean` arm.  When `false`,
+/// every predicate would immediately reject the byte, so the byte can be
+/// skipped without running any of them.
+///
+/// The set is derived exclusively from the same `syn` fields that the
+/// predicates read, so the two cannot drift independently.
+fn build_candidate_bitmap(syn: &LiteralSyntax) -> [bool; 256] {
+    let mut bitmap = [false; 256];
+
+    // Line comment tokens (e.g. `//` → b'/', `#` → b'#', `--` → b'-').
+    for token in syn.line_comment {
+        if let Some(&b) = token.as_bytes().first() {
+            bitmap[b as usize] = true;
+        }
+    }
+
+    // Block comment opener (e.g. `/*` → b'/').
+    if let Some((open, _)) = syn.block_comment {
+        if let Some(&b) = open.as_bytes().first() {
+            bitmap[b as usize] = true;
+        }
+    }
+
+    // Language-specific special openers.
+    if syn.rust_raw {
+        bitmap[b'r' as usize] = true; // r"…" / r#"…"#
+    }
+    if syn.cpp_raw {
+        bitmap[b'R' as usize] = true; // R"delim(…)delim"
+    }
+    if syn.csharp_verbatim {
+        bitmap[b'@' as usize] = true; // @"…"
+    }
+    if syn.percent_literal {
+        bitmap[b'%' as usize] = true; // %q(…)
+    }
+    if syn.heredoc {
+        bitmap[b'<' as usize] = true; // <<ID
+    }
+
+    // Symmetric multi-line and line-terminated delimiters.
+    for table in [syn.multi_line_delims, syn.line_terminated_delims] {
+        for delim in table {
+            if let Some(&b) = delim.as_bytes().first() {
+                bitmap[b as usize] = true;
+            }
+        }
+    }
+
+    bitmap
 }
 
 /// Literal syntax for `language`.
@@ -400,11 +497,16 @@ impl State {
 // ============================================================================
 
 /// Advance the scanner across one line, returning the state at end of line.
+///
+/// `candidate` is the first-byte bitmap produced by [`build_candidate_bitmap`]:
+/// when `candidate[bytes[position]]` is `false`, the `State::Clean` arm skips
+/// the byte without running any of the nine opener predicates (performance-10).
 fn scan_line(
     line: &str,
     index: usize,
     entry: State,
     syn: &LiteralSyntax,
+    candidate: &[bool; 256],
     scratch: &mut String,
 ) -> State {
     if syn.markdown_fence {
@@ -439,6 +541,14 @@ fn scan_line(
 
         match state {
             State::Clean => {
+                // performance-10: first-byte fast path.  When the current byte
+                // is not in the candidate set, no opener predicate can match it
+                // (each checks its first byte before anything else).  Skip it
+                // immediately rather than running all nine predicates.
+                if !candidate[bytes[position] as usize] {
+                    position = position.saturating_add(1);
+                    continue;
+                }
                 if starts_comment(bytes, position, syn) {
                     break; // the rest of the line is a comment
                 }
@@ -1208,12 +1318,158 @@ mod tests {
 
     #[test]
     fn multi_byte_text_scans_without_panicking_and_stays_clean() {
-        let source = "// ünïcödé — “quotes”\nlet x = \"日本語\";\nlet y = 1;\n";
+        let source = “// ünïcödé — “quotes”\nlet x = \”日本語\”;\nlet y = 1;\n”;
         let scan = scan(source, Language::Rust);
 
         assert_eq!(scan.line_count(), 3);
         for line in 0..scan.line_count() {
             assert_eq!(scan.open_after(line), None);
+        }
+    }
+
+    // --- performance-4: JSON early-out (can_open == false) ---
+
+    #[test]
+    fn json_early_out_returns_correct_line_count_and_all_none() {
+        // JSON uses LiteralSyntax::NONE; can_open() is false.
+        // scan() must return early with the correct line count and all-None
+        // open_after entries — identical behaviour to a full scan.
+        let source = “{\n  \”a\”: \”unterminated\n}\n”;
+        let result = scan(source, Language::Json);
+
+        // Line count must match str::lines semantics (trailing newline does not
+        // add an extra line).
+        assert_eq!(result.line_count(), 3, “line_count must match str::lines”);
+
+        // Every index in range must be None.
+        for i in 0..result.line_count() {
+            assert_eq!(
+                result.open_after(i),
+                None,
+                “JSON open_after({i}) must be None — no multi-line strings”
+            );
+        }
+
+        // Out-of-range index must also be None (vec is empty, get OOB → None).
+        assert_eq!(result.open_after(result.line_count()), None);
+        assert_eq!(result.close_line(0), Some(1), “close_line on clean state”);
+        assert_eq!(result.close_line(2), None, “no line after the last”);
+    }
+
+    #[test]
+    fn json_empty_text_early_out_has_zero_lines() {
+        let result = scan(“”, Language::Json);
+        assert_eq!(result.line_count(), 0);
+        assert_eq!(result.open_after(0), None);
+        assert_eq!(result.close_line(0), None);
+    }
+
+    // --- performance-10: fast-path / naive-path equivalence ---
+
+    /// Run the scanner using an all-true bitmap (naive: every byte goes through
+    /// the full predicate chain) and return the per-line open-state as a vec of
+    /// `Option<usize>` in `str::lines` order.
+    ///
+    /// `can_open()` is NOT checked here; JSON and other no-literal languages
+    /// are fed through `scan_line` too, which is fine — all predicates return
+    /// `None` for them, so the result is still all-`None`.  The purpose is to
+    /// compare with the fast path's semantic output, not its internal storage.
+    fn scan_as_naive_vec(text: &str, language: Language) -> Vec<Option<usize>> {
+        let syntax = literal_syntax(language);
+        let all_candidates = [true; 256]; // forces slow-path for every byte
+        let mut out = Vec::new();
+        let mut state = State::Clean;
+        let mut scratch = String::new();
+        for (i, line) in text.lines().enumerate() {
+            state = scan_line(line, i, state, &syntax, &all_candidates, &mut scratch);
+            out.push(state.open_line());
+        }
+        out
+    }
+
+    /// Run scan() (with the real first-byte bitmap) and return the per-line
+    /// open-state as a vec using the public API.
+    ///
+    /// Using the public `open_after(i)` method rather than the internal field
+    /// means the comparison works correctly even when the early-exit path
+    /// returns an empty `open_after` vec (JSON / no-literal languages): the
+    /// `open_after` method returns `None` for every out-of-bounds index.
+    fn scan_as_fast_vec(text: &str, language: Language) -> Vec<Option<usize>> {
+        let result = scan(text, language);
+        (0..result.line_count())
+            .map(|i| result.open_after(i))
+            .collect()
+    }
+
+    #[test]
+    fn fast_path_and_naive_path_agree_on_all_languages() {
+        // A corpus of tricky inputs chosen to exercise openers, escapes, block
+        // comments, line continuations, fences, and heredocs across all grammars.
+        const CORPUS: &[&str] = &[
+            // JS/TS template literal with embedded expression
+            “const x = `\nhello ${'world'}\n`;\n”,
+            // Python triple-quoted docstring
+            “def f():\n    \”\”\”\n    doc\n    \”\”\”\n    return 1\n”,
+            // Rust raw string with internal quotes
+            “let s = r#\”\na \”quoted\” word\n\”#;\nlet t = 1;\n”,
+            // Go raw backtick with backslash (no escape)
+            “const s = `\nraw \\ text\n`\nvar x = 1\n”,
+            // Ruby squiggly heredoc
+            “sql = <<~SQL\n  SELECT 1\nSQL\nputs sql\n”,
+            // Bash quoted heredoc
+            “cat <<'EOF'\n$not expanded\nEOF\necho done\n”,
+            // SQL doubled-quote escape
+            “SELECT 'it''s\nstill open' FROM t;\nSELECT 1;\n”,
+            // C++ raw string with custom delimiter
+            “auto s = R\”tag(\nplain )\” inside\n)tag\”;\nint x = 0;\n”,
+            // C# verbatim string
+            “var p = @\”C:\\one\nC:\\two\”;\nvar q = 1;\n”,
+            // TOML triple-quoted
+            “key = \”\”\”\nvalue\n\”\”\”\nother = 1\n”,
+            // YAML flow scalar across lines
+            “key: \”first\n  second\”\nnext: 1\n”,
+            // Markdown fenced code block
+            “text\n```rust\nlet x = 1;\n```\nafter\n”,
+            // JSON: early-out (can_open == false); all entries must be None.
+            “{\n  \”a\”: \”unterminated\n}\n”,
+            // Mixed ASCII/non-ASCII source
+            “// ünïcödé — \u{201c}quotes\u{201d}\nlet x = \”日本語\”;\nlet y = 1;\n”,
+            // Multi-line C string via backslash continuation
+            “const char *s = \”abc\\\ndef\”;\nint x = 0;\n”,
+            // Block comment hiding a quote (reports clean throughout)
+            “/* a \” quote\n   still comment */\nint x = 0;\n”,
+        ];
+
+        let all_languages: &[Language] = &[
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Python,
+            Language::Rust,
+            Language::Go,
+            Language::Java,
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Ruby,
+            Language::Kotlin,
+            Language::Swift,
+            Language::Bash,
+            Language::Sql,
+            Language::Yaml,
+            Language::Toml,
+            Language::Markdown,
+            Language::Json,
+        ];
+
+        for &lang in all_languages {
+            for &source in CORPUS {
+                let naive = scan_as_naive_vec(source, lang);
+                let fast = scan_as_fast_vec(source, lang);
+                assert_eq!(
+                    naive, fast,
+                    “fast path disagrees with naive path: lang={lang:?}\nsource={source:?}”
+                );
+            }
         }
     }
 }

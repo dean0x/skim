@@ -30,8 +30,8 @@
 //! | SQL        | `literal`                                                         | tree-sitter-sequel 0.3.11        |
 //! | Bash       | `string_content`, `heredoc_content`                               | tree-sitter-bash 0.25.1          |
 
-use crate::Language;
 use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};
+use crate::{Language, Result, SkimError};
 use tree_sitter::Tree;
 
 /// Returns the tree-sitter node-type names whose byte spans contain verbatim
@@ -118,8 +118,17 @@ pub(crate) fn literal_fragment_kinds(language: Language) -> &'static [&'static s
 /// Walk the tree and collect byte ranges of literal-content nodes.
 ///
 /// Returns sorted, non-overlapping ranges in source byte coordinates.
-/// Bounded by `MAX_AST_NODES` to prevent memory exhaustion on adversarial
-/// or deeply recursive input.
+///
+/// Errors when either cap is exceeded, mirroring `collect_removable_comments`:
+/// - `depth > MAX_AST_DEPTH` → `SkimError::ParseError` (hard limit; possible
+///   malicious grammar or input).
+/// - `node_count > MAX_AST_NODES` → `SkimError::ComplexityLimit` (soft limit;
+///   legitimate large generated file; callers degrade to lossless passthrough
+///   rather than partially-protected output).
+///
+/// Returning silently on cap exceeded was the previous behaviour: it produced
+/// partial literal protection on large files with no signal, allowing
+/// `trim_and_normalize` to trim inside string literals on the uncollected tail.
 ///
 /// The ranges cover only the TEXT content (e.g. the characters between the
 /// quote delimiters), not the delimiters themselves, for most languages.
@@ -127,17 +136,41 @@ pub(crate) fn literal_fragment_kinds(language: Language) -> &'static [&'static s
 /// covering the complete `@"…"` literal — protecting it is equivalent to
 /// protecting its content because the delimiters are fixed syntax with no
 /// collapsable whitespace.
-pub(crate) fn collect_literal_ranges(tree: &Tree, language: Language) -> Vec<(usize, usize)> {
+pub(crate) fn collect_literal_ranges(tree: &Tree, language: Language) -> Result<Vec<(usize, usize)>> {
     let kinds = literal_fragment_kinds(language);
     if kinds.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut ranges = Vec::new();
     let mut node_count: usize = 0;
-    collect_inner(tree.root_node(), kinds, &mut ranges, &mut node_count, 0);
+    collect_inner(tree.root_node(), kinds, &mut ranges, &mut node_count, 0)?;
     // Tree traversal visits nodes in document order; sort for safety.
     ranges.sort_unstable_by_key(|&(s, _)| s);
-    ranges
+    Ok(ranges)
+}
+
+/// Merge a sorted-or-unsorted list of byte ranges into a minimal sorted set,
+/// combining any adjacent or overlapping intervals.
+///
+/// Both callers of `map_ranges_to_output` (`transform_minimal` and
+/// `transform_pseudo_with_spans_and_line_map`) use this to satisfy its
+/// precondition that `removed_ranges` must be sorted and non-overlapping.
+///
+/// Also used by `collapse_whitespace` in pseudo mode to merge per-line
+/// protected-range chunks emitted for multi-line string literals.
+pub(crate) fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+    ranges.sort_unstable_by_key(|&(s, _)| s);
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 fn collect_inner(
@@ -146,10 +179,21 @@ fn collect_inner(
     ranges: &mut Vec<(usize, usize)>,
     node_count: &mut usize,
     depth: usize,
-) {
+) -> Result<()> {
+    if depth > MAX_AST_DEPTH {
+        return Err(SkimError::ParseError(format!(
+            "Maximum AST depth exceeded: {} (possible malicious input)",
+            MAX_AST_DEPTH
+        )));
+    }
+
     *node_count += 1;
-    if *node_count > MAX_AST_NODES || depth > MAX_AST_DEPTH {
-        return;
+    if *node_count > MAX_AST_NODES {
+        return Err(SkimError::ComplexityLimit {
+            what: "AST nodes",
+            count: *node_count,
+            max: MAX_AST_NODES,
+        });
     }
 
     if kinds.contains(&node.kind()) {
@@ -159,13 +203,14 @@ fn collect_inner(
         }
         // Do NOT recurse: children of content nodes are escape sequences
         // (e.g. `\n`, `\"`) — the whole content-node span is the protected unit.
-        return;
+        return Ok(());
     }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_inner(child, kinds, ranges, node_count, depth + 1);
+        collect_inner(child, kinds, ranges, node_count, depth + 1)?;
     }
+    Ok(())
 }
 
 /// Map sorted source byte ranges to their positions in the post-`remove_ranges` output.
@@ -183,6 +228,13 @@ pub(crate) fn map_ranges_to_output(
     source_ranges: &[(usize, usize)],
     removed_ranges: &[(usize, usize)],
 ) -> Vec<(usize, usize)> {
+    // Precondition: removed_ranges must be sorted and non-overlapping.
+    // Both callers establish this via merge_ranges before calling here.
+    debug_assert!(
+        removed_ranges.windows(2).all(|w| w[0].1 <= w[1].0),
+        "removed_ranges must be sorted and non-overlapping (call merge_ranges first)"
+    );
+
     let mut result = Vec::with_capacity(source_ranges.len());
     let mut ri = 0usize;
     let mut cumulative_removed: usize = 0;
@@ -287,7 +339,7 @@ mod tests {
     fn test_collect_ts_string_fragment() {
         let source = "const x = \"hello  world\";\n";
         let tree = parse(source, Language::TypeScript);
-        let ranges = collect_literal_ranges(&tree, Language::TypeScript);
+        let ranges = collect_literal_ranges(&tree, Language::TypeScript).unwrap();
         assert!(!ranges.is_empty(), "should find string_fragment");
         // The fragment should contain "hello  world" (double space preserved)
         let (s, e) = ranges[0];
@@ -300,7 +352,7 @@ mod tests {
         // string_fragment children.  Interpolation `${ a + b }` must not be.
         let source = "const x = `a  b${ a + b }c  d`;\n";
         let tree = parse(source, Language::TypeScript);
-        let ranges = collect_literal_ranges(&tree, Language::TypeScript);
+        let ranges = collect_literal_ranges(&tree, Language::TypeScript).unwrap();
         // Each string_fragment: "a  b" and "c  d"
         let combined: String = ranges
             .iter()
@@ -334,7 +386,7 @@ mod tests {
     fn test_collect_python_multiline_string() {
         let source = "x = \"\"\"\n  hello  \n\"\"\"\n";
         let tree = parse(source, Language::Python);
-        let ranges = collect_literal_ranges(&tree, Language::Python);
+        let ranges = collect_literal_ranges(&tree, Language::Python).unwrap();
         assert!(
             !ranges.is_empty(),
             "should find string_content in multiline"
@@ -352,7 +404,119 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // map_ranges_to_output
+    // collect_literal_ranges: non-ASCII / multi-byte UTF-8 (rust-3 regression)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_non_ascii_inside_literal_char_boundaries() {
+        // Literal containing multi-byte UTF-8 characters. The collected byte
+        // ranges must land on char boundaries so that source[s..e] does not panic.
+        let source = "const x = \"café  crème\";\n";
+        let tree = parse(source, Language::TypeScript);
+        let ranges = collect_literal_ranges(&tree, Language::TypeScript).unwrap();
+        assert!(!ranges.is_empty(), "should find string_fragment with non-ASCII");
+        let (s, e) = ranges[0];
+        assert!(
+            source.is_char_boundary(s),
+            "range start {s} must be a char boundary"
+        );
+        assert!(
+            source.is_char_boundary(e),
+            "range end {e} must be a char boundary"
+        );
+        // Double space between two non-ASCII words must be preserved.
+        assert_eq!(&source[s..e], "café  crème");
+    }
+
+    // -----------------------------------------------------------------------
+    // security-4: cap-exceeded returns error, not silent partial protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_literal_ranges_node_cap_returns_complexity_limit() {
+        // Generate Python source large enough to exceed MAX_AST_NODES (100,000).
+        // Each line `x = 0 + 1 + ... + 19` produces ~25 AST nodes; 4500 lines ≈ 112,500.
+        let mut source = String::new();
+        for i in 0..4500 {
+            source.push_str("x = ");
+            for j in 0..20usize {
+                if j > 0 {
+                    source.push_str(" + ");
+                }
+                source.push_str(&(i * 20 + j).to_string());
+            }
+            source.push('\n');
+        }
+        let mut parser = crate::Parser::new(Language::Python).unwrap();
+        let tree = parser.parse(&source).unwrap();
+        let result = collect_literal_ranges(&tree, Language::Python);
+        let err = result.expect_err(
+            "collect_literal_ranges must error (not silently degrade) when MAX_AST_NODES is exceeded",
+        );
+        assert!(
+            err.is_complexity_limit(),
+            "expected ComplexityLimit so the caller can degrade to passthrough; got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_ranges (rust-3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_ranges_empty() {
+        assert_eq!(merge_ranges(vec![]), vec![]);
+    }
+
+    #[test]
+    fn test_merge_ranges_single() {
+        assert_eq!(merge_ranges(vec![(1, 5)]), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn test_merge_ranges_non_overlapping_already_sorted() {
+        assert_eq!(
+            merge_ranges(vec![(0, 3), (5, 8)]),
+            vec![(0, 3), (5, 8)]
+        );
+    }
+
+    #[test]
+    fn test_merge_ranges_overlapping() {
+        // [0..5) and [3..8) overlap by [3..5) → merged to [0..8)
+        let result = merge_ranges(vec![(0, 5), (3, 8)]);
+        assert_eq!(result, vec![(0, 8)]);
+    }
+
+    #[test]
+    fn test_merge_ranges_adjacent_are_merged() {
+        // Adjacent ranges [0..3) and [3..6) share a boundary — merged.
+        let result = merge_ranges(vec![(0, 3), (3, 6)]);
+        assert_eq!(result, vec![(0, 6)]);
+    }
+
+    #[test]
+    fn test_merge_ranges_exact_duplicates() {
+        let result = merge_ranges(vec![(2, 5), (2, 5)]);
+        assert_eq!(result, vec![(2, 5)]);
+    }
+
+    #[test]
+    fn test_merge_ranges_unsorted_input() {
+        // merge_ranges must sort before merging.
+        let result = merge_ranges(vec![(10, 20), (0, 5)]);
+        assert_eq!(result, vec![(0, 5), (10, 20)]);
+    }
+
+    #[test]
+    fn test_merge_ranges_three_way_overlap() {
+        // Three mutually overlapping ranges collapse to one.
+        let result = merge_ranges(vec![(0, 6), (3, 9), (5, 12)]);
+        assert_eq!(result, vec![(0, 12)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // map_ranges_to_output — including overlapping-removed regression (rust-3)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -389,6 +553,31 @@ mod tests {
         let out = map_ranges_to_output(&source_ranges, &removed);
         assert_eq!(out[0], (5, 9)); // before removal — unchanged
         assert_eq!(out[1], (15, 20)); // shifted left by 5
+    }
+
+    #[test]
+    fn test_map_overlapping_removed_via_merge_gives_correct_offsets() {
+        // Regression for rust-3: overlapping removed_ranges must be merged before
+        // calling map_ranges_to_output.  The merged form produces the correct
+        // cumulative_removed; the unmerged form over-counts and shifts literals
+        // left by the overlap width, which on non-ASCII source causes a panic.
+        //
+        // Overlapping: remove [0..5) and [3..8) → overlap = 2 bytes → merged = [(0, 8)]
+        // Source literal at [10..20): removing 8 bytes shifts it to [2..12).
+        let source_ranges = vec![(10, 20)];
+        let removed_overlapping = vec![(0, 5), (3, 8)];
+
+        // Verify merge_ranges produces the right canonical form.
+        let removed_merged = merge_ranges(removed_overlapping);
+        assert_eq!(removed_merged, vec![(0, 8)]);
+
+        // map_ranges_to_output on the merged form must give the correct answer.
+        let out = map_ranges_to_output(&source_ranges, &removed_merged);
+        assert_eq!(
+            out,
+            vec![(2, 12)],
+            "literal at [10..20) shifted left by 8 removed bytes should be [2..12)"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -339,10 +339,12 @@ pub fn elision_marker_line(
         ElidedSide::AboveInsideLiteral => "above; cut inside a string literal",
         ElidedSide::AboveInsideFence => "above; cut inside a code fence",
     };
-    let body = format!("... ({elided} {unit} {side_text})");
+    // performance-9: collapse to a single allocation instead of two.
     match hint {
-        Some(h) => format!("{prefix} {body} \u{2014} {h}{suffix}"),
-        None => format!("{prefix} {body}{suffix}"),
+        Some(h) => format!(
+            "{prefix} ... ({elided} {unit} {side_text}) \u{2014} {h}{suffix}"
+        ),
+        None => format!("{prefix} ... ({elided} {unit} {side_text}){suffix}"),
     }
 }
 
