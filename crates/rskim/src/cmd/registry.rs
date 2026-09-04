@@ -172,6 +172,14 @@ static WRAPPER_TARGETS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 ///
 /// Returns a reference to a precomputed static list — no allocation on repeated
 /// calls (see [`WRAPPER_TARGETS`]).
+///
+/// LIMITATION: `install_wrappers_in` only iterates this list to create or
+/// update symlinks — it never removes names that have left the set. A
+/// pre-existing `~/.skim/bin/<tool>` symlink from an older install becomes
+/// an orphan when a tool is renamed or removed from `KNOWN_SUBCOMMANDS`
+/// (e.g. a `~/.skim/bin/golangci` link persists after the rename to
+/// `golangci-lint`). Pruning orphaned symlinks would require diffing the
+/// on-disk set against this list; that is a future follow-up.
 pub(crate) fn wrapper_targets() -> &'static [&'static str] {
     &WRAPPER_TARGETS
 }

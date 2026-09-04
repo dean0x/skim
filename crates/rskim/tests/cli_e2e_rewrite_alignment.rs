@@ -37,7 +37,7 @@
 //! | eslint .                 | skim eslint .           | yes (JSON/text)       |
 //! | ruff check .             | skim ruff .             | yes (JSON/text)       |
 //! | mypy .                   | skim mypy .             | yes (JSON/text)       |
-//! | golangci-lint run ./...  | skim golangci ./...     | yes (JSON/text)       |
+//! | golangci-lint run ./...  | skim golangci-lint ./... | yes (JSON/text)       |
 //! | npm audit                | skim npm audit          | yes (JSON)            |
 //! | npm install express      | skim npm install        | yes (JSON/text)       |
 //! | pip install flask        | skim pip install        | yes (text)            |

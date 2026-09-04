@@ -1294,9 +1294,13 @@ fn dispatch_inner(
         | "tree" | "wc" => file::run(&prepend(subcommand, args), analytics),
 
         _ => {
-            // D2: unknown top-level commands (npx, pip3, gmake, bundle, …) are
-            // forwarded to the system binary of the same name. skim only wraps tools
-            // in KNOWN_SUBCOMMANDS; everything else passes through byte-faithfully.
+            // D2: wrapper surface only — unknown top-level commands are forwarded
+            // to the system binary of the same name. On the explicit surface
+            // (`skim <unknown> …`), `resolve_invocation()` in `main.rs` routes
+            // unknown words to `FileOperation` before `dispatch_inner` is ever
+            // reached, so this arm is dead from that path. Commands like npx,
+            // pip3, and gmake can reach this arm via PATH wrappers, not via the
+            // explicit surface.
             // Banner is debug-gated per ADR-011 (lossless path — reader sees exactly
             // what the native tool would produce).
             let safe = sanitize_for_display(subcommand);
