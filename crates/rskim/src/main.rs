@@ -299,7 +299,13 @@ struct Args {
 
     /// Maximum output lines (AST-aware smart truncation)
     ///
-    /// Truncates output to at most N lines using priority-based selection.
+    /// Emits at most N lines total, including the elision marker. For N > 1:
+    /// N-1 content lines + 1 marker = exactly N. For N = 1 (the irreconcilable
+    /// case): 1 content line + 1 marker = 2 total — spending the only slot on
+    /// the marker would return a view with no code, violating ADR-016.
+    /// The marker only appears when the output is actually truncated; files
+    /// with fewer than N lines are emitted verbatim with no marker.
+    ///
     /// Types and signatures are kept over imports, which are kept over bodies.
     /// Never cuts mid-signature or mid-type-definition.
     #[arg(
@@ -312,9 +318,13 @@ struct Args {
 
     /// Keep only the last N lines of output
     ///
-    /// Keeps the last N lines of output, prepending a language-appropriate
-    /// truncation marker indicating how many lines were omitted above.
-    /// Mutually exclusive with --max-lines.
+    /// Emits at most N lines total from the tail, including the elision marker.
+    /// For N > 1: 1 marker + N-1 content lines = exactly N. For N = 1 (the
+    /// irreconcilable case): 1 marker + 1 content line = 2 total — spending
+    /// the only slot on the marker would return a view with no code, violating
+    /// ADR-016. The marker only appears when the output is actually truncated;
+    /// files with fewer than N lines are emitted verbatim with no marker.
+    /// Mirrors `--max-lines` semantics; mutually exclusive with it.
     #[arg(
         long,
         value_name = "N",
@@ -908,8 +918,34 @@ fn main() -> ExitCode {
     // are spawned. After this call, is_debug_enabled() is a pure atomic load.
     debug::init_debug_from_env();
 
+    // security-5: anchor the pre-routing flag scan to skim's own flag positions.
+    //
+    // The old `std::env::args().any(|a| a == "--passthrough")` matched the token
+    // anywhere in argv, including inside a tool's data arguments:
+    //   `skim grep -e --passthrough file`
+    // would enable passthrough AND strip_skim_flags would drop the token, so
+    // grep received `["-e", "file"]` — the pattern arg was corrupted.
+    //
+    // Fix: collect once, stop at POSIX `--` (same logic as
+    // `cmd::rewrite::args_before_separator`, inlined here because the `rewrite`
+    // module is private), then stop at the first non-`--flag` token (the
+    // subcommand or file argument).  A skim flag is only legal before the first
+    // positional argument.
+    let argv_for_flags: Vec<String> = std::env::args().skip(1).collect();
+    let sep_pos = argv_for_flags
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(argv_for_flags.len());
+    let pre_sep = &argv_for_flags[..sep_pos];
+    // Collect skim-flag-zone tokens (before the first positional arg or `--`)
+    // into a Vec so we can scan it twice without reconstructing the iterator.
+    let skim_flag_zone: Vec<&String> = pre_sep
+        .iter()
+        .take_while(|a| a.starts_with('-'))
+        .collect();
+
     // Extract --debug before routing so it applies to all subcommands.
-    if std::env::args().any(|a| a == "--debug") {
+    if skim_flag_zone.iter().any(|a| a.as_str() == "--debug") {
         debug::force_enable_debug();
     }
 
@@ -921,7 +957,7 @@ fn main() -> ExitCode {
     // below. strip_skim_wrappers_from_path() asserts THREADS_SPAWNED is still
     // false at the top of main(), so any future reordering that moves code
     // below THREADS_SPAWNED will be caught by that assertion.
-    if std::env::args().any(|a| a == "--passthrough") {
+    if skim_flag_zone.iter().any(|a| a.as_str() == "--passthrough") {
         cmd::set_passthrough_flag();
     }
 
@@ -1193,24 +1229,51 @@ fn process_single_arg(
     // B1 / ADR-011: structural passthrough gate for the read path.
     //
     // When SKIM_PASSTHROUGH=1, emit raw bytes without any transformation.
-    // This covers both file reads and stdin (the `-` argument).
+    // Covers all four dispatch shapes that `process_single_arg` handles:
+    // stdin (`-`), directory, glob, and single file.
+    //
+    // architecture-1: write failures use bare `?` so the `io::Error` stays as
+    // the chain head and `is_broken_pipe_chain` at the top-level boundary can
+    // detect `EPIPE` and exit 141 rather than 1.  Wrapping with `anyhow::anyhow!`
+    // produces a `Message` error with no source, which `chain()` cannot walk.
+    //
+    // consistency-3: the remedy line in the multi-file marker says
+    // "SKIM_PASSTHROUGH=1 for raw output", so every shape the marker can fire
+    // for must also work in passthrough mode.  Directories and globs are handled
+    // here so the remedy is literally reachable from any invocation that prints it.
     if cmd::is_passthrough_mode() {
         use std::io::Write as _;
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
+        let path = std::path::Path::new(file);
         if file == "-" {
             // Stdin passthrough: copy bounded stdin → stdout.
             let buf = cmd::read_stdin_bounded()?;
-            out.write_all(buf.as_bytes())
-                .map_err(|e| anyhow::anyhow!("passthrough write: {e}"))?;
+            out.write_all(buf.as_bytes())?;
+        } else if path.is_dir() {
+            // Directory passthrough: collect all skim-supported files and
+            // print their raw bytes concatenated (mirrors process_directory).
+            let paths = multi::collect_passthrough_paths_dir(path, args.no_ignore);
+            for p in &paths {
+                let contents = std::fs::read(p)
+                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
+                out.write_all(&contents)?;
+            }
+        } else if multi::has_glob_pattern(file) {
+            // Glob passthrough: expand, then print raw bytes of each match.
+            let paths = multi::collect_passthrough_paths_glob(file, args.no_ignore)?;
+            for p in &paths {
+                let contents = std::fs::read(p)
+                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
+                out.write_all(&contents)?;
+            }
         } else {
             // File passthrough: read raw bytes and copy to stdout.
             // Skip validation (size limits, UTF-8) — the point of passthrough
             // is byte-faithful forwarding without skim's transform guards.
-            let contents =
-                std::fs::read(file).map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
-            out.write_all(&contents)
-                .map_err(|e| anyhow::anyhow!("passthrough write: {e}"))?;
+            let contents = std::fs::read(file)
+                .map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
+            out.write_all(&contents)?;
         }
         return Ok(());
     }

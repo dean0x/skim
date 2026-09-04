@@ -537,6 +537,28 @@ pub(crate) fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow
     process_files(paths, options)
 }
 
+/// Collect skim-supported file paths from a directory for passthrough mode.
+///
+/// Mirrors `collect_files_from_directory` but is `pub(crate)` so the passthrough
+/// gate in `process_single_arg` can enumerate files without running the transform
+/// pipeline.  Returns an empty `Vec` when the directory is empty or has no
+/// skim-supported files (the caller is responsible for handling that case).
+pub(crate) fn collect_passthrough_paths_dir(dir: &Path, no_ignore: bool) -> Vec<PathBuf> {
+    collect_files_from_directory(dir, no_ignore)
+}
+
+/// Expand a glob pattern to matching file paths for passthrough mode.
+///
+/// Mirrors `expand_glob_to_paths` but is `pub(crate)` so the passthrough gate
+/// in `process_single_arg` can enumerate files without running the transform
+/// pipeline.
+pub(crate) fn collect_passthrough_paths_glob(
+    pattern: &str,
+    no_ignore: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    expand_glob_to_paths(pattern, no_ignore)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

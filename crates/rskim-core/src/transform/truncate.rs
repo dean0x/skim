@@ -550,12 +550,18 @@ pub fn simple_last_line_truncate_with_start(
     // Reserve 1 slot for the marker so total output = n lines (#317 / ADR-016:
     // `--last-lines N` bounds the whole output).  content_lines = n-1; the
     // marker is the first slot.
-    let mut start = total.saturating_sub(n.saturating_sub(1));
+    //
+    // N=1 carve-out (ADR-016 tail mirror): spending the only slot on the marker
+    // returns a view with no code, which violates the no-silent-loss rule.
+    // N=1 therefore emits 1 content line + 1 marker = 2 total lines, exactly
+    // as `simple_line_truncate` does for `--max-lines 1`.
+    let content_count = if n > 1 { n - 1 } else { n };
+    let mut start = total.saturating_sub(content_count);
     let mut side = ElidedSide::Above;
 
     // #511: one forward pass over `text`, run ONCE per truncation call.
-    // `start == total` (n <= 1) retains no content line, so there is no window
-    // boundary to ask about and the scan is skipped entirely.
+    // `start == total` (n == 0, not reachable via CLI) retains no content line,
+    // so there is no window boundary to ask about and the scan is skipped.
     let boundary = start.checked_sub(1).filter(|_| start < total);
     if let Some(previous) = boundary {
         let scan = literal_scan::scan(text, language);
@@ -1850,26 +1856,29 @@ mod tests {
 
     #[test]
     fn test_last_line_truncation_single_line_budget() {
-        // #511: quote-free, fence-free fixture — the retained window never begins
-        // inside a literal, so the `--last-lines` mirror leaves these exact
-        // positions and counts unchanged.
-        // N-total semantics: marker counts against the N budget (b5507ad / ADR-016).
-        // Old comment said "1 content + 1 marker = 2 total." The correct tally:
-        // content_lines = n-1 = 0, omitted = total - content_lines = 3-0 = 3.
-        // With n=1, the only slot is the marker itself (no content fits).
+        // ADR-016 N=1 tail carve-out: spending the only slot on the marker returns
+        // a view with no code, which violates the no-silent-loss rule.  The tail
+        // mirrors the head: N=1 yields 1 content line + 1 marker = 2 total lines.
+        // The content line is the LAST line of `text`; the marker precedes it and
+        // discloses the omitted count (source-space: 3 total − 1 kept = 2).
         let text = "line 1\nline 2\nline 3\n";
         let result = simple_last_line_truncate(text, Language::TypeScript, 1, None, None).unwrap();
         let result_lines: Vec<&str> = result.lines().collect();
         assert_eq!(
             result_lines.len(),
-            1,
-            "Only marker fits (n=1, N-total): 1 total, got {:?}",
+            2,
+            "N=1 tail carve-out: 1 content line + 1 marker = 2 total, got {:?}",
             result_lines
         );
         assert!(
-            result_lines[0].contains("... (3 lines above)"),
-            "got {:?}",
+            result_lines[0].contains("... (2 lines above)"),
+            "marker must disclose 2 omitted lines (source-space: 3 − 1 = 2), got {:?}",
             result_lines[0]
+        );
+        assert_eq!(
+            result_lines[1], "line 3",
+            "N=1 must retain the last content line, got {:?}",
+            result_lines[1]
         );
     }
 

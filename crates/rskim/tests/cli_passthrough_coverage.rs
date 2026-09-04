@@ -985,3 +985,296 @@ fn test_passthrough_strips_every_skim_flag_for_git_diff_show_log() {
         }
     }
 }
+
+// ============================================================================
+// architecture-1: SKIM_PASSTHROUGH=1 broken-pipe exits 141, never 1
+//
+// Pre-fix: the passthrough write failures used `anyhow::anyhow!("passthrough
+// write: {e}")`, creating a `Message` error with no source chain.
+// `is_broken_pipe_chain` walks `e.chain()` looking for a downcastable
+// `io::Error` and could not see the BrokenPipe.  The top-level boundary
+// fell through and printed `Error: passthrough write: Broken pipe (os error 32)`
+// then exited 1.
+//
+// Post-fix: bare `?` keeps the `io::Error` as the chain head so the BrokenPipe
+// is detected and exit 141 is returned.
+// ============================================================================
+
+/// How long to wait for skim before declaring a hang.
+const PIPE_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read one line from `child`'s stdout, then drop the reader so the pipe's
+/// read end closes.  Returns the line read (without its newline), or an empty
+/// string if skim produced no output.
+#[cfg(unix)]
+fn read_one_line_then_close(child: &mut std::process::Child, tag: &str) -> String {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let stdout = child.stdout.take().expect("stdout must be piped");
+    let (tx, rx) = mpsc::channel::<Option<String>>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => { let _ = tx.send(None); }
+            Ok(_) => { let _ = tx.send(Some(line.trim_end_matches('\n').to_string())); }
+        }
+        // Dropping `reader` closes the read end of the pipe — the `| head -1` moment.
+    });
+    match rx.recv_timeout(PIPE_TEST_TIMEOUT) {
+        Ok(Some(line)) => line,
+        Ok(None) => String::new(),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{tag}: skim produced no line and then blocked for {PIPE_TEST_TIMEOUT:?}");
+        }
+    }
+}
+
+/// Wait for `child` to exit, aborting after [`PIPE_TEST_TIMEOUT`].
+#[cfg(unix)]
+fn wait_for_child(child: &mut std::process::Child, tag: &str) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + PIPE_TEST_TIMEOUT;
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => return s,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{tag}: skim did not exit within {PIPE_TEST_TIMEOUT:?}");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+}
+
+/// `SKIM_PASSTHROUGH=1 skim <file> | head -1` must exit 141, not 1.
+///
+/// Pre-fix: the write failure was wrapped in `anyhow::anyhow!()` — a `Message`
+/// error with no source — so `is_broken_pipe_chain` could not find the
+/// `io::BrokenPipe` and the process exited 1 with an error on stderr.
+#[cfg(unix)]
+#[test]
+fn test_read_path_passthrough_broken_pipe_exits_141() {
+    use std::process::Stdio;
+
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("big.ts");
+    // Large enough to fill the pipe buffer (> 64 KiB) so skim blocks on write
+    // after the reader drops, reproducing the EPIPE the test is guarding.
+    let big: String = (1..=3_000)
+        .map(|i| format!("export const v{i}: number = {i};\n"))
+        .collect();
+    fs::write(&file, &big).unwrap();
+
+    let mut child = std::process::Command::new(common::skim_bin())
+        .arg(file.to_str().unwrap())
+        .env("SKIM_PASSTHROUGH", "1")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_DEBUG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let line = read_one_line_then_close(&mut child, "architecture-1-file");
+    assert!(
+        !line.is_empty(),
+        "skim must have produced at least one line before the reader closed"
+    );
+    let status = wait_for_child(&mut child, "architecture-1-file");
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "SKIM_PASSTHROUGH=1 skim <file> | head -1 must exit 141 (SIGPIPE), not 1; \
+         pre-fix the anyhow::anyhow! wrap destroyed the io::Error chain so \
+         is_broken_pipe_chain could not detect EPIPE"
+    );
+}
+
+/// `SKIM_PASSTHROUGH=1 skim log < big.log | head -1` must exit 141, not 1.
+///
+/// `skim log` is the meta-subcommand that adds its own passthrough gate.
+/// Pre-fix: same `anyhow::anyhow!` wrapping problem in `cmd/log.rs`.
+#[cfg(unix)]
+#[test]
+fn test_log_passthrough_broken_pipe_exits_141() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    // Large stdin input so skim log blocks on the write after the reader drops.
+    let big_log: String = (1..=3_000)
+        .map(|i| format!("2024-01-01T00:00:{i:02}Z INFO message number {i}\n"))
+        .collect();
+
+    let mut child = std::process::Command::new(common::skim_bin())
+        .arg("log")
+        .env("SKIM_PASSTHROUGH", "1")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_DEBUG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Write the large log to stdin in a thread so we don't deadlock when skim's
+    // stdout fills and we haven't started reading yet.
+    let mut stdin = child.stdin.take().unwrap();
+    let log_bytes = big_log.into_bytes();
+    std::thread::spawn(move || { let _ = stdin.write_all(&log_bytes); });
+
+    let line = read_one_line_then_close(&mut child, "architecture-1-log");
+    assert!(
+        !line.is_empty(),
+        "skim log must have produced at least one line before the reader closed"
+    );
+    let status = wait_for_child(&mut child, "architecture-1-log");
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "SKIM_PASSTHROUGH=1 skim log | head -1 must exit 141 (SIGPIPE), not 1"
+    );
+}
+
+// ============================================================================
+// consistency-3: SKIM_PASSTHROUGH=1 works for directories and globs
+//
+// Pre-fix: the passthrough gate in `process_single_arg` only handled stdin (`-`)
+// and file paths.  Directories and globs fell through to `std::fs::read(file)`,
+// which fails with "Is a directory" (os error 21) or "No such file" (glob),
+// exiting 1.  The class-1 marker in multi.rs hardcodes the remedy
+// `SKIM_PASSTHROUGH=1 for raw output` — so the remedy was literally unreachable.
+// ============================================================================
+
+/// `SKIM_PASSTHROUGH=1 skim <dir>` must exit 0 and produce the raw file bytes.
+///
+/// Pre-fix: `std::fs::read(dir)` returned `Is a directory (os error 21)`, exit 1.
+#[test]
+fn test_directory_passthrough_exits_zero_with_content() {
+    let dir = TempDir::new().unwrap();
+    // Create a TypeScript file so the directory has something to emit.
+    let content = "export const x: number = 1;\n";
+    let ts_file = dir.path().join("lib.ts");
+    fs::write(&ts_file, content).unwrap();
+
+    let out = passthrough_skim()
+        .arg(dir.path().to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "SKIM_PASSTHROUGH=1 skim <dir> must exit 0; got {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("export const x"),
+        "passthrough of a directory must emit the raw file content;\
+         pre-fix this path failed with 'Is a directory'.\nGot: {stdout:?}"
+    );
+}
+
+/// `SKIM_PASSTHROUGH=1 skim '<glob>'` must exit 0 and produce the raw file bytes.
+///
+/// Pre-fix: the glob string was passed to `std::fs::read()` which failed with
+/// "No such file or directory (os error 2)", exit 1.
+#[test]
+fn test_glob_passthrough_exits_zero_with_content() {
+    let dir = TempDir::new().unwrap();
+    let content = "export const y: string = 'hello';\n";
+    let ts_file = dir.path().join("app.ts");
+    fs::write(&ts_file, content).unwrap();
+
+    let glob = format!("{}/*.ts", dir.path().display());
+
+    let out = passthrough_skim()
+        .arg(&glob)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "SKIM_PASSTHROUGH=1 skim '<glob>' must exit 0; got {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("export const y"),
+        "passthrough of a glob must emit the raw file content;\
+         pre-fix this path failed with 'No such file or directory'.\nGot: {stdout:?}"
+    );
+}
+
+// ============================================================================
+// security-5: --passthrough as a wrapped-tool data arg must not be consumed
+//
+// Pre-fix: `std::env::args().any(|a| a == "--passthrough")` matched the token
+// anywhere in argv, including data arguments to wrapped tools:
+//   `skim grep -e --passthrough file`
+// would enable passthrough mode AND strip_skim_flags would drop the token,
+// so grep received `["-e", "file"]` — the pattern arg was corrupted.
+//
+// Post-fix: the scan stops at the first non-`--xxx` token (the subcommand),
+// so `--passthrough` inside a tool's args is never consumed as a skim flag.
+// ============================================================================
+
+/// `skim grep -e --passthrough <file>` — when `--passthrough` is a grep data
+/// argument, it must survive to grep's argv unchanged.
+///
+/// Verifies via a stub that writes all received args (one per line) to a
+/// sidecar file, then asserts `--passthrough` is present in the captured args.
+#[cfg(unix)]
+#[test]
+fn test_security5_passthrough_as_grep_data_arg_not_consumed() {
+    use common::{stub_path, write_stub_script};
+
+    let dir = TempDir::new().unwrap();
+    // File to search (content doesn't matter for this test).
+    let testfile = dir.path().join("testfile.txt");
+    fs::write(&testfile, "some content\n").unwrap();
+
+    // Sidecar where the stub will write all args it receives.
+    let args_file = dir.path().join("grep_args.txt");
+
+    // Stub: write one arg per line to the sidecar, then exit 1 (grep convention
+    // for "no matches") so skim can inspect the stub call without hanging.
+    write_stub_script(
+        dir.path(),
+        "grep",
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 1\n",
+            args_file.display()
+        ),
+    );
+
+    // Run `skim grep -e --passthrough <testfile>` WITHOUT SKIM_PASSTHROUGH env.
+    // If the pre-routing scan wrongly consumes `--passthrough`, strip_skim_flags
+    // removes it from grep's argv, and the stub receives `["-e", "<testfile>"]`.
+    // If the scan is correctly anchored, grep gets `["-e", "--passthrough", "<testfile>"]`.
+    let _ = std::process::Command::new(common::skim_bin())
+        .args(["grep", "-e", "--passthrough", testfile.to_str().unwrap()])
+        .env("PATH", stub_path(dir.path()))
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .env("NO_COLOR", "1")
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .output()
+        .unwrap();
+
+    let captured = fs::read_to_string(&args_file)
+        .unwrap_or_default();
+    assert!(
+        captured.contains("--passthrough"),
+        "grep's `--passthrough` data arg must survive to grep's argv unchanged;\
+         pre-fix the unanchored pre-routing scan consumed it and strip_skim_flags\
+         dropped it, corrupting the `-e` pattern.\nCaptured grep args: {captured:?}"
+    );
+}

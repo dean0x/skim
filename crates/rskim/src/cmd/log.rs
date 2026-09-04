@@ -84,8 +84,10 @@ pub(crate) fn run(
         let stdin_buf = super::read_stdin_bounded()?;
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        out.write_all(stdin_buf.as_bytes())
-            .map_err(|e| anyhow::anyhow!("skim log passthrough write: {e}"))?;
+        // architecture-1: bare `?` preserves the `io::Error` as the chain head
+        // so `is_broken_pipe_chain` at the top-level boundary can detect EPIPE
+        // and exit 141 instead of 1.
+        out.write_all(stdin_buf.as_bytes())?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -313,10 +315,7 @@ fn convert_log_result(r: rskim_compress::log::LogResult) -> LogResult {
 
 /// Emit the compressed log result and return `(analytics string, stdout status)`.
 ///
-/// Both formats route through the `cmd::execution` sinks, so this module no
-/// longer acquires a raw `io::stdout()` handle for result emission (the
-/// `clippy::disallowed_methods` allow this function used to carry is gone).
-/// The byte contract is unchanged:
+/// Byte contract:
 ///
 /// - **JSON** — envelope plus exactly one newline (`println!` semantics).
 /// - **Text** — content verbatim, with a single newline appended only when the
