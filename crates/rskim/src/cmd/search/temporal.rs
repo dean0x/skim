@@ -396,19 +396,20 @@ pub(super) fn resort_window(limit: usize) -> usize {
 /// Convert a blast-radius path-to-Jaccard map to the corresponding `FileId`s.
 ///
 /// AD-409-7: When one or more co-change partner paths have no `FileId` in the
-/// manifest (e.g., they live outside the indexed subtree), emits **exactly one**
-/// stderr line naming the dropped count and the partner total. The count is
-/// `|allowlist| − |file_ids|` computed excluding the blast-radius target (seed),
-/// which carries `SEED_STRENGTH` and is expected to be present in the manifest.
-/// The notice MUST NOT be emitted when zero paths are dropped. Exit code stays 0.
-/// No `--json` key is added here (tracked in #526 / #483).
+/// manifest (e.g., they live outside the indexed subtree), emits **at most two**
+/// stderr lines: one via [`emit_seed_unindexed_notice`] when the blast-radius
+/// target itself is absent, and one via [`emit_partial_drop_notice`] when one or
+/// more co-change partners are absent.  The partner-drop count is
+/// `|partners| − |partners_resolved|` computed as
+/// `(allowlist_len − 1) − (found − seed_resolved_as_int)`, which correctly
+/// excludes the seed from both sides regardless of whether the seed itself
+/// resolved.  The notice MUST NOT be emitted when zero partners are dropped.
+/// Exit code stays 0.  No `--json` key is added here (tracked in #526 / #483).
 ///
-/// Tests membership via `contains_key` so the Jaccard value is not required at
-/// this call site (the `FileId`-to-score mapping is built by phase C's
-/// `paths_to_scored_file_ids`).  Applies PF-004 widening (`u32::try_from(idx)`)
-/// — never `as u32`.  Emits a one-line stderr warning when the result set is empty
-/// (the blast-radius paths are not indexed), so callers do not have to repeat the
-/// check.
+/// Uses `get` (not `contains_key`) so the Jaccard value is available for seed
+/// detection: the seed carries `SEED_STRENGTH = 2.0`, which is the unique
+/// sentinel strictly greater than the Jaccard maximum of 1.0.  Applies PF-004
+/// widening (`u32::try_from(idx)`) — never `as u32`.
 ///
 /// Accepts a `&[&str]` slice (from `manifest.sorted_paths()`) so that callers
 /// which already hold the slice can pass it directly without a second allocation.
@@ -421,26 +422,31 @@ pub(super) fn paths_to_file_ids(
     allowed_paths: &super::types::BlastRadiusStrengths,
 ) -> HashSet<FileId> {
     let mut file_ids = HashSet::new();
+    // AD-409-7: track whether the seed (the entry with SEED_STRENGTH) resolved
+    // so the partner-drop arithmetic can exclude it from both sides.
+    let mut seed_resolved = false;
     for (idx, path) in sorted_paths.iter().enumerate() {
-        if allowed_paths.contains_key(*path) {
+        if let Some(&v) = allowed_paths.get(*path) {
             // PF-004: widen idx (usize) to u32 before constructing FileId.
             // The file cap (50 000) guarantees no overflow, but `try_from`
             // makes the widening explicit and safe by construction.
             if let Ok(id) = u32::try_from(idx) {
                 file_ids.insert(FileId(id));
+                if v == SEED_STRENGTH {
+                    seed_resolved = true;
+                }
             }
         }
     }
     if file_ids.is_empty() {
         emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
     } else {
-        // AD-409-7: partial-drop notice — fires when some co-change partner paths have
-        // no FileId in the manifest. The count is |allowlist| − |file_ids|, which
-        // naturally excludes the seed (the seed is expected to be in the manifest, so
-        // it contributes one to both sides and cancels). The total reported is the
-        // partner count (|allowlist| − 1 for the seed). Stderr only; no --json key;
-        // no degraded element (tracked in #526/#483 follow-up work).
-        emit_partial_drop_notice(allowed_paths.len(), file_ids.len());
+        // AD-409-7: emit a distinct notice when the seed is absent from the manifest,
+        // then the partner-drop notice (suppressed when zero partners were dropped).
+        if !seed_resolved {
+            emit_seed_unindexed_notice();
+        }
+        emit_partial_drop_notice(allowed_paths.len(), file_ids.len(), seed_resolved);
     }
     file_ids
 }
@@ -462,6 +468,21 @@ fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize)
     );
 }
 
+/// Emit a one-line stderr notice when the blast-radius target file itself is absent
+/// from the lexical manifest (e.g. the file was deleted from disk while
+/// `temporal.db` still records it, or the file is outside the indexed subtree).
+///
+/// AD-409-7: the seed is always excluded from the partner-drop arithmetic — emitting
+/// a separate notice keeps the partner count truthful ("N of M partners" never
+/// silently inflates by 1 when the seed is also absent).  Callers suppress the
+/// partner-drop notice independently when zero partners were actually dropped.
+fn emit_seed_unindexed_notice() {
+    eprintln!(
+        "skim search: blast-radius: target file not found in the indexed manifest \
+         (excluded from scoring)"
+    );
+}
+
 /// Emit a one-line stderr notice when co-change partner paths are absent from
 /// the indexed manifest.
 ///
@@ -469,23 +490,28 @@ fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize)
 /// the message text identical in both call sites (AC `ac409_4_unindexed_partner_omission_is_disclosed`
 /// verifies the exact wording end-to-end).
 ///
-/// `allowlist_len` is the total number of entries in `blast_radius_paths`
-/// (partners + the seed); `found` is the number that resolved to a `FileId`.
-/// In the expected case — the seed resolved, some partners did not — the seed is
-/// excluded from both the dropped count and the partner total because it
-/// contributes one to each side and cancels.  When the seed itself is missing
-/// from the manifest (its file was deleted from disk while `temporal.db` still
-/// records it) it is counted as one of the dropped partners; the numbers stay
-/// bounded and truthful about "how many allowlist entries were excluded from
-/// scoring", which is what the operator needs, but the seed/partner split is
-/// approximate in that case.  Callers report `found == 0` through
-/// [`emit_no_indexed_files_notice`] instead, so this function never has to
-/// render a `dropped > partner_count` line.  The notice is suppressed when
+/// AD-409-7: The partner-drop count is `(allowlist_len − 1) − (found − seed_as_int)`,
+/// which correctly excludes the seed from **both** sides regardless of whether the
+/// seed itself resolved:
+///
+/// * `seed_resolved = true` (expected case, seed in manifest): both sides cancel
+///   and the arithmetic equals `|partners| − |partners_found|`.
+/// * `seed_resolved = false` (seed absent): the seed is not in `found`, so
+///   `found` already excludes it; subtracting from `allowlist_len − 1` (the partner
+///   count) gives the true partner-drop count with no inflation.
+///
+/// Callers report `found == 0` (everything absent) through
+/// [`emit_no_indexed_files_notice`] instead, so this function is called only when
+/// at least one entry (seed or partner) resolved.  The notice is suppressed when
 /// `dropped == 0`.
-fn emit_partial_drop_notice(allowlist_len: usize, found: usize) {
-    let dropped = allowlist_len.saturating_sub(found);
+fn emit_partial_drop_notice(allowlist_len: usize, found: usize, seed_resolved: bool) {
+    // partner_count = allowlist entries minus the seed slot.
+    let partner_count = allowlist_len.saturating_sub(1);
+    // partners_found = resolved entries minus the seed (only when seed resolved).
+    let seed_bit: usize = if seed_resolved { 1 } else { 0 };
+    let partners_found = found.saturating_sub(seed_bit);
+    let dropped = partner_count.saturating_sub(partners_found);
     if dropped > 0 {
-        let partner_count = allowlist_len.saturating_sub(1);
         eprintln!(
             "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
              not found in the indexed manifest (excluded from scoring)"
@@ -513,14 +539,13 @@ fn emit_partial_drop_notice(allowlist_len: usize, found: usize) {
 /// fallback neither panics nor propagates NaN into the RRF denominator.
 ///
 /// **AD-409-7 partial-drop notice**: after the manifest scan, emits **at most
-/// one** stderr line — "matched 0 indexed files" when nothing resolved, else the
-/// partial-drop notice when `|allowed_paths| − |scored|` > 0 (i.e. some co-change
-/// partner paths are absent from the indexed manifest, e.g. files deleted from
-/// disk but still present in temporal.db via git history), and nothing at all
-/// when every path resolved.  Mirrors the identical two-branch guard in
-/// [`paths_to_file_ids`]; exactly one of the two functions runs per query, so the
-/// composite arm never double-reports (AC-7).  Exit code stays 0; no `--json`
-/// key added (tracked in #526/#483 follow-up work).
+/// two** stderr lines — "matched 0 indexed files" when nothing resolved; otherwise
+/// [`emit_seed_unindexed_notice`] when the seed is absent from the manifest, and
+/// [`emit_partial_drop_notice`] when one or more co-change partners are absent.
+/// Both notices are suppressed when their respective conditions are not met.
+/// Mirrors the identical two-branch guard in [`paths_to_file_ids`]; exactly one
+/// of the two functions runs per query, so the composite arm never double-reports
+/// (AC-7).  Exit code stays 0; no `--json` key added (tracked in #526/#483).
 ///
 /// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
 pub(super) fn paths_to_scored_file_ids(
@@ -538,7 +563,11 @@ pub(super) fn paths_to_scored_file_ids(
     // `sorted_paths.len()` — the indexed file count, which is capped by
     // `COUPLING_MAX_FILES` at index-build time so no explicit per-loop bound
     // is needed here.
+    //
+    // AD-409-7: also track whether the seed (the entry with SEED_STRENGTH) resolved
+    // so the partner-drop arithmetic can exclude it from both sides correctly.
     let mut scored: Vec<(FileId, f64)> = Vec::with_capacity(allowed_paths.len());
+    let mut seed_resolved = false;
     for (idx, path) in sorted_paths.iter().enumerate() {
         if let Some(&jaccard) = allowed_paths.get(*path) {
             // PF-004: widen idx (usize) to u32 before constructing FileId.
@@ -553,22 +582,25 @@ pub(super) fn paths_to_scored_file_ids(
                     NON_FINITE_JACCARD_FLOOR
                 };
                 scored.push((FileId(id), safe_score));
+                if jaccard == SEED_STRENGTH {
+                    seed_resolved = true;
+                }
             }
         }
     }
-    // AD-409-7: partial-drop notice — mirrors the identical two-branch guard in
-    // `paths_to_file_ids`, so whichever blast-radius arm runs discloses the same
-    // condition with the same wording (and each arm emits at most ONE line —
-    // AC-7).  `scored.is_empty()` is reported as "matched 0 indexed files"
-    // because the partial-drop arithmetic is only meaningful once the seed has
-    // resolved.  Otherwise the count is |allowlist| − |scored|, which naturally
-    // excludes the seed (the seed contributes one to each side and cancels), and
-    // the total is the partner count (|allowlist| − 1 for the seed).  Stderr
-    // only; no --json key; no degraded element (tracked in #526/#483).
+    // AD-409-7: emit notices mirroring the two-branch guard in `paths_to_file_ids`.
+    // `scored.is_empty()` is the fully-unresolved case (reported separately because
+    // the partner-drop arithmetic is only meaningful once at least one entry resolved).
+    // When at least one entry resolved: emit the seed-unindexed notice when the seed
+    // is absent, then the partner-drop notice (suppressed when zero partners dropped).
+    // Stderr only; no --json key; no degraded element (tracked in #526/#483).
     if scored.is_empty() {
         emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
     } else {
-        emit_partial_drop_notice(allowed_paths.len(), scored.len());
+        if !seed_resolved {
+            emit_seed_unindexed_notice();
+        }
+        emit_partial_drop_notice(allowed_paths.len(), scored.len(), seed_resolved);
     }
     scored
 }

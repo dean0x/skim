@@ -719,6 +719,116 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
     );
 }
 
+/// AC-7 regression: when the blast-radius TARGET FILE itself is absent from the
+/// lexical manifest (not indexed), the partial-drop count must not count the
+/// seed as a "dropped partner".
+///
+/// Fixture strategy — binary seed, indexed partner:
+///   `target.bin` holds non-UTF-8 bytes → skim's produce stage content-skips it
+///   (NonUtf8) so it lands in `skipped_entries`, not `entries`.  `sorted_paths()`
+///   only surfaces `entries`, so the blast-radius seed is absent from the manifest
+///   scan even though it exists on disk.  The file never disappears from disk, so
+///   `normalize_blast_radius_path` succeeds, and the working-tree staleness scan
+///   sees it as a previously-known skipped file (not "1 added").
+///
+///   Commits: C1 + C2 each touch target.bin + partner.rs → J = 1.0 > MIN.
+///   allowed_paths = {target.bin: SEED_STRENGTH, partner.rs: 1.0} (2 entries).
+///   manifest after build: {partner.rs} only (target.bin is in skipped_entries).
+///   scored.len() = 1 (only partner found), seed_resolved = false.
+///   Expected:
+///     - stderr contains "target file not found in the indexed manifest"
+///     - stderr does NOT contain "co-change partners not found" (0 partners dropped)
+///     - exit 0; partner.rs appears in the temporal layer
+///
+/// Pre-#409-fix behaviour: `dropped = 2 − 1 = 1`, `partner_count = 1`, emits
+/// "1 of 1 co-change partners not found" — factually false, the 1 partner WAS found.
+#[test]
+fn ac409_7_seed_unindexed_notice() {
+    let now = now_epoch();
+    let dir = TempDir::new().expect("TempDir::new");
+    let cache = TempDir::new().unwrap();
+    git_init(dir.path());
+
+    // Write target.bin with non-UTF-8 bytes so the produce stage content-skips it.
+    // This file is committed to git (so temporal sync records it) but is never
+    // included in the lexical manifest entries (only in skipped_entries).
+    let binary_content: &[u8] = &[0xc3, 0x28, 0x80, 0x81, 0xff]; // invalid UTF-8 sequence
+    let target_bin_path = dir.path().join("target.bin");
+
+    // C1: target.bin + partner.rs — first joint commit.
+    fs::write(&target_bin_path, binary_content).expect("write target.bin C1");
+    let s = StdCommand::new("git")
+        .args(["add", "target.bin"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add target.bin C1");
+    assert!(s.status.success(), "git add target.bin C1 failed");
+    write_and_stage(dir.path(), "partner.rs", "// partner v1\n");
+    git_commit(
+        dir.path(),
+        "feat: initial target+partner pair",
+        now - 10 * 86400,
+    );
+
+    // C2: target.bin + partner.rs again — J(target.bin, partner.rs) = 2/2 = 1.0.
+    fs::write(&target_bin_path, binary_content).expect("write target.bin C2");
+    let s = StdCommand::new("git")
+        .args(["add", "target.bin"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add target.bin C2");
+    assert!(s.status.success(), "git add target.bin C2 failed");
+    write_and_stage(dir.path(), "partner.rs", "// partner v2\n");
+    git_commit(
+        dir.path(),
+        "feat: second target+partner commit",
+        now - 5 * 86400,
+    );
+
+    // Build the index.  target.bin is non-UTF-8 → content-skipped (NonUtf8) →
+    // goes into skipped_entries, NOT entries.  partner.rs is valid Rust → indexed.
+    // The working-tree staleness scan knows target.bin from skipped_entries, so
+    // a later query sees 0 added/removed files and does NOT trigger a rebuild.
+    build_index(dir.path(), cache.path());
+
+    // Run blast-radius on target.bin with temporal-only weights.
+    // target.bin exists on disk (normalize_blast_radius_path succeeds) and is in
+    // temporal.db (committed twice, J=1.0 with partner.rs), but NOT in manifest
+    // entries → seed_resolved = false → emit_seed_unindexed_notice().
+    // partner.rs IS in manifest entries → partner_count=1, partners_found=1, dropped=0
+    // → emit_partial_drop_notice emits nothing.
+    let (_, stderr) = run_search_raw(
+        dir.path(),
+        cache.path(),
+        &[
+            "xqzjvmblorp_ac409_e2e_ac7_seed",
+            "--blast-radius",
+            "target.bin",
+            "--weights",
+            "0,0,1",
+            "--limit",
+            "10",
+            "--json",
+        ],
+    );
+
+    let stderr_text = String::from_utf8_lossy(&stderr);
+
+    // Must emit the seed-unindexed notice (distinct from the partner-drop notice).
+    assert!(
+        stderr_text.contains("target file not found in the indexed manifest"),
+        "AC-7 / AD-409-7: expected 'target file not found in the indexed manifest' on stderr; \
+         got: {stderr_text:?}"
+    );
+
+    // Must NOT emit the partner-drop notice: partner.rs WAS found (zero partners dropped).
+    assert!(
+        !stderr_text.contains("co-change partners not found"),
+        "AC-7 / AD-409-7: seed-unindexed case must NOT emit 'co-change partners not found' \
+         when zero partners are dropped; got: {stderr_text:?}"
+    );
+}
+
 /// AC-16a — a shallow clone (`--depth 1`) from a fixture whose HEAD commit
 /// touches >= 2 files produces exactly one co-change pair at Jaccard 1.0 and
 /// orders FileId-ASC deterministically across two runs.  Exit 0, no panic.
@@ -853,55 +963,71 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
     let cache = TempDir::new().unwrap();
     build_index(clone_dir.path(), cache.path());
 
-    // Run twice — both must exit 0 and produce byte-identical JSON stdout.
-    let (stdout1, _stderr1) = run_search_raw(
-        clone_dir.path(),
-        cache.path(),
-        &[
-            "--blast-radius",
-            "crates/rskim/src/cmd/search/query.rs",
-            "--weights",
-            "0,0,1",
-            "--limit",
-            "5",
-            "--json",
-        ],
-    );
-    let (stdout2, _stderr2) = run_search_raw(
-        clone_dir.path(),
-        cache.path(),
-        &[
-            "--blast-radius",
-            "crates/rskim/src/cmd/search/query.rs",
-            "--weights",
-            "0,0,1",
-            "--limit",
-            "5",
-            "--json",
-        ],
-    );
+    // Run twice with a text query so the composite blast-radius arm is exercised.
+    // A bare `--blast-radius` without text routes to the standalone temporal arm
+    // whose JSON carries no `degraded` key, making the degraded assertion vacuous
+    // (PF-007).  The composite arm (text + --blast-radius) always produces a
+    // `degraded` key when temporal is unavailable and passes it through
+    // output.degraded so machine consumers can parse the reason.
+    // Note: run_search_raw prepends "search" internally; extra_args must NOT repeat it.
+    let composite_args: &[&str] = &[
+        "fn", // text query: routes to composite arm (text + --blast-radius)
+        "--blast-radius",
+        "crates/rskim/src/cmd/search/query.rs",
+        "--weights",
+        "0,0,1",
+        "--limit",
+        "5",
+        "--json",
+    ];
+    let (stdout1, _stderr1) = run_search_raw(clone_dir.path(), cache.path(), composite_args);
+    let (stdout2, _stderr2) = run_search_raw(clone_dir.path(), cache.path(), composite_args);
 
-    // AC-16b: byte-identical outputs (determinism).
+    // AC-16b: ranked result paths must be identical across two runs (determinism).
+    // Byte-identical comparison is avoided because `duration_ms` legitimately
+    // varies between calls; comparing the ranked result-path list is sufficient
+    // to assert that the ranking is deterministic (PF-007).
+    let v1: Value = serde_json::from_slice(&stdout1).unwrap_or(Value::Null);
+    let v2: Value = serde_json::from_slice(&stdout2).unwrap_or(Value::Null);
+
+    let paths_of = |v: &Value| -> Vec<String> {
+        v["results"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| r["path"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let paths1 = paths_of(&v1);
+    let paths2 = paths_of(&v2);
     assert_eq!(
-        stdout1, stdout2,
-        "AC-16b: two identical queries on the shallow real-repo clone must be byte-identical"
+        paths1, paths2,
+        "AC-16b: ranked result paths must be identical across two queries on the same shallow clone"
     );
 
-    // AC-16b: the JSON must contain a `degraded` array with at least one element
-    // whose `subsystem` == "temporal".
-    let json_text = String::from_utf8_lossy(&stdout1);
-    let v: Value = serde_json::from_str(&json_text).unwrap_or(Value::Null);
+    let v = v1;
 
     if v.is_null() {
         eprintln!("AC-16b: could not parse JSON output; skipping ranking assertions");
         return;
     }
 
-    // Degraded contract: subsystem "temporal" element must be present.
+    // AC-16b degraded contract: when the shallow clone yields no temporal data
+    // (e.g. HEAD is a merge commit so #407 skips all commits → empty temporal DB),
+    // the composite arm emits a `degraded` array containing a "temporal" element.
+    // When temporal data IS available (HEAD is a non-merge commit that touches ≥2
+    // files), the `degraded` key is absent (skip_serializing_if Vec::is_empty) and
+    // results are served normally.  Both outcomes are acceptable per AC-16b; we
+    // assert the correct contract for whichever case is observed.
     let degraded = v["degraded"].as_array();
-    if let Some(degs) = degraded
-        && !degs.is_empty()
-    {
+    if let Some(degs) = degraded {
+        // degraded key is present → must contain a "temporal" subsystem element.
+        assert!(
+            !degs.is_empty(),
+            "AC-16b: if degraded key is present it must be non-empty; got: {degs:?}"
+        );
         let has_temporal = degs
             .iter()
             .any(|d| d["subsystem"].as_str() == Some("temporal"));
@@ -910,8 +1036,16 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
             "AC-16b: degraded array must contain a 'temporal' subsystem element; \
              got: {degs:?}"
         );
-        // If degs is empty, the shallow clone may have produced valid temporal data
-        // (e.g. HEAD is not a merge commit at depth 1).  Both outcomes are acceptable.
+    } else {
+        // degraded key absent → temporal was healthy; assert results are non-empty
+        // so a zero-result response (which could mask a code regression) does not
+        // silently pass (PF-007: assert observable output, not just exit 0).
+        let total = v["total"].as_i64().unwrap_or(-1);
+        assert!(
+            total > 0,
+            "AC-16b: when temporal is healthy, blast-radius on a real-repo shallow clone \
+             must return at least one result; got total={total}"
+        );
     }
     // The results array (if present) must contain no fabricated entries beyond
     // what a non-degraded query would return — we assert only exit 0 and
