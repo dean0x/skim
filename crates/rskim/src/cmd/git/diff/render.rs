@@ -798,14 +798,9 @@ fn render_with_unchanged_context(
             if r.start > node_end {
                 return false;
             }
-            // B3: overlap test (was containment).  partition_point guarantees
-            // r.start >= node_start; the early-exit above guarantees
-            // r.start <= node_end.  Any range reaching here overlaps this node.
-            // The old `r.end <= node_end` containment guard and the now-dead
-            // parent_context fallback are both removed — they were redundant
-            // given that tree-sitter always positions grandchildren inside their
-            // parent's span, but the containment form would silently skip a
-            // range that starts inside the node but ends past it.
+            // Overlap test: partition_point guarantees r.start >= node_start;
+            // the early-exit above guarantees r.start <= node_end.
+            // Any range reaching here overlaps this node.
             true
         });
 
@@ -928,16 +923,6 @@ fn render_container_with_mode(
 
         if child_start == node_start {
             // The container body — render its members, not the body node itself.
-            //
-            // Note: the B3 gap-fill (interleaving render_orphan_gap between
-            // members) was reverted here because it caused a structure-mode
-            // rendering regression.  When the body's direct children include
-            // separator tokens (`,` in Rust field_declaration_list), the gap-fill
-            // iterated over them and called render_unchanged_node, which applied
-            // the structure transform to a bare `,` token, writing ` ,\n` and
-            // also splitting field text from its comma.  The stated defect (an
-            // orphan blank line being dropped) did not reproduce on any tested
-            // fixture before B3.  See Phase B-repair commit for full analysis.
             let mut body_cursor = child.walk();
             for member in child.children(&mut body_cursor) {
                 render_container_member(output, node, &member, ctx, inputs, parser, state);

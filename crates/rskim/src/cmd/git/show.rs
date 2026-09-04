@@ -588,20 +588,32 @@ fn emit_show_commit(
             // could spuriously emit `[skim:guardrail]` to stderr.
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
-            // ADR-015 / D1 declaration — `Reencoded`, not `Complete`.
+            // ADR-015 / D1 declaration — derived, not hard-coded.
             //
             // Header fields (hash, author, date, subject, body, parents) and
-            // every hunk body (`DiffFileEntry::patch`, D3 / #510) are carried,
-            // so no disclosure is owed.  What this envelope does NOT reproduce
-            // is the raw header lines the parser does not model — `Notes:`
-            // blocks, `gpg:` / `gpgsig` signature lines, `mergetag` — plus the
-            // extended diff headers noted in `diff/mod.rs`.  Those are dropped
-            // as implementation artefacts rather than user content, which is
-            // the judgement this declaration records; a parser change that
-            // starts dropping user content must flip this to `Lossy`.
+            // every hunk body (`DiffFileEntry::patch`, D3 / #510) are carried
+            // when the commit touches text files only.  In that case no
+            // disclosure is owed (`Reencoded`).
+            //
+            // What this envelope does NOT reproduce is `gpgsig`/`mergetag` header
+            // lines (per AD-GIT-8 these are implementation artefacts, not user
+            // content) plus the extended diff headers noted in `diff/mod.rs`.
+            // `Notes:` blocks ARE captured: `parse_header_lines` enters `Body`
+            // phase after the subject line and accumulates all remaining lines in
+            // `header_region` — including any `Notes:` block — so they appear in
+            // `CommitHeader::body` and are serialised.
+            //
+            // Binary files, 100%-similarity renames, and `old mode`/`new mode`-only
+            // changes produce no hunk content, so `patch` is `None` — a real
+            // information drop that requires `Lossy` and an ADR-011 class-1 marker.
+            let completeness = if result.files.iter().all(|f| f.patch.is_some()) {
+                Completeness::Reencoded
+            } else {
+                Completeness::Lossy
+            };
             if exec::emit_json_envelope(
                 &json,
-                Completeness::Reencoded,
+                completeness,
                 "git",
                 None,
                 exec::LineTermination::Newline,

@@ -137,6 +137,13 @@ pub(super) fn run_status(
     // the user never asked for — and can wrongly compress output that is
     // actually larger than the user's literal command would have been.
     //
+    // Cost: this spawns an extra `git status <args>` subprocess on every
+    // `skim git status` invocation, doubling the git process count compared to
+    // a guard that only reads the injected porcelain output.  The trade-off is
+    // accepted because the correct guard baseline (what the user's own argv
+    // would have printed) cannot be derived from the injected form without
+    // re-executing git, and a wrong baseline causes spurious over-compression.
+    //
     // Best-effort: if the user's command fails (e.g., not in a git repo),
     // fall through to the normal porcelain baseline (`None`).
     let runner = CommandRunner::new();

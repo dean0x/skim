@@ -1711,3 +1711,55 @@ fn test_skim_git_diff_argv0_surface_does_not_expand() {
         String::from_utf8_lossy(&skim_output.stdout),
     );
 }
+
+// ============================================================================
+// architecture-15: skim git log --json stdout is always valid JSON
+// ============================================================================
+
+/// **architecture-15 regression**: `skim git log --json` must always emit
+/// valid JSON on stdout.
+///
+/// Before the fix, the JSON arm called `emit_elision(elision.as_ref())?`
+/// AFTER the JSON envelope was written.  If stdout was truncated (≥64 MiB),
+/// this appended `[skim] … commits …\n` to stdout, making the combined output
+/// invalid JSON for downstream `jq` consumers.
+///
+/// This test verifies the JSON-validity contract for the normal (non-truncated)
+/// path.  It would also catch the truncation regression if the log output ever
+/// exceeded 64 MiB in CI.
+#[test]
+fn arch15_git_log_json_stdout_is_valid_json() {
+    let output = common::skim()
+        .args(["git", "log", "--json", "-n", "5"])
+        .output()
+        .expect("skim git log --json must not fail to spawn");
+
+    assert!(
+        output.status.success(),
+        "skim git log --json must exit 0; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "arch15: skim git log --json must emit valid JSON on stdout\n\
+             parse error: {e}\n\
+             stdout (first 600 chars):\n{}",
+            &stdout[..stdout.len().min(600)]
+        )
+    });
+
+    // Before the fix, if any elision text was appended to stdout it would
+    // appear as a bare `[skim]` line after the JSON document.  After the fix,
+    // the elision is folded into the JSON body as `stdout_elision` if present.
+    let contains_bare_skim_marker = stdout
+        .lines()
+        .any(|l| l.trim_start().starts_with("[skim]") && !l.trim_start().starts_with("{"));
+    assert!(
+        !contains_bare_skim_marker,
+        "arch15: stdout must not contain a bare [skim] marker outside the JSON document\n\
+         stdout (first 600 chars):\n{}",
+        &stdout[..stdout.len().min(600)]
+    );
+}

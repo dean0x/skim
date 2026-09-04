@@ -116,8 +116,6 @@ pub(super) fn run_log(
 
     let (result_str, effective_tier) = match output_format {
         OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&result)
-                .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
             // ADR-015 / D1 declaration — `Lossy`.
             //
             // Two independent drops, neither recoverable from the envelope:
@@ -130,7 +128,24 @@ pub(super) fn run_log(
             // kept out of `raw.lines().count()` lines git produced.  When the
             // two are equal (`git log` without `-p`) the marker falls back to
             // the countless wording, which still discloses drop (1).
-            let elided = Some((result.details.len(), raw.lines().count(), "lines"));
+            //
+            // When stdout was truncated (`stdout_truncated`), the elision info
+            // is folded into the JSON body as `stdout_elision` rather than
+            // appended as plain text after the JSON document. Appending plain
+            // text after the JSON would make stdout invalid JSON (breaking `jq`
+            // and other consumers). The sink's unconditional stderr marker from
+            // `Completeness::Lossy` is a double-disclosure in that case, but
+            // keeping stdout a valid JSON document takes priority.
+            let kept = result.details.len();
+            let total = raw.lines().count();
+            let mut json_val = serde_json::to_value(&result)
+                .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
+            if let Some(marker) = elision.as_ref() {
+                json_val["stdout_elision"] = serde_json::Value::String(marker.clone());
+            }
+            let json = serde_json::to_string_pretty(&json_val)
+                .map_err(|e| anyhow::anyhow!("failed to format result: {e}"))?;
+            let elided = Some((kept, total, "lines"));
             if exec::emit_json_envelope(
                 &json,
                 Completeness::Lossy,
@@ -138,10 +153,12 @@ pub(super) fn run_log(
                 elided,
                 exec::LineTermination::Newline,
             )? == exec::StdoutStatus::PipeClosed
-                || emit_elision(elision.as_ref())? == exec::StdoutStatus::PipeClosed
             {
                 return Ok(exec::pipe_closed_exit());
             }
+            // `emit_elision` is deliberately NOT called for JSON output: the
+            // elision text is folded into the JSON body above (`stdout_elision`)
+            // and the sink's stderr marker already discloses the data loss.
             (json, parse_tier)
         }
         OutputFormat::Text => {

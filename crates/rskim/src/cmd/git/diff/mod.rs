@@ -258,20 +258,25 @@ fn render_and_format<'a>(
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-            // ADR-015 / D1 declaration — `Reencoded`, not `Complete`.
+            // ADR-015 / D1 declaration — derived, not hard-coded.
             //
-            // Every hunk body is carried verbatim in `DiffFileEntry::patch`
-            // (D3 / #510), so no disclosure is owed.  What this envelope does
-            // NOT reproduce is git's *extended* header lines — `index
-            // abc..def 100644`, `old mode` / `new mode`, `similarity index` —
-            // which the unified-diff parser consumes into structured fields
-            // (`path`, `status`) rather than carrying as text.  That is a
-            // re-encoding of the same information, which is why this stays
-            // `Reencoded`; if a future parser change drops information instead
-            // of restructuring it, this declaration must become `Lossy`.
+            // When every file entry carries a `patch` body (`DiffFileEntry::patch`
+            // is `Some`), all hunk content is faithfully re-encoded and no
+            // disclosure is owed (`Reencoded`).
+            //
+            // Binary files, 100%-similarity renames, and `old mode`/`new mode`-only
+            // changes produce no `@@` hunks, so `patch` is `None` — that IS a real
+            // information drop (git's "Binary files … differ" or the mode lines
+            // are silently absent from the JSON) and requires an ADR-011 class-1
+            // disclosure (`Lossy`).
+            let completeness = if result.files.iter().all(|f| f.patch.is_some()) {
+                Completeness::Reencoded
+            } else {
+                Completeness::Lossy
+            };
             let status = exec::emit_json_envelope(
                 &json,
-                Completeness::Reencoded,
+                completeness,
                 "git",
                 None,
                 exec::LineTermination::Newline,
@@ -394,21 +399,57 @@ pub(super) fn run_diff(
         if file_diffs.is_empty() {
             // The unified diff parser produced no files despite non-empty raw output.
             // This happens when git is invoked with a flag that produces non-unified
-            // output (e.g., `--raw`, `--dirstat`).  Serve the raw bytes verbatim so
-            // the caller sees what git actually produced (#317 compress-never-truncate).
+            // output (e.g., `--raw`, `--dirstat`, `--word-diff`).
+            //
             // Drop file_diffs first so the borrow on raw_diff ends, then move it
-            // to the stdout write and analytics (PF-018 resolution).
+            // into the output path and analytics (PF-018 resolution).
             drop(file_diffs);
-            if exec::write_to_stdout(&raw_diff)? == exec::StdoutStatus::PipeClosed {
-                return Ok(exec::pipe_closed_exit());
+            match output_format {
+                OutputFormat::Json => {
+                    // Emit a valid JSON envelope so --json callers always get
+                    // parseable output regardless of which git flags were used.
+                    // The raw text is embedded under "raw" — no information is
+                    // dropped, so Reencoded is the correct declaration.
+                    let json = {
+                        let envelope =
+                            serde_json::json!({"files": [], "raw": &raw_diff});
+                        serde_json::to_string_pretty(&envelope).map_err(|e| {
+                            anyhow::anyhow!("failed to serialize empty-parse result: {e}")
+                        })?
+                    };
+                    if exec::emit_json_envelope(
+                        &json,
+                        Completeness::Reencoded,
+                        "git",
+                        None,
+                        exec::LineTermination::Newline,
+                    )? == exec::StdoutStatus::PipeClosed
+                    {
+                        return Ok(exec::pipe_closed_exit());
+                    }
+                    super::finalize_git_output_passthrough(
+                        raw_diff,
+                        label,
+                        show_stats,
+                        rec.with_tier("passthrough"),
+                        duration,
+                    );
+                }
+                OutputFormat::Text => {
+                    // Serve raw bytes verbatim so the caller sees what git
+                    // actually produced (#317 compress-never-truncate).
+                    if exec::write_to_stdout(&raw_diff)? == exec::StdoutStatus::PipeClosed {
+                        return Ok(exec::pipe_closed_exit());
+                    }
+                    super::finalize_git_output_passthrough(
+                        raw_diff,
+                        label,
+                        show_stats,
+                        rec.with_tier("passthrough"),
+                        duration,
+                    );
+                }
             }
-            super::finalize_git_output_passthrough(
-                raw_diff,
-                label,
-                show_stats,
-                rec.with_tier("passthrough"),
-                duration,
-            );
             return Ok(ExitCode::SUCCESS);
         }
 

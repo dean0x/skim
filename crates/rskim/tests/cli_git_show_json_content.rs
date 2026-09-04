@@ -225,3 +225,198 @@ fn show_json_patch_contains_first_changed_line_verbatim() {
         &json_str[..json_str.len().min(600)],
     );
 }
+
+// ============================================================================
+// Hermetic repo helpers (architecture-3 regression tests for git show)
+// ============================================================================
+
+use std::path::Path;
+
+/// Run a git command in `dir` and panic on failure.
+///
+/// PF-009: pins all four per-test config values so the fixture is deterministic
+/// across maintainers with `commit.gpgsign=true` or non-`main` defaultBranch.
+fn git_in(dir: &Path, args: &[&str]) {
+    let step = args.join(" ");
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap_or_else(|e| panic!("hermetic setup: `git {step}` spawn failed: {e}"));
+    assert!(
+        out.status.success(),
+        "hermetic setup: `git {step}` failed;\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Create a hermetic repo with commits that produce patch-less diffs.
+///
+/// Returns the temp dir (caller must keep alive) and the repo path.  The commit
+/// layout matches `make_patchless_diff_repo` in `cli_git_diff_json_content.rs`.
+fn make_patchless_show_repo()
+-> (tempfile::TempDir, std::path::PathBuf, std::collections::HashMap<&'static str, String>)
+{
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let path = dir.path().to_path_buf();
+
+    git_in(&path, &["init", "-b", "main"]);
+    git_in(&path, &["config", "user.email", "test@example.com"]);
+    git_in(&path, &["config", "user.name", "Test"]);
+    git_in(&path, &["config", "commit.gpgsign", "false"]);
+    git_in(&path, &["config", "core.autocrlf", "false"]);
+
+    let mut shas = std::collections::HashMap::new();
+
+    // Commit 1: add a plain text file.
+    std::fs::write(path.join("hello.txt"), "hello world\n").expect("write text file");
+    git_in(&path, &["add", "hello.txt"]);
+    git_in(&path, &["commit", "-m", "add text file"]);
+
+    // Commit 2: 100%-similarity rename — no @@ hunks.
+    std::fs::rename(path.join("hello.txt"), path.join("greeting.txt"))
+        .expect("rename file");
+    git_in(&path, &["add", "-A"]);
+    git_in(&path, &["commit", "-m", "rename hello.txt -> greeting.txt"]);
+    let rename_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&path)
+        .output()
+        .expect("rev-parse HEAD")
+        .stdout;
+    shas.insert("rename", String::from_utf8(rename_sha).unwrap().trim().to_string());
+
+    // Commit 3: mode-only change — chmod +x, no content change → no @@ hunks.
+    git_in(&path, &["update-index", "--chmod=+x", "greeting.txt"]);
+    git_in(&path, &["commit", "-m", "chmod +x greeting.txt"]);
+    let mode_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&path)
+        .output()
+        .expect("rev-parse HEAD")
+        .stdout;
+    shas.insert("mode", String::from_utf8(mode_sha).unwrap().trim().to_string());
+
+    // Commit 4: add a binary file.
+    let binary_bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x00, 0x01, 0x02, 0x03];
+    std::fs::write(path.join("image.bin"), binary_bytes).expect("write binary file");
+    git_in(&path, &["add", "image.bin"]);
+    git_in(&path, &["commit", "-m", "add binary file"]);
+
+    // Commit 5: modify binary file — git will report "Binary files … differ".
+    let binary_bytes2: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x00, 0xFF, 0xFE, 0xFD];
+    std::fs::write(path.join("image.bin"), binary_bytes2).expect("write binary file v2");
+    git_in(&path, &["add", "image.bin"]);
+    git_in(&path, &["commit", "-m", "modify binary file"]);
+    let binary_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&path)
+        .output()
+        .expect("rev-parse HEAD")
+        .stdout;
+    shas.insert("binary", String::from_utf8(binary_sha).unwrap().trim().to_string());
+
+    (dir, path, shas)
+}
+
+// ============================================================================
+// architecture-3: Lossy marker fires for patch-less show output
+// ============================================================================
+
+/// **architecture-3 binary (show)**: `skim git show --json <sha>` for a commit
+/// that only modifies a binary file must fire the ADR-011 class-1 disclosure
+/// marker on stderr.
+///
+/// Before the fix, `Completeness::Reencoded` was hard-coded in
+/// `format_and_write_commit_output` and the marker never fired.
+#[test]
+fn arch3_binary_show_json_emits_lossy_marker() {
+    let (_dir, repo, shas) = make_patchless_show_repo();
+    let sha = &shas["binary"];
+
+    let output = common::skim()
+        .current_dir(&repo)
+        .args(["git", "show", sha, "--json"])
+        .output()
+        .expect("skim git show --json must not fail to spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "arch3 binary show: stdout must be valid JSON, got: {e}\n\
+             stdout (first 500 chars):\n{}",
+            &stdout[..stdout.len().min(500)]
+        )
+    });
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[skim] json view of 'git':"),
+        "arch3 binary show: expected ADR-011 class-1 marker on stderr\n\
+         stderr:\n{stderr}\n\
+         Fix: derive Completeness from files[].patch presence in show.rs."
+    );
+}
+
+/// **architecture-3 rename (show)**: `skim git show --json <sha>` for a
+/// 100%-similarity rename commit must fire the Lossy marker.
+#[test]
+fn arch3_rename_show_json_emits_lossy_marker() {
+    let (_dir, repo, shas) = make_patchless_show_repo();
+    let sha = &shas["rename"];
+
+    // Pass --find-renames=100% so git presents the change as a rename
+    // (no @@ hunks) rather than as a deletion + addition (which would have
+    // hunk content and would NOT trigger the Lossy marker).
+    let output = common::skim()
+        .current_dir(&repo)
+        .args(["git", "show", sha, "--find-renames=100%", "--json"])
+        .output()
+        .expect("skim git show --json must not fail to spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "arch3 rename show: stdout must be valid JSON, got: {e}\n\
+             stdout (first 500 chars):\n{}",
+            &stdout[..stdout.len().min(500)]
+        )
+    });
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[skim] json view of 'git':"),
+        "arch3 rename show: expected Lossy marker on stderr\n\
+         stderr:\n{stderr}"
+    );
+}
+
+/// **architecture-3 mode-only change (show)**: `skim git show --json <sha>`
+/// for a mode-only change commit must fire the Lossy marker.
+#[test]
+fn arch3_mode_show_json_emits_lossy_marker() {
+    let (_dir, repo, shas) = make_patchless_show_repo();
+    let sha = &shas["mode"];
+
+    let output = common::skim()
+        .current_dir(&repo)
+        .args(["git", "show", sha, "--json"])
+        .output()
+        .expect("skim git show --json must not fail to spawn");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "arch3 mode show: stdout must be valid JSON, got: {e}\n\
+             stdout (first 500 chars):\n{}",
+            &stdout[..stdout.len().min(500)]
+        )
+    });
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[skim] json view of 'git':"),
+        "arch3 mode show: expected Lossy marker on stderr\n\
+         stderr:\n{stderr}"
+    );
+}
