@@ -190,15 +190,24 @@ fn git_rev_list_no_merges_count(dir: &Path, path: Option<&str>) -> u32 {
 }
 
 /// Build the skim search index for `root` using an isolated `cache` directory.
+///
+/// Uses `.output()` so stderr is captured and available in failure diagnostics.
+/// AC-9 (AMENDED) specifically tests empty-stderr on a clean fixture; individual
+/// callers MAY have non-empty stderr (e.g. `ast_coverage_notice` on `.txt`-only
+/// repos) and need not assert it here.
 fn build_index(root: &Path, cache: &Path) {
-    let s = StdCommand::new(cargo_bin("skim"))
+    let out = StdCommand::new(cargo_bin("skim"))
         .args(["search", "--build", "--root"])
         .arg(root)
         .env("SKIM_CACHE_DIR", cache)
         .env("SKIM_DISABLE_ANALYTICS", "1")
-        .status()
+        .output()
         .expect("skim search --build");
-    assert!(s.success(), "skim search --build failed");
+    assert!(
+        out.status.success(),
+        "skim search --build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Run `skim search [args...] --json --root <root>` and return parsed JSON output.
@@ -367,24 +376,37 @@ fn make_author_date_repo() -> TempDir {
 
 /// Create the subdirectory-scope fixture for AC-21.
 ///
-/// Layout:
-/// - src/a.rs  and  other/b.rs  — both touched in co-changing commits.
-/// - When built with `--root <repo>/src/`, only `a.rs` (relative to src/) may
-///   appear in temporal output; `other/b.rs` must not appear.
+/// Layout (2 commits):
+/// - C1: `src/a.rs`, `src/c.rs`, `other/b.rs` (feat: add all)
+/// - C2: `src/a.rs`, `src/c.rs`, `other/b.rs` (fix: update all)
+///
+/// `src/a.rs` and `src/c.rs` co-change together in every commit, giving
+/// `--blast-radius a.rs` (with `--root src/`) a non-empty in-scope peer list
+/// (`c.rs`).  `other/b.rs` co-changes with both but is outside the subtree.
+/// When built with `--root <repo>/src/`, only paths relative to `src/` may
+/// appear; `other/b.rs` must be absent from all temporal output (ADR-009).
 fn make_subdir_scope_repo() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
     let now = now_epoch();
     git_init(dir.path());
 
-    // C1: both files (co-change pair)
+    // C1: three files — two in-scope (src/), one out-of-scope (other/).
+    //
+    // src/a.rs and src/c.rs co-change together so that --blast-radius a.rs
+    // (with --root src/) has a non-empty, in-scope peer list (c.rs).  This
+    // prevents the blast-radius assertion loop from being vacuous (PF-007):
+    // if scope-filtering is over-narrow and returns nothing, the positive
+    // assertion `c.rs is present` catches the regression.
     write_and_stage(dir.path(), "src/a.rs", "fn a1() {}\n");
+    write_and_stage(dir.path(), "src/c.rs", "fn c1() {}\n");
     write_and_stage(dir.path(), "other/b.rs", "fn b1() {}\n");
-    git_commit(dir.path(), "feat: add both", now - 20 * 86400);
+    git_commit(dir.path(), "feat: add all", now - 20 * 86400);
 
-    // C2: both files again (co-change pair)
+    // C2: all three again (reinforces the a.rs ↔ c.rs co-change pair).
     write_and_stage(dir.path(), "src/a.rs", "fn a2() {}\n");
+    write_and_stage(dir.path(), "src/c.rs", "fn c2() {}\n");
     write_and_stage(dir.path(), "other/b.rs", "fn b2() {}\n");
-    git_commit(dir.path(), "fix: update both", now - 10 * 86400);
+    git_commit(dir.path(), "fix: update all", now - 10 * 86400);
 
     dir
 }
@@ -522,40 +544,81 @@ fn test_root_subdir_scope_contains_only_subtree_paths() {
     let src_root = repo.path().join("src");
     build_index(&src_root, cache.path());
 
-    // --risky --json: only src/ paths may appear
+    // --risky --json: only src/ paths may appear.
+    //
+    // PF-007: replace `if let Some` with `.expect` so a missing/null results
+    // field is a hard failure rather than silent vacuity.  Then assert a.rs is
+    // present so an over-narrow scope filter (returning nothing) is caught.
     let risky = run_search_json(&src_root, cache.path(), &["--risky"]);
-    if let Some(results) = risky["results"].as_array() {
-        for row in results {
-            let p = row["path"].as_str().unwrap_or("(no path)");
-            assert!(
-                !p.starts_with("other/"),
-                "AC-21: --risky must not emit path outside src/ subtree: {p}"
-            );
-        }
+    let results = risky["results"]
+        .as_array()
+        .expect("AC-21: --risky results must be a JSON array");
+    assert!(
+        results.iter().any(|r| r["path"].as_str() == Some("a.rs")),
+        "AC-21: --risky must contain a.rs; got: {:?}",
+        results
+            .iter()
+            .map(|r| r["path"].as_str())
+            .collect::<Vec<_>>()
+    );
+    for row in results {
+        let p = row["path"].as_str().unwrap_or("(no path)");
+        assert!(
+            !p.starts_with("other/"),
+            "AC-21: --risky must not emit path outside src/ subtree: {p}"
+        );
     }
 
-    // --hot --json: only src/ paths
+    // --hot --json: only src/ paths.
+    //
+    // PF-007: same discipline as --risky above.
     let hot = run_search_json(&src_root, cache.path(), &["--hot"]);
-    if let Some(results) = hot["results"].as_array() {
-        for row in results {
-            let p = row["path"].as_str().unwrap_or("(no path)");
-            assert!(
-                !p.starts_with("other/"),
-                "AC-21: --hot must not emit path outside src/ subtree: {p}"
-            );
-        }
+    let results = hot["results"]
+        .as_array()
+        .expect("AC-21: --hot results must be a JSON array");
+    assert!(
+        results.iter().any(|r| r["path"].as_str() == Some("a.rs")),
+        "AC-21: --hot must contain a.rs; got: {:?}",
+        results
+            .iter()
+            .map(|r| r["path"].as_str())
+            .collect::<Vec<_>>()
+    );
+    for row in results {
+        let p = row["path"].as_str().unwrap_or("(no path)");
+        assert!(
+            !p.starts_with("other/"),
+            "AC-21: --hot must not emit path outside src/ subtree: {p}"
+        );
     }
 
-    // --blast-radius src/a.rs --json: peer must not reference other/b.rs
+    // --blast-radius a.rs --json: peer must not reference other/b.rs.
+    //
+    // The subtree-relative spelling `a.rs` is correct under `--root src/`;
+    // `src/a.rs` would not resolve (ADR-009).
+    //
+    // PF-007: replace `if let Some` with `.expect`.  Assert c.rs is present:
+    // c.rs is an in-scope co-change peer of a.rs (both appear in every commit
+    // in the fixture), so a scope filter that over-narrows to nothing is caught.
     let blast = run_search_json(&src_root, cache.path(), &["--blast-radius", "a.rs"]);
-    if let Some(results) = blast["results"].as_array() {
-        for row in results {
-            let p = row["path"].as_str().unwrap_or("(no path)");
-            assert!(
-                !p.starts_with("other/"),
-                "AC-21: --blast-radius must not emit path outside src/ subtree: {p}"
-            );
-        }
+    let results = blast["results"]
+        .as_array()
+        .expect("AC-21: --blast-radius results must be a JSON array");
+    assert!(
+        results.iter().any(|r| r["path"].as_str() == Some("c.rs")),
+        "AC-21: --blast-radius a.rs must contain c.rs as in-scope co-change peer; \
+         got: {:?}",
+        results
+            .iter()
+            .map(|r| r["path"].as_str())
+            .collect::<Vec<_>>()
+    );
+    for row in results {
+        let p = row["path"].as_str().unwrap_or("(no path)");
+        assert!(
+            !p.starts_with("other/"),
+            "AC-21: --blast-radius must not emit path outside src/ subtree: {p}"
+        );
     }
 }
 
@@ -845,5 +908,68 @@ fn test_ac18_stale_data_version_heals_no_degraded_on_next_query() {
         git_head_state, "resolved",
         "AC-18: git_head_state must remain 'resolved' after data-version \
          self-heal — the self-heal must not break HEAD resolution"
+    );
+}
+
+// ============================================================================
+// AC-9 (AMENDED): empty stderr for --build and --risky under cap
+// ============================================================================
+
+/// AC-9 (AMENDED): `skim search --build` and `skim search --risky` MUST produce
+/// empty stderr on any repository whose walk stays under both caps.
+///
+/// Neither the retained-commit nor the visited-commit `WalkBudget` notice may
+/// fire below the cap, and no existing E2E stderr assertion may change.
+///
+/// This test uses the heatmap-parity fixture (only `.rs` files, all
+/// AST-indexed) so `ast_coverage_notice` does not fire.  With 3 commits —
+/// far below any reasonable walk cap — neither budget notice fires either.
+///
+/// The amended criterion narrows the scope to `--build` and `--risky` only;
+/// it does not pre-empt the `--blast-radius` arm's unconditional stderr notice
+/// added by a separate ticket.
+#[test]
+fn test_ac9_build_and_risky_produce_no_stderr() {
+    let repo = make_heatmap_parity_repo();
+    let cache = TempDir::new().expect("cache tempdir");
+
+    // --build: stderr MUST be empty.
+    let build_out = StdCommand::new(cargo_bin("skim"))
+        .args(["search", "--build", "--root"])
+        .arg(repo.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --build output");
+    assert!(
+        build_out.status.success(),
+        "skim search --build failed: {}",
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+    let build_stderr = String::from_utf8_lossy(&build_out.stderr);
+    assert!(
+        build_stderr.is_empty(),
+        "AC-9: --build must produce empty stderr on a clean .rs-only repo; \
+         got: {build_stderr:?}"
+    );
+
+    // --risky --json: stderr MUST be empty.
+    let risky_out = StdCommand::new(cargo_bin("skim"))
+        .args(["search", "--risky", "--json", "--root"])
+        .arg(repo.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search --risky --json output");
+    assert!(
+        risky_out.status.success(),
+        "skim search --risky failed: {}",
+        String::from_utf8_lossy(&risky_out.stderr)
+    );
+    let risky_stderr = String::from_utf8_lossy(&risky_out.stderr);
+    assert!(
+        risky_stderr.is_empty(),
+        "AC-9: --risky must produce empty stderr on a clean .rs-only repo; \
+         got: {risky_stderr:?}"
     );
 }
