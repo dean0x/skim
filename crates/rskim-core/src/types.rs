@@ -763,6 +763,11 @@ impl Mode {
 /// Configuration for transformation
 ///
 /// ARCHITECTURE: This is injected into transform functions (no global state).
+///
+/// This struct is `#[non_exhaustive]` — new fields may be added in minor releases.
+/// Construct via [`TransformConfig::with_mode`] and the `with_*` builder methods
+/// rather than a struct literal, so future fields do not break your code.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TransformConfig {
     /// Transformation mode
