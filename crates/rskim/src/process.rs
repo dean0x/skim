@@ -9,7 +9,8 @@ use std::path::Path;
 
 use rskim_core::{
     ElidedSide, Language, Mode, TransformConfig, detect_language_from_path, elision_marker_line,
-    transform_auto_with_config, transform_with_config, transform_with_line_map,
+    simple_last_line_truncate_with_start, simple_line_truncate, transform_auto_with_config,
+    transform_with_config, transform_with_line_map,
 };
 
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};
@@ -97,14 +98,17 @@ pub(crate) fn parse_tier_from(mode: Mode, has_errors: bool, degraded: bool) -> &
 
 /// Apply line number annotations to `output` after the guardrail decision.
 ///
-/// When `guardrail_triggered` is true the output is raw source, so an identity
-/// map is used.  When `computed_map` is `Some`, it is used directly.
+/// Priority for map selection (highest wins):
+/// 1. `computed_map` when `Some` — either from the core transform or from a
+///    post-guardrail truncation that returned the correct window start (PF-019 /
+///    complexity-2: using `identity_line_map` after `--last-lines` truncation
+///    labels tail lines as 1..N instead of their real source numbers).
+/// 2. Identity map when `guardrail_triggered` — guardrail served raw with no
+///    subsequent truncation, so output line N corresponds to source line N.
+/// 3. Skip annotation — no map available (serde non-full modes, language
+///    detection failure): restructured output has no source correspondence.
 ///
-/// When `computed_map` is `None` (serde non-full modes, or language detection
-/// failure), line numbers are **skipped** because the output is restructured
-/// and has no meaningful line-for-line correspondence with the original source.
-///
-/// AC-11: Identity map is applied when guardrail emits raw source.
+/// AC-11: Identity map is applied when guardrail emits unbounded raw source.
 /// AC-15: Serde non-full modes skip line numbers (computed_map is None).
 pub(crate) fn apply_line_numbers(
     output: String,
@@ -115,17 +119,22 @@ pub(crate) fn apply_line_numbers(
     if !line_numbers {
         return output;
     }
+    // computed_map is checked first: it carries the correct source line numbers from
+    // the core transform OR from the post-guardrail truncation helper, and takes
+    // priority over the identity map that would otherwise be applied for the
+    // guardrail path (the identity map is wrong after --last-lines truncation).
+    if let Some(map) = computed_map {
+        return crate::format::format_with_line_numbers(&output, &map);
+    }
     if guardrail_triggered {
-        // Guardrail emitted raw source — use identity map
+        // Guardrail served raw source; no subsequent truncation was applied (or
+        // truncation produced no map). Identity map is correct: output line N = source line N.
         let map = crate::format::identity_line_map(&output);
         return crate::format::format_with_line_numbers(&output, &map);
     }
-    match computed_map {
-        Some(map) => crate::format::format_with_line_numbers(&output, &map),
-        // No line map available (serde non-full, language detection failure):
-        // skip annotation — restructured output has no source correspondence.
-        None => output,
-    }
+    // No line map available (serde non-full, language detection failure):
+    // skip annotation — restructured output has no source correspondence.
+    output
 }
 
 /// Count tokens for both original and transformed text, returning `(None, None)` on failure.
@@ -457,19 +466,22 @@ fn detect_language_from_shebang(text: &str) -> Option<Language> {
     text.lines().next().and_then(Language::from_shebang)
 }
 
-/// Apply optional line-count truncation to a raw view.
+/// Apply optional line-count truncation to a raw view for the unknown-language path.
 ///
-/// Used for the unknown-language lossless passthrough (ADR-002) and for the
-/// post-guardrail `--max-lines` / `--last-lines` bound enforcement, which fires
-/// for any language once the guardrail elects to serve raw.
+/// Only called when language detection failed (ADR-002 lossless passthrough) and
+/// no tree-sitter grammar is available. Known-language paths delegate to
+/// `enforce_line_bounds` which calls `rskim-core`'s `simple_line_truncate` /
+/// `simple_last_line_truncate_with_start` for literal-aware, ADR-016-compliant
+/// arithmetic (PF-033: one spelling of the bound, in one place).
 ///
 /// Markers are built by [`elision_marker_line`] so the head form
 /// (`… N lines truncated`) and the tail form (`… N lines above`) are spelled
-/// exactly as rskim-core spells them: the language's own comment syntax, exact
-/// omission counts, and the `SKIM_PASSTHROUGH=1` remedy clause (ADR-011 class 1).
-/// `language` is `None` only when detection failed, in which case the core
-/// falls back to the `#` prefix — the neutral choice for the shell/config
-/// scripts that dominate extension-less input.
+/// exactly as rskim-core spells them: the `#` prefix (language=None), exact
+/// omission counts in **source** space (ADR-017; text is raw, so source == output
+/// space), and the `SKIM_PASSTHROUGH=1` remedy clause (ADR-011 class 1).
+///
+/// ADR-016 N=1 carve-out: when N=1, emit 1 content line + 1 marker (2 lines)
+/// because spending the only slot on the marker returns a view with no code.
 fn passthrough_with_truncation(
     text: &str,
     language: Option<Language>,
@@ -477,16 +489,22 @@ fn passthrough_with_truncation(
     last_lines: Option<usize>,
 ) -> String {
     if let Some(n) = max_lines {
+        // Count before allocating: the no-op case (text already within budget)
+        // is the common one on the hot path. A plain count avoids building the
+        // Vec when the early return fires (performance-2 / CLAUDE.md MUST).
         // split_inclusive('\n') keeps each segment's original \r\n or \n
         // terminator, so the retained portion is byte-faithful (#317 / ADR-002).
-        // str::lines() normalises \r\n → nothing and join("\n") adds only \n,
-        // making the old approach lossy for CRLF input.
-        let segs: Vec<&str> = text.split_inclusive('\n').collect();
-        if segs.len() <= n {
+        let total = text.split_inclusive('\n').count();
+        if total <= n {
             return text.to_string();
         }
-        let keep = n.saturating_sub(1);
-        let omitted = segs.len() - keep;
+        // ADR-016: reserve 1 slot for the marker so --max-lines N ≡ head -N
+        // (at most N total lines). N=1 is the documented exception: emit 1
+        // content line + 1 marker (2 lines) rather than a bare marker with no
+        // code content (ADR-016 N=1 carve-out).
+        let keep = if n > 1 { n - 1 } else { n };
+        let omitted = total - keep; // source-space count (text is raw; ADR-017)
+        let segs: Vec<&str> = text.split_inclusive('\n').collect();
         let marker =
             elision_marker_line(language, omitted, ElidedSide::Truncated, Some(ELISION_HINT));
         // Retained segments already carry their terminators; segs[keep-1] is
@@ -496,12 +514,14 @@ fn passthrough_with_truncation(
         out.push('\n');
         out
     } else if let Some(n) = last_lines {
-        let segs: Vec<&str> = text.split_inclusive('\n').collect();
-        if segs.len() <= n {
+        let total = text.split_inclusive('\n').count();
+        if total <= n {
             return text.to_string();
         }
-        let keep = n.saturating_sub(1);
-        let omitted = segs.len() - keep;
+        // ADR-016 N=1 carve-out: same as the head path.
+        let keep = if n > 1 { n - 1 } else { n };
+        let omitted = total - keep; // source-space count (ADR-017)
+        let segs: Vec<&str> = text.split_inclusive('\n').collect();
         let marker = elision_marker_line(language, omitted, ElidedSide::Above, Some(ELISION_HINT));
         // Tail segments carry their original terminators (including \r\n).
         let tail_start = segs.len().saturating_sub(keep);
@@ -514,6 +534,112 @@ fn passthrough_with_truncation(
     } else {
         text.to_string()
     }
+}
+
+/// Enforce `--max-lines` / `--last-lines` bounds on the guardrail-served raw text.
+///
+/// Only called when `guardrail_triggered=true`: the guardrail returned raw
+/// `contents` because the compressed view was larger, and the raw content still
+/// must honour the line bound.  For the non-guardrail path (compressed view
+/// selected), the core transform already applied the bound correctly, so no
+/// outer enforcement is needed (PF-033: enforcing the same bound at two layers
+/// is not idempotent when the inner layer emits synthetic marker lines).
+///
+/// Returns `(bounded_text, Some(line_map))` when truncation fired and the map
+/// is usable for `-n` annotation, or `(text, None)` when the text fits within
+/// the budget or when the language is unknown (no literal-aware grammar).
+///
+/// For `Some(language)`, delegates entirely to `rskim-core`'s
+/// `simple_line_truncate` / `simple_last_line_truncate_with_start` so the
+/// ADR-016 N=1 carve-out, source-space elision count (ADR-017), and the #511
+/// literal-aware pull-back are inherited without re-implementing them.
+///
+/// For `None` language, falls back to `passthrough_with_truncation` (fixed
+/// N=1 arithmetic, no literal-awareness — no grammar is available).
+fn enforce_line_bounds(
+    text: &str,
+    language: Option<Language>,
+    trunc: &crate::cascade::TruncationOptions,
+    source_text: &str,
+) -> (String, Option<Vec<usize>>) {
+    if let Some(n) = trunc.max_lines {
+        match language {
+            Some(lang) => {
+                // Delegate to core: literal-aware, ADR-016 N=1 carve-out,
+                // source-space elision count (PF-033 / ADR-017).
+                let source_count = source_text.lines().count();
+                match simple_line_truncate(text, lang, n, Some(ELISION_HINT), Some(source_count)) {
+                    Ok(truncated) => {
+                        // Build a source-space line map by matching truncated lines
+                        // back to the source — marker lines get 0 (no annotation).
+                        let map = build_annotation_map_by_matching(source_text, &truncated);
+                        (truncated, Some(map))
+                    }
+                    Err(_) => (text.to_string(), None),
+                }
+            }
+            None => (
+                passthrough_with_truncation(text, None, Some(n), None),
+                None,
+            ),
+        }
+    } else if let Some(n) = trunc.last_lines {
+        match language {
+            Some(lang) => {
+                let source_count = source_text.lines().count();
+                match simple_last_line_truncate_with_start(
+                    text,
+                    lang,
+                    n,
+                    Some(ELISION_HINT),
+                    Some(source_count),
+                ) {
+                    Ok((truncated, start)) => {
+                        // PF-019 / complexity-2: `start` comes from the truncator
+                        // (the single authority on where the window begins after
+                        // any #511 forward-move). Recomputing here would drift.
+                        let n_content = truncated.lines().count().saturating_sub(1);
+                        let mut map = Vec::with_capacity(1 + n_content);
+                        map.push(0usize); // marker line — no annotation
+                        for i in 0..n_content {
+                            map.push(start + 1 + i); // 1-indexed source lines
+                        }
+                        (truncated, Some(map))
+                    }
+                    Err(_) => (text.to_string(), None),
+                }
+            }
+            None => (
+                passthrough_with_truncation(text, None, None, Some(n)),
+                None,
+            ),
+        }
+    } else {
+        (text.to_string(), None)
+    }
+}
+
+/// Build a source-space line map by matching `truncated` lines to `source` lines.
+///
+/// Content lines are verbatim source lines matched monotonically in order.
+/// Marker lines (not present in source) receive source position 0, which
+/// suppresses `-n` annotation per the `format_with_line_numbers` contract.
+fn build_annotation_map_by_matching(source: &str, truncated: &str) -> Vec<usize> {
+    let source_lines: Vec<&str> = source.lines().collect();
+    let mut src_pos = 0usize;
+    truncated
+        .lines()
+        .map(|line| {
+            for (off, &sl) in source_lines[src_pos..].iter().enumerate() {
+                if sl == line {
+                    let num = src_pos + off + 1; // 1-indexed
+                    src_pos += off + 1;
+                    return num;
+                }
+            }
+            0usize // marker or unmatched line
+        })
+        .collect()
 }
 
 /// Build the [`ProcessResult`] for the unknown-language stdin passthrough (ADR-002).
@@ -667,6 +793,11 @@ pub(crate) fn process_stdin(
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Same protection as process_file; token counting happens after so stats reflect
     // the final output. Guardrail comparison uses UN-annotated output.
+    //
+    // ADR-001: the guardrail also runs when --tokens is set (the cascade path above
+    // may have selected a mode that, after elision markers, is still larger than raw).
+    // The clone is intentional: disclosure affects view selection and we need `buffer`
+    // intact as the raw baseline for view_differs and the transparency marker.
     let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
         let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
         let triggered = outcome.was_triggered();
@@ -675,21 +806,45 @@ pub(crate) fn process_stdin(
         (transformed, false)
     };
 
+    // consistency-7: apply --max-lines / --last-lines to stdin when the guardrail
+    // served raw (the compressed path already applies the bound via the core
+    // transform; the raw path does not — PF-033 / ADR-016).
+    //
+    // enforce_line_bounds also returns the source-space line map for -n annotation
+    // (PF-019 / complexity-2: the identity map used for guardrail-triggered paths
+    // is wrong after --last-lines truncation, labelling tail lines as 1..N instead
+    // of their actual source positions).
+    let (final_output, post_trunc_map) =
+        if guardrail_triggered
+            && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
+        {
+            enforce_line_bounds(&final_output, Some(language), &options.trunc, &buffer)
+        } else {
+            (final_output, None)
+        };
+
     // Transparency marker: did the transformation produce a different view?
-    // Compare pre-line-numbers output against raw buffer. When guardrail fired,
-    // final_output == buffer so view_differs will be false (correct — raw served).
+    // Computed AFTER post-guardrail truncation so a bound that cuts makes the
+    // view lossy (view_differs = true), triggering the ADR-011 class-1 marker.
+    // When the guardrail served raw and no truncation was applied,
+    // final_output == buffer and view_differs is correctly false.
     //
     // B3 / ADR-011 class 1: view_differs is unconditional — does NOT require
-    // SKIM_REWRITTEN_FROM to be set. The lossy-view marker fires whenever the
-    // served bytes differ from raw, regardless of how skim was invoked.
+    // SKIM_REWRITTEN_FROM to be set.
     let view_differs = final_output != buffer;
 
-    // Apply line number formatting AFTER guardrail, BEFORE token stats.
+    // Apply line number formatting AFTER guardrail and post-guardrail truncation,
+    // BEFORE token stats.
+    // post_trunc_map (from enforce_line_bounds) takes priority over stdin_line_map
+    // via .or(): it carries correct source line numbers from the truncator's window
+    // start, which the identity fallback in apply_line_numbers cannot provide
+    // after --last-lines moves the window (PF-019 / complexity-2).
+    let combined_map = post_trunc_map.or(stdin_line_map);
     let final_output = apply_line_numbers(
         final_output,
         options.line_numbers,
         guardrail_triggered,
-        stdin_line_map,
+        combined_map,
     );
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
@@ -781,6 +936,12 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // Apply output guardrail: if compressed output is larger than raw, emit raw instead.
     // Token counting happens AFTER this decision so stats reflect the final output.
     // Guardrail comparison uses UN-annotated output (before line number formatting).
+    //
+    // ADR-001: the guardrail also runs when --tokens is set (the cascade may have
+    // selected a mode that, after elision markers, is still larger than raw).
+    // The clone is intentional: disclosure affects view selection and we need
+    // `contents` intact as the raw baseline for view_differs and the transparency
+    // marker below.
     let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
         let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
         let triggered = outcome.was_triggered();
@@ -789,42 +950,57 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         (result, false)
     };
 
-    // Post-guardrail max-lines enforcement (#317 / ADR-002).
+    // Post-guardrail line-bound enforcement (#317 / ADR-002 / PF-033).
     //
     // The guardrail may return raw `contents` when the compressed output (with
-    // elision markers) exceeded raw in tokens — e.g. when a tight max_lines budget
-    // produces large markers relative to a short source file.  Raw contents are
-    // still subject to `--max-lines` / `--last-lines`; apply truncation here so the
-    // hard line cap holds regardless of whether the guardrail fired.
+    // elision markers) exceeded raw in tokens.  Raw contents are still subject to
+    // `--max-lines` / `--last-lines`; apply the bound here ONLY when the guardrail
+    // fired so that raw is capped.
     //
-    // When the guardrail did NOT fire (compressed output selected), the tree-sitter
-    // path already applied truncation; passthrough_with_truncation is a no-op
-    // (returns text unchanged when line count is already within the budget).
-    let final_output = if options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some() {
-        passthrough_with_truncation(
-            &final_output,
-            language,
-            options.trunc.max_lines,
-            options.trunc.last_lines,
-        )
-    } else {
-        final_output
-    };
+    // When the guardrail did NOT fire (compressed output selected), the core
+    // transform already applied the bound correctly via `simple_line_truncate` /
+    // `simple_last_line_truncate_with_start`.  The outer pass must NOT re-apply on
+    // already-bounded output: PF-033 shows that re-applying over text that already
+    // has a synthetic marker line counts the marker as a source line (wrong
+    // coordinate space — ADR-017) and undoes the ADR-016 N=1 carve-out (the inner
+    // pass emits 2 lines for N=1 but the outer pass then sees 2 > 1 and keeps
+    // only the marker alone with zero content lines).
+    //
+    // enforce_line_bounds also returns the source-space line map for -n annotation
+    // (complexity-2 / PF-019): using the identity map on a tail-truncated view
+    // labels retained lines as 1..N instead of their actual source positions.
+    let (final_output, post_trunc_map) =
+        if guardrail_triggered
+            && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
+        {
+            enforce_line_bounds(&final_output, language, &options.trunc, &contents)
+        } else {
+            (final_output, None)
+        };
 
     // Transparency marker: did transformation produce a different view than raw bytes?
-    // Compare pre-line-numbers output to raw contents. When guardrail fired,
-    // final_output == contents so view_differs will be false (correct — raw was served).
+    // Computed AFTER post-guardrail truncation so a bound that cuts the raw view
+    // correctly makes view_differs true (ADR-011 class 1: the truncation is lossy,
+    // so the marker must fire).  When the guardrail served raw and no truncation was
+    // applied, final_output == contents and view_differs is correctly false.
     //
     // B3 / ADR-011 class 1: unconditional — does NOT require SKIM_REWRITTEN_FROM.
     let view_differs = final_output != contents;
 
-    // Apply line number formatting AFTER guardrail, BEFORE cache write and token stats.
+    // Apply line number formatting AFTER guardrail and post-guardrail truncation,
+    // BEFORE cache write and token stats.
     // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
+    //
+    // post_trunc_map (from enforce_line_bounds) takes priority over line_map via .or():
+    // it carries correct source line numbers from the truncator's window start,
+    // which the identity fallback in apply_line_numbers cannot provide after
+    // --last-lines moves the window (PF-019 / complexity-2).
+    let combined_map = post_trunc_map.or(line_map);
     let final_output = apply_line_numbers(
         final_output,
         options.line_numbers,
         guardrail_triggered,
-        line_map,
+        combined_map,
     );
 
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
@@ -993,7 +1169,11 @@ mod tests {
         );
     }
 
-    /// Branch: guardrail_triggered — identity map is applied regardless of computed_map.
+    /// Branch: guardrail_triggered with no computed_map — identity map is applied.
+    ///
+    /// When `computed_map` is `Some`, it takes priority (post-guardrail truncation
+    /// returns the correct source-space map; the identity map would be wrong for
+    /// --last-lines). This test covers the no-map guardrail path only.
     #[test]
     fn apply_line_numbers_guardrail_uses_identity_map() {
         let output = "line one\nline two\n".to_string();

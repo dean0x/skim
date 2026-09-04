@@ -468,3 +468,283 @@ fn test_max_lines_noncontiguous_spans_rust_fixture() {
         );
     }
 }
+
+// ============================================================================
+// ADR-016 N=1 carve-out regression tests (reliability-1 / reliability-3 /
+// consistency-7 / complexity-2)
+//
+// Pre-fix, the outer passthrough_with_truncation in process.rs re-applied the
+// line bound over output that rskim-core had already bounded. For N=1 this was
+// fatal: core emits [content_line, marker] (2 lines); outer pass saw 2 > 1 and
+// kept only the marker (0 content lines). Fixed by delegating post-guardrail
+// bounds to core via enforce_line_bounds and only firing that helper when the
+// guardrail actually triggered (raw was served; core produced no inner bound).
+// ============================================================================
+
+/// Pins reliability-1: `--max-lines 1 --mode=full` must yield ≥1 non-marker
+/// content line. Pre-fix the double-application zeroed the content, leaving
+/// only the elision marker (ADR-016 N=1 carve-out was undone).
+///
+/// mixed_priority.ts is 43 source lines; expected: 1 content line + marker
+/// disclosing 42 omitted lines (source-space count, ADR-017).
+#[test]
+fn max_lines_1_n1_carve_out_mode_full() {
+    let fixture = fixture_path("typescript/mixed_priority.ts");
+
+    let output = skim_cmd()
+        .arg(fixture.to_str().unwrap())
+        .arg("--mode=full")
+        .arg("--max-lines")
+        .arg("1")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    // N=1 carve-out: 1 content line + 1 marker = 2 lines total
+    // (serving only the marker with zero code violates the carve-out).
+    assert!(
+        lines.iter().any(|l| !l.contains("truncated")),
+        "--max-lines 1 N=1 carve-out: at least one non-marker content line required;\
+         pre-fix double-application served zero content lines.\nGot:\n{}",
+        stdout,
+    );
+    assert!(
+        stdout.contains("truncated"),
+        "marker must be present even with N=1 (ADR-016 loss disclosure):\n{}",
+        stdout,
+    );
+    // Marker count must be in source-space (ADR-017): 43 source lines − 1 kept = 42.
+    assert!(
+        stdout.contains("42"),
+        "marker must disclose 42 omitted source lines (not output-space count):\n{}",
+        stdout,
+    );
+}
+
+/// Pins reliability-1 on the structure path. Same invariants as the full-mode
+/// test above, but exercises the core transform path (no-guardrail) and, when
+/// the ADR-001 guard fires and serves raw, the enforce_line_bounds path.
+#[test]
+fn max_lines_1_n1_carve_out_mode_structure() {
+    let fixture = fixture_path("typescript/mixed_priority.ts");
+
+    let output = skim_cmd()
+        .arg(fixture.to_str().unwrap())
+        .arg("--mode=structure")
+        .arg("--max-lines")
+        .arg("1")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        stdout.lines().any(|l| !l.contains("truncated")),
+        "--max-lines 1 --mode=structure: at least one non-marker content line required:\n{}",
+        stdout,
+    );
+    assert!(
+        stdout.contains("truncated"),
+        "marker must be present (ADR-016 disclosure):\n{}",
+        stdout,
+    );
+}
+
+/// Pins consistency-7: the stdin path must honour --max-lines 1 with the N=1
+/// carve-out. Pre-fix, process_stdin had no post-guardrail line-bound
+/// enforcement at all, so the guardrail-raw path silently skipped truncation.
+#[test]
+fn max_lines_1_n1_carve_out_stdin() {
+    // 10-line TypeScript file via stdin. Every line is a distinct declaration
+    // so the structure view does not compress significantly, causing the
+    // ADR-001 guardrail to fire and serve raw — exercising the enforce_line_bounds
+    // path inside process_stdin.
+    let source = "type A = string;\n\
+                  type B = number;\n\
+                  type C = boolean;\n\
+                  type D = never;\n\
+                  type E = unknown;\n\
+                  type F = object;\n\
+                  type G = symbol;\n\
+                  type H = bigint;\n\
+                  type I = null;\n\
+                  type J = undefined;\n";
+
+    let output = skim_cmd()
+        .arg("-")
+        .arg("-l")
+        .arg("typescript")
+        .arg("--max-lines")
+        .arg("1")
+        .write_stdin(source)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "stdin --max-lines 1 should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        stdout.lines().any(|l| !l.contains("truncated")),
+        "stdin --max-lines 1 N=1 carve-out: at least one non-marker content line required:\n{}",
+        stdout,
+    );
+    assert!(
+        stdout.contains("truncated"),
+        "stdin --max-lines 1 must disclose the elision:\n{}",
+        stdout,
+    );
+}
+
+/// Pins reliability-3: the guardrail-served-raw path must not cut inside a
+/// multi-line template literal. Pre-fix, the outer passthrough_with_truncation
+/// was literal-blind and would naïvely slice at the computed keep-index,
+/// leaking interior literal lines into the output.
+///
+/// The fixture is a short 7-line TypeScript file where the template literal
+/// spans lines 2-6. With --mode=structure the structure output ≈ raw (all
+/// const declarations are module-level structure), so the ADR-001 guardrail
+/// fires and serves raw — exercising the enforce_line_bounds → simple_line_truncate
+/// (literal-aware) path.
+///
+/// With --max-lines 4, the naïve cut at line 3 falls inside the literal.
+/// The literal-aware pull-back retreats to line 1, producing 1 content line
+/// + marker, never any interior literal text.
+#[test]
+fn max_lines_literal_aware_pull_back() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("lit.ts");
+    // Lines:
+    //   1: const a = 1;
+    //   2: const msg = `
+    //   3:   interior text
+    //   4:   still inside
+    //   5:   last interior
+    //   6: `;
+    //   7: const b = 2;
+    // Naïve keep=N-1=3 includes lines 1-3; line 3 is inside the literal.
+    // Literal-aware: pull back to line 1 (last complete line before literal).
+    std::fs::write(
+        &file,
+        "const a = 1;\n\
+         const msg = `\n\
+           interior text\n\
+           still inside\n\
+           last interior\n\
+         `;\n\
+         const b = 2;\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--mode=structure")
+        .arg("--max-lines")
+        .arg("4")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Interior literal text must NOT appear: a literal-blind cut at line 3
+    // would leak "interior text" or "still inside" into the output.
+    assert!(
+        !stdout.contains("interior text"),
+        "literal-aware pull-back must not cut inside a template literal:\n{}",
+        stdout,
+    );
+    assert!(
+        !stdout.contains("still inside"),
+        "literal-aware pull-back must not cut inside a template literal:\n{}",
+        stdout,
+    );
+    // The elision must still be disclosed — pull-back must not silently expand
+    // the output past the budget either.
+    assert!(
+        stdout.contains("truncated"),
+        "pull-back must disclose the elision (ADR-016 / ADR-011 class 1):\n{}",
+        stdout,
+    );
+}
+
+/// Pins complexity-2: `--last-lines N -n` must annotate output lines with
+/// their true source positions, not with identity labels 1..N.
+///
+/// Pre-fix, apply_line_numbers checked `guardrail_triggered` before
+/// `computed_map`; the identity map (1..N) was applied when the guardrail
+/// served raw, producing wrong line numbers for tail-window views.
+/// After the fix, computed_map (which carries the correct start offset from
+/// simple_last_line_truncate_with_start) takes priority.
+///
+/// The fixture is an 8-line type-only TypeScript file. Structure mode keeps
+/// all type aliases (they ARE the structure), so output ≈ raw and the
+/// ADR-001 guardrail fires — serving raw and triggering the enforce_line_bounds
+/// path where the bug lived.
+///
+/// With --last-lines 3, the retained lines are source lines 6, 7, 8.
+/// Correct annotation: "6\ttype Zeta = null;" etc.
+/// Wrong annotation (pre-fix identity map): "1\ttype Zeta = null;" etc.
+#[test]
+fn last_lines_line_numbers_source_positions() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("types.ts");
+    // 8-line file: all type aliases. Structure mode emits all of them
+    // (type aliases are the structure), so compressed ≈ raw → ADR-001
+    // guardrail fires → enforce_line_bounds path is exercised.
+    //
+    // Source lines 6, 7, 8 are retained by --last-lines 3:
+    //   6: type Zeta = null;
+    //   7: type Eta = undefined;
+    //   8: type Theta = object;
+    std::fs::write(
+        &file,
+        "type Alpha = string;\n\
+         type Beta = number;\n\
+         type Gamma = boolean;\n\
+         type Delta = never;\n\
+         type Epsilon = unknown;\n\
+         type Zeta = null;\n\
+         type Eta = undefined;\n\
+         type Theta = object;\n",
+    )
+    .unwrap();
+
+    let output = skim_cmd()
+        .arg(file.to_str().unwrap())
+        .arg("--mode=structure")
+        .arg("--last-lines")
+        .arg("3")
+        .arg("-n")
+        .arg("--no-cache")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Correct: source positions 6/7/8 annotate the tail lines.
+    // The tab-separated format is "{source_line}\t{content}" (format.rs AC-18).
+    assert!(
+        stdout.contains("6\ttype") || stdout.contains("7\ttype") || stdout.contains("8\ttype"),
+        "--last-lines 3 -n must show source positions (6/7/8), not identity 1/2/3:\n{}",
+        stdout,
+    );
+    // Pre-fix identity map labelled 1, 2, 3 — none of those must appear.
+    assert!(
+        !stdout.contains("1\ttype") && !stdout.contains("2\ttype") && !stdout.contains("3\ttype"),
+        "identity map (1/2/3) detected — source positions not applied (complexity-2 regression):\n{}",
+        stdout,
+    );
+}

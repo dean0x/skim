@@ -48,6 +48,17 @@ pub use ast_walk::{AstWalkConfig, AstWalkIter, AstWalkNode};
 /// spells the marker the same way (ADR-011 class 1).
 pub use transform::utils::{ElidedSide, elision_marker_line, get_comment_prefix};
 
+/// Simple line-bound enforcement shared with the CLI post-guardrail path.
+///
+/// Exported so `rskim` can delegate its post-guardrail truncation to the same
+/// literal-aware arithmetic used inside the core transform, satisfying PF-033
+/// (one spelling of the bound, in one place) and inheriting the ADR-016 N=1
+/// carve-out, the source-space elision count (ADR-017), and the #511
+/// literal-aware pull-back for free.
+pub use transform::truncate::{
+    simple_last_line_truncate, simple_last_line_truncate_with_start, simple_line_truncate,
+};
+
 /// Return the structural priority of a tree-sitter node kind (1–5).
 ///
 /// Used by the BM25F classifier to map node kinds to [`SearchField`] variants.

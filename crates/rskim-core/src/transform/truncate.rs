@@ -347,7 +347,7 @@ const fn cut_inside_side(base: ElidedSide, language: Language) -> ElidedSide {
 /// nothing to pull back to, and the output takes the degenerate shape: the
 /// marker FIRST (so it is outside the literal and still readable), then the raw
 /// cut, with the marker naming the cut it could not avoid.
-pub(crate) fn simple_line_truncate(
+pub fn simple_line_truncate(
     text: &str,
     language: Language,
     max_lines: usize,
@@ -445,7 +445,7 @@ pub(crate) fn simple_line_truncate(
 ///
 /// See [`simple_last_line_truncate_with_start`]: the retained window never
 /// *begins* inside a multi-line string literal or a Markdown fenced code block.
-pub(crate) fn simple_last_line_truncate(
+pub fn simple_last_line_truncate(
     text: &str,
     language: Language,
     n: usize,
@@ -490,7 +490,7 @@ pub(crate) fn simple_last_line_truncate(
 /// names the cut it could not avoid — the same fail-safe as the head window, so
 /// a scanner bug can never breach the `N` bound or empty a content-bearing
 /// output.
-pub(crate) fn simple_last_line_truncate_with_start(
+pub fn simple_last_line_truncate_with_start(
     text: &str,
     language: Language,
     n: usize,
