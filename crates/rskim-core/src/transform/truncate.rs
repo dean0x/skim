@@ -187,7 +187,16 @@ pub(crate) fn truncate_to_lines(
             .end
             .min(lines.len())
             .saturating_sub(dropped_span.transformed_range.start);
-        lines_used -= dropped_lines;
+        // rust-13: the subtraction is safe only because the fallback push at
+        // the bottom of the greedy-select loop adds a span without incrementing
+        // lines_used, and the trim loop requires selected.len() > 1. Decouple
+        // the two facts with a checked_sub so a future edit cannot silently
+        // underflow.
+        debug_assert!(
+            lines_used >= dropped_lines,
+            "invariant: lines_used ({lines_used}) >= dropped_lines ({dropped_lines})"
+        );
+        lines_used = lines_used.checked_sub(dropped_lines).unwrap_or(0);
 
         // Recalculate markers with updated selection
         let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
@@ -302,12 +311,22 @@ pub(crate) fn truncate_to_lines(
 /// `--max-lines` head window, [`ElidedSide::Above`] for the `--last-lines` tail
 /// window. `language` picks the construct — Markdown's multi-line construct is
 /// a fenced code block, every other language's is a string literal.
+///
+/// Already-converted `*Inside*` variants pass through unchanged so that a
+/// double call (e.g. from a fixpoint loop that re-enters the fail-safe) does
+/// not silently relabel `TruncatedInsideFence` as `TruncatedInsideLiteral`.
+/// The catch-all `(_, _)` arms that accepted ANY `ElidedSide` have been
+/// removed; only the two unconverted inputs (`Truncated`, `Above`) are
+/// actually converted here (rust-9).
 const fn cut_inside_side(base: ElidedSide, language: Language) -> ElidedSide {
     match (base, language) {
         (ElidedSide::Above, Language::Markdown) => ElidedSide::AboveInsideFence,
         (ElidedSide::Above, _) => ElidedSide::AboveInsideLiteral,
-        (_, Language::Markdown) => ElidedSide::TruncatedInsideFence,
-        (_, _) => ElidedSide::TruncatedInsideLiteral,
+        (ElidedSide::Truncated, Language::Markdown) => ElidedSide::TruncatedInsideFence,
+        (ElidedSide::Truncated, _) => ElidedSide::TruncatedInsideLiteral,
+        // Pass already-converted *Inside* variants through unchanged.
+        // The language arm is required for exhaustiveness but not meaningful.
+        (already, _) => already,
     }
 }
 
@@ -354,11 +373,12 @@ pub fn simple_line_truncate(
     hint: Option<&str>,
     source_line_count: Option<usize>,
 ) -> Result<String> {
-    let lines: Vec<&str> = text.lines().collect();
-
-    if lines.len() <= max_lines {
+    // performance-8: count first so the early-return path pays O(N) scan
+    // instead of O(N) scan + O(N) allocation. Mirrors truncate_to_lines:84-86.
+    if text.lines().count() <= max_lines {
         return Ok(text.to_string());
     }
+    let lines: Vec<&str> = text.lines().collect();
 
     // Reserve 1 slot for the marker so that `--max-lines N` ≡ `head -N`:
     // at most N total lines (#317 / ADR-016).  content_lines = N-1; the marker
@@ -379,22 +399,46 @@ pub fn simple_line_truncate(
 
     // #511: pull the cut back out of a multi-line literal / Markdown fence.
     //
-    // The scan is a single forward pass over `text`, run ONCE per truncation
-    // call. `content_lines == 0` (only reachable via `max_lines == 0`) has no
-    // last retained line to ask about, so it skips the scan entirely.
+    // The scan is a single forward pass over `text`, computed once. The snap
+    // runs as a **bounded fixpoint** (architecture-5): a line that closes one
+    // literal and immediately opens another (e.g. Python `""" + """`) records
+    // `open_after[i] = Some(i)` while `open_after[i-1] = Some(k < i)`.
+    // A single snap to `content_lines = i` leaves the new last retained line
+    // `i-1` still inside the previous literal. Iterating until `open_after` is
+    // `None` guarantees the cut always lands in clean state.
+    //
+    // Bound: the loop decreases `content_lines` by at least 1 each iteration
+    // (guarded by `open < content_lines`), so it runs at most `lines.len()`
+    // times — which satisfies CLAUDE.md's "every loop has an explicit bound".
+    //
+    // `content_lines == 0` (only reachable via `max_lines == 0`) has no last
+    // retained line to ask about, so the loop body is skipped entirely.
     let mut side = ElidedSide::Truncated;
-    if let Some(last_retained) = content_lines.checked_sub(1) {
-        match literal_scan::scan(text, language).open_after(last_retained) {
-            // The cut lands inside a literal opened further down: retain up to
-            // the line before the opener. `open` is the opener's 0-based index,
-            // so it is also the count of lines before it. Backwards only — a
-            // forward cut would exceed the N bound (ADR-016).
-            Some(open) if open > 0 => content_lines = open,
-            // FAIL-SAFE: snapping back would leave zero content lines (the
-            // literal opens on line 1). A bare marker is not a code view, so
-            // keep the raw cut and switch to the degenerate shape below.
-            Some(_) => side = cut_inside_side(ElidedSide::Truncated, language),
-            None => {}
+    if content_lines > 0 {
+        let scan = literal_scan::scan(text, language);
+        for _ in 0..lines.len() {
+            let Some(last_retained) = content_lines.checked_sub(1) else {
+                break;
+            };
+            match scan.open_after(last_retained) {
+                // The cut lands inside a literal: snap back to just before the
+                // opener. `open` is the opener's 0-based index and also the
+                // count of clean lines before it. Continue the loop: the new
+                // last retained line may itself end inside an earlier literal.
+                // `open < content_lines` ensures we always decrease — defending
+                // against a scanner bug that returns an opener at or past the
+                // current cut.
+                Some(open) if open > 0 && open < content_lines => content_lines = open,
+                // FAIL-SAFE: snapping back would leave zero content lines (the
+                // literal opens on the first retained line). Keep the raw cut
+                // and switch to the degenerate shape (marker goes first).
+                Some(_) => {
+                    side = cut_inside_side(ElidedSide::Truncated, language);
+                    break;
+                }
+                // Clean after last_retained — the cut is safe.
+                None => break,
+            }
         }
     }
     let degenerate = side != ElidedSide::Truncated;
@@ -608,6 +652,15 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 /// `elision_hint` is appended to the truncation marker when `Some`
 /// (B5 / ADR-011 class 1 remedy clause). `None` keeps the library CLI-agnostic.
 ///
+/// # Source-space counts (reliability-8)
+///
+/// When `source_line_count` is `Some(k)`, the marker reports `k - best`
+/// lines omitted — the count in **source** space. `None` falls back to
+/// `text.lines().count() - best` (output-space count). Callers should pass
+/// the original source-file line count so that a stacked `--tokens N --max-lines M`
+/// invocation correctly reports how many source lines the agent cannot see,
+/// rather than mis-counting the synthetic marker line from the `--max-lines` pass.
+///
 /// # Literal boundaries (#511)
 ///
 /// The binary search converges on a line count, not on a syntactic boundary, so
@@ -615,7 +668,7 @@ fn count_markers(selected: &[&NodeSpan], total_lines: usize) -> usize {
 /// literal (or Markdown fenced code block) it landed in — the same rule
 /// [`simple_line_truncate`] applies to `--max-lines`. The pull-back only ever
 /// removes content lines, so the budget the search established still holds and
-/// no candidate is re-counted. The public signature is unchanged.
+/// no candidate is re-counted.
 pub(crate) fn truncate_to_token_budget<F>(
     text: &str,
     language: Language,
@@ -623,6 +676,7 @@ pub(crate) fn truncate_to_token_budget<F>(
     count_tokens: F,
     known_token_count: Option<usize>,
     elision_hint: Option<&str>,
+    source_line_count: Option<usize>,
 ) -> Result<String>
 where
     F: Fn(&str) -> usize,
@@ -631,12 +685,10 @@ where
     // already knows the token count from the cascade loop, this avoids a
     // redundant full-text tokenization.
     let full_count = known_token_count.unwrap_or_else(|| count_tokens(text));
-    debug_assert!(
-        known_token_count.is_none() || known_token_count == Some(count_tokens(text)),
-        "known_token_count ({:?}) does not match actual count ({})",
-        known_token_count,
-        count_tokens(text),
-    );
+    // performance-12: the debug_assert that called count_tokens(text) again
+    // here defeated the optimisation that known_token_count exists to provide
+    // (re-tokenising the full text on every call in debug mode). The invariant
+    // is covered by cascade integration tests instead.
     if full_count <= token_budget {
         return Ok(text.to_string());
     }
@@ -648,11 +700,17 @@ where
         return Ok(String::new());
     }
 
+    // reliability-8: use source_line_count (the true source size) when
+    // provided so the marker is accurate in source space.  Falls back to
+    // lines.len() when None — same as the previous behaviour.
+    let source_total = source_line_count.unwrap_or(lines.len());
+
     // B5: elision_hint must be captured by the closure to append the remedy clause.
-    let make_marker = |truncated_count: usize| {
+    // The marker count is `source_total - kept` — source-space omitted lines.
+    let make_marker = |kept: usize| {
         elision_marker_line(
             Some(language),
-            truncated_count,
+            source_total.saturating_sub(kept),
             ElidedSide::Truncated,
             elision_hint,
         )
@@ -688,7 +746,7 @@ where
 
         // Build candidate: mid content lines + omission marker
         // Slice from pre-joined string instead of per-iteration join
-        let marker = make_marker(lines.len() - mid);
+        let marker = make_marker(mid);
         let content_slice = &joined[..byte_end[mid - 1]];
         let mut candidate = String::with_capacity(content_slice.len() + 1 + marker.len());
         candidate.push_str(content_slice);
@@ -710,18 +768,26 @@ where
     // budget invariant established by the search still holds, with no
     // re-counting.
     //
-    // Snapping to 0 (the literal opens on line 1) hands the compact branch
-    // below a cut it could not avoid, which the marker must say.
+    // rust-4: guard the snap so it never reduces `best` to 0 when the binary
+    // search found content lines that fit (best > 0). A top-of-file literal
+    // (open == 0) means the cut landed on the first retained line with no
+    // clean line before it; keeping `best` unchanged and letting the content +
+    // marker path below handle it is preferable to serving a marker-only output
+    // with zero content lines.
     let open_at_cut = best
         .checked_sub(1)
         .and_then(|last_retained| scan.open_after(last_retained));
     let snapped_to_zero = open_at_cut == Some(0);
     if let Some(open) = open_at_cut {
-        best = open;
+        if open > 0 {
+            best = open;
+        }
+        // When open == 0, keep best unchanged; snapped_to_zero is true so the
+        // compact_side below carries the cut-inside disclosure.
     }
 
     // Build final output from pre-joined string
-    let marker = make_marker(lines.len() - best);
+    let marker = make_marker(best);
 
     // ADR-011 class 1 / #317: elision markers are unconditional — never suppress them
     // even when the marker alone exceeds the token budget. Returning an empty string
@@ -751,10 +817,20 @@ where
         s.push_str(&marker);
         s
     } else {
-        elision_marker_line(Some(language), lines.len(), compact_side, None)
+        elision_marker_line(Some(language), source_total, compact_side, None)
     };
 
-    if text.ends_with('\n') {
+    // documentation-24: always append a trailing newline to the compact
+    // marker (`best == 0`) so downstream pipeline consumers receive a
+    // complete text line regardless of whether the input had a final newline.
+    // The non-compact path (`best > 0`) mirrors the input's trailing newline
+    // behaviour — consistent with the rest of the function.
+    if best == 0 {
+        // Compact marker: unconditionally terminate as a full line.
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    } else if text.ends_with('\n') {
         output.push('\n');
     }
 
@@ -1378,7 +1454,7 @@ mod tests {
     fn test_token_budget_no_truncation_when_within_budget() {
         let text = "line one\nline two\nline three\n";
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 100, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 100, word_count, None, None, None)
                 .unwrap();
         assert_eq!(result, text);
     }
@@ -1389,7 +1465,7 @@ mod tests {
         // Budget of 10 words: should truncate since text has 8 content words
         // plus marker words
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 6, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 6, word_count, None, None, None)
                 .unwrap();
         let token_count = word_count(&result);
         assert!(
@@ -1404,7 +1480,7 @@ mod tests {
     fn test_token_budget_includes_omission_marker() {
         let text = "line one\nline two\nline three\nline four\nline five\n";
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None, None, None)
                 .unwrap();
         assert!(
             result.contains("truncated"),
@@ -1419,7 +1495,7 @@ mod tests {
         // Budget of 5: full text is 6 words, marker alone is 5 words ("// ... (3 lines truncated)")
         // so best=0, marker fits, trailing newline from original is preserved
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None, None, None)
                 .unwrap();
         assert!(
             result.ends_with('\n'),
@@ -1432,7 +1508,7 @@ mod tests {
     fn test_token_budget_no_trailing_newline_when_absent() {
         let text = "line one\nline two\nline three";
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 4, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 4, word_count, None, None, None)
                 .unwrap();
         assert!(
             !result.ends_with('\n'),
@@ -1445,7 +1521,7 @@ mod tests {
     fn test_token_budget_empty_input() {
         let text = "";
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 10, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 10, word_count, None, None, None)
                 .unwrap();
         assert_eq!(result, "");
     }
@@ -1456,7 +1532,7 @@ mod tests {
         // After ADR-011 / #317 fix: always emit the marker, never return empty string.
         let text = "line one\nline two\nline three\n";
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 1, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 1, word_count, None, None, None)
                 .unwrap();
         assert!(
             !result.is_empty(),
@@ -1474,7 +1550,7 @@ mod tests {
     fn test_token_budget_python_marker_syntax() {
         let text = "def foo(): pass\ndef bar(): pass\ndef baz(): pass\n";
         let result =
-            truncate_to_token_budget(text, Language::Python, 5, word_count, None, None).unwrap();
+            truncate_to_token_budget(text, Language::Python, 5, word_count, None, None, None).unwrap();
         if result.contains("truncated") {
             assert!(
                 result.contains("# ..."),
@@ -1491,7 +1567,7 @@ mod tests {
         // The marker "// ... (3 lines truncated)" is 5 word-tokens.
         let text = "line one\nline two\nline three\n";
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, 5, word_count, None, None, None)
                 .unwrap();
         assert!(
             result.contains("truncated"),
@@ -1529,6 +1605,7 @@ mod tests {
                 Language::TypeScript,
                 budget,
                 word_count,
+                None,
                 None,
                 None,
             )
@@ -1583,7 +1660,7 @@ mod tests {
         let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
         let known = word_count(text); // 8
         let result =
-            truncate_to_token_budget(text, Language::TypeScript, 6, word_count, Some(known), None)
+            truncate_to_token_budget(text, Language::TypeScript, 6, word_count, Some(known), None, None)
                 .unwrap();
         let token_count = word_count(&result);
         assert!(
@@ -1621,17 +1698,18 @@ mod tests {
             counting_fn,
             Some(actual_count),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(result, text, "Fast-path should return text unchanged");
-        // In debug builds the debug_assert! calls count_tokens(text) once.
-        // The fast-path unwrap_or_else should NOT call it (known_token_count is Some).
-        // So we expect at most 1 call (from debug_assert), not 2.
+        // performance-12: the debug_assert that called count_tokens(text) again has
+        // been removed. The fast-path unwrap_or_else should NOT call it (known_token_count is Some).
+        // So we expect at most 0 calls now (the removed debug_assert was the only call site).
         let calls = call_count.get();
         assert!(
             calls <= 1,
             "count_tokens should not be called via unwrap_or_else when known_token_count is Some \
-             (expected <= 1 full-text call from debug_assert, got {})",
+             (expected <= 1 full-text call, got {})",
             calls
         );
     }
@@ -1649,6 +1727,7 @@ mod tests {
                 word_count,
                 None,
                 None,
+                None,
             )
             .unwrap();
             let result_some = truncate_to_token_budget(
@@ -1657,6 +1736,7 @@ mod tests {
                 budget,
                 word_count,
                 Some(word_count(text)),
+                None,
                 None,
             )
             .unwrap();
@@ -2357,7 +2437,7 @@ mod tests {
         let budget = 14;
 
         let out =
-            truncate_to_token_budget(text, Language::TypeScript, budget, word_count, None, None)
+            truncate_to_token_budget(text, Language::TypeScript, budget, word_count, None, None, None)
                 .unwrap();
 
         assert_eq!(
@@ -2377,36 +2457,52 @@ mod tests {
     }
 
     /// The literal opens on line 1, so the snap has nowhere to retreat to:
-    /// `best` reaches 0 and the compact branch fires. The compact marker still
-    /// drops the remedy hint to save tokens (ADR-011: the hint is remedy, not
-    /// disclosure), but it must carry the `; cut inside …` clause — this
-    /// `best == 0` is the result of a cut, not of a budget too small for any
-    /// content at all.
+    /// rust-4: the snap-to-zero guard keeps at least one content line when the
+    /// binary search found a fitting candidate.
     ///
     /// At budget 14 the search picks `best = 1`: the literal's opening line (4
     /// words) plus the hinted marker "... (5 lines truncated) —
-    /// SKIM_PASSTHROUGH=1 for full output" (10 words) is exactly 14, while the
-    /// two-line candidate costs 17. That marker would sit inside the literal it
-    /// reports, so the snap drives `best` to 0. The literal's body carries three
-    /// words a line because the hinted marker alone costs 10: with a one-word
-    /// body the whole fixture (9 words) is cheaper than the opener-plus-marker
-    /// candidate (14), so no budget can both defeat the fast path and leave the
-    /// search a line to retain — the branch would be unreachable.
+    /// SKIM_PASSTHROUGH=1 for full output" (10 words) totals exactly 14. The
+    /// cut lands after line 0, and `scan.open_after(0) = Some(0)` (the backtick
+    /// on line 0 itself opens the literal that spans the entire file). The OLD
+    /// behaviour unconditionally set `best = open = 0`, producing a compact
+    /// marker with no content. The FIX (rust-4) guards `if open > 0` so the
+    /// snap only fires when it leaves at least one content line intact; when
+    /// `open == 0` the guard keeps `best = 1` and the content + regular marker
+    /// path is taken instead.
+    ///
+    /// The literal's body carries three words a line because the hinted marker
+    /// alone costs 10 tokens: with a one-word body the whole fixture (9 words)
+    /// is cheaper than the opener-plus-marker candidate (14) and the fast-path
+    /// return fires before the binary search, making this branch unreachable.
     #[test]
-    fn test_token_budget_snap_to_zero_uses_compact_marker_with_clause() {
+    fn test_token_budget_snap_to_zero_guard_keeps_content() {
         let text = "const banner = `\nalpha one two\nbeta three four\ngamma five six\ndelta seven eight\n`;\n";
 
         let out =
-            truncate_to_token_budget(text, Language::TypeScript, 14, word_count, None, Some(HINT))
+            truncate_to_token_budget(text, Language::TypeScript, 14, word_count, None, Some(HINT), None)
                 .unwrap();
 
-        assert_eq!(
-            out, "// ... (6 lines truncated; cut inside a string literal)\n",
-            "the compact marker must name the cut"
-        );
+        // rust-4: the guard does NOT snap best to 0; the literal's opening line
+        // is the one retained content line.
         assert!(
-            !out.contains(HINT),
-            "the compact form drops the remedy hint:\n{out}"
+            out.starts_with("const banner = `\n"),
+            "the literal opening line must survive snap-to-zero guard:\n{out}"
+        );
+        // The non-compact path includes the hint (HINT is the remedy clause).
+        assert!(
+            out.contains(HINT),
+            "the non-compact form must include the remedy hint:\n{out}"
+        );
+        // 5 source lines were truncated (source_total=6, kept=1).
+        assert!(
+            out.contains("5 lines"),
+            "marker must report 5 truncated lines:\n{out}"
+        );
+        // Total line count is at most 3 (1 content + 1 marker + optional blank).
+        assert!(
+            out.lines().count() <= 3,
+            "output must be at most 3 lines:\n{out}"
         );
     }
 }

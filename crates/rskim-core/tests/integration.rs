@@ -2015,7 +2015,7 @@ fn count_words(s: &str) -> usize {
 #[test]
 fn test_truncate_to_token_budget_public_api_no_truncation() {
     let text = "line one\nline two\nline three\n";
-    let result = truncate_to_token_budget(text, Language::TypeScript, 100, count_words, None, None)
+    let result = truncate_to_token_budget(text, Language::TypeScript, 100, count_words, None, None, None)
         .expect("truncate_to_token_budget should succeed");
     assert_eq!(
         result, text,
@@ -2026,7 +2026,7 @@ fn test_truncate_to_token_budget_public_api_no_truncation() {
 #[test]
 fn test_truncate_to_token_budget_public_api_truncates_over_budget() {
     let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
-    let result = truncate_to_token_budget(text, Language::TypeScript, 6, count_words, None, None)
+    let result = truncate_to_token_budget(text, Language::TypeScript, 6, count_words, None, None, None)
         .expect("truncate_to_token_budget should succeed");
     let token_count = count_words(&result);
     assert!(

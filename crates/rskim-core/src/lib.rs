@@ -399,6 +399,15 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 /// "cut inside a string literal" or "cut inside a code fence" clause to disclose
 /// the unavoidable cut. The omitted-line count in the marker is in source lines.
 ///
+/// # Breaking change (this branch)
+///
+/// A 7th parameter `source_line_count: Option<usize>` was added (reliability-8).
+/// Pass `None` to keep the previous behaviour: the omitted-line count in the marker
+/// is derived from `text.lines().count()`.  Pass `Some(k)` when the caller knows
+/// the original source-file line count — e.g. when `--max-lines` has already been
+/// applied and `text` contains a synthetic elision marker that would otherwise be
+/// counted as a real source line.
+///
 /// # Examples
 ///
 /// ```
@@ -406,7 +415,7 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// let output = "line 1\nline 2\nline 3\nline 4\nline 5";
 /// let word_count = |s: &str| -> usize { s.split_whitespace().count() };
-/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None, None)?;
+/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None, None, None)?;
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn truncate_to_token_budget<F>(
@@ -416,6 +425,7 @@ pub fn truncate_to_token_budget<F>(
     count_tokens: F,
     known_token_count: Option<usize>,
     elision_hint: Option<&str>,
+    source_line_count: Option<usize>,
 ) -> Result<String>
 where
     F: Fn(&str) -> usize,
@@ -427,6 +437,7 @@ where
         count_tokens,
         known_token_count,
         elision_hint,
+        source_line_count,
     )
 }
 

@@ -107,6 +107,9 @@ fn fallback_line_truncate(
     );
     // B5: pass the CLI-level remedy hint so the token-budget truncation marker
     // carries the SKIM_PASSTHROUGH=1 remedy clause (ADR-011 class 1).
+    // reliability-8: source_line_count is None here because fallback_line_truncate
+    // does not receive the original source-file line count. The cascade call sites
+    // that know the original count can pass it once this is plumbed through.
     let truncated = truncate_to_token_budget(
         output,
         language,
@@ -114,6 +117,7 @@ fn fallback_line_truncate(
         count_tokens_or_max,
         known_token_count,
         Some(ELISION_HINT),
+        None,
     )?;
     // ADR-016 / ADR-011 class 1: when the budget is too tight to include the
     // remedy hint inline on stdout (compact marker form), emit it on stderr so

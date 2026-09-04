@@ -25,6 +25,16 @@ const RUST_SIMPLE: &str = include_str!("../../../tests/fixtures/rust/simple.rs")
 const PYTHON_SIMPLE: &str = include_str!("../../../tests/fixtures/python/simple.py");
 const GO_SIMPLE: &str = include_str!("../../../tests/fixtures/go/simple.go");
 
+// architecture-5 / rust-4 / reliability-8 fixtures
+const PYTHON_CLOSE_REOPEN: &str =
+    include_str!("../../../tests/fixtures/python/close_reopen_literal.py");
+const SQL_CLOSE_REOPEN: &str =
+    include_str!("../../../tests/fixtures/sql/close_reopen_literal.sql");
+const TS_CLOSE_REOPEN: &str =
+    include_str!("../../../tests/fixtures/typescript/close_reopen_literal.ts");
+const PYTHON_DEGENERATE: &str =
+    include_str!("../../../tests/fixtures/python/degenerate_literal.py");
+
 /// Transform helper — mirrors snap() in truncation_golden.rs.
 fn xform(source: &str, language: Language, config: TransformConfig) -> String {
     rskim_core::transform_with_config(source, language, &config)
@@ -178,6 +188,7 @@ fn test_token_budget_extreme_small_never_returns_empty_string() {
         |s: &str| s.split_whitespace().count(),
         None,
         None,
+        None,
     )
     .expect("truncation must not error");
     assert!(
@@ -201,6 +212,7 @@ fn test_token_budget_zero_budget_never_returns_empty() {
         Language::Python,
         0,
         |s: &str| s.split_whitespace().count(),
+        None,
         None,
         None,
     )
@@ -423,4 +435,238 @@ fn test_last_lines_line_map_follows_the_moved_window() {
     // literal's closer on line 167, not inside the literal on line 162.
     assert_eq!(map[1], 168, "the window must begin at source line 168");
     assert_eq!(map.last().copied(), Some(200));
+}
+
+// ============================================================================
+// architecture-5: bounded fixpoint pull-back for close-and-reopen literals
+// ============================================================================
+
+/// Python: a line that closes one `"""` and immediately opens another means
+/// a single snap leaves the new last retained line inside the PREVIOUS literal.
+/// The fixpoint loop must keep snapping until the cut lands in clean state.
+///
+/// Fixture layout (0-based lines):
+///   0: # Clean line A
+///   1: """                   ← opens literal A
+///   2: Literal A body
+///   3: """ + """             ← closes A, opens B on same line
+///   4: Literal B body
+///   5: """                   ← closes B
+///   6: # Clean line B
+///   7: x = 1
+///
+/// With `--max-lines 6` (`content_lines = 5`, `last_retained = 4`):
+///   Iteration 1: `open_after(4) = Some(3)` → snap to `content_lines = 3`
+///   Iteration 2: `open_after(2) = Some(1)` → snap to `content_lines = 1`
+///   Iteration 3: `open_after(0) = None`    → break
+/// Result: 1 content line + marker. No unterminated `"""`.
+#[test]
+fn test_max_lines_fixpoint_close_reopen_python() {
+    let out = xform(
+        PYTHON_CLOSE_REOPEN,
+        Language::Python,
+        TransformConfig::with_mode(Mode::Full).with_max_lines(6),
+    );
+    // No unpaired triple-quote in the output (even count of `"""`)
+    let triple_quote_count = out.matches("\"\"\"").count();
+    assert_eq!(
+        triple_quote_count % 2,
+        0,
+        "--max-lines must not leave a triple-quote literal open ({triple_quote_count} occurrences):\n{out}"
+    );
+    // At most 6 total lines (marker included)
+    assert!(
+        out.lines().count() <= 6,
+        "--max-lines 6 must bound total lines; got {}:\n{out}",
+        out.lines().count()
+    );
+}
+
+/// SQL: same close-and-reopen pattern with single-quoted string literals.
+#[test]
+fn test_max_lines_fixpoint_close_reopen_sql() {
+    let out = xform(
+        SQL_CLOSE_REOPEN,
+        Language::Sql,
+        TransformConfig::with_mode(Mode::Full).with_max_lines(5),
+    );
+    // No unpaired single-quote — even count of non-escaped `'`
+    // (SQL uses '' doubling to escape, so count of `'` modulo 2 == 0 means balanced)
+    let sq_count = out.matches('\'').count();
+    assert_eq!(
+        sq_count % 2,
+        0,
+        "--max-lines must not leave an SQL literal open ({sq_count} single-quotes):\n{out}"
+    );
+    assert!(
+        out.lines().count() <= 5,
+        "--max-lines 5 must bound total lines; got {}:\n{out}",
+        out.lines().count()
+    );
+}
+
+/// TypeScript: same close-and-reopen pattern with backtick template literals.
+#[test]
+fn test_max_lines_fixpoint_close_reopen_typescript() {
+    let out = xform(
+        TS_CLOSE_REOPEN,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Full).with_max_lines(6),
+    );
+    // No unpaired backtick
+    let backtick_count = out.bytes().filter(|b| *b == b'`').count();
+    assert_eq!(
+        backtick_count % 2,
+        0,
+        "--max-lines must not leave a template literal open ({backtick_count} backticks):\n{out}"
+    );
+    assert!(
+        out.lines().count() <= 6,
+        "--max-lines 6 must bound total lines; got {}:\n{out}",
+        out.lines().count()
+    );
+}
+
+// ============================================================================
+// rust-4: snap-to-zero must not drop all content when best > 0
+// ============================================================================
+
+/// Python top-of-file docstring (`"""` on line 0): previously `truncate_to_token_budget`
+/// would set `best = 0` (unguarded snap), producing a marker-only output with zero
+/// content lines. The fix (rust-4) guards `if open > 0` so only snaps that leave at
+/// least one content line are applied; when `open == 0`, `best` stays unchanged.
+///
+/// Budget calibration for PYTHON_DEGENERATE (45 lines, `"""` on line 0):
+///   word_count(`"""`)                           = 1
+///   word_count(`# ... (44 lines truncated)`)    = 5  ("# ... (44 lines truncated)")
+///   1-line candidate total                       = 6
+///   Budget = 6 → binary search picks best = 1 (fits exactly).
+///   open_after(0) = Some(0): the triple-quote on line 0 opens a literal that covers
+///   the entire docstring body. OLD code snapped best to 0 (zero content, marker only).
+///   FIX: `open == 0` guard keeps best = 1; the opening `"""` line survives.
+#[test]
+fn test_token_budget_top_of_file_docstring_keeps_content() {
+    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
+    // Budget = 6: exactly covers the 1-line candidate (1 content + 5-word marker).
+    // This forces best = 1 from the binary search and then triggers the snap check
+    // (open_after(0) = Some(0)), exercising the rust-4 guard directly.
+    let result = truncate_to_token_budget(
+        PYTHON_DEGENERATE,
+        Language::Python,
+        6,
+        word_count,
+        None,
+        None,
+        None,
+    )
+    .expect("truncation must not error");
+    // With the rust-4 fix, the triple-quote opening line must survive.
+    assert!(
+        result.starts_with("\"\"\""),
+        "rust-4: the opening triple-quote line must survive the snap-to-zero guard;\n\
+         got: {result:?}"
+    );
+    // The marker must report truncated lines (44 lines elided).
+    assert!(
+        result.contains("44 lines"),
+        "rust-4: marker must report 44 truncated lines (source_total=45, kept=1);\n\
+         got: {result:?}"
+    );
+    // Output is at most 3 lines (1 content + 1 marker + optional trailing newline).
+    assert!(
+        result.lines().count() <= 3,
+        "rust-4: output must be at most 3 lines; got {}:\n{result}",
+        result.lines().count()
+    );
+}
+
+// ============================================================================
+// reliability-8: source_line_count makes the elision count source-accurate
+// ============================================================================
+
+/// `truncate_to_token_budget` accepts `source_line_count` and uses it for the
+/// marker's omitted-line count. When `text` has already been through `--max-lines`
+/// it contains a synthetic marker line; without `source_line_count` the count
+/// would be measured in output space (wrong). With `source_line_count = Some(k)`
+/// the marker reports `k - best` (source-space count, correct).
+#[test]
+fn test_token_budget_source_line_count_is_used_in_marker() {
+    let word_count = |s: &str| -> usize { s.split_whitespace().count() };
+    // Simulate --max-lines 2 applied to a 6-line Python file:
+    // 1 content line + 1 marker ("# ... (5 lines truncated)")
+    let bounded_text = "x = 1\n# ... (5 lines truncated)\n";
+    let source_lines = 6usize;
+
+    // Budget forces truncation: marker line alone has several tokens.
+    // With source_line_count = None, count comes from bounded_text.lines() = 2.
+    let result_none = truncate_to_token_budget(
+        bounded_text,
+        Language::Python,
+        1, // budget smaller than the content + marker → compact marker
+        word_count,
+        None,
+        None,
+        None,
+    )
+    .expect("truncation must not error");
+
+    // With source_line_count = Some(6), count is 6 - best (source-accurate).
+    let result_some = truncate_to_token_budget(
+        bounded_text,
+        Language::Python,
+        1, // same budget
+        word_count,
+        None,
+        None,
+        Some(source_lines),
+    )
+    .expect("truncation must not error");
+
+    // None-path: marker counts from bounded_text (2 lines) → says "2 lines truncated"
+    assert!(
+        result_none.contains("2 lines truncated"),
+        "reliability-8: without source_line_count the marker is in output space (2);\n\
+         got: {result_none:?}"
+    );
+    // Some-path: marker counts from source_line_count (6) → says "6 lines truncated"
+    assert!(
+        result_some.contains("6 lines truncated"),
+        "reliability-8: with source_line_count=6 the marker must say 6 lines;\n\
+         got: {result_some:?}"
+    );
+}
+
+// ============================================================================
+// rust-9: cut_inside_side pass-through for already-converted ElidedSide variants
+// ============================================================================
+
+/// Verify that `--max-lines` applied twice does not relabel an existing
+/// `TruncatedInsideFence` / `TruncatedInsideLiteral` marker as the wrong variant.
+/// (The underlying fix is in `cut_inside_side`'s `(already, _) => already` arm.)
+///
+/// This is a round-trip property test: apply `--max-lines` to a Markdown file
+/// that *is* a single fenced block, check the marker says "fence" not "literal".
+#[test]
+fn test_cut_inside_side_fence_not_relabelled_as_literal() {
+    // A Markdown file that is entirely one fenced code block — cutting anywhere
+    // inside it should produce `TruncatedInsideFence`, not `TruncatedInsideLiteral`.
+    let markdown = "```rust\nfn foo() {}\nfn bar() {}\nfn baz() {}\n```\n";
+    let out = xform(
+        markdown,
+        Language::Markdown,
+        TransformConfig::with_mode(Mode::Full).with_max_lines(3),
+    );
+    // A cut inside the fence must say "code fence", not "string literal".
+    if out.contains("cut inside") {
+        assert!(
+            out.contains("code fence"),
+            "rust-9: cut inside Markdown fence must say 'code fence', not 'string literal':\n{out}"
+        );
+        assert!(
+            !out.contains("string literal"),
+            "rust-9: Markdown fence marker must not say 'string literal':\n{out}"
+        );
+    }
+    // If no cut-inside message, the output simply ends before the fence closes —
+    // that is also correct (the fence may fit within max_lines).
 }

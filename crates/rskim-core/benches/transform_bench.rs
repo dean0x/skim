@@ -370,6 +370,7 @@ fn bench_token_budget_truncation(c: &mut Criterion) {
                         word_count,
                         None,
                         None,
+                        None,
                     )
                     .unwrap()
                 })
@@ -388,6 +389,7 @@ fn bench_token_budget_truncation(c: &mut Criterion) {
                         *budget,
                         word_count,
                         Some(*total),
+                        None,
                         None,
                     )
                     .unwrap()

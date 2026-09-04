@@ -101,6 +101,7 @@ fn ac2_closure_adapter_drives_truncate() {
             counter.as_closure(),
             None,
             None,
+            None,
         )
         .unwrap_or_else(|e| panic!("truncate failed for {encoding:?}: {e}"));
 
@@ -134,7 +135,7 @@ fn ac2_near_zero_budget_returns_marker_not_empty() {
     // returned — never an empty string. The token budget is advisory; the
     // marker always wins to prevent silent total data loss.
     let result =
-        truncate_to_token_budget(text, Language::Rust, 1, counter.as_closure(), None, None);
+        truncate_to_token_budget(text, Language::Rust, 1, counter.as_closure(), None, None, None);
     match result {
         Ok(s) => {
             // The input has 1 line; Rust prefix is `//`; hint is None.
