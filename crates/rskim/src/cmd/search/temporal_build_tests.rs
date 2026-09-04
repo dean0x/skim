@@ -4410,14 +4410,10 @@ fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
 }
 
 // ============================================================================
-// AC-13 (#407) — build-backoff sentinel gates the data-version self-heal
+// T-407-15 — zero_row_notice shallow-wins-over-empty-commits (AD-407-7)
 // ============================================================================
 
-// ============================================================================
-// T-15 — zero_row_notice shallow-wins-over-empty-commits (AD-407-7)
-// ============================================================================
-
-/// T-15 (AD-407-7, AC-15): `zero_row_notice` MUST contain the substring
+/// T-407-15 (AD-407-7, AC-15): `zero_row_notice` MUST contain the substring
 /// "shallow" when `commits` is empty and `is_shallow` is true.
 ///
 /// After #407 skips merge commits, a shallow clone whose HEAD is a merge
@@ -4450,21 +4446,21 @@ fn test_zero_row_notice_shallow_wins_over_zero_commits() {
 
     assert!(
         notice.to_ascii_lowercase().contains("shallow"),
-        "T-15 (AD-407-7, AC-15): zero_row_notice with empty commits + is_shallow=true \
+        "T-407-15 (AD-407-7, AC-15): zero_row_notice with empty commits + is_shallow=true \
          must contain 'shallow'; the shallow arm must be evaluated before the \
          empty-commits arm (arm-ordering regression); got: {notice:?}"
     );
     assert!(
         !notice.is_empty(),
-        "T-15: zero_row_notice must return a non-empty string"
+        "T-407-15: zero_row_notice must return a non-empty string"
     );
 }
 
 // ============================================================================
-// T-16 — classifier-parity: RiskRow fix_commits matches is_fix_commit
+// T-407-16 — classifier-parity: RiskRow fix_commits matches is_fix_commit
 // ============================================================================
 
-/// T-16 (AC-4): `RiskRow.fix_commits` and `RiskRow.total_commits` for a file
+/// T-407-16 (AC-4): `RiskRow.fix_commits` and `RiskRow.total_commits` for a file
 /// MUST equal the count of commits where [`rskim_search::is_fix_commit`]
 /// returns `true` / `false` applied over the SAME `HistoryResult`.
 ///
@@ -4527,12 +4523,12 @@ fn test_risk_rows_match_is_fix_commit_over_same_history() {
         .count() as u32;
     assert_eq!(
         expected_fix, 2,
-        "T-16 fixture sanity: 'fix: bug one' and 'fix: bug two' must match FIX_REGEX"
+        "T-407-16 fixture sanity: 'fix: bug one' and 'fix: bug two' must match FIX_REGEX"
     );
     assert_eq!(
         expected_total - expected_fix,
         1,
-        "T-16 fixture sanity: 'feat: new feature' must NOT match FIX_REGEX"
+        "T-407-16 fixture sanity: 'feat: new feature' must NOT match FIX_REGEX"
     );
 
     let src = FixedSource {
@@ -4555,26 +4551,26 @@ fn test_risk_rows_match_is_fix_commit_over_same_history() {
         ReanchorPolicy::Allow,
         BuildLoudness::Loud,
     )
-    .expect("T-16: rebuild_temporal_with_source must succeed");
+    .expect("T-407-16: rebuild_temporal_with_source must succeed");
 
     let db_path = cache_dir.join("temporal.db");
     let db = rskim_search::TemporalDb::open(&db_path)
-        .expect("T-16: temporal.db must be openable after rebuild");
+        .expect("T-407-16: temporal.db must be openable after rebuild");
 
     let row = db
         .risk_for_file("branch.rs")
-        .expect("T-16: risk_for_file must not return Err")
-        .expect("T-16: branch.rs must have a risk row after rebuild");
+        .expect("T-407-16: risk_for_file must not return Err")
+        .expect("T-407-16: branch.rs must have a risk row after rebuild");
 
     assert_eq!(
         row.total_commits, expected_total,
-        "T-16 (AC-4): RiskRow.total_commits must equal the total commit count \
+        "T-407-16 (AC-4): RiskRow.total_commits must equal the total commit count \
          from the injected HistoryResult; got {} expected {}",
         row.total_commits, expected_total
     );
     assert_eq!(
         row.fix_commits, expected_fix,
-        "T-16 (AC-4): RiskRow.fix_commits must equal the count of commits \
+        "T-407-16 (AC-4): RiskRow.fix_commits must equal the count of commits \
          where is_fix_commit returns true over the SAME history; got {} expected {}",
         row.fix_commits, expected_fix
     );
@@ -4583,7 +4579,7 @@ fn test_risk_rows_match_is_fix_commit_over_same_history() {
     let expected_density = f64::from(expected_fix) / f64::from(expected_total);
     assert!(
         (row.fix_density - expected_density).abs() < 1e-9,
-        "T-16: RiskRow.fix_density must be the raw fix ratio {expected_density}; \
+        "T-407-16: RiskRow.fix_density must be the raw fix ratio {expected_density}; \
          got {}",
         row.fix_density
     );
