@@ -976,13 +976,19 @@ fn test_require_flags_for_tool_git_returns_none() {
 }
 
 /// Drift guard: the values returned by `require_flags_for_tool` must equal the
-/// `require_flag` slices declared in the rule table for psql and mysql.
+/// `require_flag` slices declared in the rule table for psql and mysql; and
+/// `interactive_tool_for` must agree with those rule-table entries.
+///
+/// Renamed from `test_require_flags_for_tool_drift_guard` to cover both
+/// `require_flags_for_tool` and `interactive_tool_for` (regression-4 / issue-fix
+/// for the architecture-7 fix that extracted `interactive_tool_for` as a separate
+/// wrapper-surface predicate from `require_flags_for_tool`).
 ///
 /// This assertion makes any rule-table edit that silently breaks the D5 wrapper
 /// gate a compile-time-adjacent failure (caught at test time, not at runtime in
 /// a wrapper invocation).
 #[test]
-fn test_require_flags_for_tool_drift_guard() {
+fn test_d5_interactive_and_require_flags_drift_guard() {
     // psql: rule table declares &["-c", "--command"]
     let psql = require_flags_for_tool("psql").expect("psql must have require_flags");
     let mut psql_sorted = psql.clone();
@@ -992,6 +998,11 @@ fn test_require_flags_for_tool_drift_guard() {
     assert_eq!(
         psql_sorted, expected_psql,
         "psql require_flags must exactly match the rule-table declaration"
+    );
+    // psql is also interactive (has a require_flag set)
+    assert!(
+        interactive_tool_for("psql"),
+        "interactive_tool_for(\"psql\") must be true — D5 wrapper gate must guard it"
     );
 
     // mysql: rule table declares &["-e", "--execute"]
@@ -1003,6 +1014,31 @@ fn test_require_flags_for_tool_drift_guard() {
     assert_eq!(
         mysql_sorted, expected_mysql,
         "mysql require_flags must exactly match the rule-table declaration"
+    );
+    assert!(
+        interactive_tool_for("mysql"),
+        "interactive_tool_for(\"mysql\") must be true — D5 wrapper gate must guard it"
+    );
+
+    // sqlite3: no require_flags (None) — always interactive (any invocation
+    // can open an interactive REPL); `interactive_tool_for` must be true.
+    assert!(
+        require_flags_for_tool("sqlite3").is_none(),
+        "sqlite3 must have no require_flags (any invocation can be interactive)"
+    );
+    assert!(
+        interactive_tool_for("sqlite3"),
+        "interactive_tool_for(\"sqlite3\") must be true — no safe non-interactive flag exists"
+    );
+
+    // Non-interactive tools: git and cargo must NOT be in the interactive set.
+    assert!(
+        !interactive_tool_for("git"),
+        "interactive_tool_for(\"git\") must be false — git is never interactive"
+    );
+    assert!(
+        !interactive_tool_for("cargo"),
+        "interactive_tool_for(\"cargo\") must be false — cargo is never interactive"
     );
 }
 

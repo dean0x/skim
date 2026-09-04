@@ -127,6 +127,87 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
 /// - `"git worktree list && cargo test"` → `Some(...)` (AlreadyCompact + Rewritten)
 ///
 /// If you need the full tri-state result, call `classify_command` directly.
+/// Match a CLI argument against a flag pattern, accepting both the exact
+/// space-separated form and the `--flag=value` equals-separated form.
+///
+/// # Semantics
+///
+/// - `arg == flag` — exact token match (covers all short flags and bare long flags).
+/// - `arg.strip_prefix(flag).starts_with('=')` — equals form, restricted to long
+///   flags that start with `--` to avoid false matches on short-option clusters
+///   (`-c=val` is not a standard POSIX short-option form).
+///
+/// # Why this predicate exists
+///
+/// The wrapper D5 gate and the rewrite engine's `require_flag` check historically
+/// used inline copies of this logic — the wrapper used `=`-form extension while the
+/// engine used exact-only matching (consistency-5).  Extracting the shared predicate
+/// here ensures both surfaces use identical semantics, so `psql --command='SELECT 1'`
+/// is treated identically on the rewrite surface and the wrapper surface.
+///
+/// # Usage
+///
+/// Call from D4, D5, and the rewrite engine's `require_flag` check.  Do **not**
+/// replace `skip_if_flag_prefix` matching with this function — that comparison
+/// already uses `starts_with` for prefix matching, not equality.
+pub(crate) fn arg_matches_flag(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || (flag.starts_with("--")
+            && arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('=')))
+}
+
+/// Return the slice of args before the first POSIX `--` end-of-options separator.
+///
+/// When `--` is absent, the full slice is returned.  The returned slice stops at
+/// but does not include the `--` token itself.
+///
+/// Used by D3, D4, and D5 to avoid misclassifying user data after `--` as a flag:
+/// `grep -- --version file` should NOT trip D3 (the `--version` is a pattern,
+/// not a help-request flag).  `rg -- --json` should NOT trip D4.
+/// (consistency-8 fix: all gate scanners use this function consistently rather than
+/// scanning the whole arg list with `args.iter().any(…)`.)
+pub(crate) fn args_before_separator(args: &[String]) -> &[String] {
+    match args.iter().position(|a| a == "--") {
+        Some(pos) => &args[..pos],
+        None => args,
+    }
+}
+
+/// Return `true` when `tool_name` can open an interactive session when invoked
+/// without its required flag(s) through the PATH-wrapper surface.
+///
+/// This is the explicit predicate D5 uses to decide between
+/// `run_inherited_passthrough` (interactive session — stdio must be fully
+/// transparent) and the compressing handler (batch invocation).
+///
+/// # Why separate from `require_flags_for_tool`
+///
+/// `require_flags_for_tool` answers "does the rewrite rule require this flag to
+/// fire?" — a rewrite-surface concept.  `interactive_tool_for` answers "would this
+/// tool open an interactive TTY session on the wrapper surface without certain
+/// flags?" — a wrapper-surface concept.  Keeping them separate prevents the two
+/// notions from drifting: sqlite3 has `require_flag: &[]` (the rewrite surface is
+/// always non-interactive because the hook has piped stdin) but IS interactive on
+/// the wrapper surface when invoked without a SQL argument and with a TTY stdin.
+///
+/// # Covered tools
+///
+/// - **psql** — opens readline prompt when `-c`/`--command` is absent.
+/// - **mysql** — opens readline prompt when `-e`/`--execute` is absent.
+/// - **sqlite3** — opens readline prompt when invoked without a SQL positional
+///   argument and stdin is a TTY (the wrapper surface, unlike the hook, may have
+///   a TTY stdin).
+///
+/// D5 in `dispatch_inner` consults `require_flags_for_tool` to determine whether
+/// the required flag is present.  When `interactive_tool_for` returns `true` and
+/// none of the required flags are present (or `require_flags_for_tool` returns
+/// `None`), D5 calls `run_inherited_passthrough` so TTY features work.
+pub(crate) fn interactive_tool_for(tool_name: &str) -> bool {
+    matches!(tool_name, "psql" | "mysql" | "sqlite3")
+}
+
 /// Return the `skip_if_flag_prefix` entries for a tool from its rewrite rules.
 ///
 /// Used by `dispatch_for_wrapper` (D4) to enforce tool-specific passthrough flags

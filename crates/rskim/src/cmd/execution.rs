@@ -323,10 +323,22 @@ pub(crate) fn emit_json_envelope(
     };
 
     if status == StdoutStatus::Written && completeness == Completeness::Lossy {
+        // consistency-4 fix: META subcommands (log, proxy, …) have their own
+        // SKIM_PASSTHROUGH=1 handling (e.g. cmd/log.rs copies stdin→stdout).
+        // That makes SKIM_PASSTHROUGH=1 a literally-true remedy for them — even
+        // though `passthrough_strips_json(tool)` returns false (it applies to
+        // exec'd tool wrappers only, not to meta subcommands).
+        // Without this gate, `skim log --json` would emit:
+        //   "run 'log' directly for the full output"
+        // which on Linux is a no-op and on macOS invokes the unrelated
+        // /usr/bin/log (Apple unified logging). The correct remedy is
+        // SKIM_PASSTHROUGH=1, which the existing passthrough handler serves.
+        let passthrough_reproduces_argv = crate::cmd::registry::is_meta_subcommand(tool)
+            || super::dispatch::passthrough_strips_json(tool);
         let remedy = remedy_for(&RemedyCtx {
             tool,
             output_format: OutputFormat::Json,
-            passthrough_reproduces_argv: super::dispatch::passthrough_strips_json(tool),
+            passthrough_reproduces_argv,
         });
         // ADR-011 class 1 — unconditional, never `debug_log!`, and `eprintln!`
         // rather than `write_line_to_stderr`: this is one of skim's own short

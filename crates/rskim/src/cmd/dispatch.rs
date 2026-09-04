@@ -89,11 +89,13 @@ pub(crate) fn strip_session_id_flag(args: &[String]) -> Option<Vec<String>> {
 /// - **All tools**: `--show-stats` (extracted by every handler via
 ///   `extract_show_stats()`), `--passthrough` (always skim-only; C2),
 ///   `--max-lines`/`--max-lines=N` (value-bearing; no wrapped tool owns this),
+///   `--last-lines`/`--last-lines=N` (value-bearing; tail mirror of
+///   `--max-lines`; no wrapped tool owns this),
 ///   `--tokens`/`--tokens=N` (value-bearing; no wrapped tool owns this),
 ///   `--line-numbers` (boolean long form; short form `-n` is NOT stripped —
 ///   `git log -n <count>` is tool-owned), and `--debug` (boolean; skim global
-///   flag extracted before dispatch — `--debug` for many tools maps to their
-///   own flag, but skim intercepts it as a global before argv reaches the tool).
+///   flag — stripped UNLESS the tool owns `--debug` per its
+///   `skip_if_flag_prefix` entry in the rewrite rule table; see regression-4).
 /// - **`git` only**: bare `--json` (before `--`, extracted by
 ///   `extract_json_flag()` in every git subcommand handler) and
 ///   `--mode`/`--mode=<val>` (extracted by `extract_diff_mode()` in git
@@ -124,6 +126,7 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
             || a == "--debug"
             || a.starts_with("--max-lines")
             || a.starts_with("--tokens")
+            || a.starts_with("--last-lines")
             || (subcommand == "git" && (a == "--json" || a.starts_with("--mode")))
     });
     if !has_candidate {
@@ -167,10 +170,27 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
             continue;
         }
 
-        // `--debug` (boolean; skim global flag intercepted before dispatch).
+        // `--debug` (boolean; skim global flag) — strip ONLY when the tool does
+        // NOT own `--debug` in its own grammar (regression-4 / PF-008 fix).
+        //
+        // Tools such as `gradle`, `jest`, `docker`, `aws`, `wget`, and `playwright`
+        // list `"--debug"` in their `skip_if_flag_prefix` (the same table that
+        // backs D4 on the wrapper surface).  For those tools `--debug` is a
+        // meaningful tool flag; stripping it on the passthrough path would
+        // silently defeat the SKIM_PASSTHROUGH=1 escape hatch — exactly the
+        // scenario the hatch is designed for.
+        //
+        // The gate reads `skip_flags_for_tool(subcommand)` so the two surfaces
+        // (D4 on wrapper, strip on passthrough exec) share one source of truth
+        // and cannot drift independently.
         if arg == "--debug" {
-            i += 1;
-            continue;
+            let tool_owns_debug =
+                crate::cmd::rewrite::skip_flags_for_tool(subcommand).contains(&"--debug");
+            if !tool_owns_debug {
+                i += 1;
+                continue;
+            }
+            // Tool owns --debug: do NOT strip; fall through to the push below.
         }
 
         // `--max-lines=N` (equals form — single token).
@@ -199,6 +219,22 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
         if arg == "--tokens" {
             i += 1;
             // Consume the value token when present.
+            if i < args.len() && !args[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+
+        // `--last-lines=N` (equals form — single token; skim-only tail mirror of
+        // `--max-lines`; no wrapped tool owns this flag).
+        if arg.starts_with("--last-lines=") {
+            i += 1;
+            continue;
+        }
+
+        // `--last-lines N` (space-separated two-token form).
+        if arg == "--last-lines" {
+            i += 1;
             if i < args.len() && !args[i].starts_with('-') {
                 i += 1;
             }
@@ -251,9 +287,18 @@ pub(crate) fn strip_skim_flags(subcommand: &str, args: &[String]) -> Option<Vec<
 /// This is the single predicate that decides whether the legacy
 /// `SKIM_PASSTHROUGH=1` remedy is *literally true* on a `--json` invocation
 /// (`crate::output::fidelity::remedy_for`).  `--json` is skim-only for `git`
-/// alone; for every other tool it is a tool-owned form
+/// alone; for every other **exec'd** tool it is a tool-owned form
 /// (`gh pr list --json title`) that must survive the strip, so the passthrough
 /// exec would hand `--json` to a tool that rejects it.
+///
+/// **Note on META subcommands (consistency-4):** this function applies only to
+/// exec'd tool wrappers, not to skim's own META subcommands (`log`, `proxy`,
+/// etc.).  Meta subcommands have their own `SKIM_PASSTHROUGH=1` handling
+/// (e.g. `cmd/log.rs` copies stdin→stdout verbatim), so `SKIM_PASSTHROUGH=1`
+/// IS a valid remedy for them — but not because `strip_skim_flags` strips
+/// `--json` for them.  The caller (`emit_json_envelope` in `cmd/execution.rs`)
+/// separately gates on `is_meta_subcommand(tool)` before consulting this
+/// predicate.
 ///
 /// Kept adjacent to `strip_skim_flags` — and pinned by
 /// `passthrough_strips_json_matches_strip_set` — so the two cannot drift.
@@ -997,7 +1042,14 @@ fn dispatch_inner(
     analytics: &crate::analytics::AnalyticsConfig,
 ) -> anyhow::Result<ExitCode> {
     use crate::cmd::registry::is_meta_subcommand;
-    use crate::cmd::rewrite::{require_flags_for_tool, skip_flags_for_tool};
+    use crate::cmd::rewrite::{
+        arg_matches_flag, args_before_separator, interactive_tool_for, require_flags_for_tool,
+        skip_flags_for_tool,
+    };
+
+    // Hoist is_meta_subcommand to a single binding — D3/D4/D5 all consult it
+    // and an inline call repeated three times is a complexity-7 anti-pattern.
+    let is_meta = is_meta_subcommand(subcommand);
 
     // ── Wrapper-surface gates: D3 / D4 / D5 ──────────────────────────────────
     //
@@ -1005,14 +1057,22 @@ fn dispatch_inner(
     // wrapper-surface call, regardless of which code path assembled the call.
     // A caller that writes `dispatch_inner(Surface::Wrapper, …)` directly still
     // runs all three gates — the invariant is structural, not social.
+    //
+    // All three gates scan only the args BEFORE the POSIX `--` end-of-options
+    // separator (consistency-8): `grep -- --version file` should not trip D3
+    // (the `--version` is a literal pattern, not a help-request flag), and
+    // `rg -- --json` should not trip D4.  `args_before_separator` implements
+    // this slice once for all three gates.
     if surface == Surface::Wrapper {
+        let pre_sep = args_before_separator(args);
+
         // D3: universal help/version passthrough for non-meta tool wrappers.
         // Equivalent to skip_if_flag_prefix on the rewrite surface: when
         // `grep --help` is not rewritten (rewrite surface), it must not be
         // compressed on the wrapper surface either. The reader sees the real
         // tool's output in both cases.
-        if !is_meta_subcommand(subcommand)
-            && args
+        if !is_meta
+            && pre_sep
                 .iter()
                 .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
         {
@@ -1025,49 +1085,63 @@ fn dispatch_inner(
         // The rewrite surface handles this via `skip_if_flag_prefix`; the
         // wrapper surface honours the same set.
         //
+        // Both D4 and D5 now use `arg_matches_flag` (which accepts both the
+        // exact-token form and `--flag=value` equals form) rather than inline
+        // `arg == flag || arg.starts_with(&format!("{flag}="))`.  This closes
+        // the consistency-5 gap and eliminates the per-(arg×flag) `format!`
+        // allocation in the inner loop.
+        //
         // SECURITY (PF-012 / security-1): `env` and `printenv` are excluded
         // from this gate even though their rewrite rules list `-i`, `-u`, and
         // `-S` as skip flags. Routing `env -u HOME` to `run_raw_passthrough`
         // would dump the entire unredacted environment.  Those tools must
         // always reach their handler, which enforces credential redaction.
-        if !is_meta_subcommand(subcommand) && !redaction_is_mandatory(subcommand) {
+        if !is_meta && !redaction_is_mandatory(subcommand) {
             let skip_flags = skip_flags_for_tool(subcommand);
             if !skip_flags.is_empty()
-                && args.iter().any(|arg| {
-                    skip_flags
-                        .iter()
-                        .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-                })
+                && pre_sep
+                    .iter()
+                    .any(|arg| skip_flags.iter().any(|&flag| arg_matches_flag(arg, flag)))
             {
                 return run_raw_passthrough(subcommand, args, &[]);
             }
         }
 
-        // D5: require-flag passthrough — wrapper-surface mirror of the rewrite
+        // D5: interactive-tool gate — wrapper-surface replacement for the rewrite
         // engine's `require_flag` predicate.
         //
-        // Tools such as `psql` (requires `-c`/`--command`) and `mysql`
-        // (requires `-e`/`--execute`) gate their rewrite rule on a required
-        // flag to distinguish batch invocations (safe to intercept) from
-        // interactive sessions (must pass through unmodified).
+        // Tools such as `psql` and `mysql` open an interactive readline session
+        // when invoked without their batch flag; `sqlite3` also opens a REPL when
+        // stdin is a TTY and no SQL argument is given.  On the wrapper surface
+        // skim MUST NOT intercept these sessions: the tool needs inherited stdio
+        // so TTY line-editing, readline completion, and Ctrl-C work correctly.
+        // Using `run_raw_passthrough` (which captures stdout/stderr via pipes)
+        // instead makes the tool see `!isatty(stdout)`, disabling readline and
+        // block-buffering stderr — visually a hung session (architecture-7 fix).
         //
-        // `require_flags_for_tool` reads the same rule table as
-        // `skip_flags_for_tool` so the two surfaces cannot drift
-        // independently.  If `name` has no required flags (returns `None`),
-        // this gate is a no-op.
-        let required_flags = if is_meta_subcommand(subcommand) {
-            None
-        } else {
-            require_flags_for_tool(subcommand)
-        };
-        if let Some(required) = required_flags {
-            let has_required = args.iter().any(|arg| {
-                required
-                    .iter()
-                    .any(|&flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-            });
-            if !has_required {
-                return run_raw_passthrough(subcommand, args, &[]);
+        // The predicate `interactive_tool_for` is SEPARATE from
+        // `require_flags_for_tool` — "does the rewrite rule need this flag?" is a
+        // rewrite-surface concept, while "would this tool open a TTY session?" is
+        // a wrapper-surface concept.  `sqlite3` has `require_flag: &[]` on the
+        // rewrite surface (the hook always has piped stdin, so it is never
+        // interactive there) but IS interactive on the wrapper surface with a TTY.
+        // Both D5 and the engine now use `arg_matches_flag` so `psql --command=…`
+        // is accepted the same way on both surfaces (consistency-5).
+        if !is_meta && interactive_tool_for(subcommand) {
+            let required = require_flags_for_tool(subcommand);
+            let is_interactive = match &required {
+                Some(flags) => {
+                    // Tool has required flags: interactive iff NONE are present.
+                    !pre_sep
+                        .iter()
+                        .any(|arg| flags.iter().any(|&f| arg_matches_flag(arg, f)))
+                }
+                // No required flags → always treat wrapper invocation as interactive
+                // (sqlite3: any invocation with TTY stdin may be interactive).
+                None => true,
+            };
+            if is_interactive {
+                return Ok(run_inherited_passthrough(subcommand, args));
             }
         }
     }
@@ -1610,6 +1684,9 @@ mod tests {
         }
 
         // --- All-tools: --debug ---
+        // Stripped for tools that do NOT own --debug (git, npm, cargo have no
+        // --debug in their skip_if_flag_prefix). Kept for tools that DO own it
+        // (e.g. gradle — tested separately in test_strip_debug_kept_for_tool_owner).
         for tool in &["git", "npm", "cargo"] {
             let args = sv(&["diff", "--debug", "--cached"]);
             let r = strip_skim_flags(tool, &args).expect("must strip --debug");
@@ -1618,6 +1695,57 @@ mod tests {
                 "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --debug"
             );
         }
+
+        // --- All-tools: --last-lines / --last-lines=N ---
+        for tool in &["git", "npm", "cargo"] {
+            // Equals form
+            let eq = sv(&["log", "--last-lines=5"]);
+            let r = strip_skim_flags(tool, &eq).expect("must strip --last-lines=N");
+            assert!(
+                !r.iter().any(|a| a.starts_with("--last-lines")),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --last-lines=N"
+            );
+            // Space form
+            let sp = sv(&["log", "--last-lines", "5"]);
+            let r = strip_skim_flags(tool, &sp).expect("must strip --last-lines N");
+            assert!(
+                !r.iter().any(|a| a == "--last-lines" || a == "5"),
+                "sync-guard FAIL: strip_skim_flags({tool:?}) must strip --last-lines N"
+            );
+        }
+    }
+
+    /// `--debug` is NOT stripped for tools that own `--debug` in their rewrite
+    /// rule's `skip_if_flag_prefix` (regression-4 fix).
+    ///
+    /// Gradle lists `"--debug"` in its skip_if_flag_prefix; `strip_skim_flags`
+    /// must preserve it on the passthrough path so that
+    /// `SKIM_PASSTHROUGH=1 skim gradle --debug clean` reaches the real gradle
+    /// with `--debug` intact.
+    #[test]
+    fn test_strip_debug_kept_for_tool_owner() {
+        // Gradle owns --debug (listed in skip_if_flag_prefix for gradlew/gradle).
+        let args = sv(&["clean", "--debug", "build"]);
+        let result = strip_skim_flags("gradle", &args);
+        // None means nothing was stripped; Some means something was — but
+        // either way, --debug must still be in the output.
+        let effective: Vec<String> = match result {
+            Some(r) => r,
+            None => args,
+        };
+        assert!(
+            effective.iter().any(|a| a == "--debug"),
+            "--debug must survive strip_skim_flags for gradle (tool owns the flag); \
+             got: {effective:?}"
+        );
+
+        // Control: git does NOT own --debug; it must be stripped.
+        let git_args = sv(&["diff", "--debug", "--cached"]);
+        let r = strip_skim_flags("git", &git_args).expect("must strip --debug for git");
+        assert!(
+            !r.iter().any(|a| a == "--debug"),
+            "--debug must be stripped for git (skim-owned flag); got: {r:?}"
+        );
     }
 
     /// Drift guard (D1): `passthrough_strips_json` must agree with what
@@ -1631,7 +1759,13 @@ mod tests {
     /// the split exists to close.
     #[test]
     fn passthrough_strips_json_matches_strip_set() {
-        for tool in ["git", "npm", "cargo", "psql", "eslint", "env"] {
+        // Also covers "log" and "proxy" (consistency-4): both are META
+        // subcommands that must NOT strip --json (they are not exec'd), so
+        // passthrough_strips_json must return false for them.  The caller
+        // (emit_json_envelope in cmd/execution.rs) separately gates on
+        // is_meta_subcommand(tool) so SKIM_PASSTHROUGH=1 is still the correct
+        // remedy for those tools even though this predicate returns false.
+        for tool in ["git", "npm", "cargo", "psql", "eslint", "env", "log", "proxy"] {
             let args = sv(&["--json"]);
             let actually_strips = strip_skim_flags(tool, &args)
                 .is_some_and(|stripped| !stripped.iter().any(|a| a == "--json"));

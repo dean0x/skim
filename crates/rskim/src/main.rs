@@ -377,9 +377,20 @@ struct Args {
     /// Bypass all compression and exec the real tool with raw argv.
     ///
     /// Equivalent to setting `SKIM_PASSTHROUGH=1`. When set, skim-only flags
-    /// (`--json` for git, `--mode`, `--show-stats`, `--passthrough` itself)
     /// are stripped from the forwarded argv so the underlying tool never sees
     /// flags it does not understand.
+    ///
+    /// Stripped flags (all tools): `--show-stats`, `--passthrough`, `--debug`
+    /// (unless the tool owns `--debug` per its rewrite rule), `--max-lines N`
+    /// / `--max-lines=N` (value-bearing), `--tokens N` / `--tokens=N`
+    /// (value-bearing), `--line-numbers` (long form only; `-n` is NOT
+    /// stripped — `git log -n <count>` is tool-owned), `--last-lines N` /
+    /// `--last-lines=N` (value-bearing; stripped if present).
+    ///
+    /// Additionally stripped for `git` only: bare `--json` (before `--`),
+    /// `--mode` / `--mode=<val>`.
+    ///
+    /// Nothing is stripped after a bare `--` end-of-options separator.
     ///
     /// ORDERING: detected and latched into an atomic BEFORE threads are
     /// spawned (see `main()` startup sequence), so analytics background

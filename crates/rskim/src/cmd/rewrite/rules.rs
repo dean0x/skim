@@ -84,7 +84,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["npx", "jest"],
         rewrite_to: &["skim", "jest"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -112,7 +112,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["jest"],
         rewrite_to: &["skim", "jest"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -131,7 +131,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["npx", "playwright", "test"],
         rewrite_to: &["skim", "playwright"],
-        skip_if_flag_prefix: &["--reporter"],
+        skip_if_flag_prefix: &["--reporter", "--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -140,7 +140,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["playwright", "test"],
         rewrite_to: &["skim", "playwright"],
-        skip_if_flag_prefix: &["--reporter"],
+        skip_if_flag_prefix: &["--reporter", "--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -1394,7 +1394,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["aws"],
         rewrite_to: &["skim", "aws"],
-        skip_if_flag_prefix: &["--output"],
+        skip_if_flag_prefix: &["--output", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -1446,7 +1446,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["wget"],
         rewrite_to: &["skim", "wget"],
-        skip_if_flag_prefix: &["-O", "-q", "--quiet"],
+        skip_if_flag_prefix: &["-O", "-q", "--quiet", "--debug", "-d"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -1466,7 +1466,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "compose", "ps"],
         rewrite_to: &["skim", "docker", "compose", "ps"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1475,7 +1475,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "compose", "logs"],
         rewrite_to: &["skim", "docker", "compose", "logs"],
-        skip_if_flag_prefix: &["-f", "--follow"],
+        skip_if_flag_prefix: &["-f", "--follow", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1485,7 +1485,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "ps"],
         rewrite_to: &["skim", "docker", "ps"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1494,7 +1494,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "images"],
         rewrite_to: &["skim", "docker", "images"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1503,7 +1503,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "build"],
         rewrite_to: &["skim", "docker", "build"],
-        skip_if_flag_prefix: &["--push", "--load"],
+        skip_if_flag_prefix: &["--push", "--load", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1512,7 +1512,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "inspect"],
         rewrite_to: &["skim", "docker", "inspect"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1521,7 +1521,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "logs"],
         rewrite_to: &["skim", "docker", "logs"],
-        skip_if_flag_prefix: &["-f", "--follow"],
+        skip_if_flag_prefix: &["-f", "--follow", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
