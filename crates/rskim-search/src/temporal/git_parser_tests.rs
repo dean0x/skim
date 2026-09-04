@@ -42,7 +42,8 @@ fn init_git_repo() -> Option<TempDir> {
         return None;
     }
 
-    // Configure identity so commits work
+    // Configure identity so commits work, and disable GPG signing so commits
+    // succeed even when commit.gpgsign is set globally (AD-407-1).
     Command::new("git")
         .args(["config", "user.email", "test@example.com"])
         .current_dir(dir.path())
@@ -50,6 +51,11 @@ fn init_git_repo() -> Option<TempDir> {
         .ok()?;
     Command::new("git")
         .args(["config", "user.name", "Test User"])
+        .current_dir(dir.path())
+        .output()
+        .ok()?;
+    Command::new("git")
+        .args(["config", "commit.gpgsign", "false"])
         .current_dir(dir.path())
         .output()
         .ok()?;
@@ -66,6 +72,10 @@ fn git_available() -> bool {
 }
 
 /// Add a file and commit it in `dir`.
+///
+/// Passes `--no-verify` so commit hooks (e.g. a repo-wide `pre-commit` hook)
+/// do not silently abort the fixture and turn the test into a vacuous green
+/// (AD-407-1).
 fn git_commit_file(dir: &Path, filename: &str, content: &str, message: &str) -> bool {
     std::fs::write(dir.join(filename), content).is_ok()
         && Command::new("git")
@@ -75,7 +85,7 @@ fn git_commit_file(dir: &Path, filename: &str, content: &str, message: &str) -> 
             .map(|o| o.status.success())
             .unwrap_or(false)
         && Command::new("git")
-            .args(["commit", "-m", message])
+            .args(["commit", "--no-verify", "-m", message])
             .current_dir(dir)
             .output()
             .map(|o| o.status.success())
@@ -83,6 +93,8 @@ fn git_commit_file(dir: &Path, filename: &str, content: &str, message: &str) -> 
 }
 
 /// Delete a file and commit the deletion.
+///
+/// Passes `--no-verify` for the same reason as [`git_commit_file`] (AD-407-1).
 fn git_delete_file(dir: &Path, filename: &str, message: &str) -> bool {
     Command::new("git")
         .args(["rm", filename])
@@ -91,11 +103,24 @@ fn git_delete_file(dir: &Path, filename: &str, message: &str) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
         && Command::new("git")
-            .args(["commit", "-m", message])
+            .args(["commit", "--no-verify", "-m", message])
             .current_dir(dir)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+}
+
+/// Run a git sub-command in `dir` and return `true` iff git exits 0.
+///
+/// Used by fixture helpers to collapse repeated 6–8-line
+/// `Command::new("git")…is_ok_and(…)` blocks into single-line guards.
+/// Mirrors the pattern used by the CLI E2E helpers (AD-407-1).
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 // ============================================================================
@@ -720,12 +745,7 @@ fn init_merge_fixture() -> Option<TempDir> {
         return None;
     }
     // Branch off to feature
-    if !Command::new("git")
-        .args(["checkout", "-b", "feature"])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if !git_ok(p, &["checkout", "-b", "feature"]) {
         return None;
     }
     // B1, B2: two fix commits on feature
@@ -736,12 +756,7 @@ fn init_merge_fixture() -> Option<TempDir> {
         return None;
     }
     // Back to main
-    if !Command::new("git")
-        .args(["checkout", "main"])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if !git_ok(p, &["checkout", "main"]) {
         return None;
     }
     // A2: second commit on main
@@ -749,18 +764,16 @@ fn init_merge_fixture() -> Option<TempDir> {
         return None;
     }
     // Merge feature into main (--no-ff to guarantee a merge commit)
-    let merge_ok = Command::new("git")
-        .args([
+    if !git_ok(
+        p,
+        &[
             "merge",
             "--no-ff",
             "-m",
             "merge(#1): feature into main",
             "feature",
-        ])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !merge_ok {
+        ],
+    ) {
         return None;
     }
 
@@ -770,6 +783,10 @@ fn init_merge_fixture() -> Option<TempDir> {
 /// Add a file and commit with pinned `author_ts` and `committer_ts` timestamps
 /// (Unix seconds). Both dates are set independently; pass equal values for a
 /// uniform timestamp.
+///
+/// Passes `--no-verify` to bypass commit hooks, matching the CLI E2E helpers
+/// so a global `core.hooksPath` hook cannot silently abort fixture commits and
+/// cause all dependent tests to vacuously green (AD-407-1).
 fn git_commit_file_at(
     dir: &Path,
     filename: &str,
@@ -788,7 +805,7 @@ fn git_commit_file_at(
             .output()
             .is_ok_and(|o| o.status.success())
         && Command::new("git")
-            .args(["commit", "-m", message])
+            .args(["commit", "--no-verify", "-m", message])
             .env("GIT_AUTHOR_DATE", &author_date)
             .env("GIT_COMMITTER_DATE", &committer_date)
             .current_dir(dir)
@@ -853,6 +870,7 @@ fn test_merge_repo_total_equals_git_rev_list_no_merges() {
         return;
     }
     let Some(dir) = init_merge_fixture() else {
+        eprintln!("SKIPPED: init_merge_fixture failed — git unavailable or repo setup failed");
         return;
     };
     let Some(expected) = git_rev_list_count_no_merges(dir.path()) else {
@@ -885,6 +903,7 @@ fn test_branch_commits_present_with_real_subjects() {
         return;
     }
     let Some(dir) = init_merge_fixture() else {
+        eprintln!("SKIPPED: init_merge_fixture failed — git unavailable or repo setup failed");
         return;
     };
 
@@ -914,6 +933,7 @@ fn test_merge_commit_absent_from_history() {
         return;
     }
     let Some(dir) = init_merge_fixture() else {
+        eprintln!("SKIPPED: init_merge_fixture failed — git unavailable or repo setup failed");
         return;
     };
     let Some(head_sha) = git_rev_parse_head(dir.path()) else {
@@ -944,6 +964,7 @@ fn test_per_file_counts_match_git_log_no_merges() {
         return;
     }
     let Some(dir) = init_merge_fixture() else {
+        eprintln!("SKIPPED: init_merge_fixture failed — git unavailable or repo setup failed");
         return;
     };
 
@@ -984,6 +1005,7 @@ fn test_octopus_merge_is_skipped() {
         return;
     }
     let Some(dir) = init_git_repo() else {
+        eprintln!("SKIPPED: repo init failed");
         return;
     };
     let p = dir.path();
@@ -991,70 +1013,56 @@ fn test_octopus_merge_is_skipped() {
 
     // Root commit on main
     if !git_commit_file_at(p, "shared.txt", "v1", "chore: init", T0, T0) {
+        eprintln!("SKIPPED: root commit failed");
         return;
     }
 
     // Branch b1
-    if !Command::new("git")
-        .args(["checkout", "-b", "b1"])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if !git_ok(p, &["checkout", "-b", "b1"]) {
+        eprintln!("SKIPPED: checkout -b b1 failed");
         return;
     }
     if !git_commit_file_at(p, "b1.txt", "x", "feat: b1 work", T0 + 10, T0 + 10) {
+        eprintln!("SKIPPED: b1 commit failed");
         return;
     }
 
     // Branch b2 from main
-    if !Command::new("git")
-        .args(["checkout", "main"])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if !git_ok(p, &["checkout", "main"]) {
+        eprintln!("SKIPPED: checkout main (before b2) failed");
         return;
     }
-    if !Command::new("git")
-        .args(["checkout", "-b", "b2"])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if !git_ok(p, &["checkout", "-b", "b2"]) {
+        eprintln!("SKIPPED: checkout -b b2 failed");
         return;
     }
     if !git_commit_file_at(p, "b2.txt", "y", "feat: b2 work", T0 + 20, T0 + 20) {
+        eprintln!("SKIPPED: b2 commit failed");
         return;
     }
 
     // Back to main, octopus merge of both branches
-    if !Command::new("git")
-        .args(["checkout", "main"])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+    if !git_ok(p, &["checkout", "main"]) {
+        eprintln!("SKIPPED: checkout main (before merge) failed");
         return;
     }
-    let octopus_ok = Command::new("git")
-        .args([
+    if !git_ok(
+        p,
+        &[
             "merge",
             "--no-ff",
             "-m",
             "merge(octopus): b1 b2",
             "b1",
             "b2",
-        ])
-        .current_dir(p)
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !octopus_ok {
+        ],
+    ) {
         eprintln!("SKIPPED: octopus merge failed (git may not support it)");
         return;
     }
 
     let Some(head_sha) = git_rev_parse_head(p) else {
+        eprintln!("SKIPPED: git rev-parse HEAD failed");
         return;
     };
 
@@ -1093,6 +1101,7 @@ fn test_cutoff_uses_committer_time_not_author_time() {
         return;
     }
     let Some(dir) = init_git_repo() else {
+        eprintln!("SKIPPED: repo init failed");
         return;
     };
     let p = dir.path();
@@ -1114,15 +1123,43 @@ fn test_cutoff_uses_committer_time_not_author_time() {
         ancient_author_ts,
         recent_committer_ts,
     ) {
+        eprintln!("SKIPPED: rebased commit failed");
         return;
     }
 
-    // With 30-day window: committer date is recent → commit MUST be returned
+    // AC-7 anti-regression: add a second commit whose committer time is older
+    // than the rebased commit's so gix visits the rebased commit FIRST under
+    // ByCommitTimeCutoff/NewestFirst.  If the walk incorrectly `break`s after
+    // the first `push`, this second commit would be missing and the assertion
+    // below would catch the regression (AD-407-3).
+    let second_committer_ts = recent_committer_ts - 2 * 86_400; // 7 days ago, within 30-day window
+    if !git_commit_file_at(
+        p,
+        "extra.txt",
+        "content",
+        "chore: second commit",
+        second_committer_ts,
+        second_committer_ts,
+    ) {
+        eprintln!("SKIPPED: second commit failed");
+        return;
+    }
+
+    // With 30-day window: both commits have recent committer dates → both MUST be returned.
+    // The assertion on len==2 is the load-bearing AC-7 check: a premature break after
+    // the first push would leave the second commit absent, turning the test red.
     let src = GixSource;
     let history_30d = src.parse_history(p, 30).expect("parse_history 30d");
-    assert!(
-        !history_30d.commits.is_empty(),
-        "commit with old author date but recent committer date must be returned with lookback_days=30"
+    assert_eq!(
+        history_30d.commits.len(),
+        2,
+        "both the rebased commit and the second commit must be returned with lookback_days=30; \
+         AC-7: walk must not terminate after the first push (AD-407-3). Got: {:?}",
+        history_30d
+            .commits
+            .iter()
+            .map(|c| &c.message)
+            .collect::<Vec<_>>()
     );
     assert!(
         history_30d
@@ -1131,9 +1168,17 @@ fn test_cutoff_uses_committer_time_not_author_time() {
             .any(|c| c.message == "feat: rebased commit"),
         "rebased commit must appear in 30-day window"
     );
+    assert!(
+        history_30d
+            .commits
+            .iter()
+            .any(|c| c.message == "chore: second commit"),
+        "second commit must appear in 30-day window"
+    );
 
     // Now create a second repo where BOTH dates are ancient
     let Some(dir2) = init_git_repo() else {
+        eprintln!("SKIPPED: second repo init failed");
         return;
     };
     if !git_commit_file_at(
@@ -1144,6 +1189,7 @@ fn test_cutoff_uses_committer_time_not_author_time() {
         ancient_author_ts,
         ancient_author_ts, // committer date also old
     ) {
+        eprintln!("SKIPPED: ancient commit failed");
         return;
     }
 
@@ -1175,6 +1221,7 @@ fn test_shallow_clone_with_merge_head_yields_no_commits() {
         return;
     }
     let Some(origin) = init_merge_fixture() else {
+        eprintln!("SKIPPED: init_merge_fixture failed — git unavailable or repo setup failed");
         return;
     };
 
@@ -1216,12 +1263,13 @@ fn test_shallow_clone_with_merge_head_yields_no_commits() {
 /// descending, so commits with old author dates but recent committer dates
 /// sort LAST, not first (stable sort preserves traversal order for ties).
 #[test]
-fn test_ordering_contract_committer_time_not_author_time() {
+fn test_ordering_contract_author_time_not_committer_time() {
     if !git_available() {
         eprintln!("SKIPPED: git not available");
         return;
     }
     let Some(dir) = init_git_repo() else {
+        eprintln!("SKIPPED: repo init failed");
         return;
     };
     let p = dir.path();
@@ -1243,6 +1291,7 @@ fn test_ordering_contract_committer_time_not_author_time() {
         T_NEW_AUTHOR,
         T_OLD_COMMITTER,
     ) {
+        eprintln!("SKIPPED: commit A failed");
         return;
     }
     // Commit B: old author, new committer → gix visits this FIRST (newer committer)
@@ -1254,6 +1303,7 @@ fn test_ordering_contract_committer_time_not_author_time() {
         T_OLD_AUTHOR,
         T_NEW_COMMITTER,
     ) {
+        eprintln!("SKIPPED: commit B failed");
         return;
     }
 
