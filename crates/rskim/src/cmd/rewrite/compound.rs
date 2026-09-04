@@ -422,15 +422,25 @@ pub(super) fn command_heads(cmd: &str) -> Vec<String> {
 /// Return `true` when any pipe stage of `cmd` feeds a [`BYTE_EXACT_PIPE_CONSUMERS`]
 /// command.
 fn pipe_consumer_needs_exact_bytes(cmd: &str) -> bool {
-    let CompoundSplitResult::Compound(segments) = split_compound(cmd) else {
-        // Simple (no operator) has no consumer; Bail shapes are already caught
-        // by rule S, which runs first.
-        return false;
-    };
-    segments.windows(2).any(|pair| {
-        pair[0].trailing_operator == Some(CompoundOp::Pipe)
-            && segment_head(&pair[1]).is_some_and(|head| BYTE_EXACT_PIPE_CONSUMERS.contains(&head))
-    })
+    match split_compound(cmd) {
+        // No compound operator — no pipe consumer.
+        CompoundSplitResult::Simple(_) => false,
+        // `split_compound` bails on heredoc `<<`, `${..}` expansion, and
+        // unmatched quotes. None of these shapes are caught by `is_capture_shape`
+        // (rule S covers only `$(`, backtick, `<(`, `>(`). The token stream is
+        // untrusted, so the pipeline structure cannot be read. Treat conservatively:
+        // if the command text contains `|`, a byte-exact consumer may follow the
+        // bail-triggering token. Erring wide costs compression; erring narrow costs
+        // bytes (#317). Commands without `|` have no pipe consumer and return false,
+        // preserving the pinned property for parameter-expansion-only shapes such as
+        // `git log -n ${N}` (no marker written — see `test_command_heads_unknown_for_parameter_expansion`).
+        CompoundSplitResult::Bail => cmd.contains('|'),
+        CompoundSplitResult::Compound(segments) => segments.windows(2).any(|pair| {
+            pair[0].trailing_operator == Some(CompoundOp::Pipe)
+                && segment_head(&pair[1])
+                    .is_some_and(|head| BYTE_EXACT_PIPE_CONSUMERS.contains(&head))
+        }),
+    }
 }
 
 /// Extract a segment's command name: the first token that is neither a leading
@@ -1314,6 +1324,51 @@ mod tests {
         assert!(command_needs_exact_bytes("tee >(gzip > out.gz)"));
         // `${VAR}` is parameter expansion, not capture — must NOT arm the rule.
         assert!(!command_needs_exact_bytes("git log -n ${N}"));
+    }
+
+    /// Bail shapes that rule S (`is_capture_shape`) does NOT cover, piped into a
+    /// byte-exact consumer.  `split_compound` bails before reaching the `|`, so
+    /// the old code always returned `false`; the fix returns `cmd.contains('|')`.
+    ///
+    /// Three shapes, each pinning one bail trigger:
+    /// - heredoc `<<`
+    /// - `${..}` parameter expansion
+    /// - unmatched quote (detected at end of `split_compound`)
+    #[test]
+    fn test_needs_exact_bytes_bail_shapes_with_pipe_consumer() {
+        // Heredoc `<<` — check_bail fires before seeing the pipe.
+        assert!(command_needs_exact_bytes(
+            "git log -n 5 <<EOF | tee out.txt"
+        ));
+        // `${..}` expansion — same.
+        assert!(command_needs_exact_bytes("git log -n ${N} | tee out.txt"));
+        // Unmatched single quote — split_compound bails at end of input.
+        assert!(command_needs_exact_bytes("git log -n 5 | tee 'out.txt"));
+    }
+
+    /// The conservative Bail treatment must NOT widen to commands without a pipe.
+    /// No `|` → no pipe consumer → return false, preserving the pinned guarantee
+    /// for parameter-expansion-only and heredoc-only commands.
+    #[test]
+    fn test_needs_exact_bytes_bail_without_pipe_returns_false() {
+        // `${N}` unquoted, no pipe — pinned by test_command_heads_unknown_for_parameter_expansion.
+        assert!(!command_needs_exact_bytes("git log -n ${N}"));
+        // Heredoc with no downstream pipe.
+        assert!(!command_needs_exact_bytes("cat <<EOF"));
+        // Unmatched quote, no pipe.
+        assert!(!command_needs_exact_bytes("git log -n 'five"));
+    }
+
+    /// Quoted `"${N}"` does NOT trigger check_bail (the `$` is inside double
+    /// quotes, so the state machine skips check_bail).  `split_compound` succeeds
+    /// and returns Compound, so the pipeline is fully analysed: `cat` is not a
+    /// byte-exact consumer → false, and `tee` is → true.
+    #[test]
+    fn test_needs_exact_bytes_quoted_var_takes_normal_path() {
+        // `cat` not in BYTE_EXACT_PIPE_CONSUMERS → false.
+        assert!(!command_needs_exact_bytes(r#"git log -n "${N}" | cat"#));
+        // `tee` IS byte-exact → true (rule T fires normally).
+        assert!(command_needs_exact_bytes(r#"git log -n "${N}" | tee out.txt"#));
     }
 
     /// Rule R: file and named-FIFO redirects, including the case-8 shape.

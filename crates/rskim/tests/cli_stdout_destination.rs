@@ -1065,6 +1065,193 @@ mod destination {
         );
     }
 
+    // ========================================================================
+    // Bail-shape fixes (reliability-2): heredoc, ${VAR}, unmatched quote
+    // ========================================================================
+    //
+    // Three pipeline shapes where `split_compound` bails before reaching the
+    // `|`, causing `pipe_consumer_needs_exact_bytes` to return `false` and the
+    // hook to write no marker.  Without a marker the wrapper has only `fstat`,
+    // which sees a FIFO and compresses into the tee file — silent byte loss.
+    //
+    // The fix: `Bail => cmd.contains('|')` — conservative when a pipe is
+    // plausibly present.  Each test fires the hook with the bail-triggering form
+    // and runs a valid equivalent; the wildcard marker (keyed by PPID, written
+    // when command_heads returns an empty set) is found by the wrapper's ancestry
+    // walk.  Byte comparison to the raw baseline distinguishes raw from compressed.
+    //
+    // Each test is written to FAIL before the fix (compressed bytes != raw bytes)
+    // and PASS after (compressed bytes == raw bytes).
+
+    /// `<cmd> <<EOF | tee f` (heredoc bail) → marker written → raw bytes in file.
+    ///
+    /// `check_bail` fires on `<<` before `split_compound` reaches the `|`, so
+    /// the old code wrote no marker and the wrapper compressed.  The hook now
+    /// returns true conservatively (contains `|`), causing the wildcard marker
+    /// to be written.
+    #[test]
+    fn wrapper_pipe_tee_heredoc_bail_serves_raw() {
+        let sb = Sandbox::new();
+        let raw = sb.raw_baseline();
+        let out_file = sb.out("heredoc-bail-tee.txt");
+
+        // Fire the hook with the heredoc bail shape.  `split_compound` bails on
+        // `<<`; after the fix `pipe_consumer_needs_exact_bytes` returns true
+        // (contains `|`) and the hook writes a wildcard force-raw marker.
+        let hook_cmd = format!("git log -n 5 <<EOF | tee {}", out_file.display());
+        sb.fire_hook(&hook_cmd);
+
+        // Verify the marker was written.
+        let sessions = sb.cache().join("sessions");
+        let markers: Vec<_> = std::fs::read_dir(&sessions)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "raw"))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !markers.is_empty(),
+            "heredoc bail shape with `|` must write a force-raw marker; \
+             got no .raw files under {sessions:?}"
+        );
+
+        // Run a valid equivalent command.  The wildcard marker (PPID-keyed) is
+        // found by the ancestry walk, and the wrapper serves raw.
+        let run_script = format!("git log -n 5 | tee {}", out_file.display());
+        sb.wrapped_sh(&run_script).output().expect("run | tee");
+        let landed = std::fs::read(&out_file).expect("tee output");
+        assert_eq!(
+            landed.len(),
+            raw.len(),
+            "heredoc bail: tee file must contain raw bytes \
+             (raw={} B, landed={} B — compressed bytes signal a missing marker)",
+            raw.len(),
+            landed.len()
+        );
+        assert_eq!(landed, raw, "heredoc bail: bytes must match raw byte-for-byte");
+    }
+
+    /// `<cmd> | tee f` with unquoted `${VAR}` → marker written → raw bytes.
+    ///
+    /// `check_bail` fires on `${` before the `|`, so the old code wrote no
+    /// marker.  `${VAR}` is NOT covered by rule S (`is_capture_shape`).
+    #[test]
+    fn wrapper_pipe_tee_unquoted_var_bail_serves_raw() {
+        let sb = Sandbox::new();
+        let raw = sb.raw_baseline();
+        let out_file = sb.out("var-bail-tee.txt");
+
+        // Hook sees the literal text including `${N}` — split_compound bails.
+        let hook_cmd = format!("git log -n ${{N}} | tee {}", out_file.display());
+        sb.fire_hook(&hook_cmd);
+
+        // Verify the marker was written.
+        let sessions = sb.cache().join("sessions");
+        let markers: Vec<_> = std::fs::read_dir(&sessions)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "raw"))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !markers.is_empty(),
+            "unquoted `${{N}}` bail with `|` must write a force-raw marker"
+        );
+
+        // Run with N expanded to 5.  The wildcard marker routes the wrapper to raw.
+        let run_script = format!("N=5; git log -n $N | tee {}", out_file.display());
+        sb.wrapped_sh(&run_script).output().expect("run | tee");
+        let landed = std::fs::read(&out_file).expect("tee output");
+        assert_eq!(
+            landed.len(),
+            raw.len(),
+            "unquoted `${{N}}` bail: tee file must contain raw bytes \
+             (raw={} B, landed={} B)",
+            raw.len(),
+            landed.len()
+        );
+        assert_eq!(landed, raw, "unquoted `${{N}}` bail: bytes must match raw");
+    }
+
+    /// `<cmd> | tee f` with an unmatched quote → marker written → raw bytes.
+    ///
+    /// `split_compound` bails at end-of-input when a quote is left open, before
+    /// the consumer was identified.  Old code: no marker, compressed bytes.
+    #[test]
+    fn wrapper_pipe_tee_unmatched_quote_bail_serves_raw() {
+        let sb = Sandbox::new();
+        let raw = sb.raw_baseline();
+        let out_file = sb.out("quote-bail-tee.txt");
+
+        // Single-quote opens but never closes — split_compound bails at EOF.
+        // The command contains `|`, so the fix returns true and the hook writes
+        // a wildcard marker.
+        let hook_cmd = format!("git log -n 5 | tee '{}", out_file.display());
+        sb.fire_hook(&hook_cmd);
+
+        // Verify the marker was written.
+        let sessions = sb.cache().join("sessions");
+        let markers: Vec<_> = std::fs::read_dir(&sessions)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "raw"))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !markers.is_empty(),
+            "unmatched-quote bail with `|` must write a force-raw marker"
+        );
+
+        // Run the valid equivalent; marker routes the wrapper to raw.
+        let run_script = format!("git log -n 5 | tee {}", out_file.display());
+        sb.wrapped_sh(&run_script).output().expect("run | tee");
+        let landed = std::fs::read(&out_file).expect("tee output");
+        assert_eq!(
+            landed.len(),
+            raw.len(),
+            "unmatched-quote bail: tee file must contain raw bytes \
+             (raw={} B, landed={} B)",
+            raw.len(),
+            landed.len()
+        );
+        assert_eq!(landed, raw, "unmatched-quote bail: bytes must match raw");
+    }
+
+    /// **Negative cell**: quoted `"${N}"` takes the full parsing path (no bail),
+    /// so `cat` as the consumer is correctly identified as non-byte-exact and no
+    /// marker is written.  The wrapper compresses normally.
+    ///
+    /// This confirms the fix does not over-broaden: a properly-quoted variable
+    /// still keeps compression working for reader consumers.
+    #[test]
+    fn wrapper_pipe_cat_quoted_var_still_compresses() {
+        let sb = Sandbox::new();
+
+        // `"${N}"` is inside double quotes → check_bail is skipped → split_compound
+        // returns Compound.  `cat` is not in BYTE_EXACT_PIPE_CONSUMERS → false →
+        // no force-raw marker.
+        let hook_cmd = r#"git log -n "${N}" | cat"#;
+        sb.fire_hook(hook_cmd);
+
+        // Run with N=5; the shell expands "${N}" to 5.
+        let out = sb
+            .wrapped_sh(r#"N=5; git log -n "${N}" | cat"#)
+            .output()
+            .expect(r#"run | cat with quoted "${N}""#);
+        assert_eq!(
+            classify(&out.stdout),
+            Served::Compressed,
+            r#"quoted `"${{N}}"` with `| cat` must still compress — \
+             the fix must not over-broaden to properly-parsed commands"#
+        );
+    }
+
     /// ADR-009: `grep` stays byte-for-byte identical to the raw tool on the
     /// wrapper surface. The destination gate must not have perturbed it.
     #[test]
