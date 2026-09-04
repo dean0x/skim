@@ -973,10 +973,22 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
         String::from_utf8_lossy(&build_out.stderr)
     );
     let build_stderr = String::from_utf8_lossy(&build_out.stderr);
+    // AD-407: strip the pre-existing lexical-build progress lines before
+    // checking for unexpected temporal-walk cap notices.  The "indexed N
+    // files" line is intentional, pre-#407 behaviour (staleness.rs:
+    // "no AC backs the removal") and is not a temporal-walk notice.
+    // AC-9 AMENDED governs only MAX_COMMITS / MAX_VISITED_COMMITS notices,
+    // which MUST NOT fire on this small fixture.
+    let unexpected_build_stderr: String = build_stderr
+        .lines()
+        .filter(|l| !l.starts_with("skim search: indexed "))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        build_stderr.is_empty(),
-        "AC-9: --build must produce empty stderr on a clean .rs-only repo; \
-         got: {build_stderr:?}"
+        unexpected_build_stderr.trim().is_empty(),
+        "AC-9: --build must produce no temporal-walk cap notices on a \
+         clean .rs-only repo (neither MAX_COMMITS nor MAX_VISITED_COMMITS \
+         notice may fire below the cap); got: {build_stderr:?}"
     );
 
     // --risky --json: stderr MUST be empty.
@@ -1109,7 +1121,10 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
 
     // ── Query ────────────────────────────────────────────────────────────────
 
-    let json = run_search_json(&repo_root, cache.path(), &["--risky"]);
+    // Use a large --limit so every indexed file is returned regardless of
+    // risk rank; AC-5 verifies the commit COUNTS for query.rs, not its rank
+    // position.  600 exceeds the ~545 tracked .rs files in this workspace.
+    let json = run_search_json(&repo_root, cache.path(), &["--risky", "--limit", "600"]);
     let results = json["results"]
         .as_array()
         .expect("--risky --json results must be an array");
@@ -1350,17 +1365,42 @@ fn test_ac20_lexical_query_unaffected_by_temporal_index() {
         String::from_utf8_lossy(&out_b.stderr)
     );
 
-    // Byte-identical stdout: the temporal layer must not introduce
-    // non-determinism in lexical output.
+    // Parse both outputs before content comparison.  `duration_ms` is a
+    // wall-clock timing field and is expected to differ between calls; strip
+    // it before comparing so the assertion covers search content, not elapsed
+    // time.  AD-407-1: the full-DAG walk is build-path-only and MUST NOT
+    // introduce non-determinism in the lexical query path.
+    let json_a: Value =
+        serde_json::from_slice(&out_a.stdout).expect("AC-20: run-1 output must be valid JSON");
+    let json_b: Value =
+        serde_json::from_slice(&out_b.stdout).expect("AC-20: run-2 output must be valid JSON");
+
+    /// Strip the `duration_ms` field (wall-clock, non-deterministic) from any
+    /// JSON object, recursing into nested objects and arrays.
+    fn without_duration_ms(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let filtered: serde_json::Map<String, Value> = m
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != "duration_ms")
+                    .map(|(k, v)| (k.clone(), without_duration_ms(v)))
+                    .collect();
+                Value::Object(filtered)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(without_duration_ms).collect()),
+            other => other.clone(),
+        }
+    }
+
     assert_eq!(
-        out_a.stdout, out_b.stdout,
-        "AC-20: pure-lexical query stdout must be byte-identical across \
-         repeated calls on the same corpus and cache"
+        without_duration_ms(&json_a),
+        without_duration_ms(&json_b),
+        "AC-20: pure-lexical query content (excluding duration_ms) must be \
+         identical across repeated calls on the same corpus and cache"
     );
 
-    // Parse and inspect the JSON structure.
-    let json: Value = serde_json::from_slice(&out_a.stdout)
-        .expect("AC-20: lexical query must produce valid JSON");
+    // Use run-1's parsed output for the structural assertions below.
+    let json: Value = json_a;
 
     // `verify_mode` must be absent in default Substring mode
     // (`skip_serializing_if` in the search crate).
