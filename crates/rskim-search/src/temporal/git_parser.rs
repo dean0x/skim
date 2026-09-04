@@ -107,28 +107,38 @@ const _: () = assert!(
 
 /// Walk budget tracker — two independent counters with two distinct safety caps.
 ///
-/// Exposed as a public type so tests can drive both bounds directly without
-/// constructing a large repository (AC-8).
+/// Crate-internal type, exercised by the co-located `tests` submodule without
+/// needing to construct a large repository (AC-8).
 #[derive(Default)]
-pub struct WalkBudget {
+pub(super) struct WalkBudget {
     visited: usize,
     retained: usize,
+    /// Set to `true` by either [`charge_visit`] or [`charge_retain`] when their
+    /// respective cap fires.  Propagated to
+    /// [`crate::types::TemporalMetadata::truncated`] so the condition crosses
+    /// the `rskim-search → rskim` boundary and is mapped into the DegradedReason
+    /// SSOT the same way `is_shallow` is (AD-414-14).
+    pub(super) truncated: bool,
 }
 
 impl WalkBudget {
     /// Create a new budget with both counters at zero.
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
     /// Charge one loop iteration. Returns `true` when the visit cap has fired
     /// and the loop should break.
     ///
-    /// Prints a distinct eprintln! notice on the first call that hits the cap
-    /// (consistent with the retained-commit notice).
-    pub fn charge_visit(&mut self) -> bool {
+    /// Prints an eprintln! notice on every call that exceeds the cap; because
+    /// the caller breaks immediately on `true`, this fires at most once per walk.
+    /// Also sets `self.truncated = true` so the condition is visible to callers
+    /// via [`TemporalMetadata::truncated`].
+    #[must_use]
+    pub(super) fn charge_visit(&mut self) -> bool {
         self.visited += 1;
         if self.visited > MAX_VISITED_COMMITS {
+            self.truncated = true;
             eprintln!(
                 "skim: parse_history reached the {MAX_VISITED_COMMITS}-visit safety cap; \
                  truncating history. Pass lookback_days > 0 to scope the traversal."
@@ -142,16 +152,21 @@ impl WalkBudget {
     /// Charge one retained commit. Returns `true` when the retain cap has fired
     /// and the loop should break.
     ///
-    /// Prints a distinct eprintln! notice on the first call that hits the cap.
-    pub fn charge_retain(&mut self) -> bool {
-        if self.retained >= MAX_COMMITS {
+    /// Prints an eprintln! notice on every call that exceeds the cap; because
+    /// the caller breaks immediately on `true`, this fires at most once per walk.
+    /// Also sets `self.truncated = true` so the condition is visible to callers
+    /// via [`TemporalMetadata::truncated`].
+    #[must_use]
+    pub(super) fn charge_retain(&mut self) -> bool {
+        self.retained += 1;
+        if self.retained > MAX_COMMITS {
+            self.truncated = true;
             eprintln!(
                 "skim: parse_history reached the {MAX_COMMITS}-commit safety cap; \
                  truncating history. Pass lookback_days > 0 to scope the traversal."
             );
             true
         } else {
-            self.retained += 1;
             false
         }
     }
@@ -309,14 +324,18 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         let msg_bytes = commit_ref.message;
         let message = first_line_of(msg_bytes.to_str_lossy().as_ref()).to_owned();
 
-        // Compute changed files (tree diff vs. first parent or empty tree).
+        // Compute changed files (tree diff vs. sole parent or empty tree).
         // Pass the already-decoded commit object to avoid a second object lookup.
+        // `info.parent_ids.first().copied()` yields `None` for root commits and
+        // `Some(id)` for the one parent of a non-merge commit; the function
+        // signature prevents accidentally passing a merge commit (AD-407-2).
         // In shallow clones, the parent object may be missing — treat as empty.
-        let changed_files = match changed_files_for_commit(&repo, &commit_obj, &info.parent_ids) {
-            Ok(files) => files,
-            Err(_) if is_shallow => Vec::new(),
-            Err(e) => return Err(e),
-        };
+        let changed_files =
+            match changed_files_for_commit(&repo, &commit_obj, info.parent_ids.first().copied()) {
+                Ok(files) => files,
+                Err(_) if is_shallow => Vec::new(),
+                Err(e) => return Err(e),
+            };
 
         commits.push(CommitInfo {
             hash,
@@ -338,6 +357,7 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         metadata: TemporalMetadata {
             is_shallow,
             commit_count,
+            truncated: budget.truncated,
         },
     };
     debug_assert_eq!(
@@ -348,8 +368,16 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
     Ok(result)
 }
 
-/// Return the changed files in a commit by diffing its tree against its first
+/// Return the changed files in a commit by diffing its tree against its sole
 /// parent (or the empty tree for root commits).
+///
+/// The `parent` parameter carries the sole parent's `ObjectId` when present,
+/// or `None` for root commits.  After AD-407-2 only commits with 0 or 1 parent
+/// can reach this helper — merge commits (>1 parent) are skipped in the caller
+/// before this function is called.  Accepting `Option<gix::ObjectId>` instead
+/// of the full `ParentIds` slice makes the merge case unrepresentable at the
+/// call site so a future caller cannot accidentally pass a merge commit and
+/// silently receive a first-parent-only diff.
 ///
 /// Accepts the already-decoded `commit` object from the caller to avoid a
 /// second object-store lookup per commit.
@@ -359,16 +387,16 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
 fn changed_files_for_commit(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
-    parent_ids: &gix::traverse::commit::ParentIds,
+    parent: Option<gix::ObjectId>,
 ) -> Result<Vec<FileChangeInfo>> {
     // Get the new (this commit's) tree
     let new_tree = commit.tree().map_err(gix_err)?;
 
-    // Get old (parent's) tree, or empty tree for root commits
+    // Get old (sole parent's) tree, or empty tree for root commits
     let old_tree: gix::Tree<'_>;
     let empty_tree: gix::Tree<'_>;
 
-    let lhs: &gix::Tree<'_> = if let Some(&parent_id) = parent_ids.first() {
+    let lhs: &gix::Tree<'_> = if let Some(parent_id) = parent {
         let parent_obj = repo.find_object(parent_id).map_err(gix_err)?;
         let parent_commit = parent_obj
             .try_into_commit()
@@ -452,6 +480,7 @@ fn empty_result(is_shallow: bool) -> HistoryResult {
         metadata: TemporalMetadata {
             is_shallow,
             commit_count: 0,
+            truncated: false,
         },
     }
 }

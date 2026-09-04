@@ -48,6 +48,7 @@ fn make_history(commits: Vec<CommitInfo>) -> HistoryResult {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: count,
+            truncated: false,
         },
     }
 }
@@ -1319,6 +1320,7 @@ impl rskim_search::TemporalSource for CountingSource {
                 metadata: rskim_search::TemporalMetadata {
                     is_shallow: false,
                     commit_count: 0,
+                    truncated: false,
                 },
             })
         }
@@ -2803,6 +2805,7 @@ fn test_corrupt_db_discarded_and_rebuilt() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 2,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -2958,6 +2961,7 @@ fn test_t16_case_i_zero_commits_writes_head_not_shallow() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3042,6 +3046,7 @@ fn test_t16_case_ii_shallow_no_changed_files_writes_shallow_meta() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3123,6 +3128,7 @@ fn test_t16_case_iii_ghost_filter_drops_all_rows_writes_head() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 2,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3390,6 +3396,7 @@ fn test_check3_shallow_to_full_transition_detected_as_stale() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3552,6 +3559,7 @@ fn test_check3_linked_worktree_commondir_shallow_probe() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src = FixedSource { history };
@@ -3692,6 +3700,7 @@ fn test_check3_self_heal_no_loop() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src1 = FixedSource {
@@ -3748,6 +3757,7 @@ fn test_check3_self_heal_no_loop() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 1,
+            truncated: false,
         },
     };
     let src2 = FixedSource {
@@ -3822,6 +3832,7 @@ fn test_zero_row_notice_case_i_no_shallow_text() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     };
     let notice = super::zero_row_notice(&history, 0, false);
@@ -3861,6 +3872,7 @@ fn test_zero_row_notice_case_ii_has_shallow_text() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let notice = super::zero_row_notice(&history, 0, true);
@@ -3893,6 +3905,7 @@ fn test_zero_row_notice_case_iii_no_shallow_text() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 2,
+            truncated: false,
         },
     };
     // pre_ghost_hotspot = 1 → case (iii) fires regardless of is_shallow.
@@ -3927,6 +3940,7 @@ fn test_zero_row_notice_all_cases_single_line() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     };
     let notice_i = super::zero_row_notice(&history_i, 0, false);
@@ -3941,6 +3955,7 @@ fn test_zero_row_notice_all_cases_single_line() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 1,
+            truncated: false,
         },
     };
     let notice_ii = super::zero_row_notice(&history_ii, 0, true);
@@ -3960,6 +3975,7 @@ fn test_zero_row_notice_all_cases_single_line() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: 1,
+            truncated: false,
         },
     };
     let notice_iii = super::zero_row_notice(&history_iii, 1, false);
@@ -4248,6 +4264,7 @@ impl rskim_search::TemporalSource for UnbornSource {
             metadata: rskim_search::TemporalMetadata {
                 is_shallow: self.is_shallow,
                 commit_count: 0,
+                truncated: false,
             },
         })
     }
@@ -4372,6 +4389,7 @@ fn test_ad414_22_unresolvable_head_with_readable_history_is_left_alone() {
             metadata: rskim_search::TemporalMetadata {
                 is_shallow: false,
                 commit_count: 1,
+                truncated: false,
             },
         },
     };
@@ -4423,6 +4441,7 @@ fn test_zero_row_notice_shallow_wins_over_zero_commits() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: true,
             commit_count: 0,
+            truncated: false,
         },
     };
 
@@ -4522,6 +4541,7 @@ fn test_risk_rows_match_is_fix_commit_over_same_history() {
             metadata: rskim_search::TemporalMetadata {
                 is_shallow: false,
                 commit_count: expected_total as usize,
+                truncated: false,
             },
         },
     };

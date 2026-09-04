@@ -128,6 +128,17 @@ pub const META_DATA_VERSION: &str = "data_version";
 /// is skipped — no spurious rebuilds on upgrade.
 pub const META_IS_SHALLOW: &str = "is_shallow";
 
+/// Meta key that records whether the last build's commit walk was truncated by
+/// a safety cap (`MAX_COMMITS` or `MAX_VISITED_COMMITS`).
+///
+/// Value is `"1"` when truncated, `"0"` otherwise.  Written by
+/// `rebuild_temporal` via [`crate::temporal::storage_ops::TemporalDb::set_meta`]
+/// after a successful [`crate::temporal::storage_ops::TemporalDb::sync`], mapping
+/// [`crate::types::TemporalMetadata::truncated`] into the persistent meta table
+/// so the condition is visible at query time and in `--stats --json`.
+/// Absent row means not truncated (builds before this field existed).
+pub const META_HISTORY_TRUNCATED: &str = "history_truncated";
+
 // ============================================================================
 // Error helper
 // ============================================================================

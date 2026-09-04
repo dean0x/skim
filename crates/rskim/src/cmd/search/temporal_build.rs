@@ -929,9 +929,25 @@ pub(super) fn rebuild_temporal_with_source(
     // Check 3 in temporal_db_is_stale can detect a shallow→full transition.
     let is_shallow = risk_history.metadata.is_shallow;
 
+    // truncated from parse_history metadata: crosses the rskim-search → rskim
+    // boundary via TemporalMetadata.  Persisted to the meta table after sync()
+    // succeeds so the condition is visible at query time (DegradedReason SSOT
+    // mapping parallel to is_shallow / AD-414-14).
+    let history_truncated = risk_history.metadata.truncated;
+
     match db.sync(&hotspot_rows, &risk_rows, &cochange_rows, head, is_shallow) {
         Ok(()) => {
             on_sync_ok(&db);
+            // Persist the truncation flag so query-time code and --stats --json can
+            // expose it.  `set_meta` is a best-effort write (non-version-attestation
+            // key); a failure here does not corrupt the DB — the sync already
+            // committed — so the error is swallowed after a debug notice.
+            let trunc_val = if history_truncated { "1" } else { "0" };
+            if let Err(e) = db.set_meta(rskim_search::META_HISTORY_TRUNCATED, trunc_val)
+                && crate::debug::is_debug_enabled()
+            {
+                eprintln!("skim search [debug]: set_meta(history_truncated) failed: {e}");
+            }
             if crate::debug::is_debug_enabled() {
                 eprintln!(
                     "skim search [debug]: temporal.db updated ({} hotspot, {} risk, {} cochange rows, HEAD={}…)",

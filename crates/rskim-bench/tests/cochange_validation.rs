@@ -380,6 +380,7 @@ fn full_pipeline_synthetic_repo() {
         metadata: rskim_search::TemporalMetadata {
             is_shallow: false,
             commit_count: split.train.len(),
+            truncated: false,
         },
     };
     let _stats = builder

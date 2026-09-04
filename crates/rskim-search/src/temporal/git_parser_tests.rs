@@ -1307,8 +1307,9 @@ fn test_walk_budget_bounds() {
     );
 
     // --- Retain bound ---
-    // charge_retain() should return false for the first MAX_COMMITS calls,
-    // then true on the (MAX_COMMITS+1)th call.
+    // Both methods share the same increment-then-check idiom: increment the
+    // counter first, then return true if the new value exceeds the cap.
+    // charge_retain fires on the (MAX_COMMITS+1)th call.
     {
         let mut budget = WalkBudget::new();
         for i in 0..MAX_COMMITS {
@@ -1318,14 +1319,22 @@ fn test_walk_budget_bounds() {
             );
         }
         assert!(
+            !budget.truncated,
+            "truncated must be false while still below cap"
+        );
+        assert!(
             budget.charge_retain(),
             "charge_retain must return true after {MAX_COMMITS} charges (cap reached)"
+        );
+        assert!(
+            budget.truncated,
+            "truncated must be true once the retain cap fires"
         );
     }
 
     // --- Visit bound ---
-    // charge_visit() increments first, then checks. It fires when visited
-    // strictly exceeds MAX_VISITED_COMMITS, i.e. on the (MAX_VISITED_COMMITS+1)th call.
+    // charge_visit fires when visited strictly exceeds MAX_VISITED_COMMITS,
+    // i.e. on the (MAX_VISITED_COMMITS+1)th call.
     {
         let mut budget = WalkBudget::new();
         for i in 1..=MAX_VISITED_COMMITS {
@@ -1335,9 +1344,17 @@ fn test_walk_budget_bounds() {
             );
         }
         assert!(
+            !budget.truncated,
+            "truncated must be false while still below cap"
+        );
+        assert!(
             budget.charge_visit(),
             "charge_visit must return true on call {} (cap exceeded)",
             MAX_VISITED_COMMITS + 1
+        );
+        assert!(
+            budget.truncated,
+            "truncated must be true once the visit cap fires"
         );
     }
 }

@@ -298,6 +298,19 @@ pub struct TemporalMetadata {
     pub is_shallow: bool,
     /// Number of commits included in this result (equals `commits.len()`).
     pub commit_count: usize,
+    /// True when the commit walk was cut short by a safety cap (`MAX_COMMITS` or
+    /// `MAX_VISITED_COMMITS`).  Temporal scores are computed over a truncated
+    /// history; hot/risky rankings may under-represent files that are active only
+    /// in the capped portion of history.
+    ///
+    /// Consumers (e.g. `rebuild_temporal`) MUST persist this flag so the
+    /// condition can be surfaced via the DegradedReason SSOT at query time —
+    /// the same pattern as `is_shallow` (AD-414-14).
+    ///
+    /// `#[serde(default)]` ensures deserialization of older serialised payloads
+    /// (before this field existed) succeeds, treating absent as `false`.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Output of [`TemporalSource::parse_history`].
