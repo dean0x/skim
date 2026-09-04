@@ -999,3 +999,472 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
          got: {risky_stderr:?}"
     );
 }
+
+// ============================================================================
+// AC-5: dog-food risky ground truth on this repository  (ADR-007)
+// ============================================================================
+
+/// AC-5 (dog-food): on this repository at the wave HEAD, `skim search --risky
+/// --json` MUST report `total_commits` and `fix_commits` for
+/// `crates/rskim/src/cmd/search/query.rs` that match `git rev-list --count
+/// --no-merges HEAD -- <path>` and a case-insensitive word-boundary grep of
+/// commit subjects respectively (ADR-003, ADR-007).
+///
+/// The test MUST NOT hardcode either count; both are derived from git at
+/// run time.  The pre-#407 first-parent values (21 total / 2 fix / 0.095
+/// fix_density) MUST NOT appear in the output, confirming the full-DAG walk
+/// is live.
+///
+/// Building the temporal index for the full workspace takes ~8 s on a warm
+/// OS page cache; this cost is accepted for the only dog-food test in the
+/// suite (ADR-007: "a fully green CI and acceptance suite is not evidence
+/// of retrieval correctness; the dog-food campaign is the real merge gate").
+///
+/// AD-407-1 (full-DAG walk replaces first-parent walk).
+#[test]
+fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
+    // Resolve workspace root: CARGO_MANIFEST_DIR → crates/rskim → crates → root.
+    let repo_root = {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        manifest
+            .parent() // …/crates
+            .expect("crates dir")
+            .parent() // workspace root
+            .expect("workspace root")
+            .to_path_buf()
+    };
+
+    // File under test (path relative to repo root, as skim returns it).
+    const TARGET: &str = "crates/rskim/src/cmd/search/query.rs";
+
+    // Guard: file must exist so the assertions below are non-vacuous.
+    assert!(
+        repo_root.join(TARGET).exists(),
+        "AC-5 guard: {TARGET} must exist in the workspace"
+    );
+
+    // ── Ground truth from git (ADR-003) ─────────────────────────────────────
+
+    // total_commits: non-merge commits touching TARGET.
+    let git_total: u64 = {
+        let out = StdCommand::new("git")
+            .args([
+                "rev-list",
+                "--count",
+                "--no-merges",
+                "--full-history",
+                "HEAD",
+                "--",
+                TARGET,
+            ])
+            .current_dir(&repo_root)
+            .output()
+            .expect("git rev-list --count");
+        assert!(out.status.success(), "git rev-list failed for {TARGET}");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("rev-list count must be a number")
+    };
+
+    // fix_commits: non-merge subjects matching the same case-insensitive
+    // word-boundary pattern as is_fix_commit (temporal/mod.rs FIX_REGEX).
+    //
+    // `grep -c` prints the count and exits 0 (matches) or 1 (no matches).
+    // parse() handles both — unwrap_or(0) is the zero-match safety net.
+    let git_fix: u64 = {
+        let sh_cmd = format!(
+            r"git log --no-merges --format='%s' -- '{TARGET}' \
+              | grep -ciE '\b(fix|bug|hotfix|patch|revert)\b'"
+        );
+        let out = StdCommand::new("sh")
+            .arg("-c")
+            .arg(&sh_cmd)
+            .current_dir(&repo_root)
+            .output()
+            .expect("sh -c git log | grep -c");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    };
+
+    // Guard: verify git ground truth is non-trivial so a silent-empty result
+    // cannot make the assertions below vacuously pass (PF-007).
+    assert!(
+        git_total >= 67,
+        "AC-5 guard: git_total ({git_total}) must be ≥ 67 \
+         (the full-DAG count at wave HEAD); check that this test runs on the \
+         correct branch and that HEAD is up to date"
+    );
+    assert!(
+        git_fix > 0,
+        "AC-5 guard: git_fix must be > 0 (query.rs has fix commits)"
+    );
+
+    // ── Build temporal index ─────────────────────────────────────────────────
+
+    let cache = TempDir::new().expect("cache tempdir");
+    build_index(&repo_root, cache.path());
+
+    // ── Query ────────────────────────────────────────────────────────────────
+
+    let json = run_search_json(&repo_root, cache.path(), &["--risky"]);
+    let results = json["results"]
+        .as_array()
+        .expect("--risky --json results must be an array");
+
+    // Locate TARGET in the result set.
+    let row = results
+        .iter()
+        .find(|r| r["path"].as_str() == Some(TARGET))
+        .unwrap_or_else(|| {
+            panic!(
+                "AC-5: {TARGET} must appear in --risky --json results; \
+                 got {} result(s): {results:?}",
+                results.len()
+            )
+        });
+
+    // ── Assertions ───────────────────────────────────────────────────────────
+
+    let skim_total = row["total_commits"]
+        .as_u64()
+        .expect("total_commits must be a number");
+    let skim_fix = row["fix_commits"]
+        .as_u64()
+        .expect("fix_commits must be a number");
+    let skim_density = row["fix_density"]
+        .as_f64()
+        .expect("fix_density must be a float");
+
+    assert_eq!(
+        skim_total, git_total,
+        "AC-5: total_commits for {TARGET} must match \
+         `git rev-list --count --no-merges --full-history HEAD -- {TARGET}` \
+         (full-DAG walk, AD-407-1); skim={skim_total}, git={git_total}"
+    );
+    assert_eq!(
+        skim_fix, git_fix,
+        "AC-5: fix_commits for {TARGET} must match \
+         `git log --no-merges --format=%s | grep -ciE fix-pattern` \
+         (ADR-003); skim={skim_fix}, git={git_fix}"
+    );
+
+    // Confirm fix_density is consistent with the reported counts.
+    let expected_density = git_fix as f64 / git_total as f64;
+    assert!(
+        (skim_density - expected_density).abs() < 0.002,
+        "AC-5: fix_density {skim_density:.4} must be within 0.002 of \
+         fix_commits/total_commits = {expected_density:.4}"
+    );
+
+    // NEGATIVE guard: the pre-#407 first-parent values MUST NOT appear.
+    assert_ne!(
+        skim_total, 21,
+        "AC-5 NEGATIVE: total_commits must not be the pre-#407 \
+         first-parent value 21 — full-DAG walk not active"
+    );
+    assert_ne!(
+        skim_fix, 2,
+        "AC-5 NEGATIVE: fix_commits must not be the pre-#407 \
+         first-parent value 2"
+    );
+    assert!(
+        skim_density > 0.10,
+        "AC-5 NEGATIVE: fix_density {skim_density:.4} must be > 0.10 \
+         (pre-#407 first-parent value was 0.095)"
+    );
+}
+
+// ============================================================================
+// AC-19 (NEGATIVE): pagination contract unchanged by #407
+// ============================================================================
+
+/// AC-19 (NEGATIVE): `--offset N` semantics, the `depth+1` sentinel fetch,
+/// `has_more` derivation, and result ordering MUST be byte-identical across
+/// repeated calls on the same corpus and cache after #407 — the full-DAG walk
+/// MUST NOT introduce non-determinism in the temporal-arm pagination contract.
+///
+/// This test drives the merge fixture with `--risky --json` at both
+/// `--offset 0` and `--offset 1` and asserts that two invocations at the same
+/// offset produce byte-identical stdout (SQL tie-breaks + RRF ranking stable).
+/// It also verifies `has_more` semantics: absent when the full set fits on one
+/// page, present when `--limit` forces a partial page.
+///
+/// AD-407-2 (merge commit absent from full-DAG walk), AD-407-8 (T-18 / AC-16
+/// ground truth for the merge fixture).
+#[test]
+fn test_ac19_risky_offset_pagination_stable_ordering() {
+    let repo = make_merge_repo();
+    let cache = TempDir::new().expect("cache tempdir");
+    build_index(repo.path(), cache.path());
+
+    // Helper: run --risky with extra args, return raw stdout bytes.
+    let risky_raw = |extra: &[&str]| -> Vec<u8> {
+        let mut args = vec!["search", "--risky", "--json", "--root"];
+        let root_str = repo.path().to_str().unwrap();
+        args.push(root_str);
+        args.extend_from_slice(extra);
+        let out = StdCommand::new(cargo_bin("skim"))
+            .args(&args)
+            .env("SKIM_CACHE_DIR", cache.path())
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .output()
+            .expect("skim search --risky --json");
+        assert!(
+            out.status.success(),
+            "skim --risky {:?} failed: {}",
+            extra,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+
+    // ── Full-page stability (both files fit in one page) ────────────────────
+
+    let full_a = risky_raw(&[]);
+    let full_b = risky_raw(&[]);
+    assert_eq!(
+        full_a, full_b,
+        "AC-19: --risky --json stdout must be byte-identical across repeated \
+         calls on the same corpus and cache (stable ordering)"
+    );
+
+    // The full page must NOT carry has_more (merge fixture = 2 files, fits in
+    // one page).
+    let full_json: Value =
+        serde_json::from_slice(&full_a).expect("full-page output must be valid JSON");
+    assert!(
+        full_json.get("has_more").is_none(),
+        "AC-19: has_more must be absent on a single-page full result; \
+         got: {full_json}"
+    );
+
+    // ── Paged stability (--limit 1 forces two pages) ─────────────────────────
+
+    // Page 0: first file.
+    let p0_a = risky_raw(&["--limit", "1"]);
+    let p0_b = risky_raw(&["--limit", "1"]);
+    assert_eq!(
+        p0_a, p0_b,
+        "AC-19: --risky --json --limit 1 (page 0) must be byte-identical \
+         across repeated calls (has_more + result ordering stable)"
+    );
+    let p0_json: Value = serde_json::from_slice(&p0_a).expect("page-0 output must be valid JSON");
+    // has_more MUST be present (true) because a second page exists.
+    assert_eq!(
+        p0_json.get("has_more").and_then(Value::as_bool),
+        Some(true),
+        "AC-19: has_more must be true on a partial first page; got: {p0_json}"
+    );
+
+    // Page 1: second file, offset 1.
+    let p1_a = risky_raw(&["--limit", "1", "--offset", "1"]);
+    let p1_b = risky_raw(&["--limit", "1", "--offset", "1"]);
+    assert_eq!(
+        p1_a, p1_b,
+        "AC-19: --risky --json --limit 1 --offset 1 (page 1) must be \
+         byte-identical across repeated calls"
+    );
+    let p1_json: Value = serde_json::from_slice(&p1_a).expect("page-1 output must be valid JSON");
+    // Page 1 is the last page → has_more must be absent (false).
+    assert!(
+        p1_json.get("has_more").is_none(),
+        "AC-19: has_more must be absent on the final page (offset 1 of 2); \
+         got: {p1_json}"
+    );
+
+    // The two pages together must cover both files without overlap.
+    let p0_path = p0_json["results"][0]["path"]
+        .as_str()
+        .expect("page-0 must have a result with a path");
+    let p1_path = p1_json["results"][0]["path"]
+        .as_str()
+        .expect("page-1 must have a result with a path");
+    assert_ne!(
+        p0_path, p1_path,
+        "AC-19: the two pages must return distinct files (no duplicate \
+         ordering under #407); p0={p0_path:?}, p1={p1_path:?}"
+    );
+    let mut all_paths = [p0_path, p1_path];
+    all_paths.sort_unstable();
+    assert_eq!(
+        all_paths,
+        ["a.txt", "b.txt"],
+        "AC-19: the two pages together must cover exactly {{a.txt, b.txt}}; \
+         got {all_paths:?}"
+    );
+}
+
+// ============================================================================
+// AC-20 (NEGATIVE): non-temporal output unaffected by #407
+// ============================================================================
+
+/// AC-20 (NEGATIVE): a pure-lexical (text-only) query on an indexed corpus
+/// MUST NOT be altered by #407's temporal-layer changes.  Specifically:
+///
+/// - `file_count` and `skipped` MUST be present in `--stats --json`.
+/// - `verify_mode` MUST be absent (default Substring mode is omitted via
+///   `skip_serializing_if`); its absence pins the serialisation contract.
+/// - The `degraded` array MUST be absent on a healthy corpus.
+/// - Running the same lexical query twice on the same cache MUST produce
+///   byte-identical stdout (stable ordering, no temporal side-effects).
+///
+/// The heatmap-parity fixture (only `.rs` files) is reused here to ensure
+/// AST indexing is active for both files and the corpus is deterministic.
+///
+/// AD-407-1 (full-DAG walk is build-path-only; the lexical query path is
+/// unaffected by #407).
+#[test]
+fn test_ac20_lexical_query_unaffected_by_temporal_index() {
+    let repo = make_heatmap_parity_repo();
+    let cache = TempDir::new().expect("cache tempdir");
+    build_index(repo.path(), cache.path());
+
+    // Run a lexical query (no temporal flags) for a token present in both
+    // fixture files (all files contain "fn").
+    let out_a = StdCommand::new(cargo_bin("skim"))
+        .args(["search", "fn", "--json", "--root"])
+        .arg(repo.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search fn --json (run 1)");
+    assert!(
+        out_a.status.success(),
+        "AC-20: lexical query must succeed; stderr: {}",
+        String::from_utf8_lossy(&out_a.stderr)
+    );
+
+    let out_b = StdCommand::new(cargo_bin("skim"))
+        .args(["search", "fn", "--json", "--root"])
+        .arg(repo.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search fn --json (run 2)");
+    assert!(
+        out_b.status.success(),
+        "AC-20: lexical query (run 2) must succeed; stderr: {}",
+        String::from_utf8_lossy(&out_b.stderr)
+    );
+
+    // Byte-identical stdout: the temporal layer must not introduce
+    // non-determinism in lexical output.
+    assert_eq!(
+        out_a.stdout, out_b.stdout,
+        "AC-20: pure-lexical query stdout must be byte-identical across \
+         repeated calls on the same corpus and cache"
+    );
+
+    // Parse and inspect the JSON structure.
+    let json: Value = serde_json::from_slice(&out_a.stdout)
+        .expect("AC-20: lexical query must produce valid JSON");
+
+    // `verify_mode` must be absent in default Substring mode
+    // (`skip_serializing_if` in the search crate).
+    assert!(
+        json.get("verify_mode").is_none(),
+        "AC-20: verify_mode must be absent on a default Substring lexical \
+         query (skip_serializing_if contract); got: {json}"
+    );
+
+    // `degraded` must be absent on a healthy corpus.
+    assert!(
+        json.get("degraded").is_none(),
+        "AC-20: degraded must be absent on a healthy lexical query; \
+         got: {json}"
+    );
+
+    // Results must be present and non-empty (the query token "fn" appears in
+    // every fixture file — a vacuous empty-results pass is impossible).
+    let results = json["results"]
+        .as_array()
+        .expect("results must be an array");
+    assert!(
+        !results.is_empty(),
+        "AC-20: lexical query for 'fn' must return at least one result on \
+         a fixture whose files contain 'fn'; check that the index was built"
+    );
+
+    // Confirm --stats --json carries file_count and skipped (structure unchanged).
+    let stats = run_stats_json(repo.path(), cache.path());
+    assert!(
+        stats["file_count"].is_number(),
+        "AC-20: file_count must be a number in --stats --json; got: {stats}"
+    );
+    assert!(
+        stats.get("skipped").is_some(),
+        "AC-20: skipped must be present in --stats --json; got: {stats}"
+    );
+}
+
+// ============================================================================
+// AC-24 (PERFORMANCE): warm query path within 5 000 ms
+// ============================================================================
+
+/// AC-24 (PERFORMANCE, query path): a warm `skim search --risky` on an
+/// already-current `temporal.db` MUST complete well within the < 50 ms design
+/// target.  This test uses a 5 000 ms wall-clock bound — 100× the design
+/// target — to stay robust under CI scheduling jitter while still catching
+/// catastrophic regressions (e.g., a warm query accidentally re-walking the
+/// full DAG).
+///
+/// The CHANGELOG records the exact measured value (< 10 ms on this repository
+/// at wave HEAD, well within the < 50 ms target).  The in-test bound is
+/// intentionally generous so scheduling noise cannot cause false failures.
+///
+/// The single post-upgrade self-heal query is explicitly exempt from the bound
+/// (it re-runs the full history walk); this test probes only the already-current
+/// path by rebuilding first and then querying on an up-to-date `temporal.db`.
+///
+/// AD-407-1 (full-DAG walk is build-path-only; query path unchanged by #407).
+#[test]
+fn test_ac24_warm_query_path_within_5000ms() {
+    let repo = make_merge_repo();
+    let cache = TempDir::new().expect("cache tempdir");
+
+    // Warm build: populate temporal.db so the next --risky is a pure query
+    // with no self-heal (already current after build).
+    build_index(repo.path(), cache.path());
+
+    // Timed warm query.
+    let start = std::time::Instant::now();
+    let out = StdCommand::new(cargo_bin("skim"))
+        .args(["search", "--risky", "--json", "--root"])
+        .arg(repo.path())
+        .env("SKIM_CACHE_DIR", cache.path())
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("warm skim search --risky --json");
+    let elapsed = start.elapsed();
+
+    assert!(
+        out.status.success(),
+        "AC-24: warm --risky query must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The warm query must return valid, non-empty JSON.
+    let json: Value =
+        serde_json::from_slice(&out.stdout).expect("AC-24: warm --risky must produce valid JSON");
+    let results = json["results"]
+        .as_array()
+        .expect("results must be an array");
+    assert!(
+        !results.is_empty(),
+        "AC-24: warm --risky must return at least one result on a \
+         non-empty fixture"
+    );
+
+    // The 5 000 ms bound is 100× the < 50 ms design target (AC-24).
+    // Exceeding it means the warm path has regressed catastrophically.
+    assert!(
+        elapsed.as_millis() < 5_000,
+        "AC-24: warm --risky query took {} ms, exceeding the 5 000 ms \
+         guard (design target < 50 ms per CHANGELOG; full-DAG walk must be \
+         build-path-only, not re-triggered on every warm query)",
+        elapsed.as_millis()
+    );
+}

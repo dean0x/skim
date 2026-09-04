@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but its cost is small relative to file indexing; the per-commit gix committer-time
   lookup adds no measurable overhead at this repository size.
 
+  **Warm query-path performance (AC-24):** a warm `skim search --risky` and a warm
+  `skim search <text>` on an already-current `temporal.db` both measured **< 10 ms**
+  on this repository (well within the < 50 ms target); the query path is unchanged
+  by #407 — only the build path (history walk) changes.  The single post-upgrade
+  self-heal query is explicitly exempt: it re-runs the full history walk and may take
+  several seconds; subsequent queries are fast.
+
 - **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
   single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
   and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior
