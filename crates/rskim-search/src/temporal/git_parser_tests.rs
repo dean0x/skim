@@ -1337,6 +1337,103 @@ fn test_ordering_contract_author_time_not_committer_time() {
 }
 
 // ---------------------------------------------------------------------------
+// T-8b: ordering contract — stable sort preserves gix traversal order for
+// equal author timestamps (AC-6 stability half)
+// ---------------------------------------------------------------------------
+
+/// AC-6 stability: when two commits share an author timestamp, the stable sort
+/// by `CommitInfo.timestamp` (author time) must preserve gix's
+/// committer-time-descending traversal order.  Replacing `sort_by_key` with
+/// `sort_unstable_by_key` at the AD-407-4 sort site would make the relative
+/// order of equal-timestamp commits non-deterministic, silently breaking the
+/// `rskim-bench::temporal_split` dependency documented in the AD-407-4 rustdoc
+/// (AD-407-4).
+#[test]
+fn test_ordering_contract_stable_sort_equal_author_time() {
+    if !git_available() {
+        eprintln!("SKIPPED: git not available");
+        return;
+    }
+    let Some(dir) = init_git_repo() else {
+        eprintln!("SKIPPED: repo init failed");
+        return;
+    };
+    let p = dir.path();
+
+    // Commit P (parent): same author time, OLDER committer time.
+    // Commit H (HEAD):   same author time, NEWER committer time.
+    //
+    // Gix's ByCommitTime priority queue yields H (newer committer) first because
+    // H is HEAD — the sole seed — and its parent P is added only after H is
+    // popped.  The stable re-sort by equal author time preserves this order:
+    // commits[0] = H, commits[1] = P.  An unstable sort would make the relative
+    // order of equal-key elements non-deterministic.
+    const T_EQUAL_AUTHOR: i64 = 1_650_000_000;
+    const T_OLD_COMMITTER: i64 = 1_649_999_900; // parent commit's committer time
+    const T_NEW_COMMITTER: i64 = 1_650_000_100; // HEAD commit's committer time
+
+    // Parent commit: same author timestamp, older committer timestamp.
+    if !git_commit_file_at(
+        p,
+        "p.txt",
+        "p",
+        "feat: parent (same author, old committer)",
+        T_EQUAL_AUTHOR,
+        T_OLD_COMMITTER,
+    ) {
+        eprintln!("SKIPPED: parent commit failed");
+        return;
+    }
+    // HEAD commit: same author timestamp, newer committer timestamp.
+    if !git_commit_file_at(
+        p,
+        "h.txt",
+        "h",
+        "feat: head (same author, new committer)",
+        T_EQUAL_AUTHOR,
+        T_NEW_COMMITTER,
+    ) {
+        eprintln!("SKIPPED: HEAD commit failed");
+        return;
+    }
+
+    let src = GixSource;
+    let history = src.parse_history(p, 0).expect("parse_history");
+    assert_eq!(
+        history.commits.len(),
+        2,
+        "expected 2 commits with equal author times"
+    );
+
+    // Both commits must report equal author timestamps (the sort key).
+    assert_eq!(
+        history.commits[0].timestamp, T_EQUAL_AUTHOR,
+        "commits[0] must carry author timestamp T_EQUAL_AUTHOR"
+    );
+    assert_eq!(
+        history.commits[1].timestamp, T_EQUAL_AUTHOR,
+        "commits[1] must carry author timestamp T_EQUAL_AUTHOR"
+    );
+
+    // Stable sort preserves gix's traversal order: HEAD (newer committer) at
+    // index 0, parent (older committer) at index 1.
+    assert_eq!(
+        history.commits[0].message,
+        "feat: head (same author, new committer)",
+        "commits[0] must be HEAD (newer committer); actual order: {:?}",
+        history
+            .commits
+            .iter()
+            .map(|c| &c.message)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        history.commits[1].message, "feat: parent (same author, old committer)",
+        "commits[1] must be parent (older committer)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // T-9: walk budget bounds (AC-8)
 // ---------------------------------------------------------------------------
 
