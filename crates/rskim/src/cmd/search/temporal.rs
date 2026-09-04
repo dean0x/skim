@@ -476,6 +476,13 @@ pub(super) fn paths_to_file_ids(
 /// output, ranked below every partner with a finite Jaccard ≥ 0.10, and the
 /// fallback neither panics nor propagates NaN into the RRF denominator.
 ///
+/// **AD-409-7 partial-drop notice**: after the manifest scan, emits a one-line
+/// stderr notice when `|allowed_paths| − |scored|` > 0 (i.e. some co-change
+/// partner paths are absent from the indexed manifest, e.g. files deleted from
+/// disk but still present in temporal.db via git history).  Mirrors the
+/// identical guard in [`paths_to_file_ids`].  Exit code stays 0; no `--json`
+/// key added (tracked in #526/#483 follow-up work).
+///
 /// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
 pub(super) fn paths_to_scored_file_ids(
     sorted_paths: &[&str],
@@ -509,6 +516,22 @@ pub(super) fn paths_to_scored_file_ids(
                 scored.push((FileId(id), safe_score));
             }
         }
+    }
+    // AD-409-7: partial-drop notice — mirrors the identical guard in
+    // `paths_to_file_ids`.  Fires when some co-change partner paths have no
+    // FileId in the manifest (e.g. files deleted from disk but still in
+    // temporal.db from git history).  The count is |allowlist| − |scored|,
+    // which naturally excludes the seed (the seed is expected to be present,
+    // so it contributes one to each side and cancels).  The total is the
+    // partner count (|allowlist| − 1 for the seed).  Stderr only; no --json
+    // key; no degraded element (tracked in #526/#483 follow-up work).
+    let dropped = allowed_paths.len().saturating_sub(scored.len());
+    if dropped > 0 {
+        let partner_count = allowed_paths.len().saturating_sub(1);
+        eprintln!(
+            "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
+             not found in the indexed manifest (excluded from scoring)"
+        );
     }
     scored
 }

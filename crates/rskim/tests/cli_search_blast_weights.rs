@@ -54,6 +54,26 @@ use tempfile::TempDir;
 // Helpers
 // ============================================================================
 
+/// Find the `temporal.db` file produced by a prior `build_index(proj, cache)` call.
+///
+/// The cache layout is `cache/search/<16-char-hex>/temporal.db`.  This helper
+/// searches one level deep so tests do not need to replicate the SHA256-hash
+/// path-derivation logic.  Returns `None` if no file is found (build did not
+/// produce temporal data or was skipped).
+fn find_temporal_db(cache: &Path) -> Option<std::path::PathBuf> {
+    let search_dir = cache.join("search");
+    let entries = fs::read_dir(&search_dir).ok()?;
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let db = entry.path().join("temporal.db");
+            if db.exists() {
+                return Some(db);
+            }
+        }
+    }
+    None
+}
+
 /// Return the current Unix epoch in seconds.
 fn now_epoch() -> u64 {
     SystemTime::now()
@@ -493,25 +513,19 @@ fn ac409_3_repeated_identical_query_is_byte_identical() {
 /// the seed) and the total partner count must appear; exit code must be 0; and
 /// when zero paths are dropped NO such line must appear.
 ///
-/// The "unindexed partner" scenario is synthesized by using --root pointing to a
-/// SUBDIRECTORY of the fixture that excludes some files.  Only files inside the
-/// --root are indexed; the out-of-scope co-change entries (recorded in temporal.db
-/// for the full repo) appear as unindexed partners from the sub-root perspective.
-/// However since we cannot control temporal.db subtree scoping easily in a CLI test,
-/// we use a simpler approach: build the index with a full root (3 files indexed),
-/// then invoke --blast-radius on a target file while supplying an extra --weights 0,0,1
-/// and verifying the stderr notice.  The unindexed-partner case is instead tested by
-/// building the index on a sub-fixture that only contains anchor.rs and zstrong.rs
-/// (aweak.rs is absent from the manifest) but temporal.db records all three.
+/// Fixture strategy for "partial drop" (1 of 1):
+///   Commits: C1 = zstrong only, C2 = anchor+aweak, C3 = anchor+aweak.
+///   J(anchor, aweak) = 2/2 = 1.0 > MIN threshold → aweak IS a co-change partner.
+///   J(anchor, zstrong) = 0/3 = 0.0 < MIN threshold → zstrong is NOT a partner.
+///   So cochanges_for_file("anchor.rs") returns exactly 1 partner: aweak.
+///   allowed_paths = {anchor: SEED_STRENGTH, aweak: 1.0} (2 entries).
+///   After deleting aweak.rs from disk and rebuilding the lexical index:
+///     manifest = {anchor.rs, zstrong.rs}; aweak.rs absent.
+///   scored.len() = 1 (only anchor found), dropped = 2 − 1 = 1, partner_count = 1.
+///   Expected notice: "1 of 1 co-change partners not found in the indexed manifest".
 ///
-/// Fixture strategy for "partial drop":
-///   - Build index for a fixture with ONLY anchor.rs and zstrong.rs in the manifest.
-///   - Temporal DB has entries for anchor+aweak as well (from git history pre-index).
-///   - Actually, the temporal DB is built from git history so it will see aweak.rs.
-///   - Instead: use a SECOND fixture with 3 files in git history, but only 2 files
-///     on disk (aweak.rs deleted AFTER all commits so it appears in temporal.db).
-///
-/// The deleted-from-disk case correctly exercises the AD-409-7 notice path.
+/// The deleted-from-disk case correctly exercises the AD-409-7 notice path in
+/// paths_to_scored_file_ids (the composite --weights query path).
 #[test]
 fn ac409_4_unindexed_partner_omission_is_disclosed() {
     let now = now_epoch();
@@ -519,32 +533,75 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
     let cache = TempDir::new().unwrap();
     git_init(dir.path());
 
-    // C1: anchor + zstrong + aweak all together.
-    write_and_stage(dir.path(), "anchor.rs", "// anchor v1\n");
+    // C1: zstrong only — establishes zstrong in git history WITHOUT co-changing with
+    // anchor.  This ensures J(anchor, zstrong) = 0.0 so zstrong is never returned by
+    // cochanges_for_file("anchor.rs"), keeping it out of allowed_paths.  The only
+    // co-change partner of anchor is aweak (see C2/C3 below).
     write_and_stage(dir.path(), "zstrong.rs", "// zstrong v1\n");
-    write_and_stage(dir.path(), "aweak.rs", "// aweak v1\n");
-    git_commit(dir.path(), "feat: initial (all three)", now - 20 * 86400);
+    git_commit(
+        dir.path(),
+        "feat: initial zstrong (no anchor)",
+        now - 20 * 86400,
+    );
 
-    // C2: anchor + aweak (second joint — J(anchor,aweak) will be >= 0.10).
+    // C2: anchor + aweak (first joint commit — J(anchor,aweak) = 1/1 after this).
+    write_and_stage(dir.path(), "anchor.rs", "// anchor v1\n");
+    write_and_stage(dir.path(), "aweak.rs", "// aweak v1\n");
+    git_commit(dir.path(), "feat: anchor+aweak pair 1", now - 10 * 86400);
+
+    // C3: anchor + aweak (second joint — J(anchor,aweak) = 2/2 = 1.0 > MIN threshold).
+    // zstrong intentionally absent: J(anchor, zstrong) stays 0.0, never a partner.
     write_and_stage(dir.path(), "anchor.rs", "// anchor v2\n");
     write_and_stage(dir.path(), "aweak.rs", "// aweak v2\n");
-    git_commit(dir.path(), "feat: anchor+aweak pair", now - 10 * 86400);
+    git_commit(dir.path(), "feat: anchor+aweak pair 2", now - 5 * 86400);
 
-    // C3: anchor + zstrong.
-    write_and_stage(dir.path(), "anchor.rs", "// anchor v3\n");
-    write_and_stage(dir.path(), "zstrong.rs", "// zstrong v2\n");
-    git_commit(dir.path(), "feat: anchor+zstrong pair", now - 5 * 86400);
-
-    // Build the index with all three files on disk (temporal.db sees all three).
+    // Build the index with all three files on disk.
+    // After this build, temporal.db contains the (anchor.rs, aweak.rs) co-change row
+    // with Jaccard = 1.0 (both files appear in every one of anchor's commits: C2 and C3).
     build_index(dir.path(), cache.path());
 
-    // Now DELETE aweak.rs from disk so it is no longer in the lexical manifest
-    // on the NEXT build (the file won't be indexed).  Rebuild so the manifest
-    // reflects the 2-file state while temporal.db still records the 3-file history.
+    // Backup temporal.db BEFORE deleting aweak.rs.
+    //
+    // The build-time ghost filter (AD-408-1) removes co-change rows for files absent
+    // from disk during a rebuild.  If we rebuild after deleting aweak.rs, the
+    // (anchor, aweak) co-change row disappears from temporal.db — producing "no co-change
+    // data for anchor.rs" instead of the AD-409-7 notice.
+    //
+    // The backup/restore trick produces the correct "inconsistent" state:
+    //   - lexical manifest: anchor.rs + zstrong.rs  (aweak gone after second build)
+    //   - temporal.db:      (anchor, aweak) still present  (from the backup)
+    //
+    // Safety: the restored DB's META_GIT_HEAD equals the current git HEAD (no new
+    // commits were added), so the auto-staleness check on the subsequent query sees the
+    // DB as "current" and does NOT trigger a temporal rebuild that would overwrite it.
+    let temporal_db_path = find_temporal_db(cache.path()).expect(
+        "temporal.db must exist after first build_index — \
+         was SKIM_CACHE_DIR respected?",
+    );
+    let temporal_db_backup = fs::read(&temporal_db_path).expect("read temporal.db for backup");
+
+    // Delete aweak.rs so the NEXT lexical build excludes it from the manifest.
     fs::remove_file(dir.path().join("aweak.rs")).expect("remove aweak.rs");
 
     // Rebuild lexical index — aweak.rs is now absent from the manifest.
+    // This also rebuilds temporal (ghost filter removes aweak from co-change rows),
+    // but we restore the backup immediately after.
     build_index(dir.path(), cache.path());
+
+    // Restore the old temporal.db that still has (anchor, aweak) as a co-change pair.
+    // The lexical manifest now lists only anchor.rs + zstrong.rs; temporal still records
+    // aweak.rs as anchor.rs's co-change partner.  This is the scenario the AD-409-7
+    // notice path was designed for.
+    fs::write(&temporal_db_path, &temporal_db_backup).expect("restore temporal.db from backup");
+    // Remove any WAL / SHM files written by the SECOND build so SQLite reads the
+    // restored main-DB file directly on the next open.  These are empty after a
+    // clean build (SQLite checkpoints on last-connection-close), but deleting them
+    // is the safest guarantee that no stale WAL frames shadow the restored data.
+    let db_dir = temporal_db_path
+        .parent()
+        .expect("temporal.db has a parent dir");
+    let _ = fs::remove_file(db_dir.join("temporal.db-wal"));
+    let _ = fs::remove_file(db_dir.join("temporal.db-shm"));
 
     // Run blast-radius on anchor.rs with temporal-only weights.
     // aweak.rs is in temporal.db (co-change partner) but NOT in the lexical manifest.
