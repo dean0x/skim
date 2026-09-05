@@ -13,15 +13,11 @@ use rskim_core::{
     transform_with_config, transform_with_line_map,
 };
 
+use crate::output::ELISION_HINT;
 use crate::{cache, cascade, cascade::TruncationOptions, tokens};
 
 /// Maximum input size to prevent memory exhaustion (50MB)
 const MAX_INPUT_SIZE: usize = 50 * 1024 * 1024;
-
-/// Remedy clause appended to every elision marker this module emits
-/// (ADR-011 class 1). Matches the hint `cascade::build_config_with_opts`
-/// wires into rskim-core, so both truncation paths read identically.
-const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
 /// Options for processing a single file
 #[derive(Debug, Clone, Copy)]
@@ -1295,7 +1291,7 @@ mod tests {
         assert!(
             result
                 .output
-                .contains("# ... (3 lines truncated) — SKIM_PASSTHROUGH=1 for full output"),
+                .contains(&format!("# ... (3 lines truncated) — {ELISION_HINT}")),
             "truncated passthrough must carry the canonical hinted marker: {:?}",
             result.output
         );

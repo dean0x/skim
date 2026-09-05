@@ -8,6 +8,7 @@ use std::io::Write as _;
 
 use rskim_core::{Language, Mode, TransformConfig, truncate_to_token_budget};
 
+use crate::output::ELISION_HINT;
 use crate::tokens;
 
 /// Groups the three optional truncation parameters that frequently travel
@@ -26,12 +27,6 @@ pub(crate) struct TruncationOptions {
 /// Error message when no transformation mode produces output.
 const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produced output. \
     Ensure the file is in a supported language or specify --language.";
-
-/// Remedy clause wired into every `TransformConfig` via `with_elision_hint` and
-/// passed to `truncate_to_token_budget`.  Kept as a single literal so that
-/// `compact_marker_without_hint` can test for its absence without duplicating
-/// the string.
-const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
 /// Returns `true` when `output` carries a compact elision marker (the bare
 /// `… (N lines truncated)` form, including #511 literal-aware variants) *without*

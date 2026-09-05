@@ -15,7 +15,13 @@ pub(crate) mod tee;
 
 use std::io::{self, Write};
 
+use crate::cmd::execution::OutputFormat;
 use crate::tokens;
+
+/// Canonical escape-hatch remedy appended to every ADR-011 class-1 elision
+/// marker.  Single source of truth — `process.rs` and `cascade.rs` import
+/// this via `use crate::output::ELISION_HINT` rather than defining their own.
+pub(crate) const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
 // ============================================================================
 // ParseResult<T> — three-tier parse degradation
@@ -567,7 +573,7 @@ pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<S
     }
     let omitted = total - shown;
     Some(format!(
-        "[skim] {omitted} {unit} omitted ({shown} of {total} shown) — SKIM_PASSTHROUGH=1 for full output"
+        "[skim] {omitted} {unit} omitted ({shown} of {total} shown) — {ELISION_HINT}"
     ))
 }
 
@@ -594,7 +600,7 @@ pub(crate) fn elision_marker_unbounded_with_remedy(
 /// unknowable (the input is consumed incrementally and elision happens
 /// mid-stream). `shown_desc` describes what WAS kept (e.g. `"first 64 KiB"`).
 pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
-    elision_marker_unbounded_with_remedy(shown_desc, unit, "SKIM_PASSTHROUGH=1 for full output")
+    elision_marker_unbounded_with_remedy(shown_desc, unit, ELISION_HINT)
 }
 
 /// Canonical compressed-output hint emitted to stderr after a non-zero exit
@@ -604,7 +610,7 @@ pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
 /// matrix in [`crate::cmd::execution::record_and_report`] to keep the hint
 /// string byte-identical across both paths — single source of truth (#317).
 pub(crate) fn compressed_output_hint(code: i32) -> String {
-    format!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.")
+    format!("[skim] compressed output (exit {code}). {ELISION_HINT}.")
 }
 
 // ============================================================================
@@ -688,7 +694,19 @@ pub(crate) fn lossy_view_marker(
         return None;
     }
     let class = mode_class_label(mode_str);
-    let suffix = " \u{2014} SKIM_PASSTHROUGH=1 for raw output";
+    // Route through `remedy_for` so the printed remedy is always the narrowest
+    // one that is literally reachable from this invocation (ADR-011 class 1).
+    // The file-read path is non-JSON with passthrough reproducing argv, so
+    // `remedy_for` returns the canonical ELISION_HINT default — but the
+    // indirection keeps this consistent with `lossy_json_view_marker` and
+    // ensures future context changes (e.g. a narrowed remedy for a specific
+    // origin tool) are handled automatically.
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool: origin.unwrap_or(""),
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    let suffix = format!(" \u{2014} {remedy}");
 
     let marker = match (origin, total) {
         // Hook-rewritten, single file
@@ -760,11 +778,7 @@ mod lossy_json_view_marker_tests {
     /// kept/total pair, so the reader can size what they are missing.
     #[test]
     fn test_lossy_json_view_marker_countable() {
-        let m = lossy_json_view_marker(
-            "git",
-            Some((3, 44, "lines")),
-            "SKIM_PASSTHROUGH=1 for full output",
-        );
+        let m = lossy_json_view_marker("git", Some((3, 44, "lines")), ELISION_HINT);
         assert!(m.starts_with("[skim] json view of 'git':"), "got: {m:?}");
         assert!(
             m.contains("41 lines omitted"),
@@ -774,21 +788,19 @@ mod lossy_json_view_marker_tests {
             m.contains("(3 of 44 shown)"),
             "must name kept/total; got: {m:?}"
         );
-        assert!(
-            m.contains("SKIM_PASSTHROUGH=1 for full output"),
-            "must carry the remedy"
-        );
+        assert!(m.contains(ELISION_HINT), "must carry the remedy");
     }
 
     /// Countless arm: a summarising parser has no 1:1 unit to count, so the
     /// marker still discloses, it just cannot quantify.
     #[test]
     fn test_lossy_json_view_marker_countless() {
-        let m = lossy_json_view_marker("git", None, "SKIM_PASSTHROUGH=1 for full output");
+        let m = lossy_json_view_marker("git", None, ELISION_HINT);
         assert_eq!(
             m,
-            "[skim] json view of 'git': summarised, not the full tool output \u{2014} \
-             SKIM_PASSTHROUGH=1 for full output"
+            format!(
+                "[skim] json view of 'git': summarised, not the full tool output \u{{2014}} {ELISION_HINT}"
+            )
         );
     }
 
