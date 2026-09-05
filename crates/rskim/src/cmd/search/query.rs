@@ -527,15 +527,14 @@ pub(super) fn execute_query_with_manifest(
     // For 4a the structural lookup is a no-op; the RRF fusion of lexical+AST rank
     // alone replaces the old file_filter gate (#198).
     if let Some(ref ast_scored_vec) = config.ast_scored {
-        // AD-409-7: build the membership-only FileId allowlist HERE, not before the
-        // dispatch.  `paths_to_file_ids` has a stderr side effect (the partial-drop /
-        // zero-match notice), so hoisting it above the dispatch made the composite
-        // blast-radius arm emit that notice TWICE — once here and once from
-        // `paths_to_scored_file_ids` inside `run_blast_radius_composite_query`,
-        // violating AC-7 ("exactly one stderr line").  The compound (text+AST) arm is
-        // the only consumer of this set; the composite arm derives its own scored
-        // layer.  Computing it inside the branch also skips a wasted O(manifest) pass
-        // on the composite arm.
+        // AD-409-7: build the membership-only FileId allowlist HERE, inside this
+        // branch.  `paths_to_file_ids` has a stderr side effect (the partial-drop /
+        // zero-match notice); the compound (text+AST) arm is the only consumer of
+        // this set.  The composite arm derives its own scored layer via
+        // `paths_to_scored_file_ids`, so each query dispatch path calls exactly one
+        // of the two functions — the composite arm never double-reports (AC-7).
+        // Computing it inside the branch also skips a wasted O(manifest) pass on
+        // the composite arm.
         //
         // Disclosure asymmetry (AD-413-16): when blast_radius_paths is the
         // AnchorDiffers sentinel (Some(empty)), `paths_to_file_ids` delegates to
@@ -1059,7 +1058,7 @@ fn run_blast_radius_composite_query(
     // standalone temporal arm and avoids a confident ranking that is not a blast
     // radius at all (ADR-009).  This check runs BEFORE the lexical search so an
     // unresolvable allowlist never triggers a wasted corpus-wide BM25F pass —
-    // restoring the pre-#409 early-out ordering.
+    // matching the early-out ordering of the standalone temporal arm.
     let Some(temporal_layer) = blast_temporal_layer(config, ctx.sorted) else {
         return Ok(empty_output(config, &ctx, vm_label));
     };

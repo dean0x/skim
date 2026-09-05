@@ -430,7 +430,7 @@ pub(super) fn resort_window(limit: usize) -> usize {
 /// the composite ranking arm holds by construction — one algorithm, one copy of
 /// the notice-dispatch logic.  All stderr notices (`emit_no_indexed_files_notice`,
 /// `emit_seed_unindexed_notice`, `emit_partial_drop_notice`) are emitted inside
-/// [`paths_to_scored_file_ids`] exactly once per query.  Exit code stays 0.
+/// [`paths_to_scored_file_ids`]; each fires at most once per query.  Exit code stays 0.
 /// No `--json` key is added here (tracked in #526 / #483).
 ///
 /// Accepts a `&[&str]` slice (from `manifest.sorted_paths()`) so that callers
@@ -642,14 +642,11 @@ pub(super) enum BlastRadiusResolution {
     /// `--blast-radius` was not requested; skip filter entirely.
     NotRequested,
     /// Resolved successfully; `allow` maps each co-change partner path to its
-    /// Jaccard score, plus the blast-radius target keyed to [`SEED_STRENGTH`].
-    ///
-    /// Retyped from `HashSet<String>` (membership only) to [`BlastRadiusStrengths`]
-    /// (path → Jaccard strength) so downstream callers can build the temporal RRF
-    /// layer with per-partner scores instead of uniform 1.0 (see
-    /// [`super::query::run_blast_radius_composite_query`] and AD-409-2).
-    /// The blast-radius target itself carries `SEED_STRENGTH = 2.0`
-    /// (> max Jaccard 1.0) so it always ranks first in the temporal layer.
+    /// Jaccard score, plus the blast-radius target keyed to [`SEED_STRENGTH`]
+    /// (2.0 > max Jaccard 1.0).  Downstream callers build the temporal RRF layer
+    /// with per-partner scores so stronger co-change relationships rank higher
+    /// (see [`super::query::run_blast_radius_composite_query`] and AD-409-2).
+    /// The target always ranks first in the temporal layer.
     Allowed(BlastRadiusStrengths),
     /// Resolved but the DB is degraded: `allow` is the effective path filter
     /// (empty for `RepositoryMismatch`) and `degraded` carries the reason so
