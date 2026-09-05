@@ -96,6 +96,22 @@ fn build_index(proj: &Path, cache: &Path) {
     );
 }
 
+/// Invoke `skim search [args…] --root <proj>` and return the raw `Output`.
+///
+/// Private shared core for [`run_search_raw`] and [`run_search_raw_ok`]; callers
+/// that need to inspect the exit code should call one of those instead.
+fn search_command(proj: &Path, cache: &Path, extra_args: &[&str]) -> std::process::Output {
+    StdCommand::new(cargo_bin("skim"))
+        .args(["search"])
+        .args(extra_args)
+        .args(["--root"])
+        .arg(proj)
+        .env("SKIM_CACHE_DIR", cache)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search")
+}
+
 /// Run `skim search [args…] --root <proj>` and return the raw stdout + stderr.
 ///
 /// Unlike [`run_search_json`], this helper does **not** append `--json`; callers that
@@ -104,15 +120,7 @@ fn build_index(proj: &Path, cache: &Path) {
 /// Does **not** check the exit code — use [`run_search_raw_ok`] when the test
 /// contract requires exit 0.
 fn run_search_raw(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>) {
-    let out = StdCommand::new(cargo_bin("skim"))
-        .args(["search"])
-        .args(extra_args)
-        .args(["--root"])
-        .arg(proj)
-        .env("SKIM_CACHE_DIR", cache)
-        .env("SKIM_DISABLE_ANALYTICS", "1")
-        .output()
-        .expect("skim search");
+    let out = search_command(proj, cache, extra_args);
     (out.stdout, out.stderr)
 }
 
@@ -122,15 +130,7 @@ fn run_search_raw(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, V
 /// (AC-7, AC-16b) so that a non-zero exit causes an immediate, diagnostic
 /// test failure rather than a silent parse mismatch downstream.
 fn run_search_raw_ok(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>) {
-    let out = StdCommand::new(cargo_bin("skim"))
-        .args(["search"])
-        .args(extra_args)
-        .args(["--root"])
-        .arg(proj)
-        .env("SKIM_CACHE_DIR", cache)
-        .env("SKIM_DISABLE_ANALYTICS", "1")
-        .output()
-        .expect("skim search");
+    let out = search_command(proj, cache, extra_args);
     assert!(
         out.status.success(),
         "skim search {:?} exited {:?} (expected exit 0); stderr: {}",

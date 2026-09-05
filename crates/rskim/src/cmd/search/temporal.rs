@@ -446,14 +446,10 @@ pub(super) fn paths_to_file_ids(
     sorted_paths: &[&str],
     allowed_paths: &BlastRadiusStrengths,
 ) -> HashSet<FileId> {
-    let scored = paths_to_scored_file_ids(sorted_paths, allowed_paths);
-    // Pre-size explicitly with the resolved count (matches the `Vec::with_capacity`
-    // pattern established in `paths_to_scored_file_ids`) rather than relying on
-    // the implicit size_hint from the iterator (reliability.md: minimise allocation
-    // after initialization).
-    let mut file_ids = HashSet::with_capacity(scored.len());
-    file_ids.extend(scored.into_iter().map(|(id, _)| id));
-    file_ids
+    paths_to_scored_file_ids(sorted_paths, allowed_paths)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// Emit the one-line stderr notice for the "nothing resolved" case: the
