@@ -47,6 +47,24 @@ use super::types::{BlastRadiusStrengths, Page, ResolvedResult, TemporalAnnotatio
 /// C (seed excluded from the temporal layer entirely) were rejected.
 pub(super) const SEED_STRENGTH: f64 = 2.0;
 
+/// Stderr notice emitted when the blast-radius target file is absent from the
+/// lexical manifest.
+///
+/// Exported as a `pub(super)` constant so intra-crate tests assert against a
+/// single source of truth (consistent with `WEIGHTS_FULLY_INERT_NOTICE` and
+/// `WEIGHTS_TEMPORAL_INERT_NOTICE` in `query.rs`).
+pub(super) const BLAST_RADIUS_SEED_UNINDEXED_NOTICE: &str = "skim search: note: blast-radius target file not found in the indexed manifest \
+     (excluded from scoring)";
+
+/// Static suffix of the partial-drop notice emitted when co-change partners
+/// are absent from the manifest.
+///
+/// Intra-crate tests can reference this const to build the expected substring
+/// without duplicating the wording.  The full line is:
+/// `"skim search: note: {dropped} of {partner_count} {BLAST_RADIUS_PARTNER_NOT_FOUND}"`.
+pub(super) const BLAST_RADIUS_PARTNER_NOT_FOUND: &str =
+    "co-change partners not found in the indexed manifest (excluded from scoring)";
+
 /// Fallback score assigned to Jaccard values that are non-finite or outside the
 /// mathematical Jaccard range of `[0.0, 1.0]`.
 ///
@@ -418,17 +436,22 @@ pub(super) fn resort_window(limit: usize) -> usize {
 /// Accepts a `&[&str]` slice (from `manifest.sorted_paths()`) so that callers
 /// which already hold the slice can pass it directly without a second allocation.
 ///
-/// This function is the single source of truth for the path→FileId conversion
-/// used by all three blast-radius call sites (ast.rs standalone, query.rs lexical
-/// filter, and mod.rs resolve_blast_radius_filter).
+/// This function is the membership-only twin of [`paths_to_scored_file_ids`].
+/// Its two real call sites are the compound text+AST branch in `query.rs`
+/// (which needs only the `FileId` set, not Jaccard scores) and
+/// [`resolve_blast_radius_file_ids`].
 pub(super) fn paths_to_file_ids(
     sorted_paths: &[&str],
     allowed_paths: &BlastRadiusStrengths,
 ) -> HashSet<FileId> {
-    paths_to_scored_file_ids(sorted_paths, allowed_paths)
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect()
+    let scored = paths_to_scored_file_ids(sorted_paths, allowed_paths);
+    // Pre-size explicitly with the resolved count (matches the `Vec::with_capacity`
+    // pattern established in `paths_to_scored_file_ids`) rather than relying on
+    // the implicit size_hint from the iterator (reliability.md: minimise allocation
+    // after initialization).
+    let mut file_ids = HashSet::with_capacity(scored.len());
+    file_ids.extend(scored.into_iter().map(|(id, _)| id));
+    file_ids
 }
 
 /// Emit the one-line stderr notice for the "nothing resolved" case: the
@@ -443,7 +466,7 @@ pub(super) fn paths_to_file_ids(
 /// read "N of N−1 partners not found", which is nonsense.
 fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize) {
     eprintln!(
-        "skim search: blast-radius filter matched 0 indexed files \
+        "skim search: note: blast-radius filter matched 0 indexed files \
          (allowed {allowlist_len} paths, index has {indexed_file_count} files)"
     );
 }
@@ -456,11 +479,11 @@ fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize)
 /// a separate notice keeps the partner count truthful ("N of M partners" never
 /// silently inflates by 1 when the seed is also absent).  Callers suppress the
 /// partner-drop notice independently when zero partners were actually dropped.
+///
+/// Emits [`BLAST_RADIUS_SEED_UNINDEXED_NOTICE`] verbatim so intra-crate tests
+/// can assert against the constant rather than a duplicated string literal.
 fn emit_seed_unindexed_notice() {
-    eprintln!(
-        "skim search: blast-radius: target file not found in the indexed manifest \
-         (excluded from scoring)"
-    );
+    eprintln!("{BLAST_RADIUS_SEED_UNINDEXED_NOTICE}");
 }
 
 /// Emit a one-line stderr notice when co-change partner paths are absent from
@@ -471,20 +494,22 @@ fn emit_seed_unindexed_notice() {
 /// `dropped == 0`.  Callers report the fully-unresolved case (`found == 0`)
 /// through [`emit_no_indexed_files_notice`] instead.
 ///
-/// `partner_count` is `allowlist_len − 1` (the seed slot excluded);
-/// `partners_found` is the count of resolved entries whose stored Jaccard is
-/// **not** `SEED_STRENGTH` (incremented once per partner in the scan loop,
-/// never derived from totals after the fact).  The dropped count is therefore
+/// `partner_count` is the number of partner slots in the allowlist (total entries
+/// minus the seed slot when a seed is present, or total entries when there is no
+/// seed); `partners_found` is the count of resolved entries whose path is not the
+/// seed path (incremented once per partner in the scan loop, never derived from
+/// totals after the fact).  The dropped count is therefore
 /// `partner_count − partners_found`, computed with one `saturating_sub` (PF-004).
 ///
 /// AC `ac409_4_unindexed_partner_omission_is_disclosed` verifies the exact
-/// message wording end-to-end.
+/// message wording end-to-end.  Uses [`BLAST_RADIUS_PARTNER_NOT_FOUND`] as the
+/// static suffix so intra-crate tests can reference the constant.
 fn emit_partial_drop_notice(partner_count: usize, partners_found: usize) {
     let dropped = partner_count.saturating_sub(partners_found);
     if dropped > 0 {
         eprintln!(
-            "skim search: blast-radius: {dropped} of {partner_count} co-change partners \
-             not found in the indexed manifest (excluded from scoring)"
+            "skim search: note: {dropped} of {partner_count} {}",
+            BLAST_RADIUS_PARTNER_NOT_FOUND
         );
     }
 }
@@ -529,13 +554,24 @@ pub(super) fn paths_to_scored_file_ids(
     // `COUPLING_MAX_FILES` at index-build time so no explicit per-loop bound
     // is needed here.
     //
-    // AD-409-7: track `seed_resolved` (did the blast-radius target appear in the
-    // manifest?) and `partners_found` (how many co-change partners resolved?)
-    // as direct counters, never derived from totals after the fact.  The seed is
-    // identified by its stored value being `SEED_STRENGTH` — safe because
-    // `cochange_partner_strengths` clamps all DB-sourced Jaccard values to
-    // [0.0, 1.0] at the trust boundary, so only the explicit
-    // `allowed_paths.insert(normalized, SEED_STRENGTH)` call can produce 2.0.
+    // AD-409-7: Pre-compute the seed path exactly once so that seed identity is
+    // carried explicitly (as `Option<&str>`) rather than inferred per-entry by
+    // float comparison.  `cochange_partner_strengths` guarantees that only the
+    // explicit `allowed_paths.insert(normalized, SEED_STRENGTH)` call produces
+    // a value of 2.0; DB-sourced rows are clamped to [0.0, 1.0] at the trust
+    // boundary.  When `seed_path` is `None` — a seedless allowlist such as a
+    // test helper whose values are all 1.0 — the seed-unindexed notice is
+    // suppressed entirely, preventing a false user-visible disclosure.
+    let seed_path: Option<&str> = allowed_paths
+        .iter()
+        .find_map(|(k, &v)| (v == SEED_STRENGTH).then_some(k.as_str()));
+    // `partner_count` is the number of partner slots: total entries minus the
+    // seed slot when a seed is present, or all entries when there is no seed.
+    let partner_count = if seed_path.is_some() {
+        allowed_paths.len().saturating_sub(1)
+    } else {
+        allowed_paths.len()
+    };
     let mut scored: Vec<(FileId, f64)> = Vec::with_capacity(allowed_paths.len());
     let mut seed_resolved = false;
     let mut partners_found: usize = 0;
@@ -556,10 +592,13 @@ pub(super) fn paths_to_scored_file_ids(
                     NON_FINITE_JACCARD_FLOOR
                 };
                 scored.push((FileId(id), safe_score));
-                if jaccard == SEED_STRENGTH {
+                // Identify the seed by path, not by value, so that a seedless
+                // allowlist (seed_path == None) never sets seed_resolved = true
+                // and never triggers a false seed-unindexed notice.
+                if seed_path == Some(*path) {
                     seed_resolved = true;
                 } else {
-                    // Count resolved co-change partners (excludes the seed slot).
+                    // Count resolved co-change partners (excludes the seed path).
                     partners_found += 1;
                 }
             }
@@ -569,11 +608,14 @@ pub(super) fn paths_to_scored_file_ids(
     // `scored.is_empty()` is the fully-unresolved case; the partner-drop
     // arithmetic is only meaningful once at least one entry resolved.
     // Stderr only; no --json key; no degraded element (tracked in #526/#483).
-    let partner_count = allowed_paths.len().saturating_sub(1);
     if scored.is_empty() {
         emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
     } else {
-        if !seed_resolved {
+        // Only emit the seed-unindexed notice when a seed was intended
+        // (`seed_path.is_some()`) but its path was absent from the manifest.
+        // Suppressing it when seed_path is None prevents a false positive on
+        // seedless allowlists (e.g. AC-24 guard tests with all-1.0 values).
+        if seed_path.is_some() && !seed_resolved {
             emit_seed_unindexed_notice();
         }
         emit_partial_drop_notice(partner_count, partners_found);
