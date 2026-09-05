@@ -2271,7 +2271,7 @@ fn text_ast_blast_intersection_complete_356() {
     // In production, mod.rs resolves these from TemporalDb::cochanges_for_file.
     // Here we inject them as pre-resolved repo-relative paths — same code path
     // in execute_query (paths_to_file_ids builds the FileId set from sorted_paths).
-    let blast_paths: std::collections::HashMap<String, f64> = (1..=N)
+    let blast_paths: HashMap<String, f64> = (1..=N)
         .map(|i| (format!("src/target_{i:02}.rs"), 1.0))
         .collect();
 
@@ -2432,7 +2432,7 @@ fn text_ast_blast_intersection_complete_356() {
 /// lacked — per the wave-4 review (#356 surviving finding, testing category).
 #[test]
 fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::super::query::execute_query;
 
@@ -2482,7 +2482,7 @@ fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
     // blast_radius_paths is a strict subset of the AST-matching files.
     // filter_set = blast ∩ ast = {target_01..target_N_BLAST}.
     // The reader is restricted to only those N_BLAST files → only N_BLAST results.
-    let blast_paths: std::collections::HashMap<String, f64> = (1..=N_BLAST)
+    let blast_paths: HashMap<String, f64> = (1..=N_BLAST)
         .map(|i| (format!("src/target_{i:02}.rs"), 1.0))
         .collect();
 
@@ -3643,11 +3643,13 @@ fn bbb() {{
 /// Resolve a single repo-relative path to its `FileId` via the manifest.
 /// Panics if the path is not present (a test-setup bug).
 fn file_id_for(project: &Path, cache: &Path, rel_path: &str) -> rskim_search::FileId {
+    use std::collections::HashMap;
+
     use super::super::manifest::FileManifest;
     let manifest =
         FileManifest::load(project.to_path_buf(), cache.to_path_buf()).expect("manifest must load");
     let sorted = manifest.sorted_paths();
-    let mut allowed = std::collections::HashMap::new();
+    let mut allowed: HashMap<String, f64> = HashMap::new();
     allowed.insert(rel_path.to_string(), 1.0_f64);
     let ids = super::super::temporal::paths_to_file_ids(&sorted, &allowed);
     assert_eq!(
@@ -3738,6 +3740,8 @@ fn compound_top_result_flips_with_weights_ac1() {
 /// the intersection is unchanged; the flip is driven purely by the weight ratio.
 #[test]
 fn compound_with_blast_top_result_flips_with_weights_ac4() {
+    use std::collections::HashMap;
+
     use super::super::query::execute_query;
 
     let project = make_project_two_ast_files_lexical_skew();
@@ -3747,7 +3751,7 @@ fn compound_with_blast_top_result_flips_with_weights_ac4() {
     let ast_scored = skew_ast_scored(project.path(), cache.path());
 
     // Blast set allows both AST files → blast∩AST == AST (intersection unchanged).
-    let blast: std::collections::HashMap<String, f64> = [
+    let blast: HashMap<String, f64> = [
         ("src/aaa.rs".to_string(), 1.0),
         ("src/bbb.rs".to_string(), 1.0),
     ]
