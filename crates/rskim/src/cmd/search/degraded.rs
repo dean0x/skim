@@ -27,6 +27,16 @@ use serde::Serialize;
 // DegradedReason
 // ============================================================================
 
+/// AD-414-25: the remedy for an empty temporal DB on a **shallow** clone.
+///
+/// `skim search --rebuild` cannot help here — the commits simply are not in the
+/// clone, so a rebuild re-derives the same zero rows.  Unshallowing has to come
+/// first.  Shared by [`DegradedReason::full_message`] (human-readable notice)
+/// and [`DegradedReason::remediation_for`] (`DegradedJson.remediation`) so the
+/// two can never disagree.
+const SHALLOW_EMPTY_REMEDIATION: &str =
+    "run 'git fetch --unshallow' (or use a full clone), then 'skim search --rebuild'";
+
 /// AD-414-15: the ordering below is the **§2.3 spec precedence** — the
 /// conceptual priority a machine consumer assigns to each state when reporting.
 /// The probe order inside [`super::temporal::open_temporal_state`] differs:
@@ -167,16 +177,13 @@ impl DegradedReason {
         format!("schema version {found}, this build supports {supported}")
     }
 
-    /// Actionable remediation advice for `DegradedJson.remediation`.
+    /// Detail-independent remediation advice.
     ///
-    /// Detail-independent by design (`&'static str`), so `Empty` returns the
-    /// non-shallow default.  The shallow-specific advice ("run 'git fetch
-    /// --unshallow'…") lives only in the human-readable [`Self::full_message`],
-    /// and the sole producer of `Empty` with `detail == "shallow"` is the
-    /// build-time zero-row notice in `temporal_build.rs`, which emits stderr text
-    /// and never a `DegradedJson`.  No live `DegradedJson` can therefore disagree
-    /// with its own `message`.
-    pub(super) fn remediation(self) -> &'static str {
+    /// Every emit site must call [`Self::remediation_for`] instead: it is the
+    /// detail-aware wrapper that selects [`SHALLOW_EMPTY_REMEDIATION`] for a
+    /// shallow-clone `Empty`.  This method carries the base table so the two
+    /// cannot drift.
+    fn remediation(self) -> &'static str {
         match self {
             // Embedded in NO_TEMPORAL_DATA_MSG; repeated separately for JSON consumers.
             Self::NotGitRepo => "run 'skim search' on a git repo to auto-populate",
@@ -193,6 +200,28 @@ impl DegradedReason {
                 "commit the matched files, or run 'skim search --update' after committing"
             }
             Self::GhostFilter => "run 'skim search --rebuild' to rebuild with the current file set",
+        }
+    }
+
+    /// AD-414-25 (F-C2-01): detail-aware remediation — the value that goes into
+    /// `DegradedJson.remediation`.
+    ///
+    /// The `Empty` cause has two distinct remedies and `--rebuild` is the wrong
+    /// one for a shallow clone: rebuilding re-derives the same zero rows because
+    /// the history is not present locally.  When `meta.is_shallow` is set — the
+    /// `detail == "shallow"` signal produced by
+    /// [`super::temporal::empty_temporal_state`] at query time and by
+    /// `temporal_build::zero_row_notice` at build time — the remediation names
+    /// `git fetch --unshallow` first, matching the tail
+    /// [`Self::full_message`] already appends to the human-readable notice.
+    ///
+    /// Both fields are therefore built from [`SHALLOW_EMPTY_REMEDIATION`], so a
+    /// `DegradedJson` can never advise something its own `message` contradicts
+    /// (AD-414-1 SSOT).
+    pub(super) fn remediation_for(self, detail: &str) -> &'static str {
+        match self {
+            Self::Empty if detail.contains("shallow") => SHALLOW_EMPTY_REMEDIATION,
+            _ => self.remediation(),
         }
     }
 
@@ -213,10 +242,12 @@ impl DegradedReason {
             // AC-19: legacy constants returned verbatim — do NOT append remediation.
             Self::NotGitRepo | Self::HeadUnresolved => cause,
             // §2.3 shallow-Empty: remediation differs from Self::remediation().
-            Self::Empty if detail.contains("shallow") => format!(
-                "{cause}; run 'git fetch --unshallow' (or use a full clone), \
-                 then 'skim search --rebuild'"
-            ),
+            // AD-414-25: both this tail and `DegradedJson.remediation` read the
+            // same constant, so the JSON element cannot advise `--rebuild` while
+            // its own message advises `git fetch --unshallow`.
+            Self::Empty if detail.contains("shallow") => {
+                format!("{cause}; {SHALLOW_EMPTY_REMEDIATION}")
+            }
             // All other variants: cause + "; " + remediation().
             _ => format!("{cause}; {}", self.remediation()),
         }

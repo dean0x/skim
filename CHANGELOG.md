@@ -231,6 +231,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as before, and no line-length cap was introduced: a 20 KB single line is anchored too.
   The `0.0` score of a substring-only match is unchanged and deliberate: it is the marker
   that ranks these candidates below every exact whole-token BM25F match (AD-411-7).
+- **Query-time empty-temporal notice now names the shallow-clone cause and remedy**
+  (#414). `sync()` records `meta.is_shallow` on every build (AD-414-14) and the
+  build-time zero-row notice already advised `git fetch --unshallow`, but the
+  query-time notice and both the `degraded[].message` and `degraded[].remediation`
+  fields advised `skim search --rebuild`, which on a still-shallow clone rebuilds the
+  same zero rows. The query path now reads the stored flag from the connection it
+  already holds and, when it is set, both fields name `git fetch --unshallow` first.
+  A non-shallow repository with no analysable history, an unreadable `meta` table, and
+  a pre-AD-414-14 database without the row all keep the previous wording.
 - **Standalone `skim search --blast-radius FILE` now discloses an unusable temporal
   database** (#414). With `--blast-radius` as the only temporal flag there is no sort
   dimension to probe, so an entirely empty `temporal.db` produced

@@ -1972,7 +1972,7 @@ fn run_temporal_standalone(
     {
         let normalized = temporal::normalize_blast_radius_path(raw_path, &root)?;
         if db.cochanges_for_file(&normalized)?.is_empty() {
-            report_standalone_degraded(&temporal::empty_temporal_state(), "blast-radius", json)?;
+            report_standalone_degraded(&temporal::empty_temporal_state(&db), "blast-radius", json)?;
             return Ok(ExitCode::SUCCESS);
         }
     }

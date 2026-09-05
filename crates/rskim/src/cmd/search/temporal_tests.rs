@@ -3110,7 +3110,10 @@ fn t19b_remediation_text_conformance() {
     ];
 
     for reason in all_reasons {
-        let actual = reason.remediation();
+        // AD-414-25: `remediation_for` is the single entry point; the empty detail
+        // selects the §2.3 base table (the shallow-`Empty` branch is pinned by
+        // `f_c2_01_empty_notice_branches_on_shallow_detail`).
+        let actual = reason.remediation_for("");
         let want = expected_remediation(reason);
         assert_eq!(
             actual, want,
@@ -3293,6 +3296,104 @@ fn t19b_all_ad_414_anchors_present() {
              crates/rskim/src/cmd/search/ or crates/rskim-search/src/"
         );
     }
+}
+
+/// AD-414-25 / F-C2-01 — the `Empty` notice branches on the shallow flag in BOTH
+/// halves of the contract: the human-readable message AND
+/// `DegradedJson.remediation`.
+///
+/// The build-time zero-row notice always named `git fetch --unshallow`; the
+/// query-time notice advised `skim search --rebuild`, which on a still-shallow
+/// clone rebuilds the same zero rows.  PF-007 discriminating observables: the
+/// unshallow advice is present for `detail == "shallow"` and absent for the
+/// default detail, on both fields.
+#[test]
+fn f_c2_01_empty_notice_branches_on_shallow_detail() {
+    let plain = TemporalUnavailable {
+        reason: DegradedReason::Empty,
+        detail: String::new(),
+    };
+    let shallow = TemporalUnavailable {
+        reason: DegradedReason::Empty,
+        detail: "shallow".to_string(),
+    };
+
+    let plain_msg = degraded_notice(&plain, "", Fallback::NoResults);
+    let shallow_msg = degraded_notice(&shallow, "", Fallback::NoResults);
+
+    assert!(
+        !plain_msg.contains("unshallow"),
+        "non-shallow Empty must NOT advise unshallowing; got: {plain_msg:?}"
+    );
+    assert!(
+        shallow_msg.contains("a shallow clone is the usual cause")
+            && shallow_msg.contains("git fetch --unshallow"),
+        "shallow Empty message must name the cause and the unshallow remedy; \
+         got: {shallow_msg:?}"
+    );
+
+    assert_eq!(
+        DegradedReason::Empty.remediation_for(""),
+        "run 'skim search --rebuild'",
+        "non-shallow Empty remediation must stay the rebuild advice"
+    );
+    assert_eq!(
+        DegradedReason::Empty.remediation_for("shallow"),
+        "run 'git fetch --unshallow' (or use a full clone), then 'skim search --rebuild'",
+        "shallow Empty remediation must name unshallowing first"
+    );
+    // AD-414-1 SSOT: the remediation must be a suffix of the message it ships
+    // with, so a JSON consumer can never be advised something the message denies.
+    assert!(
+        shallow_msg.ends_with(DegradedReason::Empty.remediation_for("shallow")),
+        "shallow message {shallow_msg:?} must end with its own remediation"
+    );
+
+    // Detail-independence for every other variant is unchanged.
+    assert_eq!(
+        DegradedReason::Missing.remediation_for("shallow"),
+        DegradedReason::Missing.remediation_for(""),
+        "only Empty branches on the shallow detail"
+    );
+}
+
+/// AD-414-25 / F-C2-01 — `empty_temporal_state` reads `meta.is_shallow` from the
+/// open connection rather than assuming the non-shallow default.
+///
+/// PF-007 discriminating observable: `detail` is `"shallow"` for a DB synced with
+/// `is_shallow = true` and empty for one synced with `is_shallow = false`.  An
+/// absent `meta` row (a pre-AD-414-14 DB) must degrade to the non-shallow wording
+/// and never fabricate a shallow claim.
+#[test]
+fn f_c2_01_empty_temporal_state_reads_meta_is_shallow() {
+    let (_dir_shallow, db_shallow) = temp_db();
+    db_shallow.sync(&[], &[], &[], "deadbeef", true).unwrap();
+    assert_eq!(
+        super::empty_temporal_state(&db_shallow).detail,
+        "shallow",
+        "is_shallow=1 in meta must produce the shallow detail"
+    );
+
+    let (_dir_full, db_full) = temp_db();
+    db_full.sync(&[], &[], &[], "deadbeef", false).unwrap();
+    assert_eq!(
+        super::empty_temporal_state(&db_full).detail,
+        "",
+        "is_shallow=0 in meta must produce the default detail"
+    );
+
+    // Never synced → no is_shallow row at all.
+    let (_dir_bare, db_bare) = temp_db();
+    assert_eq!(
+        super::empty_temporal_state(&db_bare).detail,
+        "",
+        "an absent is_shallow row must degrade to the non-shallow wording"
+    );
+    assert_eq!(
+        super::empty_temporal_state(&db_bare).reason,
+        DegradedReason::Empty,
+        "the reason is always Empty regardless of the shallow flag"
+    );
 }
 
 /// T-19(c): the three `Fallback` tail texts match the §2.3 normative table.

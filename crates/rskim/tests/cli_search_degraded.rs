@@ -2234,3 +2234,87 @@ fn f_c2_02_healthy_zero_partner_blast_radius_stays_quiet() {
         );
     }
 }
+/// AD-414-25 / F-C2-01 — on a genuinely shallow clone the QUERY-time notice must
+/// name the shallow cause and the `git fetch --unshallow` remedy, matching the
+/// build-time zero-row notice.
+///
+/// `sync()` records `meta.is_shallow` on every build (AD-414-14), so the flag is
+/// available to the query path; before the fix the query-time message and the
+/// `degraded[].remediation` both advised `skim search --rebuild`, which on a
+/// still-shallow clone rebuilds the same zero rows.
+///
+/// PF-007 discriminating observables: `a shallow clone is the usual cause` and
+/// `git fetch --unshallow` in BOTH stderr and `degraded[0].remediation`.
+#[test]
+fn f_c2_01_shallow_clone_query_notice_names_unshallow() {
+    let source_dir = TempDir::new().expect("TempDir");
+    let source = source_dir.path().join("repo");
+    fs::create_dir_all(&source).unwrap();
+    make_repo2(&source);
+
+    // --depth is silently ignored for bare local paths; file:// is required for a
+    // genuinely shallow clone.
+    let clone_dir = TempDir::new().expect("clone TempDir");
+    let clone_root = clone_dir.path().join("shallow");
+    let url = format!("file://{}", source.display());
+    let out = StdCommand::new("git")
+        .args(["clone", "--depth", "1", &url])
+        .arg(&clone_root)
+        .output()
+        .expect("git clone --depth 1");
+    assert!(
+        out.status.success(),
+        "git clone --depth 1 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        clone_root.join(".git/shallow").exists(),
+        "premise: the clone must be genuinely shallow (.git/shallow present)"
+    );
+
+    let cache = TempDir::new().expect("cache TempDir");
+    build_index(&clone_root, cache.path());
+
+    let db_path = find_search_cache(cache.path()).join("temporal.db");
+    assert_eq!(
+        sqlite_count(&db_path, "hotspot"),
+        0,
+        "premise: a depth-1 clone yields no walkable history, so zero hotspot rows"
+    );
+
+    let (stdout, stderr, code) = skim_search(
+        &["--hot", "--limit", "5", "--json"],
+        &clone_root,
+        cache.path(),
+    );
+    assert_eq!(code, 0, "F-C2-01: shallow --hot must exit 0");
+
+    for needle in &[
+        "a shallow clone is the usual cause",
+        "git fetch --unshallow",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "F-C2-01: query-time stderr must contain '{needle}'; got:\n{stderr}"
+        );
+    }
+
+    let v: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("F-C2-01: --json parse error: {e}\n{stdout}"));
+    let degraded = v["degraded"]
+        .as_array()
+        .unwrap_or_else(|| panic!("F-C2-01: degraded array must be present; got:\n{stdout}"));
+    assert_eq!(degraded[0]["reason"].as_str(), Some("empty"));
+    let remediation = degraded[0]["remediation"].as_str().unwrap_or_default();
+    assert!(
+        remediation.contains("git fetch --unshallow"),
+        "F-C2-01: degraded.remediation must name unshallowing on a shallow clone; \
+         got: {remediation:?}"
+    );
+    let message = degraded[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.ends_with(remediation),
+        "F-C2-01 (AD-414-1): the message must end with its own remediation; \
+         message={message:?} remediation={remediation:?}"
+    );
+}

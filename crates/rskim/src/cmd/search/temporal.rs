@@ -236,7 +236,9 @@ impl DegradedJson {
             requested,
             applied,
             message,
-            remediation: u.reason.remediation(),
+            // AD-414-25: detail-aware so a shallow-clone `Empty` advises
+            // `git fetch --unshallow` rather than a rebuild that cannot help.
+            remediation: u.reason.remediation_for(&u.detail),
         }
     }
 
@@ -257,7 +259,9 @@ impl DegradedJson {
             requested: "blast-radius",
             applied: "lexical",
             message,
-            remediation: u.reason.remediation(),
+            // AD-414-25: detail-aware so a shallow-clone `Empty` advises
+            // `git fetch --unshallow` rather than a rebuild that cannot help.
+            remediation: u.reason.remediation_for(&u.detail),
         }
     }
 }
@@ -390,7 +394,7 @@ pub(super) fn open_temporal_state_for(
             if let Some(s) = sort
                 && dimension_is_empty(&db, s)
             {
-                return TemporalOpen::Unavailable(empty_temporal_state());
+                return TemporalOpen::Unavailable(empty_temporal_state(&db));
             }
             TemporalOpen::Open(db)
         }
@@ -405,10 +409,36 @@ pub(super) fn open_temporal_state_for(
 /// probe in [`open_temporal_state_for`], the composite blast-radius arm in
 /// [`resolve_blast_radius_paths`], and the standalone blast-radius arm in
 /// `mod.rs::run_temporal_standalone` — cannot drift from one another.
-pub(super) fn empty_temporal_state() -> TemporalUnavailable {
+///
+/// # AD-414-25 (F-C2-01): the shallow-clone branch
+///
+/// The build-time zero-row notice has always distinguished the two ways a
+/// temporal DB ends up with no rows — a repository that genuinely has no
+/// analysable history, versus a `--depth N` clone whose history was never
+/// fetched — and names `git fetch --unshallow` for the second.  The query-time
+/// notice did not: it advised `skim search --rebuild`, which on a still-shallow
+/// clone rebuilds the same zero rows.  `sync()` records
+/// [`rskim_search::META_IS_SHALLOW`] on every build (AD-414-14), so the flag is
+/// read here from the connection the caller already holds.
+///
+/// The `"shallow"` detail string is the same signal
+/// `temporal_build::zero_row_notice` emits, so both notices flow through the one
+/// [`DegradedReason::full_message`] branch (AD-414-1 SSOT).  A `meta` read
+/// failure or an absent row (pre-AD-414-14 DBs) degrades to the non-shallow
+/// wording — never to a fabricated shallow claim.
+pub(super) fn empty_temporal_state(db: &TemporalDb) -> TemporalUnavailable {
+    let is_shallow = db
+        .get_meta(rskim_search::META_IS_SHALLOW)
+        .ok()
+        .flatten()
+        .is_some_and(|v| v.trim() == "1");
     TemporalUnavailable {
         reason: DegradedReason::Empty,
-        detail: String::new(),
+        detail: if is_shallow {
+            "shallow".to_string()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -744,7 +774,7 @@ pub(super) fn resolve_blast_radius_paths(
         // check.
         if dimension_is_empty(&db, TemporalSort::Hot) {
             // AD-414-25: shallow-aware Empty (see `empty_temporal_state`).
-            let u = empty_temporal_state();
+            let u = empty_temporal_state(&db);
             let msg = degraded_notice(&u, "--blast-radius", Fallback::Lexical);
             eprintln!("skim search: {msg}");
             return Ok(BlastRadiusResolution::Degraded(u));
