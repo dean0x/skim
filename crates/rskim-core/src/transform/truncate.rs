@@ -832,17 +832,17 @@ where
         elision_marker_line(Some(language), source_total, compact_side, None)
     };
 
-    // documentation-24: always append a trailing newline to the compact
-    // marker (`best == 0`) so downstream pipeline consumers receive a
-    // complete text line regardless of whether the input had a final newline.
-    // The non-compact path (`best > 0`) mirrors the input's trailing newline
-    // behaviour — consistent with the rest of the function.
-    if best == 0 {
-        // Compact marker: unconditionally terminate as a full line.
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-    } else if text.ends_with('\n') {
+    // Trailing-newline contract, both marker forms alike: the output mirrors
+    // the input. A source that ended without a final newline yields output that
+    // ends without one, so skim never invents a byte the source did not have —
+    // the same fidelity rule the rest of this module follows, and the reason
+    // `test_token_budget_no_trailing_newline_when_absent` pins it.
+    //
+    // The consequence is that on a newline-less source the compact marker can
+    // abut whatever follows it in a pipeline. That is accepted: inventing a
+    // terminator would be a byte-level change to output the caller did not ask
+    // for, and the marker is already unconditional disclosure without it.
+    if text.ends_with('\n') {
         output.push('\n');
     }
 
