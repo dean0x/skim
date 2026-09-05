@@ -276,7 +276,7 @@ pub(crate) fn in_protected(pos: usize, protected: &[(usize, usize)]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)] // Unwrapping and panics are acceptable in tests
 mod tests {
     use super::*;
     use crate::{Language, Parser};
@@ -450,9 +450,12 @@ mod tests {
         let mut parser = crate::Parser::new(Language::Python).unwrap();
         let tree = parser.parse(&source).unwrap();
         let result = collect_literal_ranges(&tree, Language::Python);
-        let err = result.expect_err(
-            "collect_literal_ranges must error (not silently degrade) when MAX_AST_NODES is exceeded",
-        );
+        let err = match result {
+            Ok(_) => panic!(
+                "collect_literal_ranges must error (not silently degrade) when MAX_AST_NODES is exceeded"
+            ),
+            Err(e) => e,
+        };
         assert!(
             err.is_complexity_limit(),
             "expected ComplexityLimit so the caller can degrade to passthrough; got: {err}"

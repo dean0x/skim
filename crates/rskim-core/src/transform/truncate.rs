@@ -204,7 +204,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
             lines_used >= dropped_lines,
             "invariant: lines_used ({lines_used}) >= dropped_lines ({dropped_lines})"
         );
-        lines_used = lines_used.checked_sub(dropped_lines).unwrap_or(0);
+        lines_used = lines_used.saturating_sub(dropped_lines);
 
         // Recalculate markers with updated selection
         let selected_spans: Vec<&NodeSpan> = selected.iter().map(|(_, s)| *s).collect();
@@ -792,12 +792,10 @@ where
         .checked_sub(1)
         .and_then(|last_retained| scan.open_after(last_retained));
     let snapped_to_zero = open_at_cut == Some(0);
-    if let Some(open) = open_at_cut {
-        if open > 0 {
-            best = open;
-        }
-        // When open == 0, keep best unchanged; snapped_to_zero is true so the
-        // compact_side below carries the cut-inside disclosure.
+    // When open == 0, keep `best` unchanged; `snapped_to_zero` is true so the
+    // compact_side below carries the cut-inside disclosure.
+    if let Some(open) = open_at_cut.filter(|&o| o > 0) {
+        best = open;
     }
 
     // Build final output from pre-joined string

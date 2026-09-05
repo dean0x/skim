@@ -514,15 +514,15 @@ fn emit_result(
 
     match result {
         ParseResult::Full(tr) | ParseResult::Degraded(tr, _) => {
-            if write_line_to_stdout(&tr.to_string())? == StdoutStatus::PipeClosed {
+            if write_line_to_stdout(tr.as_ref())? == StdoutStatus::PipeClosed {
                 return Ok(StdoutStatus::PipeClosed);
             }
             result.emit_markers(&mut err)?;
 
-            if tr.summary.fail > 0 {
-                if shared::emit_failure_context(cleaned_output, 1)? == StdoutStatus::PipeClosed {
-                    return Ok(StdoutStatus::PipeClosed);
-                }
+            if tr.summary.fail > 0
+                && shared::emit_failure_context(cleaned_output, 1)? == StdoutStatus::PipeClosed
+            {
+                return Ok(StdoutStatus::PipeClosed);
             }
         }
         ParseResult::Passthrough(raw) => {

@@ -387,10 +387,10 @@ pub(crate) fn set_force_raw(force_raw: bool, tools: &[String], cache_dir: &Path)
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if let Ok(meta) = std::fs::symlink_metadata(&dir) {
-                if meta.file_type().is_symlink() || (meta.mode() & 0o022) != 0 {
-                    return;
-                }
+            if std::fs::symlink_metadata(&dir).is_ok_and(|meta| {
+                meta.file_type().is_symlink() || (meta.mode() & 0o022) != 0
+            }) {
+                return;
             }
         }
     }

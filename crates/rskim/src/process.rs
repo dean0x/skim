@@ -407,7 +407,7 @@ fn run_transform(
                             if lo >= hi {
                                 break;
                             }
-                            let mid = lo + (hi - lo + 1) / 2;
+                            let mid = lo + (hi - lo).div_ceil(2);
                             let candidate = passthrough_with_truncation(
                                 contents,
                                 None,

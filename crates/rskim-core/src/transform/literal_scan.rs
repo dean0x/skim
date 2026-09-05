@@ -280,10 +280,11 @@ fn build_candidate_bitmap(syn: &LiteralSyntax) -> [bool; 256] {
     }
 
     // Block comment opener (e.g. `/*` → b'/').
-    if let Some((open, _)) = syn.block_comment {
-        if let Some(&b) = open.as_bytes().first() {
-            bitmap[b as usize] = true;
-        }
+    if let Some(&b) = syn
+        .block_comment
+        .and_then(|(open, _)| open.as_bytes().first())
+    {
+        bitmap[b as usize] = true;
     }
 
     // Language-specific special openers.
