@@ -71,8 +71,7 @@ pub(crate) fn compact_marker_without_hint(output: &str, hint: &str) -> bool {
     // "lines truncated" matches the plural standard form ("lines truncated)") and
     // the #511 literal-aware form ("lines truncated; cut inside …").
     // "line truncated" (no 's') matches the singular form.
-    let has_marker =
-        last_line.contains("lines truncated") || last_line.contains("line truncated");
+    let has_marker = last_line.contains("lines truncated") || last_line.contains("line truncated");
     let has_hint = !hint.is_empty() && last_line.contains(hint);
     has_marker && !has_hint
 }
@@ -378,9 +377,15 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            10,
+            Language::TypeScript,
+            100,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "word1 word2 word3");
@@ -398,9 +403,15 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
         let trunc = TruncationOptions::default();
 
-        let (_output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, 100, transform)
-                .unwrap();
+        let (_output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            10,
+            Language::TypeScript,
+            100,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Signatures);
     }
@@ -417,9 +428,15 @@ mod tests {
         let transform = mock_transform(source, &mode_sizes);
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::TypeScript, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Structure,
+            &trunc,
+            5,
+            Language::TypeScript,
+            100,
+            transform,
+        )
+        .unwrap();
 
         // Should use the most aggressive mode that produced output
         assert_eq!(mode_used, Mode::Types);
@@ -446,9 +463,15 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let (output, mode_used) =
-            cascade_for_token_budget(Mode::Types, &trunc, 10, Language::TypeScript, 100, transform)
-                .unwrap();
+        let (output, mode_used) = cascade_for_token_budget(
+            Mode::Types,
+            &trunc,
+            10,
+            Language::TypeScript,
+            100,
+            transform,
+        )
+        .unwrap();
 
         assert_eq!(mode_used, Mode::Types);
         assert_eq!(output, "a b c d e");
@@ -491,7 +514,8 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Full);
         assert_eq!(output, "a b c d e");
@@ -506,7 +530,8 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "a b c d e");
@@ -522,7 +547,8 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, 100, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, 100, transform)
+                .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         // ADR-011 class 1 / #317: compact elision marker always emitted when no content
@@ -568,7 +594,8 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let result = cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, 100, transform);
+        let result =
+            cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, 100, transform);
 
         assert!(result.is_err());
         assert!(
@@ -644,9 +671,8 @@ mod tests {
         //
         // This output simulates a file that documents the hint (like CLAUDE.md or
         // process.rs) followed by a compact elision marker on the last line.
-        let output = format!(
-            "// Example: {ELISION_HINT}\nfn foo() {{}}\n// ... (5 lines truncated)"
-        );
+        let output =
+            format!("// Example: {ELISION_HINT}\nfn foo() {{}}\n// ... (5 lines truncated)");
         // has_hint must be false because the hint is NOT on the last line.
         assert!(
             compact_marker_without_hint(&output, ELISION_HINT),
@@ -659,8 +685,7 @@ mod tests {
     fn compact_marker_without_hint_hint_on_last_line_with_marker_is_false() {
         // Sanity: a full marker (hint ON the last line alongside the count)
         // must still return false so we do not double-emit the hint on stderr.
-        let full =
-            format!("fn foo() {{}}\n// ... (3 lines truncated) — {ELISION_HINT}");
+        let full = format!("fn foo() {{}}\n// ... (3 lines truncated) — {ELISION_HINT}");
         assert!(
             !compact_marker_without_hint(&full, ELISION_HINT),
             "full marker (hint on last line) must not trigger the stderr remedy"

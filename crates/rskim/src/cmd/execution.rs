@@ -368,13 +368,11 @@ pub(crate) fn emit_json_envelope(
         // on EPIPE (e.g. `skim log --json 2>&1 | head`) while the former
         // returns a Result that we silently discard — stderr loss on a broken
         // pipe is acceptable, a panic is not (regression-6).
-        let _ = write_line_to_stderr(
-            &crate::output::lossy_json_view_marker(
-                tool,
-                elided.map(|e| (e.kept, e.total, e.unit)),
-                &remedy,
-            ),
-        );
+        let _ = write_line_to_stderr(&crate::output::lossy_json_view_marker(
+            tool,
+            elided.map(|e| (e.kept, e.total, e.unit)),
+            &remedy,
+        ));
     }
 
     Ok(status)
@@ -1601,7 +1599,11 @@ mod tests {
     /// `Some(ElidedCount { kept, total, unit: "lines" })`.
     #[test]
     fn elided_count_countable_form_when_kept_lt_total() {
-        let elided = ElidedCount { kept: 3, total: 44, unit: "lines" };
+        let elided = ElidedCount {
+            kept: 3,
+            total: 44,
+            unit: "lines",
+        };
         let marker = crate::output::lossy_json_view_marker(
             "git",
             Some((elided.kept, elided.total, elided.unit)),
@@ -1626,7 +1628,11 @@ mod tests {
     /// conversion cannot silently swap `kept` and `total` and pass.
     #[test]
     fn elided_count_countless_form_when_kept_eq_total() {
-        let elided = ElidedCount { kept: 44, total: 44, unit: "lines" };
+        let elided = ElidedCount {
+            kept: 44,
+            total: 44,
+            unit: "lines",
+        };
         let marker = crate::output::lossy_json_view_marker(
             "log",
             Some((elided.kept, elided.total, elided.unit)),

@@ -157,9 +157,11 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
                 // also considered.
                 &before_sep[1..]
             };
-            let has_required = all_tokens_after_cmd
-                .iter()
-                .any(|&tok| rule.require_flag.iter().any(|&f| super::arg_matches_flag(tok, f)));
+            let has_required = all_tokens_after_cmd.iter().any(|&tok| {
+                rule.require_flag
+                    .iter()
+                    .any(|&f| super::arg_matches_flag(tok, f))
+            });
             if !has_required {
                 skipped = true;
                 continue;

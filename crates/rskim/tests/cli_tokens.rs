@@ -283,7 +283,9 @@ fn test_tokens_budget_honoured_for_unknown_language_file() {
     // 50 lines × ~10 tokens each ≈ 500 tokens — well above a budget of 5.
     let mut content = String::new();
     for i in 0..50 {
-        content.push_str(&format!("line number {i} with some extra words to pad token count\n"));
+        content.push_str(&format!(
+            "line number {i} with some extra words to pad token count\n"
+        ));
     }
     // No extension so language detection falls back to the unknown-language path.
     let file_path = temp_dir.path().join("datafile");

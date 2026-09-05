@@ -342,9 +342,7 @@ pub fn elision_marker_line(
     };
     // performance-9: collapse to a single allocation instead of two.
     match hint {
-        Some(h) => format!(
-            "{prefix} ... ({elided} {unit} {side_text}) \u{2014} {h}{suffix}"
-        ),
+        Some(h) => format!("{prefix} ... ({elided} {unit} {side_text}) \u{2014} {h}{suffix}"),
         None => format!("{prefix} ... ({elided} {unit} {side_text}){suffix}"),
     }
 }

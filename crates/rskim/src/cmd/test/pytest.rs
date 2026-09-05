@@ -498,7 +498,7 @@ fn emit_result(
     output: &CommandOutput,
     cleaned_output: &str,
 ) -> anyhow::Result<crate::cmd::execution::StdoutStatus> {
-    use crate::cmd::execution::{write_line_to_stdout, write_to_stdout, StdoutStatus};
+    use crate::cmd::execution::{StdoutStatus, write_line_to_stdout, write_to_stdout};
     use std::io::Write;
 
     // Stdout writes go through the classifying sinks so that `EPIPE` (downstream
@@ -1000,8 +1000,8 @@ FAILED tests/test_b.py::test_two - assert 1 == 2
             exit_code: Some(0),
             duration: Duration::ZERO,
         };
-        let status =
-            emit_result(&result, &output, "").expect("emit_result must not error when pipe is open");
+        let status = emit_result(&result, &output, "")
+            .expect("emit_result must not error when pipe is open");
         assert_eq!(
             status,
             StdoutStatus::Written,

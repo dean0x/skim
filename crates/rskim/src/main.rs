@@ -939,10 +939,7 @@ fn main() -> ExitCode {
     let pre_sep = &argv_for_flags[..sep_pos];
     // Collect skim-flag-zone tokens (before the first positional arg or `--`)
     // into a Vec so we can scan it twice without reconstructing the iterator.
-    let skim_flag_zone: Vec<&String> = pre_sep
-        .iter()
-        .take_while(|a| a.starts_with('-'))
-        .collect();
+    let skim_flag_zone: Vec<&String> = pre_sep.iter().take_while(|a| a.starts_with('-')).collect();
 
     // Extract --debug before routing so it applies to all subcommands.
     if skim_flag_zone.iter().any(|a| a.as_str() == "--debug") {
@@ -1271,8 +1268,8 @@ fn process_single_arg(
             // File passthrough: read raw bytes and copy to stdout.
             // Skip validation (size limits, UTF-8) — the point of passthrough
             // is byte-faithful forwarding without skim's transform guards.
-            let contents = std::fs::read(file)
-                .map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
+            let contents =
+                std::fs::read(file).map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
             out.write_all(&contents)?;
         }
         return Ok(());

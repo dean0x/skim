@@ -64,10 +64,7 @@ fn test_gh_issue_view_emits_compressed_not_injected_json() {
         .assert()
         .success()
         // skim's compressed output must contain the issue title or number.
-        .stdout(
-            predicate::str::contains("Minimal issue")
-                .or(predicate::str::contains("99")),
-        )
+        .stdout(predicate::str::contains("Minimal issue").or(predicate::str::contains("99")))
         // regression-3: the injected --json raw bytes must NOT be the output.
         // If the guard fired and elected passthrough, stdout would start with '{'.
         // Compressed skim output never starts with a bare JSON object.

@@ -588,7 +588,10 @@ fn max_lines_1_n1_carve_out_stdin() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "stdin --max-lines 1 should succeed");
+    assert!(
+        output.status.success(),
+        "stdin --max-lines 1 should succeed"
+    );
 
     let stdout = String::from_utf8(output.stdout).unwrap();
 

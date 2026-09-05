@@ -136,7 +136,10 @@ pub(crate) fn scan(text: &str, language: Language) -> LiteralScan {
         open_after.push(state.open_line());
     }
 
-    LiteralScan { open_after, line_count }
+    LiteralScan {
+        open_after,
+        line_count,
+    }
 }
 
 impl LiteralScan {

@@ -1017,8 +1017,12 @@ fn read_one_line_then_close(child: &mut std::process::Child, tag: &str) -> Strin
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => { let _ = tx.send(None); }
-            Ok(_) => { let _ = tx.send(Some(line.trim_end_matches('\n').to_string())); }
+            Ok(0) | Err(_) => {
+                let _ = tx.send(None);
+            }
+            Ok(_) => {
+                let _ = tx.send(Some(line.trim_end_matches('\n').to_string()));
+            }
         }
         // Dropping `reader` closes the read end of the pipe — the `| head -1` moment.
     });
@@ -1126,7 +1130,9 @@ fn test_log_passthrough_broken_pipe_exits_141() {
     // stdout fills and we haven't started reading yet.
     let mut stdin = child.stdin.take().unwrap();
     let log_bytes = big_log.into_bytes();
-    std::thread::spawn(move || { let _ = stdin.write_all(&log_bytes); });
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&log_bytes);
+    });
 
     let line = read_one_line_then_close(&mut child, "architecture-1-log");
     assert!(
@@ -1194,10 +1200,7 @@ fn test_glob_passthrough_exits_zero_with_content() {
 
     let glob = format!("{}/*.ts", dir.path().display());
 
-    let out = passthrough_skim()
-        .arg(&glob)
-        .output()
-        .unwrap();
+    let out = passthrough_skim().arg(&glob).output().unwrap();
 
     assert!(
         out.status.success(),
@@ -1269,8 +1272,7 @@ fn test_security5_passthrough_as_grep_data_arg_not_consumed() {
         .output()
         .unwrap();
 
-    let captured = fs::read_to_string(&args_file)
-        .unwrap_or_default();
+    let captured = fs::read_to_string(&args_file).unwrap_or_default();
     assert!(
         captured.contains("--passthrough"),
         "grep's `--passthrough` data arg must survive to grep's argv unchanged;\

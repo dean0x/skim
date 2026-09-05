@@ -304,9 +304,7 @@ pub(crate) fn run(
             if tool_name.as_str() == "env" && tool_args.iter().any(|a| a.contains('=')) {
                 // Find the first non-assignment arg (the child program name).
                 let child_idx = tool_args.iter().position(|a| !a.contains('='));
-                let child_prog = child_idx
-                    .and_then(|i| tool_args.get(i))
-                    .map(String::as_str);
+                let child_prog = child_idx.and_then(|i| tool_args.get(i)).map(String::as_str);
                 if matches!(child_prog, Some("env") | Some("printenv")) {
                     // Child is env/printenv: pass the args AFTER the child name
                     // to the redacting handler.  The VAR=val overrides are not

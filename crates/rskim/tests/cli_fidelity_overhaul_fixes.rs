@@ -244,7 +244,10 @@ fn reliability_8_tokens_elision_count_is_in_source_space() {
 
     // Verify we built what we intended.
     let source_lines: usize = source.lines().count();
-    assert_eq!(source_lines, 40, "fixture must have exactly 40 source lines");
+    assert_eq!(
+        source_lines, 40,
+        "fixture must have exactly 40 source lines"
+    );
 
     fs::write(&file_path, &source).unwrap();
 

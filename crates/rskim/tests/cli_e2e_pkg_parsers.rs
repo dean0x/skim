@@ -371,5 +371,7 @@ fn test_yarn_unknown_subcommand_stderr_with_debug() {
         .assert()
         .success()
         // With SKIM_DEBUG the class-2 banner must appear.
-        .stderr(predicate::str::contains("skim yarn: unknown subcommand 'build'"));
+        .stderr(predicate::str::contains(
+            "skim yarn: unknown subcommand 'build'",
+        ));
 }

@@ -103,7 +103,10 @@ mod env_redaction {
     #[test]
     fn env_d4_skip_flag_u_does_not_leak_secrets() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let output = base_wrapper_cmd("env")
             .args(["-u", "HOME"])
@@ -129,7 +132,10 @@ mod env_redaction {
     #[test]
     fn printenv_wrapper_does_not_leak_secrets() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let output = base_wrapper_cmd("printenv")
             .env("SKIM_TEST_TOKEN", "secret-printenv-d4-xyz")
@@ -168,7 +174,10 @@ mod env_redaction {
     #[test]
     fn env_redirect_to_file_redacts_secrets() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let out_path = tmpdir.path().join("env_out.txt");
@@ -211,7 +220,10 @@ mod env_redaction {
     #[test]
     fn env_assignment_printenv_child_redacts_secrets() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let output = base_wrapper_cmd("env")
             .args(["FOO=1", "printenv"])
@@ -245,7 +257,10 @@ mod env_redaction {
     #[test]
     fn env_assignment_env_child_redacts_secrets() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let output = base_wrapper_cmd("env")
             .args(["FOO=1", "env"])
@@ -276,7 +291,10 @@ mod env_redaction {
     #[test]
     fn env_assignment_non_env_child_execs_raw() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         // Stub child: prints a unique sentinel to confirm it ran directly.
         let stub_dir = tempfile::tempdir().unwrap();
@@ -324,15 +342,13 @@ mod env_redaction {
         }
 
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let output = base_wrapper_cmd("env")
-            .args([
-                "SKIM_TEST_TOKEN=secret-sh-child-xyz",
-                "sh",
-                "-c",
-                "env",
-            ])
+            .args(["SKIM_TEST_TOKEN=secret-sh-child-xyz", "sh", "-c", "env"])
             .env_remove("SKIM_TEST_TOKEN") // ensure value comes from the in-line assignment
             .output()
             .expect("skim binary must be spawnable");
@@ -365,7 +381,10 @@ mod env_redaction {
     #[test]
     fn wrapper_d3_help_flag_passes_through_after_arch10_move() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         // Stub grep that prints a distinctive help sentinel.
         let stub_dir = tempfile::tempdir().unwrap();
@@ -399,7 +418,10 @@ mod env_redaction {
     #[test]
     fn wrapper_d4_skip_flag_rg_json_passes_through_after_arch10_move() {
         let skim = skim_bin();
-        assert!(skim.exists(), "skim binary must exist — run `cargo build` first");
+        assert!(
+            skim.exists(),
+            "skim binary must exist — run `cargo build` first"
+        );
 
         let stub_dir = tempfile::tempdir().unwrap();
         let sentinel_out = r#"{"type":"begin","data":{"path":{"text":"file.rs"}}}"#;

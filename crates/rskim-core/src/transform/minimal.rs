@@ -5,7 +5,9 @@
 //!
 //! Token reduction target: 15-30%
 
-use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges};
+use crate::transform::literals::{
+    collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges,
+};
 use crate::transform::utils::is_function_scope_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};

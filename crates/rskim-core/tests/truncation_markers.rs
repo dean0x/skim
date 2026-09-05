@@ -28,8 +28,7 @@ const GO_SIMPLE: &str = include_str!("../../../tests/fixtures/go/simple.go");
 // architecture-5 / rust-4 / reliability-8 fixtures
 const PYTHON_CLOSE_REOPEN: &str =
     include_str!("../../../tests/fixtures/python/close_reopen_literal.py");
-const SQL_CLOSE_REOPEN: &str =
-    include_str!("../../../tests/fixtures/sql/close_reopen_literal.sql");
+const SQL_CLOSE_REOPEN: &str = include_str!("../../../tests/fixtures/sql/close_reopen_literal.sql");
 const TS_CLOSE_REOPEN: &str =
     include_str!("../../../tests/fixtures/typescript/close_reopen_literal.ts");
 const PYTHON_DEGENERATE: &str =

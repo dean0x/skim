@@ -408,12 +408,8 @@ fn run_transform(
                                 break;
                             }
                             let mid = lo + (hi - lo).div_ceil(2);
-                            let candidate = passthrough_with_truncation(
-                                contents,
-                                None,
-                                Some(mid),
-                                None,
-                            );
+                            let candidate =
+                                passthrough_with_truncation(contents, None, Some(mid), None);
                             let fits = tokens::count_tokens(&candidate)
                                 .map(|c| c <= budget)
                                 .unwrap_or(false);
@@ -621,10 +617,7 @@ fn enforce_line_bounds(
                     Err(_) => (text.to_string(), None),
                 }
             }
-            None => (
-                passthrough_with_truncation(text, None, Some(n), None),
-                None,
-            ),
+            None => (passthrough_with_truncation(text, None, Some(n), None), None),
         }
     } else if let Some(n) = trunc.last_lines {
         match language {
@@ -652,10 +645,7 @@ fn enforce_line_bounds(
                     Err(_) => (text.to_string(), None),
                 }
             }
-            None => (
-                passthrough_with_truncation(text, None, None, Some(n)),
-                None,
-            ),
+            None => (passthrough_with_truncation(text, None, None, Some(n)), None),
         }
     } else {
         (text.to_string(), None)
@@ -861,14 +851,13 @@ pub(crate) fn process_stdin(
     // (PF-019 / complexity-2: the identity map used for guardrail-triggered paths
     // is wrong after --last-lines truncation, labelling tail lines as 1..N instead
     // of their actual source positions).
-    let (final_output, post_trunc_map) =
-        if guardrail_triggered
-            && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
-        {
-            enforce_line_bounds(&final_output, Some(language), &options.trunc, &buffer)
-        } else {
-            (final_output, None)
-        };
+    let (final_output, post_trunc_map) = if guardrail_triggered
+        && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
+    {
+        enforce_line_bounds(&final_output, Some(language), &options.trunc, &buffer)
+    } else {
+        (final_output, None)
+    };
 
     // Transparency marker: did the transformation produce a different view?
     // Computed AFTER post-guardrail truncation so a bound that cuts makes the
@@ -1021,14 +1010,13 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // enforce_line_bounds also returns the source-space line map for -n annotation
     // (complexity-2 / PF-019): using the identity map on a tail-truncated view
     // labels retained lines as 1..N instead of their actual source positions.
-    let (final_output, post_trunc_map) =
-        if guardrail_triggered
-            && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
-        {
-            enforce_line_bounds(&final_output, language, &options.trunc, &contents)
-        } else {
-            (final_output, None)
-        };
+    let (final_output, post_trunc_map) = if guardrail_triggered
+        && (options.trunc.max_lines.is_some() || options.trunc.last_lines.is_some())
+    {
+        enforce_line_bounds(&final_output, language, &options.trunc, &contents)
+    } else {
+        (final_output, None)
+    };
 
     // Transparency marker: did transformation produce a different view than raw bytes?
     // Computed AFTER post-guardrail truncation so a bound that cuts the raw view

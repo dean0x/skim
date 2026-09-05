@@ -254,9 +254,11 @@ fn git_in(dir: &Path, args: &[&str]) {
 ///
 /// Returns the temp dir (caller must keep alive) and the repo path.  The commit
 /// layout matches `make_patchless_diff_repo` in `cli_git_diff_json_content.rs`.
-fn make_patchless_show_repo()
--> (tempfile::TempDir, std::path::PathBuf, std::collections::HashMap<&'static str, String>)
-{
+fn make_patchless_show_repo() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::collections::HashMap<&'static str, String>,
+) {
     let dir = tempfile::tempdir().expect("tempdir must succeed");
     let path = dir.path().to_path_buf();
 
@@ -274,8 +276,7 @@ fn make_patchless_show_repo()
     git_in(&path, &["commit", "-m", "add text file"]);
 
     // Commit 2: 100%-similarity rename — no @@ hunks.
-    std::fs::rename(path.join("hello.txt"), path.join("greeting.txt"))
-        .expect("rename file");
+    std::fs::rename(path.join("hello.txt"), path.join("greeting.txt")).expect("rename file");
     git_in(&path, &["add", "-A"]);
     git_in(&path, &["commit", "-m", "rename hello.txt -> greeting.txt"]);
     let rename_sha = std::process::Command::new("git")
@@ -284,7 +285,10 @@ fn make_patchless_show_repo()
         .output()
         .expect("rev-parse HEAD")
         .stdout;
-    shas.insert("rename", String::from_utf8(rename_sha).unwrap().trim().to_string());
+    shas.insert(
+        "rename",
+        String::from_utf8(rename_sha).unwrap().trim().to_string(),
+    );
 
     // Commit 3: mode-only change — chmod +x, no content change → no @@ hunks.
     git_in(&path, &["update-index", "--chmod=+x", "greeting.txt"]);
@@ -295,7 +299,10 @@ fn make_patchless_show_repo()
         .output()
         .expect("rev-parse HEAD")
         .stdout;
-    shas.insert("mode", String::from_utf8(mode_sha).unwrap().trim().to_string());
+    shas.insert(
+        "mode",
+        String::from_utf8(mode_sha).unwrap().trim().to_string(),
+    );
 
     // Commit 4: add a binary file.
     let binary_bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x00, 0x01, 0x02, 0x03];
@@ -314,7 +321,10 @@ fn make_patchless_show_repo()
         .output()
         .expect("rev-parse HEAD")
         .stdout;
-    shas.insert("binary", String::from_utf8(binary_sha).unwrap().trim().to_string());
+    shas.insert(
+        "binary",
+        String::from_utf8(binary_sha).unwrap().trim().to_string(),
+    );
 
     (dir, path, shas)
 }

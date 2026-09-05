@@ -1769,7 +1769,9 @@ mod tests {
         // (emit_json_envelope in cmd/execution.rs) separately gates on
         // is_meta_subcommand(tool) so SKIM_PASSTHROUGH=1 is still the correct
         // remedy for those tools even though this predicate returns false.
-        for tool in ["git", "npm", "cargo", "psql", "eslint", "env", "log", "proxy"] {
+        for tool in [
+            "git", "npm", "cargo", "psql", "eslint", "env", "log", "proxy",
+        ] {
             let args = sv(&["--json"]);
             let actually_strips = strip_skim_flags(tool, &args)
                 .is_some_and(|stripped| !stripped.iter().any(|a| a == "--json"));

@@ -136,7 +136,10 @@ pub(crate) fn literal_fragment_kinds(language: Language) -> &'static [&'static s
 /// covering the complete `@"…"` literal — protecting it is equivalent to
 /// protecting its content because the delimiters are fixed syntax with no
 /// collapsable whitespace.
-pub(crate) fn collect_literal_ranges(tree: &Tree, language: Language) -> Result<Vec<(usize, usize)>> {
+pub(crate) fn collect_literal_ranges(
+    tree: &Tree,
+    language: Language,
+) -> Result<Vec<(usize, usize)>> {
     let kinds = literal_fragment_kinds(language);
     if kinds.is_empty() {
         return Ok(Vec::new());
@@ -414,7 +417,10 @@ mod tests {
         let source = "const x = \"café  crème\";\n";
         let tree = parse(source, Language::TypeScript);
         let ranges = collect_literal_ranges(&tree, Language::TypeScript).unwrap();
-        assert!(!ranges.is_empty(), "should find string_fragment with non-ASCII");
+        assert!(
+            !ranges.is_empty(),
+            "should find string_fragment with non-ASCII"
+        );
         let (s, e) = ranges[0];
         assert!(
             source.is_char_boundary(s),
@@ -478,10 +484,7 @@ mod tests {
 
     #[test]
     fn test_merge_ranges_non_overlapping_already_sorted() {
-        assert_eq!(
-            merge_ranges(vec![(0, 3), (5, 8)]),
-            vec![(0, 3), (5, 8)]
-        );
+        assert_eq!(merge_ranges(vec![(0, 3), (5, 8)]), vec![(0, 3), (5, 8)]);
     }
 
     #[test]

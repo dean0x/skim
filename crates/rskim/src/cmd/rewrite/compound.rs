@@ -1368,7 +1368,9 @@ mod tests {
         // `cat` not in BYTE_EXACT_PIPE_CONSUMERS → false.
         assert!(!command_needs_exact_bytes(r#"git log -n "${N}" | cat"#));
         // `tee` IS byte-exact → true (rule T fires normally).
-        assert!(command_needs_exact_bytes(r#"git log -n "${N}" | tee out.txt"#));
+        assert!(command_needs_exact_bytes(
+            r#"git log -n "${N}" | tee out.txt"#
+        ));
     }
 
     /// Rule R: file and named-FIFO redirects, including the case-8 shape.

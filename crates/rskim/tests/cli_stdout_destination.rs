@@ -1130,7 +1130,10 @@ mod destination {
             raw.len(),
             landed.len()
         );
-        assert_eq!(landed, raw, "heredoc bail: bytes must match raw byte-for-byte");
+        assert_eq!(
+            landed, raw,
+            "heredoc bail: bytes must match raw byte-for-byte"
+        );
     }
 
     /// `<cmd> | tee f` with unquoted `${VAR}` → marker written → raw bytes.

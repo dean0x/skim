@@ -387,9 +387,9 @@ pub(crate) fn set_force_raw(force_raw: bool, tools: &[String], cache_dir: &Path)
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if std::fs::symlink_metadata(&dir).is_ok_and(|meta| {
-                meta.file_type().is_symlink() || (meta.mode() & 0o022) != 0
-            }) {
+            if std::fs::symlink_metadata(&dir)
+                .is_ok_and(|meta| meta.file_type().is_symlink() || (meta.mode() & 0o022) != 0)
+            {
                 return;
             }
         }
@@ -1350,7 +1350,10 @@ mod tests {
 
         // hook.log must contain a warning mentioning the failure.
         let hook_log = cache_tmp.path().join("hook.log");
-        assert!(hook_log.exists(), "hook.log must be created on marker failure");
+        assert!(
+            hook_log.exists(),
+            "hook.log must be created on marker failure"
+        );
         let log_content = std::fs::read_to_string(&hook_log).unwrap();
         assert!(
             log_content.contains("force-raw:"),

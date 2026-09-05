@@ -37,7 +37,9 @@
 //! called on a node you already hold descends *into* that node and is cheap; it is
 //! `parent()` in front of it that pays the root descent.
 
-use crate::transform::literals::{collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges};
+use crate::transform::literals::{
+    collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges,
+};
 use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -3128,7 +3130,10 @@ mod tests {
             // Mixed: ASCII opener, multi-byte middle, ASCII closer
             ("fn f(x: u8, y: 日) -> 本\n", "fn f(x: u8, y: 日) -> 本\n"),
             // Curly-quote characters (3-byte UTF-8) that look like ASCII quotes
-            ("\u{201c}hello\u{201d}  world\n", "\u{201c}hello\u{201d} world\n"),
+            (
+                "\u{201c}hello\u{201d}  world\n",
+                "\u{201c}hello\u{201d} world\n",
+            ),
         ];
 
         for &(input, expected) in cases {

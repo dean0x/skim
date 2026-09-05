@@ -111,38 +111,6 @@ mod cross_surface {
         cmd.output().expect("wrapper surface must be spawnable")
     }
 
-    /// Run skim in wrapper mode with piped stdin content.
-    ///
-    /// Writes `stdin_content` to the child process before reading output.
-    /// Used for meta subcommands (e.g. `log`) that read from stdin.
-    fn run_wrapper_with_stdin(
-        tool: &str,
-        args: &[&str],
-        stdin_content: &str,
-        path: &str,
-        cache_dir: &Path,
-    ) -> Output {
-        let skim = skim_bin();
-        let mut cmd = Command::new(&skim);
-        cmd.arg0(tool);
-        cmd.args(args);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        base_env(&mut cmd, path, cache_dir);
-
-        let mut child = cmd.spawn().expect("wrapper-with-stdin must be spawnable");
-        // Take ownership of the ChildStdin handle so dropping it closes the
-        // pipe and sends EOF to the child before we call wait_with_output.
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(stdin_content.as_bytes())
-                .expect("write to child stdin must succeed");
-            // stdin dropped here → pipe closed → EOF for child
-        }
-        child.wait_with_output().expect("wrapper-with-stdin wait_with_output must succeed")
-    }
-
     /// Run skim on the EXPLICIT surface with piped stdin content.
     ///
     /// The wrapper variant above dispatches on `argv[0]`, which only works for
@@ -170,7 +138,9 @@ mod cross_surface {
                 .write_all(stdin_content.as_bytes())
                 .expect("write to child stdin must succeed");
         }
-        child.wait_with_output().expect("explicit-with-stdin wait_with_output must succeed")
+        child
+            .wait_with_output()
+            .expect("explicit-with-stdin wait_with_output must succeed")
     }
 
     /// Run the rewritten command returned by `skim rewrite`.
@@ -833,8 +803,7 @@ mod cross_surface {
         // The stub's stdout must appear: D5's run_inherited_passthrough lets the
         // child write directly to the parent's captured pipe.
         assert_eq!(
-            wrapper_out.stdout,
-            b"sqlite3-stub-output\n",
+            wrapper_out.stdout, b"sqlite3-stub-output\n",
             "sqlite3 D5: stub stdout must flow through inherited passthrough unchanged"
         );
     }
@@ -862,8 +831,12 @@ mod cross_surface {
         // Wrapper surface: D3 must not fire. The stub should be called through the
         // grep handler (not through raw passthrough with the real grep binary).
         // We verify by checking exit code and that the stub output appears.
-        let wrapper_out =
-            run_wrapper("grep", &["--", "--version", "file"], &path, cache_dir.path());
+        let wrapper_out = run_wrapper(
+            "grep",
+            &["--", "--version", "file"],
+            &path,
+            cache_dir.path(),
+        );
         assert_eq!(
             wrapper_out.status.code(),
             Some(0),
@@ -873,8 +846,7 @@ mod cross_surface {
             rw.status.code(),
         );
         assert_eq!(
-            wrapper_out.stdout,
-            b"file.txt:42:--version\n",
+            wrapper_out.stdout, b"file.txt:42:--version\n",
             "grep -- --version file: stub stdout must be returned (D3 did not fire)"
         );
     }
@@ -906,7 +878,10 @@ mod cross_surface {
         );
         // Stub output must be returned (possibly compressed through handler).
         // The stub output is 1 line so it may be returned verbatim.
-        assert!(!wrapper_out.stdout.is_empty(), "rg -- --json: stub must produce output");
+        assert!(
+            !wrapper_out.stdout.is_empty(),
+            "rg -- --json: stub must produce output"
+        );
 
         // Rewrite surface: `rg -- --json pattern` has a rewrite rule for rg;
         // the rewrite engine does not fire D4 (it uses skip_if_flag_prefix in
@@ -1008,7 +983,9 @@ mod cross_surface {
         cmd.args(["gradle", "--debug", "clean"]);
         base_env(&mut cmd, &path, cache_dir.path());
         cmd.env("SKIM_PASSTHROUGH", "1");
-        let out = cmd.output().expect("skim gradle --debug clean must be spawnable");
+        let out = cmd
+            .output()
+            .expect("skim gradle --debug clean must be spawnable");
 
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert_eq!(

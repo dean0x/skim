@@ -335,9 +335,11 @@ fn emit_result(
         // The count is exact when a `LogResult` exists: `entries.len()` emitted
         // entries against `total_lines` input lines.
         let elided = match result {
-            ParseResult::Full(r) | ParseResult::Degraded(r, _) => {
-                Some(exec::ElidedCount { kept: r.entries.len(), total: r.total_lines, unit: "lines" })
-            }
+            ParseResult::Full(r) | ParseResult::Degraded(r, _) => Some(exec::ElidedCount {
+                kept: r.entries.len(),
+                total: r.total_lines,
+                unit: "lines",
+            }),
             ParseResult::Passthrough(_) | ParseResult::RawPassthrough => None,
         };
         let status = exec::emit_json_envelope(

@@ -21,8 +21,8 @@
 
 mod common;
 
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 
 // ============================================================================
 // Hermetic repo helpers (architecture-3 / architecture-4 regression tests)
@@ -73,16 +73,12 @@ fn make_patchless_diff_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     git_in(&path, &["commit", "-m", "add text file"]);
 
     // Commit 2: 100%-similarity rename — no @@ hunks expected.
-    std::fs::rename(path.join("hello.txt"), path.join("greeting.txt"))
-        .expect("rename file");
+    std::fs::rename(path.join("hello.txt"), path.join("greeting.txt")).expect("rename file");
     git_in(&path, &["add", "-A"]);
     git_in(&path, &["commit", "-m", "rename hello.txt -> greeting.txt"]);
 
     // Commit 3: mode-only change — chmod +x, no content change → no @@ hunks.
-    git_in(
-        &path,
-        &["update-index", "--chmod=+x", "greeting.txt"],
-    );
+    git_in(&path, &["update-index", "--chmod=+x", "greeting.txt"]);
     git_in(&path, &["commit", "-m", "chmod +x greeting.txt"]);
 
     // Commit 4: add a binary file.
@@ -303,7 +299,13 @@ fn arch3_rename_100pct_diff_json_emits_lossy_marker() {
     // than a deletion + addition (which would have hunk content).
     let output = common::skim()
         .current_dir(&repo)
-        .args(["git", "diff", "HEAD~4..HEAD~3", "--find-renames=100%", "--json"])
+        .args([
+            "git",
+            "diff",
+            "HEAD~4..HEAD~3",
+            "--find-renames=100%",
+            "--json",
+        ])
         .output()
         .expect("skim git diff --json must not fail to spawn");
 

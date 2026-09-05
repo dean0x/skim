@@ -411,8 +411,7 @@ pub(super) fn run_diff(
                     // The raw text is embedded under "raw" — no information is
                     // dropped, so Reencoded is the correct declaration.
                     let json = {
-                        let envelope =
-                            serde_json::json!({"files": [], "raw": &raw_diff});
+                        let envelope = serde_json::json!({"files": [], "raw": &raw_diff});
                         serde_json::to_string_pretty(&envelope).map_err(|e| {
                             anyhow::anyhow!("failed to serialize empty-parse result: {e}")
                         })?

@@ -294,8 +294,7 @@ mod tests {
         sorted_dispatch.sort_unstable();
         sorted_known.sort_unstable();
         assert_eq!(
-            sorted_dispatch,
-            sorted_known,
+            sorted_dispatch, sorted_known,
             "lint::run dispatch keys and KNOWN_LINTERS are out of sync — \
              add the new linter to both the match statement and KNOWN_LINTERS"
         );
