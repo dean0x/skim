@@ -499,14 +499,21 @@ fn cochange_partner_strengths_carries_jaccard_both_directions() {
 }
 
 /// `paths_to_file_ids` must drop unindexed partner paths silently (returning
-/// only FileIds that exist in the manifest) and the AD-409-7 partial-drop count
-/// EXCLUDES the seed so it reports |partners_dropped| of |partners_total|, not
-/// |all_entries_dropped| of |all_entries_total|.
+/// only FileIds that exist in the manifest).
 ///
-/// When zero paths are dropped the function must NOT emit the notice at all —
-/// verified here via the return-value cardinality (the full manifest membership
-/// check is the absence condition; the stderr text is verified by the CLI E2E
-/// test `ac409_4_unindexed_partner_omission_is_disclosed`).
+/// This unit test asserts **membership only** — which paths resolve to `FileId`s
+/// and which do not.  The AD-409-7 partial-drop notice (`emit_partial_drop_notice`)
+/// writes to stderr and cannot be captured here without introducing a sink
+/// parameter into production code; its exact wording and the
+/// `(allowlist_len-1) − (found − seed_bit)` formula are covered end-to-end by
+/// `ac409_4_unindexed_partner_omission_is_disclosed`.
+///
+/// Sub-case A (partial drop): allowlist has 3 entries (seed + 2 partners), but
+/// only 2 are in the manifest — `partner_b.rs` is absent.  Exactly 2 `FileId`s
+/// must be returned and `FileId(2)` must not appear.
+///
+/// Sub-case B (no drop): allowlist has 2 entries (seed + 1 partner), both in
+/// the manifest.  Both resolve; 2 `FileId`s must be returned.
 #[test]
 fn paths_to_file_ids_drops_unindexed_partners_and_excludes_seed_from_count() {
     use rskim_search::FileId;
@@ -541,20 +548,11 @@ fn paths_to_file_ids_drops_unindexed_partners_and_excludes_seed_from_count() {
         !file_ids.contains(&FileId(2)),
         "sub-case A: partner_b.rs has no FileId and must be absent"
     );
-    // The AD-409-7 formula: dropped = allowed.len() - file_ids.len() = 3 - 2 = 1.
-    // partner_count = allowed.len() - 1 = 2 (seed excluded from total).
-    // This means the notice would read "1 of 2 co-change partners not found".
-    // That is verified by the CLI E2E test ac409_4_unindexed_partner_omission_is_disclosed.
-    let dropped = allowed.len().saturating_sub(file_ids.len());
-    let partner_count = allowed.len().saturating_sub(1); // seed excluded
-    assert_eq!(dropped, 1, "sub-case A: exactly one partner is dropped");
-    assert_eq!(
-        partner_count, 2,
-        "sub-case A: partner_count EXCLUDES the seed, so must be 2 not 3 (AD-409-7)"
-    );
+    // Notice text for this case ("1 of 2 co-change partners not found") is
+    // verified by ac409_4_unindexed_partner_omission_is_disclosed (E2E).
 
     // ── Sub-case B: no partners dropped ─────────────────────────────────────
-    // Manifest includes both seed and partner — dropped == 0 → no notice.
+    // Manifest includes both seed and partner — all resolve, no notice emitted.
     let sorted_paths_b: &[&str] = &["anchor.rs", "partner_a.rs"];
     let mut allowed_b: HashMap<String, f64> = HashMap::new();
     allowed_b.insert("anchor.rs".to_string(), super::SEED_STRENGTH);
@@ -562,16 +560,11 @@ fn paths_to_file_ids_drops_unindexed_partners_and_excludes_seed_from_count() {
 
     let file_ids_b = super::paths_to_file_ids(sorted_paths_b, &allowed_b);
 
+    // Cardinality == allowlist size confirms zero drop (both entries resolved).
     assert_eq!(
         file_ids_b.len(),
         2,
         "sub-case B: all indexed paths must be present — no drop"
-    );
-    // dropped == 0: the notice MUST NOT fire (verified by return-value cardinality).
-    let dropped_b = allowed_b.len().saturating_sub(file_ids_b.len());
-    assert_eq!(
-        dropped_b, 0,
-        "sub-case B: zero paths dropped — AD-409-7 notice must NOT be emitted"
     );
 }
 
