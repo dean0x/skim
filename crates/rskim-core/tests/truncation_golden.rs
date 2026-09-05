@@ -9,9 +9,21 @@
 //! `INSTA_UPDATE=always cargo nextest run -p rskim-core` and commit the new
 //! snapshots alongside the fix.
 //!
+//! # What these goldens can and cannot show
+//!
+//! An unchanged snapshot proves only that output did not move — never that the
+//! output is correct, since a golden records whatever the code produced when it
+//! was blessed, bugs included, and re-blessing the whole set is one environment
+//! variable away.  Do not cite "no snapshots moved" as evidence that a change is
+//! correct; that argument needs assertions which state the expected contract
+//! (see `truncation_markers.rs`, which pins ADR-016 line bounds directly).
+//! These goldens answer a narrower question: did anything change that nobody
+//! intended to change?
+//!
 //! # Coverage
 //!
-//! 5 languages × 6 modes × 4 bound variants = 120 snapshot cells.
+//! 5 languages × 6 modes × 4 bound variants, minus the combinations that are
+//! not generated: 76 snapshot cells.
 //! Not all cells produce distinct output (e.g. Full mode ignores max_lines);
 //! the value comes from the matrix completeness, not the distinctness.
 //!

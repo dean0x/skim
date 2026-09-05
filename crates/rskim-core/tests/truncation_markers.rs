@@ -41,18 +41,6 @@ fn xform(source: &str, language: Language, config: TransformConfig) -> String {
         .expect("transform must succeed for fixture inputs")
 }
 
-/// Count non-marker content lines.
-#[allow(dead_code)] // retained for tests that assert content-vs-marker composition
-fn content_lines(output: &str) -> Vec<&str> {
-    output
-        .lines()
-        .filter(|l| {
-            // A truncation marker contains "truncated" or "lines above" (last_lines variant).
-            !l.contains("truncated") && !l.contains("lines above")
-        })
-        .collect()
-}
-
 // ============================================================================
 // (a) Missing marker on pseudo/minimal + --max-lines
 // ============================================================================
@@ -228,10 +216,17 @@ fn test_token_budget_zero_budget_never_returns_empty() {
 // (d) Off-by-one: pseudo --max-lines=N must emit N content lines (not N-1)
 // ============================================================================
 
-/// `--max-lines N` = at most N lines TOTAL, marker included (b5507ad / ADR-002).
+/// `--max-lines N` = at most N lines TOTAL, marker included (ADR-016).
 /// It backs the `head -N` rewrite, and `head -N` emits at most N lines — a bound
 /// the tool can exceed is not a bound. So a truncating run emits N-1 content
 /// lines plus one elision marker.
+///
+/// These are LINE-BASED modes (pseudo/minimal), where `simple_line_truncate`
+/// emits exactly N lines once truncation fires. The assertion is therefore an
+/// equality, not an upper bound: `<=` alone is one-sided and is satisfied by an
+/// over-truncating regression that returns 2 lines under `--max-lines 20`
+/// (PF-025 rule 9). AST multi-span modes legitimately emit fewer than N and
+/// keep `<=` elsewhere in this file.
 #[test]
 fn test_pseudo_max_lines_n_emits_n_total_lines_rust() {
     // RUST_SIMPLE has 34 source lines; pseudo output has more than 20 lines.
@@ -241,17 +236,26 @@ fn test_pseudo_max_lines_n_emits_n_total_lines_rust() {
         Language::Rust,
         TransformConfig::with_mode(Mode::Pseudo).with_max_lines(n),
     );
-    assert!(
-        out.lines().count() <= n,
-        "pseudo + --max-lines={n} must not exceed {n} lines total (got {}).\n\
-         Full output:\n{out}",
-        out.lines().count()
+    let total_pseudo = xform(
+        RUST_SIMPLE,
+        Language::Rust,
+        TransformConfig::with_mode(Mode::Pseudo),
     );
-    assert!(
-        out.contains("truncated"),
-        "pseudo + --max-lines={n} elided content and must disclose it.\n\
-         Full output:\n{out}"
-    );
+    if total_pseudo.lines().count() > n {
+        assert_eq!(
+            out.lines().count(),
+            n,
+            "ADR-016: pseudo + --max-lines={n} must emit exactly {n} lines TOTAL \
+             when truncating (got {}).\n\
+             Full output:\n{out}",
+            out.lines().count()
+        );
+        assert!(
+            out.contains("truncated"),
+            "pseudo + --max-lines={n} elided content and must disclose it.\n\
+             Full output:\n{out}"
+        );
+    }
 }
 
 #[test]
@@ -270,9 +274,11 @@ fn test_pseudo_max_lines_n_emits_n_total_lines_go() {
     );
     // Only run the assertion when the pseudo output exceeds the budget.
     if total_pseudo.lines().count() > n {
-        assert!(
-            out.lines().count() <= n,
-            "pseudo + --max-lines={n} must not exceed {n} lines total (got {}).\n\
+        assert_eq!(
+            out.lines().count(),
+            n,
+            "ADR-016: pseudo + --max-lines={n} must emit exactly {n} lines TOTAL \
+             when truncating (got {}).\n\
              Full output:\n{out}",
             out.lines().count()
         );
@@ -298,9 +304,11 @@ fn test_minimal_max_lines_n_emits_n_total_lines() {
         TransformConfig::with_mode(Mode::Minimal),
     );
     if total_minimal.lines().count() > n {
-        assert!(
-            out.lines().count() <= n,
-            "minimal + --max-lines={n} must not exceed {n} lines total (got {}).\n\
+        assert_eq!(
+            out.lines().count(),
+            n,
+            "ADR-016: minimal + --max-lines={n} must emit exactly {n} lines TOTAL \
+             when truncating (got {}).\n\
              Full output:\n{out}",
             out.lines().count()
         );
