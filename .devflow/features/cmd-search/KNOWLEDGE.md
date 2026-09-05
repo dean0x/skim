@@ -669,7 +669,9 @@ pub(super) fn resolve_blast_radius_file_ids(
 ) -> anyhow::Result<Option<HashSet<FileId>>>
     // Single resolver for the standalone --ast path's blast-radius.
     // Calls resolve_blast_radius_paths → extracts BlastRadiusStrengths →
-    // uses paths_to_file_ids(sorted_paths, allowed_paths) for O(n log n) lookup.
+    // uses paths_to_file_ids(sorted_paths, allowed_paths): ONE linear pass over
+    // sorted_paths with an O(1) map lookup per entry — O(n) in the indexed file
+    // count, not a binary search (AD-409-5).
 
 pub(super) fn apply_temporal_enrichment(
     results: &mut [ResolvedResult], sort: TemporalSort, db
@@ -988,9 +990,12 @@ Files:
   ordering in ADR-006 requires the refresh to happen BEFORE `open_ast_engine`.
   A stale AST index must be rebuilt before the query engine is opened.
 
-- **Using `paths_to_file_ids` or `paths_to_scored_file_ids` without a sorted `sorted_paths` input**:
-  both functions use binary search and require the input to be lexicographically sorted.
-  `manifest.sorted_paths()` guarantees this; building the slice manually does not.
+- **Using `paths_to_file_ids` or `paths_to_scored_file_ids` with a `sorted_paths` slice
+  that is not the manifest's own sorted order**: both functions derive `FileId(idx)` from
+  the *position* of each entry in the slice, so the slice must be exactly
+  `manifest.sorted_paths()`. Neither performs a binary search — each does ONE linear pass
+  over the slice with an O(1) map lookup per entry (AD-409-5) — so an unsorted or
+  re-ordered slice does not fail loudly; it silently yields wrong `FileId`s.
 
 - **Applying the blast-radius FileId filter AFTER truncating to `--limit`**: the
   blast-radius intersection must happen before truncation (PF-006: silent

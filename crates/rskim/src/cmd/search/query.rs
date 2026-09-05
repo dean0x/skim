@@ -1031,10 +1031,10 @@ fn run_blast_radius_composite_query(
     config: &super::types::QueryConfig,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
-    // Precondition: this function is only dispatched when blast_radius_paths is
-    // Some (execute_query_with_manifest line ~587).  `blast_temporal_layer` has
-    // a safe `?` fallback for None, but the assertion makes the invariant
-    // checkable rather than narrative (reliability.md; ADR-009).
+    // Precondition: this function is only dispatched from the
+    // `config.blast_radius_paths.is_some()` gate in `execute_query_with_manifest`.
+    // `blast_temporal_layer` has a safe `?` fallback for None, but the assertion
+    // makes the invariant checkable rather than narrative (reliability.md; ADR-009).
     debug_assert!(
         config.blast_radius_paths.is_some(),
         "composite blast-radius arm requires a resolved allowlist \
