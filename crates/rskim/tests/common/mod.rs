@@ -36,6 +36,70 @@ pub fn skim() -> assert_cmd::Command {
     c
 }
 
+/// Spawn a sandboxed skim binary with bounded retry on ETXTBSY (os error 26).
+///
+/// # Why this exists
+///
+/// On Linux, `execve(2)` fails with ETXTBSY ("Text file busy") when a
+/// concurrently-forked child process holds an open writable file descriptor to
+/// the binary being exec'd.  This race surfaces when parallel integration tests
+/// do `std::fs::copy(src, dest)` and immediately exec `dest`: another test's
+/// `fork()` can inherit the writable fd from `std::fs::copy` before the parent
+/// closes it (the fd is O_CLOEXEC-marked, so it is released when *that child*
+/// execs, but not before).  The kernel keeps the inode's write count nonzero
+/// for the duration of that window — typically a few milliseconds under normal
+/// load.
+///
+/// # Protocol
+///
+/// `configure` is called once per attempt so the command can be freshly
+/// rebuilt without consuming a shared mutable builder.  Returns an [`Assert`]
+/// ready for chaining `.success()`, `.failure()`, etc.
+///
+/// # Bound
+///
+/// Exactly `ETXTBSY_MAX_ATTEMPTS` (5) total tries.  Back-off is
+/// `25 ms × 2^attempt`, giving cumulative sleep of at most
+/// 25 + 50 + 100 + 200 = 375 ms across the four retries before giving up.
+///
+/// [`Assert`]: assert_cmd::assert::Assert
+pub fn skim_sandboxed_with_bin_retried<F>(
+    home: &std::path::Path,
+    bin: &std::path::Path,
+    configure: F,
+) -> assert_cmd::assert::Assert
+where
+    F: Fn(&mut assert_cmd::Command),
+{
+    /// POSIX ETXTBSY — "Text file busy".  Value 26 is correct on Linux and macOS.
+    const ETXTBSY: i32 = 26;
+    /// Maximum spawn attempts before giving up.  Five covers the race window
+    /// observed in CI (typically resolved in 1–2 retries) with headroom to spare.
+    const ETXTBSY_MAX_ATTEMPTS: u32 = 5;
+
+    for attempt in 0..ETXTBSY_MAX_ATTEMPTS {
+        let mut cmd = skim_sandboxed_with_bin(home, bin);
+        configure(&mut cmd);
+        match cmd.output() {
+            Ok(output) => return assert_cmd::assert::Assert::new(output),
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                // Another process holds a writable fd to the binary.  Sleep
+                // briefly and let it exec (which closes the O_CLOEXEC fd).
+                if attempt + 1 < ETXTBSY_MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(25u64 << attempt));
+                } else {
+                    panic!(
+                        "spawn still ETXTBSY after {} attempts: {}",
+                        ETXTBSY_MAX_ATTEMPTS, e
+                    );
+                }
+            }
+            Err(e) => panic!("spawn failed (attempt {}): {}", attempt + 1, e),
+        }
+    }
+    unreachable!("loop exits only via return or panic")
+}
+
 /// Build a sandboxed command for the given skim binary path.
 ///
 /// This is the **single authoritative source** for the sandbox env-var block
