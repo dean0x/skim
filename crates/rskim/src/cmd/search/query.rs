@@ -536,6 +536,16 @@ pub(super) fn execute_query_with_manifest(
         // the only consumer of this set; the composite arm derives its own scored
         // layer.  Computing it inside the branch also skips a wasted O(manifest) pass
         // on the composite arm.
+        //
+        // Disclosure asymmetry (AD-413-16): when blast_radius_paths is the
+        // AnchorDiffers sentinel (Some(empty)), `paths_to_file_ids` delegates to
+        // `paths_to_scored_file_ids` which emits "matched 0 indexed files" on stderr
+        // for this arm.  The composite blast-radius arm (below) does NOT emit that
+        // notice for the AnchorDiffers case — `blast_temporal_layer` short-circuits
+        // before calling `paths_to_scored_file_ids` because `resolve_blast_radius_paths`
+        // already emitted the mismatch notice.  Both arms return zero results; the
+        // extra notice on this arm is redundant but harmless (AC-7 governs
+        // double-counting only within a single dispatch path).  Tracked in #528.
         let blast_file_ids: Option<HashSet<FileId>> = config
             .blast_radius_paths
             .as_ref()
@@ -741,6 +751,30 @@ struct QueryContext<'a> {
     start: Instant,
 }
 
+/// Build a zero-result [`QueryOutput`] for early-out guards that share an
+/// identical nine-field literal across [`run_compound_query`] and
+/// [`run_blast_radius_composite_query`].
+///
+/// Centralising the construction means adding a field to `QueryOutput` requires
+/// one edit here rather than three (or more) scattered sites.
+fn empty_output(
+    config: &super::types::QueryConfig,
+    ctx: &QueryContext<'_>,
+    vm_label: Option<&'static str>,
+) -> QueryOutput {
+    QueryOutput {
+        query: config.text.clone(),
+        total: 0,
+        has_more: false,
+        verify_mode: vm_label,
+        results: vec![],
+        duration_ms: ctx.start.elapsed().as_millis() as u64,
+        index_stats: Some(ctx.stats.clone()),
+        ast_coverage: None,
+        degraded: vec![],
+    }
+}
+
 /// Execute the compound text+AST query branch (#198, #356).
 ///
 /// Restricts the lexical engine to the AST-matched FileId set (AD-356-1),
@@ -778,17 +812,7 @@ fn run_compound_query(
     // Correctness guard (AC12): an empty file_filter causes the reader to score
     // zero files regardless of sq.limit.
     if ast_fid_set.is_empty() {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
+        return Ok(empty_output(config, &ctx, vm_label));
     }
 
     // Compute the lexical file_filter and pool size (AD-356-1 / AD-356-2).
@@ -817,17 +841,7 @@ fn run_compound_query(
     // guards prevent unnecessary reader/intersect work and make the intent
     // explicit rather than relying on reader side-effect semantics (#356, ADR-003).
     if filter_set.is_empty() {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
+        return Ok(empty_output(config, &ctx, vm_label));
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
     // guaranteed by the early-out above, so .max(1) is now a compile-time
@@ -1018,6 +1032,15 @@ fn run_blast_radius_composite_query(
     config: &super::types::QueryConfig,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
+    // Precondition: this function is only dispatched when blast_radius_paths is
+    // Some (execute_query_with_manifest line ~587).  `blast_temporal_layer` has
+    // a safe `?` fallback for None, but the assertion makes the invariant
+    // checkable rather than narrative (reliability.md; ADR-009).
+    debug_assert!(
+        config.blast_radius_paths.is_some(),
+        "composite blast-radius arm requires a resolved allowlist \
+         (guaranteed by execute_query_with_manifest at the blast_radius_paths.is_some() gate)"
+    );
     // AD-403-7: compute once for all QueryOutput sites in this function.
     let vm_label = verify_mode_for(config.phrase, config.near).json_label();
 
@@ -1038,17 +1061,7 @@ fn run_blast_radius_composite_query(
     // unresolvable allowlist never triggers a wasted corpus-wide BM25F pass —
     // restoring the pre-#409 early-out ordering.
     let Some(temporal_layer) = blast_temporal_layer(config, ctx.sorted) else {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
+        return Ok(empty_output(config, &ctx, vm_label));
     };
 
     // Step 1: fetch a WIDE lexical ranked list WITHOUT a file_filter.

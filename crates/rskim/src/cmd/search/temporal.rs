@@ -930,7 +930,7 @@ pub(super) fn cochange_partner_strengths(
             // Clamp to the mathematical Jaccard range [0.0, 1.0].  Non-finite
             // values and out-of-range values (including a corrupt 2.0 that would
             // impersonate SEED_STRENGTH) are both mapped to the floor.
-            let safe = if j.is_finite() && j >= 0.0 && j <= 1.0 {
+            let safe = if j.is_finite() && (0.0..=1.0).contains(&j) {
                 j
             } else {
                 NON_FINITE_JACCARD_FLOOR

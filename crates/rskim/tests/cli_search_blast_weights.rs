@@ -44,11 +44,13 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command as StdCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use tempfile::TempDir;
+
+mod common;
+use common::git_fixture::{git_commit, git_init, now_epoch, write_and_stage};
 
 // ============================================================================
 // Helpers
@@ -74,77 +76,6 @@ fn find_temporal_db(cache: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Return the current Unix epoch in seconds.
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_secs()
-}
-
-/// Initialise a git repository with hermetic, non-signing identity.
-fn git_init(dir: &Path) {
-    for args in &[
-        vec!["init"],
-        vec!["config", "user.email", "test@t.invalid"],
-        vec!["config", "user.name", "Test"],
-        vec!["config", "commit.gpgsign", "false"],
-    ] {
-        let s = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap_or_else(|e| panic!("git {:?}: {e}", args));
-        assert!(
-            s.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&s.stderr)
-        );
-    }
-    // Use "main" as the initial branch name.
-    let _ = StdCommand::new("git")
-        .args(["checkout", "-b", "main"])
-        .current_dir(dir)
-        .output();
-}
-
-/// Write `content` to `dir/<filename>` and stage it.
-fn write_and_stage(dir: &Path, filename: &str, content: &str) {
-    let path = dir.join(filename);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(&path, content).unwrap_or_else(|e| panic!("write {filename}: {e}"));
-    let s = StdCommand::new("git")
-        .args(["add", filename])
-        .current_dir(dir)
-        .output()
-        .expect("git add");
-    assert!(s.status.success(), "git add {filename} failed");
-}
-
-/// Commit staged changes with pinned author and committer timestamps.
-///
-/// `ts` is a Unix epoch value used for both `GIT_AUTHOR_DATE` and
-/// `GIT_COMMITTER_DATE` so tests are deterministic across timezones.
-fn git_commit(dir: &Path, message: &str, ts: u64) {
-    let ts_str = ts.to_string();
-    let s = StdCommand::new("git")
-        .args(["commit", "--no-verify", "-m", message])
-        .env("GIT_AUTHOR_DATE", &ts_str)
-        .env("GIT_COMMITTER_DATE", &ts_str)
-        .current_dir(dir)
-        .output()
-        .expect("git commit");
-    assert!(
-        s.status.success(),
-        "git commit '{}' failed: {}",
-        message,
-        String::from_utf8_lossy(&s.stderr)
-    );
-}
-
 /// Build lexical + temporal index for `proj` into `cache`.
 fn build_index(proj: &Path, cache: &Path) {
     let out = StdCommand::new(cargo_bin("skim"))
@@ -165,6 +96,9 @@ fn build_index(proj: &Path, cache: &Path) {
 ///
 /// Unlike [`run_search_json`], this helper does **not** append `--json`; callers that
 /// need JSON output must pass `"--json"` in `extra_args`.
+///
+/// Does **not** check the exit code — use [`run_search_raw_ok`] when the test
+/// contract requires exit 0.
 fn run_search_raw(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let out = StdCommand::new(cargo_bin("skim"))
         .args(["search"])
@@ -175,6 +109,31 @@ fn run_search_raw(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, V
         .env("SKIM_DISABLE_ANALYTICS", "1")
         .output()
         .expect("skim search");
+    (out.stdout, out.stderr)
+}
+
+/// Like [`run_search_raw`] but asserts exit 0 before returning.
+///
+/// Use this whenever the test contract states that the command MUST exit 0
+/// (AC-7, AC-16b) so that a non-zero exit causes an immediate, diagnostic
+/// test failure rather than a silent parse mismatch downstream.
+fn run_search_raw_ok(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>) {
+    let out = StdCommand::new(cargo_bin("skim"))
+        .args(["search"])
+        .args(extra_args)
+        .args(["--root"])
+        .arg(proj)
+        .env("SKIM_CACHE_DIR", cache)
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim search");
+    assert!(
+        out.status.success(),
+        "skim search {:?} exited {:?} (expected exit 0); stderr: {}",
+        extra_args,
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     (out.stdout, out.stderr)
 }
 
@@ -711,7 +670,11 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
     // Run blast-radius on anchor.rs with temporal-only weights.
     // aweak.rs is in temporal.db (co-change partner) but NOT in the lexical manifest.
     // AD-409-7: exactly one stderr line must be emitted naming the dropped count.
-    let (stdout, stderr) = run_search_raw(
+    //
+    // AC-7 also requires exit 0 — run_search_raw_ok panics if the exit code is non-zero,
+    // so a regression that makes this arm crash is caught immediately rather than silently
+    // propagating as a parse mismatch.
+    let (stdout, stderr) = run_search_raw_ok(
         dir.path(),
         cache.path(),
         &[
@@ -727,9 +690,6 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
     );
 
     let stderr_text = String::from_utf8_lossy(&stderr);
-
-    // Exit 0: the notice must NOT change the exit code.
-    // (checked by the fact that run_search_raw returned — we parse the JSON below)
 
     // AD-409-7: the stderr must contain the "not found in the indexed manifest" notice.
     // The count excludes the seed (anchor.rs) from the total — "1 of 1" partner dropped.
@@ -755,6 +715,20 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
         notice_lines, 1,
         "AC-7: the partial-drop notice must appear EXACTLY once, not {notice_lines} times; \
          got: {stderr_text:?}"
+    );
+
+    // Positive contract: anchor.rs (the seed) must appear in the results.
+    // aweak.rs was the only co-change partner but is absent from the manifest;
+    // anchor.rs IS in the manifest (as seed with SEED_STRENGTH) and must be returned.
+    let v: Value =
+        serde_json::from_slice(&stdout).expect("AC-7: skim search --json must produce valid JSON");
+    let results = v["results"]
+        .as_array()
+        .expect("AC-7: results must be an array");
+    let paths: Vec<&str> = results.iter().filter_map(|r| r["path"].as_str()).collect();
+    assert!(
+        paths.contains(&"anchor.rs"),
+        "AC-7: anchor.rs (the seed) must appear in the temporal layer results; got: {paths:?}"
     );
 
     // JSON stdout must not contain any new key for the dropped partners.
@@ -878,7 +852,9 @@ fn ac409_7_seed_unindexed_notice() {
     // entries → seed_resolved = false → emit_seed_unindexed_notice().
     // partner.rs IS in manifest entries → partner_count=1, partners_found=1, dropped=0
     // → emit_partial_drop_notice emits nothing.
-    let (_, stderr) = run_search_raw(
+    //
+    // AC-7 also requires exit 0 (the notice must not change the exit code).
+    let (stdout, stderr) = run_search_raw_ok(
         dir.path(),
         cache.path(),
         &[
@@ -907,6 +883,20 @@ fn ac409_7_seed_unindexed_notice() {
         !stderr_text.contains("co-change partners not found"),
         "AC-7 / AD-409-7: seed-unindexed case must NOT emit 'co-change partners not found' \
          when zero partners are dropped; got: {stderr_text:?}"
+    );
+
+    // Positive contract: partner.rs must appear in results (it is the only resolved partner).
+    // AC-7 requires that exit 0 && partner.rs in results; asserting just exit 0 (PF-007).
+    let v: Value = serde_json::from_slice(&stdout)
+        .expect("AC-7 seed-unindexed: skim search --json must produce valid JSON");
+    let results = v["results"]
+        .as_array()
+        .expect("AC-7: results must be an array");
+    let paths: Vec<&str> = results.iter().filter_map(|r| r["path"].as_str()).collect();
+    assert!(
+        paths.contains(&"partner.rs"),
+        "AC-7 seed-unindexed: partner.rs must appear in temporal layer results \
+         (it is the one co-change partner that IS in the manifest); got: {paths:?}"
     );
 }
 
@@ -1080,15 +1070,17 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
         "5",
         "--json",
     ];
-    let (stdout1, _stderr1) = run_search_raw(clone_dir.path(), cache.path(), composite_args);
-    let (stdout2, _stderr2) = run_search_raw(clone_dir.path(), cache.path(), composite_args);
+    let (stdout1, _stderr1) = run_search_raw_ok(clone_dir.path(), cache.path(), composite_args);
+    let (stdout2, _stderr2) = run_search_raw_ok(clone_dir.path(), cache.path(), composite_args);
 
     // AC-16b: ranked result paths must be identical across two runs (determinism).
     // Byte-identical comparison is avoided because `duration_ms` legitimately
     // varies between calls; comparing the ranked result-path list is sufficient
     // to assert that the ranking is deterministic (PF-007).
-    let v1: Value = serde_json::from_slice(&stdout1).unwrap_or(Value::Null);
-    let v2: Value = serde_json::from_slice(&stdout2).unwrap_or(Value::Null);
+    let v1: Value = serde_json::from_slice(&stdout1)
+        .expect("AC-16b: skim search --json must emit valid JSON (run 1)");
+    let v2: Value = serde_json::from_slice(&stdout2)
+        .expect("AC-16b: skim search --json must emit valid JSON (run 2)");
 
     let paths_of = |v: &Value| -> Vec<String> {
         v["results"]
@@ -1110,33 +1102,23 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
     let v = v1;
 
     // AC-16b degraded contract: HEAD is a merge commit → #407 skips all commits →
-    // temporal DB is empty → composite arm emits `degraded` with subsystem "temporal".
-    // When temporal data is unexpectedly available (e.g. git behaviour change),
-    // we assert non-empty results instead so a zero-result response does not silently
-    // pass (PF-007: assert observable output, not just exit 0).
-    let degraded = v["degraded"].as_array();
-    if let Some(degs) = degraded {
-        // degraded key is present → must contain a "temporal" subsystem element.
-        assert!(
-            !degs.is_empty(),
-            "AC-16b: if degraded key is present it must be non-empty; got: {degs:?}"
-        );
-        let has_temporal = degs
-            .iter()
-            .any(|d| d["subsystem"].as_str() == Some("temporal"));
-        assert!(
-            has_temporal,
-            "AC-16b: degraded array must contain a 'temporal' subsystem element; \
-             got: {degs:?}"
-        );
-    } else {
-        // degraded key absent → temporal was unexpectedly healthy; assert results are
-        // non-empty so a zero-result response does not silently pass (PF-007).
-        let total = v["total"].as_i64().unwrap_or(-1);
-        assert!(
-            total > 0,
-            "AC-16b: when temporal is healthy on a shallow clone, blast-radius \
-             must return at least one result; got total={total}"
-        );
-    }
+    // temporal DB is empty → composite arm ALWAYS emits `degraded` with subsystem
+    // "temporal". The fixture guarantees this state (merge-commit HEAD + shallow
+    // clone → zero non-merge commits visible → temporal DB empty after build).
+    // The assertion is unconditional: no `else` branch (PF-007).
+    let degs = v["degraded"].as_array().expect(
+        "AC-16b: 'degraded' key must be present — fixture guarantees temporal is \
+             unavailable (merge-commit HEAD + shallow clone = zero non-merge commits)",
+    );
+    assert!(
+        !degs.is_empty(),
+        "AC-16b: degraded array must be non-empty; got: {degs:?}"
+    );
+    let has_temporal = degs
+        .iter()
+        .any(|d| d["subsystem"].as_str() == Some("temporal"));
+    assert!(
+        has_temporal,
+        "AC-16b: degraded array must contain a 'temporal' subsystem element; got: {degs:?}"
+    );
 }
