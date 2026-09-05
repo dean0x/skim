@@ -1,7 +1,7 @@
 ---
 feature: cmd-search
 name: Search CLI (skim search subcommand)
-description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, binary manifest, SKFM, MANIFEST_FORMAT_VERSION, version_matches, manifest_stale, total-on-disk size, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, cochange_partner_paths, temporal_build, build_lock, AstNgramCache, CachedAstEntry, CompositeWeights6, --weights, layers_matched, AstResult, format_ast_json, format_ast_text, recover_line, read_line_at, resolve_git_dir, is_hex_sha, warn_skip, MIN_COCHANGE_JACCARD, LOCK_POLL_MS, LOCK_DEADLINE_SECS, stderr prefix, skim search:, skim search [debug]:, skim_bin_path, query_substring_present, run_compound_query, filter_set, disjoint blast radius, accumulate_posting_tfs, collect_scored_results, temporal_annotation_tag, shrink_to_fit, postings_buf, WorkingTreeDelta, WorkingTreeChanged, scan_working_tree, freshness_entries, temporal_db_is_stale, try_rebuild_temporal_nonfatal, ValidityMarker, validity, weights_inert_notice, wilson_lower_bound, risk_score_wilson_decay, AD-378, AD-379, AD-376, AD-377, AD-413-15, AD-413-16, AD-413-17, HeadState, git_head_state, resolve_common_dir, resolve_repo_toplevel, ReanchorPolicy, AnchorState, temporal_anchor_state, anchor_state_on_db, warn_if_temporal_unverifiable, warn_if_temporal_unverifiable_at, read_temporal_meta, RefreshOutcome, resolve_hooks_dir, SHARED_HOOKS_SCOPE_MSG, HooksOutcome, create_real_git_worktree, apply_scope_filter, record_temporal_anchor, gitdir.rs, temporal_state.rs."
+description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, binary manifest, SKFM, MANIFEST_FORMAT_VERSION, version_matches, manifest_stale, total-on-disk size, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, paths_to_scored_file_ids, cochange_partner_strengths, BlastRadiusStrengths, BlastRadiusResolution, SEED_STRENGTH, temporal_build, build_lock, AstNgramCache, CachedAstEntry, CompositeWeights6, --weights, layers_matched, AstResult, format_ast_json, format_ast_text, recover_line, read_line_at, resolve_git_dir, is_hex_sha, warn_skip, MIN_COCHANGE_JACCARD, LOCK_POLL_MS, LOCK_DEADLINE_SECS, stderr prefix, skim search:, skim search [debug]:, skim_bin_path, query_substring_present, run_compound_query, filter_set, disjoint blast radius, accumulate_posting_tfs, collect_scored_results, temporal_annotation_tag, shrink_to_fit, postings_buf, WorkingTreeDelta, WorkingTreeChanged, scan_working_tree, freshness_entries, temporal_db_is_stale, try_rebuild_temporal_nonfatal, ValidityMarker, validity, weights_inert_notice, wilson_lower_bound, risk_score_wilson_decay, AD-378, AD-379, AD-376, AD-377, AD-413-15, AD-413-16, AD-413-17, HeadState, git_head_state, resolve_common_dir, resolve_repo_toplevel, ReanchorPolicy, AnchorState, temporal_anchor_state, anchor_state_on_db, warn_if_temporal_unverifiable, warn_if_temporal_unverifiable_at, read_temporal_meta, RefreshOutcome, resolve_hooks_dir, SHARED_HOOKS_SCOPE_MSG, HooksOutcome, create_real_git_worktree, apply_scope_filter, record_temporal_anchor, gitdir.rs, temporal_state.rs."
 category: architecture
 directories: [crates/rskim/src/cmd/search/]
 referencedFiles:
@@ -81,8 +81,9 @@ cmd/search/
                           run_ast_standalone; read_line_at; pattern_description;
                           re-exports: AstResult, format_ast_json, format_ast_text (from rskim_search)
   temporal.rs           — open_temporal_db; resort_window; resolve_blast_radius_paths;
-                          resolve_blast_radius_file_ids; paths_to_file_ids;
-                          cochange_partner_paths; query_standalone; apply_temporal_enrichment;
+                          resolve_blast_radius_file_ids; paths_to_file_ids; paths_to_scored_file_ids;
+                          cochange_partner_strengths; BlastRadiusResolution; BlastRadiusStrengths;
+                          SEED_STRENGTH; query_standalone; apply_temporal_enrichment;
                           enrich_ast_results; format_temporal_text; format_temporal_json;
                           normalize_blast_radius_path; check_temporal_staleness (#[cfg(test)] only)
   temporal_build.rs     — rebuild_temporal; build_hotspot_rows; build_risk_rows;
@@ -657,16 +658,18 @@ pub(super) fn normalize_blast_radius_path(raw: &str, root: &Path) -> anyhow::Res
     // Strips root prefix; replaces \\ with / for Windows cross-platform consistency.
 
 pub(super) fn resolve_blast_radius_paths(
-    blast_radius: Option<&str>, root, db_path, json
-) -> anyhow::Result<Option<HashSet<String>>>
-    // Normalizes path, opens db, queries cochanges_for_file, returns partner paths
-    // Returns Ok(None) when temporal.db is absent (graceful degradation)
+    blast_radius: Option<&str>, root, cache_dir, json, head
+) -> anyhow::Result<BlastRadiusResolution>
+    // Normalizes path, opens db, queries cochanges_for_file, seeds target at SEED_STRENGTH (2.0).
+    // Returns BlastRadiusResolution::NotRequested (blast_radius None), ::Allowed(BlastRadiusStrengths),
+    // ::Filtered{allow, degraded} (RepositoryMismatch), or ::Degraded(u) (other unavailable).
 
 pub(super) fn resolve_blast_radius_file_ids(
-    blast_radius, root, db_path, sorted_paths: &[&str], json
+    blast_radius, root, cache_dir, sorted_paths: &[&str], json, head
 ) -> anyhow::Result<Option<HashSet<FileId>>>
-    // Single resolver for the standalone --ast path's blast-radius
-    // uses paths_to_file_ids(sorted_paths, partner_paths_set) for O(n log n) lookup
+    // Single resolver for the standalone --ast path's blast-radius.
+    // Calls resolve_blast_radius_paths → extracts BlastRadiusStrengths →
+    // uses paths_to_file_ids(sorted_paths, allowed_paths) for O(n log n) lookup.
 
 pub(super) fn apply_temporal_enrichment(
     results: &mut [ResolvedResult], sort: TemporalSort, db
@@ -901,7 +904,7 @@ struct Flags {
 
 struct QueryConfig {
     text, limit, offset: Option<usize>, json, root, cache_dir,
-    blast_radius_paths: Option<HashSet<String>>,
+    blast_radius_paths: Option<BlastRadiusStrengths>,  // HashMap<String, f64>; seed at SEED_STRENGTH=2.0
     ast_scored: Option<Vec<(FileId, f64)>>,   // FileId-ASC sorted
     composite_weights: Option<CompositeWeights6>,
 }
@@ -985,8 +988,8 @@ Files:
   ordering in ADR-006 requires the refresh to happen BEFORE `open_ast_engine`.
   A stale AST index must be rebuilt before the query engine is opened.
 
-- **Using `paths_to_file_ids` without a sorted `sorted_paths` input**: the function
-  uses binary search and requires the input to be lexicographically sorted.
+- **Using `paths_to_file_ids` or `paths_to_scored_file_ids` without a sorted `sorted_paths` input**:
+  both functions use binary search and require the input to be lexicographically sorted.
   `manifest.sorted_paths()` guarantees this; building the slice manually does not.
 
 - **Applying the blast-radius FileId filter AFTER truncating to `--limit`**: the
@@ -1145,7 +1148,8 @@ Files:
 - `crates/rskim/src/cmd/search/temporal_build.rs` — `rebuild_temporal`;
   hotspot/risk/cochange row builders; `current_epoch_secs`; `warn_skip!` macro
 - `crates/rskim/src/cmd/search/temporal.rs` — `normalize_blast_radius_path`;
-  `resolve_blast_radius_paths`; `resolve_blast_radius_file_ids`;
+  `resolve_blast_radius_paths`; `resolve_blast_radius_file_ids`; `paths_to_scored_file_ids`;
+  `cochange_partner_strengths`; `BlastRadiusResolution`; `BlastRadiusStrengths`; `SEED_STRENGTH`;
   `apply_temporal_enrichment`; `enrich_ast_results`; `query_standalone`; formatters
 - `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`;
   `validate_ast_pattern`; `resolve_ast_scored`; `run_ast_standalone`;
