@@ -1,0 +1,6 @@
+[
+  {"databaseId": 101, "displayTitle": "Build release artifact", "status": "completed", "conclusion": "failure"},
+  {"databaseId": 102, "displayTitle": "Run tests", "status": "completed", "conclusion": "success"},
+  {"databaseId": 103, "displayTitle": "Deploy to staging", "status": "in_progress", "conclusion": ""},
+  {"databaseId": 104, "displayTitle": "Security scan", "status": "completed", "conclusion": "cancelled"}
+]

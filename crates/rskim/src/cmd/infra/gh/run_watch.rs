@@ -63,6 +63,20 @@ pub(super) const MAX_STREAM_JOBS: usize = 64;
 /// `--exit-status` flag is propagated to `gh` in spawn mode; non-zero
 /// workflow exit is forwarded as the process exit code.
 pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow::Result<ExitCode> {
+    // architecture-14: `gh run watch` streams real-time status updates over an
+    // extended period.  There is no well-defined JSON envelope for a streaming
+    // response, so `--json` cannot be honoured.  Fail loudly per the MUST
+    // "fail loud, never silently" design constraint rather than silently
+    // returning plain text.
+    if ctx.json_output {
+        eprintln!(
+            "skim: `gh run watch --json` is not supported — \
+             `gh run watch` streams live status updates and has no JSON output shape.\n\
+             Omit --json to get compressed streaming text output."
+        );
+        return Ok(ExitCode::FAILURE);
+    }
+
     let parser = Box::new(RunWatchParser::new());
 
     let label = super::super::build_streaming_label(

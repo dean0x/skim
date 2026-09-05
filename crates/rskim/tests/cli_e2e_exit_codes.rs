@@ -212,35 +212,52 @@ fn test_exit_code_pytest_passthrough_garbage() {
 // assertion to FAIL, catching the regression.
 // ============================================================================
 
-/// diff exit 1 = files differ — Full-tier compressed body, hint suppressed.
+/// diff exit 1 = files differ — passthrough tier, byte parity, hint suppressed.
 ///
-/// This is the core Fix B integration test: skim compresses the diff output
-/// (non-empty body → Full tier), propagates exit code 1, and does NOT print
-/// the "[skim] compressed output" hint because diff is in BENIGN_EXIT1_PROGRAMS.
+/// # What this pins (A3b / PF-011)
+///
+/// `parse_impl` returns `ParseResult::RawPassthrough` for every input, so there
+/// is no compressed body to assert on — the contract is now **byte parity with
+/// the tool skim actually ran**, plus faithful exit-code propagation, plus no
+/// compressed-output hint (`tier_name() == "passthrough"` is what suppresses it,
+/// independently of the `BENIGN_EXIT1_PROGRAMS` path this test originally
+/// guarded — both must hold).
+///
+/// # Fixture size is deliberately small
+///
+/// A two-line file is exactly the case a net-savings guard cannot win: it is the
+/// realistic small-input case, and the previous revision of this test enlarged it
+/// to 15 lines *specifically so the guard would keep skim's render*. Bending the
+/// input until the guard agrees tests the fixture, not the guard. Byte parity is
+/// size-independent, so the small fixture is now the honest one.
 #[test]
-fn test_diff_differing_files_exit1_full_tier_hint_suppressed() {
+fn test_diff_differing_files_exit1_passthrough_byte_parity_hint_suppressed() {
     let dir = tempfile::tempdir().unwrap();
     let file_a = dir.path().join("a.txt");
     let file_b = dir.path().join("b.txt");
     fs::write(&file_a, "alpha\nbeta\n").unwrap();
     fs::write(&file_b, "alpha\ngamma\n").unwrap();
+    let (a, b) = (file_a.to_str().unwrap(), file_b.to_str().unwrap());
+
+    // Baseline: the user's literal command. `prepare_args` is a no-op — no
+    // `-u` is injected — so `skim diff a b` runs exactly `diff a b`.
+    // (Full parity across all flag forms is pinned in `tests/cli_e2e_diff_parity.rs`.)
+    let native = std::process::Command::new("diff")
+        .args([a, b])
+        .output()
+        .expect("native diff must run");
+    assert_eq!(native.status.code(), Some(1), "precondition: files differ");
 
     skim_cmd()
-        .args(["diff", file_a.to_str().unwrap(), file_b.to_str().unwrap()])
+        .args(["diff", a, b])
         .assert()
         // Exit code must be propagated faithfully (files differ = 1).
         .code(1)
-        // stdout must contain compressed diff body (Full tier, non-empty).
-        // FileResult::render produces "diff 1" header when shown == total.
-        .stdout(predicate::str::contains("diff"))
-        .stdout(predicate::str::contains("changed"))
-        // Fix 2 (#317): the actual changed lines must survive to stdout, not
-        // just a diffstat header/footer. "beta" (deletion) and "gamma"
-        // (insertion) come from the patch body; a diffstat-only regression
-        // would drop them. These hold whether the net-savings guard emits the
-        // compressed FileResult (`-beta`/`+gamma`) or falls back to raw diff.
-        .stdout(predicate::str::contains("beta"))
-        .stdout(predicate::str::contains("gamma"))
+        // Byte parity: skim must emit exactly what the tool emitted — not a
+        // subset, not a re-render.
+        .stdout(predicates::ord::eq(
+            String::from_utf8(native.stdout).unwrap(),
+        ))
         // The hint must NOT appear: diff exit 1 is benign ("files differ"),
         // not an error. Printing the hint would mislead agents.
         .stderr(predicate::str::contains("[skim] compressed output").not());

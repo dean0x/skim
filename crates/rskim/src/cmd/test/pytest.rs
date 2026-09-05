@@ -489,35 +489,46 @@ fn flush_failure(
 /// Returns [`StdoutStatus::PipeClosed`] when the downstream reader went away, so
 /// the caller can stop and return `pipe_closed_exit()` instead of continuing to
 /// produce output.
+// No #[allow(clippy::disallowed_methods)] here: stdout writes go through
+// `write_line_to_stdout` / `write_to_stdout` (the classifying sinks), so
+// `io::stdout()` is never called directly (architecture-17).  The `io::stderr()`
+// call below is not a disallowed method.
 fn emit_result(
     result: &ParseResult<TestResult>,
     output: &CommandOutput,
     cleaned_output: &str,
 ) -> anyhow::Result<crate::cmd::execution::StdoutStatus> {
+    use crate::cmd::execution::{StdoutStatus, write_line_to_stdout, write_to_stdout};
     use std::io::Write;
 
-    let stdout = io::stdout();
+    // Stdout writes go through the classifying sinks so that `EPIPE` (downstream
+    // reader gone) is returned as `StdoutStatus::PipeClosed` and the caller can
+    // stop gracefully (architecture-17).  A raw `writeln!(io::stdout().lock(), …)?`
+    // would propagate `BrokenPipe` as an `anyhow::Error`, bypassing the
+    // `PipeClosed` path entirely and leaving the analytics derivation unreached.
+    //
+    // Stderr is acquired directly: `std::io::stderr` is not a disallowed method,
+    // and `emit_markers` requires a concrete `Write` handle.
     let stderr = io::stderr();
-    let mut out = stdout.lock();
     let mut err = stderr.lock();
 
     match result {
         ParseResult::Full(tr) | ParseResult::Degraded(tr, _) => {
-            writeln!(out, "{tr}")?;
+            if write_line_to_stdout(tr.as_ref())? == StdoutStatus::PipeClosed {
+                return Ok(StdoutStatus::PipeClosed);
+            }
             result.emit_markers(&mut err)?;
 
-            if tr.summary.fail > 0 {
-                // `emit_failure_context` takes its own stdout lock; `Stdout` is
-                // backed by a reentrant lock, so nesting is safe.
-                if shared::emit_failure_context(cleaned_output, 1)?
-                    == crate::cmd::execution::StdoutStatus::PipeClosed
-                {
-                    return Ok(crate::cmd::execution::StdoutStatus::PipeClosed);
-                }
+            if tr.summary.fail > 0
+                && shared::emit_failure_context(cleaned_output, 1)? == StdoutStatus::PipeClosed
+            {
+                return Ok(StdoutStatus::PipeClosed);
             }
         }
         ParseResult::Passthrough(raw) => {
-            write!(out, "{raw}")?;
+            if write_to_stdout(raw)? == StdoutStatus::PipeClosed {
+                return Ok(StdoutStatus::PipeClosed);
+            }
             result.emit_markers(&mut err)?;
         }
         ParseResult::RawPassthrough => {
@@ -530,7 +541,7 @@ fn emit_result(
         write!(err, "{}", output.stderr)?;
     }
 
-    Ok(crate::cmd::execution::StdoutStatus::Written)
+    Ok(StdoutStatus::Written)
 }
 
 // ============================================================================
@@ -964,6 +975,61 @@ FAILED tests/test_b.py::test_two - assert 1 == 2
         assert!(
             detect_section_header("=== warnings summary").is_none(),
             "=== prefix without === suffix should return None"
+        );
+    }
+
+    // ========================================================================
+    // architecture-17: emit_result uses the classifying sink (write_line_to_stdout)
+    // ========================================================================
+
+    /// Verify that emit_result returns StdoutStatus::Written for a Passthrough
+    /// result (empty raw content), proving that the function correctly uses
+    /// the classifying sink and returns the right status when the pipe is open.
+    ///
+    /// The PipeClosed path (exit 141) is exercised by the E2E test in
+    /// `tests/cli_stdout_destination.rs` which drives the subprocess against
+    /// `| head -0` to force EPIPE.
+    #[test]
+    fn test_emit_result_passthrough_returns_written() {
+        use crate::cmd::execution::StdoutStatus;
+
+        let result = ParseResult::Passthrough("".to_string());
+        let output = CommandOutput {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: Duration::ZERO,
+        };
+        let status = emit_result(&result, &output, "")
+            .expect("emit_result must not error when pipe is open");
+        assert_eq!(
+            status,
+            StdoutStatus::Written,
+            "emit_result must return Written when stdout is open (architecture-17)"
+        );
+    }
+
+    /// Verify that emit_result returns StdoutStatus::Written for a Full result,
+    /// proving the write_line_to_stdout path is reached and returns correctly.
+    #[test]
+    fn test_emit_result_full_returns_written() {
+        use crate::cmd::execution::StdoutStatus;
+        use std::time::Duration;
+
+        let input = load_fixture("test", "pytest_pass.txt");
+        let parsed = parse(&input);
+        let output = CommandOutput {
+            stdout: input.clone(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            duration: Duration::ZERO,
+        };
+        let status = emit_result(&parsed, &output, &input)
+            .expect("emit_result must not error when pipe is open");
+        assert_eq!(
+            status,
+            StdoutStatus::Written,
+            "emit_result must return Written for Full result when stdout is open (architecture-17)"
         );
     }
 }

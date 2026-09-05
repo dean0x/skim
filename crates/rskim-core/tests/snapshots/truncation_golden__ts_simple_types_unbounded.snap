@@ -1,0 +1,5 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(TS_SIMPLE, Language::TypeScript, TransformConfig::with_mode(Mode::Types))"
+---
+

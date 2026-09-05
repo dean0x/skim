@@ -299,22 +299,38 @@ struct Args {
 
     /// Maximum output lines (AST-aware smart truncation)
     ///
-    /// Truncates output to at most N lines using priority-based selection.
+    /// Emits at most N lines total, including the elision marker. For N > 1:
+    /// N-1 content lines + 1 marker = exactly N. For N = 1 (the irreconcilable
+    /// case): 1 content line + 1 marker = 2 total — spending the only slot on
+    /// the marker would return a view with no code, violating ADR-016.
+    /// The marker only appears when the output is actually truncated; files
+    /// with fewer than N lines are emitted verbatim with no marker.
+    ///
     /// Types and signatures are kept over imports, which are kept over bodies.
     /// Never cuts mid-signature or mid-type-definition.
     #[arg(
         long,
         value_name = "N",
-        help = "Truncate output to at most N lines (AST-aware)"
+        help = "Emit at most N lines in total, including the elision marker \
+                (N=1 emits one content line plus the marker); equivalent to `head -N` with disclosure"
     )]
     max_lines: Option<usize>,
 
     /// Keep only the last N lines of output
     ///
-    /// Keeps the last N lines of output, prepending a language-appropriate
-    /// truncation marker indicating how many lines were omitted above.
-    /// Mutually exclusive with --max-lines.
-    #[arg(long, value_name = "N", help = "Keep only the last N lines of output")]
+    /// Emits at most N lines total from the tail, including the elision marker.
+    /// For N > 1: 1 marker + N-1 content lines = exactly N. For N = 1 (the
+    /// irreconcilable case): 1 marker + 1 content line = 2 total — spending
+    /// the only slot on the marker would return a view with no code, violating
+    /// ADR-016. The marker only appears when the output is actually truncated;
+    /// files with fewer than N lines are emitted verbatim with no marker.
+    /// Mirrors `--max-lines` semantics; mutually exclusive with it.
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Emit at most N lines in total from the tail, including the elision marker \
+                (N=1 emits one content line plus the marker); equivalent to `tail -N` with disclosure"
+    )]
     last_lines: Option<usize>,
 
     /// Token budget - cascade through modes until output fits within N tokens
@@ -326,7 +342,9 @@ struct Args {
     #[arg(
         long,
         value_name = "N",
-        help = "Cascade through modes until output fits within N tokens"
+        help = "Fit the output within N tokens by escalating modes, then line-truncating \
+                with a marker; on very small budgets the count stays on stdout and the \
+                SKIM_PASSTHROUGH=1 remedy is printed to stderr"
     )]
     tokens: Option<usize>,
 
@@ -365,6 +383,33 @@ struct Args {
     /// Enable debug output (warnings/notices on stderr)
     #[arg(long, global = true)]
     debug: bool,
+
+    /// Bypass all compression and exec the real tool with raw argv.
+    ///
+    /// Equivalent to setting `SKIM_PASSTHROUGH=1`. When set, skim-only flags
+    /// are stripped from the forwarded argv so the underlying tool never sees
+    /// flags it does not understand.
+    ///
+    /// Stripped flags (all tools): `--show-stats`, `--passthrough`, `--debug`
+    /// (unless the tool owns `--debug` per its rewrite rule), `--max-lines N`
+    /// / `--max-lines=N` (value-bearing), `--tokens N` / `--tokens=N`
+    /// (value-bearing), `--line-numbers` (long form only; `-n` is NOT
+    /// stripped — `git log -n <count>` is tool-owned), `--last-lines N` /
+    /// `--last-lines=N` (value-bearing; stripped if present).
+    ///
+    /// Additionally stripped for `git` only: bare `--json` (before `--`),
+    /// `--mode` / `--mode=<val>`.
+    ///
+    /// Nothing is stripped after a bare `--` end-of-options separator.
+    ///
+    /// ORDERING: detected and latched into an atomic BEFORE threads are
+    /// spawned (see `main()` startup sequence), so analytics background
+    /// threads always observe the correct passthrough state.
+    #[arg(
+        long,
+        help = "Bypass all compression (equivalent to SKIM_PASSTHROUGH=1)"
+    )]
+    passthrough: bool,
 }
 
 /// Build the clap `Command` from `Args` for use by shell completion generation.
@@ -632,23 +677,46 @@ where
         .filter(|s| analytics::is_safe_session_id(s))
 }
 
-/// Pure PATH filter: removes all entries that match `~/.skim/bin` from `path`.
+/// Pure PATH filter: removes all entries that match the wrappers directory from `path`.
 ///
 /// Returns `Some(filtered)` when at least one entry was removed, `None` when
-/// the wrappers directory cannot be determined or the path is unchanged.
+/// the wrappers directory is absent from `path` or nothing was removed.
 ///
 /// Extracted as a pure function (no `set_var`) so it can be unit-tested
 /// directly without touching the process environment.
-fn filter_wrappers_from_path(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
-    // Fast-path: if the raw PATH string contains no ".skim" substring, the
-    // wrappers directory cannot be present.  Skip the expensive
-    // split-normalize-filter-join entirely — this is the common case when
+///
+/// The `wrappers_dir` parameter is the resolved wrappers directory (from
+/// `cmd::skim_wrappers_dir()`).  Accepting it explicitly rather than calling
+/// `skim_wrappers_dir()` internally keeps the function testable with arbitrary
+/// paths — including paths that do NOT contain `.skim` (D6 fix: the old
+/// hardcoded `b".skim"` fast-path check would silently skip filtering when
+/// `SKIM_WRAPPERS_DIR` pointed outside `~/.skim/`, leaving the wrapper dir in
+/// PATH and causing infinite recursion in the tool handler).
+fn filter_wrappers_from_path(
+    path: &std::ffi::OsStr,
+    wrappers_dir: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    let wrappers_dir = wrappers_dir?;
+
+    // Fast-path: if the raw PATH bytes contain no substring matching the
+    // wrappers directory, the directory cannot be present. Skip the expensive
+    // split-normalize-filter-join — this is the common case when
     // `skim init --wrappers` has not been run.
-    if !path.as_encoded_bytes().windows(5).any(|w| w == b".skim") {
+    //
+    // D6: the needle is derived from the ACTUAL resolved wrappers_dir rather
+    // than a hardcoded b".skim" substring. This ensures that
+    // SKIM_WRAPPERS_DIR=/custom/skim-wrappers (a path without ".skim") is
+    // still correctly stripped from PATH.
+    let dir_bytes = wrappers_dir.as_os_str().as_encoded_bytes();
+    if !dir_bytes.is_empty()
+        && !path
+            .as_encoded_bytes()
+            .windows(dir_bytes.len())
+            .any(|w| w == dir_bytes)
+    {
         return None;
     }
 
-    let wrappers_dir = cmd::skim_wrappers_dir()?;
     // Syntactic normalization only: collapses trailing slashes and `..`
     // segments so they don't defeat the equality check.  Filesystem symlinks
     // in *parent* directories are NOT resolved — use std::fs::canonicalize
@@ -704,7 +772,7 @@ fn strip_skim_wrappers_from_path() {
         Some(p) => p,
         None => return,
     };
-    if let Some(new_path) = filter_wrappers_from_path(&path) {
+    if let Some(new_path) = filter_wrappers_from_path(&path, cmd::skim_wrappers_dir()) {
         // SAFETY: THREADS_SPAWNED is false (asserted above), so no other
         // thread can be reading the environment concurrently.
         unsafe {
@@ -714,56 +782,131 @@ fn strip_skim_wrappers_from_path() {
 }
 
 // ============================================================================
-// D2b (#370): stdout-is-regular-file predicate for wrapper passthrough
+// D2b (#370) / D5: stdout gate — serve raw when stdout is not a TTY or pipe
 // ============================================================================
 
-/// Testable seam: return `true` when the `io::Result<Metadata>` describes a
-/// regular file. Used by [`stdout_is_regular_file`] so the check can be unit-
-/// tested with synthetic metadata without touching real file descriptors.
+/// Testable seam: return `true` when stdout should serve raw bytes.
+///
+/// The gate compresses **iff fd 1 is a terminal or a FIFO**, and serves raw for
+/// everything else — regular files, non-terminal character devices, sockets,
+/// block devices, directories.
+///
+/// Kept separate from [`stdout_should_serve_raw`] so tests can drive it with a
+/// `Metadata` obtained from a real fd of a chosen type plus an explicit
+/// `is_tty`, without having to install that fd as the process's own fd 1.
+///
+/// # Why `is_tty` is a parameter and not `FileType::is_char_device()`
+///
+/// This gate used `is_char_device()` as a stand-in for `isatty(1)`. Every
+/// character device that is *not* a terminal — `/dev/null`, `/dev/zero`,
+/// `/dev/random` — was therefore misclassified as a terminal and compressed
+/// into. `is_tty` must come from a real `isatty(1)` test
+/// (`std::io::stdout().is_terminal()`); the file type alone cannot answer it.
+///
+/// # Pipes are ambiguous here by construction
+///
+/// `| cat` and `| tee out.txt` present fd 1 as the same FIFO. `fstat` cannot
+/// see the far end of a pipe, so this gate deliberately defaults FIFOs to
+/// *compress* — `| cat` is the overwhelmingly common shape and compressing it
+/// is skim's core value. The byte-exact pipe shapes are resolved on the one
+/// surface that can observe pipeline structure, the rewrite engine, which
+/// hands its verdict to the wrapper out of band (see [`force_raw_requested`]).
 #[cfg(unix)]
-fn is_regular_file_stdout(meta: std::io::Result<std::fs::Metadata>) -> bool {
-    meta.map(|m| m.is_file()).unwrap_or(false)
+fn stdout_should_serve_raw_impl(meta: std::io::Result<std::fs::Metadata>, is_tty: bool) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    if is_tty {
+        // A terminal is a live reader — compression is the whole point.
+        return false;
+    }
+    match meta {
+        // Cannot determine the sink (e.g. fd 1 closed) — compress. Preserves
+        // the pre-existing defensive default; there is no file to corrupt.
+        Err(_) => false,
+        Ok(m) => !m.file_type().is_fifo(),
+    }
 }
 
-/// Return `true` when the process's stdout (fd 1) is a regular file.
+/// Return `true` when the process's stdout (fd 1) should receive raw bytes.
 ///
-/// When a PATH-wrapper invocation is `~/.skim/bin/gh api … > out.json`, the
-/// shell sets fd 1 → the file BEFORE exec-ing the wrapper. No `>` appears in
-/// argv, so the rewrite-engine guard (D2-A) cannot catch it. Detecting the fd
-/// directly and running the real tool with inherited stdio ensures raw bytes
-/// reach the file unmodified (#370, #317). Pipes/ttys are not regular files
-/// and fall through to normal compression (skim's core use case).
+/// Compress iff fd 1 is a terminal or a pipe; serve raw for every other sink.
 ///
-/// **Shared invariant (cross-surface):** "stdout redirected to a regular file
-/// must receive the tool's raw bytes, never a skim summary." This invariant is
-/// enforced by two independent mechanisms — one per interception surface —
-/// because each surface observes the redirect at a different stage:
-/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` after the shell has
-///   already consumed `>` and opened the file; no `>` token remains in argv.
-/// - **Rewrite surface (static):** `stdout_redirected_to_file` in
-///   `cmd/rewrite/compound.rs` — syntactic `>` scan before the command runs.
+/// **Shared invariant (cross-surface):** "stdout going somewhere that needs an
+/// exact capture must receive the tool's raw bytes, never a skim summary."
+/// This invariant is enforced by two independent mechanisms — one per
+/// interception surface — because each surface observes the destination at a
+/// different stage, and each can see something the other structurally cannot:
+/// - **Wrapper surface (here, runtime):** `fstat(fd 1)` + `isatty(1)` after the
+///   shell has already consumed `>` and opened the target; no redirect token
+///   remains in argv. Ground truth about the fd — blind to the far end of a pipe.
+/// - **Rewrite surface (static):** `stdout_redirected_to_file` and
+///   `command_needs_exact_bytes` in `cmd/rewrite/compound.rs` — a syntactic scan
+///   before the command runs. Blind to what the shell actually did — but it is
+///   the only surface that can see `| tee out.txt` and `$(…)`.
 ///
-/// Keep the two detectors in lockstep. If you widen or narrow the detection
-/// semantics here, audit `stdout_redirected_to_file` for the same forms
-/// (`>f`, `>>f`, `1>f`, `&>f`, `&>>f`).
+/// Ground truth decides where it can observe; syntax fills the one gap it cannot
+/// (see [`force_raw_requested`]).
 ///
 /// Non-Unix: always returns `false` (compression proceeds normally).
 #[cfg(unix)]
-fn stdout_is_regular_file() -> bool {
+#[allow(clippy::disallowed_methods)] // fd 1 identity check: ManuallyDrop borrow without I/O; not a write sink
+fn stdout_should_serve_raw() -> bool {
+    use std::io::IsTerminal;
     use std::mem::ManuallyDrop;
     use std::os::unix::io::FromRawFd;
     // Borrow fd 1 via a ManuallyDrop wrapper so the destructor never closes it.
     // SAFETY: ManuallyDrop suppresses File's Drop, so fd 1 is never closed
     // (no double-close). If fd 1 is invalid (e.g. the process was started with
-    // stdout closed), f.metadata() returns Err; is_regular_file_stdout falls
-    // back to false and normal compression proceeds.
+    // stdout closed), metadata() returns Err; we fall back to false (compress).
     let f = unsafe { ManuallyDrop::new(std::fs::File::from_raw_fd(1)) };
-    is_regular_file_stdout(f.metadata())
+    stdout_should_serve_raw_impl(f.metadata(), std::io::stdout().is_terminal())
 }
 
 #[cfg(not(unix))]
-fn stdout_is_regular_file() -> bool {
+fn stdout_should_serve_raw() -> bool {
     false
+}
+
+/// Return `true` when the rewrite surface marked the current command as needing
+/// byte-exact stdout **for `tool`**.
+///
+/// This closes the one gap `fstat` cannot: a pipe's far end. When the PreToolUse
+/// hook sees `| tee out.txt`, `$(…)`, or a redirect onto a file/named FIFO, it
+/// records a force-raw marker in the PID-keyed sidecar; this wrapper invocation
+/// discovers it by walking its process ancestry. The marker is re-evaluated —
+/// set *or cleared* — by every hook invocation that reaches command extraction,
+/// so it never outlives a command the hook actually processed; five early exits
+/// (passthrough mode, AwarenessOnly agents, stdin read error, JSON parse error,
+/// missing command field) skip the write.
+///
+/// # Why the tool name is part of the key
+///
+/// PPID is not a command identity. Every command an agent runs shares that one
+/// PID, so a PPID-only marker was shared mutable state: a `| tee` verdict leaked
+/// onto every *other* wrapper invocation under the same agent — a concurrent
+/// tool call, a background job, a hook-less nested sub-agent — and an unrelated
+/// command's clear could delete a live one. Keying on the command heads the hook
+/// saw (`cmd/rewrite/compound.rs::command_heads`) narrows it to the tools that
+/// command actually names. See `set_force_raw` for the residual exposure that
+/// remains: two *same-tool* commands under one agent still share a key.
+///
+/// **ACCEPTED LIMITATION (documented, and pinned by
+/// `no_hook_means_fstat_only_behaviour` in `tests/cli_stdout_destination.rs`):**
+/// the marker exists only when the hook actually fires. A bare wrapper
+/// invocation with no PreToolUse hook installed — a plain interactive shell with
+/// `~/.skim/bin` on `PATH`, or an agent that bypasses hooks — gets `fstat`-only
+/// behaviour, so `git log | tee out.txt` still compresses there. Closing that
+/// would require the wrapper to inspect its sibling processes, which is neither
+/// portable nor reliable. Skim does not pretend otherwise.
+///
+/// Failure direction: a stale or missing marker makes a FIFO compress. For
+/// `| cat` that is lossless; for a byte-exact consumer (`| tee f`,
+/// `| sha256sum`) it is byte loss — measured 304 bytes served instead of 6803,
+/// with nothing on stderr. See `session_sidecar.rs` on the same-tool clear
+/// (#514) and `no_hook_means_fstat_only_behaviour` for the hook-less case.
+fn force_raw_requested(tool: &str) -> bool {
+    cmd::resolve_cache_dir()
+        .as_deref()
+        .is_some_and(|dir| cmd::session_sidecar::read_force_raw(dir, tool))
 }
 
 fn main() -> ExitCode {
@@ -775,9 +918,44 @@ fn main() -> ExitCode {
     // are spawned. After this call, is_debug_enabled() is a pure atomic load.
     debug::init_debug_from_env();
 
+    // security-5: anchor the pre-routing flag scan to skim's own flag positions.
+    //
+    // The old `std::env::args().any(|a| a == "--passthrough")` matched the token
+    // anywhere in argv, including inside a tool's data arguments:
+    //   `skim grep -e --passthrough file`
+    // would enable passthrough AND strip_skim_flags would drop the token, so
+    // grep received `["-e", "file"]` — the pattern arg was corrupted.
+    //
+    // Fix: collect once, stop at POSIX `--` (same logic as
+    // `cmd::rewrite::args_before_separator`, inlined here because the `rewrite`
+    // module is private), then stop at the first non-`--flag` token (the
+    // subcommand or file argument).  A skim flag is only legal before the first
+    // positional argument.
+    let argv_for_flags: Vec<String> = std::env::args().skip(1).collect();
+    let sep_pos = argv_for_flags
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(argv_for_flags.len());
+    let pre_sep = &argv_for_flags[..sep_pos];
+    // Collect skim-flag-zone tokens (before the first positional arg or `--`)
+    // into a Vec so we can scan it twice without reconstructing the iterator.
+    let skim_flag_zone: Vec<&String> = pre_sep.iter().take_while(|a| a.starts_with('-')).collect();
+
     // Extract --debug before routing so it applies to all subcommands.
-    if std::env::args().any(|a| a == "--debug") {
+    if skim_flag_zone.iter().any(|a| a.as_str() == "--debug") {
         debug::force_enable_debug();
+    }
+
+    // C2: latch --passthrough into an atomic BEFORE THREADS_SPAWNED so that
+    // analytics background threads always observe the correct value.
+    // Mirrors the --debug pre-parse pattern above.
+    //
+    // ORDERING INVARIANT: this store happens before THREADS_SPAWNED.store(true)
+    // below. strip_skim_wrappers_from_path() asserts THREADS_SPAWNED is still
+    // false at the top of main(), so any future reordering that moves code
+    // below THREADS_SPAWNED will be caught by that assertion.
+    if skim_flag_zone.iter().any(|a| a.as_str() == "--passthrough") {
+        cmd::set_passthrough_flag();
     }
 
     // B4: hidden early-exit used by `skim doctor` to identify each binary on $PATH.
@@ -850,26 +1028,60 @@ fn main() -> ExitCode {
     // parsing and route directly to the appropriate handler. PATH stripping
     // above ensures the handler won't find the symlink again (no recursion).
     let result: anyhow::Result<ExitCode> = if let Some((name, args)) = detect_argv0_dispatch() {
-        // D2b (#370): when stdout is a regular file the shell has already
-        // redirected fd 1 to the file before exec-ing us. Run the real tool
-        // with inherited stdio so its raw bytes reach the file unmodified (#317).
-        // Pipes/ttys are not regular files → still compress (normal path).
+        // D2b (#370): when stdout is going somewhere that needs an exact
+        // capture, the shell has already wired fd 1 up before exec-ing us. Run
+        // the real tool with inherited stdio so its raw bytes reach that
+        // destination unmodified (#317).
+        //
+        // Two inputs, one per observable: `stdout_should_serve_raw` is
+        // ground truth about fd 1 (files, non-terminal char devices, sockets);
+        // `force_raw_requested` carries the rewrite surface's verdict about the
+        // one thing fd 1 cannot reveal — the far end of a pipe (`| tee f`,
+        // `$(…)`) — for THIS tool. TTYs and plain `| cat` match neither and
+        // still compress.
+        //
         // Guard is scoped to this wrapper-dispatch branch only. The Subcommand
         // and FileOperation branches below are intentionally NOT guarded:
         // `skim file.ts > out.txt` and `skim grep … > out.txt` are explicit skim
         // invocations where the user wants skim's output saved — hoisting this
-        // guard above detect_argv0_dispatch() would break that workflow.
-        if stdout_is_regular_file() {
-            Ok(cmd::run_inherited_passthrough(&name, &args))
+        // guard above detect_argv0_dispatch() would break that workflow. See the
+        // case-8 rationale on `stdout_redirected_to_file` in cmd/rewrite/compound.rs.
+        if stdout_should_serve_raw() || force_raw_requested(&name) {
+            if cmd::redaction_is_mandatory(&name) {
+                // ADR-011 class 1: raw bytes were requested for a tool whose
+                // handler enforces credential redaction.  Serving the raw tool
+                // output here would expose secrets (`GITHUB_TOKEN`, etc.) that
+                // the compressed view would have redacted to `***` — a
+                // *different-bytes* path in ADR-011 terms.  Unconditional
+                // marker: block the raw serve and fall through to the handler.
+                // (PF-012 / security-1)
+                eprintln!(
+                    "[skim] {name}: raw output blocked — redaction is mandatory; \
+                     routing through handler to protect secrets"
+                );
+                cmd::dispatch_for_wrapper(&name, &args, &analytics)
+            } else {
+                // ADR-011 class 2: choosing raw loses nothing (no redaction
+                // control applies to this tool), so this is a debug-gated
+                // banner, never an unconditional marker.
+                crate::debug_log!(
+                    "[skim] wrapper: stdout needs exact bytes; serving raw for '{name}'"
+                );
+                Ok(cmd::run_inherited_passthrough(&name, &args))
+            }
         } else {
-            cmd::dispatch(&name, &args, &analytics)
+            // D3/D4/D5 gates live inside dispatch_for_wrapper → dispatch_inner
+            // so `grep --help`, `git --help`, etc. forward to the real tool.
+            cmd::dispatch_for_wrapper(&name, &args, &analytics)
         }
     } else {
         match resolve_invocation() {
             Ok(Invocation::FileOperation) => {
                 run_file_operation(&analytics).map(|()| ExitCode::SUCCESS)
             }
-            Ok(Invocation::Subcommand { name, args }) => cmd::dispatch(&name, &args, &analytics),
+            Ok(Invocation::Subcommand { name, args }) => {
+                cmd::dispatch_explicit(&name, &args, &analytics)
+            }
             Err(e) => Err(e),
         }
     };
@@ -1003,6 +1215,7 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
 /// 2. directory → recursive directory walk
 /// 3. glob      → glob pattern expansion
 /// 4. file path → single file processing
+#[allow(clippy::disallowed_methods)] // Top-level arg dispatcher; delegates to write_result_and_stats and process_files which hold the locks
 fn process_single_arg(
     file: &str,
     args: &Args,
@@ -1010,6 +1223,58 @@ fn process_single_arg(
     process_options: process::ProcessOptions,
     multi_options: multi::MultiFileOptions,
 ) -> anyhow::Result<()> {
+    // B1 / ADR-011: structural passthrough gate for the read path.
+    //
+    // When SKIM_PASSTHROUGH=1, emit raw bytes without any transformation.
+    // Covers all four dispatch shapes that `process_single_arg` handles:
+    // stdin (`-`), directory, glob, and single file.
+    //
+    // architecture-1: write failures use bare `?` so the `io::Error` stays as
+    // the chain head and `is_broken_pipe_chain` at the top-level boundary can
+    // detect `EPIPE` and exit 141 rather than 1.  Wrapping with `anyhow::anyhow!`
+    // produces a `Message` error with no source, which `chain()` cannot walk.
+    //
+    // consistency-3: the remedy line in the multi-file marker says
+    // "SKIM_PASSTHROUGH=1 for raw output", so every shape the marker can fire
+    // for must also work in passthrough mode.  Directories and globs are handled
+    // here so the remedy is literally reachable from any invocation that prints it.
+    if cmd::is_passthrough_mode() {
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let path = std::path::Path::new(file);
+        if file == "-" {
+            // Stdin passthrough: copy bounded stdin → stdout.
+            let buf = cmd::read_stdin_bounded()?;
+            out.write_all(buf.as_bytes())?;
+        } else if path.is_dir() {
+            // Directory passthrough: collect all skim-supported files and
+            // print their raw bytes concatenated (mirrors process_directory).
+            let paths = multi::collect_passthrough_paths_dir(path, args.no_ignore);
+            for p in &paths {
+                let contents = std::fs::read(p)
+                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
+                out.write_all(&contents)?;
+            }
+        } else if multi::has_glob_pattern(file) {
+            // Glob passthrough: expand, then print raw bytes of each match.
+            let paths = multi::collect_passthrough_paths_glob(file, args.no_ignore)?;
+            for p in &paths {
+                let contents = std::fs::read(p)
+                    .map_err(|e| anyhow::anyhow!("passthrough read {}: {e}", p.display()))?;
+                out.write_all(&contents)?;
+            }
+        } else {
+            // File passthrough: read raw bytes and copy to stdout.
+            // Skip validation (size limits, UTF-8) — the point of passthrough
+            // is byte-faithful forwarding without skim's transform guards.
+            let contents =
+                std::fs::read(file).map_err(|e| anyhow::anyhow!("passthrough read {file}: {e}"))?;
+            out.write_all(&contents)?;
+        }
+        return Ok(());
+    }
+
     // Capture cwd on the main thread before any background threads are spawned.
     // (std::env::current_dir is not safe to call from background threads in general.)
     let cwd = std::env::current_dir()
@@ -1127,39 +1392,130 @@ mod tests {
     use super::*;
 
     // ========================================================================
-    // D2b (#370): is_regular_file_stdout unit tests
+    // stdout_should_serve_raw_impl — compress iff terminal or FIFO
+    //
+    // Every case below is driven by a REAL fd of the relevant type (a real
+    // /dev/null, a real socketpair, a real mkfifo), not by synthetic metadata:
+    // the whole defect this gate had was believing a file-type bit answered a
+    // question only isatty() can answer, so the tests must exercise the real
+    // types the kernel reports.
     // ========================================================================
 
+    /// Regular file → serve raw (the `> out.txt` case).
     #[cfg(unix)]
     #[test]
-    fn test_is_regular_file_stdout_true_for_file() {
+    fn test_stdout_should_serve_raw_true_for_regular_file() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let meta = tmp.as_file().metadata();
         assert!(
-            is_regular_file_stdout(meta),
-            "metadata from a regular file must return true"
+            stdout_should_serve_raw_impl(tmp.as_file().metadata(), false),
+            "regular file must serve raw"
         );
     }
 
+    /// Error result → compress (defensive default; nothing to corrupt).
     #[cfg(unix)]
     #[test]
-    fn test_is_regular_file_stdout_false_for_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta = std::fs::metadata(tmp.path());
-        assert!(
-            !is_regular_file_stdout(meta),
-            "metadata from a directory must return false"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_is_regular_file_stdout_false_for_err() {
+    fn test_stdout_should_serve_raw_false_for_err() {
         let meta: std::io::Result<std::fs::Metadata> =
             Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(
-            !is_regular_file_stdout(meta),
-            "Err metadata must return false (defensive)"
+            !stdout_should_serve_raw_impl(meta, false),
+            "Err metadata must fall through to compress (defensive)"
+        );
+    }
+
+    /// Directory → serve raw (not a terminal, not a FIFO).
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            stdout_should_serve_raw_impl(std::fs::metadata(tmp.path()), false),
+            "directory metadata (not terminal, not FIFO) must serve raw"
+        );
+    }
+
+    /// A terminal compresses — that is the whole point of skim.
+    ///
+    /// Driven through the `is_tty` parameter rather than a real pty because
+    /// `is_tty` is exactly what `isatty(1)` produces at the call site.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_false_for_terminal() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            !stdout_should_serve_raw_impl(tmp.as_file().metadata(), true),
+            "a terminal must compress regardless of the underlying file type"
+        );
+    }
+
+    /// **The char-device bug.** `/dev/null` is a character device but NOT a
+    /// terminal. The old gate used `is_char_device()` as an `isatty()` proxy and
+    /// therefore compressed into `/dev/null`, `/dev/zero` and `/dev/random`
+    /// alike. A real `/dev/null` fd, with `is_tty` false as `isatty(1)` would
+    /// report it, must serve raw.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_non_terminal_char_device() {
+        use std::os::unix::fs::FileTypeExt;
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null must be openable");
+        let meta = devnull.metadata().expect("metadata on /dev/null");
+        // Guard the premise: if this is not a char device the test proves nothing.
+        assert!(
+            meta.file_type().is_char_device(),
+            "/dev/null must be a character device for this test to be meaningful"
+        );
+        assert!(
+            stdout_should_serve_raw_impl(devnull.metadata(), false),
+            "/dev/null is a char device but not a terminal — must serve raw, \
+             not be mistaken for a TTY"
+        );
+    }
+
+    /// A FIFO compresses by default: `fstat` cannot see the far end, and
+    /// `| cat` is the common shape. The byte-exact pipe shapes are resolved by
+    /// `force_raw_requested`, not here.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_false_for_fifo() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("p");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode; both are valid.
+        assert_eq!(
+            unsafe { libc::mkfifo(c.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+        let meta = std::fs::metadata(&fifo).expect("metadata on fifo");
+        assert!(meta.file_type().is_fifo(), "premise: path must be a FIFO");
+        assert!(
+            !stdout_should_serve_raw_impl(std::fs::metadata(&fifo), false),
+            "a FIFO must compress by default — `| cat` must not regress"
+        );
+    }
+
+    /// An AF_UNIX socket is neither a terminal nor a FIFO → serve raw.
+    #[cfg(unix)]
+    #[test]
+    fn test_stdout_should_serve_raw_true_for_socket() {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        // SAFETY: socketpair fills a 2-element array of fds; the buffer is sized
+        // correctly and the domain/type constants are valid.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair failed");
+        // SAFETY: fds[0] is a fresh, owned fd from socketpair; File takes ownership.
+        let sock = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same for the peer end; dropped at end of scope.
+        let _peer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        assert!(
+            stdout_should_serve_raw_impl(sock.metadata(), false),
+            "an AF_UNIX socket is neither a terminal nor a FIFO — must serve raw"
         );
     }
 
@@ -1577,8 +1933,9 @@ mod tests {
         let input_paths = vec![wrappers.clone(), other.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        // Call the real extracted function — no manual replication.
-        let result = filter_wrappers_from_path(&path_str)
+        // D6: pass wrappers_dir explicitly — the function no longer reads it
+        // from the LazyLock cache internally.
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers))
             .expect("wrappers dir present — filter must return Some");
 
         let result_paths: Vec<_> = std::env::split_paths(&result).collect();
@@ -1595,14 +1952,16 @@ mod tests {
     /// PATH without ~/.skim/bin returns None (no change needed).
     #[test]
     fn test_strip_skim_wrappers_no_change_when_absent() {
+        let home = dirs::home_dir().unwrap();
+        let wrappers = home.join(".skim").join("bin");
         let other = std::path::PathBuf::from("/usr/local/bin");
         let other2 = std::path::PathBuf::from("/usr/bin");
 
         let input_paths = vec![other.clone(), other2.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        // filter_wrappers_from_path returns None when nothing was removed.
-        let result = filter_wrappers_from_path(&path_str);
+        // D6: pass wrappers_dir explicitly.
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers));
         assert!(
             result.is_none(),
             "path without wrappers dir must return None (no change)"
@@ -1620,7 +1979,7 @@ mod tests {
         let input_paths = vec![before.clone(), wrappers.clone(), after.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        let result = filter_wrappers_from_path(&path_str)
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers))
             .expect("wrappers dir present — filter must return Some");
         let filtered: Vec<_> = std::env::split_paths(&result).collect();
 
@@ -1643,7 +2002,7 @@ mod tests {
         let input_paths = vec![wrappers.clone(), other.clone(), wrappers.clone()];
         let path_str = std::env::join_paths(&input_paths).unwrap();
 
-        let result = filter_wrappers_from_path(&path_str)
+        let result = filter_wrappers_from_path(&path_str, Some(&wrappers))
             .expect("wrappers dir present — filter must return Some");
         let filtered: Vec<_> = std::env::split_paths(&result).collect();
 
@@ -1653,6 +2012,40 @@ mod tests {
             "both duplicate wrappers entries must be removed"
         );
         assert_eq!(filtered[0], other, "only /usr/bin must remain");
+    }
+
+    /// D6 regression: when SKIM_WRAPPERS_DIR points to a path without ".skim",
+    /// filter_wrappers_from_path must still correctly remove it from PATH.
+    ///
+    /// The old code fast-pathed on `b".skim"` — a path like
+    /// `/custom/skim-wrappers/bin` would pass the fast-path check (no ".skim"
+    /// substring) and return None, leaving the wrapper dir in PATH and causing
+    /// infinite recursion. The D6 fix derives the fast-path needle from the
+    /// actual resolved wrappers_dir.
+    #[test]
+    fn test_strip_skim_wrappers_custom_dir_without_skim_substring() {
+        // A custom wrappers dir whose path does NOT contain ".skim".
+        let custom_wrappers = std::path::PathBuf::from("/opt/custom-wrappers/bin");
+        let other = std::path::PathBuf::from("/usr/bin");
+
+        let input_paths = vec![custom_wrappers.clone(), other.clone()];
+        let path_str = std::env::join_paths(&input_paths).unwrap();
+
+        // The old code (windows(5).any(|w| w == b".skim")) would return None here
+        // because "/opt/custom-wrappers/bin" contains no ".skim" substring.
+        // The D6 fix correctly detects and removes the custom wrappers dir.
+        let result = filter_wrappers_from_path(&path_str, Some(&custom_wrappers))
+            .expect("custom wrappers dir in PATH — filter must return Some (D6 regression)");
+
+        let result_paths: Vec<_> = std::env::split_paths(&result).collect();
+        assert!(
+            !result_paths.contains(&custom_wrappers),
+            "custom wrappers dir without '.skim' in path must be removed (D6)"
+        );
+        assert!(
+            result_paths.contains(&other),
+            "non-wrapper dirs must be preserved"
+        );
     }
 
     // ========================================================================
@@ -1841,28 +2234,33 @@ mod tests {
     // filter_wrappers_from_path tests
     // ========================================================================
 
-    /// Fast-path: PATH with no ".skim" substring returns None without allocation.
+    /// Fast-path: PATH with no wrappers_dir substring returns None without allocation.
     #[test]
     fn test_filter_wrappers_fast_path_no_skim() {
+        let wrappers = std::path::Path::new("/home/user/.skim/bin");
         let path = std::ffi::OsString::from("/usr/local/bin:/usr/bin:/bin");
-        let result = filter_wrappers_from_path(&path);
+        let result = filter_wrappers_from_path(&path, Some(wrappers));
         assert!(
             result.is_none(),
-            "PATH with no '.skim' must return None immediately (fast-path)"
+            "PATH without the wrappers_dir must return None (no filtering needed)"
         );
     }
 
-    /// Fast-path passes through to full filter when ".skim" is present but
-    /// does not match the wrappers directory — result may be None (unchanged).
+    /// Fast-path passes through to full filter when a similar-looking path is
+    /// present but does not match the exact wrappers directory — result is None.
     #[test]
     fn test_filter_wrappers_fast_path_skim_present_but_no_match() {
-        // A path containing ".skim" in a different position should not cause
-        // a panic; it falls through to the full filter which returns None
-        // when nothing was removed.
+        // D6: the needle is derived from wrappers_dir, not a hardcoded ".skim".
+        // A path containing a similar-looking segment is NOT filtered unless it
+        // matches the exact wrappers_dir bytes.
+        let wrappers = std::path::Path::new("/home/user/.skim/bin");
         let path = std::ffi::OsString::from("/usr/local/bin:/some/.skim-other/bin:/usr/bin");
-        // We can't assert the exact value because it depends on skim_wrappers_dir(),
-        // but we can assert no panic occurs and the function is callable.
-        let _ = filter_wrappers_from_path(&path);
+        let result = filter_wrappers_from_path(&path, Some(wrappers));
+        // The path does not contain "/home/user/.skim/bin", so nothing is filtered.
+        assert!(
+            result.is_none(),
+            "PATH without exact wrappers_dir match must return None"
+        );
     }
 
     /// KNOWN LIMITATION: filter_wrappers_from_path uses syntactic normalization

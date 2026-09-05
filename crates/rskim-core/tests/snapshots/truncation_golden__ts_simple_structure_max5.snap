@@ -1,0 +1,8 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(TS_SIMPLE, Language::TypeScript,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(5))"
+---
+// ... (5 lines truncated)
+export function add(a: number, b: number): number  {...}
+// ... (1 line truncated)
+export function greet(name: string): string  {...}

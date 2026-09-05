@@ -1,0 +1,17 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(TS_SIMPLE, Language::TypeScript,\nTransformConfig::with_mode(Mode::Pseudo).with_max_lines(15))"
+---
+/**
+ * FIXTURE: Simple TypeScript functions
+ * TESTS: Basic function signature extraction
+ */
+
+export function add(a: number, b: number): number {
+    return a + b
+}
+
+export function greet(name: string): string {
+    const message = `Hello, ${name}!`
+    return message
+}

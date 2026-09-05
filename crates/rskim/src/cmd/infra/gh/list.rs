@@ -89,6 +89,9 @@ pub(super) fn parse_impl(output: &CommandOutput) -> ParseResult<InfraResult> {
 /// - Label: `number` (issues/PRs) or `databaseId` (runs)
 /// - Title: `title` (issues/PRs) or `displayTitle` (runs)
 /// - State: `state` (issues/PRs) or `status` (runs)
+/// - Conclusion: `conclusion` (run list only; appended to status as `status/conclusion`)
+/// - Author: `author.login` (PR list; appended as `@login`)
+/// - Labels: `labels[].name` (issue list; appended as `[label1, label2]`)
 ///
 /// Returns `None` if neither label alternative is present.
 fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
@@ -113,11 +116,47 @@ fn json_entry_to_infra_item(entry: &serde_json::Value) -> Option<InfraItem> {
         .unwrap_or("")
         .to_lowercase();
 
-    let value = if state.is_empty() {
-        title
-    } else {
-        format!("{title} ({state})")
+    // E3: read `conclusion` for run list — failed runs showed "(completed)" without it.
+    let conclusion = entry
+        .get("conclusion")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let state_display = match (state.as_str(), conclusion.as_deref()) {
+        ("", _) => String::new(),
+        (s, Some(c)) => format!("{s}/{c}"),
+        (s, None) => s.to_string(),
     };
+
+    // E3: read `author.login` for PR list.
+    let author_login = entry
+        .get("author")
+        .and_then(|v| v.get("login"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    // E3: read `labels[].name` for issue list.
+    let label_names: Vec<&str> = entry
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("name").and_then(|n| n.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut value = title;
+    if !state_display.is_empty() {
+        value = format!("{value} ({state_display})");
+    }
+    if let Some(login) = author_login {
+        value = format!("{value} @{login}");
+    }
+    if !label_names.is_empty() {
+        value = format!("{value} [{}]", label_names.join(", "));
+    }
 
     Some(InfraItem { label, value })
 }
@@ -264,6 +303,109 @@ mod tests {
             "Expected Passthrough, got {}",
             result.tier_name()
         );
+    }
+
+    // ========================================================================
+    // E3: gh field-drop fixes — conclusion, author, labels
+    // ========================================================================
+
+    /// E3: run list must show conclusion alongside status.
+    /// Failed runs must render `(completed/failure)` not `(completed)`.
+    #[test]
+    fn test_run_list_conclusion_shown() {
+        let input = load_fixture("gh_run_list.json");
+        let result = try_parse_json_list(input.trim()).expect("run list must parse");
+        let values: Vec<&str> = result.items.iter().map(|i| i.value.as_str()).collect();
+
+        // Failed run: must include conclusion
+        assert!(
+            values.iter().any(|v| v.contains("completed/failure")),
+            "failed run must show (completed/failure), got: {:?}",
+            values
+        );
+        // Successful run: show conclusion too
+        assert!(
+            values.iter().any(|v| v.contains("completed/success")),
+            "successful run must show (completed/success), got: {:?}",
+            values
+        );
+        // In-progress run: no conclusion (empty string in fixture)
+        assert!(
+            values
+                .iter()
+                .any(|v| v.contains("in_progress") && !v.contains('/')),
+            "in-progress run has no conclusion, got: {:?}",
+            values
+        );
+    }
+
+    /// E3: PR list must include author login.
+    #[test]
+    fn test_pr_list_author_shown() {
+        let input = load_fixture("gh_pr_list.json");
+        let result = try_parse_json_list(input.trim()).expect("pr list must parse");
+        let values: Vec<&str> = result.items.iter().map(|i| i.value.as_str()).collect();
+
+        assert!(
+            values.iter().any(|v| v.contains("@alice")),
+            "PR list must include author login (@alice), got: {:?}",
+            values
+        );
+    }
+
+    /// E3: issue list with labels must include label names.
+    #[test]
+    fn test_issue_list_labels_shown() {
+        let json = r#"[
+            {"number": 42, "title": "Login fails on mobile", "state": "OPEN",
+             "labels": [{"name": "bug"}, {"name": "mobile"}]}
+        ]"#;
+        let result = try_parse_json_list(json).expect("issue list must parse");
+        let value = &result.items[0].value;
+        assert!(
+            value.contains("[bug, mobile]"),
+            "issue labels must be shown, got: {value}"
+        );
+    }
+
+    /// E3 static lint: every field injected into `--json` must be read in the parser.
+    ///
+    /// Prevents the category of bug where a field appears in the `--json` field list
+    /// but is never accessed in `json_entry_to_infra_item`, silently dropping data
+    /// (e.g., `conclusion` was requested but not read, so a failed run showed
+    /// "(completed)" instead of "(completed/failure)").
+    ///
+    /// This test reads the list.rs source via `include_str!` and asserts that every
+    /// field name from the injected `--json` strings appears as `.get("field")` in
+    /// the same file. A one-line grep equivalent in test form.
+    #[test]
+    fn test_json_field_list_no_dropped_fields() {
+        let source = include_str!("list.rs");
+
+        // All --json fields injected by prepare_args for the three list commands.
+        let all_fields = [
+            // pr list
+            "number",
+            "title",
+            "state",
+            "author",
+            // issue list (number/title/state shared)
+            "labels",
+            // run list
+            "databaseId",
+            "displayTitle",
+            "status",
+            "conclusion",
+        ];
+
+        for field in &all_fields {
+            let pattern = format!(".get(\"{field}\")");
+            assert!(
+                source.contains(&pattern),
+                "Field '{field}' is injected into --json but never read via {pattern} in list.rs; \
+                 this causes silent data loss (E3 / avoids PF-025)"
+            );
+        }
     }
 
     #[test]

@@ -36,8 +36,12 @@ pub(super) const MAX_RELEASE_BODY_LINES: usize = 200;
 pub(super) const MAX_RELEASE_ASSETS: usize = 20;
 
 /// JSON fields to inject for `gh release view`.
+///
+/// Only fields that are actually read in `try_parse_json` are requested here.
+/// `createdAt` and `targetCommitish` were removed because they are not rendered
+/// in the output — requesting fields that do not affect output is misleading (E3).
 const RELEASE_VIEW_FIELDS: &str =
-    "tagName,name,body,isDraft,isPrerelease,publishedAt,assets,author,createdAt,targetCommitish";
+    "tagName,name,body,isDraft,isPrerelease,publishedAt,assets,author";
 
 // ============================================================================
 // Public entry point

@@ -101,6 +101,17 @@ struct CacheEntry {
     /// Old cache entries without this field deserialize with `None` (backward-compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parse_tier: Option<String>,
+    /// Whether the served view differs from the raw file bytes.
+    ///
+    /// Written from the authoritative byte comparison in `process_file` so the
+    /// cache-hit path in `try_cached_result` does not have to infer it from the
+    /// mode (consistency-2: mode-inference is wrong when the ADR-001 guardrail
+    /// chose raw bytes).
+    ///
+    /// `None` on backward-compatible reads of old entries; callers fall back to
+    /// mode-inference in that case (`mode != Mode::Full`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    view_differs: Option<bool>,
 }
 
 /// Data returned on a successful cache lookup.
@@ -112,6 +123,11 @@ pub(crate) struct CacheHit {
     pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if available).
     pub(crate) transformed_tokens: Option<usize>,
+    /// Whether the served view differs from the raw file bytes.
+    ///
+    /// `None` for cache entries written before this field was added — callers
+    /// fall back to mode-inference (`mode != Mode::Full`) in that case.
+    pub(crate) view_differs: Option<bool>,
 }
 
 /// Parameters for writing a cache entry.
@@ -136,6 +152,12 @@ pub(crate) struct CacheWriteParams<'a> {
     ///
     /// Line-numbered and unnumbered outputs are cached separately because they differ.
     pub(crate) line_numbers: bool,
+    /// Whether the served view differs from the raw file bytes.
+    ///
+    /// Computed from the authoritative byte comparison in `process_file` and stored
+    /// here so the cache-hit path in `try_cached_result` can reproduce the correct
+    /// answer without re-reading the file (consistency-2).
+    pub(crate) view_differs: bool,
 }
 
 /// Returns the skim cache directory, creating it with owner-only permissions if it does not
@@ -167,10 +189,26 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
     Ok(cache_dir)
 }
 
+/// Cache schema version — MUST be bumped whenever output bytes change.
+///
+/// This constant is folded into the SHA-256 hash that names every cache file.
+/// When this value changes, every existing cache entry silently misses (the
+/// old file is at a different hash path) and is re-generated on first access.
+/// This guarantees that a warm cache never serves stale bytes after an
+/// output-format change in a later phase of the fidelity overhaul.
+///
+/// **Rule**: bump this constant in the same commit that changes output bytes.
+/// Do not update it for changes that do not affect what `transform()` emits.
+const CACHE_SCHEMA_VERSION: u32 = 2;
+
 /// Generate cache key from file path, mtime, mode, truncation options, and line_numbers flag.
 ///
 /// `line_numbers` is included in the key because line-numbered and unnumbered outputs
 /// differ in content and should be cached independently.
+///
+/// `CACHE_SCHEMA_VERSION` is included so that any change to the output format
+/// (a later phase of the fidelity overhaul) automatically invalidates all warm
+/// entries without needing to clear the cache manually.
 fn cache_key(
     path: &Path,
     mtime: SystemTime,
@@ -184,7 +222,8 @@ fn cache_key(
     let opt_str = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
 
     let hash_input = format!(
-        "{}|{}|{:?}|{}|{}|{}|{}",
+        "cache_schema_v{}|{}|{}|{:?}|{}|{}|{}|{}",
+        CACHE_SCHEMA_VERSION,
         canonical_path.display(),
         mtime_secs,
         mode,
@@ -228,6 +267,7 @@ pub(crate) fn read_cache(
             content: entry.content,
             original_tokens: entry.original_tokens,
             transformed_tokens: entry.transformed_tokens,
+            view_differs: entry.view_differs,
         })
     } else {
         // Stale entry: best-effort cleanup.
@@ -261,6 +301,7 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
         transformed_tokens: params.transformed_tokens,
         effective_mode: params.effective_mode.map(|m| format!("{m:?}")),
         parse_tier: params.parse_tier.clone(),
+        view_differs: Some(params.view_differs),
     };
 
     let json = serde_json::to_string(&entry)?;
@@ -494,6 +535,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             line_numbers: false,
+            view_differs: false,
         })
         .unwrap();
 
@@ -553,6 +595,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             line_numbers: false,
+            view_differs: false,
         })
         .unwrap();
 
@@ -599,6 +642,7 @@ mod tests {
             effective_mode: Some(Mode::Signatures),
             parse_tier: None,
             line_numbers: false,
+            view_differs: true,
         })
         .unwrap();
 
@@ -649,6 +693,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             line_numbers: false,
+            view_differs: false,
         })
         .unwrap();
         let hit = read_cache(&path, Mode::Structure, &default_trunc, false).unwrap();
@@ -666,5 +711,59 @@ mod tests {
 
         // Cache should be invalidated (mtime changed)
         assert!(read_cache(&path, Mode::Structure, &default_trunc, false).is_none());
+    }
+
+    /// A1: CACHE_SCHEMA_VERSION is folded into the hash key.
+    ///
+    /// Proof strategy: compare the production key (which includes
+    /// `cache_schema_v{N}|...`) against a key computed from the same inputs
+    /// but WITHOUT any version prefix (the pre-A1 baseline).  They must
+    /// differ, which means bumping CACHE_SCHEMA_VERSION always produces a
+    /// different filename and automatically invalidates any warm entry written
+    /// by an older build.
+    ///
+    /// If this test ever fails, `hash_input` no longer includes the schema
+    /// version and the safety guarantee is broken — a format change in a
+    /// later phase of the fidelity overhaul could serve stale cached bytes.
+    #[test]
+    fn test_schema_version_in_cache_key() {
+        use sha2::{Digest, Sha256};
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "schema version test content").unwrap();
+        let path = temp_file.path();
+        let metadata = fs::metadata(path).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let trunc = TruncationOptions::default();
+
+        // Production key — uses `cache_schema_v{CACHE_SCHEMA_VERSION}|...`
+        let key_production = cache_key(path, mtime, Mode::Structure, &trunc, false).unwrap();
+
+        // Simulate the pre-A1 hash: same inputs, NO version prefix.
+        // If `key_production == key_legacy`, CACHE_SCHEMA_VERSION is absent
+        // from hash_input and the invalidation guarantee is broken.
+        let canonical = path.canonicalize().unwrap();
+        let mtime_secs = mtime
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let legacy_input = format!(
+            "{}|{}|{:?}|none|none|none|0",
+            canonical.display(),
+            mtime_secs,
+            Mode::Structure,
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(legacy_input.as_bytes());
+        let key_legacy = format!("{:x}", hasher.finalize());
+
+        assert_ne!(
+            key_production, key_legacy,
+            "CACHE_SCHEMA_VERSION must be included in hash_input. \
+             Without it, output-format changes in later phases cannot \
+             invalidate warm cache entries. \
+             Bump CACHE_SCHEMA_VERSION in the same commit that changes \
+             what transform() emits."
+        );
     }
 }

@@ -303,6 +303,67 @@ fn test_skim_git_status_short_longform_never_expands_vs_raw() {
     );
 }
 
+/// A1: `skim git status` (NO flags) on a small hermetic dirty repo must NEVER
+/// emit MORE bytes than the raw `git status` output.
+///
+/// Before A1, `raw_override` was only populated when the user supplied a
+/// conflicting format flag (e.g. `-s`, `--short`).  For a bare `git status`
+/// invocation, `raw_override = None` and the guard compared compressed output
+/// against the injected `--porcelain=v2 --branch` bytes (machine-readable with
+/// branch header lines).  The porcelain form is typically LARGER than the default
+/// `git status` output — so the guard could fire KEEP even when compressed
+/// output was larger than what the user typed, violating the "never expand vs
+/// user intent" guarantee (ADR-001).
+///
+/// After A1, `raw_override` is always populated.  This test pins the correct
+/// behavior end-to-end.
+#[test]
+fn test_skim_git_status_no_flags_never_expands_vs_raw() {
+    let (_dir, repo) = make_hermetic_dirty_repo();
+
+    // Capture raw `git status` output for the baseline.
+    let raw_output = std::process::Command::new("git")
+        .arg("status")
+        .current_dir(&repo)
+        .output()
+        .expect("git must be available");
+    let raw_len = raw_output.stdout.len();
+
+    // Run `skim git status` (no flags) against the same repo.
+    let skim_output = common::skim()
+        .args(["git", "status"])
+        .current_dir(&repo)
+        .env_remove("SKIM_PASSTHROUGH")
+        .env_remove("SKIM_DEBUG")
+        .env("SKIM_DISABLE_ANALYTICS", "1")
+        .output()
+        .expect("skim git status must not fail to spawn");
+
+    assert!(
+        skim_output.status.success(),
+        "skim git status must exit 0; stderr={}",
+        String::from_utf8_lossy(&skim_output.stderr)
+    );
+
+    let skim_len = skim_output.stdout.len();
+
+    // ADR-001 / A1 invariant: skim must NEVER emit more bytes than the raw
+    // `git status` baseline — the command the user actually typed.  Prior to A1
+    // the guard used the injected `--porcelain=v2 --branch` output as baseline,
+    // which could allow compressed output that is larger than native `git status`.
+    assert!(
+        skim_len <= raw_len,
+        "A1: skim git status (no flags) expanded vs raw git status\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}\n  \
+         raw_override must be set unconditionally (A1) so the guard compares \
+         against the user's literal command output, not the injected porcelain form.",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout)
+    );
+}
+
 /// Create a hermetic git repo where the worker clone is 1 commit ahead of origin.
 ///
 /// Layout: bare repo (remote) ← seed (initial push) ← worker (1 unpushed commit).
@@ -579,13 +640,20 @@ fn test_skim_git_fetch_with_new_origin_commit_reports_update() {
 // Error cases
 // ============================================================================
 
+/// D2: unknown git subcommands are forwarded to git itself via run_raw_passthrough.
+/// Git exits non-zero and emits its own "is not a git command" error rather than
+/// skim's old "unknown git subcommand" message.
 #[test]
 fn test_skim_git_unknown_subcommand() {
     common::skim()
         .args(["git", "unknown_subcmd"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown git subcommand"));
+        // D2: git's native error surfaces. "not a git command" is git's wording
+        // on every version since 1.6 and is sufficient on its own; the former
+        // `.or(contains("unknown"))` disjunct would also pass if skim reinstated
+        // its old "unknown git subcommand" message, making the assertion vacuous.
+        .stderr(predicate::str::contains("not a git command"));
 }
 
 #[test]
@@ -862,14 +930,20 @@ fn test_skim_git_show_stat_passthrough() {
         .success();
 }
 
+/// D2: unknown git subcommands are forwarded to git itself via run_raw_passthrough.
+/// Git exits non-zero and emits its own "is not a git command" error rather than
+/// skim's old list of supported subcommands (which included "show").
 #[test]
 fn test_skim_git_show_unknown_subcommand_message() {
-    // The "unknown git subcommand" error should now list "show" in the supported list.
     common::skim()
         .args(["git", "totally_unknown_cmd_xyz"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("show"));
+        // D2: git's native error surfaces. "not a git command" is git's wording
+        // on every version since 1.6 and is sufficient on its own; the former
+        // `.or(contains("unknown"))` disjunct would also pass if skim reinstated
+        // its old list of supported subcommands (which contained "unknown").
+        .stderr(predicate::str::contains("not a git command"));
 }
 
 #[test]
@@ -985,14 +1059,17 @@ fn test_skim_git_show_head_commit_mode_json() {
 /// path (show.rs Tier-1) is a safety net that cannot be triggered in practice.
 /// This test targets commit mode (`skim git show HEAD`, no colon-path), which
 /// calls `apply_to_stderr` in `emit_show_commit` (show.rs) and CAN inflate when
-/// the AST-aware hunk renderer adds breadcrumbs and per-line numbers that exceed
-/// the raw diff metadata saved.
+/// per-line numbers added by `render_raw_hunks` exceed the metadata savings from
+/// the compact skim commit header.
 ///
-/// Inflation scenario: two-commit hermetic repo where the second commit modifies
-/// an existing TypeScript file by appending 20 functions (f20..f39, two-digit
-/// names).  The skim commit render adds line numbers and AST breadcrumbs to each
-/// diff line; the overhead exceeds the diff-metadata savings, so compressed >
-/// raw (verified empirically: raw ~745 bytes, compressed inflates past that).
+/// Inflation scenario: two-commit hermetic repo where the second commit ADDS a
+/// new TypeScript file (inflate.ts) with 100 functions (f000..f099).
+/// Status = Added → `render_raw_hunks` path in `render_diff_file` (skips AST
+/// overlay entirely).  `render_raw_hunks` prepends a 3-digit line number column
+/// (`ln_width = 3` for 100 lines), adding 4 chars per line × 100 lines = 400
+/// chars of inflation.  The skim compact commit header saves ~90 chars vs raw
+/// (strips the 40-char hash, Author/Date headers, and indent).  Net: render
+/// inflates by ~310 chars → `compressed.len() > raw.len()` → guardrail fires.
 ///
 /// Paired assertions (avoids PF-009 by using a hermetic repo):
 ///   SKIM_DEBUG=1        → banner PRESENT  (catches a revert of Fix 5 that makes
@@ -1008,27 +1085,29 @@ fn test_skim_git_show_commit_guardrail_is_debug_gated() {
     git_in(&repo, &["config", "user.email", "test@example.com"]);
     git_in(&repo, &["config", "user.name", "Test"]);
 
-    // First commit: establish inflate.ts with f0..f19 (single/double-digit names).
-    let mut ts_src_v1 = String::new();
-    for i in 0..20 {
-        ts_src_v1.push_str(&format!("function f{i}() {{ }}\n"));
+    // First commit: a minimal anchor so HEAD~1 exists.
+    std::fs::write(repo.join("README.md"), "# test\n").expect("write README.md");
+    git_in(&repo, &["add", "README.md"]);
+    git_in(&repo, &["commit", "-m", "initial"]);
+
+    // Second commit: ADD inflate.ts with 100 zero-padded functions (f000..f099).
+    //
+    // Choosing status=Added is deliberate: `render_diff_file` returns
+    // `render_raw_hunks` immediately for Added files (no AST overlay), so this
+    // test is independent of the C1a breadcrumb-walk fix and will keep working
+    // even if the AST default-mode render compresses further.
+    //
+    // With 100 lines, `line_number_width` returns 3 (max new-file line = 101).
+    // Each added line grows from `+function fNNN() { }\n` (22 chars in raw) to
+    // `+NNN function fNNN() { }\n` (26 chars in render) → +4 chars × 100 = 400
+    // chars inflation, which exceeds the ~90-char commit-header saving.
+    let mut ts_src = String::new();
+    for i in 0..100usize {
+        ts_src.push_str(&format!("function f{i:0>3}() {{ }}\n"));
     }
-    std::fs::write(repo.join("inflate.ts"), &ts_src_v1).expect("write inflate.ts v1");
+    std::fs::write(repo.join("inflate.ts"), &ts_src).expect("write inflate.ts");
     git_in(&repo, &["add", "inflate.ts"]);
     git_in(&repo, &["commit", "-m", "add inflate fixture"]);
-
-    // Second commit: append f20..f39 (all two-digit names).
-    // The commit diff shows the f17..f19 context lines plus the 20 additions.
-    // skim commit render adds per-line numbers (+20, +21, …) and AST breadcrumbs
-    // to each hunk line, inflating past the raw diff size (≥ 256 bytes) so the
-    // guardrail at apply_to_stderr in emit_show_commit fires.
-    let mut ts_src_v2 = ts_src_v1.clone();
-    for i in 20..40 {
-        ts_src_v2.push_str(&format!("function f{i}() {{ }}\n"));
-    }
-    std::fs::write(repo.join("inflate.ts"), &ts_src_v2).expect("write inflate.ts v2");
-    git_in(&repo, &["add", "inflate.ts"]);
-    git_in(&repo, &["commit", "-m", "extend inflate fixture"]);
 
     // With SKIM_DEBUG=1: guardrail fires AND banner is visible → PRESENT.
     let debug_out = common::skim()
@@ -1630,5 +1709,57 @@ fn test_skim_git_diff_argv0_surface_does_not_expand() {
          raw={raw_len}B  skim={skim_len}B\n  \
          skim stdout={:?}",
         String::from_utf8_lossy(&skim_output.stdout),
+    );
+}
+
+// ============================================================================
+// architecture-15: skim git log --json stdout is always valid JSON
+// ============================================================================
+
+/// **architecture-15 regression**: `skim git log --json` must always emit
+/// valid JSON on stdout.
+///
+/// Before the fix, the JSON arm called `emit_elision(elision.as_ref())?`
+/// AFTER the JSON envelope was written.  If stdout was truncated (≥64 MiB),
+/// this appended `[skim] … commits …\n` to stdout, making the combined output
+/// invalid JSON for downstream `jq` consumers.
+///
+/// This test verifies the JSON-validity contract for the normal (non-truncated)
+/// path.  It would also catch the truncation regression if the log output ever
+/// exceeded 64 MiB in CI.
+#[test]
+fn arch15_git_log_json_stdout_is_valid_json() {
+    let output = common::skim()
+        .args(["git", "log", "--json", "-n", "5"])
+        .output()
+        .expect("skim git log --json must not fail to spawn");
+
+    assert!(
+        output.status.success(),
+        "skim git log --json must exit 0; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "arch15: skim git log --json must emit valid JSON on stdout\n\
+             parse error: {e}\n\
+             stdout (first 600 chars):\n{}",
+            &stdout[..stdout.len().min(600)]
+        )
+    });
+
+    // Before the fix, if any elision text was appended to stdout it would
+    // appear as a bare `[skim]` line after the JSON document.  After the fix,
+    // the elision is folded into the JSON body as `stdout_elision` if present.
+    let contains_bare_skim_marker = stdout
+        .lines()
+        .any(|l| l.trim_start().starts_with("[skim]") && !l.trim_start().starts_with("{"));
+    assert!(
+        !contains_bare_skim_marker,
+        "arch15: stdout must not contain a bare [skim] marker outside the JSON document\n\
+         stdout (first 600 chars):\n{}",
+        &stdout[..stdout.len().min(600)]
     );
 }

@@ -1743,9 +1743,10 @@ fn test_max_lines_output_never_exceeds_limit() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Output should be at most 5 lines, got {}: {:?}",
+        line_count <= 6,
+        "Output should be at most 6 lines (5 content + 1 trailing marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1771,9 +1772,10 @@ fn test_max_lines_types_preferred_over_functions() {
     );
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 10,
-        "Output should be at most 10 lines, got {}",
+        line_count <= 11,
+        "Output should be at most 11 lines (10 content + 1 trailing marker), got {}",
         line_count,
     );
 }
@@ -1813,9 +1815,10 @@ fn test_max_lines_with_signatures_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 3,
-        "Signatures mode with max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "Signatures mode with max_lines=3 should produce at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1828,9 +1831,10 @@ fn test_max_lines_with_types_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Types mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count <= 6,
+        "Types mode with max_lines=5 should produce at most 6 lines (5 content + 1 marker), got {}",
         line_count,
     );
 }
@@ -1842,9 +1846,10 @@ fn test_max_lines_with_full_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4.2: max_lines=N produces N content lines + 1 marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Full mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count <= 6,
+        "Full mode with max_lines=5 should produce at most 6 lines (5 content + 1 marker), got {}",
         line_count,
     );
 }
@@ -1856,9 +1861,10 @@ fn test_max_lines_with_minimal_mode() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: minimal mode (single-span fast-path) emits N content + 1 marker = N+1 total.
     assert!(
-        line_count <= 5,
-        "Minimal mode with max_lines=5 should produce at most 5 lines, got {}",
+        line_count <= 6,
+        "Minimal mode with max_lines=5 should produce at most 6 lines (5 content + 1 marker), got {}",
         line_count,
     );
 }
@@ -1929,9 +1935,10 @@ fn test_max_lines_json_simple_truncation() {
     let result = transform_with_config(source, Language::Json, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4.2: max_lines=N produces N content lines + 1 marker = N+1 total.
     assert!(
-        line_count <= 3,
-        "JSON max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "JSON max_lines=3 should produce at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1946,9 +1953,10 @@ fn test_max_lines_yaml_simple_truncation() {
     let result = transform_with_config(source, Language::Yaml, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4.2: max_lines=N produces N content lines + 1 marker = N+1 total.
     assert!(
-        line_count <= 3,
-        "YAML max_lines=3 should produce at most 3 lines, got {}: {:?}",
+        line_count <= 4,
+        "YAML max_lines=3 should produce at most 4 lines (3 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
@@ -1961,15 +1969,20 @@ fn test_max_lines_1_returns_at_least_one_meaningful_line() {
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
     let line_count = result.lines().count();
+    // E4: N content + 1 trailing marker = N+1 total. For max_lines=1 the no-content
+    // safety fallback triggers simple_line_truncate → 1 content + 1 marker = 2 lines.
     assert!(
-        line_count <= 1,
-        "max_lines=1 should produce at most 1 line, got {}: {:?}",
+        line_count <= 2,
+        "max_lines=1 should produce at most 2 lines (1 content + 1 marker), got {}: {:?}",
         line_count,
         result,
     );
+    // Must contain at least 1 content line (non-marker).
+    let has_content = result.lines().any(|l| !l.contains("lines truncated"));
     assert!(
-        !result.trim().is_empty(),
-        "max_lines=1 should produce at least one meaningful line"
+        has_content,
+        "max_lines=1 should contain at least one content line: {:?}",
+        result,
     );
 }
 
@@ -1979,10 +1992,11 @@ fn test_max_lines_omission_markers_present() {
     let config = TransformConfig::with_mode(Mode::Structure).with_max_lines(5);
     let result = transform_with_config(source, Language::TypeScript, &config).unwrap();
 
-    // The file is large enough that truncation should produce omission markers
+    // The file is large enough that truncation should produce omission markers.
+    // After E2 every marker carries an exact count: "// ... (N lines truncated)".
     assert!(
-        result.contains("// ... (truncated)"),
-        "Should contain TypeScript omission markers: {:?}",
+        result.contains("// ...") && result.contains("lines truncated"),
+        "Should contain TypeScript counted omission markers: {:?}",
         result,
     );
 }
@@ -2001,8 +2015,16 @@ fn count_words(s: &str) -> usize {
 #[test]
 fn test_truncate_to_token_budget_public_api_no_truncation() {
     let text = "line one\nline two\nline three\n";
-    let result = truncate_to_token_budget(text, Language::TypeScript, 100, count_words, None)
-        .expect("truncate_to_token_budget should succeed");
+    let result = truncate_to_token_budget(
+        text,
+        Language::TypeScript,
+        100,
+        count_words,
+        None,
+        None,
+        None,
+    )
+    .expect("truncate_to_token_budget should succeed");
     assert_eq!(
         result, text,
         "Text within budget should be returned unchanged"
@@ -2012,8 +2034,9 @@ fn test_truncate_to_token_budget_public_api_no_truncation() {
 #[test]
 fn test_truncate_to_token_budget_public_api_truncates_over_budget() {
     let text = "word1 word2\nword3 word4\nword5 word6\nword7 word8\n";
-    let result = truncate_to_token_budget(text, Language::TypeScript, 6, count_words, None)
-        .expect("truncate_to_token_budget should succeed");
+    let result =
+        truncate_to_token_budget(text, Language::TypeScript, 6, count_words, None, None, None)
+            .expect("truncate_to_token_budget should succeed");
     let token_count = count_words(&result);
     assert!(
         token_count <= 6,
@@ -2845,19 +2868,19 @@ fn test_typescript_pseudo() {
     let source = include_str!("../../../tests/fixtures/typescript/simple.ts");
     let result = transform(source, Language::TypeScript, Mode::Pseudo).unwrap();
 
-    // Param type annotations should be stripped; return type preserved (A4 contract).
-    // Fixture: `add(a: number, b: number): number` — params stripped, return kept.
+    // ADR-008/E1: param type annotations are now preserved as API surface.
+    // Fixture: `add(a: number, b: number): number` — both params and return preserved.
     assert!(
-        result.contains("function add(a, b)"),
-        "param type annotations should be stripped, got: {result}"
+        result.contains("function add(a: number, b: number)"),
+        "param type annotations must be preserved (ADR-008), got: {result}"
     );
     assert!(
         result.contains("): number"),
         "return type annotation must be preserved as API surface (A4), got: {result}"
     );
     assert!(
-        result.contains("function greet(name)"),
-        "param type annotation stripped in greet, got: {result}"
+        result.contains("function greet(name: string)"),
+        "param type annotation preserved in greet (ADR-008), got: {result}"
     );
     assert!(
         result.contains("): string"),
@@ -3049,10 +3072,10 @@ fn test_pseudo_with_config() {
         result.contains("export"),
         "export preserved as API surface via config API"
     );
-    // Param type annotations stripped; return type preserved (A4 contract).
+    // ADR-008/E1: param type annotations preserved; return type preserved (A4 contract).
     assert!(
-        result.contains("function add(a, b)"),
-        "param type annotations stripped via config API, got: {result}"
+        result.contains("function add(a: number, b: number)"),
+        "param type annotations preserved via config API (ADR-008), got: {result}"
     );
     assert!(
         result.contains("): number"),

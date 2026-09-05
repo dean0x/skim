@@ -11,19 +11,46 @@ mod common;
 // Real cargo test execution
 // ============================================================================
 
+/// Run `skim cargo test` against a trivial zero-dependency temp crate.
+///
+/// # Why a temp crate (not `-p rskim-core` on this repo)
+///
+/// The previous version of this test ran `skim cargo test -p rskim-core`
+/// against skim's own workspace. That approach shared `target/` with the outer
+/// test run, relinked 10 test binaries after any rskim-core edit, ran 16
+/// doctests, and hit the 120 s timeout twice during a machine-wide stall on
+/// 2026-09-02 (measured 4.8–6.1 s warm locally, ~26 s on CI). A temp crate
+/// decouples from `target/` state and machine load — same precedent used by
+/// `test_build_cargo_success_exit_code` in `cli_e2e_build_parsers.rs` (issue
+/// #447). The crate compiles in ~1–2 s on a cold runner.
+///
+/// Workspace isolation: `common::trivial_cargo_project()` places the directory
+/// under the system temp root, outside the skim workspace tree. Its
+/// `Cargo.toml` also includes an explicit `[workspace]` table that severs any
+/// upward workspace walk cargo might attempt.
+///
+/// # What this still uniquely proves (four properties)
+///
+/// 1. Real cargo accepts `--message-format=json` injected by `build_cargo_args`
+///    + `inject_flag_before_separator` (`crates/rskim/src/cmd/test/cargo.rs`).
+/// 2. `RE_CARGO_SUMMARY` (tier-2 regex) matches genuine stable-toolchain
+///    libtest summary output (`test result: ok. 1 passed; 0 failed; 0 ignored;
+///    …`), rendering `pass: 1 fail: 0 skip: 0` on stdout.
+/// 3. Exit-code handling on a real passing `cargo test` (`expected_exit_codes =
+///    &[101]` path) plus the ADR-001 net-savings guard against a real baseline.
+/// 4. `should_read_stdin` declines stdin when args are present so cargo is
+///    actually spawned (no stdin path taken).
 #[test]
-fn test_skim_test_cargo_in_this_repo() {
-    // Run `skim cargo test -p rskim-core` on skim's own repo.
-    // This executes a real `cargo test` and parses the output.
-    // We use -p rskim-core to limit scope and speed up the test.
-    let assert = common::skim()
-        .args(["cargo", "test", "-p", "rskim-core"])
+fn test_skim_test_cargo_real_cargo_trivial_crate() {
+    let dir = common::trivial_cargo_project();
+    common::skim()
+        .args(["cargo", "test"])
+        .current_dir(dir.path())
         .env_remove("SKIM_PASSTHROUGH")
         .timeout(std::time::Duration::from_secs(120))
-        .assert();
-
-    // Should produce structured output with pass count (tier 2 regex)
-    assert.stdout(predicate::str::contains("pass:"));
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pass: 1"));
 }
 
 // ============================================================================
@@ -180,64 +207,102 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
 }
 
 // ============================================================================
-// Unknown cargo subcommand — error path coverage
+// Unknown subcommand — error path coverage (D2 passthrough semantics)
 // ============================================================================
 
-/// `skim cargo unknownthing` must fail with an "unknown subcommand" error
-/// on stderr. This covers the `unknown` arm in `dispatch_cargo`.
+// D2: unknown subcommands in these dispatchers are forwarded to the native
+// binary via run_raw_passthrough instead of returning a skim-generated "unknown
+// subcommand" error. These tests verify:
+//   (a) skim exits non-zero (the stub exits 1)
+//   (b) the stub's sentinel appears in stdout — proves skim forwarded to the
+//       tool, not that the test merely passed because the tool binary was absent
+//   (c) skim's own debug-gated banner is absent from stderr in default mode
+//       (ADR-011 lossless path; real messages are e.g. "skim cargo: unknown
+//       subcommand '{x}' — passing through", never the bare "skim: unknown
+//       subcommand" literal the old assertions checked)
+//
+// Stub-based (unix-only): a shell script stands in for the real tool so the
+// test distinguishes "skim forwarded" from "skim failed to spawn missing binary".
+
+/// D2 stub test: `skim cargo unknownthing` forwards to cargo, exits non-zero.
+/// The stub exits 1 with a sentinel — proves forwarding, not spawn-failure.
+#[cfg(unix)]
 #[test]
 fn test_skim_cargo_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "cargo", "STUB-CARGO-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["cargo", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        // Stub ran — skim forwarded to cargo via run_raw_passthrough.
+        .stdout(predicate::str::contains("STUB-CARGO-SENTINEL"))
+        // D2: debug-gated banner never reaches stderr in default mode.
+        .stderr(predicate::str::contains("skim cargo: unknown subcommand").not());
 }
 
-// ============================================================================
-// Error-path E2E coverage — go, npm, pnpm, pip unknown/missing subcommands
-// ============================================================================
-
-/// `skim go unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `unknown` arm in `dispatch_go`.
+/// D2 stub test: `skim go unknownthing` forwards to go, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_go_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "go", "STUB-GO-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["go", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stdout(predicate::str::contains("STUB-GO-SENTINEL"))
+        .stderr(predicate::str::contains("skim go: unknown subcommand").not());
 }
 
-/// `skim npm unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `other` arm in `pkg::npm::run`.
+/// D2 stub test: `skim npm unknownthing` forwards to npm, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_npm_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "npm", "STUB-NPM-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["npm", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stdout(predicate::str::contains("STUB-NPM-SENTINEL"))
+        .stderr(predicate::str::contains("skim npm: unknown subcommand").not());
 }
 
-/// `skim pnpm unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `other` arm in `pkg::pnpm::run`.
+/// D2 stub test: `skim pnpm unknownthing` forwards to pnpm, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_pnpm_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "pnpm", "STUB-PNPM-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["pnpm", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stdout(predicate::str::contains("STUB-PNPM-SENTINEL"))
+        .stderr(predicate::str::contains("skim pnpm: unknown subcommand").not());
 }
 
-/// `skim pip unknownthing` must fail with an "unknown subcommand" error.
-/// Covers the `other` arm in `pkg::pip::run`.
+/// D2 stub test: `skim pip unknownthing` forwards to pip, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_pip_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "pip", "STUB-PIP-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["pip", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown subcommand"));
+        .stdout(predicate::str::contains("STUB-PIP-SENTINEL"))
+        .stderr(predicate::str::contains("skim pip: unknown subcommand").not());
 }

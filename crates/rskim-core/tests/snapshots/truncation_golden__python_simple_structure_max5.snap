@@ -1,0 +1,9 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Structure).with_max_lines(5))"
+---
+# ... (11 lines truncated)
+class Calculator:
+    def add(self, x: int, y: int) -> int:
+         {...}
+# ... (3 lines truncated)

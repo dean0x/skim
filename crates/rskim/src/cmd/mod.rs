@@ -94,7 +94,10 @@ pub(crate) mod ux;
 // ============================================================================
 
 mod dispatch;
-pub(crate) use dispatch::{dispatch, run_inherited_passthrough, run_raw_passthrough};
+pub(crate) use dispatch::{
+    dispatch_explicit, dispatch_for_wrapper, redaction_is_mandatory, run_inherited_passthrough,
+    run_raw_passthrough,
+};
 
 pub(crate) mod execution;
 pub(crate) use execution::{
@@ -239,8 +242,81 @@ pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
 /// When passthrough mode is active, all compression is bypassed and raw output
 /// is forwarded unchanged. Useful for debugging or when the compressed output
 /// is too aggressive for a particular workflow.
+///
+/// # Where the hatch is honoured
+///
+/// The claim above is enforced STRUCTURALLY, at the convergence point in
+/// [`crate::cmd::dispatch::dispatch`] — not per handler.  Honouring it per
+/// handler is what made the claim false in the first place: every `git`
+/// subcommand, every `build` tool and `gh run watch` ignored it outright
+/// (measured: `SKIM_PASSTHROUGH=1 skim git log -n 3` emitted 361 bytes against
+/// 7733 raw), and the handlers that DID honour it read argv AFTER `prepare_args`
+/// had injected format flags, so the hatch streamed a command the user never
+/// typed (PF-024).  ADR-011 states the constraint directly: "the hatch must be
+/// honored centrally rather than re-implemented per handler."
+///
+/// Eleven call sites remain; each covers something the convergence point
+/// structurally cannot:
+///
+/// - `main.rs::process_single_arg` — the READ path never enters `cmd::dispatch`.
+/// - `cmd/log.rs`, `cmd/proxy.rs` — META subcommands, excluded from the gate by
+///   construction (exec-ing them as OS binaries would run an unrelated program).
+/// - `cmd/execution.rs`, `cmd/test/shared.rs` — the FILTER role (piped stdin, no
+///   real args), where the correct answer is "hand the caller's bytes back", not
+///   "exec the tool".  The gate declines in that role rather than duplicating
+///   these paths against a different arg shape.
+/// - `cmd/dispatch.rs` (×2) — the convergence gate itself; one arm fires the
+///   central passthrough path, the other guards the daemon-detection check.
+/// - `cmd/file/mod.rs` — propagates the flag into `FileOperation` config so the
+///   file-read path honours it without re-entering dispatch.
+/// - `cmd/rewrite/hook.rs` — the hook JSON responder; it exits early before
+///   attempting any command rewrite when the flag is set.
+/// - `cmd/test/pytest.rs`, `cmd/test/go.rs` — the FILTER role for piped test
+///   output (SKIM_PASSTHROUGH=1 pipes stdin back verbatim).  The dispatch gate
+///   declines for filter-role invocations via `handler_reads_stdin`, so these
+///   per-handler checks are live, not dead, and cannot be removed.
+/// - `main.rs:process_piped_passthrough` — top-level stdin pump for the
+///   explicit `skim --passthrough` invocation.
+///
+/// `cmd/file/env.rs` is the one deliberate REFUSAL: `never_passthrough: true`
+/// keeps credential redaction on both branches (PF-012).
+///
+/// C2: also returns `true` when the `--passthrough` CLI flag has been set via
+/// [`set_passthrough_flag`] — providing flag parity with `SKIM_PASSTHROUGH=1`.
 pub(crate) fn is_passthrough_mode() -> bool {
-    check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok())
+    check_passthrough_value(std::env::var("SKIM_PASSTHROUGH").ok()) || is_passthrough_flag_set()
+}
+
+// ============================================================================
+// --passthrough CLI flag (C2)
+// ============================================================================
+
+/// Process-wide flag that activates passthrough mode via `--passthrough`.
+///
+/// Written with `Release` ordering before `THREADS_SPAWNED` is set in
+/// `main()`, so analytics threads always see the correct value.
+/// Mirrors the `DEBUG_FORCE_ENABLED` pattern in `debug.rs`.
+static PASSTHROUGH_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable passthrough mode via the `--passthrough` CLI flag.
+///
+/// Must be called in `main()` BEFORE `THREADS_SPAWNED.store(true, …)` so
+/// that any background analytics threads observe the correct value.  The
+/// `strip_skim_wrappers_from_path()` assertion in `main()` catches future
+/// reorderings at runtime.
+///
+/// Thread-safe alternative to `std::env::set_var("SKIM_PASSTHROUGH", "1")`,
+/// which is not safe to call after threads are spawned.
+pub(crate) fn set_passthrough_flag() {
+    PASSTHROUGH_FLAG.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Check whether `--passthrough` was given on the command line.
+///
+/// Returns `true` if [`set_passthrough_flag`] has been called.  This is a
+/// pure atomic load with no allocations or syscalls.
+pub(crate) fn is_passthrough_flag_set() -> bool {
+    PASSTHROUGH_FLAG.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Core truthy-value check for a `SKIM_PASSTHROUGH` value already extracted as
@@ -299,13 +375,43 @@ pub(crate) fn extract_show_stats(args: &[String]) -> (Vec<String>, bool) {
 ///
 /// This centralises the pattern that was previously copy-pasted across git,
 /// lint, and pkg subcommand entry points.
+/// Extract skim's `--json` output flag from args.
+///
+/// Returns `(filtered_args, is_json)` where `filtered_args` has skim's `--json`
+/// removed and `is_json` is true when the flag was present.
+///
+/// D4 improvements over the original implementation:
+/// - **Position-aware**: only strips bare `--json`; never strips `--json=value`
+///   (e.g. `gh pr list --json title,number` — the gh field-selector must survive).
+/// - **Separator-aware**: never strips `--json` after the POSIX `--` separator
+///   (args after `--` are positional arguments, not skim flags).
+///
+/// Note: tools with their own `--json` flag (rg, tree) should be handled by the
+/// caller's passthrough logic (D3/D4: the rewrite surface's `skip_if_flag_prefix`
+/// equivalent). On the wrapper surface, `dispatch_for_wrapper` handles `--version`
+/// and `--help`; tool-owned `--json` is handled by checking `skip_if_flag_prefix`
+/// in `dispatch_for_wrapper` (see D4 extension in dispatch.rs).
 pub(crate) fn extract_json_flag(args: &[String]) -> (Vec<String>, bool) {
-    let is_json = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args
-        .iter()
-        .filter(|a| a.as_str() != "--json")
-        .cloned()
-        .collect();
+    let mut is_json = false;
+    let mut past_separator = false;
+    let mut filtered = Vec::with_capacity(args.len());
+
+    for arg in args {
+        if arg == "--" {
+            past_separator = true;
+            filtered.push(arg.clone());
+            continue;
+        }
+        // Only strip bare `--json` (skim's output-format flag), and only before `--`.
+        // `--json=value` is a tool-owned flag (e.g. gh's field-selector) — keep it.
+        if !past_separator && arg.as_str() == "--json" {
+            is_json = true;
+            // Strip from filtered — caller uses json_output=true for JSON formatting.
+        } else {
+            filtered.push(arg.clone());
+        }
+    }
+
     (filtered, is_json)
 }
 
@@ -395,6 +501,55 @@ mod tests {
         let (filtered, is_json) = extract_json_flag(&args);
         assert!(!is_json);
         assert_eq!(filtered, vec!["--cached"]);
+    }
+
+    // D4 additions: value-aware and separator-aware extract_json_flag tests.
+
+    /// `--json=value` is a tool-owned flag (e.g. gh field-selector); must NOT be stripped.
+    #[test]
+    fn test_extract_json_flag_with_value_not_stripped() {
+        let args: Vec<String> = vec!["--json=title,number".into(), "--limit=10".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        // Tool-owned --json=value must survive — skim only strips bare --json.
+        assert!(
+            !is_json,
+            "--json=value must not set skim's json_output flag"
+        );
+        assert_eq!(
+            filtered,
+            vec!["--json=title,number", "--limit=10"],
+            "--json=value must not be stripped from tool args"
+        );
+    }
+
+    /// `--json` after `--` is a positional argument; must NOT be stripped.
+    #[test]
+    fn test_extract_json_flag_after_separator_not_stripped() {
+        let args: Vec<String> = vec!["--cached".into(), "--".into(), "--json".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        // --json after -- is a positional arg passed to the tool, not skim's flag.
+        assert!(
+            !is_json,
+            "--json after -- must not set skim's json_output flag"
+        );
+        assert_eq!(
+            filtered,
+            vec!["--cached", "--", "--json"],
+            "--json after -- must survive in filtered args"
+        );
+    }
+
+    /// Bare `--json` before `--` is still stripped (skim's output-format flag).
+    #[test]
+    fn test_extract_json_flag_before_separator_is_stripped() {
+        let args: Vec<String> = vec!["--json".into(), "--".into(), "positional".into()];
+        let (filtered, is_json) = extract_json_flag(&args);
+        assert!(is_json, "bare --json before -- must set json_output=true");
+        assert_eq!(
+            filtered,
+            vec!["--", "positional"],
+            "bare --json before -- must be stripped; positional args must survive"
+        );
     }
 
     // ========================================================================

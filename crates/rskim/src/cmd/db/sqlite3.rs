@@ -38,6 +38,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
+    never_passthrough: false,
 };
 
 /// Flags that indicate the user has already set an output format.

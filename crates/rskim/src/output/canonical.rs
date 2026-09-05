@@ -890,12 +890,35 @@ impl fmt::Display for DiffFileStatus {
     }
 }
 
-/// A single file entry within a diff result
+/// A single file entry within a diff result.
+///
+/// # D3 — patch body (issue #510)
+///
+/// The `patch` field carries the raw unified-diff hunk content for this file,
+/// concatenated across all hunks (each hunk retains its `@@ … @@` header).
+/// It is serialised to JSON so `skim git diff --json` consumers can reconstruct
+/// the full diff without re-running git.
+///
+/// `patch` is optional and skipped from JSON when absent (`None`) to preserve
+/// backward-compatibility with callers that construct `DiffFileEntry` for
+/// display-only paths where the raw patch is not available.
+///
+/// # ADR-011 class-1 / Completeness::Reencoded
+///
+/// When `patch` is `Some`, the JSON envelope faithfully re-encodes all diff
+/// content (`Completeness::Reencoded`); no disclosure marker is owed.
+/// When `patch` is `None`, the JSON is metadata-only and a disclosure marker
+/// is owed on the class-1 path (not currently implemented — D3 fills this).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiffFileEntry {
     pub(crate) path: String,
     pub(crate) status: DiffFileStatus,
     pub(crate) changed_regions: usize,
+    /// Raw unified-diff hunk text for this file (all hunks concatenated).
+    /// Serialised to JSON; `None` on display-only paths where the patch is
+    /// not available (e.g. `ensure_rendered` after JSON deserialization).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) patch: Option<String>,
 }
 
 /// Complete diff result with file entries and pre-rendered display
@@ -928,10 +951,16 @@ impl DiffResult {
         self.rendered
     }
 
-    /// Recompute rendered field if empty (e.g., after deserialization)
+    /// Recompute `rendered` if empty (e.g. after JSON deserialization).
+    ///
+    /// # D3 — patch body
+    ///
+    /// When `DiffFileEntry.patch` is `Some`, `ensure_rendered` appends the raw
+    /// hunk content so the text view is rebuilt faithfully, not just as a lossy
+    /// file-list summary.  This restores the house convention that serialised
+    /// types can be round-tripped without losing content.
     pub(crate) fn ensure_rendered(&mut self) {
         if self.rendered.is_empty() {
-            // Re-render from file entries as a summary fallback
             use std::fmt::Write;
             let mut output = format!("{} files changed", self.files_changed);
             for file in &self.files {
@@ -940,6 +969,13 @@ impl DiffResult {
                     "\n {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
+                // D3: if the patch body is present, append it so the rendered
+                // view is a faithful reconstruction, not just a stat summary.
+                if let Some(patch) = &file.patch
+                    && !patch.is_empty()
+                {
+                    let _ = write!(output, "\n{patch}");
+                }
             }
             self.rendered = output;
         }
@@ -2015,11 +2051,13 @@ mod tests {
                     path: "src/main.rs".to_string(),
                     status: DiffFileStatus::Modified,
                     changed_regions: 3,
+                    patch: None,
                 },
                 DiffFileEntry {
                     path: "src/lib.rs".to_string(),
                     status: DiffFileStatus::Added,
                     changed_regions: 1,
+                    patch: None,
                 },
             ],
             String::new(), // simulate empty rendered field
@@ -2313,6 +2351,7 @@ mod tests {
             path: "src/main.rs".to_string(),
             status: DiffFileStatus::Modified,
             changed_regions: 2,
+            patch: None,
         }];
         let result = ShowCommitResult::new(
             "abc1234567".to_string(),
@@ -2365,11 +2404,13 @@ mod tests {
                 path: "a.rs".to_string(),
                 status: DiffFileStatus::Added,
                 changed_regions: 1,
+                patch: None,
             },
             DiffFileEntry {
                 path: "b.rs".to_string(),
                 status: DiffFileStatus::Deleted,
                 changed_regions: 3,
+                patch: None,
             },
         ];
         let result = ShowCommitResult::new(
@@ -2394,6 +2435,7 @@ mod tests {
             path: "src/lib.rs".to_string(),
             status: DiffFileStatus::Modified,
             changed_regions: 5,
+            patch: None,
         }];
         let original = ShowCommitResult::new(
             "cafebabe".to_string(),
@@ -2449,6 +2491,7 @@ mod tests {
                 path: "src/foo.rs".to_string(),
                 status: DiffFileStatus::Modified,
                 changed_regions: 4,
+                patch: None,
             }],
             rendered: String::new(),
         };
@@ -2767,6 +2810,14 @@ impl ShowCommitResult {
                     "\n {} ({}, {} regions)",
                     file.path, file.status, file.changed_regions
                 );
+                // D3 (issue #510): if the patch body is present, append it so
+                // the rendered view is a faithful reconstruction, not just a
+                // stat summary.
+                if let Some(patch) = &file.patch
+                    && !patch.is_empty()
+                {
+                    let _ = write!(output, "\n{patch}");
+                }
             }
             if !self.body.is_empty() {
                 let _ = write!(output, "\n{}", self.body);

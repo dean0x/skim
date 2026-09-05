@@ -109,6 +109,8 @@ pub(super) fn run_script(
             skip_net_savings_guard: false,
             // npm run output is the script's own stdout; success output is not empty.
             synthesize_success_line: None,
+            raw_override: None,
+            never_passthrough: false,
         },
         move |output: &CommandOutput| parse_npm_output(output, tool),
     )

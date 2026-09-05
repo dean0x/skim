@@ -11,13 +11,15 @@
 //!
 //! Commands that appear as the *source* side of a pipe (e.g. `ls | head`,
 //! `git diff | head`, `rg pat | head`) are NEVER rewritten.  This is enforced
-//! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks
-//! `has_pipe_operator` on the full segment list and returns `None` immediately
-//! if any pipe operator is present, so the entire pipeline passes through
-//! untouched (enforced by the `has_pipe_operator` short-circuit in
-//! `try_rewrite_compound`, compound.rs).  No per-rule flag is needed or
-//! used — git diff/log/show as pipe sources are protected by this global
-//! short-circuit, not by any field on `RewriteRule`.  SEE: AD-RW-2.
+//! GLOBALLY in `compound.rs`: `try_rewrite_compound` checks each pipeline
+//! segment via `has_pipe_operator`; most shapes (including all examples above)
+//! pass through untouched.  Exception: a two-stage `<cmd> | cat` where bare
+//! `cat` is the sole consumer IS rewritten when `command_needs_exact_bytes` is
+//! clear (force-raw sidecar absent) — all other pipe shapes still pass through
+//! (enforced by the `has_pipe_operator` short-circuit in `try_rewrite_compound`,
+//! compound.rs).  No per-rule flag is needed or used — git diff/log/show as
+//! pipe sources are protected by this global short-circuit, not by any field on
+//! `RewriteRule`.  SEE: AD-RW-2.
 
 use std::sync::LazyLock;
 
@@ -82,7 +84,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["npx", "jest"],
         rewrite_to: &["skim", "jest"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -110,7 +112,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["jest"],
         rewrite_to: &["skim", "jest"],
-        skip_if_flag_prefix: &[],
+        skip_if_flag_prefix: &["--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -129,7 +131,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["npx", "playwright", "test"],
         rewrite_to: &["skim", "playwright"],
-        skip_if_flag_prefix: &["--reporter"],
+        skip_if_flag_prefix: &["--reporter", "--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -138,7 +140,7 @@ const TEST_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["playwright", "test"],
         rewrite_to: &["skim", "playwright"],
-        skip_if_flag_prefix: &["--reporter"],
+        skip_if_flag_prefix: &["--reporter", "--debug"],
         category: RewriteCategory::Test,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -551,10 +553,11 @@ const LINT_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
-    // golangci-lint
+    // golangci-lint (D1: rewrite_to uses canonical "golangci-lint" to match the new
+    // KNOWN_SUBCOMMANDS entry and wrapper symlink name)
     RewriteRule {
         prefix: &["golangci-lint", "run"],
-        rewrite_to: &["skim", "golangci"],
+        rewrite_to: &["skim", "golangci-lint"],
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -563,7 +566,7 @@ const LINT_RULES: &[RewriteRule] = &[
     },
     RewriteRule {
         prefix: &["golangci-lint"],
-        rewrite_to: &["skim", "golangci"],
+        rewrite_to: &["skim", "golangci-lint"],
         skip_if_flag_prefix: &["--out-format"],
         category: RewriteCategory::Lint,
         skip_if_middle_contains_eq: false,
@@ -1391,7 +1394,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["aws"],
         rewrite_to: &["skim", "aws"],
-        skip_if_flag_prefix: &["--output"],
+        skip_if_flag_prefix: &["--output", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -1443,7 +1446,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["wget"],
         rewrite_to: &["skim", "wget"],
-        skip_if_flag_prefix: &["-O", "-q", "--quiet"],
+        skip_if_flag_prefix: &["-O", "-q", "--quiet", "--debug", "-d"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: &[],
@@ -1463,7 +1466,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "compose", "ps"],
         rewrite_to: &["skim", "docker", "compose", "ps"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1472,7 +1475,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "compose", "logs"],
         rewrite_to: &["skim", "docker", "compose", "logs"],
-        skip_if_flag_prefix: &["-f", "--follow"],
+        skip_if_flag_prefix: &["-f", "--follow", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1482,7 +1485,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "ps"],
         rewrite_to: &["skim", "docker", "ps"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1491,7 +1494,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "images"],
         rewrite_to: &["skim", "docker", "images"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1500,7 +1503,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "build"],
         rewrite_to: &["skim", "docker", "build"],
-        skip_if_flag_prefix: &["--push", "--load"],
+        skip_if_flag_prefix: &["--push", "--load", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1509,7 +1512,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "inspect"],
         rewrite_to: &["skim", "docker", "inspect"],
-        skip_if_flag_prefix: &["--format"],
+        skip_if_flag_prefix: &["--format", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1518,7 +1521,7 @@ const INFRA_RULES: &[RewriteRule] = &[
     RewriteRule {
         prefix: &["docker", "logs"],
         rewrite_to: &["skim", "docker", "logs"],
-        skip_if_flag_prefix: &["-f", "--follow"],
+        skip_if_flag_prefix: &["-f", "--follow", "--debug"],
         category: RewriteCategory::Infra,
         skip_if_middle_contains_eq: false,
         global_value_flags: DOCKER_GLOBAL_FLAGS,
@@ -1797,25 +1800,14 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
         global_value_flags: &[],
         require_flag: &[],
     },
-    // diff
-    RewriteRule {
-        prefix: &["diff"],
-        rewrite_to: &["skim", "diff"],
-        skip_if_flag_prefix: &[
-            "--help",
-            "--version",
-            "-y",
-            "--side-by-side",
-            "-q",
-            "--brief",
-            "-e",
-            "--ed",
-        ],
-        category: RewriteCategory::FileOps,
-        skip_if_middle_contains_eq: false,
-        global_value_flags: &[],
-        require_flag: &[],
-    },
+    // diff — rewrite rule intentionally absent (D1/PF-011 decision, 2026-08-26).
+    //
+    // `skim diff` is a pure passthrough (RawPassthrough for every input after the
+    // Phase 1 fix). Rewriting `diff a b` → `skim diff a b` spawns an extra process
+    // with zero compression benefit — skim forwards the bytes unchanged regardless.
+    // PF-011 says: if skim would cost more than not using skim, run the native command.
+    // The wrapper symlink (~/.skim/bin/diff) is kept for backward-compat; the
+    // RawPassthrough path is still byte-identical to native diff on the wrapper surface.
     // ls catch-all (B.1) — DESIGN NOTE (AD-RW-2)
     //
     // Fires for any `ls` invocation not matched by a more-specific earlier rule
@@ -1824,7 +1816,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     //
     // Pipe-source passthrough (`ls | head`) is handled GLOBALLY by
     // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
-    // — not by any per-rule field.  SEE: AD-RW-2.
+    // — not by any per-rule field.  Exception: `ls | cat` (bare cat sole
+    // consumer) is rewritten.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["ls"],
         rewrite_to: &["skim", "ls"],
@@ -1841,7 +1834,8 @@ const FILE_OPS_RULES: &[RewriteRule] = &[
     //
     // Pipe-source passthrough (`grep pat | head`) is handled GLOBALLY by
     // `has_pipe_operator` short-circuit in `try_rewrite_compound` (compound.rs)
-    // — not by any per-rule field.  SEE: AD-RW-2.
+    // — not by any per-rule field.  Exception: `grep pat | cat` (bare cat sole
+    // consumer) is rewritten.  SEE: AD-RW-2.
     RewriteRule {
         prefix: &["grep"],
         rewrite_to: &["skim", "grep"],
@@ -1895,8 +1889,9 @@ mod tests {
     use super::*;
 
     /// Expected rule count — update this constant together with the category arrays.
-    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(16) + DB(3)
-    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 26 + 28 + 16 + 3;
+    /// TEST(18) + BUILD(13) + GIT(7) + LINT(43) + PKG(26) + INFRA(28) + FILE_OPS(15) + DB(3)
+    /// FILE_OPS was 16; diff rewrite rule removed (D1/PF-011: pure passthrough, zero savings).
+    const EXPECTED_RULE_COUNT: usize = 18 + 13 + 7 + 43 + 26 + 28 + 15 + 3;
 
     #[test]
     fn test_rule_count_matches_expected() {
@@ -2416,5 +2411,60 @@ mod tests {
             try_rewrite(&["rg", "-h"]).is_none(),
             "rg -h should pass through (not rewritten to skim rg)"
         );
+    }
+
+    // ========================================================================
+    // D1: Registry ≡ rewrite-head cross-check
+    //
+    // Every rewrite rule's leading token (prefix[0]) must be in
+    // wrapper_targets() or be a documented alias for a tool that IS wrapped.
+    // This test catches drift like the golangci/golangci-lint mismatch where
+    // the rewrite intercepted `golangci-lint` but the wrapper symlink was named
+    // `golangci` — agents on the wrapper surface got different behaviour.
+    // ========================================================================
+
+    /// Every rewrite rule head must be a wrapper target OR a documented alias.
+    ///
+    /// Aliases are secondary invocation names for tools that skim handles
+    /// under a canonical name. They do not need their own wrapper symlink.
+    /// Any new alias must be deliberate — add it here with a comment.
+    #[test]
+    fn test_rewrite_heads_are_wrapper_targets_or_documented_aliases() {
+        use crate::cmd::registry::wrapper_targets;
+        use std::collections::BTreeSet;
+
+        // Known aliases: rewrite heads that are NOT their own wrapper symlink
+        // targets because they are secondary spellings of a canonical tool name.
+        const KNOWN_ALIASES: &[&str] = &[
+            "./gradlew", // path-prefixed gradlew — aliased to gradlew handler
+            "./mvnw",    // path-prefixed mvnw — aliased to mvnw handler
+            "bundle",    // Bundler CLI — aliased to npm/pkg handler
+            "gmake",     // GNU make alias — aliased to make handler
+            "npx",       // npm exec — aliased to npm handler
+            "pip3",      // pip for Python 3 — aliased to pip handler
+            "python",    // python interpreter — aliased to pip handler
+            "python3",   // python 3 interpreter — aliased to pip handler
+        ];
+
+        let wrapper_set: BTreeSet<&str> = wrapper_targets().iter().copied().collect();
+
+        for rule in all_rules() {
+            let Some(&head) = rule.prefix.first() else {
+                continue;
+            };
+            if KNOWN_ALIASES.contains(&head) {
+                continue;
+            }
+            assert!(
+                wrapper_set.contains(head),
+                "Rewrite rule head '{head}' (prefix {:?}) is not in wrapper_targets() \
+                 and not in KNOWN_ALIASES — registry drift detected.\n\
+                 Fix: either correct the spelling in KNOWN_SUBCOMMANDS to match '{head}', \
+                 or add '{head}' to KNOWN_ALIASES if it is an alias for a canonical tool.\n\
+                 Example of drift this test catches: 'golangci' in KNOWN_SUBCOMMANDS \
+                 while rewrite rules intercepted 'golangci-lint' (the real binary name).",
+                rule.prefix,
+            );
+        }
     }
 }

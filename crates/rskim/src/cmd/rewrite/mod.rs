@@ -36,8 +36,8 @@ use std::process::ExitCode;
 
 use acknowledge::is_segment_ack;
 use compound::{
-    command_needs_passthrough, has_pipe_operator, rewrite_would_corrupt, splice_redirects_back,
-    split_compound, try_rewrite_compound,
+    command_needs_passthrough, has_pipe_operator, is_bare_cat_pipeline, rewrite_would_corrupt,
+    splice_redirects_back, split_compound, try_rewrite_compound,
 };
 use engine::try_rewrite;
 use hook::{parse_agent_flag, run_hook_mode};
@@ -127,6 +127,129 @@ pub(crate) fn classify_command(command: &str) -> CommandClassification {
 /// - `"git worktree list && cargo test"` → `Some(...)` (AlreadyCompact + Rewritten)
 ///
 /// If you need the full tri-state result, call `classify_command` directly.
+/// Match a CLI argument against a flag pattern, accepting both the exact
+/// space-separated form and the `--flag=value` equals-separated form.
+///
+/// # Semantics
+///
+/// - `arg == flag` — exact token match (covers all short flags and bare long flags).
+/// - `arg.strip_prefix(flag).starts_with('=')` — equals form, restricted to long
+///   flags that start with `--` to avoid false matches on short-option clusters
+///   (`-c=val` is not a standard POSIX short-option form).
+///
+/// # Why this predicate exists
+///
+/// The wrapper D5 gate and the rewrite engine's `require_flag` check historically
+/// used inline copies of this logic — the wrapper used `=`-form extension while the
+/// engine used exact-only matching (consistency-5).  Extracting the shared predicate
+/// here ensures both surfaces use identical semantics, so `psql --command='SELECT 1'`
+/// is treated identically on the rewrite surface and the wrapper surface.
+///
+/// # Usage
+///
+/// Call from D4, D5, and the rewrite engine's `require_flag` check.  Do **not**
+/// replace `skip_if_flag_prefix` matching with this function — that comparison
+/// already uses `starts_with` for prefix matching, not equality.
+pub(crate) fn arg_matches_flag(arg: &str, flag: &str) -> bool {
+    arg == flag
+        || (flag.starts_with("--")
+            && arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('=')))
+}
+
+/// Return the slice of args before the first POSIX `--` end-of-options separator.
+///
+/// When `--` is absent, the full slice is returned.  The returned slice stops at
+/// but does not include the `--` token itself.
+///
+/// Used by D3, D4, and D5 to avoid misclassifying user data after `--` as a flag:
+/// `grep -- --version file` should NOT trip D3 (the `--version` is a pattern,
+/// not a help-request flag).  `rg -- --json` should NOT trip D4.
+/// (consistency-8 fix: all gate scanners use this function consistently rather than
+/// scanning the whole arg list with `args.iter().any(…)`.)
+pub(crate) fn args_before_separator(args: &[String]) -> &[String] {
+    match args.iter().position(|a| a == "--") {
+        Some(pos) => &args[..pos],
+        None => args,
+    }
+}
+
+/// Return `true` when `tool_name` can open an interactive session when invoked
+/// without its required flag(s) through the PATH-wrapper surface.
+///
+/// This is the explicit predicate D5 uses to decide between
+/// `run_inherited_passthrough` (interactive session — stdio must be fully
+/// transparent) and the compressing handler (batch invocation).
+///
+/// # Why separate from `require_flags_for_tool`
+///
+/// `require_flags_for_tool` answers "does the rewrite rule require this flag to
+/// fire?" — a rewrite-surface concept.  `interactive_tool_for` answers "would this
+/// tool open an interactive TTY session on the wrapper surface without certain
+/// flags?" — a wrapper-surface concept.  Keeping them separate prevents the two
+/// notions from drifting: sqlite3 has `require_flag: &[]` (the rewrite surface is
+/// always non-interactive because the hook has piped stdin) but IS interactive on
+/// the wrapper surface when invoked without a SQL argument and with a TTY stdin.
+///
+/// # Covered tools
+///
+/// - **psql** — opens readline prompt when `-c`/`--command` is absent.
+/// - **mysql** — opens readline prompt when `-e`/`--execute` is absent.
+/// - **sqlite3** — opens readline prompt when invoked without a SQL positional
+///   argument and stdin is a TTY (the wrapper surface, unlike the hook, may have
+///   a TTY stdin).
+///
+/// D5 in `dispatch_inner` consults `require_flags_for_tool` to determine whether
+/// the required flag is present.  When `interactive_tool_for` returns `true` and
+/// none of the required flags are present (or `require_flags_for_tool` returns
+/// `None`), D5 calls `run_inherited_passthrough` so TTY features work.
+pub(crate) fn interactive_tool_for(tool_name: &str) -> bool {
+    matches!(tool_name, "psql" | "mysql" | "sqlite3")
+}
+
+/// Return the `skip_if_flag_prefix` entries for a tool from its rewrite rules.
+///
+/// Used by `dispatch_for_wrapper` (D4) to enforce tool-specific passthrough flags
+/// on the wrapper surface — mirroring `skip_if_flag_prefix` on the rewrite surface.
+/// For example, `rg --json` and `tree --json` set these tools' own JSON output mode
+/// and must not be intercepted by skim's `--json` output-format handler.
+///
+/// Returns an owned `Vec` so the caller does not need to hold a borrow on the rules
+/// iterator. The `--help`, `-h`, `--version`, and `-V` flags are excluded because
+/// `dispatch_for_wrapper` handles them separately (D3) before this is consulted.
+pub(crate) fn skip_flags_for_tool(tool_name: &str) -> Vec<&'static str> {
+    rules::all_rules()
+        .filter(|r| r.prefix.first().copied() == Some(tool_name))
+        .flat_map(|r| r.skip_if_flag_prefix.iter().copied())
+        .filter(|&f| !matches!(f, "--help" | "-h" | "--version" | "-V"))
+        .collect()
+}
+
+/// Return the `require_flag` entries for a tool from its rewrite rules.
+///
+/// Used by `dispatch_for_wrapper` (D5) to enforce the require-flag passthrough
+/// on the wrapper surface — mirroring `require_flag` in the rewrite engine.
+/// For example, `psql` requires `-c`/`--command` and `mysql` requires
+/// `-e`/`--execute`; without those flags the tool opens an interactive session
+/// that must not be intercepted by skim.
+///
+/// Returns `None` when no rules for `tool_name` declare any required flags (the
+/// tool does not gate on a required flag and the D5 check is a no-op). Returns
+/// `Some(flags)` when at least one rule does; the D5 gate falls back to raw
+/// passthrough when NONE of those flags appears in the argument list.
+///
+/// Reads the same [`rules::all_rules`] table as [`skip_flags_for_tool`] so the
+/// two surfaces cannot drift independently.
+#[must_use]
+pub(crate) fn require_flags_for_tool(tool_name: &str) -> Option<Vec<&'static str>> {
+    let flags: Vec<&'static str> = rules::all_rules()
+        .filter(|r| r.prefix.first().copied() == Some(tool_name))
+        .flat_map(|r| r.require_flag.iter().copied())
+        .collect();
+    if flags.is_empty() { None } else { Some(flags) }
+}
+
 // Kept for backward-compatibility; primary callers are tests in discover.rs.
 #[allow(dead_code)]
 pub(crate) fn would_rewrite(command: &str) -> Option<String> {
@@ -289,14 +412,35 @@ fn classify_compound(segments: &[CommandSegment]) -> CommandClassification {
 
 /// Classify a pipe expression.
 ///
-/// Pipes are NEVER rewritten (#317, user-approved): compressing the producer
-/// silently changes what downstream consumers (`grep`, `wc`, `head`) see.
-/// The first segment is only inspected to distinguish "already optimal"
-/// (`AlreadyCompact`) from a genuine compression gap (`Unhandled`).
+/// Most pipe shapes are left unclassified (`Unhandled`) because compressing the
+/// producer silently changes what downstream consumers (`grep`, `wc`, `head`) see
+/// (#317, user-approved). The sole exception is the bare `| cat` shape (AD-RW-2):
+/// exactly two segments with bare `cat` as the consumer and no redirects anywhere.
+/// That shape is classified the same way `try_rewrite_compound` handles it — by
+/// reusing [`is_bare_cat_pipeline`] — so the two surfaces cannot drift.
+///
+/// For all other pipes the first segment is inspected only to distinguish
+/// "already optimal" (`AlreadyCompact`) from a genuine compression gap
+/// (`Unhandled`).
 fn classify_compound_pipe(segments: &[CommandSegment]) -> CommandClassification {
     let Some(first) = segments.first() else {
         return CommandClassification::Unhandled;
     };
+
+    // AD-RW-2: bare `| cat` is the one pipeline shape the rewrite engine handles.
+    // Delegate to `is_bare_cat_pipeline` (the same predicate `try_rewrite_compound`
+    // uses) so classify_command and the hook surface cannot drift independently.
+    if is_bare_cat_pipeline(segments) {
+        let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
+        return match classify_segment_fine(&token_refs) {
+            SegmentClassification::Rewritten(tokens) => {
+                // Reconstruct the full pipeline: <rewritten_source> | cat
+                CommandClassification::Rewritten(format!("{} | cat", tokens.join(" ")))
+            }
+            SegmentClassification::AlreadyCompact(_) => CommandClassification::AlreadyCompact,
+            SegmentClassification::NoMatch => CommandClassification::Unhandled,
+        };
+    }
 
     let token_refs: Vec<&str> = first.tokens.iter().map(|s| s.as_str()).collect();
     if is_segment_ack(&token_refs) {

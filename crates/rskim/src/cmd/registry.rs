@@ -22,76 +22,76 @@ use std::sync::LazyLock;
 /// `is_known_subcommand` can use `binary_search` — O(log n) instead of O(n).
 /// The `test_known_subcommands_are_sorted` test enforces this.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "agents",      // meta: skim management
-    "aws",         // infrastructure
-    "biome",       // linter
-    "black",       // linter
-    "cargo",       // multi-category dispatcher
-    "completions", // meta: skim management
-    "curl",        // infrastructure
-    "cypress",     // test runner
-    "df",          // file operations
-    "diff",        // file operations
-    "dig",         // infrastructure
-    "discover",    // meta: skim management
-    "docker",      // infrastructure
-    "doctor",      // meta: skim management
-    "dotnet",      // test runner / passthrough
-    "dprint",      // linter
-    "du",          // file operations
-    "env",         // file operations
-    "eslint",      // linter
-    "find",        // file operations
-    "gh",          // infrastructure
-    "git",         // multi-category dispatcher
-    "go",          // multi-category dispatcher
-    "gofmt",       // linter
-    "golangci",    // linter
-    "gradle",      // build tool
-    "gradlew",     // build tool
-    "grep",        // file operations
-    "heatmap",     // meta: skim management
-    "init",        // meta: skim management
-    "jest",        // test runner
-    "kubectl",     // infrastructure
-    "learn",       // meta: skim management
-    "log",         // meta: skim management (log compression, not a system tool)
-    "ls",          // file operations
-    "make",        // build tool
-    "mvn",         // build tool
-    "mvnw",        // build tool
-    "mypy",        // linter
-    "mysql",       // database
-    "npm",         // package manager
-    "nslookup",    // infrastructure
-    "oxlint",      // linter
-    "pip",         // package manager
-    "playwright",  // test runner
-    "pnpm",        // package manager
-    "prettier",    // linter
-    "printenv",    // file operations
+    "agents",        // meta: skim management
+    "aws",           // infrastructure
+    "biome",         // linter
+    "black",         // linter
+    "cargo",         // multi-category dispatcher
+    "completions",   // meta: skim management
+    "curl",          // infrastructure
+    "cypress",       // test runner
+    "df",            // file operations
+    "diff",          // file operations
+    "dig",           // infrastructure
+    "discover",      // meta: skim management
+    "docker",        // infrastructure
+    "doctor",        // meta: skim management
+    "dotnet",        // test runner / passthrough
+    "dprint",        // linter
+    "du",            // file operations
+    "env",           // file operations
+    "eslint",        // linter
+    "find",          // file operations
+    "gh",            // infrastructure
+    "git",           // multi-category dispatcher
+    "go",            // multi-category dispatcher
+    "gofmt",         // linter
+    "golangci-lint", // linter (binary name is `golangci-lint`, not `golangci`)
+    "gradle",        // build tool
+    "gradlew",       // build tool
+    "grep",          // file operations
+    "heatmap",       // meta: skim management
+    "init",          // meta: skim management
+    "jest",          // test runner
+    "kubectl",       // infrastructure
+    "learn",         // meta: skim management
+    "log",           // meta: skim management (log compression, not a system tool)
+    "ls",            // file operations
+    "make",          // build tool
+    "mvn",           // build tool
+    "mvnw",          // build tool
+    "mypy",          // linter
+    "mysql",         // database
+    "npm",           // package manager
+    "nslookup",      // infrastructure
+    "oxlint",        // linter
+    "pip",           // package manager
+    "playwright",    // test runner
+    "pnpm",          // package manager
+    "prettier",      // linter
+    "printenv",      // file operations
     #[cfg(feature = "proxy")]
     "proxy", // meta: skim Layer-3 HTTP reverse proxy (#303)
-    "ps",          // file operations
-    "psql",        // database
-    "pytest",      // test runner
-    "rewrite",     // meta: skim management
-    "rg",          // file operations
-    "rubocop",     // linter
-    "ruff",        // linter
-    "rustfmt",     // linter
-    "search",      // meta: skim management
-    "sqlite3",     // database
-    "stats",       // meta: skim management
-    "swift",       // test runner / passthrough
-    "swiftlint",   // linter
-    "terraform",   // infrastructure
-    "tree",        // file operations
-    "tsc",         // build tool
-    "vitest",      // test runner
-    "wc",          // file operations
-    "wget",        // infrastructure
-    "yarn",        // package manager
+    "ps",            // file operations
+    "psql",          // database
+    "pytest",        // test runner
+    "rewrite",       // meta: skim management
+    "rg",            // file operations
+    "rubocop",       // linter
+    "ruff",          // linter
+    "rustfmt",       // linter
+    "search",        // meta: skim management
+    "sqlite3",       // database
+    "stats",         // meta: skim management
+    "swift",         // test runner / passthrough
+    "swiftlint",     // linter
+    "terraform",     // infrastructure
+    "tree",          // file operations
+    "tsc",           // build tool
+    "vitest",        // test runner
+    "wc",            // file operations
+    "wget",          // infrastructure
+    "yarn",          // package manager
 ];
 
 /// Meta/management subcommands that belong to skim itself.
@@ -172,6 +172,14 @@ static WRAPPER_TARGETS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 ///
 /// Returns a reference to a precomputed static list — no allocation on repeated
 /// calls (see [`WRAPPER_TARGETS`]).
+///
+/// LIMITATION: `install_wrappers_in` only iterates this list to create or
+/// update symlinks — it never removes names that have left the set. A
+/// pre-existing `~/.skim/bin/<tool>` symlink from an older install becomes
+/// an orphan when a tool is renamed or removed from `KNOWN_SUBCOMMANDS`
+/// (e.g. a `~/.skim/bin/golangci` link persists after the rename to
+/// `golangci-lint`). Pruning orphaned symlinks would require diffing the
+/// on-disk set against this list; that is a future follow-up.
 pub(crate) fn wrapper_targets() -> &'static [&'static str] {
     &WRAPPER_TARGETS
 }

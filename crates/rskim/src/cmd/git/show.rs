@@ -51,6 +51,7 @@ use rskim_core::{Language, Mode, TransformConfig};
 use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, ShowCommitResult};
+use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
 use rayon::prelude::*;
@@ -496,10 +497,32 @@ fn render_show_diff(
             i >= MAX_AST_FILE_COUNT,
             true, // is_show: source must be read from the commit, not the working tree
         );
+        // D3 (issue #510): carry raw hunk content so --json consumers get the
+        // full patch body, mirroring render_and_format in diff/mod.rs.  This is
+        // what lets `emit_show_commit` declare [`Completeness::Reencoded`] — all
+        // content is faithfully represented in a different encoding, so ADR-011
+        // class-1 disclosure is not owed.
+        let patch = {
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            for hunk in &fd.hunks {
+                let _ = writeln!(
+                    buf,
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                );
+                for line in &hunk.patch_lines {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            }
+            if buf.is_empty() { None } else { Some(buf) }
+        };
         let entry = DiffFileEntry {
             path: fd.path.clone(),
             status: fd.status.clone(),
             changed_regions: fd.hunks.len(),
+            patch,
         };
         (rendered, entry)
     };
@@ -565,7 +588,37 @@ fn emit_show_commit(
             // could spuriously emit `[skim:guardrail]` to stderr.
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize show result: {e}"))?;
-            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed {
+            // ADR-015 / D1 declaration — derived, not hard-coded.
+            //
+            // Header fields (hash, author, date, subject, body, parents) and
+            // every hunk body (`DiffFileEntry::patch`, D3 / #510) are carried
+            // when the commit touches text files only.  In that case no
+            // disclosure is owed (`Reencoded`).
+            //
+            // What this envelope does NOT reproduce is `gpgsig`/`mergetag` header
+            // lines (per AD-GIT-8 these are implementation artefacts, not user
+            // content) plus the extended diff headers noted in `diff/mod.rs`.
+            // `Notes:` blocks ARE captured: `parse_header_lines` enters `Body`
+            // phase after the subject line and accumulates all remaining lines in
+            // `header_region` — including any `Notes:` block — so they appear in
+            // `CommitHeader::body` and are serialised.
+            //
+            // Binary files, 100%-similarity renames, and `old mode`/`new mode`-only
+            // changes produce no hunk content, so `patch` is `None` — a real
+            // information drop that requires `Lossy` and an ADR-011 class-1 marker.
+            let completeness = if result.files.iter().all(|f| f.patch.is_some()) {
+                Completeness::Reencoded
+            } else {
+                Completeness::Lossy
+            };
+            if exec::emit_json_envelope(
+                &json,
+                completeness,
+                "git",
+                None,
+                exec::LineTermination::Newline,
+            )? == exec::StdoutStatus::PipeClosed
+            {
                 return Ok(exec::StdoutStatus::PipeClosed);
             }
             finalize_git_output_owned(raw, json, label, show_stats, rec_full, duration);

@@ -9,12 +9,19 @@
 #![allow(dead_code)]
 
 pub(crate) mod canonical;
+pub(crate) mod fidelity;
 pub(crate) mod guardrail;
 pub(crate) mod tee;
 
 use std::io::{self, Write};
 
+use crate::cmd::execution::OutputFormat;
 use crate::tokens;
+
+/// Canonical escape-hatch remedy appended to every ADR-011 class-1 elision
+/// marker.  Single source of truth — `process.rs` and `cascade.rs` import
+/// this via `use crate::output::ELISION_HINT` rather than defining their own.
+pub(crate) const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
 // ============================================================================
 // ParseResult<T> — three-tier parse degradation
@@ -74,6 +81,29 @@ impl<T> ParseResult<T> {
             ParseResult::Full(_) => "full",
             ParseResult::Degraded(_, _) => "degraded",
             ParseResult::Passthrough(_) | ParseResult::RawPassthrough => "passthrough",
+        }
+    }
+
+    /// The [`Completeness`] of this result's **JSON envelope** (ADR-015 / D1).
+    ///
+    /// Derived, not declared, because the tier already carries the answer:
+    ///
+    /// - `Passthrough(raw)` / `RawPassthrough` — the envelope embeds the tool's
+    ///   bytes verbatim as `{"tier":"passthrough","raw":…}`.  Every byte is
+    ///   present in a different encoding: [`Completeness::Reencoded`].
+    /// - `Full(inner)` / `Degraded(inner, _)` — a parser summarised the tool's
+    ///   output into a typed struct; the un-modelled remainder (unrecognised
+    ///   lines, formatting, ordering detail) is gone: [`Completeness::Lossy`].
+    ///
+    /// The text path must NOT use this — it has `fidelity::view_differs` for a
+    /// byte-level answer.  This is the JSON path's substitute for that
+    /// comparison, which a re-encoded envelope makes meaningless.
+    pub(crate) fn completeness(&self) -> fidelity::Completeness {
+        match self {
+            ParseResult::Passthrough(_) | ParseResult::RawPassthrough => {
+                fidelity::Completeness::Reencoded
+            }
+            ParseResult::Full(_) | ParseResult::Degraded(_, _) => fidelity::Completeness::Lossy,
         }
     }
 }
@@ -543,7 +573,7 @@ pub(crate) fn elision_marker(shown: usize, total: usize, unit: &str) -> Option<S
     }
     let omitted = total - shown;
     Some(format!(
-        "[skim] {omitted} {unit} omitted ({shown} of {total} shown) — SKIM_PASSTHROUGH=1 for full output"
+        "[skim] {omitted} {unit} omitted ({shown} of {total} shown) — {ELISION_HINT}"
     ))
 }
 
@@ -570,7 +600,7 @@ pub(crate) fn elision_marker_unbounded_with_remedy(
 /// unknowable (the input is consumed incrementally and elision happens
 /// mid-stream). `shown_desc` describes what WAS kept (e.g. `"first 64 KiB"`).
 pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
-    elision_marker_unbounded_with_remedy(shown_desc, unit, "SKIM_PASSTHROUGH=1 for full output")
+    elision_marker_unbounded_with_remedy(shown_desc, unit, ELISION_HINT)
 }
 
 /// Canonical compressed-output hint emitted to stderr after a non-zero exit
@@ -580,7 +610,7 @@ pub(crate) fn elision_marker_unbounded(shown_desc: &str, unit: &str) -> String {
 /// matrix in [`crate::cmd::execution::record_and_report`] to keep the hint
 /// string byte-identical across both paths — single source of truth (#317).
 pub(crate) fn compressed_output_hint(code: i32) -> String {
-    format!("[skim] compressed output (exit {code}). SKIM_PASSTHROUGH=1 for full output.")
+    format!("[skim] compressed output (exit {code}). {ELISION_HINT}.")
 }
 
 // ============================================================================
@@ -607,14 +637,55 @@ pub(crate) fn rewrite_origin() -> Option<String> {
     }
 }
 
-/// Build a transparency marker for hook-rewritten file reads.
+/// Map a mode name to a human-readable class description (B4 / ADR-011 class 1).
 ///
-/// Returns `None` when `differing == 0` (view is byte-identical to raw bytes).
+/// The class label names what was elided so the reader knows what information
+/// they are missing without needing to know skim internals.
 ///
-/// Single file: `[skim] transformed view (cat → skim --mode=pseudo): not raw file bytes — SKIM_PASSTHROUGH=1 for raw output`
-/// Multi-file:  `[skim] transformed view (cat → skim --mode=pseudo): 2/3 files not raw bytes — SKIM_PASSTHROUGH=1 for raw output`
-pub(crate) fn rewrite_transparency_marker(
-    origin: &str,
+/// Made `pub(crate)` by D1 so downstream callers (e.g. `fidelity::remedy_for`
+/// contexts) can name the elided class without duplicating the label table.
+pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
+    match mode_str {
+        "pseudo" => "pseudo view: bodies and syntactic detail removed",
+        "minimal" => "minimal view: comments and bodies removed",
+        "structure" => "structure view: bodies removed",
+        "signatures" => "signatures view: bodies removed",
+        "types" => "types view: non-type declarations removed",
+        // `full` reaches this table only when a line bound elided part of the
+        // file (`head`/`tail` rewrites): the served lines are verbatim, so the
+        // class names the range, not a transformation.
+        "full" => "line-sliced view: content verbatim, lines outside the range omitted",
+        _ => "transformed view",
+    }
+}
+
+/// Lossy-view marker for file reads (B3 / ADR-011 class 1 — unconditional).
+///
+/// Fires whenever the served view differs from raw bytes, regardless of whether
+/// the read was triggered by a hook rewrite (`SKIM_REWRITTEN_FROM`) or an
+/// explicit `skim <file>` invocation.  This is an ADR-011 class 1 marker:
+/// it is unconditional and NOT gated by `SKIM_DEBUG`.
+///
+/// Returns `None` when `differing == 0` (view is byte-identical to raw).
+///
+/// # Marker format
+///
+/// With hook-rewrite origin (e.g. `SKIM_REWRITTEN_FROM=cat`):
+/// ```text
+/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// ```
+///
+/// Without origin (explicit `skim file.ts --mode=pseudo`):
+/// ```text
+/// [skim] pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// ```
+///
+/// Multi-file (with or without origin):
+/// ```text
+/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: 2/3 files — SKIM_PASSTHROUGH=1 for raw output
+/// ```
+pub(crate) fn lossy_view_marker(
+    origin: Option<&str>,
     mode_str: &str,
     differing: usize,
     total: usize,
@@ -622,55 +693,211 @@ pub(crate) fn rewrite_transparency_marker(
     if differing == 0 {
         return None;
     }
-    let inner = if total <= 1 {
-        "not raw file bytes".to_string()
-    } else {
-        format!("{differing}/{total} files not raw bytes")
+    let class = mode_class_label(mode_str);
+    // Route through `remedy_for` so the printed remedy is always the narrowest
+    // one that is literally reachable from this invocation (ADR-011 class 1).
+    // The file-read path is non-JSON with passthrough reproducing argv, so
+    // `remedy_for` returns the canonical ELISION_HINT default — but the
+    // indirection keeps this consistent with `lossy_json_view_marker` and
+    // ensures future context changes (e.g. a narrowed remedy for a specific
+    // origin tool) are handled automatically.
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool: origin.unwrap_or(""),
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    let suffix = format!(" \u{2014} {remedy}");
+
+    let marker = match (origin, total) {
+        // Hook-rewritten, single file
+        (Some(orig), n) if n <= 1 => format!(
+            "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}{suffix}"
+        ),
+        // Hook-rewritten, multi-file
+        (Some(orig), _) => format!(
+            "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}: {differing}/{total} files{suffix}"
+        ),
+        // Direct invocation, single file
+        (None, n) if n <= 1 => format!("[skim] {class}{suffix}"),
+        // Direct invocation, multi-file
+        (None, _) => format!("[skim] {class}: {differing}/{total} files{suffix}"),
     };
-    Some(format!(
-        "[skim] transformed view ({origin} \u{2192} skim --mode={mode_str}): {inner} — SKIM_PASSTHROUGH=1 for raw output"
-    ))
+    Some(marker)
+}
+
+/// Lossy-view marker for `--json` command output (D1 / ADR-011 class 1 —
+/// unconditional).
+///
+/// The JSON sibling of [`lossy_view_marker`].  A JSON envelope always differs
+/// textually from raw, so the byte comparison that drives the file-read marker
+/// cannot decide anything here; the caller declares
+/// [`fidelity::Completeness::Lossy`] instead and this function renders the
+/// disclosure.
+///
+/// # Why this is a class-1 marker, not a class-2 banner
+///
+/// It fires exactly when the reader is served *less* than the tool produced.
+/// ADR-011 class 1 is unconditional and NOT gated by `SKIM_DEBUG`; class 2
+/// (`debug_log!`) is for lossless internal decisions.  Do not re-conflate them.
+///
+/// # Format
+///
+/// Countable — `elided = Some((kept, total, unit))` with `kept < total`:
+/// ```text
+/// [skim] json view of 'git': 41 lines omitted (3 of 44 shown) — SKIM_PASSTHROUGH=1 for full output
+/// ```
+///
+/// Countless — `elided = None`, or a `(kept, total, _)` pair with no loss to
+/// report (`kept >= total`), which is what a summarising parser with no 1:1 unit
+/// produces:
+/// ```text
+/// [skim] json view of 'git': summarised, not the full tool output — SKIM_PASSTHROUGH=1 for full output
+/// ```
+///
+/// `remedy` comes from [`fidelity::remedy_for`] so the hint is only printed when
+/// it is literally reachable from the invocation that printed it.
+pub(crate) fn lossy_json_view_marker(
+    tool: &str,
+    elided: Option<(usize, usize, &str)>,
+    remedy: &str,
+) -> String {
+    let body = match elided {
+        Some((kept, total, unit)) if kept < total => {
+            format!("{} {unit} omitted ({kept} of {total} shown)", total - kept)
+        }
+        _ => "summarised, not the full tool output".to_string(),
+    };
+    format!("[skim] json view of '{tool}': {body} \u{2014} {remedy}")
 }
 
 #[cfg(test)]
-mod rewrite_transparency_tests {
+mod lossy_json_view_marker_tests {
+    use super::*;
+
+    /// Countable arm: the marker names the exact number of omitted units and the
+    /// kept/total pair, so the reader can size what they are missing.
+    #[test]
+    fn test_lossy_json_view_marker_countable() {
+        let m = lossy_json_view_marker("git", Some((3, 44, "lines")), ELISION_HINT);
+        assert!(m.starts_with("[skim] json view of 'git':"), "got: {m:?}");
+        assert!(
+            m.contains("41 lines omitted"),
+            "must name the delta; got: {m:?}"
+        );
+        assert!(
+            m.contains("(3 of 44 shown)"),
+            "must name kept/total; got: {m:?}"
+        );
+        assert!(m.contains(ELISION_HINT), "must carry the remedy");
+    }
+
+    /// Countless arm: a summarising parser has no 1:1 unit to count, so the
+    /// marker still discloses, it just cannot quantify.
+    #[test]
+    fn test_lossy_json_view_marker_countless() {
+        let m = lossy_json_view_marker("git", None, ELISION_HINT);
+        assert_eq!(
+            m,
+            format!(
+                "[skim] json view of 'git': summarised, not the full tool output — {ELISION_HINT}"
+            )
+        );
+    }
+
+    /// `kept >= total` is not a countable loss — the marker must fall back to the
+    /// countless wording rather than print "0 lines omitted" or underflow.
+    #[test]
+    fn test_lossy_json_view_marker_kept_ge_total_falls_back() {
+        for pair in [(5usize, 5usize), (7, 2)] {
+            let m = lossy_json_view_marker(
+                "psql",
+                Some((pair.0, pair.1, "rows")),
+                "run 'psql' directly for the full output",
+            );
+            assert!(
+                m.contains("summarised, not the full tool output"),
+                "kept={} total={} must use the countless wording; got: {m:?}",
+                pair.0,
+                pair.1
+            );
+            assert!(!m.contains("omitted"), "must not claim a count; got: {m:?}");
+        }
+    }
+
+    /// The remedy is a parameter, not a literal: the narrow `remedy_for` arm must
+    /// reach stderr verbatim, with no `SKIM_PASSTHROUGH=1` leaking in.
+    #[test]
+    fn test_lossy_json_view_marker_carries_narrow_remedy() {
+        let m = lossy_json_view_marker("psql", None, "run 'psql' directly for the full output");
+        assert!(
+            m.ends_with("run 'psql' directly for the full output"),
+            "got: {m:?}"
+        );
+        assert!(
+            !m.contains("SKIM_PASSTHROUGH=1"),
+            "the narrow remedy must not be padded with the unreachable hatch; got: {m:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lossy_view_marker_tests {
     use super::*;
 
     #[test]
-    fn test_rewrite_transparency_marker_single_differing() {
-        let result = rewrite_transparency_marker("cat", "pseudo", 1, 1);
-        assert_eq!(
-            result,
-            Some(
-                "[skim] transformed view (cat \u{2192} skim --mode=pseudo): not raw file bytes \
-                 — SKIM_PASSTHROUGH=1 for raw output"
-                    .to_string()
-            )
+    fn test_lossy_view_marker_with_origin_single_file() {
+        // With origin: "transformed view" header + class description.
+        let result = lossy_view_marker(Some("cat"), "pseudo", 1, 1);
+        let marker = result.expect("differing=1 must produce a marker");
+        assert!(
+            marker.contains("[skim] transformed view"),
+            "must have header"
+        );
+        assert!(marker.contains("cat"), "must name origin");
+        assert!(marker.contains("pseudo"), "must name mode");
+        assert!(marker.contains("bodies"), "B4: must name elided class");
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must carry remedy hint"
         );
     }
 
     #[test]
-    fn test_rewrite_transparency_marker_multi_file() {
-        let result = rewrite_transparency_marker("cat", "pseudo", 2, 3);
-        assert_eq!(
-            result,
-            Some(
-                "[skim] transformed view (cat \u{2192} skim --mode=pseudo): 2/3 files not raw bytes \
-                 — SKIM_PASSTHROUGH=1 for raw output"
-                    .to_string()
-            )
+    fn test_lossy_view_marker_with_origin_multi_file() {
+        let result = lossy_view_marker(Some("cat"), "pseudo", 2, 3);
+        let marker = result.expect("differing=2 must produce a marker");
+        assert!(marker.contains("transformed view"), "must have header");
+        assert!(marker.contains("2/3"), "must have file counts");
+        assert!(marker.contains("pseudo"), "must name mode");
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must carry remedy hint"
         );
     }
 
     #[test]
-    fn test_rewrite_transparency_marker_zero_differing_returns_none() {
-        assert_eq!(rewrite_transparency_marker("cat", "pseudo", 0, 1), None);
-        assert_eq!(rewrite_transparency_marker("tail", "structure", 0, 5), None);
+    fn test_lossy_view_marker_without_origin_direct_invocation() {
+        // B3: fires without SKIM_REWRITTEN_FROM — no "transformed view" header.
+        let result = lossy_view_marker(None, "pseudo", 1, 1);
+        let marker = result.expect("differing=1 must produce a marker");
+        // B4: class label is the primary identifier for direct invocations.
+        assert!(marker.contains("pseudo"), "must name mode class");
+        assert!(marker.contains("bodies"), "B4: must name elided class");
+        assert!(
+            marker.contains("SKIM_PASSTHROUGH=1"),
+            "must carry remedy hint"
+        );
     }
 
     #[test]
-    fn test_rewrite_transparency_marker_head_structure() {
-        let m = rewrite_transparency_marker("head", "structure", 1, 1)
+    fn test_lossy_view_marker_zero_differing_returns_none() {
+        assert_eq!(lossy_view_marker(Some("cat"), "pseudo", 0, 1), None);
+        assert_eq!(lossy_view_marker(None, "structure", 0, 5), None);
+    }
+
+    #[test]
+    fn test_lossy_view_marker_head_structure_b4() {
+        let m = lossy_view_marker(Some("head"), "structure", 1, 1)
             .expect("head + differing=1 must produce a marker");
         assert!(m.contains("head"), "marker must name the origin command");
         assert!(m.contains("structure"), "marker must name the mode");
@@ -678,11 +905,55 @@ mod rewrite_transparency_tests {
             m.contains("SKIM_PASSTHROUGH=1"),
             "marker must include passthrough hint"
         );
+        // B4: structure class is named
+        assert!(
+            m.contains("bodies removed"),
+            "B4: structure marker must name 'bodies removed'"
+        );
     }
 
     #[test]
     fn test_rewrite_origin_env_constant() {
         assert_eq!(REWRITE_ORIGIN_ENV, "SKIM_REWRITTEN_FROM");
+    }
+
+    #[test]
+    fn test_mode_class_labels_cover_all_known_modes() {
+        // Ensure mode_class_label returns meaningful strings for all known modes.
+        for mode in &["pseudo", "minimal", "structure", "signatures", "types"] {
+            let label = super::mode_class_label(mode);
+            assert!(
+                !label.is_empty(),
+                "class label must be non-empty for mode {mode}"
+            );
+            assert!(
+                label.len() > "transformed view".len(),
+                "B4: class label must be more descriptive than 'transformed view' for mode {mode}"
+            );
+        }
+    }
+
+    /// RED at 167e73f: `mode_class_label("full")` falls through to the generic
+    /// `"transformed view"` catch-all instead of a dedicated description.
+    ///
+    /// Today: `mode_class_label("full")` returns `"transformed view"`.
+    /// After fix: returns `"line-sliced view: content verbatim, lines outside the range omitted"`.
+    ///
+    /// This is a new `"full"` match arm in the `mode_class_label` match —
+    /// do NOT edit `test_mode_class_labels_cover_all_known_modes` (it covers the
+    /// five non-full modes and is intentionally separate from this test).
+    #[test]
+    fn test_mode_class_label_full_has_dedicated_arm() {
+        let label = super::mode_class_label("full");
+        let fallback = super::mode_class_label("__nonexistent__");
+        assert_eq!(
+            label, "line-sliced view: content verbatim, lines outside the range omitted",
+            "full mode must have a dedicated class label, got: {label:?}"
+        );
+        assert_ne!(
+            label, fallback,
+            "full mode label must differ from the default fallback ({fallback:?})"
+        );
     }
 }
 

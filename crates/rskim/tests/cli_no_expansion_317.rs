@@ -230,3 +230,165 @@ fn no_expansion_wc_l_tiny_input() {
          raw={raw_len}B  skim={skim_len}B",
     );
 }
+
+// ============================================================================
+// B1 regression — `skim git diff --raw / --dirstat` must serve real git output
+// ============================================================================
+//
+// Before the fix, `parse_unified_diff` returned zero files for non-unified
+// git diff output formats (e.g. `--raw`, `--dirstat`).  The code treated
+// "zero parsed files" as "no changes", printing "No changes" to stderr and
+// emitting 0 bytes to stdout — total content loss.
+//
+// The fix: when the unified parser yields no files but the raw output is
+// non-empty, serve the raw bytes verbatim (#317 compress-never-truncate).
+
+/// Create a hermetic two-commit repo and return `(tempdir_guard, repo_path)`.
+///
+/// PF-026: raw git is invoked by absolute path so the skim rewrite hook on
+/// the developer's machine cannot interpose on the baseline measurement.
+fn two_commit_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo dir");
+
+    let git_in = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap_or_else(|e| panic!("git {} spawn failed: {e}", args.join(" ")));
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    git_in(&["init", "-b", "main"]);
+    git_in(&["config", "user.email", "test@example.com"]);
+    git_in(&["config", "user.name", "Test"]);
+    git_in(&["config", "diff.algorithm", "myers"]);
+    // Put the file in a subdirectory so `--dirstat` aggregates at the `src/`
+    // level and produces non-empty output.  Root-only diffs produce no dirstat
+    // output on macOS git 2.50.1 (Apple Git-155) because the root dir `.` has
+    // no named-directory contribution to report.  `--raw` still works for
+    // root-level files, but using a subdir is compatible with both flags.
+    std::fs::create_dir_all(repo.join("src")).expect("create src dir");
+    std::fs::write(repo.join("src/file.rs"), "fn before() {}\n").expect("write before");
+    git_in(&["add", "src/file.rs"]);
+    git_in(&["commit", "-m", "before"]);
+    std::fs::write(repo.join("src/file.rs"), "fn after() {}\n").expect("write after");
+    git_in(&["add", "src/file.rs"]);
+    git_in(&["commit", "-m", "after"]);
+
+    (dir, repo)
+}
+
+/// `skim git diff --raw` must serve the same bytes as real `git diff --raw --no-color`.
+///
+/// The skim wrapper injects `--no-color` before calling git, so the comparison
+/// baseline is `git diff --no-color --raw` (PF-026: invoked by absolute path).
+/// Before the fix this test would fail with skim emitting 0 bytes.
+#[test]
+fn git_diff_raw_flag_serves_real_git_output() {
+    let (_dir, repo) = two_commit_git_repo();
+
+    // Raw control: invoke git by absolute path so the skim rewrite hook cannot
+    // intercept it (PF-026).  Use --no-color to match what skim injects internally.
+    let raw_out = std::process::Command::new("/usr/bin/git")
+        .args(["diff", "--no-color", "--raw", "HEAD~1..HEAD"])
+        .current_dir(&repo)
+        .output()
+        .expect("git must run");
+    assert!(raw_out.status.success(), "git diff --raw must succeed");
+
+    let raw_bytes = raw_out.stdout.len();
+    assert!(
+        raw_bytes > 0,
+        "git diff --raw must produce non-empty output (sanity check)"
+    );
+
+    // skim output — must equal the raw bytes, not 0.
+    let skim_out = skim_cmd()
+        .current_dir(&repo)
+        .args(["git", "diff", "--raw", "HEAD~1..HEAD"])
+        .output()
+        .expect("skim git diff must run");
+
+    let skim_bytes = skim_out.stdout.len();
+    assert_eq!(
+        skim_bytes,
+        raw_bytes,
+        "skim git diff --raw: expected {raw_bytes} bytes (same as git), got {skim_bytes}\n\
+         skim stdout={:?}\n\
+         raw stdout={:?}\n\
+         This means the parser yielded zero files and the raw bytes were not served (#317).",
+        String::from_utf8_lossy(&skim_out.stdout),
+        String::from_utf8_lossy(&raw_out.stdout),
+    );
+}
+
+/// `skim git diff --dirstat` must serve the same bytes as real `git diff --dirstat --no-color`.
+///
+/// `--dirstat` format is also non-unified and was silently dropped to 0 bytes
+/// before the B1 fix.
+#[test]
+fn git_diff_dirstat_flag_serves_real_git_output() {
+    let (_dir, repo) = two_commit_git_repo();
+
+    let raw_out = std::process::Command::new("/usr/bin/git")
+        .args(["diff", "--no-color", "--dirstat", "HEAD~1..HEAD"])
+        .current_dir(&repo)
+        .output()
+        .expect("git must run");
+    assert!(raw_out.status.success(), "git diff --dirstat must succeed");
+
+    let raw_bytes = raw_out.stdout.len();
+    assert!(
+        raw_bytes > 0,
+        "git diff --dirstat must produce non-empty output (sanity check)"
+    );
+
+    let skim_out = skim_cmd()
+        .current_dir(&repo)
+        .args(["git", "diff", "--dirstat", "HEAD~1..HEAD"])
+        .output()
+        .expect("skim git diff must run");
+
+    let skim_bytes = skim_out.stdout.len();
+    assert_eq!(
+        skim_bytes,
+        raw_bytes,
+        "skim git diff --dirstat: expected {raw_bytes} bytes, got {skim_bytes}\n\
+         skim stdout={:?}\n\
+         raw stdout={:?}",
+        String::from_utf8_lossy(&skim_out.stdout),
+        String::from_utf8_lossy(&raw_out.stdout),
+    );
+}
+
+/// `skim git diff` with genuinely no changes must emit 0 bytes (correct).
+///
+/// This verifies that the B1 fix does not break the true-empty case — when git
+/// diff legitimately produces empty output (no changes), skim must also emit
+/// nothing (not serve an empty string to stdout as a write).
+#[test]
+fn git_diff_no_changes_emits_nothing() {
+    let (_dir, repo) = two_commit_git_repo();
+
+    // Diff the first commit against itself — truly no changes.
+    let skim_out = skim_cmd()
+        .current_dir(&repo)
+        .args(["git", "diff", "HEAD~1..HEAD~1"])
+        .output()
+        .expect("skim git diff must run");
+
+    assert_eq!(
+        skim_out.stdout.len(),
+        0,
+        "skim git diff with no changes must emit 0 bytes, got {:?}",
+        String::from_utf8_lossy(&skim_out.stdout),
+    );
+}

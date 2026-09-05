@@ -1,0 +1,17 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(RUST_SIMPLE, Language::Rust, TransformConfig::with_mode(Mode::Types))"
+---
+pub struct Calculator {
+    value: i32,
+}
+
+pub trait Compute {
+    fn compute(&self, x: i32) -> i32;
+}
+
+pub enum Status {
+    Active,
+    Inactive,
+    Pending,
+}

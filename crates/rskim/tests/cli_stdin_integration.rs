@@ -114,7 +114,16 @@ fn test_stdin_binary_input_fails() {
 
 #[test]
 fn test_stdin_max_lines_and_stats() {
-    let input = "fn a() { 1 }\nfn b() { 2 }\nfn c() { 3 }";
+    // Use functions with substantial bodies so the B5 elision-hint overhead
+    // (≈10 tokens appended to every truncation marker) is absorbed by genuine
+    // body savings. Single-expression bodies like `{ 1 }` compress to roughly
+    // the same token count as the marker, causing the guardrail to fire and emit
+    // raw (bypassing --max-lines, so "truncated" never appears in stdout).
+    let input = concat!(
+        "fn a() { let x = long_function_name_one(1, 2, 3); let y = another_function(x); x + y }\n",
+        "fn b() { let x = long_function_name_one(4, 5, 6); let y = another_function(x); x + y }\n",
+        "fn c() { let x = long_function_name_one(7, 8, 9); let y = another_function(x); x + y }",
+    );
 
     common::skim()
         .args(["-", "--lang=rust", "--max-lines=2", "--show-stats"])

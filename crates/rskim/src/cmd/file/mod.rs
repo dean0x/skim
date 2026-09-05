@@ -124,6 +124,8 @@ pub(super) const fn passthrough_config<'a>(spec: PassthroughSpec<'a>) -> ToolRun
         skip_net_savings_guard: false,
         synthesize_success_line: None,
         injected_format_flag: None,
+        raw_override: None,
+        never_passthrough: false,
     }
 }
 
@@ -283,7 +285,44 @@ pub(crate) fn run(
         "df" => df::run(tool_args, &ctx),
         "diff" => diff::run(tool_args, &ctx),
         "du" => du::run(tool_args, &ctx),
-        "env" | "printenv" => env::run(tool_args, &ctx),
+        "env" | "printenv" => {
+            // D2: when any arg contains '=' this is a VAR=value assignment invocation:
+            //   env FOO=1 npm test  →  exec the real `env` binary unchanged (B2)
+            // The env handler (CONFIG.program = "printenv") cannot understand VAR=val
+            // syntax — it would forward the tokens as file arguments to printenv.
+            // (Consistent with skip_if_middle_contains_eq on the rewrite surface.)
+            //
+            // SECURITY (PF-012 / testing-14): when the child program is itself
+            // `env` or `printenv` (e.g. `env FOO=1 printenv`), routing to the
+            // real `env` binary would execute `printenv` unmediated — leaking
+            // the environment including redaction-mandatory keys.  Route those
+            // shapes to the skim env handler instead.
+            //
+            // ACCEPTED LIMITATION: `env FOO=1 sh -c env` still leaks because
+            // the child is `sh` and skim cannot inspect what an arbitrary child
+            // will print.  This shape is pinned in the regression test suite.
+            if tool_name.as_str() == "env" && tool_args.iter().any(|a| a.contains('=')) {
+                // Find the first non-assignment arg (the child program name).
+                let child_idx = tool_args.iter().position(|a| !a.contains('='));
+                let child_prog = child_idx.and_then(|i| tool_args.get(i)).map(String::as_str);
+                if matches!(child_prog, Some("env") | Some("printenv")) {
+                    // Child is env/printenv: pass the args AFTER the child name
+                    // to the redacting handler.  The VAR=val overrides are not
+                    // applied (skim calls `printenv` directly, not via `env`),
+                    // but the output is fully redacted — the security property.
+                    let after_child: Vec<String> = child_idx
+                        .map(|i| tool_args[i + 1..].to_vec())
+                        .unwrap_or_default();
+                    env::run(&after_child, &ctx)
+                } else {
+                    // General case (e.g. `env FOO=1 npm test`): exec the real
+                    // `env` binary unchanged so VAR=val is honoured by the OS.
+                    super::run_raw_passthrough("env", tool_args, &[])
+                }
+            } else {
+                env::run(tool_args, &ctx)
+            }
+        }
         "find" => find::run(tool_args, &ctx),
         "grep" => grep::run(tool_args, &ctx),
         "ls" => ls::run(tool_args, &ctx, "ls"),

@@ -1,0 +1,36 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(GO_COMMENTS, Language::Go, TransformConfig::with_mode(Mode::Pseudo))"
+---
+package main
+
+
+// Add adds two numbers together.
+// This is a Go doc comment adjacent to a declaration (KEEP).
+func Add(a int, b int) int {
+	// This comment is inside a function body (KEEP)
+	result := a + b // inline comment in body (KEEP)
+	return result
+}
+
+
+// Calculator is a simple calculator.
+// Multi-line Go doc comment (KEEP).
+type Calculator struct {
+	value int
+}
+
+
+// NewCalculator creates a new Calculator.
+func NewCalculator(value int) *Calculator {
+	// body comment (KEEP)
+	return &Calculator{value: value}
+}
+
+// Add adds to the calculator value.
+func (c *Calculator) Add(x int) int {
+	return c.value + x
+}
+
+
+var Version = "1.0.0"

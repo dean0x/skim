@@ -346,6 +346,7 @@ impl Drop for DropGuard {
 ///
 /// Analytics are recorded at EOF via the Drop guard.
 #[allow(dead_code)]
+#[allow(clippy::disallowed_methods)] // GH response streaming sink; unbounded JSON stream must be streamed, not buffered
 pub(super) fn run_streamed_stdin(
     mut parser: Box<dyn StreamingParser>,
     cfg: StreamConfig,
@@ -385,11 +386,18 @@ pub(super) fn run_streamed_stdin(
     }
 
     // Finalize -- parser is consumed here; totals are already tracked in guard.
+    // architecture-16 / PF-021: route both writes through write_failure_exit so
+    // a pipe closing during finalize exits 141 rather than 0.  Every write in
+    // the main loop already does this; the finalize path must be consistent.
     if let Some(output) = parser.finalize() {
         let compressed_len = output.len() + 1;
         guard.update(0, compressed_len);
-        let _ = writeln!(stdout, "{output}");
-        let _ = stdout.flush();
+        if let Err(e) = writeln!(stdout, "{output}") {
+            return write_failure_exit(&e);
+        }
+        if let Err(e) = stdout.flush() {
+            return write_failure_exit(&e);
+        }
     }
 
     guard.record();
@@ -426,6 +434,7 @@ pub(super) fn run_streamed_stdin(
 ///
 /// If `cmd` is not on PATH, prints `error: gh not found on PATH` to stderr
 /// and returns exit code 127.
+#[allow(clippy::disallowed_methods)] // GH spawned-process stream; unbounded response requires streaming handle
 pub(super) fn run_streamed_spawned(
     mut parser: Box<dyn StreamingParser>,
     cmd: &str,
@@ -531,10 +540,17 @@ pub(super) fn run_streamed_spawned(
     }
 
     // Finalize.
+    // architecture-16 / PF-021: route both writes through write_failure_exit so
+    // a pipe closing during finalize exits 141 rather than 0.  Every write in
+    // the main loop already does this; the finalize path must be consistent.
     if let Some(output) = parser.finalize() {
         guard.update(0, output.len() + 1);
-        let _ = writeln!(stdout, "{output}");
-        let _ = stdout.flush();
+        if let Err(e) = writeln!(stdout, "{output}") {
+            return write_failure_exit(&e);
+        }
+        if let Err(e) = stdout.flush() {
+            return write_failure_exit(&e);
+        }
     }
 
     // Wait for child and propagate exit code.

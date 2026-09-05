@@ -5,8 +5,12 @@
 //! JSON, YAML, and TOML are handled separately without tree-sitter (serde-based).
 
 pub(crate) mod json;
+pub(crate) mod literal_scan;
+pub(crate) mod literals;
 pub(crate) mod minimal;
 pub(crate) mod pseudo;
+#[cfg(test)]
+pub(crate) mod scaling_guard;
 pub(crate) mod signatures;
 pub(crate) mod structure;
 pub(crate) mod toml;
@@ -49,9 +53,19 @@ pub(crate) fn transform_tree(
 ) -> Result<String> {
     let (text, spans) = transform_tree_with_spans(source, tree, language, config)?;
 
-    // Apply truncation if max_lines is set
+    // Apply truncation if max_lines is set (B5: thread elision_hint for remedy clause).
+    // E3: pass the original source line count so markers state omitted SOURCE lines.
     if let Some(max_lines) = config.max_lines {
-        truncate::truncate_to_lines(&text, &spans, language, max_lines)
+        // E3: count source lines lazily — the closure is called only when
+        // truncation actually happens (performance-3 / ADR-017 source-space marker).
+        truncate::truncate_to_lines(
+            &text,
+            &spans,
+            language,
+            max_lines,
+            config.elision_hint.as_deref(),
+            || source.lines().count(),
+        )
     } else {
         Ok(text)
     }
@@ -156,9 +170,18 @@ pub(crate) fn transform_tree_with_line_map(
         }
     };
 
-    // Apply max_lines truncation (adjusting the line map)
+    // Apply max_lines truncation (adjusting the line map) (B5: thread elision_hint).
+    // E3: count source lines lazily — the closure is called only when truncation
+    // actually happens (performance-3 / ADR-017 source-space marker).
     let (final_text, final_line_map) = if let Some(max_lines) = config.max_lines {
-        let truncated_text = truncate::truncate_to_lines(&text, &spans, language, max_lines)?;
+        let truncated_text = truncate::truncate_to_lines(
+            &text,
+            &spans,
+            language,
+            max_lines,
+            config.elision_hint.as_deref(),
+            || source.lines().count(),
+        )?;
         // After truncation, the output has a subset of lines plus omission markers.
         // Rebuild the line map: match output lines back to pre-truncation line map.
         let final_line_map = reconcile_line_map_after_truncation(&text, &truncated_text, &line_map);
@@ -308,45 +331,103 @@ pub(crate) fn compute_line_map_from_removed_ranges(
 
 /// Normalize a line map to match `trim_and_normalize`'s blank-line dropping.
 ///
-/// `trim_and_normalize` has two blank-line rules that reduce output lines:
+/// `trim_and_normalize` has rules that reduce output lines:
 ///
-/// 1. **Leading blanks dropped** — blank lines before the first non-blank line
-///    are silently discarded. `trim_and_normalize` calls `result.push_str("")`
-///    for each such line, but `result` remains empty (an empty push is a no-op),
-///    so the blank never appears in the output.
+/// 1. **Zero-byte lines while result is empty** — any line whose trimmed content
+///    is empty (`trim_end == line_start`) contributes zero bytes. When no content
+///    has been emitted yet (`result.is_empty()`), such a line does not appear in
+///    `lines()` output — this includes regular blank lines AND protected sentinel
+///    lines (e.g. the `\n` of a blank line inside a multi-line string literal,
+///    which `collapse_whitespace` marks as `in_protected` but still emits zero
+///    bytes when it appears at the start of the output).
 /// 2. **3+ consecutive blanks capped to 2** — blank runs longer than 2 are
-///    truncated. The third (and any subsequent) blank in a run is skipped via
-///    `continue`.
+///    truncated. The third (and any subsequent) blank in a run is skipped.
 ///
-/// Both rules must be mirrored here so the line map stays in sync with the
-/// output text that `trim_and_normalize` produces.
+/// All rules must be mirrored here so the line map stays in sync with the
+/// output text that `trim_and_normalize` produces (PF-019).
+///
+/// **Literal-aware blank detection** — a line is considered blank only when
+/// ALL of its bytes (after trimming trailing *unprotected* whitespace) are
+/// absent.  A line that consists entirely of protected spaces (e.g. the body
+/// of a multi-line string literal) is NOT blank and is kept in the map.
 ///
 /// `pre_normalized_text` is the intermediate text (after `collapse_whitespace`,
-/// before `trim_and_normalize`). `line_map` has the same length as the number
-/// of lines in `pre_normalized_text`. Returns a filtered line map that matches
-/// the final post-normalized output.
+/// before `trim_and_normalize`).  `line_map` has the same length as the number
+/// of lines in `pre_normalized_text`.  `protected` carries the literal-range
+/// intervals in `pre_normalized_text` byte coordinates (i.e. the output of
+/// `collapse_whitespace`'s protected-range return value).
+///
+/// Returns a filtered line map that matches the final post-normalized output.
 pub(crate) fn normalize_line_map_blanks(
     pre_normalized_text: &str,
     line_map: Vec<usize>,
+    protected: &[(usize, usize)],
 ) -> Vec<usize> {
+    use crate::transform::literals::in_protected;
+
+    let bytes = pre_normalized_text.as_bytes();
+    let n = bytes.len();
     let mut result = Vec::with_capacity(line_map.len());
     let mut consecutive_blanks: usize = 0;
+    let mut pos = 0usize;
+    let mut map_idx = 0usize;
 
-    for (line, &src_line) in pre_normalized_text.lines().zip(line_map.iter()) {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
+    while pos < n {
+        let line_start = pos;
+
+        // Locate the newline that terminates this line.
+        let nl = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+        // CRLF: strip \r from content end before trimming.
+        let has_cr = nl > line_start && bytes[nl - 1] == b'\r';
+        let content_end = if has_cr { nl - 1 } else { nl };
+        pos = if nl < n { nl + 1 } else { n };
+
+        let src_line = line_map.get(map_idx).copied().unwrap_or(0);
+        map_idx += 1;
+
+        // Compute trim_end: scan backward, skip trailing unprotected whitespace.
+        // A byte is skipped only if it is a space/tab AND not protected.
+        let mut trim_end = content_end;
+        while trim_end > line_start {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // A line is blank when the backward scan reached line_start:
+        // every byte was unprotected whitespace (implying no protected bytes either,
+        // because a protected byte would have stopped the scan).
+        //
+        // Exception: a truly-empty line (trim_end == line_start, no content bytes)
+        // whose START position falls inside a protected range is a blank line that
+        // lives inside a multi-line string literal and must NOT be capped.
+        // `collapse_whitespace` emits a one-byte sentinel range covering the '\n'
+        // of such lines so that the check `in_protected(line_start, ...)` catches them.
+        let is_blank = trim_end == line_start && !in_protected(line_start, protected);
+
+        if is_blank {
             // Rule 1: mirror trim_and_normalize's leading-blank drop.
-            // trim_and_normalize calls result.push_str("") for every blank line,
-            // but since `result` stays empty until the first non-blank content is
-            // pushed, those blanks never appear in the output. Skip the map entry
-            // for the same leading blank lines.
+            //
+            // Scope note: this mirrors the UNPROTECTED case only. A protected
+            // sentinel line (trim_end == line_start but inside a literal) is
+            // deliberately excluded, because `collapse_whitespace` emits a
+            // one-byte '\n' for it — the line is non-empty in the output and
+            // must keep its map entry. Widening this to every zero-trim line
+            // drops an entry the text retains and shifts every later `-n`
+            // annotation by one, which `test_line_numbers_pseudo_leading_blank_lines`
+            // catches (PF-019).
             if result.is_empty() {
                 continue;
             }
             // Rule 2: cap consecutive blanks at 2.
             consecutive_blanks += 1;
             if consecutive_blanks > 2 {
-                // trim_and_normalize drops this line — skip it in the map too.
                 continue;
             }
         } else {
@@ -638,7 +719,7 @@ mod tests {
         // Fast path: counts already match (no 3+ blank runs).
         let text = "a\n\nb\n";
         let line_map = vec![1, 2, 3];
-        let result = normalize_line_map_blanks(text, line_map.clone());
+        let result = normalize_line_map_blanks(text, line_map.clone(), &[]);
         assert_eq!(result, line_map);
     }
 
@@ -649,7 +730,7 @@ mod tests {
         let text = "a\n\n\n\nb\n";
         // line_map before normalization: a=1, blank=2, blank=3, blank=4, b=5
         let line_map = vec![1, 2, 3, 4, 5];
-        let result = normalize_line_map_blanks(text, line_map);
+        let result = normalize_line_map_blanks(text, line_map, &[]);
         // trim_and_normalize keeps at most 2 consecutive blanks:
         // a(keep) blank(keep,1) blank(keep,2) blank(DROP,3) b(keep)
         // → [1, 2, 3, 5] (source lines for kept lines)
@@ -658,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_normalize_line_map_empty() {
-        let result = normalize_line_map_blanks("", vec![]);
+        let result = normalize_line_map_blanks("", vec![], &[]);
         assert!(result.is_empty());
     }
 
@@ -671,7 +752,7 @@ mod tests {
         let text = "\n\ncode\n";
         // Three entries in the intermediate map: src lines 1, 2, 3
         let line_map = vec![1, 2, 3];
-        let result = normalize_line_map_blanks(text, line_map);
+        let result = normalize_line_map_blanks(text, line_map, &[]);
         // Only "code" (src line 3) appears in the output.
         assert_eq!(
             result,
@@ -685,7 +766,7 @@ mod tests {
         // K=1 leading blank: the single blank must be dropped.
         let text = "\nfoo\nbar\n";
         let line_map = vec![1, 2, 3];
-        let result = normalize_line_map_blanks(text, line_map);
+        let result = normalize_line_map_blanks(text, line_map, &[]);
         assert_eq!(result, vec![2, 3]);
     }
 
@@ -697,7 +778,7 @@ mod tests {
         let text = "\n\n\n\n\nimport os\n";
         // Pre-normalized line map: 5 blank lines (src 21-25) + import (src 26)
         let line_map = vec![21, 22, 23, 24, 25, 26];
-        let result = normalize_line_map_blanks(text, line_map);
+        let result = normalize_line_map_blanks(text, line_map, &[]);
         assert_eq!(
             result,
             vec![26],
@@ -722,8 +803,8 @@ mod tests {
             ("\na\n\n\n\nb\n", vec![1, 2, 3, 4, 5, 6]),
         ];
         for (text, line_map) in cases {
-            let normalized_map = normalize_line_map_blanks(text, line_map.clone());
-            let normalized_text = trim_and_normalize(text);
+            let normalized_map = normalize_line_map_blanks(text, line_map.clone(), &[]);
+            let normalized_text = trim_and_normalize(text, &[]);
             assert_eq!(
                 normalized_map.len(),
                 normalized_text.lines().count(),
@@ -737,8 +818,29 @@ mod tests {
         // restore at minimal.rs:406-408) but map returns [].  Harmless: format.rs
         // degrades via `.get(i).unwrap_or(0)` and renders a blank line with no
         // prefix, which is correct output for a blank line.
-        let blank_map = normalize_line_map_blanks("\n\n", vec![1, 2]);
+        let blank_map = normalize_line_map_blanks("\n\n", vec![1, 2], &[]);
         assert!(blank_map.is_empty(), "all-blank input returns empty map");
+
+        // Known divergence (rust-5, unresolved): a hand-constructed protected
+        // sentinel at byte 0 — `trim_and_normalize("\nhello\n", &[(0, 1)])` —
+        // yields one text line while the map keeps two entries.
+        //
+        // The narrow condition that would drop it (`trim_end == line_start &&
+        // result.is_empty()`, ignoring protectedness) is NOT correct: applied to
+        // the real pseudo pipeline it drops an entry the text retains and shifts
+        // every later `-n` annotation by one, which
+        // `cli_line_numbers::test_line_numbers_pseudo_leading_blank_lines`
+        // measures end to end. So the protected case stays in the map.
+        //
+        // The divergence is therefore synthetic: this `protected` slice is not
+        // the shape `collapse_whitespace` emits for a leading blank in the real
+        // pipeline. Resolving it properly means having the map derive emptiness
+        // from `trim_and_normalize` itself rather than re-deriving it, which is
+        // a larger change than PF-019 warrants here. Like the all-blank case
+        // above, it degrades safely: `format.rs` falls back to
+        // `.get(i).unwrap_or(0)`.
+        //
+        // PF-025: the end-to-end test is the oracle, not this fixture.
     }
 
     // ========================================================================

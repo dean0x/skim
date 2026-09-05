@@ -44,6 +44,21 @@ pub use types::{Language, Mode, Parser, Result, SkimError, TransformConfig, Tran
 
 pub use ast_walk::{AstWalkConfig, AstWalkIter, AstWalkNode};
 
+/// Elision-marker vocabulary shared with the CLI so every truncation path
+/// spells the marker the same way (ADR-011 class 1).
+pub use transform::utils::{ElidedSide, elision_marker_line, get_comment_prefix};
+
+/// Simple line-bound enforcement shared with the CLI post-guardrail path.
+///
+/// Exported so `rskim` can delegate its post-guardrail truncation to the same
+/// literal-aware arithmetic used inside the core transform, satisfying PF-033
+/// (one spelling of the bound, in one place) and inheriting the ADR-016 N=1
+/// carve-out, the source-space elision count (ADR-017), and the #511
+/// literal-aware pull-back for free.
+pub use transform::truncate::{
+    simple_last_line_truncate, simple_last_line_truncate_with_start, simple_line_truncate,
+};
+
 /// Return the structural priority of a tree-sitter node kind (1–5).
 ///
 /// Used by the BM25F classifier to map node kinds to [`SearchField`] variants.
@@ -360,13 +375,38 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 /// * `known_token_count` - Pre-computed token count of `text`, if available.
 ///   When `Some(count)`, skips the initial full-text tokenization.
 ///   Pass `None` when the count is unknown.
+/// * `elision_hint` - Optional remedy clause appended to the omission marker
+///   (B5 / ADR-011 class 1). Pass `None` for CLI-agnostic library use.
+///   The CLI passes `Some("SKIM_PASSTHROUGH=1 for full output")`.
 ///
 /// # Returns
 /// Text fitting within the token budget, with omission marker if truncated.
-/// If `token_budget` is 0 or smaller than the omission marker itself (~5-7
-/// tokens), an empty string is returned rather than violating the budget
-/// invariant. Callers should validate the budget upstream or handle the
-/// empty-string edge case.
+/// Output fits the budget whenever at least one content line fits together
+/// with the marker. If no content line fits, the compact omission marker
+/// line (no hint) is returned on its own — this may exceed a budget smaller
+/// than the marker itself. An empty string is never returned for non-empty
+/// input (ADR-011 class 1 / #317, ADR-016). Callers that must never exceed
+/// the budget should treat "output is exactly the marker line" as the signal.
+///
+/// # Literal boundaries (#511)
+///
+/// After the budget search converges, if the last retained line ends inside a
+/// multi-line string literal or a Markdown fenced code block, the cut is pulled
+/// back to that literal's opening line. The pull-back only removes content lines,
+/// so the token budget established by the search still holds and no line is
+/// re-counted. If pulling back would leave zero content lines (the literal opens
+/// on the first line of the text), the compact marker carries a
+/// "cut inside a string literal" or "cut inside a code fence" clause to disclose
+/// the unavoidable cut. The omitted-line count in the marker is in source lines.
+///
+/// # Breaking change (this branch)
+///
+/// A 7th parameter `source_line_count: Option<usize>` was added (reliability-8).
+/// Pass `None` to keep the previous behaviour: the omitted-line count in the marker
+/// is derived from `text.lines().count()`.  Pass `Some(k)` when the caller knows
+/// the original source-file line count — e.g. when `--max-lines` has already been
+/// applied and `text` contains a synthetic elision marker that would otherwise be
+/// counted as a real source line.
 ///
 /// # Examples
 ///
@@ -375,7 +415,7 @@ pub fn transform_detailed(source: &str, language: Language, mode: Mode) -> Resul
 ///
 /// let output = "line 1\nline 2\nline 3\nline 4\nline 5";
 /// let word_count = |s: &str| -> usize { s.split_whitespace().count() };
-/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None)?;
+/// let truncated = truncate_to_token_budget(output, Language::TypeScript, 5, word_count, None, None, None)?;
 /// # Ok::<(), rskim_core::SkimError>(())
 /// ```
 pub fn truncate_to_token_budget<F>(
@@ -384,6 +424,8 @@ pub fn truncate_to_token_budget<F>(
     token_budget: usize,
     count_tokens: F,
     known_token_count: Option<usize>,
+    elision_hint: Option<&str>,
+    source_line_count: Option<usize>,
 ) -> Result<String>
 where
     F: Fn(&str) -> usize,
@@ -394,6 +436,8 @@ where
         token_budget,
         count_tokens,
         known_token_count,
+        elision_hint,
+        source_line_count,
     )
 }
 

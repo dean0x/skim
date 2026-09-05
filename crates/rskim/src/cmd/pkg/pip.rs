@@ -48,13 +48,14 @@ pub(crate) fn run(
         "check" => run_check(subcmd_args, show_stats, json_output, rec),
         "list" => run_list(subcmd_args, show_stats, json_output, rec),
         other => {
+            // D2: unknown pip subcommands (freeze, show, download, wheel, …) are
+            // forwarded to the real pip binary. Banner is debug-gated per ADR-011
+            // (lossless path — reader sees exactly what pip would produce).
             let safe = crate::cmd::sanitize_for_display(other);
-            eprintln!(
-                "skim pip: unknown subcommand '{safe}'\n\
-                 Available: install, check, list\n\
-                 Run 'skim pip --help' for usage"
-            );
-            Ok(ExitCode::FAILURE)
+            crate::debug_log!("skim pip: unknown subcommand '{safe}' — passing through to pip");
+            let mut all_args: Vec<String> = vec![other.to_string()];
+            all_args.extend_from_slice(subcmd_args);
+            crate::cmd::run_raw_passthrough("pip", &all_args, &[])
         }
     }
 }

@@ -33,6 +33,8 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // eslint --format json outputs `[]` on success (non-empty) → Full tier; no blank output to fill.
     synthesize_success_line: None,
     injected_format_flag: None,
+    raw_override: None,
+    never_passthrough: false,
 };
 
 // Static regex patterns compiled once via LazyLock.

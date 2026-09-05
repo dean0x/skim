@@ -169,7 +169,9 @@ File reads (`cat`, `head`, `tail` on code files) are rewritten
 into direct skim reads (example: `cat file.ts` becomes
 `skim file.ts --mode=pseudo`), so the output is a structured view, not
 raw file contents; seeing `skim` run in place of the original command
-is expected.
+is expected. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20`
+(verbatim lines; when the file is longer, one slot goes to the elision marker); `tail -5 file.ts`
+likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines.
 
 Compression changes how results are presented, and rewritten file reads
 show a structured view rather than exact file contents; skim prints a
@@ -317,6 +319,7 @@ pub(super) fn confirm_proceed() -> anyhow::Result<bool> {
 }
 
 /// Raw (non-TTY) fallback for [`confirm_proceed`].
+#[allow(clippy::disallowed_methods)] // TTY interaction: flush after print! before blocking read; bounded init output
 fn confirm_proceed_raw() -> anyhow::Result<bool> {
     use std::io::{BufRead, Read, Write};
     print!("Proceed? [Y/n] ");
@@ -367,6 +370,7 @@ fn confirm_proceed_raw() -> anyhow::Result<bool> {
 /// - `agent_label` — human-readable agent name for the prompt (e.g. "Claude Code").
 /// - `config_file` — exact path of the file that will be modified.
 /// - `entries` — each entry that will be added, printed verbatim.
+#[allow(clippy::disallowed_methods)] // TTY interaction: flush after print! before blocking read; bounded init output
 pub(crate) fn confirm_grant(agent_label: &str, config_file: &Path, entries: &[String]) -> bool {
     use std::io::{BufRead, IsTerminal, Read, Write};
 

@@ -97,13 +97,6 @@ pub(super) fn run_status(
     show_stats: bool,
     rec: crate::analytics::RecordingContext<'_>,
 ) -> anyhow::Result<ExitCode> {
-    // Detect whether the user supplied any format-substituting flags.
-    // Stop scanning at `--` — pathspecs after the terminator are not flags.
-    let has_conflicting = args
-        .iter()
-        .take_while(|a| a.as_str() != "--")
-        .any(|a| is_conflicting_status_flag(a.as_str()));
-
     // Transform conflicting format flags:
     // - Before `--`: strip only the conflicting chars; drop token if nothing remains.
     // - At `--` and after: pass through verbatim (pathspecs, not flags).
@@ -134,26 +127,35 @@ pub(super) fn run_status(
 
     let label = super::build_analytics_label("status", args, show_stats, rec.enabled);
 
-    // C-7: When the user's command was substituted, capture the raw output of
-    // the user's literal `git status <args>` so the net-savings guard compares
-    // against the right baseline.  This is NOT a skip — a large dirty repo
-    // where porcelain genuinely beats `--short` will still compress.
-    let user_raw_override: Option<String> = if has_conflicting {
-        let runner = CommandRunner::new();
-        let mut user_args: Vec<String> = global_flags.to_vec();
-        user_args.push("status".to_string());
-        user_args.extend_from_slice(args);
-        let arg_refs: Vec<&str> = user_args.iter().map(String::as_str).collect();
-        // Best-effort: if the user's command fails (e.g., not in a git repo),
-        // fall through to the normal porcelain baseline.
-        runner
-            .run("git", &arg_refs)
-            .ok()
-            .filter(|o| o.exit_code == Some(0))
-            .map(|o| crate::output::strip_ansi(&o.stdout))
-    } else {
-        None
-    };
+    // A1 (C-7 extended): Always capture the user's literal `git status <args>`
+    // output as the guard baseline.  Previously this was only captured when
+    // `has_conflicting` — but even when the user's flags are compatible, the
+    // injected `--porcelain=v2 --branch` form can be considerably larger than
+    // the default `git status` output (it outputs machine-readable header lines
+    // for every branch tracking field).  Without pre-capturing, the guard
+    // compares the skim summary against the injected form's bytes — a baseline
+    // the user never asked for — and can wrongly compress output that is
+    // actually larger than the user's literal command would have been.
+    //
+    // Cost: this spawns an extra `git status <args>` subprocess on every
+    // `skim git status` invocation, doubling the git process count compared to
+    // a guard that only reads the injected porcelain output.  The trade-off is
+    // accepted because the correct guard baseline (what the user's own argv
+    // would have printed) cannot be derived from the injected form without
+    // re-executing git, and a wrong baseline causes spurious over-compression.
+    //
+    // Best-effort: if the user's command fails (e.g., not in a git repo),
+    // fall through to the normal porcelain baseline (`None`).
+    let runner = CommandRunner::new();
+    let mut user_args: Vec<String> = global_flags.to_vec();
+    user_args.push("status".to_string());
+    user_args.extend_from_slice(args);
+    let arg_refs: Vec<&str> = user_args.iter().map(String::as_str).collect();
+    let user_raw_override: Option<String> = runner
+        .run("git", &arg_refs)
+        .ok()
+        .filter(|o| o.exit_code == Some(0))
+        .map(|o| crate::output::strip_ansi(&o.stdout));
 
     // C-7: pass the user's literal command output as the raw override so
     // the net-savings guard compares against the right baseline.  The
@@ -167,6 +169,12 @@ pub(super) fn run_status(
         super::ParsedCommandOptions {
             combine_stderr: false,
             raw_override: user_raw_override,
+            // ADR-015 / D1 declaration — `Lossy`.  The handler injects
+            // `--porcelain=v2` and `parse_status` folds those records into
+            // counted groups, so the envelope is a summary of what the user's
+            // literal `git status` would have printed.  No 1:1 unit to count
+            // against the raw output, so `elided` = None.
+            completeness: crate::output::fidelity::Completeness::Lossy,
         },
         parse_status,
     )

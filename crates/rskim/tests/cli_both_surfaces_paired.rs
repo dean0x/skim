@@ -40,6 +40,18 @@ mod both_surfaces {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt as _;
 
+    /// Per-binary cache sandbox (PF-017) — see the identical note in
+    /// `cli_wrapper_argv0.rs`.
+    ///
+    /// The argv0-surface halves of these pairs read the force-raw marker via
+    /// `force_raw_requested()`, which walks process ancestry. Without an
+    /// override that resolves to the developer's real `~/.cache/skim` and
+    /// reaches the shared nextest runner PID, so a hook-mode test in another
+    /// binary can flip them to raw passthrough — bypassing the mypy success-line
+    /// synthesis they assert.
+    static CACHE_SANDBOX: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir"));
+
     /// Path to the built skim binary (same resolution as cli_wrapper_argv0.rs).
     fn skim_bin() -> std::path::PathBuf {
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_skim") {
@@ -105,6 +117,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n\
             .args(["ls", "-la", "d1", "d2"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -147,6 +160,7 @@ drwxr-xr-x  3 user group  96 Jan 01 ..\n\
             .args(["-la", "d1", "d2"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -197,6 +211,7 @@ src/app.py:12:        return self.value\n";
             .args(["grep", "-n", "process", "src/app.py"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -226,6 +241,7 @@ src/app.py:12:        return self.value\n";
             .args(["-n", "process", "src/app.py"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -259,6 +275,7 @@ src/app.py:12:        return self.value\n";
             .args(["mypy", "src/"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -289,6 +306,7 @@ src/app.py:12:        return self.value\n";
             .args(["src/"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -346,6 +364,7 @@ src/app.py:12:        return self.value\n";
             .args(["du", "-a"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -357,6 +376,7 @@ src/app.py:12:        return self.value\n";
             .args(["-a"])
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()

@@ -101,9 +101,30 @@ pub(super) fn rewrite_would_corrupt(cmd: &str) -> bool {
 /// `>` inside single or double quotes is ignored (no over-bail). Maximally
 /// strict: catches spaced/glued/append/fd-prefixed forms, `&>file`, `>&FILE`,
 /// and glued-middle `foo>out`. Skips `2>`/`2>>` (stderr — stdout still reaches
-/// the agent) and fd-dups (`>&1`, `>&2`, `>&-`, `1>&2`).
+/// the agent) and fd-dups (`>&1`, `>&2`, `>&-`, `1>&2`) whose source fd does not
+/// itself point at a file.
 ///
 /// CHECK ORDER (source-fd before target) is load-bearing.
+///
+/// # fd-2 tracking: `cmd 2>f >&2` (case 8)
+///
+/// `2>f` looks stderr-only and `>&2` looks like a harmless fd-dup, so a scanner
+/// that judges each token in isolation sees no stdout→file redirect at all — yet
+/// the pair routes fd 1 onto `f`. Running the rewrite this scan used to permit
+/// for `git log -n 5 2>f >&2` put 623 compressed bytes into a file where raw git
+/// wrote 10716 (measured on this branch). The scan therefore carries one bit of
+/// state, `fd2_is_file`, updated left-to-right so ORDER is honoured: `>&2 2>f`
+/// (dup first, redirect after) leaves fd 1 on the original stderr and correctly
+/// does not bail.
+///
+/// This is the deliberate fix for case 8, rather than moving the check to an
+/// `fstat` on the explicit-subcommand path. An fd-1 `fstat` gate on
+/// `Invocation::Subcommand` would also fire for `skim git log > out.txt` — a
+/// command where the user typed `skim` themselves — and silently serve raw,
+/// overriding an explicit request. That path cannot distinguish a user-authored
+/// `skim …` from a hook-injected one, so ground truth there would defeat intent.
+/// Ground truth belongs on the surface where skim was never asked for (the
+/// wrapper); syntax belongs on the surface that can see the redirect.
 fn stdout_redirected_to_file(cmd: &str) -> bool {
     // Byte-indexed scanner: avoids a Vec<char> heap allocation on the rewrite
     // hot path. All operator characters (`>`, `'`, `"`, `\`, `2`, `&`, `-`,
@@ -119,6 +140,9 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
     let mut i = 0usize;
     let mut in_single = false;
     let mut in_double = false;
+    // Does fd 2 currently point at a file? Set by `2>FILE` / `2>>FILE`, cleared
+    // by `2>&N`. Read when fd 1 is dup'd from fd 2 (`>&2`, `1>&2`).
+    let mut fd2_is_file = false;
 
     while i < len {
         let ch = bytes[i];
@@ -173,6 +197,15 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
             if i < len && bytes[i] == b'>' {
                 i += 1;
             }
+            // Record where fd 2 lands. `2>&N` is an fd-dup (fd 2 follows another
+            // fd, which is not a file here — a file-bound fd 1 would already have
+            // bailed); anything else, including a bare trailing `2>`, is a file
+            // target. A later `>&2` then routes stdout into that file (case 8).
+            let mut t = i;
+            while t < len && bytes[t] == b' ' {
+                t += 1;
+            }
+            fd2_is_file = !(t < len && bytes[t] == b'&');
             continue;
         }
 
@@ -202,6 +235,12 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
                 let is_fd_dup = (bytes[k] == b'-' && m == k + 1)
                     || bytes[k..m].iter().all(|b| b.is_ascii_digit());
                 if is_fd_dup {
+                    // `>&2` / `1>&2` points fd 1 wherever fd 2 currently points.
+                    // If a preceding `2>FILE` put fd 2 on a file, stdout now
+                    // lands in that file — bail (case 8).
+                    if fd2_is_file && bytes[k] == b'2' && m == k + 1 {
+                        return true;
+                    }
                     i = m;
                     continue;
                 }
@@ -212,6 +251,213 @@ fn stdout_redirected_to_file(cmd: &str) -> bool {
     }
 
     false
+}
+
+// ---- Byte-exact destination detection (cross-surface fidelity parity) ----
+
+/// Pipe consumers that persist or digest the EXACT bytes of their stdin.
+///
+/// Membership means "compressing the producer corrupts this consumer's result",
+/// not merely "this consumer reads bytes". `cat`, `head`, `grep`, `less`, `jq`
+/// and friends are deliberately ABSENT: they render the stream for a reader, and
+/// compressing what an agent is about to read is skim's entire purpose.
+///
+/// The set only needs to cover consumers that persist WITHOUT a `>` redirect —
+/// `| gzip > out.gz` is already caught by [`stdout_redirected_to_file`] via its
+/// `>`. That keeps the list small and reviewable.
+///
+/// HEURISTIC, and honest about it: this is a denylist, so an unlisted persisting
+/// consumer still gets compressed bytes. A denylist was chosen over an allowlist
+/// of safe readers because the allowlist's failure mode — serving raw for every
+/// unlisted consumer — would silently kill compression for `| grep`, `| wc`,
+/// `| head` and every other everyday pipeline, which is the outcome this work
+/// explicitly rejects.
+const BYTE_EXACT_PIPE_CONSUMERS: &[&str] = &[
+    // Write the stream verbatim to a destination of their own.
+    "tee",
+    "dd",
+    "sponge", // Archive or re-encode the stream verbatim.
+    "gzip",
+    "bzip2",
+    "xz",
+    "zstd",
+    "base64",
+    "tar",
+    "openssl",
+    // Digest the exact bytes — any substitution changes the answer.
+    "cksum",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "shasum",
+];
+
+/// Return `true` when `cmd`'s stdout destination requires the tool's exact
+/// bytes, so the wrapper surface must serve raw even though `fstat` alone would
+/// choose to compress.
+///
+/// This is the rewrite engine acting as the authority on the one thing it can
+/// see and `fstat` cannot: **pipeline shape**. `| cat` and `| tee out.txt` are
+/// the same FIFO to the wrapper; only a look at the far end distinguishes them.
+///
+/// Three rules, in cost order:
+/// - **S — capture/plumbing**: `$(…)`, backticks and process substitution make
+///   the shell consume stdout as a value or wire it to another command's fd.
+///   (`${…}` is parameter expansion, not capture, and is deliberately excluded.)
+/// - **R — redirect**: stdout or both streams land on a file or named FIFO,
+///   including the `2>f … >&2` fd-dup shape.
+/// - **T — byte-exact pipe consumer**: the pipeline's next stage persists or
+///   digests the exact bytes ([`BYTE_EXACT_PIPE_CONSUMERS`]).
+///
+/// Anything else — plain `| cat`, `| grep`, `| head`, a TTY — returns `false`
+/// and keeps compressing.
+pub(super) fn command_needs_exact_bytes(cmd: &str) -> bool {
+    // Rule S: the shell captures stdout as a value or plumbs it into an fd.
+    if is_capture_shape(cmd) {
+        return true;
+    }
+    // Rule R: stdout (or both streams) lands on a file or named FIFO.
+    if stdout_redirected_to_file(cmd) {
+        return true;
+    }
+    // Rule T: the downstream pipe stage needs the bytes verbatim.
+    pipe_consumer_needs_exact_bytes(cmd)
+}
+
+/// Rule S: the shell consumes stdout as a value (`$(…)`, backticks) or wires it
+/// into another command's fd (`<(…)`, `>(…)`).
+///
+/// (`${…}` is parameter expansion, not capture, and is deliberately excluded.)
+///
+/// Also the authoritative "tokenisation cannot be trusted here" predicate:
+/// these shapes nest a whole command inside one whitespace-delimited token, so
+/// [`command_heads`] refuses to guess at head names for them.
+fn is_capture_shape(cmd: &str) -> bool {
+    cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") || cmd.contains(">(")
+}
+
+/// Upper bound on the number of distinct command heads recorded for one
+/// command.
+///
+/// Every loop and resource gets an explicit bound. Real commands name a handful
+/// of tools; a pathological one-liner must not be able to make the hook write an
+/// unbounded number of marker files. Exceeding it reports *unknown* rather than
+/// a truncated set — see [`command_heads`].
+const MAX_COMMAND_HEADS: usize = 16;
+
+/// Commands that exec *another* command given as their argument.
+///
+/// For these the segment head names the launcher, not the tool whose stdout is
+/// actually captured: `timeout 60 git log | tee f` has head `timeout`, and
+/// marking `timeout` would leave `git` unmarked — a byte loss. Each takes its
+/// own options with its own arity (`timeout 60 …`, `nice -n 5 …`), so the real
+/// tool cannot be recovered by skipping a fixed number of tokens. They report
+/// *unknown* instead and fall back to the wildcard.
+///
+/// `sudo` and `command` are absent deliberately: [`tokens_head`] already steps
+/// over them to reach the real tool.
+const EXEC_PREFIXES: &[&str] = &[
+    "env", "nice", "ionice", "chrt", "nohup", "setsid", "timeout", "stdbuf", "unbuffer", "xargs",
+    "time", "doas", "watch", "script",
+];
+
+/// The basenames of every command head in `cmd`, deduplicated and capped at
+/// [`MAX_COMMAND_HEADS`].
+///
+/// This is the *scope* of [`command_needs_exact_bytes`]: the set of tools whose
+/// wrapper invocations belong to this command. The hook records the verdict
+/// under these names so a marker set for `git log | tee f` cannot change what a
+/// concurrent, hook-less, or later `cargo`/`grep`/`ls` wrapper invocation does.
+///
+/// An **empty** result means "the tool set is not knowable from this text".
+/// Callers must treat that as *all tools*, never as *no tools*: erring wide
+/// costs compression, erring narrow costs bytes.
+///
+/// **Partial knowledge is not knowledge.** If any segment's head cannot be
+/// resolved to a plain tool name — a capture shape, a `Bail` shape, an
+/// [`EXEC_PREFIXES`] launcher, an unrepresentable name (`sudo -u bob git` heads
+/// on `-u`), or more heads than [`MAX_COMMAND_HEADS`] — the whole command
+/// reports unknown. Returning the heads it *could* read would leave the
+/// unreadable stage's tool unmarked, and an unmarked byte-exact stage is
+/// exactly the byte loss this marker exists to prevent.
+pub(super) fn command_heads(cmd: &str) -> Vec<String> {
+    // A capture shape hides a command inside a single whitespace token
+    // (`out=$(git log)` tokenises to `out=$(git`, `log`, …), so `tokens_head`
+    // would confidently return the wrong name. Report "unknown" instead.
+    if is_capture_shape(cmd) {
+        return Vec::new();
+    }
+
+    let segments = match split_compound(cmd) {
+        CompoundSplitResult::Simple(tokens) => vec![tokens],
+        CompoundSplitResult::Compound(segments) => segments.into_iter().map(|s| s.tokens).collect(),
+        // Unsupported shell syntax — the token stream is not trustworthy.
+        CompoundSplitResult::Bail => return Vec::new(),
+    };
+
+    let mut heads: Vec<String> = Vec::new();
+    for tokens in &segments {
+        // An empty segment is not a command (`git log;` trails one).
+        if tokens.is_empty() {
+            continue;
+        }
+        let Some(head) = tokens_head(tokens).filter(|h| {
+            crate::cmd::session_sidecar::is_safe_marker_tool(h) && !EXEC_PREFIXES.contains(h)
+        }) else {
+            return Vec::new();
+        };
+        if heads.iter().any(|h| h == head) {
+            continue;
+        }
+        if heads.len() == MAX_COMMAND_HEADS {
+            return Vec::new();
+        }
+        heads.push(head.to_string());
+    }
+
+    heads
+}
+
+/// Return `true` when any pipe stage of `cmd` feeds a [`BYTE_EXACT_PIPE_CONSUMERS`]
+/// command.
+fn pipe_consumer_needs_exact_bytes(cmd: &str) -> bool {
+    match split_compound(cmd) {
+        // No compound operator — no pipe consumer.
+        CompoundSplitResult::Simple(_) => false,
+        // `split_compound` bails on heredoc `<<`, `${..}` expansion, and
+        // unmatched quotes. None of these shapes are caught by `is_capture_shape`
+        // (rule S covers only `$(`, backtick, `<(`, `>(`). The token stream is
+        // untrusted, so the pipeline structure cannot be read. Treat conservatively:
+        // if the command text contains `|`, a byte-exact consumer may follow the
+        // bail-triggering token. Erring wide costs compression; erring narrow costs
+        // bytes (#317). Commands without `|` have no pipe consumer and return false,
+        // preserving the pinned property for parameter-expansion-only shapes such as
+        // `git log -n ${N}` (no marker written — see `test_command_heads_unknown_for_parameter_expansion`).
+        CompoundSplitResult::Bail => cmd.contains('|'),
+        CompoundSplitResult::Compound(segments) => segments.windows(2).any(|pair| {
+            pair[0].trailing_operator == Some(CompoundOp::Pipe)
+                && segment_head(&pair[1])
+                    .is_some_and(|head| BYTE_EXACT_PIPE_CONSUMERS.contains(&head))
+        }),
+    }
+}
+
+/// Extract a segment's command name: the first token that is neither a leading
+/// `VAR=VAL` assignment nor a privilege/dispatch prefix, reduced to its basename
+/// so `/usr/bin/tee` matches `tee`.
+fn segment_head(seg: &CommandSegment) -> Option<&str> {
+    tokens_head(&seg.tokens)
+}
+
+/// [`segment_head`] over a bare token slice, for the `Simple` (no compound
+/// operator) split result which carries tokens rather than segments.
+fn tokens_head(tokens: &[String]) -> Option<&str> {
+    tokens
+        .iter()
+        .map(String::as_str)
+        .find(|t| !t.contains('=') && *t != "sudo" && *t != "command")
+        .map(|t| t.rsplit('/').next().unwrap_or(t))
 }
 
 /// Return `true` when a recognized redirect token (`2>&1`, `>/dev/null`, …)
@@ -657,23 +903,85 @@ pub(super) fn has_pipe_operator(segments: &[CommandSegment]) -> bool {
         .any(|s| s.trailing_operator == Some(CompoundOp::Pipe))
 }
 
+/// Rebuild the command text from a split segment list: each segment's tokens,
+/// the redirects [`strip_segment_redirects`] lifted out of it, and the operator
+/// that follows it.
+///
+/// [`try_rewrite_compound`] is handed segments alone, but the destination
+/// predicates ([`command_needs_exact_bytes`]) read *syntax*, which only exists
+/// in the joined form. Runs of whitespace are not preserved — commands whose
+/// tokenisation is lossy are already refused upstream by
+/// [`rewrite_would_corrupt`].
+fn rejoin_segments(segments: &[CommandSegment]) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in segments {
+        parts.extend(seg.tokens.iter().map(String::as_str));
+        parts.extend(seg.stripped_redirects.iter().map(String::as_str));
+        if let Some(op) = seg.trailing_operator {
+            parts.push(op.as_str());
+        }
+    }
+    parts.join(" ")
+}
+
+/// Return `true` for the one pipeline shape AD-RW-2 permits: `<source> | cat`,
+/// with bare `cat` as the sole consumer.
+///
+/// `| cat` is a **reader render** — an agent defeating a pager, not persisting
+/// bytes — and compressing what an agent is about to read is skim's entire
+/// purpose. So this shape rewrites while every other pipeline still bails: only
+/// the far end of the pipe separates `| cat` from `| tee out.txt`, and reading
+/// it wrong costs the user data. The hook's [`command_needs_exact_bytes`]
+/// verdict for such a command is `false`, so no force-raw marker is set — which
+/// is consistent, because the explicit-subcommand path the rewrite emits
+/// compresses into the FIFO on purpose.
+///
+/// The shape is deliberately exact — exactly two segments joined by a single
+/// `|`, the source carrying no redirects, the consumer being the single token
+/// `cat` with no arguments and no operator of its own. `cat -n`, `cat -`,
+/// `cat file`, a third stage, and any interleaved `&&`/`||`/`;` all fall
+/// outside it.
+///
+/// [`command_needs_exact_bytes`] over the rejoined text is then the safety
+/// gate, and it is what keeps `… | cat > f` (rule R, whose `>`/target tokens
+/// stay inside the consumer segment) and `… | cat | tee f` (rule T) raw.
+pub(super) fn is_bare_cat_pipeline(segments: &[CommandSegment]) -> bool {
+    let [source, consumer] = segments else {
+        return false;
+    };
+    if source.trailing_operator != Some(CompoundOp::Pipe) || !source.stripped_redirects.is_empty() {
+        return false;
+    }
+    if consumer.trailing_operator.is_some()
+        || !consumer.stripped_redirects.is_empty()
+        || consumer.tokens != ["cat"]
+    {
+        return false;
+    }
+    !command_needs_exact_bytes(&rejoin_segments(segments))
+}
+
 /// Attempt to rewrite a compound command expression.
 ///
 /// For `&&`/`||`/`;`: tries `try_rewrite()` on each segment independently.
-/// For `|`: NEVER rewrites (#317, user-approved): compressing a pipe
-/// producer silently changes what downstream `grep`/`wc`/`head` consume —
-/// the whole pipeline passes through untouched.
+/// For `|`: bails (#317, user-approved) — compressing a pipe producer silently
+/// changes what downstream `grep`/`wc`/`head` consume, so the whole pipeline
+/// passes through untouched. The single exception is
+/// [`is_bare_cat_pipeline`]: `<source> | cat` rewrites its source, because
+/// bare `cat` renders the stream for a reader rather than consuming its bytes.
 /// Returns `Some(RewriteResult)` if ANY segment was rewritten, `None` otherwise.
 pub(super) fn try_rewrite_compound(segments: &[CommandSegment]) -> Option<RewriteResult> {
     if segments.is_empty() {
         return None;
     }
 
-    if has_pipe_operator(segments) {
+    if has_pipe_operator(segments) && !is_bare_cat_pipeline(segments) {
         return None;
     }
 
-    // For &&/||/; — try rewriting each segment independently
+    // For &&/||/; (and the bare-`| cat` shape) — try rewriting each segment
+    // independently. `try_rewrite` declines bare `cat`, so the consumer stage
+    // of a `| cat` pipeline is re-emitted verbatim.
     let mut any_rewritten = false;
     let mut first_category: Option<RewriteCategory> = None;
     let mut parts: Vec<String> = Vec::new();
@@ -905,6 +1213,329 @@ mod tests {
             !rewrite_would_corrupt(r#"git commit -m "x > y""#),
             "quoted >"
         );
+    }
+
+    // ========================================================================
+    // Case 8: `2>f >&2` — fd 1 dup'd from a file-bound fd 2
+    // ========================================================================
+
+    /// The measured data-loss case. `2>f` then `>&2` routes stdout onto `f`,
+    /// but each token in isolation looks harmless (stderr-only, then fd-dup).
+    /// Before this guard the engine emitted `skim git log -n 5 2>f >&2`, which
+    /// wrote 623 compressed bytes where raw git wrote 10716.
+    #[test]
+    fn test_corrupt_guard_stderr_file_then_dup_to_stdout_bails() {
+        assert!(
+            rewrite_would_corrupt("git log -n 5 2>f >&2"),
+            "2>f then >&2 puts stdout in f — must bail"
+        );
+        assert!(
+            rewrite_would_corrupt("git log -n 5 2>/tmp/x.txt >&2"),
+            "absolute path target"
+        );
+        assert!(
+            rewrite_would_corrupt("cargo test 2> log.txt >&2"),
+            "spaced 2> form"
+        );
+        assert!(
+            rewrite_would_corrupt("cargo test 2>>log.txt >&2"),
+            "2>> append then dup"
+        );
+        assert!(
+            rewrite_would_corrupt("cargo test 2>f 1>&2"),
+            "explicit 1>&2 dup form"
+        );
+    }
+
+    /// ORDER is load-bearing: dup FIRST, then redirect fd 2, leaves fd 1 on the
+    /// original stderr — no stdout→file redirect exists, so the fd-2 tracking
+    /// must NOT fire.
+    ///
+    /// Asserted against `stdout_redirected_to_file` directly, not
+    /// `rewrite_would_corrupt`: the outer guard bails on this shape anyway via
+    /// the deliberately coarse `redirect_order_hazard` (a recognized `>&2`
+    /// followed by an unrecognized `>`-bearing `2>f`), which would mask whether
+    /// the fd-2 state machine got the ordering right.
+    #[test]
+    fn test_stdout_redirect_scan_respects_dup_before_stderr_redirect() {
+        assert!(
+            !stdout_redirected_to_file("cargo test >&2 2>f"),
+            ">&2 before 2>f — fd 1 follows the ORIGINAL stderr, no stdout->file"
+        );
+        // Sanity: the reverse order DOES route stdout into the file.
+        assert!(
+            stdout_redirected_to_file("cargo test 2>f >&2"),
+            "2>f before >&2 — fd 1 lands on f"
+        );
+    }
+
+    /// `2>&1` points fd 2 at fd 1 (not a file), so a later `>&2` is a no-op dup
+    /// and must not bail — otherwise the extremely common `cmd 2>&1` shapes
+    /// would stop being rewritten.
+    #[test]
+    fn test_corrupt_guard_fd2_dup_does_not_arm_the_guard() {
+        assert!(
+            !rewrite_would_corrupt("cargo test 2>&1 >&2"),
+            "2>&1 leaves fd 2 off-file; >&2 must stay a harmless dup"
+        );
+        assert!(!rewrite_would_corrupt("cargo test >&2"), "bare >&2");
+        assert!(!rewrite_would_corrupt("cargo test 1>&2"), "bare 1>&2");
+    }
+
+    // ========================================================================
+    // command_needs_exact_bytes — the rewrite surface's verdict for the wrapper
+    // ========================================================================
+
+    /// Rule T: a pipe consumer that persists or digests exact bytes.
+    #[test]
+    fn test_needs_exact_bytes_byte_exact_pipe_consumers() {
+        assert!(command_needs_exact_bytes("git log -n 5 | tee out.txt"));
+        assert!(command_needs_exact_bytes("git log -n 5 | tee -a out.txt"));
+        assert!(command_needs_exact_bytes("git log | sha256sum"));
+        assert!(command_needs_exact_bytes("git log | dd of=out.bin"));
+        assert!(command_needs_exact_bytes("git log | base64"));
+        // Basename reduction: an absolute path to the same tool still matches.
+        assert!(command_needs_exact_bytes("git log | /usr/bin/tee out.txt"));
+        // Leading env assignments and `sudo` do not hide the consumer.
+        assert!(command_needs_exact_bytes("git log | LC_ALL=C tee out.txt"));
+        assert!(command_needs_exact_bytes("git log | sudo tee /etc/x"));
+    }
+
+    /// **The case that must not regress.** Readers keep compressing — this is
+    /// skim's core value, and a blanket "any pipe → raw" rule was rejected
+    /// precisely because it would destroy it.
+    #[test]
+    fn test_needs_exact_bytes_reader_pipes_still_compress() {
+        assert!(!command_needs_exact_bytes("git log -n 5 | cat"));
+        assert!(!command_needs_exact_bytes("git log -n 5 | head -20"));
+        assert!(!command_needs_exact_bytes("git log | grep fix"));
+        assert!(!command_needs_exact_bytes("git log | wc -l"));
+        assert!(!command_needs_exact_bytes("git log | less"));
+        assert!(!command_needs_exact_bytes("git log -n 5"));
+        assert!(!command_needs_exact_bytes("cargo test && cargo build"));
+    }
+
+    /// Rule S: the shell consumes stdout as a value or plumbs it into an fd.
+    #[test]
+    fn test_needs_exact_bytes_capture_and_process_substitution() {
+        assert!(command_needs_exact_bytes("out=$(git log -n 5)"));
+        assert!(command_needs_exact_bytes("echo `git log -n 5`"));
+        assert!(command_needs_exact_bytes("diff <(git log) <(git log -n 1)"));
+        assert!(command_needs_exact_bytes("tee >(gzip > out.gz)"));
+        // `${VAR}` is parameter expansion, not capture — must NOT arm the rule.
+        assert!(!command_needs_exact_bytes("git log -n ${N}"));
+    }
+
+    /// Bail shapes that rule S (`is_capture_shape`) does NOT cover, piped into a
+    /// byte-exact consumer.  `split_compound` bails before reaching the `|`, so
+    /// the old code always returned `false`; the fix returns `cmd.contains('|')`.
+    ///
+    /// Three shapes, each pinning one bail trigger:
+    /// - heredoc `<<`
+    /// - `${..}` parameter expansion
+    /// - unmatched quote (detected at end of `split_compound`)
+    #[test]
+    fn test_needs_exact_bytes_bail_shapes_with_pipe_consumer() {
+        // Heredoc `<<` — check_bail fires before seeing the pipe.
+        assert!(command_needs_exact_bytes(
+            "git log -n 5 <<EOF | tee out.txt"
+        ));
+        // `${..}` expansion — same.
+        assert!(command_needs_exact_bytes("git log -n ${N} | tee out.txt"));
+        // Unmatched single quote — split_compound bails at end of input.
+        assert!(command_needs_exact_bytes("git log -n 5 | tee 'out.txt"));
+    }
+
+    /// The conservative Bail treatment must NOT widen to commands without a pipe.
+    /// No `|` → no pipe consumer → return false, preserving the pinned guarantee
+    /// for parameter-expansion-only and heredoc-only commands.
+    #[test]
+    fn test_needs_exact_bytes_bail_without_pipe_returns_false() {
+        // `${N}` unquoted, no pipe — pinned by test_command_heads_unknown_for_parameter_expansion.
+        assert!(!command_needs_exact_bytes("git log -n ${N}"));
+        // Heredoc with no downstream pipe.
+        assert!(!command_needs_exact_bytes("cat <<EOF"));
+        // Unmatched quote, no pipe.
+        assert!(!command_needs_exact_bytes("git log -n 'five"));
+    }
+
+    /// Quoted `"${N}"` does NOT trigger check_bail (the `$` is inside double
+    /// quotes, so the state machine skips check_bail).  `split_compound` succeeds
+    /// and returns Compound, so the pipeline is fully analysed: `cat` is not a
+    /// byte-exact consumer → false, and `tee` is → true.
+    #[test]
+    fn test_needs_exact_bytes_quoted_var_takes_normal_path() {
+        // `cat` not in BYTE_EXACT_PIPE_CONSUMERS → false.
+        assert!(!command_needs_exact_bytes(r#"git log -n "${N}" | cat"#));
+        // `tee` IS byte-exact → true (rule T fires normally).
+        assert!(command_needs_exact_bytes(
+            r#"git log -n "${N}" | tee out.txt"#
+        ));
+    }
+
+    /// Rule R: file and named-FIFO redirects, including the case-8 shape.
+    #[test]
+    fn test_needs_exact_bytes_redirects() {
+        assert!(command_needs_exact_bytes("git log -n 5 > out.txt"));
+        assert!(command_needs_exact_bytes("git log -n 5 >> out.txt"));
+        assert!(command_needs_exact_bytes("git log -n 5 > /dev/null"));
+        assert!(command_needs_exact_bytes("git log -n 5 > myfifo"));
+        assert!(command_needs_exact_bytes("git log -n 5 2>f >&2"));
+        // A `>` inside a pipeline stage still counts (`| gzip > f.gz`).
+        assert!(command_needs_exact_bytes("git log | gzip > out.gz"));
+        // stderr-only redirects leave stdout alone.
+        assert!(!command_needs_exact_bytes("git log -n 5 2> err.txt"));
+    }
+
+    // ========================================================================
+    // command_heads — the SCOPE of that verdict
+    // ========================================================================
+
+    /// Every stage of a pipeline is named, so one hook invocation covers every
+    /// wrapper invocation it will produce.
+    #[test]
+    fn test_command_heads_names_every_pipeline_stage() {
+        assert_eq!(command_heads("git log -n 5 | tee out.txt"), ["git", "tee"]);
+        assert_eq!(command_heads("cargo test && git log"), ["cargo", "git"]);
+        assert_eq!(command_heads("git log -n 5"), ["git"]);
+    }
+
+    /// The same normalisation `segment_head` already applies for rule T:
+    /// basename reduction, and leading `VAR=VAL` / `sudo` / `command` skipped.
+    #[test]
+    fn test_command_heads_normalises_like_rule_t() {
+        assert_eq!(
+            command_heads("git log | /usr/bin/tee out.txt"),
+            ["git", "tee"]
+        );
+        assert_eq!(
+            command_heads("git log | LC_ALL=C tee out.txt"),
+            ["git", "tee"]
+        );
+        assert_eq!(command_heads("git log | sudo tee /etc/x"), ["git", "tee"]);
+    }
+
+    /// Repeats collapse, and the list is bounded — a pathological one-liner must
+    /// not make the hook write an unbounded number of marker files. Overflowing
+    /// the bound reports *unknown* (wildcard), never a truncated set: a
+    /// truncated set would leave the dropped tools unmarked.
+    #[test]
+    fn test_command_heads_dedupes_and_is_bounded() {
+        assert_eq!(command_heads("git log | git cat-file --batch"), ["git"]);
+
+        let at_bound: String = (0..MAX_COMMAND_HEADS)
+            .map(|i| format!("tool{i} x"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        assert_eq!(command_heads(&at_bound).len(), MAX_COMMAND_HEADS);
+
+        let over_bound: String = (0..MAX_COMMAND_HEADS + 1)
+            .map(|i| format!("tool{i} x"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        assert!(
+            command_heads(&over_bound).is_empty(),
+            "overflowing the bound must report unknown, not a truncated set"
+        );
+    }
+
+    /// **A launcher is not the tool whose stdout is captured.**
+    ///
+    /// `timeout 60 git log | tee f` heads on `timeout`; marking `timeout` would
+    /// leave `git` unmarked and the tee would capture compressed bytes. These
+    /// report unknown so the wildcard covers `git`.
+    #[test]
+    fn test_command_heads_unknown_for_exec_prefixes() {
+        for cmd in [
+            "timeout 60 git log | tee out.txt",
+            "env GIT_PAGER=cat git log | tee out.txt",
+            "nice -n 5 git log > out.txt",
+            "nohup git log > out.txt",
+            "xargs git show < list",
+        ] {
+            assert!(
+                command_heads(cmd).is_empty(),
+                "`{cmd}` heads on a launcher — must report unknown"
+            );
+        }
+        // `sudo` and `command` are stepped over, so the real tool is reached.
+        assert_eq!(command_heads("sudo git log | tee out.txt"), ["git", "tee"]);
+    }
+
+    /// A head that is not a representable tool name makes the whole command
+    /// unknown, rather than being silently dropped from an otherwise-populated
+    /// set. `sudo -u bob git log` heads on `-u`: dropping it would mark only
+    /// `tee` and leave `git` unmarked.
+    #[test]
+    fn test_command_heads_unknown_when_a_head_is_unrepresentable() {
+        assert!(command_heads("sudo -u bob git log | tee out.txt").is_empty());
+    }
+
+    /// **Empty means "unknown", never "none".** A capture shape hides a whole
+    /// command inside one whitespace token, so `tokens_head` would confidently
+    /// return the wrong name (`out=$(git log)` tokenises to `out=$(git`, `log`).
+    /// Reporting an empty set routes these to the wildcard marker instead.
+    #[test]
+    fn test_command_heads_refuses_to_guess_on_capture_shapes() {
+        assert!(command_heads("out=$(git log -n 5)").is_empty());
+        assert!(command_heads("echo `git log -n 5`").is_empty());
+        assert!(command_heads("diff <(git log) <(git log -n 1)").is_empty());
+        assert!(command_heads("tee >(gzip > out.gz)").is_empty());
+    }
+
+    /// `${VAR}` is parameter expansion, not capture: it must NOT arm rule S
+    /// (asserted in `test_needs_exact_bytes_capture_and_process_substitution`).
+    /// Head extraction is separately unknown for it, because `split_compound`
+    /// bails on `${` for tokenisation safety — so the two answers are
+    /// "not byte-exact" and "tools unknown", which together mean *no* marker.
+    ///
+    /// Pinned because the two predicates arrive at "unknown" by different
+    /// routes, and a future change to either must not silently make this
+    /// command start writing a wildcard marker.
+    #[test]
+    fn test_command_heads_unknown_for_parameter_expansion() {
+        assert!(!command_needs_exact_bytes("git log -n ${N}"));
+        assert!(command_heads("git log -n ${N}").is_empty());
+    }
+
+    /// **The invariant that keeps the narrowing lossless in the byte direction.**
+    ///
+    /// For every shape `command_needs_exact_bytes` accepts, the tool that
+    /// actually produces the captured stdout must end up covered: either the
+    /// head list names it, or the list is empty and the wildcard covers
+    /// everything. A command that is byte-exact but whose producer is missing
+    /// from a *non-empty* list would compress into a file — the exact loss this
+    /// marker exists to prevent.
+    #[test]
+    fn test_byte_exact_producer_is_always_covered() {
+        let cases = [
+            ("git log -n 5 | tee out.txt", "git"),
+            ("git log | sha256sum", "git"),
+            ("git log -n 5 > out.txt", "git"),
+            ("git log -n 5 >> out.txt", "git"),
+            ("git log -n 5 2>f >&2", "git"),
+            ("git log | gzip > out.gz", "git"),
+            ("git log -n 5 > myfifo", "git"),
+            ("out=$(git log -n 5)", "git"),
+            ("echo `git log -n 5`", "git"),
+            ("diff <(git log) <(git log -n 1)", "diff"),
+            ("timeout 60 git log | tee out.txt", "git"),
+            ("env GIT_PAGER=cat git log > out.txt", "git"),
+            ("sudo -u bob git log | tee out.txt", "git"),
+            ("cargo test && git log | tee out.txt", "git"),
+        ];
+        for (cmd, producer) in cases {
+            assert!(
+                command_needs_exact_bytes(cmd),
+                "precondition: `{cmd}` must be byte-exact"
+            );
+            let heads = command_heads(cmd);
+            assert!(
+                heads.is_empty() || heads.iter().any(|h| h == producer),
+                "`{cmd}`: producer `{producer}` is not covered by {heads:?} — \
+                 a non-empty list that omits the producer leaves it unmarked"
+            );
+        }
     }
 
     /// #322: a recognized redirect token sitting *inside* quoted text becomes a
@@ -1524,5 +2155,265 @@ mod tests {
             !command_needs_passthrough("cargo test && cargo build"),
             "compound clean command must not need passthrough"
         );
+    }
+
+    // ========================================================================
+    // AD-RW-2 reversal — narrow `<rewritable command> | cat` shape
+    //
+    // AD-RW-2 currently bails on EVERY pipeline via `has_pipe_operator`.  The
+    // reversal allows the narrow shape `<source> | cat` (bare `cat`, no args,
+    // single downstream stage) because `| cat` is a reader render whose sole
+    // purpose is to defeat pagers — compressing what an agent is about to read
+    // is skim's core value.
+    //
+    // RED tests (1–3): fail today (has_pipe_operator returns None); pass after
+    //   the reversal.
+    // CONTROL tests (4–9): pass today AND after the reversal — pin the safety
+    //   gate so the reversal cannot silently escape its narrow shape.
+    // ========================================================================
+
+    /// Binary verdict: `skim rewrite 'git log -n 3 | cat'` → exit 1 (no rewrite).
+    ///
+    /// After the AD-RW-2 reversal the pure 2-stage pipeline `<source> | cat`
+    /// must be rewritten: the source segment is compressed, `| cat` is
+    /// preserved verbatim.
+    ///
+    /// RED: fails today because `has_pipe_operator` short-circuits to None for
+    /// every pipeline; passes after the reversal.
+    #[test]
+    fn pipe_to_bare_cat_rewrites_the_source() {
+        match split_compound("git log -n 3 | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                let joined = result
+                    .expect("git log -n 3 | cat must be rewritten after AD-RW-2 reversal")
+                    .tokens
+                    .join(" ");
+                assert_eq!(
+                    joined, "skim git log -n 3 | cat",
+                    "source must be rewritten; downstream `| cat` preserved verbatim"
+                );
+            }
+            other => panic!("Expected Compound for `git log -n 3 | cat`, got {other:?}"),
+        }
+    }
+
+    /// Binary verdict: `skim rewrite 'cat README.md'` → exit 0,
+    /// stdout = `SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo`.
+    ///
+    /// `cat <file>` is rewritten standalone, so when it appears as the pipe
+    /// source in `cat README.md | cat` the source segment must be rewritten
+    /// exactly as the standalone form with ` | cat` appended.
+    ///
+    /// RED: fails today (has_pipe_operator bails); passes after the reversal.
+    #[test]
+    fn pipe_to_bare_cat_rewrites_file_read_source() {
+        match split_compound("cat README.md | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                let joined = result
+                    .expect("cat README.md | cat must be rewritten after AD-RW-2 reversal")
+                    .tokens
+                    .join(" ");
+                assert_eq!(
+                    joined, "SKIM_REWRITTEN_FROM=cat skim README.md --mode=pseudo | cat",
+                    "source rewritten as standalone form; | cat appended verbatim"
+                );
+            }
+            other => panic!("Expected Compound for `cat README.md | cat`, got {other:?}"),
+        }
+    }
+
+    /// Binary verdict: `skim rewrite 'grep -rn foo src'` → exit 0,
+    /// stdout = `skim grep -rn foo src`.
+    /// Binary verdict: `skim rewrite 'grep -rn foo src | cat'` → exit 1 (no rewrite).
+    ///
+    /// `grep -rn foo src` is rewritten standalone; when piped to bare `cat` the
+    /// source must be rewritten as the standalone form with ` | cat` appended.
+    ///
+    /// Note: `grep foo file | head` is separately pinned as NOT rewritten by
+    /// `test_pipe_catch_all_grep_not_rewritten` (non-cat downstream, outside
+    /// the narrow shape).
+    ///
+    /// RED: fails today (has_pipe_operator bails); passes after the reversal.
+    #[test]
+    fn pipe_to_bare_cat_rewrites_grep_source() {
+        match split_compound("grep -rn foo src | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                let result = try_rewrite_compound(&segments);
+                let joined = result
+                    .expect("grep -rn foo src | cat must be rewritten after AD-RW-2 reversal")
+                    .tokens
+                    .join(" ");
+                assert_eq!(
+                    joined, "skim grep -rn foo src | cat",
+                    "source rewritten as standalone form; | cat appended verbatim"
+                );
+            }
+            other => {
+                panic!("Expected Compound for `grep -rn foo src | cat`, got {other:?}")
+            }
+        }
+    }
+
+    /// `git log -n 3 | cat > /tmp/x.txt`: the stdout redirect on the `cat`
+    /// stage routes the pipeline output to a file.  Rule R fires →
+    /// `command_needs_exact_bytes` is true → the rewrite must be refused.
+    ///
+    /// Binary verdict: exit 1 (not rewritten — `rewrite_would_corrupt` bails
+    /// on the stdout redirect before `try_rewrite_compound` is called).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (safety: the `cat` segment has a stripped redirect — not bare `cat` —
+    /// so the narrow shape check must refuse it).
+    #[test]
+    fn pipe_to_cat_then_redirect_is_not_rewritten() {
+        assert!(
+            command_needs_exact_bytes("git log -n 3 | cat > /tmp/x.txt"),
+            "safety gate precondition: Rule R must arm for the stdout redirect"
+        );
+        match split_compound("git log -n 3 | cat > /tmp/x.txt") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 | cat > /tmp/x.txt must not be rewritten \
+                     (cat segment carries a stripped stdout redirect)"
+                );
+            }
+            other => panic!("Expected Compound, got {other:?}"),
+        }
+    }
+
+    /// `git log -n 3 | cat | tee /tmp/x.txt`: `tee` is a byte-exact consumer
+    /// (Rule T); the downstream is not bare `cat` (it is a 3-stage pipeline).
+    ///
+    /// Binary verdict: exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (safety: 3 pipeline stages → not the narrow 2-stage `<source> | cat`
+    /// shape; Rule T also arms `command_needs_exact_bytes`).
+    #[test]
+    fn pipe_to_cat_then_tee_is_not_rewritten() {
+        assert!(
+            command_needs_exact_bytes("git log -n 3 | cat | tee /tmp/x.txt"),
+            "safety gate precondition: Rule T must arm for tee"
+        );
+        match split_compound("git log -n 3 | cat | tee /tmp/x.txt") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 | cat | tee /tmp/x.txt must not be rewritten \
+                     (3-stage pipeline, tee downstream)"
+                );
+            }
+            other => panic!("Expected Compound, got {other:?}"),
+        }
+    }
+
+    /// `git log -n 3 | cat -n`: downstream `cat` carries the `-n` flag
+    /// (number lines).  The narrow shape requires bare `cat` with NO arguments.
+    ///
+    /// Binary verdict: exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (safety: `cat` with any argument is not bare `cat` → shape rejected).
+    #[test]
+    fn pipe_to_cat_with_args_is_not_rewritten() {
+        match split_compound("git log -n 3 | cat -n") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 | cat -n must not be rewritten (`cat -n` has args)"
+                );
+            }
+            other => panic!("Expected Compound for `git log -n 3 | cat -n`, got {other:?}"),
+        }
+    }
+
+    /// Non-cat reader consumers (`head`, `wc`, `grep`) are outside the narrow
+    /// `| cat` shape and must never trigger the reversal.
+    ///
+    /// Binary verdict: all three exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (only bare `cat` with no args qualifies as the downstream stage).
+    #[test]
+    fn pipe_to_non_cat_reader_is_not_rewritten() {
+        for cmd in [
+            "git log -n 3 | head -5",
+            "git log -n 3 | wc -l",
+            "git log -n 3 | grep fix",
+        ] {
+            match split_compound(cmd) {
+                CompoundSplitResult::Compound(segments) => {
+                    assert!(
+                        try_rewrite_compound(&segments).is_none(),
+                        "`{cmd}` must not be rewritten (non-cat downstream)"
+                    );
+                }
+                other => panic!("Expected Compound for `{cmd}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// `echo $(git log -n 3 | cat)`: command substitution wraps the pipeline
+    /// in `$(…)`.  Rule S fires in `command_needs_exact_bytes`; the outer
+    /// command also bails via `rewrite_would_corrupt` (and `split_compound`
+    /// returns Bail on `$(`).  The `| cat` inside the capture is never
+    /// visible to the reversal.
+    ///
+    /// Binary verdict: exit 1 (not rewritten).
+    ///
+    /// CONTROL: passes today and after the reversal — the outer guards fire
+    /// before `try_rewrite_compound` is ever reached.
+    #[test]
+    fn pipe_to_cat_inside_capture_is_not_rewritten() {
+        assert!(
+            rewrite_would_corrupt("echo $(git log -n 3 | cat)"),
+            "Rule S: $( triggers the corruption guard"
+        );
+        assert!(
+            command_needs_exact_bytes("echo $(git log -n 3 | cat)"),
+            "Rule S: command substitution arms exact-bytes"
+        );
+        match split_compound("echo $(git log -n 3 | cat)") {
+            CompoundSplitResult::Bail => {}
+            other => panic!("Expected Bail for capture shape, got {other:?}"),
+        }
+    }
+
+    /// `git log -n 3 && git status | cat`: 3-segment compound mixing `&&` and
+    /// `|` operators.
+    ///
+    /// Binary verdict: exit 1 (not rewritten today).
+    ///
+    /// After the reversal this must STILL not be rewritten.  The narrow
+    /// AD-RW-2 reversal applies only to pure 2-stage pipelines `<source> | cat`
+    /// where the ENTIRE command is that shape (no interleaved `&&`/`||`/`;`).
+    /// `&&` sequences ARE rewritten segment-by-segment today, but that
+    /// existing path only fires on non-pipe compounds; introducing a mixed
+    /// `&&` + `|` rewrite path would require new multi-operator logic that is
+    /// out of scope for the narrow reversal.  Pinned as a safety invariant to
+    /// prevent the reversal from silently growing beyond its approved shape.
+    ///
+    /// CONTROL: passes today (has_pipe_operator bails) and after the reversal
+    /// (narrow shape check: more than 2 segments, and a non-Pipe operator
+    /// precedes the `|`, so the shape is rejected).
+    #[test]
+    fn pipe_to_cat_after_and_sequence() {
+        match split_compound("git log -n 3 && git status | cat") {
+            CompoundSplitResult::Compound(segments) => {
+                assert!(
+                    try_rewrite_compound(&segments).is_none(),
+                    "git log -n 3 && git status | cat must not be rewritten: \
+                     the narrow AD-RW-2 reversal applies only to pure 2-stage \
+                     `<source> | cat` pipelines; this 3-segment mixed-operator \
+                     compound is outside the approved shape"
+                );
+            }
+            other => {
+                panic!("Expected Compound for `git log -n 3 && git status | cat`, got {other:?}")
+            }
+        }
     }
 }

@@ -1,0 +1,42 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(RUST_COMMENTS, Language::Rust, TransformConfig::with_mode(Mode::Pseudo))"
+---
+//! Module-level doc comment (KEEP)
+//! This describes the module (KEEP)
+
+
+/// Function doc comment (KEEP)
+/// Multi-line doc comment (KEEP)
+pub fn add(a: i32, b: i32) -> i32 {
+    // This comment is inside a function body (KEEP)
+    let result = a + b // inline comment in body (KEEP)
+    result
+}
+
+
+/// Struct doc comment (KEEP)
+pub struct Calculator {
+    /// Field doc comment (KEEP)
+    value: i32,
+}
+
+
+/// Impl doc comment (KEEP)
+impl Calculator {
+    /// Constructor doc (KEEP)
+    pub fn new(value: i32) -> Self {
+        // body comment (KEEP)
+        Self { value }
+    }
+
+    /// Add method doc (KEEP)
+    pub fn add(&self, x: i32) -> i32 {
+        self.value + x
+    }
+}
+
+//! Another inner doc comment (KEEP)
+
+
+pub const VERSION: &str = "1.0.0"
