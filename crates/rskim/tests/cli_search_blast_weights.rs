@@ -1375,44 +1375,238 @@ fn ac409_ac13_pagination_is_disjoint() {
     );
 }
 
-/// AC-19 — `text --blast-radius X --hot` must exit 0 and produce parseable JSON.
+// ============================================================================
+// FX-HOT-DIVERGE fixture
+// ============================================================================
+
+/// Create the FX-HOT-DIVERGE fixture.
 ///
-/// The compound `text + --blast-radius + --hot` arm re-sorts the blast-radius
-/// result window by hotspot score.  Uses the FX-LINEAR fixture; both co-change
-/// Jaccard and commit-frequency (hotspot) data are present in `temporal.db` so
-/// the `--hot` sort is fully exercised, not just degraded gracefully.
+/// Three Rust source files where the fused (Jaccard-based) ordering and the
+/// hotspot ordering are visibly different:
 ///
-/// Exit 0 is asserted unconditionally by `run_search_raw_ok`.
+/// - `seed.rs`   — blast-radius target
+/// - `zzrare.rs` — strong co-change partner (J = 3/4 = 0.75), only old commits
+/// - `active.rs` — weak co-change partner (J = 2/7 ~= 0.286), recent solo commits
+///
+/// Commit layout (7 non-merge commits):
+///   C1 (60d ago): seed.rs + zzrare.rs + active.rs  (all three)
+///   C2 (55d ago): seed.rs + zzrare.rs               (pair 2)
+///   C3 (50d ago): seed.rs + zzrare.rs               (pair 3, J(seed,zzrare) = 3/4 = 0.75)
+///   C4 (45d ago): seed.rs + active.rs               (pair 2, J(seed,active) = 2/7 ~= 0.286)
+///   C5 (15d ago): active.rs alone                   (recent boost)
+///   C6 (10d ago): active.rs alone                   (recent boost)
+///   C7 (5d ago):  active.rs alone                   (recent boost)
+///
+/// Derived Jaccard values:
+///   seed total = 4 (C1+C2+C3+C4)
+///   zzrare total = 3 (C1+C2+C3)
+///   active total = 5 (C1+C4+C5+C6+C7)
+///   J(seed, zzrare) = 3/(4+3-3) = 3/4 = 0.75
+///   J(seed, active) = 2/(4+5-2) = 2/7 ~= 0.286
+///
+/// Hotspot order (exponential decay, half-life 30d):
+///   active (many recent commits) > seed (only old commits) > zzrare (fewest total)
+///
+/// This divergence makes the AC-19 invariant directly testable:
+///   fused temporal order: [seed, zzrare, active]
+///   hotspot-re-sorted order: [active, seed, zzrare]
+fn make_hot_diverge_fixture() -> TempDir {
+    let now = now_epoch();
+    let dir = TempDir::new().expect("TempDir::new");
+    git_init(dir.path());
+
+    // C1: all three (baseline joint commit for all pairs).
+    write_and_stage(dir.path(), "seed.rs", "// seed content\n");
+    write_and_stage(dir.path(), "zzrare.rs", "// zzrare content\n");
+    write_and_stage(dir.path(), "active.rs", "// active content\n");
+    git_commit(
+        dir.path(),
+        "feat: initial commit (all three)",
+        now - 60 * 86400,
+    );
+
+    // C2: seed + zzrare (second joint commit — pushes J(seed,zzrare) toward 0.75).
+    write_and_stage(dir.path(), "seed.rs", "// seed content v2\n");
+    write_and_stage(dir.path(), "zzrare.rs", "// zzrare content v2\n");
+    git_commit(dir.path(), "feat: seed+zzrare pair 2", now - 55 * 86400);
+
+    // C3: seed + zzrare (third joint — J(seed,zzrare) = 3/(4+3-3) = 3/4 = 0.75).
+    write_and_stage(dir.path(), "seed.rs", "// seed content v3\n");
+    write_and_stage(dir.path(), "zzrare.rs", "// zzrare content v3\n");
+    git_commit(dir.path(), "feat: seed+zzrare pair 3", now - 50 * 86400);
+
+    // C4: seed + active (second joint — J(seed,active) = 2/(4+5-2) = 2/7 ~= 0.286).
+    write_and_stage(dir.path(), "seed.rs", "// seed content v4\n");
+    write_and_stage(dir.path(), "active.rs", "// active content v2\n");
+    git_commit(
+        dir.path(),
+        "feat: seed+active second joint",
+        now - 45 * 86400,
+    );
+
+    // C5-C7: active alone — recent commits elevate active hotspot above seed and zzrare.
+    write_and_stage(dir.path(), "active.rs", "// active content v3\n");
+    git_commit(dir.path(), "chore: active solo 1", now - 15 * 86400);
+    write_and_stage(dir.path(), "active.rs", "// active content v4\n");
+    git_commit(dir.path(), "chore: active solo 2", now - 10 * 86400);
+    write_and_stage(dir.path(), "active.rs", "// active content v5\n");
+    git_commit(dir.path(), "chore: active solo 3", now - 5 * 86400);
+
+    dir
+}
+
+// ============================================================================
+// AC-19 real guard
+// ============================================================================
+
+/// AC-19 real guard: `text --blast-radius X --hot` returns the hotspot-DESC
+/// re-sort of the top `resort_window(limit)` slice of the NEW fused ordering.
+///
+/// Uses FX-HOT-DIVERGE where the fused (Jaccard-based) ordering and the hotspot
+/// ordering are visibly different:
+///   - `zzrare.rs`: strong Jaccard partner (J=0.75), low hotspot (only old commits)
+///   - `active.rs`: weak Jaccard partner (J~=0.286), high hotspot (many recent commits)
+///
+/// Fused temporal order (`--weights 0,0,1`): [seed.rs, zzrare.rs, active.rs]
+/// Expected hotspot re-sort of top resort_window(3)=100: [active.rs, seed.rs, zzrare.rs]
+///
+/// The expected order is computed in-test from two independent CLI queries:
+///   1. The fused ordering (without `--hot`), using `--limit resort_window(N)`, which
+///      establishes the top-window slice that production re-sorts.
+///   2. The standalone `--hot --json` output, which supplies per-file hotspot scores.
+///
+/// These are cross-referenced against the actual compound `--hot` result to verify
+/// the AC-19 invariant directly without relying on internal state.
+///
+/// `resort_window(N)` arithmetic is replicated in-test with a comment naming the
+/// source (`pub(super) fn resort_window` in `crates/rskim/src/cmd/search/temporal.rs`).
 #[test]
-fn ac409_ac19_blast_hot_exits_zero() {
-    let fixture = make_linear_fixture();
+fn ac409_ac19_blast_hot_resorts_fused_top_window_by_hotspot() {
+    let fixture = make_hot_diverge_fixture();
     let cache = TempDir::new().unwrap();
     build_index(fixture.path(), cache.path());
 
-    // text + --blast-radius + --hot: routes to composite blast-radius arm with
-    // hotspot re-sort.  `--weights 0,0,1` to make blast-radius temporal the
-    // sole ranking signal so result order is deterministic.
-    let (stdout, _stderr) = run_search_raw_ok(
+    let limit: usize = 3;
+    // Replicates pub(super) fn resort_window(limit) in temporal.rs:
+    //   limit.saturating_mul(5).max(100)
+    // This is the size of the top-window slice that --hot re-sorts in production.
+    let window: usize = limit.saturating_mul(5).max(100);
+    let window_str = window.to_string();
+    let limit_str = limit.to_string();
+
+    // Query 1: fused ordering WITHOUT --hot, fetching resort_window(limit) results.
+    // Uses --weights 0,0,1 so the temporal (Jaccard-based) layer is the sole ranking
+    // signal, making the order deterministic and independent of lexical BM25F scores.
+    // The query "seed" matches seed.rs in the lexical pool; zzrare.rs and active.rs
+    // appear as co_change_partner results from the temporal layer.
+    let fused = run_search_json(
         fixture.path(),
         cache.path(),
         &[
-            "anchor",
+            "seed",
             "--blast-radius",
-            "anchor.rs",
+            "seed.rs",
+            "--weights",
+            "0,0,1",
+            "--limit",
+            &window_str,
+        ],
+    );
+    let fused_paths: Vec<String> = fused["results"]
+        .as_array()
+        .expect("AC-19: fused results must be a JSON array")
+        .iter()
+        .map(|r| {
+            r["path"]
+                .as_str()
+                .expect("AC-19: fused result must have path")
+                .to_string()
+        })
+        .collect();
+
+    // Non-vacuity: the fused query must return results for the re-sort to be exercised.
+    assert!(
+        !fused_paths.is_empty(),
+        "AC-19 fixture error: fused query returned no results; cannot test re-sort"
+    );
+
+    // Query 2: standalone --hot --json to obtain per-file hotspot scores.
+    // Format: {"mode":"hot", "results": [{"path":"...", "hotspot_score": f64, ...}]}
+    let hot_standalone =
+        run_search_json(fixture.path(), cache.path(), &["--hot", "--limit", "100"]);
+    let hotspot_scores: std::collections::HashMap<String, f64> = hot_standalone["results"]
+        .as_array()
+        .expect("AC-19: standalone --hot results must be an array")
+        .iter()
+        .map(|r| {
+            let path = r["path"]
+                .as_str()
+                .expect("AC-19: --hot result must have path")
+                .to_string();
+            let score = r["hotspot_score"]
+                .as_f64()
+                .expect("AC-19: --hot result must have hotspot_score");
+            (path, score)
+        })
+        .collect();
+
+    // Compute expected: hotspot-DESC re-sort of the top `window` fused paths, then
+    // take the first `limit` entries.  Ties broken by path ASC, matching the
+    // sort_by_temporal comparator in temporal.rs (`.then_with(|| a.path().cmp(b.path()))`).
+    let window_slice: Vec<String> = fused_paths.iter().take(window).cloned().collect();
+    let mut sorted = window_slice.clone();
+    sorted.sort_by(|a, b| {
+        let sa = hotspot_scores.get(a).copied().unwrap_or(-1.0);
+        let sb = hotspot_scores.get(b).copied().unwrap_or(-1.0);
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    let expected_paths: Vec<&str> = sorted.iter().map(|s| s.as_str()).take(limit).collect();
+
+    // Non-vacuity guard: the fused ordering and hotspot ordering must differ so the
+    // test exercises the re-sort and cannot pass by coincidence.  If the fixture
+    // design fails this check, the test cannot detect AC-19 regressions.
+    let fused_top: Vec<&str> = window_slice
+        .iter()
+        .map(|s| s.as_str())
+        .take(limit)
+        .collect();
+    assert_ne!(
+        fused_top, expected_paths,
+        "AC-19 non-vacuity: fused ordering and hotspot ordering are identical; \
+         the fixture must produce a divergence for the re-sort to be testable"
+    );
+
+    // Query 3: actual compound --hot result — the result under test.
+    // Exit 0 is asserted by run_search_json.
+    let actual = run_search_json(
+        fixture.path(),
+        cache.path(),
+        &[
+            "seed",
+            "--blast-radius",
+            "seed.rs",
             "--hot",
             "--weights",
             "0,0,1",
             "--limit",
-            "5",
-            "--json",
+            &limit_str,
         ],
     );
-
-    // AC-19: exit 0 (asserted above by run_search_raw_ok).
-    // The JSON must be parseable and results must be an array (no crash).
-    let v: Value =
-        serde_json::from_slice(&stdout).expect("AC-19: skim search --json must produce valid JSON");
-    let _results = v["results"]
+    let actual_paths: Vec<&str> = actual["results"]
         .as_array()
-        .expect("AC-19: results must be a JSON array");
+        .expect("AC-19: compound --hot results must be an array")
+        .iter()
+        .map(|r| r["path"].as_str().expect("AC-19: result must have path"))
+        .collect();
+
+    // AC-19 criterion: the compound --hot result set MUST equal the hotspot-DESC
+    // re-sort of the top resort_window(limit) slice of the NEW fused ordering.
+    assert_eq!(
+        actual_paths, expected_paths,
+        "AC-19: compound --hot result does not match the hotspot-DESC re-sort \
+         of the top resort_window({limit})={window} fused entries; \
+         fused_top={fused_top:?} hotspot_re_sorted={expected_paths:?} actual={actual_paths:?}"
+    );
 }

@@ -337,6 +337,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     ranking, not the old alphabetical ordering.  This is a correctness improvement, not a
     regression: the window now reflects the strongest co-change partners rather than the
     alphabetically-earliest ones (AC-19 user-visible consequence).
+  - `skim search <text> --blast-radius FILE` with a co-change allowlist whose partners all
+    resolve to zero indexed files (e.g. all partners deleted or outside the `--root` subtree)
+    now returns zero results with the partial-drop notice on stderr, rather than silently
+    falling back to an unfiltered lexical result list (AD-413-16 semantics restored).
 
 - **`skim search` single-token queries now use AND-intersection + raw occurrence-count ranking** (#372) —
   Prior to this change, all lexical queries used a BM25F UNION pool: candidates ranked by BM25F score,
