@@ -188,17 +188,21 @@ fn test_doctor_exits_0_on_binary_pin_mismatch() {
     // Run `init` using the copy so the hook pins to copy_path (via
     // current_exe() inside the copy).  Routes through skim_sandboxed_with_bin
     // so the sandbox env-var block stays in one authoritative place (PF-017).
-    common::skim_sandboxed_with_bin(home, &copy_path)
-        .args([
+    //
+    // Use the retry wrapper: on Linux, parallel tests can trigger ETXTBSY
+    // (os error 26) when a concurrently-forked child inherits the writable fd
+    // from std::fs::copy before it has exec'd and closed its O_CLOEXEC fds.
+    common::skim_sandboxed_with_bin_retried(home, &copy_path, |cmd| {
+        cmd.args([
             "init",
             "--agent",
             "claude-code",
             "--no-guidance",
             "--no-wrappers",
         ])
-        .env("PATH", hermetic_path())
-        .assert()
-        .success();
+        .env("PATH", hermetic_path());
+    })
+    .success();
 
     // Run doctor from the original binary: same version/commit, different path
     // → Verified integrity, pin_is_current == false → exit 0 (advisory ⚠, not drift).
@@ -345,17 +349,21 @@ fn test_doctor_exits_1_on_wrapper_target_mismatch() {
     }
 
     // Install hook AND wrappers using the copy — symlinks will point to copy_path.
-    common::skim_sandboxed_with_bin(home, &copy_path)
-        .args([
+    //
+    // Use the retry wrapper: on Linux, parallel tests can trigger ETXTBSY
+    // (os error 26) when a concurrently-forked child inherits the writable fd
+    // from std::fs::copy before it has exec'd and closed its O_CLOEXEC fds.
+    common::skim_sandboxed_with_bin_retried(home, &copy_path, |cmd| {
+        cmd.args([
             "init",
             "--agent",
             "claude-code",
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path())
-        .assert()
-        .success();
+        .env("PATH", hermetic_path());
+    })
+    .success();
 
     // Verify at least one wrapper symlink was created.
     let wrappers_dir = home.join(".skim").join("bin");
