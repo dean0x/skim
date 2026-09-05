@@ -94,38 +94,75 @@ fn ac2_closure_adapter_drives_truncate() {
         let counter = Counter::new(encoding).unwrap();
         let budget = 20usize;
 
-        let truncated =
-            truncate_to_token_budget(text, Language::Rust, budget, counter.as_closure(), None)
-                .unwrap_or_else(|e| panic!("truncate failed for {encoding:?}: {e}"));
+        let truncated = truncate_to_token_budget(
+            text,
+            Language::Rust,
+            budget,
+            counter.as_closure(),
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("truncate failed for {encoding:?}: {e}"));
 
         let actual_count = counter.count(&truncated);
+        // ADR-011 class 1 / #317 / ADR-016: when no content line fits together
+        // with the marker, the compact omission marker is returned on its own —
+        // the marker always wins over budget, even when it alone exceeds the budget.
+        // A single trimmed-marker line is the "marker wins" signal.
+        let marker_line = truncated.trim_end_matches('\n');
+        let is_compact_marker = marker_line.starts_with("// ...")
+            && (marker_line.contains("lines truncated)")
+                || marker_line.contains("line truncated)"))
+            && !marker_line.contains('\n');
         assert!(
-            actual_count <= budget,
-            "encoding {encoding:?}: output tokens {actual_count} > budget {budget}"
+            actual_count <= budget || is_compact_marker,
+            "encoding {encoding:?}: output tokens {actual_count} > budget {budget}; \
+             output: {truncated:?}"
         );
     }
 }
 
 #[test]
-fn ac2_near_zero_budget_returns_empty_or_marker() {
+fn ac2_near_zero_budget_returns_marker_not_empty() {
     use rskim_core::{Language, truncate_to_token_budget};
 
     let counter = Counter::new(Encoding::Cl100k).unwrap();
     let text = "fn hello() -> &'static str { \"world\" }";
 
-    // Near-zero budget: per the documented invariant, if the budget is smaller
-    // than the omission marker, an empty string is returned (not a panic).
-    let result = truncate_to_token_budget(text, Language::Rust, 1, counter.as_closure(), None);
+    // Near-zero budget: per ADR-011 class 1 / #317 / ADR-016, when the budget
+    // is smaller than the omission marker itself, the compact marker is still
+    // returned — never an empty string. The token budget is advisory; the
+    // marker always wins to prevent silent total data loss.
+    let result = truncate_to_token_budget(
+        text,
+        Language::Rust,
+        1,
+        counter.as_closure(),
+        None,
+        None,
+        None,
+    );
     match result {
         Ok(s) => {
-            let count = counter.count(&s);
+            // The input has 1 line; Rust prefix is `//`; hint is None.
+            // Expected compact marker: "// ... (1 line truncated)" — non-empty,
+            // no hint clause, no SKIM_PASSTHROUGH remedy.
             assert!(
-                count <= 1,
-                "near-zero budget: output tokens {count} > budget 1; output: {s:?}"
+                !s.is_empty(),
+                "near-zero budget: must not return empty string (ADR-016 / #317)"
+            );
+            let marker = s.trim_end_matches('\n');
+            assert_eq!(
+                marker, "// ... (1 line truncated)",
+                "near-zero budget: expected compact marker, got: {s:?}"
+            );
+            assert!(
+                !marker.contains("SKIM_PASSTHROUGH"),
+                "near-zero budget: compact marker must not contain hint clause, got: {s:?}"
             );
         }
         Err(e) => {
-            // Some truncation errors are also acceptable per the invariant doc
             panic!("unexpected error on near-zero budget: {e}");
         }
     }

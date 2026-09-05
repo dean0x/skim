@@ -42,6 +42,19 @@ mod argv0_dispatch {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt as _;
 
+    /// Per-binary cache sandbox (PF-017) — see the identical note in
+    /// `cli_e2e_rewrite.rs`.
+    ///
+    /// These are *reader*-side tests: `force_raw_requested()` walks this
+    /// process's ancestry for a force-raw marker. Left pointing at the real
+    /// `~/.cache/skim`, the PID it reaches is the shared nextest runner, so a
+    /// marker written by a hook-mode test in a concurrently-running binary
+    /// flips these invocations to `run_inherited_passthrough` — bypassing the
+    /// session-id stripping and tree compression they assert. The collision is
+    /// scheduling-dependent, so it appears only at certain suite sizes.
+    static CACHE_SANDBOX: std::sync::LazyLock<tempfile::TempDir> =
+        std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir"));
+
     /// Path to the skim binary built by `cargo test`.
     ///
     /// `CARGO_BIN_EXE_skim` is set by cargo for integration tests of bin crates.
@@ -121,6 +134,7 @@ mod argv0_dispatch {
             // Pass no positional args so stub ls uses its sidecar output.
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -175,6 +189,7 @@ mod argv0_dispatch {
             .arg0("grep")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -232,6 +247,7 @@ mod argv0_dispatch {
             .arg0("grep")
             .args(["--session-id=skew-test", "hello", file.to_str().unwrap()])
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -289,6 +305,7 @@ mod argv0_dispatch {
             .arg0("grep")
             .args(["--session-id", "skew-test", "hello", file.to_str().unwrap()])
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -373,6 +390,7 @@ mod argv0_dispatch {
             .arg0("ls")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             // Redirect stdout to a real file — NOT assert_cmd's default pipe.
@@ -405,7 +423,7 @@ mod argv0_dispatch {
     }
 
     /// D2b control: when stdout is a PIPE, the wrapper runs skim's handler normally —
-    /// the `stdout_is_regular_file()` fstat gate must NOT fire.
+    /// the `stdout_should_serve_raw()` fstat gate must NOT fire.
     ///
     /// Uses `tree` (Tier-2 text parser, structural compression) with a stub that
     /// includes depth-4+ entries hidden by skim's MAX_DEPTH=3 cap.  Skim strips the
@@ -510,6 +528,7 @@ mod argv0_dispatch {
             .arg0("tree")
             .env("PATH", &path)
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .env_remove("SKIM_PASSTHROUGH")
             .env_remove("SKIM_DEBUG")
             .output()
@@ -569,6 +588,7 @@ mod argv0_dispatch {
             .arg0("skim")
             .arg("--help")
             .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
             .output()
             .expect("skim binary must be spawnable");
 
@@ -582,6 +602,395 @@ mod argv0_dispatch {
         assert!(
             stdout.contains("skim") || stdout.contains("Usage"),
             "skim --help must print usage/help text; got: {stdout:?}"
+        );
+    }
+
+    // ========================================================================
+    // Tests: B2 (skip_if_middle_contains_eq) and B3 (require_flag) wrapper gaps
+    //
+    // The rewrite engine has two predicates that prevent certain commands from
+    // being rewritten to `skim <tool>`:
+    //
+    //   B2  `skip_if_middle_contains_eq` (engine.rs ~:132-139): `env LANG=C sort`
+    //       contains an `=`-bearing middle token signalling env-var assignment for a
+    //       child process, not printenv-style output.  The env rewrite rule sets this
+    //       flag (rules.rs ~:1787).  On the wrapper surface, `dispatch_for_wrapper`
+    //       currently has no equivalent check — `env FOO=bar printf %s x` falls
+    //       through to `dispatch("env", …)`, which routes to skim's env handler.
+    //       The handler runs `printenv FOO=bar printf %s x` instead of the real
+    //       `env` binary, producing wrong output.
+    //
+    //   B3  `require_flag` (engine.rs ~:145-161): `psql` requires `-c`/`--command`
+    //       and `mysql` requires `-e`/`--execute` — without them the tool opens an
+    //       interactive session that should not be intercepted.  The wrapper surface
+    //       currently has no equivalent check.
+    //
+    // The fix (not yet applied) will add both checks to `dispatch_for_wrapper` so
+    // those shapes reach `run_raw_passthrough` instead of skim's handlers.
+    //
+    // Observation technique (all five tests):
+    //   — B2 (tests 1-2): The env handler always runs `printenv` regardless of args.
+    //     Real `env FOO=bar prog` executes `prog`; skim's handler runs `printenv`
+    //     instead and produces wrong (or empty) output.  stdout exactness proves
+    //     which path ran.
+    //   — B3 (tests 3-5): skim's db handlers set tool-specific env overrides
+    //     (`PGPAGER=cat` for psql, `MYSQL_PAGER=cat` for mysql) before spawning the
+    //     child binary.  A raw passthrough does NOT inject these overrides.  A fake
+    //     shell script stub reads its own env and prints the value — presence of
+    //     `cat` in the output proves skim's handler ran; its absence proves raw
+    //     passthrough.  Tier 3 (non-parseable) output from the fake passes through
+    //     skim verbatim, so the env-var value is observable end-to-end.
+    //
+    // NOTE on D3 and `-h`: D3 in `dispatch_for_wrapper` passes through any command
+    // containing exactly `-h` (as a help flag).  psql's `-h host` short-form ALSO
+    // matches, so `psql -h localhost` already escapes via D3 today and the B3 gap
+    // is invisible for that shape.  Tests 3 and 5 use `--host=localhost` (long form
+    // without the ambiguous `-h`) to expose the gap against the psql/mysql handlers.
+    // ========================================================================
+
+    /// Create a temp dir containing a shell-script stub named `name`.
+    ///
+    /// Unlike [`make_stub_dir`], the script body is arbitrary — the caller
+    /// controls exactly what the stub does (including reading its own env).
+    fn make_script_stub(name: &str, script_body: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!("#!/bin/sh\n{script_body}\n");
+        let script_path = dir.path().join(name);
+        fs::write(&script_path, &script).unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    // ── B2: env with `=`-containing middle token ──────────────────────────────
+
+    /// B2 — `=`-argument passthrough (RED at b79e287^; GREEN since b79e287).
+    ///
+    /// `env FOO=bar /usr/bin/printf %s x` on the wrapper surface: the handler
+    /// in `cmd/file/mod.rs` detects any `=`-containing arg and calls
+    /// `run_raw_passthrough("env", …)` directly.  The real `env` binary sets
+    /// `FOO=bar` and exec's `/usr/bin/printf %s x`.  stdout = `"x"`, exit 0.
+    ///
+    /// The wrapper surface needs no D5-style interactivity gate here — the
+    /// shape is detected by arg content (contains `'='`) inside the env branch
+    /// of `dispatch_inner`, consistent with `skip_if_middle_contains_eq` on
+    /// the rewrite surface.
+    ///
+    /// Observable: exit 0, stdout exactly `"x"`.
+    #[test]
+    fn wrapper_env_with_assignment_runs_the_real_env() {
+        let skim = skim_bin();
+        assert!(
+            skim.exists(),
+            "skim binary must exist at {}: run `cargo build` first",
+            skim.display()
+        );
+
+        // `/usr/bin/printf` — absolute path avoids any PATH ambiguity after
+        // skim strips wrappers.  Stable on macOS and Linux.
+        let printf_bin = "/usr/bin/printf";
+        assert!(
+            std::path::Path::new(printf_bin).exists(),
+            "{printf_bin} must exist on this system"
+        );
+
+        // argv[0]="env", args: an assignment token + child program + its args.
+        // skim detects the '=' token and calls run_raw_passthrough("env", …).
+        // Real env executes: env FOO=bar /usr/bin/printf %s x → stdout "x".
+        let output = std::process::Command::new(&skim)
+            .arg0("env")
+            .args(["FOO=bar", printf_bin, "%s", "x"])
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        // GREEN since b79e287: real env ran, exit 0.
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wrapper env FOO=bar /usr/bin/printf %s x must exit 0 \
+             (real env executed printf; GREEN since b79e287)\nstderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // GREEN since b79e287: real env ran printf → stdout is exactly "x"
+        // (printf %s x outputs raw bytes with no trailing newline).
+        assert_eq!(
+            stdout, "x",
+            "wrapper env FOO=bar /usr/bin/printf %s x must produce stdout 'x' \
+             (real env executed printf; GREEN since b79e287)\ngot stdout={stdout:?}"
+        );
+    }
+
+    /// B2 control — **GREEN today and after fix**.
+    ///
+    /// When argv[0]="env" receives NO `=`-containing middle tokens (bare `env`),
+    /// the shape is env listing the environment — skim's handler IS designed to
+    /// process this.  The B2 fix must not break the common case.
+    ///
+    /// **Observable:** `SKIM_TEST_TOKEN` ends with the `_TOKEN` sensitive suffix.
+    /// Skim's env handler calls `printenv` and redacts it to `***`.  If the fix
+    /// accidentally bypasses the handler for bare `env`, the raw value
+    /// `secret-value-xyz` would appear in stdout instead.
+    ///
+    /// This test is GREEN today (handler runs, redacts) and must remain GREEN
+    /// after the B2 fix (bare `env` has no `=` middle tokens → handler still runs).
+    #[test]
+    fn wrapper_env_without_assignment_still_uses_skim_handler() {
+        let skim = skim_bin();
+        assert!(
+            skim.exists(),
+            "skim binary must exist at {}: run `cargo build` first",
+            skim.display()
+        );
+
+        // No args — bare `env` invocation.  SKIM_TEST_TOKEN ends with _TOKEN
+        // (a SENSITIVE_SUFFIXES entry) → skim's env handler must redact it.
+        let output = std::process::Command::new(&skim)
+            .arg0("env")
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
+            .env("SKIM_TEST_TOKEN", "secret-value-xyz")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wrapper env (bare) must exit 0; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Skim's env handler ran: the raw secret must NOT appear in stdout.
+        assert!(
+            !stdout.contains("secret-value-xyz"),
+            "raw secret must NOT appear — skim's env handler must redact it; \
+             got: {stdout:?}"
+        );
+
+        // The key must appear with redacted value: confirms the handler ran,
+        // not a raw passthrough.
+        assert!(
+            stdout.contains("SKIM_TEST_TOKEN=***"),
+            "SKIM_TEST_TOKEN must be redacted to *** by skim's env handler; \
+             got: {stdout:?}"
+        );
+    }
+
+    // ── B3: psql without -c / --command ──────────────────────────────────────
+
+    /// B3 — psql without `-c` passes through raw (RED at b3a31ec^; GREEN since b3a31ec).
+    ///
+    /// `psql --host=localhost -U u dbname` has no `-c`/`--command` flag; the
+    /// invocation is interactive.  `dispatch_for_wrapper` detects missing
+    /// `-c`/`--command` via `require_flags_for_tool` and calls
+    /// `run_raw_passthrough` → `PGPAGER` is NOT injected → stdout contains
+    /// `"pgpager=UNSET"`.
+    ///
+    /// **Discriminating observable:** skim's psql handler sets `PGPAGER=cat`
+    /// via `CONFIG.env_overrides` before spawning the child binary.  A raw
+    /// passthrough does NOT inject `PGPAGER`.  The fake psql stub reads
+    /// `$PGPAGER` from its own environment and prints it.  skim's psql parser
+    /// cannot parse "FAKE-PSQL pgpager=…" as tabular SQL → Tier 3 passthrough
+    /// → skim emits the fake's line verbatim.  The env value is therefore
+    /// observable end-to-end in skim's stdout.
+    ///
+    /// Note: `psql -h localhost` is NOT used here because D3 in
+    /// `dispatch_for_wrapper` matches `-h` as a help flag and already passes
+    /// through.  `--host=localhost` exposes the require_flag gate.
+    #[test]
+    fn wrapper_psql_without_command_flag_passes_through_raw() {
+        // Fake psql: reads PGPAGER from env (skim's psql handler injects it;
+        // raw passthrough does not) and prints a sentinel line.
+        // "FAKE-PSQL pgpager=…" is not parseable as tabular psql output →
+        // Tier 3 passthrough → skim emits the line verbatim.
+        let stub_dir = make_script_stub(
+            "psql",
+            r#"printf 'FAKE-PSQL pgpager=%s\n' "${PGPAGER:-UNSET}""#,
+        );
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+        assert!(
+            skim.exists(),
+            "skim binary must exist at {}: run `cargo build` first",
+            skim.display()
+        );
+
+        let output = std::process::Command::new(&skim)
+            .arg0("psql")
+            // --host= long-form avoids the D3 `-h` help-flag match.
+            .args(["--host=localhost", "-U", "u", "dbname"])
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
+            // Explicitly unset PGPAGER so any `pgpager=cat` in stdout can
+            // only come from skim's psql handler injecting the override.
+            .env_remove("PGPAGER")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wrapper psql (no -c) must exit 0; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Sanity: the fake psql ran at all.
+        assert!(
+            stdout.contains("FAKE-PSQL"),
+            "fake psql sentinel must appear in stdout; got: {stdout:?}"
+        );
+
+        // GREEN since b3a31ec: raw passthrough ran — PGPAGER NOT injected by skim.
+        assert!(
+            !stdout.contains("pgpager=cat"),
+            "wrapper psql --host= (no -c) must NOT have skim's psql handler \
+             inject PGPAGER=cat; 'pgpager=cat' in stdout proves skim's handler \
+             ran instead of raw passthrough (B3, require_flags_for_tool).\n\
+             got stdout={stdout:?}"
+        );
+    }
+
+    /// B3 control — psql with `-c` — **GREEN today and after fix**.
+    ///
+    /// `psql -c 'select 1'` HAS the required `-c` flag; it is a batch
+    /// invocation that skim's psql handler is designed to compress.  The B3
+    /// fix must preserve this routing: when `-c` is present, the handler runs.
+    ///
+    /// **Observable:** skim's psql handler sets `PGPAGER=cat` →
+    /// stdout contains `"pgpager=cat"` (proves handler ran, not passthrough).
+    ///
+    /// This test is GREEN today (handler runs) and must remain GREEN after fix
+    /// (require_flag check sees `-c` → lets `dispatch()` handle it normally).
+    #[test]
+    fn wrapper_psql_with_command_flag_uses_skim_handler() {
+        let stub_dir = make_script_stub(
+            "psql",
+            r#"printf 'FAKE-PSQL pgpager=%s\n' "${PGPAGER:-UNSET}""#,
+        );
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+        assert!(skim.exists(), "skim binary must exist");
+
+        let output = std::process::Command::new(&skim)
+            .arg0("psql")
+            .args(["-c", "select 1"])
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
+            .env_remove("PGPAGER")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wrapper psql -c must exit 0; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Skim's psql handler injected PGPAGER=cat → fake printed "pgpager=cat".
+        assert!(
+            stdout.contains("pgpager=cat"),
+            "wrapper psql -c must route to skim's psql handler \
+             (PGPAGER=cat injected by CONFIG.env_overrides); \
+             got: {stdout:?}"
+        );
+    }
+
+    // ── B3: mysql without -e / --execute ─────────────────────────────────────
+
+    /// B3 — mysql without `-e` passes through raw (RED at b3a31ec^; GREEN since b3a31ec).
+    ///
+    /// `mysql --host=localhost` has no `-e`/`--execute` flag; the invocation
+    /// is interactive.  `dispatch_for_wrapper` detects missing `-e`/`--execute`
+    /// via `require_flags_for_tool` and calls `run_raw_passthrough` →
+    /// `MYSQL_PAGER` NOT injected → stdout contains `"mysqlpager=UNSET"`.
+    ///
+    /// **Discriminating observable:** skim's mysql handler sets `MYSQL_PAGER=cat`
+    /// via `CONFIG.env_overrides` before spawning the child binary.  A raw
+    /// passthrough does NOT inject `MYSQL_PAGER`.  The fake mysql stub reads
+    /// `$MYSQL_PAGER` from its own env and prints it.  skim's mysql parser
+    /// cannot parse "FAKE-MYSQL mysqlpager=…" as tabular mysql output → Tier 3
+    /// passthrough → skim emits the line verbatim.
+    ///
+    /// Note: `mysql -h localhost` is NOT used because D3 matches `-h` as a
+    /// help flag and already passes through.
+    #[test]
+    fn wrapper_mysql_without_execute_flag_passes_through_raw() {
+        // Fake mysql: reads MYSQL_PAGER from env (skim's mysql handler injects
+        // it; raw passthrough does not).
+        // "FAKE-MYSQL mysqlpager=…" is not parseable as TSV or bordered mysql
+        // output → Tier 3 passthrough → skim emits the line verbatim.
+        let stub_dir = make_script_stub(
+            "mysql",
+            r#"printf 'FAKE-MYSQL mysqlpager=%s\n' "${MYSQL_PAGER:-UNSET}""#,
+        );
+        let path = prepend_path(stub_dir.path());
+
+        let skim = skim_bin();
+        assert!(
+            skim.exists(),
+            "skim binary must exist at {}: run `cargo build` first",
+            skim.display()
+        );
+
+        let output = std::process::Command::new(&skim)
+            .arg0("mysql")
+            // --host= long-form avoids the D3 `-h` help-flag match.
+            .args(["--host=localhost"])
+            .env("PATH", &path)
+            .env("SKIM_DISABLE_ANALYTICS", "1")
+            .env("SKIM_CACHE_DIR", CACHE_SANDBOX.path())
+            // Explicitly unset MYSQL_PAGER so any `mysqlpager=cat` in stdout
+            // can only come from skim's mysql handler injecting the override.
+            .env_remove("MYSQL_PAGER")
+            .env_remove("SKIM_PASSTHROUGH")
+            .env_remove("SKIM_DEBUG")
+            .output()
+            .expect("skim binary must be spawnable");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wrapper mysql (no -e) must exit 0; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Sanity: the fake mysql ran at all.
+        assert!(
+            stdout.contains("FAKE-MYSQL"),
+            "fake mysql sentinel must appear in stdout; got: {stdout:?}"
+        );
+
+        // GREEN since b3a31ec: raw passthrough ran — MYSQL_PAGER NOT injected by skim.
+        assert!(
+            !stdout.contains("mysqlpager=cat"),
+            "wrapper mysql --host= (no -e) must NOT have skim's mysql handler \
+             inject MYSQL_PAGER=cat; 'mysqlpager=cat' in stdout proves skim's \
+             handler ran instead of raw passthrough (B3, require_flags_for_tool).\n\
+             got stdout={stdout:?}"
         );
     }
 }

@@ -1,0 +1,40 @@
+# crates/rskim/clippy.toml
+#
+# D-lint gate: every new direct `io::stdout()` acquisition must be reviewed
+# before landing.  Each exempt site carries `#[allow(clippy::disallowed_methods)]`
+# with a one-line justification.  New callsites that bypass the centralized path
+# (execution::write_to_stdout / write_line_to_stdout / emit_raw_passthrough) are
+# rejected by this gate.
+#
+# Rationale: this crate's cmd/mod.rs documents the rule that tool output MUST
+# go through the centralized write_to_stdout / write_line_to_stdout / emit_raw_
+# passthrough path so that PipeClosed is handled gracefully. A new io::stdout()
+# in production code is a policy defect unless the site IS that infrastructure.
+#
+# Exempt sites fall into two categories (27 total as of this writing):
+#
+#   1. Genuine streaming sinks / core output infrastructure (~15 sites):
+#      execution.rs (the 5 policy-terminus functions), dispatch.rs (raw-passthrough
+#      pump), file/passthrough_stream.rs, log.rs, multi.rs, process.rs,
+#      infra/gh/streaming.rs (×2), main.rs (fd-identity check + top-level
+#      dispatcher) — these ARE the centralized path or are byte-faithful pumps
+#      for unbounded streams that must stream, not buffer.
+#
+#   2. Meta-subcommand report writers (~12 sites): completions.rs, discover.rs,
+#      heatmap/mod.rs, learn.rs, rewrite/hook.rs, search/mod.rs (×4), stats.rs,
+#      init/helpers.rs (×2) — these write skim's own structured output (JSON
+#      reports, dashboard tables, TTY prompts).  They propagate `Err` on write
+#      failure, so the pipe contract survives, but they are NOT streaming sinks.
+#      The exemption is legitimate because there is no user-tool output to route
+#      through the centralized path; the justification on each site names its
+#      specific output kind so reviewers can tell intent from accident.
+#
+# What is NOT banned here:
+# - `print!` / `println!` for skim's own short notices (help text, banners,
+#   token-stats lines). These are explicitly exempted in cmd/mod.rs policy.
+# - `std::io::stderr` — stderr is already gated by the ADR-011 marker taxonomy
+#   (class-1 unconditional, class-2 debug-gated) which is enforced by code review.
+
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "use execution::write_to_stdout / emit_raw_passthrough for tool output (cmd/mod.rs policy); add #[allow] with justification for core infrastructure sites" },
+]

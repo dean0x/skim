@@ -20,10 +20,24 @@ use std::os::unix::fs::PermissionsExt as _;
 use tempfile::TempDir;
 mod common;
 
+/// Per-binary cache sandbox for the hook-mode invocations below.
+///
+/// `skim rewrite --hook` writes the D5 force-raw marker to
+/// `{SKIM_CACHE_DIR}/sessions/{ppid}.raw`.  With no override that resolves to
+/// the developer's real `~/.cache/skim`, and the PID it keys on is the shared
+/// nextest runner — so a hook test here leaves a marker that
+/// `force_raw_requested()` finds from an unrelated wrapper-surface test binary
+/// running concurrently, flipping it to serve raw and fail.  The collision is
+/// scheduling-dependent, so it surfaces only at certain suite sizes; adding any
+/// new test binary can move the schedule enough to expose it.
+static CACHE_SANDBOX: std::sync::LazyLock<TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir must succeed"));
+
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_REWRITTEN_FROM");
+    cmd.env("SKIM_CACHE_DIR", CACHE_SANDBOX.path());
     cmd
 }
 
@@ -920,22 +934,25 @@ fn test_rewrite_python3_m_mypy() {
         .stdout(predicate::str::contains("skim mypy src/"));
 }
 
+/// D1: rewrite target updated from "golangci" to "golangci-lint" to match
+/// the real binary name (`golangci-lint`, not `golangci`).
 #[test]
 fn test_rewrite_golangci_lint_run() {
     skim_cmd()
         .args(["rewrite", "golangci-lint", "run", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim golangci ./..."));
+        .stdout(predicate::str::contains("skim golangci-lint ./..."));
 }
 
+/// D1: rewrite target updated from "golangci" to "golangci-lint".
 #[test]
 fn test_rewrite_golangci_lint_bare() {
     skim_cmd()
         .args(["rewrite", "golangci-lint", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim golangci ./..."));
+        .stdout(predicate::str::contains("skim golangci-lint ./..."));
 }
 
 // ============================================================================
@@ -1619,13 +1636,50 @@ fn write_fake_gh(bin_dir: &std::path::Path) -> std::path::PathBuf {
     // Valid issue-view JSON: has number + state + body (all required
     // discriminators for issue_view::try_parse_json). The body contains the
     // sentinel so we can distinguish raw passthrough from a structured summary.
+    //
+    // # Why this payload is populated rather than minimal
+    //
+    // These tests discriminate GATE-FIRED from GATE-DECLINED, and the only
+    // observable that separates them is "raw wire bytes" vs "structured summary".
+    // On a minimal payload the ADR-001 net-savings guard CORRECTLY falls back to
+    // raw on the gate-declined branch too, so both branches emit identical bytes
+    // and the test cannot discriminate at all. Populating labels / assignees /
+    // comments gives the compressor something real to compact, which is what
+    // restores the discriminator — it is not tuning the input until a guard
+    // agrees.
+    //
+    // MEASURED with this payload: raw 381 B → issue_view 352 B, gh api 287 B.
+    // The body is kept under `compact_json_value`'s 200-byte `MAX_STRING_LEN` so
+    // the api handler's ~120-byte elision note does not fire; a body past that
+    // threshold makes the compact form LARGER than raw and the guard serves raw.
+    //
+    // `write_fake_gh_minimal` below is the companion at the original minimal
+    // size, and asserts the guard's real verdict there (raw, on both branches).
+    fs::write(
+        &gh_path,
+        "#!/bin/sh\nprintf '%s' '{\"number\":93,\"state\":\"OPEN\",\"title\":\"Test PR: add feature\",\"body\":\"__FAKE_GH_SENTINEL__ Feature: structured output. Tasks: API design, tests, implementation, review. Acceptance: all tests pass, no regressions.\",\"labels\":[{\"name\":\"enhancement\"},{\"name\":\"needs-review\"}],\"assignees\":[{\"login\":\"octocat\"}],\"comments\":[{\"author\":{\"login\":\"reviewer\"},\"body\":\"LGTM, just fix the nits\"}]}'\n",
+    )
+    .unwrap();
+    let perms = std::fs::Permissions::from_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+    gh_path
+}
+
+/// Minimal-payload fake `gh` — the ORIGINAL fixture, 114 wire bytes.
+///
+/// Empty `labels` / `assignees` / `comments` and a 20-char body: there is
+/// nothing in it to compact. This is the fixture the gate tests used before it
+/// was enlarged, and it is kept as a companion so the guard's verdict on a
+/// genuinely minimal payload stays asserted rather than engineered away.
+#[cfg(unix)]
+fn write_fake_gh_minimal(bin_dir: &std::path::Path) -> std::path::PathBuf {
+    let gh_path = bin_dir.join("gh");
     fs::write(
         &gh_path,
         "#!/bin/sh\nprintf '%s' '{\"number\":93,\"state\":\"OPEN\",\"title\":\"Test\",\"body\":\"__FAKE_GH_SENTINEL__\",\"labels\":[],\"assignees\":[],\"comments\":[]}'\n",
     )
     .unwrap();
-    let perms = std::fs::Permissions::from_mode(0o755);
-    fs::set_permissions(&gh_path, perms).unwrap();
+    fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
     gh_path
 }
 
@@ -1644,6 +1698,68 @@ fn fake_gh_on_path() -> (TempDir, String) {
         std::env::var("PATH").unwrap_or_default()
     );
     (bin_dir, new_path)
+}
+
+/// [`fake_gh_on_path`] with the minimal payload.
+#[cfg(unix)]
+fn minimal_fake_gh_on_path() -> (TempDir, String) {
+    let bin_dir = TempDir::new().unwrap();
+    write_fake_gh_minimal(bin_dir.path());
+    let new_path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (bin_dir, new_path)
+}
+
+/// Companion at the ORIGINAL fixture size: on a payload with nothing to compact,
+/// the ADR-001 net-savings guard must serve RAW — on BOTH branches of the gate.
+///
+/// This is the verdict the enlarged fixture hides, and it is the correct one:
+/// PF-011's lesson is that an already-minimal payload has no compression to
+/// find, so a wrapper that renders it anyway costs tokens for nothing. Asserting
+/// it here means the enlarged fixture above is documented as a discriminator
+/// aid, not as evidence that skim compresses everything.
+#[cfg(unix)]
+#[test]
+fn test_gh_minimal_payload_guard_serves_raw_on_both_gate_branches() {
+    let (_bin_dir, new_path) = minimal_fake_gh_on_path();
+    let raw = "{\"number\":93,\"state\":\"OPEN\",\"title\":\"Test\",\"body\":\"__FAKE_GH_SENTINEL__\",\"labels\":[],\"assignees\":[],\"comments\":[]}";
+
+    // Branch 1: gate FIRES (`-q` steering flag) → run_raw_passthrough.
+    let gated = common::skim()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("PATH", &new_path)
+        .args(["gh", "issue", "view", "93", "-q", ".body"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&gated.stdout).trim_end(),
+        raw,
+        "gate-fired branch must forward the fake gh's bytes verbatim"
+    );
+
+    // Branch 2: gate DECLINES (no steering flag) → the compressor runs, and the
+    // net-savings guard then falls back to raw because the compact form is not
+    // smaller. Same bytes, different reason — which is exactly why this fixture
+    // cannot discriminate the gate and the enlarged one is needed for that.
+    let ungated = common::skim()
+        .env_remove("SKIM_PASSTHROUGH")
+        .env("PATH", &new_path)
+        .args(["gh", "issue", "view", "93"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&ungated.stdout).trim_end(),
+        raw,
+        "on a minimal payload the net-savings guard must serve RAW, not a \
+         structured summary that costs more tokens than the input (PF-011)"
+    );
+    assert!(
+        !String::from_utf8_lossy(&ungated.stdout).contains("issue view"),
+        "no skim-structured header may appear when the guard chose raw"
+    );
 }
 
 /// Layer 2 handler gate fires on `-q .body` → bytes forwarded verbatim.
@@ -2737,12 +2853,17 @@ fn fix_e_git_show_pipe_passes_through() {
 #[test]
 fn test_hook_rewritten_cat_with_session_id_executes() {
     let dir = TempDir::new().unwrap();
-    // Use TypeScript so pseudo mode strips parameter type annotations (`: number`),
-    // guaranteeing view_differs = true and the transparency marker fires.
+    // Use a class with a decorator so pseudo mode strips content and fires the
+    // transparency marker.  A plain typed function is no longer sufficient after
+    // E1 (ADR-008): parameter type annotations are now preserved, and A4 already
+    // preserved return types — together they make simple functions byte-identical
+    // to raw.  The @injectable() decorator and the `private name: string` property
+    // type annotation are both still stripped in pseudo mode, guaranteeing
+    // view_differs = true.
     let file = dir.path().join("roundtrip.ts");
     fs::write(
         &file,
-        "export function answer(x: number, y: number): number {\n  return x + y;\n}\n",
+        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
     )
     .unwrap();
 
@@ -2801,7 +2922,7 @@ fn test_hook_rewritten_cat_with_session_id_executes() {
         .args(&tokens[skim_start + 1..])
         .assert()
         .code(0)
-        .stdout(predicate::str::contains("answer"))
+        .stdout(predicate::str::contains("greet"))
         .get_output()
         .stderr
         .clone();

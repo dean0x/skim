@@ -5,6 +5,9 @@
 //!
 //! Token reduction target: 15-30%
 
+use crate::transform::literals::{
+    collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges,
+};
 use crate::transform::utils::is_function_scope_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -81,17 +84,24 @@ pub(crate) fn transform_minimal(
     // total from O(N²) to O(N log N) across N ranges.
     let newlines = build_newline_table(source);
 
-    // Adjust ranges for full-line removal, sort, and dedup
-    let mut final_ranges: Vec<(usize, usize)> = ctx
-        .ranges
-        .iter()
-        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
-        .collect();
-    final_ranges.sort_unstable_by_key(|&(start, _)| start);
-    final_ranges.dedup();
+    // Adjust ranges for full-line removal, then merge to produce a sorted,
+    // non-overlapping set.  merge_ranges handles overlaps that line-level
+    // adjustment introduces (adjacent AST nodes that expand to the same line)
+    // and exact duplicates — satisfying map_ranges_to_output's precondition.
+    let final_ranges: Vec<(usize, usize)> = merge_ranges(
+        ctx.ranges
+            .iter()
+            .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
+            .collect(),
+    );
+
+    // Collect literal-fragment ranges from the source tree before removal so
+    // trim_and_normalize can skip trailing-space trimming inside literals.
+    let literal_ranges = collect_literal_ranges(tree, language)?;
+    let protected = map_ranges_to_output(&literal_ranges, &final_ranges);
 
     let after_removal = remove_ranges(source, &final_ranges)?;
-    let normalized = trim_and_normalize(&after_removal);
+    let normalized = trim_and_normalize(&after_removal, &protected);
 
     Ok(normalized)
 }
@@ -713,11 +723,11 @@ pub(crate) fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<S
             )));
         }
 
-        // Skip overlapping ranges, extending the removal window if needed
-        if start < last_pos {
-            last_pos = last_pos.max(end);
-            continue;
-        }
+        // Callers must pass sorted, non-overlapping ranges (established by merge_ranges).
+        debug_assert!(
+            start >= last_pos,
+            "overlapping ranges are impossible after merge_ranges; start={start} last_pos={last_pos}"
+        );
 
         if !source.is_char_boundary(start) || !source.is_char_boundary(end) {
             return Err(SkimError::ParseError(format!(
@@ -742,18 +752,62 @@ pub(crate) fn remove_ranges(source: &str, ranges: &[(usize, usize)]) -> Result<S
     Ok(result)
 }
 
-/// Trim trailing whitespace from each line and normalize blank lines in a single pass
+/// Trim trailing whitespace and normalize blank lines in a single pass.
 ///
 /// Combines two operations to avoid an extra allocation:
-/// 1. Trims trailing whitespace from each line
+/// 1. Trims trailing whitespace from each line (unprotected bytes only)
 /// 2. Normalizes blank lines: 3+ consecutive blank lines become 2
-pub(crate) fn trim_and_normalize(source: &str) -> String {
+///
+/// **Literal-aware:** byte ranges in `protected` are never trimmed, and a line
+/// is only considered blank when the backward-scan reaches the line start —
+/// meaning every byte was unprotected whitespace.  A line whose trailing bytes
+/// are protected (e.g. a string literal with trailing spaces) is preserved
+/// verbatim.
+///
+/// Index-based iteration (not `.lines()`) so that byte offsets remain
+/// correlatable with `protected` range coordinates.  CRLF line endings are
+/// normalised to LF.
+pub(crate) fn trim_and_normalize(source: &str, protected: &[(usize, usize)]) -> String {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blanks: usize = 0;
+    let mut pos = 0usize;
 
-    for line in source.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() {
+    while pos < n {
+        let line_start = pos;
+
+        // Locate the newline that terminates this line.
+        let nl = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+        // CRLF: exclude the `\r` from trimmed content.
+        let has_cr = nl > line_start && bytes[nl - 1] == b'\r';
+        let content_end = if has_cr { nl - 1 } else { nl };
+        pos = if nl < n { nl + 1 } else { n };
+
+        // Compute trim_end: scan backward, skip trailing unprotected whitespace.
+        let mut trim_end = content_end;
+        while trim_end > line_start {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // A line is blank when every byte was unprotected whitespace.
+        // Exception: a truly-empty line (trim_end == line_start, no content bytes)
+        // whose START position falls inside a protected range is a blank line that
+        // lives inside a multi-line string literal and must NOT be capped.
+        // (`trim_end == line_start` implies no protected content bytes; but the
+        // position itself may be inside a protected range — e.g. the `\n` of a
+        // blank line that is part of a Python """…""" body.)
+        let is_blank = trim_end == line_start && !in_protected(line_start, protected);
+
+        if is_blank {
             consecutive_blanks += 1;
             if consecutive_blanks > 2 {
                 continue;
@@ -765,7 +819,7 @@ pub(crate) fn trim_and_normalize(source: &str) -> String {
         if !result.is_empty() {
             result.push('\n');
         }
-        result.push_str(trimmed);
+        result.push_str(&source[line_start..trim_end]);
     }
 
     if source.ends_with('\n') {
@@ -1147,28 +1201,28 @@ mod tests {
     #[test]
     fn test_trim_and_normalize_preserves_two_blanks() {
         let input = "a\n\n\nb\n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "a\n\n\nb\n");
     }
 
     #[test]
     fn test_trim_and_normalize_reduces_four_blanks_to_two() {
         let input = "a\n\n\n\n\nb\n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "a\n\n\nb\n");
     }
 
     #[test]
     fn test_trim_and_normalize_no_change_needed() {
         let input = "a\n\nb\n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "a\n\nb\n");
     }
 
     #[test]
     fn test_trim_and_normalize_trims_trailing_whitespace() {
         let input = "hello   \nworld  \n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "hello\nworld\n");
     }
 
@@ -1176,7 +1230,7 @@ mod tests {
     fn test_trim_and_normalize_combined() {
         // Verify both trimming and normalization happen in one pass
         let input = "hello   \n\n\n\n\nworld  \n";
-        let result = trim_and_normalize(input);
+        let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "hello\n\n\nworld\n");
     }
 
@@ -1363,24 +1417,47 @@ mod tests {
     //                  N=4000 → ~18.6ms (linear interpolation from the two points above)
     //   N=4000 vs N=8000 ratio on fixed code:         ~30.4 / ~18.6 ≈ 1.63×
     //   N=4000 vs N=8000 ratio on O(N²) unfixed code: ~8032ms / ~2008ms ≈ 4.0×
-    //   Threshold 2.5× sits midway: ≥ 0.9 margin from linear upper (1.6×),
-    //                               ≥ 1.3 margin below quadratic lower (3.8×).
+    //   Threshold 2.8 ≈ 2^1.5: exponent-space midpoint between 2^1 (linear) and
+    //     2^2 (quadratic).  The historical 2.5 was empirically fitted; 2.8 is
+    //     derived.  Both give adequate margin (≥ 0.9 from linear upper bound,
+    //     ≥ 1.2 below quadratic lower at 4.0×).
     //
     // N sizes chosen so that t1 (N=4000) reliably exceeds 2 ms even on fast debug
     // hardware (~18 ms measured), keeping the noise floor assertion below the expected
     // measurement by ~9×.
 
+    /// Time N=4000 and N=8000 contiguous-leading-comment Python files with
+    /// `transform_minimal`.  Parse is hoisted outside the sample loop (per
+    /// `scaling_guard` module doc).  Returns (min, median) of 5 samples for each N.
+    fn sample_python_minimal(source: &str) -> (f64, f64) {
+        let mut parser = crate::Parser::new(Language::Python).unwrap();
+        let tree = parser.parse(source).unwrap(); // hoisted outside sample loop
+        let config = TransformConfig::default();
+        crate::transform::scaling_guard::time_5(|| {
+            let start = std::time::Instant::now();
+            let r = transform_minimal(source, &tree, Language::Python, &config);
+            assert!(
+                r.is_ok(),
+                "Python minimal transform must succeed: {:?}",
+                r.err()
+            );
+            start.elapsed().as_secs_f64() * 1000.0
+        })
+    }
+
     #[test]
     fn test_quadratic_scaling_guard() {
         // WHAT THIS TEST PROVES: that the doubling ratio (N=4000 → N=8000) stays
-        // below 2.5×. An O(N) implementation produces ~1.3–1.6×; O(N²) produces
-        // ~4.0×. The 2.5 threshold sits midway between them.
+        // below 2.8×.  An O(N) implementation produces ~1.3–1.6×; O(N²) produces
+        // ~4.0×.  Threshold 2.8 ≈ 2^1.5 is the exponent-space midpoint (derived;
+        // see the comment block above the helper).
+        //
+        // Each call returns (min, median) of 5 samples (scaling_guard rule).
+        // Ratio uses MIN; noise floor uses MEDIAN.
+        // Parse is hoisted outside the sample loop — we time the walk, not the parser.
         //
         // WHAT THIS TEST DOES NOT PROVE: absolute throughput or strict O(N) vs
         // O(N log N). It discriminates linear from quadratic, no finer.
-        //
-        // Build N=4000 and N=8000 contiguous-leading-comment Python files.
-        // (The same "gap-then-body-function" fixture as the other timing tests.)
         let make_source = |n: usize| {
             let mut s = String::with_capacity(n * 25 + 16);
             for i in 0..n {
@@ -1392,66 +1469,42 @@ mod tests {
         let source_4k = make_source(4000);
         let source_8k = make_source(8000);
 
-        let mut parser = crate::Parser::new(Language::Python).unwrap();
-        let config = TransformConfig::default();
-
-        // Warm up (parse once before measuring; avoids one-time tree-sitter
-        // initialisation costs skewing the N=4000 sample).
+        // Warm up before the first timed run.
         {
+            let mut parser = crate::Parser::new(Language::Python).unwrap();
             let tree = parser.parse(&source_4k).unwrap();
+            let config = TransformConfig::default();
             let _ = transform_minimal(&source_4k, &tree, Language::Python, &config);
         }
 
-        // Measure N=4000
-        let t1 = {
-            let tree = parser.parse(&source_4k).unwrap();
-            let start = std::time::Instant::now();
-            let r = transform_minimal(&source_4k, &tree, Language::Python, &config);
-            let elapsed = start.elapsed();
-            assert!(r.is_ok(), "N=4000 transform must succeed: {:?}", r.err());
-            elapsed
-        };
+        let (t1_min, t1_median) = sample_python_minimal(&source_4k);
+        let (t2_min, _) = sample_python_minimal(&source_8k);
 
-        // Measure N=8000
-        let t2 = {
-            let tree = parser.parse(&source_8k).unwrap();
-            let start = std::time::Instant::now();
-            let r = transform_minimal(&source_8k, &tree, Language::Python, &config);
-            let elapsed = start.elapsed();
-            assert!(r.is_ok(), "N=8000 transform must succeed: {:?}", r.err());
-            elapsed
-        };
-
-        let t1_ms = t1.as_secs_f64() * 1000.0;
-        let t2_ms = t2.as_secs_f64() * 1000.0;
-
-        // N=4000 must produce a measurable result above the OS noise floor.
-        // In debug builds this is ~18 ms; 2 ms is the floor — if it completes
-        // faster than that, either the transform is being cached/skipped or N
-        // needs to be raised further.
-        //
-        // We FAIL rather than skip: a silently-passing ratio guard is worse than
-        // no guard at all. This assertion is the tripwire against that failure mode.
+        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
+        // We FAIL rather than skip: a silently-passing guard provides no protection.
         assert!(
-            t1_ms >= 2.0,
-            "N=4000 transform completed in {t1_ms:.3}ms — too fast to measure reliably \
-             (expected ≥ 2ms; ~18ms measured on debug builds). Either the transform is \
-             being cached/skipped or N should be raised further. \
+            t1_median >= 2.0,
+            "N=4000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 2ms; ~18ms measured on debug builds). Either the \
+             transform is being cached/skipped or N should be raised further. \
              DO NOT convert this to a skip — a silently-passing guard provides no protection."
         );
 
-        // The doubling ratio must stay below 2.5 (O(N²) produces ~4.0×, O(N) ~1.3–1.6×).
-        // Threshold 2.5 is midway: ≥ 0.9 margin from linear upper bound, ≥ 1.3 below quadratic.
-        let ratio = t2_ms / t1_ms;
+        // Ratio uses MIN (ratio gate — scaling_guard rule).
+        // Threshold is 2.8 ≈ 2^1.5, the exponent-space midpoint (derived, not fitted).
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.75×;
+        // normal implementation measures ~1.63×.
+        let ratio = t2_min / t1_min;
         assert!(
-            ratio < 2.5,
-            "Doubling N from 4000 to 8000 must produce a ratio below 2.5 (got {ratio:.2}×). \
+            ratio < 2.8,
+            "Doubling N from 4000 to 8000 must produce a ratio below 2.8 (got {ratio:.2}×). \
              O(N) → ~1.3–1.6×; O(N²) → ~4.0× (empirically measured). \
+             Threshold 2.8 ≈ 2^1.5 is the exponent-space midpoint between linear and quadratic. \
              This indicates a regression to super-linear scaling. Check that \
              compute_header_end_byte uses a TreeCursor (not next_named_sibling), \
              is_module_header_comment uses depth (not parent() calls), and \
              collect_removable_comments threads in_function_body (not is_inside_function_body). \
-             N=4000 took {t1_ms:.1}ms, N=8000 took {t2_ms:.1}ms."
+             N=4000 min {t1_min:.1}ms, N=8000 min {t2_min:.1}ms."
         );
     }
 
@@ -1941,41 +1994,50 @@ mod tests {
         s
     }
 
-    fn time_go_minimal(source: &str) -> f64 {
+    /// Time `transform_minimal` on `source` with 5 samples.
+    /// Parse is hoisted outside the sample loop — we time the walk, not the parser.
+    /// Returns `(min, median)` per the `scaling_guard` sampling rule.
+    fn time_go_minimal(source: &str) -> (f64, f64) {
         let mut parser = crate::Parser::new(Language::Go).unwrap();
-        let tree = parser.parse(source).unwrap();
+        let tree = parser.parse(source).unwrap(); // hoisted outside sample loop
         let config = TransformConfig::default();
-        let start = std::time::Instant::now();
-        let r = transform_minimal(source, &tree, Language::Go, &config);
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "minimal transform must succeed: {:?}", r.err());
-        ms
+        crate::transform::scaling_guard::time_5(|| {
+            let start = std::time::Instant::now();
+            let r = transform_minimal(source, &tree, Language::Go, &config);
+            assert!(r.is_ok(), "minimal transform must succeed: {:?}", r.err());
+            start.elapsed().as_secs_f64() * 1000.0
+        })
     }
 
-    fn time_go_pseudo(source: &str) -> f64 {
+    /// Time `transform_pseudo` on `source` with 5 samples.
+    /// Parse is hoisted outside the sample loop — we time the walk, not the parser.
+    /// Returns `(min, median)` per the `scaling_guard` sampling rule.
+    fn time_go_pseudo(source: &str) -> (f64, f64) {
         let mut parser = crate::Parser::new(Language::Go).unwrap();
-        let tree = parser.parse(source).unwrap();
+        let tree = parser.parse(source).unwrap(); // hoisted outside sample loop
         let config = TransformConfig::default();
-        let start = std::time::Instant::now();
-        let r = crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
-            source,
-            &tree,
-            Language::Go,
-            &config,
-        );
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-        ms
+        crate::transform::scaling_guard::time_5(|| {
+            let start = std::time::Instant::now();
+            let r = crate::transform::pseudo::transform_pseudo_with_spans_and_line_map(
+                source,
+                &tree,
+                Language::Go,
+                &config,
+            );
+            assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
+            start.elapsed().as_secs_f64() * 1000.0
+        })
     }
 
     /// Cheap cubic tripwire. Runs FIRST inside each ratio guard so that a
     /// reintroduced Θ(M³) implementation fails in ~40 s at N=1000 instead of
     /// letting the N=8000 measurement grind for hours.
-    fn assert_no_cubic_regression(timer: fn(&str) -> f64, mode: &str) {
-        let probe = timer(&go_leading_run_source(1000));
+    /// Uses MEDIAN of 5 samples (absolute gate — scaling_guard rule).
+    fn assert_no_cubic_regression(timer: fn(&str) -> (f64, f64), mode: &str) {
+        let (_, probe_median) = timer(&go_leading_run_source(1000));
         assert!(
-            probe < 200.0,
-            "[{mode}] N=1000 Go leading comment run took {probe:.1}ms (budget 200ms). \
+            probe_median < 200.0,
+            "[{mode}] N=1000 Go leading comment run median took {probe_median:.1}ms (budget 200ms). \
              The Θ(M³/3) per-node next_named_sibling() walk took 41616ms here; the \
              linear precompute takes ~1.5ms. This is a CUBIC regression — check that \
              is_go_doc_comment does a binary_search over compute_go_doc_comment_starts \
@@ -1990,7 +2052,7 @@ mod tests {
         // cubic code exceeds it by ~208×.
         let n = 1000usize;
         let source = go_leading_run_source(n);
-        let elapsed = time_go_minimal(&source);
+        let (_, elapsed_median) = time_go_minimal(&source);
 
         // Behaviour assertion alongside the timing: the whole run precedes
         // `package main`, which is NOT an is_go_declaration kind, so every one
@@ -2001,9 +2063,10 @@ mod tests {
             "a leading comment run terminated by package_clause must be stripped entirely"
         );
 
+        // Absolute gate: uses MEDIAN of 5 samples (scaling_guard rule).
         assert!(
-            elapsed < 200.0,
-            "{n} leading Go comments must process in < 200ms (got {elapsed:.1}ms); \
+            elapsed_median < 200.0,
+            "{n} leading Go comments must process in < 200ms median (got {elapsed_median:.1}ms); \
              the old Θ(M³/3) walk took 41616ms at N={n}."
         );
     }
@@ -2012,27 +2075,29 @@ mod tests {
     fn test_go_leading_comment_run_scaling_guard() {
         assert_no_cubic_regression(time_go_minimal, "minimal");
 
-        let t1 = time_go_minimal(&go_leading_run_source(4000));
-        let t2 = time_go_minimal(&go_leading_run_source(8000));
+        let (t1_min, t1_median) = time_go_minimal(&go_leading_run_source(4000));
+        let (t2_min, _) = time_go_minimal(&go_leading_run_source(8000));
 
-        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
-        // in this work went vacuous when a fix made it too fast to measure, and
-        // a silently-passing scaling guard provides no protection at all.
+        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
+        // We FAIL rather than skip: a silently-passing scaling guard provides no protection.
         assert!(
-            t1 >= 1.5,
-            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
+            t1_median >= 1.5,
+            "N=4000 median of 5 completed in {t1_median:.3}ms — too fast to measure reliably \
              (expected ≥ 1.5ms; ~6.5ms measured on debug builds). Either the \
              transform is being cached/skipped or N must be raised. \
              DO NOT convert this to a skip."
         );
 
-        let ratio = t2 / t1;
+        // Ratio uses MIN (ratio gate — scaling_guard rule).
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.72×;
+        // normal implementation measures 1.84×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
              (got {ratio:.2}×; measured 1.84× on the linear implementation). \
              O(N) → ~2.0×; O(N²) → ~4.0×; 2.8 ≈ 2^1.5 is the exponent-space \
-             midpoint. N=4000 took {t1:.2}ms, N=8000 took {t2:.2}ms."
+             midpoint. N=4000 min {t1_min:.2}ms, N=8000 min {t2_min:.2}ms."
         );
     }
 
@@ -2044,21 +2109,25 @@ mod tests {
         //
         // This shape was already linear before the fix (α = 1.08) — it is a
         // REGRESSION guard, not evidence of the fix. See the series above.
-        let t1 = time_go_minimal(&go_doc_blocks_source(1000));
-        let t2 = time_go_minimal(&go_doc_blocks_source(2000));
+        let (t1_min, t1_median) = time_go_minimal(&go_doc_blocks_source(1000));
+        let (t2_min, _) = time_go_minimal(&go_doc_blocks_source(2000));
 
+        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
         assert!(
-            t1 >= 3.0,
-            "n=1000 doc blocks completed in {t1:.3}ms — too fast to measure \
+            t1_median >= 3.0,
+            "n=1000 doc blocks median of 5 completed in {t1_median:.3}ms — too fast to measure \
              reliably (expected ≥ 3ms; ~25ms measured). DO NOT convert to a skip."
         );
 
-        let ratio = t2 / t1;
+        // Ratio uses MIN (ratio gate — scaling_guard rule).
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.54×;
+        // normal implementation measures 1.99×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling doc-block count from 1000 to 2000 must produce a ratio \
              below 2.8 (got {ratio:.2}×; measured 1.99×). \
-             n=1000 took {t1:.2}ms, n=2000 took {t2:.2}ms."
+             n=1000 min {t1_min:.2}ms, n=2000 min {t2_min:.2}ms."
         );
     }
 
@@ -2070,21 +2139,25 @@ mod tests {
         // and no keywords, so this measures the comment walk almost in isolation.
         assert_no_cubic_regression(time_go_pseudo, "pseudo");
 
-        let t1 = time_go_pseudo(&go_leading_run_source(4000));
-        let t2 = time_go_pseudo(&go_leading_run_source(8000));
+        let (t1_min, t1_median) = time_go_pseudo(&go_leading_run_source(4000));
+        let (t2_min, _) = time_go_pseudo(&go_leading_run_source(8000));
 
+        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
         assert!(
-            t1 >= 1.5,
-            "N=4000 pseudo completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 1.5ms; ~6.6ms measured). DO NOT convert this to a skip."
+            t1_median >= 1.5,
+            "N=4000 pseudo median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 1.5ms; ~6.6ms measured). DO NOT convert this to a skip."
         );
 
-        let ratio = t2 / t1;
+        // Ratio uses MIN (ratio gate — scaling_guard rule).
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.67×;
+        // normal implementation measures 2.02×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 4000 to 8000 in pseudo mode must produce a ratio \
              below 2.8 (got {ratio:.2}×; measured 2.02×). \
-             N=4000 took {t1:.2}ms, N=8000 took {t2:.2}ms."
+             N=4000 min {t1_min:.2}ms, N=8000 min {t2_min:.2}ms."
         );
     }
 
@@ -2105,6 +2178,198 @@ mod tests {
         assert_eq!(
             end, 23,
             "line end must be byte 23 (includes the trailing newline)"
+        );
+    }
+
+    // ========================================================================
+    // C2a — trim_and_normalize literal protection unit tests
+    // ========================================================================
+
+    #[test]
+    fn test_trim_and_normalize_preserves_protected_trailing_spaces() {
+        // Protected range [7..9) covers the two spaces inside the string "  ".
+        // trim_and_normalize must NOT trim them.
+        // Input: `x = "  "\n` — the `  ` is protected
+        let input = "x = \"  \"\n";
+        // "x = \"" = 5 bytes, spaces at [5..7), closing " at 7
+        // Wait: x=0 ' '=1 '='=2 ' '=3 '"'=4 ' '=5 ' '=6 '"'=7 '\n'=8
+        // string_content = bytes [5..7)
+        let protected = vec![(5, 7)];
+        let result = trim_and_normalize(input, &protected);
+        // Trailing `"` is at byte 7 — not a space, so trim_end stops there.
+        // The two spaces inside the literal are not at the end of the line anyway.
+        assert_eq!(result, "x = \"  \"\n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_trailing_protected_spaces_preserved() {
+        // When a string literal with trailing spaces is the last thing on the line,
+        // the spaces must be preserved if they are in a protected range.
+        // Input line: `"  "  ` where the 2 spaces inside quotes are protected [1..3)
+        // and the 2 spaces outside the closing quote are NOT protected.
+        // Expected: the outside trailing spaces are trimmed, the inside ones preserved.
+        // Layout: '"'=0 ' '=1 ' '=2 '"'=3 ' '=4 ' '=5 '\n'=6
+        let input = "\"  \"  \n";
+        let protected = vec![(1, 3)]; // the two spaces inside the quotes
+        let result = trim_and_normalize(input, &protected);
+        // Outside trailing spaces [4..6) are trimmed; literal content [1..3) is kept.
+        assert_eq!(result, "\"  \"\n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_protected_spaces_only_line_not_blank() {
+        // A line consisting entirely of protected spaces should NOT be blank.
+        // Protected: bytes [0..5) = 5 spaces
+        let input = "     \n";
+        let protected = vec![(0, 5)];
+        let result = trim_and_normalize(input, &protected);
+        // Not blank → kept verbatim (no trailing space trim since they're all protected)
+        assert_eq!(result, "     \n");
+    }
+
+    #[test]
+    fn test_trim_and_normalize_five_blank_lines_inside_string_preserved() {
+        // 5 blank lines inside a string literal must NOT be capped to 2.
+        // Each blank line is a single '\n'; together they form string content.
+        // We mark all of them as protected.
+        let input = "a\n\n\n\n\n\nb\n";
+        // Bytes: a=0 \n=1 \n=2 \n=3 \n=4 \n=5 \n=6 b=7 \n=8
+        // Mark the 5 inner blank lines [2..7) as protected
+        // (representing multi-line string content)
+        let protected = vec![(2, 7)];
+        let result = trim_and_normalize(input, &protected);
+        // All 5 protected blank lines must survive
+        assert_eq!(result, "a\n\n\n\n\n\nb\n");
+    }
+
+    // ========================================================================
+    // C2a — transform_minimal literal-protection integration tests (14 langs)
+    // ========================================================================
+
+    fn transform_min(source: &str, language: Language) -> String {
+        let mut parser = crate::Parser::new(language).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = crate::TransformConfig::with_mode(crate::Mode::Minimal);
+        transform_minimal(source, &tree, language, &config).unwrap()
+    }
+
+    #[test]
+    fn test_minimal_ts_literal_double_space_preserved() {
+        let source = "const INDENT = \"  \";\n";
+        let result = transform_min(source, Language::TypeScript);
+        assert!(result.contains("\"  \""), "TS minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_js_literal_double_space_preserved() {
+        let source = "const INDENT = '  ';\n";
+        let result = transform_min(source, Language::JavaScript);
+        assert!(result.contains("'  '"), "JS minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_python_literal_double_space_preserved() {
+        let source = "INDENT = \"  \"\n";
+        let result = transform_min(source, Language::Python);
+        assert!(result.contains("\"  \""), "Python minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_rust_literal_double_space_preserved() {
+        let source = "const INDENT: &str = \"  \";\n";
+        let result = transform_min(source, Language::Rust);
+        assert!(result.contains("\"  \""), "Rust minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_go_literal_double_space_preserved() {
+        let source = "var INDENT = \"  \"\n";
+        let result = transform_min(source, Language::Go);
+        assert!(result.contains("\"  \""), "Go minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_java_literal_double_space_preserved() {
+        let source = "class A { String s = \"  \"; }\n";
+        let result = transform_min(source, Language::Java);
+        assert!(result.contains("\"  \""), "Java minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_c_literal_double_space_preserved() {
+        let source = "char *s = \"  \";\n";
+        let result = transform_min(source, Language::C);
+        assert!(result.contains("\"  \""), "C minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_cpp_literal_double_space_preserved() {
+        let source = "std::string s = \"  \";\n";
+        let result = transform_min(source, Language::Cpp);
+        assert!(result.contains("\"  \""), "C++ minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_csharp_literal_double_space_preserved() {
+        let source = "string s = \"  \";\n";
+        let result = transform_min(source, Language::CSharp);
+        assert!(result.contains("\"  \""), "C# minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_ruby_literal_double_space_preserved() {
+        let source = "s = \"  \"\n";
+        let result = transform_min(source, Language::Ruby);
+        assert!(result.contains("\"  \""), "Ruby minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_kotlin_literal_double_space_preserved() {
+        let source = "val s = \"  \"\n";
+        let result = transform_min(source, Language::Kotlin);
+        assert!(result.contains("\"  \""), "Kotlin minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_swift_literal_double_space_preserved() {
+        let source = "let s = \"  \"\n";
+        let result = transform_min(source, Language::Swift);
+        assert!(result.contains("\"  \""), "Swift minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_sql_literal_double_space_preserved() {
+        let source = "SELECT '  ' AS s;\n";
+        let result = transform_min(source, Language::Sql);
+        assert!(result.contains("'  '"), "SQL minimal: got {result:?}");
+    }
+
+    #[test]
+    fn test_minimal_bash_literal_double_space_preserved() {
+        let source = "s=\"  \"\n";
+        let result = transform_min(source, Language::Bash);
+        assert!(result.contains("\"  \""), "Bash minimal: got {result:?}");
+    }
+
+    // ========================================================================
+    // C2d — normalize_line_map_blanks literal-protection integration
+    // ========================================================================
+
+    #[test]
+    fn test_line_map_integrity_with_protected_space_line() {
+        use crate::transform::normalize_line_map_blanks;
+        // A line consisting entirely of protected spaces must NOT be dropped from
+        // the map (it would be treated as blank without literal awareness).
+        let text = "a\n     \nb\n";
+        // Bytes: a=0 \n=1 ' '=2 ' '=3 ' '=4 ' '=5 ' '=6 \n=7 b=8 \n=9
+        let protected = vec![(2, 7)]; // 5 spaces on line 2 are protected
+        let map = vec![1, 2, 3];
+        let result = normalize_line_map_blanks(text, map, &protected);
+        // Line 2 ("     ") is NOT blank (all spaces are protected) → kept
+        assert_eq!(
+            result,
+            vec![1, 2, 3],
+            "protected-space line must not be dropped from map"
         );
     }
 }

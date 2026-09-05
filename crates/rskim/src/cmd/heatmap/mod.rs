@@ -278,6 +278,7 @@ fn prepare_commits(
 ///
 /// All git I/O is routed through `source` — infra checks (repo detection, root,
 /// shallow clone, commit count) and the commit fetch all use the same trait object.
+#[allow(clippy::disallowed_methods)] // Heatmap analysis output; skim-generated, locked handle for atomic multi-line write
 fn run_with_source(
     source: &dyn GitDataSource,
     args: HeatmapArgs,

@@ -22,10 +22,20 @@ use predicates::prelude::*;
 use serial_test::serial;
 mod common;
 
+/// Per-binary cache sandbox — see the identical note in `cli_e2e_rewrite.rs`.
+///
+/// `skim rewrite --hook` writes the D5 force-raw marker into
+/// `{SKIM_CACHE_DIR}/sessions/{ppid}.raw`, keyed to the shared nextest runner
+/// PID.  Left pointing at the real `~/.cache/skim`, that marker is visible to
+/// wrapper-surface tests in other binaries via `force_raw_requested()`.
+static CACHE_SANDBOX: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("cache sandbox tempdir must succeed"));
+
 fn skim_cmd() -> Command {
     let mut cmd = common::skim();
     // Remove SKIM_PASSTHROUGH so the daemon guard is active.
     cmd.env_remove("SKIM_PASSTHROUGH");
+    cmd.env("SKIM_CACHE_DIR", CACHE_SANDBOX.path());
     cmd
 }
 

@@ -113,6 +113,7 @@ const KNOWN_FLAGS: &str = "--build, --rebuild, --update, --stats, --install-hook
 /// were already the recommended surface. A cold `skim search index` auto-builds
 /// the index (via `auto_refresh_if_stale`) and then returns lexical results for
 /// the word "index".
+#[allow(clippy::disallowed_methods)] // Search output entry point; delegates to streaming BufWriter sinks in subordinate fns
 pub(crate) fn run(
     args: &[String],
     analytics: &crate::analytics::AnalyticsConfig,
@@ -992,6 +993,7 @@ fn run_update(
 // --stats
 // ============================================================================
 
+#[allow(clippy::disallowed_methods)] // Search stats output; streaming BufWriter for potentially large index statistics
 fn run_stats(json: bool, root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let (root, cache_dir) = resolve_root_and_cache(root_override)?;
 
@@ -1444,6 +1446,7 @@ fn run_remove_hooks(root_override: &Option<PathBuf>) -> anyhow::Result<ExitCode>
 // Query execution
 // ============================================================================
 
+#[allow(clippy::disallowed_methods)] // Search result streaming; result set may be large, BufWriter for throughput
 fn run_query(
     text: &str,
     flags: &Flags,
@@ -1873,6 +1876,7 @@ fn report_standalone_degraded(
 /// but the function NEVER called auto_refresh_if_stale, so temporal.db was
 /// never self-healed on the standalone --hot/--cold/--risky path.
 /// The call below fixes that gap (#357 BLOCKER).
+#[allow(clippy::disallowed_methods)] // Temporal search output; streaming handle for sorted result set
 fn run_temporal_standalone(
     page: types::Page,
     json: bool,

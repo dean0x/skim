@@ -424,10 +424,17 @@ impl Language {
                 Err(e) => return Err(e),
             };
 
-        // Apply last_lines truncation as a post-processing step
+        // Apply last_lines truncation as a post-processing step (B5: pass elision_hint).
+        // source_line_count=None: `result` is tree-sitter output; source-space counts
+        // for the last_lines path are not critical here (it shows the tail of output).
         let (result, line_map) = if let Some(n) = config.last_lines {
-            let truncated =
-                crate::transform::truncate::simple_last_line_truncate(&result, self, n)?;
+            let truncated = crate::transform::truncate::simple_last_line_truncate(
+                &result,
+                self,
+                n,
+                config.elision_hint.as_deref(),
+                None,
+            )?;
             let final_map = if let Some(ref map) = line_map {
                 // Reconcile the line map after last_lines truncation
                 let reconciled =
@@ -452,7 +459,9 @@ impl Language {
     ///
     /// Line maps are built arithmetically from source line counts rather than via
     /// content-based matching to avoid duplicate-line mis-attribution (e.g. `}` matching
-    /// its first occurrence instead of the tail occurrence).
+    /// its first occurrence instead of the tail occurrence). The one input the
+    /// arithmetic does not own is where the `--last-lines` window begins: that comes
+    /// back from the truncator, which may move it forward (#511).
     fn transform_passthrough_with_line_map(
         self,
         source: &str,
@@ -467,22 +476,43 @@ impl Language {
             //
             // simple_last_line_truncate produces:
             //   - If total <= n: unchanged (identity map)
-            //   - If total > n: 1 marker line + (n-1) content lines from the tail
+            //   - If total > n: 1 marker line + the tail from `start` (below)
             //
             // Marker line gets source_line = 0 (no annotation).
-            // Content line i (0-indexed within content) gets source_line:
-            //   source_line_count - n_content + 1 + i  (1-indexed)
+            // Content line i (0-indexed within content) gets source_line
+            // `start + 1 + i` (1-indexed).
             let source_line_count = source.lines().count();
-            let truncated = crate::transform::truncate::simple_last_line_truncate(source, self, n)?;
+            // E3: source_line_count=None is correct here — `source` IS the original
+            // text, so lines.len() == source_line_count. Pass None to avoid recomputing.
+            //
+            // PF-019 / #511: take the retained start FROM the truncator. This map is
+            // the ONLY source of the `-n` annotations, and the window is no longer at
+            // a fixed offset: #511 moves it forward when it would otherwise begin
+            // inside a multi-line string literal or a Markdown code fence. A start
+            // recomputed here would disagree with the truncator's and silently
+            // mislabel every retained line.
+            let (truncated, start) =
+                crate::transform::truncate::simple_last_line_truncate_with_start(
+                    source,
+                    self,
+                    n,
+                    config.elision_hint.as_deref(),
+                    None,
+                )?;
             let line_map = if config.line_numbers {
                 if source_line_count <= n {
                     // No truncation occurred: identity map
                     let count = truncated.lines().count();
                     Some((1..=count).collect::<Vec<usize>>())
                 } else {
-                    // Truncation occurred: marker + n_content tail lines
-                    let n_content = n.saturating_sub(1); // lines reserved for content
-                    let start_line = source_line_count - n_content + 1; // 1-indexed
+                    // Truncation occurred: 1 marker line + the retained tail.
+                    // N-total semantics (b5507ad / ADR-016): `--last-lines N` yields at
+                    // most N lines TOTAL, so the marker consumes one of the N slots.
+                    // `start` is the truncator's own 0-based first retained line, so
+                    // n_content is whatever is left after it — n-1 in the common case,
+                    // fewer when #511 moved the window forward.
+                    let n_content = source_line_count.saturating_sub(start);
+                    let start_line = start + 1; // 1-indexed
                     let mut map = Vec::with_capacity(1 + n_content);
                     map.push(0_usize); // marker line has no annotation
                     for i in 0..n_content {
@@ -499,10 +529,16 @@ impl Language {
         // Apply max_lines truncation for passthrough paths. Tree-sitter languages
         // handle max_lines inside transform_tree via AST-aware priority selection,
         // but for passthrough (Full mode or serde/Markdown Minimal/Pseudo) we must
-        // apply it here as a simple line truncation.
+        // apply it here as a simple line truncation (B5: pass elision_hint).
         if let Some(max_lines) = config.max_lines {
-            let truncated =
-                crate::transform::truncate::simple_line_truncate(source, self, max_lines)?;
+            // E3: source_line_count=None is correct — `source` IS the original text.
+            let truncated = crate::transform::truncate::simple_line_truncate(
+                source,
+                self,
+                max_lines,
+                config.elision_hint.as_deref(),
+                None,
+            )?;
             let line_map = if config.line_numbers {
                 // After simple_line_truncate the output is a prefix of the source
                 // (with an optional trailing truncation marker). Build the map by
@@ -547,15 +583,34 @@ impl Language {
             // SAFETY: callers must only invoke this for is_serde_based() languages.
             _ => unreachable!("transform_serde_with_line_map called for non-serde language"),
         };
-        // Apply max_lines truncation (no meaningful line map for restructured output).
+        // E5: compute source line count ONCE — serde transforms restructure the text
+        // so raw_result has far fewer lines than source (e.g. 29 vs 327 for ci.yml,
+        // a 11.3× understatement). The marker must state SOURCE lines omitted so
+        // agents know the true scope of what they cannot see (ADR-011 class 1).
+        let source_line_count = source.lines().count();
+
+        // Apply max_lines truncation (no meaningful line map for restructured output)
+        // (B5: pass elision_hint through; E5: pass source_line_count for honest counts).
         let result = if let Some(max_lines) = config.max_lines {
-            crate::transform::truncate::simple_line_truncate(&raw_result, self, max_lines)?
+            crate::transform::truncate::simple_line_truncate(
+                &raw_result,
+                self,
+                max_lines,
+                config.elision_hint.as_deref(),
+                Some(source_line_count),
+            )?
         } else {
             raw_result
         };
-        // Apply last_lines truncation.
+        // Apply last_lines truncation (B5: pass elision_hint through; E5: source count).
         let result = if let Some(n) = config.last_lines {
-            crate::transform::truncate::simple_last_line_truncate(&result, self, n)?
+            crate::transform::truncate::simple_last_line_truncate(
+                &result,
+                self,
+                n,
+                config.elision_hint.as_deref(),
+                Some(source_line_count),
+            )?
         } else {
             result
         };
@@ -762,6 +817,11 @@ impl Mode {
 /// Configuration for transformation
 ///
 /// ARCHITECTURE: This is injected into transform functions (no global state).
+///
+/// This struct is `#[non_exhaustive]` — new fields may be added in minor releases.
+/// Construct via [`TransformConfig::with_mode`] and the `with_*` builder methods
+/// rather than a struct literal, so future fields do not break your code.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct TransformConfig {
     /// Transformation mode
@@ -812,6 +872,17 @@ pub struct TransformConfig {
     /// When `false` (default), the source line map is `None` and no line number
     /// computation is performed.
     pub line_numbers: bool,
+
+    /// Remedy hint appended to truncation/elision markers (B5 / ADR-011).
+    ///
+    /// When set, the core library appends this string to every elision marker it
+    /// emits (e.g. `"… (N lines truncated) — SKIM_PASSTHROUGH=1 for full output"`).
+    ///
+    /// ARCHITECTURE: Defaults to `None` so the library stays CLI-agnostic.
+    /// The CLI layer (rskim binary) sets it to `"SKIM_PASSTHROUGH=1 for full output"`
+    /// via `with_elision_hint` in `cascade::build_config_with_opts`. Library users
+    /// who do not populate this field get markers without the remedy clause.
+    pub elision_hint: Option<String>,
 }
 
 impl Default for TransformConfig {
@@ -823,6 +894,7 @@ impl Default for TransformConfig {
             max_lines: None,
             last_lines: None,
             line_numbers: false,
+            elision_hint: None,
         }
     }
 }
@@ -873,6 +945,16 @@ impl TransformConfig {
     /// formatting.
     pub fn with_line_numbers(mut self, enabled: bool) -> Self {
         self.line_numbers = enabled;
+        self
+    }
+
+    /// Builder: Set the remedy hint appended to elision markers (B5 / ADR-011).
+    ///
+    /// Called by the CLI layer (rskim binary) to thread `"SKIM_PASSTHROUGH=1
+    /// for full output"` into every truncation/elision marker the core library
+    /// emits. Library users who do not call this get markers without the clause.
+    pub fn with_elision_hint(mut self, hint: impl Into<String>) -> Self {
+        self.elision_hint = Some(hint.into());
         self
     }
 }

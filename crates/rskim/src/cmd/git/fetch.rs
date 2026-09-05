@@ -43,7 +43,10 @@ pub(super) fn run_fetch(
         rec,
         output_format,
         label,
-        super::ParsedCommandOptions::combined(),
+        // ADR-015 / D1 declaration — `Lossy`.  `parse_fetch` classifies ref
+        // updates into a structured summary and drops the progress/noise lines
+        // (`remote: …`, `Unpacking …`) entirely; countless, so `elided` = None.
+        super::ParsedCommandOptions::combined(crate::output::fidelity::Completeness::Lossy),
         parse_fetch,
     )
 }

@@ -160,15 +160,20 @@ fn test_gh_pr_checks_exit8_summary_and_exit_code() {
 /// Stub diff emits a unified diff with `--- a/src/main.rs\t<mtime>` headers
 /// and exits 1 (files differ — the normal, expected exit code).
 ///
-/// With `skip_ansi_strip: true` on diff's CONFIG, the `\t` in the header
-/// line survives and `try_parse_standalone_unified` splits on it, keeping
-/// path and timestamp separate.  Without the flag, the tab is dropped and
-/// the path is fused with the mtime.
+/// # What changed with A3b
 ///
-/// Asserts: exit 1, the entry contains "src/main.rs" as part of a clean
-/// path reference, and does NOT contain the glued form "src/main.rs2026".
+/// This test used to assert on `try_parse_standalone_unified`'s rendered field
+/// (`a/src/main.rs: +1, -1`), i.e. it proved the tab survived by proving the
+/// PARSER had split on it. There is no parser any more — `parse_impl` returns
+/// `RawPassthrough` — so the property is now asserted in its strongest form:
+/// **the stub's bytes reach the reader unmodified**, tab included. Byte equality
+/// subsumes "not glued": a dropped `\t` is a byte difference.
+///
+/// `skip_ansi_strip: true` is still exactly what makes this hold — the ANSI
+/// strip step in `execution.rs` runs BEFORE `parse()` and shadows the `output`
+/// binding, so `RawPassthrough` does not bypass it.
 #[test]
-fn test_diff_tab_header_path_not_glued() {
+fn test_diff_tab_header_survives_byte_faithfully() {
     let stub_dir = make_stub("diff", DIFF_UNIFIED_TEXT, 1);
     let path = prepend_path(stub_dir.path());
     let skim = common::skim_bin();
@@ -190,8 +195,13 @@ fn test_diff_tab_header_path_not_glued() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("a/src/main.rs:"),
-        "path renders as clean field — tab must survive and split path from mtime; got: {stdout}"
+        DIFF_UNIFIED_TEXT.contains('\t'),
+        "precondition: the fixture must carry a TAB in its `--- path\\t<mtime>` header"
+    );
+    assert_eq!(
+        stdout, DIFF_UNIFIED_TEXT,
+        "diff output must reach the reader byte-for-byte — the TAB in \
+         `--- a/src/main.rs\\t<mtime>` included (PF-006 / ADR-012)"
     );
     assert!(
         !stdout.contains("main.rs2026") && !stdout.contains("main.rs 2026"),

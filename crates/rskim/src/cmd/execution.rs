@@ -12,6 +12,7 @@ use crate::cmd::stream_pump::{
     PUMP_BUF_BYTES, StreamOutcome, StreamSpec, stream_child, write_tail,
 };
 use crate::output::ParseResult;
+use crate::output::fidelity::{Completeness, RemedyCtx, remedy_for};
 use crate::runner::{CommandOutput, CommandRunner};
 
 // ============================================================================
@@ -45,165 +46,16 @@ pub(crate) enum SavingsDecision {
     Passthrough,
 }
 
-/// Byte length of the longest run containing no ASCII whitespace.
-///
-/// cl100k BPE splits on whitespace, so a long no-split run is the pathological
-/// (~O(n²) per-word merge) dimension; this bounds it.  Runs through the input
-/// once (O(n)) with no allocation.
-fn longest_nonwhitespace_run(s: &str) -> usize {
-    let mut longest = 0usize;
-    let mut current = 0usize;
-    for &b in s.as_bytes() {
-        if b.is_ascii_whitespace() {
-            current = 0;
-        } else {
-            current += 1;
-            longest = longest.max(current);
-        }
-    }
-    longest
-}
-
 /// Decide whether to emit `compressed` or fall back to `raw`.
 ///
-/// **Conservative rule:** keep compressed IFF `compressed_tokens < raw_tokens`
-/// (strictly less).  Tie (equal) or larger → `Passthrough`.
-/// This is the verbatim user decision: *"conservative — keep compressed ONLY IF
-/// strictly smaller than raw, measured in tokens, always."*
-/// Boundary: saving exactly 0 tokens → Passthrough; saving 1 token → Keep.
-///
-/// **Tokenizer-unavailable fallback:** if `count_token_pair` returns `(None, None)`
-/// (counter init failed), fall back to a **byte** comparison:
-/// keep iff `compressed.len() < raw.len()` (strictly less).
-/// Never panics, never expands.
-///
-/// **Comparison normalization:** trailing whitespace is trimmed from both sides
-/// before comparison so a single trailing newline does not flip the decision
-/// arbitrarily (e.g. `println!` always appends `\n`; the raw command may or may
-/// not end with `\n`).  This keeps boundary cases stable.
-///
-/// **Empty-raw behaviour:** if raw is empty/whitespace-only, compressed output is
-/// NOT strictly smaller (0 < 0 fails) → Passthrough (emit raw, i.e. nothing).
-/// A silent command stays silent, matching the raw tool exactly.
-///
-/// **JSON exempt:** callers are responsible for not calling this function when
-/// `output_format == OutputFormat::Json`.  JSON responses must never be rewritten
-/// to non-JSON; the guard only applies to `OutputFormat::Text` paths.
-///
-/// **Already-passthrough exempt:** if the parse tier is already `"passthrough"`,
-/// `compressed` IS the raw body (no re-encoding occurred); skip the guard.
-///
-/// **#317 invariant:** this guard only ever moves output toward *more-complete
-/// raw*.  It can never show LESS than raw.
-///
-/// **Size cap (performance):** tokenizing costs ~0.3 s/MB in release builds
-/// (~10× that unoptimized/debug), so for inputs above 256 KiB the function falls
-/// back to byte comparison — keeping the guard's added latency to roughly
-/// 100–150 ms worst case at the cap in release, comfortably within budget —
-/// consistent with the "never expand" promise.  Below the cap the exact token
-/// decision is used; above it, byte length is a safe proxy (a large output that
-/// compresses wins on both axes; only near-ties differ, and those are rare at
-/// scale).  Token accuracy matters most for small outputs (tight expansion
-/// margins); those are well below the cap and always tokenized.
-///
-/// **Longest-run guard (degenerate inputs):** cl100k BPE splits on whitespace,
-/// so a single long run of non-whitespace characters is the pathological
-/// dimension — the tokenizer's per-word merge loop becomes O(n²) in the run
-/// length.  When either string has a non-whitespace run > 4 KiB (and both are
-/// below the size cap), the function falls back to the same byte-comparison path.
-/// Real line-oriented shell output never produces runs this long; the guard only
-/// fires on minified JS, base64 blobs, or similar single-line data — exactly the
-/// cases where byte comparison is already safe (the "never expand" invariant still
-/// holds: a compressed blob that is byte-shorter is also cheaper to transmit).
+/// Thin wrapper over [`crate::output::fidelity::decide`] — the canonical
+/// unified gate (A2).  Keep compressed IFF strictly smaller in BOTH bytes AND
+/// tokens; tie → Passthrough.  See `output/fidelity.rs` for full semantics.
 pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
-    /// 256 KiB — above this threshold skip tokenization (performance cap).
-    /// Tokenization costs ~0.3 s/MB in release (~10× in debug), so this bounds
-    /// the guard's added latency to roughly 100–150 ms at the cap in release;
-    /// larger outputs fall back to byte comparison.
-    const TOKEN_SIZE_CAP: usize = 256 * 1024;
-    /// 4 KiB — longest non-whitespace run above which we fall back to byte
-    /// comparison.  cl100k BPE's per-word merge is O(n²) in run length; 4 KiB
-    /// bounds the per-word merge cost to a safe constant.  Real line-oriented
-    /// output never reaches this; minified JS / base64 single-line blobs do —
-    /// they safely fall back to byte comparison (never-expand invariant holds).
-    const TOKEN_RUN_CAP: usize = 4 * 1024;
-    // Compile-time invariant: TOKEN_SIZE_CAP must be strictly greater than
-    // TOKEN_RUN_CAP so the run-scan is always bounded to ≤TOKEN_SIZE_CAP bytes.
-    // If these constants are ever changed, this assertion catches the violation.
-    const { assert!(TOKEN_SIZE_CAP > TOKEN_RUN_CAP) };
-
-    // Normalize whitespace from both ends so leading/trailing formatting
-    // (e.g., a `println!` trailing newline, or a leading space before "OK")
-    // does not flip a tie.  We compare trimmed lengths; the actual emitted
-    // bytes are unchanged.
-    let raw_t = raw.trim();
-    let comp_t = compressed.trim();
-
-    // Conservative rule: keep compressed IFF strictly smaller than raw.
-    //
-    // Tie (equal tokens/bytes) or larger → Passthrough.  This is intentionally
-    // conservative: the guard only ever moves output toward more-complete raw, so
-    // it cannot show LESS than the raw tool.  A tie means no savings; the raw form
-    // is equally complete and always safe to emit.
-    //
-    // Empty-raw case: if raw is empty/whitespace-only, comp_t.len() > 0 means
-    // compressed is NOT strictly smaller (0 < n fails "comp < raw").  The uniform
-    // rule therefore emits raw (nothing) — which is the faithful "never expand"
-    // behaviour: a silent command stays silent, matching the raw tool exactly.
-    //
-    // Oversized inputs (> 256 KiB): tokenization is skipped for performance;
-    // byte comparison is used instead — consistent with the "never expand" promise.
-    //
-    // Degenerate-run inputs (longest non-ws run > 4 KiB, only checked when below
-    // the size cap): tokenization is skipped to avoid O(n²) BPE merge cost; byte
-    // comparison is used instead.  The scan is bounded to ≤256 KiB each.
-
-    // Determine whether to take the fast byte-comparison path.
-    let over_size_cap = raw.len() > TOKEN_SIZE_CAP || compressed.len() > TOKEN_SIZE_CAP;
-
-    // Byte early-exit: if bytes already say compressed is not strictly shorter,
-    // the decision is Passthrough regardless of tokens or run length — skip all
-    // further scanning.  This covers the empty-raw case (raw_t.len() == 0 means
-    // comp_t.len() >= 0 is always true → Passthrough) and the common "compression
-    // doesn't win" path where up to ~512 KiB of run-scan would otherwise run
-    // needlessly.  Must come before the run guard so the scan is never paid when
-    // the byte gate already settles the decision.
-    if comp_t.len() >= raw_t.len() {
-        return SavingsDecision::Passthrough;
-    }
-
-    // comp_t.len() < raw_t.len() here — bytes say compressed is strictly shorter.
-    // Run guard: only scan when below the size cap (bounds the scan to ≤256 KiB
-    // each).  A single-char repeated string has a non-whitespace run equal to its
-    // own length; short human-readable output has runs ≤ line length (~80–200 b).
-    // Scanning here is safe: the byte early-exit above means we only reach this
-    // point when compressed is already byte-shorter, so the scan is only paid on
-    // the minority path where a token comparison could change the decision.
-    let over_run_cap = !over_size_cap
-        && (longest_nonwhitespace_run(raw) > TOKEN_RUN_CAP
-            || longest_nonwhitespace_run(compressed) > TOKEN_RUN_CAP);
-
-    if over_size_cap || over_run_cap {
-        // Above size cap or run cap: byte comparison only (no tokenisation).
-        // comp_t.len() < raw_t.len() was already verified above → Keep.
-        return SavingsDecision::Keep;
-    }
-
-    // comp_t.len() < raw_t.len() here — bytes say compressed is strictly shorter.
-    // Confirm with token counts; if the tokenizer says compressed uses MORE tokens
-    // than raw (byte-compression but token-expansion), passthrough.
-    match crate::process::count_token_pair(raw_t, comp_t) {
-        (Some(raw_tok), Some(comp_tok)) => {
-            if comp_tok < raw_tok {
-                // Strictly fewer tokens — keep compressed.
-                SavingsDecision::Keep
-            } else {
-                // Token tie or token-expansion even though bytes were shorter → Passthrough.
-                SavingsDecision::Passthrough
-            }
-        }
-        // Tokenizer unavailable: byte comparison says comp_t.len() < raw_t.len() → Keep.
-        _ => SavingsDecision::Keep,
+    use crate::output::fidelity::{FidelityDecision, decide};
+    match decide(raw, compressed) {
+        FidelityDecision::Keep => SavingsDecision::Keep,
+        FidelityDecision::Passthrough => SavingsDecision::Passthrough,
     }
 }
 
@@ -336,6 +188,7 @@ fn write_line_and_flush(out: &mut impl Write, s: &str) -> io::Result<()> {
 /// A [`StdoutStatus::PipeClosed`] result is *not* an error: callers must stop
 /// producing output and return [`pipe_closed_exit`] so the closed pipe never
 /// reports as exit `1`.
+#[allow(clippy::disallowed_methods)] // IS the foundational raw-passthrough sink; cmd/mod.rs policy terminus
 pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, StdoutStatus)> {
     let mut out = io::stdout().lock();
     let status = classify_write(write_and_flush(&mut out, raw, true))?;
@@ -374,6 +227,7 @@ pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, Stdou
 /// A closed downstream pipe returns [`StdoutStatus::PipeClosed`] rather than an
 /// error — see [`pipe_closed_code`] for why a broken pipe must never become
 /// exit `1`.
+#[allow(clippy::disallowed_methods)] // IS the centralized write_to_stdout channel; cmd/mod.rs policy terminus
 pub(crate) fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stdout().lock();
     Ok(classify_write(write_and_flush(&mut handle, s, false))?)
@@ -384,6 +238,7 @@ pub(crate) fn write_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
 ///
 /// Byte-identical to `println!`, including the newline it appends to a body that
 /// already ends in one; see [`write_line_and_flush`].
+#[allow(clippy::disallowed_methods)] // IS the centralized write_line_to_stdout channel; cmd/mod.rs policy terminus
 pub(crate) fn write_line_to_stdout(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stdout().lock();
     Ok(classify_write(write_line_and_flush(&mut handle, s))?)
@@ -406,6 +261,121 @@ pub(crate) fn write_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
 pub(crate) fn write_line_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
     let mut handle = io::stderr().lock();
     Ok(classify_write(write_line_and_flush(&mut handle, s))?)
+}
+
+// ============================================================================
+// JSON disclosure sink (D1 / ADR-015)
+// ============================================================================
+
+/// Named struct for the elision count threaded into [`emit_json_envelope`].
+///
+/// Replaces the anonymous `(usize, usize, &str)` tuple so field order is
+/// enforced by name rather than position.  Callers must use the named-field
+/// form — `ElidedCount { kept: …, total: …, unit: "lines" }` — so that
+/// transposing `kept` and `total` is a compile error rather than a silent
+/// semantic inversion of the ADR-011 class-1 marker.
+///
+/// The `cascade.rs` `TruncationOptions` struct applies this same remedy to
+/// its own adjacent same-typed `Option<usize>` fields.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ElidedCount {
+    /// Number of items actually emitted in the envelope.
+    pub(crate) kept: usize,
+    /// Total items the tool produced (kept + elided).
+    pub(crate) total: usize,
+    /// Singular/plural noun for the unit ("lines", "entries", …).
+    pub(crate) unit: &'static str,
+}
+
+/// Whether a JSON envelope is written with a trailing newline.
+///
+/// Load-bearing, not cosmetic: the `--json` exits do **not** agree on this
+/// today, and routing them through one sink must not move a single stdout byte.
+/// `render_output` writes its envelope through [`write_to_stdout`], which
+/// appends nothing; every other JSON exit uses `println!` semantics.  Making the
+/// choice an explicit parameter is what keeps both contracts intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LineTermination {
+    /// Append exactly one `\n` after the envelope (`println!` byte contract).
+    Newline,
+    /// Write the envelope verbatim, appending nothing.
+    None,
+}
+
+/// The single exit for every `--json` envelope: write it to stdout, then
+/// disclose on stderr when the caller declared the view [`Completeness::Lossy`].
+///
+/// # Why `completeness` is a required parameter
+///
+/// [`Completeness`] has no `Default`, so a new `--json` handler cannot reach
+/// this sink without choosing a value.  That is the type-level enforcement:
+/// "does this envelope contain everything the tool produced?" is a question the
+/// handler must answer, because a re-encoded envelope always differs textually
+/// from raw and `fidelity::view_differs` cannot answer it.
+///
+/// # What each declaration means
+///
+/// - [`Completeness::Complete`] / [`Completeness::Reencoded`] — nothing is
+///   written to stderr.  Not even an ADR-011 class-2 banner: the reader asked
+///   for JSON and got 100% of the content, so there is no unexpected internal
+///   decision to report.
+/// - [`Completeness::Lossy`] — an unconditional class-1 marker
+///   ([`crate::output::lossy_json_view_marker`]) naming the tool, the elided
+///   count when one exists, and the narrowest remedy that is actually true for
+///   this invocation ([`remedy_for`]).
+///
+/// `elided = Some(ElidedCount { kept, total, unit })` renders the countable
+/// wording when `kept < total`; `None` (or `kept >= total`) renders
+/// "summarised, not the full tool output".  Callers must use the named-field
+/// form — never `.into()` — so that field order is visible and verifiable at
+/// the call site.
+///
+/// A [`StdoutStatus::PipeClosed`] result suppresses the marker — the reader is
+/// gone, so there is nobody to disclose to — and callers must stop producing
+/// output and return [`pipe_closed_exit`].
+pub(crate) fn emit_json_envelope(
+    json: &str,
+    completeness: Completeness,
+    tool: &str,
+    elided: Option<ElidedCount>,
+    terminate: LineTermination,
+) -> anyhow::Result<StdoutStatus> {
+    let status = match terminate {
+        LineTermination::Newline => write_line_to_stdout(json)?,
+        LineTermination::None => write_to_stdout(json)?,
+    };
+
+    if status == StdoutStatus::Written && completeness == Completeness::Lossy {
+        // consistency-4 fix: META subcommands (log, proxy, …) have their own
+        // SKIM_PASSTHROUGH=1 handling (e.g. cmd/log.rs copies stdin→stdout).
+        // That makes SKIM_PASSTHROUGH=1 a literally-true remedy for them — even
+        // though `passthrough_strips_json(tool)` returns false (it applies to
+        // exec'd tool wrappers only, not to meta subcommands).
+        // Without this gate, `skim log --json` would emit:
+        //   "run 'log' directly for the full output"
+        // which on Linux is a no-op and on macOS invokes the unrelated
+        // /usr/bin/log (Apple unified logging). The correct remedy is
+        // SKIM_PASSTHROUGH=1, which the existing passthrough handler serves.
+        let passthrough_reproduces_argv = crate::cmd::registry::is_meta_subcommand(tool)
+            || super::dispatch::passthrough_strips_json(tool);
+        let remedy = remedy_for(&RemedyCtx {
+            tool,
+            output_format: OutputFormat::Json,
+            passthrough_reproduces_argv,
+        });
+        // ADR-011 class 1 — unconditional, never `debug_log!`.
+        // Use `write_line_to_stderr` instead of `eprintln!`: the latter panics
+        // on EPIPE (e.g. `skim log --json 2>&1 | head`) while the former
+        // returns a Result that we silently discard — stderr loss on a broken
+        // pipe is acceptable, a panic is not (regression-6).
+        let _ = write_line_to_stderr(&crate::output::lossy_json_view_marker(
+            tool,
+            elided.map(|e| (e.kept, e.total, e.unit)),
+            &remedy,
+        ));
+    }
+
+    Ok(status)
 }
 
 use super::{is_passthrough_mode, read_stdin_bounded, should_read_stdin};
@@ -532,6 +502,45 @@ pub(crate) struct ParsedCommandConfig<'a> {
     ///
     /// Default: `None`.
     pub synthesize_success_line: Option<&'a str>,
+    /// Pre-captured bytes of the user's literal (uninjected) command output.
+    ///
+    /// When `Some`, replaces `output.stdout` (the injected command's output) as:
+    ///
+    /// (a) The guard baseline in `savings_decision` — the comparison target that
+    ///     determines whether compressed output is strictly smaller than what the
+    ///     user's command would have produced.
+    ///
+    /// (b) The guard's raw fallback emission — what is written to stdout when the
+    ///     guard decides compressed output is no shorter.
+    ///
+    /// (c) The `SKIM_PASSTHROUGH=1` escape hatch — emitted verbatim instead of
+    ///     streaming the (potentially injected) command when set.
+    ///
+    /// Only set for **read-only / idempotent** handlers where re-running the
+    /// user's literal command has no side effects.  Handlers that inject
+    /// side-effecting flags (e.g. `black --check` suppresses file writes) MUST
+    /// NOT set this field — streaming the injected command is the correct
+    /// `SKIM_PASSTHROUGH=1` behavior for those handlers and the guard must
+    /// treat the injected output as the baseline.
+    ///
+    /// Default: `None` (guard operates on `output.stdout`; passthrough streams
+    /// the injected command unchanged — pre-fix behavior).
+    pub raw_override: Option<String>,
+    /// When `true`, SKIM_PASSTHROUGH=1 does NOT bypass this handler's parse_impl.
+    ///
+    /// Normally, `SKIM_PASSTHROUGH=1` bypasses all compression and streams the
+    /// raw tool output directly to stdout.  For handlers where the parse_impl
+    /// is a **security control** (not just a compression step), bypassing it would
+    /// violate a non-negotiable invariant.
+    ///
+    /// Currently set for: `env` / `printenv` — credential redaction (PF-012).
+    ///
+    /// PF-012 rationale: a security control that holds on only ONE branch of a
+    /// conditional is not a control.  `skim env` MUST redact credential values
+    /// regardless of byte arithmetic or passthrough mode.
+    ///
+    /// Default: `false` (passthrough bypasses parse_impl as normal).
+    pub never_passthrough: bool,
 }
 
 /// How a child process's exit status should steer output handling. (#317)
@@ -647,15 +656,36 @@ where
 
 /// Render parsed result to stdout, returning the output string for analytics
 /// and whether the reader was still attached.
+///
+/// `tool` is the program name, needed only on the JSON path so the disclosure
+/// marker can name the tool and resolve the narrowest true remedy.
+///
+/// # Byte contract (D1 / R1)
+///
+/// This sink has always written its JSON envelope through [`write_to_stdout`],
+/// which appends **nothing** — unlike every other `--json` exit, which uses
+/// `println!` semantics.  Routing through [`emit_json_envelope`] preserves that
+/// by passing [`LineTermination::None`]; changing it would move stdout bytes on
+/// every parsed-command `--json` invocation.
 fn render_output<T>(
     result: &ParseResult<T>,
     output_format: OutputFormat,
+    tool: &str,
 ) -> anyhow::Result<(String, StdoutStatus)>
 where
     T: AsRef<str> + serde::Serialize,
 {
     let s = serialize_output(result, output_format)?;
-    let status = write_to_stdout(&s)?;
+    let status = match output_format {
+        // ADR-015 / D1 declaration — derived, not hand-written: the tier already
+        // answers it.  `Passthrough(raw)` re-encodes the tool's bytes verbatim
+        // (`Reencoded`); `Full`/`Degraded` carry a parser's summary of them
+        // (`Lossy`).  See `ParseResult::completeness`.
+        OutputFormat::Json => {
+            emit_json_envelope(&s, result.completeness(), tool, None, LineTermination::None)?
+        }
+        OutputFormat::Text => write_to_stdout(&s)?,
+    };
     Ok((s, status))
 }
 
@@ -686,6 +716,7 @@ where
 /// The `SKIM_PASSTHROUGH=1` escape hatch over a *spawned* child uses
 /// [`stream_passthrough_raw`] instead, which reproduces this byte contract
 /// exactly while streaming.
+#[allow(clippy::disallowed_methods)] // Low-level raw passthrough; within the foundational output infrastructure
 fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     let code = output.exit_code.unwrap_or(1);
     {
@@ -736,7 +767,8 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 /// Child's own code on clean EOF; [`pipe_closed_exit`] (`141` on unix) when the
 /// reader closes the pipe. **Never `1` on pipe closure** — for `grep`/`rg`/`diff`
 /// exit 1 is the wire protocol for "no matches found".
-fn stream_passthrough_raw(
+#[allow(clippy::disallowed_methods)] // Streaming passthrough sink; too large to buffer, must stream byte-by-byte
+pub(crate) fn stream_passthrough_raw(
     program: &str,
     args: &[String],
     env_overrides: &[(&str, &str)],
@@ -980,6 +1012,8 @@ where
         forward_stderr,
         skip_net_savings_guard,
         synthesize_success_line,
+        raw_override,
+        never_passthrough,
     } = config;
 
     // Passthrough mode: bypass all compression and forward raw output.
@@ -990,8 +1024,24 @@ where
     // non-UTF-8 bytes to U+FFFD, and cannot deliver anything until the child
     // exits.  Branching after it would inherit all three defects no matter how
     // the bytes were subsequently written.  Streaming here is what removes them.
-    let passthrough = is_passthrough_mode();
+    //
+    // `never_passthrough = true` (PF-012) permanently disables this shortcut for
+    // handlers where parse_impl is a security control (e.g. `env` / `printenv`
+    // credential redaction).  SKIM_PASSTHROUGH=1 bypasses compression, not
+    // non-negotiable safety properties.
+    let passthrough = is_passthrough_mode() && !never_passthrough;
     if passthrough && !use_stdin {
+        // A1: when the handler pre-captured the user's literal command output,
+        // emit those bytes instead of streaming the (potentially injected) command.
+        // raw_override = None falls through to the original streaming path so
+        // handlers that did not set it see no behavior change.
+        if let Some(ref raw) = raw_override {
+            let (_, status) = emit_raw_passthrough(raw)?;
+            if status == StdoutStatus::PipeClosed {
+                return Ok(pipe_closed_exit());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
         return stream_passthrough_raw(program, args, env_overrides, install_hint);
     }
 
@@ -1142,12 +1192,25 @@ where
         if output_format == OutputFormat::Json {
             let val = serde_json::json!({"tier": "passthrough", "raw": &output.stdout});
             let mut json_str = serde_json::to_string(&val)?;
-            if !json_str.ends_with('\n') {
-                json_str.push('\n');
-            }
-            if write_to_stdout(&json_str)? == StdoutStatus::PipeClosed {
+            // ADR-015 / D1 declaration — `Reencoded`.  The envelope embeds
+            // `output.stdout` verbatim as a JSON string, so every byte the tool
+            // produced reaches the reader; only the framing differs.
+            //
+            // `LineTermination::Newline` reproduces the manual `push('\n')` this
+            // site used to do before writing: `serde_json::to_string` never ends
+            // in a newline, so exactly one was always appended.
+            if emit_json_envelope(
+                &json_str,
+                Completeness::Reencoded,
+                program,
+                None,
+                LineTermination::Newline,
+            )? == StdoutStatus::PipeClosed
+            {
                 return Ok(pipe_closed_exit());
             }
+            // The analytics string must still carry the newline that was written.
+            json_str.push('\n');
             (json_str, tier_name)
         } else {
             let (tier, status) = emit_raw_passthrough(&output.stdout)?;
@@ -1161,7 +1224,15 @@ where
         && !skip_net_savings_guard
     {
         let compressed_str = serialize_output(&result, output_format)?;
-        match savings_decision(&output.stdout, &compressed_str) {
+        // A1: use the user's literal command output as the guard baseline when
+        // the handler pre-captured it (`raw_override = Some`).  Without this,
+        // a handler that injects flags (e.g. `git status --porcelain=v2`) would
+        // compare compressed output against the injected command's stdout, not
+        // against what the user's literal command would have produced — so an
+        // "expansion" relative to the user's command could pass the guard while
+        // a genuine "compression" could fail it.
+        let guard_raw: &str = raw_override.as_deref().unwrap_or(&output.stdout);
+        match savings_decision(guard_raw, &compressed_str) {
             SavingsDecision::Keep => {
                 if write_to_stdout(&compressed_str)? == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
@@ -1172,17 +1243,20 @@ where
                 // Emit raw verbatim; record analytics under "passthrough" tier
                 // so `should_emit_compressed_hint` stays silent (passthrough tier
                 // never gets the hint — the body is already verbatim raw).
-                let raw = &output.stdout;
-                let (tier, status) = emit_raw_passthrough(raw)?;
+                // A1: emit user's literal output when available, not the injected
+                // command's stdout — the fallback must show what the user expected
+                // to see, not skim's internal machine-readable representation.
+                let emit_raw: &str = raw_override.as_deref().unwrap_or(&output.stdout);
+                let (tier, status) = emit_raw_passthrough(emit_raw)?;
                 if status == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
                 }
-                (raw.clone(), tier)
+                (emit_raw.to_owned(), tier)
             }
         }
     } else {
         // JSON or Passthrough(String): write normally, no guard needed.
-        let (s, status) = render_output(&result, output_format)?;
+        let (s, status) = render_output(&result, output_format, program)?;
         if status == StdoutStatus::PipeClosed {
             return Ok(pipe_closed_exit());
         }
@@ -1326,6 +1400,25 @@ pub(crate) struct ToolRunConfig<'a> {
     ///
     /// Default: `None`.
     pub injected_format_flag: Option<&'a str>,
+    /// Pre-captured bytes of the user's literal (uninjected) command output.
+    ///
+    /// See [`ParsedCommandConfig::raw_override`] for full rationale.
+    ///
+    /// Only set for **read-only / idempotent** handlers where re-running the
+    /// user's literal command has no side effects.  Handlers that inject
+    /// side-effecting flags (e.g. `black --check` suppresses file writes) must
+    /// leave this `None`.
+    ///
+    /// Default: `None`.
+    pub raw_override: Option<String>,
+    /// Prevent SKIM_PASSTHROUGH=1 from bypassing this handler's parse_impl.
+    ///
+    /// See [`ParsedCommandConfig::never_passthrough`] for full rationale.
+    /// Set to `true` only for handlers where parse_impl is a security control
+    /// (currently: `env` / `printenv` credential redaction — PF-012).
+    ///
+    /// Default: `false`.
+    pub never_passthrough: bool,
 }
 
 /// Returns the line to synthesize when skim's format-flag injection caused
@@ -1411,6 +1504,8 @@ where
             forward_stderr: config.forward_stderr,
             skip_net_savings_guard: config.skip_net_savings_guard,
             synthesize_success_line: effective_success_line,
+            raw_override: config.raw_override,
+            never_passthrough: config.never_passthrough,
         },
         parse_fn,
     )
@@ -1423,6 +1518,135 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concrete fn-pointer type for [`emit_json_envelope`]; named here to keep
+    /// the coercion in the signature-pin test readable and to satisfy the
+    /// `clippy::type_complexity` lint.
+    type JsonSink = fn(
+        &str,
+        Completeness,
+        &str,
+        Option<ElidedCount>,
+        LineTermination,
+    ) -> anyhow::Result<StdoutStatus>;
+
+    // ========================================================================
+    // D1 — the JSON disclosure sink's signature is the enforcement
+    //
+    // `rskim` is bin-only (no `src/lib.rs`), so doctests never run and
+    // `trybuild` cannot link against `pub(crate)` items.  A coercion to a
+    // concrete `fn` pointer is therefore the available compile-level pin: it
+    // fails to build if `emit_json_envelope` is deleted (E0425), if the
+    // `Completeness` parameter is dropped, or if the line-termination
+    // parameter is removed.  This makes `emit_json_envelope` the only
+    // *declared* way to write a `--json` envelope: a handler that
+    // bypasses it via `println!` or `write!(stdout, …)` outside
+    // `execution.rs` would not be caught by this compile-level pin.
+    // ========================================================================
+
+    /// Pins the exact signature of [`emit_json_envelope`].
+    ///
+    /// The `Completeness` parameter is the whole point of D1: it has no
+    /// `Default`, so it cannot be elided at a call site, and this coercion means
+    /// it cannot be elided from the signature either without a compile error.
+    #[test]
+    fn emit_json_envelope_signature_requires_completeness_and_termination() {
+        // The coercion is the compile-level assertion: it is a type error unless
+        // `emit_json_envelope` has exactly this shape.
+        let sink: JsonSink = emit_json_envelope;
+
+        // Exercise the coercion on the zero-byte, nothing-to-disclose path:
+        // an empty envelope with `LineTermination::None` writes no stdout bytes,
+        // and `Reencoded` writes no stderr marker.
+        let status = sink(
+            "",
+            Completeness::Reencoded,
+            "git",
+            None,
+            LineTermination::None,
+        )
+        .expect("empty Reencoded envelope must not fail");
+        assert_eq!(status, StdoutStatus::Written);
+    }
+
+    /// `LineTermination` must keep both arms distinct — collapsing them would
+    /// silently add or remove a trailing newline on one of the JSON exits.
+    #[test]
+    fn line_termination_arms_are_distinct() {
+        assert_ne!(LineTermination::Newline, LineTermination::None);
+    }
+
+    // ========================================================================
+    // ElidedCount — ADR-011 class-1 marker wording
+    //
+    // These tests mirror the two migrated call sites:
+    //   cmd/log.rs  — Some(ElidedCount { kept: entries.len(), total: total_lines, unit: "lines" })
+    //   cmd/git/log.rs — Some(ElidedCount { kept, total, unit: "lines" })
+    //
+    // The marker wording is decided inside `lossy_json_view_marker`
+    // (crate::output) using the `(kept, total, unit)` tuple that
+    // `emit_json_envelope` derives from an `ElidedCount` via
+    // `.map(|e| (e.kept, e.total, e.unit))`.  Exercising that path here
+    // ensures the named-field form at the call site produces the correct output.
+    // ========================================================================
+
+    /// `ElidedCount` with `kept < total` renders the countable form of the
+    /// ADR-011 class-1 marker: exact omission delta and kept/total pair.
+    ///
+    /// This mirrors the `cmd/log.rs` call site:
+    /// `Some(ElidedCount { kept: r.entries.len(), total: r.total_lines, unit: "lines" })`
+    /// and the `cmd/git/log.rs` call site:
+    /// `Some(ElidedCount { kept, total, unit: "lines" })`.
+    #[test]
+    fn elided_count_countable_form_when_kept_lt_total() {
+        let elided = ElidedCount {
+            kept: 3,
+            total: 44,
+            unit: "lines",
+        };
+        let marker = crate::output::lossy_json_view_marker(
+            "git",
+            Some((elided.kept, elided.total, elided.unit)),
+            "SKIM_PASSTHROUGH=1 for full output",
+        );
+        assert!(
+            marker.contains("41 lines omitted"),
+            "countable form must name the delta (total - kept); got: {marker:?}"
+        );
+        assert!(
+            marker.contains("(3 of 44 shown)"),
+            "countable form must name kept/total pair; got: {marker:?}"
+        );
+    }
+
+    /// `ElidedCount` with `kept >= total` (no actual elision) renders the
+    /// countless form: "summarised, not the full tool output".
+    ///
+    /// The countless branch fires when `kept >= total` — the condition inside
+    /// `lossy_json_view_marker`.  `None` also reaches it, but this test
+    /// verifies the struct-based path so a future refactor of the tuple
+    /// conversion cannot silently swap `kept` and `total` and pass.
+    #[test]
+    fn elided_count_countless_form_when_kept_eq_total() {
+        let elided = ElidedCount {
+            kept: 44,
+            total: 44,
+            unit: "lines",
+        };
+        let marker = crate::output::lossy_json_view_marker(
+            "log",
+            Some((elided.kept, elided.total, elided.unit)),
+            "SKIM_PASSTHROUGH=1 for full output",
+        );
+        assert!(
+            marker.contains("summarised, not the full tool output"),
+            "countless form must use 'summarised' wording; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("omitted"),
+            "countless form must not claim items were omitted; got: {marker:?}"
+        );
+    }
 
     // ========================================================================
     // Closed-downstream-pipe contract (A0)
@@ -2150,7 +2374,7 @@ mod tests {
         );
         // Sanity: all non-ws runs are 1 byte (run guard must NOT fire).
         assert!(
-            longest_nonwhitespace_run(&compressed) < 4 * 1024,
+            crate::output::fidelity::longest_nonwhitespace_run(&compressed) < 4 * 1024,
             "compressed non-ws run must be < 4 KiB to keep token path"
         );
         // Both below the size cap.
@@ -2243,6 +2467,123 @@ mod tests {
             "256 KiB single-run decision took {}ms — run guard must skip tokenization \
              (full tokenization path costs ~3 s; 500 ms bound proves it was skipped)",
             elapsed.as_millis()
+        );
+    }
+
+    // ========================================================================
+    // A1: raw_override guard baseline semantics
+    //
+    // These tests verify that `savings_decision` is called with the correct
+    // baseline — the user's literal command output — when raw_override is set.
+    //
+    // Context: before A1, the guard compared compressed output against the
+    // INJECTED command's stdout (e.g. `git status --porcelain=v2 --branch`
+    // rather than the user's `git status`).  This meant:
+    //   - On a small clean repo, `--porcelain=v2 --branch` produces ~60 B of
+    //     machine-readable headers while the user's `git status` produces ~40 B
+    //     of human-readable output.  A compressed GitResult might be 20 B — which
+    //     is strictly smaller than the porcelain baseline (60 B) so the guard said
+    //     KEEP.  But it is NOT smaller than the user baseline (40 B), so the
+    //     guard SHOULD say KEEP in that case too... wait, 20 < 40 so the guard
+    //     is actually correct.  The problem scenario is when compressed ≥ user-
+    //     baseline but < injected-baseline.
+    //
+    // The tests below document the property by testing `savings_decision` directly
+    // with representative baseline pairs: they verify the conservative tie→Passthrough
+    // rule that `run_parsed_command_with_exit` relies on when `raw_override` is set.
+    // ========================================================================
+
+    /// A1 property: when the guard baseline is the user's literal command output
+    /// (raw_override set) and compressed equals that baseline, the result is
+    /// Passthrough (tie rule — not strictly smaller).
+    ///
+    /// Without A1, the guard would compare against the injected command's output,
+    /// which might be larger, causing a spurious Keep even when the compressed
+    /// output is no smaller than what the user would have seen.
+    #[test]
+    fn a1_guard_baseline_tie_gives_passthrough() {
+        // Simulated user baseline: human-readable `git status` output (~40 bytes).
+        let user_baseline = "On branch main\nnothing to commit, working tree clean\n";
+        // Simulated compressed output: equal size to user baseline — a tie.
+        // The guard must say Passthrough (conservative: strictly-smaller-to-keep).
+        let compressed_equal = user_baseline; // exactly equal bytes
+        assert_eq!(
+            savings_decision(user_baseline, compressed_equal),
+            SavingsDecision::Passthrough,
+            "A1: tie against user baseline → Passthrough (guard must not favor injected-form)"
+        );
+    }
+
+    /// A1 property: when the guard baseline is the user's literal command output
+    /// and compressed is strictly smaller, Keep is correct.
+    #[test]
+    fn a1_guard_baseline_smaller_gives_keep() {
+        let user_baseline =
+            "On branch main\nChanges not staged for commit:\n  modified: src/main.rs\n\n";
+        // Skim compresses to a one-liner — strictly smaller.
+        let compressed = "1 modified\n";
+        assert_eq!(
+            savings_decision(user_baseline, compressed),
+            SavingsDecision::Keep,
+            "A1: compressed strictly smaller than user baseline → Keep"
+        );
+    }
+
+    /// A1 property: raw_override field exists on ParsedCommandConfig with the
+    /// correct type.  This is a compile-time guard — the test only runs to confirm
+    /// the struct can be constructed with the field set.
+    #[test]
+    fn a1_parsed_command_config_has_raw_override_field() {
+        // This test is primarily a compile check: if raw_override is removed or
+        // renamed, this fails to compile before it fails at runtime.
+        let override_bytes = "user literal output\n".to_string();
+        let _ = ParsedCommandConfig {
+            program: "test-tool",
+            args: &[],
+            env_overrides: &[],
+            install_hint: "",
+            use_stdin: false,
+            show_stats: false,
+            output_format: crate::cmd::OutputFormat::Text,
+            family: "test",
+            skip_ansi_strip: false,
+            rec: crate::analytics::RecordingContext {
+                enabled: false,
+                command_type: crate::analytics::CommandType::FileOps,
+                parse_tier: None,
+                session_id: None,
+            },
+            expected_exit_codes: &[],
+            forward_stderr: false,
+            skip_net_savings_guard: false,
+            synthesize_success_line: None,
+            raw_override: Some(override_bytes),
+            never_passthrough: false,
+        };
+        // If we reach here, the field exists and accepts an owned String.
+    }
+
+    /// A1 property: ToolRunConfig has raw_override field with correct type.
+    #[test]
+    fn a1_tool_run_config_has_raw_override_field() {
+        let config = ToolRunConfig {
+            program: "test",
+            env_overrides: &[],
+            install_hint: "",
+            family: "test",
+            skip_ansi_strip: false,
+            command_type: crate::analytics::CommandType::FileOps,
+            expected_exit_codes: &[],
+            forward_stderr: false,
+            skip_net_savings_guard: false,
+            synthesize_success_line: None,
+            injected_format_flag: None,
+            raw_override: Some("user output\n".to_string()),
+            never_passthrough: false,
+        };
+        assert!(
+            config.raw_override.is_some(),
+            "ToolRunConfig.raw_override must accept Some(String)"
         );
     }
 }

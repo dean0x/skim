@@ -45,13 +45,13 @@ pub(crate) fn run(
         "audit" => run_audit(subcmd_args, show_stats, json_output, rec),
         "outdated" => run_outdated(subcmd_args, show_stats, json_output, rec),
         other => {
+            // D2: unknown pnpm subcommands (add, remove, dlx, exec, …) are forwarded
+            // to the real pnpm binary. Banner is debug-gated per ADR-011 (lossless).
             let safe = crate::cmd::sanitize_for_display(other);
-            eprintln!(
-                "skim pnpm: unknown subcommand '{safe}'\n\
-                 Available: install, audit, outdated\n\
-                 Run 'skim pnpm --help' for usage"
-            );
-            Ok(ExitCode::FAILURE)
+            crate::debug_log!("skim pnpm: unknown subcommand '{safe}' — passing through to pnpm");
+            let mut all_args: Vec<String> = vec![other.to_string()];
+            all_args.extend_from_slice(subcmd_args);
+            crate::cmd::run_raw_passthrough("pnpm", &all_args, &[])
         }
     }
 }

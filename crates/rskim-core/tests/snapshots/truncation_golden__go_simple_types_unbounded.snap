@@ -1,0 +1,13 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Types))"
+---
+type Calculator struct {
+    value int
+}
+
+type Computer interface {
+    Compute(x int) int
+}
+
+type Status int

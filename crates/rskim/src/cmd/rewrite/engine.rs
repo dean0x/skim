@@ -142,6 +142,12 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
         // be present somewhere after the prefix.  Used to distinguish
         // `psql -c "SQL"` (batch, safe to rewrite) from `psql -h host -d db`
         // (interactive, must not rewrite).
+        //
+        // Uses `super::arg_matches_flag` so both the exact form (`-c`) and the
+        // `--flag=value` equals form (`--command='SELECT 1'`) are recognised.
+        // This closes the consistency-5 gap where the wrapper surface accepted
+        // `--command='SELECT 1'` via `starts_with` while the rewrite surface
+        // only accepted it as exact-token `--command`.
         if !rule.require_flag.is_empty() {
             let all_tokens_after_cmd = if strict_match {
                 middle
@@ -151,9 +157,11 @@ pub(super) fn try_rewrite(tokens: &[&str]) -> Option<RewriteResult> {
                 // also considered.
                 &before_sep[1..]
             };
-            let has_required = all_tokens_after_cmd
-                .iter()
-                .any(|tok| rule.require_flag.iter().any(|f| tok == f));
+            let has_required = all_tokens_after_cmd.iter().any(|&tok| {
+                rule.require_flag
+                    .iter()
+                    .any(|&f| super::arg_matches_flag(tok, f))
+            });
             if !has_required {
                 skipped = true;
                 continue;

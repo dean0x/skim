@@ -44,7 +44,9 @@ pub(crate) fn run(
             // Unknown subcommand → raw passthrough. Don't compress things we
             // don't understand (e.g., `yarn build`, `yarn run dev`).
             let safe = crate::cmd::sanitize_for_display(other);
-            eprintln!("skim yarn: unknown subcommand '{safe}' — passing through to yarn");
+            // D2/ADR-011: banner is debug-gated — this is a no-loss raw-fallback
+            // path (skim passes through to the real tool byte-faithfully).
+            crate::debug_log!("skim yarn: unknown subcommand '{safe}' — passing through to yarn");
             let mut all_args: Vec<String> = vec![other.to_string()];
             all_args.extend_from_slice(subcmd_args);
             crate::cmd::run_raw_passthrough("yarn", &all_args, &[])

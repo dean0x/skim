@@ -23,6 +23,7 @@ use rayon::prelude::*;
 use crate::cmd::execution as exec;
 use crate::cmd::{OutputFormat, extract_output_format, user_has_flag};
 use crate::output::canonical::{DiffFileEntry, DiffResult};
+use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
 use super::{finalize_git_output_owned, map_exit_code, run_passthrough};
@@ -198,10 +199,34 @@ fn render_and_format<'a>(
             skip_ast,
             false,
         );
+        // D3 (issue #510): carry raw hunk content so --json consumers get the
+        // full patch body.  Reconstruct each hunk header from the parsed fields
+        // (old/new start + count) and append the original patch lines verbatim.
+        //
+        // This is what lets the emit site below declare
+        // [`Completeness::Reencoded`] — all hunk content is faithfully carried
+        // in a different encoding, so ADR-011 class-1 disclosure is not owed.
+        let patch = {
+            use std::fmt::Write as _;
+            let mut buf = String::new();
+            for hunk in &file_diff.hunks {
+                let _ = writeln!(
+                    buf,
+                    "@@ -{},{} +{},{} @@",
+                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                );
+                for line in &hunk.patch_lines {
+                    buf.push_str(line);
+                    buf.push('\n');
+                }
+            }
+            if buf.is_empty() { None } else { Some(buf) }
+        };
         let entry = DiffFileEntry {
             path: file_diff.path.clone(),
             status: file_diff.status.clone(),
             changed_regions: file_diff.hunks.len(),
+            patch,
         };
         (rendered, entry)
     };
@@ -233,7 +258,29 @@ fn render_and_format<'a>(
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize diff result: {e}"))?;
-            let status = exec::write_line_to_stdout(&json)?;
+            // ADR-015 / D1 declaration — derived, not hard-coded.
+            //
+            // When every file entry carries a `patch` body (`DiffFileEntry::patch`
+            // is `Some`), all hunk content is faithfully re-encoded and no
+            // disclosure is owed (`Reencoded`).
+            //
+            // Binary files, 100%-similarity renames, and `old mode`/`new mode`-only
+            // changes produce no `@@` hunks, so `patch` is `None` — that IS a real
+            // information drop (git's "Binary files … differ" or the mode lines
+            // are silently absent from the JSON) and requires an ADR-011 class-1
+            // disclosure (`Lossy`).
+            let completeness = if result.files.iter().all(|f| f.patch.is_some()) {
+                Completeness::Reencoded
+            } else {
+                Completeness::Lossy
+            };
+            let status = exec::emit_json_envelope(
+                &json,
+                completeness,
+                "git",
+                None,
+                exec::LineTermination::Newline,
+            )?;
             return Ok((json, status));
         }
         OutputFormat::Text => {
@@ -350,20 +397,58 @@ pub(super) fn run_diff(
         let file_diffs = parse_unified_diff(&raw_diff);
 
         if file_diffs.is_empty() {
-            eprintln!("No changes");
-            // This branch is only hit when parse_unified_diff returns an empty vec
-            // despite raw_diff being non-empty (malformed diff). Keep a consistent
-            // analytics record identical to the trim-is-empty branch above.
-            // Drop file_diffs first so the borrow on raw_diff ends, then move
-            // raw_diff into the passthrough variant (PF-018 resolution).
+            // The unified diff parser produced no files despite non-empty raw output.
+            // This happens when git is invoked with a flag that produces non-unified
+            // output (e.g., `--raw`, `--dirstat`, `--word-diff`).
+            //
+            // Drop file_diffs first so the borrow on raw_diff ends, then move it
+            // into the output path and analytics (PF-018 resolution).
             drop(file_diffs);
-            super::finalize_git_output_passthrough(
-                raw_diff,
-                label,
-                show_stats,
-                rec.with_tier("degraded"),
-                duration,
-            );
+            match output_format {
+                OutputFormat::Json => {
+                    // Emit a valid JSON envelope so --json callers always get
+                    // parseable output regardless of which git flags were used.
+                    // The raw text is embedded under "raw" — no information is
+                    // dropped, so Reencoded is the correct declaration.
+                    let json = {
+                        let envelope = serde_json::json!({"files": [], "raw": &raw_diff});
+                        serde_json::to_string_pretty(&envelope).map_err(|e| {
+                            anyhow::anyhow!("failed to serialize empty-parse result: {e}")
+                        })?
+                    };
+                    if exec::emit_json_envelope(
+                        &json,
+                        Completeness::Reencoded,
+                        "git",
+                        None,
+                        exec::LineTermination::Newline,
+                    )? == exec::StdoutStatus::PipeClosed
+                    {
+                        return Ok(exec::pipe_closed_exit());
+                    }
+                    super::finalize_git_output_passthrough(
+                        raw_diff,
+                        label,
+                        show_stats,
+                        rec.with_tier("passthrough"),
+                        duration,
+                    );
+                }
+                OutputFormat::Text => {
+                    // Serve raw bytes verbatim so the caller sees what git
+                    // actually produced (#317 compress-never-truncate).
+                    if exec::write_to_stdout(&raw_diff)? == exec::StdoutStatus::PipeClosed {
+                        return Ok(exec::pipe_closed_exit());
+                    }
+                    super::finalize_git_output_passthrough(
+                        raw_diff,
+                        label,
+                        show_stats,
+                        rec.with_tier("passthrough"),
+                        duration,
+                    );
+                }
+            }
             return Ok(ExitCode::SUCCESS);
         }
 

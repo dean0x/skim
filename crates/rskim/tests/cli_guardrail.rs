@@ -97,7 +97,7 @@ fn test_guardrail_triggers_when_output_inflates() {
     let file = dir.path().join("inflating.ts");
 
     // Each line is ~18 bytes: `function XX() { }\n`
-    // 20 functions = ~360 bytes raw (above MIN_RAW_SIZE_FOR_GUARDRAIL of 256)
+    // 20 functions = ~360 bytes raw (well above the guardrail activation size).
     // Each function body `{ }` (3 bytes) -> ` {...}` (6 bytes) = +3 bytes
     // Total output growth: 20 * 3 = 60 extra bytes -> ~420 bytes output vs ~360 raw
     let mut source = String::new();
@@ -136,8 +136,7 @@ fn test_guardrail_triggers_when_output_inflates() {
 #[test]
 fn test_guardrail_fires_silently_without_debug() {
     // Identical inflating source to test_guardrail_triggers_when_output_inflates:
-    // 20 functions with empty bodies inflate under --mode=structure above the
-    // MIN_RAW_SIZE_FOR_GUARDRAIL threshold.
+    // 20 functions with empty bodies inflate under --mode=structure (guardrail fires).
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("inflating.ts");
 

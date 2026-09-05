@@ -8,9 +8,11 @@
 //!   position, Rust `-> T` via normal recursion since Rust has no strip_kinds for
 //!   return types)
 //!
-//! For Python and TypeScript, parameter, variable, and property type annotations are
-//! still stripped. Rust preserves parameter types (pseudo mode strips only lifetimes,
-//! type parameters, where clauses, and attributes for Rust).
+//! For Python, parameter and variable type annotations are still stripped.
+//! TypeScript preserves parameter type annotations (ADR-007); only decorator,
+//! `readonly`, and `abstract` are stripped alongside variable/property `type_annotation`.
+//! Rust strips lifetimes, type parameters, where clauses, and attribute items only;
+//! `mutable_specifier` is preserved as it is part of the function's API surface.
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
 //! Token reduction target: 30-50%
@@ -35,6 +37,9 @@
 //! called on a node you already hold descends *into* that node and is cheap; it is
 //! `parent()` in front of it that pays the root descent.
 
+use crate::transform::literals::{
+    collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges,
+};
 use crate::transform::truncate::NodeSpan;
 use crate::{Language, Result, SkimError, TransformConfig};
 use tree_sitter::{Node, Tree};
@@ -210,10 +215,8 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 /// Type annotations and decorators are NOT inline modifiers — their trailing spaces
 /// may belong to surrounding syntax (e.g., `: number = 42`).
 fn is_inline_modifier_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "lifetime" | "mutable_specifier" | "readonly" | "abstract"
-    )
+    // `mutable_specifier` was removed because it is no longer stripped (E2.4).
+    matches!(kind, "lifetime" | "readonly" | "abstract")
 }
 
 /// Per-language rules for what constitutes "noise" in pseudo mode
@@ -232,9 +235,12 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
     match language {
         Language::TypeScript => PseudoRules {
             strip_kinds: &[
+                // `type_annotation` is stripped for variable/property positions; parameter
+                // annotations are preserved via a guard in collect_noise_ranges (ADR-007).
                 "type_annotation",
-                "type_parameters",
-                "type_arguments",
+                // `type_parameters` and `type_arguments` were removed so generic signatures
+                // like `identity<T>` and call-sites like `Migration<'a'>` survive intact
+                // (E2.2/E2.3 — declaration/use-site consistency).
                 "decorator",
                 "readonly",
                 "abstract",
@@ -271,7 +277,8 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
                 "type_parameters",
                 "where_clause",
                 "attribute_item",
-                "mutable_specifier",
+                // "mutable_specifier" intentionally NOT listed — `&mut self` and `&mut T`
+                // convey mutation intent and are part of the function's API surface (E2.4).
             ],
             strip_keywords: &[],
             strip_semicolons: true,
@@ -466,54 +473,64 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     };
     // The root has no parent, no previous sibling and no field name — exactly
     // `WalkPosition::default()`. Every deeper position is supplied by the caller's
-    // child loop.
+    // child loop.  `in_for_header` starts false at the root.
     collect_noise_ranges(
         tree.root_node(),
         &mut ctx,
         &rules,
         0,
         false,
+        false,
         WalkPosition::default(),
     )?;
-
-    // Sort, dedup, and adjust ranges for full line removal
-    ctx.ranges.sort_unstable_by_key(|&(start, _)| start);
-    ctx.ranges.dedup();
 
     // Precompute the newline offset table so adjust_range_for_line_removal
     // resolves line boundaries in O(log N) (binary search) instead of O(start)
     // (rfind scan), reducing the total from O(N²) to O(N log N) across N ranges.
     let newlines = build_newline_table(source);
 
-    let mut final_ranges: Vec<(usize, usize)> = ctx
-        .ranges
-        .iter()
-        .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
-        .collect();
-
-    // Re-sort after adjustment (line-level adjustments can change ordering)
-    final_ranges.sort_unstable_by_key(|&(start, _)| start);
-
+    // Adjust ranges for full-line removal, then merge to produce a sorted,
+    // non-overlapping set.  merge_ranges handles overlaps that line-level
+    // adjustment introduces (adjacent AST nodes that expand to the same line)
+    // and exact duplicates — satisfying map_ranges_to_output's precondition.
+    let final_ranges: Vec<(usize, usize)> = merge_ranges(
+        ctx.ranges
+            .iter()
+            .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
+            .collect(),
+    );
     // Compute the source line map from the byte-level removal ranges.
     // Must be done before remove_ranges, using the ranges themselves, so that
     // modified lines (e.g. `def f(a: int):` → `def f(a):`) still map to their
     // correct source line rather than getting source_line=0 from text matching.
     let line_map_after_removal = compute_line_map_from_removed_ranges(source, &final_ranges);
 
+    // Collect literal-fragment ranges from the source tree before removal.
+    // These are mapped to post-removal coordinates so that collapse_whitespace
+    // and trim_and_normalize can skip whitespace normalisation inside literals.
+    let literal_ranges = collect_literal_ranges(tree, language)?;
+    let protected_in_result = map_ranges_to_output(&literal_ranges, &final_ranges);
+
     let result = remove_ranges(source, &final_ranges)?;
 
     // Post-process — collapse whitespace artifacts and normalize.
     // collapse_whitespace is line-count-preserving (works within lines only).
-    let result = collapse_whitespace(&result);
+    // Returns the collapsed string AND the protected ranges in output coordinates
+    // (needed by trim_and_normalize and normalize_line_map_blanks).
+    let (result, protected_after_collapse) = collapse_whitespace(&result, &protected_in_result);
     // trim_and_normalize may drop lines when there are 3+ consecutive blanks.
     // Capture the text before that step so normalize_line_map_blanks can replay
     // the same logic to keep the line map in sync.
     let pre_normalized = result;
-    let result = trim_and_normalize(&pre_normalized);
+    let result = trim_and_normalize(&pre_normalized, &protected_after_collapse);
 
     // Mirror trim_and_normalize's blank-line dropping on the line map so the
     // two stay in sync (3+ consecutive blank lines → drop beyond 2).
-    let line_map = normalize_line_map_blanks(&pre_normalized, line_map_after_removal);
+    let line_map = normalize_line_map_blanks(
+        &pre_normalized,
+        line_map_after_removal,
+        &protected_after_collapse,
+    );
 
     // Build spans (single source_file span for truncation compatibility)
     let line_count = result.lines().count();
@@ -522,40 +539,176 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     Ok((result, spans, line_map))
 }
 
-/// Collapse whitespace artifacts from inline removal:
-/// - Multiple consecutive spaces in content portion -> single space
-/// - Trailing whitespace on lines is trimmed
-/// - Leading spaces left by inline removal are trimmed
-/// - Indentation is preserved
-fn collapse_whitespace(source: &str) -> String {
+/// Collapse whitespace artifacts from inline removal.
+///
+/// Per-line operations (for unprotected content only):
+/// - Multiple consecutive spaces → single space
+/// - Trailing whitespace trimmed
+/// - Leading spaces left by inline removal trimmed
+/// - Indentation preserved verbatim
+///
+/// **Literal-aware:** byte ranges listed in `protected` are emitted verbatim;
+/// no collapsing or trimming is applied inside them.
+///
+/// **CRLF handling:** `\r\n` line endings are normalised to `\n` in the output
+/// (explicit, not silent as in the old `.lines()`-based implementation).
+///
+/// **Returns** the collapsed string together with the positions of `protected`
+/// ranges inside the output (needed so `trim_and_normalize` can continue to
+/// skip the same byte spans after the collapse has shifted coordinates).
+fn collapse_whitespace(
+    source: &str,
+    protected: &[(usize, usize)],
+) -> (String, Vec<(usize, usize)>) {
+    let bytes = source.as_bytes();
+    let n = bytes.len();
     let mut result = String::with_capacity(source.len());
+    // Collect (output_start, output_end) for each protected chunk we emit verbatim.
+    let mut new_protected: Vec<(usize, usize)> = Vec::with_capacity(protected.len());
 
-    for line in source.lines() {
-        let indent_len = line.len() - line.trim_start().len();
-        let content = line[indent_len..].trim_end();
+    // Monotonically advancing cursor into `protected` for the forward pass.
+    let mut prot_cursor = 0usize;
 
-        result.push_str(&line[..indent_len]);
+    let mut pos = 0usize;
+    while pos < n {
+        let line_start = pos;
 
-        // State machine: `leading` skips initial spaces after indent,
-        // `prev_space` collapses consecutive space runs to single space.
+        // Locate the newline terminating this line.
+        let nl_pos = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+
+        // CRLF: a `\r` immediately before `\n` belongs to the line ending.
+        let has_cr = nl_pos > line_start && bytes[nl_pos - 1] == b'\r';
+        // Content end: exclusive, does not include `\r` or `\n`.
+        let content_end = if has_cr { nl_pos - 1 } else { nl_pos };
+
+        // Advance `pos` past this line (including `\n` if present).
+        pos = if nl_pos < n { nl_pos + 1 } else { n };
+
+        // Advance prot_cursor past ranges that end before line_start.
+        while prot_cursor < protected.len() && protected[prot_cursor].1 <= line_start {
+            prot_cursor += 1;
+        }
+
+        // --- Indent: leading whitespace NOT inside a protected range ---
+        let indent_end = {
+            let mut s = line_start;
+            while s < content_end {
+                // Stop if a protected range starts here.
+                if prot_cursor < protected.len() && protected[prot_cursor].0 <= s {
+                    break;
+                }
+                match bytes[s] {
+                    b' ' | b'\t' => s += 1,
+                    _ => break,
+                }
+            }
+            s
+        };
+        result.push_str(&source[line_start..indent_end]);
+
+        // --- Content: [indent_end..content_end) ---
+
+        // Step 1: trim_end — scan backward, skip trailing unprotected whitespace.
+        let mut trim_end = content_end;
+        while trim_end > indent_end {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Step 2: forward pass over [indent_end..trim_end) emitting content.
+        // Protected chunks → verbatim; unprotected → collapse consecutive spaces.
+        let mut p = indent_end;
+        let mut lpc = prot_cursor; // local copy so prot_cursor is undisturbed
         let mut prev_space = false;
         let mut leading = true;
-        for ch in content.chars() {
-            if ch == ' ' {
-                if !prev_space && !leading {
-                    result.push(ch);
-                }
-                prev_space = true;
-            } else {
-                leading = false;
-                result.push(ch);
-                prev_space = false;
+
+        while p < trim_end {
+            // Advance lpc past ranges that end before p.
+            while lpc < protected.len() && protected[lpc].1 <= p {
+                lpc += 1;
             }
+
+            if lpc < protected.len() && protected[lpc].0 <= p {
+                // Inside a protected range: emit verbatim up to range end (or trim_end).
+                let mut range_end = protected[lpc].1.min(trim_end);
+                // Defence-in-depth: if a shifted range_end is not on a char boundary
+                // (possible if merge_ranges didn't fully normalise overlapping removed_ranges),
+                // clamp backward to the nearest valid boundary rather than panicking.
+                while range_end > p && !source.is_char_boundary(range_end) {
+                    range_end -= 1;
+                }
+                let out_start = result.len();
+                result.push_str(&source[p..range_end]);
+                let out_end = result.len();
+                if out_start < out_end {
+                    new_protected.push((out_start, out_end));
+                }
+                p = range_end;
+                prev_space = false;
+                leading = false;
+            } else {
+                // Unprotected byte: apply collapse logic.
+                let b = bytes[p];
+                if b == b' ' || b == b'\t' {
+                    // Collapse: emit at most one space per run, skip leading spaces.
+                    if !prev_space && !leading {
+                        result.push(' ');
+                    }
+                    prev_space = true;
+                    p += 1;
+                } else if b < 0x80 {
+                    // performance-11: ASCII fast path.  `b < 0x80` guarantees a
+                    // single-byte codepoint, so no `is_char_boundary` check is
+                    // needed.  The guard preserves all multi-byte UTF-8 code paths
+                    // below — only confirmed-ASCII bytes take this branch.
+                    leading = false;
+                    result.push(b as char);
+                    p += 1;
+                    prev_space = false;
+                } else {
+                    // Non-ASCII: decode the full UTF-8 char.  tree-sitter guarantees
+                    // that protected-range boundaries lie on char boundaries, and the
+                    // char-boundary clamp above keeps range_end valid, so
+                    // `source[p..]` is always a valid UTF-8 string slice here.
+                    let ch = source[p..].chars().next().unwrap_or('\0');
+                    leading = false;
+                    result.push(ch);
+                    p += ch.len_utf8();
+                    prev_space = false;
+                }
+            }
+        }
+
+        // Emit normalised line ending (CRLF → LF).
+        //
+        // Sentinel: if this is a truly-empty line (no bytes between line_start and
+        // content_end — just a bare '\n') AND its position falls inside a protected
+        // input range, emit a one-byte protected range covering the '\n' about to be
+        // pushed.  This signals to `trim_and_normalize` and `normalize_line_map_blanks`
+        // that the blank line is inside a multi-line string literal and must NOT be
+        // subject to the 3+ consecutive-blank cap.
+        //
+        // Whitespace-only lines inside a literal (e.g. "    \n" in a string body)
+        // do NOT need this sentinel because their content bytes are already recorded
+        // in `new_protected` by the forward pass above.
+        if content_end == line_start && in_protected(line_start, protected) {
+            let nl_out = result.len();
+            new_protected.push((nl_out, nl_out + 1));
         }
         result.push('\n');
     }
 
-    result
+    // Merge adjacent/overlapping output ranges produced by multi-line strings
+    // emitting consecutive per-line chunks.
+    let new_protected = merge_ranges(new_protected);
+    (result, new_protected)
 }
 
 /// Handle language-specific AST patterns that require multi-node context.
@@ -599,6 +752,8 @@ fn collect_noise_ranges(
     rules: &PseudoRules,
     depth: usize,
     in_function_body: bool,
+    // `in_for_header`: true when node is in a for-loop's non-body clause (E2.1).
+    in_for_header: bool,
     pos: WalkPosition,
 ) -> Result<()> {
     // SECURITY: Prevent stack overflow from deeply nested AST
@@ -652,6 +807,21 @@ fn collect_noise_ranges(
             return Ok(());
         }
 
+        // E1 (ADR-007): TypeScript parameter type annotations are API surface.
+        // `type_annotation` was historically stripped for all positions as
+        // undifferentiated noise; the A4 contract now extends to parameters.
+        // Guard fires when the immediate parent is a parameter node kind.
+        if kind == "type_annotation"
+            && pos.parent_kind.is_some_and(|pk| {
+                matches!(
+                    pk,
+                    "required_parameter" | "optional_parameter" | "rest_parameter" | "rest_pattern"
+                )
+            })
+        {
+            return Ok(());
+        }
+
         let start = node.start_byte();
         let end = node.end_byte();
         let adjusted_start = adjust_type_start(ctx.language, kind, ctx.source_bytes, start);
@@ -679,16 +849,28 @@ fn collect_noise_ranges(
     }
 
     // Check for semicolon stripping (statement-terminating only, not for-loop headers).
+    //
+    // Two conditions gate preservation:
+    // 1. Direct child of a for-loop node — the `pos.parent_kind` check catches `;`
+    //    nodes that are direct children of `for_statement` (e.g., the condition
+    //    separator in `for(;;)`).
+    // 2. `in_for_header` — catches `;` nodes nested INSIDE a for-loop's non-body
+    //    children (e.g., the `;` inside `lexical_declaration` in `for(let i=0;…)`).
+    //
     // The parent kind is threaded from the parent's child loop rather than read back
     // via `parent()`, which re-descends from the tree root (PF-020).
     if rules.strip_semicolons && kind == ";" {
-        let is_for_loop = pos.parent_kind.is_some_and(|parent_kind| {
+        let is_for_loop_direct_child = pos.parent_kind.is_some_and(|parent_kind| {
             matches!(
                 parent_kind,
-                "for_statement" | "for_in_statement" | "for_of_statement"
+                "for_statement"
+                    | "for_in_statement"
+                    | "for_of_statement"
+                    | "for_range_loop"
+                    | "enhanced_for_statement"
             )
         });
-        if !is_for_loop {
+        if !is_for_loop_direct_child && !in_for_header {
             ctx.ranges.push((node.start_byte(), node.end_byte()));
             return Ok(());
         }
@@ -711,9 +893,49 @@ fn collect_noise_ranges(
     // `child_in_body` is threaded on the same principle, so `is_removable_comment`
     // never calls `parent()` either.
     let child_in_body = in_function_body || is_function_scope_kind(kind, ctx.language);
+
+    // E2.1: Propagate `in_for_header` so that semicolons nested inside a for-loop's
+    // header (e.g., the `;` inside `lexical_declaration` in `for(let i=0;…)`) are not
+    // stripped.  Strategy:
+    // - When the current node IS a for-loop node: non-body children are in the header.
+    // - When already inside a for-header: propagate through non-block intermediaries.
+    //   A new scope boundary (statement_block, compound_statement, block) resets the
+    //   flag so that statement-terminating semicolons inside nested closures or lambdas
+    //   in a for-header are still stripped correctly.
+    let is_for_loop_node = matches!(
+        kind,
+        "for_statement"
+            | "for_in_statement"
+            | "for_of_statement"
+            | "for_range_loop"
+            | "enhanced_for_statement"
+    );
+    let for_body_child_id: Option<usize> = if is_for_loop_node {
+        node.child_by_field_name("body").map(|n| n.id())
+    } else {
+        None
+    };
+
     let language = ctx.language;
     for (child, child_pos) in ChildPositions::new(node, language) {
-        collect_noise_ranges(child, ctx, rules, depth + 1, child_in_body, child_pos)?;
+        let child_in_for_header = if is_for_loop_node {
+            // Non-body children of a for-loop are inside its header.
+            Some(child.id()) != for_body_child_id
+        } else if in_for_header {
+            // Propagate through intermediate nodes that are not new scope boundaries.
+            !matches!(kind, "statement_block" | "compound_statement" | "block")
+        } else {
+            false
+        };
+        collect_noise_ranges(
+            child,
+            ctx,
+            rules,
+            depth + 1,
+            child_in_body,
+            child_in_for_header,
+            child_pos,
+        )?;
     }
 
     Ok(())
@@ -849,17 +1071,17 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_typescript_pseudo_strips_type_annotations() {
-        // Param type annotations are stripped; RETURN type annotation is preserved
-        // as API surface (A4 contract — pseudo mode preserves return types).
+    fn test_typescript_pseudo_preserves_param_annotations() {
+        // ADR-007 / E1: parameter type annotations are API surface — preserved in
+        // pseudo mode.  Both param annotations and the return annotation survive.
         let source = "function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
-        // Parameter type annotations should be stripped
+        // Parameter type annotations must be preserved (ADR-007)
         assert!(
-            result.contains("function add(a, b)"),
-            "function name and params preserved without param types, got: {result}"
+            result.contains("function add(a: number, b: number)"),
+            "param type annotations must be preserved as API surface (ADR-007), got: {result}"
         );
-        // Return type annotation is preserved as API surface
+        // Return type annotation is preserved as API surface (ADR-007)
         assert!(
             result.contains("): number"),
             "return type annotation must be preserved as API surface, got: {result}"
@@ -870,6 +1092,7 @@ mod tests {
     #[test]
     fn test_typescript_pseudo_preserves_export() {
         // `export` is API-surface information — preserved in pseudo mode (A4 contract).
+        // After ADR-007 / E1, param annotations are also API surface and preserved.
         let source =
             "export function greet(name: string): string {\n    return `Hello, ${name}!`;\n}\n";
         let result = transform(source, Language::TypeScript);
@@ -878,31 +1101,60 @@ mod tests {
             "export keyword must be preserved as API surface, got: {result}"
         );
         assert!(
-            result.contains("function greet(name)"),
-            "function signature preserved without types, got: {result}"
+            result.contains("function greet(name: string)"),
+            "function signature with param types preserved (ADR-007), got: {result}"
         );
     }
 
     #[test]
-    fn test_typescript_pseudo_strips_type_parameters() {
+    fn test_typescript_pseudo_preserves_type_parameters() {
+        // E2.3: `type_parameters` removed from TypeScript strip_kinds — generic
+        // signatures like `identity<T>` must survive so callers see the type contract.
         let source = "function identity<T>(value: T): T {\n    return value;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
-            !result.contains("<T>"),
-            "type parameters should be stripped"
+            result.contains("<T>"),
+            "type parameters must be preserved (E2.3), got: {result}"
         );
+        // With E1 (param annotations preserved) and E2.3 (type params preserved),
+        // the full typed signature is retained.
         assert!(
-            result.contains("function identity(value)"),
-            "function preserved"
+            result.contains("function identity<T>(value: T): T"),
+            "full typed signature preserved, got: {result}"
         );
     }
 
+    #[test]
+    fn test_typescript_pseudo_preserves_type_arguments() {
+        // E2.2: `type_arguments` removed from TypeScript strip_kinds — call-site
+        // generics like `Migration<'a'>` must not be silently erased.
+        let source = "const m = new Migration<User>();\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("Migration<User>"),
+            "type arguments must be preserved (E2.2), got: {result}"
+        );
+    }
+
+    /// E2.5 / PF-025: byte-exact for-loop test.
+    ///
+    /// The previous version only asserted `contains("i < 10")` — a vacuous check
+    /// that passes even when the for-header semicolons are corrupted.  This test
+    /// pins the FULL for-header to catch any future regression.
     #[test]
     fn test_typescript_pseudo_preserves_for_loop_semicolons() {
         let source = "function loop() {\n    for (let i = 0; i < 10; i++) {\n        console.log(i);\n    }\n}\n";
         let result = transform(source, Language::TypeScript);
-        // For-loop header semicolons should be preserved
-        assert!(result.contains("i < 10"), "for-loop condition preserved");
+        // Both for-header semicolons must be preserved; the body semicolon is stripped.
+        assert!(
+            result.contains("for (let i = 0; i < 10; i++)"),
+            "for-loop header must be intact (both semicolons preserved), got: {result}"
+        );
+        // Statement-terminating semicolon in the body is stripped.
+        assert!(
+            result.contains("console.log(i)") && !result.contains("console.log(i);"),
+            "body semicolons still stripped, got: {result}"
+        );
     }
 
     #[test]
@@ -927,6 +1179,26 @@ mod tests {
     // ========================================================================
     // JavaScript pseudo tests
     // ========================================================================
+
+    /// E2.1 / PF-025: JavaScript for-loop header semicolons preserved (byte-exact).
+    ///
+    /// JavaScript uses the same `for_statement` node kind as TypeScript.
+    /// This verifies the `in_for_header` propagation works identically for JS.
+    #[test]
+    fn test_javascript_pseudo_preserves_for_loop_semicolons() {
+        let source = "function loop() {\n    for (let i = 0; i < 10; i++) {\n        console.log(i);\n    }\n}\n";
+        let result = transform(source, Language::JavaScript);
+        // Both for-header semicolons must be preserved; the body semicolon is stripped.
+        assert!(
+            result.contains("for (let i = 0; i < 10; i++)"),
+            "JavaScript for-loop header must be intact (E2.1), got: {result}"
+        );
+        // Body semicolons stripped
+        assert!(
+            result.contains("console.log(i)") && !result.contains("console.log(i);"),
+            "JavaScript body semicolons still stripped, got: {result}"
+        );
+    }
 
     #[test]
     fn test_javascript_pseudo_preserves_export_strips_semicolons() {
@@ -1081,9 +1353,57 @@ mod tests {
         assert!(result.contains("fn add"), "function preserved");
     }
 
+    #[test]
+    fn test_rust_pseudo_preserves_mutable_specifier() {
+        // E2.4: `mutable_specifier` removed from Rust strip_kinds — `&mut self` and
+        // `&mut T` convey mutation intent and are part of the API contract.
+        let source = "impl Counter {\n    pub fn increment(&mut self) {\n        self.count += 1;\n    }\n}\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("&mut self"),
+            "mutable_specifier must be preserved as API surface (E2.4), got: {result}"
+        );
+        // Ensure `& self` (stripped form) is NOT produced
+        assert!(
+            !result.contains("& self"),
+            "mutable_specifier must not be stripped, got: {result}"
+        );
+    }
+
     // ========================================================================
     // Java pseudo tests
     // ========================================================================
+
+    /// E2.1: Java basic for-loop header semicolons preserved.
+    ///
+    /// Java uses `for_statement` for basic C-style for loops. The `in_for_header`
+    /// flag must propagate through Java's `local_variable_declaration` initializer
+    /// into the `;` nodes nested inside it.
+    #[test]
+    fn test_java_pseudo_preserves_for_loop_semicolons() {
+        let source = "class Example {\n    void run() {\n        for (int i = 0; i < 10; i++) {\n            System.out.println(i);\n        }\n    }\n}\n";
+        let result = transform(source, Language::Java);
+        // Both for-header semicolons preserved
+        assert!(
+            result.contains("for (int i = 0; i < 10; i++)"),
+            "Java for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
+    /// E2.1: Java enhanced for (for-each) semicolon-free header preserved.
+    ///
+    /// Java enhanced_for_statement (`for (Type x : collection)`) does not use
+    /// semicolons in its header — the `:` is preserved, and no incorrect
+    /// semicolon stripping should occur.
+    #[test]
+    fn test_java_pseudo_preserves_enhanced_for() {
+        let source = "class Example {\n    void run(int[] arr) {\n        for (int x : arr) {\n            System.out.println(x);\n        }\n    }\n}\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            result.contains("for (int x : arr)"),
+            "Java enhanced for-each must be intact (E2.1), got: {result}"
+        );
+    }
 
     #[test]
     fn test_java_pseudo_preserves_visibility() {
@@ -1144,6 +1464,21 @@ mod tests {
     // C pseudo tests
     // ========================================================================
 
+    /// E2.1: C for-loop header semicolons preserved.
+    ///
+    /// C uses `for_statement` with a `for_statement_block` or `expression_statement`
+    /// initializer. The `;` inside the initializer must survive via `in_for_header`.
+    #[test]
+    fn test_c_pseudo_preserves_for_loop_semicolons() {
+        let source = "void loop() {\n    for (int i = 0; i < 10; i++) {\n        printf(\"%d\", i);\n    }\n}\n";
+        let result = transform(source, Language::C);
+        // Both for-header semicolons preserved (byte-exact header).
+        assert!(
+            result.contains("for (int i = 0; i < 10; i++)"),
+            "C for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
     #[test]
     fn test_c_pseudo_strips_qualifiers() {
         let source = "static const int MAX = 100;\n";
@@ -1164,6 +1499,35 @@ mod tests {
     // ========================================================================
     // C++ pseudo tests
     // ========================================================================
+
+    /// E2.1: C++ basic for-loop header semicolons preserved.
+    ///
+    /// C++ uses `for_statement` (same as C) for basic loops. The `in_for_header`
+    /// propagation must work here too.
+    #[test]
+    fn test_cpp_pseudo_preserves_for_loop_semicolons() {
+        let source = "void loop() {\n    for (int i = 0; i < 10; i++) {\n        std::cout << i;\n    }\n}\n";
+        let result = transform(source, Language::Cpp);
+        // Both for-header semicolons preserved (byte-exact header).
+        assert!(
+            result.contains("for (int i = 0; i < 10; i++)"),
+            "C++ for-loop header must be intact (E2.1), got: {result}"
+        );
+    }
+
+    /// E2.1: C++ range-based for (for_range_loop) preserved.
+    ///
+    /// C++ range-based for uses `for_range_loop` node kind. No semicolons in
+    /// the header, but the colon `:` separator must survive.
+    #[test]
+    fn test_cpp_pseudo_preserves_for_range_loop() {
+        let source = "void process(std::vector<int>& vec) {\n    for (int x : vec) {\n        std::cout << x;\n    }\n}\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            result.contains("for (int x : vec)"),
+            "C++ range-based for must be intact (E2.1), got: {result}"
+        );
+    }
 
     #[test]
     fn test_cpp_pseudo_preserves_access_specifiers() {
@@ -1194,14 +1558,14 @@ mod tests {
 
     #[test]
     fn test_collapse_whitespace_basic() {
-        let result = collapse_whitespace("  pub  fn  add() {}\n");
+        let (result, _) = collapse_whitespace("  pub  fn  add() {}\n", &[]);
         // Multiple spaces collapsed, leading indent preserved
         assert_eq!(result, "  pub fn add() {}\n");
     }
 
     #[test]
     fn test_collapse_whitespace_preserves_indentation() {
-        let result = collapse_whitespace("    let x = 1\n");
+        let (result, _) = collapse_whitespace("    let x = 1\n", &[]);
         assert_eq!(result, "    let x = 1\n");
     }
 
@@ -1395,6 +1759,7 @@ mod tests {
         // BUG 5 (historical): Stripping `export` used to leave a leading space.
         // Now `export` is preserved (A4), so output starts with "export function …"
         // — no leading space in either case.  The no-leading-space invariant holds.
+        // After ADR-007/E1: param type annotations are also preserved.
         let source = "export function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
@@ -1402,8 +1767,8 @@ mod tests {
             "output should not start with a leading space, got: {result}"
         );
         assert!(
-            result.contains("function add(a, b)"),
-            "function signature clean (type annotations stripped), got: {result}"
+            result.contains("function add(a: number, b: number)"),
+            "function signature with param types preserved (ADR-007), got: {result}"
         );
     }
 
@@ -1511,13 +1876,15 @@ mod tests {
     #[test]
     fn test_is_inline_modifier_kind_positives() {
         assert!(is_inline_modifier_kind("lifetime"));
-        assert!(is_inline_modifier_kind("mutable_specifier"));
+        // `mutable_specifier` removed from is_inline_modifier_kind (E2.4) —
+        // it is no longer in the strip list so the trailing-space consumer is moot.
         assert!(is_inline_modifier_kind("readonly"));
         assert!(is_inline_modifier_kind("abstract"));
     }
 
     #[test]
     fn test_is_inline_modifier_kind_negatives() {
+        assert!(!is_inline_modifier_kind("mutable_specifier")); // E2.4: no longer inline modifier
         assert!(!is_inline_modifier_kind("type_annotation"));
         assert!(!is_inline_modifier_kind("decorator"));
         assert!(!is_inline_modifier_kind("identifier"));
@@ -1574,7 +1941,7 @@ mod tests {
     #[test]
     fn test_rust_special_case_continues_recursion_into_body() {
         // Rust function body children are still reachable via normal recursion.
-        // mutable_specifier inside params should still be stripped.
+        // After E2.4: mutable_specifier is NO LONGER stripped — `&mut self` is API surface.
         // visibility_modifier (pub) is PRESERVED as API surface (A4 contract).
         // Return type is PRESERVED as API surface (A4 contract).
         let source =
@@ -1585,8 +1952,8 @@ mod tests {
             "pub must be preserved as API surface (A4), got: {result}"
         );
         assert!(
-            !result.contains("mut "),
-            "mut should be stripped via child recursion, got: {result}"
+            result.contains("&mut self"),
+            "mutable_specifier must be preserved as API surface (E2.4), got: {result}"
         );
         assert!(
             result.contains("-> bool"),
@@ -1651,11 +2018,10 @@ mod tests {
     fn test_collapse_whitespace_preserves_indent_when_modifier_stripped() {
         // When an inline modifier is stripped (e.g., `    pub fn` -> `     fn`),
         // the extra space becomes part of indentation and is preserved.
-        // The `leading` flag skips any content-leading spaces after indent detection.
-        let result = collapse_whitespace("    fn add() {}\n");
+        let (result, _) = collapse_whitespace("    fn add() {}\n", &[]);
         assert_eq!(result, "    fn add() {}\n", "normal 4-space indent");
 
-        let result = collapse_whitespace("     fn add() {}\n");
+        let (result, _) = collapse_whitespace("     fn add() {}\n", &[]);
         assert_eq!(
             result, "     fn add() {}\n",
             "5-space indent preserved as indentation"
@@ -1664,14 +2030,14 @@ mod tests {
 
     #[test]
     fn test_collapse_whitespace_empty_lines() {
-        let result = collapse_whitespace("line one\n\nline two\n");
+        let (result, _) = collapse_whitespace("line one\n\nline two\n", &[]);
         assert_eq!(result, "line one\n\nline two\n");
     }
 
     #[test]
     fn test_collapse_whitespace_whitespace_only_lines() {
         // Whitespace-only lines: indent portion is kept, content is empty
-        let result = collapse_whitespace("    \n  \n\n");
+        let (result, _) = collapse_whitespace("    \n  \n\n", &[]);
         // After trim_end on content (empty), only indent remains, then newline
         assert_eq!(result, "    \n  \n\n");
     }
@@ -1679,7 +2045,7 @@ mod tests {
     #[test]
     fn test_collapse_whitespace_multiline_mixed_patterns() {
         let input = "fn foo() {\n    let  x  =  1\n\n     return  x\n}\n";
-        let result = collapse_whitespace(input);
+        let (result, _) = collapse_whitespace(input, &[]);
         // Line 1: no extra spaces
         // Line 2: indent=4, "let  x  =  1" -> "let x = 1"
         // Line 3: empty
@@ -1690,21 +2056,21 @@ mod tests {
 
     #[test]
     fn test_collapse_whitespace_trailing_spaces_trimmed() {
-        let result = collapse_whitespace("fn foo()   \n");
+        let (result, _) = collapse_whitespace("fn foo()   \n", &[]);
         assert_eq!(result, "fn foo()\n", "trailing spaces should be trimmed");
     }
 
     #[test]
     fn test_collapse_whitespace_leading_spaces_become_indent() {
         // When remove_ranges leaves a gap (e.g., "export function" -> " function"),
-        // trim_start() treats the leading spaces as indentation, not content.
-        let result = collapse_whitespace(" function add()\n");
+        // the leading spaces are treated as indentation.
+        let (result, _) = collapse_whitespace(" function add()\n", &[]);
         assert_eq!(
             result, " function add()\n",
             "single leading space is part of indent"
         );
 
-        let result = collapse_whitespace("  function add()\n");
+        let (result, _) = collapse_whitespace("  function add()\n", &[]);
         assert_eq!(
             result, "  function add()\n",
             "two leading spaces treated as indentation"
@@ -1790,6 +2156,7 @@ mod tests {
     /// TypeScript: arrow function with return type preserved.
     #[test]
     fn test_typescript_pseudo_preserves_arrow_return() {
+        // After ADR-007/E1, param annotations are also preserved.
         let source =
             "const getUser = async (id: number): Promise<User> => {\n    return fetch(id);\n};\n";
         let result = transform(source, Language::TypeScript);
@@ -1797,14 +2164,14 @@ mod tests {
             result.contains("): Promise<User>"),
             "arrow function return type must be preserved, got: {result}"
         );
-        // Param type stripped
+        // E1: param type annotations preserved (ADR-007)
         assert!(
-            !result.contains("id: number"),
-            "param type annotation must be stripped, got: {result}"
+            result.contains("id: number"),
+            "param type annotation must be preserved (ADR-007), got: {result}"
         );
     }
 
-    /// TypeScript: interface method return type preserved; param type stripped.
+    /// TypeScript: interface method return type preserved; param type preserved (ADR-007).
     #[test]
     fn test_typescript_pseudo_interface_method_return_preserved() {
         let source = "interface Repo {\n    find(id: number): User;\n}\n";
@@ -1813,14 +2180,14 @@ mod tests {
             result.contains("): User"),
             "interface method return type must be preserved, got: {result}"
         );
-        // Param type stripped
+        // E1/ADR-007: param type annotations are now preserved as API surface
         assert!(
-            !result.contains("id: number"),
-            "param type must be stripped in interface method, got: {result}"
+            result.contains("id: number"),
+            "param type annotation preserved in interface method (ADR-007), got: {result}"
         );
     }
 
-    /// TypeScript: optional param with return type — param type stripped, return preserved.
+    /// TypeScript: optional param with return type — both preserved (ADR-007).
     #[test]
     fn test_typescript_pseudo_optional_param_return_preserved() {
         let source = "function opt(a?: string): string {\n    return a ?? '';\n}\n";
@@ -1828,6 +2195,11 @@ mod tests {
         assert!(
             result.contains("): string"),
             "return type must be preserved for optional-param function, got: {result}"
+        );
+        // E1: optional param type annotation also preserved
+        assert!(
+            result.contains("a?: string"),
+            "optional param type annotation preserved (ADR-007), got: {result}"
         );
     }
 
@@ -2258,7 +2630,7 @@ mod tests {
     // ========================================================================
     //
     // pseudo is the PRODUCTION path: the cat/head/tail rewrite selects
-    // --mode=pseudo for regular code files (ADR-008), so this walker is the
+    // --mode=pseudo for regular code files (ADR-007), so this walker is the
     // hottest agent-facing transform in the product. Every pre-existing perf
     // guard in this workspace is PYTHON-minimal-only or GO-only, so a
     // TypeScript / C++ / Java / C# pseudo regression had no coverage at all.
@@ -2321,15 +2693,24 @@ mod tests {
     // linear (2.0×) and quadratic (4.0×), matching the Go guards in minimal.rs.
     // These shapes measure 2.01×–2.07× at the guard sizes, so 2.8 leaves ~35 % headroom.
 
-    fn time_pseudo(source: &str, language: Language) -> f64 {
+    /// Time the pseudo transform for `source` in `language`.
+    ///
+    /// Returns `(min, median)` of 5 samples (see `scaling_guard` module doc):
+    /// - Use `min`    for ratio gates:    `ratio = t2_min / t1_min; assert!(ratio < 2.8)`
+    /// - Use `median` for absolute gates: `assert!(t1_median >= FLOOR)`
+    ///
+    /// The parse is hoisted outside the sampling loop — we time the walk, not the
+    /// parser (per `scaling_guard` module doc).
+    fn time_pseudo(source: &str, language: Language) -> (f64, f64) {
         let mut parser = Parser::new(language).unwrap();
-        let tree = parser.parse(source).unwrap();
+        let tree = parser.parse(source).unwrap(); // hoisted outside the sample loop
         let config = TransformConfig::with_mode(Mode::Pseudo);
-        let start = std::time::Instant::now();
-        let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-        assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
-        ms
+        crate::transform::scaling_guard::time_5(|| {
+            let start = std::time::Instant::now();
+            let r = transform_pseudo_with_spans_and_line_map(source, &tree, language, &config);
+            assert!(r.is_ok(), "pseudo transform must succeed: {:?}", r.err());
+            start.elapsed().as_secs_f64() * 1000.0
+        })
     }
 
     /// N top-level statements, each terminated by a `;` — the site-1 population.
@@ -2376,27 +2757,32 @@ mod tests {
 
         // N=8000 is ~56 k AST nodes, comfortably under MAX_AST_NODES (100 k);
         // above it this would silently become an Err(ComplexityLimit) assertion.
-        let t1 = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
-        let t2 = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
+        //
+        // Each call returns (min, median) of 5 samples.  Parse is hoisted outside
+        // the sample loop (see scaling_guard module doc).
+        let (t1_min, t1_median) = time_pseudo(&ts_semicolon_source(4000), Language::TypeScript);
+        let (t2_min, _) = time_pseudo(&ts_semicolon_source(8000), Language::TypeScript);
 
-        // Noise floor. We FAIL rather than skip: an absolute-ms guard elsewhere
-        // in this work went vacuous when a fix made it too fast to measure, and
-        // a silently-passing scaling guard provides no protection at all.
+        // Noise floor uses MEDIAN (absolute gate — scaling_guard rule).
+        // We FAIL rather than skip: a vacuous floor provides no protection.
         assert!(
-            t1 >= 8.0,
-            "N=4000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 8ms; ~36.0ms measured on debug builds). Either the \
-             transform is being cached/skipped or N must be raised. \
+            t1_median >= 8.0,
+            "N=4000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 8ms; ~36.0ms measured on debug builds). \
+             Either the transform is being cached/skipped or N must be raised. \
              DO NOT convert this to a skip."
         );
 
-        let ratio = t2 / t1;
+        // Ratio uses MIN (ratio gate — scaling_guard rule).
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.86×;
+        // normal implementation measures 2.07×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 4000 to 8000 must produce a ratio below 2.8 \
              (got {ratio:.2}×; measured 2.07×). O(N) → ~2.0×; O(N²) → ~4.0×; \
-             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 took {t1:.2}ms, \
-             N=8000 took {t2:.2}ms. Check that the walker threads WalkPosition \
+             2.8 ≈ 2^1.5 is the exponent-space midpoint. N=4000 min {t1_min:.2}ms, \
+             N=8000 min {t2_min:.2}ms. Check that the walker threads WalkPosition \
              and does not walk siblings per node (PF-020)."
         );
     }
@@ -2415,21 +2801,24 @@ mod tests {
             "pseudo must still strip Python parameter annotations, got: {out}"
         );
 
-        let t1 = time_pseudo(&python_return_type_source(1000), Language::Python);
-        let t2 = time_pseudo(&python_return_type_source(2000), Language::Python);
+        let (t1_min, t1_median) = time_pseudo(&python_return_type_source(1000), Language::Python);
+        let (t2_min, _) = time_pseudo(&python_return_type_source(2000), Language::Python);
 
+        // Noise floor uses MEDIAN (absolute gate).
         assert!(
-            t1 >= 6.0,
-            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 6ms; ~27.3ms measured). DO NOT convert this to a skip."
+            t1_median >= 6.0,
+            "N=1000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 6ms; ~27.3ms measured). DO NOT convert to a skip."
         );
 
-        let ratio = t2 / t1;
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.79×;
+        // normal implementation measures 2.04×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.04×). N=1000 took {t1:.2}ms, \
-             N=2000 took {t2:.2}ms."
+             (got {ratio:.2}×; measured 2.04×). N=1000 min {t1_min:.2}ms, \
+             N=2000 min {t2_min:.2}ms."
         );
     }
 
@@ -2443,21 +2832,334 @@ mod tests {
             "the `template` keyword must be consumed with its parameter list, got: {out}"
         );
 
-        let t1 = time_pseudo(&cpp_template_source(1000), Language::Cpp);
-        let t2 = time_pseudo(&cpp_template_source(2000), Language::Cpp);
+        let (t1_min, t1_median) = time_pseudo(&cpp_template_source(1000), Language::Cpp);
+        let (t2_min, _) = time_pseudo(&cpp_template_source(2000), Language::Cpp);
 
+        // Noise floor uses MEDIAN (absolute gate).
         assert!(
-            t1 >= 5.0,
-            "N=1000 completed in {t1:.3}ms — too fast to measure reliably \
-             (expected ≥ 5ms; ~24.2ms measured). DO NOT convert this to a skip."
+            t1_median >= 5.0,
+            "N=1000 median of 5 completed in {t1_median:.3}ms — too fast to measure \
+             reliably (expected ≥ 5ms; ~24.2ms measured). DO NOT convert to a skip."
         );
 
-        let ratio = t2 / t1;
+        // A3 discrimination evidence: under a quadratic walk the ratio was 3.03×;
+        // normal implementation measures 2.01×.
+        let ratio = t2_min / t1_min;
         assert!(
             ratio < 2.8,
             "Doubling N from 1000 to 2000 must produce a ratio below 2.8 \
-             (got {ratio:.2}×; measured 2.01×). N=1000 took {t1:.2}ms, \
-             N=2000 took {t2:.2}ms."
+             (got {ratio:.2}×; measured 2.01×). N=1000 min {t1_min:.2}ms, \
+             N=2000 min {t2_min:.2}ms."
         );
+    }
+
+    // ========================================================================
+    // C2a — literal corruption regression tests
+    // ========================================================================
+    //
+    // These tests were written BEFORE the fix (TDD) and prove that whitespace
+    // inside string literals is preserved through pseudo mode.  They would fail
+    // against the old collapse_whitespace that had no literal awareness.
+
+    /// Property: for each literal node in `source`, its raw text content must
+    /// appear unchanged (as a substring) in `result`.
+    /// Returns false if any literal's content was modified.
+    #[cfg(test)]
+    fn assert_literals_preserved(source: &str, result: &str, language: Language) -> bool {
+        use crate::transform::literals::collect_literal_ranges;
+        let mut parser = Parser::new(language).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let ranges = collect_literal_ranges(&tree, language).unwrap();
+        for (ls, le) in ranges {
+            let lit = &source[ls..le];
+            if !result.contains(lit) {
+                return false;
+            }
+        }
+        true
+    }
+
+    // C2e — property assertion: prove it passes on correct output and
+    //        REJECTS a known-corrupted output.
+
+    #[test]
+    fn test_c2e_property_passes_on_correct_pseudo_output() {
+        let source = "const INDENT = \"  \";\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            assert_literals_preserved(source, &result, Language::TypeScript),
+            "Property violated: literal content corrupted in pseudo output. Got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_c2e_property_detects_literal_corruption() {
+        // Construct the corrupted output the old code would have produced:
+        // "  " (two spaces) → " " (one space) via old collapse_whitespace.
+        let source = "const INDENT = \"  \";\n";
+        let corrupted = "const INDENT = \" \";\n"; // one space instead of two
+        assert!(
+            !assert_literals_preserved(source, corrupted, Language::TypeScript),
+            "Property assertion should detect the two-spaces→one-space corruption"
+        );
+    }
+
+    // --- TypeScript pseudo: double-space string literal preserved ---
+
+    #[test]
+    fn test_ts_pseudo_literal_double_space_preserved() {
+        // C2a: "  " inside a string must not be collapsed to " "
+        let source = "const INDENT = \"  \";\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("\"  \""),
+            "double-space string literal must survive pseudo: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_pseudo_template_literal_spaces_preserved() {
+        // C2a: spaces inside template literal text preserved; interpolation NOT protected
+        let source = "const s = `a  b`;\n";
+        let result = transform(source, Language::TypeScript);
+        assert!(
+            result.contains("`a  b`"),
+            "double-space in template literal must survive pseudo: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_ts_pseudo_interpolation_not_protected() {
+        // Spaces INSIDE ${...} (interpolation) must still be collapsed —
+        // only the string_fragment children are protected, not the whole template.
+        let source = "const s = `x${  a  +  b  }y`;\n";
+        let result = transform(source, Language::TypeScript);
+        // The result should contain collapsed whitespace in the interpolation
+        // (we can't predict exact output, but "  " must not appear inside `${...}`).
+        // The string_fragment "x" and "y" around the interpolation are protected.
+        // Verify output doesn't contain 4+ consecutive spaces (collapse happened).
+        assert!(
+            !result.contains("    "),
+            "more than 3 consecutive spaces should not appear (interpolation collapsed): {result:?}"
+        );
+    }
+
+    // --- JavaScript pseudo: single-quote and template literals ---
+
+    #[test]
+    fn test_js_pseudo_single_quote_literal_preserved() {
+        let source = "const s = 'hello   world';\n";
+        let result = transform(source, Language::JavaScript);
+        assert!(
+            result.contains("'hello   world'"),
+            "triple-space in single-quote string must survive: got {result:?}"
+        );
+    }
+
+    // --- Python pseudo: string with trailing spaces ---
+
+    #[test]
+    fn test_python_pseudo_string_trailing_spaces_preserved() {
+        // Trailing spaces inside a string must not be trimmed.
+        let source = "x = \"hello  \"\n";
+        let result = transform(source, Language::Python);
+        assert!(
+            result.contains("\"hello  \""),
+            "trailing spaces inside string literal must survive pseudo: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_pseudo_multiline_string_spaces_preserved() {
+        // Multi-line string content with trailing spaces (PF-019 case).
+        let source = "x = \"\"\"\n  hello  \n\"\"\"\n";
+        let result = transform(source, Language::Python);
+        // The string_content spans the whole body; trailing spaces must survive.
+        assert!(
+            result.contains("  hello  "),
+            "trailing spaces inside multiline string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Rust pseudo: string literal spaces ---
+
+    #[test]
+    fn test_rust_pseudo_string_literal_spaces_preserved() {
+        let source = "fn f() { let s = \"a  b\"; }\n";
+        let result = transform(source, Language::Rust);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Rust string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Go pseudo: interpreted and raw string ---
+
+    #[test]
+    fn test_go_pseudo_interpreted_string_preserved() {
+        let source = "func f() { s := \"a  b\" }\n";
+        let result = transform(source, Language::Go);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Go interpreted string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- C pseudo ---
+
+    #[test]
+    fn test_c_pseudo_string_literal_spaces_preserved() {
+        let source = "void f() { char *s = \"a  b\"; }\n";
+        let result = transform(source, Language::C);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in C string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- C++ pseudo ---
+
+    #[test]
+    fn test_cpp_pseudo_string_literal_spaces_preserved() {
+        let source = "void f() { std::string s = \"a  b\"; }\n";
+        let result = transform(source, Language::Cpp);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in C++ string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Java pseudo ---
+
+    #[test]
+    fn test_java_pseudo_string_literal_spaces_preserved() {
+        let source = "class A { String s = \"a  b\"; }\n";
+        let result = transform(source, Language::Java);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Java string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Ruby pseudo ---
+
+    #[test]
+    fn test_ruby_pseudo_string_literal_spaces_preserved() {
+        let source = "s = \"a  b\"\n";
+        let result = transform(source, Language::Ruby);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Ruby string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Kotlin pseudo ---
+
+    #[test]
+    fn test_kotlin_pseudo_string_literal_spaces_preserved() {
+        let source = "val s = \"a  b\"\n";
+        let result = transform(source, Language::Kotlin);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Kotlin string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- Bash pseudo ---
+
+    #[test]
+    fn test_bash_pseudo_string_literal_spaces_preserved() {
+        let source = "s=\"a  b\"\n";
+        let result = transform(source, Language::Bash);
+        assert!(
+            result.contains("\"a  b\""),
+            "double-space in Bash string must survive pseudo: got {result:?}"
+        );
+    }
+
+    // --- CRLF handling (C2c) ---
+
+    #[test]
+    fn test_collapse_whitespace_crlf_normalised_to_lf() {
+        // CRLF line endings must be normalised to LF (explicit, not silent).
+        let input = "fn foo()  \r\nfn bar()  \r\n";
+        let (result, _) = collapse_whitespace(input, &[]);
+        // CRLF stripped → LF only; trailing spaces trimmed
+        assert_eq!(
+            result, "fn foo()\nfn bar()\n",
+            "CRLF must be normalised to LF"
+        );
+    }
+
+    #[test]
+    fn test_collapse_whitespace_crlf_preserves_literal_content() {
+        // Literal content inside a CRLF file must still be protected.
+        // Construct protected range for the double-space: bytes 7..9 in "s = \"  \"\r\n"
+        // "s = \"" = 5 bytes, then "  " = 2 bytes at [5..7]
+        // Actually source = "s = \"  \"\r\n" — let's compute:
+        //   s=0 ' '=1 '='=2 ' '=3 '"'=4 ' '=5 ' '=6 '"'=7 '\r'=8 '\n'=9
+        // The protected range for the two spaces is [5, 7).
+        let source = "s = \"  \"\r\n";
+        let protected = vec![(5, 7)];
+        let (result, new_prot) = collapse_whitespace(source, &protected);
+        assert_eq!(result, "s = \"  \"\n", "CRLF stripped; literal preserved");
+        assert!(
+            !new_prot.is_empty(),
+            "protected range must survive CRLF normalisation"
+        );
+    }
+
+    // --- performance-11: ASCII fast path does not corrupt multi-byte sequences ---
+
+    #[test]
+    fn test_collapse_whitespace_non_ascii_bytes_not_corrupted_by_ascii_fast_path() {
+        // The ASCII fast path (b < 0x80) must only fire for single-byte
+        // codepoints.  Multi-byte UTF-8 sequences must still travel the
+        // `source[p..].chars().next()` branch so their full codepoint is
+        // pushed and `p` advances by the correct byte length.
+        //
+        // Each test string contains a mix of ASCII and multi-byte codepoints;
+        // the assertion checks the output byte-for-byte.
+        let cases: &[(&str, &str)] = &[
+            // Japanese (3-byte UTF-8)
+            ("fn foo(日本語)  \n", "fn foo(日本語)\n"),
+            // Emoji (4-byte UTF-8)
+            ("x = 🦀  \n", "x = 🦀\n"),
+            // Combining characters (2-byte UTF-8)
+            ("ünïcödé  value\n", "ünïcödé value\n"),
+            // Mixed: ASCII opener, multi-byte middle, ASCII closer
+            ("fn f(x: u8, y: 日) -> 本\n", "fn f(x: u8, y: 日) -> 本\n"),
+            // Curly-quote characters (3-byte UTF-8) that look like ASCII quotes
+            (
+                "\u{201c}hello\u{201d}  world\n",
+                "\u{201c}hello\u{201d} world\n",
+            ),
+        ];
+
+        for &(input, expected) in cases {
+            let (result, _) = collapse_whitespace(input, &[]);
+            assert_eq!(
+                result, expected,
+                "non-ASCII input corrupted: input={input:?}"
+            );
+
+            // Verify the output is valid UTF-8 (would panic if not).
+            let _ = result.chars().count();
+        }
+    }
+
+    #[test]
+    fn test_collapse_whitespace_non_ascii_in_protected_range_survives() {
+        // A non-ASCII sequence that falls inside a protected range must be
+        // emitted verbatim (the protected-range path, not the fast path).
+        // "fn f(日本語)\n" — protect the Japanese chars.
+        // "fn f(" = 5 ASCII bytes; "日" (U+65E5) = 3 bytes, "本" (U+672C) = 3
+        // bytes, "語" (U+8A9E) = 3 bytes → protected range [5, 14).
+        let source = "fn f(\u{65E5}\u{672C}\u{8A9E})\n";
+        let protected = vec![(5, 14)];
+        let (result, _) = collapse_whitespace(source, &protected);
+        assert_eq!(result, "fn f(日本語)\n");
+        // Confirm the output is valid UTF-8.
+        let _ = result.chars().count();
     }
 }

@@ -211,7 +211,8 @@ pub(crate) fn run(
     // The router holds a BinarySinkStub for its Contract bridge; the per-call
     // apply() path receives the real sink via TransformStage::apply.
     let analytics = Arc::new(rskim_proxy::analytics::NoopAnalyticsHook);
-    let pipeline = if std::env::var("SKIM_PASSTHROUGH").as_deref() == Ok("1") {
+    // B2: use shared helper so "true"/"yes" are accepted, not just "1".
+    let pipeline = if super::is_passthrough_mode() {
         TransformPipeline::identity()
     } else {
         let router = BlockRouter::new(Arc::new(BinarySinkStub));

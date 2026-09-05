@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use crate::cmd::OutputFormat;
 use crate::cmd::execution as exec;
 use crate::output::canonical::GitResult;
+use crate::output::fidelity::Completeness;
 use crate::runner::CommandRunner;
 
 // ============================================================================
@@ -76,12 +77,19 @@ pub(crate) fn run(
         "commit" => commit::run_commit(&global_flags, subcmd_args, show_stats, rec),
         "push" => push::run_push(&global_flags, subcmd_args, show_stats, rec),
         other => {
-            let safe_other = crate::cmd::sanitize_for_display(other);
-            anyhow::bail!(
-                "unknown git subcommand: '{safe_other}'\n\n\
-                 Supported: status, diff, fetch, log, show, commit, push\n\
-                 Run 'skim git --help' for usage"
-            );
+            // D2: unknown git subcommands (branch, checkout, rev-parse, stash, …) are
+            // forwarded to the real git binary unchanged. skim only compresses the
+            // subcommands it understands; everything else passes through byte-faithfully.
+            // The banner is debug-gated per ADR-011 (no-loss path — the reader sees
+            // exactly what git would produce).
+            let safe = crate::cmd::sanitize_for_display(other);
+            crate::debug_log!("skim git: unknown subcommand '{safe}' — passing through to git");
+            // Reconstruct full args: subcommand + remaining subcmd_args, then
+            // re-prepend any global git flags so they reach the real binary.
+            let mut all_args: Vec<String> = global_flags.to_vec();
+            all_args.push(other.to_string());
+            all_args.extend_from_slice(subcmd_args);
+            super::run_raw_passthrough("git", &all_args, &[])
         }
     }
 }
@@ -347,7 +355,14 @@ pub(super) fn run_passthrough(
 ///
 /// Grouping these reduces the argument count to stay within Clippy's
 /// `too_many_arguments` limit while keeping all parameters documented together.
-#[derive(Default)]
+///
+/// # No `Default` — intentional (ADR-015 / D1)
+///
+/// `completeness` has no sensible default: a `--json` handler that does not
+/// state whether its envelope carries everything git produced is exactly the
+/// silent-loss defect the disclosure split closes.  Deriving `Default` here
+/// would reintroduce a way to skip that decision, so it is deliberately absent
+/// — every construction site must spell the value out.
 pub(super) struct ParsedCommandOptions {
     /// When `true`, the parser receives `stderr + stdout` combined.  Git fetch
     /// writes its output to stderr; set to `true` for fetch, `false` otherwise.
@@ -357,16 +372,22 @@ pub(super) struct ParsedCommandOptions {
     /// baseline must reflect the **user's literal command** output, not skim's
     /// internally substituted command.  Pass `None` for standard behaviour.
     pub raw_override: Option<String>,
+    /// Whether the `--json` envelope this run emits contains everything the raw
+    /// git command produced.  Consumed only on the JSON path; the text path is
+    /// governed by the net-savings guard instead.
+    pub completeness: Completeness,
 }
 
 impl ParsedCommandOptions {
     /// Combined-stderr options: parser receives `stderr + stdout`, no baseline override.
     ///
     /// Used by commit, fetch, and push — all write their primary output to stderr.
-    pub fn combined() -> Self {
+    /// Each states its own `completeness`; the constructor does not choose one.
+    pub fn combined(completeness: Completeness) -> Self {
         Self {
             combine_stderr: true,
             raw_override: None,
+            completeness,
         }
     }
 }
@@ -379,7 +400,8 @@ impl ParsedCommandOptions {
 /// `label` is the analytics label string built by the caller from the user's
 /// **original** (pre-rewrite) args via [`build_analytics_label`].
 ///
-/// See [`ParsedCommandOptions`] for `combine_stderr` and `raw_override` docs.
+/// See [`ParsedCommandOptions`] for `combine_stderr`, `raw_override`, and
+/// `completeness` docs.
 ///
 /// # AD-GIT-14 (2026-04-11) — analytics recording on non-zero exit
 ///
@@ -404,6 +426,7 @@ where
     let ParsedCommandOptions {
         combine_stderr,
         raw_override,
+        completeness,
     } = opts;
     let runner = CommandRunner::new();
     let arg_refs: Vec<&str> = subcmd_args.iter().map(String::as_str).collect();
@@ -468,7 +491,19 @@ where
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            if exec::write_line_to_stdout(&json)? == exec::StdoutStatus::PipeClosed {
+            // ADR-015 / D1 — the declaration comes from the caller
+            // (`ParsedCommandOptions::completeness`), because only the caller
+            // knows what its parser modelled.  `elided` is `None`: these
+            // parsers summarise into `operation`/`summary`/`details` with no
+            // 1:1 unit to count against the raw output.
+            if exec::emit_json_envelope(
+                &json,
+                completeness,
+                "git",
+                None,
+                exec::LineTermination::Newline,
+            )? == exec::StdoutStatus::PipeClosed
+            {
                 return Ok(exec::pipe_closed_exit());
             }
             (json, parse_tier)

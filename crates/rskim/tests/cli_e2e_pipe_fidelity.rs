@@ -24,7 +24,7 @@
 //!   it.
 //! - **Not the PATH-wrapper front-end.**  No test sets `argv[0]`, so
 //!   `detect_argv0_dispatch` never runs and neither does the wrapper-only
-//!   fidelity gate above it (`main.rs`: `stdout_is_regular_file()` →
+//!   fidelity gate above it (`main.rs`: `stdout_should_serve_raw()` →
 //!   `cmd::run_inherited_passthrough`, #370).  The wrapper eventually calls the
 //!   same `cmd::dispatch`, so the handler behaviour asserted here does apply
 //!   there — but that is an inference about the shared body, not coverage of the
@@ -742,7 +742,7 @@ fn t8_stdin_input_still_routes_to_the_buffered_path() {
 // Surface: every test below drives the **explicit subcommand** path
 // (`skim grep …`), reaching the handler through `cmd::dispatch`.  None of them
 // exercises the rewrite engine, and none sets `argv[0]`, so the PATH-wrapper
-// front-end (`detect_argv0_dispatch` and the `stdout_is_regular_file` gate) is
+// front-end (`detect_argv0_dispatch` and the `stdout_should_serve_raw` gate) is
 // not covered either — see the module header.
 // ============================================================================
 

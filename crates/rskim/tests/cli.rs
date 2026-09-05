@@ -245,9 +245,16 @@ fn test_cli_all_languages_structure() {
         .success()
         .stdout(predicate::str::contains("{...}"));
 
-    // Rust
+    // Rust — needs a multi-statement body so structure mode saves tokens vs raw.
+    // A single-expression body like `{ 42 }` ties on token count with `{...}`,
+    // triggering the tie→Passthrough rule (A2/A4 guardrail). Two statements
+    // produce a body substantially larger than `{...}` in bytes and tokens.
     let rs_file = temp_dir.path().join("test.rs");
-    fs::write(&rs_file, "fn test() { 42 }").unwrap();
+    fs::write(
+        &rs_file,
+        "fn compute_result(x: i64, y: i64) -> i64 { let sum = x + y; let product = x * y; sum + product }",
+    )
+    .unwrap();
     common::skim()
         .arg(&rs_file)
         .assert()
@@ -791,8 +798,11 @@ fn test_cli_pseudo_mode() {
         .success()
         .stdout(predicate::str::contains("function add"))
         .stdout(predicate::str::contains("return a + b"))
-        // Param type annotations should be stripped; return type preserved (A4 contract)
-        .stdout(predicate::str::contains("function add(a, b)"))
+        // ADR-008/E1: param type annotations are API surface — preserved in pseudo mode.
+        // Both parameter and return type annotations survive.
+        .stdout(predicate::str::contains(
+            "function add(a: number, b: number)",
+        ))
         .stdout(predicate::str::contains("): number"))
         // `export` is preserved as API surface (A4 contract)
         .stdout(predicate::str::contains("export"));

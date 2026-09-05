@@ -55,23 +55,40 @@ fn test_transparency_marker_fires_on_tagged_pseudo_read() {
 }
 
 // ============================================================================
-// Marker is silent without origin tag
+// Marker fires without origin tag when view differs (B3 behavior)
 // ============================================================================
 
-/// Explicit `skim file.rs --mode=pseudo` without the env tag must NOT emit a marker.
-/// This prevents false positives on direct skim invocations.
+/// After B3: `skim file.ts --mode=pseudo` without the env tag DOES emit a
+/// lossy-view marker when the pseudo view differs from raw bytes.
+///
+/// ADR-011 class 1: loss-bearing markers are unconditional — they do not
+/// require `SKIM_REWRITTEN_FROM` to be set.
+///
+/// Previously: "must NOT emit a marker" (pre-B3 behavior).
+/// Now: marker fires whenever view_differs (B3 generalization).
 #[test]
-fn test_no_marker_without_origin_tag() {
+fn test_lossy_marker_fires_without_origin_tag_b3() {
     let dir = TempDir::new().unwrap();
-    let file = dir.path().join("lib.rs");
-    fs::write(&file, "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+    let file = dir.path().join("lib.ts");
+    // TypeScript pseudo mode strips decorators and non-parameter type annotations.
+    // The @inject() decorator is removed; parameter types are preserved (E1/ADR-008).
+    // (A plain function only loses its semicolons, which may not change the token count
+    // enough to pass the fidelity guardrail — use a class with a decorator instead.)
+    fs::write(
+        &file,
+        "@inject()\nexport class Calculator {\n  private value: number;\n  add(a: number, b: number): number { return a + b; }\n}\n",
+    )
+    .unwrap();
 
     skim_cmd()
         .arg(&file)
         .arg("--mode=pseudo")
+        .arg("--no-cache")
         .assert()
         .success()
-        .stderr(predicate::str::contains("[skim] transformed view").not());
+        // B3: marker fires even without SKIM_REWRITTEN_FROM.
+        .stderr(predicate::str::contains("[skim]"))
+        .stderr(predicate::str::contains("pseudo"));
 }
 
 // ============================================================================
@@ -91,7 +108,8 @@ fn test_no_marker_when_output_equals_raw_full_mode() {
         .arg("--mode=full")
         .assert()
         .success()
-        .stderr(predicate::str::contains("[skim] transformed view").not());
+        // B3: marker still silent when view_differs=false (output == raw bytes).
+        .stderr(predicate::str::is_empty());
 }
 
 // ============================================================================
@@ -110,7 +128,7 @@ fn test_no_marker_when_guardrail_fires() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("inflating.ts");
 
-    // 20 functions × ~18 bytes = ~360 bytes raw (above MIN_RAW_SIZE_FOR_GUARDRAIL of 256).
+    // 20 functions × ~18 bytes = ~360 bytes raw (well above guardrail activation size).
     // Each empty body `{ }` (3 bytes) → ` {...}` (6 bytes) = +3 bytes per function,
     // so the compressed output exceeds the raw size and the guardrail fires.
     let mut source = String::new();
@@ -174,9 +192,11 @@ fn test_transparency_marker_names_structure_mode() {
         .stderr;
     let stderr = String::from_utf8_lossy(&stderr_bytes);
 
+    // B3/B4: the marker fires unconditionally when view differs and names the mode.
+    // With SKIM_REWRITTEN_FROM=cat, the format is: "[skim] transformed view (cat → skim
+    // --mode=structure): structure view: bodies removed — SKIM_PASSTHROUGH=1 for raw output"
     // Either the view differs (marker fires naming "structure") or it doesn't (no marker).
-    // If it fires, the mode name must be "structure", not "pseudo".
-    if stderr.contains("[skim] transformed view") {
+    if !stderr.is_empty() {
         assert!(
             stderr.contains("structure"),
             "transparency marker must name 'structure' mode; got: {stderr}"
@@ -192,10 +212,12 @@ fn test_transparency_marker_names_structure_mode() {
 // head tag with --max-lines
 // ============================================================================
 
-/// head tag with `--max-lines`: structure mode strips the function body (mirroring
-/// what the head rewrite actually emits: `SKIM_REWRITTEN_FROM=head skim <file>
-/// --mode=structure --max-lines N`).  Structure mode guarantees view differs from
-/// raw, so the marker must appear and must name `head`.
+/// head tag with `--max-lines`: the test drives `--mode=structure` explicitly via
+/// `SKIM_REWRITTEN_FROM=head` and the `--mode=structure` argument — it is
+/// independent of what the head rewrite handler actually emits (which has changed
+/// over time: pseudo → structure → full).  Structure mode strips the function body,
+/// guaranteeing the view differs from raw bytes, so the transparency marker must
+/// appear and must name `head`.
 #[test]
 fn test_transparency_marker_with_head_tag() {
     let dir = TempDir::new().unwrap();
@@ -230,15 +252,15 @@ fn test_multi_file_aggregate_marker_emitted_once() {
     let dir = TempDir::new().unwrap();
     let f1 = dir.path().join("a.ts");
     let f2 = dir.path().join("b.ts");
-    // TS pseudo mode strips `: number` type annotations → view differs from raw.
+    // TS pseudo mode strips decorators → view differs from raw. Parameter types preserved (E1).
     fs::write(
         &f1,
-        "export function foo(x: number): number {\n  return x * 2;\n}\n",
+        "@service()\nexport class Foo {\n  private x: number;\n  foo(x: number): number { return x * 2; }\n}\n",
     )
     .unwrap();
     fs::write(
         &f2,
-        "export function bar(x: number): number {\n  return x + 1;\n}\n",
+        "@service()\nexport class Bar {\n  private x: number;\n  bar(x: number): number { return x + 1; }\n}\n",
     )
     .unwrap();
 
@@ -257,8 +279,10 @@ fn test_multi_file_aggregate_marker_emitted_once() {
         marker_count, 1,
         "multi-file transparency marker must appear exactly once; got {marker_count} occurrences in stderr:\n{stderr}"
     );
+    // B4 format: "... <class description>: 2/2 files — SKIM_PASSTHROUGH=1 for raw output"
+    // (old format was "2/2 files not raw bytes")
     assert!(
-        stderr.contains("2/2 files not raw bytes"),
+        stderr.contains("2/2 files"),
         "multi-file marker must show 2/2 count; got: {stderr}"
     );
 }
@@ -268,16 +292,16 @@ fn test_multi_file_aggregate_marker_emitted_once() {
 // ============================================================================
 
 /// Cache hit path: the marker must also fire when the result comes from the
-/// skim cache (not just on fresh reads). Uses a TypeScript file so pseudo
-/// mode definitely produces a different view (strips parameter type annotations).
+/// skim cache (not just on fresh reads). Uses a TypeScript class with a decorator
+/// so pseudo mode definitely produces a different view (E1: parameter types preserved).
 #[test]
 fn test_transparency_marker_fires_on_cache_hit() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("cached.ts");
-    // TS pseudo mode strips `: number` type annotations → view differs from raw.
+    // TS pseudo mode strips decorators → view differs from raw. Parameter types preserved (E1).
     fs::write(
         &file,
-        "export function square(x: number): number {\n  return x * x;\n}\n",
+        "@service()\nexport class Calc {\n  private v: number;\n  square(x: number): number { return x * x; }\n}\n",
     )
     .unwrap();
 

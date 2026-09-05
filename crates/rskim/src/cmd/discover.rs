@@ -459,6 +459,7 @@ fn print_debug_section(analysis: &DiscoverAnalysis, debug: bool) {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // Discovery JSON output; skim-generated, streaming handle for correctness
 fn print_json_report(analysis: &DiscoverAnalysis, config: &DiscoverConfig) -> anyhow::Result<()> {
     let skimmable_reads: Vec<_> = analysis
         .code_reads

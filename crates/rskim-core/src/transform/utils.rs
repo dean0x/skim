@@ -241,7 +241,8 @@ pub(crate) fn score_node_kind(kind: &str) -> u8 {
 /// Get the single-line comment prefix for a language
 ///
 /// Used to generate omission markers in the correct comment syntax.
-pub(crate) fn get_comment_prefix(language: Language) -> &'static str {
+#[must_use]
+pub fn get_comment_prefix(language: Language) -> &'static str {
     match language {
         Language::TypeScript
         | Language::JavaScript
@@ -267,6 +268,82 @@ pub(crate) fn get_comment_suffix(language: Language) -> &'static str {
     match language {
         Language::Markdown => " -->",
         _ => "",
+    }
+}
+
+/// Which side of the retained window an elision marker accounts for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ElidedSide {
+    /// Lines dropped *after* the retained window (`--max-lines`): `(N lines truncated)`.
+    Truncated,
+    /// Lines dropped *before* the retained window (`--last-lines`): `(N lines above)`.
+    Above,
+    /// [`ElidedSide::Truncated`], for the degenerate cut where the retained
+    /// window could not be pulled back out of a multi-line string literal
+    /// because the literal opens on the first retained line (#511):
+    /// `(N lines truncated; cut inside a string literal)`.
+    ///
+    /// The clause is part of the disclosure (ADR-011 class 1): the reader is
+    /// told not just how much is missing but that what remains is the head of
+    /// a literal, so its trailing delimiter is absent by construction.
+    TruncatedInsideLiteral,
+    /// [`ElidedSide::TruncatedInsideLiteral`] for a Markdown fenced code block:
+    /// `(N lines truncated; cut inside a code fence)`.
+    TruncatedInsideFence,
+    /// [`ElidedSide::Above`], for the degenerate `--last-lines` window that
+    /// could not be moved forward out of a multi-line string literal because
+    /// the literal has no closing delimiter before end of file (#511):
+    /// `(N lines above; cut inside a string literal)`.
+    ///
+    /// The head window pulls *back* and the tail window moves *forward*, but
+    /// the disclosure obligation is identical: what remains is the middle of a
+    /// literal, so its opening delimiter is absent by construction.
+    AboveInsideLiteral,
+    /// [`ElidedSide::AboveInsideLiteral`] for a Markdown fenced code block:
+    /// `(N lines above; cut inside a code fence)`.
+    AboveInsideFence,
+}
+
+/// Build the canonical elision marker line for `language`.
+///
+/// Shape: `<prefix> ... (N lines truncated)<suffix>`, with the optional remedy
+/// clause inserted as ` — <hint>` (ADR-011 class 1) *inside* the comment, before
+/// the closing suffix. Markdown is the only language with a non-empty suffix, and
+/// the rule exists for it: the marker reads
+/// `<!-- ... (N lines truncated) — <hint> -->`, one self-contained HTML comment,
+/// never `--> — <hint>` which would leak the hint into the rendered document as
+/// visible prose. Every other suffix is empty, so their bytes are unaffected.
+///
+/// `language` is `None` only where detection failed: an extension-less or
+/// unknown-extension file, or stdin without `--filename`. Those inputs are
+/// shell/config scripts in practice, so the marker falls back to the `#` prefix
+/// and an empty suffix. [`get_comment_prefix`] has no such arm because it is
+/// only reached once a language is known.
+#[must_use]
+pub fn elision_marker_line(
+    language: Option<Language>,
+    elided: usize,
+    side: ElidedSide,
+    hint: Option<&str>,
+) -> String {
+    let (prefix, suffix) = match language {
+        Some(lang) => (get_comment_prefix(lang), get_comment_suffix(lang)),
+        None => ("#", ""),
+    };
+    let unit = if elided == 1 { "line" } else { "lines" };
+    let side_text = match side {
+        ElidedSide::Truncated => "truncated",
+        ElidedSide::Above => "above",
+        ElidedSide::TruncatedInsideLiteral => "truncated; cut inside a string literal",
+        ElidedSide::TruncatedInsideFence => "truncated; cut inside a code fence",
+        ElidedSide::AboveInsideLiteral => "above; cut inside a string literal",
+        ElidedSide::AboveInsideFence => "above; cut inside a code fence",
+    };
+    // performance-9: collapse to a single allocation instead of two.
+    match hint {
+        Some(h) => format!("{prefix} ... ({elided} {unit} {side_text}) \u{2014} {h}{suffix}"),
+        None => format!("{prefix} ... ({elided} {unit} {side_text}){suffix}"),
     }
 }
 

@@ -182,6 +182,7 @@ fn no_ignore_hint(no_ignore: bool) -> &'static str {
 ///
 /// Precondition: `paths` must be non-empty. Callers should validate and
 /// produce a descriptive error (with `--no-ignore` hint) before calling.
+#[allow(clippy::disallowed_methods)] // Multi-file streaming output; may span thousands of files, streaming handle required
 fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Result<()> {
     debug_assert!(
         !paths.is_empty(),
@@ -277,12 +278,12 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
         );
     }
 
-    if view_differs_count > 0
-        && let Some(origin) = crate::output::rewrite_origin()
-    {
+    // B3 / ADR-011 class 1: emit lossy-view marker unconditionally when any
+    // file's view differs from raw bytes.  Previously gated on `SKIM_REWRITTEN_FROM`.
+    if view_differs_count > 0 {
         let mode_str = format!("{:?}", options.process.mode).to_lowercase();
-        if let Some(marker) = crate::output::rewrite_transparency_marker(
-            &origin,
+        if let Some(marker) = crate::output::lossy_view_marker(
+            crate::output::rewrite_origin().as_deref(),
             &mode_str,
             view_differs_count,
             total_paths,
@@ -534,6 +535,28 @@ pub(crate) fn process_directory(dir: &Path, options: MultiFileOptions) -> anyhow
     }
 
     process_files(paths, options)
+}
+
+/// Collect skim-supported file paths from a directory for passthrough mode.
+///
+/// Mirrors `collect_files_from_directory` but is `pub(crate)` so the passthrough
+/// gate in `process_single_arg` can enumerate files without running the transform
+/// pipeline.  Returns an empty `Vec` when the directory is empty or has no
+/// skim-supported files (the caller is responsible for handling that case).
+pub(crate) fn collect_passthrough_paths_dir(dir: &Path, no_ignore: bool) -> Vec<PathBuf> {
+    collect_files_from_directory(dir, no_ignore)
+}
+
+/// Expand a glob pattern to matching file paths for passthrough mode.
+///
+/// Mirrors `expand_glob_to_paths` but is `pub(crate)` so the passthrough gate
+/// in `process_single_arg` can enumerate files without running the transform
+/// pipeline.
+pub(crate) fn collect_passthrough_paths_glob(
+    pattern: &str,
+    no_ignore: bool,
+) -> anyhow::Result<Vec<PathBuf>> {
+    expand_glob_to_paths(pattern, no_ignore)
 }
 
 #[cfg(test)]

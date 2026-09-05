@@ -58,11 +58,11 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 
 ### Command Rewriting (`skim init`)
 - PreToolUse hook rewrites `ls`, `grep`, `gh`, `cargo test`, `vitest`, `git diff` into skim equivalents
-- File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents
+- File reads (`cat`, `head`, `tail` on code files) are rewritten into direct skim reads (e.g. `cat file.ts` → `skim file.ts --mode=pseudo`); output is a structured view, not raw bytes — skim emits a one-line stderr notice whenever the served view differs from raw file contents. `head -20 file.ts` becomes `skim file.ts --mode=full --max-lines 20` (verbatim lines; when the file is longer, one slot goes to the elision marker), and `tail -5 file.ts` likewise with `--last-lines 5`; bare `head`/`tail` default to 10 lines
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
-- Round-trip safe: commands with pipes, newlines, heredocs, or command substitution are never rewritten
-- Known limitation: PATH wrappers (`skim init --wrappers`) intercept each pipeline segment independently, so a piped consumer may see compressed output from a compressing wrapper — use `SKIM_PASSTHROUGH=1` when that is undesirable (tracked in #319). Note: `grep` and `rg` now emit native byte-faithful passthrough and are not affected by this caveat
+- Round-trip safe: commands with newlines, heredocs, or command substitution are never rewritten; piped commands are refused too, with one exception — `<cmd> | cat` (bare `cat`, sole consumer, no redirects) rewrites its source, because bare `cat` renders a stream for a reader rather than consuming its bytes
+- PATH wrappers (`skim init --wrappers`) now apply a force-raw sidecar marker (set by the PreToolUse hook when it identifies a pipeline shape where compression would cause byte loss) and an `fstat`/`isatty` gate (which serves raw bytes when stdout is a regular file, socket, or non-terminal character device). Together these partially close the compression-into-piped-consumer window (#319). Two holes remain (#514): (1) a same-tool concurrent command can clear a live marker, and (2) when no PreToolUse hook fires at all the wrapper falls back to `fstat`-only behaviour with no pipeline-shape awareness. Use `SKIM_PASSTHROUGH=1` when byte-exact output is required in those cases
 
 ### Test Output Compression
 - `skim cargo test`, `skim pytest`, `skim vitest`, `skim jest`, `skim go test`
@@ -74,7 +74,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Extracts errors, warnings, and summaries
 
 ### Lint Output Compression
-- `skim eslint`, `skim ruff`, `skim mypy`, `skim golangci`, `skim prettier`, `skim rustfmt`, `skim biome`, `skim dprint`, `skim oxlint`, `skim black`, `skim gofmt`
+- `skim eslint`, `skim ruff`, `skim mypy`, `skim golangci-lint`, `skim prettier`, `skim rustfmt`, `skim biome`, `skim dprint`, `skim oxlint`, `skim black`, `skim gofmt`
 - Extracts errors and warnings with severity grouping
 - Three-tier degradation from structured parse to regex fallback to passthrough
 
@@ -240,6 +240,12 @@ skim - --language typescript   # Stdin (recommended; shebang auto-detected)
 - `-m, --mode` - Transformation mode: `structure` (default), `signatures`, `types`, `full`, `minimal`, `pseudo`
 - `-l, --language` - Override auto-detection (recommended for stdin; else shebang is tried, then lossless passthrough)
 - `-j, --jobs` - Parallel processing threads (default: CPU cores)
+- `-n, --line-numbers` - Annotate output with original source line numbers (prefix `{line}\t{content}`)
+- `--max-lines N` - Emit at most N lines total; when content is elided, one slot goes to the elision marker
+- `--last-lines N` - Emit at most N lines from the tail; when content is elided, one slot goes to the elision marker
+- `--tokens N` - Fit output within N tokens by escalating through modes, then line-truncating with a marker
+- `--passthrough` - Bypass all compression and exec the real tool with raw argv (equivalent to `SKIM_PASSTHROUGH=1`)
+- `--debug` - Enable raw-fallback diagnostic banners on stderr (loss-bearing elision markers are always emitted regardless)
 - `--no-cache` - Disable caching
 - `--show-stats` - Show token reduction stats
 - `--disable-analytics` - Disable analytics recording
@@ -254,14 +260,14 @@ Skim offers six modes with different levels of aggressiveness:
 |------------|-----------|------------------------------------------|----------------------------|
 | Full       | 0%        | Everything (original source)             | Testing/comparison         |
 | Minimal    | 15-30%    | All code, doc comments                   | Light cleanup              |
-| Pseudo     | 30-50%    | Logic flow, names, values, return types  | LLM context with logic     |
+| Pseudo     | 30-50%    | Logic flow, names, values, return types; parameter types preserved for TypeScript and Rust | LLM context with logic     |
 | Structure  | 70-80%    | Signatures, types, classes, imports      | Understanding architecture |
 | Signatures | 85-92%    | Only callable signatures                 | API documentation          |
 | Types      | 90-95%    | Only type definitions                    | Type system analysis       |
 
 ```bash
 skim file.ts --mode structure   # Default
-skim file.ts --mode pseudo      # Pseudocode (preserves return types + visibility; strips decorators)
+skim file.ts --mode pseudo      # Pseudocode (preserves return types, parameter types for TS/Rust; strips decorators)
 skim file.ts --mode signatures  # More aggressive
 skim file.ts --mode types       # Most aggressive
 skim file.ts --mode full        # No transformation

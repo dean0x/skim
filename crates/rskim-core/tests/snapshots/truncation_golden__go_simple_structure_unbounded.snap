@@ -1,0 +1,32 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Structure))"
+---
+// FIXTURE: Simple Go functions
+// TESTS: Basic function signature extraction
+
+package main
+
+import "fmt"
+
+func Add(a int, b int) int  {...}
+
+func Greet(name string) string  {...}
+
+type Calculator struct {
+    value int
+}
+
+func (c *Calculator) Add(x int) int  {...}
+
+type Computer interface {
+    Compute(x int) int
+}
+
+type Status int
+
+const (
+    Active Status = iota
+    Inactive
+    Pending
+)

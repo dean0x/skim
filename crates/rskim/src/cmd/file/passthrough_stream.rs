@@ -62,6 +62,7 @@ use crate::cmd::stream_pump::{
 /// count.  `--show-stats` is unaffected: it is deliberately routed to the
 /// buffered sink, so the number skim *displays inline* is byte-for-byte what it
 /// was.
+#[allow(clippy::disallowed_methods)] // Streaming passthrough sink for file content; unbounded size requires streaming
 pub(super) fn run_passthrough_streamed(
     spec: &PassthroughSpec<'_>,
     args: &[String],

@@ -15,6 +15,7 @@ use clap_complete::Shell;
 /// Parses a shell name from `args`, builds a full synthetic command that
 /// includes all file-operation flags and known subcommands, then generates
 /// the completion script to stdout.
+#[allow(clippy::disallowed_methods)] // Shell completions output; unbounded, routed through clap_complete's streaming API
 pub(crate) fn run(
     args: &[String],
     _analytics: &crate::analytics::AnalyticsConfig,

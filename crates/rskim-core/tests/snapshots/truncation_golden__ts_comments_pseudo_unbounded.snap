@@ -1,0 +1,45 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(TS_COMMENTS, Language::TypeScript,\nTransformConfig::with_mode(Mode::Pseudo))"
+---
+/**
+ * This is a JSDoc comment (KEEP)
+ * @param x - first number
+ * @param y - second number
+ * @returns the sum
+ */
+export function add(x: number, y: number): number {
+    // This comment is inside a function body (KEEP)
+    const result = x + y // inline comment in body (KEEP)
+    return result
+}
+
+
+/**
+ * A documented class (KEEP)
+ */
+export class Calculator {
+    private value
+
+    /** Constructor doc (KEEP) */
+    constructor(value: number) {
+        this.value = value
+    }
+
+    /**
+     * Add method doc (KEEP)
+     */
+    add(x: number): number {
+        // body comment (KEEP)
+        return this.value + x
+    }
+}
+
+
+export interface Config {
+    name
+    value
+}
+
+
+export const VERSION = "1.0.0"

@@ -1,0 +1,14 @@
+---
+source: crates/rskim-core/tests/truncation_golden.rs
+expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(Mode::Pseudo).with_last_lines(10))"
+---
+# ... (12 lines above)
+    message = f"Hello, {name}!"
+    return message
+
+class Calculator:
+    def add(x, y) -> int:
+        return x + y
+
+    def multiply(x, y) -> int:
+        return x * y

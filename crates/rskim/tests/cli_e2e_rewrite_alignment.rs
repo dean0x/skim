@@ -37,7 +37,7 @@
 //! | eslint .                 | skim eslint .           | yes (JSON/text)       |
 //! | ruff check .             | skim ruff .             | yes (JSON/text)       |
 //! | mypy .                   | skim mypy .             | yes (JSON/text)       |
-//! | golangci-lint run ./...  | skim golangci ./...     | yes (JSON/text)       |
+//! | golangci-lint run ./...  | skim golangci-lint ./... | yes (JSON/text)       |
 //! | npm audit                | skim npm audit          | yes (JSON)            |
 //! | npm install express      | skim npm install        | yes (JSON/text)       |
 //! | pip install flask        | skim pip install        | yes (text)            |
@@ -239,19 +239,24 @@ fn test_alignment_mypy_rewrite_and_handler() {
         .stdout(predicate::str::contains("mypy"));
 }
 
-/// Verify `golangci-lint run ./...` rewrites to `skim golangci ./...`
+/// Verify `golangci-lint run ./...` rewrites to `skim golangci-lint ./...`
 /// AND the handler processes golangci JSON output.
+///
+/// D1: rewrite target updated from "golangci" to "golangci-lint" to match the
+/// actual binary name. Handler dispatch also uses the canonical "golangci-lint".
 #[test]
 fn test_alignment_golangci_rewrite_and_handler() {
     skim_cmd()
         .args(["rewrite", "golangci-lint", "run", "./..."])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skim golangci"));
+        // D1: rewrite_to changed from ["skim", "golangci"] to ["skim", "golangci-lint"]
+        .stdout(predicate::str::contains("skim golangci-lint"));
 
     let fixture = include_str!("fixtures/cmd/lint/golangci_fail.json");
     skim_cmd()
-        .args(["golangci"])
+        // D1: use canonical "golangci-lint" subcommand name
+        .args(["golangci-lint"])
         .write_stdin(fixture)
         .assert()
         .stdout(predicate::str::contains("golangci"));

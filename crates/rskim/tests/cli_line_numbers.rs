@@ -573,9 +573,6 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
     }
 
     // 2. Numbered content lines must have the CORRECT source line numbers.
-    //    simple_last_line_truncate(n=3) reserves 1 slot for the marker, so
-    //    it keeps the last 2 content lines: source lines 9 and 10 of a 10-line file.
-    //    Before the bug fix, content lines got sequential numbers [1, 2] instead.
     let content_line_nums: Vec<usize> = lines
         .iter()
         .filter_map(|l| {
@@ -584,16 +581,20 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
         })
         .collect();
 
+    // N-total semantics (b5507ad / ADR-002): `--last-lines 3` yields at most 3
+    // lines TOTAL — 1 marker + 2 content lines, the last 2 of a 10-line file.
     assert_eq!(
         content_line_nums.len(),
         2,
-        "simple_last_line_truncate(n=3) yields 1 marker + 2 content lines, got: {:?}",
+        "--last-lines 3 yields 1 marker + 2 content lines (N-total), got: {:?}",
         content_line_nums
     );
+    // PF-019: real source line numbers, not sequential from 1 and not shifted by
+    // the marker slot.
     assert_eq!(
         content_line_nums,
         vec![9, 10],
-        "Content lines should have real source line numbers 9 and 10 (not sequential from 1 or 2)"
+        "Content lines must carry their real source line numbers 9 and 10"
     );
 }
 
@@ -1209,20 +1210,23 @@ fn test_line_numbers_last_lines_correct_source_numbers() {
         })
         .collect();
 
-    // simple_last_line_truncate(n=3) reserves 1 slot for the marker, so it keeps
-    // the last 2 content lines: source lines 4 and 5 of a 5-line file.
-    // Before the bug fix, content lines got sequential numbers [1, 2] instead.
+    // N-total semantics (b5507ad / ADR-002): `--last-lines N` yields at most N
+    // lines TOTAL, so the marker consumes one slot and n=3 gives 1 marker + 2
+    // content lines — the last 2 of a 5-line file, i.e. source lines 4 and 5.
+    // PF-019: the numbers must be the REAL source lines. Before the fix they were
+    // sequential from 1; a later off-by-one in the arithmetic line map reported
+    // [3, 4] for content that is genuinely lines 4 and 5.
     assert_eq!(
         content_lines.len(),
         2,
-        "simple_last_line_truncate(n=3) yields 1 marker + 2 content lines, got: {:?}",
+        "--last-lines 3 yields 1 marker + 2 content lines (N-total), got: {:?}",
         content_lines
     );
     let nums: Vec<usize> = content_lines.iter().map(|(n, _)| *n).collect();
     assert_eq!(
         nums,
         vec![4, 5],
-        "Content lines should have source line numbers 4 and 5 (not sequential from 1)"
+        "Content lines must carry their real source line numbers 4 and 5"
     );
 }
 
@@ -1328,11 +1332,12 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
 
-    // Should have exactly 3 lines: marker + 2 content lines
+    // N-total semantics (b5507ad / ADR-002): `--last-lines 3` yields at most 3
+    // lines TOTAL — 1 marker + 2 content lines. The marker consumes one slot.
     assert_eq!(
         lines.len(),
         3,
-        "With --last-lines 3, output should have 3 lines (marker + 2 content). Got:\n{}",
+        "With --last-lines 3, output should have 3 lines total (1 marker + 2 content). Got:\n{}",
         stdout
     );
 
@@ -1349,7 +1354,7 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
         num_str.parse::<usize>().ok()
     };
 
-    // Second line: source line 5 (`    return 2;`)
+    // Second line (lines[1]): source line 5 (`    return 2;`)
     let num1 = parse_line_num(lines[1]);
     assert_eq!(
         num1,
@@ -1359,12 +1364,14 @@ fn test_line_numbers_last_lines_full_mode_duplicate_lines() {
         lines[1]
     );
 
-    // Third line: source line 6 (`}`) — NOT line 3 which is also `}`
+    // Third line (lines[2]): source line 6 (`}`) — NOT line 3, which is also `}`.
+    // This is the regression the test exists for: a content-matching line map
+    // would attribute the tail `}` to its FIRST occurrence (PF-019).
     let num2 = parse_line_num(lines[2]);
     assert_eq!(
         num2,
         Some(6),
-        "Content line 2 (closing `}}`) should map to source line 6 (its real position), \
+        "Closing `}}` should map to source line 6 (its real position), \
          not line 3 (first `}}` occurrence). Got: {:?} (full line: {:?})",
         num2,
         lines[2]
