@@ -601,6 +601,16 @@ pub(super) fn paths_to_scored_file_ids(
     // boundary.  When `seed_path` is `None` — a seedless allowlist such as a
     // test helper whose values are all 1.0 — the seed-unindexed notice is
     // suppressed entirely, preventing a false user-visible disclosure.
+    // AD-409-9: an empty allowlist is a sentinel, never a scan.  Two producers
+    // reach here with one: the `AnchorDiffers` `Filtered { allow: empty }` arm
+    // (mismatch notice already emitted) and the zero-partner seed suppression in
+    // `resolve_blast_radius_paths` ("no co-change data for X" already emitted).
+    // Both have disclosed the situation; running the manifest scan would only add
+    // a third, less informative "matched 0 indexed files (allowed 0 paths, …)"
+    // line.  Return before any notice so exactly one explanation reaches stderr.
+    if allowed_paths.is_empty() {
+        return Vec::new();
+    }
     let seed_path: Option<&str> = allowed_paths
         .iter()
         .find_map(|(k, &v)| (v == SEED_STRENGTH).then_some(k.as_str()));
@@ -785,7 +795,27 @@ pub(super) fn resolve_blast_radius_paths(
     // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
     // surface matches within the target file in addition to its co-change partners.
     // SEED_STRENGTH (2.0 > max Jaccard 1.0) ensures the target ranks first in the temporal layer.
-    allowed_paths.insert(normalized, SEED_STRENGTH);
+    //
+    // AD-409-9 (F-C1-01): the seed is injected ONLY when the target actually has
+    // a co-change relation — i.e. at least one cochange row exists for it.  A
+    // blast radius IS a co-change relation; with zero partners there is no
+    // relation to rank, so seeding the temporal layer with the target alone
+    // manufactured a ranking out of nothing: `skim search <gibberish>
+    // --blast-radius solo.rs` returned solo.rs as its own `co_change_partner` at
+    // the bare RRF sentinel score (temporal weight / 61), immediately after
+    // stderr had said "no co-change data for solo.rs".  #409's AC-20 forbids
+    // exactly that ("MUST NOT fabricate any ranking"); AC-2's seed-first rule
+    // (Option A, AD-409-3) is scoped to targets that HAVE partners and is
+    // unchanged here.
+    //
+    // The empty allowlist that results is the "blast radius contributes nothing"
+    // sentinel already understood downstream: `blast_temporal_layer` early-outs
+    // to `empty_output` (ADR-009) and `paths_to_scored_file_ids` returns an empty
+    // layer, so every blast-radius arm reports zero results — matching what the
+    // standalone `--blast-radius` arm already returns for the same target.
+    if !partners.is_empty() {
+        allowed_paths.insert(normalized, SEED_STRENGTH);
+    }
     Ok(BlastRadiusResolution::Allowed(allowed_paths))
 }
 

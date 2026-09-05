@@ -1610,3 +1610,130 @@ fn ac409_ac19_blast_hot_resorts_fused_top_window_by_hotspot() {
          fused_top={fused_top:?} hotspot_re_sorted={expected_paths:?} actual={actual_paths:?}"
     );
 }
+
+// ============================================================================
+// F-C1-01 — AD-409-9: zero-partner seed must not be ranked
+// ============================================================================
+
+/// AD-409-9 / F-C1-01 — a `--blast-radius` seed with ZERO co-change partners must
+/// not be injected into the temporal layer.
+///
+/// Before the fix, `resolve_blast_radius_paths` inserted the seed with
+/// `SEED_STRENGTH` unconditionally, so `skim search <gibberish> --blast-radius
+/// solo.rs` returned solo.rs as its own `co_change_partner` at the pure RRF
+/// sentinel score (temporal weight / 61) — immediately after stderr had said
+/// "no co-change data for solo.rs".  #409 AC-20 forbids fabricating a ranking in
+/// exactly this state; AC-2's seed-first rule is scoped to seeds that HAVE
+/// partners and is re-asserted below so the fix cannot over-reach.
+///
+/// Fixture: `solo.rs` is added in its own commit, so it never co-occurs with any
+/// other file.  `pair_a.rs` / `pair_b.rs` are committed together twice, giving
+/// `pair_a.rs` a genuine partner at J = 1.0.
+///
+/// PF-007 discriminating observables:
+///   (a) the zero-partner query returns `results: []` while stderr still carries
+///       the "no co-change data" notice, and
+///   (b) the with-partners query still ranks the seed first — proving the change
+///       is scoped to the zero-partner case rather than disabling seeding.
+#[test]
+fn ac409_9_zero_partner_seed_is_not_ranked() {
+    let now = now_epoch();
+    let dir = TempDir::new().expect("TempDir::new");
+    let cache = TempDir::new().unwrap();
+    git_init(dir.path());
+
+    // C1 + C2: pair_a.rs and pair_b.rs always change together → J = 1.0.
+    write_and_stage(dir.path(), "pair_a.rs", "fn pair_one() { let v = 1; }\n");
+    write_and_stage(dir.path(), "pair_b.rs", "fn pair_two() { let v = 2; }\n");
+    git_commit(dir.path(), "feat: add the pair", now - 20 * 86400);
+    write_and_stage(dir.path(), "pair_a.rs", "fn pair_one() { let v = 11; }\n");
+    write_and_stage(dir.path(), "pair_b.rs", "fn pair_two() { let v = 22; }\n");
+    git_commit(dir.path(), "feat: touch the pair again", now - 10 * 86400);
+
+    // C3: solo.rs alone → zero co-change partners.
+    write_and_stage(
+        dir.path(),
+        "solo.rs",
+        "fn solo_fn() { let solo_marker = 3; }\n",
+    );
+    git_commit(dir.path(), "feat: add solo", now - 5 * 86400);
+
+    build_index(dir.path(), cache.path());
+
+    // Premise (PF-007): solo.rs really has no co-change rows.  Without this a
+    // fixture drift would make the empty-results assertion vacuous.
+    let db = find_temporal_db(cache.path()).expect("temporal.db must exist after --build");
+    let out = StdCommand::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT COUNT(*) FROM cochange WHERE file_a='solo.rs' OR file_b='solo.rs';")
+        .output()
+        .expect("sqlite3 cochange count");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "0",
+        "AC-20 premise: solo.rs must have 0 co-change partners; a co-change row means \
+         the fixture commits were restructured"
+    );
+
+    // (a) Zero-partner seed + a text query that matches nothing → no results.
+    let (stdout, stderr) = run_search_raw_ok(
+        dir.path(),
+        cache.path(),
+        &[
+            "xqzjvmblorp_ac409_9_nomatch",
+            "--blast-radius",
+            "solo.rs",
+            "--weights",
+            "0,0,1",
+            "--limit",
+            "10",
+            "--json",
+        ],
+    );
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr_text.contains("no co-change data"),
+        "AC-20: the existing no-co-change notice must be unchanged; got: {stderr_text:?}"
+    );
+    let v: Value =
+        serde_json::from_slice(&stdout).expect("AC-20: skim search --json must produce valid JSON");
+    let results = v["results"].as_array().expect("results must be an array");
+    assert!(
+        results.is_empty(),
+        "AD-409-9 / AC-20: a seed with zero co-change partners must NOT be returned \
+         as its own co_change_partner; got: {results:?}"
+    );
+
+    // (b) Scope guard — a seed that DOES have a partner still ranks first
+    // (AC-2 / AD-409-3 Option A is unchanged).
+    let (stdout2, _) = run_search_raw_ok(
+        dir.path(),
+        cache.path(),
+        &[
+            "xqzjvmblorp_ac409_9_nomatch",
+            "--blast-radius",
+            "pair_a.rs",
+            "--weights",
+            "0,0,1",
+            "--limit",
+            "10",
+            "--json",
+        ],
+    );
+    let v2: Value = serde_json::from_slice(&stdout2).expect("valid JSON");
+    let paths2: Vec<&str> = v2["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .filter_map(|r| r["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths2.first(),
+        Some(&"pair_a.rs"),
+        "AC-2 scope guard: with partners present the seed must still rank first; got: {paths2:?}"
+    );
+    assert!(
+        paths2.contains(&"pair_b.rs"),
+        "AC-2 scope guard: the genuine co-change partner must still be returned; got: {paths2:?}"
+    );
+}

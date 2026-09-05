@@ -231,6 +231,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as before, and no line-length cap was introduced: a 20 KB single line is anchored too.
   The `0.0` score of a substring-only match is unchanged and deliberate: it is the marker
   that ranks these candidates below every exact whole-token BM25F match (AD-411-7).
+- **`--blast-radius` no longer ranks a target that has no co-change partners** (#409).
+  The blast-radius target was injected into the temporal layer unconditionally, so
+  `skim search <text-that-matches-nothing> --blast-radius solo.rs` returned `solo.rs`
+  as its own `co_change_partner` at the bare reciprocal-rank sentinel score, immediately
+  after stderr had said `no co-change data for "solo.rs"`. #409 AC-20 forbids
+  fabricating a ranking in that state. The target is now injected only when it actually
+  has at least one co-change row; the seed-first rule for targets that do have partners
+  (AC-2, AD-409-3 option A) is unchanged, as are the Jaccard ordering and the
+  partial-drop notices. **Behaviour change:** on a target with zero co-change partners
+  every `--blast-radius` arm now returns zero results, which matches what the standalone
+  `--blast-radius` arm already returned for that target and follows ADR-009 (when the
+  blast radius contributes nothing, return nothing rather than a confident ranking that
+  is not a blast radius); text matches inside such a target are no longer surfaced by
+  the composite arm. The redundant `blast-radius filter matched 0 indexed files` stderr
+  line is suppressed when the allowlist is empty, so exactly one explanation reaches
+  stderr.
 - **Query-time empty-temporal notice now names the shallow-clone cause and remedy**
   (#414). `sync()` records `meta.is_shallow` on every build (AD-414-14) and the
   build-time zero-row notice already advised `git fetch --unshallow`, but the
