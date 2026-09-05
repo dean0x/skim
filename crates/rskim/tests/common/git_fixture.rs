@@ -54,6 +54,15 @@ pub fn git_init(dir: &Path) {
 
 /// Write `content` to `dir/<filename>` and stage it.
 pub fn write_and_stage(dir: &Path, filename: &str, content: &str) {
+    write_and_stage_bytes(dir, filename, content.as_bytes());
+}
+
+/// Write raw bytes to `filename` (relative to `dir`) and `git add` it.
+///
+/// Use this sibling of [`write_and_stage`] when the content is non-UTF-8
+/// (e.g. a binary fixture that should appear in git history but be skipped
+/// by skim's UTF-8 content filter, as in the AC-7 seed-unindexed test).
+pub fn write_and_stage_bytes(dir: &Path, filename: &str, content: &[u8]) {
     let path = dir.join(filename);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();

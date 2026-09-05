@@ -13,9 +13,11 @@
 //! # FX-LINEAR fixture structure
 //!
 //! Three Rust source files whose byte-wise path order INVERTS Jaccard order:
-//!   - `aweak.rs`  (alphabetically first)  → J(anchor, aweak)  ≈ 0.40
-//!   - `anchor.rs` (alphabetically middle) → SEED  (blast-radius target)
+//!   - `anchor.rs` (alphabetically first)  → SEED  (blast-radius target)
+//!   - `aweak.rs`  (alphabetically second) → J(anchor, aweak)  = 0.40
 //!   - `zstrong.rs` (alphabetically last)  → J(anchor, zstrong) = 0.60
+//!
+//! Byte-wise: anchor < aweak < zstrong ('n' 0x6E < 'w' 0x77 at position 1).
 //!
 //! Commit layout (5 total non-merge commits):
 //!   - C1: anchor.rs + zstrong.rs + aweak.rs  (all three)
@@ -50,7 +52,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 mod common;
-use common::git_fixture::{git_commit, git_init, now_epoch, write_and_stage};
+use common::git_fixture::{
+    git_commit, git_init, now_epoch, write_and_stage, write_and_stage_bytes,
+};
 
 // ============================================================================
 // Helpers
@@ -302,11 +306,11 @@ fn make_merge_commit_fixture() -> TempDir {
 
 /// AC-1 — `--weights 0,0,1` follows Jaccard DESC, NOT byte-wise path order.
 ///
-/// Byte-wise order: aweak < anchor < zstrong.
+/// Byte-wise order: anchor < aweak < zstrong ('n' < 'w' at position 1).
 /// Expected output order: anchor (seed, SEED_STRENGTH), zstrong (J=0.60), aweak (J=0.40).
 /// Scores: 1/61, 1/62, 1/63 (±1e-12).
 ///
-/// Pre-#409 (defect): aweak, anchor, zstrong (alphabetical = FileId-sort order).
+/// Pre-#409 (defect): anchor, aweak, zstrong (alphabetical = FileId-sort order).
 /// Post-#409 (fix):   anchor, zstrong, aweak  (Jaccard DESC, seed first).
 #[test]
 fn ac409_1_temporal_weight_only_follows_jaccard() {
@@ -358,13 +362,13 @@ fn ac409_1_temporal_weight_only_follows_jaccard() {
         .map(|r| r["path"].as_str().expect("path str"))
         .collect();
 
-    // Byte-wise order would be: [aweak.rs, anchor.rs, zstrong.rs].
+    // Byte-wise order (FileId order) would be: [anchor.rs, aweak.rs, zstrong.rs].
     // Jaccard order (seed first, then DESC by J): [anchor.rs, zstrong.rs, aweak.rs].
     assert_eq!(
         paths,
         ["anchor.rs", "zstrong.rs", "aweak.rs"],
         "AC-1: results must be ordered seed-first then by Jaccard DESC, \
-         not by byte-wise path order (aweak < anchor < zstrong)"
+         not by byte-wise path order (anchor < aweak < zstrong)"
     );
 
     // Score assertions (±1e-12): temporal-only RRF score w/(RRF_K + rank).
@@ -809,16 +813,9 @@ fn ac409_7_seed_unindexed_notice() {
     // This file is committed to git (so temporal sync records it) but is never
     // included in the lexical manifest entries (only in skipped_entries).
     let binary_content: &[u8] = &[0xc3, 0x28, 0x80, 0x81, 0xff]; // invalid UTF-8 sequence
-    let target_bin_path = dir.path().join("target.bin");
 
     // C1: target.bin + partner.rs — first joint commit.
-    fs::write(&target_bin_path, binary_content).expect("write target.bin C1");
-    let s = StdCommand::new("git")
-        .args(["add", "target.bin"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git add target.bin C1");
-    assert!(s.status.success(), "git add target.bin C1 failed");
+    write_and_stage_bytes(dir.path(), "target.bin", binary_content);
     write_and_stage(dir.path(), "partner.rs", "// partner v1\n");
     git_commit(
         dir.path(),
@@ -827,13 +824,7 @@ fn ac409_7_seed_unindexed_notice() {
     );
 
     // C2: target.bin + partner.rs again — J(target.bin, partner.rs) = 2/2 = 1.0.
-    fs::write(&target_bin_path, binary_content).expect("write target.bin C2");
-    let s = StdCommand::new("git")
-        .args(["add", "target.bin"])
-        .current_dir(dir.path())
-        .output()
-        .expect("git add target.bin C2");
-    assert!(s.status.success(), "git add target.bin C2 failed");
+    write_and_stage_bytes(dir.path(), "target.bin", binary_content);
     write_and_stage(dir.path(), "partner.rs", "// partner v2\n");
     git_commit(
         dir.path(),
