@@ -390,14 +390,25 @@ pub(super) fn open_temporal_state_for(
             if let Some(s) = sort
                 && dimension_is_empty(&db, s)
             {
-                return TemporalOpen::Unavailable(TemporalUnavailable {
-                    reason: DegradedReason::Empty,
-                    detail: String::new(),
-                });
+                return TemporalOpen::Unavailable(empty_temporal_state());
             }
             TemporalOpen::Open(db)
         }
         unavail => unavail,
+    }
+}
+
+/// AD-414-24: the single query-time producer of `DegradedReason::Empty`.
+///
+/// Every arm that has to report an empty temporal DB calls this rather than
+/// constructing the struct inline, so the three call sites — the sort-dimension
+/// probe in [`open_temporal_state_for`], the composite blast-radius arm in
+/// [`resolve_blast_radius_paths`], and the standalone blast-radius arm in
+/// `mod.rs::run_temporal_standalone` — cannot drift from one another.
+pub(super) fn empty_temporal_state() -> TemporalUnavailable {
+    TemporalUnavailable {
+        reason: DegradedReason::Empty,
+        detail: String::new(),
     }
 }
 
@@ -732,10 +743,8 @@ pub(super) fn resolve_blast_radius_paths(
         // non-empty-partners path above handles it correctly without any emptiness
         // check.
         if dimension_is_empty(&db, TemporalSort::Hot) {
-            let u = TemporalUnavailable {
-                reason: DegradedReason::Empty,
-                detail: String::new(),
-            };
+            // AD-414-25: shallow-aware Empty (see `empty_temporal_state`).
+            let u = empty_temporal_state();
             let msg = degraded_notice(&u, "--blast-radius", Fallback::Lexical);
             eprintln!("skim search: {msg}");
             return Ok(BlastRadiusResolution::Degraded(u));

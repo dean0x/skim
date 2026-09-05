@@ -2065,3 +2065,172 @@ fn t_ac30_step9_plain_query_no_temporal_notice_on_stderr() {
         );
     }
 }
+
+// ============================================================================
+// Group 12: standalone --blast-radius disclosure parity — F-C2-02 / F-C2-01
+// ============================================================================
+
+/// AD-414-24 / F-C2-02 — standalone `--blast-radius FILE` must disclose a
+/// non-`ready` temporal state, exactly as the composite `text + --blast-radius`
+/// arm already did.
+///
+/// `open_temporal_state_for` receives `sort = None` on this arm (there is no
+/// `--hot`/`--cold`/`--risky`), so before the fix its emptiness probe never ran
+/// and an entirely empty temporal DB produced
+/// `{"mode":"blast-radius","target":…,"total":0,"results":[]}` with no
+/// `degraded` key and an empty stderr — byte-indistinguishable from a healthy DB
+/// in which the file simply has no co-change partners.
+///
+/// PF-007 discriminating observables: `degraded[0].reason` and
+/// `degraded[0].requested`.  `newer-schema` is covered alongside `empty` because
+/// it takes the other route (the `Unavailable` arm of `open_temporal_state_for`)
+/// and must keep producing the same shape.
+#[test]
+fn f_c2_02_standalone_blast_radius_discloses_degraded_state() {
+    // FX-EMPTY: schema-only temporal.db, zero rows.
+    let (_dir_e, root_e, cache_e, _db_dir_e) = make_fx_empty();
+
+    // FX-NEWER: healthy DB whose user_version is bumped beyond this build.
+    let dir_n = TempDir::new().expect("TempDir");
+    let root_n = dir_n.path().join("repo");
+    fs::create_dir_all(&root_n).unwrap();
+    make_repo2(&root_n);
+    let cache_n = TempDir::new().expect("cache TempDir");
+    build_index(&root_n, cache_n.path());
+    make_newer_temporal(&find_search_cache(cache_n.path()).join("temporal.db"));
+
+    let cases: &[(&str, &Path, &Path)] = &[
+        ("empty", root_e.as_path(), cache_e.path()),
+        ("unsupported_version", root_n.as_path(), cache_n.path()),
+    ];
+
+    for (reason, root, cache) in cases {
+        let (stdout, stderr, code) = skim_search(
+            &["--blast-radius", "src/zebra.rs", "--limit", "5", "--json"],
+            root,
+            cache,
+        );
+        assert_eq!(
+            code, 0,
+            "F-C2-02: standalone blast-radius on {reason} must exit 0; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.trim().is_empty(),
+            "F-C2-02: standalone blast-radius on {reason} must emit a stderr notice; got empty"
+        );
+
+        let v: Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("F-C2-02: {reason} --json parse error: {e}\n{stdout}"));
+        let degraded = v["degraded"].as_array().unwrap_or_else(|| {
+            panic!("F-C2-02: {reason} --json must carry a degraded array; got:\n{stdout}")
+        });
+        assert_eq!(
+            degraded.len(),
+            1,
+            "F-C2-02: {reason} must carry exactly one degraded element; got:\n{stdout}"
+        );
+        assert_eq!(
+            degraded[0]["subsystem"].as_str(),
+            Some("temporal"),
+            "F-C2-02: {reason} degraded.subsystem must be 'temporal'"
+        );
+        assert_eq!(
+            degraded[0]["reason"].as_str(),
+            Some(*reason),
+            "F-C2-02: degraded.reason must be '{reason}'; got:\n{stdout}"
+        );
+        assert_eq!(
+            degraded[0]["requested"].as_str(),
+            Some("blast-radius"),
+            "F-C2-02: degraded.requested must be the bare flag name 'blast-radius'"
+        );
+        // F2 / AD-414-19: the standalone arm serves no result set, so `applied`
+        // must NOT claim a lexical ordering.
+        assert_eq!(
+            degraded[0]["applied"].as_str(),
+            Some("none"),
+            "F-C2-02: degraded.applied must be 'none' on the standalone arm"
+        );
+        // AD-414-1: the JSON message is the stderr notice minus the program-name
+        // prefix that the CLI output layer prepends.
+        let msg = degraded[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            stderr.contains(msg) && !msg.is_empty(),
+            "F-C2-02: degraded.message {msg:?} must appear verbatim in stderr:\n{stderr}"
+        );
+    }
+}
+
+/// AD-414-24 / F-C2-02 (negative) — a HEALTHY temporal DB in which the target
+/// file simply has no co-change partners must stay quiet: zero results, no
+/// `degraded` element, no shallow/empty wording.
+///
+/// This is the case the disclosure must NOT swallow (G-3: co-change emptiness
+/// never borrows the empty-DB wording).  PF-007: the sqlite premise assertion
+/// guards against fixture drift that would silently give alpha.rs a partner and
+/// make the `degraded`-absent assertion vacuous.
+#[test]
+fn f_c2_02_healthy_zero_partner_blast_radius_stays_quiet() {
+    let dir = TempDir::new().expect("TempDir");
+    let root = dir.path().join("repo");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/alpha.rs"),
+        "fn alpha_widget() { let y = 2; }\n",
+    )
+    .unwrap();
+    git_init(&root);
+    git_add_commit(&root, "c1: add alpha only");
+    fs::write(
+        root.join("src/zebra.rs"),
+        "fn zebra_widget() { let x = 1; }\n",
+    )
+    .unwrap();
+    git_add_commit(&root, "c2: add zebra only");
+    fs::write(
+        root.join("src/zebra.rs"),
+        "fn zebra_widget() { let x = 3; }\n// touched\n",
+    )
+    .unwrap();
+    git_add_commit(&root, "fix: bug in zebra widget");
+
+    let cache = TempDir::new().expect("cache TempDir");
+    build_index(&root, cache.path());
+
+    let db_path = find_search_cache(cache.path()).join("temporal.db");
+    assert_eq!(
+        sqlite_cochange_count(&db_path, "src/alpha.rs"),
+        0,
+        "premise: alpha.rs must have 0 co-change partners (separate commits)"
+    );
+    assert!(
+        sqlite_count(&db_path, "hotspot") > 0,
+        "premise: the temporal DB must be healthy (hotspot rows present), otherwise \
+         the 'no degraded element' assertion is vacuous"
+    );
+
+    let (stdout, stderr, code) = skim_search(
+        &["--blast-radius", "src/alpha.rs", "--limit", "5", "--json"],
+        &root,
+        cache.path(),
+    );
+    assert_eq!(code, 0, "healthy zero-partner blast-radius must exit 0");
+    let v: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--json parse error: {e}\n{stdout}"));
+    assert!(
+        v["degraded"].is_null(),
+        "F-C2-02 negative: a healthy DB with a zero-partner file must emit NO \
+         degraded element; got:\n{stdout}"
+    );
+    assert_eq!(
+        v["total"].as_u64(),
+        Some(0),
+        "F-C2-02 negative: zero-partner blast-radius still returns zero results"
+    );
+    for bad in &["shallow", "unshallow", "no commit history", "0 rows"] {
+        assert!(
+            !stderr.contains(bad),
+            "F-C2-02 negative: healthy stderr must NOT contain '{bad}'; got:\n{stderr}"
+        );
+    }
+}

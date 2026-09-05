@@ -1806,6 +1806,57 @@ struct DegradedOnlyJson {
     degraded: Vec<temporal::DegradedJson>,
 }
 
+/// Emit the degraded disclosure for the standalone temporal arm and nothing else.
+///
+/// Extracted so every standalone early-out — the `open_temporal_state_for`
+/// `Unavailable` arm and the AD-414-24 empty-DB blast-radius probe — produces a
+/// byte-identical pair of signals (stderr notice + `--json` object) instead of
+/// each site re-deriving the shape.
+///
+/// * `requested` — bare flag name (`TemporalSort::json_name`, or
+///   `"blast-radius"`); `DegradedJson.requested` per AC-4 / RD-5.
+/// * `applied` is always `"none"` here (F2 / AD-414-19): the standalone arm
+///   serves no result set, so claiming `"lexical"` would be false.
+/// * `flag = ""` suppresses the human-readable fallback tail, keeping the legacy
+///   byte-identical assertions on this arm valid.
+///
+/// `NotGitRepo` keeps its AC9 `warning` key on stdout with `degraded` as a
+/// sibling; every other reason prints the notice on stderr and, in `--json`
+/// mode, one parseable object on stdout (SE-6).
+fn report_standalone_degraded(
+    u: &temporal::TemporalUnavailable,
+    requested: &'static str,
+    json: bool,
+) -> anyhow::Result<()> {
+    // DegradedJson::new is the single constructor (Finding [medium/architecture]):
+    // it calls degraded_notice internally so DegradedJson.message always matches
+    // what is printed to stderr (AD-414-1 SSOT).
+    let dj = temporal::DegradedJson::new(u, requested, "none", "", temporal::Fallback::NoResults);
+    if u.reason == temporal::DegradedReason::NotGitRepo {
+        // NotGitRepo: preserve AC9 byte-identical `warning` on stdout and add
+        // `degraded` as a sibling key for machine consumers.
+        if json {
+            // Clone the message so dj can be moved into the vec while we still
+            // hold a reference for the `warning` field.
+            let msg_str = dj.message.clone();
+            let msg = WarningWithDegradedJson {
+                warning: &msg_str,
+                degraded: vec![dj],
+            };
+            println!("{}", serde_json::to_string(&msg)?);
+        } else {
+            eprintln!("skim search: {}", dj.message);
+        }
+    } else {
+        eprintln!("skim search: {}", dj.message);
+        if json {
+            let msg = DegradedOnlyJson { degraded: vec![dj] };
+            println!("{}", serde_json::to_string(&msg)?);
+        }
+    }
+    Ok(())
+}
+
 /// Execute a standalone temporal query (no text search term provided).
 ///
 /// Opens the temporal DB from the resolved cache directory, ensures it is
@@ -1887,55 +1938,44 @@ fn run_temporal_standalone(
     {
         temporal::TemporalOpen::Open(db) => db,
         temporal::TemporalOpen::Unavailable(u) => {
-            // DegradedJson::new is the single constructor (Finding [medium/architecture]):
-            // it calls degraded_notice internally so DegradedJson.message always
-            // matches what is printed to stderr (AD-414-1 SSOT).
-            // Covers all reasons including Empty (folded from the former separate probe).
-            //
-            // F2 / AD-414-19: `applied` is `"none"` on the standalone arm (no
-            // text query, no results served).  The plan's AC-4 / OD-B value of
-            // `"lexical"` applies only to the text+temporal arm (mod.rs:1700),
-            // where lexical order genuinely is what gets served.  On the
-            // standalone arm there is no result set at all (DegradedOnlyJson has
-            // no `results` key), so `"lexical"` is a false claim to a machine
-            // consumer.  AC-6 pins only `reason == "empty"` for this arm.
-            // `Fallback::NoResults` only affects the human-readable tail, which
-            // is suppressed here (flag = "") so the choice has no effect on the
-            // message; `applied` is the JSON-only contract field.
-            let dj = temporal::DegradedJson::new(
-                &u,
-                requested_flag,
-                "none",
-                "",
-                temporal::Fallback::NoResults,
-            );
-            if u.reason == temporal::DegradedReason::NotGitRepo {
-                // NotGitRepo: preserve AC9 byte-identical `warning` on stdout and add
-                // `degraded` as a sibling key for machine consumers.
-                if json {
-                    // Clone the message so dj can be moved into the vec while we
-                    // still hold a reference for the `warning` field.
-                    let msg_str = dj.message.clone();
-                    let msg = WarningWithDegradedJson {
-                        warning: &msg_str,
-                        degraded: vec![dj],
-                    };
-                    println!("{}", serde_json::to_string(&msg)?);
-                } else {
-                    eprintln!("skim search: {}", dj.message);
-                }
-            } else {
-                // All other reasons (including Empty): notice to stderr; in --json mode
-                // emit one parseable object on stdout (SE-6).
-                eprintln!("skim search: {}", dj.message);
-                if json {
-                    let msg = DegradedOnlyJson { degraded: vec![dj] };
-                    println!("{}", serde_json::to_string(&msg)?);
-                }
-            }
+            // Covers all reasons including Empty (folded from the former separate
+            // probe).  `report_standalone_degraded` owns the stderr/JSON shape and
+            // the "applied = none" contract (F2 / AD-414-19).
+            report_standalone_degraded(&u, requested_flag, json)?;
             return Ok(ExitCode::SUCCESS);
         }
     };
+
+    // AD-414-24 (F-C2-02): disclosure parity for standalone `--blast-radius`.
+    //
+    // `open_temporal_state_for` probes emptiness for the requested *sort*
+    // dimension.  With `--blast-radius FILE` as the only temporal flag there is
+    // no sort, so `sort = None` is passed and no probe runs (G-3: co-change
+    // emptiness must never borrow the shallow/empty wording).  An entirely empty
+    // temporal DB then reached `query_standalone`, which returned
+    // `{"mode":"blast-radius","total":0,"results":[]}` with no `degraded` key and
+    // nothing on stderr — indistinguishable from a healthy DB in which this file
+    // simply has no co-change partners.  The composite arm
+    // (`resolve_blast_radius_paths`) has always disclosed this case, so the two
+    // arms disagreed on the same DB state.
+    //
+    // The predicate mirrors the composite arm exactly — partner set empty AND the
+    // hotspot table empty — so a DB that holds co-change rows but no hotspot rows
+    // (reachable in synthetic fixtures) is never misreported as `empty`.  The
+    // cheap `dimension_is_empty` probe is evaluated first, so a healthy DB never
+    // pays for the partner lookup.  Every other `Unavailable` reason
+    // (missing / corrupt / newer-schema / repository-mismatch / not-a-repo) is
+    // already surfaced by the `open_temporal_state_for` arm above.
+    if temporal_sort.is_none()
+        && let Some(raw_path) = blast_radius
+        && temporal::dimension_is_empty(&db, types::TemporalSort::Hot)
+    {
+        let normalized = temporal::normalize_blast_radius_path(raw_path, &root)?;
+        if db.cochanges_for_file(&normalized)?.is_empty() {
+            report_standalone_degraded(&temporal::empty_temporal_state(), "blast-radius", json)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
 
     let (output, has_more) =
         temporal::query_standalone(temporal_sort, blast_radius, page, &db, &root)?;

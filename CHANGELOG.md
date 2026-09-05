@@ -231,6 +231,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as before, and no line-length cap was introduced: a 20 KB single line is anchored too.
   The `0.0` score of a substring-only match is unchanged and deliberate: it is the marker
   that ranks these candidates below every exact whole-token BM25F match (AD-411-7).
+- **Standalone `skim search --blast-radius FILE` now discloses an unusable temporal
+  database** (#414). With `--blast-radius` as the only temporal flag there is no sort
+  dimension to probe, so an entirely empty `temporal.db` produced
+  `{"mode":"blast-radius","target":...,"total":0,"results":[]}` with no `degraded` key
+  and nothing on stderr, which is indistinguishable from a healthy database in which the
+  file simply has no co-change partners. The arm now emits the same `degraded` element
+  the composite `text + --blast-radius` arm emits (`subsystem: "temporal"`, the typed
+  `reason`, `requested: "blast-radius"`, `applied: "none"`) plus the matching stderr
+  notice, for every non-ready temporal state. A healthy database whose target file has
+  zero co-change partners is unaffected: it still returns zero results quietly, with no
+  `degraded` element.
 - **`skim search --build` on a repository with no commits now reports its empty
   history** (#414) — `skim search --build` (and `--rebuild` / `--update`) in a freshly
   `git init`-ed repository with files but no commits printed only the `indexed N files`
