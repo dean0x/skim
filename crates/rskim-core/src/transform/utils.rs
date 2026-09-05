@@ -273,6 +273,7 @@ pub(crate) fn get_comment_suffix(language: Language) -> &'static str {
 
 /// Which side of the retained window an elision marker accounts for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ElidedSide {
     /// Lines dropped *after* the retained window (`--max-lines`): `(N lines truncated)`.
     Truncated,

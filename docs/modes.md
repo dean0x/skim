@@ -8,7 +8,7 @@ Skim offers six transformation modes, each with different levels of aggressivene
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
 | Minimal    | 15-30%          | All code, doc comments, Python/Ruby/SQL/Bash module header comments | Non-doc comments; module headers stripped in Rust, C, TypeScript, Go, and all other languages |
-| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types | Parameter type annotations (Python only), generics (except inside preserved return types), decorators, semicolons |
+| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types | Parameter type annotations (Python only), generics in Rust/Java/Kotlin/Swift/C# (TypeScript preserves them), decorators, semicolons |
 | Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
@@ -257,7 +257,7 @@ skim file.ts --mode full
 
 **Token reduction: 30-50%**
 
-Pseudo mode strips syntactic noise (Python parameter type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. TypeScript and Rust parameter types are preserved as API surface (ADR-008). The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
+Pseudo mode strips syntactic noise (Python parameter type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. TypeScript and Rust parameter types are preserved as API surface (ADR-007). The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
 
 ### What's Preserved
 
@@ -271,7 +271,7 @@ Pseudo mode strips syntactic noise (Python parameter type annotations, decorator
 
 ### What's Removed
 
-- Parameter type annotations (`: int`, `: str`) — **Python only**; TypeScript and Rust both preserve parameter types as API surface (ADR-008). Return types are preserved in all languages (see above)
+- Parameter type annotations (`: int`, `: str`) — **Python only**; TypeScript and Rust both preserve parameter types as API surface (ADR-007). Return types are preserved in all languages (see above)
 - Rust-specific noise: lifetimes (`<'a>`), type parameters and where clauses, attribute items (`#[derive(...)]`)
 - Non-visibility keyword modifiers (`static`, `final`, Kotlin `open`)
 - Decorators (`@Override`, `@cache`)
@@ -326,7 +326,7 @@ def calculate(x, y) -> float:
 
 | Language   | What's Stripped                                                                 |
 |------------|--------------------------------------------------------------------------------|
-| TypeScript | Decorators, `readonly`, `abstract`, `;` — parameter and return types preserved (ADR-008) |
+| TypeScript | Decorators, `readonly`, `abstract`, `;` — parameter and return types preserved (ADR-007) |
 | JavaScript | Decorators, `;`                                                                   |
 | Python     | Parameter type annotations, decorators, `self`/`cls` first param (return types preserved) |
 | Rust       | Lifetimes, type params, where clauses, attribute items, `;` — parameter and return types preserved |
@@ -355,7 +355,7 @@ def calculate(x, y) -> float:
 ```
 Need implementation details? → Use Full mode
     ↓ No
-Need logic flow without type noise? → Use Pseudo mode
+Need logic flow with minimal noise? → Use Pseudo mode
     ↓ No
 Need only types/interfaces? → Use Types mode
     ↓ No

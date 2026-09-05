@@ -9,7 +9,7 @@
 //!   return types)
 //!
 //! For Python, parameter and variable type annotations are still stripped.
-//! TypeScript now preserves parameter type annotations (ADR-008); only decorator,
+//! TypeScript preserves parameter type annotations (ADR-007); only decorator,
 //! `readonly`, and `abstract` are stripped alongside variable/property `type_annotation`.
 //! Rust strips lifetimes, type parameters, where clauses, and attribute items only;
 //! `mutable_specifier` is preserved as it is part of the function's API surface.
@@ -234,7 +234,7 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
         Language::TypeScript => PseudoRules {
             strip_kinds: &[
                 // `type_annotation` is stripped for variable/property positions; parameter
-                // annotations are preserved via a guard in collect_noise_ranges (ADR-008).
+                // annotations are preserved via a guard in collect_noise_ranges (ADR-007).
                 "type_annotation",
                 // `type_parameters` and `type_arguments` were removed so generic signatures
                 // like `identity<T>` and call-sites like `Migration<'a'>` survive intact
@@ -806,7 +806,7 @@ fn collect_noise_ranges(
             return Ok(());
         }
 
-        // E1 (ADR-008): TypeScript parameter type annotations are API surface.
+        // E1 (ADR-007): TypeScript parameter type annotations are API surface.
         // `type_annotation` was historically stripped for all positions as
         // undifferentiated noise; the A4 contract now extends to parameters.
         // Guard fires when the immediate parent is a parameter node kind.
@@ -1071,14 +1071,14 @@ mod tests {
 
     #[test]
     fn test_typescript_pseudo_preserves_param_annotations() {
-        // ADR-008 / E1: parameter type annotations are API surface — preserved in
+        // ADR-007 / E1: parameter type annotations are API surface — preserved in
         // pseudo mode.  Both param annotations and the return annotation survive.
         let source = "function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
-        // Parameter type annotations must be preserved (ADR-008)
+        // Parameter type annotations must be preserved (ADR-007)
         assert!(
             result.contains("function add(a: number, b: number)"),
-            "param type annotations must be preserved as API surface (ADR-008), got: {result}"
+            "param type annotations must be preserved as API surface (ADR-007), got: {result}"
         );
         // Return type annotation is preserved as API surface (ADR-007)
         assert!(
@@ -1091,7 +1091,7 @@ mod tests {
     #[test]
     fn test_typescript_pseudo_preserves_export() {
         // `export` is API-surface information — preserved in pseudo mode (A4 contract).
-        // After ADR-008 / E1, param annotations are also API surface and preserved.
+        // After ADR-007 / E1, param annotations are also API surface and preserved.
         let source =
             "export function greet(name: string): string {\n    return `Hello, ${name}!`;\n}\n";
         let result = transform(source, Language::TypeScript);
@@ -1101,7 +1101,7 @@ mod tests {
         );
         assert!(
             result.contains("function greet(name: string)"),
-            "function signature with param types preserved (ADR-008), got: {result}"
+            "function signature with param types preserved (ADR-007), got: {result}"
         );
     }
 
@@ -1758,7 +1758,7 @@ mod tests {
         // BUG 5 (historical): Stripping `export` used to leave a leading space.
         // Now `export` is preserved (A4), so output starts with "export function …"
         // — no leading space in either case.  The no-leading-space invariant holds.
-        // After ADR-008/E1: param type annotations are also preserved.
+        // After ADR-007/E1: param type annotations are also preserved.
         let source = "export function add(a: number, b: number): number {\n    return a + b;\n}\n";
         let result = transform(source, Language::TypeScript);
         assert!(
@@ -1767,7 +1767,7 @@ mod tests {
         );
         assert!(
             result.contains("function add(a: number, b: number)"),
-            "function signature with param types preserved (ADR-008), got: {result}"
+            "function signature with param types preserved (ADR-007), got: {result}"
         );
     }
 
@@ -2155,7 +2155,7 @@ mod tests {
     /// TypeScript: arrow function with return type preserved.
     #[test]
     fn test_typescript_pseudo_preserves_arrow_return() {
-        // After ADR-008/E1, param annotations are also preserved.
+        // After ADR-007/E1, param annotations are also preserved.
         let source =
             "const getUser = async (id: number): Promise<User> => {\n    return fetch(id);\n};\n";
         let result = transform(source, Language::TypeScript);
@@ -2163,14 +2163,14 @@ mod tests {
             result.contains("): Promise<User>"),
             "arrow function return type must be preserved, got: {result}"
         );
-        // E1: param type annotations preserved (ADR-008)
+        // E1: param type annotations preserved (ADR-007)
         assert!(
             result.contains("id: number"),
-            "param type annotation must be preserved (ADR-008), got: {result}"
+            "param type annotation must be preserved (ADR-007), got: {result}"
         );
     }
 
-    /// TypeScript: interface method return type preserved; param type preserved (ADR-008).
+    /// TypeScript: interface method return type preserved; param type preserved (ADR-007).
     #[test]
     fn test_typescript_pseudo_interface_method_return_preserved() {
         let source = "interface Repo {\n    find(id: number): User;\n}\n";
@@ -2179,14 +2179,14 @@ mod tests {
             result.contains("): User"),
             "interface method return type must be preserved, got: {result}"
         );
-        // E1/ADR-008: param type annotations are now preserved as API surface
+        // E1/ADR-007: param type annotations are now preserved as API surface
         assert!(
             result.contains("id: number"),
-            "param type annotation preserved in interface method (ADR-008), got: {result}"
+            "param type annotation preserved in interface method (ADR-007), got: {result}"
         );
     }
 
-    /// TypeScript: optional param with return type — both preserved (ADR-007/ADR-008).
+    /// TypeScript: optional param with return type — both preserved (ADR-007).
     #[test]
     fn test_typescript_pseudo_optional_param_return_preserved() {
         let source = "function opt(a?: string): string {\n    return a ?? '';\n}\n";
@@ -2198,7 +2198,7 @@ mod tests {
         // E1: optional param type annotation also preserved
         assert!(
             result.contains("a?: string"),
-            "optional param type annotation preserved (ADR-008), got: {result}"
+            "optional param type annotation preserved (ADR-007), got: {result}"
         );
     }
 
@@ -2629,7 +2629,7 @@ mod tests {
     // ========================================================================
     //
     // pseudo is the PRODUCTION path: the cat/head/tail rewrite selects
-    // --mode=pseudo for regular code files (ADR-008), so this walker is the
+    // --mode=pseudo for regular code files (ADR-007), so this walker is the
     // hottest agent-facing transform in the product. Every pre-existing perf
     // guard in this workspace is PYTHON-minimal-only or GO-only, so a
     // TypeScript / C++ / Java / C# pseudo regression had no coverage at all.
