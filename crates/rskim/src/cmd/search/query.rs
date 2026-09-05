@@ -949,6 +949,43 @@ fn run_compound_query(
     })
 }
 
+/// Resolves `config.blast_radius_paths` into a Jaccard-scored temporal layer
+/// and returns `None` when the blast radius contributes nothing to the fusion.
+///
+/// `None` is returned in two cases (AD-413-16 / ADR-009):
+/// - `Some(empty)` allowlist — the `AnchorDiffers` sentinel: the temporal DB
+///   belongs to a different repository; the `paths_to_scored_file_ids` scan is
+///   skipped because the mismatch notice was already emitted upstream.
+/// - `Some(non-empty)` allowlist where every path fails to resolve to a
+///   `FileId` in the current manifest (e.g. all co-change partners deleted from
+///   disk or outside the `--root` subtree); `paths_to_scored_file_ids` emits
+///   the disclosure notice before returning an empty vec.
+///
+/// AD-409-2: each resolved partner carries its actual Jaccard co-change
+/// strength as the raw temporal score; the blast-radius target carries
+/// `SEED_STRENGTH` (2.0 > max Jaccard 1.0) so it always occupies rank 1.
+/// AD-409-6: rank derivation from these scores is delegated to
+/// `merge_layer_scores`, which applies a total comparator (score DESC, then
+/// FileId ASC) to each layer before accumulating RRF terms.
+fn blast_temporal_layer(
+    config: &super::types::QueryConfig,
+    sorted: &[&str],
+) -> Option<Vec<(FileId, f64)>> {
+    // The dispatch in execute_query_with_manifest guarantees blast_radius_paths
+    // is Some(..) at this call site; `?` is a safe fallback for any future
+    // call-site relaxation.
+    let allowed = config.blast_radius_paths.as_ref()?;
+    // AD-413-16: Some(empty) is the AnchorDiffers sentinel — the temporal DB
+    // belongs to a different repository; `resolve_blast_radius_paths` already
+    // emitted the mismatch notice.  Skip `paths_to_scored_file_ids` to avoid a
+    // redundant "0 indexed files" stderr line for this case.
+    if allowed.is_empty() {
+        return None;
+    }
+    let layer = super::temporal::paths_to_scored_file_ids(sorted, allowed);
+    if layer.is_empty() { None } else { Some(layer) }
+}
+
 /// Execute the composite UNION blast-radius re-ranking path (#200).
 ///
 /// Fuses the lexical ranked list and the temporal co-change ranked list into
@@ -989,18 +1026,18 @@ fn run_blast_radius_composite_query(
         .composite_weights
         .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
 
-    // AD-413-16: Some(empty) means AnchorDiffers — the temporal DB belongs to a
-    // different repository.  The allowlist is intentionally empty; every call site
-    // must return zero results to match the standalone arm (run_temporal_standalone
-    // returns 0 rows on AnchorDiffers).  Falling through would collapse to pure
-    // lexical (UNION skips the empty temporal layer), returning all text matches
-    // without the blast-radius filter — wrong repo data silently expanded, not
-    // isolated.  #409 retyped this guard from the resolved `HashSet<FileId>` to the
-    // source path map, so it now tests ONLY the "allowlist is intentionally empty"
-    // sentinel; the "allowlist non-empty but nothing indexed" case is caught by the
-    // companion `temporal_layer.is_empty()` guard after Step 2, which is the one that
-    // mirrors run_compound_query's `filter_set.is_empty()` early-out.
-    if matches!(config.blast_radius_paths.as_ref(), Some(p) if p.is_empty()) {
+    // AD-413-16 / ADR-009 unified early-out: `blast_temporal_layer` covers BOTH
+    // the `Some(empty)` AnchorDiffers sentinel (temporal DB belongs to a different
+    // repository — mismatch notice already emitted by `resolve_blast_radius_paths`)
+    // and the "allowlist non-empty but no path resolves to a FileId" case (all
+    // co-change partners deleted from disk or outside the `--root` subtree —
+    // disclosed by `paths_to_scored_file_ids` on stderr).  In either case the blast
+    // radius contributes nothing to the fusion; returning zero results matches the
+    // standalone temporal arm and avoids a confident ranking that is not a blast
+    // radius at all (ADR-009).  This check runs BEFORE the lexical search so an
+    // unresolvable allowlist never triggers a wasted corpus-wide BM25F pass —
+    // restoring the pre-#409 early-out ordering.
+    let Some(temporal_layer) = blast_temporal_layer(config, ctx.sorted) else {
         return Ok(QueryOutput {
             query: config.text.clone(),
             total: 0,
@@ -1012,7 +1049,7 @@ fn run_blast_radius_composite_query(
             ast_coverage: None,
             degraded: vec![],
         });
-    }
+    };
 
     // Step 1: fetch a WIDE lexical ranked list WITHOUT a file_filter.
     //
@@ -1063,54 +1100,13 @@ fn run_blast_radius_composite_query(
     // AD-393-12: select the verify predicate for the blast path.
     let blast_verify_mode = verify_mode_for(config.phrase, config.near);
 
-    // Step 2: build the temporal ranked list from Jaccard co-change strengths.
-    //
-    // AD-409-2: each partner receives its actual Jaccard score (not a uniform 1.0)
-    // so that merge_layer_scores' total comparator (score DESC, FileId ASC) assigns
-    // deterministic ranks proportional to co-change strength.  The blast-radius
-    // target itself carries SEED_STRENGTH (2.0 > max Jaccard 1.0) so it always
-    // occupies temporal rank 1.
-    //
-    // When blast_radius_paths is None (temporal DB absent or not requested),
-    // degrades to lexical-only ranking via the empty default.
-    let temporal_layer: Vec<(FileId, f64)> = config
-        .blast_radius_paths
-        .as_ref()
-        .map(|allowed| super::temporal::paths_to_scored_file_ids(ctx.sorted, allowed))
-        .unwrap_or_default();
-    // AD-409-6: rank derivation is delegated to merge_layer_scores, which
-    // applies a total comparator (score DESC, then FileId ASC) to each layer
-    // before accumulating RRF terms.
-
-    // AD-413-16 (second half): the allowlist is non-empty but NOT ONE of its paths
-    // has a FileId in the manifest — e.g. every co-change partner (and the target)
-    // was deleted from disk while temporal.db still records them.  Before #409 this
-    // was caught by the `Some(ids) if ids.is_empty()` guard above, which tested the
-    // RESOLVED FileId set; #409 retyped that guard to test the SOURCE path map, so
-    // the resolved-empty case has to be re-asserted here to keep the pre-#409
-    // membership semantics and the documented parity with run_compound_query's
-    // `filter_set.is_empty()` early-out.  Falling through would return the plain
-    // lexical result list under a `--blast-radius` flag that contributed nothing —
-    // a confident ranking that is not a blast radius at all (ADR-009).
-    // `paths_to_scored_file_ids` has already disclosed the condition on stderr.
-    if temporal_layer.is_empty() {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
-    }
-
-    // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
+    // Step 2: lexical ranked list from raw_lex (already sorted DESC by score).
+    // AD-409-6: rank derivation for the temporal layer is delegated to
+    // `merge_layer_scores`, which applies a total comparator (score DESC, then
+    // FileId ASC) to each layer before accumulating RRF terms.
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();
 
-    // Step 4: N-signal RRF UNION merge.
+    // Step 3: N-signal RRF UNION merge.
     // The blast-radius path fuses only the lexical and co-change (temporal)
     // signals, so only those two layers are constructed here. The `ast` weight
     // (0.3 by default) and the extended signals (import_graph, dir_proximity,
@@ -1123,7 +1119,7 @@ fn run_blast_radius_composite_query(
     ];
     let ranked = merge_layer_scores(layers);
 
-    // Step 5: rank the full UNION set, then apply verification + truncation LAST.
+    // Step 4: rank the full UNION set, then apply verification + truncation LAST.
     //
     // AD-355-2: do NOT truncate before verification.  The UNION contract requires
     // all candidates to be ranked before any are dropped.  After verification the
@@ -1133,7 +1129,7 @@ fn run_blast_radius_composite_query(
     // is a relevance gate, not a #317 output cap.  No elision_marker needed.
     let lex_map: HashMap<FileId, &SearchResult> = raw_lex.iter().map(|r| (r.file_id, r)).collect();
 
-    // Step 6: recompose results with verification for lexical-hit candidates.
+    // Step 5: recompose results with verification for lexical-hit candidates.
     //
     // For files present in the lexical pool: read snippet + verify substring
     // membership in a SINGLE file read via extract_snippet_and_verify (AD-355-1).
