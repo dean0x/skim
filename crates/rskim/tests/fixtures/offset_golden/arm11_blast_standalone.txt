@@ -1,0 +1,9 @@
+Co-change partners of file1.ts (5 files):
+
+  Jaccard  Count  Path
+  ───────  ─────  ────────────────────────────────
+  0.200        1  file3.ts
+  0.200        1  file4.ts
+  0.200        1  file5.ts
+  0.167        1  file6.ts
+  0.143        1  file2.ts

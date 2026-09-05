@@ -12,13 +12,40 @@
 //! # Traversal strategy
 //!
 //! Commits are visited from newest to oldest using gix's `ByCommitTime(NewestFirst)`
-//! sort order. When `lookback_days > 0`, a `ByCommitTimeCutoff` sort stops the walk
-//! as soon as the traversal queue contains no commits newer than the cutoff, which
-//! is far more efficient than a full traversal with post-hoc filtering.
+//! sort order (a committer-time priority queue). When `lookback_days > 0`, a
+//! `ByCommitTimeCutoff` sort stops the walk as soon as the traversal queue contains
+//! no commits newer than the cutoff, which is far more efficient than a full
+//! traversal with post-hoc filtering. The cutoff operates on **committer date**,
+//! matching `git log --since` semantics (AD-407-3).
 //!
-//! For each commit we diff its tree against its first parent's tree using
-//! `Tree::changes()` (requires the `blob-diff` gix feature). Root commits
+//! The walker visits the **full DAG** (not first-parent-only). Merge commits
+//! (commits with more than one parent, including octopus merges) are skipped
+//! **before** the object decode and the tree diff, so their subjects never enter
+//! the fix-risk classifier and a merge costs nothing beyond one queue pop
+//! (AD-407-1, AD-407-2). This matches `git log --no-merges`, which is exactly
+//! what `skim heatmap` uses.
+//!
+//! For each non-merge commit we diff its tree against its first parent's tree
+//! using `Tree::changes()` (requires the `blob-diff` gix feature). Root commits
 //! (no parent) are diffed against the empty tree.
+//!
+//! Returned commits are sorted **stably** by `CommitInfo.timestamp` descending
+//! (author time, newest first) (AD-407-4). For commits with equal author
+//! timestamps the relative order reflects gix's committer-time priority queue
+//! and is not further specified. This is the documented ordering contract;
+//! consumers such as `rskim-bench::temporal_split` rely on it.
+//!
+//! # Walk bounds
+//!
+//! Two independent safety caps prevent OOM / runaway walks on large repositories
+//! (e.g. linux kernel: 1 M+ commits) when `lookback_days = 0`:
+//!
+//! - `MAX_COMMITS` — maximum number of **retained** (non-merge) commits.
+//! - `MAX_VISITED_COMMITS` — maximum number of loop **iterations** (visits),
+//!   always ≥ `MAX_COMMITS`. A separate eprintln! fires for each cap.
+//!
+//! Both bounds are testable without constructing a large repository via
+//! [`WalkBudget::charge_retain`] and [`WalkBudget::charge_visit`].
 //!
 //! # Limitations
 //!
@@ -51,6 +78,123 @@ fn gix_err(e: impl std::fmt::Display) -> SearchError {
 }
 
 // ============================================================================
+// Walk budget
+// ============================================================================
+
+/// Safety cap on **retained** (non-merge) commits.
+///
+/// Prevents OOM on very large repositories (e.g. linux kernel: 1M+ commits)
+/// when `lookback_days = 0`. A distinct notice is printed when this cap fires.
+const MAX_COMMITS: usize = 100_000;
+
+/// Safety cap on loop **iterations** (visits), including merge-skipped commits.
+///
+/// After removing `.first_parent_only()`, merge commits are visited and discarded
+/// without being pushed, so `MAX_COMMITS` no longer bounds loop iterations.
+/// This second bound prevents infinite walks on merge-heavy repositories.
+/// The 4× multiplier provides headroom over the observed visits-per-retained ratio
+/// (1.08× on this repo, ~1.13× on linux.git) while remaining a safety valve that
+/// should never fire in practice (AD-407-1).
+///
+/// `MAX_VISITED_COMMITS >= MAX_COMMITS` is enforced at compile time.
+const MAX_VISITED_COMMITS: usize = 4 * MAX_COMMITS;
+
+/// Compile-time assertion: the visit bound must be at least as large as the
+/// retain bound.
+const _: () = assert!(
+    MAX_VISITED_COMMITS >= MAX_COMMITS,
+    "MAX_VISITED_COMMITS must be >= MAX_COMMITS"
+);
+
+/// Walk budget tracker — two independent counters with two distinct safety caps.
+///
+/// Crate-internal type, exercised by the co-located `tests` submodule without
+/// needing to construct a large repository (AC-8).
+#[derive(Default)]
+pub(super) struct WalkBudget {
+    visited: usize,
+    retained: usize,
+    /// Set to `true` by either [`WalkBudget::charge_visit`] or
+    /// [`WalkBudget::charge_retain`] when their respective cap fires.
+    /// Propagated to [`crate::types::TemporalMetadata::truncated`] so the
+    /// condition crosses the `rskim-search → rskim` boundary, where
+    /// `rebuild_temporal` persists it under `META_HISTORY_TRUNCATED`.  The
+    /// user-visible signal in this release is the `eprintln!` below; query-time
+    /// surfacing through the DegradedReason SSOT (the `is_shallow` pattern,
+    /// AD-414-14) is follow-up work, not part of #407.
+    pub(super) truncated: bool,
+    /// Latch: set to `true` the first time the visit cap fires so the
+    /// eprintln! notice is edge-triggered — it fires exactly once on the
+    /// transition call and never again on subsequent above-cap calls.
+    visit_notice_emitted: bool,
+    /// Latch: set to `true` the first time the retain cap fires so the
+    /// eprintln! notice is edge-triggered — it fires exactly once on the
+    /// transition call and never again on subsequent above-cap calls.
+    retain_notice_emitted: bool,
+}
+
+impl WalkBudget {
+    /// Create a new budget with both counters at zero.
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charge one loop iteration. Returns `true` when the visit cap has fired
+    /// and the loop should break.
+    ///
+    /// Prints exactly one eprintln! notice on the first call that exceeds the
+    /// cap (edge-triggered: the `visit_notice_emitted` latch suppresses
+    /// re-emission on every subsequent above-cap call, making the behaviour
+    /// safe regardless of whether the caller breaks on `true`).
+    /// Also sets `self.truncated = true` so the condition is visible to callers
+    /// via [`TemporalMetadata::truncated`].
+    #[must_use = "the return value is the walk bound; ignoring it removes the cap"]
+    pub(super) fn charge_visit(&mut self) -> bool {
+        self.visited += 1;
+        if self.visited > MAX_VISITED_COMMITS {
+            if !self.visit_notice_emitted {
+                self.visit_notice_emitted = true;
+                eprintln!(
+                    "skim: parse_history reached the {MAX_VISITED_COMMITS}-visit safety cap; \
+                     truncating history. Pass lookback_days > 0 to scope the traversal."
+                );
+            }
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Charge one retained commit. Returns `true` when the retain cap has fired
+    /// and the loop should break.
+    ///
+    /// Prints exactly one eprintln! notice on the first call that exceeds the
+    /// cap (edge-triggered: the `retain_notice_emitted` latch suppresses
+    /// re-emission on every subsequent above-cap call, making the behaviour
+    /// safe regardless of whether the caller breaks on `true`).
+    /// Also sets `self.truncated = true` so the condition is visible to callers
+    /// via [`TemporalMetadata::truncated`].
+    #[must_use = "the return value is the walk bound; ignoring it removes the cap"]
+    pub(super) fn charge_retain(&mut self) -> bool {
+        self.retained += 1;
+        if self.retained > MAX_COMMITS {
+            if !self.retain_notice_emitted {
+                self.retain_notice_emitted = true;
+                eprintln!(
+                    "skim: parse_history reached the {MAX_COMMITS}-commit safety cap; \
+                     truncating history. Pass lookback_days > 0 to scope the traversal."
+                );
+            }
+            self.truncated = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ============================================================================
 // GixSource
 // ============================================================================
 
@@ -61,6 +205,24 @@ fn gix_err(e: impl std::fmt::Display) -> SearchError {
 pub struct GixSource;
 
 impl TemporalSource for GixSource {
+    /// Walk the full commit DAG and return all non-merge commits.
+    ///
+    /// # Ordering contract
+    ///
+    /// Commits are yielded by gix in committer-time-descending order (newest
+    /// first). After the walk, the result is **stably** re-sorted by
+    /// `CommitInfo.timestamp` (author time) descending (AD-407-4). For
+    /// equal-timestamp commits the relative order reflects gix's committer-time
+    /// priority queue and is not further specified.
+    ///
+    /// Consumers that rely on newest-first ordering (e.g. `rskim-bench::temporal_split`)
+    /// may depend on this contract.
+    ///
+    /// # `lookback_days`
+    ///
+    /// Every production caller passes `0` (no cutoff), so the AD-407-3
+    /// `ByCommitTimeCutoff` path is currently exercised only by tests. Follow-up
+    /// #523 tracks wiring the parameter through or removing it (ADR-004).
     fn parse_history(&self, repo_path: &Path, lookback_days: u32) -> Result<HistoryResult> {
         parse_history_impl(repo_path, lookback_days)
     }
@@ -69,10 +231,6 @@ impl TemporalSource for GixSource {
 // ============================================================================
 // Implementation
 // ============================================================================
-
-/// Safety cap on commit traversal to prevent OOM on very large repositories
-/// (e.g. linux kernel: 1M+ commits) when `lookback_days = 0`.
-const MAX_COMMITS: usize = 100_000;
 
 fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryResult> {
     // Open repository, discovering .git in parent directories
@@ -111,7 +269,14 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         None
     };
 
-    // Configure rev-walk sorting
+    // Configure rev-walk sorting.
+    //
+    // AD-407-3: Use gix's ByCommitTimeCutoff (committer-date filter) instead of
+    // a manual author-date break. The manual guard compared the wrong clock and,
+    // now that the commit-date priority queue is live (full DAG walk), one
+    // rebased or cherry-picked commit (old author date, recent committer date)
+    // would terminate the entire walk. gix's cutoff matches `git log --since`
+    // semantics exactly.
     let sorting = match cutoff_secs {
         Some(cutoff) => Sorting::ByCommitTimeCutoff {
             order: CommitTimeOrder::NewestFirst,
@@ -120,22 +285,21 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         None => Sorting::ByCommitTime(CommitTimeOrder::NewestFirst),
     };
 
+    // AD-407-1: Walk the FULL DAG so every commit on every merged branch is
+    // visible to the temporal layer. Merge commits are skipped inside the loop
+    // before the tree diff (AD-407-2).
     let walk = repo
         .rev_walk([head_id])
-        .first_parent_only()
         .sorting(sorting)
         .all()
         .map_err(gix_err)?;
 
     let mut commits: Vec<CommitInfo> = Vec::new();
+    let mut budget = WalkBudget::new();
 
     for info_result in walk {
-        // Guard against OOM on very large repositories (e.g. linux kernel).
-        if commits.len() >= MAX_COMMITS {
-            eprintln!(
-                "skim: parse_history reached the {MAX_COMMITS}-commit safety cap; \
-                 truncating history. Pass lookback_days > 0 to scope the traversal."
-            );
+        // Visit-count guard — fires before any commit processing.
+        if budget.charge_visit() {
             break;
         }
 
@@ -144,6 +308,18 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
             Err(_) if is_shallow => break,
             Err(e) => return Err(gix_err(e)),
         };
+
+        // AD-407-2: Skip merge commits (>1 parent, including octopus merges).
+        // Merge subjects (e.g. "merge(#NNN): …") never match FIX_REGEX, so
+        // letting them through would corrupt fix-risk classification.
+        // `Info::parent_ids` is filled in by the walk itself, so this test needs
+        // no object-store access: the skip runs BEFORE the object load, the
+        // decode, and the tree diff, and a merge therefore costs one queue pop
+        // and nothing else. `debug_assert_eq!(commit_count, commits.len())`
+        // still holds because merges are never pushed.
+        if info.parent_ids.len() > 1 {
+            continue;
+        }
 
         // Decode the full commit object for author/message fields.
         // The same object is reused in changed_files_for_commit below to avoid
@@ -160,8 +336,8 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
             }
         };
 
-        // Safety check: if the commit predates the cutoff, stop walking
-        if cutoff_secs.is_some_and(|cutoff| timestamp < cutoff) {
+        // Retain-count guard — fires before pushing to `commits`.
+        if budget.charge_retain() {
             break;
         }
 
@@ -171,14 +347,18 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         let msg_bytes = commit_ref.message;
         let message = first_line_of(msg_bytes.to_str_lossy().as_ref()).to_owned();
 
-        // Compute changed files (tree diff vs. first parent or empty tree).
+        // Compute changed files (tree diff vs. sole parent or empty tree).
         // Pass the already-decoded commit object to avoid a second object lookup.
+        // `info.parent_ids.first().copied()` yields `None` for root commits and
+        // `Some(id)` for the one parent of a non-merge commit; the function
+        // signature prevents accidentally passing a merge commit (AD-407-2).
         // In shallow clones, the parent object may be missing — treat as empty.
-        let changed_files = match changed_files_for_commit(&repo, &commit_obj, &info.parent_ids) {
-            Ok(files) => files,
-            Err(_) if is_shallow => Vec::new(),
-            Err(e) => return Err(e),
-        };
+        let changed_files =
+            match changed_files_for_commit(&repo, &commit_obj, info.parent_ids.first().copied()) {
+                Ok(files) => files,
+                Err(_) if is_shallow => Vec::new(),
+                Err(e) => return Err(e),
+            };
 
         commits.push(CommitInfo {
             hash,
@@ -189,12 +369,19 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
         });
     }
 
+    // AD-407-4: Stable sort by author-time descending so the ordering contract
+    // is a real guarantee, not a fixture accident (PF-007). For commits with
+    // equal author timestamps the relative order reflects gix's committer-time
+    // priority queue and is not further specified.
+    commits.sort_by_key(|c| std::cmp::Reverse(c.timestamp));
+
     let commit_count = commits.len();
     let result = HistoryResult {
         commits,
         metadata: TemporalMetadata {
             is_shallow,
             commit_count,
+            truncated: budget.truncated,
         },
     };
     debug_assert_eq!(
@@ -205,8 +392,16 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
     Ok(result)
 }
 
-/// Return the changed files in a commit by diffing its tree against its first
+/// Return the changed files in a commit by diffing its tree against its sole
 /// parent (or the empty tree for root commits).
+///
+/// The `parent` parameter carries the sole parent's `ObjectId` when present,
+/// or `None` for root commits.  After AD-407-2 only commits with 0 or 1 parent
+/// can reach this helper — merge commits (>1 parent) are skipped in the caller
+/// before this function is called.  Accepting `Option<gix::ObjectId>` instead
+/// of the full `ParentIds` slice makes the merge case unrepresentable at the
+/// call site so a future caller cannot accidentally pass a merge commit and
+/// silently receive a first-parent-only diff.
 ///
 /// Accepts the already-decoded `commit` object from the caller to avoid a
 /// second object-store lookup per commit.
@@ -216,16 +411,16 @@ fn parse_history_impl(repo_path: &Path, lookback_days: u32) -> Result<HistoryRes
 fn changed_files_for_commit(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
-    parent_ids: &gix::traverse::commit::ParentIds,
+    parent: Option<gix::ObjectId>,
 ) -> Result<Vec<FileChangeInfo>> {
     // Get the new (this commit's) tree
     let new_tree = commit.tree().map_err(gix_err)?;
 
-    // Get old (parent's) tree, or empty tree for root commits
+    // Get old (sole parent's) tree, or empty tree for root commits
     let old_tree: gix::Tree<'_>;
     let empty_tree: gix::Tree<'_>;
 
-    let lhs: &gix::Tree<'_> = if let Some(&parent_id) = parent_ids.first() {
+    let lhs: &gix::Tree<'_> = if let Some(parent_id) = parent {
         let parent_obj = repo.find_object(parent_id).map_err(gix_err)?;
         let parent_commit = parent_obj
             .try_into_commit()
@@ -309,6 +504,7 @@ fn empty_result(is_shallow: bool) -> HistoryResult {
         metadata: TemporalMetadata {
             is_shallow,
             commit_count: 0,
+            truncated: false,
         },
     }
 }

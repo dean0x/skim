@@ -1,8 +1,10 @@
-//! Shared I/O utilities for the on-disk store builders.
+//! Shared I/O utilities for the on-disk store builders and readers.
 //!
 //! Centralised here so that `ast_index/store/builder.rs`,
-//! `index/builder.rs`, and `cochange/builder.rs` all share one
-//! implementation and cannot drift apart.
+//! `index/builder.rs`, `cochange/builder.rs`, and the two integrity probe
+//! functions (`AstIndexReader::index_integrity`,
+//! `NgramIndexReader::lexical_index_integrity`) all share one implementation
+//! and cannot drift apart.
 
 use std::path::Path;
 
@@ -14,8 +16,12 @@ use crate::Result;
 ///
 /// Strategy: `NamedTempFile::new_in` (temp file in the same directory as the
 /// target, avoiding cross-device rename) → `write_all` → `sync_all` (flush
-/// kernel page cache to durable storage) → set `0o644` permissions on Unix →
-/// `persist` (atomic rename).
+/// kernel page cache to durable storage) → set `0o600` (owner-only)
+/// permissions on Unix → `persist` (atomic rename).
+///
+/// `0o600` matches the temporal store (`temporal/storage.rs`) so every
+/// `.skim/` index artifact is owner-readable only; the index can embed paths
+/// and code structure, so it should not be world-readable on shared hosts.
 ///
 /// A reader that finds the target file present can therefore assume it is
 /// complete and durably written.  Without a subsequent directory fsync the
@@ -36,9 +42,114 @@ pub(crate) fn atomic_write(dir: &Path, path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o644))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
     }
 
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Maximum number of `ErrorKind::Interrupted` (EINTR) retries tolerated while
+/// filling an index header buffer.
+///
+/// A header read is at most 62 bytes, so a healthy system needs zero retries and
+/// a heavily-signalled one needs a handful.  The cap exists so the retry arm —
+/// which by definition makes no progress — cannot spin indefinitely under a
+/// signal storm (every retry must have a fixed upper bound).  Exhausting the
+/// budget surfaces the last `Interrupted` error as [`crate::SearchError::Io`],
+/// which `check_staleness` treats as "rebuild", never as silent success.
+pub(crate) const MAX_EINTR_RETRIES: usize = 16;
+
+/// Steps 1–4 shared by both index integrity probes:
+/// open the `.skidx` file, fill `buf` with up to `buf.len()` bytes, validate
+/// that at least 6 bytes were read, validate the magic bytes, and return the
+/// decoded version word.
+///
+/// Returns `(file, version, bytes_filled)` where `file` is the still-open
+/// handle (usable for `file.metadata()?.len()` in step 6 of the caller,
+/// which avoids a TOCTOU gap and surfaces a real I/O error rather than
+/// silently substituting 0 on stat failure).
+///
+/// The caller is responsible for the foreign-version early exit (AD-414-6):
+///
+/// ```text
+/// let (mut file, version, n) =
+///     probe_index_header(&idx_path, &mut buf, "foo.skidx", MAGIC)?;
+/// if version != FORMAT_VERSION {
+///     return Ok(version);  // foreign layout — size checks must not proceed
+/// }
+/// ```
+///
+/// # Errors
+///
+/// - [`crate::SearchError::Io`] if the file at `path` cannot be opened, or
+///   a non-interrupted read error occurs while filling the header buffer.
+///   `EINTR` / `ErrorKind::Interrupted` is retried up to
+///   [`MAX_EINTR_RETRIES`] times; the last one is surfaced as `Io` rather
+///   than retried forever.
+/// - [`crate::SearchError::IndexCorrupted`] if fewer than 6 bytes could be
+///   read from the file, or the first 4 bytes do not equal `expected_magic`.
+pub(crate) fn probe_index_header(
+    path: &Path,
+    buf: &mut [u8],
+    label: &str,
+    expected_magic: &[u8; 4],
+) -> Result<(std::fs::File, u16, usize)> {
+    use std::io::Read as _;
+
+    // Step 1: open and fill the buffer.
+    //
+    // `Read::read` may return fewer bytes than requested even when more are
+    // available, so a single call cannot distinguish "short file" from "short
+    // read" — treating the latter as corruption costs the user a full rebuild
+    // of a healthy index.  Fill the buffer explicitly.
+    //
+    // Bounded by construction: every iteration either breaks on EOF (0-byte
+    // read), advances `n` by at least one byte toward `buf.len()`, or consumes
+    // one of the `MAX_EINTR_RETRIES` interrupt retries — so the loop performs at
+    // most `buf.len() + MAX_EINTR_RETRIES` iterations.  The retry budget is what
+    // keeps the `Interrupted` arm (which does NOT advance `n`) from spinning
+    // forever under a pathological signal storm.
+    let mut file = std::fs::File::open(path)?;
+    let mut n = 0usize;
+    let mut eintr_retries = 0usize;
+    while n < buf.len() {
+        match file.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            // EINTR is a transient kernel interrupt, not a real I/O failure.
+            // Retrying here matches what `read_exact` does internally and
+            // prevents `check_staleness`'s `Err(_) => true` arm from
+            // reclassifying a healthy index as corrupt on a spurious EINTR.
+            // Unlike `read_exact`, the retry budget is explicit and finite.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                eintr_retries += 1;
+                if eintr_retries > MAX_EINTR_RETRIES {
+                    return Err(crate::SearchError::Io(e));
+                }
+            }
+            Err(e) => return Err(crate::SearchError::Io(e)),
+        }
+    }
+
+    // Step 2: need at least 6 bytes for magic + version.
+    if n < 6 {
+        return Err(crate::SearchError::IndexCorrupted(format!(
+            "{label} too short: need 6 bytes for magic+version, got {n}"
+        )));
+    }
+
+    // Step 3: validate magic.
+    let magic = &buf[0..4];
+    if magic != expected_magic.as_ref() {
+        return Err(crate::SearchError::IndexCorrupted(format!(
+            "{label} bad magic: expected {:?}, got {:?}",
+            expected_magic, magic
+        )));
+    }
+
+    // Step 4: decode version.
+    let version = u16::from_le_bytes([buf[4], buf[5]]);
+
+    Ok((file, version, n))
 }

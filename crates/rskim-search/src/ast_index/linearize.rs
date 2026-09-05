@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser, ast_size_limit};
 
 use crate::ast_weights::NODE_KIND_VOCABULARY;
 use crate::types::SearchError;
@@ -45,20 +45,6 @@ pub(crate) const MAX_AST_DEPTH: u32 = AstWalkConfig::DEFAULT_MAX_DEPTH;
 #[cfg(test)]
 pub(crate) const MAX_AST_NODES: u32 = AstWalkConfig::DEFAULT_MAX_NODES;
 
-/// Maximum source file size accepted for linearization (100 KiB).
-///
-/// Files exceeding this limit return `Ok(LinearizeResult::default())` rather
-/// than an error.
-const MAX_FILE_SIZE: usize = 100 * 1024;
-
-/// Maximum source file size for SQL files (1 MiB).
-///
-/// SQL migrations and schema dumps are routinely larger than 100 KiB, so SQL
-/// uses a higher limit to match `rskim-research/src/ast_extract.rs`. Files
-/// between 100 KiB and 1 MiB that are SQL will be linearized; all other
-/// languages still use `MAX_FILE_SIZE`.
-const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
-
 // ============================================================================
 // Public types
 // ============================================================================
@@ -70,9 +56,20 @@ const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
 /// to resolve the string. A `kind_id` of `0` (sentinel) means the grammar
 /// kind was not found in the vocabulary (unknown kind).
 ///
-/// `depth` is the 0-indexed traversal depth from the root. Parent–child
+/// `depth` is the 0-indexed depth from the root. Parent–child
 /// relationships are recoverable: a node's parent is the nearest preceding
 /// node with `depth == self.depth - 1`.
+///
+/// # AD-394-6: `start_line`/`start_byte` are transient, never persisted
+///
+/// Added for OD-394-1 (synthetic-marker line recovery): `start_line` (1-indexed)
+/// and `start_byte` carry the node's source position so `extract.rs` can record
+/// a representative position per emitted synthetic marker in the SAME traversal
+/// that emits it (ADR-006 — one pass, no second detection re-implementation).
+/// `LinearNode` is a transient in-memory intermediate — only n-gram postings and
+/// per-file `StructuralMetrics` are ever serialized (`store/builder.rs`,
+/// `store/format.rs FORMAT_VERSION=2`) — so this addition does NOT change the
+/// on-disk format, bump `FORMAT_VERSION`, or trigger a rebuild/self-heal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinearNode {
     /// Vocabulary ID into `NODE_KIND_VOCABULARY`. `0` is the sentinel for
@@ -80,6 +77,10 @@ pub struct LinearNode {
     pub kind_id: NodeKindId,
     /// 0-indexed depth from the tree root (root node is depth 0).
     pub depth: u16,
+    /// 1-indexed source line the node starts on (AD-394-6). Transient/unpersisted.
+    pub start_line: u32,
+    /// Byte offset the node starts at (AD-394-6). Transient/unpersisted.
+    pub start_byte: u32,
 }
 
 /// Result of linearizing a single source file.
@@ -189,9 +190,8 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// Linearize a source file into a pre-order depth-encoded node sequence.
 ///
 /// Returns `Ok(LinearizeResult::default())` (empty result) for:
-/// - Files exceeding `MAX_FILE_SIZE` (100 KiB) for most languages, or
-///   `MAX_FILE_SIZE_LARGE` (1 MiB) for SQL
-/// - Non-tree-sitter languages (JSON, YAML, TOML)
+/// - Files exceeding the AST size cap (1 MiB, from `rskim_core::ast_size_limit`)
+/// - Non-tree-sitter languages (JSON, YAML, TOML — `ast_size_limit` returns `None`)
 /// - Parse failures (tree-sitter is error-tolerant, so this is rare)
 ///
 /// Returns `Err(SearchError::Ast)` only when the grammar itself fails to
@@ -203,18 +203,20 @@ static LANG_MAPS: LazyLock<HashMap<Language, Vec<Option<u16>>>> = LazyLock::new(
 /// `language` fails to load (grammar crate not compiled in, ABI mismatch,
 /// etc.). This is distinct from a parse error, which produces an empty result.
 pub fn linearize_source(source: &str, language: Language) -> crate::types::Result<LinearizeResult> {
-    // Guard 1: oversized files return empty result (not an error).
-    // SQL migrations/schema dumps can exceed 100 KiB, so SQL uses a larger
-    // limit (1 MiB) consistent with rskim-research/src/ast_extract.rs.
-    let size_limit = match language {
-        Language::Sql => MAX_FILE_SIZE_LARGE,
-        _ => MAX_FILE_SIZE,
-    };
-    if source.len() > size_limit {
-        return Ok(LinearizeResult::default());
+    // Guard 1: oversized files and non-tree-sitter languages return empty result.
+    // ast_size_limit returns None for JSON/YAML/TOML (no grammar) and Some(cap)
+    // for the 14 tree-sitter languages.  A unified 1 MiB cap replaces the old
+    // 100 KiB / 1 MiB-for-SQL two-tier (AD-405-1 / AC-405-21).
+    match ast_size_limit(language) {
+        None => return Ok(LinearizeResult::default()),
+        Some(cap) if source.len() as u64 > cap => return Ok(LinearizeResult::default()),
+        Some(_) => {}
     }
 
-    // Guard 2: non-tree-sitter languages have no CST → return empty result.
+    // Guard 2: look up the per-language node-kind vocab map.  Languages without
+    // a tree-sitter grammar were already rejected by ast_size_limit returning None
+    // in Guard 1, but LANG_MAPS is the compile-time source of truth for which
+    // grammars are compiled in — a missing entry here is a config mismatch.
     let lang_map = match LANG_MAPS.get(&language) {
         Some(m) => m,
         None => return Ok(LinearizeResult::default()),
@@ -269,9 +271,18 @@ fn linearize_tree(tree: &tree_sitter::Tree, lang_map: &[Option<u16>]) -> Lineari
         // saturating_cast is the correct pattern for converting u32 → u16.
         #[allow(clippy::cast_possible_truncation)]
         let depth = item.depth.min(u32::from(u16::MAX)) as u16;
+        // AD-394-6 / PF-004: widen usize → u32 BEFORE saturating_add(1) for
+        // 1-indexing — mirrors reparse.rs's recover_line row→line conversion.
+        // No u16 depth arithmetic is introduced here (PF-004 is about depth
+        // comparisons; this is an independent source-position field).
+        let row = item.node.start_position().row;
+        let start_line = u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1);
+        let start_byte = u32::try_from(item.node.start_byte()).unwrap_or(u32::MAX);
         nodes.push(LinearNode {
             kind_id: vocab_id,
             depth,
+            start_line,
+            start_byte,
         });
     }
 

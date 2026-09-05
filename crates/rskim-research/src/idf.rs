@@ -2,24 +2,37 @@
 
 use std::collections::HashMap;
 
-use crate::types::BigramWeight;
+use crate::types::{BigramWeight, TrigramWeight};
 
 /// Compute IDF using the smoothed formula: ln(N / (df + 1)) + 1.0
 ///
-/// Returns a value ≥ 1.0. Universal bigrams (df ≈ N) score near 1.0;
-/// rare bigrams (df = 1 in a large corpus) score near ln(N) + 1.
+/// Returns a value ≥ 1.0. Universal n-grams (df ≈ N) score near 1.0;
+/// rare n-grams (df = 1 in a large corpus) score near ln(N) + 1.
+///
+/// This function is shared by both the bigram weight-table path
+/// (`compute_weight_table`) and the trigram weight-table path
+/// (`compute_trigram_weight_table`); the "n-gram" terminology here covers both.
 ///
 /// # Panics (debug only)
 ///
 /// Panics in debug builds if `total_docs == 0`, which would produce `NEG_INFINITY`.
 /// Callers must ensure the corpus is non-empty before invoking this function.
+///
+/// # PF-004 (widen before arithmetic)
+///
+/// `df` is widened to `u64` before adding 1 to avoid a wrapping overflow when
+/// `df == u32::MAX` (which would produce 0 as the denominator, yielding `+inf`).
+/// In practice `df` is bounded by the number of indexed files, so u32::MAX is
+/// unreachable — but the widen-before-arithmetic pattern is applied verbatim per
+/// PF-004 for correctness and consistency with the rest of the codebase.
 #[must_use]
 pub fn compute_idf(df: u32, total_docs: u32) -> f32 {
     debug_assert!(
         total_docs > 0,
         "total_docs must be > 0; got 0 — caller must guard against empty corpus"
     );
-    ((total_docs as f64) / ((df + 1) as f64)).ln() as f32 + 1.0
+    // PF-004: widen to u64 before adding 1 to prevent wrapping when df == u32::MAX.
+    ((total_docs as f64) / ((u64::from(df) + 1) as f64)).ln() as f32 + 1.0
 }
 
 /// Build the weight table from a document-frequency map.
@@ -52,6 +65,38 @@ pub fn compute_weight_table(
 
     // Sort ascending by bigram key for binary-search lookups.
     weights.sort_by_key(|w| w.bigram);
+    weights
+}
+
+/// Build a trigram weight table from a document-frequency map.
+///
+/// Trigrams with IDF below `threshold` are excluded. The result is sorted
+/// by trigram key ascending (enabling binary search in `rskim-search`).
+///
+/// Returns an empty vec immediately if `total_docs == 0`.
+#[must_use]
+pub fn compute_trigram_weight_table(
+    df_map: &HashMap<u32, u32>,
+    total_docs: u32,
+    threshold: f32,
+) -> Vec<TrigramWeight> {
+    if total_docs == 0 {
+        return Vec::new();
+    }
+    let mut weights: Vec<TrigramWeight> = df_map
+        .iter()
+        .filter_map(|(&trigram, &df)| {
+            let idf = compute_idf(df, total_docs);
+            if idf >= threshold {
+                Some(TrigramWeight { trigram, idf })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Sort ascending by trigram key for binary-search lookups.
+    weights.sort_by_key(|w| w.trigram);
     weights
 }
 

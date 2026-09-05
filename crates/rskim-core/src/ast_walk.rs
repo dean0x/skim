@@ -257,6 +257,79 @@ impl<'a> Iterator for AstWalkIter<'a> {
 impl<'a> std::iter::FusedIterator for AstWalkIter<'a> {}
 
 // ============================================================================
+// AST size limit (AD-405-1, AD-405-13)
+// ============================================================================
+
+/// Default maximum file size for AST indexing and re-parsing: 1 MiB.
+///
+/// ## AD-405-13: Justification for 1 MiB
+///
+/// 1 MiB covers all five of skim's own hand-written over-100-KiB search-
+/// implementation files (ast_tests.rs 180,321 bytes down to query_tests.rs
+/// 109,033 bytes) with >5x headroom, so skim's own AST layer can finally see
+/// skim's own search implementation.  It stays below the 5 MiB walk cap
+/// (walk.rs:87) so a [1 MiB, 5 MiB] excluded band survives and the accounting
+/// machinery still has a job.  The sole remaining tracked file left excluded is
+/// the 2.57 MB auto-generated `weights.rs` table.
+///
+/// The old two-tier (100 KiB for all except SQL, 1 MiB for SQL) collapses
+/// into this single value.  `ast_size_limit` is the ONLY definition.
+pub const AST_SIZE_LIMIT_DEFAULT: u64 = 1024 * 1024;
+
+/// Return the maximum file size accepted for AST indexing and re-parsing for
+/// the given language, or `None` when the language has no tree-sitter grammar.
+///
+/// ## AD-405-1: Wildcard-free match — no `_` arm
+///
+/// Every `Language` variant is named explicitly.  Adding a new language variant
+/// without also adding an arm here causes a compile-time exhaustiveness error,
+/// making it impossible to silently regress coverage for a new language.  A
+/// `_ =>` wildcard would bypass that guard and allow new languages to be silently
+/// excluded from AST indexing forever.
+///
+/// ## AD-405-13: Value rationale
+///
+/// See [`AST_SIZE_LIMIT_DEFAULT`].  All 15 tree-sitter languages share the same
+/// cap; the old SQL-specific 1 MiB exception is dissolved.  JSON, YAML, and TOML
+/// have no tree-sitter grammar in this codebase and return `None`.
+///
+/// Returning `Some` means the language has a grammar, not that it is present in
+/// the AST index's `LANG_MAPS` node-kind vocabulary.  Bash has a grammar but no
+/// vocabulary entry, so `linearize_source` admits it past the size gate and then
+/// returns an empty result at the `LANG_MAPS` lookup (Guard 2).
+///
+/// ## Anti-pattern avoided
+///
+/// This function MUST NOT reference `LANG_MAPS` from `linearize.rs` (a
+/// `LazyLock` that constructs 14 tree-sitter parsers at first access).  Calling
+/// `ast_size_limit` from `--stats` must be free of parser-construction cost.
+#[must_use]
+pub fn ast_size_limit(lang: crate::Language) -> Option<u64> {
+    use crate::Language;
+    match lang {
+        // Tree-sitter grammars — eligible for AST indexing.
+        Language::TypeScript
+        | Language::JavaScript
+        | Language::Python
+        | Language::Rust
+        | Language::Go
+        | Language::Java
+        | Language::Markdown
+        | Language::C
+        | Language::Cpp
+        | Language::CSharp
+        | Language::Ruby
+        | Language::Sql
+        | Language::Kotlin
+        | Language::Swift
+        | Language::Bash => Some(AST_SIZE_LIMIT_DEFAULT),
+
+        // Data formats — no tree-sitter grammar; never AST-indexed.
+        Language::Json | Language::Yaml | Language::Toml => None,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -524,6 +597,66 @@ mod tests {
             non_error + iter.error_count(),
             "invariant: node_count == non_error + error_count"
         );
+    }
+
+    // ── ast_size_limit contract (AD-405-1 / AD-405-13) ───────────────────────
+
+    /// All 15 tree-sitter languages must return `Some(AST_SIZE_LIMIT_DEFAULT)`.
+    ///
+    /// The list is kept explicit (no wildcard) so that adding a 16th tree-sitter
+    /// language without updating this test produces a compile-time error in
+    /// `ast_size_limit`'s exhaustive match — not a silent miss here.
+    #[test]
+    fn ast_size_limit_tree_sitter_langs_return_some_one_mib() {
+        use crate::Language;
+
+        const ONE_MIB: u64 = 1024 * 1024;
+        assert_eq!(
+            AST_SIZE_LIMIT_DEFAULT, ONE_MIB,
+            "AST_SIZE_LIMIT_DEFAULT must be exactly 1 MiB (1 048 576 bytes)"
+        );
+
+        let tree_sitter_langs = [
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Python,
+            Language::Rust,
+            Language::Go,
+            Language::Java,
+            Language::Markdown,
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Ruby,
+            Language::Sql,
+            Language::Kotlin,
+            Language::Swift,
+            Language::Bash,
+        ];
+
+        for lang in tree_sitter_langs {
+            assert_eq!(
+                ast_size_limit(lang),
+                Some(ONE_MIB),
+                "ast_size_limit({lang:?}) should be Some(1 MiB)"
+            );
+        }
+    }
+
+    /// JSON, YAML, and TOML have no tree-sitter grammar and must return `None`.
+    #[test]
+    fn ast_size_limit_data_format_langs_return_none() {
+        use crate::Language;
+
+        let data_format_langs = [Language::Json, Language::Yaml, Language::Toml];
+
+        for lang in data_format_langs {
+            assert_eq!(
+                ast_size_limit(lang),
+                None,
+                "ast_size_limit({lang:?}) should be None (no tree-sitter grammar)"
+            );
+        }
     }
 
     // ── Zero limits yield nothing ─────────────────────────────────────────────

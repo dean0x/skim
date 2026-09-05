@@ -442,6 +442,38 @@ pub(crate) fn inject_flag_before_separator(args: &mut Vec<String>, flag: &str) {
     }
 }
 
+/// Return `true` when `rel` is a safe, repo-relative path that will not escape
+/// the repository root when joined via `root.join(rel)`.
+///
+/// Rejects paths with any of:
+/// - [`std::path::Component::ParentDir`] (`..`) — classic path-traversal vector.
+/// - [`std::path::Component::RootDir`] (`/`) — makes `Path::join` replace the
+///   base rather than append.
+/// - [`std::path::Component::Prefix`] (`C:`) — Windows drive-relative paths
+///   (e.g. `C:foo`) that escape the root on that platform.
+///
+/// This is the **single canonical containment guard** for untrusted git-history
+/// and git-diff paths (applies ADR-008). All three call sites that stat a
+/// repo-relative string from git output MUST delegate here — not inline their
+/// own variant — so the invariant stays in one place and cannot drift:
+/// - `cmd::search::walk::list_tracked_files` (git index paths)
+/// - `cmd::search::temporal_build::rel_is_regular_file` (temporal history paths)
+/// - `cmd::heatmap::resolve_diff_files` (git diff paths)
+///
+/// Note: the guard does NOT defend against in-tree symlinks whose targets resolve
+/// outside `root` — that is a low-severity, defense-in-depth concern noted for
+/// conscious acceptance (AD-408-2).
+#[must_use]
+pub(crate) fn is_repo_relative_safe(rel: &std::path::Path) -> bool {
+    use std::path::Component;
+    !rel.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

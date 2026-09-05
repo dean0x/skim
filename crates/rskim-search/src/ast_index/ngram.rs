@@ -89,7 +89,6 @@ impl AstBigram {
     /// should use [`encode`][Self::encode] to guarantee the correct encoding.
     #[must_use]
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn from_raw(key: u32) -> Self {
         Self(key)
     }
@@ -152,7 +151,6 @@ impl AstTrigram {
     /// form.  External callers should use [`encode`][Self::encode].
     #[must_use]
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn from_raw(key: u64) -> Self {
         Self(key)
     }

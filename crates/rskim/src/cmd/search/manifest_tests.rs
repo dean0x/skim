@@ -27,6 +27,7 @@ fn sample_entry(path: &str, sha256: &str) -> ManifestEntry {
         lang: "rust".to_string(),
         field_map: encode_field_map(&sample_field_map()),
         mtime: None,
+        size: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn test_manifest_roundtrip_multiple_entries() {
             lang: "rust".to_string(),
             field_map: encode_field_map(&sample_field_map()),
             mtime: None,
+            size: None,
         })
         .collect();
 
@@ -223,43 +225,67 @@ fn test_save_is_atomic_existing_file_replaced() {
 // Safety limits
 // ============================================================================
 
+/// AC-3 (#380): a binary manifest whose declared entry_count exceeds
+/// `MAX_MANIFEST_ENTRIES` MUST be rejected BEFORE allocating — `load()` returns
+/// `Ok(empty)` without panic and without attempting to read millions of entries.
 #[test]
-fn test_load_stops_at_entry_cap() {
+fn test_load_rejects_over_cap_entry_count() {
     use super::MAX_MANIFEST_ENTRIES;
-    use std::io::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let cache_dir = root.clone();
-
-    // Write a manifest with more entries than MAX_MANIFEST_ENTRIES.
     let path = cache_dir.join("index.skfiles");
-    let mut f = std::fs::File::create(&path).unwrap();
 
-    // Header line — use current FORMAT_VERSION so the version check passes
-    // and load actually parses entry lines (testing the entry cap, not version mismatch).
-    let header = serde_json::json!({"version": FileManifest::FORMAT_VERSION, "root": root.to_string_lossy()});
-    writeln!(f, "{header}").unwrap();
-
-    // Write MAX_MANIFEST_ENTRIES + 10 entry lines.
-    for i in 0..(MAX_MANIFEST_ENTRIES + 10) {
-        let entry = serde_json::json!({
-            "path": format!("src/file_{i}.rs"),
-            "sha256": "a".repeat(64),
-            "lang": "rust",
-            "field_map": []
-        });
-        writeln!(f, "{entry}").unwrap();
-    }
-    drop(f);
+    // Forge a valid SKFM header with a count just over the cap, no body.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SKFM");
+    buf.extend_from_slice(&FileManifest::FORMAT_VERSION.to_le_bytes());
+    let forged = u32::try_from(MAX_MANIFEST_ENTRIES + 1).unwrap();
+    buf.extend_from_slice(&forged.to_le_bytes());
+    // root string (length-prefixed) so the header block parses up to the count check.
+    let root_bytes = root.to_string_lossy();
+    buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    buf.extend_from_slice(root_bytes.as_bytes());
+    buf.push(0u8); // git_head absent
+    std::fs::write(&path, &buf).unwrap();
 
     let manifest = FileManifest::load(root, cache_dir).unwrap();
-    // Must not exceed the cap (entries beyond the cap are simply ignored).
-    assert!(
-        manifest.entries.len() <= MAX_MANIFEST_ENTRIES,
-        "entry count {} exceeds MAX_MANIFEST_ENTRIES {}",
-        manifest.entries.len(),
-        MAX_MANIFEST_ENTRIES
+    assert_eq!(
+        manifest.entry_count(),
+        0,
+        "over-cap declared entry_count must be rejected before allocation (AC-3)"
+    );
+}
+
+/// AC-3 (#380), the required NEGATIVE: a forged `u32::MAX` entry_count plus an
+/// oversized declared per-entry length yields `Ok(empty)` WITHOUT panic — the
+/// decoder must reject before slicing/allocating.
+#[test]
+fn test_load_forged_count_and_length_no_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+    let path = cache_dir.join("index.skfiles");
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SKFM");
+    buf.extend_from_slice(&FileManifest::FORMAT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&u32::MAX.to_le_bytes()); // forged count
+    let root_bytes = root.to_string_lossy();
+    buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    buf.extend_from_slice(root_bytes.as_bytes());
+    buf.push(0u8); // git_head absent
+    // First entry: a path field with a forged u32::MAX length prefix and no data.
+    buf.extend_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&path, &buf).unwrap();
+
+    // Must not panic; must reject the whole file.
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        manifest.entry_count(),
+        0,
+        "forged count + oversized length must yield empty without panic (AC-3 negative)"
     );
 }
 
@@ -332,6 +358,7 @@ fn test_mtime_persisted_in_manifest() {
         lang: "rust".to_string(),
         field_map: vec![],
         mtime: Some(mtime_value),
+        size: None,
     };
 
     let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
@@ -347,16 +374,11 @@ fn test_mtime_persisted_in_manifest() {
     );
 }
 
-/// A manifest written with a stale `version` field (e.g. by an older version
-/// of skim) must be silently discarded and replaced with an empty manifest.
-///
-/// This test was previously named `test_mtime_backward_compat_none` and verified
-/// that a v1 manifest entry without a `mtime` field was loaded with `mtime: None`.
-/// After bumping FORMAT_VERSION to 2 (Issue #193: custom field mapping for
-/// JSON/YAML/TOML/Markdown), v1 manifests are intentionally rejected — skim
-/// must re-index from scratch to pick up the new field classifications.
+/// AC-4 (#380): a v3 JSONL manifest (the immediate predecessor, post-#373) MUST
+/// be discarded on load — it lacks the SKFM binary magic, so `load()` cold-starts
+/// and `version_matches()` reports a mismatch (which drives the rebuild).
 #[test]
-fn test_stale_version_manifest_triggers_cold_start() {
+fn test_stale_v3_jsonl_manifest_triggers_cold_start() {
     use std::io::Write as _;
 
     let dir = tempfile::tempdir().unwrap();
@@ -364,9 +386,11 @@ fn test_stale_version_manifest_triggers_cold_start() {
     let cache_dir = root.clone();
     let path = cache_dir.join("index.skfiles");
 
-    // Write a v1 manifest (FORMAT_VERSION is now 2).
+    // Write a v3 JSONL manifest (the format #373 produced). Starts with `{`,
+    // never the SKFM magic.
     let mut f = std::fs::File::create(&path).unwrap();
-    let header = serde_json::json!({"version": 1, "root": root.to_string_lossy()});
+    let header =
+        serde_json::json!({"version": 3, "root": root.to_string_lossy(), "git_head": null});
     writeln!(f, "{header}").unwrap();
     let entry_json = serde_json::json!({
         "path": "src/old.rs",
@@ -377,12 +401,42 @@ fn test_stale_version_manifest_triggers_cold_start() {
     writeln!(f, "{entry_json}").unwrap();
     drop(f);
 
-    // Loading a v1 manifest against FORMAT_VERSION 2 must produce an empty
-    // manifest (cold start), not preserve the v1 entries.
-    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    // load() must cold-start (no SKFM magic).
+    let manifest = FileManifest::load(root.clone(), cache_dir.clone()).unwrap();
     assert!(
         manifest.lookup("src/old.rs").is_none(),
-        "v1 manifest must be discarded on version mismatch — cold start required"
+        "v3 JSONL manifest must be discarded after the binary 3→4 bump — cold start required (AC-4)"
+    );
+    // version_matches() must report below-current so check_staleness rebuilds.
+    assert!(
+        !FileManifest::version_matches(&cache_dir).unwrap(),
+        "v3 JSONL manifest must NOT be accepted as current (AC-4 negative)"
+    );
+}
+
+/// AC-4 (#380): an even-older v2 JSONL manifest is likewise rejected (no magic).
+#[test]
+fn test_stale_v2_jsonl_manifest_triggers_cold_start() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+    let path = cache_dir.join("index.skfiles");
+
+    let mut f = std::fs::File::create(&path).unwrap();
+    let header = serde_json::json!({"version": 2, "root": root.to_string_lossy()});
+    writeln!(f, "{header}").unwrap();
+    drop(f);
+
+    let manifest = FileManifest::load(root.clone(), cache_dir.clone()).unwrap();
+    assert!(
+        manifest.lookup("anything").is_none(),
+        "v2 JSONL manifest must be discarded — cold start required (AC-4)"
+    );
+    assert!(
+        !FileManifest::version_matches(&cache_dir).unwrap(),
+        "v2 JSONL manifest must NOT be accepted as current (AC-4 negative)"
     );
 }
 
@@ -410,30 +464,26 @@ fn test_git_head_roundtrip() {
     );
 }
 
-/// Backward compat: manifest at current FORMAT_VERSION but without `git_head`
-/// in the header JSON → `stored_git_head()` returns `None` via `serde(default)`.
+/// A binary manifest written with `git_head: None` (presence byte 0) round-trips
+/// to `stored_git_head() == None`.
 #[test]
-fn test_git_head_backward_compat_none() {
-    use std::io::Write as _;
-
+fn test_git_head_none_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let cache_dir = root.clone();
-    let path = cache_dir.join("index.skfiles");
 
-    let mut f = std::fs::File::create(&path).unwrap();
-    // Write header at current FORMAT_VERSION but omit git_head — tests
-    // that serde(default) correctly yields None for the missing field.
-    let header = serde_json::json!({"version": FileManifest::FORMAT_VERSION, "root": root.to_string_lossy()});
-    writeln!(f, "{header}").unwrap();
-    drop(f);
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.set_git_head(None);
+    manifest.insert(sample_entry("src/x.rs", &"a".repeat(64)));
+    manifest.save().unwrap();
 
-    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
     assert_eq!(
-        manifest.stored_git_head(),
+        loaded.stored_git_head(),
         None,
-        "manifest without git_head field should return None via serde(default)"
+        "manifest saved with git_head None must load back as None"
     );
+    assert!(loaded.lookup("src/x.rs").is_some(), "entry must survive");
 }
 
 /// sorted_paths returns entry paths in alphabetical order.
@@ -452,6 +502,7 @@ fn test_sorted_paths_invariant() {
             lang: "rust".to_string(),
             field_map: vec![],
             mtime: None,
+            size: None,
         });
     }
 
@@ -495,4 +546,514 @@ fn test_sorted_paths_empty() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = FileManifest::new(dir.path().to_path_buf(), dir.path().to_path_buf());
     assert!(manifest.sorted_paths().is_empty());
+}
+
+// ============================================================================
+// Binary format (#380)
+// ============================================================================
+
+/// AC-1 (#380): a field_map whose END byte-offset exceeds `u16::MAX` (65535) MUST
+/// survive save()→load() with every field byte-identical. The old u16 key path
+/// (#355 Part B legacy) truncated such offsets; the binary v4 encoder uses u32.
+#[test]
+fn test_field_map_large_offset_roundtrip_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // End offset 70000 > u16::MAX (65535).
+    let big_field_map = vec![
+        (
+            0usize,
+            100usize,
+            SearchField::FunctionSignature.discriminant(),
+        ),
+        (100, 70_000, SearchField::FunctionBody.discriminant()),
+    ];
+    let entry = ManifestEntry {
+        path: "src/huge.rs".to_string(),
+        sha256: "f".repeat(64),
+        lang: "rust".to_string(),
+        field_map: big_field_map.clone(),
+        mtime: Some(1_700_000_123),
+        size: Some(80_000),
+    };
+
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(entry.clone());
+    manifest.save().unwrap();
+
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    let found = loaded.lookup("src/huge.rs").unwrap();
+    assert_eq!(
+        found, &entry,
+        "every field (incl. the >u16::MAX offset) must round-trip byte-identical (AC-1)"
+    );
+    assert_eq!(
+        found.field_map, big_field_map,
+        "the 70000 end offset must NOT be truncated (AC-1)"
+    );
+}
+
+/// AC-1 NEGATIVE (#380): the on-disk `index.skfiles` MUST NOT contain ASCII JSON
+/// array encoding after save() — i.e. no literal `],[` substring. This is the
+/// discriminating check that the encoding is binary, not JSONL.
+#[test]
+fn test_saved_manifest_is_not_jsonl() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(sample_entry("src/a.rs", &"a".repeat(64)));
+    manifest.insert(sample_entry("src/b.rs", &"b".repeat(64)));
+    manifest.save().unwrap();
+
+    let bytes = fs::read(cache_dir.join("index.skfiles")).unwrap();
+    // Must start with the SKFM magic.
+    assert_eq!(
+        &bytes[0..4],
+        b"SKFM",
+        "binary manifest must start with SKFM magic"
+    );
+    // Must NOT contain the JSON-array delimiter the JSONL field_map produced.
+    let needle = b"],[";
+    assert!(
+        !bytes.windows(needle.len()).any(|w| w == needle),
+        "binary manifest must not contain JSON-array encoding `],[` (AC-1 negative)"
+    );
+}
+
+/// AC-2 (#380): the binary body MUST begin with the 4-byte magic, then version,
+/// then a u32 entry count.
+#[test]
+fn test_binary_header_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(sample_entry("a.rs", &"a".repeat(64)));
+    manifest.insert(sample_entry("b.rs", &"b".repeat(64)));
+    manifest.save().unwrap();
+
+    let bytes = fs::read(cache_dir.join("index.skfiles")).unwrap();
+    assert_eq!(&bytes[0..4], b"SKFM");
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    assert_eq!(version, FileManifest::FORMAT_VERSION);
+    assert_eq!(version, 7, "FORMAT_VERSION must be 7 (AD-411-5 / #411)");
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    assert_eq!(
+        count, 2,
+        "entry count must be encoded as u32 in the header (AC-2)"
+    );
+}
+
+/// AC-2 (#380): load() returns Ok(empty) when the magic is absent.
+#[test]
+fn test_load_absent_magic_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Plausible length but wrong magic.
+    fs::write(
+        cache_dir.join("index.skfiles"),
+        b"XXXX\x04\x00\x00\x00\x00\x00\x00\x00",
+    )
+    .unwrap();
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(manifest.entry_count(), 0, "absent magic → Ok(empty) (AC-2)");
+}
+
+/// AC-2 (#380): load() returns Ok(empty) when the version does not match FORMAT_VERSION
+/// (e.g. a stale v5 binary, or a forged version int).
+#[test]
+fn test_load_wrong_version_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"SKFM");
+    buf.extend_from_slice(&99u32.to_le_bytes()); // wrong version
+    buf.extend_from_slice(&0u32.to_le_bytes()); // count
+    let root_bytes = root.to_string_lossy();
+    buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    buf.extend_from_slice(root_bytes.as_bytes());
+    buf.push(0u8);
+    fs::write(cache_dir.join("index.skfiles"), &buf).unwrap();
+
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(manifest.entry_count(), 0, "version != 7 → Ok(empty) (AC-2)");
+}
+
+/// AC-2 / AC-5 (#380): load() returns Ok(empty) when the body is truncated below
+/// the fixed header.
+#[test]
+fn test_load_truncated_header_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    fs::write(cache_dir.join("index.skfiles"), b"SKFM\x04").unwrap(); // 5 bytes, < 12
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(manifest.entry_count(), 0, "truncated header → Ok(empty)");
+}
+
+/// AC-5 (#380), FALSIFIABLE: a valid header declaring count=3 but a body holding
+/// only ~1.5 entries MUST reject the WHOLE file — `entry_count()` is 0, never a
+/// partially-recovered manifest shorter than written (preserves the FileId↔path
+/// alignment invariant).
+#[test]
+fn test_load_truncated_body_rejects_whole_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Build a valid 3-entry manifest, then truncate the on-disk bytes mid-second-entry.
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        manifest.insert(sample_entry(name, &"a".repeat(64)));
+    }
+    manifest.save().unwrap();
+
+    let path = cache_dir.join("index.skfiles");
+    let full = fs::read(&path).unwrap();
+    // Confirm the header really declared 3 entries.
+    assert_eq!(u32::from_le_bytes(full[8..12].try_into().unwrap()), 3);
+    // Truncate to a point well past the header but before all 3 entries decode —
+    // ~60% of the file lands inside the body.
+    let cut = full.len() * 6 / 10;
+    fs::write(&path, &full[..cut]).unwrap();
+
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        loaded.entry_count(),
+        0,
+        "truncated body (count=3, <3 entries present) must reject WHOLE file → entry_count()==0 (AC-5)"
+    );
+}
+
+/// AC-2 / AC-3 (#380): a forged over-cap count combined with an under-length body
+/// never panics and yields empty (complements the in-module forged-length test).
+#[test]
+fn test_load_over_max_file_bytes_returns_empty() {
+    use super::MAX_MANIFEST_FILE_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+    let path = cache_dir.join("index.skfiles");
+
+    // Sparse file over the byte cap — must be rejected before reading into RAM.
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(MAX_MANIFEST_FILE_BYTES + 1).unwrap();
+    drop(file);
+
+    let manifest = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        manifest.entry_count(),
+        0,
+        "manifest over MAX_MANIFEST_FILE_BYTES must be discarded (AC-3)"
+    );
+}
+
+/// AC-11 / regression (#380): the full set of entry fields (path, sha, lang,
+/// field_map, mtime, size, git_head) round-trips byte-identical for several
+/// entries — the query path reads exactly the same entry data it did under JSONL.
+#[test]
+fn test_full_entry_set_roundtrip_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    let entries = vec![
+        ManifestEntry {
+            path: "README.md".to_string(),
+            sha256: "1".repeat(64),
+            lang: "markdown".to_string(),
+            field_map: vec![],
+            mtime: Some(10),
+            size: Some(20),
+        },
+        ManifestEntry {
+            path: "src/a.rs".to_string(),
+            sha256: "2".repeat(64),
+            lang: "rust".to_string(),
+            field_map: encode_field_map(&sample_field_map()),
+            mtime: None,
+            size: Some(4096),
+        },
+        ManifestEntry {
+            path: "src/z.ts".to_string(),
+            sha256: "3".repeat(64),
+            lang: "typescript".to_string(),
+            field_map: vec![(0, 1, 0u8), (1, 100_000, 1u8)],
+            mtime: Some(99),
+            size: None,
+        },
+    ];
+
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.set_git_head(Some("c".repeat(40)));
+    for e in &entries {
+        manifest.insert(e.clone());
+    }
+    manifest.save().unwrap();
+
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(loaded.stored_git_head(), Some("c".repeat(40).as_str()));
+    for e in &entries {
+        assert_eq!(
+            loaded.lookup(&e.path),
+            Some(e),
+            "entry {} must round-trip",
+            e.path
+        );
+    }
+    // Sorted order (FileId↔path contract) preserved.
+    assert_eq!(
+        loaded.sorted_paths(),
+        vec!["README.md", "src/a.rs", "src/z.ts"]
+    );
+}
+
+// ============================================================================
+// #395 / #411 — FORMAT_VERSION 7 + skip section tests
+// ============================================================================
+
+/// AC6 (partial): FORMAT_VERSION must equal 7. version_matches returns false
+/// for v4/v5/v6 headers and true for a v7 header (the self-heal trigger, AD-411-5).
+///
+/// v5→v6 bump (#411, AD-411-5): field attribution changed (identifiers now
+/// classify context-aware instead of unconditional SymbolName); manifests written
+/// by v5 hold stale field_maps and must be cold-started so the self-heal
+/// re-classifies all files on the first query after upgrade.
+///
+/// v6→v7 bump (#411, AD-411-5): compile-time SSOT guard aligns FORMAT_VERSION
+/// with `rskim_search::CLASSIFIER_SCHEMA_VERSION = 7` so future classifier
+/// changes fail the build unless both constants are advanced together.
+#[test]
+fn test_ac6_format_version_7_and_version_matches() {
+    // Compile-time check: constant must be 7.
+    assert_eq!(
+        FileManifest::FORMAT_VERSION,
+        7,
+        "FORMAT_VERSION must be 7 (AD-411-5 / #411)"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path();
+
+    // Build the root bytes from the canonical path.
+    let root_str = dir.path().to_string_lossy();
+    let root_bytes = root_str.as_bytes();
+
+    // Forge a v4 SKFM header — must be rejected (stale, triggers rebuild).
+    let mut v4_buf: Vec<u8> = Vec::new();
+    v4_buf.extend_from_slice(b"SKFM");
+    v4_buf.extend_from_slice(&4u32.to_le_bytes()); // version 4
+    v4_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v4_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v4_buf.extend_from_slice(root_bytes);
+    v4_buf.push(0u8); // git_head absent
+    v4_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+    fs::write(cache_dir.join("index.skfiles"), &v4_buf).unwrap();
+    assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "v4 header must return false (triggers self-heal rebuild, AD-395-3)"
+    );
+
+    // Forge a v5 SKFM header — must also be rejected (stale after AD-411-5 bump).
+    let mut v5_buf: Vec<u8> = Vec::new();
+    v5_buf.extend_from_slice(b"SKFM");
+    v5_buf.extend_from_slice(&5u32.to_le_bytes()); // version 5
+    v5_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v5_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v5_buf.extend_from_slice(root_bytes);
+    v5_buf.push(0u8); // git_head absent
+    v5_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+    fs::write(cache_dir.join("index.skfiles"), &v5_buf).unwrap();
+    assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "v5 header must return false (stale after AD-411-5 bump, triggers self-heal re-classify)"
+    );
+
+    // Forge a v6 SKFM header — must be rejected (stale after v6→v7 SSOT bump).
+    let mut v6_buf: Vec<u8> = Vec::new();
+    v6_buf.extend_from_slice(b"SKFM");
+    v6_buf.extend_from_slice(&6u32.to_le_bytes()); // version 6
+    v6_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v6_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v6_buf.extend_from_slice(root_bytes);
+    v6_buf.push(0u8); // git_head absent
+    v6_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+    fs::write(cache_dir.join("index.skfiles"), &v6_buf).unwrap();
+    assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "v6 header must return false (stale after CLASSIFIER_SCHEMA_VERSION SSOT bump to v7, AD-411-5)"
+    );
+
+    // Forge a v7 SKFM header — must be accepted (current version).
+    let mut v7_buf: Vec<u8> = Vec::new();
+    v7_buf.extend_from_slice(b"SKFM");
+    v7_buf.extend_from_slice(&7u32.to_le_bytes()); // version 7
+    v7_buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count
+    v7_buf.extend_from_slice(&u32::try_from(root_bytes.len()).unwrap().to_le_bytes());
+    v7_buf.extend_from_slice(root_bytes);
+    v7_buf.push(0u8); // git_head absent
+    v7_buf.extend_from_slice(&0u32.to_le_bytes()); // skip_count = 0
+    fs::write(cache_dir.join("index.skfiles"), &v7_buf).unwrap();
+    assert!(
+        FileManifest::version_matches(cache_dir).unwrap(),
+        "v7 header must return true (current version, AD-411-5)"
+    );
+}
+
+/// AC6 NEGATIVE: version_matches must not return true for version 4.
+#[test]
+fn test_ac6_version_matches_rejects_v4() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path();
+
+    // Minimal v4 header.
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"SKFM");
+    buf.extend_from_slice(&4u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // No root — that's fine for version_matches which only reads 12 bytes.
+    fs::write(cache_dir.join("index.skfiles"), &buf).unwrap();
+
+    assert!(
+        !FileManifest::version_matches(cache_dir).unwrap(),
+        "version 4 must return false (AD-395-3 negative)"
+    );
+}
+
+/// Truncated-v7 manifest (skip_count missing) rejects whole — codec consistency (AD-380-3).
+///
+/// The `else` branch in `FileManifest::load` now cold-starts when `read_u32()` for
+/// the skip_count returns `None` (buffer ended exactly at the skip section boundary).
+/// This is a v7-only scenario: v4/v5/v6 manifests are rejected by `decode_header` before
+/// reaching this code.
+#[test]
+fn test_v7_manifest_truncated_at_skip_count_rejects_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Build a manifest with 1 indexed entry and 0 skip entries; save it.
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(sample_entry("src/valid.rs", &"v".repeat(64)));
+    manifest.save().unwrap();
+
+    // The last 4 bytes are the skip_count (u32 LE = 0). Strip them to simulate
+    // a write that was killed after entries but before the skip section.
+    let mut bytes = fs::read(cache_dir.join("index.skfiles")).unwrap();
+    assert!(bytes.len() >= 4, "manifest must be at least 4 bytes");
+    let truncated_len = bytes.len() - 4;
+    bytes.truncate(truncated_len);
+    fs::write(cache_dir.join("index.skfiles"), &bytes).unwrap();
+
+    // Load must cold-start (reject whole) — not silently accept with empty skips.
+    let loaded = FileManifest::load(root, cache_dir).unwrap();
+    assert_eq!(
+        loaded.entry_count(),
+        0,
+        "v7 manifest truncated exactly at the skip_count boundary must reject-whole \
+         (entry_count == 0), not silently accept the indexed entries (AD-380-3)"
+    );
+}
+
+/// AC10 — v7 manifest round-trip: skip entries survive encode/load, are
+/// excluded from sorted_paths() and entry_count(), and a forged skip_count
+/// over MAX_MANIFEST_ENTRIES causes load() to reject-whole (AD-395-4).
+#[test]
+fn test_ac10_v7_manifest_round_trip_and_skip_isolation() {
+    use super::super::types::{PersistedSkipReason, SkippedEntry};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let cache_dir = root.clone();
+
+    // Build a manifest with 2 indexed entries + 2 skip entries.
+    let mut manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    manifest.insert(sample_entry("a.rs", &"a".repeat(64)));
+    manifest.insert(sample_entry("b.rs", &"b".repeat(64)));
+
+    let skip1 = SkippedEntry {
+        path: "bundle.js".to_string(),
+        mtime: Some(1_700_000_000),
+        size: Some(70_000),
+        reason: PersistedSkipReason::Minified,
+    };
+    let skip2 = SkippedEntry {
+        path: "icon.bin".to_string(),
+        mtime: None,
+        size: None,
+        reason: PersistedSkipReason::NonUtf8,
+    };
+    manifest.insert_skip(skip1.clone());
+    manifest.insert_skip(skip2.clone());
+    manifest.save().unwrap();
+
+    // Load and verify.
+    let loaded = FileManifest::load(root.clone(), cache_dir.clone()).unwrap();
+
+    // AC10: skip entries excluded from sorted_paths / entry_count.
+    assert_eq!(
+        loaded.entry_count(),
+        2,
+        "skip entries must NOT count toward entry_count"
+    );
+    assert_eq!(
+        loaded.sorted_paths(),
+        vec!["a.rs", "b.rs"],
+        "skip entries must NOT appear in sorted_paths"
+    );
+
+    // AC10: skip entries round-trip with full fidelity.
+    let skip_vec: Vec<&SkippedEntry> = loaded.skipped().collect();
+    assert_eq!(skip_vec.len(), 2, "must round-trip 2 skip entries");
+    // BTreeMap iterates in key order: "bundle.js" < "icon.bin".
+    assert_eq!(skip_vec[0].path, "bundle.js");
+    assert_eq!(skip_vec[0].mtime, Some(1_700_000_000));
+    assert_eq!(skip_vec[0].size, Some(70_000));
+    assert_eq!(skip_vec[0].reason, PersistedSkipReason::Minified);
+    assert_eq!(skip_vec[1].path, "icon.bin");
+    assert_eq!(skip_vec[1].mtime, None);
+    assert_eq!(skip_vec[1].size, None);
+    assert_eq!(skip_vec[1].reason, PersistedSkipReason::NonUtf8);
+
+    // AC10: forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole.
+    //
+    // Strategy: save a manifest WITH >= 1 real indexed entry and 0 skip entries,
+    // then overwrite the last 4 bytes (the skip_count) with u32::MAX.
+    // Asserting entry_count() == 0 on the result is the DISCRIMINATING check:
+    // a correct reject-whole discards the valid indexed entries too, whereas a
+    // reject-PART regression (drop only the corrupt skip section while keeping
+    // entries) would leave entry_count() > 0 and the assertion would catch it.
+    // This mirrors the forged-ENTRY-count tests at lines 232/265 above.
+    let mut one_entry_manifest = FileManifest::new(root.clone(), cache_dir.clone());
+    one_entry_manifest.insert(sample_entry("src/real.rs", &"r".repeat(64)));
+    // No skip entries: the last 4 bytes of the encoded buffer are skip_count = 0.
+    one_entry_manifest.save().unwrap();
+    let mut forged = fs::read(cache_dir.join("index.skfiles")).unwrap();
+    // Overwrite the trailing skip_count (u32 LE) with u32::MAX.
+    let len = forged.len();
+    forged[len - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+    fs::write(cache_dir.join("index.skfiles"), &forged).unwrap();
+    let rejected = FileManifest::load(root.clone(), cache_dir.clone()).unwrap();
+    assert_eq!(
+        rejected.entry_count(),
+        0,
+        "forged skip_count > MAX_MANIFEST_ENTRIES must reject-whole — \
+         the 1 indexed entry must also be discarded (cold start)"
+    );
+    assert_eq!(
+        rejected.skipped().count(),
+        0,
+        "rejected manifest must have no skip entries"
+    );
 }

@@ -103,6 +103,213 @@ fn test_v1_header_rejected_with_format_version_message() {
     );
 }
 
+/// Format v2 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// This validates the ADR-006 invariant: old-format indexes are rejected cleanly
+/// so the staleness check triggers a full rebuild, not corruption.
+#[test]
+fn test_v2_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 2 (old format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 2, // old v2 format
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 2 — FORMAT_VERSION is now 7.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v2 header must be rejected by v7 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v2 rejection must include 'please rebuild': {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v2 rejection must mention format version: {err}"
+    );
+}
+
+/// Format v3 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AC3 / ADR-006: After the v3→v4 format bump (#358 Item 2), the v4 reader
+/// must reject v3 indexes cleanly so the staleness check triggers a full
+/// rebuild — the old index is NOT corrupted, just incompatible.
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v3_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 3 (pre-v4 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 3, // old v3 format (pre-varint posting compression)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 3 — FORMAT_VERSION is now 7.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v3 header must be rejected by v7 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v3 rejection must include 'please rebuild' (actionable per ADR-006): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v3 rejection must mention 'format version' or 'unsupported': {err}"
+    );
+}
+
+/// Format v4 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AD-LXFMT-4: After the v4→v5 format bump (#392 / #380 Phase 2 — `PostingEntry`
+/// gains `token_position`), the v5 reader must reject v4 indexes cleanly so the
+/// staleness check triggers a full rebuild — the old index is NOT corrupted,
+/// just incompatible.
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v4_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 4 (pre-v5 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 4, // old v4 format (pre-token_position posting field)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 4 — FORMAT_VERSION is now 7.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v4 header must be rejected by v7 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v4 rejection must include 'please rebuild' (actionable per ADR-006): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v4 rejection must mention 'format version' or 'unsupported': {err}"
+    );
+}
+
+/// Format v5 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AD-411-5: After the v5→v6 format bump (#411), the v6 reader must reject v5
+/// indexes cleanly so the staleness check triggers a full rebuild — the old
+/// index is NOT corrupted, only the stored field_id semantics for identifier byte
+/// ranges changed (declaration names now carry definition-tier field_ids instead
+/// of the old unconditional SymbolName).  A v5 on-disk index would therefore
+/// produce mis-ranked results rather than garbage, making clean rejection + self-
+/// heal (via `check_staleness` guard `v < LEXICAL_INDEX_FORMAT_VERSION`) the
+/// correct response (ADR-006, self-heal via existing `v < FORMAT_VERSION` guard).
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v5_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 5 (pre-v6 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 5, // old v5 format (pre-AD-411-1 field_id semantic change)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 5 — FORMAT_VERSION is now 7.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v5 header must be rejected by v7 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v5 rejection must include 'please rebuild' (actionable per ADR-006 / AD-411-5): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v5 rejection must mention 'format version' or 'unsupported': {err}"
+    );
+}
+
+/// Format v6 indexes must be rejected with an actionable 'please rebuild' message.
+///
+/// AD-411-7: After the v6→v7 format bump (#411 alignment fix), the v7 reader must
+/// reject v6 indexes cleanly so the staleness check triggers a full rebuild — the
+/// old index is NOT corrupted, only the posting codec changed (v7 adds a
+/// `delta_token_length` 5th varint per entry for exact-token verification in
+/// `search_exact_intersection`). A v6 on-disk index lacks `token_length` data and
+/// would cause `decode_postings_varint` to desync or read across entry boundaries,
+/// making clean rejection the only safe response (ADR-006, self-heal via the
+/// existing `v < LEXICAL_INDEX_FORMAT_VERSION` guard in `staleness.rs`).
+///
+/// PF-007 compliance: asserts BOTH discriminating substrings
+/// ("unsupported format version" AND "please rebuild") so the test fails if
+/// either message is missing, not just if decode_header() returns Ok(()).
+#[test]
+fn test_v6_header_rejected_with_please_rebuild_message() {
+    // Construct a well-formed 62-byte header but with version = 6 (pre-v7 format).
+    let h = SkidxHeader {
+        magic: *SKIDX_MAGIC,
+        version: 6, // old v6 format (pre-AD-411-7 token_length posting field)
+        ngram_count: 0,
+        file_count: 0,
+        postings_file_size: 0,
+        avg_doc_length: 0.0,
+        avg_field_lengths: [0.0; 8],
+        checksum: 0,
+    };
+    let encoded = encode_header(&h);
+    // decode_header must NOT accept version 6 — FORMAT_VERSION is now 7.
+    let result = decode_header(&encoded);
+    assert!(result.is_err(), "v6 header must be rejected by v7 reader");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("please rebuild"),
+        "v6 rejection must include 'please rebuild' (actionable per ADR-006 / AD-411-7): {err}"
+    );
+    assert!(
+        err.contains("format version") || err.contains("unsupported"),
+        "v6 rejection must mention 'format version' or 'unsupported': {err}"
+    );
+}
+
+/// Verify the v3 SkidxEntry size constant is 16 bytes.
+#[test]
+fn test_entry_size_is_16_bytes() {
+    assert_eq!(
+        SKIDX_ENTRY_SIZE, 16,
+        "v3 SkidxEntry must be 16 bytes (ngram_key widened to u32)"
+    );
+    let e = SkidxEntry {
+        ngram_key: 0x0066_6E20u32, // "fn " trigram
+        posting_offset: 0,
+        posting_length: 0,
+    };
+    let encoded = encode_entry(&e);
+    assert_eq!(encoded.len(), 16, "encoded entry must be exactly 16 bytes");
+}
+
 #[test]
 fn test_header_truncated() {
     let result = decode_header(&[0u8; 10]);
@@ -117,13 +324,14 @@ fn test_header_truncated() {
 
 #[test]
 fn test_entry_roundtrip() {
+    // v3: ngram_key is u32 (trigram: (b1<<16)|(b2<<8)|b3 = 0x68_65_6C = "hel")
     let e = SkidxEntry {
-        ngram_key: 0x6865, // "he"
+        ngram_key: 0x0068656C, // "hel" trigram
         posting_offset: 4096,
         posting_length: 27,
     };
     let encoded = encode_entry(&e);
-    assert_eq!(encoded.len(), SKIDX_ENTRY_SIZE);
+    assert_eq!(encoded.len(), SKIDX_ENTRY_SIZE, "v3 entry must be 16 bytes");
     let decoded = decode_entry(&encoded).unwrap();
     assert_eq!(decoded, e);
 }
@@ -131,45 +339,6 @@ fn test_entry_roundtrip() {
 #[test]
 fn test_entry_truncated() {
     let result = decode_entry(&[0u8; 5]);
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("truncated"), "unexpected error: {err}");
-}
-
-// -----------------------------------------------------------------------
-// Posting roundtrip
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_posting_roundtrip() {
-    let p = PostingEntry {
-        doc_id: 7,
-        field_id: crate::SearchField::FunctionSignature.discriminant(),
-        position: 1024,
-    };
-    let encoded = encode_posting(&p);
-    assert_eq!(encoded.len(), POSTING_ENTRY_SIZE);
-    let decoded = decode_posting(&encoded).unwrap();
-    assert_eq!(decoded, p);
-}
-
-#[test]
-fn test_posting_bad_field_id() {
-    let p = PostingEntry {
-        doc_id: 0,
-        field_id: 200, // invalid
-        position: 0,
-    };
-    let encoded = encode_posting(&p);
-    let result = decode_posting(&encoded);
-    assert!(result.is_err());
-    let err = format!("{}", result.unwrap_err());
-    assert!(err.contains("invalid field_id"), "unexpected error: {err}");
-}
-
-#[test]
-fn test_posting_truncated() {
-    let result = decode_posting(&[0u8; 3]);
     assert!(result.is_err());
     let err = format!("{}", result.unwrap_err());
     assert!(err.contains("truncated"), "unexpected error: {err}");
@@ -208,10 +377,13 @@ fn test_file_meta_field_lengths_encode_decode() {
     assert_eq!(decoded.doc_length, total);
 }
 
-/// Verify the v2 header size constant matches actual encoded size.
+/// Verify the v3 header size constant matches actual encoded size (unchanged from v2).
 #[test]
 fn test_header_size_is_62_bytes() {
-    assert_eq!(SKIDX_HEADER_SIZE, 62, "v2 header must be 62 bytes");
+    assert_eq!(
+        SKIDX_HEADER_SIZE, 62,
+        "v3 header must be 62 bytes (unchanged from v2)"
+    );
     let h = SkidxHeader {
         magic: *SKIDX_MAGIC,
         version: FORMAT_VERSION,
@@ -226,10 +398,13 @@ fn test_header_size_is_62_bytes() {
     assert_eq!(encoded.len(), 62);
 }
 
-/// Verify the v2 FileMetaEntry size constant matches actual encoded size.
+/// Verify the FileMetaEntry size constant matches actual encoded size (unchanged from v2 → v3).
 #[test]
 fn test_file_meta_size_is_37_bytes() {
-    assert_eq!(FILE_META_SIZE, 37, "v2 FileMetaEntry must be 37 bytes");
+    assert_eq!(
+        FILE_META_SIZE, 37,
+        "v2/v3 FileMetaEntry must be 37 bytes (unchanged by #355)"
+    );
     let m = FileMetaEntry {
         lang_id: 0,
         doc_length: 0,
@@ -415,7 +590,7 @@ fn test_read_array_start_beyond_data_returns_err() {
 // Binary search
 // -----------------------------------------------------------------------
 
-fn make_entries(keys: &[u16]) -> Vec<u8> {
+fn make_entries(keys: &[u32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(keys.len() * SKIDX_ENTRY_SIZE);
     for (i, &key) in keys.iter().enumerate() {
         let e = SkidxEntry {
@@ -430,34 +605,35 @@ fn make_entries(keys: &[u16]) -> Vec<u8> {
 
 #[test]
 fn test_lookup_ngram_found() {
-    let keys = &[0x0100u16, 0x0200, 0x0300, 0x0400];
+    // v3: u32 trigram keys.
+    let keys = &[0x0001_0000u32, 0x0002_0000, 0x0003_0000, 0x0004_0000];
     let data = make_entries(keys);
-    let result = lookup_ngram(&data, 0x0200).unwrap();
+    let result = lookup_ngram(&data, 0x0002_0000).unwrap();
     assert!(result.is_some());
     let entry = result.unwrap();
-    assert_eq!(entry.ngram_key, 0x0200);
+    assert_eq!(entry.ngram_key, 0x0002_0000);
     assert_eq!(entry.posting_offset, 100);
 }
 
 #[test]
 fn test_lookup_ngram_not_found() {
-    let keys = &[0x0100u16, 0x0300];
+    let keys = &[0x0001_0000u32, 0x0003_0000];
     let data = make_entries(keys);
-    let result = lookup_ngram(&data, 0x0200).unwrap();
+    let result = lookup_ngram(&data, 0x0002_0000).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
 fn test_lookup_ngram_empty() {
-    let result = lookup_ngram(&[], 0x1234).unwrap();
+    let result = lookup_ngram(&[], 0x1234_5678u32).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
 fn test_lookup_ngram_single_match() {
-    let data = make_entries(&[0xABCDu16]);
-    let result = lookup_ngram(&data, 0xABCD).unwrap();
-    assert_eq!(result.unwrap().ngram_key, 0xABCD);
+    let data = make_entries(&[0x00AB_CDEFu32]);
+    let result = lookup_ngram(&data, 0x00AB_CDEF).unwrap();
+    assert_eq!(result.unwrap().ngram_key, 0x00AB_CDEF);
 }
 
 #[test]
@@ -507,4 +683,474 @@ fn test_bm25_zero_avg_doc_len_no_panic() {
     // avg_doc_len = 0 should not panic — treated as 1.0 internally
     let score = bm25_score(1.0, 2.0, 100, 0.0);
     assert!(score.is_finite(), "BM25 should return finite value");
+}
+
+// -----------------------------------------------------------------------
+// v4 varint codec (encode_varint / decode_varint)
+// -----------------------------------------------------------------------
+
+/// Varint round-trip for a range of representative u32 values.
+///
+/// AC4 precursor: verifies that the varint primitive round-trips correctly
+/// before testing the full posting codec built on top of it.
+#[test]
+fn test_varint_roundtrip_representative_values() {
+    let values: &[u32] = &[
+        0,
+        1,
+        127,
+        128, // first 2-byte value
+        255,
+        16383,
+        16384, // first 3-byte value
+        2097151,
+        2097152, // first 4-byte value
+        268435455,
+        268435456, // first 5-byte value
+        u32::MAX,
+    ];
+    for &v in values {
+        let mut buf = Vec::new();
+        let written = encode_varint(v, &mut buf);
+        assert!(
+            (1..=5).contains(&written),
+            "varint for {v} must be 1-5 bytes, got {written}"
+        );
+        let (decoded, consumed) = decode_varint(&buf, 0).unwrap();
+        assert_eq!(decoded, v, "varint round-trip failed for {v}");
+        assert_eq!(consumed, written, "consumed bytes mismatch for {v}");
+    }
+}
+
+/// decode_varint must return IndexCorrupted for a truncated input.
+#[test]
+fn test_varint_decode_truncated_returns_err() {
+    // A continuation byte (MSB set) with no following byte — truncated.
+    let buf = [0x80u8]; // says "more bytes follow" but none are present
+    let result = decode_varint(&buf, 0);
+    assert!(result.is_err(), "truncated varint must return Err");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("truncated"),
+        "error should mention truncated: {err}"
+    );
+}
+
+/// decode_varint must return IndexCorrupted for a 6-byte (overflow) varint.
+#[test]
+fn test_varint_decode_overflow_returns_err() {
+    // Six consecutive continuation bytes — exceeds the 5-byte u32 maximum.
+    let buf = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x00];
+    let result = decode_varint(&buf, 0);
+    assert!(result.is_err(), "6-byte varint must return Err (overflow)");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("overflow"),
+        "error should mention overflow: {err}"
+    );
+}
+
+/// encode_varint / decode_varint at a non-zero offset.
+#[test]
+fn test_varint_decode_at_offset() {
+    let mut buf = vec![0xFFu8, 0xFFu8]; // 2 bytes of prefix garbage
+    encode_varint(300, &mut buf); // 300 = 0x12C → 2-byte varint: [0xAC, 0x02]
+    let (val, n) = decode_varint(&buf, 2).unwrap();
+    assert_eq!(val, 300, "varint at offset 2 should decode to 300");
+    assert_eq!(n, 2, "300 encodes to 2 bytes");
+}
+
+// -----------------------------------------------------------------------
+// v4 posting codec (encode_postings_varint / decode_postings_varint)
+// AC4: byte-faithful round-trip across empty / single / multi-doc / max-gap
+// -----------------------------------------------------------------------
+
+/// Helper: encode a list of PostingEntry values and decode them back.
+fn posting_roundtrip(postings: &[PostingEntry]) -> Vec<PostingEntry> {
+    let mut buf = Vec::new();
+    encode_postings_varint(postings, &mut buf);
+    decode_postings_varint(&buf).unwrap()
+}
+
+/// AC4 — empty posting list round-trips cleanly to an empty Vec.
+#[test]
+fn test_posting_codec_empty_list() {
+    let result = posting_roundtrip(&[]);
+    assert!(
+        result.is_empty(),
+        "empty posting list should round-trip to empty"
+    );
+}
+
+/// AC4 — single-entry posting list round-trips exactly.
+#[test]
+fn test_posting_codec_single_entry() {
+    let p = PostingEntry {
+        doc_id: 42,
+        field_id: crate::SearchField::FunctionSignature.discriminant(),
+        position: 1024,
+        token_position: 7,
+        token_length: 12,
+    };
+    let decoded = posting_roundtrip(&[p]);
+    assert_eq!(
+        decoded.len(),
+        1,
+        "single-entry round-trip must return 1 entry"
+    );
+    assert_eq!(decoded[0], p, "single-entry must decode to exact input");
+}
+
+/// AC4 — multi-doc posting list with 3+ entries spanning multiple doc_ids.
+///
+/// This is the primary AC4 discriminating assertion: encodes a posting list
+/// with multiple distinct doc_ids, decodes it, and asserts exact
+/// (doc_id, field_id, position) tuple match for every entry.
+#[test]
+fn test_posting_codec_multi_doc_roundtrip() {
+    let postings = vec![
+        PostingEntry {
+            doc_id: 0,
+            field_id: crate::SearchField::TypeDefinition.discriminant(),
+            position: 0,
+            token_position: 0,
+            token_length: 8,
+        },
+        PostingEntry {
+            doc_id: 0,
+            field_id: crate::SearchField::FunctionSignature.discriminant(),
+            position: 5,
+            token_position: 2,
+            token_length: 10,
+        },
+        PostingEntry {
+            doc_id: 1,
+            field_id: crate::SearchField::Other.discriminant(),
+            position: 10,
+            token_position: 4,
+            token_length: 5,
+        },
+        PostingEntry {
+            doc_id: 3,
+            field_id: crate::SearchField::TypeDefinition.discriminant(),
+            position: 100,
+            token_position: 50,
+            token_length: 7,
+        },
+        PostingEntry {
+            doc_id: 3,
+            field_id: crate::SearchField::Other.discriminant(),
+            position: 200,
+            token_position: 55,
+            token_length: 3,
+        },
+    ];
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(
+        decoded.len(),
+        postings.len(),
+        "multi-doc round-trip must preserve entry count"
+    );
+    for (i, (got, want)) in decoded.iter().zip(postings.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "entry[{i}] mismatch: got {:?}, want {:?}",
+            got, want
+        );
+    }
+}
+
+/// AC4 — posting list with maximum doc_id gap (u32::MAX - 0 = u32::MAX).
+///
+/// Verifies that wrapping_add arithmetic in the decoder handles the largest
+/// possible delta without panicking or silently truncating.
+#[test]
+fn test_posting_codec_max_gap_docid() {
+    let postings = vec![
+        PostingEntry {
+            doc_id: 0,
+            field_id: 0,
+            position: 0,
+            token_position: 0,
+            token_length: 5,
+        },
+        PostingEntry {
+            doc_id: u32::MAX,
+            field_id: 0,
+            position: 0,
+            token_position: 0,
+            token_length: 5,
+        },
+    ];
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(
+        decoded.len(),
+        2,
+        "max-gap posting list must round-trip to 2 entries"
+    );
+    assert_eq!(decoded[0].doc_id, 0, "first entry doc_id must be 0");
+    assert_eq!(
+        decoded[1].doc_id,
+        u32::MAX,
+        "second entry doc_id must be u32::MAX"
+    );
+}
+
+/// AC4 — posting list with large position values.
+#[test]
+fn test_posting_codec_large_positions() {
+    let postings = vec![
+        PostingEntry {
+            doc_id: 5,
+            field_id: 0,
+            position: 0,
+            token_position: 0,
+            token_length: 6,
+        },
+        PostingEntry {
+            doc_id: 5,
+            field_id: 0,
+            position: 1_000_000,
+            token_position: 1,
+            token_length: 6,
+        },
+        PostingEntry {
+            doc_id: 5,
+            field_id: 0,
+            position: u32::MAX,
+            token_position: 2,
+            token_length: 6,
+        },
+    ];
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(decoded.len(), 3);
+    assert_eq!(decoded[0].position, 0);
+    assert_eq!(decoded[1].position, 1_000_000);
+    assert_eq!(decoded[2].position, u32::MAX);
+}
+
+/// AC4 / Finding 1+3 — cross-field position-decrease round-trip within the same doc.
+///
+/// Verifies that the encoder resets `prev_position`, `prev_token_position`, AND
+/// `prev_token_length` (v7, AD-411-7) when `field_id` changes (even if `doc_id`
+/// is unchanged) so that the first position/token_position/token_length in field
+/// N+1 does NOT produce a near-u32::MAX delta when it is lower than the last
+/// value of field N.
+///
+/// Example scenario: within doc 0, field TypeDefinition (=0) covers bytes
+/// 200..300 (position 250, token_position 25, token_length 10), then field Other
+/// (=7) covers bytes 0..200 (position 10, token_position 1, token_length 3).
+/// Sorted by (doc_id, field_id, position) the TypeDefinition entry (pos 250)
+/// comes before the Other entry (pos 10).  Without the field-boundary reset, the
+/// encoder would compute `10.wrapping_sub(250)` = 4294967056 for delta_position
+/// (and analogous wraparounds for delta_token_position and delta_token_length)
+/// and emit maximum 5-byte varints — worst case, defeating compression.  With
+/// the fix, all three accumulators reset to 0 on the field boundary so
+/// `delta_position = 10`, `delta_token_position = 1`, and `delta_token_length =
+/// 3`, each encoding as a 1-byte varint.
+///
+/// PF-007 compliance (primary + compression guard):
+/// 1. Exact decoded `(doc_id, field_id, position, token_position, token_length)`
+///    tuples are asserted — a round-trip that silently wraps-and-recovers would
+///    still pass otherwise.
+/// 2. Encoded buffer byte-length is asserted against the expected compact size
+///    (11 bytes for this input with v7 token_length field).  Removing the
+///    field-boundary reset from BOTH encoder and decoder keeps round-trip
+///    lossless (wrapping arithmetic is always invertible) but regresses the
+///    encoded size, making this test fail the moment the compression feature is
+///    deleted or broken.
+///
+/// Expected encoding (with field-boundary reset, v7):
+///   Entry 0 (doc=0, field=0=TypeDefinition, pos=250, tok_pos=25, tok_len=10):
+///     [0x00]               1 byte  delta_doc_id=0
+///     [0x00]               1 byte  field_id=0
+///     [0xfa, 0x01]         2 bytes varint(250)
+///     [0x19]               1 byte  varint(25)
+///     [0x0a]               1 byte  varint(10)
+///   Entry 1 (doc=0, field=7=Other, pos=10, tok_pos=1, tok_len=3): all reset to 0
+///     [0x00]               1 byte  delta_doc_id=0
+///     [0x07]               1 byte  field_id=7
+///     [0x0a]               1 byte  varint(10 - 0 = 10)
+///     [0x01]               1 byte  varint(1 - 0 = 1)
+///     [0x03]               1 byte  varint(3 - 0 = 3)
+///   Total: 11 bytes
+///
+/// Without the reset, entry 1's delta_position, delta_token_position, and
+/// delta_token_length all wrap to near-u32::MAX (5-byte varints each), growing
+/// the total well beyond 11 bytes.
+#[test]
+fn test_posting_codec_cross_field_position_decrease_roundtrip() {
+    // doc_id = 0, field TypeDefinition (discriminant 0), high position (250)
+    // doc_id = 0, field Other (discriminant 7), lower position (10)
+    // Sorted by (doc_id, field_id, position):
+    //   (0, 0=TypeDefinition, 250) < (0, 7=Other, 10)
+    // field_id 0 < field_id 7, so TypeDefinition entry comes first despite
+    // having a higher byte position than the Other entry.
+    let td = crate::SearchField::TypeDefinition.discriminant(); // 0
+    let other = crate::SearchField::Other.discriminant(); // 7
+    let postings = vec![
+        PostingEntry {
+            doc_id: 0,
+            field_id: td,
+            position: 250,
+            token_position: 25,
+            token_length: 10,
+        },
+        PostingEntry {
+            doc_id: 0,
+            field_id: other,
+            position: 10,
+            token_position: 1,
+            token_length: 3,
+        },
+    ];
+    // Verify the input is sorted (as the builder would produce it).
+    assert!(
+        postings[0] < postings[1],
+        "test invariant: postings must be sorted ascending by (doc_id, field_id, position)"
+    );
+
+    // Assert encoded buffer length (PF-007 compression guard): without the
+    // field-boundary reset (position, token_position, AND token_length) the
+    // encoded size balloons via 5-byte wrapping-delta varints; with the reset
+    // it is 11 bytes (v7 adds one varint per entry for token_length).
+    // Removing or disabling the reset must fail this assertion.
+    let mut encoded_buf = Vec::new();
+    encode_postings_varint(&postings, &mut encoded_buf);
+    assert_eq!(
+        encoded_buf.len(),
+        11,
+        "encoded cross-field posting list must be 11 bytes (v7: field-boundary reset \
+         keeps delta_position=10, delta_token_position=1, delta_token_length=3, all \
+         1-byte varints; without the reset each delta wraps near u32::MAX and costs \
+         a 5-byte varint)"
+    );
+
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(
+        decoded.len(),
+        2,
+        "cross-field position-decrease must round-trip to 2 entries"
+    );
+    assert_eq!(
+        decoded[0], postings[0],
+        "first entry (TypeDefinition, pos=250, token_pos=25) must decode exactly"
+    );
+    assert_eq!(
+        decoded[1], postings[1],
+        "second entry (Other, pos=10, token_pos=1) must decode exactly after cross-field reset"
+    );
+}
+
+/// AD-LXFMT-4 / AD-411-7 — v7 round-trip: multiple docs plus a field_id change
+/// within a doc, with varied `token_position` and `token_length` values.
+/// Exercises the same reset logic as the cross-field test above but across a
+/// 3-entry, 2-doc posting list (doc_id delta > 1 on one hop) to broaden
+/// coverage beyond the single field-boundary case.
+#[test]
+fn test_posting_codec_v5_token_position_roundtrip() {
+    let td = crate::SearchField::TypeDefinition.discriminant(); // 0
+    let other = crate::SearchField::Other.discriminant(); // 7
+    let postings = vec![
+        PostingEntry {
+            doc_id: 0,
+            field_id: td,
+            position: 50,
+            token_position: 20,
+            token_length: 8,
+        },
+        PostingEntry {
+            doc_id: 0,
+            field_id: other,
+            // Lower than the previous entry's position/token_position/token_length —
+            // exercises the field-boundary reset for ALL three coordinates.
+            position: 12,
+            token_position: 3,
+            token_length: 4,
+        },
+        PostingEntry {
+            doc_id: 2,
+            field_id: td,
+            position: 400,
+            token_position: 150,
+            token_length: 12,
+        },
+    ];
+    assert!(
+        postings[0] < postings[1] && postings[1] < postings[2],
+        "test invariant: postings must be sorted ascending by (doc_id, field_id, position)"
+    );
+
+    let decoded = posting_roundtrip(&postings);
+    assert_eq!(
+        decoded.len(),
+        postings.len(),
+        "v5 round-trip must preserve entry count"
+    );
+    for (i, (got, want)) in decoded.iter().zip(postings.iter()).enumerate() {
+        assert_eq!(
+            got, want,
+            "entry[{i}] mismatch: got {:?}, want {:?}",
+            got, want
+        );
+    }
+}
+
+/// decode_postings_varint must return IndexCorrupted for an invalid field_id.
+#[test]
+fn test_posting_codec_invalid_field_id_returns_err() {
+    let p = PostingEntry {
+        doc_id: 0,
+        field_id: 200, // invalid — not a valid SearchField discriminant
+        position: 0,
+        token_position: 0,
+        token_length: 5,
+    };
+    let mut buf = Vec::new();
+    encode_postings_varint(&[p], &mut buf);
+    // field_id=200 is stored verbatim; decoder must reject it.
+    let result = decode_postings_varint(&buf);
+    assert!(result.is_err(), "invalid field_id must cause decode error");
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("field_id"),
+        "error should mention field_id: {err}"
+    );
+}
+
+/// Finding 4 (AC4 error-path gap): decode_postings_varint returns IndexCorrupted
+/// when a valid doc_id varint is decoded but no field_id byte follows
+/// ("truncated before field_id" branch in decode_postings_varint).
+///
+/// This is the posting-walker's distinct truncation branch that was not covered
+/// by the existing varint-primitive test (`test_varint_decode_truncated_returns_err`,
+/// which truncates INSIDE the varint, not AFTER it).  The production decode path
+/// used by `reader.rs::lookup_postings` calls `decode_postings_varint` directly;
+/// a corrupt or truncated `.skpost` slice that ends exactly after a doc_id varint
+/// hits this branch.
+///
+/// PF-007 compliance: asserts the discriminating error substring "field_id" OR
+/// "truncated" so the test fails the moment the branch is removed or the error
+/// message changes semantically.
+#[test]
+fn test_posting_codec_truncated_before_field_id_returns_err() {
+    // Manually construct a buffer that contains a valid 1-byte doc_id varint
+    // (value 0x01 = delta 1, MSB clear = terminal byte) followed by NO field_id
+    // byte.  This simulates a .skpost slice truncated mid-entry after the
+    // doc_id varint but before the field_id byte.
+    //
+    // Layout per entry: [varint delta_doc_id][u8 field_id][varint delta_position]
+    // We emit [0x01] and stop — the doc_id varint is complete (MSB=0, value=1)
+    // but field_id is absent, hitting the "truncated before field_id" branch.
+    let buf = vec![0x01u8]; // valid 1-byte varint (doc_id delta=1), no field_id follows
+    let result = decode_postings_varint(&buf);
+    assert!(
+        result.is_err(),
+        "truncated-before-field_id slice must return Err, got Ok"
+    );
+    let err = format!("{}", result.unwrap_err());
+    assert!(
+        err.contains("field_id") || err.contains("truncated"),
+        "error must mention 'field_id' or 'truncated': {err}"
+    );
 }

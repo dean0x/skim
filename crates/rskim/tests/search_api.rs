@@ -49,6 +49,8 @@ fn search_query_with_all_filters() {
         offset: Some(0),
         bm25f_config: None,
         file_filter: None,
+        phrase: false,
+        near: None,
     };
     assert_eq!(q.lang, Some(rskim_core::Language::Rust));
     assert_eq!(q.limit, Some(10));

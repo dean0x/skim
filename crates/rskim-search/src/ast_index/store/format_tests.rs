@@ -123,10 +123,10 @@ fn header_rejects_wrong_version_one() {
 }
 
 #[test]
-fn header_rejects_wrong_version_three() {
-    // A future version (3) must also be rejected by this binary.
+fn header_rejects_wrong_version_four() {
+    // A future version (4) must also be rejected by this binary.
     let mut encoded = encode_header(&make_valid_header());
-    encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
+    encoded[4..6].copy_from_slice(&4u16.to_le_bytes());
     let err = decode_header(&encoded).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -141,7 +141,7 @@ fn header_future_version_suggests_upgrade_not_rebuild() {
     // user needs a NEWER binary, not a rebuild.  The error message must say "upgrade"
     // rather than "please rebuild the AST index" so the user gets actionable guidance.
     let mut encoded = encode_header(&make_valid_header());
-    encoded[4..6].copy_from_slice(&3u16.to_le_bytes()); // v3 is a future version
+    encoded[4..6].copy_from_slice(&4u16.to_le_bytes()); // v4 is a future version
     let err = decode_header(&encoded).unwrap_err();
     let msg = format!("{err}");
     assert!(
@@ -469,12 +469,13 @@ fn file_meta_rejects_truncation() {
 }
 
 // ============================================================================
-// A1: FORMAT_VERSION == 2, magic unchanged
+// A1: FORMAT_VERSION == 3, magic unchanged
 // ============================================================================
 
 #[test]
-fn a1_format_version_is_2() {
-    assert_eq!(FORMAT_VERSION, 2, "A1: FORMAT_VERSION must be 2");
+fn a1_format_version_is_3() {
+    // #405 (AD-405-15): bumped 2 -> 3 for the 100 KiB -> 1 MiB AST size-cap raise.
+    assert_eq!(FORMAT_VERSION, 3, "A1: FORMAT_VERSION must be 3");
 }
 
 #[test]

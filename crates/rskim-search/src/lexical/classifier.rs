@@ -36,22 +36,258 @@ use rskim_core::Language;
 
 use crate::SearchField;
 
-/// Map a node_kind_priority value (1–5) to a [`SearchField`] for indexing.
+/// Returns `true` if `kind` is an identifier-family node type that receives
+/// context-aware field classification (AD-411-1).
+#[inline]
+fn is_identifier_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "field_identifier"
+            | "property_identifier"
+            | "variable_name"
+            | "attribute_name"
+    )
+}
+
+/// Returns `true` if `kind` is a value/const/binding/field/variant declaration
+/// whose `name`-field child is a definition name that should receive a
+/// definition-tier field (AD-411-1, OD4).
 ///
-/// Priority 5 (type definitions) → TypeDefinition
-/// Priority 4 (function declarations) → FunctionSignature
-/// Priority 3 (imports/exports) → ImportExport
-/// Priority 2 (class/module containers) → FunctionBody (treated as body-level)
-/// Priority 1 (everything else) → Other
+/// These kinds are NOT in the priority 3,4,5 set but their name-child identifiers
+/// are definitions, not call sites.  Also includes C/C++ declarator helper nodes
+/// so their identifier children receive the SymbolName degradation (not FunctionBody)
+/// when the grammar does not use `"name"` as the field name.
 ///
-/// Comments and string literals get their own fields via dedicated node kinds
-/// handled in [`classify_node_kind`].
+/// See also [`is_container_decl_kind`] for the class/module container complement.
+#[inline]
+fn is_value_decl_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // Rust
+        "const_item"
+            | "static_item"
+            | "let_declaration"
+            // TypeScript / JavaScript
+            | "lexical_declaration"
+            | "variable_declarator"
+            | "variable_declaration"
+            | "public_field_definition"
+            // Java / C# / Swift / Kotlin
+            | "field_declaration"
+            | "local_variable_declaration"
+            | "constant_declaration"
+            | "property_declaration"
+            // C / C++ declaration helpers (name is nested under declarator, not name:)
+            | "function_declarator"
+            | "declarator"
+            | "init_declarator"
+            | "pointer_declarator"
+            | "parameter_declaration"
+            // Go
+            | "var_declaration"
+            | "const_declaration"
+            | "short_var_declaration"
+            | "var_spec"
+            | "const_spec"
+            // Enum variants (Rust enum_variant, Java/Kotlin enum_entry)
+            | "enum_variant"
+            | "enum_entry"
+            // SQL: create_query holds the table/view/index name via name: identifier;
+            // column_definition holds the column name similarly.
+            // object_reference wraps the table name in CREATE TABLE via name: identifier
+            // (tree-sitter-sequel: create_table → object_reference → name: identifier).
+            // Adding it here ensures table names are never mis-classified as FunctionBody;
+            // they degrade to FunctionSignature (definition tier) even in reference
+            // contexts where the grandparent is not a CREATE statement.
+            | "create_query"
+            | "column_definition"
+            | "object_reference"
+    )
+}
+
+/// Returns `true` if `kind` is a class/module/impl container node (priority 2 in
+/// `rskim_core::node_kind_info`) whose `name:` field child is the container's own
+/// definition name and should rank at the [`SearchField::TypeDefinition`] tier rather
+/// than the call-site tier.
+///
+/// # Semantic rationale
+///
+/// `rskim_core::node_kind_priority` assigns class/module/namespace containers priority 2
+/// because the *truncation* algorithm (which shares the same table) must rank a class
+/// *body* lower than a function body — priority there governs body retention ordering,
+/// not the semantic tier of the class's *name*.  Consequently the `>= 3` threshold in
+/// [`map_identifier_to_field`] excludes these containers from the declaration check, and
+/// without this function the class *name* identifier falls through to
+/// [`SearchField::FunctionBody`] (call-site tier) — the cross-language inconsistency
+/// identified in the #411 review (applies ADR-007 dog-food gate; applies ADR-001
+/// fix-immediately rule).
+///
+/// This function corrects that by marking all priority-2 container kinds as declaration
+/// contexts.  When their `name:` child is an [`is_identifier_kind`] identifier,
+/// `map_identifier_to_field` returns [`SearchField::TypeDefinition`] — the same tier
+/// used for Rust `struct_item` (priority 5) and Python `class_definition` (priority 5),
+/// giving class-based OO languages consistent definition-name ranking.
+///
+/// # Coverage of kinds whose identifier types are not yet in `is_identifier_kind`
+///
+/// Ruby `class` / `module` (name: `constant`), Kotlin `class_declaration`
+/// (name: `simple_identifier`), and C++ `namespace_definition`
+/// (name: `namespace_identifier`) use identifier types absent from
+/// [`is_identifier_kind`], so their name children are not routed to
+/// [`map_identifier_to_field`] today.  They are included here for
+/// forward-compatibility: when their identifier types are added to
+/// [`is_identifier_kind`] they will automatically inherit the correct tier.
+///
+/// # Effect of `impl_item` on ranking
+///
+/// Including `impl_item` in this function is **not** inert.  Its priority is 2
+/// in `rskim_core::node_kind_priority`, so without this function `parent_is_decl`
+/// would be `false` for `impl` blocks and their type/trait identifier children
+/// (`type_identifier` in `impl Foo` / `impl Trait for Foo`) would classify as
+/// [`SearchField::FunctionBody`].  With `impl_item` here, `parent_is_decl` is
+/// `true`; since the grammar field for those identifiers is `type:` / `trait:`
+/// (never `name:`), they route through the `field_name != Some("name")` branch
+/// and return [`SearchField::SymbolName`] — an intentional elevation above the
+/// call-site tier.  `impl` blocks bind behaviour to a named type or trait;
+/// ranking their identifiers at `SymbolName` improves search relevance for
+/// type/trait names without misclassifying them as full type definitions.
+///
+/// Go's `struct_type` and `interface_type` truly are inert: the type name lives
+/// in the enclosing `type_spec`, not as a direct identifier child of those nodes.
+///
+/// # Maintenance — keep in sync with priority-2 container kinds
+///
+/// This list intentionally duplicates the priority-2 container kinds from
+/// `rskim_core::node_kind_priority`.  The `>= 3` check in [`map_identifier_to_field`]
+/// cannot include priority-2 kinds (priority 2 governs body-retention ordering in
+/// the truncation algorithm, not semantic tier), so this function bridges the gap.
+/// When a new grammar assigns priority 2 to a container kind, add it here as well
+/// so its definition name receives the correct [`SearchField::TypeDefinition`] tier.
+#[inline]
+fn is_container_decl_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        // TS / JS / Java / C# / Kotlin — class definitions (name: identifier or type_identifier)
+        "class_declaration"
+            // C++ — class/struct definitions (name: type_identifier)
+            | "class_specifier"
+            // Ruby — class (name: constant, not yet in is_identifier_kind; harmless today)
+            | "class"
+            // Ruby / TS / JS — module (name: constant or identifier)
+            | "module"
+            | "module_declaration"
+            // Rust — impl blocks (field `type:`/`trait:`, not `name:`): identifier
+            // children return SymbolName via field_name != Some("name") — intentional
+            // elevation of impl type/trait references above call-site tier.
+            | "impl_item"
+            // C++ / C# — namespaces (name: namespace_identifier — not in is_identifier_kind)
+            | "namespace_definition"
+            | "namespace_declaration"
+            // Go — interface_type / struct_type: type name lives in the enclosing
+            // type_spec, not as a direct identifier child — truly inert.
+            | "interface_type"
+            | "struct_type"
+    )
+}
+
+/// Map an identifier node to a [`SearchField`] using parent context.
+///
+/// # AD-411-1
+///
+/// Declaration-name rule: an identifier-family node is a "declaration name"
+/// iff `cursor.field_name()` returns `Some("name")` AND its direct parent is a
+/// declaration kind (priority 3/4/5, a value/const/binding/field/variant kind,
+/// OR a class/module container kind — see [`is_container_decl_kind`]).
+///
+/// - `field_name == Some("name")` + parent priority 4 (fn) → [`SearchField::FunctionSignature`]
+/// - `field_name == Some("name")` + parent priority 5 (type) → [`SearchField::TypeDefinition`]
+/// - `field_name == Some("name")` + parent priority 3 (import) → [`SearchField::ImportExport`]
+/// - `field_name == Some("name")` + parent is container-decl kind → [`SearchField::TypeDefinition`]
+///   (class / module / namespace names rank at the type-definition tier — cross-language
+///   consistency fix for TS/JS/Java/C++/C# `class Foo {}` names; AD-411-1 container rule)
+/// - `field_name == Some("name")` + parent is value-decl kind → [`SearchField::FunctionSignature`]
+///   (**AD-411-6** option a: const/value/binding definition names map to
+///   FunctionSignature so their boost on the exact-symbol path is strictly above
+///   TypeDefinition, ensuring a const definition outranks a Markdown heading
+///   whose `classify_markdown` stamps it as TypeDefinition — OD3 + OD4 satisfied)
+/// - `field_name != Some("name")` + parent is ANY declaration kind →
+///   [`SearchField::SymbolName`] (degradation: grammar uses a different field
+///   name; never ranks below today's unconditional SymbolName — OD4 guarantee)
+/// - otherwise (non-declaration parent) → [`SearchField::FunctionBody`]
+///   (call sites, references, and type-reference identifiers)
+fn map_identifier_to_field(
+    field_name: Option<&'static str>,
+    parent_kind: Option<&'static str>,
+) -> SearchField {
+    let parent = match parent_kind {
+        Some(k) => k,
+        None => return SearchField::FunctionBody,
+    };
+
+    let parent_priority = rskim_core::node_kind_priority(parent);
+    let parent_is_decl =
+        parent_priority >= 3 || is_value_decl_kind(parent) || is_container_decl_kind(parent);
+
+    if !parent_is_decl {
+        // Not in any declaration context → call site / reference / type reference.
+        return SearchField::FunctionBody;
+    }
+
+    if field_name != Some("name") {
+        // In a declaration but field_name is not "name": the grammar uses a
+        // different field for its declaration name child (e.g. C's `declarator:`
+        // or Kotlin's `simple_identifier`).  Degrade to SymbolName — guaranteed
+        // not worse than the old unconditional SymbolName path (OD4).
+        return SearchField::SymbolName;
+    }
+
+    // Container kinds (priority 2) define named types / modules.  Their `name:`
+    // identifier child is a type-definition name, not a call site.
+    // AD-411-1 container rule: map to TypeDefinition for cross-language consistency
+    // with Rust struct_item (priority 5) and Python class_definition (priority 5).
+    if is_container_decl_kind(parent) {
+        return SearchField::TypeDefinition;
+    }
+
+    // We are the "name:" field child of a priority-3/4/5 declaration — inherit field.
+    match parent_priority {
+        5 => SearchField::TypeDefinition,
+        4 => SearchField::FunctionSignature,
+        3 => SearchField::ImportExport,
+        _ => {
+            // Parent is a value/const/binding/field/variant declaration (priority < 3,
+            // caught by is_value_decl_kind above).
+            // AD-411-6 (option a): map to FunctionSignature.
+            // Rationale for option a over option b: mapping const/value names to
+            // FunctionSignature keeps SymbolName as the degradation tier for grammars
+            // without a "name:" field rather than the primary const-definition tier.
+            // FunctionSignature (boost 4.0 default, 8.0 exact-symbol) is semantically
+            // loose but rank-correct: these are definitions, and definition-tier boost
+            // is what the scorer needs.
+            //
+            // Note: BM25FConfig::default() FunctionBody was raised from 1.0 to 2.0
+            // (AD-411-1 retuning) because call-site identifiers now route here instead
+            // of the old unconditional SymbolName (3.5).  The new ordering
+            // FnSig(4.0) > FnBody(2.0) preserves multi-word ranking quality without
+            // fully collapsing the definition vs call-site signal gap.
+            SearchField::FunctionSignature
+        }
+    }
+}
+
+/// Map a non-identifier AST node to a [`SearchField`].
+///
+/// Handles comments, string literals, body blocks, and priority-based
+/// classification.  Identifier-family nodes are dispatched separately by
+/// [`map_identifier_to_field`] which has access to cursor context (AD-411-1).
 ///
 /// # Coupling
 ///
-/// The specific node kinds matched here (comments, strings, identifiers, body
-/// blocks) are kept in sync with `rskim_core::transform::utils::node_kind_info`
-/// and `rskim_core::transform::utils::find_body_child`. Any new node kind
+/// The specific node kinds matched here (comments, strings, body blocks) are
+/// kept in sync with `rskim_core::transform::utils::node_kind_info` and
+/// `rskim_core::transform::utils::find_body_child`.  Any new node kind
 /// categories added to those functions may need a corresponding case here.
 fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
     // First check for specific comment/string kinds regardless of priority.
@@ -69,15 +305,6 @@ fn map_priority_to_field(kind: &str, priority: u8) -> SearchField {
         | "template_literal"
         | "quoted_string" => {
             return SearchField::StringLiteral;
-        }
-        // Identifier / name nodes → SymbolName
-        "identifier"
-        | "type_identifier"
-        | "field_identifier"
-        | "property_identifier"
-        | "variable_name"
-        | "attribute_name" => {
-            return SearchField::SymbolName;
         }
         // Body/block nodes → FunctionBody.
         //
@@ -194,8 +421,22 @@ pub fn classify_source(
 
         if start < end {
             let kind = node.kind();
-            let priority = rskim_core::node_kind_priority(kind);
-            let field = map_priority_to_field(kind, priority);
+
+            // AD-411-1: identifier-family nodes receive context-aware field
+            // classification — their field depends on whether they are the
+            // declaration name child of a declaring parent node.
+            let field = if is_identifier_kind(kind) {
+                // cursor.field_name() returns the field name of the current node
+                // within its parent (e.g. Some("name") for `name:` fields).
+                // node.parent().map(|p| p.kind()) is always &'static str in
+                // tree-sitter 0.25 (grammar node kinds are interned statics).
+                let field_name = cursor.field_name();
+                let parent_kind = node.parent().map(|p| p.kind());
+                map_identifier_to_field(field_name, parent_kind)
+            } else {
+                let priority = rskim_core::node_kind_priority(kind);
+                map_priority_to_field(kind, priority)
+            };
 
             if field != SearchField::Other {
                 node_ranges.push((start..end, field));

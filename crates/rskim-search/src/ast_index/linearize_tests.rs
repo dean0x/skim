@@ -14,9 +14,10 @@
 
 use rskim_core::Language;
 
-use super::{LinearNode, LinearizeResult, MAX_AST_DEPTH, MAX_AST_NODES, MAX_FILE_SIZE};
+use super::{LinearNode, LinearizeResult, MAX_AST_DEPTH, MAX_AST_NODES};
 use crate::ast_index::linearize::LANG_MAPS;
 use crate::ast_weights::NODE_KIND_VOCABULARY;
+use rskim_core::ast_size_limit;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -56,11 +57,70 @@ fn linear_node_is_copy() {
     let n = LinearNode {
         kind_id: 42,
         depth: 3,
+        start_line: 7,
+        start_byte: 100,
     };
     let copy = n;
     assert_eq!(copy.kind_id, 42);
     assert_eq!(copy.depth, 3);
     assert_eq!(n.kind_id, 42); // using n after assignment proves Copy
+}
+
+// ── AD-394-6: start_line / start_byte population ─────────────────────────────
+
+#[test]
+fn linear_node_default_has_zero_line_and_byte() {
+    let n = LinearNode::default();
+    assert_eq!(n.start_line, 0);
+    assert_eq!(n.start_byte, 0);
+}
+
+#[test]
+fn start_line_is_one_indexed_and_monotonic_in_pre_order() {
+    // "fn main() {}" — root starts at line 1 (1-indexed), byte 0.
+    let result = parse_and_linearize("fn main() {}", Language::Rust);
+    let root = &result.nodes[0];
+    assert_eq!(
+        root.start_line, 1,
+        "root node must start on 1-indexed line 1; got {}",
+        root.start_line
+    );
+    assert_eq!(
+        root.start_byte, 0,
+        "root node must start at byte 0; got {}",
+        root.start_byte
+    );
+
+    // Pre-order traversal visits nodes in ascending start-byte order, so
+    // start_byte must be non-decreasing across the sequence.
+    for pair in result.nodes.windows(2) {
+        assert!(
+            pair[0].start_byte <= pair[1].start_byte,
+            "pre-order start_byte must be non-decreasing: {} then {}",
+            pair[0].start_byte,
+            pair[1].start_byte
+        );
+    }
+}
+
+#[test]
+fn start_line_advances_for_nodes_on_later_lines() {
+    let source = "fn a() {}\nfn b() {}\nfn c() {}\n";
+    let result = parse_and_linearize(source, Language::Rust);
+    // At least one node must be recorded on each of lines 1, 2, and 3 —
+    // proves start_line is actually populated from the real source position,
+    // not left at the zero default.
+    for expected_line in [1u32, 2, 3] {
+        assert!(
+            result.nodes.iter().any(|n| n.start_line == expected_line),
+            "expected at least one node on line {expected_line}; lines seen: {:?}",
+            result
+                .nodes
+                .iter()
+                .map(|n| n.start_line)
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
@@ -276,7 +336,7 @@ fn no_node_has_depth_at_or_above_max_ast_depth() {
 #[test]
 fn node_count_never_exceeds_max_ast_nodes() {
     // NOTE: The MAX_AST_NODES (100K) guard cannot be triggered by real source
-    // without also exceeding MAX_FILE_SIZE (100 KiB): reaching 100K nodes would
+    // without also exceeding the file-size limit (1 MiB): reaching 100K nodes would
     // require ~12,500+ simple statements (~140 KiB), which the file-size guard
     // catches first. The guard for MAX_AST_NODES is therefore exercised by the
     // tree-sitter walk (nested/wide ASTs), not by statement count.
@@ -297,8 +357,9 @@ fn node_count_never_exceeds_max_ast_nodes() {
 
 #[test]
 fn oversized_file_returns_default() {
-    // File larger than MAX_FILE_SIZE should return empty default result.
-    let big = "fn x() {}\n".repeat(MAX_FILE_SIZE / 10 + 1);
+    // File larger than the AST size limit should return empty default result.
+    let limit = ast_size_limit(Language::Rust).unwrap() as usize;
+    let big = "fn x() {}\n".repeat(limit / 10 + 1);
     let result = parse_and_linearize(&big, Language::Rust);
     assert!(
         result.nodes.is_empty(),
@@ -312,6 +373,58 @@ fn oversized_file_returns_default() {
         result.error_count, 0,
         "oversized file must return error_count 0"
     );
+}
+
+/// Old 100 KiB cap (bytes) — the lower bound of the newly-included band.
+///
+/// AD-405-1 raised the per-language AST size cap from 100 KiB (all non-SQL
+/// languages) to 1 MiB (unified for all 14 tree-sitter languages). Files in
+/// [100 KiB, 1 MiB) were previously excluded; they must now be indexed.
+#[cfg(test)]
+const OLD_AST_CAP_BYTES: usize = 100 * 1024;
+
+#[test]
+fn midband_file_100kib_to_1mib_is_ast_indexed() {
+    // D-3 regression guard: a file in the newly-included 100 KiB–1 MiB band
+    // must produce non-empty AST nodes. The old threshold was 100 KiB; the new
+    // unified cap (AD-405-1) is 1 MiB. Returning LinearizeResult::default()
+    // silently for midband files would pass every exclusion-direction size test
+    // but fail here — that is the exact D-3 hazard this test exists to catch.
+    let line = "fn func(x: i32) -> i32 { x + 1 }\n";
+    // 4096 repetitions × 33 bytes ≈ 132 KiB — well within [100 KiB, 1 MiB).
+    let source: String = line.repeat(4096);
+
+    let limit = ast_size_limit(Language::Rust).expect("Rust must have a size limit");
+
+    // Self-check: the source must sit in the newly-included band.
+    assert!(
+        source.len() > OLD_AST_CAP_BYTES,
+        "test source ({} bytes) must exceed old 100 KiB cap ({} bytes) to cover \
+         the newly-included band",
+        source.len(),
+        OLD_AST_CAP_BYTES,
+    );
+    assert!(
+        (source.len() as u64) < limit,
+        "test source ({} bytes) must be under the 1 MiB cap ({} bytes) to be indexed",
+        source.len(),
+        limit,
+    );
+
+    let result = parse_and_linearize(&source, Language::Rust);
+    assert!(
+        !result.nodes.is_empty(),
+        "midband file ({} bytes, 100 KiB–1 MiB band) must produce non-empty AST \
+         nodes; got 0 — possible silent-empty-postings regression (D-3)",
+        source.len(),
+    );
+    assert!(
+        result.node_count > 0,
+        "node_count must be > 0 for a midband file ({} bytes); got {}",
+        source.len(),
+        result.node_count,
+    );
+    assert_node_count_invariant(&result);
 }
 
 // ── Cycle 6: Multi-language ───────────────────────────────────────────────────
@@ -485,8 +598,8 @@ fn binary_like_input_returns_ok_default() {
 fn linearize_1000_line_file_under_10ms() {
     use std::time::Instant;
 
-    // Generate a ~1000-line Rust file (well under MAX_FILE_SIZE).
-    // Each line is one function ~40 bytes; 1000 lines ≈ 40 KiB < 100 KiB limit.
+    // Generate a ~1000-line Rust file (well under the 1 MiB AST size limit).
+    // Each line is one function ~40 bytes; 1000 lines ≈ 40 KiB < 1 MiB limit.
     let source: String = (0..1000)
         .map(|i| format!("fn func_{i}(x: i32) -> i32 {{ x + {i} }}\n"))
         .collect();

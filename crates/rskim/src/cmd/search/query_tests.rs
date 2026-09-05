@@ -7,7 +7,11 @@ use std::io::BufWriter;
 
 use tempfile::tempdir;
 
-use super::{execute_query, format_json_output, format_text_output};
+use super::{
+    execute_query, format_json_output, format_text_output, near_diagnostic_notice,
+    positional_inert_notice, verify_mode_for,
+};
+use crate::cmd::search::snippet::VerifyMode;
 use crate::cmd::search::types::{QueryConfig, QueryOutput};
 
 // ============================================================================
@@ -41,16 +45,55 @@ fn create_test_project(root: &std::path::Path) {
     .unwrap();
 }
 
+/// Create a project for AC12/AC13/AC14 UNION blast-radius tests.
+///
+/// auth.rs contains a unique function `zqjxblip_check` that does NOT
+/// share any 4-char n-grams with lib.rs.  lib.rs contains only database
+/// schema helpers — no "verify", "zqjx", or "token" substrings — so
+/// a query for "zqjxblip_check" returns a lexical hit only for auth.rs.
+/// lib.rs acts as the pure co-change-only partner with zero lexical overlap.
+fn create_union_test_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // auth.rs: contains the unique query term only.
+    // "zqjxblip_check" uses a 4-char nonsense prefix "zqjx" that cannot appear
+    // in any natural Rust file, guaranteeing zero n-gram overlap with lib.rs.
+    fs::write(
+        src.join("auth.rs"),
+        "pub fn zqjxblip_check(t: &str) -> bool { !t.is_empty() }\n",
+    )
+    .unwrap();
+    // lib.rs: content with NO overlap with "zqjxblip" (no z, q, j, x cluster).
+    // Uses common Rust keywords/types that are far from the auth.rs term.
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Foo { pub count: u32 }\n\
+         impl Foo {\n\
+             pub fn new(n: u32) -> Self { Self { count: n } }\n\
+             pub fn total(&self) -> u32 { self.count }\n\
+         }\n",
+    )
+    .unwrap();
+}
+
 /// Build a QueryConfig pointing at `root` and `cache_dir`.
 fn make_config(root: &std::path::Path, cache_dir: &std::path::Path, text: &str) -> QueryConfig {
     QueryConfig {
         text: text.to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: None,
-        ast_file_ids: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
     }
 }
 
@@ -138,9 +181,13 @@ fn test_format_text_output_empty_results() {
     let output = QueryOutput {
         query: "nothing".to_string(),
         total: 0,
+        has_more: false,
+        verify_mode: None,
         results: vec![],
         duration_ms: 5,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
     let mut buf = BufWriter::new(Vec::new());
     format_text_output(&output, &mut buf).unwrap();
@@ -179,14 +226,19 @@ fn test_format_text_output_includes_path_and_score() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
         query: "authenticate".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 3,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -219,14 +271,19 @@ fn test_format_text_output_includes_stale_marker() {
         stale: true,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
         query: "old_fn".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 2,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -235,6 +292,74 @@ fn test_format_text_output_includes_stale_marker() {
     assert!(
         s.contains("[stale]"),
         "stale result must include '[stale]' marker in output, got: {s:?}"
+    );
+}
+
+// ============================================================================
+// format_text_output echoes effective query in non-empty summary (AC6)
+// ============================================================================
+
+/// AC6: The non-empty human-text summary includes the effective query so a
+/// mangled query can never masquerade as a successful search.
+///
+/// PF-007 (discriminating): Uses a query token "xqzuniq_query" that does NOT
+/// appear in the path or snippet, so `s.contains("xqzuniq_query")` can only
+/// be satisfied by the summary line.  The composite assertion
+/// `s.contains(r#"result(s) for "xqzuniq_query""#)` fails when the echo is
+/// reverted to the old `"{} result(s) in {}ms"` format — it would produce
+/// `1 result(s) in 2ms`, which does not contain `for "xqzuniq_query"`.
+#[test]
+fn test_format_text_output_non_empty_echoes_query() {
+    use crate::cmd::search::types::{ResolvedResult, SnippetContext, SnippetLine};
+
+    // Path and snippet intentionally contain no part of the query token
+    // "xqzuniq_query" — that string can only appear in the summary line echo.
+    let result = ResolvedResult {
+        path: "src/module.rs".to_string(),
+        score: 7.5,
+        field: "function_signature".to_string(),
+        line_number: Some(1),
+        line_range: Some(1..2),
+        snippet: Some(SnippetContext {
+            lines: vec![SnippetLine {
+                line_number: 1,
+                content: "pub fn module_func() {}".to_string(),
+                is_match: true,
+            }],
+        }),
+        stale: false,
+        match_positions: vec![],
+        temporal: None,
+        layers_matched: vec![],
+    };
+
+    let output = QueryOutput {
+        query: "xqzuniq_query".to_string(),
+        total: 1,
+        has_more: false,
+        verify_mode: None,
+        results: vec![result],
+        duration_ms: 2,
+        index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
+    };
+
+    let mut buf = BufWriter::new(Vec::new());
+    format_text_output(&output, &mut buf).unwrap();
+    let s = String::from_utf8(buf.into_inner().unwrap()).unwrap();
+
+    // AC6 / PF-007 (discriminating): the summary line must be in the new
+    // `N result(s) for "Q" in Xms` format.  This assertion fails when the echo
+    // is reverted to `"{} result(s) in {}ms"` (old format produces
+    // `1 result(s) in 2ms`, which contains neither `for` nor the quoted query).
+    // Neither the path (`src/module.rs`) nor the snippet (`pub fn module_func()`)
+    // contain "xqzuniq_query", so the only source of this substring is the
+    // summary line — making the assertion a true discriminating guard for AD-412-4.
+    assert!(
+        s.contains(r#"result(s) for "xqzuniq_query""#),
+        "AC6: summary line must echo effective query in the form \
+         'N result(s) for \"xqzuniq_query\" in Xms' (AD-412-4); got: {s:?}"
     );
 }
 
@@ -317,6 +442,7 @@ fn test_resolved_result_line_range_some_serializes_start_end() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -342,6 +468,7 @@ fn test_resolved_result_line_range_none_serializes_null() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
@@ -356,12 +483,17 @@ fn test_resolved_result_line_range_none_serializes_null() {
 // blast_radius_paths filter
 // ============================================================================
 
-/// When blast_radius_paths is set, execute_query must restrict results to
-/// the allowed paths. The target file itself is included in the set (Issue fix:
-/// previously only co-change *partners* were included, excluding the target).
+/// When blast_radius_paths is set, execute_query uses UNION composite ranking
+/// (#200): the blast-radius member that lexically matches must appear in results.
+///
+/// Note: as of #200 the blast-radius path uses UNION semantics (not the old
+/// filter/intersection semantics).  Lexically relevant files outside the
+/// blast-radius set may also appear in results — this is intentional.  The
+/// invariant under test is that the blast member IS included, not that the
+/// result set is restricted to it.
 #[test]
 fn test_execute_query_blast_radius_includes_only_allowed_paths() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -369,30 +501,37 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    // Allow only src/auth.rs in the blast-radius set.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
+    // blast-radius map: src/auth.rs only (uniform 1.0 strength — seed not set here).
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "authenticate".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
-        ast_file_ids: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
-    // All results must be from the allowed set.
-    for r in &output.results {
-        assert_eq!(
-            r.path, "src/auth.rs",
-            "blast-radius filter must restrict results to allowed paths, got: {}",
-            r.path
-        );
-    }
+    // UNION mode (#200): src/auth.rs lexically matches "authenticate" AND is
+    // in the blast-radius set → it MUST appear in results.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "blast-radius member that lexically matches must appear in UNION results (AC12)"
+    );
+
+    // query must succeed and return at least one result.
+    assert!(!output.results.is_empty(), "results must not be empty");
 }
 
 /// When blast_radius_paths contains the target file, a query that matches
@@ -400,7 +539,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
 /// Regression for: combined mode was excluding the target file itself.
 #[test]
 fn test_execute_query_blast_radius_target_file_is_included() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -410,18 +549,23 @@ fn test_execute_query_blast_radius_target_file_is_included() {
 
     // Build an allowlist that includes src/auth.rs (the "target") plus a
     // partner that has no matching content for "authenticate".
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // target
-    allowed.insert("src/does_not_exist.rs".to_string()); // partner (not indexed)
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // target
+    allowed.insert("src/does_not_exist.rs".to_string(), 1.0); // partner (not indexed)
 
     let config = QueryConfig {
         text: "authenticate".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
         blast_radius_paths: Some(allowed),
-        ast_file_ids: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
     };
 
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
@@ -435,6 +579,487 @@ fn test_execute_query_blast_radius_target_file_is_included() {
 }
 
 // ============================================================================
+// AC12 — UNION inclusion: co-change-only file appears (POSITIVE, discriminating)
+//
+// A file Y is indexed (has a FileId in the manifest) but does NOT match the
+// text query Q.  When Y is in blast_radius_paths, it must appear in UNION
+// results ranked by its temporal RRF term alone.  Under the OLD filtered-
+// intersection behaviour Y would be ABSENT (it was dropped because it didn't
+// match the query).  This test asserts the strict PRESENT-in-UNION /
+// WOULD-BE-ABSENT-in-filter difference.
+// ============================================================================
+
+#[test]
+fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // Uses a project where lib.rs has ZERO n-gram overlap with the query term.
+    create_union_test_project(&root);
+
+    // Query text: "zqjxblip_check" — unique to src/auth.rs only.
+    // src/lib.rs has no shared 4-grams with this term → pure co-change-only partner.
+    //
+    // blast_radius_paths: include BOTH src/auth.rs (lexical match) AND
+    // src/lib.rs (co-change partner that does NOT match the query).
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexically matches query
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change partner; does NOT match query
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC12 POSITIVE: src/lib.rs is a co-change partner that does NOT match
+    // "zqjxblip_check" lexically (zero n-gram overlap), but IS in
+    // blast_radius_paths → must appear in UNION results ranked by its temporal
+    // RRF term alone.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        has_lib,
+        "AC12: co-change-only file (src/lib.rs) that does NOT match the query \
+        must appear in UNION results due to its temporal blast-radius rank; \
+        got results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // DISCRIMINATING — under OLD filter semantics src/lib.rs would be ABSENT
+    // because it didn't match the query.  Document the strict contract:
+    // UNION mode includes it; filtered mode would not.
+    // Both src/auth.rs (lexical hit) and src/lib.rs (co-change hit) must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AC12: lexically-matching file (src/auth.rs) must also appear in UNION results"
+    );
+}
+
+// ============================================================================
+// AC13 — UNION cardinality and ordering bounds (NEGATIVE)
+//
+// The composite UNION output must:
+// (a) Contain no duplicate FileIds
+// (b) Be sorted fused-RRF-score DESC, then path ASC as tiebreak
+// (c) Have count == min(|union|, limit)
+// (d) Apply rank-then-limit LAST (a co-change-only file ranking in top-N
+//     must not be pre-truncated before fusion)
+// ============================================================================
+
+#[test]
+fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_union_test_project(&root);
+
+    // blast_radius_paths with both indexed files so the union is the full index.
+    // Both files are in the temporal list; auth.rs also matches the lexical query.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+    allowed.insert("src/lib.rs".to_string(), 1.0);
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // (a) No duplicate paths (FileIds map 1:1 to paths in the sorted manifest).
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    let unique_paths: HashSet<&str> = paths.iter().copied().collect();
+    assert_eq!(
+        paths.len(),
+        unique_paths.len(),
+        "AC13(a): no duplicate paths in UNION output; got {:?}",
+        paths
+    );
+
+    // (b) Result count <= limit (rank-then-limit).
+    assert!(
+        output.results.len() <= 20,
+        "AC13(c): result count must be <= limit (20), got {}",
+        output.results.len()
+    );
+
+    // (c) Scores are non-increasing (fused-RRF-score DESC order).
+    // Ties may exist; adjacent ties are not a violation of the ordering contract.
+    let scores: Vec<f64> = output.results.iter().map(|r| r.score).collect();
+    for window in scores.windows(2) {
+        assert!(
+            window[0] >= window[1] - 1e-9,
+            "AC13(b): scores must be non-increasing (DESC order); found {:?}",
+            scores
+        );
+    }
+
+    // (d) All returned paths come from the union of lexical candidates and
+    // temporal co-change partners — no fabricated files.
+    // Every path must be a valid indexed path (resolves from the manifest).
+    for r in &output.results {
+        assert!(
+            !r.path.is_empty(),
+            "AC13(a): every result must have a non-empty path"
+        );
+        // Co-change-only results carry field "co_change_partner" (no snippet).
+        // Lexical results carry real field names.
+        // Both are valid UNION members.
+    }
+}
+
+#[test]
+fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_union_test_project(&root);
+
+    // Both indexed files in blast-radius; query matches only one.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexical match
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change-only
+
+    // limit = 1: only the top-ranked result is returned.
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 1,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC13(c): count = min(|union|, limit) = min(2, 1) = 1.
+    assert_eq!(
+        output.results.len(),
+        1,
+        "AC13(c): limit=1 must return exactly 1 result from the UNION of 2 candidates; \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    // D-5 / AD-404-11: blast-radius composite path must set has_more=true when
+    // candidate count (2) exceeds limit (1).  The probe-then-truncate logic in
+    // run_blast_radius_composite_query collects limit+1=2 items, finds len > limit,
+    // sets has_more=true, then truncates to limit=1.
+    assert!(
+        output.has_more,
+        "D-5: blast-radius composite must set has_more=true when \
+        UNION candidate count (2) > limit (1); got has_more={}",
+        output.has_more
+    );
+}
+
+// ============================================================================
+// AC14 — co-change-only result carries fused-RRF score, not BM25F
+// ============================================================================
+
+#[test]
+fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // lib.rs has zero n-gram overlap with "zqjxblip_check" → pure co-change partner.
+    create_union_test_project(&root);
+
+    // blast_radius_paths includes lib.rs (co-change-only: no "zqjxblip_check" match).
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+    allowed.insert("src/lib.rs".to_string(), 1.0);
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Find the co-change-only result (src/lib.rs) if present.
+    // If found, assert:
+    // (a) Its field is "co_change_partner" (not a BM25F field type).
+    // (b) Its score is a small positive fused-RRF value (not a BM25F magnitude).
+    //     RRF scores are wᵢ / (RRF_K + rankᵢ), so with weight 0.2 and rank 1,
+    //     score ≈ 0.2 / (60 + 1) ≈ 0.00328 — not a BM25F magnitude.
+    if let Some(lib_result) = output.results.iter().find(|r| r.path == "src/lib.rs") {
+        assert_eq!(
+            lib_result.field, "co_change_partner",
+            "AC14: co-change-only result must have field='co_change_partner', not a BM25F field type"
+        );
+        // Score must be finite and positive (fused RRF term).
+        assert!(
+            lib_result.score.is_finite() && lib_result.score > 0.0,
+            "AC14: co-change-only score must be a finite positive fused-RRF value, got {}",
+            lib_result.score
+        );
+        // Score must be small (well below typical BM25F magnitudes of 5–100).
+        // A pure temporal RRF score with w=0.2 and rank 1 is ≈ 0.00328.
+        assert!(
+            lib_result.score < 5.0,
+            "AC14: fused-RRF score must be small (< 5.0), not a BM25F magnitude; got {}",
+            lib_result.score
+        );
+    }
+    // Note: if src/lib.rs is not in results, AC12 would have caught it first.
+    // This test is complementary to AC12 and focuses on the score field contract.
+}
+
+// ============================================================================
+// AD-393-12: positional co-change-only peer gate
+//
+// In positional mode (phrase: true or near: Some(_)), co-change-only files
+// (those present in blast_radius_paths but absent from the lexical result set)
+// MUST be dropped unconditionally.  Any file that truly contains the phrase is
+// reachable via the lexical path; the co-change-only path adds no recall in
+// positional mode and risks including wrong-language peers (D17/AC16 violation).
+//
+// This test injects blast_radius_paths containing a co-change-only file (lib.rs,
+// which does NOT contain the query phrase) and asserts it is EXCLUDED.  The
+// lexically-matching file (auth.rs, which DOES contain the phrase) must appear.
+// ============================================================================
+
+#[test]
+fn test_positional_cochange_only_peer_is_dropped() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // auth.rs: contains "zqjxblip_check" as an exact word token.
+    // lib.rs: does NOT contain "zqjxblip_check" — pure co-change-only partner.
+    create_union_test_project(&root);
+
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexical hit + phrase match
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change-only: does NOT contain phrase
+
+    let config = QueryConfig {
+        text: "zqjxblip_check".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        // Positional mode: the `else if positional { return None; }` gate activates.
+        phrase: true,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+
+    // AD-393-12 POSITIVE: auth.rs has a lexical hit AND passes phrase
+    // verification (word token "zqjxblip_check" present) → must appear.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AD-393-12: positional lexical-hit file (src/auth.rs) must appear in results; \
+         got {:?}",
+        paths
+    );
+
+    // AD-393-12 NEGATIVE (discriminating): lib.rs is co-change-only in positional
+    // mode and must be DROPPED by the `else if positional { return None; }` gate.
+    // Under the old "read-and-verify" implementation, lib.rs would be included if
+    // it happened to contain the phrase; under the new unconditional-drop it is
+    // always excluded, preventing the --lang bypass class of false positives.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AD-393-12: co-change-only file (src/lib.rs) MUST be dropped in positional mode; \
+         got {:?}",
+        paths
+    );
+}
+
+// ============================================================================
+// AD-413-16: empty-allowlist (AnchorDiffers) early-out in composite query
+//
+// When blast_radius_paths is Some(empty_set) — produced by resolve_blast_radius_paths
+// on AnchorDiffers (wrong-repo temporal DB) — run_blast_radius_composite_query MUST
+// return zero results rather than degrading to a full unfiltered lexical search.
+//
+// The pre-fix code used `.unwrap_or_default()` which collapsed Some(empty) into an
+// empty temporal_layer, bypassing the blast-radius filter and returning all lexical
+// matches.  This test is the discriminating regression guard.
+// ============================================================================
+
+/// AD-413-16 regression: empty blast_radius_paths (AnchorDiffers sentinel) must
+/// return zero results, not the full unfiltered lexical result set.
+#[test]
+fn test_blast_radius_empty_allowlist_returns_zero_results() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // Use a project where the query "authenticate" produces lexical results.
+    create_test_project(&root);
+
+    // Some(empty) = AnchorDiffers sentinel — wrong repo DB.
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(HashMap::new()), // empty allowlist → AnchorDiffers path
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AD-413-16: empty allowlist MUST yield zero results.
+    // Before the fix, this returned all lexical "authenticate" matches (up to limit)
+    // because Some(empty) collapsed to an empty temporal_layer via unwrap_or_default(),
+    // effectively disabling the blast-radius filter.
+    assert!(
+        output.results.is_empty(),
+        "AD-413-16: empty blast_radius_paths must return zero results (not full lexical set); \
+         got {} results: {:?}",
+        output.results.len(),
+        output
+            .results
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output.total, 0,
+        "AD-413-16: total must be 0 for empty allowlist"
+    );
+}
+
+/// AD-413-16 companion regression (#409 container retype): a NON-empty allowlist
+/// whose paths are all absent from the lexical manifest must ALSO return zero
+/// results — the blast-radius signal contributed nothing, so returning the plain
+/// lexical hit list under a `--blast-radius` flag would be a confident ranking
+/// that is not a blast radius (ADR-009).
+///
+/// Before #409 this case was covered by the same guard as the empty allowlist,
+/// because that guard tested the RESOLVED `HashSet<FileId>`.  #409 retyped it to
+/// test the source path map, so this is the discriminating guard for the
+/// `temporal_layer.is_empty()` early-out that restores the pre-#409 semantics.
+#[test]
+fn test_blast_radius_allowlist_with_no_indexed_paths_returns_zero_results() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // "authenticate" DOES produce lexical results in this project — so a fall-through
+    // would be observable as a non-empty result set.
+    create_test_project(&root);
+
+    // Non-empty allowlist, but neither path exists in the manifest (seed included):
+    // every co-change partner was deleted from disk while temporal.db still lists them.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/deleted_seed.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/deleted_partner.rs".to_string(), 0.75);
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        output.results.is_empty(),
+        "an allowlist that resolves to zero FileIds must return zero results, not the \
+         unfiltered lexical set; got {} results: {:?}",
+        output.results.len(),
+        output
+            .results
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output.total, 0,
+        "total must be 0 when no allowlist path is indexed"
+    );
+}
+
+// ============================================================================
 // format_json_output
 // ============================================================================
 
@@ -443,9 +1068,13 @@ fn test_format_json_output_is_valid_json() {
     let output = QueryOutput {
         query: "test".to_string(),
         total: 0,
+        has_more: false,
+        verify_mode: None,
         results: vec![],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
     let mut buf = BufWriter::new(Vec::new());
     format_json_output(&output, &mut buf).unwrap();
@@ -479,14 +1108,19 @@ fn test_format_text_output_includes_temporal_hotspot() {
             hotspot_score: Some(0.95),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
         query: "hot".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -520,14 +1154,19 @@ fn test_format_text_output_includes_temporal_risk() {
             risk_score: Some(0.80),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
         query: "risky".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -558,14 +1197,19 @@ fn test_format_text_output_omits_temporal_when_none() {
         stale: false,
         match_positions: vec![],
         temporal: None,
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
         query: "plain".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -600,14 +1244,19 @@ fn test_format_json_output_includes_temporal_annotations() {
             risk_score: Some(0.70),
             ..Default::default()
         }),
+        layers_matched: vec![],
     };
 
     let output = QueryOutput {
         query: "hot".to_string(),
         total: 1,
+        has_more: false,
+        verify_mode: None,
         results: vec![result],
         duration_ms: 1,
         index_stats: None,
+        ast_coverage: None,
+        degraded: vec![],
     };
 
     let mut buf = BufWriter::new(Vec::new());
@@ -630,5 +1279,2603 @@ fn test_format_json_output_includes_temporal_annotations() {
     assert!(
         (rs - 0.70).abs() < 1e-6,
         "risk_score must be ~0.70, got {rs}"
+    );
+}
+
+// ============================================================================
+// #355 Part A — Exact-match verification (AC1 / AC2 / AC3)
+//
+// PF-007: every test asserts a discriminating observable, not just exit-0.
+// AC2: gibberish query → 0 results on ALL paths.
+// AC3: every returned result literally contains the query token(s).
+// AC1: an exact symbol query returns only files containing it.
+// ============================================================================
+
+/// AC2 — gibberish query produces 0 verified results on the pure-lexical path.
+///
+/// PF-007 (discriminating): asserts results.is_empty() for a query whose trigrams
+/// are absent from the index — so the reader returns 0 candidates and verification
+/// never runs.  This guards the trigram-miss path, not the verify gate.
+/// The discriminating coverage for the verify gate is in:
+///   - `test_ac1_verify_gate_drops_trigram_overlap_non_literal` (non-literal that shares trigrams)
+///   - `test_ac3_every_result_contains_query_term_pure_lexical` (content check per result)
+///   - `test_ac2_verify_gate_drops_compound_lexical_hit_without_literal` (compound path)
+#[test]
+fn test_ac2_gibberish_query_returns_zero_results_pure_lexical() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // "xqzjvmblorp" is a provably absent gibberish string — its trigrams (e.g. "xqz",
+    // "qzj", "zjv"…) do not appear in any natural code file, so the trigram index
+    // returns 0 candidates before verification even runs.  The empty result here
+    // comes from zero trigram overlap, not from the verify gate.
+    let config = make_config(&root, &cache_dir, "xqzjvmblorp");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC2: verified result set must be empty (trigram-miss path).
+    assert!(
+        output.results.is_empty(),
+        "AC2: gibberish query 'xqzjvmblorp' must return 0 results (no trigram overlap); \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (compound path, trigram-miss) — gibberish query + AST filter → 0 results.
+///
+/// NOTE: this test exercises the "no trigrams in index" path, NOT the verify gate.
+/// For the discriminating compound-path verify-gate test, see
+/// `test_ac2_verify_gate_drops_compound_lexical_hit_without_literal` below.
+#[test]
+fn test_ac2_gibberish_query_returns_zero_results_compound_path() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // Use a fake ast_scored vector (file 0 with score 1.0); the gibberish query
+    // has no trigram overlap with the corpus so raw_lex is empty; intersect_and_rank
+    // short-circuits to [] before the verify gate is even reached.
+    let config = QueryConfig {
+        text: "xqzjvmblorp".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![(FileId(0), 1.0)]),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        output.results.is_empty(),
+        "AC2 (compound path, trigram-miss): gibberish query must return 0 results; \
+        got {} results: {:?}",
+        output.results.len(),
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (compound path, verify gate discriminating) — a file that the lexical index
+/// returns as a candidate AND the fake AST scored it highly, but does NOT contain
+/// the literal query, must be dropped by the verify gate.
+///
+/// PF-007 (discriminating): this test WOULD FAIL if the verify gate were removed
+/// from `resolve_paths_and_snippets_verified`.  "authenticate_user" shares trigrams
+/// with lib.rs (which contains "authenticate" and "user" as separate words), so the
+/// compound path's `raw_lex` includes lib.rs.  With a fake ast_scored entry for
+/// lib.rs, it survives `intersect_and_rank`.  Only the verify gate drops it.
+///
+/// This is the template from AC1 (pure-lexical verify gate) ported to the compound
+/// (text+AST) path — fixes PF-007 Finding 10.
+#[test]
+fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // auth.rs: contains the exact literal "authenticate_user".
+    fs::write(
+        src.join("auth.rs"),
+        "/// Authenticate a user by token.\n\
+         pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    // lib.rs: contains "authenticate" and "user" as SEPARATE words — shares many
+    // trigrams with "authenticate_user" — but NOT the literal "authenticate_user".
+    // The fake AST score gives lib.rs a higher-than-auth AST score so it will be
+    // in `raw_lex` AND in the intersection result; only the verify gate must drop it.
+    fs::write(
+        src.join("lib.rs"),
+        "/// Authenticate the request.\n\
+         pub fn check_user(id: u32) -> bool { id > 0 }\n\
+         pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    // Build the index so FileId(0)=auth.rs, FileId(1)=lib.rs (sorted alphabetically).
+    {
+        let build_config = QueryConfig {
+            text: "authenticate_user".to_string(),
+            limit: 20,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        };
+        // First run with no ast_scored builds the index (cold start).
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
+    }
+
+    // Now run the compound path: give FileId(1)=lib.rs a HIGH AST score so it
+    // wins the intersection and survives into recompose.  The verify gate must
+    // drop it because "authenticate_user" is absent from lib.rs.
+    let config = QueryConfig {
+        text: "authenticate_user".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        // FileId(0)=auth.rs: low AST score; FileId(1)=lib.rs: high AST score.
+        // The fake AST order ensures lib.rs appears in the intersection with auth.rs.
+        ast_scored: Some(vec![(FileId(0), 0.5), (FileId(1), 2.0)]),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 (discriminating): lib.rs must NOT appear in verified results.
+    // It shares trigrams with "authenticate_user" and has a higher AST score,
+    // but the literal string is absent — the verify gate MUST drop it.
+    // Removing the verify gate from resolve_paths_and_snippets_verified would
+    // cause lib.rs to appear here, failing this assertion.
+    let has_lib = output.results.iter().any(|r| r.path.contains("lib.rs"));
+    assert!(
+        !has_lib,
+        "AC2 (compound verify gate): 'lib.rs' has trigram overlap AND a high AST score \
+        but does NOT contain the literal 'authenticate_user' — the verify gate must drop it. \
+        Found in results — verify gate is absent or broken on the compound path. \
+        Results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // auth.rs MUST appear (it contains the literal).
+    let has_auth = output.results.iter().any(|r| r.path.contains("auth.rs"));
+    assert!(
+        has_auth,
+        "AC2 (compound verify gate): 'auth.rs' contains the literal 'authenticate_user' \
+        and must appear in compound results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC2 (blast-radius path) — gibberish query + blast-radius → 0 verified
+/// lexical-hit results; only co-change-only stubs (no snippet, field=co_change_partner)
+/// may appear.
+///
+/// PF-007: the discriminating check is that NO result carries a non-None snippet
+/// (which would mean the file was read and the verify gate passed).  "xqzjvmblorp"
+/// shares no trigrams with the corpus, so no file enters the lexical branch at all.
+/// This test pairs with test_ac2_short_query_fallback_blast_radius_exercises_verify_gate
+/// which uses a <3-byte query that DOES reach the reader's fallback and exercises the
+/// verify gate on the blast-radius path.
+#[test]
+fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+
+    let config = QueryConfig {
+        text: "xqzjvmblorp".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 discriminating: no result may have a non-None snippet.
+    // A non-None snippet means the file was read AND query_substring_present
+    // returned true — which would require "xqzjvmblorp" to appear in a file.
+    // Any result with a snippet here is a false positive from the verify gate.
+    //
+    // Co-change-only stubs (field="co_change_partner", snippet=None) are
+    // exempt — they are returned by UNION semantics without lexical verification.
+    for r in &output.results {
+        assert!(
+            r.snippet.is_none(),
+            "AC2 (blast-radius): no result with a snippet expected for a gibberish query; \
+            a snippet means the verify gate passed — false positive; found: {:?}",
+            r
+        );
+    }
+}
+
+/// AC2 (blast-radius short-query fallback) — a 2-byte query that reaches the
+/// AD-355-7 fallback on the blast-radius path exercises the verify gate.
+///
+/// PF-007 (discriminating, F14): the corpus has one file that CONTAINS the 2-byte
+/// query "zz" (`match.rs`) and one that does NOT (`nomatch.rs`).  Both are in the
+/// blast-radius allowlist.  The test asserts by PATH MEMBERSHIP:
+///
+/// - `match.rs` (contains "zz") MUST appear in results — the gate's keep path.
+/// - `nomatch.rs` (does not contain "zz") MUST NOT appear — the gate's drop path.
+///
+/// This is a STRICT SUBSET check: if the verify gate is removed the non-matching
+/// file would survive the fallback and appear in results, failing the "absent"
+/// assertion.  If the keep path is broken the matching file would be dropped,
+/// failing the "present" assertion.  The test therefore fails in BOTH regression
+/// directions — making it a genuine guard per PF-007.
+///
+/// Previously the test used `r.snippet.is_none()` which cannot distinguish
+/// gate-on from gate-off (short-query candidates always have empty match_positions
+/// so `snippet` is always `None` regardless of the verify decision).
+#[test]
+fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Corpus: match.rs CONTAINS "zz"; nomatch.rs does NOT.
+    // Both are in the blast-radius allowlist so both reach the verify gate.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // "zz" appears in match.rs (the token we search for).
+    fs::write(
+        src.join("match.rs"),
+        "// contains the target token\npub fn check_zz(x: &str) -> bool { x.contains(\"zz\") }\n",
+    )
+    .unwrap();
+    // "zz" is absent from nomatch.rs.
+    fs::write(
+        src.join("nomatch.rs"),
+        "pub fn parse_config(s: &str) -> Option<String> { Some(s.to_string()) }\n",
+    )
+    .unwrap();
+
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/match.rs".to_string(), 1.0);
+    allowed.insert("src/nomatch.rs".to_string(), 1.0);
+
+    let config = QueryConfig {
+        text: "zz".to_string(), // 2 bytes → AD-355-7 fallback
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 DISCRIMINATING assertions — path-membership, not snippet presence:
+
+    // (1) The file that contains "zz" MUST be in results (verifies the keep path).
+    let has_match = output.results.iter().any(|r| r.path == "src/match.rs");
+    assert!(
+        has_match,
+        "AC2 (blast-radius short-query, keep path): 'src/match.rs' contains the literal \
+        'zz' and must appear in verified results after the AD-355-7 fallback; \
+        results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // (2) The file that does NOT contain "zz" MUST NOT be in results (verifies the
+    //     drop path — this assertion fails if the verify gate is removed or bypassed).
+    let has_nomatch = output.results.iter().any(|r| r.path == "src/nomatch.rs");
+    assert!(
+        !has_nomatch,
+        "AC2 (blast-radius short-query, drop path): 'src/nomatch.rs' does NOT contain \
+        the literal 'zz' and must be dropped by the verify gate; found in results — \
+        verify gate is absent or broken on the blast-radius short-query path. \
+        Results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+/// AC3 — every returned result literally contains the query term (pure-lexical).
+///
+/// PF-007 (discriminating): reads the content of each returned file and asserts
+/// the query term is present as a literal substring.  This test would fail if
+/// verification were disabled (bigram-noise false positives would appear).
+#[test]
+fn test_ac3_every_result_contains_query_term_pure_lexical() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_test_project(&root);
+
+    // "authenticate" is a real term in src/auth.rs.
+    let config = make_config(&root, &cache_dir, "authenticate");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.results.is_empty(),
+        "AC3: 'authenticate' must find at least one result"
+    );
+
+    for r in &output.results {
+        let abs_path = root.join(&r.path);
+        let content = fs::read_to_string(&abs_path).unwrap_or_default();
+        assert!(
+            content.contains("authenticate"),
+            "AC3: result file '{}' must contain the literal query term 'authenticate'; \
+            file content: {content:?}",
+            r.path
+        );
+    }
+}
+
+/// AC1 — an exact symbol query returns ONLY files containing it; the defining
+/// file ranks at position 0 (the highest-ranked result).
+///
+/// PF-007 (discriminating): asserts (a) the definer is present and (b) every
+/// non-definer result is absent from the verified set when the symbol is unique.
+/// This would fail without the wider pool + verify-then-truncate invariant.
+#[test]
+fn test_ac1_exact_symbol_returns_only_containing_files_and_definer_is_first() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // Controlled corpus: auth.rs defines `frbnqlwx_unique_symbol`; lib.rs does NOT.
+    // The symbol uses a nonsense prefix that can't appear in lib.rs accidentally.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("auth.rs"),
+        "/// The authoritative definer.\npub fn frbnqlwx_unique_symbol(x: u32) -> u32 { x }\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("lib.rs"),
+        "pub struct Config { pub value: u32 }\nimpl Config { pub fn new(v: u32) -> Self { Self { value: v } } }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "frbnqlwx_unique_symbol");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC1(a): the definer file must be in results.
+    let has_definer = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_definer,
+        "AC1: definer file 'src/auth.rs' must appear in results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC1(b): no result may be a file that does NOT contain the symbol.
+    // lib.rs does not contain "frbnqlwx_unique_symbol" — it must be absent.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AC1: 'src/lib.rs' does not contain 'frbnqlwx_unique_symbol' and must \
+        NOT appear in verified results (this would fail without verification)"
+    );
+
+    // AC1(c): definer is the top-ranked result.
+    let first_path = output
+        .results
+        .first()
+        .map(|r| r.path.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        first_path,
+        "src/auth.rs",
+        "AC1: definer 'src/auth.rs' must be results[0]; got {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC3 (inline): every returned result must contain the query term.
+    for r in &output.results {
+        let abs_path = root.join(&r.path);
+        let content = fs::read_to_string(&abs_path).unwrap_or_default();
+        assert!(
+            content.contains("frbnqlwx_unique_symbol"),
+            "AC3: every verified result must contain 'frbnqlwx_unique_symbol'; \
+            '{}' does not: {content:?}",
+            r.path
+        );
+    }
+}
+
+/// AC1 (verify gate specifically exercised) — lib.rs shares trigrams with the
+/// query term but does NOT contain the literal string.
+///
+/// The original AC1 test uses a purely unique symbol with zero trigram overlap
+/// in lib.rs — so lib.rs is trivially absent from candidates.  This test
+/// specifically exercises the verify gate: lib.rs contains trigram-generating
+/// substrings that share individual trigrams with the target query token, but
+/// NOT the literal token.  Without the verify gate, lib.rs would be a false
+/// positive.  With the gate, only the definer file survives.
+///
+/// PF-007 (discriminating): this test WOULD FAIL if verify gate were removed,
+/// because the trigram index would return lib.rs as a candidate and it would
+/// appear in results without the gate dropping it.
+#[test]
+fn test_ac1_verify_gate_drops_trigram_overlap_non_literal() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Query token: "authenticate_user".
+    // auth.rs: contains the exact literal "authenticate_user".
+    fs::write(
+        src.join("auth.rs"),
+        "/// Authenticate a user by token.\n\
+         pub fn authenticate_user(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    // lib.rs: contains the trigram-generating substrings "authenticate" and
+    // "user" as SEPARATE words, generating many shared trigrams with
+    // "authenticate_user", but the exact literal string "authenticate_user"
+    // is NOT present.  The verify gate must drop lib.rs.
+    fs::write(
+        src.join("lib.rs"),
+        "/// Authenticate the request.\n\
+         pub fn check_user(id: u32) -> bool { id > 0 }\n\
+         pub fn authenticate(token: &str) -> bool { !token.is_empty() }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "authenticate_user");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC1: definer must be present.
+    let has_auth = output.results.iter().any(|r| r.path == "src/auth.rs");
+    assert!(
+        has_auth,
+        "AC1 (verify gate): 'src/auth.rs' defines 'authenticate_user' and must appear; \
+        got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // PF-007 (discriminating): lib.rs must NOT appear because although it shares
+    // trigrams with "authenticate_user", it does not contain the literal string.
+    // Without the verify gate, lib.rs would be a false positive.
+    let has_lib = output.results.iter().any(|r| r.path == "src/lib.rs");
+    assert!(
+        !has_lib,
+        "AC1 (verify gate): 'src/lib.rs' shares trigrams with 'authenticate_user' but \
+        does NOT contain the literal string — verify gate must drop it; \
+        found in results, which means verify gate is absent or broken"
+    );
+}
+
+// ============================================================================
+// AC10 — Snippet baseline: match line == known line for exact-symbol path
+//
+// RESOLVED Decision 2: positions collected from ALL intersected trigrams,
+// snippet's match line must equal the file line that contains the token.
+// PF-007: this test would fail if match_positions is empty (no positions
+// forwarded from the intersection) because extract_snippet_and_verify would
+// return SnippetOutcome::Unavailable → line_number == None.
+// ============================================================================
+
+/// AC10 — exact-symbol path must collect match_positions from ALL intersected
+/// trigrams and produce a snippet whose match line equals the known token line.
+///
+/// PF-007 (discriminating): if positions are NOT collected from the intersection
+/// (e.g. empty match_positions forwarded), `extract_snippet_and_verify` returns
+/// `SnippetOutcome::Unavailable` and `line_number` is `None` — the assertion
+/// below catches both the missing-position bug and the wrong-line bug.
+///
+/// The token is placed on line 7 (1-based) to avoid trivial pass from coincidental
+/// line-0 defaults.
+#[test]
+fn test_ac10_snippet_match_line_equals_known_token_line() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Token: "qxzplumb_resolver" on line 7 (1-based), surrounded by 6 other lines.
+    // Lines 1–6: filler; line 7: the token.
+    let content = "// line 1 header\n\
+                   // line 2\n\
+                   // line 3\n\
+                   // line 4\n\
+                   // line 5\n\
+                   // line 6\n\
+                   pub fn qxzplumb_resolver(x: u32) -> u32 { x }\n\
+                   // line 8 footer\n";
+
+    fs::write(src.join("resolver.rs"), content).unwrap();
+    // lib.rs: no "qxzplumb_resolver" at all (acts as negative control).
+    fs::write(
+        src.join("lib.rs"),
+        "pub mod resolver;\npub struct Config { pub value: u32 }\n",
+    )
+    .unwrap();
+
+    let config = make_config(&root, &cache_dir, "qxzplumb_resolver");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // The query must find at least one result (the definer file).
+    assert!(
+        !output.results.is_empty(),
+        "AC10: 'qxzplumb_resolver' must find at least one result; got 0"
+    );
+
+    // Find the resolver.rs result.
+    let resolver_result = output
+        .results
+        .iter()
+        .find(|r| r.path.ends_with("resolver.rs"));
+    assert!(
+        resolver_result.is_some(),
+        "AC10: 'src/resolver.rs' must appear in results; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    let r = resolver_result.unwrap();
+
+    // AC10 core: line_number must be Some and equal line 7 (1-based).
+    // If match_positions were empty (RESOLVED Decision 2 violated),
+    // extract_snippet_and_verify would return Unavailable → line_number = None.
+    assert!(
+        r.line_number.is_some(),
+        "AC10: snippet line_number must be Some — if None, match_positions was empty \
+        (RESOLVED Decision 2 violated: positions not collected from ALL intersected trigrams); \
+        result: {:?}",
+        r
+    );
+    assert_eq!(
+        r.line_number.unwrap(),
+        7,
+        "AC10: snippet match line must be 7 (1-based; the token 'qxzplumb_resolver' is \
+        on line 7); got {}. Wrong line means trigram positions are off or the snippet \
+        extractor is computing the wrong match line.",
+        r.line_number.unwrap()
+    );
+
+    // AC10: lib.rs must NOT appear (it does not contain the token).
+    let has_lib = output.results.iter().any(|r| r.path.ends_with("lib.rs"));
+    assert!(
+        !has_lib,
+        "AC10: 'src/lib.rs' does not contain 'qxzplumb_resolver' and must be absent"
+    );
+}
+
+// ============================================================================
+// AC11b — End-to-end pagination: --limit + --offset produce disjoint pages
+//
+// RESOLVED Decision 3: offset applied AFTER verification on the pure-lexical
+// CLI path.  execute_query_with_manifest must honor offset end-to-end.
+// PF-007: disjoint-page assertion fails if offset is applied pre-verify (pages
+// can overlap when stale/incidental-overlap candidates are dropped).
+// ============================================================================
+
+/// AC11b — end-to-end pagination via execute_query: --limit 1 --offset 0 and
+/// --limit 1 --offset 1 must return disjoint, non-empty, correctly-ordered pages.
+///
+/// PF-007 (discriminating): if offset is applied pre-verify (inside the reader,
+/// before the verify step drops stale/incidental-overlap files), both pages
+/// could return the same file or the second page could be empty when
+/// offset == 1 shifts past all candidates before verification runs.
+/// This test catches both the pre-verify offset bug and the no-offset-wired bug.
+#[test]
+fn test_ac11b_end_to_end_pagination_disjoint_pages() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Two files both containing the token "qxzpag_token" so both survive the verify
+    // gate; with limit=1 each page shows exactly one file.
+    let token = "qxzpag_token";
+    fs::write(
+        src.join("file_a.rs"),
+        format!("pub fn {token}_handler() {{ }}\n"),
+    )
+    .unwrap();
+    // file_b.rs also contains the token — it must appear on page 2.
+    fs::write(src.join("file_b.rs"), format!("pub use crate::{token};\n")).unwrap();
+
+    // Page 0: limit=1, offset=0 (the default).
+    let config_p0 = QueryConfig {
+        text: token.to_string(),
+        limit: 1,
+        offset: None, // offset 0
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let page0 = execute_query(&config_p0, &TEST_ANALYTICS).unwrap();
+
+    // Page 1: same limit, offset=1 (skip the rank-1 result).
+    let config_p1 = QueryConfig {
+        text: token.to_string(),
+        limit: 1,
+        offset: Some(1),
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let page1 = execute_query(&config_p1, &TEST_ANALYTICS).unwrap();
+
+    // Both pages must return exactly 1 result.
+    assert_eq!(
+        page0.results.len(),
+        1,
+        "AC11b: page 0 (limit=1, offset=0) must return exactly 1 result; got {}",
+        page0.results.len()
+    );
+    assert_eq!(
+        page1.results.len(),
+        1,
+        "AC11b: page 1 (limit=1, offset=1) must return exactly 1 result; got {}. \
+        If offset is not wired (always None), page 1 returns the same result as page 0 \
+        or is empty (neither is correct).",
+        page1.results.len()
+    );
+
+    // Pages must be disjoint: the result on page 1 must differ from page 0.
+    let path0 = &page0.results[0].path;
+    let path1 = &page1.results[0].path;
+    assert_ne!(
+        path0, path1,
+        "AC11b: page 0 and page 1 must be disjoint (different files); both returned \
+        {:?}. This means offset is not being applied (pre-verify or not at all).",
+        path0
+    );
+}
+
+// ============================================================================
+// AC12 — End-to-end recall: execute_query_with_manifest on exact-symbol path
+//
+// RESOLVED Decision 3 / AD-372-3: the caller must NOT apply LEXICAL_CANDIDATE_POOL_K
+// for single-token queries (sq.limit = None) so the full intersection reaches the
+// verify step.  This integration test proves the definer appears in the final
+// QueryOutput.results even when it is the only match across a multi-file corpus.
+// ============================================================================
+
+/// AC12 — end-to-end recall via execute_query_with_manifest: a single-token query
+/// over a corpus with a large definer file must return the definer in the output.
+///
+/// PF-007 (discriminating): if sq.limit were set to LEXICAL_CANDIDATE_POOL_K × N
+/// and the definer is at rank > pool_limit, it would be truncated before the verify
+/// step and the assertion below would fail.  The exact-symbol path's sq.limit=None
+/// guarantees the full intersection reaches verification.
+#[test]
+fn test_ac12_e2e_caller_recall_single_token_finds_definer() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Definer: file_0.rs defines the unique single-token symbol "qxzcalimba_def".
+    let token = "qxzcalimba_def";
+    fs::write(
+        src.join("file_0.rs"),
+        format!("/// The authoritative definer.\npub fn {token}(n: u32) -> u32 {{ n }}\n"),
+    )
+    .unwrap();
+    // Noise files: do NOT contain the token so only file_0.rs survives the verify gate.
+    for i in 1..=5u32 {
+        fs::write(
+            src.join(format!("noise_{i}.rs")),
+            format!("pub fn helper_{i}(x: u32) -> u32 {{ x + {i} }}\n"),
+        )
+        .unwrap();
+    }
+
+    let config = make_config(&root, &cache_dir, token);
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // AC12: the definer must appear in results.
+    let has_definer = output.results.iter().any(|r| r.path.ends_with("file_0.rs"));
+    assert!(
+        has_definer,
+        "AC12: definer 'src/file_0.rs' must appear in e2e results for token {:?}; \
+        got: {:?}. If missing, sq.limit was applied BEFORE verification (pool cap cut it out).",
+        token,
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    // AC12 (negative): noise files must NOT appear (they don't contain the token).
+    for i in 1..=5u32 {
+        let noise_path = format!("src/noise_{i}.rs");
+        let has_noise = output.results.iter().any(|r| r.path == noise_path);
+        assert!(
+            !has_noise,
+            "AC12: noise file '{}' does not contain '{}' and must NOT appear in results",
+            noise_path, token
+        );
+    }
+}
+
+// ============================================================================
+// AC13 — K-pool branching: multi-word uses LEXICAL_CANDIDATE_POOL_K; single-token
+// bypasses it (sq.limit = None on exact path).
+//
+// PF-007: a falsifiable test at the caller level verifying the branch.
+// ============================================================================
+
+/// AC13 — the execute_query caller must NOT apply LEXICAL_CANDIDATE_POOL_K for
+/// single-token queries and MUST apply it for multi-word queries.
+///
+/// PF-007 (discriminating, two-sided):
+/// (a) Single-token: with limit=1, a corpus where BOTH files contain the token
+///     must still find the second-ranked file when offset=1 — possible only if
+///     sq.limit=None (the full intersection reaches the verify step).
+/// (b) Multi-word: with limit=1, the K-pool widening (5×) must surface a file
+///     that would be missed if only `limit` (=1) candidates were fetched.
+///
+/// The test uses disjoint unique prefixes so n-gram overlap cannot contaminate
+/// the single-token path into the multi-word branch.
+#[test]
+fn test_ac13_single_token_bypasses_k_pool_multi_word_uses_it() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Two files both contain single token "qxzac13_sym".
+    // file_a.rs has MORE occurrences so it ranks #1; file_b.rs ranks #2.
+    let token = "qxzac13_sym";
+    fs::write(
+        src.join("file_a.rs"),
+        format!(
+            "// many occurrences\n\
+             pub fn {token}_a() {{ }}\n\
+             pub fn {token}_b() {{ }}\n\
+             pub fn {token}_c() {{ }}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        src.join("file_b.rs"),
+        format!("// single occurrence\npub fn {token}_entry() {{ }}\n"),
+    )
+    .unwrap();
+
+    // AC13(a): single-token path — with limit=1, offset=0 → rank-1 file.
+    //          with limit=1, offset=1 → rank-2 file.
+    // Both pages must be non-empty, proving sq.limit=None (not capped to 1).
+    let p0 = execute_query(
+        &QueryConfig {
+            text: token.to_string(),
+            limit: 1,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .unwrap();
+    let p1 = execute_query(
+        &QueryConfig {
+            text: token.to_string(),
+            limit: 1,
+            offset: Some(1),
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .unwrap();
+
+    // AC13(a): both pages must be non-empty and disjoint.
+    assert_eq!(
+        p0.results.len(),
+        1,
+        "AC13(a): page 0 (single-token, limit=1, offset=0) must return 1 result; got {}",
+        p0.results.len()
+    );
+    assert_eq!(
+        p1.results.len(),
+        1,
+        "AC13(a): page 1 (single-token, limit=1, offset=1) must return 1 result; \
+        got {} — if 0, sq.limit was capped to 1 (K-pool applied on single-token path, wrong).",
+        p1.results.len()
+    );
+    assert_ne!(
+        p0.results[0].path, p1.results[0].path,
+        "AC13(a): pages must be disjoint; both returned {:?}",
+        p0.results[0].path
+    );
+
+    // AC13(b): multi-word path — discriminating check that LEXICAL_CANDIDATE_POOL_K
+    // widening is applied.
+    //
+    // With limit=1, the BM25F UNION pool is max(1*5, 100)=100, so file_b.rs is in
+    // the pre-verify pool even though it would rank #2 in lexical relevance (file_a.rs
+    // has more occurrences of the single token).  The two-word query "qxzac13_sym entry"
+    // only matches file_b.rs (file_b contains "qxzac13_sym_entry" which passes the
+    // substring verify for both tokens; file_a.rs lacks "entry").
+    //
+    // Discrimination: without K-pool widening (pool = limit = 1), the query would
+    // fetch only 1 candidate; if that candidate is file_a.rs (which fails the "entry"
+    // verify), the result would be empty.  With K-pool, pool=100 includes file_b.rs,
+    // so the result is non-empty.  We assert non-empty (not just contains file_b) to
+    // avoid dependence on BM25F's exact rank-1 assignment for file_a.rs.
+    let multi = execute_query(
+        &QueryConfig {
+            text: format!("{token} entry"),
+            limit: 1,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        },
+        &TEST_ANALYTICS,
+    )
+    .unwrap();
+
+    // file_b.rs contains both "qxzac13_sym" and "entry" as literal substrings
+    // (in "qxzac13_sym_entry"); file_a.rs does NOT contain "entry".
+    // The result must be non-empty — without K-pool widening this would fail
+    // if file_a.rs is the only candidate fetched (fails "entry" verify → 0 results).
+    assert!(
+        !multi.results.is_empty(),
+        "AC13(b): multi-word query '{} entry' with limit=1 must return >= 1 result via K-pool; \
+        got 0 — suggests K-pool widening is not applied on the multi-word path. \
+        Results: {:?}",
+        token,
+        multi.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let has_file_b = multi.results.iter().any(|r| r.path.ends_with("file_b.rs"));
+    assert!(
+        has_file_b,
+        "AC13(b): multi-word query '{} entry' must surface file_b.rs (contains both tokens); \
+        got: {:?}",
+        token,
+        multi.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+}
+
+// ============================================================================
+// AC15a — Measured SLA: short_query_fallback with N=5,000 files stays < 2,000 ms
+//
+// RESOLVED Decision 4: the de-truncation of short_query_fallback (AD-372-4)
+// removed the internal .take(limit) so all indexed files are returned to the
+// caller for verification.  This is O(file_count) fan-out.  The SLA test is
+// the load-bearing reliability guarantee (reliability.md: every loop has a
+// fixed upper bound) that licenses the de-truncation.
+//
+// PF-007 (discriminating): without this timed bound the de-truncation has no
+// measured safety net; a pathological corpus could silently make short queries
+// unbounded.  This test fails if the wall-clock cost exceeds 2,000 ms.
+// ============================================================================
+
+/// AC15a — short_query_fallback recall guard: every file containing "fn" in a
+/// 5,000-file corpus must appear in the result, including files with high
+/// sequential IDs (above the old CANDIDATE_POOL_FLOOR of 100).
+///
+/// Runs unconditionally in both debug and release builds so the de-truncation
+/// contract (AD-372-4) is always guarded.  The companion SLA test below
+/// (`test_ac15a_sla`) is release-only (wall-clock assertions need release timings).
+///
+/// PF-007 (discriminating): if the old `.take(limit)` pre-truncation is
+/// re-added to `short_query_fallback`, files with sorted file_id >= limit will
+/// disappear from the result set and `output.results.len() < min_expected` will
+/// fire, catching the regression in every `cargo test` run, not just release.
+#[test]
+fn test_ac15a_short_query_fallback_5000_files_recall() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // Build N=5_000 minimal Rust files each containing "fn".
+    const N: usize = 5_000;
+    for i in 0..N {
+        fs::write(
+            src.join(format!("f{i:04}.rs")),
+            format!("pub fn proc_{i}(x: u32) -> u32 {{ x }}\n"),
+        )
+        .unwrap();
+    }
+
+    // Cold-start: build the index.
+    {
+        let build_config = QueryConfig {
+            text: "proc_0000".to_string(),
+            limit: 20,
+            offset: None,
+            json: false,
+            root: root.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+            blast_radius_paths: None,
+            ast_scored: None,
+            composite_weights: None,
+            phrase: false,
+            near: None,
+            lang: None,
+        };
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
+    }
+
+    // "fn" is 2 bytes → short_query_fallback path (AD-355-7).
+    // Limit is set high to ensure all 5,000 results can be returned.
+    let query_config = QueryConfig {
+        text: "fn".to_string(),
+        limit: N + 100,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
+
+    // AC15a (recall): all N files contain "fn", so verify returns all of them.
+    // At minimum 90% must be present — confirms no internal pre-truncation.
+    let min_expected = N * 9 / 10;
+    assert!(
+        output.results.len() >= min_expected,
+        "AC15a: short_query_fallback must return >= {min_expected} (90% of {N}) results for 'fn'; \
+        got {} — old .take(limit) pre-truncation re-introduced (AD-372-4 violated).",
+        output.results.len()
+    );
+
+    // AC15a: a specific known high-id file (f4999.rs) must appear, confirming
+    // files beyond the old CANDIDATE_POOL_FLOOR=100 are not silently dropped.
+    let has_high_id_file = output.results.iter().any(|r| r.path.contains("f4999.rs"));
+    assert!(
+        has_high_id_file,
+        "AC15a: f4999.rs must appear in results; \
+        suggests old CANDIDATE_POOL_FLOOR truncation still active (AD-372-4 violated)"
+    );
+}
+
+/// AC15a — short_query_fallback SLA: N=5,000 indexed files, "fn" query must
+/// complete in under 2,000 ms wall-clock (release profile).
+///
+/// Gated `#[cfg(not(debug_assertions))]` because:
+/// - Debug builds are ~4–10× slower; the 2,000 ms SLA is calibrated for release.
+/// - The recall contract (de-truncation correctness) is guarded by the
+///   unconditional `test_ac15a_short_query_fallback_5000_files_recall` above.
+///
+/// PF-007 (discriminating): without this timed bound the de-truncated O(file_count)
+/// fan-out has no measured safety net; a pathological corpus could silently make
+/// short queries unbounded.
+#[test]
+#[cfg(not(debug_assertions))]
+fn test_ac15a_short_query_fallback_5000_files_sla() {
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    const N: usize = 5_000;
+    for i in 0..N {
+        fs::write(
+            src.join(format!("f{i:04}.rs")),
+            format!("pub fn proc_{i}(x: u32) -> u32 {{ x }}\n"),
+        )
+        .unwrap();
+    }
+
+    // Cold-start: build the index.
+    {
+        let _ = execute_query(
+            &QueryConfig {
+                text: "proc_0000".to_string(),
+                limit: 20,
+                offset: None,
+                json: false,
+                root: root.to_path_buf(),
+                cache_dir: cache_dir.to_path_buf(),
+                blast_radius_paths: None,
+                ast_scored: None,
+                composite_weights: None,
+                phrase: false,
+                near: None,
+                lang: None,
+            },
+            &TEST_ANALYTICS,
+        )
+        .unwrap();
+    }
+
+    let query_config = QueryConfig {
+        text: "fn".to_string(),
+        limit: N + 100,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let t_start = Instant::now();
+    let output = execute_query(&query_config, &TEST_ANALYTICS).unwrap();
+    let elapsed_ms = t_start.elapsed().as_millis();
+
+    eprintln!(
+        "AC15a SLA: short_query_fallback N={N} files, 'fn' query: {elapsed_ms}ms, \
+        results={}, SLA=2000ms",
+        output.results.len()
+    );
+
+    // AC15a (SLA): the verified fan-out must stay under 2,000 ms wall-clock.
+    assert!(
+        elapsed_ms < 2_000,
+        "AC15a: short_query_fallback for {N} files took {elapsed_ms}ms, exceeding the \
+        RESOLVED Decision 4 SLA of 2,000ms. The O(file_count) verify fan-out is \
+        unbounded — profile short_query_fallback or the verify step."
+    );
+}
+
+// ============================================================================
+// #377 — inert-`--weights` notice decision matrix + help-text + wording
+// ============================================================================
+//
+// These tests cover the pure decision seam `weights_inert_notice` (the single
+// source of truth shared by execute_query_with_manifest and the two standalone
+// dispatch arms in mod.rs) and the wording correctness fix from the blocking
+// review. All assertions are falsifiable (PF-007): each fails if the #377
+// behavior is reverted.
+
+/// Helper: build VALID weights from an "l,a,t" string (panics on parse error,
+/// which is a test-author bug, not production input).
+fn weights(s: &str) -> rskim_search::CompositeWeights6 {
+    rskim_search::CompositeWeights6::parse_weights_flag(s).unwrap()
+}
+
+/// AC2 (NEGATIVE): no `--weights` supplied (`None`) is silent on every path shape.
+#[test]
+fn ac2_weights_inert_notice_none_is_silent_on_all_paths() {
+    use super::weights_inert_notice as notice;
+    // (has_text, has_ast, has_blast) — exhaustive 2^3 shapes, all with None.
+    for &(t, a, b) in &[
+        (true, true, true),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+        (false, true, true),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
+    ] {
+        assert!(
+            notice(None, t, a, b).is_none(),
+            "AC2: None weights must never emit a notice (t={t}, a={a}, b={b})"
+        );
+    }
+}
+
+/// AC7 (POSITIVE): VALID `--weights` on the pure-lexical path is wholly inert →
+/// the FULLY-inert notice fires.
+#[test]
+fn ac7_weights_inert_notice_pure_lexical_fires_fully_inert() {
+    use super::weights_inert_notice as notice;
+    let n = notice(Some(weights("0.8,0.1,0.1")), true, false, false);
+    assert_eq!(
+        n,
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "AC7: --weights on pure-lexical (text, no --ast, no --blast) must emit the fully-inert notice"
+    );
+}
+
+/// AC8 (POSITIVE): VALID `--weights` on the standalone --ast path (no text) is
+/// wholly inert → the SAME fully-inert notice fires (single shared constant, PF-008).
+#[test]
+fn ac8_weights_inert_notice_standalone_ast_fires_same_constant() {
+    use super::weights_inert_notice as notice;
+    let lexical = notice(Some(weights("0.8,0.1,0.1")), true, false, false);
+    let standalone_ast = notice(Some(weights("0.8,0.1,0.1")), false, true, false);
+    assert_eq!(
+        standalone_ast,
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "AC8: --weights on standalone --ast (no text) must emit the fully-inert notice"
+    );
+    assert_eq!(
+        standalone_ast, lexical,
+        "AC8: standalone --ast and pure-lexical must emit the IDENTICAL notice constant (PF-008)"
+    );
+}
+
+/// Blocking-review fix #1 coverage: the temporal-only and blast-only standalone
+/// shapes (no text, no --ast) are wholly inert and emit the SAME fully-inert
+/// notice as pure-lexical / standalone-AST. This is the decision-seam half of the
+/// mod.rs dispatch-arm fix (the CLI half is asserted in mod.rs subprocess tests).
+#[test]
+fn weights_inert_notice_temporal_and_blast_only_fire_fully_inert() {
+    use super::weights_inert_notice as notice;
+    // temporal-only: --hot/--cold/--risky with no text, no --ast, no --blast.
+    assert_eq!(
+        notice(Some(weights("0.5,0.3,0.2")), false, false, false),
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "temporal-only standalone (--hot --weights) must emit the fully-inert notice (#377 fix #1)"
+    );
+    // blast-radius-only: --blast-radius FILE with no text and no --ast.
+    assert_eq!(
+        notice(Some(weights("0.5,0.3,0.2")), false, false, true),
+        Some(super::WEIGHTS_FULLY_INERT_NOTICE),
+        "blast-only standalone (--blast-radius --weights, no text/--ast) must emit the \
+         fully-inert notice (#377 fix #1)"
+    );
+}
+
+/// AC3 / AC4a (POSITIVE): on a compound text+--ast path the temporal weight is
+/// inert, so a NON-ZERO temporal weight fires the TEMPORAL-scoped notice — but a
+/// zero temporal weight does not (no temporal contribution was requested).
+#[test]
+fn ac3_ac4a_weights_inert_notice_compound_temporal_predicate() {
+    use super::weights_inert_notice as notice;
+    // temporal != 0.0 → temporal-scoped notice (AC3 uses 0.5,0.3,9.9; AC4a uses 0,0,0.9).
+    assert_eq!(
+        notice(Some(weights("0.5,0.3,9.9")), true, true, false),
+        Some(super::WEIGHTS_TEMPORAL_INERT_NOTICE),
+        "AC3: non-zero temporal on text+--ast must emit the temporal-inert notice"
+    );
+    assert_eq!(
+        notice(Some(weights("0.0,0.0,0.9")), true, true, false),
+        Some(super::WEIGHTS_TEMPORAL_INERT_NOTICE),
+        "AC4a: 0,0,0.9 on text+--ast must emit the temporal-inert notice"
+    );
+    // temporal == 0.0 → silent (AC1/AC4 weightings carry temporal 0.0).
+    assert!(
+        notice(Some(weights("0.9,0.1,0.0")), true, true, false).is_none(),
+        "AC1/AC4: zero temporal on text+--ast requests no temporal signal → no notice"
+    );
+    assert!(
+        notice(Some(weights("0.1,0.9,0.0")), true, true, false).is_none(),
+        "AC1/AC4: zero temporal on text+--ast requests no temporal signal → no notice"
+    );
+    // Same rule with --blast-radius ALSO present (text+--ast+--blast triple).
+    assert_eq!(
+        notice(Some(weights("0.0,0.0,0.9")), true, true, true),
+        Some(super::WEIGHTS_TEMPORAL_INERT_NOTICE),
+        "AC4a: 0,0,0.9 on text+--ast+--blast must still emit the temporal-inert notice"
+    );
+}
+
+/// AC4a counterpart (POSITIVE): the blast-radius composite path (text, no --ast)
+/// honors ALL THREE weights → never inert, never a notice.
+#[test]
+fn weights_inert_notice_blast_without_ast_is_silent() {
+    use super::weights_inert_notice as notice;
+    for s in ["0.9,0.1,0.0", "0.1,0.9,0.0", "0.0,0.0,0.9", "0.5,0.3,0.2"] {
+        assert!(
+            notice(Some(weights(s)), true, false, true).is_none(),
+            "blast-radius composite (text, no --ast) honors all 3 weights → no notice (weights={s})"
+        );
+    }
+}
+
+/// Blocking-review fix #2 (wording correctness): the two notices MUST be distinct,
+/// and the compound (temporal-scoped) notice MUST NOT claim the whole flag "had no
+/// effect on this query" — that wording is factually wrong on the text+--ast path
+/// where lexical+ast weights DID tune ranking. The fully-inert notice (pure-lexical
+/// etc.) MAY say so because there it is true.
+#[test]
+fn weights_notices_are_distinct_and_compound_wording_is_accurate() {
+    assert_ne!(
+        super::WEIGHTS_FULLY_INERT_NOTICE,
+        super::WEIGHTS_TEMPORAL_INERT_NOTICE,
+        "the fully-inert and temporal-inert notices must be distinct strings (review fix #2)"
+    );
+    // The compound notice must scope the inert claim to the temporal component.
+    assert!(
+        super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("temporal"),
+        "the compound notice must name the temporal component as the inert one"
+    );
+    // It must NOT use the unconditional 'had no effect on this query' wording.
+    assert!(
+        !super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("had no effect on this query"),
+        "the compound notice must NOT claim the whole --weights flag had no effect (review fix #2): \
+         lexical+ast weights DID tune ranking on the text+--ast path"
+    );
+    // It must affirm that lexical+ast WERE applied (the accurate part).
+    assert!(
+        super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("lexical")
+            && super::WEIGHTS_TEMPORAL_INERT_NOTICE.contains("ast"),
+        "the compound notice must state lexical+ast weights were applied"
+    );
+}
+
+// ---- AC10: help text reflects BOTH composite paths + temporal-inert rule ----
+
+/// AC10 (Documentation, NEGATIVE): `print_help` body (SEARCH_HELP_TEXT) must NOT
+/// claim weights are blast-radius-only, MUST reference the text+--ast path, and
+/// MUST state the temporal weight is inert whenever --ast is present (PF-008).
+#[test]
+fn ac10_help_text_reflects_both_composite_paths_and_temporal_inert() {
+    let help = crate::cmd::search::SEARCH_HELP_TEXT;
+
+    assert!(
+        !help.contains("Only active on the --blast-radius composite ranking path"),
+        "AC10: obsolete blast-radius-only wording must be gone from --weights help"
+    );
+    assert!(
+        help.contains("--blast-radius"),
+        "AC10: --weights help must still mention the --blast-radius composite path"
+    );
+    assert!(
+        help.contains("--ast"),
+        "AC10: --weights help must reference the text+--ast composite path"
+    );
+    // Temporal-inert-whenever-`--ast`-present, stated explicitly.
+    assert!(
+        help.contains("temporal weight is INERT whenever --ast"),
+        "AC10: --weights help must explicitly state the temporal weight is inert whenever --ast \
+         is present"
+    );
+    // AC-404-16: --offset must appear in the help text (pagination on all arms).
+    assert!(
+        help.contains("--offset"),
+        "AC-404-16: --offset must appear in the skim search help text (pagination flag)"
+    );
+}
+
+// ============================================================================
+// AD-396 anchor-trust: E2E ground-truth tests (ADR-007 / AC1 / AC2 / AC6 /
+// AC7 / AC19)
+// ============================================================================
+
+/// Create a controlled "decoy + true-match" project for anchor tests.
+///
+/// - `auth.rs`: line 1 = comment with "authentic" (decoy — shares trigrams with
+///   "authentic_fn" but is NOT the full token); line 2 = true match.
+/// - `lib.rs`: unrelated content (controls recall baseline).
+fn create_anchor_trust_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+    // auth.rs: decoy on line 1, true token on line 2.
+    // The "// authentic prefix" comment shares the "auth" / "authent" trigrams
+    // with "authentic_fn" — the pre-#396 bug would anchor on line 1 when the
+    // trigram reader returned a position inside the comment.
+    fs::write(
+        src.join("auth.rs"),
+        "// authentic prefix comment\npub fn authentic_fn(s: &str) -> bool { !s.is_empty() }\n",
+    )
+    .unwrap();
+
+    // multi.rs: for multi-token queries (AC16/AC17).
+    // Tier 1 line: line 3 has BOTH "alfa_token" and "beta_token".
+    fs::write(
+        src.join("multi.rs"),
+        "// alfa_token comment\n// beta_token comment\nfn alfa_token_beta_token() {}\n",
+    )
+    .unwrap();
+
+    // lib.rs: no "authentic_fn", no "alfa_token"/"beta_token".
+    fs::write(src.join("lib.rs"), "pub mod auth;\npub mod multi;\n").unwrap();
+}
+
+/// Build config for anchor-trust tests.
+fn make_anchor_config(
+    root: &std::path::Path,
+    cache_dir: &std::path::Path,
+    text: &str,
+) -> QueryConfig {
+    QueryConfig {
+        text: text.to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    }
+}
+
+/// AC1 / AC2 / AC19 — ADR-007 anchor-trust ground truth: every result's
+/// `line_number` must reference a line containing the query token.
+///
+/// PF-007: the discriminating observable is that the file's actual line N
+/// contains the token — not just that line_number is Some or exit-0.
+///
+/// The corpus has a "decoy" comment line (shared trigrams) above the true
+/// match line.  Pre-#396 the anchor landed on the comment; post-#396 it
+/// must land on the true match line.
+#[test]
+fn test_anchor_line_contains_query_token_ac1_ac2_ac19() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Must find at least one result.
+    assert!(
+        !output.results.is_empty(),
+        "AC1: 'authentic_fn' must be found in the corpus"
+    );
+
+    // ADR-007 / AC19: for every result with Some(line_number), the file's
+    // actual line must contain the query token.
+    for r in &output.results {
+        if let Some(ln) = r.line_number {
+            let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+            let anchor_line_text = file_content
+                .lines()
+                .nth((ln as usize).saturating_sub(1))
+                .unwrap_or("");
+            assert!(
+                anchor_line_text.contains("authentic_fn"),
+                "AC1/AC19: result path={} line_number={ln} must contain 'authentic_fn'; \
+                 got line text: {anchor_line_text:?}",
+                r.path
+            );
+        }
+    }
+}
+
+/// AC6 / AC5 — JSON contract: `line_range` must be the single anchor line
+/// `{{n, n+1}}` and must agree with `line_number`.
+///
+/// PF-007: the discriminating observable is the exact `line_range.end` value.
+/// With pre-#396 multi-trigram positions, line_range spanned from the first
+/// to the last trigram position (could be a wide span); post-#396 it is the
+/// single anchor line {{n, n+1}}.
+///
+/// Precondition (PF-007): assert results are non-empty before entering the
+/// per-result loop — an empty result set would make every iteration vacuous
+/// and let a broken index or verify gate silently pass the test.
+#[test]
+fn test_anchor_line_range_is_single_line_ac6() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 precondition: an empty result set makes the loop body vacuous.
+    // auth.rs contains "authentic_fn" on line 2; if results are empty the
+    // index or verify gate is broken and the AC6 contract goes untested.
+    assert!(
+        !output.results.is_empty(),
+        "AC6 precondition: query 'authentic_fn' must produce ≥1 result; \
+         corpus has auth.rs with the literal on line 2 — empty result set \
+         means the verify gate or index is broken. Got 0 results."
+    );
+
+    for r in &output.results {
+        if let (Some(ln), Some(lr)) = (r.line_number, r.line_range.clone()) {
+            assert_eq!(
+                lr,
+                (ln as usize)..(ln as usize + 1),
+                "AC6: line_range must be single anchor line {{n, n+1}} for line_number={ln}; \
+                 got line_range={lr:?}"
+            );
+        }
+    }
+}
+
+/// AC7 — Recall and ranking unchanged: the fix must NOT drop any file that
+/// was returned before (the anchor change affects line_number/snippet only,
+/// not which files are returned).
+///
+/// PF-007: the discriminating observable is the COMPLETE ordered path set and
+/// total count, not merely the presence of auth.rs. The corpus contains three
+/// files (auth.rs, lib.rs, multi.rs); only auth.rs contains "authentic_fn".
+/// A regression that reorders results, changes count, or adds spurious files
+/// would not be caught by a presence-only assertion.
+#[test]
+fn test_anchor_fix_does_not_drop_results_ac7() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    let config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+
+    // AC7 / PF-007: assert the COMPLETE path set and count.
+    // Corpus: auth.rs (contains "authentic_fn"), lib.rs ("pub mod auth/multi"),
+    // multi.rs ("alfa_token_beta_token"). Only auth.rs contains the literal.
+    // Any regression that drops auth.rs, adds a spurious file, or changes
+    // the count will fail this assertion.
+    assert_eq!(
+        paths,
+        vec!["src/auth.rs"],
+        "AC7: result set must be exactly ['src/auth.rs'] (count=1); \
+         lib.rs and multi.rs do NOT contain 'authentic_fn' and must not appear. \
+         A drop, spurious addition, or reorder regression will fail here. \
+         Got: {paths:?}"
+    );
+}
+
+/// AC16 — Multi-token Tier 1: earliest line containing ALL tokens wins.
+///
+/// PF-007: the discriminating observable is line_number == 3 (the "alfa_token
+/// and beta_token" line), not line 1 (alfa_token-only) or line 2 (beta_token-only).
+#[test]
+fn test_multi_token_tier1_earliest_all_tokens_line_ac16() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    // "alfa_token beta_token" — multi.rs has them on separate lines (1, 2) and
+    // on the same line at line 3 (in the function name "alfa_token_beta_token").
+    // Note: "alfa_token_beta_token" contains "alfa_token" (substr) and
+    // "beta_token" (substr) on the same line → Tier 1 fires.
+    let config = make_anchor_config(&root, &cache_dir, "alfa_token beta_token");
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // PF-007 (non-vacuous): assert multi.rs IS in results before checking anchor.
+    // multi.rs contains "alfa_token" and "beta_token" (as separate lines 1–2 and
+    // combined in "alfa_token_beta_token" on line 3); it must survive the verify gate.
+    // A regression that drops multi.rs or nulls its anchor passes vacuously under the
+    // old `if let` guard — the unconditional assert below prevents that.
+    let multi_result = output.results.iter().find(|r| r.path.contains("multi.rs"));
+    assert!(
+        multi_result.is_some(),
+        "AC16 (PF-007): multi.rs must be in results for query 'alfa_token beta_token'; \
+         it contains both tokens and must survive the verify gate. \
+         Got results: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let r = multi_result.unwrap();
+
+    // AC16 / AD-396-2 Tier 1: the EARLIEST line containing ALL tokens is line 3.
+    // Line 1 = "// alfa_token comment" (alfa_token only).
+    // Line 2 = "// beta_token comment" (beta_token only).
+    // Line 3 = "fn alfa_token_beta_token() {}" — contains BOTH as substrings.
+    // Tier 1 fires on line 3 (first line satisfying the AND condition).
+    assert_eq!(
+        r.line_number,
+        Some(3),
+        "AC16/Tier-1 (PF-007): line_number must be 3 ('fn alfa_token_beta_token()' — \
+         earliest line with BOTH tokens); got {:?}. \
+         Line 1 has only 'alfa_token'; line 2 has only 'beta_token'.",
+        r.line_number
+    );
+
+    // ADR-007 ground truth: read the actual anchor line and confirm ≥1 token.
+    let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+    let anchor_line = file_content
+        .lines()
+        .nth(2) // line 3 is 0-indexed as 2
+        .unwrap_or("");
+    assert!(
+        anchor_line.contains("alfa_token") || anchor_line.contains("beta_token"),
+        "AC16/ADR-007: anchor line 3 must contain ≥1 query token; got: {anchor_line:?}"
+    );
+}
+
+/// Compound `--ast <pattern> <text>` path — TEXT anchor trust (ADR-007 / Cross-Plan Amendment).
+///
+/// When `ast_scored` is `Some` (the compound text+AST path), the TEXT anchor
+/// must point to a line that CONTAINS the query token, not to the decoy line
+/// above it.  This test was mandated by the Cross-Plan Amendment which pulls
+/// the compound text anchor explicitly in-scope for #396.
+///
+/// PF-007: the discriminating observable is `line_number == 2` (true match),
+/// not `1` (decoy).
+///
+/// Corpus (from `create_anchor_trust_project`):
+/// - auth.rs line 1 = "// authentic prefix comment"  (decoy — shares trigrams)
+/// - auth.rs line 2 = "pub fn authentic_fn(s: &str) -> bool { !s.is_empty() }"
+///
+/// auth.rs is sorted first among {auth.rs, lib.rs, multi.rs} → FileId(0).
+/// Giving it a non-zero AST score puts it through the compound
+/// intersect+RRF path, which must still re-anchor via
+/// `substring_first_anchor` to line 2.
+#[test]
+fn test_compound_ast_path_text_anchor_trust_adr007() {
+    use rskim_search::FileId;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_anchor_trust_project(&root);
+
+    // Cold-start: build the index with a pure-lexical query first so FileIds
+    // are assigned deterministically (auth.rs=0, lib.rs=1, multi.rs=2).
+    {
+        let build_config = make_anchor_config(&root, &cache_dir, "authentic_fn");
+        let _ = execute_query(&build_config, &TEST_ANALYTICS).unwrap();
+    }
+
+    // Compound path: auth.rs (FileId 0) receives an AST score of 1.0 so it
+    // enters the intersect_and_rank step alongside the lexical hit.
+    let config = QueryConfig {
+        text: "authentic_fn".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(vec![(FileId(0), 1.0)]),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // auth.rs must be in results (it contains the literal "authentic_fn").
+    let auth_result = output.results.iter().find(|r| r.path.contains("auth.rs"));
+    assert!(
+        auth_result.is_some(),
+        "compound anchor trust (ADR-007): auth.rs must be in results for \
+         query 'authentic_fn' on the compound path; got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+    let r = auth_result.unwrap();
+
+    // ADR-007 / PF-007: anchor must be line 2 (true match), NOT line 1 (decoy).
+    // Pre-#396, the compound path could carry a trigram-position anchor pointing
+    // at the decoy comment; post-#396 it must use substring_first_anchor.
+    assert_eq!(
+        r.line_number,
+        Some(2),
+        "compound anchor trust (ADR-007): line_number must be 2 \
+         ('pub fn authentic_fn(...)'); got {:?}. \
+         Decoy is on line 1 ('// authentic prefix comment'). \
+         A regression in the compound path's re-anchoring would land on line 1.",
+        r.line_number
+    );
+
+    // ADR-007 ground truth: confirm the actual file line contains the token.
+    let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
+    let anchor_line = file_content
+        .lines()
+        .nth(1) // line 2 is 0-indexed as 1
+        .unwrap_or("");
+    assert!(
+        anchor_line.contains("authentic_fn"),
+        "compound anchor trust (ADR-007): anchor line 2 must contain 'authentic_fn'; \
+         got: {anchor_line:?}"
+    );
+}
+
+/// AC4 — `match_positions` field must be absent from JSON output.
+///
+/// PF-007: the discriminating observable is the absent key — if serde(skip) is
+/// accidentally removed, the key would appear and this test would catch it.
+#[test]
+fn test_match_positions_absent_from_json_output_ac4() {
+    use crate::cmd::search::types::{ResolvedResult, SnippetContext, SnippetLine};
+
+    let result = ResolvedResult {
+        path: "src/auth.rs".to_string(),
+        score: 5.0,
+        field: "function_signature".to_string(),
+        line_number: Some(2),
+        line_range: Some(2..3),
+        snippet: Some(SnippetContext {
+            lines: vec![SnippetLine {
+                line_number: 2,
+                content: "pub fn authentic_fn()".to_string(),
+                is_match: true,
+            }],
+        }),
+        stale: false,
+        match_positions: vec![0..5, 10..15], // populated — must NOT appear in JSON
+        temporal: None,
+        layers_matched: vec![],
+    };
+
+    let value = serde_json::to_value(&result).expect("ResolvedResult must serialize");
+
+    // AC4: match_positions must be absent (field is #[serde(skip)]).
+    assert!(
+        value.get("match_positions").is_none(),
+        "AC4: match_positions must be absent from JSON; got: {:?}",
+        value.get("match_positions")
+    );
+
+    // AC4: line_number must be an integer.
+    assert_eq!(
+        value["line_number"], 2,
+        "AC4: line_number must be the integer 2"
+    );
+    // AC6: line_range must be {{start:2, end:3}}.
+    assert_eq!(
+        value["line_range"]["start"], 2,
+        "AC6: line_range.start must be 2"
+    );
+    assert_eq!(
+        value["line_range"]["end"], 3,
+        "AC6: line_range.end must be 3 (single-anchor-line)"
+    );
+}
+
+// ============================================================================
+// D-5 / AD-404-11: has_more on pure-lexical text path
+// ============================================================================
+
+/// Create a project where N files each contain a unique function that also
+/// uses the shared token "qxz_shared_probe" so that a query for that token
+/// matches all N files.
+fn create_multi_match_project(root: &std::path::Path, n: usize) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    for i in 1..=n {
+        fs::write(
+            src.join(format!("f{i:02}.rs")),
+            format!("/// File {i}.\npub fn qxz_shared_probe_{i}() -> u32 {{ {i} }}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// D-5 / AD-404-11: `has_more` must be `true` on the pure-lexical text path
+/// when verified results exceed the page (limit < total matches).
+///
+/// Pre-fix: `has_more` was hardcoded `false` at all `QueryOutput` construction
+/// sites in `query.rs`, so callers could not distinguish "last page" from "more
+/// pages exist" on the text-query surface (D-5 contract unfulfilled).
+///
+/// Post-fix: `resolve_paths_and_snippets_verified` uses "probe one more" to
+/// set `has_more = true` when verified results > limit + offset.
+#[test]
+fn test_has_more_true_on_pure_lexical_text_path_when_limit_less_than_total() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // 3 files each containing "qxz_shared_probe"; limit=1 → has_more must be true.
+    create_multi_match_project(&root, 3);
+
+    let config = QueryConfig {
+        text: "qxz_shared_probe".to_string(),
+        limit: 1,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Exactly 1 result returned (limit honored).
+    assert_eq!(
+        output.results.len(),
+        1,
+        "D-5: limit=1 must return exactly 1 result; got {}",
+        output.results.len()
+    );
+
+    // D-5: has_more must be true because 3 files match but only 1 is on this page.
+    assert!(
+        output.has_more,
+        "D-5 (pure-lexical text path): has_more must be true when limit=1 \
+         and multiple files match; got has_more=false. Pre-fix regression — \
+         has_more was hardcoded false at the QueryOutput construction site."
+    );
+}
+
+/// D-5 / AD-404-11: `has_more` must be `false` when all verified results fit
+/// on one page (last-page / single-page invariant).
+///
+/// Paired with `test_has_more_true_on_pure_lexical_text_path_when_limit_less_than_total`
+/// to guard both directions of the D-5 contract.
+#[test]
+fn test_has_more_false_when_all_results_fit_on_page() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // 2 files; limit=100 → all results fit on one page → has_more must be false.
+    create_multi_match_project(&root, 2);
+
+    let config = QueryConfig {
+        text: "qxz_shared_probe".to_string(),
+        limit: 100,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.has_more,
+        "D-5: has_more must be false when all results fit on one page; \
+         got has_more=true with {} results and limit=100",
+        output.results.len()
+    );
+}
+
+// ============================================================================
+// AC-403: positional composition unit tests (#403)
+// ============================================================================
+
+// ── AC-403-T1: verify_mode_for truth table ───────────────────────────────────
+
+/// AC-403 / AD-403-1: verify_mode_for must map all four (phrase, near) cells
+/// to the correct VerifyMode variant (exhaustive tuple match — no combination
+/// should fall through to a default).
+#[test]
+fn ac403_verify_mode_for_truth_table() {
+    // (false, None) → Substring
+    assert!(
+        matches!(verify_mode_for(false, None), VerifyMode::Substring),
+        "AD-403-1: (false, None) must map to Substring"
+    );
+    // (false, Some(5)) → Near(5)
+    assert!(
+        matches!(verify_mode_for(false, Some(5)), VerifyMode::Near(5)),
+        "AD-403-1: (false, Some(5)) must map to Near(5)"
+    );
+    // (true, None) → Phrase
+    assert!(
+        matches!(verify_mode_for(true, None), VerifyMode::Phrase),
+        "AD-403-1: (true, None) must map to Phrase"
+    );
+    // (true, Some(4)) → PhraseNear(4)
+    assert!(
+        matches!(verify_mode_for(true, Some(4)), VerifyMode::PhraseNear(4)),
+        "AD-403-1: (true, Some(4)) must map to PhraseNear(4)"
+    );
+}
+
+// ── AC-403-T2: positional_inert_notice truth table ───────────────────────────
+
+/// AC-403 / AD-403-5: positional_inert_notice truth table.
+///
+/// The notice fires iff at least one positional flag is set AND has_text=false.
+/// When has_text=true the flags are active — no notice. When no positional flag
+/// is set — no notice regardless of has_text.
+#[test]
+fn ac403_positional_inert_notice_truth_table() {
+    // No positional flag → always None.
+    assert_eq!(
+        positional_inert_notice(false, None, false),
+        None,
+        "no flags + no text: must be None"
+    );
+    assert_eq!(
+        positional_inert_notice(false, None, true),
+        None,
+        "no flags + text: must be None"
+    );
+
+    // Flags present + text → None (flags are active).
+    assert_eq!(
+        positional_inert_notice(true, None, true),
+        None,
+        "--phrase + text: must be None (flag is honored)"
+    );
+    assert_eq!(
+        positional_inert_notice(false, Some(5), true),
+        None,
+        "--near 5 + text: must be None (flag is honored)"
+    );
+    assert_eq!(
+        positional_inert_notice(true, Some(3), true),
+        None,
+        "--phrase --near 3 + text: must be None (flags are honored)"
+    );
+
+    // Flags present + no text → Some(notice).
+    let n1 = positional_inert_notice(true, None, false);
+    assert!(n1.is_some(), "--phrase + no text: must be Some(notice)");
+    assert!(
+        n1.as_deref().unwrap_or("").contains("--phrase"),
+        "--phrase notice must name the flag; got {:?}",
+        n1
+    );
+
+    let n2 = positional_inert_notice(false, Some(7), false);
+    assert!(n2.is_some(), "--near 7 + no text: must be Some(notice)");
+    assert!(
+        n2.as_deref().unwrap_or("").contains("--near 7"),
+        "--near 7 notice must name the flag and value; got {:?}",
+        n2
+    );
+
+    let n3 = positional_inert_notice(true, Some(3), false);
+    assert!(
+        n3.is_some(),
+        "--phrase --near 3 + no text: must be Some(notice)"
+    );
+    let n3_text = n3.as_deref().unwrap_or("");
+    assert!(
+        n3_text.contains("--phrase") && n3_text.contains("--near 3"),
+        "--phrase --near 3 notice must name both flags; got {:?}",
+        n3
+    );
+}
+
+// ── AC-403-T3: near_diagnostic_notice truth table ────────────────────────────
+
+/// AC-403 / AD-403-6: near_diagnostic_notice truth table (4 cells × has_text).
+///
+/// Fires on single-word query and N < word_count - 1. Does NOT fire when near
+/// is None, when query is empty, or when N is large enough.
+#[test]
+fn ac403_near_diagnostic_notice_truth_table() {
+    // near=None → always None.
+    assert_eq!(near_diagnostic_notice(None, "alpha beta"), None);
+    assert_eq!(near_diagnostic_notice(None, "alpha"), None);
+
+    // Empty query → None (covered by positional_inert_notice upstream).
+    assert_eq!(near_diagnostic_notice(Some(3), ""), None);
+    assert_eq!(near_diagnostic_notice(Some(3), "   "), None);
+
+    // Single-word query + any N → Some(notice).
+    let single = near_diagnostic_notice(Some(5), "alpha");
+    assert!(
+        single.is_some(),
+        "single-word query + --near 5 must produce notice"
+    );
+    assert!(
+        single.as_deref().unwrap_or("").contains("single-word"),
+        "notice must explain 'single-word'; got {:?}",
+        single
+    );
+
+    // N < word_count - 1 → Some(notice).
+    // 3-word query: word_count=3, N must be >= 2 to be satisfiable.
+    // N=1 < 2 → notice.
+    let n1 = near_diagnostic_notice(Some(1), "alpha beta gamma");
+    assert!(
+        n1.is_some(),
+        "--near 1 on 3-word query must produce notice (unsatisfiable: span >= 2)"
+    );
+
+    // N=2 == word_count-1 → no notice (smallest satisfiable span for 3-word query).
+    assert_eq!(
+        near_diagnostic_notice(Some(2), "alpha beta gamma"),
+        None,
+        "--near 2 on 3-word query is satisfiable (span == word_count - 1): must be None"
+    );
+
+    // N=10 >> word_count-1 → no notice.
+    assert_eq!(
+        near_diagnostic_notice(Some(10), "alpha beta gamma"),
+        None,
+        "--near 10 on 3-word query is satisfiable: must be None"
+    );
+
+    // 2-word query: word_count=2, N must be >= 1; N=0 is rejected by parse,
+    // so any N >= 1 is satisfiable for a 2-word query.
+    assert_eq!(
+        near_diagnostic_notice(Some(1), "alpha beta"),
+        None,
+        "--near 1 on 2-word query is satisfiable: must be None"
+    );
+}
+
+/// Verify that `near_diagnostic_notice` uses the punctuation-aware word tokenizer
+/// (count_query_word_tokens / collect_word_spans) rather than whitespace splitting,
+/// so punctuated code-search queries produce the correct word count.
+///
+/// The two divergence cases are:
+/// - Undercount: `"foo.bar baz"` → whitespace=2, real=3 tokens.
+///   --near 1 is unsatisfiable for 3 real tokens (need span >= 2), so the notice
+///   MUST fire.  With a broken whitespace count (2 tokens, need span >= 1) it
+///   would silently be skipped.
+/// - Overcount / misfire: `"foo::bar"` → whitespace=1, real=2 tokens.
+///   --near 5 is satisfiable for 2 real tokens, so the notice MUST NOT fire.
+///   With a broken whitespace count (1 token) the "single-word" notice would
+///   erroneously fire even though --near is meaningful.
+#[test]
+fn ac403_near_diagnostic_punctuation_tokenizer() {
+    // Undercount divergence: "foo.bar baz" is 3 real tokens (foo, bar, baz).
+    // --near 1 requires span >= 2, so it is unsatisfiable → notice must fire.
+    let undercnt = near_diagnostic_notice(Some(1), "foo.bar baz");
+    assert!(
+        undercnt.is_some(),
+        "--near 1 on 3-real-token query 'foo.bar baz' must produce notice (unsatisfiable)"
+    );
+
+    // Verify the notice says it cannot match (not "single-word").
+    assert!(
+        undercnt.as_deref().unwrap_or("").contains("cannot match"),
+        "notice for 3-token unsatisfiable near must say 'cannot match'; got {:?}",
+        undercnt
+    );
+
+    // Satisfiable threshold: --near 2 == word_count - 1 for 3 tokens → no notice.
+    assert_eq!(
+        near_diagnostic_notice(Some(2), "foo.bar baz"),
+        None,
+        "--near 2 on 3-token 'foo.bar baz' is satisfiable: must be None"
+    );
+
+    // Overcount / misfire divergence: "foo::bar" is 2 real tokens (foo, bar).
+    // --near 5 is satisfiable (5 >= 2-1 = 1) → no notice must fire.
+    assert_eq!(
+        near_diagnostic_notice(Some(5), "foo::bar"),
+        None,
+        "--near 5 on 2-token 'foo::bar' is satisfiable: must not emit single-word notice"
+    );
+
+    // "foo::bar" with --near 0 is blocked by parse, so test --near 1 (satisfiable).
+    assert_eq!(
+        near_diagnostic_notice(Some(1), "foo::bar"),
+        None,
+        "--near 1 on 2-token 'foo::bar' is satisfiable: must be None"
+    );
+
+    // Single punctuation-joined token still fires: "foo_bar" is one token.
+    let single_token = near_diagnostic_notice(Some(3), "foo_bar");
+    assert!(
+        single_token.is_some(),
+        "--near 3 on single-token 'foo_bar' must produce single-word notice"
+    );
+    assert!(
+        single_token
+            .as_deref()
+            .unwrap_or("")
+            .contains("single-word"),
+        "notice for single-token near must say 'single-word'; got {:?}",
+        single_token
+    );
+}
+
+// ── AC-403-T4: SEARCH_HELP_TEXT positional documentation ─────────────────────
+
+/// AC-403-13: SEARCH_HELP_TEXT must contain documentation for --phrase, --near,
+/// --lang, composition rule, and "word token" (the unit of N).
+/// Must also NOT contain em-dashes or en-dashes in new copy (plain ASCII hyphens).
+#[test]
+fn ac403_search_help_text_positional_documentation() {
+    let help = crate::cmd::search::SEARCH_HELP_TEXT;
+
+    // Required vocabulary.
+    assert!(
+        help.contains("--phrase"),
+        "AC-403-13: SEARCH_HELP_TEXT must document --phrase"
+    );
+    assert!(
+        help.contains("--near"),
+        "AC-403-13: SEARCH_HELP_TEXT must document --near"
+    );
+    assert!(
+        help.contains("--lang"),
+        "AC-403-13: SEARCH_HELP_TEXT must document --lang"
+    );
+    assert!(
+        help.contains("word token") || help.contains("word tokens"),
+        "AC-403-13: SEARCH_HELP_TEXT must explain the 'word token' unit for --near N"
+    );
+    assert!(
+        help.contains("case-sensitive") || help.contains("case sensitive"),
+        "AC-403-13: SEARCH_HELP_TEXT must state --phrase matching is case-sensitive"
+    );
+
+    // Composition rule documented.
+    assert!(
+        help.contains("--phrase --near") || help.contains("--phrase and --near"),
+        "AC-403-13: SEARCH_HELP_TEXT must document the --phrase --near N composition"
+    );
+}
+
+// ============================================================================
+// #405 — ast_coverage_notice pure decision seam (AD-405-4 / PF-008 / D-4)
+// ============================================================================
+//
+// `ast_coverage_notice` is the single source of truth for the AST size-coverage
+// notice wording, shared by run_build / run_update / run_ast_standalone /
+// run_query / run_stats. AD-405-4 requires every emitting site to print a string
+// starting with the shared `AST_COVERAGE_PREFIX` prefix, and requires the seam to
+// return `None` on a clean corpus so callers never gate on `is_clean()` themselves.
+// These assertions are falsifiable (PF-007): each fails if the #405 notice contract
+// regresses.
+
+/// NEGATIVE (AC-405-8): a clean corpus (every file within the AST size cap) is
+/// silent — the seam returns `None`, so no site emits a spurious notice and the
+/// "pure-lexical carries no AST caveat" promise holds.
+#[test]
+fn ast_coverage_notice_none_on_clean_corpus() {
+    use super::ast_coverage_notice;
+    use rskim_search::{CoverageEntry, ast_coverage};
+
+    let clean = ast_coverage(std::iter::once(CoverageEntry {
+        path: "src/small.rs",
+        lang: "rust",
+        size: Some(100),
+    }));
+    assert!(
+        clean.is_clean(),
+        "an in-cap file must yield a clean coverage"
+    );
+    assert_eq!(
+        ast_coverage_notice(&clean),
+        None,
+        "clean corpus must produce no coverage notice (AC-405-8)"
+    );
+}
+
+/// POSITIVE (AD-405-4 / PF-008): an excluded file (over the 1 MiB cap) fires the
+/// notice, which MUST start with the shared `AST_COVERAGE_PREFIX` prefix, report
+/// the excluded count, and carry the per-language breakdown.
+#[test]
+fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
+    use super::{AST_COVERAGE_PREFIX, ast_coverage_notice};
+    use rskim_search::{CoverageEntry, ast_coverage};
+
+    let over_cap = rskim_core::AST_SIZE_LIMIT_DEFAULT + 1;
+    let dirty = ast_coverage(std::iter::once(CoverageEntry {
+        path: "src/huge.rs",
+        lang: "rust",
+        size: Some(over_cap),
+    }));
+    assert!(
+        !dirty.is_clean(),
+        "an over-cap file must yield a non-clean coverage"
+    );
+
+    let notice =
+        ast_coverage_notice(&dirty).expect("an excluded file must produce a coverage notice");
+    assert!(
+        notice.starts_with(AST_COVERAGE_PREFIX),
+        "notice must start with the shared prefix (AD-405-4/PF-008): got {notice:?}"
+    );
+    assert!(
+        notice.contains("1 file(s) exceed"),
+        "notice must report the excluded count: got {notice:?}"
+    );
+    assert!(
+        notice.contains("By language: rust 1"),
+        "notice must carry the per-language breakdown: got {notice:?}"
+    );
+}
+
+// ============================================================================
+// AC-409 unit tests — Jaccard-ranked temporal layer (#409)
+// ============================================================================
+
+/// Create a synthetic project for the AC-409 Jaccard-ranking unit tests.
+///
+/// The three files are named so that the seed (`zzanchor.rs`) sorts LAST
+/// byte-wise, ensuring that seed-first ranking can only be produced by
+/// `SEED_STRENGTH`, never by the pre-#409 defect (uniform 1.0 + FileId-ASC sort):
+///   - aweak.rs    (alphabetically first)  → weak J  (J=0.30)
+///   - zstrong.rs  (alphabetically second) → strong J (J=0.80)
+///   - zzanchor.rs (alphabetically last; the blast-radius seed) → SEED_STRENGTH
+///
+/// With the old uniform-1.0 / FileId-sort defect, aweak would rank first
+/// (FileId(0) gets rank 1 when all scores are equal).
+/// After the fix, zzanchor (seed, SEED_STRENGTH=2.0) ranks first, zstrong second,
+/// aweak third.
+fn create_ac409_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Content is irrelevant to the Jaccard-ranking tests — the temporal scores
+    // come from blast_radius_paths, not from file content.
+    fs::write(src.join("aweak.rs"), "// aweak — weak co-change partner\n").unwrap();
+    fs::write(
+        src.join("zstrong.rs"),
+        "// zstrong — strong co-change partner\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zzanchor.rs"),
+        "// zzanchor — blast-radius seed (sorts last)\n",
+    )
+    .unwrap();
+}
+
+/// Build a [`QueryConfig`] with the common defaults used by the AC-409 unit tests.
+///
+/// All optional fields (offset, json, ast_scored, phrase, near, lang) are set to
+/// their zero/false/None defaults.  Pass `composite_weights: None` for the default
+/// RRF weights, or `Some(temporal_only_weights())` for `--weights 0,0,1`.
+fn blast_config(
+    root: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    text: &str,
+    allowed: std::collections::HashMap<String, f64>,
+    composite_weights: Option<rskim_search::compound::CompositeWeights>,
+) -> QueryConfig {
+    QueryConfig {
+        text: text.to_string(),
+        limit: 10,
+        offset: None,
+        json: false,
+        root,
+        cache_dir,
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights,
+        phrase: false,
+        near: None,
+        lang: None,
+    }
+}
+
+/// Return `CompositeWeights` equivalent to `--weights 0,0,1` (temporal only).
+///
+/// Extracted from the three AC-409 tests that use temporal-only weights to avoid
+/// re-typing all six fields at each site.
+fn temporal_only_weights() -> rskim_search::compound::CompositeWeights {
+    rskim_search::compound::CompositeWeights {
+        lexical: 0.0,
+        ast: 0.0,
+        temporal: 1.0,
+        import_graph: 0.0,
+        dir_proximity: 0.0,
+        structural_coupling: 0.0,
+    }
+}
+
+/// AC-1 — `--weights 0,0,1` ranks partners by Jaccard DESC, NOT by byte-wise
+/// path order.
+///
+/// Byte-wise order: aweak < zstrong < zzanchor ('a' < 'z' < 'zz').
+/// The Jaccard order is zzanchor (seed, 2.0) > zstrong (0.80) > aweak (0.30).
+/// After the fix the output order must be [zzanchor, zstrong, aweak]; before the
+/// fix it would be [aweak, zstrong, zzanchor] (alphabetical = FileId-sort defect).
+///
+/// Expected scores (±1e-12):
+///   zzanchor: 1.0/61  (temporal rank 1, weight 1.0)
+///   zstrong:  1.0/62  (temporal rank 2)
+///   aweak:    1.0/63  (temporal rank 3)
+#[test]
+fn test_ac409_temporal_weight_only_ranks_by_jaccard_not_alphabetical() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_ac409_project(&root);
+
+    // blast_radius_paths: zzanchor is the seed (SEED_STRENGTH > 1.0 > any Jaccard).
+    // zstrong has a higher Jaccard than aweak so it must rank before aweak.
+    // Using a gibberish query to suppress lexical contributions completely.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/zzanchor.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/zstrong.rs".to_string(), 0.80);
+    allowed.insert("src/aweak.rs".to_string(), 0.30);
+
+    // --weights 0,0,1: temporal only
+    let config = blast_config(
+        root.clone(),
+        cache_dir.clone(),
+        "xqzjvmblorp_ac409_unique", // gibberish — zero lexical hits
+        allowed,
+        Some(temporal_only_weights()),
+    );
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Three co-change-only partners must appear (no lexical hits, but UNION mode
+    // surfaces them via their temporal scores).
+    assert_eq!(
+        output.results.len(),
+        3,
+        "AC-1: expected 3 results (zzanchor, zstrong, aweak); got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["src/zzanchor.rs", "src/zstrong.rs", "src/aweak.rs"],
+        "AC-1: results must be ordered by Jaccard DESC (zzanchor seed first, zstrong second, \
+         aweak third), NOT by byte-wise path order (aweak < zstrong < zzanchor)"
+    );
+
+    // Score check (±1e-12): temporal-only RRF gives w/(RRF_K + rank).
+    let eps = 1e-12_f64;
+    assert!(
+        (output.results[0].score - 1.0 / (RRF_K + 1.0)).abs() < eps,
+        "AC-1: zzanchor (rank 1) score must be 1/61 (±1e-12); got {}",
+        output.results[0].score
+    );
+    assert!(
+        (output.results[1].score - 1.0 / (RRF_K + 2.0)).abs() < eps,
+        "AC-1: zstrong (rank 2) score must be 1/62 (±1e-12); got {}",
+        output.results[1].score
+    );
+    assert!(
+        (output.results[2].score - 1.0 / (RRF_K + 3.0)).abs() < eps,
+        "AC-1: aweak (rank 3) score must be 1/63 (±1e-12); got {}",
+        output.results[2].score
+    );
+}
+
+/// AC-2 — the blast-radius seed file occupies temporal rank 1 with score
+/// exactly 1.0/61.0 under `--weights 0,0,1`, even though it has the HIGHEST
+/// FileId (sorts last byte-wise).
+///
+/// `zzanchor.rs` sorts after `aweak.rs` and `zstrong.rs` (FileId 2 of 3), so
+/// the pre-#409 defect (uniform 1.0 + sort by FileId-ASC) would place `aweak.rs`
+/// (FileId 0) at rank 1 — asserting `zzanchor.rs` at rank 1 can only be satisfied
+/// by the `SEED_STRENGTH` sentinel (2.0 > any Jaccard) introduced by the fix.
+#[test]
+fn test_ac409_seed_file_ranks_first_in_temporal_layer() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_ac409_project(&root);
+
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/zzanchor.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/zstrong.rs".to_string(), 0.80);
+    allowed.insert("src/aweak.rs".to_string(), 0.30);
+
+    let config = blast_config(
+        root,
+        cache_dir,
+        "xqzjvmblorp_ac409_seed",
+        allowed,
+        Some(temporal_only_weights()),
+    );
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.results.is_empty(),
+        "AC-2: results must not be empty (seed must appear)"
+    );
+    assert_eq!(
+        output.results[0].path, "src/zzanchor.rs",
+        "AC-2: seed (zzanchor.rs, FileId 2 of 3) must occupy rank 1 of the temporal-only \
+         output; the pre-#409 defect would place aweak.rs (FileId 0) first instead"
+    );
+    let expected_score = 1.0 / (RRF_K + 1.0);
+    let eps = 1e-12_f64;
+    assert!(
+        (output.results[0].score - expected_score).abs() < eps,
+        "AC-2: seed score must equal 1.0/(RRF_K+1) = 1.0/61.0 (±1e-12); got {}",
+        output.results[0].score
+    );
+}
+
+/// AC-5 — at default weights (0.5, 0.3, 0.2), a file that matches BOTH layers
+/// accumulates both rank terms with the temporal rank derived from Jaccard:
+///
+/// - hit.rs: lexical rank 1 + temporal rank 2 (J=0.20, weaker than zpartner)
+///   → fused score = 0.5/61 + 0.2/62  (±1e-12)
+/// - zpartner.rs: co-change-only, temporal rank 1 (J=0.90)
+///   → fused score = 0.2/61           (±1e-12)
+///
+/// The temporal layer is sorted DESC by Jaccard: zpartner(0.9) rank 1,
+/// hit.rs(0.2) rank 2.  No seed in blast_radius_paths here — this unit test
+/// exercises the two-layer accumulation directly.
+///
+/// Ordering: hit.rs (0.5/61 + 0.2/62 ≈ 0.01142) outscores zpartner.rs (0.2/61
+/// ≈ 0.00328) because its lexical contribution dominates, so hit.rs ranks first.
+#[test]
+fn test_ac409_both_layers_accumulate_with_temporal_rank_from_jaccard() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // hit.rs contains the unique query token; zpartner.rs does not.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("hit.rs"),
+        "pub fn xqzjvmblorp_ac409_ac5_hit() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zpartner.rs"),
+        "pub struct NoHitHere { count: u32 }\n",
+    )
+    .unwrap();
+
+    // blast_radius_paths: hit.rs(J=0.20), zpartner.rs(J=0.90) — no seed sentinel.
+    // Temporal layer sorted DESC: zpartner(0.9)→rank 1, hit.rs(0.2)→rank 2.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/hit.rs".to_string(), 0.20);
+    allowed.insert("src/zpartner.rs".to_string(), 0.90);
+
+    let config = blast_config(
+        root,
+        cache_dir,
+        "xqzjvmblorp_ac409_ac5_hit",
+        allowed,
+        None, // default: lexical=0.5, ast=0.3, temporal=0.2
+    );
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Both files must appear.
+    let hit_result = output
+        .results
+        .iter()
+        .find(|r| r.path == "src/hit.rs")
+        .expect("AC-5: hit.rs must appear in results");
+    let zpartner_result = output
+        .results
+        .iter()
+        .find(|r| r.path == "src/zpartner.rs")
+        .expect("AC-5: zpartner.rs must appear in results");
+
+    // Verify: hit.rs has a snippet (lexical match), zpartner.rs is co-change-only.
+    assert!(
+        hit_result.snippet.is_some(),
+        "AC-5: hit.rs lexically matches the query so snippet must be non-None"
+    );
+    assert!(
+        zpartner_result.snippet.is_none(),
+        "AC-5: zpartner.rs is a co-change-only partner — snippet must be None"
+    );
+
+    // Score assertions (±1e-12).
+    let eps = 1e-12_f64;
+    let expected_hit = 0.5 / (RRF_K + 1.0) + 0.2 / (RRF_K + 2.0);
+    assert!(
+        (hit_result.score - expected_hit).abs() < eps,
+        "AC-5: hit.rs score must be 0.5/61 + 0.2/62 = {expected_hit} (±1e-12); got {}",
+        hit_result.score
+    );
+    let expected_zpartner = 0.2 / (RRF_K + 1.0);
+    assert!(
+        (zpartner_result.score - expected_zpartner).abs() < eps,
+        "AC-5: zpartner.rs score must be 0.2/61 = {expected_zpartner} (±1e-12); got {}",
+        zpartner_result.score
+    );
+
+    // Ordering: hit.rs fused score (0.5/61 + 0.2/62 ≈ 0.01142) exceeds zpartner.rs
+    // score (0.2/61 ≈ 0.00328) because hit.rs accumulates both lexical rank 1 and
+    // temporal rank 2.  hit.rs must therefore appear first in the output.
+    let hit_pos = output
+        .results
+        .iter()
+        .position(|r| r.path == "src/hit.rs")
+        .unwrap();
+    let zpartner_pos = output
+        .results
+        .iter()
+        .position(|r| r.path == "src/zpartner.rs")
+        .unwrap();
+    assert!(
+        hit_pos < zpartner_pos,
+        "AC-5: hit.rs (fused score ≈ 0.5/61 + 0.2/62) must rank before zpartner.rs \
+         (score ≈ 0.2/61); hit at index {hit_pos}, zpartner at index {zpartner_pos}"
+    );
+}
+
+/// AC-15 — a co-change row whose stored Jaccard is NaN or ±∞ MUST NOT panic,
+/// MUST NOT propagate a non-finite value into the fused output score, and the
+/// file MUST still appear in results (ranked below every valid partner).
+#[test]
+fn test_ac409_non_finite_jaccard_does_not_panic_and_stays_finite() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("normal.rs"),
+        "// normal partner — finite Jaccard\n",
+    )
+    .unwrap();
+    fs::write(src.join("nan_file.rs"), "// partner with NaN Jaccard\n").unwrap();
+
+    // blast_radius_paths: normal_partner has finite J=0.8, nan_file has NaN J.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/normal.rs".to_string(), 0.80);
+    allowed.insert("src/nan_file.rs".to_string(), f64::NAN);
+
+    let config = blast_config(
+        root,
+        cache_dir,
+        "xqzjvmblorp_ac409_ac15_unique", // gibberish
+        allowed,
+        Some(temporal_only_weights()),
+    );
+
+    // MUST NOT panic.
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Both files must appear in results (the NaN-Jaccard file is still included;
+    // its score is mapped to NON_FINITE_JACCARD_FLOOR = 0.0 and it ranks last).
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    assert!(
+        paths.contains(&"src/normal.rs"),
+        "AC-15: normal.rs (finite Jaccard=0.8) must appear in results; got: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"src/nan_file.rs"),
+        "AC-15: nan_file.rs must still appear (no panic, not silently dropped); got: {paths:?}"
+    );
+
+    // All output scores must be finite.
+    for r in &output.results {
+        assert!(
+            r.score.is_finite(),
+            "AC-15: non-finite Jaccard must not propagate to the output score; \
+             path={}, score={}",
+            r.path,
+            r.score
+        );
+    }
+
+    // nan_file (floor score=0.0, temporal rank below normal.rs) must rank AFTER
+    // normal.rs which has finite Jaccard=0.8 (temporal rank 1).
+    let normal_idx = paths.iter().position(|&p| p == "src/normal.rs").unwrap();
+    let nan_idx = paths.iter().position(|&p| p == "src/nan_file.rs").unwrap();
+    assert!(
+        normal_idx < nan_idx,
+        "AC-15: normal.rs (finite J=0.8) must rank above nan_file.rs (floor score=0.0); \
+         normal at index {normal_idx}, nan at index {nan_idx}"
     );
 }

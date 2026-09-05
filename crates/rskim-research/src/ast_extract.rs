@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser};
+use rskim_core::{AstWalkConfig, AstWalkIter, Language, Parser, ast_size_limit};
 
 use crate::ast_types::{
     AstBigram, AstCorpusStats, AstLanguageStats, AstTrigram, NodeKindId, NodeKindVocabulary,
@@ -22,12 +22,9 @@ use crate::types::SourceFile;
 // wherever a local override is needed, or use `AstWalkConfig::default()` to
 // pick up both at once.
 
-/// Maximum source file size accepted for AST extraction (100 KiB default).
-const MAX_FILE_SIZE: usize = 100 * 1024;
-
-/// Extended file size limit for languages whose typical files are large
-/// schema dumps or data-heavy documents (e.g. SQL migrations).
-const MAX_FILE_SIZE_LARGE: usize = 1024 * 1024;
+// Per-file size gate: rskim_core::ast_size_limit(language) -> Option<u64>
+// (AD-405-1 / AC-405-21).  Both rskim-search and rskim-research share the
+// same function so drift between the two crates is impossible by construction.
 
 /// Maximum number of trigrams collected per file (memory guard).
 const MAX_TRIGRAMS_PER_FILE: usize = 50_000;
@@ -54,7 +51,7 @@ pub struct AstFileResult {
 /// Extract AST bigrams and (optionally) trigrams from a single source file.
 ///
 /// Returns an empty result — not an error — when:
-/// - `source` exceeds `MAX_FILE_SIZE`
+/// - `source` exceeds the AST size cap (`rskim_core::ast_size_limit`, 1 MiB)
 /// - `language` does not have a tree-sitter grammar (JSON, YAML, TOML)
 /// - The source fails to parse (tree-sitter is error-tolerant, so this is rare)
 ///
@@ -69,14 +66,17 @@ pub fn extract_ast_ngrams_from_file(
     vocab: &mut NodeKindVocabulary,
     collect_trigrams: bool,
 ) -> anyhow::Result<AstFileResult> {
-    let size_limit = match language {
-        Language::Sql => MAX_FILE_SIZE_LARGE,
-        _ => MAX_FILE_SIZE,
+    // ast_size_limit returns None for JSON/YAML/TOML (no grammar) and Some(cap)
+    // for the 14 tree-sitter languages.  A unified 1 MiB cap replaces the old
+    // two-tier (AD-405-1 / AC-405-21).
+    let cap = match ast_size_limit(language) {
+        None => return Ok(AstFileResult::default()),
+        Some(c) => c,
     };
-    if source.len() > size_limit {
+    if source.len() as u64 > cap {
         eprintln!(
             "Warning: skipping file larger than {} KiB for AST extraction",
-            size_limit / 1024
+            cap / 1024
         );
         return Ok(AstFileResult::default());
     }
@@ -603,8 +603,12 @@ mod tests {
     #[test]
     fn oversized_file_returns_empty() {
         let mut vocab = NodeKindVocabulary::new();
-        // 200 KiB source — exceeds MAX_FILE_SIZE
-        let large_source = "fn x() {}\n".repeat(20_000);
+        // Source must exceed the 1 MiB cap (rskim_core::AST_SIZE_LIMIT_DEFAULT = 1_048_576).
+        // "fn x() {}\n" is 10 bytes; (CAP / 10 + 1) repetitions = CAP + 10 bytes > 1 MiB.
+        // (#405: cap raised from 100 KiB to 1 MiB; test updated to stay over the new cap.)
+        let line = "fn x() {}\n";
+        let n_lines = rskim_core::AST_SIZE_LIMIT_DEFAULT as usize / line.len() + 1;
+        let large_source = line.repeat(n_lines);
         let result =
             extract_ast_ngrams_from_file(&large_source, Language::Rust, &mut vocab, false).unwrap();
         assert!(

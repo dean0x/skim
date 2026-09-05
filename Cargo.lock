@@ -2552,6 +2552,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "filetime",
+ "gix",
  "globset",
  "ignore",
  "indicatif",
@@ -2720,6 +2721,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "criterion",
+ "filetime",
  "gix",
  "memmap2",
  "rayon",

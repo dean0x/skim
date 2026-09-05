@@ -397,16 +397,35 @@ fn test_whitespace_only_query_returns_empty() {
     assert!(result.is_ok(), "whitespace-only query should not error");
 }
 
+/// AD-355-7 / PF-007: a single-character query cannot produce trigrams, so the
+/// inner `NgramIndexReader` falls back to returning ALL indexed files as score-0
+/// candidates.  `QueryEngine` must not short-circuit before delegating to the
+/// inner layer (the only short-circuit here is an empty-string check, not a
+/// short-length check).
+///
+/// Discriminating observable: the indexed file (FileId 0) IS present in the
+/// candidate set, even though the query char 'x' is absent from the content.
+/// The caller (Part A verify step) decides who survives based on substring
+/// membership.  An empty result set would hide the AD-355-7 fallback and break
+/// short-query recall.
 #[test]
-fn test_single_char_query_returns_empty() {
+fn test_single_char_query_returns_all_file_candidates_ad355_7() {
     let (_dir, engine) =
         build_query_engine(&[(FileId(0), "fn foo() {}", rskim_core::Language::Rust)]);
-    let result = engine.search(&SearchQuery::new("x")).unwrap();
-    // Single character cannot form a bigram, so the index returns nothing
+    let mut q = SearchQuery::new("x"); // 1-byte query — no trigrams possible
+    q.limit = Some(50);
+    let result = engine.search(&q).unwrap();
+    // AD-355-7: the inner reader returns all indexed files as score-0 candidates.
+    // QueryEngine must not suppress this (no short-circuit on short queries).
     assert!(
-        result.is_empty(),
-        "single-char query should return empty results"
+        result.iter().any(|r| r.file_id.0 == 0),
+        "AD-355-7: FileId(0) must appear in short-query candidate set; got {:?}",
+        result.iter().map(|r| r.file_id.0).collect::<Vec<_>>()
     );
+    // All candidates carry score 0.0 — ranking is deferred to the verify layer.
+    for r in &result {
+        assert_eq!(r.score, 0.0, "short-query candidates must have score 0.0");
+    }
 }
 
 #[test]

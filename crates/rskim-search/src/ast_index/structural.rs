@@ -96,6 +96,27 @@ pub fn bucket_label(edge_index: usize) -> NodeKindId {
     BUCKET_LABEL_BASE + edge_index as NodeKindId
 }
 
+/// AD-394-3: `true` iff `id` is a synthetic marker ID — either a reserved
+/// synthetic PARENT id (`EMPTY_BODY`/`DEEP_NODE`/`LARGE_BODY`/`MANY_PARAMS`,
+/// 65000-65003) or a bucket-label CHILD id (`>= BUCKET_LABEL_BASE` = 64900).
+///
+/// Synthetic parent IDs and bucket-label child IDs are all `>= BUCKET_LABEL_BASE`
+/// (64900), while every real vocabulary ID satisfies `id < vocab_len()` (1740).
+/// `BUCKET_LABEL_BASE` cleanly separates the two ID spaces — the invariant
+/// `vocab_len() <= BUCKET_LABEL_BASE` is asserted by a unit test below.
+///
+/// This is the single source of truth for the "is this id synthetic?"
+/// predicate, used by `compound::reparse`'s verify gate and `recover_line` to
+/// route synthetic-marker AST patterns through extraction-reuse instead of the
+/// real-CST ancestor walk (`vocab_lookup` never yields a synthetic ID, so the
+/// strict walk is structurally unsatisfiable for them). Previously duplicated
+/// ad hoc as an inline `>= BUCKET_LABEL_BASE` check in `extract_tests.rs`.
+#[inline]
+#[must_use]
+pub fn is_synthetic_id(id: NodeKindId) -> bool {
+    id >= BUCKET_LABEL_BASE
+}
+
 // ============================================================================
 // Bucket edge tables
 // ============================================================================

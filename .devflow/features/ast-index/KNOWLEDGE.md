@@ -1,7 +1,7 @@
 ---
 feature: ast-index
 name: AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
-description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, query.rs, Wave 3f, Wave 3g, cmd-search, self-heal, auto-rebuild."
+description: "Use when implementing AST-based n-gram extraction, building or reading the on-disk structural index, adding a new language to the structural index, debugging depth or node-count truncation, extending the shared vocabulary, working with AstBigram/AstTrigram IDF weights, extracting structural n-grams or structural metrics from linearized nodes, using the Pattern Library (structural code patterns), using the shared AstWalkIter traversal primitive, or working with the Wave 3f BM25-ranked AST structural query engine (AstQueryEngine, AstQuery, parse_ast_query, AstPostingSource). Keywords: linearize, CST, AST, n-gram, bigram, trigram, NodeKindId, AstBigram, AstTrigram, AstNgramSet, AstBigramEntry, AstTrigramEntry, NODE_KIND_VOCABULARY, LANG_MAPS, LinearNode, AstWalkIter, AstWalkConfig, tree-sitter, depth-encoded, pre-order, IDF, ast_bigram_idf, ast_trigram_idf, extract_ast_ngrams, extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights, StructuralMetrics, structural, Pattern, patterns, EMPTY_BODY, DEEP_NODE, LARGE_BODY, MANY_PARAMS, bucket_label, synthetic n-gram, store, AstIndexBuilder, AstIndexReader, AstPosting, AstFileMetaEntry, skidx, skpost, SKAX, FORMAT_VERSION, AST_INDEX_FORMAT_VERSION, on-disk index, mmap, posting list, build_from_files, lookup_bigram, lookup_trigram, index_version, index_integrity, AstQuery, AstQueryEngine, AstPostingSource, parse_ast_query, search_ast, AST_BM25_K1, AST_BM25_B, ScoringCtx, LiteMeta, file_lang_and_node_count, ast_query_to_ngram_set, score_ngram_set, CAPACITY_FLOOR, query submodule split, Wave 3f, Wave 3g, Wave 4, cmd-search, self-heal, auto-rebuild, validate_ast_pattern, ValidityMarker, validity, ast_index.skverify, CRC32 fast path, AD-376-5, AstNgramCache, CachedAstEntry, skcache, ast_cache, AST_CACHE_FILENAME, AST_CACHE_FORMAT_VERSION."
 category: architecture
 directories: [crates/rskim-search/src/ast_index/, crates/rskim-core/src/]
 referencedFiles:
@@ -12,7 +12,11 @@ referencedFiles:
   - crates/rskim-search/src/ast_index/extract.rs
   - crates/rskim-search/src/ast_index/structural.rs
   - crates/rskim-search/src/ast_index/patterns.rs
-  - crates/rskim-search/src/ast_index/query.rs
+  - crates/rskim-search/src/ast_index/query/mod.rs
+  - crates/rskim-search/src/ast_index/query/adapter.rs
+  - crates/rskim-search/src/ast_index/query/engine.rs
+  - crates/rskim-search/src/ast_index/query/parse.rs
+  - crates/rskim-search/src/ast_index/query/scoring.rs
   - crates/rskim-search/src/ast_index/mod.rs
   - crates/rskim-search/src/ast_index/store/format.rs
   - crates/rskim-search/src/ast_index/store/builder.rs
@@ -23,8 +27,8 @@ referencedFiles:
   - crates/rskim-search/benches/ast_index_bench.rs
   - crates/rskim-search/benches/ast_query.rs
 created: 2026-06-01
-updated: 2026-06-12
-version: 7
+updated: 2026-07-01
+version: 11
 ---
 
 # AST Index (CST Linearization + N-gram Encoding + On-Disk Store)
@@ -34,9 +38,16 @@ version: 7
 The `ast_index` module converts tree-sitter Concrete Syntax Trees (CSTs) into a
 compact, flat representation suitable for downstream n-gram extraction and IDF-weighted
 structural search. It is the AST layer of a 3-layer search system (Lexical, Temporal,
-AST n-gram) built across Waves 3a–3g.
+AST n-gram) built across Waves 3a–4.
 
-Seven sub-modules make up the full Wave 3f/3g implementation:
+Nine sub-modules make up the full Wave 3f/3g/4 implementation:
+
+- **`ast_cache`** — (Wave 4 incremental build) `AstNgramCache` / `CachedAstEntry`:
+  a content-SHA-keyed binary cache of per-file n-gram payloads persisted to
+  `ast_index.skcache`. Keyed by hex-encoded SHA-256 of file content. The CLI
+  consume loop checks the cache before calling `derive_ast_entry`; hits skip the
+  tree-sitter linearization + extraction entirely. Public visibility (`pub mod
+  ast_cache`) so `crates/rskim/src/cmd/search/index.rs` can import it directly.
 
 - **`linearize`** — converts source text into `Vec<LinearNode>` (pre-order depth-first
   sequence), each node carrying a shared vocabulary ID and traversal depth.
@@ -54,17 +65,37 @@ Seven sub-modules make up the full Wave 3f/3g implementation:
   in 5 categories, GOLD-verified against real code examples.
 - **`store`** — (Wave 3d/3e) two-file mmap'd on-disk inverted index; format v2 adds
   per-file structural metrics and `avg_max_depth`.
-- **`query`** — (Wave 3f, #197) BM25-ranked structural pattern query engine. Exposes
-  `AstQueryEngine<R: AstPostingSource>`, `AstQuery` enum, and `parse_ast_query` parser.
-  Implements the `SearchLayer` adapter for Wave-3g CLI integration. `pub mod query` — the
-  only sub-module with public module visibility (others are `mod`-private, re-exported
-  via `mod.rs`).
+- **`query/`** — (Wave 3f, #197; split #287) BM25-ranked structural pattern query engine.
+  **As of #287, `query.rs` is a 4-way submodule directory**, not a single file. The
+  directory structure is:
+  - `query/mod.rs` — public re-export surface; `#[path]`-includes `query_tests.rs`
+  - `query/parse.rs` — `AstQuery` enum, `parse_ast_query()`, parsing helpers
+  - `query/engine.rs` — `AstQueryEngine`, `SearchLayer` adapter, `ast_query_to_ngram_set`
+  - `query/scoring.rs` — `ScoringCtx`, BM25 helpers, IDF memoization, `LiteMeta`
+  - `query/adapter.rs` — `AstPostingSource` trait and its `AstIndexReader` impl
+
+  The `query` module remains `pub mod query` in `ast_index/mod.rs` — externally visible.
+  Internal sub-modules (`parse`, `engine`, `scoring`, `adapter`) are `mod`-private within
+  `query/`; only items re-exported from `query/mod.rs` are part of the API.
 
 The design is intentionally minimal: `linearize_source` is the only stateful-setup
 entry point. All n-gram encoding, weight lookup, extraction, and BM25 scoring are pure.
 
 The DFS traversal logic lives in `rskim-core::AstWalkIter` to be shared with
 `rskim-research` without duplicating cursor management or bounds guarding.
+
+## Module Visibility
+
+`ast_cache` is `pub mod` — externally visible so the CLI crate can import
+`AstNgramCache` and `CachedAstEntry` directly.
+
+`query` is `pub mod` — externally visible (unchanged from pre-split).
+
+`store` and `structural` are `pub(crate)` — accessible within `rskim-search`
+but not from external crates.
+
+All other sub-modules (`extract`, `linearize`, `ngram`, `patterns`) are
+`mod`-private within `ast_index`.
 
 ## Module Visibility: store sub-modules are pub(crate)
 
@@ -81,6 +112,10 @@ reachable at the crate-root level.
 
 All items below are accessible via `rskim_search::ast_index::{name}`:
 
+- **Wave 4 incremental cache**: `AstNgramCache`, `CachedAstEntry`,
+  `AST_CACHE_FILENAME` (alias of `ast_cache::CACHE_FILENAME`),
+  `AST_CACHE_FORMAT_VERSION` (alias of `ast_cache::CACHE_FORMAT_VERSION`) —
+  re-exported from `ast_cache`
 - `extract_ast_ngrams`, `extract_ast_ngrams_with_metrics`, `extract_ast_ngrams_with_weights`
 - `AstBigramEntry`, `AstNgramSet`, `AstTrigramEntry`
 - `LinearNode`, `LinearizeResult`, `linearize_source`
@@ -90,8 +125,8 @@ All items below are accessible via `rskim_search::ast_index::{name}`:
 - `AstFileMetaEntry`, `AstIndexBuilder`, `AstIndexReader`, `AstPosting`
 - `StructuralMetrics`
 - `NodeKindId` (type alias for `u16`)
-- **Wave 3f**: `AST_BM25_B`, `AST_BM25_K1`, `AstPostingSource`, `AstQuery`,
-  `AstQueryEngine`, `parse_ast_query`
+- **Wave 3f / #287**: `AST_BM25_B`, `AST_BM25_K1`, `AstPostingSource`, `AstQuery`,
+  `AstQueryEngine`, `parse_ast_query` — re-exported from `query/mod.rs`
 
 ### From `rskim_search::*` (crate-root re-exports)
 
@@ -100,9 +135,11 @@ This is the full set — use `rskim_search::{name}` for all of them:
 
 ```
 AST_BM25_B, AST_BM25_K1,
+AST_CACHE_FILENAME, AST_CACHE_FORMAT_VERSION,
 AstBigram, AstBigramEntry, AstFileMetaEntry, AstIndexBuilder, AstIndexReader,
-AstNgramSet, AstPosting, AstPostingSource, AstQuery, AstQueryEngine,
+AstNgramCache, AstNgramSet, AstPosting, AstPostingSource, AstQuery, AstQueryEngine,
 AstTrigram, AstTrigramEntry,
+CachedAstEntry,
 DEFAULT_AST_WEIGHT, LinearNode, LinearizeResult, NodeKindId,
 Pattern, PatternCategory, StructuralMetrics,
 all_patterns, ast_bigram_idf, ast_trigram_idf,
@@ -112,8 +149,8 @@ vocab_len, vocab_lookup, vocab_resolve
 ```
 
 Additionally, `AST_INDEX_FORMAT_VERSION: u16` is a standalone crate-root constant
-(not re-exported from `ast_index` — defined directly in `lib.rs`). **As of Wave 3g
-single-source refactor**, it is defined as:
+(not re-exported from `ast_index` — defined directly in `lib.rs`). As of Wave 3g
+single-source refactor, it is defined as:
 
 ```rust
 pub const AST_INDEX_FORMAT_VERSION: u16 = ast_index::store::format::FORMAT_VERSION;
@@ -137,11 +174,13 @@ Access it via `rskim_search::ast_index::pattern_to_query_set`.
 - `crate::ast_weights::{ast_bigram_weight, ast_trigram_weight}` — per-language IDF tables
 - `crate::types::SearchError::Ast` for the one error path not silenced gracefully
 - `crate::types::{SearchLayer, SearchQuery, SearchResult, SearchField}` — implemented by
-  `AstQueryEngine<AstIndexReader>` in `query.rs` (Wave 3g adapter)
+  `AstQueryEngine<AstIndexReader>` in `query/engine.rs` (Wave 3g adapter)
 - `crate::index::lang_map::{lang_to_id, lang_from_id}` — single source of truth for
   language ↔ u8 ID mapping (widened to `pub(crate)` in `index/mod.rs` so `store/` reuses it)
 - `crate::io_util::atomic_write` — shared atomic-write helper (NamedTempFile + sync_all +
   persist); also used by `cochange::builder`
+- `crate::lexical::MAX_QUERY_BYTES` — `MAX_AST_QUERY_BYTES` in `query/parse.rs` is now
+  aliased from this so both layers share one source of truth (4096 bytes)
 
 Non-tree-sitter languages (JSON, YAML, TOML) have no entry in `LANG_MAPS`.
 `linearize_source` returns an empty default; `ast_bigram_idf` returns `DEFAULT_AST_WEIGHT`.
@@ -301,10 +340,22 @@ pattern.resolved_bigrams() -> Vec<AstBigram>             // silently drops unres
 pattern.resolved_trigrams() -> Vec<AstTrigram>
 ```
 
-### query.rs — AST Structural Query Engine (Wave 3f, #197)
+### query/ — AST Structural Query Engine (Wave 3f #197; split #287; perf #286)
 
-The query-side of the AST index. Implements BM25-ranked structural pattern search over
-the on-disk index. Three key types:
+**As of #287, `query.rs` is a 4-way submodule directory** (`crates/rskim-search/src/ast_index/query/`).
+The split is structural only — the public API surface is identical to the pre-split file;
+`query/mod.rs` re-exports exactly the same symbols. The internal decomposition is:
+
+```
+query/
+  mod.rs     — public re-exports; includes query_tests.rs via #[path]
+  parse.rs   — AstQuery enum, parse_ast_query, parsing helpers
+  engine.rs  — AstQueryEngine, SearchLayer adapter, ast_query_to_ngram_set, score_ngram_set
+  scoring.rs — ScoringCtx, bm25_with_lite, idf_for_language, LiteMeta, CAPACITY_FLOOR
+  adapter.rs — AstPostingSource trait, AstIndexReader impl
+```
+
+#### query/parse.rs
 
 **`AstQuery` enum** — the only `String → AstQuery` boundary is `parse_ast_query`:
 
@@ -315,80 +366,6 @@ the on-disk index. Three key types:
 | `SingleNode(NodeKindId)` | underscore-separated vocab name | Deferred to #283 (unigram index) |
 
 `AstQuery` implements `PartialEq` using pointer equality for `Pattern` variants.
-
-**`AstPostingSource` trait** — DI seam between the query engine and its index:
-
-```rust
-pub trait AstPostingSource: Send + Sync {
-    fn lookup_bigram(&self, b: AstBigram) -> Result<Vec<AstPosting>>;
-    fn lookup_trigram(&self, t: AstTrigram) -> Result<Vec<AstPosting>>;
-    fn file_meta(&self, doc_id: u32) -> Result<AstFileMetaEntry>;
-    fn avg_node_count(&self) -> f32;
-    fn file_count(&self) -> u32;
-}
-```
-
-`AstIndexReader` implements this trait. Tests use `FakePostingSource` (in `query_tests.rs`).
-
-**`AstQueryEngine<R: AstPostingSource>`** — immutable, `&self`-only, `Send + Sync`:
-
-```rust
-impl<R: AstPostingSource> AstQueryEngine<R> {
-    pub fn new(reader: R) -> Self                          // DI constructor (tests/Wave 4)
-    pub fn search_ast(&self, q: &AstQuery) -> Result<Vec<(FileId, f64)>>  // Wave-4 hook
-}
-impl AstQueryEngine<AstIndexReader> {
-    pub fn open(dir: &Path) -> Result<Self>                // CLI convenience constructor
-}
-```
-
-`search_ast` returns results sorted **FileId-ASC** (Wave-4 merge-join contract).
-`SingleNode` variant returns `SearchError::InvalidQuery` referencing #283.
-
-**The CLI layer (`cmd/search/ast.rs`) calls `search_ast` directly** (not through
-`SearchLayer::search`) for both `resolve_ast_file_filter` and `run_ast_standalone`.
-This avoids `SearchResult` construction, `usize::MAX` sort, and `SearchLayer` overhead.
-`SearchLayer` is still implemented for Wave 4 integration but is not the primary
-CLI dispatch path as of Wave 3g.
-
-`validate_ast_pattern` in `cmd/search/ast.rs` returns `anyhow::Result<AstQuery>` (not
-`anyhow::Result<()>`). The return value is the parsed query, enabling callers that need
-both validation and the query object to avoid a second `parse_ast_query` call. The
-pre-dispatch call in `mod.rs` uses `?` and discards the value; `run_ast_standalone` calls
-`validate_ast_pattern` and uses the returned `AstQuery` directly.
-
-**OR-union BM25 scoring:**
-
-```
-score(file) = Σ idf(lang, ngram) · (tf_norm / (tf_norm + k1))
-  where tf_norm = tf / length_norm
-        length_norm = 1 - b + b · (node_count / avg_node_count)
-        k1 = 1.2, b = 0.75
-```
-
-Length normalization uses `node_count` (from `AstFileMetaEntry`) not byte count. IDF is
-per-language (from `ast_bigram_idf`/`ast_trigram_idf`); falls back to `1.0` for unknown
-language. When `avg_node_count == 0`, `length_norm = 1.0`.
-
-**Gap-fix #6**: query n-gram keys are deduped before lookup (`dedup_by_key` on sorted
-bigrams and trigrams). Without this, a pattern with duplicate n-gram entries would
-double-score files. `debug_assert!` verifies post-dedup uniqueness.
-
-**C4 guarantee**: `AstPosting.count >= 1` is validated by `decode_posting` in the reader;
-the `bm25_with_idf` helper relies on this — no separate guard for `tf > 0`.
-
-**`SearchLayer` adapter (Wave 3g)**:
-
-`AstQueryEngine<AstIndexReader>` implements `SearchLayer` via a concrete `impl` block
-(not a blanket). The `search` method:
-
-1. Returns `Ok(vec![])` if `query.ast_pattern == None` (Wave-4 no-op)
-2. Returns `Err(InvalidQuery("empty AST query"))` if pattern is `Some("")`
-3. Otherwise: `parse_ast_query` → `search_ast` → apply `file_filter` → apply `lang` filter
-   → sort score-DESC/FileId-ASC tie-break → apply `offset`/`limit` → return `Vec<SearchResult>`
-
-`line_range: 0..0` and `match_positions: vec![]` are stub values — full match attribution
-is deferred to Wave 4.
 
 **`parse_ast_query`** — total function, never panics:
 
@@ -402,10 +379,152 @@ is deferred to Wave 4.
 | Empty segment or > 3 segments | `Err(InvalidQuery)` |
 | > 4096 bytes | `Err(InvalidQuery)` |
 
+`MAX_AST_QUERY_BYTES` is `pub(super)` in `parse.rs` and is now aliased from
+`crate::lexical::MAX_QUERY_BYTES` (single source of truth — both layers share 4096 bytes).
+
+#### query/adapter.rs
+
+**`AstPostingSource` trait** — DI seam between the query engine and its index.
+As of Wave 4 (#286, P1), a new method `file_lang_and_node_count` was added with a
+default implementation that delegates to `file_meta`:
+
+```rust
+pub trait AstPostingSource: Send + Sync {
+    fn lookup_bigram(&self, b: AstBigram) -> Result<Vec<AstPosting>>;
+    fn lookup_trigram(&self, t: AstTrigram) -> Result<Vec<AstPosting>>;
+    fn file_meta(&self, doc_id: u32) -> Result<AstFileMetaEntry>;
+    fn avg_node_count(&self) -> f32;
+    fn file_count(&self) -> u32;
+    // P1 (#286): partial decode — default impl delegates to file_meta
+    fn file_lang_and_node_count(&self, doc_id: u32) -> Result<(u8, u32)> { ... }
+}
+```
+
+`AstIndexReader` implements this trait and overrides `file_lang_and_node_count` with a
+fast path that decodes only bytes `[0..5]` of the 15-byte on-disk record (lang_id + node_count).
+Test fakes compiled against the trait before P1 continue to work via the default implementation.
+
+#### query/scoring.rs
+
+Houses BM25 scoring helpers extracted into a dedicated module (#287):
+
+- **`AST_BM25_K1: f64 = 1.2`** and **`AST_BM25_B: f64 = 0.75`** — note these are `f64`,
+  not `f32`. They are re-exported through `query/mod.rs` as `pub` items.
+- **`CAPACITY_FLOOR: usize = 16`** — minimum initial capacity for the `scores` FxHashMap.
+  Prevents pathological grow-from-1 churn on tiny queries that suddenly fan out.
+- **`LiteMeta { lang_id: u8, node_count: u32 }`** — 5-byte minimal metadata used as
+  the per-posting cache value type (P1 #286). Replaces `AstFileMetaEntry` (15 bytes) in
+  the meta cache, reducing cache footprint by 10 bytes per entry.
+- **`ScoringCtx { scores: FxHashMap<u32, f64>, meta_cache: Option<FxHashMap<u32, LiteMeta>>, file_count: usize }`**
+  — accumulates scoring state for one `run_ngram_set` call. Bundles capacity reservation
+  and score accumulation into one struct to avoid 7-parameter function signatures.
+  `meta_cache` is `None` for single-n-gram queries (no cross-list cache benefit from C1).
+
+**Wave 4 performance optimizations (#286)**:
+
+| Code | Optimization | Detail |
+|---|---|---|
+| P1 | Partial decode | `score_postings` calls `file_lang_and_node_count` (5 bytes) instead of `file_meta` (15 bytes) |
+| P2 | Scalar IDF cache | `last_lang`/`last_idf` scalar pair collapses O(postings) IDF lookups to O(distinct langs per n-gram) |
+| P3 | Posting-driven capacity | `scores.reserve(postings.len().min(file_count).saturating_sub(scores.len()))` per posting list; starts at `CAPACITY_FLOOR`; avoids both over-allocation (broad queries) and under-sizing (empty-first-list) |
+| P4 | Lang filter fold-in | `run_ngram_set` accepts `lang_filter: Option<Language>`; postings whose lang_id doesn't match are skipped before insertion, eliminating the second `file_meta` decode loop that previously ran in `SearchLayer::search` |
+
+#### query/engine.rs
+
+**`AstQueryEngine<R: AstPostingSource>`** — immutable, `&self`-only, `Send + Sync`:
+
+```rust
+impl<R: AstPostingSource> AstQueryEngine<R> {
+    pub fn new(reader: R) -> Self                           // DI constructor (tests/Wave 4)
+    pub fn search_ast(&self, q: &AstQuery) -> Result<Vec<(FileId, f64)>>  // Wave-4 hook
+    pub(super) fn run_ngram_set(&self, set: &AstNgramSet, lang_filter: Option<Language>) -> Result<Vec<(FileId, f64)>>
+    pub(super) fn score_ngram_set(&self, set: &AstNgramSet, lang_filter: Option<Language>) -> Result<ScoringCtx>
+}
+impl AstQueryEngine<AstIndexReader> {
+    pub fn open(dir: &Path) -> Result<Self>                 // CLI convenience constructor
+}
+```
+
+`search_ast` returns results sorted **FileId-ASC** (Wave-4 merge-join contract), always
+passes `lang_filter = None` (unfiltered, AC12 contract).
+`SingleNode` variant returns `SearchError::InvalidQuery` referencing #283.
+
+**`score_ngram_set`** is a private helper shared by `run_ngram_set` (production) and
+`run_ngram_set_with_capacity` (test-only capacity hook). It handles dedup, ScoringCtx
+construction, and the scoring loop, returning the populated `ScoringCtx`. Both callers
+delegate to it and differ only in how they consume the result.
+
+**`ast_query_to_ngram_set`** is the single `AstQuery → AstNgramSet` dispatch point,
+shared by `search_ast` and `SearchLayer::search` to prevent the match arms and
+`InvalidQuery` message for `SingleNode` from drifting between call sites (#286):
+
+```rust
+pub(super) fn ast_query_to_ngram_set(q: &AstQuery) -> Result<Cow<'_, AstNgramSet>> {
+    match q {
+        AstQuery::SingleNode(_) => Err(InvalidQuery("...#283")),
+        AstQuery::Pattern(p) => Ok(Cow::Owned(pattern_to_query_set(p))),
+        AstQuery::Containment(set) => Ok(Cow::Borrowed(set)),  // zero-clone hot path
+    }
+}
+```
+
+The `Containment` arm borrows directly (no clone) on the hot path.
+
+**The CLI layer (`cmd/search/ast.rs`) calls `search_ast` directly** (not through
+`SearchLayer::search`) for both `resolve_ast_file_filter` and `run_ast_standalone`.
+This avoids `SearchResult` construction, `usize::MAX` sort, and `SearchLayer` overhead.
+`SearchLayer` is still implemented for Wave 4 integration but is not the primary
+CLI dispatch path as of Wave 3g.
+
+`validate_ast_pattern` in `cmd/search/ast.rs` returns `anyhow::Result<AstQuery>` (not
+`anyhow::Result<()>`). The return value is the parsed query, enabling callers that need
+both validation and the query object to avoid a second `parse_ast_query` call. The
+pre-dispatch call in `mod.rs` uses `?` and discards the value; `run_ast_standalone` calls
+`validate_ast_pattern` and uses the returned `AstQuery` directly.
+
+**`SearchLayer` adapter (Wave 3g, #286 P4 enhancement)**:
+
+`AstQueryEngine<AstIndexReader>` implements `SearchLayer` via a concrete `impl` block
+(not a blanket). The `search` method:
+
+1. Returns `Err(InvalidQuery)` if `temporal_flags` is set (temporal sorting on AST
+   layer is deferred to Wave 4)
+2. Returns `Ok(vec![])` if `query.ast_pattern == None` (Wave-4 no-op)
+3. Returns `Err(InvalidQuery("empty AST query"))` if pattern is `Some("")`
+4. Trims the raw pattern before parsing (so the >4096-byte length guard applies to
+   actual content, not surrounding whitespace)
+5. Calls `ast_query_to_ngram_set` → `run_ngram_set(set, query.lang)` (P4: lang filter
+   folded into scoring)
+6. Applies `file_filter` allowlist (no I/O)
+7. Sorts score-DESC/FileId-ASC tie-break
+8. Applies `offset`/`limit` (default limit: **20**)
+9. Returns `Vec<SearchResult>` with `line_range: 0..0` and `match_positions: vec![]` (stubs)
+
+**OR-union BM25 scoring:**
+
+```
+score(file) = Σ idf(lang, ngram) · (tf_norm / (tf_norm + k1))
+  where tf_norm = tf / length_norm
+        length_norm = 1 - b + b · (node_count / avg_node_count)
+        k1 = 1.2 (f64), b = 0.75 (f64)
+```
+
+Length normalization uses `node_count` (from `LiteMeta`, sourced from `AstFileMetaEntry`)
+not byte count. IDF is per-language (from `ast_bigram_idf`/`ast_trigram_idf`); falls
+back to `UNKNOWN_LANG_IDF = 1.0` for unknown language. When `avg_node_count == 0`,
+`length_norm = 1.0`.
+
+**Gap-fix #6**: query n-gram keys are deduped before lookup (`dedup_by_key` on sorted
+bigrams and trigrams). Without this, a pattern with duplicate n-gram entries would
+double-score files. `debug_assert!` verifies post-dedup uniqueness.
+
+**C4 guarantee**: `AstPosting.count >= 1` is validated by `decode_posting` in the reader;
+`bm25_with_lite` relies on this — no separate guard for `tf > 0`.
+
 **Test coverage**: comprehensive unit suite (groups A1–A6 engine correctness, B2–B6
-scoring/dedup/sort, plus parse-error tests) in `query_tests.rs` using `FakePostingSource` harness.
-Criterion bench in `benches/ast_query.rs`: 3 scenarios × 10k synthetic files
-(`bench_hot_bigram`, `bench_rare_trigram`, `bench_multi_ngram_pattern`).
+scoring/dedup/sort, AC1–AC12 Wave 4 perf acceptance tests) in `query_tests.rs` using
+`FakePostingSource` harness. Criterion bench in `benches/ast_query.rs`: 3 scenarios ×
+10k synthetic files (`bench_hot_bigram`, `bench_rare_trigram`, `bench_multi_ngram_pattern`).
 
 ### store sub-module — On-Disk Format v2
 
@@ -450,10 +569,31 @@ zero. Every file — including those yielding zero n-grams — must receive exac
 non-sequential).
 
 **Version probing:** `AstIndexReader::index_version(dir)` reads only the first 6 bytes
-(magic + version) cheaply. The CLI self-heal path in `crates/rskim/src/cmd/search/`
-(Wave 3g, #199) uses this probe: if the stored version is absent or below
-`AST_INDEX_FORMAT_VERSION`, the CLI triggers an auto-rebuild before executing the query.
-See `cmd-search` feature knowledge for the consumer-side wiring.
+(magic + version) cheaply and remains available for callers that only need the version
+number. The CLI self-heal path in `crates/rskim/src/cmd/search/` (Wave 3g, #199) now
+calls `AstIndexReader::index_integrity(dir)` instead (AD-414-6): this probe reads the
+full header and validates both `.skidx` and `.skpost` file sizes, returning
+`SearchError::IndexCorrupted` on a structural mismatch or the version number on any
+version mismatch. If the returned version is absent or below `AST_INDEX_FORMAT_VERSION`,
+the CLI triggers an auto-rebuild before executing the query. See `cmd-search` feature
+knowledge for the consumer-side wiring.
+
+**Partial decode path (P1 #286):** `AstIndexReader::file_lang_and_node_count(file_index)` reads
+the same byte range as `file_meta` but calls `decode_lang_and_node_count` to decode only
+bytes `[0..5]` (lang_id + node_count). The decode offset is the single source of truth shared
+with `decode_file_meta` so the two paths cannot drift.
+
+**Validity marker CRC32 fast path (#376, AD-376-5):** `AstIndexReader::open` carries the
+same validity-marker mechanism as the lexical reader. After successfully verifying the CRC32,
+`open` writes `ast_index.skverify` (a 52-byte `ValidityMarker` sidecar from `crate::validity`).
+On subsequent opens, if the marker's `(idx_len, idx_mtime_ns, post_len, post_mtime_ns,
+header_checksum)` matches the freshly-stat'd files, the full CRC32 is SKIPPED. This moves the
+per-open CRC32 cost off the `--ast` query hot path (was median 57 ms / p90 77 ms on large corpora).
+Trust boundary (AD-376-2): a content byte-flip that preserves len+mtime+header.checksum is
+served unverified (silent mis-rank risk, accepted per AC1 / PF-007). On any marker miss the
+full CRC32 still runs. `AstIndexBuilder::flush` unlinks `ast_index.skverify` BEFORE writing
+fresh files (AD-376-4) so aborted rebuilds cannot leave a stale marker. The verify-back open
+in `flush` re-validates and stamps a fresh marker (AC8).
 
 #### Reader API Contracts (C1–C7)
 
@@ -472,6 +612,7 @@ Reader also exposes:
 - `file_metrics(file_index) -> Result<StructuralMetrics>` — extracts structural fields
   from the same on-disk entry as `file_meta`
 - `avg_max_depth() -> f32` — corpus-average CST depth (from v2 header bytes [38..42])
+- `file_lang_and_node_count(file_index) -> Result<(u8, u32)>` — P1 fast path (5 bytes)
 
 #### Cross-Index FileId Contract
 
@@ -512,15 +653,20 @@ extract_ast_ngrams_with_metrics(&[LinearNode], Language)
 
 AstQueryEngine::search_ast(q: &AstQuery)
     │
-    ├── SingleNode     → Err(InvalidQuery) [deferred to #283]
-    ├── Pattern(p)     → pattern_to_query_set(p) → run_ngram_set
-    └── Containment(s) → run_ngram_set(s)
-
-    run_ngram_set(set: &AstNgramSet)
-        ├── dedup_by_key bigrams and trigrams (gap-fix #6)
-        ├── For each bigram: lookup_bigram → bm25 → scores[doc_id] += score
-        ├── For each trigram: lookup_trigram → bm25 → scores[doc_id] += score
-        └── filter (score > 0) → sort FileId-ASC → Vec<(FileId, f64)>
+    ├── ast_query_to_ngram_set(q)
+    │       ├── SingleNode     → Err(InvalidQuery) [deferred to #283]
+    │       ├── Pattern(p)     → pattern_to_query_set(p) → Cow::Owned
+    │       └── Containment(s) → Cow::Borrowed (zero-clone)
+    └── run_ngram_set(set, lang_filter=None)   [Wave-4 unfiltered contract]
+            └── score_ngram_set(set, None)     [private shared helper]
+                    ├── dedup_by_key bigrams and trigrams (gap-fix #6)
+                    ├── P3: CAPACITY_FLOOR init; reserve(new_slots) per posting list
+                    ├── For each bigram: lookup_bigram → score_postings → scores[doc_id] += BM25
+                    │       ├── P1: file_lang_and_node_count (5 bytes, not 15)
+                    │       ├── P2: last_lang/last_idf scalar IDF cache
+                    │       └── P4: skip if lang_filter mismatch (None here → no-op)
+                    └── For each trigram: lookup_trigram → score_postings → scores[doc_id] += BM25
+            └── ScoringCtx::into_sorted_vec → filter (score > 0) → sort FileId-ASC
 ```
 
 ## Constraints and Bounds
@@ -531,14 +677,15 @@ AstQueryEngine::search_ast(q: &AstQuery)
 | `MAX_FILE_SIZE_LARGE` (SQL) | 1 MiB | `linearize.rs` |
 | `DEFAULT_MAX_DEPTH` | 500 | `AstWalkConfig` |
 | `DEFAULT_MAX_NODES` | 100,000 | `AstWalkConfig` |
-| `MAX_AST_QUERY_BYTES` | 4096 | `query.rs` |
+| `MAX_AST_QUERY_BYTES` | 4096 (alias of `lexical::MAX_QUERY_BYTES`) | `query/parse.rs` |
 | `HEADER_SIZE` | 48 B | `store/format.rs` |
 | `BIGRAM_ENTRY_SIZE` | 16 B | `store/format.rs` |
 | `TRIGRAM_ENTRY_SIZE` | 20 B | `store/format.rs` |
 | `POSTING_ENTRY_SIZE` | 8 B | `store/format.rs` |
 | `FILE_META_SIZE` (v2) | **15 B** | `store/format.rs` |
-| `AST_BM25_K1` | 1.2 | `query.rs` |
-| `AST_BM25_B` | 0.75 | `query.rs` |
+| `AST_BM25_K1` | 1.2 (**f64**) | `query/scoring.rs` |
+| `AST_BM25_B` | 0.75 (**f64**) | `query/scoring.rs` |
+| `CAPACITY_FLOOR` | 16 | `query/scoring.rs` |
 | Vocabulary size | 1740 | `ast_weights.rs` |
 | Free synthetic ID start | 1740 | `structural.rs` comment |
 | `EMPTY_BODY` | 65000 | `structural.rs` |
@@ -548,6 +695,7 @@ AstQueryEngine::search_ast(q: &AstQuery)
 | `BUCKET_LABEL_BASE` | 64900 | `structural.rs` |
 | `MAX_BUCKET_EDGES` | 99 | `structural.rs` |
 | `AST_INDEX_FORMAT_VERSION` | 2 (alias of `FORMAT_VERSION`) | `lib.rs` (crate root) |
+| `SearchLayer::search` default limit | 20 | `query/engine.rs` |
 
 ## Anti-Patterns
 
@@ -618,7 +766,26 @@ AstQueryEngine::search_ast(q: &AstQuery)
   are `pub(crate)` to allow `lib.rs` to reference `FORMAT_VERSION` as the single source
   of truth for `AST_INDEX_FORMAT_VERSION`. Reverting breaks the compile-time assertion.
 
+- **Implementing `AstPostingSource` in a test fake without overriding `file_lang_and_node_count`**:
+  the default implementation delegates to `file_meta`, so test fakes that implement
+  `file_meta` correctly get the P1 path for free. Only the production `AstIndexReader`
+  needs to override with the 5-byte fast path.
+
+- **Pre-allocating `scores` at `file_count()`**: P3 (#286) uses posting-driven capacity
+  (`CAPACITY_FLOOR` + `reserve(new_slots)` per list). Pre-allocating at `file_count` wastes
+  memory for selective queries. Always let `score_ngram_set` handle capacity.
+
+- **Adding a temporal filter to an AST-only query via `SearchLayer::search`**: the
+  `SearchLayer` impl now returns `Err(InvalidQuery)` immediately when `temporal_flags`
+  is set. Temporal sorting on the AST layer is deferred to Wave 4.
+
 ## Gotchas
+
+- **`query/` is a directory, not a file** (as of #287): do not attempt to open or create
+  `crates/rskim-search/src/ast_index/query.rs`. The module is at
+  `crates/rskim-search/src/ast_index/query/mod.rs`. `query_tests.rs` remains at the
+  `ast_index/` level (not inside `query/`) and is included via `#[path = "../query_tests.rs"]`
+  in `query/mod.rs`.
 
 - **`level_stack` is internal to `AstWalkIter`**: any depth-related bug fix must be made
   in `crates/rskim-core/src/ast_walk.rs`, not in `linearize.rs`.
@@ -643,9 +810,10 @@ AstQueryEngine::search_ast(q: &AstQuery)
   must not confuse `None` post_mmap with "not found" at the API level.
 
 - **v1 indexes are hard-rejected**: `decode_header` returns "unsupported format version: 1
-  (expected 2); please rebuild the AST index". The `index_version` probe lets callers detect
-  this before a full `open` call fails. The CLI self-heal path (Wave 3g, #199) uses this probe
-  in `crates/rskim/src/cmd/search/` — see the `cmd-search` feature knowledge for wiring details.
+  (expected 2); please rebuild the AST index". The `index_version` probe lets callers cheaply
+  detect this before a full `open` call fails. The CLI self-heal path (Wave 3g, #199) uses
+  `index_integrity` (AD-414-6) rather than the bare `index_version` probe, because it also
+  validates file sizes; see the `cmd-search` feature knowledge for wiring details.
 
 - **`COMMENT_KIND_IDS` and `PUNCTUATION_KIND_IDS` lazy init at first `is_counted_child` call**:
   the initialization is O(#kinds × log(vocab_len)), tiny but not zero. Benchmarks should
@@ -667,9 +835,14 @@ AstQueryEngine::search_ast(q: &AstQuery)
   and exposed via `AstIndexReader::file_metrics`, but ranking integration is deferred
   to Wave 4 (#198/#200). Do not factor them into scoring before the integration is wired.
 
-- **`query.rs` is `pub mod`, not `mod`**: it is the only `ast_index` sub-module with
-  public module visibility. This is intentional to expose the `AstPostingSource` trait
-  for external implementors (Wave 4 integrators, test fakes).
+- **`query/mod.rs` is `pub mod`, not `mod`**: all sub-modules inside `query/` are
+  `mod`-private to `query/`. This keeps `ScoringCtx`, `LiteMeta`, `CAPACITY_FLOOR`,
+  `ast_query_to_ngram_set`, and the `score_ngram_set` helper crate-internal. Only items
+  re-exported by `query/mod.rs` are part of the external API — same surface as pre-split.
+
+- **BM25 constants `AST_BM25_K1` and `AST_BM25_B` are `f64`**, not `f32`. The BM25
+  scoring in `bm25_with_lite` uses `f64` arithmetic throughout. Any code comparing or
+  combining these constants should use `f64`, not `f32`.
 
 - **BM25 uses node_count for length normalization, not byte count**: this means two files
   with the same byte size but different language grammars will have different `length_norm`
@@ -680,27 +853,64 @@ AstQueryEngine::search_ast(q: &AstQuery)
   `rskim_search::ast_index::pattern_to_query_set`. The CLI layer accesses it through
   `ast_index::*` imports, not the crate-root re-export.
 
-- **AST index is rebuilt on every `skim search index` call (no incremental cache yet)**:
-  the CLI currently re-extracts all files' AST n-grams on every refresh. Incremental
-  caching is tracked in issue #290.
+- **`AstNgramCache::save()` takes no path argument** (as of the `fbc67b0` refactor):
+  the cache directory is stored internally at construction time (`load(dir)` or
+  `with_dir(dir)`). `empty()` creates a detached instance (empty `PathBuf`) for
+  tests that inspect the cache without saving — do not call `save()` on an
+  `empty()` instance in production. All three constructors: `load(dir)` (incremental
+  build, reads existing skcache), `with_dir(dir)` (cold-start/`--force`, empty
+  cache bound to dir), `empty()` (detached test instance, no backing store).
+
+- **`AstNgramCache` is keyed by content SHA-256, not file path**: cache hits are
+  portable across renames. Lookup is `O(1)` (HashMap). Cache misses call
+  `derive_ast_entry` (linearize + extract). The cache is loaded once at build start
+  and saved once at build end via `AstNgramCache::save()` (atomic write, no path
+  argument — the path is stored internally when constructed via `load` or
+  `with_dir`). A partial failure in `save` leaves the old cache intact.
+
+- **AST n-gram cache (`ast_index.skcache`) is now incremental** (as of Wave 4):
+  the CLI consume loop checks `AstNgramCache::lookup` by content SHA before calling
+  `derive_ast_entry`. Files whose content did not change between builds skip AST
+  extraction entirely. Issue #290 is addressed by this cache implementation.
 
 - **`AST_INDEX_FORMAT_VERSION` is a type alias of `FORMAT_VERSION` with a compile-time
   assert**: `pub const AST_INDEX_FORMAT_VERSION: u16 = ast_index::store::format::FORMAT_VERSION;`.
   Changing it to a separate literal requires updating both constants and the assert.
 
+- **The scalar IDF cache resets per n-gram, not per file**: `last_lang`/`last_idf` in
+  `score_postings` are local to one `score_postings` call (one n-gram's posting list).
+  This is correct (AC8): cross-n-gram reuse would be incorrect since different n-grams
+  have different IDF weights for the same language.
+
+- **P3 `new_slots` is a lower bound for `meta_cache`**: on lang-filtered runs, decoded-but-
+  skipped postings populate the cache without entering `scores`, so `scores.len()` can be
+  smaller than `meta_cache.len()`. The `reserve(new_slots)` call is additive and never
+  under-sizes the cache.
+
 ## Key Files
 
+- `crates/rskim-search/src/ast_index/ast_cache.rs` — `AstNgramCache`, `CachedAstEntry`,
+  `CACHE_FILENAME = "ast_index.skcache"`, `CACHE_FORMAT_VERSION`; content-SHA-keyed
+  incremental build cache; `pub mod` visibility. Constructors: `load(dir)`,
+  `with_dir(dir)` (cold-start), `empty()` (detached test instance). `save()` writes to
+  the stored `cache_dir` (no path arg).
+- `crates/rskim-search/src/ast_index/ast_cache_tests.rs` — co-located tests (included
+  via `#[path]` in `ast_cache.rs`)
 - `crates/rskim-core/src/ast_walk.rs` — `AstWalkIter`, `AstWalkConfig` (canonical limit source), `AstWalkNode`
 - `crates/rskim-search/src/ast_index/linearize.rs` — `LANG_MAPS`, `linearize_source`, `linearize_tree`; SQL size override; delegates DFS to `AstWalkIter`
 - `crates/rskim-search/src/ast_index/ngram.rs` — `AstBigram`, `AstTrigram`, vocabulary helpers, IDF weight lookups
 - `crates/rskim-search/src/ast_index/extract.rs` — `extract_ast_ngrams_with_metrics` (single-pass, Wave 3e), `extract_ast_ngrams_with_weights` (DI core), `AstNgramSet`, `AstBigramEntry`, `AstTrigramEntry`
 - `crates/rskim-search/src/ast_index/structural.rs` — synthetic IDs, bucket edge tables, `StructuralMetrics`, `is_counted_child`, `COMMENT_KIND_IDS`, `PUNCTUATION_KIND_IDS` (Wave 3e); `pub(crate)` visibility
 - `crates/rskim-search/src/ast_index/patterns.rs` — 29-pattern GOLD-verified catalog, `Pattern`, `PatternCategory`, `lookup_pattern`, `pattern_to_query_set` (Wave 3e); `f6_exact_catalog_count` and `f6_per_category_counts` tests lock catalog counts
-- **`crates/rskim-search/src/ast_index/query.rs`** — `AstQuery`, `AstQueryEngine`, `AstPostingSource`, `parse_ast_query`, BM25 scoring (Wave 3f, #197); `pub mod`
-- `crates/rskim-search/src/ast_index/store/format.rs` — pure binary codec: all on-disk struct definitions (v2), encode/decode, binary search helpers, CRC32; no I/O; `pub(crate)` visibility (now accessible from `lib.rs`)
+- **`crates/rskim-search/src/ast_index/query/mod.rs`** — public re-export surface; `#[path]`-includes `query_tests.rs`; `pub mod query`
+- **`crates/rskim-search/src/ast_index/query/parse.rs`** — `AstQuery`, `parse_ast_query`, parsing helpers; `MAX_AST_QUERY_BYTES` aliased from `lexical::MAX_QUERY_BYTES`
+- **`crates/rskim-search/src/ast_index/query/engine.rs`** — `AstQueryEngine`, `SearchLayer` adapter, `ast_query_to_ngram_set`, `score_ngram_set`; Wave 3f/3g/4
+- **`crates/rskim-search/src/ast_index/query/scoring.rs`** — `ScoringCtx`, `LiteMeta`, `AST_BM25_K1` (f64), `AST_BM25_B` (f64), `CAPACITY_FLOOR`, `bm25_with_lite`, `idf_for_language`; Wave 4 P1-P4 (#286)
+- **`crates/rskim-search/src/ast_index/query/adapter.rs`** — `AstPostingSource` trait (with `file_lang_and_node_count` default), `AstIndexReader` impl with P1 override
+- `crates/rskim-search/src/ast_index/store/format.rs` — pure binary codec: all on-disk struct definitions (v2), encode/decode, binary search helpers, CRC32, `decode_lang_and_node_count`; no I/O; `pub(crate)` visibility (now accessible from `lib.rs`)
 - `crates/rskim-search/src/ast_index/store/builder.rs` — `AstIndexBuilder`: merge primitive, parallel `build_from_files`, atomic write via `crate::io_util::atomic_write`, FileId enforcement
-- `crates/rskim-search/src/ast_index/store/reader.rs` — `AstIndexReader`, `AstPosting`: mmap open/validate, `lookup_bigram`, `lookup_trigram`, `file_meta`, `file_metrics`, `index_version`, `avg_max_depth`
-- `crates/rskim-search/src/ast_index/mod.rs` — public re-exports for all seven sub-modules
+- `crates/rskim-search/src/ast_index/store/reader.rs` — `AstIndexReader`, `AstPosting`: mmap open/validate, `lookup_bigram`, `lookup_trigram`, `file_meta`, `file_metrics`, `file_lang_and_node_count`, `index_version`, `avg_max_depth`
+- `crates/rskim-search/src/ast_index/mod.rs` — public re-exports for all sub-modules
 - `crates/rskim-search/src/ast_weights.rs` — auto-generated `NODE_KIND_VOCABULARY` (1740 entries, sorted) and per-language IDF tables; do not edit manually
 - `crates/rskim-search/src/lib.rs` — crate-root re-exports including `AST_INDEX_FORMAT_VERSION` (alias of `FORMAT_VERSION` with compile-time assert) and full Wave 3g export set
 - `crates/rskim-search/benches/ast_query.rs` — Criterion benchmark: 3 scenarios × 10k synthetic files
@@ -721,9 +931,9 @@ AstQueryEngine::search_ast(q: &AstQuery)
   and `Result<T>` alias pattern.
 - Feature: `cmd-search` — CLI command layer (`crates/rskim/src/cmd/search/`) that builds
   and queries this index. Owns the file manifest, FileId alignment between AST and lexical
-  indexes, the `--ast` flag, and the self-heal/auto-rebuild path using `AstIndexReader::index_version`
-  vs `AST_INDEX_FORMAT_VERSION`. Cross-link: the `cmd-search` feature knowledge documents
-  the consumer-side wiring for Wave 3g.
+  indexes, the `--ast` flag, and the self-heal/auto-rebuild path using
+  `AstIndexReader::index_integrity` (AD-414-6) vs `AST_INDEX_FORMAT_VERSION`. Cross-link:
+  the `cmd-search` feature knowledge documents the consumer-side wiring for Wave 3g.
 - Feature: `research-ast` — `rskim-research` crate that produces `ast_weights.rs` via
   `ast-codegen`; also uses `AstWalkIter` from `rskim-core`.
 - `crates/rskim-search/src/index/mod.rs` — lexical sibling; `lang_map` widened to `pub(crate)` here.
@@ -731,10 +941,17 @@ AstQueryEngine::search_ast(q: &AstQuery)
 - Issue #197 (complete, Wave 3f): `AstQueryEngine`, `AstQuery`, `parse_ast_query`, BM25 scoring, `SearchLayer` adapter.
 - Issue #199 (shipped, Wave 3g, PR #291): CLI `--ast` flag, building the AST index alongside
   the lexical index with FileId alignment, and self-heal/auto-rebuild on absent-or-below-FORMAT_VERSION
-  via the `AstIndexReader::index_version` 6-byte probe. Consumer in `crates/rskim/src/cmd/search/`.
+  via the `AstIndexReader::index_integrity` probe (AD-414-6; also validates file sizes — supersedes
+  the bare `index_version` 6-byte probe for the CLI self-heal path). Consumer in `crates/rskim/src/cmd/search/`.
   Note: `run_ast_standalone` in `ast.rs` accepts `blast_file_ids: Option<HashSet<FileId>>` (pre-resolved
   by `mod.rs` via `temporal::resolve_blast_radius_file_ids`) — not raw path strings. The function is
   DB-free by design.
+- Issue #286 (shipped, Wave 4 perf): P1-P4 BM25 scoring optimizations — partial decode, scalar IDF
+  cache, posting-driven capacity sizing, lang filter fold-in. Adds `ScoringCtx`, `LiteMeta`,
+  `ast_query_to_ngram_set`, `file_lang_and_node_count`.
+- Issue #287 (shipped, Wave 4 refactor): structural split of `query.rs` into 4-way submodule directory
+  (`query/mod.rs`, `parse.rs`, `engine.rs`, `scoring.rs`, `adapter.rs`). Pure structural — public API
+  unchanged (AC-3: re-exports byte-identical to pre-split).
 - Issue #198 / #200 (deferred, Wave 4): ranking integration of structural-complexity scoring.
 - Issue #273 (follow-up): on-disk compression (delta + VarInt / Roaring Bitmaps).
 - Issue #283 (deferred): unigram index for `AstQuery::SingleNode` execution.

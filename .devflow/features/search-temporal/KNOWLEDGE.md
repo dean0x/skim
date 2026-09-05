@@ -14,7 +14,7 @@ referencedFiles:
   - crates/rskim-search/src/temporal/storage.rs
   - crates/rskim-search/src/lib.rs
 created: 2026-05-26
-updated: 2026-05-26
+updated: 2026-09-03
 ---
 
 # Search Temporal Integration
@@ -39,7 +39,12 @@ Temporal signals let developers answer questions like "which files in my search 
 
 **Graceful degradation:** Missing `temporal.db` is always a warning + exit 0, never an error. If the DB load or query fails after opening, `apply_temporal_enrichment` logs a warning to stderr and returns without modifying results.
 
-**Staleness warning:** When `temporal.db` exists but its stored git HEAD differs from the current repo HEAD, a warning is printed to stderr in standalone mode. The search continues with stale data rather than refusing to operate.
+**Staleness and degraded state:** When temporal data cannot be served (missing DB,
+corrupt DB, newer schema, repository anchor mismatch, or empty rows), the #414
+degraded-state vocabulary provides typed notices to both stderr and JSON output via
+the `degraded[]` array. `--stats --json` reports `temporal_state` and `staleness`
+from the PRE-self-heal state (AD-414-10). See the `cmd-search` feature knowledge entry
+for the full degraded-state contract.
 
 ## State Transitions
 
@@ -51,8 +56,10 @@ args parsed
   └── SearchAction::Query(text)
         └── text non-empty → run_query(text, temporal_sort, blast_radius, ...)
               └── blast_radius set → normalize path, load co-change partners,
-                  build HashSet → QueryConfig.blast_radius_paths
-                  → execute_query (with file_filter inside BM25F engine)
+                  build BlastRadiusStrengths (HashMap<String, f64>), seed target at SEED_STRENGTH=2.0
+                  → BlastRadiusResolution::Allowed → QueryConfig.blast_radius_paths
+                  → execute_query (composite UNION RRF; file_filter only on the
+                    compound text+--ast arm)
               └── temporal_sort set → apply_temporal_enrichment after BM25F
         └── text empty AND (temporal_sort OR blast_radius set)
               → run_temporal_standalone(temporal_sort, blast_radius, ...)
@@ -62,23 +69,30 @@ args parsed
 
 ## Technical Implementation Patterns
 
-### Blast-Radius Pre-filtering for Combined Mode
+### Blast-Radius Resolution for Combined Mode
 
-When `--blast-radius` is combined with a text query, the co-change partners are resolved to a `HashSet<String>` of repo-relative paths before the BM25F query. This set is passed into `QueryConfig.blast_radius_paths`, which `query.rs` converts to a `FileId` allowlist and injects as `SearchQuery.file_filter` before executing the search. This ensures the `--limit` cap applies to the filtered set, not the full unfiltered result set.
+When `--blast-radius` is combined with a text query, the co-change partners are resolved to a `BlastRadiusStrengths` map (`HashMap<String, f64>`: partner paths to Jaccard scores, plus the blast-radius target itself at `SEED_STRENGTH = 2.0`) before the BM25F query. The resolution result (`BlastRadiusResolution`) is stored in `QueryConfig.blast_radius_paths`.
 
-The resolution in `run_query` is:
+**Two different downstream arms consume that map — do not conflate them:**
+
+| Arm | Dispatch condition | How the map is used |
+|-----|--------------------|---------------------|
+| Compound text+`--ast` | `ast_scored.is_some()` | `paths_to_file_ids` → `HashSet<FileId>`, intersected with the AST set and injected as `SearchQuery.file_filter` so `--limit` applies to the filtered set. |
+| Composite blast-radius | `ast_scored.is_none()` and `blast_radius_paths.is_some()` | `paths_to_scored_file_ids` → a Jaccard-scored `Vec<(FileId, f64)>` temporal layer. The lexical search runs with **no** `file_filter` (a WIDE `K × limit` pool) because UNION semantics require ranking the full candidate set; truncation happens LAST, after RRF fusion and verification. |
+
+The resolution in `run_query` (simplified) is:
 ```rust
-// Partners resolved before execute_query so the limit applies to the filtered set.
-// If temporal_db is None, blast_radius_paths stays None (no pre-filtering).
-if let (Some(raw_path), Some(db)) = (blast_radius, &temporal_db) {
-    let normalized = temporal::normalize_blast_radius_path(raw_path, &root)?;
-    let partners = db.cochanges_for_file(&normalized)?;
-    // ... build HashSet from partners
-    blast_radius_paths = Some(paths);
-}
+// resolve_blast_radius_paths returns BlastRadiusResolution (not Option<HashSet<String>>).
+let resolution = temporal::resolve_blast_radius_paths(blast_radius, &root, &cache_dir, json, &head)?;
+// ::NotRequested            → blast_radius_paths = None
+// ::Allowed(strengths)      → blast_radius_paths = Some(strengths)
+// ::Filtered{allow, .. }    → blast_radius_paths = Some(allow)  ← Some(EMPTY) on RepositoryMismatch
+// ::Degraded(u)             → blast_radius_paths = None
 ```
 
-The key insight: `blast_radius_paths` is consumed by `QueryConfig` and the `file_filter` is a `HashSet<FileId>`, so the pre-filtering is zero-cost at the BM25F scoring layer — no results are discarded post-limit.
+**`Some(empty)` is NOT `None` (AD-413-16 / AC-9).** `Filtered` carries an intentionally empty allowlist for `RepositoryMismatch` (the temporal DB belongs to a different repository); the composite arm must return ZERO results for it. Collapsing `Filtered` to `None` would fall through to a plain unfiltered lexical search — wrong-repo data silently expanded rather than isolated.
+
+The key insight: carrying Jaccard scores (rather than a plain path set) is what lets the temporal RRF layer rank partners by co-change strength instead of by `FileId` (which is the alphabetical index position — the #409 defect).
 
 ### Path Normalization for --blast-radius
 
@@ -129,21 +143,30 @@ Combined mode (text + temporal): the existing `QueryOutput` JSON structure gains
 
 ## Error Handling and Recovery
 
+The degraded-state vocabulary is maintained in `cmd-search` (feature knowledge entry).
+The high-level behaviors:
+
 | Failure scenario | Behavior |
 |---|---|
-| `temporal.db` missing | Warning to stderr, exit 0 (both standalone and combined modes) |
-| `temporal.db` corrupt / unreadable | `open_temporal_db` returns `None` → same graceful path |
-| DB stale vs current HEAD | Warning to stderr, continue with stale data |
+| `temporal.db` missing / corrupt / newer-schema | `open_temporal_state` returns `TemporalOpen::Unavailable` with a typed `DegradedReason`; JSON output gains a `degraded[]` array; exit 0 |
+| Standalone temporal arm unavailable | `applied = "none"` in `degraded[0]`, no `results` key in JSON (AD-414-19) |
+| Text+temporal arm unavailable | `applied = "lexical"` in `degraded[0]`, BM25F results served (AD-414-19) |
+| Repository mismatch (`meta.git_toplevel` differs) | `DegradedReason::RepositoryMismatch`; no rows served; exit 0 |
 | `--blast-radius` path not found | Hard error: "blast-radius file not found: <path>" (exit 1) |
-| `--blast-radius` path outside repo | Hard error: "path is outside the project root" (exit 1) |
-| DB query fails after opening | `apply_temporal_enrichment` logs warning, returns without re-sorting |
-| No co-change data for target | Warning to stderr ("no co-change data for ..."), empty results, exit 0 |
+| DB query fails after opening | `apply_temporal_enrichment` warns to stderr, returns without re-sorting |
+| `parse_history` fails on rebuild | Build-backoff sentinel written (`temporal.db.build_backoff`); `META_GIT_HEAD` NOT written; retry bounded to one walk per HEAD (AD-414-17 / AD-414-21) |
+
+For the complete degraded-state type hierarchy (`DegradedReason`, `DegradedJson`,
+`TemporalOpen`, `Fallback`, `degraded_notice`) and the `applied` per-arm contract, see
+the `cmd-search` feature knowledge entry (Degraded-State Vocabulary section).
 
 ## Anti-Patterns
 
 **Do not put temporal sorting inside `query.rs`**. The `execute_query` function returns BM25F-ordered results and knows nothing about temporal signals. Temporal re-sorting belongs in `mod.rs` calling `temporal::apply_temporal_enrichment` after `execute_query` returns. Mixing sorting responsibilities would break the I/O boundary between query execution and result enrichment.
 
-**Do not apply the blast-radius filter post-limit**. The `blast_radius_paths` must be resolved to a `QueryConfig.blast_radius_paths` HashSet before calling `execute_query`, so that `query.rs` can inject it as a `SearchQuery.file_filter`. Filtering after the limit would silently discard co-change partners that happened to rank outside the top-N of the full result set.
+**Do not truncate the blast-radius candidate set before ranking**. `blast_radius_paths` must be resolved into a `BlastRadiusStrengths` map before `execute_query` so both arms see the full partner set: the compound text+`--ast` arm intersects it into `SearchQuery.file_filter` before LIMIT, and the composite arm ranks the full lexical∪temporal UNION and truncates LAST (after RRF fusion and verification). Applying `--limit` earlier on either arm silently discards co-change partners that ranked outside the top-N of the unfiltered lexical list.
+
+**Do not add a `file_filter` to the composite blast-radius arm**. `run_blast_radius_composite_query` deliberately runs the lexical search *unfiltered* over a wide `K × limit` pool. A `file_filter` there would drop every text-only match outside the partner set, collapsing the UNION back to an intersection and removing the lexical signal the RRF fusion needs.
 
 **Do not treat missing `temporal.db` as an error**. Temporal data is optional — a fresh repo that has never run `skim heatmap` has no DB. Returning exit 1 would break any script that runs `skim search --hot` on CI before the first heatmap run.
 
@@ -157,13 +180,16 @@ Combined mode (text + temporal): the existing `QueryOutput` JSON structure gains
 
 **`apply_temporal_enrichment` uses `load_hotspots()` / `load_risks()` (full table scan)**, not the paginated `top_hotspots()`. This is intentional: the text search already limited the result set to ≤ `limit` files, and we need all temporal scores to annotate them correctly. If the temporal DB grows very large, this may become a bottleneck.
 
-**Staleness check requires `git` on PATH**. `check_temporal_staleness` shells out to `git -C root rev-parse HEAD`. If git is absent or the directory is not a repo, `read_git_head` returns `None` and staleness checking is silently skipped (no warning, no error).
+**`check_temporal_staleness` is `#[cfg(test)]` only**. It is not used from any
+production query path (Decision O-B in `cmd-search`). Production temporal staleness
+uses `temporal_db_is_stale(cache_dir, current_head, git_dir)` in `staleness.rs`
+(three lightweight SQLite reads: HEAD match, data_version, shallow→full probe).
 
 ## Key Files
 
 - `crates/rskim/src/cmd/search/temporal.rs` — all temporal helpers: path normalization, DB open/check, standalone query dispatch, text+temporal enrichment, output formatters
 - `crates/rskim/src/cmd/search/temporal_tests.rs` — co-located tests for temporal.rs (linked via `#[path]` attribute)
-- `crates/rskim/src/cmd/search/types.rs` — `TemporalSort`, `TemporalAnnotation`, `ResolvedResult` (with `temporal` field), `QueryConfig` (with `blast_radius_paths`)
+- `crates/rskim/src/cmd/search/types.rs` — `TemporalSort`, `TemporalAnnotation`, `ResolvedResult` (with `temporal` field), `QueryConfig` (with `blast_radius_paths: Option<BlastRadiusStrengths>`), `BlastRadiusStrengths` type alias (`HashMap<String, f64>`)
 - `crates/rskim/src/cmd/search/mod.rs` — top-level dispatch: `run_query` (combined mode), `run_temporal_standalone` (standalone mode), `parse_flags` (mutual exclusion enforcement)
 - `crates/rskim/src/cmd/search/query.rs` — BM25F search execution; `file_filter` injection from `blast_radius_paths`; `temporal_annotation_tag` for text output suffix
 - `crates/rskim-search/src/temporal/storage.rs` — `TemporalDb`, `HotspotRow`, `RiskRow`, `CochangeRow`, `META_GIT_HEAD`

@@ -7,6 +7,494 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### BREAKING
+
+- **`skim search` temporal layer now walks the full commit DAG** (#407) — the
+  commit population for `--hot`, `--cold`, `--risky`, and `--blast-radius` changes
+  from first-parent-only traversal to a full DAG walk that skips merge commits, matching
+  `git log --no-merges` and skim heatmap's population.  The measured effect on this
+  repository: `crates/rskim/src/cmd/search/query.rs` moves from 21 first-parent commits
+  to 67 full-DAG commits, and fix density rises from 0.095 to 0.522.  Hot/risky scores
+  were previously undercounted by approximately 3× on branch-heavy workflows.
+
+  **Upgrade note (one slow query per root):** the first query after upgrading costs one
+  slow rebuild per project root while the `TEMPORAL_DATA_VERSION` self-heal (1 → 2)
+  replaces the stored data.  Subsequent queries are fast until HEAD advances; the first
+  query after each new commit re-walks history.  (If a previous history walk failed for
+  the current HEAD, the retry backoff defers the heal until HEAD advances or you run an
+  explicit `skim search --rebuild`.)
+
+  **Adopted-root caveat:** a `--root` whose `temporal.db` records a different
+  `git_toplevel` (e.g. the enclosing repository changed) is **refused** rather than
+  silently re-anchored — skim exits 0 with a typed notice.  The remedy is an explicit
+  `skim search --rebuild --root <path>` which re-anchors and writes the new toplevel
+  (PF-017 by design).
+
+  **`--blast-radius` consequence:** because Jaccard numerators and `file_counts`
+  denominators now reflect the full commit population, co-change peer **sets and ordering**
+  may differ from pre-#407 databases after the self-heal rebuild (AD-407-9).
+
+  **Build-time performance (AC-23):** The full-DAG walk visits about 2.5x more commits
+  on this repository (264 first-parent to 662 full-DAG, with merge commits skipped before
+  the tree diff); this cost is build-time only and does not touch the per-query path.
+  A guarded before/after benchmark is tracked under the open cold-build performance ticket #410.
+
+  **Warm query-path performance (AC-24):** a warm `skim search --risky` and a warm
+  `skim search <text>` on an already-current `temporal.db` both measured **< 10 ms**
+  on this repository (well within the < 50 ms target); the query path is unchanged
+  by #407 — only the build path (history walk) changes.  The single post-upgrade
+  self-heal query is explicitly exempt: it re-runs the full history walk and may take
+  several seconds; subsequent queries are fast.
+
+- **`skim search` argv parsing is now strict and symmetric** (#412) — unknown
+  single-dash flags (`-i`, `-w`, `-C`) are rejected with an `unrecognised flag` error
+  and a pointer to the `--` escape hatch, matching the pre-existing long-flag behavior
+  (previously they were silently folded into the query text). Combining a text query
+  with an action flag (e.g. `skim search foo --rebuild`) now hard-errors as an ambiguous
+  mixed form instead of silently running the action and discarding the query. Bare `-`
+  remains a valid positional query token.
+
+- **`skim search` AST index format: v2 → v3 (1 MiB size cap + coverage policy)** (#405):
+  The AST structural index format version is bumped from 2 to 3 to reflect the raised
+  per-file size cap (100 KiB → 1 MiB) and the new coverage taxonomy.  Any existing
+  `ast_index.skidx` written by a prior version is automatically detected as stale and
+  triggers a cold rebuild on the next query (`check_staleness`).  No manual `--rebuild`
+  needed, but expect the rebuild to index more files (and produce a proportionally larger
+  `ast_index.skpost`) if your repo contains files between 100 KiB and 1 MiB.
+
+- **`skim search` AST extraction cache format: v1 → v2 (size-cap policy change)** (#405):
+  The per-file AST extraction cache (`ast_index.skcache`) format version is bumped from 1
+  to 2.  Cached entries computed under the old 100 KiB cap are silently discarded on the
+  next build; affected files are re-extracted at up to 1 MiB.  No user action required.
+
+- **`skim search` manifest format: v2 → v3 (FileId↔path ordering skew fix)** (#373) —
+  Standalone `--ast` queries and all other FileId consumers (lexical, blast-radius, temporal)
+  could return the wrong files whenever the project contained nested directories (e.g.
+  `foo/bar.rs` and `foo.rs`), because FileIds were assigned in `PathBuf` component order
+  but resolved in `BTreeMap<String>` byte order.  The fix aligns both sides to byte-wise
+  string order.  The manifest on-disk JSONL layout is unchanged; the version bump forces a
+  one-time automatic rebuild on the first query after upgrade so no pre-existing index
+  silently serves wrong files.  No manual `--rebuild` needed.
+
+- **`skim search` index format: v3 → v4 (posting lists now delta+varint compressed)** (#358) —
+  Posting entries changed from a fixed 9-byte layout to a variable-length delta+varint encoding
+  (`[varint delta_doc_id][u8 field_id][varint delta_position]`), reducing the lexical index size
+  by approximately 61% on a representative corpus (measured: 3.53x source ratio vs 9.04x before
+  compression).  Any existing `.skim/` index written by a prior version is silently stale; the
+  first query triggers an automatic rebuild (`auto_refresh_if_stale`).  To force an immediate
+  rebuild: `skim search --rebuild`.
+
+- **`skim search` index format: v2 → v3 (n-gram key widened u16 → u32)** (#355) —
+  The n-gram inverted-index key is now a 32-bit trigram `(b1<<16)|(b2<<8)|b3` instead
+  of a 16-bit bigram `(b1<<8)|b2`.  Any existing `.skim/` index written by a prior
+  version is silently stale; the first query triggers an automatic rebuild
+  (`auto_refresh_if_stale`).  To force an immediate rebuild: `skim search --rebuild`.
+
+### Added
+- **`skim search` AST size cap raised 100 KiB → 1 MiB** (#405): Files up to 1 MiB are
+  now eligible for AST structural indexing (named patterns and containment queries via
+  `--ast`).  Files that exceed 1 MiB remain excluded and are fully text-searchable.
+  The cap is language-aware (`ast_size_limit(Language)`): data formats (JSON/YAML/TOML)
+  are never AST-indexed (`ast_size_limit` returns `None` for them — they are
+  non-participants, not uncapped participants).  Expect a proportionally
+  larger `ast_index.skpost` on repos with large source files.
+
+- **`ast_coverage` in `--ast` JSON output and `--stats --json`** (#405): The
+  `--ast` JSON envelopes (`AstJsonEnvelope`, `QueryOutput`) now include an `ast_coverage`
+  key when any files are excluded from AST indexing by the size cap.  The key is absent
+  when all files are within cap (`is_clean()`).  Fields: `size_eligible_files`,
+  `size_excluded_files`, `undetermined_files`, `excluded_by_lang` (per-language breakdown),
+  and `excluded` (bounded path-sorted sample of up to 10 excluded files).
+  `skim search --stats --json` applies the same omit-when-clean guard as the `--ast` surfaces.
+
+- **`skim search` coverage notice on `--build` / `--rebuild` / `--update` / `--ast` / `--stats` / first-ever build**
+  (#405): When files are excluded from AST indexing by the 1 MiB cap, a notice is printed
+  to stderr on every explicit build, refresh, standalone `--ast` query, `--stats` invocation,
+  and the first-ever build triggered by a pure-lexical query (NoIndex case).
+  The notice lists the file count and per-language breakdown, and is suppressed when all
+  files are within cap.  It does NOT fire on incremental self-heals (D-4 cadence).
+
+- **`skim search --stats` AST coverage section (text mode)** (#405): `skim search --stats`
+  now prints `ast eligible`, `ast excluded`, and (when non-zero) `ast undetermined` lines
+  after the existing stats when any files are excluded by the cap.  The section is omitted
+  on clean repos (no excluded or undetermined files), keeping `--stats` output byte-identical
+  to the pre-cap binary on clean codebases.
+
+- **`skim search --phrase --near N` composition**: `--phrase` and `--near N` may now be
+  combined: the composed semantic is ordered (strictly ascending word positions) AND total span
+  ≤ N word tokens - a `PhraseNear(N)` verify mode.  Previously `--near` was silently discarded
+  whenever `--phrase` was also set.  Fix applies at both the index-reader layer (posting
+  intersection) and the verify/CLI-gate layer.  `--phrase --near (k-1)` is semantically
+  equivalent to `--phrase` for a k-word query; `--phrase --near N` ⊆ `--near N` (never wider
+  than the bare near result set). (#403)
+- **`verify_mode` in `skim search --json` output**: the `QueryOutput` envelope now includes a
+  `verify_mode` key (`"phrase"`, `"near"`, or `"phrase_near"`) when a non-default positional
+  mode is active.  The key is absent (not null) for plain substring queries to maintain
+  byte-identity for existing callers. (#403)
+- **Inert-flag notice for `--phrase` / `--near` on non-text arms**: using `--phrase` or
+  `--near` with `--build`, `--rebuild`, `--update`, `--stats`, `--ast` (standalone), or
+  temporal-only queries now prints a notice to stderr instead of silently discarding the flags.
+  Exit code remains 0. (#403)
+- **`skim search --offset N`** — skip `N` verified results before collecting `--limit` results,
+  enabling pagination across all query paths (pure-lexical, compound text+`--ast`,
+  `--blast-radius`, and temporal).  The offset is applied AFTER the verify gate so page
+  boundaries are stable even when stale/incidental-overlap candidates are dropped.
+  Default: 0 (no skip). (#372)
+- **`skim search --weights lexical,ast,temporal`** — tune the `--blast-radius` composite
+  ranking; default `0.5,0.3,0.2`. Ratios only (not normalized; zero and non-sum-to-1 are
+  accepted, negative/NaN/inf rejected). On the `--blast-radius` path only the lexical and
+  temporal signals are active — the AST weight is inert until the full text+AST+temporal
+  compound dispatch lands (#339). (#200, #202)
+- **`skim search --blast-radius` union fusion** — co-change peers are now union-fused with
+  lexical hits via reciprocal-rank fusion: a file that only co-changes with the target
+  (no lexical match) now appears in results, scored by fused RRF rather than being dropped.
+  (#198, #200)
+- **Temporal DB auto-refresh on `skim search`** — after an index (re)build, the temporal
+  database is rebuilt when git `HEAD` has changed, keeping `--hot`/`--cold`/`--risky`/
+  `--blast-radius` current without a manual rebuild step. Non-fatal and debug-gated: a
+  temporal failure never fails the lexical search. (#289)
+- **Incremental AST n-gram cache** — the index reuses per-file AST structural entries
+  (`ast_index.skcache`) across builds for files whose content is unchanged, avoiding a
+  full AST re-parse on every rebuild. (#290)
+- **`skim search --` end-of-flags separator** (#412) — every token after a bare `--`
+  is treated as literal query text, so dash-leading terms (`-Werror`, `->`, `-5`) and
+  even flag-looking words (`--rebuild`, `-h`) can be searched: `skim search -- -Werror`.
+  Output flags (`--json`, `--limit`, `--root`, …) must appear BEFORE `--`, and the
+  `--help`/`-h` scan is likewise bounded at the first `--`.
+- **`skim search` text-mode summary now echoes the effective query** (#412) — the
+  non-empty human summary reads `N result(s) for "query" in Tms` (previously
+  `N result(s) in Tms`) so a mangled query can never masquerade as a successful search.
+  JSON output is unchanged.
+- **`git_head_state` in `skim search --stats --json`** (#413) — the `--stats --json`
+  object now includes a `"git_head_state"` string key alongside the existing
+  `"git_head"` key.  Values: `"resolved"` (HEAD resolves to a SHA), `"unresolved"`
+  (HEAD exists but cannot be resolved to a commit — unborn branch or reftable backend),
+  `"not_a_repo"` (root is not inside a git repository).  Unlike `"git_head"` (which
+  is the SHA stored at the last index build), `"git_head_state"` reflects the live
+  resolution status at call time and can legitimately diverge from `"git_head"` before
+  the first post-upgrade rebuild (e.g. a linked worktree with `"git_head": null` and
+  `"git_head_state": "resolved"`).  Additive — all pre-existing keys are byte-identical
+  on upgrade; the key is absent from the `{"error": "no index found"}` object (AC21).
+
+- **`temporal_state` and `staleness` in `skim search --stats --json`** (#414) — the
+  `--stats --json` object now includes two additional keys:
+  - `"temporal_state"` — health of the temporal database at query time.  Values:
+    `"ready"` (populated and consistent), `"empty"` (present but zero hotspot rows),
+    `"corrupt"` (SQLite-level corruption; DB discarded and one rebuild attempt follows),
+    `"newer-schema"` (written by a newer binary; refused — upgrade skim to access it),
+    `"missing"` (no `temporal.db` found).
+  - `"staleness"` — lexical index staleness at query time.  Values: `"current"` (index
+    HEAD matches current HEAD and working tree is unchanged),
+    `"stale (HEAD changed: <prev8>…→<cur8>…)"` (HEAD changed since last build),
+    `"stale (no HEAD recorded)"` (manifest has no stored HEAD, or an artifact is missing
+    or below its current format version), `"stale (working tree changed: N modified,
+    N added, N removed)"`.
+    `--stats` reports on an index and never creates one: with no `index.skidx` present it
+    still prints `{"error":"no index found","cache_dir":"<path>"}` and exits 1 (unchanged),
+    so the internal cold-start verdict `"no index"` is not among the values this key can
+    take.
+  **Snapshot asymmetry (AD-414-10):** `git_head`, `temporal_state`, and `staleness` are
+  captured from the PRE-self-heal state.  All other fields (`file_count`, `skipped`,
+  `ast_coverage`) are from the POST-self-heal state.  A `temporal_state` of `"missing"`
+  or `"corrupt"`, or a `staleness` of `"stale (no HEAD recorded)"`, can therefore coexist
+  with a valid `file_count` — this is the intended observable contract.  Additive — all
+  pre-existing keys are byte-identical on upgrade.
+
+- **`degraded` array in `skim search --json` when temporal ranking is unavailable** (#414) —
+  when `--hot`, `--cold`, `--risky`, or `--blast-radius` is requested but temporal data
+  cannot be served (DB missing, corrupt, newer-schema, empty, or repository mismatch),
+  the `--json` envelope now includes a `"degraded"` array.  Each element is an object
+  with keys: `subsystem` (always `"temporal"` in this release), `reason` (`"missing"`,
+  `"corrupt"`, `"newer-schema"`, `"empty"`, or `"mismatch"`), `requested` (the flag that
+  was requested), `applied` (`"lexical"` on text-query arms including text +
+  `--blast-radius`; `"none"` on standalone temporal and standalone `--blast-radius`
+  arms — no results served there; `"ast"` reserved for #483, not emitted today),
+  `message` (human-readable: the stderr notice text without the leading
+  `skim search: ` program-name prefix that the CLI output layer prepends, so
+  `stderr.contains(message)` holds byte-for-byte while the two strings are not equal),
+  `remediation` (actionable hint).  The field is absent (`skip_serializing_if`) on
+  healthy queries to keep byte-identity for existing callers.
+
+### Fixed
+- **Documented that `degraded[].message` omits the `skim search: ` program-name
+  prefix** (#414, documentation only). The stderr notice is printed as
+  `skim search: {message}` by the CLI output layer, so the JSON `message` field is the
+  notice text without that prefix. CLAUDE.md, the AD-414-1 rustdoc and the #414
+  changelog entry above previously read as a byte-identity claim between the two, which
+  a `message == first_stderr_line` comparison fails. The code is unchanged: the prefix
+  belongs to the terminal presentation, not to the machine-readable contract.
+- **`skim search` anchors substring-only matches instead of reporting
+  `line_number: null`** (#395). A file that contains the query only inside a longer
+  identifier (for example `mk4_longline_marker` inside the 919-byte token
+  `AAAA...AAAAmk4_longline_marker`) stays in the result set for git-grep recall parity
+  (ADR-007), but it carries no aligned whole-token posting because the AD-411-7
+  `token_length` gate rejects it. Such candidates reach the snippet layer with an empty
+  `match_positions` vec, and the AD-396-5 short-query guard nulled their content-derived
+  anchor, so `--json` returned `line_number: null`, `line_range: null` and
+  `snippet: null` for a genuinely matched file (an agent piping `path:line` into a read
+  got nothing). The guard is now scoped to the case it was written for, a query too short
+  to produce any trigram (`extract_query_ngrams(...).is_empty()`, the same predicate the
+  reader uses to route to `short_query_fallback`), so these results now carry a real
+  `line_number`, `line_range` and snippet, resolved by the substring-verify gate from the
+  file bytes. Queries below the trigram threshold (`fn`, `if`) stay snippet-less exactly
+  as before, and no line-length cap was introduced: a 20 KB single line is anchored too.
+  The `0.0` score of a substring-only match is unchanged and deliberate: it is the marker
+  that ranks these candidates below every exact whole-token BM25F match (AD-411-7).
+- **`--blast-radius` no longer ranks a target that has no co-change partners** (#409).
+  The blast-radius target was injected into the temporal layer unconditionally, so
+  `skim search <text-that-matches-nothing> --blast-radius solo.rs` returned `solo.rs`
+  as its own `co_change_partner` at the bare reciprocal-rank sentinel score, immediately
+  after stderr had said `no co-change data for "solo.rs"`. #409 AC-20 forbids
+  fabricating a ranking in that state. The target is now injected only when it actually
+  has at least one co-change row; the seed-first rule for targets that do have partners
+  (AC-2, AD-409-3 option A) is unchanged, as are the Jaccard ordering and the
+  partial-drop notices. **Behaviour change:** on a target with zero co-change partners
+  every `--blast-radius` arm now returns zero results, which matches what the standalone
+  `--blast-radius` arm already returned for that target and follows ADR-009 (when the
+  blast radius contributes nothing, return nothing rather than a confident ranking that
+  is not a blast radius); text matches inside such a target are no longer surfaced by
+  the composite arm. The redundant `blast-radius filter matched 0 indexed files` stderr
+  line is suppressed when the allowlist is empty, so exactly one explanation reaches
+  stderr.
+- **Query-time empty-temporal notice now names the shallow-clone cause and remedy**
+  (#414). `sync()` records `meta.is_shallow` on every build (AD-414-14) and the
+  build-time zero-row notice already advised `git fetch --unshallow`, but the
+  query-time notice and both the `degraded[].message` and `degraded[].remediation`
+  fields advised `skim search --rebuild`, which on a still-shallow clone rebuilds the
+  same zero rows. The query path now reads the stored flag from the connection it
+  already holds and, when it is set, both fields name `git fetch --unshallow` first.
+  A non-shallow repository with no analysable history, an unreadable `meta` table, and
+  a pre-AD-414-14 database without the row all keep the previous wording.
+- **Standalone `skim search --blast-radius FILE` now discloses an unusable temporal
+  database** (#414). With `--blast-radius` as the only temporal flag there is no sort
+  dimension to probe, so an entirely empty `temporal.db` produced
+  `{"mode":"blast-radius","target":...,"total":0,"results":[]}` with no `degraded` key
+  and nothing on stderr, which is indistinguishable from a healthy database in which the
+  file simply has no co-change partners. The arm now emits the same `degraded` element
+  the composite `text + --blast-radius` arm emits (`subsystem: "temporal"`, the typed
+  `reason`, `requested: "blast-radius"`, `applied: "none"`) plus the matching stderr
+  notice, for every non-ready temporal state. A healthy database whose target file has
+  zero co-change partners is unaffected: it still returns zero results quietly, with no
+  `degraded` element.
+- **`skim search --build` on a repository with no commits now reports its empty
+  history** (#414) — `skim search --build` (and `--rebuild` / `--update`) in a freshly
+  `git init`-ed repository with files but no commits printed only the `indexed N files`
+  line: no `temporal.db` was created and no temporal notice was emitted at all.  An
+  unborn HEAD resolves to no SHA, and the temporal orchestrator returned on that absence
+  before any temporal code ran, so the "no commits" case of the zero-row build notice was
+  unreachable from every CLI arm.  A repository with no commits is an *empty history*,
+  not a build failure: the explicit build arms now write a present-but-empty
+  `temporal.db` and print one stderr line naming the cause
+  (`temporal data is empty (0 rows) — this repository has no commit history skim can
+  analyse`), which — correctly — does **not** mention `shallow` on a non-shallow
+  repository.  The empty database records no `git_head`, so the first query after the
+  repository's first commit rebuilds it automatically.  Plain queries are unaffected and
+  stay silent.
+- **`skim search` linked worktree HEAD resolution and temporal data** (#413) — in a
+  repository with linked worktrees (`git worktree add`), `skim search` read HEAD from
+  the per-worktree `.git` file and then attempted to resolve the symbolic ref in the same
+  directory, finding nothing.  The result was `git HEAD : (none)`, a zero-byte temporal
+  database, and `--hot`/`--cold`/`--risky` serving no temporal data in the linked worktree
+  even though the history was fully present in the primary clone.  Fixed by following the
+  `commondir` pointer from the per-worktree git dir to the shared repository, resolving the
+  ref in the common directory's ref namespaces (loose refs then `packed-refs`).  Also fixes
+  `--install-hooks`/`--remove-hooks` in a linked worktree (previously died with
+  `Not a directory (os error 20)`): hooks now route to the shared `<commondir>/hooks`
+  directory and both commands disclose the shared scope on stderr.  First-query cost after
+  upgrade: one rebuild of `temporal.db` (previously the DB was absent or frozen).
+  `--root <subdirectory-of-a-repo>` now also adopts the enclosing repository's HEAD
+  instead of reporting no temporal data.
+- **`skim search` symbolic-ref path validation tightened** (#482) — a `HEAD` file
+  containing `ref: refs/../../../outside-sha` (a path that starts with `refs/` but
+  escapes the git directory via `..` components) was read and its out-of-tree SHA was
+  persisted into `index.skfiles` and `temporal.db`.  Fixed by applying the ADR-008
+  canonical guard (`is_repo_relative_safe`) in addition to the existing `refs/` prefix
+  check, so any symbolic-ref path containing `..`, an absolute root `/`, or a Windows
+  prefix is rejected before the file is opened.
+
+- **`skim search --rebuild` was a silent no-op when `temporal.db.build_backoff` was set**
+  (#414, AD-414-16) — a per-HEAD backoff sentinel (`temporal.db.build_backoff`, written
+  when a temporal build fails for a given HEAD commit) was checked unconditionally, so
+  an explicit `--rebuild` was silently short-circuited as if it were an automatic quiet
+  retry.  Fixed: `BuildLoudness::Loud` (the `--rebuild`/`--build`/`--update` path) now
+  clears the sentinel at the start of the temporal rebuild (before the backoff gate),
+  so an explicit rebuild always proceeds regardless of prior failures.  `--build` and
+  `--rebuild` reach the clear unconditionally; `--update` reaches it only when
+  `auto_refresh_if_stale` decides a rebuild is warranted.  Only the automatic quiet
+  refresh path (`BuildLoudness::Silent`) still respects the sentinel to bound noisy
+  retry loops.
+
+- **`temporal.db` not rebuilt after SQLite-level corruption** (#414) — when
+  `temporal.db` contained SQLite-level corruption (`SQLITE_CORRUPT` or `SQLITE_NOTADB`),
+  skim now discards the corrupt file and immediately performs one rebuild attempt.
+  Previously the corruption was reported in `temporal_state` but the file was left in
+  place and no rebuild was triggered, leaving the temporal arm permanently degraded.
+
+- **`--stats --json` emits a notice when `temporal.db` exists but has zero hotspot
+  rows** (#414) — an existing but empty temporal DB (all hotspot rows deleted or a
+  repo with only one commit) now reports `temporal_state: "empty"` and emits a
+  degraded notice so callers know why temporal ranking returned no results.
+- **`skim search --near` silently dropped when `--phrase` was also set** (#403):
+  Two independent layers each had the same bug: reader.rs used `if want_phrase { phrase_alignments } else { near_match }`,
+  and query.rs used `if phrase { Phrase } else if near { Near }`.  In both cases `--near N`
+  was completely ignored when `--phrase` was present.  Fix: both layers now use an exhaustive
+  `(phrase, near)` tuple match with a new `PhraseNear(N)` arm, so the composed semantic
+  (ordered + total span ≤ N) is correctly dispatched at the posting-intersection layer and
+  at the verify/CLI-gate layer. (#403)
+- **`skim search --hot/--cold/--risky/--blast-radius` now honors `--offset`** (#404) —
+  Standalone temporal paths silently ignored `--offset` because `limit` was threaded as a
+  bare `usize` at the dispatch site and `offset` was never passed into `run_temporal_standalone`
+  at all.  Fix: `Page{limit, offset}` is now propagated into `query_standalone` (all four
+  temporal arms), `format_temporal_text` (page-aware headers and empty-page messages), and a
+  bounded-page stderr notice is emitted when `has_more=true` so agents can detect the last
+  page without the unsound `len < limit` heuristic.  `has_more` is also present in the JSON
+  envelope on standalone temporal queries.  At `--offset 0` output is byte-identical to
+  pre-#404 behavior for inputs with distinct temporal scores.  Equal-score results follow
+  an updated path-ASC tiebreak (resolution 8) that differs from the implicit path-DESC
+  ordering the old `.reverse()` produced — a negligible edge case in practice.
+
+### Removed
+- **`skim search index` legacy positional subcommand** (#375) — the bareword `index`
+  as a leading positional to `skim search` was removed.  `skim search index` now
+  runs a **lexical query** for the word "index" (exit 0, returns matching files) rather
+  than building the index.  Builds go exclusively through the flag surface:
+  `skim search --build` (incremental), `skim search --rebuild` (full rebuild from
+  scratch), and `skim search --update` (refresh if stale).  A cold `skim search index`
+  on a fresh project auto-builds the index before running the query (existing
+  self-heal behavior — no change needed).  Historical `skim search index --rebuild`
+  calls in previous release notes refer to past release behavior and are unchanged.
+
+### Changed
+- **`skim search --blast-radius` temporal ranking now uses co-change Jaccard strength** (#409) —
+  The co-change POPULATION change (full DAG walk, merge commits skipped) shipped in #407 and is
+  not re-described here.  This entry covers the RANKING change only.
+
+  Prior to #409, the temporal RRF axis of a composite `skim search <text> --blast-radius FILE`
+  query (including `--weights` variants) discarded each co-change partner's Jaccard score and
+  assigned every partner a uniform temporal score of 1.0, sorted by internal FileId (which is
+  the alphabetical index position of the file path in the manifest).  The result was that the
+  co-change-strongest partner could rank last while the alphabetically-first file ranked first,
+  regardless of co-change strength — a silent-degradation defect (ADR-009).
+
+  After #409:
+  - Each co-change partner carries its actual Jaccard co-change strength as its raw temporal score.
+  - The blast-radius target (the `--blast-radius FILE` argument) ranks **first** in the temporal
+    layer via a finite sentinel `SEED_STRENGTH = 2.0` (> maximum Jaccard of 1.0 by construction).
+  - `merge_layer_scores`' per-layer sort is now a total comparator (score DESC, FileId ASC),
+    eliminating any non-determinism from equal-score ties.
+  - Unindexed co-change partners (paths recorded in `temporal.db` but absent from the lexical
+    manifest — e.g., files outside a `--root` subtree) are now disclosed on stderr with a count
+    of dropped partners (excluding the seed); exit code remains 0.  Additionally, when the
+    blast-radius target file itself is absent from the indexed manifest, a separate notice is
+    emitted on stderr (the target is excluded from scoring but the query continues).
+
+  **User-visible consequences:**
+  - `skim search <text> --blast-radius FILE --limit 1 --json` with a temporal-dominant
+    `--weights` (e.g. `0,0,1`) now returns the **seed** (`FILE` itself), not the
+    alphabetically-first co-change partner.  At default weights (`0.5,0.3,0.2`) the seed tops
+    the temporal layer, but the fused ranking still combines the lexical axis, so a file with
+    a strong lexical match may outrank it in the composite score.
+  - `skim search <text> --blast-radius FILE --hot` (and `--cold`, `--risky`) may return a
+    **different set** because the hotspot re-sort window is drawn from the newly-ordered fused
+    ranking, not the old alphabetical ordering.  This is a correctness improvement, not a
+    regression: the window now reflects the strongest co-change partners rather than the
+    alphabetically-earliest ones (AC-19 user-visible consequence).
+  - `skim search <text> --blast-radius FILE` with a co-change allowlist whose partners all
+    resolve to zero indexed files (e.g. all partners deleted or outside the `--root` subtree)
+    now returns zero results with the partial-drop notice on stderr, rather than silently
+    falling back to an unfiltered lexical result list (AD-413-16 semantics restored).
+
+- **`skim search` single-token queries now use AND-intersection + raw occurrence-count ranking** (#372) —
+  Prior to this change, all lexical queries used a BM25F UNION pool: candidates ranked by BM25F score,
+  which divides term-frequency by field length, penalising large files.  For single contiguous tokens
+  (≥ 3 bytes, no interior whitespace — the common identifier search), the engine now:
+  (1) AND-intersects the query's trigram posting lists (grep-exact, corpus-size-independent recall),
+  (2) ranks surviving files by raw occurrence count (length-norm-free, AD-372-6) so large-file definers
+  with multiple references are not buried by small stubs that have 1 occurrence in a tiny file.
+  BM25F UNION is unchanged for multi-word queries.  The verify gate (literal substring membership)
+  is preserved on both paths.  Result ordering for single-token queries may change after upgrade.
+- **`skim search` lexical results are now filtered to files literally containing the query** (#355) —
+  Prior to this change the n-gram index returned candidates ranked by BM25F score, but no
+  literal-substring check was performed: a file could appear in results even if none of its
+  bytes contained the exact query string (false positives from bigram-overlap noise).  A
+  candidate-then-verify gate now reads each candidate file once and confirms the query string
+  is present as a literal substring before the result is emitted.  Files that pass the trigram
+  index but fail the literal check are silently dropped.  **Short queries (< 3 bytes)**:
+  queries too short to generate any trigrams now trigger an all-files fallback (AD-355-7);
+  the same verify gate applies, so only files literally containing the 1–2 byte query are
+  returned.  Scores for short-query results are 0.0 (no trigram ranking possible).
+- **`skim search --ast` output format** — text rows now render the score as `[N]`
+  (previously `score: N`) and append a `:line` suffix plus a source snippet when the
+  matched pattern node is line-recovered; degraded (non-recovered) rows omit both. JSON
+  output gains optional `line` and `snippet` fields — additive, so existing consumers of
+  `path`/`score` are unaffected. (#201)
+- **`--root <subdirectory-of-a-repo>` now resolves the enclosing repository** (#413) —
+  a `--root` that is a subdirectory of a git repository adopts that repository's HEAD
+  (bounded ancestor walk, nearest match) and therefore builds real temporal data, where
+  it previously reported `git HEAD : (none)` and `no temporal data`.  The temporal rows
+  are scoped and re-anchored to the indexed subtree, so one `--root` is one result
+  universe: every temporal arm returns only paths inside the subtree, and `--blast-radius`
+  co-change peers outside it are dropped.  Pass the repository toplevel as `--root` for
+  repository-wide ranking.  The repository that produced the rows is recorded as
+  `meta.git_toplevel`; if the enclosing repository later changes, temporal arms refuse
+  (no rows served, `temporal.db` byte-unchanged, exit 0) instead of silently rescoring —
+  `--build`/`--rebuild`/`--update` re-anchor and disclose the old and the new toplevel.
+  A subdirectory root gains its own `temporal.db`, so its first build walks history once.
+  Staleness for adopted roots is scoped to a working-tree metadata scan (mtime + size)
+  rather than a HEAD-SHA comparison: a commit that touches only files OUTSIDE the
+  subtree does not trigger a rebuild of the subdirectory index, because the repo-wide
+  HEAD advancing is not evidence that the subtree changed.
+- **`skim search --install-hooks`/`--remove-hooks` now resolve git's own hooks directory**
+  (#413) — the hooks path is resolved through the `commondir` chain (matching
+  `git rev-parse --git-path hooks`) instead of being hand-built as `<root>/.git/hooks`.
+  In a linked worktree this is the shared `<commondir>/hooks`, so installing or removing
+  from one worktree changes hook behaviour for **every worktree** of the clone; both
+  commands print the absolute resolved directory and disclose that scope on stderr, and
+  `--remove-hooks` no longer prints a success line when nothing was removed.  Plain
+  repositories and non-repository roots resolve to the same path as before.
+  A `--root` that is a subdirectory of a git repository but has no `.git` entry of
+  its own is **refused** — the command exits with an error naming the enclosing
+  repository so the caller can re-run with the correct `--root`.
+- **`skim search` temporal-arm degradation messages are now reason-specific** (#413) —
+  previously, all "no temporal data" conditions on `--hot`/`--cold`/`--risky`/
+  `--blast-radius` (and the temporal path of `--ast`) emitted a single generic message:
+  `"no temporal data — run 'skim search' on a git repo to auto-populate"`.  That
+  message is now reserved for the non-git case (root is not inside any git repository).
+  Three reason-specific messages replace it for the remaining conditions:
+  (1) **Unresolved HEAD** (unborn branch or reftable backend): starts with
+  `"git HEAD could not be resolved to a SHA"`;
+  (2) **Resolved HEAD, empty temporal build** (no git-log entries for the root):
+  starts with `"git HEAD resolved but the temporal build produced no data"`;
+  (3) **Resolved HEAD, anchor mismatch** (on-disk `temporal.db` was built from a
+  different repository): starts with `"temporal data on disk was built from a
+  different repository"`.
+  Scripts or automation that matched the previous generic text will not match
+  conditions (1)–(3); the stable prefix of each new message is the named constant
+  in source (`HEAD_UNRESOLVED_TEMPORAL_MSG`, `TEMPORAL_BUILD_EMPTY_MSG`,
+  `SUBDIR_ROOT_TEMPORAL_MSG`) for tests that need a reliable assertion target.
+
+### Fixed
+- **`skim search --rebuild`/`--build` now populate `temporal.db`** (#357) — explicit
+  rebuilds previously produced only the lexical+AST index; temporal/co-change data
+  (`--hot`/`--cold`/`--risky`/`--blast-radius`) was silently unavailable until the
+  next auto-refresh cycle.  The rebuild path now calls `rebuild_temporal` after
+  `build_index`, producing a complete index in one step.
+- **`--hot`/`--cold`/`--risky`/`--blast-radius` self-heal a stale or missing `temporal.db`**
+  (#357) — when the lexical index was Current but `temporal.db` was absent or its stored
+  `META_GIT_HEAD` diverged from the current HEAD (e.g. post-upgrade, manual deletion, or
+  a first rebuild after the above fix landed), these flags silently returned degraded
+  output.  `auto_refresh_if_stale` now checks temporal staleness independently of lexical
+  staleness and self-heals before the early-return.  Extends the #289 temporal auto-refresh
+  to cover this previously-unguarded gap.  Non-fatal: a temporal failure never fails the
+  lexical search (ADR-006/D5).
+- **`skim search <text> --ast <pattern>` compound intersection no longer silently drops
+  valid matches** (#356) — the old `CANDIDATE_POOL_K = 4` multiplier capped the lexical
+  candidate pool at `limit * 4`, so files ranking beyond position `limit * 4` in the
+  unfiltered lexical list were invisible to the intersection even when they satisfied both
+  the text query and the AST pattern.  The lexical pool is now restricted to the exact
+  AST-matched file set (`file_filter = AST set`, `sq.limit = |AST set|`), making the
+  compound intersection complete by construction.  Part of the #198/#200 compound
+  text+AST path.
 ### Changed
 - **`skim proxy` is now gated behind a non-default `proxy` cargo feature** — default builds are
   HTTP/TLS-free (AC9); release binaries include the proxy. Source builds opt in via

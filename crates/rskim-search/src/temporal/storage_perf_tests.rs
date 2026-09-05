@@ -118,7 +118,8 @@ fn sync_writes_all_tables_atomically() {
         jaccard: 0.3,
     }];
 
-    db.sync(&hotspots, &risks, &cochanges, "abc123").unwrap();
+    db.sync(&hotspots, &risks, &cochanges, "abc123", false)
+        .unwrap();
 
     assert_eq!(db.load_hotspots().unwrap().len(), 1);
     assert_eq!(db.load_risks().unwrap().len(), 1);
@@ -147,7 +148,7 @@ fn sync_replaces_on_second_call() {
         count: 2,
         jaccard: 0.4,
     }];
-    db.sync(&h1, &r1, &c1, "sha1").unwrap();
+    db.sync(&h1, &r1, &c1, "sha1", false).unwrap();
 
     let h2 = vec![HotspotRow {
         file_path: "x.rs".into(),
@@ -168,7 +169,7 @@ fn sync_replaces_on_second_call() {
         count: 5,
         jaccard: 0.7,
     }];
-    db.sync(&h2, &r2, &c2, "sha2").unwrap();
+    db.sync(&h2, &r2, &c2, "sha2", false).unwrap();
 
     let loaded_h = db.load_hotspots().unwrap();
     assert_eq!(loaded_h.len(), 1);
@@ -191,7 +192,7 @@ fn sync_replaces_on_second_call() {
 #[test]
 fn sync_sets_meta_keys() {
     let (_dir, db) = temp_db();
-    db.sync(&[], &[], &[], "deadbeef").unwrap();
+    db.sync(&[], &[], &[], "deadbeef", false).unwrap();
 
     let head = db.get_meta(META_GIT_HEAD).unwrap();
     let updated = db.get_meta(META_LAST_UPDATED).unwrap();
@@ -305,7 +306,8 @@ fn sync_10k_each_under_500ms() {
     let ceiling = threshold_ms(2_500, 500);
 
     let start = Instant::now();
-    db.sync(&hotspots, &risks, &cochanges, "perf_head").unwrap();
+    db.sync(&hotspots, &risks, &cochanges, "perf_head", false)
+        .unwrap();
     let elapsed = start.elapsed();
 
     assert!(
