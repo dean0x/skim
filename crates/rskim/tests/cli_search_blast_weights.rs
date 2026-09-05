@@ -161,7 +161,10 @@ fn build_index(proj: &Path, cache: &Path) {
     );
 }
 
-/// Run `skim search [args…] --root <proj> --json` and return the raw stdout + stderr.
+/// Run `skim search [args…] --root <proj>` and return the raw stdout + stderr.
+///
+/// Unlike [`run_search_json`], this helper does **not** append `--json`; callers that
+/// need JSON output must pass `"--json"` in `extra_args`.
 fn run_search_raw(proj: &Path, cache: &Path, extra_args: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let out = StdCommand::new(cargo_bin("skim"))
         .args(["search"])
@@ -258,6 +261,78 @@ fn make_linear_fixture() -> TempDir {
     // C5: anchor only (solo — bumps anchor total from 4 to 5).
     write_and_stage(dir.path(), "anchor.rs", "// anchor v5\n");
     git_commit(dir.path(), "chore: anchor solo commit", now - 5 * 86400);
+
+    dir
+}
+
+/// Create a fixture whose HEAD is a merge commit (needed for AC-16b).
+///
+/// Layout:
+///   C1 (main): `alpha.rs` + `beta.rs`  — non-merge, co-changes both files.
+///   C2 (feat): `gamma.rs`               — non-merge, on a side branch.
+///   M  (main): merge commit             — merge of feat into main, HEAD after clone.
+///
+/// When cloned with `--depth 1` (via a `file://` URL so `--depth` is honoured),
+/// the HEAD of the clone is the merge commit M.  After #407's full-DAG walk skips
+/// merge commits, zero non-merge commits are visible → `temporal.db` is empty →
+/// skim degrades gracefully on the next composite query.
+fn make_merge_commit_fixture() -> TempDir {
+    let now = now_epoch();
+    let dir = TempDir::new().expect("TempDir::new");
+    git_init(dir.path());
+
+    // C1: two files co-changed on main.
+    write_and_stage(dir.path(), "alpha.rs", "// alpha v1\n");
+    write_and_stage(dir.path(), "beta.rs", "// beta v1\n");
+    git_commit(dir.path(), "feat: initial co-change", now - 20 * 86400);
+
+    // Create a side branch and add one commit there.
+    let s = StdCommand::new("git")
+        .args(["checkout", "-b", "feat-branch"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git checkout -b feat-branch");
+    assert!(
+        s.status.success(),
+        "git checkout -b feat-branch failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    write_and_stage(dir.path(), "gamma.rs", "// gamma v1\n");
+    git_commit(
+        dir.path(),
+        "feat: add gamma on feat-branch",
+        now - 10 * 86400,
+    );
+
+    // Return to main.
+    let s = StdCommand::new("git")
+        .args(["checkout", "main"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git checkout main");
+    assert!(
+        s.status.success(),
+        "git checkout main failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+
+    // M: merge commit — this becomes HEAD of the shallow clone.
+    let s = StdCommand::new("git")
+        .args([
+            "merge",
+            "--no-ff",
+            "feat-branch",
+            "-m",
+            "merge: feat-branch into main",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("git merge --no-ff");
+    assert!(
+        s.status.success(),
+        "git merge failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
 
     dir
 }
@@ -689,18 +764,24 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
         !json_text.contains("dropped_partners"),
         "AC-7: JSON stdout must not contain 'dropped_partners' key"
     );
+}
 
-    // Subcase: NO notice when zero partners are dropped (zstrong is still in manifest).
-    // Run standalone blast-radius which does NOT go through paths_to_file_ids for the
-    // notice path; instead check by running the composite query with only indexed paths.
-    // We verify the "zero drops" case by running against a full-manifest fixture.
+/// AC-7 (subcase) — when zero co-change partners are absent from the manifest, the
+/// "not found in the indexed manifest" notice MUST NOT appear on stderr.
+///
+/// Uses the FX-LINEAR fixture (all three files on disk and in the manifest) so that
+/// every partner returned by `cochanges_for_file("anchor.rs")` is present in the
+/// lexical index.  This scenario runs the composite `--weights` path, which is the
+/// path that emits the AD-409-7 notice when partners are dropped.
+#[test]
+fn ac409_4b_no_notice_when_zero_partners_dropped() {
     let fixture = make_linear_fixture();
-    let cache2 = TempDir::new().unwrap();
-    build_index(fixture.path(), cache2.path());
+    let cache = TempDir::new().unwrap();
+    build_index(fixture.path(), cache.path());
 
-    let (_, stderr2) = run_search_raw(
+    let (_, stderr) = run_search_raw(
         fixture.path(),
-        cache2.path(),
+        cache.path(),
         &[
             "xqzjvmblorp_ac409_e2e_ac7_nodrop",
             "--blast-radius",
@@ -712,10 +793,10 @@ fn ac409_4_unindexed_partner_omission_is_disclosed() {
             "--json",
         ],
     );
-    let stderr2_text = String::from_utf8_lossy(&stderr2);
+    let stderr_text = String::from_utf8_lossy(&stderr);
     assert!(
-        !stderr2_text.contains("not found in the indexed manifest"),
-        "AC-7: when zero partners are dropped, the notice MUST NOT appear; got: {stderr2_text:?}"
+        !stderr_text.contains("not found in the indexed manifest"),
+        "AC-7b: when zero partners are dropped, the notice MUST NOT appear; got: {stderr_text:?}"
     );
 }
 
@@ -844,13 +925,17 @@ fn ac409_16a_shallow_clone_ties_are_deterministic() {
     git_commit(source.path(), "feat: initial co-change", now - 5 * 86400);
 
     // Shallow clone: --depth 1 gives exactly one commit → J(alpha,beta) = 1.0.
+    // Must use a `file://` URL so that git honours `--depth`; a bare local path
+    // silently ignores --depth (git uses the local transport and emits
+    // "warning: --depth is ignored in local clones; use file:// instead.").
     let clone_dir = TempDir::new().unwrap();
+    let source_url = format!("file://{}", source.path().display());
     let s = StdCommand::new("git")
         .args([
             "clone",
             "--depth",
             "1",
-            source.path().to_str().unwrap(),
+            &source_url,
             clone_dir.path().to_str().unwrap(),
         ])
         .output()
@@ -859,6 +944,13 @@ fn ac409_16a_shallow_clone_ties_are_deterministic() {
         s.status.success(),
         "git clone --depth 1 failed: {}",
         String::from_utf8_lossy(&s.stderr)
+    );
+    // Guard: --depth is only honoured for file:// URLs; a bare path silently
+    // produces a full clone and makes the test premise vacuous.
+    assert!(
+        clone_dir.path().join(".git/shallow").exists(),
+        "AC-16a: clone must be genuinely shallow (.git/shallow must exist); \
+         --depth is ignored for bare local-path clones — use file:// instead"
     );
 
     let cache = TempDir::new().unwrap();
@@ -892,8 +984,8 @@ fn ac409_16a_shallow_clone_ties_are_deterministic() {
         ],
     );
 
-    // Both runs must exit 0 (assert_cmd guarantees this via assert().success()).
-    // Result paths must be byte-identical (deterministic, no panic).
+    // Both runs must exit 0; run_search_json panics (via assert!) if the process
+    // exits non-zero.  Result paths must be byte-identical (deterministic, no panic).
     let empty1: Vec<serde_json::Value> = vec![];
     let paths1: Vec<Option<&str>> = v1["results"]
         .as_array()
@@ -924,41 +1016,49 @@ fn ac409_16a_shallow_clone_ties_are_deterministic() {
     );
 }
 
-/// AC-16b — `git clone --depth 1` of THIS repository exits 0, emits a degraded
-/// element with `subsystem: "temporal"`, emits NO fabricated ranking, and produces
+/// AC-16b — a `--depth 1` shallow clone whose HEAD is a merge commit exits 0,
+/// emits a `degraded` element with `subsystem: "temporal"`, and produces
 /// byte-identical output across two runs.
 ///
-/// After #407, a `--depth 1` clone whose sole commit is a merge commit yields
-/// zero non-merge commits → skim detects a shallow state and degrades gracefully.
-/// We assert only the degraded contract, never a specific ranking.
+/// Uses a hermetic purpose-built fixture (`make_merge_commit_fixture`) so the
+/// test is fast and self-contained.  The fixture's HEAD is a merge commit; after
+/// #407's full-DAG walk skips merge commits, zero non-merge commits are visible →
+/// temporal DB is empty → skim degrades gracefully on the composite query.
+///
+/// Must clone via a `file://` URL so that `--depth 1` is actually honoured;
+/// git silently ignores `--depth` for bare local-path sources.
 #[test]
 fn ac409_16b_real_repo_shallow_degrades_gracefully() {
-    // Shallow clone of THIS repository.
-    let this_repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
+    // Build a hermetic fixture whose HEAD is a merge commit (see make_merge_commit_fixture).
+    let source = make_merge_commit_fixture();
 
+    // Clone via file:// so --depth 1 is honoured; a bare local path silently
+    // ignores --depth ("warning: --depth is ignored in local clones; use file://
+    // instead.") and produces a full clone without creating .git/shallow.
     let clone_dir = TempDir::new().unwrap();
+    let source_url = format!("file://{}", source.path().display());
     let s = StdCommand::new("git")
         .args([
             "clone",
             "--depth",
             "1",
-            this_repo.to_str().unwrap(),
+            &source_url,
             clone_dir.path().to_str().unwrap(),
         ])
         .output()
         .expect("git clone --depth 1");
-    // If clone fails (e.g. network isolated), skip gracefully.
-    if !s.status.success() {
-        eprintln!(
-            "AC-16b: git clone --depth 1 failed ({}); skipping test",
-            String::from_utf8_lossy(&s.stderr)
-        );
-        return;
-    }
+    assert!(
+        s.status.success(),
+        "AC-16b: git clone --depth 1 failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    // Guard: --depth is only honoured for file:// URLs; a bare path produces a full
+    // clone without .git/shallow, making the shallow-state code path unreachable.
+    assert!(
+        clone_dir.path().join(".git/shallow").exists(),
+        "AC-16b: clone must be genuinely shallow (.git/shallow must exist); \
+         --depth is ignored for bare local-path clones — use file:// instead"
+    );
 
     let cache = TempDir::new().unwrap();
     build_index(clone_dir.path(), cache.path());
@@ -971,9 +1071,9 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
     // output.degraded so machine consumers can parse the reason.
     // Note: run_search_raw prepends "search" internally; extra_args must NOT repeat it.
     let composite_args: &[&str] = &[
-        "fn", // text query: routes to composite arm (text + --blast-radius)
+        "alpha", // text query: routes to composite arm (text + --blast-radius)
         "--blast-radius",
-        "crates/rskim/src/cmd/search/query.rs",
+        "alpha.rs", // file present in the fixture working tree
         "--weights",
         "0,0,1",
         "--limit",
@@ -1009,18 +1109,11 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
 
     let v = v1;
 
-    if v.is_null() {
-        eprintln!("AC-16b: could not parse JSON output; skipping ranking assertions");
-        return;
-    }
-
-    // AC-16b degraded contract: when the shallow clone yields no temporal data
-    // (e.g. HEAD is a merge commit so #407 skips all commits → empty temporal DB),
-    // the composite arm emits a `degraded` array containing a "temporal" element.
-    // When temporal data IS available (HEAD is a non-merge commit that touches ≥2
-    // files), the `degraded` key is absent (skip_serializing_if Vec::is_empty) and
-    // results are served normally.  Both outcomes are acceptable per AC-16b; we
-    // assert the correct contract for whichever case is observed.
+    // AC-16b degraded contract: HEAD is a merge commit → #407 skips all commits →
+    // temporal DB is empty → composite arm emits `degraded` with subsystem "temporal".
+    // When temporal data is unexpectedly available (e.g. git behaviour change),
+    // we assert non-empty results instead so a zero-result response does not silently
+    // pass (PF-007: assert observable output, not just exit 0).
     let degraded = v["degraded"].as_array();
     if let Some(degs) = degraded {
         // degraded key is present → must contain a "temporal" subsystem element.
@@ -1037,17 +1130,13 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
              got: {degs:?}"
         );
     } else {
-        // degraded key absent → temporal was healthy; assert results are non-empty
-        // so a zero-result response (which could mask a code regression) does not
-        // silently pass (PF-007: assert observable output, not just exit 0).
+        // degraded key absent → temporal was unexpectedly healthy; assert results are
+        // non-empty so a zero-result response does not silently pass (PF-007).
         let total = v["total"].as_i64().unwrap_or(-1);
         assert!(
             total > 0,
-            "AC-16b: when temporal is healthy, blast-radius on a real-repo shallow clone \
+            "AC-16b: when temporal is healthy on a shallow clone, blast-radius \
              must return at least one result; got total={total}"
         );
     }
-    // The results array (if present) must contain no fabricated entries beyond
-    // what a non-degraded query would return — we assert only exit 0 and
-    // byte-identity, not the specific result count, per AC-16b.
 }

@@ -565,9 +565,11 @@ pub(super) fn execute_query_with_manifest(
     //   1. Fetch a WIDER lexical pool (limit * BLAST_CANDIDATE_POOL_K) WITHOUT a
     //      file_filter so text-only matches outside the co-change partner set
     //      are still present in the lexical ranked list.
-    //   2. Build a temporal ranked list from the co-change partner set:
-    //      each partner gets an equal score of 1.0 so they all contribute rank
-    //      terms to the RRF fusion.
+    //   2. Build a Jaccard-scored temporal ranked list: the blast-radius target
+    //      carries SEED_STRENGTH (2.0 > max Jaccard 1.0) and each partner
+    //      carries its actual Jaccard co-change strength; merge_layer_scores'
+    //      total comparator (score DESC, FileId ASC) derives deterministic
+    //      per-layer ranks from these values (AD-409-2).
     //   3. Run merge_layer_scores over [lexical, temporal] with the composite
     //      weights from config or the default profile.
     //   4. Recompose: carry the lexical SearchResult (snippet + line_range)
