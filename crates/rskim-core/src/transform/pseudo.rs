@@ -497,7 +497,6 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
             .map(|&(start, end)| adjust_range_for_line_removal(source, start, end, &newlines))
             .collect(),
     );
-
     // Compute the source line map from the byte-level removal ranges.
     // Must be done before remove_ranges, using the ranges themselves, so that
     // modified lines (e.g. `def f(a: int):` → `def f(a):`) still map to their

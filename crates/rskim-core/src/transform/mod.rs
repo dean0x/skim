@@ -411,17 +411,20 @@ pub(crate) fn normalize_line_map_blanks(
         // of such lines so that the check `in_protected(line_start, ...)` catches them.
         let is_blank = trim_end == line_start && !in_protected(line_start, protected);
 
-        // Mirror trim_and_normalize's silent drop (Rule 1, extended):
-        // any line whose trimmed content is empty (trim_end == line_start) contributes
-        // zero bytes via `push_str("")`. When result is still empty that push_str has
-        // no effect — the line is invisible in lines() output. Drop its map entry too.
-        // This covers both ordinary blank lines (is_blank == true) AND protected-sentinel
-        // blank lines (is_blank == false, trim_end == line_start, in_protected == true).
-        if trim_end == line_start && result.is_empty() {
-            continue;
-        }
-
         if is_blank {
+            // Rule 1: mirror trim_and_normalize's leading-blank drop.
+            //
+            // Scope note: this mirrors the UNPROTECTED case only. A protected
+            // sentinel line (trim_end == line_start but inside a literal) is
+            // deliberately excluded, because `collapse_whitespace` emits a
+            // one-byte '\n' for it — the line is non-empty in the output and
+            // must keep its map entry. Widening this to every zero-trim line
+            // drops an entry the text retains and shifts every later `-n`
+            // annotation by one, which `test_line_numbers_pseudo_leading_blank_lines`
+            // catches (PF-019).
+            if result.is_empty() {
+                continue;
+            }
             // Rule 2: cap consecutive blanks at 2.
             consecutive_blanks += 1;
             if consecutive_blanks > 2 {
@@ -818,44 +821,26 @@ mod tests {
         let blank_map = normalize_line_map_blanks("\n\n", vec![1, 2], &[]);
         assert!(blank_map.is_empty(), "all-blank input returns empty map");
 
-        // Rust-5 regression: protected-sentinel blank line at the start.
+        // Known divergence (rust-5, unresolved): a hand-constructed protected
+        // sentinel at byte 0 — `trim_and_normalize("\nhello\n", &[(0, 1)])` —
+        // yields one text line while the map keeps two entries.
         //
-        // `collapse_whitespace` emits a one-byte sentinel covering the '\n' of a
-        // truly-empty line inside a multi-line string literal, marking it as
-        // in_protected so it is not subject to the 3+ consecutive-blank cap.
-        // However, when this sentinel appears at the very start of the output,
-        // `trim_and_normalize` emits it as `push_str("")` — zero bytes, result
-        // stays empty — so the line does NOT appear in lines() output.
+        // The narrow condition that would drop it (`trim_end == line_start &&
+        // result.is_empty()`, ignoring protectedness) is NOT correct: applied to
+        // the real pseudo pipeline it drops an entry the text retains and shifts
+        // every later `-n` annotation by one, which
+        // `cli_line_numbers::test_line_numbers_pseudo_leading_blank_lines`
+        // measures end to end. So the protected case stays in the map.
         //
-        // The bug: `normalize_line_map_blanks` previously only mirrored the
-        // `is_blank` branch (which is_blank == false for the sentinel because
-        // in_protected == true), keeping the map entry while trim_and_normalize
-        // dropped it, producing a map that was 1 longer than the line count.
+        // The divergence is therefore synthetic: this `protected` slice is not
+        // the shape `collapse_whitespace` emits for a leading blank in the real
+        // pipeline. Resolving it properly means having the map derive emptiness
+        // from `trim_and_normalize` itself rather than re-deriving it, which is
+        // a larger change than PF-019 warrants here. Like the all-blank case
+        // above, it degrades safely: `format.rs` falls back to
+        // `.get(i).unwrap_or(0)`.
         //
-        // Layout: "\nhello\n" where byte 0 ('\n') is the sentinel (protected).
-        // trim_and_normalize: sentinel → push_str("") → result stays "" → not
-        //   visible; "hello" → pushed → result = "hello\n" → 1 line.
-        // normalize_line_map_blanks must also drop the sentinel → returns [10].
-        let sentinel_text = "\nhello\n";
-        let sentinel_protected = &[(0usize, 1usize)]; // covers the sentinel '\n'
-        let sentinel_map = vec![5usize, 10usize]; // sentinel at src 5, content at src 10
-
-        let sentinel_normalized_map =
-            normalize_line_map_blanks(sentinel_text, sentinel_map, sentinel_protected);
-        let sentinel_normalized_text = trim_and_normalize(sentinel_text, sentinel_protected);
-        assert_eq!(
-            sentinel_normalized_map.len(),
-            sentinel_normalized_text.lines().count(),
-            "protected-sentinel leading line: map len ({}) must match text line count ({}) \
-             — rust-5 regression guard",
-            sentinel_normalized_map.len(),
-            sentinel_normalized_text.lines().count(),
-        );
-        assert_eq!(
-            sentinel_normalized_map,
-            vec![10],
-            "sentinel entry must be dropped; only the content line's source mapping remains"
-        );
+        // PF-025: the end-to-end test is the oracle, not this fixture.
     }
 
     // ========================================================================

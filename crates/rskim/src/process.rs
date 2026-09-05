@@ -882,11 +882,16 @@ pub(crate) fn process_stdin(
 
     // Apply line number formatting AFTER guardrail and post-guardrail truncation,
     // BEFORE token stats.
-    // post_trunc_map (from enforce_line_bounds) takes priority over stdin_line_map
-    // via .or(): it carries correct source line numbers from the truncator's window
-    // start, which the identity fallback in apply_line_numbers cannot provide
-    // after --last-lines moves the window (PF-019 / complexity-2).
-    let combined_map = post_trunc_map.or(stdin_line_map);
+    // When the guardrail served raw output, stdin_line_map (computed for the
+    // compressed view) has the wrong entry count for the raw text and must not be
+    // used.  Mirror the file-path logic: only use stdin_line_map when the guardrail
+    // did NOT trigger; for the guardrail path fall back to post_trunc_map or None
+    // (apply_line_numbers uses the identity map when combined_map is None).
+    let combined_map = if guardrail_triggered {
+        post_trunc_map
+    } else {
+        post_trunc_map.or(stdin_line_map)
+    };
     let final_output = apply_line_numbers(
         final_output,
         options.line_numbers,
@@ -1038,11 +1043,25 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // BEFORE cache write and token stats.
     // AC-12: Cache key includes line_numbers (handled in cache::read_cache/write_cache).
     //
-    // post_trunc_map (from enforce_line_bounds) takes priority over line_map via .or():
-    // it carries correct source line numbers from the truncator's window start,
-    // which the identity fallback in apply_line_numbers cannot provide after
-    // --last-lines moves the window (PF-019 / complexity-2).
-    let combined_map = post_trunc_map.or(line_map);
+    // When the guardrail served raw output (guardrail_triggered = true), the
+    // transform's line_map was computed for the *compressed* view and has fewer
+    // entries than the raw text.  Using it to annotate the raw output produces a
+    // misaligned map (leading blank lines get the wrong source numbers, and later
+    // lines shift by however many entries were dropped — #476 / PF-019 regression).
+    //
+    // Correct logic:
+    //   - guardrail triggered + truncation applied → use post_trunc_map (it was
+    //     built from the raw text by enforce_line_bounds, so entry count matches)
+    //   - guardrail triggered + no truncation    → pass None; apply_line_numbers
+    //     falls back to the identity map, which is correct for the raw text
+    //   - guardrail NOT triggered               → use post_trunc_map (from
+    //     --max-lines/--last-lines on the compressed view) or line_map (from the
+    //     transform), whichever is set
+    let combined_map = if guardrail_triggered {
+        post_trunc_map // None unless truncation was also applied
+    } else {
+        post_trunc_map.or(line_map)
+    };
     let final_output = apply_line_numbers(
         final_output,
         options.line_numbers,
