@@ -38,26 +38,19 @@
 //! `current_dir` set to the fixture root.  Fixtures use pinned
 //! `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` so counts are deterministic.
 
-use std::fs;
 use std::path::Path;
 use std::process::Command as StdCommand;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod common;
+use common::git_fixture::{git_commit, git_init, now_epoch, write_and_stage};
+
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Return the current Unix epoch in seconds.
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_secs()
-}
 
 /// Returns `true` when the repository at `repo_path` is a shallow clone;
 /// `false` on a full clone.
@@ -114,69 +107,6 @@ fn is_shallow_checkout(repo_path: &Path) -> bool {
         }
     }
     false
-}
-
-/// Initialise a git repository with hermetic, non-signing identity.
-fn git_init(dir: &Path) {
-    for args in &[
-        vec!["init"],
-        vec!["config", "user.email", "test@t.invalid"],
-        vec!["config", "user.name", "Test"],
-        vec!["config", "commit.gpgsign", "false"],
-    ] {
-        let s = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap_or_else(|e| panic!("git {:?}: {e}", args));
-        assert!(
-            s.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&s.stderr)
-        );
-    }
-    // Use "main" as the initial branch name (avoids warnings on some git versions).
-    let _ = StdCommand::new("git")
-        .args(["checkout", "-b", "main"])
-        .current_dir(dir)
-        .output();
-}
-
-/// Write `content` to `dir/<filename>` and stage it.
-fn write_and_stage(dir: &Path, filename: &str, content: &str) {
-    let path = dir.join(filename);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap();
-    }
-    fs::write(&path, content).unwrap_or_else(|e| panic!("write {filename}: {e}"));
-    let s = StdCommand::new("git")
-        .args(["add", filename])
-        .current_dir(dir)
-        .output()
-        .expect("git add");
-    assert!(s.status.success(), "git add {filename} failed");
-}
-
-/// Commit staged changes with pinned author and committer timestamps.
-///
-/// `ts` is a Unix epoch value used for both `GIT_AUTHOR_DATE` and
-/// `GIT_COMMITTER_DATE` so tests are deterministic across timezones.
-fn git_commit(dir: &Path, message: &str, ts: u64) {
-    let ts_str = ts.to_string();
-    let s = StdCommand::new("git")
-        .args(["commit", "--no-verify", "-m", message])
-        .env("GIT_AUTHOR_DATE", &ts_str)
-        .env("GIT_COMMITTER_DATE", &ts_str)
-        .current_dir(dir)
-        .output()
-        .expect("git commit");
-    assert!(
-        s.status.success(),
-        "git commit '{}' failed: {}",
-        message,
-        String::from_utf8_lossy(&s.stderr)
-    );
 }
 
 /// Checkout (or create) a branch.

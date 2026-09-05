@@ -371,56 +371,200 @@ fn staleness_returns_none_when_current() {
 }
 
 // ============================================================================
-// cochange_partner_paths — direct unit tests
+// cochange_partner_strengths — direct unit tests
 // ============================================================================
 
-/// When `target` matches `file_a`, the partner set contains `file_b`.
+/// When `target` matches `file_a`, the partner map contains `file_b` with the
+/// correct Jaccard score.
 #[test]
-fn cochange_partner_paths_target_is_file_a() {
+fn cochange_partner_strengths_target_is_file_a() {
     let rows = vec![CochangeRow {
         file_a: "src/auth.rs".to_string(),
         file_b: "src/middleware.rs".to_string(),
         count: 5,
         jaccard: 0.75,
     }];
-    let partners = super::cochange_partner_paths(&rows, "src/auth.rs");
-    assert!(
-        partners.contains("src/middleware.rs"),
-        "partner must be file_b when target is file_a"
+    let partners = super::cochange_partner_strengths(&rows, "src/auth.rs");
+    assert_eq!(
+        partners.get("src/middleware.rs").copied(),
+        Some(0.75),
+        "partner must be file_b with the row's Jaccard score when target is file_a"
     );
     assert!(
-        !partners.contains("src/auth.rs"),
-        "target itself must not appear in partner set"
+        !partners.contains_key("src/auth.rs"),
+        "target itself must not appear in partner map"
     );
 }
 
-/// When `target` matches `file_b`, the partner set contains `file_a`.
+/// When `target` matches `file_b`, the partner map contains `file_a` with the
+/// correct Jaccard score.
 #[test]
-fn cochange_partner_paths_target_is_file_b() {
+fn cochange_partner_strengths_target_is_file_b() {
     let rows = vec![CochangeRow {
         file_a: "src/auth.rs".to_string(),
         file_b: "src/middleware.rs".to_string(),
         count: 5,
         jaccard: 0.75,
     }];
-    let partners = super::cochange_partner_paths(&rows, "src/middleware.rs");
-    assert!(
-        partners.contains("src/auth.rs"),
-        "partner must be file_a when target is file_b"
+    let partners = super::cochange_partner_strengths(&rows, "src/middleware.rs");
+    assert_eq!(
+        partners.get("src/auth.rs").copied(),
+        Some(0.75),
+        "partner must be file_a with the row's Jaccard score when target is file_b"
     );
     assert!(
-        !partners.contains("src/middleware.rs"),
-        "target itself must not appear in partner set"
+        !partners.contains_key("src/middleware.rs"),
+        "target itself must not appear in partner map"
     );
 }
 
-/// Empty input produces an empty partner set.
+/// Empty input produces an empty partner map.
 #[test]
-fn cochange_partner_paths_empty_input() {
-    let partners = super::cochange_partner_paths(&[], "src/anything.rs");
+fn cochange_partner_strengths_empty_input() {
+    let partners = super::cochange_partner_strengths(&[], "src/anything.rs");
     assert!(
         partners.is_empty(),
-        "empty input must produce empty partner set"
+        "empty input must produce empty partner map"
+    );
+}
+
+/// `SEED_STRENGTH` must be strictly greater than the Jaccard maximum of 1.0
+/// so the blast-radius target always ranks first in the temporal layer.
+///
+/// Verified as a compile-time constant assertion (resolved decision Option A).
+#[test]
+fn seed_strength_exceeds_max_jaccard() {
+    // const { assert!(…) } makes this a compile-time check rather than a runtime
+    // assertion on a known constant (clippy::assertions_on_constants).
+    const {
+        assert!(
+            super::SEED_STRENGTH > 1.0,
+            "SEED_STRENGTH must exceed the Jaccard maximum (1.0) — resolved decision Option A"
+        )
+    };
+}
+
+/// With multiple co-change rows, each partner maps to ITS OWN Jaccard score —
+/// not to the score of the other partner, not to a uniform value.
+///
+/// This verifies the bidirectional extraction: a target can appear as `file_a`
+/// in one row and `file_b` in another, and each peer must carry the score from
+/// ITS row, not from the other row.
+///
+/// AC-409: guards against a mapping error where partners share a score instead
+/// of each carrying the Jaccard from the row in which it appeared.
+#[test]
+fn cochange_partner_strengths_carries_jaccard_both_directions() {
+    // Row 1: target is file_a — partner "b.rs" carries jaccard=0.80.
+    // Row 2: target is file_b — partner "c.rs" carries jaccard=0.30.
+    // The two Jaccard values are distinct so a swap is detectable.
+    let rows = vec![
+        CochangeRow {
+            file_a: "target.rs".to_string(),
+            file_b: "b.rs".to_string(),
+            count: 4,
+            jaccard: 0.80,
+        },
+        CochangeRow {
+            file_a: "c.rs".to_string(),
+            file_b: "target.rs".to_string(),
+            count: 2,
+            jaccard: 0.30,
+        },
+    ];
+    let partners = super::cochange_partner_strengths(&rows, "target.rs");
+
+    // b.rs came from Row 1 where target was file_a — must carry 0.80, not 0.30.
+    assert_eq!(
+        partners.get("b.rs").copied(),
+        Some(0.80),
+        "b.rs (from file_b side of row 1) must carry the row-1 Jaccard 0.80, not 0.30"
+    );
+    // c.rs came from Row 2 where target was file_b — must carry 0.30, not 0.80.
+    assert_eq!(
+        partners.get("c.rs").copied(),
+        Some(0.30),
+        "c.rs (from file_a side of row 2) must carry the row-2 Jaccard 0.30, not 0.80"
+    );
+    // Target itself must not appear.
+    assert!(
+        !partners.contains_key("target.rs"),
+        "target itself must not appear in the partner map"
+    );
+    assert_eq!(
+        partners.len(),
+        2,
+        "partner map must contain exactly the two peers"
+    );
+}
+
+/// `paths_to_file_ids` must drop unindexed partner paths silently (returning
+/// only FileIds that exist in the manifest).
+///
+/// This unit test asserts **membership only** — which paths resolve to `FileId`s
+/// and which do not.  The AD-409-7 partial-drop notice (`emit_partial_drop_notice`)
+/// writes to stderr and cannot be captured here without introducing a sink
+/// parameter into production code; its exact wording and the
+/// `(allowlist_len-1) − (found − seed_bit)` formula are covered end-to-end by
+/// `ac409_4_unindexed_partner_omission_is_disclosed`.
+///
+/// Sub-case A (partial drop): allowlist has 3 entries (seed + 2 partners), but
+/// only 2 are in the manifest — `partner_b.rs` is absent.  Exactly 2 `FileId`s
+/// must be returned and `FileId(2)` must not appear.
+///
+/// Sub-case B (no drop): allowlist has 2 entries (seed + 1 partner), both in
+/// the manifest.  Both resolve; 2 `FileId`s must be returned.
+#[test]
+fn paths_to_file_ids_drops_unindexed_partners_and_excludes_seed_from_count() {
+    use rskim_search::FileId;
+    use std::collections::HashMap;
+
+    // ── Sub-case A: one partner not in manifest ──────────────────────────────
+    // Manifest: ["anchor.rs", "partner_a.rs"] — partner_b.rs is NOT indexed.
+    let sorted_paths: &[&str] = &["anchor.rs", "partner_a.rs"];
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    // seed (anchor) + two partners; partner_b is outside the manifest.
+    allowed.insert("anchor.rs".to_string(), super::SEED_STRENGTH);
+    allowed.insert("partner_a.rs".to_string(), 0.80);
+    allowed.insert("partner_b.rs".to_string(), 0.50); // NOT in sorted_paths
+
+    let file_ids = super::paths_to_file_ids(sorted_paths, &allowed);
+
+    // Only anchor.rs (FileId(0)) and partner_a.rs (FileId(1)) appear.
+    assert_eq!(
+        file_ids.len(),
+        2,
+        "sub-case A: two indexed paths must yield two FileIds"
+    );
+    assert!(
+        file_ids.contains(&FileId(0)),
+        "sub-case A: anchor.rs (FileId 0) must be in the returned set"
+    );
+    assert!(
+        file_ids.contains(&FileId(1)),
+        "sub-case A: partner_a.rs (FileId 1) must be in the returned set"
+    );
+    assert!(
+        !file_ids.contains(&FileId(2)),
+        "sub-case A: partner_b.rs has no FileId and must be absent"
+    );
+    // Notice text for this case ("1 of 2 co-change partners not found") is
+    // verified by ac409_4_unindexed_partner_omission_is_disclosed (E2E).
+
+    // ── Sub-case B: no partners dropped ─────────────────────────────────────
+    // Manifest includes both seed and partner — all resolve, no notice emitted.
+    let sorted_paths_b: &[&str] = &["anchor.rs", "partner_a.rs"];
+    let mut allowed_b: HashMap<String, f64> = HashMap::new();
+    allowed_b.insert("anchor.rs".to_string(), super::SEED_STRENGTH);
+    allowed_b.insert("partner_a.rs".to_string(), 0.80);
+
+    let file_ids_b = super::paths_to_file_ids(sorted_paths_b, &allowed_b);
+
+    // Cardinality == allowlist size confirms zero drop (both entries resolved).
+    assert_eq!(
+        file_ids_b.len(),
+        2,
+        "sub-case B: all indexed paths must be present — no drop"
     );
 }
 

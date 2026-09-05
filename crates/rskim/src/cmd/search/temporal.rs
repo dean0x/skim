@@ -8,7 +8,7 @@
 //! - Combined text+temporal enrichment (`apply_temporal_enrichment`).
 //! - Output formatting for standalone temporal queries.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -29,7 +29,53 @@ pub(super) use super::degraded::{
 pub(super) use super::degraded::cause_substrings_for_guard;
 
 use super::staleness::{AnchorState, HeadState};
-use super::types::{Page, ResolvedResult, TemporalAnnotation, TemporalSort};
+use super::types::{BlastRadiusStrengths, Page, ResolvedResult, TemporalAnnotation, TemporalSort};
+
+// ============================================================================
+// Blast-radius constants
+// ============================================================================
+
+/// Sentinel score for the blast-radius target file in the temporal layer.
+///
+/// AD-409-3: `SEED_STRENGTH = 2.0` is a **finite** sentinel strictly greater than the
+/// Jaccard maximum of 1.0. It is the resolved decision Option A from ticket #409:
+/// the blast-radius target (seed) always ranks **first** in the temporal layer.
+/// `merge_layer_scores` sorts each layer by score DESC (AD-409-4), placing the
+/// seed at rank 1 because `2.0 > max_jaccard(1.0)`.
+///
+/// Options B (sentinel == 1.0, indistinguishable from a perfect Jaccard match) and
+/// C (seed excluded from the temporal layer entirely) were rejected.
+pub(super) const SEED_STRENGTH: f64 = 2.0;
+
+/// Stderr notice emitted when the blast-radius target file is absent from the
+/// lexical manifest.
+///
+/// Exported as a `pub(super)` constant so intra-crate tests assert against a
+/// single source of truth (consistent with `WEIGHTS_FULLY_INERT_NOTICE` and
+/// `WEIGHTS_TEMPORAL_INERT_NOTICE` in `query.rs`).
+pub(super) const BLAST_RADIUS_SEED_UNINDEXED_NOTICE: &str = "skim search: note: blast-radius target file not found in the indexed manifest \
+     (excluded from scoring)";
+
+/// Static suffix of the partial-drop notice emitted when co-change partners
+/// are absent from the manifest.
+///
+/// Intra-crate tests can reference this const to build the expected substring
+/// without duplicating the wording.  The full line is:
+/// `"skim search: note: {dropped} of {partner_count} {BLAST_RADIUS_PARTNER_NOT_FOUND}"`.
+pub(super) const BLAST_RADIUS_PARTNER_NOT_FOUND: &str =
+    "co-change partners not found in the indexed manifest (excluded from scoring)";
+
+/// Fallback score assigned to Jaccard values that are non-finite or outside the
+/// mathematical Jaccard range of `[0.0, 1.0]`.
+///
+/// Any value outside `[0.0, 1.0]` arriving from `temporal.db` is corrupt data —
+/// Jaccard similarity is mathematically confined to that interval.  Clamping such
+/// values here, at the trust boundary in [`cochange_partner_strengths`], ensures
+/// that no corrupt row can impersonate the seed sentinel (`SEED_STRENGTH = 2.0`)
+/// or outrank it (`1e308 > 2.0`).  The floor is strictly below
+/// `rskim_search::MIN_COCHANGE_JACCARD` (0.10), so out-of-range-clamped files
+/// rank after every valid co-change partner in the temporal layer.
+const NON_FINITE_JACCARD_FLOOR: f64 = 0.0;
 
 // ============================================================================
 // Path normalization
@@ -377,44 +423,202 @@ pub(super) fn resort_window(limit: usize) -> usize {
 // Blast-radius → FileId resolution (shared helper)
 // ============================================================================
 
-/// Convert a set of repo-relative path strings to the corresponding `FileId`s.
+/// Convert a blast-radius path-to-Jaccard map to the corresponding `FileId`s.
 ///
-/// Iterates the pre-computed `sorted_paths` slice once, collecting `FileId`s for
-/// every path in `allowed_paths`.  Applies PF-004 widening (`u32::try_from(idx)`)
-/// — never `as u32`.  Emits a one-line stderr warning when the result set is empty
-/// (the blast-radius paths are not indexed), so callers do not have to repeat the
-/// check.
+/// AD-409-7: Delegates to [`paths_to_scored_file_ids`] and discards the score
+/// component, so membership parity between the filter arm (lexical / AST) and
+/// the composite ranking arm holds by construction — one algorithm, one copy of
+/// the notice-dispatch logic.  After the manifest scan, emits at most two stderr
+/// lines: "matched 0 indexed files" when nothing resolved; otherwise
+/// [`emit_seed_unindexed_notice`] when the seed is absent from the manifest, and
+/// [`emit_partial_drop_notice`] when one or more co-change partners are absent.
+/// Each notice fires at most once per query.  Exit code stays 0.
+/// No `--json` key is added here (tracked in #483).
 ///
 /// Accepts a `&[&str]` slice (from `manifest.sorted_paths()`) so that callers
 /// which already hold the slice can pass it directly without a second allocation.
 ///
-/// This function is the single source of truth for the path→FileId conversion
-/// used by all three blast-radius call sites (ast.rs standalone, query.rs lexical
-/// filter, and mod.rs resolve_blast_radius_filter).
+/// This function is the membership-only twin of [`paths_to_scored_file_ids`].
+/// Its two real call sites are the compound text+AST branch in `query.rs`
+/// (which needs only the `FileId` set, not Jaccard scores) and
+/// [`resolve_blast_radius_file_ids`].
 pub(super) fn paths_to_file_ids(
     sorted_paths: &[&str],
-    allowed_paths: &HashSet<String>,
+    allowed_paths: &BlastRadiusStrengths,
 ) -> HashSet<FileId> {
-    let mut file_ids = HashSet::new();
+    paths_to_scored_file_ids(sorted_paths, allowed_paths)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Emit the one-line stderr notice for the "nothing resolved" case: the
+/// blast-radius allowlist is non-empty but not one of its paths has a `FileId`
+/// in the manifest.
+///
+/// Called by [`paths_to_scored_file_ids`] (the single implementation of the
+/// manifest scan) when the blast-radius allowlist is non-empty but zero entries
+/// resolved.  Reported separately from the partial-drop notice because a
+/// "N−1 of N−1 partners not found" line is less informative than naming both
+/// the allowlist size and the index size when nothing at all resolved.
+fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize) {
+    eprintln!(
+        "skim search: note: blast-radius filter matched 0 indexed files \
+         (allowed {allowlist_len} paths, index has {indexed_file_count} files)"
+    );
+}
+
+/// Emit a one-line stderr notice when the blast-radius target file itself is absent
+/// from the lexical manifest (e.g. the file was deleted from disk while
+/// `temporal.db` still records it, or the file is outside the indexed subtree).
+///
+/// AD-409-7: the seed is always excluded from the partner-drop arithmetic — emitting
+/// a separate notice keeps the partner count truthful ("N of M partners" never
+/// silently inflates by 1 when the seed is also absent).  Callers suppress the
+/// partner-drop notice independently when zero partners were actually dropped.
+///
+/// Emits [`BLAST_RADIUS_SEED_UNINDEXED_NOTICE`] verbatim so intra-crate tests
+/// can assert against the constant rather than a duplicated string literal.
+fn emit_seed_unindexed_notice() {
+    eprintln!("{BLAST_RADIUS_SEED_UNINDEXED_NOTICE}");
+}
+
+/// Emit a one-line stderr notice when co-change partner paths are absent from
+/// the indexed manifest.
+///
+/// Called by [`paths_to_scored_file_ids`] (the single implementation of the
+/// manifest scan) after the scan completes.  The notice is suppressed when
+/// `dropped == 0`.  Callers report the fully-unresolved case (`found == 0`)
+/// through [`emit_no_indexed_files_notice`] instead.
+///
+/// `partner_count` is the number of partner slots in the allowlist (total entries
+/// minus the seed slot when a seed is present, or total entries when there is no
+/// seed); `partners_found` is the count of resolved entries whose path is not the
+/// seed path (incremented once per partner in the scan loop, never derived from
+/// totals after the fact).  The dropped count is therefore
+/// `partner_count − partners_found`, computed with one `saturating_sub` (PF-004).
+///
+/// AC `ac409_4_unindexed_partner_omission_is_disclosed` verifies the exact
+/// message wording end-to-end.  Uses [`BLAST_RADIUS_PARTNER_NOT_FOUND`] as the
+/// static suffix so intra-crate tests can reference the constant.
+fn emit_partial_drop_notice(partner_count: usize, partners_found: usize) {
+    let dropped = partner_count.saturating_sub(partners_found);
+    if dropped > 0 {
+        eprintln!(
+            "skim search: note: {dropped} of {partner_count} {}",
+            BLAST_RADIUS_PARTNER_NOT_FOUND
+        );
+    }
+}
+
+/// Convert a blast-radius path-to-Jaccard map to a scored `(FileId, f64)` layer
+/// for the temporal RRF pass inside `run_blast_radius_composite_query`.
+///
+/// AD-409-2: This is the scored twin of [`paths_to_file_ids`] — both agree on
+/// *membership* (every path that has a `FileId` in the manifest appears in both
+/// outputs) and differ only in what they return: a `HashSet<FileId>` for the
+/// membership-only filter path vs. a `Vec<(FileId, f64)>` scored layer for the
+/// composite ranking path.  The blast-radius target carries `SEED_STRENGTH = 2.0`
+/// (> max Jaccard of 1.0) so it always occupies temporal rank 1 after
+/// `merge_layer_scores`' per-layer total sort.  Each co-change partner carries
+/// its actual Jaccard co-change strength as read from `TemporalDb::cochanges_for_file`.
+///
+/// **AC-15 finiteness**: a partner whose stored Jaccard is NaN or ±∞ (the DB
+/// should not produce this, but is guarded defensively) is mapped to
+/// `NON_FINITE_JACCARD_FLOOR` (0.0), which is strictly below
+/// `rskim_search::MIN_COCHANGE_JACCARD` (0.10).  The file still appears in the
+/// output, ranked below every partner with a finite Jaccard ≥ 0.10, and the
+/// fallback neither panics nor propagates NaN into the RRF denominator.
+///
+/// **AD-409-7 partial-drop notice**: after the manifest scan, emits **at most
+/// two** stderr lines — "matched 0 indexed files" when nothing resolved; otherwise
+/// [`emit_seed_unindexed_notice`] when the seed is absent from the manifest, and
+/// [`emit_partial_drop_notice`] when one or more co-change partners are absent.
+/// Both notices are suppressed when their respective conditions are not met.
+/// [`paths_to_file_ids`] delegates to this function and discards the score
+/// component, so the two blast-radius arms always agree on membership and notice
+/// text by construction (AD-409-7; AC-7).  Exit code stays 0; no `--json` key
+/// added (tracked in #483).
+///
+/// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
+pub(super) fn paths_to_scored_file_ids(
+    sorted_paths: &[&str],
+    allowed_paths: &BlastRadiusStrengths,
+) -> Vec<(FileId, f64)> {
+    // AD-409-5: ONE bounded pass over the manifest slice.  Each path is looked
+    // up in the allowlist map exactly once; a `(FileId, score)` pair is emitted
+    // only when the path is present.  The pass is bounded by
+    // `sorted_paths.len()` — the indexed file count, which is capped by
+    // `COUPLING_MAX_FILES` at index-build time so no explicit per-loop bound
+    // is needed here.
+    //
+    // AD-409-7: Pre-compute the seed path exactly once so that seed identity is
+    // carried explicitly (as `Option<&str>`) rather than inferred per-entry by
+    // float comparison.  `cochange_partner_strengths` guarantees that only the
+    // explicit `allowed_paths.insert(normalized, SEED_STRENGTH)` call produces
+    // a value of 2.0; DB-sourced rows are clamped to [0.0, 1.0] at the trust
+    // boundary.  When `seed_path` is `None` — a seedless allowlist such as a
+    // test helper whose values are all 1.0 — the seed-unindexed notice is
+    // suppressed entirely, preventing a false user-visible disclosure.
+    let seed_path: Option<&str> = allowed_paths
+        .iter()
+        .find_map(|(k, &v)| (v == SEED_STRENGTH).then_some(k.as_str()));
+    // `partner_count` is the number of partner slots: total entries minus the
+    // seed slot when a seed is present, or all entries when there is no seed.
+    let partner_count = if seed_path.is_some() {
+        allowed_paths.len().saturating_sub(1)
+    } else {
+        allowed_paths.len()
+    };
+    let mut scored: Vec<(FileId, f64)> = Vec::with_capacity(allowed_paths.len());
+    let mut seed_resolved = false;
+    let mut partners_found: usize = 0;
     for (idx, path) in sorted_paths.iter().enumerate() {
-        if allowed_paths.contains(*path) {
+        if let Some(&jaccard) = allowed_paths.get(*path) {
             // PF-004: widen idx (usize) to u32 before constructing FileId.
             // The file cap (50 000) guarantees no overflow, but `try_from`
             // makes the widening explicit and safe by construction.
             if let Ok(id) = u32::try_from(idx) {
-                file_ids.insert(FileId(id));
+                // AC-15: NON_FINITE_JACCARD_FLOOR guards any residual non-finite
+                // value that survived into the allowlist (belt-and-suspenders).
+                // The primary guard is the Jaccard clamping in
+                // `cochange_partner_strengths`; SEED_STRENGTH (2.0) itself is
+                // finite and passes the is_finite() check correctly.
+                let safe_score = if jaccard.is_finite() {
+                    jaccard
+                } else {
+                    NON_FINITE_JACCARD_FLOOR
+                };
+                scored.push((FileId(id), safe_score));
+                // Identify the seed by path, not by value, so that a seedless
+                // allowlist (seed_path == None) never sets seed_resolved = true
+                // and never triggers a false seed-unindexed notice.
+                if seed_path == Some(*path) {
+                    seed_resolved = true;
+                } else {
+                    // Count resolved co-change partners (excludes the seed path).
+                    partners_found += 1;
+                }
             }
         }
     }
-    if file_ids.is_empty() {
-        eprintln!(
-            "skim search: blast-radius filter matched 0 indexed files \
-             (allowed {} paths, index has {} files)",
-            allowed_paths.len(),
-            sorted_paths.len()
-        );
+    // AD-409-7: emit notices for the two disclosure conditions.
+    // `scored.is_empty()` is the fully-unresolved case; the partner-drop
+    // arithmetic is only meaningful once at least one entry resolved.
+    // Stderr only; no --json key; no degraded element (tracked in #483).
+    if scored.is_empty() {
+        emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
+    } else {
+        // Only emit the seed-unindexed notice when a seed was intended
+        // (`seed_path.is_some()`) but its path was absent from the manifest.
+        // Suppressing it when seed_path is None prevents a false positive on
+        // seedless allowlists (e.g. AC-24 guard tests with all-1.0 values).
+        if seed_path.is_some() && !seed_resolved {
+            emit_seed_unindexed_notice();
+        }
+        emit_partial_drop_notice(partner_count, partners_found);
     }
-    file_ids
+    scored
 }
 
 /// Resolution of a `--blast-radius` request.
@@ -435,13 +639,18 @@ pub(super) fn paths_to_file_ids(
 pub(super) enum BlastRadiusResolution {
     /// `--blast-radius` was not requested; skip filter entirely.
     NotRequested,
-    /// Resolved successfully; `allow` is the full co-change partner set.
-    Allowed(std::collections::HashSet<String>),
+    /// Resolved successfully; `allow` maps each co-change partner path to its
+    /// Jaccard score, plus the blast-radius target keyed to [`SEED_STRENGTH`]
+    /// (2.0 > max Jaccard 1.0).  Downstream callers build the temporal RRF layer
+    /// with per-partner scores so stronger co-change relationships rank higher
+    /// (see [`super::query::run_blast_radius_composite_query`] and AD-409-2).
+    /// The target always ranks first in the temporal layer.
+    Allowed(BlastRadiusStrengths),
     /// Resolved but the DB is degraded: `allow` is the effective path filter
     /// (empty for `RepositoryMismatch`) and `degraded` carries the reason so
     /// callers can push a `DegradedJson` entry to `output.degraded` (AC-7).
     Filtered {
-        allow: std::collections::HashSet<String>,
+        allow: BlastRadiusStrengths,
         degraded: TemporalUnavailable,
     },
     /// Fully degraded: temporal DB is unavailable; blast-radius cannot be applied.
@@ -450,8 +659,8 @@ pub(super) enum BlastRadiusResolution {
 
 /// Resolve a `--blast-radius` raw path to the set of co-change partner paths.
 ///
-/// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path) and
-/// `resolve_blast_radius_filter` (text-query path in `mod.rs`).  Returns a
+/// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path, and
+/// text + blast-radius path in `mod.rs`).  Returns a
 /// [`BlastRadiusResolution`] that encodes whether blast-radius was requested, resolved
 /// successfully, or degraded — and in the `RepositoryMismatch` case, carries BOTH an
 /// empty allowlist (zero results) AND the degraded reason for `output.degraded`.
@@ -499,7 +708,7 @@ pub(super) fn resolve_blast_radius_paths(
             // output.degraded receives an entry — previously silent).
             if u.reason == DegradedReason::RepositoryMismatch {
                 return Ok(BlastRadiusResolution::Filtered {
-                    allow: std::collections::HashSet::new(),
+                    allow: HashMap::new(),
                     degraded: u,
                 });
             }
@@ -533,10 +742,11 @@ pub(super) fn resolve_blast_radius_paths(
         }
         eprintln!("skim search: no co-change data for {raw_path:?}");
     }
-    let mut allowed_paths = cochange_partner_paths(&partners, &normalized);
+    let mut allowed_paths = cochange_partner_strengths(&partners, &normalized);
     // Include the target file itself so queries like `skim search auth --blast-radius src/auth.rs`
     // surface matches within the target file in addition to its co-change partners.
-    allowed_paths.insert(normalized);
+    // SEED_STRENGTH (2.0 > max Jaccard 1.0) ensures the target ranks first in the temporal layer.
+    allowed_paths.insert(normalized, SEED_STRENGTH);
     Ok(BlastRadiusResolution::Allowed(allowed_paths))
 }
 
@@ -545,15 +755,15 @@ pub(super) fn resolve_blast_radius_paths(
 /// Unified resolver used by every blast-radius call site:
 /// - `run_ast_standalone` caller in `mod.rs` (standalone `--ast --blast-radius`)
 /// - `execute_query_with_manifest` blast-radius arm (query.rs, via `paths_to_file_ids`)
-/// - `resolve_blast_radius_filter` (mod.rs, text + blast-radius)
+/// - `resolve_blast_radius_file_ids` (mod.rs, text + blast-radius composite path)
 ///
 /// Algorithm:
 /// 1. If `blast_radius` is `None`, return `Ok(None)` immediately.
 /// 2. Open `temporal.db` under `cache_dir`.  If absent/corrupt/empty, emit the
 ///    degraded notice and return `Ok(None)`.
 /// 3. Normalize the raw path to repo-relative form.
-/// 4. Look up co-change partners, add the target file itself.
-/// 5. Convert the path set to `FileId`s via `paths_to_file_ids`.
+/// 4. Look up co-change partners (with Jaccard scores), add the target with `SEED_STRENGTH`.
+/// 5. Convert the path map to `FileId`s via `paths_to_file_ids`.
 /// 6. Return `Ok(Some(file_ids))`.
 ///
 /// # Errors
@@ -687,17 +897,41 @@ fn cochange_partner<'a>(row: &'a rskim_search::CochangeRow, target: &str) -> &'a
     }
 }
 
-/// Extract the set of partner paths from a slice of co-change rows.
+/// Extract the map of partner paths to their co-change Jaccard scores from a slice of
+/// co-change rows.
 ///
-/// Uses `cochange_partner` to resolve both `file_a`/`file_b` directions. The
-/// `target` file itself is NOT included — callers add it separately when needed.
-pub(super) fn cochange_partner_paths(
+/// AD-409-1: Returns a [`BlastRadiusStrengths`] map of partner paths to their Jaccard
+/// co-change scores. Both `file_a`→`file_b` and `file_b`→`file_a` directions are
+/// resolved via `cochange_partner`, preserving the Jaccard value for each partner.
+/// The `target` file itself is NOT included — callers add it separately with
+/// [`SEED_STRENGTH`] when needed.
+///
+/// **Trust-boundary Jaccard clamping (security):** Jaccard is mathematically
+/// confined to `[0.0, 1.0]`.  Any finite value outside that range arriving from
+/// `temporal.db` is corrupt data.  Such values — including a corrupt row carrying
+/// exactly `SEED_STRENGTH` (2.0) — are mapped to [`NON_FINITE_JACCARD_FLOOR`]
+/// here, at the single point where partner rows cross the DB trust boundary.
+/// This guarantees that only the explicit `allowed_paths.insert(normalized,
+/// SEED_STRENGTH)` call performed by the caller can produce a sentinel value of
+/// 2.0 in the allowlist; no corrupt co-change row can impersonate the seed.
+pub(super) fn cochange_partner_strengths(
     partners: &[rskim_search::CochangeRow],
     target: &str,
-) -> std::collections::HashSet<String> {
+) -> BlastRadiusStrengths {
     partners
         .iter()
-        .map(|p| cochange_partner(p, target).to_string())
+        .map(|p| {
+            let j = p.jaccard;
+            // Clamp to the mathematical Jaccard range [0.0, 1.0].  Non-finite
+            // values and out-of-range values (including a corrupt 2.0 that would
+            // impersonate SEED_STRENGTH) are both mapped to the floor.
+            let safe = if j.is_finite() && (0.0..=1.0).contains(&j) {
+                j
+            } else {
+                NON_FINITE_JACCARD_FLOOR
+            };
+            (cochange_partner(p, target).to_string(), safe)
+        })
         .collect()
 }
 

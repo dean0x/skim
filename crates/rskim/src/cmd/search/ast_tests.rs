@@ -215,7 +215,7 @@ fn make_query_config(
     text: &str,
     limit: usize,
     ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
-    blast_radius_paths: Option<std::collections::HashSet<String>>,
+    blast_radius_paths: Option<super::super::types::BlastRadiusStrengths>,
 ) -> super::super::types::QueryConfig {
     super::super::types::QueryConfig {
         text: text.to_string(),
@@ -2232,15 +2232,16 @@ fn distractor_{i}() {{
 ///
 /// # Why `blast_radius_paths` is passed directly (no TemporalDb in test)
 ///
-/// `execute_query` accepts `blast_radius_paths: Some(HashSet<String>)` as
-/// pre-resolved repo-relative paths.  `mod.rs` uses `TemporalDb` to BUILD that
-/// set before calling `execute_query`; the test bypasses `mod.rs` and injects
-/// the paths directly — same production path, no test-only TemporalDb needed.
+/// `execute_query` accepts `blast_radius_paths: Some(BlastRadiusStrengths)` (a
+/// `HashMap<String, f64>`) as pre-resolved repo-relative paths with Jaccard scores.
+/// `mod.rs` uses `TemporalDb` to BUILD that map before calling `execute_query`; the
+/// test bypasses `mod.rs` and injects the paths directly — same production path, no
+/// test-only TemporalDb needed.
 /// This is intentional per the NO-FAKE-SOLUTIONS rule: the intersection logic
 /// in `run_compound_query` is independent of how the blast path set was built.
 #[test]
 fn text_ast_blast_intersection_complete_356() {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::super::query::execute_query;
 
@@ -2270,7 +2271,9 @@ fn text_ast_blast_intersection_complete_356() {
     // In production, mod.rs resolves these from TemporalDb::cochanges_for_file.
     // Here we inject them as pre-resolved repo-relative paths — same code path
     // in execute_query (paths_to_file_ids builds the FileId set from sorted_paths).
-    let blast_paths: HashSet<String> = (1..=N).map(|i| format!("src/target_{i:02}.rs")).collect();
+    let blast_paths: HashMap<String, f64> = (1..=N)
+        .map(|i| (format!("src/target_{i:02}.rs"), 1.0))
+        .collect();
 
     // -- AC3(a) full-set at --limit N: all N qualifying files returned ---------
     let full_config = make_query_config(
@@ -2366,8 +2369,8 @@ fn text_ast_blast_intersection_complete_356() {
     // The filter_set.is_empty() early-out in run_compound_query (query.rs #356)
     // now handles this case explicitly rather than relying on the reader returning
     // 0 docs for an empty file_filter — both produce empty results.
-    let disjoint_blast: HashSet<String> = (1..=DISTRACTORS)
-        .map(|i| format!("src/noast_{i:02}.rs"))
+    let disjoint_blast: HashMap<String, f64> = (1..=DISTRACTORS)
+        .map(|i| (format!("src/noast_{i:02}.rs"), 1.0))
         .collect();
 
     let disjoint_config = make_query_config(
@@ -2429,7 +2432,7 @@ fn text_ast_blast_intersection_complete_356() {
 /// lacked — per the wave-4 review (#356 surviving finding, testing category).
 #[test]
 fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::super::query::execute_query;
 
@@ -2479,8 +2482,8 @@ fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
     // blast_radius_paths is a strict subset of the AST-matching files.
     // filter_set = blast ∩ ast = {target_01..target_N_BLAST}.
     // The reader is restricted to only those N_BLAST files → only N_BLAST results.
-    let blast_paths: HashSet<String> = (1..=N_BLAST)
-        .map(|i| format!("src/target_{i:02}.rs"))
+    let blast_paths: HashMap<String, f64> = (1..=N_BLAST)
+        .map(|i| (format!("src/target_{i:02}.rs"), 1.0))
         .collect();
 
     let blast_config = make_query_config(
@@ -2524,7 +2527,7 @@ fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
     // results — confirms the file_filter is applied, not just the count.
     for r in &blast_output.results {
         assert!(
-            blast_paths.contains(&r.path),
+            blast_paths.contains_key(&r.path),
             "AC3 (blast subset membership): result path {:?} is not in the blast set {:?}. \
              Only blast-set files must appear when blast+AST is active — a non-blast \
              file here means file_filter is not being applied in run_compound_query.",
@@ -3640,12 +3643,14 @@ fn bbb() {{
 /// Resolve a single repo-relative path to its `FileId` via the manifest.
 /// Panics if the path is not present (a test-setup bug).
 fn file_id_for(project: &Path, cache: &Path, rel_path: &str) -> rskim_search::FileId {
+    use std::collections::HashMap;
+
     use super::super::manifest::FileManifest;
     let manifest =
         FileManifest::load(project.to_path_buf(), cache.to_path_buf()).expect("manifest must load");
     let sorted = manifest.sorted_paths();
-    let mut allowed = std::collections::HashSet::new();
-    allowed.insert(rel_path.to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(rel_path.to_string(), 1.0_f64);
     let ids = super::super::temporal::paths_to_file_ids(&sorted, &allowed);
     assert_eq!(
         ids.len(),
@@ -3735,6 +3740,8 @@ fn compound_top_result_flips_with_weights_ac1() {
 /// the intersection is unchanged; the flip is driven purely by the weight ratio.
 #[test]
 fn compound_with_blast_top_result_flips_with_weights_ac4() {
+    use std::collections::HashMap;
+
     use super::super::query::execute_query;
 
     let project = make_project_two_ast_files_lexical_skew();
@@ -3744,10 +3751,12 @@ fn compound_with_blast_top_result_flips_with_weights_ac4() {
     let ast_scored = skew_ast_scored(project.path(), cache.path());
 
     // Blast set allows both AST files → blast∩AST == AST (intersection unchanged).
-    let blast: std::collections::HashSet<String> =
-        ["src/aaa.rs".to_string(), "src/bbb.rs".to_string()]
-            .into_iter()
-            .collect();
+    let blast: HashMap<String, f64> = [
+        ("src/aaa.rs".to_string(), 1.0),
+        ("src/bbb.rs".to_string(), 1.0),
+    ]
+    .into_iter()
+    .collect();
 
     let mut lex_heavy = make_query_config(
         project.path(),

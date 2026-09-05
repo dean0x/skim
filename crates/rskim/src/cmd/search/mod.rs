@@ -1975,6 +1975,9 @@ fn run_temporal_standalone(
 /// test verifies the `--weights` section names *both* composite paths and the
 /// temporal-inert-on-`--ast` rule, and that the obsolete "Only active on the
 /// `--blast-radius` composite ranking path" wording is gone.
+///
+/// AD-409-8: The `--weights` temporal axis (blast-radius path) ranks co-change partners by
+/// Jaccard co-change strength; higher Jaccard -> higher temporal rank contribution (#409).
 pub(super) const SEARCH_HELP_TEXT: &str = "\
 Usage: skim search [OPTIONS] [QUERY]
 
@@ -2081,6 +2084,9 @@ Composite ranking options (#200, #377):
                        Active on TWO composite paths:
                          - --blast-radius (no --ast): all three weights apply
                            (lexical + ast + temporal).
+                           The temporal component ranks co-change partners by
+                           Jaccard co-change strength (#409): higher
+                           strength → higher temporal rank contribution.
                          - text + --ast (the intersection path): lexical and ast
                            apply. The temporal weight is INERT whenever --ast is
                            present, since the AST intersection fuses only the

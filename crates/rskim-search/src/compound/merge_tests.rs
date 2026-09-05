@@ -333,3 +333,69 @@ fn test_merge_layer_scores_sort_order_desc_score_asc_fileid() {
     assert_eq!(result[0].0, FileId(10), "ASC FileId tiebreaker (AC3)");
     assert_eq!(result[1].0, FileId(20));
 }
+
+// ── AC-3 per-layer total comparator tests ────────────────────────────────────
+
+#[test]
+fn test_per_layer_equal_scores_rank_by_file_id_asc() {
+    // AC-3 / AD-409-4: two entries with equal scores in the SAME layer must be
+    // ranked by FileId ASC as the tiebreaker.  The input is supplied in
+    // descending FileId order (FileId(7) first) to confirm that the sort, not
+    // the insertion order, determines the rank.
+    //
+    // Layer: [(FileId(7), 0.5), (FileId(3), 0.5)] weight 1.0
+    // Expected per-layer sort: FileId(3) → rank 1, FileId(7) → rank 2
+    // RRF scores: FileId(3) = 1/(60+1), FileId(7) = 1/(60+2).
+    let layers = vec![(layer(&[(7, 0.5), (3, 0.5)]), 1.0)];
+    let result = merge_layer_scores(&layers);
+    assert_eq!(result.len(), 2);
+    assert_eq!(
+        result[0].0,
+        FileId(3),
+        "lower FileId must take rank-1 when scores are equal (per-layer total comparator)"
+    );
+    assert_eq!(result[1].0, FileId(7));
+    let expected_rank1 = 1.0 / (60.0 + 1.0);
+    let expected_rank2 = 1.0 / (60.0 + 2.0);
+    assert!(
+        (result[0].1 - expected_rank1).abs() < 1e-12,
+        "rank-1 RRF score mismatch: got {}, want {expected_rank1}",
+        result[0].1
+    );
+    assert!(
+        (result[1].1 - expected_rank2).abs() < 1e-12,
+        "rank-2 RRF score mismatch: got {}, want {expected_rank2}",
+        result[1].1
+    );
+}
+
+#[test]
+fn test_per_layer_jaccard_order_drives_rank_not_file_id() {
+    // AC-3 / AD-409-4: within a single layer the entry with the HIGHER score
+    // must receive rank 1, even when its FileId is numerically larger.
+    //
+    // Layer: [(FileId(0), 0.1), (FileId(9), 0.9)] weight 1.0
+    // FileId(9) has score 0.9 > 0.1 → rank 1; FileId(0) → rank 2.
+    // This confirms score DESC drives the per-layer sort, not FileId ASC.
+    let layers = vec![(layer(&[(0, 0.1), (9, 0.9)]), 1.0)];
+    let result = merge_layer_scores(&layers);
+    assert_eq!(result.len(), 2);
+    assert_eq!(
+        result[0].0,
+        FileId(9),
+        "higher-score entry must be rank-1 regardless of FileId order (score DESC)"
+    );
+    assert_eq!(result[1].0, FileId(0));
+    let expected_rank1 = 1.0 / (60.0 + 1.0);
+    let expected_rank2 = 1.0 / (60.0 + 2.0);
+    assert!(
+        (result[0].1 - expected_rank1).abs() < 1e-12,
+        "rank-1 RRF score mismatch: got {}, want {expected_rank1}",
+        result[0].1
+    );
+    assert!(
+        (result[1].1 - expected_rank2).abs() < 1e-12,
+        "rank-2 RRF score mismatch: got {}, want {expected_rank2}",
+        result[1].1
+    );
+}

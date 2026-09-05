@@ -305,6 +305,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls in previous release notes refer to past release behavior and are unchanged.
 
 ### Changed
+- **`skim search --blast-radius` temporal ranking now uses co-change Jaccard strength** (#409) —
+  The co-change POPULATION change (full DAG walk, merge commits skipped) shipped in #407 and is
+  not re-described here.  This entry covers the RANKING change only.
+
+  Prior to #409, the temporal RRF axis of a composite `skim search <text> --blast-radius FILE`
+  query (including `--weights` variants) discarded each co-change partner's Jaccard score and
+  assigned every partner a uniform temporal score of 1.0, sorted by internal FileId (which is
+  the alphabetical index position of the file path in the manifest).  The result was that the
+  co-change-strongest partner could rank last while the alphabetically-first file ranked first,
+  regardless of co-change strength — a silent-degradation defect (ADR-009).
+
+  After #409:
+  - Each co-change partner carries its actual Jaccard co-change strength as its raw temporal score.
+  - The blast-radius target (the `--blast-radius FILE` argument) ranks **first** in the temporal
+    layer via a finite sentinel `SEED_STRENGTH = 2.0` (> maximum Jaccard of 1.0 by construction).
+  - `merge_layer_scores`' per-layer sort is now a total comparator (score DESC, FileId ASC),
+    eliminating any non-determinism from equal-score ties.
+  - Unindexed co-change partners (paths recorded in `temporal.db` but absent from the lexical
+    manifest — e.g., files outside a `--root` subtree) are now disclosed on stderr with a count
+    of dropped partners (excluding the seed); exit code remains 0.  Additionally, when the
+    blast-radius target file itself is absent from the indexed manifest, a separate notice is
+    emitted on stderr (the target is excluded from scoring but the query continues).
+
+  **User-visible consequences:**
+  - `skim search <text> --blast-radius FILE --limit 1 --json` with a temporal-dominant
+    `--weights` (e.g. `0,0,1`) now returns the **seed** (`FILE` itself), not the
+    alphabetically-first co-change partner.  At default weights (`0.5,0.3,0.2`) the seed tops
+    the temporal layer, but the fused ranking still combines the lexical axis, so a file with
+    a strong lexical match may outrank it in the composite score.
+  - `skim search <text> --blast-radius FILE --hot` (and `--cold`, `--risky`) may return a
+    **different set** because the hotspot re-sort window is drawn from the newly-ordered fused
+    ranking, not the old alphabetical ordering.  This is a correctness improvement, not a
+    regression: the window now reflects the strongest co-change partners rather than the
+    alphabetically-earliest ones (AC-19 user-visible consequence).
+
 - **`skim search` single-token queries now use AND-intersection + raw occurrence-count ranking** (#372) —
   Prior to this change, all lexical queries used a BM25F UNION pool: candidates ranked by BM25F score,
   which divides term-frequency by field length, penalising large files.  For single contiguous tokens

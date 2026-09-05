@@ -504,13 +504,6 @@ pub(super) fn execute_query_with_manifest(
     // file_filter construction and the path-resolution step below.
     let sorted = manifest.sorted_paths();
 
-    // Build the FileId allowlist from blast-radius paths.
-    // Used for blast-radius-only and blast+AST paths.
-    let blast_file_ids: Option<HashSet<FileId>> = config
-        .blast_radius_paths
-        .as_ref()
-        .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
-
     // ── Compound text+AST path (#198, #356) ──────────────────────────────────
     //
     // When `ast_scored` is Some, run the compound text+AST intersection:
@@ -534,6 +527,28 @@ pub(super) fn execute_query_with_manifest(
     // For 4a the structural lookup is a no-op; the RRF fusion of lexical+AST rank
     // alone replaces the old file_filter gate (#198).
     if let Some(ref ast_scored_vec) = config.ast_scored {
+        // AD-409-7: build the membership-only FileId allowlist HERE, inside this
+        // branch.  `paths_to_file_ids` has a stderr side effect (the partial-drop /
+        // zero-match notice); the compound (text+AST) arm is the only consumer of
+        // this set.  The composite arm derives its own scored layer via
+        // `paths_to_scored_file_ids`, so each query dispatch path calls exactly one
+        // of the two functions — the composite arm never double-reports (AC-7).
+        // Computing it inside the branch also skips a wasted O(manifest) pass on
+        // the composite arm.
+        //
+        // Disclosure asymmetry (AD-413-16): when blast_radius_paths is the
+        // AnchorDiffers sentinel (Some(empty)), `paths_to_file_ids` delegates to
+        // `paths_to_scored_file_ids` which emits "matched 0 indexed files" on stderr
+        // for this arm.  The composite blast-radius arm (below) does NOT emit that
+        // notice for the AnchorDiffers case — `blast_temporal_layer` short-circuits
+        // before calling `paths_to_scored_file_ids` because `resolve_blast_radius_paths`
+        // already emitted the mismatch notice.  Both arms return zero results; the
+        // extra notice on this arm is redundant but harmless (AC-7 governs
+        // double-counting only within a single dispatch path).  Tracked in #528.
+        let blast_file_ids: Option<HashSet<FileId>> = config
+            .blast_radius_paths
+            .as_ref()
+            .map(|allowed_paths| super::temporal::paths_to_file_ids(&sorted, allowed_paths));
         return run_compound_query(
             config,
             ast_scored_vec,
@@ -559,9 +574,11 @@ pub(super) fn execute_query_with_manifest(
     //   1. Fetch a WIDER lexical pool (limit * BLAST_CANDIDATE_POOL_K) WITHOUT a
     //      file_filter so text-only matches outside the co-change partner set
     //      are still present in the lexical ranked list.
-    //   2. Build a temporal ranked list from the co-change partner set:
-    //      each partner gets an equal score of 1.0 so they all contribute rank
-    //      terms to the RRF fusion.
+    //   2. Build a Jaccard-scored temporal ranked list: the blast-radius target
+    //      carries SEED_STRENGTH (2.0 > max Jaccard 1.0) and each partner
+    //      carries its actual Jaccard co-change strength; merge_layer_scores'
+    //      total comparator (score DESC, FileId ASC) derives deterministic
+    //      per-layer ranks from these values (AD-409-2).
     //   3. Run merge_layer_scores over [lexical, temporal] with the composite
     //      weights from config or the default profile.
     //   4. Recompose: carry the lexical SearchResult (snippet + line_range)
@@ -579,7 +596,6 @@ pub(super) fn execute_query_with_manifest(
     if config.blast_radius_paths.is_some() {
         return run_blast_radius_composite_query(
             config,
-            &blast_file_ids,
             QueryContext {
                 engine: &engine,
                 sorted: &sorted,
@@ -734,6 +750,30 @@ struct QueryContext<'a> {
     start: Instant,
 }
 
+/// Build a zero-result [`QueryOutput`] for early-out guards that share an
+/// identical nine-field literal across [`run_compound_query`] and
+/// [`run_blast_radius_composite_query`].
+///
+/// Centralising the construction means adding a field to `QueryOutput` requires
+/// one edit here rather than three (or more) scattered sites.
+fn empty_output(
+    config: &super::types::QueryConfig,
+    ctx: &QueryContext<'_>,
+    vm_label: Option<&'static str>,
+) -> QueryOutput {
+    QueryOutput {
+        query: config.text.clone(),
+        total: 0,
+        has_more: false,
+        verify_mode: vm_label,
+        results: vec![],
+        duration_ms: ctx.start.elapsed().as_millis() as u64,
+        index_stats: Some(ctx.stats.clone()),
+        ast_coverage: None,
+        degraded: vec![],
+    }
+}
+
 /// Execute the compound text+AST query branch (#198, #356).
 ///
 /// Restricts the lexical engine to the AST-matched FileId set (AD-356-1),
@@ -771,17 +811,7 @@ fn run_compound_query(
     // Correctness guard (AC12): an empty file_filter causes the reader to score
     // zero files regardless of sq.limit.
     if ast_fid_set.is_empty() {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
+        return Ok(empty_output(config, &ctx, vm_label));
     }
 
     // Compute the lexical file_filter and pool size (AD-356-1 / AD-356-2).
@@ -810,17 +840,7 @@ fn run_compound_query(
     // guards prevent unnecessary reader/intersect work and make the intent
     // explicit rather than relying on reader side-effect semantics (#356, ADR-003).
     if filter_set.is_empty() {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
+        return Ok(empty_output(config, &ctx, vm_label));
     }
     // AD-356-2: size sq.limit to the candidate set.  filter_set.len() >= 1 is
     // guaranteed by the early-out above, so .max(1) is now a compile-time
@@ -942,6 +962,43 @@ fn run_compound_query(
     })
 }
 
+/// Resolves `config.blast_radius_paths` into a Jaccard-scored temporal layer
+/// and returns `None` when the blast radius contributes nothing to the fusion.
+///
+/// `None` is returned in two cases (AD-413-16 / ADR-009):
+/// - `Some(empty)` allowlist — the `AnchorDiffers` sentinel: the temporal DB
+///   belongs to a different repository; the `paths_to_scored_file_ids` scan is
+///   skipped because the mismatch notice was already emitted upstream.
+/// - `Some(non-empty)` allowlist where every path fails to resolve to a
+///   `FileId` in the current manifest (e.g. all co-change partners deleted from
+///   disk or outside the `--root` subtree); `paths_to_scored_file_ids` emits
+///   the disclosure notice before returning an empty vec.
+///
+/// AD-409-2: each resolved partner carries its actual Jaccard co-change
+/// strength as the raw temporal score; the blast-radius target carries
+/// `SEED_STRENGTH` (2.0 > max Jaccard 1.0) so it always occupies rank 1.
+/// AD-409-6: rank derivation from these scores is delegated to
+/// `merge_layer_scores`, which applies a total comparator (score DESC, then
+/// FileId ASC) to each layer before accumulating RRF terms.
+fn blast_temporal_layer(
+    config: &super::types::QueryConfig,
+    sorted: &[&str],
+) -> Option<Vec<(FileId, f64)>> {
+    // The dispatch in execute_query_with_manifest guarantees blast_radius_paths
+    // is Some(..) at this call site; `?` is a safe fallback for any future
+    // call-site relaxation.
+    let allowed = config.blast_radius_paths.as_ref()?;
+    // AD-413-16: Some(empty) is the AnchorDiffers sentinel — the temporal DB
+    // belongs to a different repository; `resolve_blast_radius_paths` already
+    // emitted the mismatch notice.  Skip `paths_to_scored_file_ids` to avoid a
+    // redundant "0 indexed files" stderr line for this case.
+    if allowed.is_empty() {
+        return None;
+    }
+    let layer = super::temporal::paths_to_scored_file_ids(sorted, allowed);
+    if layer.is_empty() { None } else { Some(layer) }
+}
+
 /// Execute the composite UNION blast-radius re-ranking path (#200).
 ///
 /// Fuses the lexical ranked list and the temporal co-change ranked list into
@@ -960,20 +1017,29 @@ fn run_compound_query(
 ///
 /// # Temporal ranked list construction (AC11 source identity)
 ///
-/// The temporal ranked list is built from `blast_paths` (already resolved from
-/// `TemporalDb::cochanges_for_file` — the same SQLite source the CLI used
-/// before #200).  Each co-change partner path is assigned an equal score of
-/// `1.0` (uniform temporal rank input) and converted to `FileId` via the
-/// manifest's `sorted_paths`.  The Jaccard-value-aware ranking within the
-/// temporal list is not preserved here; the RRF framework uses rank, not
-/// magnitude, so the order within the temporal list only matters when there
-/// are many co-change partners.  Improvement tracked for follow-up: use the
-/// Jaccard score as the raw temporal score for better rank ordering (#200+).
+/// The temporal ranked list is built from `config.blast_radius_paths` (already
+/// resolved from `TemporalDb::cochanges_for_file` — the same SQLite source the
+/// CLI used before #200) via [`super::temporal::paths_to_scored_file_ids`].
+/// Each co-change partner carries its actual Jaccard co-change strength as the
+/// raw temporal score; the blast-radius target itself carries `SEED_STRENGTH`
+/// (2.0 > max Jaccard 1.0) so it always occupies temporal rank 1.
+/// `merge_layer_scores`' per-layer total comparator (score DESC, FileId ASC)
+/// then derives deterministic ranks from these values — the stronger the
+/// co-change relationship, the higher the temporal rank contribution to the
+/// fused RRF score.
 fn run_blast_radius_composite_query(
     config: &super::types::QueryConfig,
-    blast_file_ids: &Option<HashSet<FileId>>,
     ctx: QueryContext<'_>,
 ) -> anyhow::Result<QueryOutput> {
+    // Precondition: this function is only dispatched from the
+    // `config.blast_radius_paths.is_some()` gate in `execute_query_with_manifest`.
+    // `blast_temporal_layer` has a safe `?` fallback for None, but the assertion
+    // makes the invariant checkable rather than narrative (reliability.md; ADR-009).
+    debug_assert!(
+        config.blast_radius_paths.is_some(),
+        "composite blast-radius arm requires a resolved allowlist \
+         (guaranteed by execute_query_with_manifest at the blast_radius_paths.is_some() gate)"
+    );
     // AD-403-7: compute once for all QueryOutput sites in this function.
     let vm_label = verify_mode_for(config.phrase, config.near).json_label();
 
@@ -982,26 +1048,20 @@ fn run_blast_radius_composite_query(
         .composite_weights
         .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
 
-    // AD-413-16: Some(empty) means AnchorDiffers — the temporal DB belongs to a
-    // different repository.  The allowlist is intentionally empty; every call site
-    // must return zero results to match the standalone arm (run_temporal_standalone
-    // returns 0 rows on AnchorDiffers).  Falling through would collapse to pure
-    // lexical (UNION skips the empty temporal layer), returning all text matches
-    // without the blast-radius filter — wrong repo data silently expanded, not
-    // isolated.  Early-out mirrors run_compound_query's filter_set.is_empty() guard.
-    if matches!(blast_file_ids, Some(ids) if ids.is_empty()) {
-        return Ok(QueryOutput {
-            query: config.text.clone(),
-            total: 0,
-            has_more: false,
-            verify_mode: vm_label,
-            results: vec![],
-            duration_ms: ctx.start.elapsed().as_millis() as u64,
-            index_stats: Some(ctx.stats),
-            ast_coverage: None,
-            degraded: vec![],
-        });
-    }
+    // AD-413-16 / ADR-009 unified early-out: `blast_temporal_layer` covers BOTH
+    // the `Some(empty)` AnchorDiffers sentinel (temporal DB belongs to a different
+    // repository — mismatch notice already emitted by `resolve_blast_radius_paths`)
+    // and the "allowlist non-empty but no path resolves to a FileId" case (all
+    // co-change partners deleted from disk or outside the `--root` subtree —
+    // disclosed by `paths_to_scored_file_ids` on stderr).  In either case the blast
+    // radius contributes nothing to the fusion; returning zero results matches the
+    // standalone temporal arm and avoids a confident ranking that is not a blast
+    // radius at all (ADR-009).  This check runs BEFORE the lexical search so an
+    // unresolvable allowlist never triggers a wasted corpus-wide BM25F pass —
+    // matching the early-out ordering of the standalone temporal arm.
+    let Some(temporal_layer) = blast_temporal_layer(config, ctx.sorted) else {
+        return Ok(empty_output(config, &ctx, vm_label));
+    };
 
     // Step 1: fetch a WIDE lexical ranked list WITHOUT a file_filter.
     //
@@ -1052,23 +1112,13 @@ fn run_blast_radius_composite_query(
     // AD-393-12: select the verify predicate for the blast path.
     let blast_verify_mode = verify_mode_for(config.phrase, config.near);
 
-    // Step 2: build the temporal ranked list from blast_paths.
-    // Each co-change partner path → FileId (via sorted_paths index).
-    // Score = 1.0 (uniform; RRF uses rank not magnitude, so this suffices).
-    // The target file itself is included in blast_paths by resolve_blast_radius_paths.
-    // When blast_file_ids is None (temporal DB absent), degrades to lexical-only ranking.
-    let mut temporal_layer: Vec<(FileId, f64)> = blast_file_ids
-        .as_ref()
-        .map(|ids| ids.iter().map(|&fid| (fid, 1.0)).collect())
-        .unwrap_or_default();
-    // Sort by FileId for deterministic rank assignment within the layer.
-    // All have equal scores, so the sort order determines their temporal ranks.
-    temporal_layer.sort_unstable_by_key(|&(fid, _)| fid.0);
-
-    // Step 3: lexical ranked list from raw_lex (already sorted DESC by score).
+    // Step 2: lexical ranked list from raw_lex (already sorted DESC by score).
+    // AD-409-6: rank derivation for the temporal layer is delegated to
+    // `merge_layer_scores`, which applies a total comparator (score DESC, then
+    // FileId ASC) to each layer before accumulating RRF terms.
     let lexical_layer: Vec<(FileId, f64)> = raw_lex.iter().map(|r| (r.file_id, r.score)).collect();
 
-    // Step 4: N-signal RRF UNION merge.
+    // Step 3: N-signal RRF UNION merge.
     // The blast-radius path fuses only the lexical and co-change (temporal)
     // signals, so only those two layers are constructed here. The `ast` weight
     // (0.3 by default) and the extended signals (import_graph, dir_proximity,
@@ -1081,7 +1131,7 @@ fn run_blast_radius_composite_query(
     ];
     let ranked = merge_layer_scores(layers);
 
-    // Step 5: rank the full UNION set, then apply verification + truncation LAST.
+    // Step 4: rank the full UNION set, then apply verification + truncation LAST.
     //
     // AD-355-2: do NOT truncate before verification.  The UNION contract requires
     // all candidates to be ranked before any are dropped.  After verification the
@@ -1091,7 +1141,7 @@ fn run_blast_radius_composite_query(
     // is a relevance gate, not a #317 output cap.  No elision_marker needed.
     let lex_map: HashMap<FileId, &SearchResult> = raw_lex.iter().map(|r| (r.file_id, r)).collect();
 
-    // Step 6: recompose results with verification for lexical-hit candidates.
+    // Step 5: recompose results with verification for lexical-hit candidates.
     //
     // For files present in the lexical pool: read snippet + verify substring
     // membership in a SINGLE file read via extract_snippet_and_verify (AD-355-1).

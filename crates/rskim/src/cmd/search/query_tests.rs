@@ -493,7 +493,7 @@ fn test_resolved_result_line_range_none_serializes_null() {
 /// result set is restricted to it.
 #[test]
 fn test_execute_query_blast_radius_includes_only_allowed_paths() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -501,9 +501,9 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    // blast-radius set: src/auth.rs only.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
+    // blast-radius map: src/auth.rs only (uniform 1.0 strength — seed not set here).
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "authenticate".to_string(),
@@ -539,7 +539,7 @@ fn test_execute_query_blast_radius_includes_only_allowed_paths() {
 /// Regression for: combined mode was excluding the target file itself.
 #[test]
 fn test_execute_query_blast_radius_target_file_is_included() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -549,9 +549,9 @@ fn test_execute_query_blast_radius_target_file_is_included() {
 
     // Build an allowlist that includes src/auth.rs (the "target") plus a
     // partner that has no matching content for "authenticate".
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // target
-    allowed.insert("src/does_not_exist.rs".to_string()); // partner (not indexed)
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // target
+    allowed.insert("src/does_not_exist.rs".to_string(), 1.0); // partner (not indexed)
 
     let config = QueryConfig {
         text: "authenticate".to_string(),
@@ -591,7 +591,7 @@ fn test_execute_query_blast_radius_target_file_is_included() {
 
 #[test]
 fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -605,9 +605,9 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
     //
     // blast_radius_paths: include BOTH src/auth.rs (lexical match) AND
     // src/lib.rs (co-change partner that does NOT match the query).
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // lexically matches query
-    allowed.insert("src/lib.rs".to_string()); // co-change partner; does NOT match query
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexically matches query
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change partner; does NOT match query
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -663,7 +663,7 @@ fn test_ac12_union_includes_cochange_only_file_absent_from_lexical() {
 
 #[test]
 fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -673,9 +673,9 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
 
     // blast_radius_paths with both indexed files so the union is the full index.
     // Both files are in the temporal list; auth.rs also matches the lexical query.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
-    allowed.insert("src/lib.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+    allowed.insert("src/lib.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -738,7 +738,7 @@ fn test_ac13_union_no_duplicate_file_ids_and_correct_cardinality() {
 
 #[test]
 fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -747,9 +747,9 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
     create_union_test_project(&root);
 
     // Both indexed files in blast-radius; query matches only one.
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // lexical match
-    allowed.insert("src/lib.rs".to_string()); // co-change-only
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexical match
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change-only
 
     // limit = 1: only the top-ranked result is returned.
     let config = QueryConfig {
@@ -796,7 +796,7 @@ fn test_ac13_limit_applied_after_fusion_rank_then_limit() {
 
 #[test]
 fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -806,9 +806,9 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
     create_union_test_project(&root);
 
     // blast_radius_paths includes lib.rs (co-change-only: no "zqjxblip_check" match).
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
-    allowed.insert("src/lib.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
+    allowed.insert("src/lib.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -872,7 +872,7 @@ fn test_ac14_cochange_only_result_carries_fused_rrf_score() {
 
 #[test]
 fn test_positional_cochange_only_peer_is_dropped() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -882,9 +882,9 @@ fn test_positional_cochange_only_peer_is_dropped() {
     // lib.rs: does NOT contain "zqjxblip_check" — pure co-change-only partner.
     create_union_test_project(&root);
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string()); // lexical hit + phrase match
-    allowed.insert("src/lib.rs".to_string()); // co-change-only: does NOT contain phrase
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0); // lexical hit + phrase match
+    allowed.insert("src/lib.rs".to_string(), 1.0); // co-change-only: does NOT contain phrase
 
     let config = QueryConfig {
         text: "zqjxblip_check".to_string(),
@@ -946,7 +946,7 @@ fn test_positional_cochange_only_peer_is_dropped() {
 /// return zero results, not the full unfiltered lexical result set.
 #[test]
 fn test_blast_radius_empty_allowlist_returns_zero_results() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -963,7 +963,7 @@ fn test_blast_radius_empty_allowlist_returns_zero_results() {
         json: false,
         root: root.to_path_buf(),
         cache_dir: cache_dir.to_path_buf(),
-        blast_radius_paths: Some(HashSet::new()), // empty allowlist → AnchorDiffers path
+        blast_radius_paths: Some(HashMap::new()), // empty allowlist → AnchorDiffers path
         ast_scored: None,
         composite_weights: None,
         phrase: false,
@@ -991,6 +991,71 @@ fn test_blast_radius_empty_allowlist_returns_zero_results() {
     assert_eq!(
         output.total, 0,
         "AD-413-16: total must be 0 for empty allowlist"
+    );
+}
+
+/// AD-413-16 companion regression (#409 container retype): a NON-empty allowlist
+/// whose paths are all absent from the lexical manifest must ALSO return zero
+/// results — the blast-radius signal contributed nothing, so returning the plain
+/// lexical hit list under a `--blast-radius` flag would be a confident ranking
+/// that is not a blast radius (ADR-009).
+///
+/// Before #409 this case was covered by the same guard as the empty allowlist,
+/// because that guard tested the RESOLVED `HashSet<FileId>`.  #409 retyped it to
+/// test the source path map, so this is the discriminating guard for the
+/// `temporal_layer.is_empty()` early-out that restores the pre-#409 semantics.
+#[test]
+fn test_blast_radius_allowlist_with_no_indexed_paths_returns_zero_results() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    // "authenticate" DOES produce lexical results in this project — so a fall-through
+    // would be observable as a non-empty result set.
+    create_test_project(&root);
+
+    // Non-empty allowlist, but neither path exists in the manifest (seed included):
+    // every co-change partner was deleted from disk while temporal.db still lists them.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/deleted_seed.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/deleted_partner.rs".to_string(), 0.75);
+
+    let config = QueryConfig {
+        text: "authenticate".to_string(),
+        limit: 20,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache_dir.to_path_buf(),
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        output.results.is_empty(),
+        "an allowlist that resolves to zero FileIds must return zero results, not the \
+         unfiltered lexical set; got {} results: {:?}",
+        output.results.len(),
+        output
+            .results
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        output.total, 0,
+        "total must be 0 when no allowlist path is indexed"
     );
 }
 
@@ -1427,7 +1492,7 @@ fn test_ac2_verify_gate_drops_compound_lexical_hit_without_literal() {
 /// verify gate on the blast-radius path.
 #[test]
 fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -1435,8 +1500,8 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
     fs::create_dir_all(&cache_dir).unwrap();
     create_test_project(&root);
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/auth.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/auth.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "xqzjvmblorp".to_string(),
@@ -1492,7 +1557,7 @@ fn test_ac2_gibberish_query_no_lexical_hits_blast_radius() {
 /// so `snippet` is always `None` regardless of the verify decision).
 #[test]
 fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -1518,9 +1583,9 @@ fn test_ac2_short_query_fallback_blast_radius_exercises_verify_gate() {
     )
     .unwrap();
 
-    let mut allowed: HashSet<String> = HashSet::new();
-    allowed.insert("src/match.rs".to_string());
-    allowed.insert("src/nomatch.rs".to_string());
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/match.rs".to_string(), 1.0);
+    allowed.insert("src/nomatch.rs".to_string(), 1.0);
 
     let config = QueryConfig {
         text: "zz".to_string(), // 2 bytes → AD-355-7 fallback
@@ -3410,5 +3475,407 @@ fn ast_coverage_notice_fires_with_shared_prefix_when_excluded() {
     assert!(
         notice.contains("By language: rust 1"),
         "notice must carry the per-language breakdown: got {notice:?}"
+    );
+}
+
+// ============================================================================
+// AC-409 unit tests — Jaccard-ranked temporal layer (#409)
+// ============================================================================
+
+/// Create a synthetic project for the AC-409 Jaccard-ranking unit tests.
+///
+/// The three files are named so that the seed (`zzanchor.rs`) sorts LAST
+/// byte-wise, ensuring that seed-first ranking can only be produced by
+/// `SEED_STRENGTH`, never by the pre-#409 defect (uniform 1.0 + FileId-ASC sort):
+///   - aweak.rs    (alphabetically first)  → weak J  (J=0.30)
+///   - zstrong.rs  (alphabetically second) → strong J (J=0.80)
+///   - zzanchor.rs (alphabetically last; the blast-radius seed) → SEED_STRENGTH
+///
+/// With the old uniform-1.0 / FileId-sort defect, aweak would rank first
+/// (FileId(0) gets rank 1 when all scores are equal).
+/// After the fix, zzanchor (seed, SEED_STRENGTH=2.0) ranks first, zstrong second,
+/// aweak third.
+fn create_ac409_project(root: &std::path::Path) {
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    // Content is irrelevant to the Jaccard-ranking tests — the temporal scores
+    // come from blast_radius_paths, not from file content.
+    fs::write(src.join("aweak.rs"), "// aweak — weak co-change partner\n").unwrap();
+    fs::write(
+        src.join("zstrong.rs"),
+        "// zstrong — strong co-change partner\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zzanchor.rs"),
+        "// zzanchor — blast-radius seed (sorts last)\n",
+    )
+    .unwrap();
+}
+
+/// Build a [`QueryConfig`] with the common defaults used by the AC-409 unit tests.
+///
+/// All optional fields (offset, json, ast_scored, phrase, near, lang) are set to
+/// their zero/false/None defaults.  Pass `composite_weights: None` for the default
+/// RRF weights, or `Some(temporal_only_weights())` for `--weights 0,0,1`.
+fn blast_config(
+    root: std::path::PathBuf,
+    cache_dir: std::path::PathBuf,
+    text: &str,
+    allowed: std::collections::HashMap<String, f64>,
+    composite_weights: Option<rskim_search::compound::CompositeWeights>,
+) -> QueryConfig {
+    QueryConfig {
+        text: text.to_string(),
+        limit: 10,
+        offset: None,
+        json: false,
+        root,
+        cache_dir,
+        blast_radius_paths: Some(allowed),
+        ast_scored: None,
+        composite_weights,
+        phrase: false,
+        near: None,
+        lang: None,
+    }
+}
+
+/// Return `CompositeWeights` equivalent to `--weights 0,0,1` (temporal only).
+///
+/// Extracted from the three AC-409 tests that use temporal-only weights to avoid
+/// re-typing all six fields at each site.
+fn temporal_only_weights() -> rskim_search::compound::CompositeWeights {
+    rskim_search::compound::CompositeWeights {
+        lexical: 0.0,
+        ast: 0.0,
+        temporal: 1.0,
+        import_graph: 0.0,
+        dir_proximity: 0.0,
+        structural_coupling: 0.0,
+    }
+}
+
+/// AC-1 — `--weights 0,0,1` ranks partners by Jaccard DESC, NOT by byte-wise
+/// path order.
+///
+/// Byte-wise order: aweak < zstrong < zzanchor ('a' < 'z' < 'zz').
+/// The Jaccard order is zzanchor (seed, 2.0) > zstrong (0.80) > aweak (0.30).
+/// After the fix the output order must be [zzanchor, zstrong, aweak]; before the
+/// fix it would be [aweak, zstrong, zzanchor] (alphabetical = FileId-sort defect).
+///
+/// Expected scores (±1e-12):
+///   zzanchor: 1.0/61  (temporal rank 1, weight 1.0)
+///   zstrong:  1.0/62  (temporal rank 2)
+///   aweak:    1.0/63  (temporal rank 3)
+#[test]
+fn test_ac409_temporal_weight_only_ranks_by_jaccard_not_alphabetical() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_ac409_project(&root);
+
+    // blast_radius_paths: zzanchor is the seed (SEED_STRENGTH > 1.0 > any Jaccard).
+    // zstrong has a higher Jaccard than aweak so it must rank before aweak.
+    // Using a gibberish query to suppress lexical contributions completely.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/zzanchor.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/zstrong.rs".to_string(), 0.80);
+    allowed.insert("src/aweak.rs".to_string(), 0.30);
+
+    // --weights 0,0,1: temporal only
+    let config = blast_config(
+        root.clone(),
+        cache_dir.clone(),
+        "xqzjvmblorp_ac409_unique", // gibberish — zero lexical hits
+        allowed,
+        Some(temporal_only_weights()),
+    );
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Three co-change-only partners must appear (no lexical hits, but UNION mode
+    // surfaces them via their temporal scores).
+    assert_eq!(
+        output.results.len(),
+        3,
+        "AC-1: expected 3 results (zzanchor, zstrong, aweak); got: {:?}",
+        output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
+    );
+
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["src/zzanchor.rs", "src/zstrong.rs", "src/aweak.rs"],
+        "AC-1: results must be ordered by Jaccard DESC (zzanchor seed first, zstrong second, \
+         aweak third), NOT by byte-wise path order (aweak < zstrong < zzanchor)"
+    );
+
+    // Score check (±1e-12): temporal-only RRF gives w/(RRF_K + rank).
+    let eps = 1e-12_f64;
+    assert!(
+        (output.results[0].score - 1.0 / (RRF_K + 1.0)).abs() < eps,
+        "AC-1: zzanchor (rank 1) score must be 1/61 (±1e-12); got {}",
+        output.results[0].score
+    );
+    assert!(
+        (output.results[1].score - 1.0 / (RRF_K + 2.0)).abs() < eps,
+        "AC-1: zstrong (rank 2) score must be 1/62 (±1e-12); got {}",
+        output.results[1].score
+    );
+    assert!(
+        (output.results[2].score - 1.0 / (RRF_K + 3.0)).abs() < eps,
+        "AC-1: aweak (rank 3) score must be 1/63 (±1e-12); got {}",
+        output.results[2].score
+    );
+}
+
+/// AC-2 — the blast-radius seed file occupies temporal rank 1 with score
+/// exactly 1.0/61.0 under `--weights 0,0,1`, even though it has the HIGHEST
+/// FileId (sorts last byte-wise).
+///
+/// `zzanchor.rs` sorts after `aweak.rs` and `zstrong.rs` (FileId 2 of 3), so
+/// the pre-#409 defect (uniform 1.0 + sort by FileId-ASC) would place `aweak.rs`
+/// (FileId 0) at rank 1 — asserting `zzanchor.rs` at rank 1 can only be satisfied
+/// by the `SEED_STRENGTH` sentinel (2.0 > any Jaccard) introduced by the fix.
+#[test]
+fn test_ac409_seed_file_ranks_first_in_temporal_layer() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    create_ac409_project(&root);
+
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(
+        "src/zzanchor.rs".to_string(),
+        super::super::temporal::SEED_STRENGTH,
+    );
+    allowed.insert("src/zstrong.rs".to_string(), 0.80);
+    allowed.insert("src/aweak.rs".to_string(), 0.30);
+
+    let config = blast_config(
+        root,
+        cache_dir,
+        "xqzjvmblorp_ac409_seed",
+        allowed,
+        Some(temporal_only_weights()),
+    );
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !output.results.is_empty(),
+        "AC-2: results must not be empty (seed must appear)"
+    );
+    assert_eq!(
+        output.results[0].path, "src/zzanchor.rs",
+        "AC-2: seed (zzanchor.rs, FileId 2 of 3) must occupy rank 1 of the temporal-only \
+         output; the pre-#409 defect would place aweak.rs (FileId 0) first instead"
+    );
+    let expected_score = 1.0 / (RRF_K + 1.0);
+    let eps = 1e-12_f64;
+    assert!(
+        (output.results[0].score - expected_score).abs() < eps,
+        "AC-2: seed score must equal 1.0/(RRF_K+1) = 1.0/61.0 (±1e-12); got {}",
+        output.results[0].score
+    );
+}
+
+/// AC-5 — at default weights (0.5, 0.3, 0.2), a file that matches BOTH layers
+/// accumulates both rank terms with the temporal rank derived from Jaccard:
+///
+/// - hit.rs: lexical rank 1 + temporal rank 2 (J=0.20, weaker than zpartner)
+///   → fused score = 0.5/61 + 0.2/62  (±1e-12)
+/// - zpartner.rs: co-change-only, temporal rank 1 (J=0.90)
+///   → fused score = 0.2/61           (±1e-12)
+///
+/// The temporal layer is sorted DESC by Jaccard: zpartner(0.9) rank 1,
+/// hit.rs(0.2) rank 2.  No seed in blast_radius_paths here — this unit test
+/// exercises the two-layer accumulation directly.
+///
+/// Ordering: hit.rs (0.5/61 + 0.2/62 ≈ 0.01142) outscores zpartner.rs (0.2/61
+/// ≈ 0.00328) because its lexical contribution dominates, so hit.rs ranks first.
+#[test]
+fn test_ac409_both_layers_accumulate_with_temporal_rank_from_jaccard() {
+    use rskim_search::compound::RRF_K;
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    // hit.rs contains the unique query token; zpartner.rs does not.
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("hit.rs"),
+        "pub fn xqzjvmblorp_ac409_ac5_hit() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        src.join("zpartner.rs"),
+        "pub struct NoHitHere { count: u32 }\n",
+    )
+    .unwrap();
+
+    // blast_radius_paths: hit.rs(J=0.20), zpartner.rs(J=0.90) — no seed sentinel.
+    // Temporal layer sorted DESC: zpartner(0.9)→rank 1, hit.rs(0.2)→rank 2.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/hit.rs".to_string(), 0.20);
+    allowed.insert("src/zpartner.rs".to_string(), 0.90);
+
+    let config = blast_config(
+        root,
+        cache_dir,
+        "xqzjvmblorp_ac409_ac5_hit",
+        allowed,
+        None, // default: lexical=0.5, ast=0.3, temporal=0.2
+    );
+
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Both files must appear.
+    let hit_result = output
+        .results
+        .iter()
+        .find(|r| r.path == "src/hit.rs")
+        .expect("AC-5: hit.rs must appear in results");
+    let zpartner_result = output
+        .results
+        .iter()
+        .find(|r| r.path == "src/zpartner.rs")
+        .expect("AC-5: zpartner.rs must appear in results");
+
+    // Verify: hit.rs has a snippet (lexical match), zpartner.rs is co-change-only.
+    assert!(
+        hit_result.snippet.is_some(),
+        "AC-5: hit.rs lexically matches the query so snippet must be non-None"
+    );
+    assert!(
+        zpartner_result.snippet.is_none(),
+        "AC-5: zpartner.rs is a co-change-only partner — snippet must be None"
+    );
+
+    // Score assertions (±1e-12).
+    let eps = 1e-12_f64;
+    let expected_hit = 0.5 / (RRF_K + 1.0) + 0.2 / (RRF_K + 2.0);
+    assert!(
+        (hit_result.score - expected_hit).abs() < eps,
+        "AC-5: hit.rs score must be 0.5/61 + 0.2/62 = {expected_hit} (±1e-12); got {}",
+        hit_result.score
+    );
+    let expected_zpartner = 0.2 / (RRF_K + 1.0);
+    assert!(
+        (zpartner_result.score - expected_zpartner).abs() < eps,
+        "AC-5: zpartner.rs score must be 0.2/61 = {expected_zpartner} (±1e-12); got {}",
+        zpartner_result.score
+    );
+
+    // Ordering: hit.rs fused score (0.5/61 + 0.2/62 ≈ 0.01142) exceeds zpartner.rs
+    // score (0.2/61 ≈ 0.00328) because hit.rs accumulates both lexical rank 1 and
+    // temporal rank 2.  hit.rs must therefore appear first in the output.
+    let hit_pos = output
+        .results
+        .iter()
+        .position(|r| r.path == "src/hit.rs")
+        .unwrap();
+    let zpartner_pos = output
+        .results
+        .iter()
+        .position(|r| r.path == "src/zpartner.rs")
+        .unwrap();
+    assert!(
+        hit_pos < zpartner_pos,
+        "AC-5: hit.rs (fused score ≈ 0.5/61 + 0.2/62) must rank before zpartner.rs \
+         (score ≈ 0.2/61); hit at index {hit_pos}, zpartner at index {zpartner_pos}"
+    );
+}
+
+/// AC-15 — a co-change row whose stored Jaccard is NaN or ±∞ MUST NOT panic,
+/// MUST NOT propagate a non-finite value into the fused output score, and the
+/// file MUST still appear in results (ranked below every valid partner).
+#[test]
+fn test_ac409_non_finite_jaccard_does_not_panic_and_stays_finite() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let cache_dir = dir.path().join("cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+
+    let src = root.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(
+        src.join("normal.rs"),
+        "// normal partner — finite Jaccard\n",
+    )
+    .unwrap();
+    fs::write(src.join("nan_file.rs"), "// partner with NaN Jaccard\n").unwrap();
+
+    // blast_radius_paths: normal_partner has finite J=0.8, nan_file has NaN J.
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert("src/normal.rs".to_string(), 0.80);
+    allowed.insert("src/nan_file.rs".to_string(), f64::NAN);
+
+    let config = blast_config(
+        root,
+        cache_dir,
+        "xqzjvmblorp_ac409_ac15_unique", // gibberish
+        allowed,
+        Some(temporal_only_weights()),
+    );
+
+    // MUST NOT panic.
+    let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
+
+    // Both files must appear in results (the NaN-Jaccard file is still included;
+    // its score is mapped to NON_FINITE_JACCARD_FLOOR = 0.0 and it ranks last).
+    let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+    assert!(
+        paths.contains(&"src/normal.rs"),
+        "AC-15: normal.rs (finite Jaccard=0.8) must appear in results; got: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"src/nan_file.rs"),
+        "AC-15: nan_file.rs must still appear (no panic, not silently dropped); got: {paths:?}"
+    );
+
+    // All output scores must be finite.
+    for r in &output.results {
+        assert!(
+            r.score.is_finite(),
+            "AC-15: non-finite Jaccard must not propagate to the output score; \
+             path={}, score={}",
+            r.path,
+            r.score
+        );
+    }
+
+    // nan_file (floor score=0.0, temporal rank below normal.rs) must rank AFTER
+    // normal.rs which has finite Jaccard=0.8 (temporal rank 1).
+    let normal_idx = paths.iter().position(|&p| p == "src/normal.rs").unwrap();
+    let nan_idx = paths.iter().position(|&p| p == "src/nan_file.rs").unwrap();
+    assert!(
+        normal_idx < nan_idx,
+        "AC-15: normal.rs (finite J=0.8) must rank above nan_file.rs (floor score=0.0); \
+         normal at index {normal_idx}, nan at index {nan_idx}"
     );
 }

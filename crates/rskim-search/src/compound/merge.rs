@@ -27,6 +27,13 @@
 //!   `FileId`-ASC as a total comparator for equal scores.  `total_cmp` is used
 //!   throughout so NaN (which cannot occur in the RRF denominator) is handled
 //!   safely as defence in depth.
+//! - **Per-layer rank determinism**: each input layer is sorted by the same
+//!   total comparator (score DESC, `FileId` ASC) before ranks are assigned.
+//!   Equal-score entries within a single layer — e.g. two co-change partners
+//!   with identical Jaccard — therefore receive deterministic relative ranks
+//!   regardless of HashMap or Vec iteration order in the caller.  This
+//!   ensures that changing the *scores* (not the membership) of a layer
+//!   changes the output ordering in a predictable, test-verifiable way.
 //! - **UNION semantics**: a FileId present in only one layer is INCLUDED in the
 //!   output, ranked by its single rank term (graceful-absence).
 //! - **No HashMap iteration in output**: accumulation uses a `HashMap` but the
@@ -105,10 +112,14 @@ pub fn merge_layer_scores(layers: &[(Vec<(FileId, f64)>, f64)]) -> Vec<(FileId, 
         // For large layers the sort dominates; for small layers the alloc
         // dominates — both are bounded by the caller's layer sizes.
         let mut sorted_layer: Vec<(FileId, f64)> = layer.clone();
-        sorted_layer.sort_unstable_by(|&(_, a), &(_, b)| {
-            // DESC by score; NaN goes last (defence in depth — callers should
-            // not produce NaN raw scores, but total_cmp handles it safely).
-            b.total_cmp(&a)
+        sorted_layer.sort_unstable_by(|&(a_fid, a), &(b_fid, b)| {
+            // AD-409-4: total comparator — score DESC, then FileId ASC as a
+            // deterministic tiebreaker.  Applies to every layer (lexical, AST,
+            // temporal) so equal-score partners within a single layer receive
+            // stable, predictable ranks regardless of input order.  NaN goes
+            // last via total_cmp (defence in depth; AC-15 ensures callers do
+            // not produce NaN, but total_cmp handles it safely here too).
+            b.total_cmp(&a).then_with(|| a_fid.0.cmp(&b_fid.0))
         });
 
         // Assign 1-based ranks and accumulate RRF contributions.
