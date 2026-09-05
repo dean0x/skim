@@ -235,11 +235,14 @@ fn try_cached_result(
     let origin_active = crate::output::rewrite_origin().is_some();
     let needs_raw_read = needs_recount || origin_active;
 
-    // A cache hit in a lossy mode means the served view differs from raw bytes
-    // (the original transform stripped bodies/comments/etc.).  When the
-    // origin tag is present we compare cached content against raw bytes to
-    // detect mid-flight changes; otherwise we infer view_differs from the mode.
-    let cache_hit_view_differs = options.mode != Mode::Full;
+    // consistency-2: use the `view_differs` value stored in the cache record when
+    // available (written from the authoritative byte comparison in process_file).
+    // Fall back to mode-inference only for old cache entries that pre-date the field.
+    // Mode-inference (`mode != Mode::Full`) is wrong when the ADR-001 guardrail chose
+    // to serve raw bytes: the cached content IS the raw file, so view_differs is false,
+    // but mode-inference would say true (causing the transparency marker to fire on a
+    // byte-identical warm hit but not on the cold hit — inconsistent behaviour).
+    let cache_hit_view_differs = hit.view_differs.unwrap_or(options.mode != Mode::Full);
 
     let (orig_tokens, trans_tokens, view_differs) = if needs_raw_read {
         match read_and_validate(path) {
@@ -249,11 +252,10 @@ fn try_cached_result(
                 } else {
                     (hit.original_tokens, hit.transformed_tokens)
                 };
-                let differs = if origin_active {
-                    hit.content != contents
-                } else {
-                    cache_hit_view_differs
-                };
+                // Use the stored view_differs when available.  When missing (old cache
+                // entry), compare bytes — the file is in hand and this is the
+                // authoritative check regardless of origin_active (consistency-2).
+                let differs = hit.view_differs.unwrap_or_else(|| hit.content != contents);
                 (orig, trans, differs)
             }
             Err(e) => {
@@ -392,11 +394,15 @@ fn run_transform(
 
             // AC-10: Token counting for mode selection does NOT include line number annotations.
             // Run cascade WITHOUT line_numbers to select the best mode.
+            // reliability-8: pass the source line count so fallback_line_truncate can
+            // report a source-space omission count rather than an output-space count.
+            let source_line_count = contents.lines().count();
             let (output, mode) = cascade::cascade_for_token_budget(
                 options.mode,
                 &options.trunc,
                 budget,
                 language,
+                source_line_count,
                 transform_file,
             )?;
 
@@ -745,12 +751,16 @@ pub(crate) fn process_stdin(
         .token_budget
     {
         Some(budget) => {
-            // AC-10: Cascade mode selection without line numbers, then re-run with line numbers
+            // AC-10: Cascade mode selection without line numbers, then re-run with line numbers.
+            // reliability-8: pass the source line count so fallback_line_truncate can
+            // report a source-space omission count rather than an output-space count.
+            let source_line_count = buffer.lines().count();
             let (output, mode) = cascade::cascade_for_token_budget(
                 options.mode,
                 &options.trunc,
                 budget,
                 language,
+                source_line_count,
                 |config| Ok(Some(transform_with_config(&buffer, language, config)?)),
             )?;
             // Use the re-run output directly as the final output (avoids double transform).
@@ -1025,6 +1035,9 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             effective_mode,
             parse_tier: parse_tier.map(str::to_string),
             line_numbers: options.line_numbers,
+            // consistency-2: store the authoritative view_differs so the
+            // cache-hit path does not have to re-derive it from the mode.
+            view_differs,
         });
     }
 

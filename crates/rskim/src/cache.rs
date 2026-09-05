@@ -101,6 +101,17 @@ struct CacheEntry {
     /// Old cache entries without this field deserialize with `None` (backward-compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parse_tier: Option<String>,
+    /// Whether the served view differs from the raw file bytes.
+    ///
+    /// Written from the authoritative byte comparison in `process_file` so the
+    /// cache-hit path in `try_cached_result` does not have to infer it from the
+    /// mode (consistency-2: mode-inference is wrong when the ADR-001 guardrail
+    /// chose raw bytes).
+    ///
+    /// `None` on backward-compatible reads of old entries; callers fall back to
+    /// mode-inference in that case (`mode != Mode::Full`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    view_differs: Option<bool>,
 }
 
 /// Data returned on a successful cache lookup.
@@ -112,6 +123,11 @@ pub(crate) struct CacheHit {
     pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if available).
     pub(crate) transformed_tokens: Option<usize>,
+    /// Whether the served view differs from the raw file bytes.
+    ///
+    /// `None` for cache entries written before this field was added — callers
+    /// fall back to mode-inference (`mode != Mode::Full`) in that case.
+    pub(crate) view_differs: Option<bool>,
 }
 
 /// Parameters for writing a cache entry.
@@ -136,6 +152,12 @@ pub(crate) struct CacheWriteParams<'a> {
     ///
     /// Line-numbered and unnumbered outputs are cached separately because they differ.
     pub(crate) line_numbers: bool,
+    /// Whether the served view differs from the raw file bytes.
+    ///
+    /// Computed from the authoritative byte comparison in `process_file` and stored
+    /// here so the cache-hit path in `try_cached_result` can reproduce the correct
+    /// answer without re-reading the file (consistency-2).
+    pub(crate) view_differs: bool,
 }
 
 /// Returns the skim cache directory, creating it with owner-only permissions if it does not
@@ -245,6 +267,7 @@ pub(crate) fn read_cache(
             content: entry.content,
             original_tokens: entry.original_tokens,
             transformed_tokens: entry.transformed_tokens,
+            view_differs: entry.view_differs,
         })
     } else {
         // Stale entry: best-effort cleanup.
@@ -278,6 +301,7 @@ pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
         transformed_tokens: params.transformed_tokens,
         effective_mode: params.effective_mode.map(|m| format!("{m:?}")),
         parse_tier: params.parse_tier.clone(),
+        view_differs: Some(params.view_differs),
     };
 
     let json = serde_json::to_string(&entry)?;
@@ -511,6 +535,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             line_numbers: false,
+            view_differs: false,
         })
         .unwrap();
 
@@ -570,6 +595,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             line_numbers: false,
+            view_differs: false,
         })
         .unwrap();
 
@@ -616,6 +642,7 @@ mod tests {
             effective_mode: Some(Mode::Signatures),
             parse_tier: None,
             line_numbers: false,
+            view_differs: true,
         })
         .unwrap();
 
@@ -666,6 +693,7 @@ mod tests {
             effective_mode: None,
             parse_tier: None,
             line_numbers: false,
+            view_differs: false,
         })
         .unwrap();
         let hit = read_cache(&path, Mode::Structure, &default_trunc, false).unwrap();

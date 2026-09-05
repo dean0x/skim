@@ -267,6 +267,37 @@ pub(crate) fn write_line_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
 // JSON disclosure sink (D1 / ADR-015)
 // ============================================================================
 
+/// Named struct for the elision count threaded into [`emit_json_envelope`].
+///
+/// Replaces the anonymous `(usize, usize, &str)` tuple so field order is
+/// enforced by name rather than position.  Callers that currently pass a
+/// tuple literal can convert via `ElidedCount::from((kept, total, unit))` or
+/// the `Into` blanket: `(kept, total, unit).into()`.
+///
+/// ## Migration note
+///
+/// `emit_json_envelope` currently still accepts `Option<(usize, usize, &str)>`
+/// for backward compatibility with call sites in `cmd/log.rs` and
+/// `cmd/git/log.rs` that are owned by sibling agents.  Once those are updated
+/// (see call-site notes in the issue-fix report), the signature will switch to
+/// `Option<ElidedCount>` and this `From` impl becomes the only remaining
+/// compatibility shim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ElidedCount {
+    /// Number of items actually emitted in the envelope.
+    pub(crate) kept: usize,
+    /// Total items the tool produced (kept + elided).
+    pub(crate) total: usize,
+    /// Singular/plural noun for the unit ("lines", "entries", …).
+    pub(crate) unit: &'static str,
+}
+
+impl From<(usize, usize, &'static str)> for ElidedCount {
+    fn from((kept, total, unit): (usize, usize, &'static str)) -> Self {
+        ElidedCount { kept, total, unit }
+    }
+}
+
 /// Whether a JSON envelope is written with a trailing newline.
 ///
 /// Load-bearing, not cosmetic: the `--json` exits do **not** agree on this
@@ -306,6 +337,9 @@ pub(crate) enum LineTermination {
 ///
 /// `elided = Some((kept, total, unit))` renders the countable wording; `None`
 /// (or `kept >= total`) renders "summarised, not the full tool output".
+/// Prefer constructing the tuple via [`ElidedCount`] and converting with
+/// `.map(|e| (e.kept, e.total, e.unit))` — the signature will migrate to
+/// `Option<ElidedCount>` once call sites in sibling files are updated.
 ///
 /// A [`StdoutStatus::PipeClosed`] result suppresses the marker — the reader is
 /// gone, so there is nobody to disclose to — and callers must stop producing
@@ -340,12 +374,13 @@ pub(crate) fn emit_json_envelope(
             output_format: OutputFormat::Json,
             passthrough_reproduces_argv,
         });
-        // ADR-011 class 1 — unconditional, never `debug_log!`, and `eprintln!`
-        // rather than `write_line_to_stderr`: this is one of skim's own short
-        // notices, not forwarded tool stderr (see the module note in cmd/mod.rs).
-        eprintln!(
-            "{}",
-            crate::output::lossy_json_view_marker(tool, elided, &remedy)
+        // ADR-011 class 1 — unconditional, never `debug_log!`.
+        // Use `write_line_to_stderr` instead of `eprintln!`: the latter panics
+        // on EPIPE (e.g. `skim log --json 2>&1 | head`) while the former
+        // returns a Result that we silently discard — stderr loss on a broken
+        // pipe is acceptable, a panic is not (regression-6).
+        let _ = write_line_to_stderr(
+            &crate::output::lossy_json_view_marker(tool, elided, &remedy),
         );
     }
 

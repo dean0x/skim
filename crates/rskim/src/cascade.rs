@@ -4,6 +4,8 @@
 //! fits within a caller-specified token budget, with a final line-truncation
 //! fallback.
 
+use std::io::Write as _;
+
 use rskim_core::{Language, Mode, TransformConfig, truncate_to_token_budget};
 
 use crate::tokens;
@@ -32,7 +34,8 @@ const NO_OUTPUT_MSG: &str = "Token budget cascade: no transformation mode produc
 const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 
 /// Returns `true` when `output` carries a compact elision marker (the bare
-/// `… (N lines truncated)` form) *without* the remedy `hint` appended to it.
+/// `… (N lines truncated)` form, including #511 literal-aware variants) *without*
+/// the remedy `hint` appended to it.
 ///
 /// When the token budget is too tight to include the hint inline on stdout,
 /// `truncate_to_token_budget` drops it and emits only the line count.  The
@@ -45,9 +48,37 @@ const ELISION_HINT: &str = "SKIM_PASSTHROUGH=1 for full output";
 /// | full marker — hint appended    | `false` |
 /// | no marker at all               | `false` |
 /// | empty string                   | `false` |
+///
+/// ## Scoping to the last line
+///
+/// The scan is intentionally restricted to the **last line** of `output` for
+/// two independent reasons:
+///
+/// 1. **Marker vocabulary coverage:** #511 extended the marker to literal-aware
+///    forms (`… (N lines truncated; cut inside a string literal)`, `…; cut inside
+///    a code fence)`).  These contain `"truncated;"` rather than `"truncated)"`,
+///    so the previous whole-buffer regex missed them entirely and the stderr remedy
+///    was never emitted.  A scan for `"lines truncated"` (without the closing
+///    character) covers all present and future closing characters at once.
+///
+/// 2. **False-negative prevention:** scanning the whole buffer for the `hint`
+///    string matches files that contain the literal text `SKIM_PASSTHROUGH=1 for
+///    full output` (e.g. `CLAUDE.md`, `process.rs`, `truncate.rs`) and falsely
+///    suppresses the stderr remedy even when the on-stdout marker is genuinely
+///    compact.  The marker is always the last line of a truncated output, so
+///    scoping to the last line eliminates this false negative.
+///
+/// **Contract:** do not change the marker wording without updating this function —
+/// the scan is deliberately specific to catch vocabulary drift early.
 pub(crate) fn compact_marker_without_hint(output: &str, hint: &str) -> bool {
-    let has_marker = output.contains("lines truncated)") || output.contains("line truncated)");
-    let has_hint = !hint.is_empty() && output.contains(hint);
+    // Scope to the last line only (see doc above for the two-reason rationale).
+    let last_line = output.lines().last().unwrap_or("");
+    // "lines truncated" matches the plural standard form ("lines truncated)") and
+    // the #511 literal-aware form ("lines truncated; cut inside …").
+    // "line truncated" (no 's') matches the singular form.
+    let has_marker =
+        last_line.contains("lines truncated") || last_line.contains("line truncated");
+    let has_hint = !hint.is_empty() && last_line.contains(hint);
     has_marker && !has_hint
 }
 
@@ -94,12 +125,18 @@ fn count_tokens_or_max(text: &str) -> usize {
 /// Apply line-based truncation as a final fallback when all modes exceed the budget.
 ///
 /// Emits a diagnostic to stderr and delegates to `truncate_to_token_budget`.
+///
+/// `source_line_count` is the number of lines in the **original source file**.
+/// It is forwarded to `truncate_to_token_budget` so the elision marker reports
+/// how many source lines were omitted (ADR-017 / reliability-8), rather than
+/// an output-space count that includes synthetic marker lines from a prior pass.
 fn fallback_line_truncate(
     output: &str,
     language: Language,
     token_budget: usize,
     mode: Mode,
     known_token_count: Option<usize>,
+    source_line_count: usize,
 ) -> anyhow::Result<(String, Mode)> {
     eprintln!(
         "[skim] token budget: all modes exceeded budget, applying line truncation ({} mode)",
@@ -107,9 +144,8 @@ fn fallback_line_truncate(
     );
     // B5: pass the CLI-level remedy hint so the token-budget truncation marker
     // carries the SKIM_PASSTHROUGH=1 remedy clause (ADR-011 class 1).
-    // reliability-8: source_line_count is None here because fallback_line_truncate
-    // does not receive the original source-file line count. The cascade call sites
-    // that know the original count can pass it once this is plumbed through.
+    // reliability-8: pass source_line_count so the elision count is in source
+    // space, not output space.
     let truncated = truncate_to_token_budget(
         output,
         language,
@@ -117,14 +153,21 @@ fn fallback_line_truncate(
         count_tokens_or_max,
         known_token_count,
         Some(ELISION_HINT),
-        None,
+        Some(source_line_count),
     )?;
     // ADR-016 / ADR-011 class 1: when the budget is too tight to include the
     // remedy hint inline on stdout (compact marker form), emit it on stderr so
     // the reader always sees SKIM_PASSTHROUGH=1 regardless of how tight the
     // budget is.  Unconditional — not gated by SKIM_DEBUG.
+    //
+    // regression-6: use writeln! on the locked handle instead of eprintln! to
+    // avoid panicking when fd 2 is broken (e.g. `2>&1 | head`); discard the
+    // error — if stderr is closed there is nobody to disclose to.
     if compact_marker_without_hint(&truncated, ELISION_HINT) {
-        eprintln!("[skim] output truncated to the --tokens budget — {ELISION_HINT}");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "[skim] output truncated to the --tokens budget — {ELISION_HINT}"
+        );
     }
     Ok((truncated, mode))
 }
@@ -134,11 +177,17 @@ fn fallback_line_truncate(
 /// Tries each mode from `starting_mode` through increasingly aggressive modes.
 /// If no mode fits, applies line-based truncation as a final fallback.
 /// Diagnostics are emitted to stderr only when escalating beyond the starting mode.
+///
+/// `source_line_count` is the number of lines in the original source file.
+/// It is threaded to the final `fallback_line_truncate` call so the elision
+/// marker reports a source-space count rather than an output-space count
+/// (ADR-017 / reliability-8).
 pub(crate) fn cascade_for_token_budget<F>(
     starting_mode: Mode,
     trunc: &TruncationOptions,
     token_budget: usize,
     language: Language,
+    source_line_count: usize,
     transform_fn: F,
 ) -> anyhow::Result<(String, Mode)>
 where
@@ -149,7 +198,14 @@ where
     // - Structure/Signatures/Types: structure-extracted (all identical)
     // Short-circuit to avoid up to 3 redundant parse+transform cycles.
     if language.is_serde_based() {
-        return cascade_serde(starting_mode, trunc, token_budget, language, &transform_fn);
+        return cascade_serde(
+            starting_mode,
+            trunc,
+            token_budget,
+            language,
+            source_line_count,
+            &transform_fn,
+        );
     }
 
     let cascade = starting_mode.cascade_from_here();
@@ -210,7 +266,14 @@ where
         // Non-empty source where every structural mode produced empty output
         // (e.g. a Rust file containing only comments, no fn/type declarations):
         // line-truncate the raw source so the reader gets content.
-        return fallback_line_truncate(&raw, language, token_budget, starting_mode, None);
+        return fallback_line_truncate(
+            &raw,
+            language,
+            token_budget,
+            starting_mode,
+            None,
+            source_line_count,
+        );
     }
 
     // Guard: no mode produced output at all (all returned Ok(None)).
@@ -222,6 +285,7 @@ where
         token_budget,
         last_mode,
         last_token_count,
+        source_line_count,
     )
 }
 
@@ -235,6 +299,7 @@ fn cascade_serde<F>(
     trunc: &TruncationOptions,
     token_budget: usize,
     language: Language,
+    source_line_count: usize,
     transform_fn: &F,
 ) -> anyhow::Result<(String, Mode)>
 where
@@ -267,6 +332,7 @@ where
                 token_budget,
                 Mode::Structure,
                 Some(extracted_tokens),
+                source_line_count,
             );
         }
     }
@@ -279,6 +345,7 @@ where
         token_budget,
         starting_mode,
         Some(first_tokens),
+        source_line_count,
     )
 }
 
@@ -317,7 +384,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, 100, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
@@ -337,7 +404,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (_output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::TypeScript, 100, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Signatures);
@@ -356,7 +423,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::TypeScript, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::TypeScript, 100, transform)
                 .unwrap();
 
         // Should use the most aggressive mode that produced output
@@ -385,7 +452,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Types, &trunc, 10, Language::TypeScript, transform)
+            cascade_for_token_budget(Mode::Types, &trunc, 10, Language::TypeScript, 100, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Types);
@@ -404,6 +471,7 @@ mod tests {
             &trunc,
             100,
             Language::TypeScript,
+            100,
             transform,
         );
 
@@ -428,7 +496,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Full);
         assert_eq!(output, "a b c d e");
@@ -443,7 +511,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 10, Language::Json, 100, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         assert_eq!(output, "a b c d e");
@@ -459,7 +527,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, transform).unwrap();
+            cascade_for_token_budget(Mode::Full, &trunc, 5, Language::Json, 100, transform).unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
         // ADR-011 class 1 / #317: compact elision marker always emitted when no content
@@ -483,7 +551,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Yaml, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Yaml, 100, transform)
                 .unwrap();
 
         assert_eq!(mode_used, Mode::Structure);
@@ -505,7 +573,7 @@ mod tests {
 
         let trunc = TruncationOptions::default();
 
-        let result = cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, transform);
+        let result = cascade_for_token_budget(Mode::Full, &trunc, 100, Language::Toml, 100, transform);
 
         assert!(result.is_err());
         assert!(
@@ -550,6 +618,60 @@ mod tests {
         assert!(!compact_marker_without_hint("", ELISION_HINT));
     }
 
+    // ── rust-2: #511 literal-aware marker vocabulary ────────────────────────
+
+    #[test]
+    fn compact_marker_without_hint_cut_inside_string_literal_is_true() {
+        // #511 extended the marker vocabulary: when the cut falls inside a string
+        // literal the marker reads "lines truncated; cut inside a string literal)"
+        // (no closing ')' after 'truncated').  The old whole-buffer scan for
+        // "lines truncated)" missed this form; the new last-line scan finds it.
+        assert!(compact_marker_without_hint(
+            "fn foo() {}\n// ... (3 lines truncated; cut inside a string literal)",
+            ELISION_HINT
+        ));
+    }
+
+    #[test]
+    fn compact_marker_without_hint_cut_inside_code_fence_is_true() {
+        // Same as above but the "cut inside a code fence" variant.
+        assert!(compact_marker_without_hint(
+            "# heading\n# ... (7 lines truncated; cut inside a code fence)",
+            ELISION_HINT
+        ));
+    }
+
+    #[test]
+    fn compact_marker_without_hint_hint_in_file_content_still_fires() {
+        // rust-2 second defect: if the file content contains the literal hint
+        // string, the old whole-buffer `has_hint` check would return true and
+        // suppress the stderr remedy even though the last-line marker is compact.
+        //
+        // This output simulates a file that documents the hint (like CLAUDE.md or
+        // process.rs) followed by a compact elision marker on the last line.
+        let output = format!(
+            "// Example: {ELISION_HINT}\nfn foo() {{}}\n// ... (5 lines truncated)"
+        );
+        // has_hint must be false because the hint is NOT on the last line.
+        assert!(
+            compact_marker_without_hint(&output, ELISION_HINT),
+            "compact_marker_without_hint must return true even when hint text \
+             appears earlier in the output (only the last line should be scanned)"
+        );
+    }
+
+    #[test]
+    fn compact_marker_without_hint_hint_on_last_line_with_marker_is_false() {
+        // Sanity: a full marker (hint ON the last line alongside the count)
+        // must still return false so we do not double-emit the hint on stderr.
+        let full =
+            format!("fn foo() {{}}\n// ... (3 lines truncated) — {ELISION_HINT}");
+        assert!(
+            !compact_marker_without_hint(&full, ELISION_HINT),
+            "full marker (hint on last line) must not trigger the stderr remedy"
+        );
+    }
+
     // ── Empty-output skip tests (RED fixture regression) ────────────────────
 
     #[test]
@@ -571,7 +693,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         let (output, _mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, 100, transform)
                 .unwrap();
 
         // #317 / ADR-011: result must be non-empty and carry the elision marker.
@@ -607,7 +729,7 @@ mod tests {
 
         // Budget of 5 tokens — the raw source exceeds it, so line-truncation applies.
         let result =
-            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, transform);
+            cascade_for_token_budget(Mode::Structure, &trunc, 5, Language::Rust, 100, transform);
 
         let (output, _mode_used) = result.expect("should not error when raw source is available");
         assert!(
@@ -638,7 +760,7 @@ mod tests {
         // Budget of 10 tokens: Structure exceeds it, Signatures is empty (skipped),
         // Types ("type Foo = u32;" ≈ 6 tokens) fits.
         let (output, mode_used) =
-            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::Rust, transform)
+            cascade_for_token_budget(Mode::Structure, &trunc, 10, Language::Rust, 100, transform)
                 .unwrap();
 
         assert_eq!(
