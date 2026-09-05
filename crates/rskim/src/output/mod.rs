@@ -799,7 +799,7 @@ mod lossy_json_view_marker_tests {
         assert_eq!(
             m,
             format!(
-                "[skim] json view of 'git': summarised, not the full tool output \u{{2014}} {ELISION_HINT}"
+                "[skim] json view of 'git': summarised, not the full tool output — {ELISION_HINT}"
             )
         );
     }

@@ -1318,7 +1318,7 @@ mod tests {
 
     #[test]
     fn multi_byte_text_scans_without_panicking_and_stays_clean() {
-        let source = “// ünïcödé — “quotes”\nlet x = \”日本語\”;\nlet y = 1;\n”;
+        let source = "// ünïcödé — \u{201c}quotes\u{201d}\nlet x = \"日本語\";\nlet y = 1;\n";
         let scan = scan(source, Language::Rust);
 
         assert_eq!(scan.line_count(), 3);
@@ -1334,31 +1334,31 @@ mod tests {
         // JSON uses LiteralSyntax::NONE; can_open() is false.
         // scan() must return early with the correct line count and all-None
         // open_after entries — identical behaviour to a full scan.
-        let source = “{\n  \”a\”: \”unterminated\n}\n”;
+        let source = "{\n  \"a\": \"unterminated\n}\n";
         let result = scan(source, Language::Json);
 
         // Line count must match str::lines semantics (trailing newline does not
         // add an extra line).
-        assert_eq!(result.line_count(), 3, “line_count must match str::lines”);
+        assert_eq!(result.line_count(), 3, "line_count must match str::lines");
 
         // Every index in range must be None.
         for i in 0..result.line_count() {
             assert_eq!(
                 result.open_after(i),
                 None,
-                “JSON open_after({i}) must be None — no multi-line strings”
+                "JSON open_after({i}) must be None — no multi-line strings"
             );
         }
 
         // Out-of-range index must also be None (vec is empty, get OOB → None).
         assert_eq!(result.open_after(result.line_count()), None);
-        assert_eq!(result.close_line(0), Some(1), “close_line on clean state”);
-        assert_eq!(result.close_line(2), None, “no line after the last”);
+        assert_eq!(result.close_line(0), Some(1), "close_line on clean state");
+        assert_eq!(result.close_line(2), None, "no line after the last");
     }
 
     #[test]
     fn json_empty_text_early_out_has_zero_lines() {
-        let result = scan(“”, Language::Json);
+        let result = scan("", Language::Json);
         assert_eq!(result.line_count(), 0);
         assert_eq!(result.open_after(0), None);
         assert_eq!(result.close_line(0), None);
@@ -1407,37 +1407,37 @@ mod tests {
         // comments, line continuations, fences, and heredocs across all grammars.
         const CORPUS: &[&str] = &[
             // JS/TS template literal with embedded expression
-            “const x = `\nhello ${'world'}\n`;\n”,
+            "const x = `\nhello ${'world'}\n`;\n",
             // Python triple-quoted docstring
-            “def f():\n    \”\”\”\n    doc\n    \”\”\”\n    return 1\n”,
+            "def f():\n    \"\"\"\n    doc\n    \"\"\"\n    return 1\n",
             // Rust raw string with internal quotes
-            “let s = r#\”\na \”quoted\” word\n\”#;\nlet t = 1;\n”,
+            "let s = r#\"\na \"quoted\" word\n\"#;\nlet t = 1;\n",
             // Go raw backtick with backslash (no escape)
-            “const s = `\nraw \\ text\n`\nvar x = 1\n”,
+            "const s = `\nraw \\ text\n`\nvar x = 1\n",
             // Ruby squiggly heredoc
-            “sql = <<~SQL\n  SELECT 1\nSQL\nputs sql\n”,
+            "sql = <<~SQL\n  SELECT 1\nSQL\nputs sql\n",
             // Bash quoted heredoc
-            “cat <<'EOF'\n$not expanded\nEOF\necho done\n”,
+            "cat <<'EOF'\n$not expanded\nEOF\necho done\n",
             // SQL doubled-quote escape
-            “SELECT 'it''s\nstill open' FROM t;\nSELECT 1;\n”,
+            "SELECT 'it''s\nstill open' FROM t;\nSELECT 1;\n",
             // C++ raw string with custom delimiter
-            “auto s = R\”tag(\nplain )\” inside\n)tag\”;\nint x = 0;\n”,
+            "auto s = R\"tag(\nplain )\" inside\n)tag\";\nint x = 0;\n",
             // C# verbatim string
-            “var p = @\”C:\\one\nC:\\two\”;\nvar q = 1;\n”,
+            "var p = @\"C:\\one\nC:\\two\";\nvar q = 1;\n",
             // TOML triple-quoted
-            “key = \”\”\”\nvalue\n\”\”\”\nother = 1\n”,
+            "key = \"\"\"\nvalue\n\"\"\"\nother = 1\n",
             // YAML flow scalar across lines
-            “key: \”first\n  second\”\nnext: 1\n”,
+            "key: \"first\n  second\"\nnext: 1\n",
             // Markdown fenced code block
-            “text\n```rust\nlet x = 1;\n```\nafter\n”,
+            "text\n```rust\nlet x = 1;\n```\nafter\n",
             // JSON: early-out (can_open == false); all entries must be None.
-            “{\n  \”a\”: \”unterminated\n}\n”,
+            "{\n  \"a\": \"unterminated\n}\n",
             // Mixed ASCII/non-ASCII source
-            “// ünïcödé — \u{201c}quotes\u{201d}\nlet x = \”日本語\”;\nlet y = 1;\n”,
+            "// ünïcödé — \u{201c}quotes\u{201d}\nlet x = \"日本語\";\nlet y = 1;\n",
             // Multi-line C string via backslash continuation
-            “const char *s = \”abc\\\ndef\”;\nint x = 0;\n”,
+            "const char *s = \"abc\\\ndef\";\nint x = 0;\n",
             // Block comment hiding a quote (reports clean throughout)
-            “/* a \” quote\n   still comment */\nint x = 0;\n”,
+            "/* a \" quote\n   still comment */\nint x = 0;\n",
         ];
 
         let all_languages: &[Language] = &[
@@ -1467,7 +1467,7 @@ mod tests {
                 let fast = scan_as_fast_vec(source, lang);
                 assert_eq!(
                     naive, fast,
-                    “fast path disagrees with naive path: lang={lang:?}\nsource={source:?}”
+                    "fast path disagrees with naive path: lang={lang:?}\nsource={source:?}"
                 );
             }
         }
