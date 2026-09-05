@@ -292,7 +292,13 @@ pub(super) struct DegradedJson {
     pub requested: &'static str,
     /// The ranking actually served (e.g. `"lexical"`, `"ast"`).
     pub applied: &'static str,
-    /// Human-readable notice (identical to what was printed to stderr).
+    /// Human-readable notice.
+    ///
+    /// Equal to the stderr notice text **without** the leading `skim search: `
+    /// program-name prefix: every emit site prints `skim search: {message}`, so
+    /// the stderr line is the prefix followed by this exact string, and
+    /// `stderr.contains(message)` holds byte-for-byte. Consumers that want the
+    /// stderr line verbatim must prepend the prefix themselves.
     pub message: String,
     /// Machine-readable remediation advice.
     pub remediation: &'static str,
@@ -320,8 +326,15 @@ pub(super) enum Fallback {
 // degraded_notice (SSOT — AD-414-1)
 // ============================================================================
 
-/// AD-414-1: single source of truth for every degraded-state notice,
-/// generalising the documented `--ast` contract (warn on stderr, keep the
+/// AD-414-1: single source of truth for every degraded-state notice text.
+///
+/// The string returned here is what `DegradedJson.message` carries and what each
+/// emit site prints as `skim search: {returned}`. The JSON field is therefore the
+/// stderr notice minus the leading `skim search: ` program-name prefix, not a
+/// byte-for-byte copy of the stderr line; the prefix is added by the CLI output
+/// layer, which JSON consumers do not go through.
+///
+/// Generalises the documented `--ast` contract (warn on stderr, keep the
 /// upstream order, exit 0).  Loud when skim cannot self-fix, cause-specific,
 /// and always carries a remediation.  This is the ONLY builder of degraded-state
 /// notice text: every emit site formats the string it returns rather than
@@ -363,7 +376,8 @@ pub(super) fn degraded_notice(u: &TemporalUnavailable, flag: &str, fallback: Fal
 ///
 /// Shared by two call sites that must emit the same string:
 /// - [`super::temporal::resolve_blast_radius_paths`] — prints to stderr.
-/// - `mod.rs::run_query` — writes to `DegradedJson.message` (must match stderr).
+/// - `mod.rs::run_query` — writes to `DegradedJson.message` (must be the same
+///   text, which stderr carries after the `skim search: ` prefix).
 pub(super) fn blast_radius_degraded_msg(u: &TemporalUnavailable) -> String {
     if u.reason == DegradedReason::NotGitRepo {
         format!(

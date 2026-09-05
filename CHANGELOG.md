@@ -209,11 +209,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was requested), `applied` (`"lexical"` on text-query arms including text +
   `--blast-radius`; `"none"` on standalone temporal and standalone `--blast-radius`
   arms — no results served there; `"ast"` reserved for #483, not emitted today),
-  `message` (human-readable),
+  `message` (human-readable: the stderr notice text without the leading
+  `skim search: ` program-name prefix that the CLI output layer prepends, so
+  `stderr.contains(message)` holds byte-for-byte while the two strings are not equal),
   `remediation` (actionable hint).  The field is absent (`skip_serializing_if`) on
   healthy queries to keep byte-identity for existing callers.
 
 ### Fixed
+- **Documented that `degraded[].message` omits the `skim search: ` program-name
+  prefix** (#414, documentation only). The stderr notice is printed as
+  `skim search: {message}` by the CLI output layer, so the JSON `message` field is the
+  notice text without that prefix. CLAUDE.md, the AD-414-1 rustdoc and the #414
+  changelog entry above previously read as a byte-identity claim between the two, which
+  a `message == first_stderr_line` comparison fails. The code is unchanged: the prefix
+  belongs to the terminal presentation, not to the machine-readable contract.
 - **`skim search` anchors substring-only matches instead of reporting
   `line_number: null`** (#395). A file that contains the query only inside a longer
   identifier (for example `mk4_longline_marker` inside the 919-byte token

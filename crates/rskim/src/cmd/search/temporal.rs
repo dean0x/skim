@@ -202,9 +202,11 @@ impl DegradedJson {
     /// Construct a `DegradedJson` whose `message` is produced by [`degraded_notice`].
     ///
     /// This is the single constructor for all standard degraded-state JSON elements,
-    /// ensuring `DegradedJson.message` is always identical to what is printed to
-    /// stderr via the same `degraded_notice` call (AD-414-1 SSOT enforcement,
-    /// Finding [medium/architecture]).
+    /// ensuring `DegradedJson.message` always comes from the same `degraded_notice`
+    /// call as the stderr notice (AD-414-1 SSOT enforcement, Finding
+    /// [medium/architecture]).  The stderr line is that string prefixed with
+    /// `skim search: ` by the emit site, so the JSON field equals the notice text
+    /// without the program-name prefix rather than the whole stderr line.
     ///
     /// * `requested` — bare flag name (e.g. `"hot"`, `"blast-radius"`) per AC-4 /
     ///   RD-5 (use [`TemporalSort::json_name`], not [`TemporalSort::flag_name`]).
@@ -245,8 +247,9 @@ impl DegradedJson {
     /// Construct a `DegradedJson` for blast-radius degradation.
     ///
     /// Uses [`blast_radius_degraded_msg`] as the message source so the JSON
-    /// element matches the stderr notice emitted by [`resolve_blast_radius_paths`]
-    /// (AC-7 / AC-19(b) byte-identical contract for `NotGitRepo`).
+    /// element carries the same notice text [`resolve_blast_radius_paths`] prints
+    /// after the `skim search: ` prefix (AC-7 / AC-19(b) byte-identical contract
+    /// for `NotGitRepo`).
     ///
     /// All non-`NotGitRepo` reasons delegate to `degraded_notice` with
     /// `flag = "--blast-radius"` and [`Fallback::Lexical`], same as a
