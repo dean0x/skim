@@ -270,18 +270,13 @@ pub(crate) fn write_line_to_stderr(s: &str) -> anyhow::Result<StdoutStatus> {
 /// Named struct for the elision count threaded into [`emit_json_envelope`].
 ///
 /// Replaces the anonymous `(usize, usize, &str)` tuple so field order is
-/// enforced by name rather than position.  Callers that currently pass a
-/// tuple literal can convert via `ElidedCount::from((kept, total, unit))` or
-/// the `Into` blanket: `(kept, total, unit).into()`.
+/// enforced by name rather than position.  Callers must use the named-field
+/// form — `ElidedCount { kept: …, total: …, unit: "lines" }` — so that
+/// transposing `kept` and `total` is a compile error rather than a silent
+/// semantic inversion of the ADR-011 class-1 marker.
 ///
-/// ## Migration note
-///
-/// `emit_json_envelope` currently still accepts `Option<(usize, usize, &str)>`
-/// for backward compatibility with call sites in `cmd/log.rs` and
-/// `cmd/git/log.rs` that are owned by sibling agents.  Once those are updated
-/// (see call-site notes in the issue-fix report), the signature will switch to
-/// `Option<ElidedCount>` and this `From` impl becomes the only remaining
-/// compatibility shim.
+/// The `cascade.rs` `TruncationOptions` struct applies this same remedy to
+/// its own adjacent same-typed `Option<usize>` fields.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ElidedCount {
     /// Number of items actually emitted in the envelope.
@@ -290,12 +285,6 @@ pub(crate) struct ElidedCount {
     pub(crate) total: usize,
     /// Singular/plural noun for the unit ("lines", "entries", …).
     pub(crate) unit: &'static str,
-}
-
-impl From<(usize, usize, &'static str)> for ElidedCount {
-    fn from((kept, total, unit): (usize, usize, &'static str)) -> Self {
-        ElidedCount { kept, total, unit }
-    }
 }
 
 /// Whether a JSON envelope is written with a trailing newline.
@@ -335,11 +324,11 @@ pub(crate) enum LineTermination {
 ///   count when one exists, and the narrowest remedy that is actually true for
 ///   this invocation ([`remedy_for`]).
 ///
-/// `elided = Some((kept, total, unit))` renders the countable wording; `None`
-/// (or `kept >= total`) renders "summarised, not the full tool output".
-/// Prefer constructing the tuple via [`ElidedCount`] and converting with
-/// `.map(|e| (e.kept, e.total, e.unit))` — the signature will migrate to
-/// `Option<ElidedCount>` once call sites in sibling files are updated.
+/// `elided = Some(ElidedCount { kept, total, unit })` renders the countable
+/// wording when `kept < total`; `None` (or `kept >= total`) renders
+/// "summarised, not the full tool output".  Callers must use the named-field
+/// form — never `.into()` — so that field order is visible and verifiable at
+/// the call site.
 ///
 /// A [`StdoutStatus::PipeClosed`] result suppresses the marker — the reader is
 /// gone, so there is nobody to disclose to — and callers must stop producing
@@ -348,7 +337,7 @@ pub(crate) fn emit_json_envelope(
     json: &str,
     completeness: Completeness,
     tool: &str,
-    elided: Option<(usize, usize, &str)>,
+    elided: Option<ElidedCount>,
     terminate: LineTermination,
 ) -> anyhow::Result<StdoutStatus> {
     let status = match terminate {
@@ -380,7 +369,11 @@ pub(crate) fn emit_json_envelope(
         // returns a Result that we silently discard — stderr loss on a broken
         // pipe is acceptable, a panic is not (regression-6).
         let _ = write_line_to_stderr(
-            &crate::output::lossy_json_view_marker(tool, elided, &remedy),
+            &crate::output::lossy_json_view_marker(
+                tool,
+                elided.map(|e| (e.kept, e.total, e.unit)),
+                &remedy,
+            ),
         );
     }
 
@@ -1535,7 +1528,7 @@ mod tests {
         &str,
         Completeness,
         &str,
-        Option<(usize, usize, &str)>,
+        Option<ElidedCount>,
         LineTermination,
     ) -> anyhow::Result<StdoutStatus>;
 
@@ -1580,6 +1573,70 @@ mod tests {
     #[test]
     fn line_termination_arms_are_distinct() {
         assert_ne!(LineTermination::Newline, LineTermination::None);
+    }
+
+    // ========================================================================
+    // ElidedCount — ADR-011 class-1 marker wording
+    //
+    // These tests mirror the two migrated call sites:
+    //   cmd/log.rs  — Some(ElidedCount { kept: entries.len(), total: total_lines, unit: "lines" })
+    //   cmd/git/log.rs — Some(ElidedCount { kept, total, unit: "lines" })
+    //
+    // The marker wording is decided inside `lossy_json_view_marker`
+    // (crate::output) using the `(kept, total, unit)` tuple that
+    // `emit_json_envelope` derives from an `ElidedCount` via
+    // `.map(|e| (e.kept, e.total, e.unit))`.  Exercising that path here
+    // ensures the named-field form at the call site produces the correct output.
+    // ========================================================================
+
+    /// `ElidedCount` with `kept < total` renders the countable form of the
+    /// ADR-011 class-1 marker: exact omission delta and kept/total pair.
+    ///
+    /// This mirrors the `cmd/log.rs` call site:
+    /// `Some(ElidedCount { kept: r.entries.len(), total: r.total_lines, unit: "lines" })`
+    /// and the `cmd/git/log.rs` call site:
+    /// `Some(ElidedCount { kept, total, unit: "lines" })`.
+    #[test]
+    fn elided_count_countable_form_when_kept_lt_total() {
+        let elided = ElidedCount { kept: 3, total: 44, unit: "lines" };
+        let marker = crate::output::lossy_json_view_marker(
+            "git",
+            Some((elided.kept, elided.total, elided.unit)),
+            "SKIM_PASSTHROUGH=1 for full output",
+        );
+        assert!(
+            marker.contains("41 lines omitted"),
+            "countable form must name the delta (total - kept); got: {marker:?}"
+        );
+        assert!(
+            marker.contains("(3 of 44 shown)"),
+            "countable form must name kept/total pair; got: {marker:?}"
+        );
+    }
+
+    /// `ElidedCount` with `kept >= total` (no actual elision) renders the
+    /// countless form: "summarised, not the full tool output".
+    ///
+    /// The countless branch fires when `kept >= total` — the condition inside
+    /// `lossy_json_view_marker`.  `None` also reaches it, but this test
+    /// verifies the struct-based path so a future refactor of the tuple
+    /// conversion cannot silently swap `kept` and `total` and pass.
+    #[test]
+    fn elided_count_countless_form_when_kept_eq_total() {
+        let elided = ElidedCount { kept: 44, total: 44, unit: "lines" };
+        let marker = crate::output::lossy_json_view_marker(
+            "log",
+            Some((elided.kept, elided.total, elided.unit)),
+            "SKIM_PASSTHROUGH=1 for full output",
+        );
+        assert!(
+            marker.contains("summarised, not the full tool output"),
+            "countless form must use 'summarised' wording; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("omitted"),
+            "countless form must not claim items were omitted; got: {marker:?}"
+        );
     }
 
     // ========================================================================

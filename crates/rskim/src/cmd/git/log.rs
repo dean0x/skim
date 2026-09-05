@@ -145,7 +145,7 @@ pub(super) fn run_log(
             }
             let json = serde_json::to_string_pretty(&json_val)
                 .map_err(|e| anyhow::anyhow!("failed to format result: {e}"))?;
-            let elided = Some((kept, total, "lines"));
+            let elided = Some(exec::ElidedCount { kept, total, unit: "lines" });
             if exec::emit_json_envelope(
                 &json,
                 Completeness::Lossy,

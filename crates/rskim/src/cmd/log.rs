@@ -336,7 +336,7 @@ fn emit_result(
         // entries against `total_lines` input lines.
         let elided = match result {
             ParseResult::Full(r) | ParseResult::Degraded(r, _) => {
-                Some((r.entries.len(), r.total_lines, "lines"))
+                Some(exec::ElidedCount { kept: r.entries.len(), total: r.total_lines, unit: "lines" })
             }
             ParseResult::Passthrough(_) | ParseResult::RawPassthrough => None,
         };
