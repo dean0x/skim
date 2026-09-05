@@ -210,68 +210,99 @@ fn test_skim_cargo_b_alias_dispatches_to_build() {
 // Unknown subcommand — error path coverage (D2 passthrough semantics)
 // ============================================================================
 
-// D2: unknown subcommands in these dispatchers are now forwarded to the native
+// D2: unknown subcommands in these dispatchers are forwarded to the native
 // binary via run_raw_passthrough instead of returning a skim-generated "unknown
 // subcommand" error. These tests verify:
-//   (a) skim exits non-zero (native tool fails or binary not found)
-//   (b) skim's own "unknown subcommand" message is absent (native tool drives stderr)
+//   (a) skim exits non-zero (the stub exits 1)
+//   (b) the stub's sentinel appears in stdout — proves skim forwarded to the
+//       tool, not that the test merely passed because the tool binary was absent
+//   (c) skim's own debug-gated banner is absent from stderr in default mode
+//       (ADR-011 lossless path; real messages are e.g. "skim cargo: unknown
+//       subcommand '{x}' — passing through", never the bare "skim: unknown
+//       subcommand" literal the old assertions checked)
+//
+// Stub-based (unix-only): a shell script stands in for the real tool so the
+// test distinguishes "skim forwarded" from "skim failed to spawn missing binary".
 
-/// `skim cargo unknownthing` must exit non-zero with cargo's native error.
-/// D2: skim forwards to cargo via run_raw_passthrough; cargo's "no such command"
-/// error surfaces directly — skim no longer wraps it in its own message.
+/// D2 stub test: `skim cargo unknownthing` forwards to cargo, exits non-zero.
+/// The stub exits 1 with a sentinel — proves forwarding, not spawn-failure.
+#[cfg(unix)]
 #[test]
 fn test_skim_cargo_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "cargo", "STUB-CARGO-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["cargo", "unknownthing"])
         .assert()
         .failure()
-        // D2: cargo's native error, not skim's. Content varies by cargo version.
-        .stderr(predicate::str::contains("skim: unknown subcommand").not());
+        // Stub ran — skim forwarded to cargo via run_raw_passthrough.
+        .stdout(predicate::str::contains("STUB-CARGO-SENTINEL"))
+        // D2: debug-gated banner never reaches stderr in default mode.
+        .stderr(predicate::str::contains("skim cargo: unknown subcommand").not());
 }
 
-/// `skim go unknownthing` must exit non-zero.
-/// D2: skim forwards to go via run_raw_passthrough. If go is not installed,
-/// skim exits with a SpawnFailed error instead of "unknown subcommand".
+/// D2 stub test: `skim go unknownthing` forwards to go, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_go_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "go", "STUB-GO-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["go", "unknownthing"])
         .assert()
         .failure()
-        // D2: no skim-generated "unknown subcommand" — either go's native error
-        // (if go is installed) or a spawn-failure from skim (if go is absent).
-        .stderr(predicate::str::contains("skim: unknown subcommand").not());
+        .stdout(predicate::str::contains("STUB-GO-SENTINEL"))
+        .stderr(predicate::str::contains("skim go: unknown subcommand").not());
 }
 
-/// `skim npm unknownthing` must exit non-zero with npm's native error.
-/// D2: skim forwards to npm; npm's "Unknown command" error surfaces directly.
+/// D2 stub test: `skim npm unknownthing` forwards to npm, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_npm_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "npm", "STUB-NPM-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["npm", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("skim: unknown subcommand").not());
+        .stdout(predicate::str::contains("STUB-NPM-SENTINEL"))
+        .stderr(predicate::str::contains("skim npm: unknown subcommand").not());
 }
 
-/// `skim pnpm unknownthing` must exit non-zero.
-/// D2: skim forwards to pnpm; pnpm's native error surfaces directly.
+/// D2 stub test: `skim pnpm unknownthing` forwards to pnpm, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_pnpm_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "pnpm", "STUB-PNPM-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["pnpm", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("skim: unknown subcommand").not());
+        .stdout(predicate::str::contains("STUB-PNPM-SENTINEL"))
+        .stderr(predicate::str::contains("skim pnpm: unknown subcommand").not());
 }
 
-/// `skim pip unknownthing` must exit non-zero with pip's native error.
-/// D2: skim forwards to pip; pip's "ERROR: unknown command" surfaces directly.
+/// D2 stub test: `skim pip unknownthing` forwards to pip, exits non-zero.
+#[cfg(unix)]
 #[test]
 fn test_skim_pip_unknown_subcommand_errors() {
+    let stub_dir = tempfile::tempdir().unwrap();
+    common::make_stub(stub_dir.path(), "pip", "STUB-PIP-SENTINEL\n", "", 1);
+    let path = common::stub_path(stub_dir.path());
     common::skim()
+        .env("PATH", &path)
         .args(["pip", "unknownthing"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("skim: unknown subcommand").not());
+        .stdout(predicate::str::contains("STUB-PIP-SENTINEL"))
+        .stderr(predicate::str::contains("skim pip: unknown subcommand").not());
 }

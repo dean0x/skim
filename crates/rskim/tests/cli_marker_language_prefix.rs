@@ -7,13 +7,14 @@
 //! `process::passthrough_with_truncation` is the fallback used by four call
 //! sites, notably the post-guardrail hard-cap enforcement (~process.rs:782)
 //! that fires for ANY language whenever `--max-lines`/`--last-lines` is set
-//! and the guardrail selected the raw view.  As of HEAD it hardcodes `#`
-//! regardless of language and uses a different phrasing ("C-form"):
+//! and the guardrail selected the raw view.  RED at dc55e9a^: it hardcoded `#`
+//! regardless of language and used a different phrasing ("C-form"):
 //!   `# ... (N lines truncated; use SKIM_PASSTHROUGH=1 to see all)`
+//! GREEN since dc55e9a: language-aware prefix ("A-form") shipped.
 //!
-//! These RED tests pin the *correct* behaviour (A-form, language-aware prefix)
-//! so the fix can be validated end-to-end.  The single control test
-//! (`max_lines_marker_keeps_hash_prefix_on_python`) must stay GREEN throughout.
+//! These tests pin the A-form, language-aware prefix (correct behaviour).
+//! The single control test (`max_lines_marker_keeps_hash_prefix_on_python`)
+//! must stay GREEN throughout.
 
 use assert_cmd::Command;
 use tempfile::TempDir;

@@ -573,10 +573,6 @@ fn test_line_numbers_with_last_lines_truncation_marker_no_prefix() {
     }
 
     // 2. Numbered content lines must have the CORRECT source line numbers.
-    //    E4.2: simple_last_line_truncate(n=3) emits n=3 content lines + 1 marker
-    //    (the marker does NOT consume a content slot). Content lines are the last 3:
-    //    source lines 8, 9, and 10 of a 10-line file.
-    //    Before the bug fix, content lines got sequential numbers [1, 2] instead.
     let content_line_nums: Vec<usize> = lines
         .iter()
         .filter_map(|l| {

@@ -663,23 +663,19 @@ mod argv0_dispatch {
 
     // ── B2: env with `=`-containing middle token ──────────────────────────────
 
-    /// B2 gap — **RED today** (fix not yet applied).
+    /// B2 — `=`-argument passthrough (RED at b79e287^; GREEN since b79e287).
     ///
-    /// When argv[0]="env" receives an `=`-containing middle token (`FOO=bar`),
-    /// the invocation is `env VAR=val prog args` — it sets an env var and then
-    /// exec's a child program.  The rewrite engine skips this shape via
-    /// `skip_if_middle_contains_eq` (rules.rs ~:1787).  The wrapper surface
-    /// currently has no equivalent check.
-    ///
-    /// **Expected after fix:** `dispatch_for_wrapper` detects `FOO=bar` and
-    /// calls `run_raw_passthrough("env", …)`.  The real `env` binary sets
+    /// `env FOO=bar /usr/bin/printf %s x` on the wrapper surface: the handler
+    /// in `cmd/file/mod.rs` detects any `=`-containing arg and calls
+    /// `run_raw_passthrough("env", …)` directly.  The real `env` binary sets
     /// `FOO=bar` and exec's `/usr/bin/printf %s x`.  stdout = `"x"`, exit 0.
     ///
-    /// **Observed today (RED):** `dispatch_for_wrapper` falls through to
-    /// `dispatch("env", …)`, which routes to skim's env handler.  The handler
-    /// runs `printenv FOO=bar /usr/bin/printf %s x`; printenv treats those
-    /// tokens as env-var *names* to look up — none are set — and exits 1 with
-    /// empty stdout.  The assertions `stdout == "x"` and `exit 0` both fail.
+    /// The wrapper surface needs no D5-style interactivity gate here — the
+    /// shape is detected by arg content (contains `'='`) inside the env branch
+    /// of `dispatch_inner`, consistent with `skip_if_middle_contains_eq` on
+    /// the rewrite surface.
+    ///
+    /// Observable: exit 0, stdout exactly `"x"`.
     #[test]
     fn wrapper_env_with_assignment_runs_the_real_env() {
         let skim = skim_bin();
@@ -698,10 +694,8 @@ mod argv0_dispatch {
         );
 
         // argv[0]="env", args: an assignment token + child program + its args.
+        // skim detects the '=' token and calls run_raw_passthrough("env", …).
         // Real env executes: env FOO=bar /usr/bin/printf %s x → stdout "x".
-        // Skim's env handler executes: printenv FOO=bar /usr/bin/printf %s x
-        //   → printenv treats each arg as a var name to look up
-        //   → none are set → empty stdout, exit 1.
         let output = std::process::Command::new(&skim)
             .arg0("env")
             .args(["FOO=bar", printf_bin, "%s", "x"])
@@ -712,27 +706,23 @@ mod argv0_dispatch {
             .output()
             .expect("skim binary must be spawnable");
 
-        // After fix: real env ran, exit 0.
-        // Today (RED): skim's env handler ran printenv, exit 1.
+        // GREEN since b79e287: real env ran, exit 0.
         assert_eq!(
             output.status.code(),
             Some(0),
-            "wrapper env FOO=bar /usr/bin/printf %s x must exit 0 after fix \
-             (real env executed printf); today skim's env handler runs printenv \
-             and exits 1.\nstderr={}",
+            "wrapper env FOO=bar /usr/bin/printf %s x must exit 0 \
+             (real env executed printf; GREEN since b79e287)\nstderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // After fix: real env ran printf → stdout is exactly "x" (no newline:
-        //   printf %s x outputs raw bytes with no trailing newline).
-        // Today (RED): skim ran printenv → stdout is empty (vars not found).
+        // GREEN since b79e287: real env ran printf → stdout is exactly "x"
+        // (printf %s x outputs raw bytes with no trailing newline).
         assert_eq!(
             stdout, "x",
-            "wrapper env FOO=bar /usr/bin/printf %s x must produce stdout 'x' after fix \
-             (real env executed printf); today skim routes to the env handler \
-             which runs printenv and produces no output.\ngot stdout={stdout:?}"
+            "wrapper env FOO=bar /usr/bin/printf %s x must produce stdout 'x' \
+             (real env executed printf; GREEN since b79e287)\ngot stdout={stdout:?}"
         );
     }
 
@@ -797,12 +787,13 @@ mod argv0_dispatch {
 
     // ── B3: psql without -c / --command ──────────────────────────────────────
 
-    /// B3 gap — psql — **RED today** (fix not yet applied).
+    /// B3 — psql without `-c` passes through raw (RED at b3a31ec^; GREEN since b3a31ec).
     ///
     /// `psql --host=localhost -U u dbname` has no `-c`/`--command` flag; the
-    /// invocation is interactive.  The rewrite engine uses
-    /// `require_flag: &["-c", "--command"]` to skip it.  The wrapper surface
-    /// currently has no equivalent check and routes to skim's psql handler.
+    /// invocation is interactive.  `dispatch_for_wrapper` detects missing
+    /// `-c`/`--command` via `require_flags_for_tool` and calls
+    /// `run_raw_passthrough` → `PGPAGER` is NOT injected → stdout contains
+    /// `"pgpager=UNSET"`.
     ///
     /// **Discriminating observable:** skim's psql handler sets `PGPAGER=cat`
     /// via `CONFIG.env_overrides` before spawning the child binary.  A raw
@@ -812,17 +803,9 @@ mod argv0_dispatch {
     /// → skim emits the fake's line verbatim.  The env value is therefore
     /// observable end-to-end in skim's stdout.
     ///
-    /// **Expected after fix:** `dispatch_for_wrapper` detects missing
-    /// `-c`/`--command` and calls `run_raw_passthrough` → `PGPAGER` is NOT
-    /// injected → stdout contains `"pgpager=UNSET"`.
-    ///
-    /// **Observed today (RED):** `dispatch_for_wrapper` has no require_flag
-    /// check → `dispatch("psql", …)` → psql handler injects `PGPAGER=cat` →
-    /// fake prints `pgpager=cat` → assertion `!contains("pgpager=cat")` fails.
-    ///
     /// Note: `psql -h localhost` is NOT used here because D3 in
     /// `dispatch_for_wrapper` matches `-h` as a help flag and already passes
-    /// through, masking the B3 gap.  `--host=localhost` exposes it.
+    /// through.  `--host=localhost` exposes the require_flag gate.
     #[test]
     fn wrapper_psql_without_command_flag_passes_through_raw() {
         // Fake psql: reads PGPAGER from env (skim's psql handler injects it;
@@ -872,13 +855,12 @@ mod argv0_dispatch {
             "fake psql sentinel must appear in stdout; got: {stdout:?}"
         );
 
-        // After fix: raw passthrough ran — PGPAGER was NOT injected by skim.
-        // Today (RED): skim's psql handler set PGPAGER=cat before spawning.
+        // GREEN since b3a31ec: raw passthrough ran — PGPAGER NOT injected by skim.
         assert!(
             !stdout.contains("pgpager=cat"),
             "wrapper psql --host= (no -c) must NOT have skim's psql handler \
              inject PGPAGER=cat; 'pgpager=cat' in stdout proves skim's handler \
-             ran instead of raw passthrough (B3 fix not yet applied).\n\
+             ran instead of raw passthrough (B3, require_flags_for_tool).\n\
              got stdout={stdout:?}"
         );
     }
@@ -937,12 +919,12 @@ mod argv0_dispatch {
 
     // ── B3: mysql without -e / --execute ─────────────────────────────────────
 
-    /// B3 gap — mysql — **RED today** (fix not yet applied).
+    /// B3 — mysql without `-e` passes through raw (RED at b3a31ec^; GREEN since b3a31ec).
     ///
     /// `mysql --host=localhost` has no `-e`/`--execute` flag; the invocation
-    /// is interactive.  The rewrite engine uses
-    /// `require_flag: &["-e", "--execute"]` to skip it.  The wrapper surface
-    /// currently has no equivalent check and routes to skim's mysql handler.
+    /// is interactive.  `dispatch_for_wrapper` detects missing `-e`/`--execute`
+    /// via `require_flags_for_tool` and calls `run_raw_passthrough` →
+    /// `MYSQL_PAGER` NOT injected → stdout contains `"mysqlpager=UNSET"`.
     ///
     /// **Discriminating observable:** skim's mysql handler sets `MYSQL_PAGER=cat`
     /// via `CONFIG.env_overrides` before spawning the child binary.  A raw
@@ -951,16 +933,8 @@ mod argv0_dispatch {
     /// cannot parse "FAKE-MYSQL mysqlpager=…" as tabular mysql output → Tier 3
     /// passthrough → skim emits the line verbatim.
     ///
-    /// **Expected after fix:** `dispatch_for_wrapper` detects missing
-    /// `-e`/`--execute` and calls `run_raw_passthrough` → `MYSQL_PAGER` NOT
-    /// injected → stdout contains `"mysqlpager=UNSET"`.
-    ///
-    /// **Observed today (RED):** `dispatch_for_wrapper` has no require_flag
-    /// check → mysql handler injects `MYSQL_PAGER=cat` → fake prints
-    /// `mysqlpager=cat` → assertion `!contains("mysqlpager=cat")` fails.
-    ///
     /// Note: `mysql -h localhost` is NOT used because D3 matches `-h` as a
-    /// help flag and already passes through, masking the B3 gap.
+    /// help flag and already passes through.
     #[test]
     fn wrapper_mysql_without_execute_flag_passes_through_raw() {
         // Fake mysql: reads MYSQL_PAGER from env (skim's mysql handler injects
@@ -1010,13 +984,12 @@ mod argv0_dispatch {
             "fake mysql sentinel must appear in stdout; got: {stdout:?}"
         );
 
-        // After fix: raw passthrough ran — MYSQL_PAGER was NOT injected by skim.
-        // Today (RED): skim's mysql handler set MYSQL_PAGER=cat before spawning.
+        // GREEN since b3a31ec: raw passthrough ran — MYSQL_PAGER NOT injected by skim.
         assert!(
             !stdout.contains("mysqlpager=cat"),
             "wrapper mysql --host= (no -e) must NOT have skim's mysql handler \
              inject MYSQL_PAGER=cat; 'mysqlpager=cat' in stdout proves skim's \
-             handler ran instead of raw passthrough (B3 fix not yet applied).\n\
+             handler ran instead of raw passthrough (B3, require_flags_for_tool).\n\
              got stdout={stdout:?}"
         );
     }

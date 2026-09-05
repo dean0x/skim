@@ -649,11 +649,11 @@ fn test_skim_git_unknown_subcommand() {
         .args(["git", "unknown_subcmd"])
         .assert()
         .failure()
-        // D2: git's native error surfaces; "not a git command" covers both old
-        // and new git versions. Skim no longer emits "unknown git subcommand".
-        .stderr(
-            predicate::str::contains("not a git command").or(predicate::str::contains("unknown")),
-        );
+        // D2: git's native error surfaces. "not a git command" is git's wording
+        // on every version since 1.6 and is sufficient on its own; the former
+        // `.or(contains("unknown"))` disjunct would also pass if skim reinstated
+        // its old "unknown git subcommand" message, making the assertion vacuous.
+        .stderr(predicate::str::contains("not a git command"));
 }
 
 #[test]
@@ -939,11 +939,11 @@ fn test_skim_git_show_unknown_subcommand_message() {
         .args(["git", "totally_unknown_cmd_xyz"])
         .assert()
         .failure()
-        // D2: git's native error surfaces; "not a git command" covers both old and
-        // new git versions. Skim no longer emits a list of supported subcommands.
-        .stderr(
-            predicate::str::contains("not a git command").or(predicate::str::contains("unknown")),
-        );
+        // D2: git's native error surfaces. "not a git command" is git's wording
+        // on every version since 1.6 and is sufficient on its own; the former
+        // `.or(contains("unknown"))` disjunct would also pass if skim reinstated
+        // its old list of supported subcommands (which contained "unknown").
+        .stderr(predicate::str::contains("not a git command"));
 }
 
 #[test]

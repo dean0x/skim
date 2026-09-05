@@ -6,13 +6,13 @@
 //!   when the file contains only `fn` items and no type declarations.
 //!
 //! Root cause (`crates/rskim/src/cascade.rs` ~:123–147):
-//!   The cascade escalates through modes and accepts an escalated output of ""
-//!   because `count_tokens_or_max("") == 0 <= budget`; only `Ok(None)` triggers
-//!   `continue`. The fix will treat empty escalated output as "does not satisfy",
-//!   continue the cascade, and fall back to line truncation with an elision
-//!   marker containing the word `truncated` when every mode is empty.
+//!   The cascade escalated through modes and accepted an escalated output of ""
+//!   because `count_tokens_or_max("") == 0 <= budget`; only `Ok(None)` triggered
+//!   `continue`. The fix (9f0be23) treats empty escalated output as "does not
+//!   satisfy", continues the cascade, and falls back to line truncation with an
+//!   elision marker containing the word `truncated` when every mode is empty.
 //!
-//! Both tests below will be RED today and GREEN after the fix.
+//! RED at 9f0be23^; GREEN since 9f0be23.
 
 use tempfile::TempDir;
 
