@@ -56,13 +56,15 @@ pub(crate) fn transform_tree(
     // Apply truncation if max_lines is set (B5: thread elision_hint for remedy clause).
     // E3: pass the original source line count so markers state omitted SOURCE lines.
     if let Some(max_lines) = config.max_lines {
+        // E3: count source lines lazily — the closure is called only when
+        // truncation actually happens (performance-3 / ADR-017 source-space marker).
         truncate::truncate_to_lines(
             &text,
             &spans,
             language,
             max_lines,
             config.elision_hint.as_deref(),
-            Some(source.lines().count()),
+            || source.lines().count(),
         )
     } else {
         Ok(text)
@@ -169,7 +171,8 @@ pub(crate) fn transform_tree_with_line_map(
     };
 
     // Apply max_lines truncation (adjusting the line map) (B5: thread elision_hint).
-    // E3: pass source_line_count so markers state omitted SOURCE lines.
+    // E3: count source lines lazily — the closure is called only when truncation
+    // actually happens (performance-3 / ADR-017 source-space marker).
     let (final_text, final_line_map) = if let Some(max_lines) = config.max_lines {
         let truncated_text = truncate::truncate_to_lines(
             &text,
@@ -177,7 +180,7 @@ pub(crate) fn transform_tree_with_line_map(
             language,
             max_lines,
             config.elision_hint.as_deref(),
-            Some(source.lines().count()),
+            || source.lines().count(),
         )?;
         // After truncation, the output has a subset of lines plus omission markers.
         // Rebuild the line map: match output lines back to pre-truncation line map.

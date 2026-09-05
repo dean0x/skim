@@ -255,7 +255,7 @@ pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
 /// typed (PF-024).  ADR-011 states the constraint directly: "the hatch must be
 /// honored centrally rather than re-implemented per handler."
 ///
-/// Three call sites remain, and each covers something the convergence point
+/// Eleven call sites remain; each covers something the convergence point
 /// structurally cannot:
 ///
 /// - `main.rs::process_single_arg` — the READ path never enters `cmd::dispatch`.
@@ -265,6 +265,18 @@ pub(crate) fn read_stdin_bounded() -> anyhow::Result<String> {
 ///   real args), where the correct answer is "hand the caller's bytes back", not
 ///   "exec the tool".  The gate declines in that role rather than duplicating
 ///   these paths against a different arg shape.
+/// - `cmd/dispatch.rs` (×2) — the convergence gate itself; one arm fires the
+///   central passthrough path, the other guards the daemon-detection check.
+/// - `cmd/file/mod.rs` — propagates the flag into `FileOperation` config so the
+///   file-read path honours it without re-entering dispatch.
+/// - `cmd/rewrite/hook.rs` — the hook JSON responder; it exits early before
+///   attempting any command rewrite when the flag is set.
+/// - `cmd/test/pytest.rs`, `cmd/test/go.rs` — the FILTER role for piped test
+///   output (SKIM_PASSTHROUGH=1 pipes stdin back verbatim).  The dispatch gate
+///   declines for filter-role invocations via `handler_reads_stdin`, so these
+///   per-handler checks are live, not dead, and cannot be removed.
+/// - `main.rs:process_piped_passthrough` — top-level stdin pump for the
+///   explicit `skim --passthrough` invocation.
 ///
 /// `cmd/file/env.rs` is the one deliberate REFUSAL: `never_passthrough: true`
 /// keeps credential redaction on both branches (PF-012).
