@@ -377,7 +377,33 @@ pub(super) fn run_diff(
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
-        eprintln!("No changes");
+        // --json contract: stdout must always be valid JSON.  Git produced
+        // nothing (e.g. `--dirstat` or `--summary` on a root-files-only range);
+        // represent that as an empty file list so JSON consumers always get a
+        // parseable envelope.  Reencoded: no information is dropped — we
+        // faithfully represent that git returned an empty result.
+        match output_format {
+            OutputFormat::Json => {
+                let json = serde_json::to_string_pretty(&serde_json::json!({
+                    "files": [],
+                    "raw": "No changes\n"
+                }))
+                .map_err(|e| anyhow::anyhow!("failed to serialize empty diff result: {e}"))?;
+                if exec::emit_json_envelope(
+                    &json,
+                    Completeness::Reencoded,
+                    "git",
+                    None,
+                    exec::LineTermination::Newline,
+                )? == exec::StdoutStatus::PipeClosed
+                {
+                    return Ok(exec::pipe_closed_exit());
+                }
+            }
+            OutputFormat::Text => {
+                eprintln!("No changes");
+            }
+        }
         // Move raw_diff: 1 allocation (clone) on the analytics path, 0 when
         // disabled (PF-018 resolution).
         super::finalize_git_output_passthrough(

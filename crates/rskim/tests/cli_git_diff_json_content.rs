@@ -364,41 +364,129 @@ fn arch3_mode_only_diff_json_emits_lossy_marker() {
 // architecture-4: --dirstat --json produces parseable JSON
 // ============================================================================
 
-/// **architecture-4 dirstat**: `skim git diff --dirstat --json` must emit valid
-/// JSON on stdout.
+/// **architecture-4 dirstat — deterministic hermetic repo**: `skim git diff
+/// --dirstat --json` must emit valid JSON on stdout for BOTH output shapes:
 ///
-/// Before the fix, the B1 empty-parse branch unconditionally called
-/// `exec::write_to_stdout(&raw_diff)`, bypassing the JSON sink entirely.
-/// This made stdout a plain-text dirstat report — unparseable by `jq` or any
-/// JSON consumer despite the caller asking for `--json`.
+/// - **Case A** (non-empty dirstat): a commit that changes a file inside a
+///   subdirectory.  `git diff --dirstat` produces e.g. `100.0% subdir/` — this
+///   is non-empty but not a unified diff, so it goes through the B1 empty-parse
+///   branch (already handled correctly before this fix).
 ///
-/// After the fix, the empty-parse branch branches on `output_format` and wraps
-/// the raw output in `{"files":[],"raw":"<git output>"}`.
+/// - **Case B** (empty dirstat — the bug): a commit that changes only root-level
+///   files.  `git diff --dirstat` produces empty stdout because dirstat only
+///   accounts for subdirectories.  This hit the empty-diff guard in `run_diff`,
+///   which printed "No changes" to stderr and returned with *nothing* on stdout
+///   — violating the `--json` contract.  After the fix, the empty-diff guard
+///   checks `output_format` and emits `{"files":[],"raw":"No changes\n"}`.
+///
+/// ## Why the original test was fragile
+///
+/// The old test ran `skim git diff HEAD~1..HEAD --dirstat --json` against the
+/// live skim repo.  A docs-only commit touching only root-level files
+/// (CHANGELOG.md, README.md) triggered the empty-dirstat path and caused the
+/// test to fail — this is what blocked PR #536, a changelog-only change.
+/// Pinning to a hermetic fixture makes the test independent of HEAD.
 #[test]
 fn arch4_dirstat_json_produces_parseable_json() {
-    // Run against the skim repo itself (any real git repo works here).
-    let output = common::skim()
+    // -----------------------------------------------------------------------
+    // Build a hermetic repo with known commit structure:
+    //   commit 1 (baseline): root.txt only — gives us a non-empty base.
+    //   commit 2: subdir/deep.txt — diff HEAD~2..HEAD~1 has a non-empty dirstat.
+    //   commit 3: root.txt modified — diff HEAD~1..HEAD has an empty dirstat
+    //             (root-level files do not appear in --dirstat output).
+    // -----------------------------------------------------------------------
+    let dir = tempfile::tempdir().expect("tempdir must succeed");
+    let repo = dir.path().to_path_buf();
+
+    // PF-009: pin all four git identity / signing config values so the fixture
+    // is deterministic across maintainers with commit.gpgsign=true or a
+    // non-`main` defaultBranch.
+    git_in(&repo, &["init", "-b", "main"]);
+    git_in(&repo, &["config", "user.email", "test@example.com"]);
+    git_in(&repo, &["config", "user.name", "Test"]);
+    git_in(&repo, &["config", "commit.gpgsign", "false"]);
+    git_in(&repo, &["config", "core.autocrlf", "false"]);
+
+    // Commit 1: baseline root-level file.
+    std::fs::write(repo.join("root.txt"), "root content\n").unwrap();
+    git_in(&repo, &["add", "root.txt"]);
+    git_in(&repo, &["commit", "-m", "initial root file"]);
+
+    // Commit 2: add a file inside a subdirectory.
+    // `git diff HEAD~2..HEAD~1 --dirstat` → "  100.0% subdir/" (non-empty).
+    std::fs::create_dir(repo.join("subdir")).unwrap();
+    std::fs::write(repo.join("subdir/deep.txt"), "inside a directory\n").unwrap();
+    git_in(&repo, &["add", "subdir/deep.txt"]);
+    git_in(&repo, &["commit", "-m", "add file in subdirectory"]);
+
+    // Commit 3: modify only the root-level file.
+    // `git diff HEAD~1..HEAD --dirstat` → empty stdout (root-level files are
+    // not in any subdirectory and thus do not appear in dirstat output).
+    std::fs::write(repo.join("root.txt"), "modified root content\n").unwrap();
+    git_in(&repo, &["add", "root.txt"]);
+    git_in(&repo, &["commit", "-m", "modify root-level file only"]);
+
+    // -----------------------------------------------------------------------
+    // Case A: non-empty dirstat (subdirectory change).
+    // Range HEAD~2..HEAD~1 = commit 1 → commit 2.
+    // git produces dirstat lines; skim's B1 empty-parse branch wraps in JSON.
+    // -----------------------------------------------------------------------
+    let out_a = common::skim()
+        .current_dir(&repo)
+        .args(["git", "diff", "HEAD~2..HEAD~1", "--dirstat", "--json"])
+        .output()
+        .expect("skim git diff --dirstat --json must not fail to spawn");
+
+    let stdout_a = String::from_utf8_lossy(&out_a.stdout);
+    let parsed_a = serde_json::from_str::<serde_json::Value>(&stdout_a);
+    assert!(
+        parsed_a.is_ok(),
+        "arch4 case A (subdir change): --dirstat --json must produce valid JSON\n\
+         parse error: {:?}\n\
+         stdout:\n{}",
+        parsed_a.err(),
+        &stdout_a[..stdout_a.len().min(600)]
+    );
+    assert!(
+        parsed_a.unwrap().is_object(),
+        "arch4 case A: JSON output must be an object"
+    );
+
+    // -----------------------------------------------------------------------
+    // Case B: empty dirstat (root-only change) — this is the bug location.
+    // Range HEAD~1..HEAD = commit 2 → commit 3.
+    // git produces empty stdout; skim's empty-diff guard must emit JSON.
+    // -----------------------------------------------------------------------
+    let out_b = common::skim()
+        .current_dir(&repo)
         .args(["git", "diff", "HEAD~1..HEAD", "--dirstat", "--json"])
         .output()
         .expect("skim git diff --dirstat --json must not fail to spawn");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed = serde_json::from_str::<serde_json::Value>(&stdout);
-
+    let stdout_b = String::from_utf8_lossy(&out_b.stdout);
+    let parsed_b = serde_json::from_str::<serde_json::Value>(&stdout_b);
     assert!(
-        parsed.is_ok(),
-        "arch4: --dirstat --json must produce valid JSON on stdout\n\
+        parsed_b.is_ok(),
+        "arch4 case B (root-only change): --dirstat --json must produce valid JSON\n\
          got parse error: {:?}\n\
          stdout (first 600 chars):\n{}",
-        parsed.err(),
-        &stdout[..stdout.len().min(600)]
+        parsed_b.err(),
+        &stdout_b[..stdout_b.len().min(600)]
     );
-
-    // The JSON must be an object (either a DiffResult envelope or the
-    // empty-parse {"files":[],"raw":"..."} fallback).
-    let val = parsed.unwrap();
+    let val_b = parsed_b.unwrap();
     assert!(
-        val.is_object(),
-        "arch4: --dirstat --json output must be a JSON object\nvalue: {val:?}"
+        val_b.is_object(),
+        "arch4 case B: --dirstat --json output must be a JSON object\nvalue: {val_b:?}"
+    );
+    // Verify the exact envelope shape for the empty-dirstat case.
+    assert_eq!(
+        val_b["files"],
+        serde_json::json!([]),
+        "arch4 case B: 'files' must be an empty array for an empty dirstat"
+    );
+    assert_eq!(
+        val_b["raw"],
+        serde_json::json!("No changes\n"),
+        "arch4 case B: 'raw' must carry \"No changes\\n\" for an empty dirstat"
     );
 }
