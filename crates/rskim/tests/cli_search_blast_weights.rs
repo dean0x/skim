@@ -585,7 +585,8 @@ fn ac409_3_repeated_identical_query_is_byte_identical() {
 ///   allowed_paths = {anchor: SEED_STRENGTH, aweak: 1.0} (2 entries).
 ///   After deleting aweak.rs from disk and rebuilding the lexical index:
 ///     manifest = {anchor.rs, zstrong.rs}; aweak.rs absent.
-///   scored.len() = 1 (only anchor found), dropped = 2 − 1 = 1, partner_count = 1.
+///   scored.len() = 1 (only anchor/seed found), partner_count = (2−1) = 1,
+///   partners_found = 0, dropped = (2−1) − (1−1) = 1.
 ///   Expected notice: "1 of 1 co-change partners not found in the indexed manifest".
 ///
 /// The deleted-from-disk case correctly exercises the AD-409-7 notice path in
@@ -1121,4 +1122,306 @@ fn ac409_16b_real_repo_shallow_degrades_gracefully() {
         has_temporal,
         "AC-16b: degraded array must contain a 'temporal' subsystem element; got: {degs:?}"
     );
+}
+
+// ============================================================================
+// Finding 3 — AD-409-7: seed-absent AND partner-dropped combination
+// ============================================================================
+
+/// AD-409-7 regression — when the seed is absent from the manifest AND at least
+/// one co-change partner is also absent, BOTH notices must fire independently:
+///   1. "target file not found in the indexed manifest"  (seed-unindexed)
+///   2. "1 of 2 co-change partners not found …"          (partial-drop)
+///
+/// Critically, `partner_count` EXCLUDES the seed slot (AD-409-7: the allowlist
+/// is built as `{seed: SEED_STRENGTH, partner1: 1.0, partner2: 1.0}`, giving
+/// `len() = 3`; `partner_count = 3.saturating_sub(1) = 2`).  The notice must
+/// therefore read "1 of 2", not "1 of 3" or "2 of 2".
+///
+/// Fixture:
+///   `target.bin`  — non-UTF-8 bytes → content-skipped (NonUtf8) → NOT in manifest
+///   `partner1.rs` — non-UTF-8 bytes → content-skipped (NonUtf8) → NOT in manifest
+///   `partner2.rs` — valid UTF-8 Rust → indexed → IN manifest
+///
+///   C1 + C2 each touch all three files →
+///     J(target.bin, partner1.rs) = 2/2 = 1.0  (partner1.rs is a co-change partner)
+///     J(target.bin, partner2.rs) = 2/2 = 1.0  (partner2.rs is a co-change partner)
+///
+///   blast-radius on target.bin:
+///     allowed = {target.bin: 2.0, partner1.rs: 1.0, partner2.rs: 1.0}
+///     partner_count = 2 (seed excluded)
+///     Manifest: only partner2.rs present → partners_found = 1, dropped = 1
+///     Notices: both fire.
+#[test]
+fn ac409_7b_seed_unindexed_and_partner_dropped() {
+    let now = now_epoch();
+    let dir = TempDir::new().expect("TempDir::new");
+    let cache = TempDir::new().unwrap();
+    git_init(dir.path());
+
+    // Non-UTF-8 bytes: used for both target.bin and partner1.rs so the produce
+    // stage content-skips them (NonUtf8) → they land in skipped_entries, not
+    // entries → absent from sorted_paths() → NOT matched in the manifest scan.
+    let binary: &[u8] = &[0xc3, 0x28, 0x80, 0x81, 0xff];
+
+    // C1: all three files co-changed together.
+    let target_path = dir.path().join("target.bin");
+    let partner1_path = dir.path().join("partner1.rs");
+    fs::write(&target_path, binary).expect("write target.bin C1");
+    fs::write(&partner1_path, binary).expect("write partner1.rs C1");
+    let s = StdCommand::new("git")
+        .args(["add", "target.bin", "partner1.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add C1");
+    assert!(
+        s.status.success(),
+        "git add C1 failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    write_and_stage(dir.path(), "partner2.rs", "// partner2 v1\n");
+    git_commit(
+        dir.path(),
+        "feat: initial all-three commit",
+        now - 10 * 86400,
+    );
+
+    // C2: all three files again → J = 1.0 for every pair.
+    fs::write(&target_path, binary).expect("write target.bin C2");
+    fs::write(&partner1_path, binary).expect("write partner1.rs C2");
+    let s = StdCommand::new("git")
+        .args(["add", "target.bin", "partner1.rs"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add C2");
+    assert!(
+        s.status.success(),
+        "git add C2 failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    write_and_stage(dir.path(), "partner2.rs", "// partner2 v2\n");
+    git_commit(dir.path(), "feat: second all-three commit", now - 5 * 86400);
+
+    build_index(dir.path(), cache.path());
+
+    // Blast-radius on target.bin (non-UTF-8 seed, not in manifest).
+    // AC-7 / AD-409-7: exit 0 (checked by run_search_raw_ok).
+    let (stdout, stderr) = run_search_raw_ok(
+        dir.path(),
+        cache.path(),
+        &[
+            "xqzjvmblorp_ac409_e2e_ac7b_both_notices",
+            "--blast-radius",
+            "target.bin",
+            "--weights",
+            "0,0,1",
+            "--limit",
+            "10",
+            "--json",
+        ],
+    );
+
+    let stderr_text = String::from_utf8_lossy(&stderr);
+
+    // Notice 1: seed-unindexed — must fire because target.bin is not in the manifest.
+    assert!(
+        stderr_text.contains("target file not found in the indexed manifest"),
+        "AD-409-7 (7b): expected seed-unindexed notice on stderr; got: {stderr_text:?}"
+    );
+
+    // Notice 2: partial-drop — must read "1 of 2" (not "2 of 2"): partner_count
+    // excludes the seed slot; only partner1.rs is dropped (partner2.rs is found).
+    assert!(
+        stderr_text.contains("1 of 2") && stderr_text.contains("co-change partners not found"),
+        "AD-409-7 (7b): expected '1 of 2 co-change partners not found' on stderr \
+         (seed excluded from partner_count); got: {stderr_text:?}"
+    );
+
+    // Positive: partner2.rs must appear in results (only resolved partner).
+    let v: Value = serde_json::from_slice(&stdout)
+        .expect("AD-409-7 (7b): skim search --json must produce valid JSON");
+    let results = v["results"].as_array().expect("results must be an array");
+    let paths: Vec<&str> = results.iter().filter_map(|r| r["path"].as_str()).collect();
+    assert!(
+        paths.contains(&"partner2.rs"),
+        "AD-409-7 (7b): partner2.rs must appear in results (it is the only indexed partner); \
+         got: {paths:?}"
+    );
+}
+
+// ============================================================================
+// Finding 4 — AC-12, AC-13, AC-19: missing composite-arm coverage
+// ============================================================================
+
+/// AC-12 — `--weights 0,0,0` with `--blast-radius` MUST return zero results.
+///
+/// `merge_layer_scores` skips any layer whose weight is `0.0` (AD-377-4).
+/// When all three weights are zero the scores `HashMap` is never populated →
+/// the ranked list is empty → zero results, exit 0.
+#[test]
+fn ac409_ac12_zero_weights_returns_empty() {
+    let fixture = make_linear_fixture();
+    let cache = TempDir::new().unwrap();
+    build_index(fixture.path(), cache.path());
+
+    // Composite arm: text query present, blast-radius constraint, all weights 0.
+    let (stdout, _stderr) = run_search_raw_ok(
+        fixture.path(),
+        cache.path(),
+        &[
+            "anchor",
+            "--blast-radius",
+            "anchor.rs",
+            "--weights",
+            "0,0,0",
+            "--limit",
+            "10",
+            "--json",
+        ],
+    );
+
+    let v: Value =
+        serde_json::from_slice(&stdout).expect("AC-12: skim search --json must produce valid JSON");
+    let results = v["results"]
+        .as_array()
+        .expect("AC-12: results must be an array");
+    assert!(
+        results.is_empty(),
+        "AC-12: --weights 0,0,0 + --blast-radius must return zero results; got: {results:?}"
+    );
+    let total = v["total"].as_i64().unwrap_or(-1);
+    assert_eq!(
+        total, 0,
+        "AC-12: total must be 0 when all weights are zero; got total={total}"
+    );
+}
+
+/// AC-13 — `--offset`/`--limit` pagination on the composite blast-radius arm
+/// MUST produce disjoint pages whose concatenation equals the full unpaginated
+/// result.
+///
+/// Uses the FX-LINEAR fixture with a text query that routes to the composite
+/// arm (text + `--blast-radius`) and temporal-only weights so the ranking is
+/// deterministic.  Page size 1 guarantees disjointness is verified for every
+/// individual result regardless of total count.
+#[test]
+fn ac409_ac13_pagination_is_disjoint() {
+    let fixture = make_linear_fixture();
+    let cache = TempDir::new().unwrap();
+    build_index(fixture.path(), cache.path());
+
+    // Shared args: composite arm, temporal-only weights for determinism.
+    let shared: &[&str] = &[
+        "xqzjvmblorp_ac13_pagination",
+        "--blast-radius",
+        "anchor.rs",
+        "--weights",
+        "0,0,1",
+        "--json",
+    ];
+
+    // Unpaginated baseline.
+    let mut args_full = shared.to_vec();
+    args_full.extend_from_slice(&["--limit", "20"]);
+    let (stdout_full, _) = run_search_raw_ok(fixture.path(), cache.path(), &args_full);
+    let v_full: Value = serde_json::from_slice(&stdout_full)
+        .expect("AC-13: unpaginated query must produce valid JSON");
+    let full_paths: Vec<String> = v_full["results"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r["path"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Require at least 2 results so pagination is non-trivial.
+    assert!(
+        full_paths.len() >= 2,
+        "AC-13: FX-LINEAR fixture must produce >= 2 blast-radius results; got: {full_paths:?}"
+    );
+
+    // Collect pages with limit=1 (one result per page) until exhausted.
+    let total = full_paths.len();
+    let mut paginated_paths: Vec<String> = Vec::new();
+    for offset in 0..total {
+        let offset_str = offset.to_string();
+        let mut args_page = shared.to_vec();
+        args_page.extend_from_slice(&["--limit", "1", "--offset", &offset_str]);
+        let (stdout_page, _) = run_search_raw_ok(fixture.path(), cache.path(), &args_page);
+        let v_page: Value = serde_json::from_slice(&stdout_page)
+            .expect("AC-13: paginated query must produce valid JSON");
+        let page_paths: Vec<String> = v_page["results"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| r["path"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Each page of size 1 must return exactly 1 result.
+        assert_eq!(
+            page_paths.len(),
+            1,
+            "AC-13: page at offset={offset} (limit=1) must return exactly 1 result; \
+             got: {page_paths:?}"
+        );
+        // The result must not duplicate any result from earlier pages (disjointness).
+        assert!(
+            !paginated_paths.contains(&page_paths[0]),
+            "AC-13: result '{}' at offset={offset} duplicates a result from an earlier page \
+             (pages are not disjoint); paginated so far: {paginated_paths:?}",
+            page_paths[0]
+        );
+        paginated_paths.push(page_paths[0].clone());
+    }
+
+    // Concatenation of per-page results must equal the unpaginated full result.
+    assert_eq!(
+        full_paths, paginated_paths,
+        "AC-13: concatenated pages must equal the unpaginated result; \
+         full={full_paths:?}, paginated={paginated_paths:?}"
+    );
+}
+
+/// AC-19 — `text --blast-radius X --hot` must exit 0 and produce parseable JSON.
+///
+/// The compound `text + --blast-radius + --hot` arm re-sorts the blast-radius
+/// result window by hotspot score.  Uses the FX-LINEAR fixture; both co-change
+/// Jaccard and commit-frequency (hotspot) data are present in `temporal.db` so
+/// the `--hot` sort is fully exercised, not just degraded gracefully.
+///
+/// Exit 0 is asserted unconditionally by `run_search_raw_ok`.
+#[test]
+fn ac409_ac19_blast_hot_exits_zero() {
+    let fixture = make_linear_fixture();
+    let cache = TempDir::new().unwrap();
+    build_index(fixture.path(), cache.path());
+
+    // text + --blast-radius + --hot: routes to composite blast-radius arm with
+    // hotspot re-sort.  `--weights 0,0,1` to make blast-radius temporal the
+    // sole ranking signal so result order is deterministic.
+    let (stdout, _stderr) = run_search_raw_ok(
+        fixture.path(),
+        cache.path(),
+        &[
+            "anchor",
+            "--blast-radius",
+            "anchor.rs",
+            "--hot",
+            "--weights",
+            "0,0,1",
+            "--limit",
+            "5",
+            "--json",
+        ],
+    );
+
+    // AC-19: exit 0 (asserted above by run_search_raw_ok).
+    // The JSON must be parseable and results must be an array (no crash).
+    let v: Value =
+        serde_json::from_slice(&stdout).expect("AC-19: skim search --json must produce valid JSON");
+    let _results = v["results"]
+        .as_array()
+        .expect("AC-19: results must be a JSON array");
 }

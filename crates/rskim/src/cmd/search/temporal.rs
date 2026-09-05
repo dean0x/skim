@@ -40,8 +40,8 @@ use super::types::{BlastRadiusStrengths, Page, ResolvedResult, TemporalAnnotatio
 /// AD-409-3: `SEED_STRENGTH = 2.0` is a **finite** sentinel strictly greater than the
 /// Jaccard maximum of 1.0. It is the resolved decision Option A from ticket #409:
 /// the blast-radius target (seed) always ranks **first** in the temporal layer.
-/// Phase C's `paths_to_scored_file_ids` sorts the temporal layer by score DESC,
-/// placing the seed at rank 1 because `2.0 > max_jaccard(1.0)`.
+/// `merge_layer_scores` sorts each layer by score DESC (AD-409-4), placing the
+/// seed at rank 1 because `2.0 > max_jaccard(1.0)`.
 ///
 /// Options B (sentinel == 1.0, indistinguishable from a perfect Jaccard match) and
 /// C (seed excluded from the temporal layer entirely) were rejected.
@@ -458,12 +458,11 @@ pub(super) fn paths_to_file_ids(
 /// blast-radius allowlist is non-empty but not one of its paths has a `FileId`
 /// in the manifest.
 ///
-/// Shared by [`paths_to_file_ids`] and [`paths_to_scored_file_ids`] so both
-/// blast-radius arms disclose the same condition with the same wording.  This
-/// case is reported separately from the partial-drop notice because the
-/// partial-drop arithmetic (`|allowlist| − |found|` of `|allowlist| − 1`) is
-/// only meaningful when the seed itself resolved; with `found == 0` it would
-/// read "N of N−1 partners not found", which is nonsense.
+/// Called by [`paths_to_scored_file_ids`] (the single implementation of the
+/// manifest scan) when the blast-radius allowlist is non-empty but zero entries
+/// resolved.  Reported separately from the partial-drop notice because a
+/// "N−1 of N−1 partners not found" line is less informative than naming both
+/// the allowlist size and the index size when nothing at all resolved.
 fn emit_no_indexed_files_notice(allowlist_len: usize, indexed_file_count: usize) {
     eprintln!(
         "skim search: note: blast-radius filter matched 0 indexed files \
@@ -538,9 +537,10 @@ fn emit_partial_drop_notice(partner_count: usize, partners_found: usize) {
 /// [`emit_seed_unindexed_notice`] when the seed is absent from the manifest, and
 /// [`emit_partial_drop_notice`] when one or more co-change partners are absent.
 /// Both notices are suppressed when their respective conditions are not met.
-/// Mirrors the identical two-branch guard in [`paths_to_file_ids`]; exactly one
-/// of the two functions runs per query, so the composite arm never double-reports
-/// (AC-7).  Exit code stays 0; no `--json` key added (tracked in #526/#483).
+/// [`paths_to_file_ids`] delegates to this function and discards the score
+/// component, so the two blast-radius arms always agree on membership and notice
+/// text by construction (AD-409-7; AC-7).  Exit code stays 0; no `--json` key
+/// added (tracked in #526/#483).
 ///
 /// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
 pub(super) fn paths_to_scored_file_ids(
