@@ -1,7 +1,7 @@
 ---
 feature: file-wrapper-fidelity
 name: File-Wrapper Output Fidelity (grep/rg/diff/status/log passthrough & budgets)
-description: "Use when adding or modifying file/git command wrappers, debugging byte-fidelity issues, changing passthrough logic, working on the JSON disclosure sink (emit_json_envelope, Completeness, LineTermination, lossy_json_view_marker), working on remedy_for / passthrough_strips_json, adding or updating strip_skim_flags, working on the fidelity gate (fidelity.rs::decide), modifying git status flag-stripping or AheadBehind rendering, adjusting memory caps on git log output, touching the skip_ansi_strip flag, working on the ANSI strip scanner, modifying git-diff AST breadcrumb source resolution, adding a raw_override field, working on the elision marker (elision_marker_line in rskim-core, passthrough_with_truncation in process.rs), working on cascade empty-output fallback (compact_marker_without_hint), or working on the SKIM_PASSTHROUGH convergence gate. Keywords: emit_json_envelope, Completeness, LineTermination, lossy_json_view_marker, remedy_for, RemedyCtx, passthrough_strips_json, elision_marker_line, passthrough_with_truncation, compact_marker_without_hint, strip_skim_flags, Surface, dispatch_explicit, dispatch_inner, require_flags_for_tool, RawPassthrough, skip_ansi_strip, strip_escape_sequences, MAX_SEQ_SCAN, AheadBehind, elision marker, run_stdout_degrade, CONFLICTING_SHORT_OPTS, net-savings guard, source_matches_diff, is_show, get_file_source, fidelity.rs, decide(), raw_override, never_passthrough, lossy_view_marker, emit_source_line, verify_ast_render, EmittedCursor, stream_passthrough_raw, command_needs_exact_bytes."
+description: "Use when adding or modifying file/git command wrappers, debugging byte-fidelity issues, changing passthrough logic, working on the JSON disclosure sink (emit_json_envelope, Completeness, LineTermination, lossy_json_view_marker), working on remedy_for / passthrough_strips_json, adding or updating strip_skim_flags, working on the fidelity gate (fidelity.rs::decide), modifying git status flag-stripping or AheadBehind rendering, adjusting memory caps on git log output, touching the skip_ansi_strip flag, working on the ANSI strip scanner, modifying git-diff AST breadcrumb source resolution, adding a raw_override field, working on the elision marker (elision_marker_line in rskim-core, passthrough_with_truncation in process.rs), working on cascade empty-output fallback (compact_marker_without_hint), or working on the SKIM_PASSTHROUGH convergence gate. Keywords: emit_json_envelope, Completeness, LineTermination, lossy_json_view_marker, remedy_for, RemedyCtx, passthrough_strips_json, elision_marker_line, passthrough_with_truncation, compact_marker_without_hint, strip_skim_flags, Surface, dispatch_explicit, dispatch_inner, RawPassthrough, skip_ansi_strip, strip_escape_sequences, MAX_SEQ_SCAN, AheadBehind, elision marker, run_stdout_degrade, CONFLICTING_SHORT_OPTS, net-savings guard, source_matches_diff, is_show, get_file_source, fidelity.rs, decide(), raw_override, never_passthrough, lossy_view_marker, emit_source_line, verify_ast_render, EmittedCursor, stream_passthrough_raw, command_needs_exact_bytes."
 category: component-patterns
 directories:
   - crates/rskim/src/cmd/file
@@ -21,7 +21,7 @@ updated: 2026-09-02
 
 This feature area covers the end-to-end fidelity contract for skim's file and git command wrappers: grep, rg, diff, git status, git log, and git show. The #317 invariant — "never show less than raw" — is enforced through three coordinated mechanisms: the `ParseResult::RawPassthrough` variant (byte-faithful zero-clone passthrough), the `skip_ansi_strip` flag (opt-out of the ANSI strip step), and the unified fidelity gate in `output/fidelity.rs`.
 
-The dispatch layer is consolidated: a single `decide()` function in `output/fidelity.rs` replaces two diverging sites. `SKIM_PASSTHROUGH=1` is honored at `cmd/dispatch.rs`. The JSON output path now has a single disclosure sink (`emit_json_envelope` in `cmd/execution.rs`) that enforces `Completeness` declarations at compile time, replacing the deleted `ViewClass` type. The elision marker is single-sourced in `rskim_core::elision_marker_line`; `process.rs::passthrough_with_truncation` and the cascade path both call it. Standalone `diff` was reclassified as pure passthrough (PF-011) — its hunk-budget parser has been deleted.
+The dispatch layer is consolidated: a single `decide()` function in `output/fidelity.rs` replaces two diverging sites. `SKIM_PASSTHROUGH=1` is honored at `cmd/dispatch.rs`. The JSON output path has a single disclosure sink (`emit_json_envelope` in `cmd/execution.rs`) that enforces `Completeness` declarations at compile time. The elision marker is single-sourced in `rskim_core::elision_marker_line`; `process.rs::passthrough_with_truncation` and the cascade path both call it. Standalone `diff` was reclassified as pure passthrough (PF-011) — its hunk-budget parser has been deleted.
 
 ## Core Responsibilities
 
@@ -49,7 +49,7 @@ The dispatch layer is consolidated: a single `decide()` function in `output/fide
 
 `Completeness` has **no `Default` impl** by design. A handler that attempts to build a JSON response without choosing `Complete`, `Reencoded`, or `Lossy` gets a compile error — the type-level enforcement that prevents silent `Complete` mislabelling (ADR-015 / D1). `ViewClass` was deleted when `Completeness` replaced it.
 
-**Seven explicit handler declarations** and one generic path:
+**Eight explicit handler declarations** and two tier-derived paths:
 
 | Handler | Completeness | Rationale |
 |---|---|---|
@@ -61,7 +61,7 @@ The dispatch layer is consolidated: a single `decide()` function in `output/fide
 | `git fetch` | `Lossy` | Parser classifies ref updates; elides fetch progress |
 | `git commit` | `Lossy` | Parser keeps hash + subject; elides body/stats |
 | `git log` | `Lossy` | Keeps N entries; truncates to 64 MiB ceiling |
-| Generic (all other handlers) | Via `ParseResult::completeness()` | Tier-derived: Passthrough → `Reencoded`; Full/Degraded → `Lossy` |
+| Tier-derived sites (`output/mod.rs`, `cmd/log.rs`) | Via `ParseResult::completeness()` | Passthrough → `Reencoded`; Full/Degraded → `Lossy` |
 
 **`LineTermination`** is a required parameter that preserves per-sink byte contracts. The generic path (`render_output`) passes `LineTermination::None` because it used `write_to_stdout` (no trailing newline) before routing through the sink; every other JSON exit uses `LineTermination::Newline`. This is load-bearing — changing it moves stdout bytes.
 
@@ -102,7 +102,7 @@ POSIX `--` end-of-options: nothing is stripped after a bare `--`.
 
 **Unified rule: Keep IFF compressed is strictly smaller than raw in BOTH bytes AND tokens. Tie (equal) → Passthrough.**
 
-- **256-byte floor removed (A4)**: small inputs are no longer exempt.
+- **No size floor**: the net-savings guard measures all inputs; small inputs are not exempt.
 - **Tie semantics unified**: both sites use the same `>=` early-exit.
 - **L3 (`rskim-contract`)** is deliberately unchanged.
 
@@ -134,14 +134,16 @@ When all modes produced empty output (e.g., a Rust file containing only comments
 
 Two public entry points gate access to the shared `dispatch_inner(Surface, …)` core:
 
-- **`dispatch_for_wrapper(name, args, analytics)`** — the wrapper surface (PATH symlinks). Applies three gates before `dispatch_inner(Surface::Wrapper, …)`:
-  - **D3** (help/version flags): passes through without compression
-  - **D4** (skip-flags): strips tool-specific flags via `skip_flags_for_tool`
-  - **D5** (`require_flags_for_tool`): tools like psql and mysql require specific flags to enable machine-readable output; absent flags → passthrough instead of garbled compression
+- **`dispatch_for_wrapper(name, args, analytics)`** — the wrapper surface (PATH symlinks). A one-line tag: stamps the call as `Surface::Wrapper` and delegates to `dispatch_inner`. The D3/D4/D5 wrapper gates live **inside** `dispatch_inner` behind `if surface == Surface::Wrapper { … }`, making it structurally impossible to call the shared core on the wrapper surface without those gates running.
 
-- **`dispatch_explicit(subcommand, args, analytics)`** — the explicit surface (user typed `skim <tool>`). Tags the call as `Surface::Explicit` and delegates to `dispatch_inner` directly.
+- **`dispatch_explicit(subcommand, args, analytics)`** — the explicit surface (user typed `skim <tool>`). Tags the call as `Surface::Explicit` and delegates to `dispatch_inner` directly. No D3/D4/D5 gates are applied on the explicit surface — those are wrapper-surface concerns.
 
 `Surface` is a `pub(crate)` enum (`Surface::Explicit`, `Surface::Wrapper`) that makes the dispatch path a compile-time discriminant rather than a runtime flag.
+
+**Wrapper gates D3/D4/D5** (all inside `dispatch_inner`, gated on `if surface == Surface::Wrapper`):
+- **D3** (checked via `args_before_separator`): `--help`, `-h`, `--version`, `-V` exec the real tool's own help via `run_raw_passthrough`.
+- **D4** (via `arg_matches_flag` + `skip_flags_for_tool`): tool-owned flags skim must not intercept (e.g., `rg --json`). `redaction_is_mandatory(subcommand)` blocks this gate for `env`/`printenv` — skipping it would serve unredacted credentials.
+- **D5** (interactive-tool gate, via `interactive_tool_for` + `require_flags_for_tool`): if `interactive_tool_for(subcommand)` returns true and no required flags are present, exec via `run_inherited_passthrough` with inherited stdio so TTY line-editing works. `interactive_tool_for` asks "would this tool open a readline session?"; `require_flags_for_tool` asks "does the rewrite rule need this flag?" — both D4 and D5 use `arg_matches_flag` for consistent flag parsing.
 
 ### Force-Raw Marker: Accepted Limitations
 
@@ -149,11 +151,12 @@ The `{ppid}.{tool}.raw` sidecar marker carries the rewrite engine's stdout-desti
 
 **Five hook early returns occur before `set_force_raw` is called** (stdin read failure, JSON parse failure, missing/unparseable field, and two others). These paths do not clear any previous marker — if a prior command set a force-raw marker, it may persist until the next full hook invocation.
 
-**"Never byte loss" claim is false.** Measured: 304 bytes delivered vs 6803 raw bytes when skim compressed into `| tee f` after the marker was absent (same-tool clear #514, or no hook). Two accepted limitations:
+**A stale or missing marker can cost bytes.** Measured: 304 bytes delivered vs 6803 raw bytes when skim compressed into `| tee f` after the marker was absent (same-tool clear #514, or no hook). Three accepted limitations:
 1. **No hook**: a bare wrapper invocation with no PreToolUse hook gets `fstat`-only behaviour (no marker).
 2. **Same-tool clear (#514)**: a concurrent `git status` can clear a live `git log | tee f` marker because both share the `{ppid}.git.raw` key.
+3. **PID reuse** (lossless): a recycled PID within the `FORCE_RAW_MAX_AGE` window (300 s) may cause the wrapper to find a stale marker and serve raw instead of compressing — extra raw bytes, none lost.
 
-Both failures compress rather than suppress — but into a pipe sink that needed exact bytes, so the compression is data-loss. The docs now say so explicitly.
+Limitations 1 and 2 cost bytes; limitation 3 fails toward lossless passthrough.
 
 ### `raw_override` — Consistent Baseline and Fallback Source
 
@@ -166,13 +169,13 @@ Only set for **read-only / idempotent** handlers. Generalizes what `git status` 
 
 ### `SKIM_PASSTHROUGH=1` Convergence Gate
 
-Honored at `cmd/dispatch.rs::dispatch()`. The gate fires iff: `is_passthrough_mode() && !is_meta_subcommand && subcommand != "env" && !handler_reads_stdin(...)`.
+Honored inside `cmd/dispatch.rs::dispatch_inner()`. The gate fires iff: `is_passthrough_mode() && !is_meta_subcommand && subcommand != "env" && !handler_reads_stdin(...)`.
 
 **Filter role must not fire**: `cat out.log | skim cypress run` pipes into skim for compression. The gate skips exec when `handler_reads_stdin` is true, preventing the piped payload from being discarded.
 
 ### Lossy-View Marker (Text Mode): `lossy_view_marker`
 
-Fires when the served view differs from raw bytes (byte-comparison, not hook-rewritten-from check). Class-1 marker — unconditional, not gated by `SKIM_DEBUG`. Returns `None` when `differing == 0` (lossless passthrough). `rewrite_transparency_marker` is a deprecated compatibility alias. Separate from `lossy_json_view_marker` which covers the JSON path.
+Fires when the served view differs from raw bytes (byte-comparison, not hook-rewritten-from check). Class-1 marker — unconditional, not gated by `SKIM_DEBUG`. Returns `None` when `differing == 0` (lossless passthrough). Separate from `lossy_json_view_marker` which covers the JSON path.
 
 ### git status: CONFLICTING_SHORT_OPTS and AheadBehind
 
@@ -212,7 +215,7 @@ Unexpected exit codes forward raw before ANSI stripping. Signal kill (`exit_code
 
 **Firing `lossy_view_marker` on lossless passthrough paths.** A no-loss raw-fallback notice is ADR-011 class-2 and must be `SKIM_DEBUG`-gated.
 
-**Pinning branch-only SHAs in tests.** Branch refs vanish on squash-merge; CI uses a depth-1 checkout that resolves no history. Pin commit SHAs that are reachable from main, or the Test Suite job will report "unknown revision". (The Test Suite job now uses fetch-depth 0 to fix existing pinned-SHA failures.)
+**Pinning branch-only SHAs in tests.** Branch refs vanish on squash-merge; CI uses a depth-1 checkout that resolves no history. Pin commit SHAs that are reachable from main, or the Test Suite job will report "unknown revision". (The CI Test Suite job uses fetch-depth 0 — a depth-1 checkout cannot resolve historical SHAs.)
 
 ## Gotchas
 
@@ -222,7 +225,7 @@ Unexpected exit codes forward raw before ANSI stripping. Signal kill (`exit_code
 
 **`passthrough_strips_json` is the single source of truth for the `--json` strip predicate.** It is tested by a sync-guard alongside `strip_skim_flags`. If a new tool gains skim-owned `--json`, update both functions.
 
-**`verify_ast_render` runs for ALL modes now (C1e), not just Default.** Prior to this branch, `--mode structure` and `--mode full` could ship duplicate lines and added-as-context renders without failing ADR-001.
+**`verify_ast_render` runs for ALL modes, not just Default.** It catches duplicate lines, backward line numbers, and added-as-context rendering for every mode.
 
 **`to_json_envelope()` panics on `RawPassthrough` at runtime.** The `unreachable!()` is intentional — `execution.rs` handles this path before `serialize_output`.
 
@@ -237,8 +240,8 @@ Unexpected exit codes forward raw before ANSI stripping. Signal kill (`exit_code
 ## Key Files
 
 - `crates/rskim/src/output/fidelity.rs` — `decide()` (unified L2 gate); `Completeness` (replaces deleted `ViewClass`); `FidelityDecision`; `remedy_for`; `RemedyCtx`; `passthrough_strips_json` (colocated in dispatch.rs); `view_differs`
-- `crates/rskim/src/output/mod.rs` — `ParseResult` enum; `strip_escape_sequences` (ESC-scoped, preserves TABs, `MAX_SEQ_SCAN=2048`); `lossy_view_marker` (text mode); `lossy_json_view_marker` (JSON mode); `multi_file_lossy_marker`; `mode_class_label`; `elision_marker`
-- `crates/rskim/src/cmd/dispatch.rs` — `dispatch_for_wrapper()` (D3/D4/D5 wrapper gates → `dispatch_inner(Surface::Wrapper)`); `dispatch_explicit()` (→ `dispatch_inner(Surface::Explicit)`); `Surface` enum; `strip_skim_flags` (8 flag types); `passthrough_strips_json`; `MULTI_LEVEL_DISPATCHERS`; `HANDLER_CONSUMED_TOKENS`
+- `crates/rskim/src/output/mod.rs` — `ParseResult` enum; `strip_escape_sequences` (ESC-scoped, preserves TABs, `MAX_SEQ_SCAN=2048`); `lossy_view_marker` (text mode; handles single and multi-file); `lossy_json_view_marker` (JSON mode); `mode_class_label`; `elision_marker`
+- `crates/rskim/src/cmd/dispatch.rs` — `dispatch_for_wrapper()` (thin tag → `Surface::Wrapper`); `dispatch_explicit()` (→ `Surface::Explicit`); private `dispatch_inner(surface, …)` (shared core; D3/D4/D5 wrapper gates live here behind `if surface == Surface::Wrapper`); `redaction_is_mandatory()`; `Surface` enum; `strip_skim_flags` (8 flag types); `passthrough_strips_json`; `MULTI_LEVEL_DISPATCHERS`; `HANDLER_CONSUMED_TOKENS`
 - `crates/rskim/src/cmd/execution.rs` — `emit_json_envelope(json, completeness, tool, elided, terminate)` (single JSON sink); `LineTermination`; `stream_passthrough_raw`; `emit_raw_passthrough`; `savings_decision`; `RawPassthrough` fast-path; ANSI strip step; `raw_override` consumers; `never_passthrough` gate
 - `crates/rskim/src/process.rs` — `passthrough_with_truncation(text, language, max_lines, last_lines)` (uses `elision_marker_line`; CRLF-safe via `split_inclusive`); `write_result_and_stats`; guardrail integration; `view_differs` computation
 - `crates/rskim/src/cascade.rs` — `cascade_for_token_budget`; empty-output guard (`saw_empty_output`); `compact_marker_without_hint`; `fallback_line_truncate`; ADR-016 stderr channel split
@@ -258,9 +261,8 @@ Unexpected exit codes forward raw before ANSI stripping. Signal kill (`exit_code
 - **ADR-001**: Net-savings guard — byte comparison baseline, token fallback; the guard is blind to content-substitution corruption (only `verify_ast_render` catches that); marker bytes can tip it to raw
 - **ADR-011**: Elision markers (class-1, unconditional) vs. raw-fallback banners (class-2, `SKIM_DEBUG`-gated); `lossy_json_view_marker` is class-1; `compact_marker_without_hint` triggers a class-1 stderr emission
 - **ADR-016**: `--max-lines N` = N total incl. marker, N=1 exception; tight `--tokens` = count on stdout, remedy on stderr (the compact-marker channel split)
-- **PF-019**: Mode is a correctness boundary; `verify_ast_render` now covers all modes
+- **PF-019**: Mode is a correctness boundary; `verify_ast_render` covers all modes, not just Default
 - **PF-024**: Guard baseline and fallback must use the user's literal command output, not the injected-flag output; `raw_override` is the fix
 - **PF-025**: Proposed invariants must be tested against known-corrupt inputs
-- **PF-026**: (referenced for JSON disclosure enforcement patterns)
 - **PF-027**: Resizing fixtures until the guard agrees is a silent revert; always verify by diffing bytes
-- Feature: `hook-binary-pinning` — `dispatch_for_wrapper()` also gates `SKIM_PASSTHROUGH` at the wrapper entry; force-raw sidecar architecture; cross-surface fidelity parity
+- Feature: `hook-binary-pinning` — the B1 `SKIM_PASSTHROUGH` gate and D3/D4/D5 wrapper gates inside `dispatch_inner`, force-raw sidecar architecture, and cross-surface conformance testing are shared between the two feature areas
