@@ -214,6 +214,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   healthy queries to keep byte-identity for existing callers.
 
 ### Fixed
+- **`skim search` anchors substring-only matches instead of reporting
+  `line_number: null`** (#395). A file that contains the query only inside a longer
+  identifier (for example `mk4_longline_marker` inside the 919-byte token
+  `AAAA...AAAAmk4_longline_marker`) stays in the result set for git-grep recall parity
+  (ADR-007), but it carries no aligned whole-token posting because the AD-411-7
+  `token_length` gate rejects it. Such candidates reach the snippet layer with an empty
+  `match_positions` vec, and the AD-396-5 short-query guard nulled their content-derived
+  anchor, so `--json` returned `line_number: null`, `line_range: null` and
+  `snippet: null` for a genuinely matched file (an agent piping `path:line` into a read
+  got nothing). The guard is now scoped to the case it was written for, a query too short
+  to produce any trigram (`extract_query_ngrams(...).is_empty()`, the same predicate the
+  reader uses to route to `short_query_fallback`), so these results now carry a real
+  `line_number`, `line_range` and snippet, resolved by the substring-verify gate from the
+  file bytes. Queries below the trigram threshold (`fn`, `if`) stay snippet-less exactly
+  as before, and no line-length cap was introduced: a 20 KB single line is anchored too.
+  The `0.0` score of a substring-only match is unchanged and deliberate: it is the marker
+  that ranks these candidates below every exact whole-token BM25F match (AD-411-7).
 - **`skim search --build` on a repository with no commits now reports its empty
   history** (#414) — `skim search --build` (and `--rebuild` / `--update`) in a freshly
   `git init`-ed repository with files but no commits printed only the `indexed N files`

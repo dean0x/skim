@@ -615,6 +615,98 @@ fn test_three_byte_query_gets_anchor_ac10_boundary() {
     );
 }
 
+/// AD-396-8 (F-C4-01): a **substring-only** candidate — one whose postings were
+/// rejected by the AD-411-7 `token_length` gate, so `search_exact_intersection`
+/// emits it with EMPTY `match_positions` — must still receive the content-derived
+/// anchor produced by `substring_first_anchor`.
+///
+/// Fixture: the marker is glued to a 900-byte `A` run, so the whole 919-byte run
+/// is one word token and the query is only a substring of it.  The line is 955
+/// bytes, matching the c4-merge `src/longline.rs` shape that produced
+/// `line_number: null`.
+///
+/// PF-007 discriminating observable: `SnippetOutcome::Ok { match_line: 1, .. }`.
+/// Before the AD-396-8 narrowing the guard nulled the anchor for every
+/// empty-positions Substring candidate and this returned `Unavailable`.
+#[test]
+fn test_substring_only_long_token_gets_anchor_ad396_8() {
+    use super::extract_snippet_and_verify;
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    let pad = "A".repeat(900);
+    let content = format!("fn long_one() {{ let payload = \"{pad}mk4_longline_marker\"; }}\n");
+    // Premise guard: the c4-merge shape is one line of 955 bytes including its
+    // newline (PF-007 — a fixture drift that shortens the line would make the
+    // assertions vacuous).
+    assert_eq!(
+        (content.len(), content.lines().count()),
+        (955, 1),
+        "fixture premise: 955 bytes on a single line (c4-merge src/longline.rs shape)"
+    );
+    fs::write(root.join("src/longline.rs"), &content).unwrap();
+
+    let (outcome, verified) = extract_snippet_and_verify(
+        &root,
+        "src/longline.rs",
+        &[], // empty positions — AD-411-7 token_length gate aligned nothing
+        None,
+        "mk4_longline_marker",
+        super::VerifyMode::Substring,
+    );
+
+    assert!(
+        verified,
+        "AD-396-8: file containing the query must verify; got outcome={outcome:?}"
+    );
+    assert!(
+        matches!(outcome, super::SnippetOutcome::Ok { match_line: 1, .. }),
+        "AD-396-8: substring-only candidate must be anchored to line 1, not left \
+         unanchored; got {outcome:?}"
+    );
+}
+
+/// AD-396-8 (F-C4-01): the same guarantee at 20 KB on one line — no hard
+/// line-length cap was introduced, so the anchor is still resolved.
+///
+/// The file (20 051 bytes) stays well under `MAX_SNIPPET_FILE_BYTES`, so the
+/// full-read path applies and `substring_first_anchor` scans the whole file.
+#[test]
+fn test_substring_only_20kb_line_gets_anchor_ad396_8() {
+    use super::extract_snippet_and_verify;
+    use std::fs;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    fs::create_dir_all(root.join("src")).unwrap();
+    let pad = "B".repeat(20_000);
+    let content = format!("fn huge_one() {{ let payload = \"{pad}mk4_huge_marker\"; }}\n");
+    fs::write(root.join("src/hugeline.rs"), &content).unwrap();
+
+    let (outcome, verified) = extract_snippet_and_verify(
+        &root,
+        "src/hugeline.rs",
+        &[],
+        None,
+        "mk4_huge_marker",
+        super::VerifyMode::Substring,
+    );
+
+    assert!(
+        verified,
+        "AD-396-8: 20 KB line must verify; got {outcome:?}"
+    );
+    assert!(
+        matches!(outcome, super::SnippetOutcome::Ok { match_line: 1, .. }),
+        "AD-396-8: a 20 KB single line must still be anchored to line 1 (no hard \
+         line-length cap); got {outcome:?}"
+    );
+}
+
 /// AD-396-3 / AC8 proxy: a file containing only the FIRST of two query tokens
 /// must NOT be returned as verified for a two-token query (no verify-gate widening).
 ///

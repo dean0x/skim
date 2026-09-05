@@ -340,7 +340,28 @@ pub(super) fn extract_snippet_and_verify(
     // snippet-less) while `verified` still gates inclusion.  Only the Substring
     // path is affected — Phrase/Near short-word fallback keeps its predicate
     // anchor to avoid a #393 regression.
-    let anchor_range = if matches!(verify_mode, VerifyMode::Substring) && match_positions.is_empty()
+    //
+    // AD-396-8 (F-C4-01): `match_positions.is_empty()` alone is NOT the
+    // short-query signal.  A **substring-only** candidate — a file whose content
+    // contains the query only inside a longer identifier, e.g. the query
+    // `mk4_longline_marker` inside the 919-byte token
+    // `AAAA…AAAAmk4_longline_marker` — also arrives here with empty positions:
+    // `align_whole_token`'s AD-411-7 `token_length` gate assigns it zero aligned
+    // occurrences, so `search_exact_intersection` emits it with an empty
+    // `byte_pos_vec` (and score 0.0, by design).  Nulling the anchor for those
+    // candidates produced `line_number: null` for a genuinely matched file,
+    // even though `substring_first_anchor` had just located the occurrence by
+    // scanning the file bytes.
+    //
+    // The guard is therefore narrowed to the state it was written for: a query
+    // that cannot produce any trigram, which is exactly the condition
+    // `NgramIndexReader::search_ngrams` uses to route to `short_query_fallback`
+    // (`extract_query_ngrams(...).is_empty()`, AD-355-7 / AD-372-4).  Reusing
+    // that function keeps the two sites from drifting.  It is evaluated last so
+    // the healthy path (non-empty positions) never pays for it.
+    let anchor_range = if matches!(verify_mode, VerifyMode::Substring)
+        && match_positions.is_empty()
+        && rskim_search::extract_query_ngrams(query).is_empty()
     {
         None
     } else {
