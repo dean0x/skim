@@ -34,12 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   denominators now reflect the full commit population, co-change peer **sets and ordering**
   may differ from pre-#407 databases after the self-heal rebuild (AD-407-9).
 
-  **Build-time performance (AC-23):** `skim search --rebuild` on this repository with
-  a warm OS page cache: pre-#407 baseline (057ff42, first-parent-only) **7.95 s**;
-  post-#407 (full-DAG) **8.06 s** — ratio **1.01×**, well within the ≤ 3× guard.
-  The temporal history walk visits 2.5× more commits (264 first-parent → 662 full-DAG)
-  but its cost is small relative to file indexing; the per-commit gix committer-time
-  lookup adds no measurable overhead at this repository size.
+  **Build-time performance (AC-23):** The full-DAG walk visits about 2.5x more commits
+  on this repository (264 first-parent to 662 full-DAG, with merge commits skipped before
+  the tree diff); this cost is build-time only and does not touch the per-query path.
+  A guarded before/after benchmark is tracked under the open cold-build performance ticket #410.
 
   **Warm query-path performance (AC-24):** a warm `skim search --risky` and a warm
   `skim search <text>` on an already-current `temporal.db` both measured **< 10 ms**
