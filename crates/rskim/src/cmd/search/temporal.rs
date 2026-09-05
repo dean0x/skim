@@ -428,10 +428,12 @@ pub(super) fn resort_window(limit: usize) -> usize {
 /// AD-409-7: Delegates to [`paths_to_scored_file_ids`] and discards the score
 /// component, so membership parity between the filter arm (lexical / AST) and
 /// the composite ranking arm holds by construction — one algorithm, one copy of
-/// the notice-dispatch logic.  All stderr notices (`emit_no_indexed_files_notice`,
-/// `emit_seed_unindexed_notice`, `emit_partial_drop_notice`) are emitted inside
-/// [`paths_to_scored_file_ids`]; each fires at most once per query.  Exit code stays 0.
-/// No `--json` key is added here (tracked in #526 / #483).
+/// the notice-dispatch logic.  After the manifest scan, emits at most two stderr
+/// lines: "matched 0 indexed files" when nothing resolved; otherwise
+/// [`emit_seed_unindexed_notice`] when the seed is absent from the manifest, and
+/// [`emit_partial_drop_notice`] when one or more co-change partners are absent.
+/// Each notice fires at most once per query.  Exit code stays 0.
+/// No `--json` key is added here (tracked in #483).
 ///
 /// Accepts a `&[&str]` slice (from `manifest.sorted_paths()`) so that callers
 /// which already hold the slice can pass it directly without a second allocation.
@@ -540,7 +542,7 @@ fn emit_partial_drop_notice(partner_count: usize, partners_found: usize) {
 /// [`paths_to_file_ids`] delegates to this function and discards the score
 /// component, so the two blast-radius arms always agree on membership and notice
 /// text by construction (AD-409-7; AC-7).  Exit code stays 0; no `--json` key
-/// added (tracked in #526/#483).
+/// added (tracked in #483).
 ///
 /// Applies PF-004 widening (`u32::try_from(idx)`) — never `as u32`.
 pub(super) fn paths_to_scored_file_ids(
@@ -607,7 +609,7 @@ pub(super) fn paths_to_scored_file_ids(
     // AD-409-7: emit notices for the two disclosure conditions.
     // `scored.is_empty()` is the fully-unresolved case; the partner-drop
     // arithmetic is only meaningful once at least one entry resolved.
-    // Stderr only; no --json key; no degraded element (tracked in #526/#483).
+    // Stderr only; no --json key; no degraded element (tracked in #483).
     if scored.is_empty() {
         emit_no_indexed_files_notice(allowed_paths.len(), sorted_paths.len());
     } else {
@@ -661,8 +663,8 @@ pub(super) enum BlastRadiusResolution {
 
 /// Resolve a `--blast-radius` raw path to the set of co-change partner paths.
 ///
-/// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path) and
-/// `resolve_blast_radius_filter` (text-query path in `mod.rs`).  Returns a
+/// Shared core for both `resolve_blast_radius_file_ids` (standalone AST path, and
+/// text + blast-radius path in `mod.rs`).  Returns a
 /// [`BlastRadiusResolution`] that encodes whether blast-radius was requested, resolved
 /// successfully, or degraded — and in the `RepositoryMismatch` case, carries BOTH an
 /// empty allowlist (zero results) AND the degraded reason for `output.degraded`.
@@ -757,7 +759,7 @@ pub(super) fn resolve_blast_radius_paths(
 /// Unified resolver used by every blast-radius call site:
 /// - `run_ast_standalone` caller in `mod.rs` (standalone `--ast --blast-radius`)
 /// - `execute_query_with_manifest` blast-radius arm (query.rs, via `paths_to_file_ids`)
-/// - `resolve_blast_radius_filter` (mod.rs, text + blast-radius)
+/// - `resolve_blast_radius_file_ids` (mod.rs, text + blast-radius composite path)
 ///
 /// Algorithm:
 /// 1. If `blast_radius` is `None`, return `Ok(None)` immediately.
