@@ -1539,8 +1539,11 @@ mod tests {
     // `trybuild` cannot link against `pub(crate)` items.  A coercion to a
     // concrete `fn` pointer is therefore the available compile-level pin: it
     // fails to build if `emit_json_envelope` is deleted (E0425), if the
-    // `Completeness` parameter is dropped or defaulted away, or if the
-    // line-termination parameter is removed.
+    // `Completeness` parameter is dropped, or if the line-termination
+    // parameter is removed.  This makes `emit_json_envelope` the only
+    // *declared* way to write a `--json` envelope: a handler that
+    // bypasses it via `println!` or `write!(stdout, …)` outside
+    // `execution.rs` would not be caught by this compile-level pin.
     // ========================================================================
 
     /// Pins the exact signature of [`emit_json_envelope`].

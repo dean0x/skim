@@ -975,20 +975,22 @@ fn test_require_flags_for_tool_git_returns_none() {
     );
 }
 
-/// Drift guard: the values returned by `require_flags_for_tool` must equal the
-/// `require_flag` slices declared in the rule table for psql and mysql; and
-/// `interactive_tool_for` must agree with those rule-table entries.
+/// Pins the exact return value of [`require_flags_for_tool`] for psql and mysql,
+/// verifies [`interactive_tool_for`] for all DB tools, and asserts that the shared
+/// [`arg_matches_flag`] predicate accepts each rule-table flag in both short and
+/// long (`--flag=value`) forms.
 ///
-/// Renamed from `test_require_flags_for_tool_drift_guard` to cover both
-/// `require_flags_for_tool` and `interactive_tool_for` (regression-4 / issue-fix
-/// for the architecture-7 fix that extracted `interactive_tool_for` as a separate
-/// wrapper-surface predicate from `require_flags_for_tool`).
+/// The first two blocks are the strictest of the three psql/mysql tests: the
+/// `contains`-based tests above are strictly weaker, so this equality assertion
+/// is the real regression pin.
 ///
-/// This assertion makes any rule-table edit that silently breaks the D5 wrapper
-/// gate a compile-time-adjacent failure (caught at test time, not at runtime in
-/// a wrapper invocation).
+/// The `arg_matches_flag` block is the cross-source drift guard: both the wrapper
+/// gate and the rewrite engine route through `arg_matches_flag`, so verifying it
+/// here against the flags returned by `require_flags_for_tool` confirms that both
+/// surfaces agree for the same tool and argument — and that the shared predicate
+/// handles both short-flag and `--flag=value` forms correctly.
 #[test]
-fn test_d5_interactive_and_require_flags_drift_guard() {
+fn test_require_flags_exact_values_and_arg_matches_flag_cross_source_pin() {
     // psql: rule table declares &["-c", "--command"]
     let psql = require_flags_for_tool("psql").expect("psql must have require_flags");
     let mut psql_sorted = psql.clone();
@@ -1040,6 +1042,40 @@ fn test_d5_interactive_and_require_flags_drift_guard() {
         !interactive_tool_for("cargo"),
         "interactive_tool_for(\"cargo\") must be false — cargo is never interactive"
     );
+
+    // Cross-source drift guard: `arg_matches_flag` — the shared predicate used
+    // by both the wrapper gate and the rewrite engine — must recognise each flag
+    // returned by `require_flags_for_tool` in both its short form and its
+    // `--flag=value` long form.  This pins the agreement between surfaces: a
+    // change that breaks `arg_matches_flag` for a rule-table flag would cause
+    // both the D5 wrapper gate and the rewrite engine to disagree, and this
+    // assertion catches it before the mismatch reaches a wrapper invocation.
+    for flag in &psql_sorted {
+        assert!(
+            arg_matches_flag(flag, flag),
+            "arg_matches_flag must accept psql's own flag '{flag}' as a self-match"
+        );
+        if flag.starts_with("--") {
+            let long_form = format!("{flag}=SELECT 1");
+            assert!(
+                arg_matches_flag(&long_form, flag),
+                "arg_matches_flag must accept psql's long flag '{flag}' with '=value' suffix"
+            );
+        }
+    }
+    for flag in &mysql_sorted {
+        assert!(
+            arg_matches_flag(flag, flag),
+            "arg_matches_flag must accept mysql's own flag '{flag}' as a self-match"
+        );
+        if flag.starts_with("--") {
+            let long_form = format!("{flag}=SELECT 1");
+            assert!(
+                arg_matches_flag(&long_form, flag),
+                "arg_matches_flag must accept mysql's long flag '{flag}' with '=value' suffix"
+            );
+        }
+    }
 }
 
 // ========================================================================

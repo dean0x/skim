@@ -379,13 +379,54 @@ fn run_transform(
                 // erroring with UnsupportedLanguage. Matches the None-branch
                 // degrade; the SKIM_DEBUG notice is emitted by process_file once
                 // this returns.
-                let output = passthrough_with_truncation(
+                //
+                // Honour the token budget (ADR-016: a bound the tool can exceed is
+                // not a bound). No tree-sitter grammar is available so mode
+                // escalation is impossible, but line-level truncation to fit the
+                // budget is both possible and correct. ADR-017: the text is raw at
+                // this point, so line counts are in source space.
+                let source_line_count = contents.lines().count();
+                // Step 1: apply explicit max-lines / last-lines bounds.
+                let bounded = passthrough_with_truncation(
                     contents,
                     None,
                     options.trunc.max_lines,
                     options.trunc.last_lines,
                 );
-                return Ok((output, options.mode, false, None, true)); // degraded=true
+                // Step 2: if the bounded output still exceeds the token budget,
+                // shrink further. Binary search over head-truncation (max-lines)
+                // since no grammar is available for semantic truncation. Explicit
+                // iteration ceiling ≤ 64 satisfies CLAUDE.md "every loop has an
+                // explicit bound" (log2(N)+1 ≤ 64 for any realistic file size).
+                let final_output = match tokens::count_tokens(&bounded) {
+                    Ok(tok) if tok <= budget => bounded,
+                    _ => {
+                        let mut lo = 1usize;
+                        let mut hi = source_line_count;
+                        for _ in 0..64 {
+                            if lo >= hi {
+                                break;
+                            }
+                            let mid = lo + (hi - lo + 1) / 2;
+                            let candidate = passthrough_with_truncation(
+                                contents,
+                                None,
+                                Some(mid),
+                                None,
+                            );
+                            let fits = tokens::count_tokens(&candidate)
+                                .map(|c| c <= budget)
+                                .unwrap_or(false);
+                            if fits {
+                                lo = mid;
+                            } else {
+                                hi = mid.saturating_sub(1);
+                            }
+                        }
+                        passthrough_with_truncation(contents, None, Some(lo), None)
+                    }
+                };
+                return Ok((final_output, options.mode, false, None, true)); // degraded=true
             };
 
             // AC-10: Token counting for mode selection does NOT include line number annotations.

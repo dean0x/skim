@@ -266,3 +266,51 @@ fn test_show_stats_empty_file() {
         .assert()
         .success();
 }
+
+/// `--tokens N` on an extension-less file must honour the budget rather than
+/// silently emit the whole file (consistency-15 / ADR-016).
+///
+/// The unknown-language path previously called `passthrough_with_truncation`
+/// with `max_lines` and `last_lines` only, discarding the token budget.  After
+/// the fix, a binary search finds the largest head prefix that fits within N
+/// tokens and emits it with an elision marker on stdout.
+#[test]
+fn test_tokens_budget_honoured_for_unknown_language_file() {
+    let temp_dir = TempDir::new().unwrap();
+    // Write an extension-less file that is long enough to exceed a tiny budget.
+    // 50 lines × ~10 tokens each ≈ 500 tokens — well above a budget of 5.
+    let mut content = String::new();
+    for i in 0..50 {
+        content.push_str(&format!("line number {i} with some extra words to pad token count\n"));
+    }
+    // No extension so language detection falls back to the unknown-language path.
+    let file_path = temp_dir.path().join("datafile");
+    fs::write(&file_path, &content).unwrap();
+
+    let output = common::skim()
+        .arg(&file_path)
+        .arg("--tokens")
+        .arg("5")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+
+    // The output must NOT be the entire file (50 lines).  If the budget were
+    // silently ignored we would get all 50 lines; after the fix the output is
+    // truncated to fit within the budget.
+    let line_count = stdout.lines().count();
+    assert!(
+        line_count < 50,
+        "--tokens 5 on an unknown-language file must truncate output; got {line_count} lines"
+    );
+
+    // An elision marker must be present so the reader knows content was dropped
+    // (ADR-011 class 1 / #317: compress, never truncate silently).
+    assert!(
+        stdout.contains("lines truncated") || stdout.contains("line truncated"),
+        "--tokens budget truncation must emit an elision marker; got: {stdout:?}"
+    );
+}
