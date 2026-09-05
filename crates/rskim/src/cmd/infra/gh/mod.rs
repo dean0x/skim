@@ -79,16 +79,20 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // not an error. Without this, exit 8 is raw-forwarded before parsing.
     expected_exit_codes: &[8],
     forward_stderr: false,
-    // PF-024 / regression-3: every `gh` handler injects `--json <fields>` in
-    // prepare_args, so the net-savings guard's raw-fallback path would emit the
-    // *injected* command's stdout (raw `--json` output) rather than what the
-    // user's original argv would have produced.  `raw_override` is `None` on
-    // every `gh` CONFIG — no handler arms it — so the guard cannot honour its
-    // "fallback must show what the user expected to see" contract.  Restoring
-    // `skip_net_savings_guard: true` keeps the pre-branch behaviour and closes
-    // the defect immediately.  Arming `raw_override` for all `gh` handlers is
-    // the full fix tracked by architecture-8 (separate ticket).
-    skip_net_savings_guard: true,
+    // The net-savings guard runs for `gh`, and must: on a minimal payload the
+    // structured summary costs more tokens than the input, so without the guard
+    // skim would expand rather than compress. `test_gh_minimal_payload_guard_
+    // serves_raw_on_both_gate_branches` pins that (PF-011, and the #317 spirit).
+    //
+    // Known residual (regression-3, coupled to architecture-8): every `gh`
+    // handler injects `--json <fields>` in prepare_args and no `gh` CONFIG arms
+    // `raw_override`, so when the guard elects the fallback it emits the
+    // *injected* command's stdout rather than what the user's own argv would
+    // have printed. Skipping the guard would trade that fidelity nuance on a
+    // fallback path for a guaranteed expansion on every small payload — the
+    // worse of the two. The real fix is arming `raw_override` here, which is
+    // architecture-8; do not flip this flag without doing that first.
+    skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
     raw_override: None,

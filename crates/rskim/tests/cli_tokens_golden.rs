@@ -30,7 +30,7 @@ fn golden_fixture() -> PathBuf {
 /// The marker appears on the line after the token stats line.
 /// `--no-cache` ensures a cold-path read so view_differs is always computed
 /// from the actual transform (not the cache-path inference).
-const GOLDEN_STATS_LINE: &str = "[skim] 65 tokens \u{2192} 45 tokens (30.8% reduction)\n[skim] structure view: bodies removed \u{2014} SKIM_PASSTHROUGH=1 for raw output";
+const GOLDEN_STATS_LINE: &str = "[skim] 65 tokens \u{2192} 45 tokens (30.8% reduction)\n[skim] structure view: bodies removed \u{2014} SKIM_PASSTHROUGH=1 for full output";
 
 #[test]
 fn ac13_show_stats_exact_golden() {

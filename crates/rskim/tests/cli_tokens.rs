@@ -135,9 +135,11 @@ fn test_no_stats_by_default() {
     fs::write(&file_path, "function test() { return 42; }").unwrap();
 
     // Without --show-stats, stderr must not contain token-stats output.
-    // The ADR-011 class-1 lossy-view marker ("[skim] transformed view:…") may
-    // appear unconditionally when the structure view differs from raw — that is
-    // expected and is not stats output.
+    // The ADR-011 class-1 lossy-view marker may appear unconditionally when the
+    // served view differs from raw — that is expected and is not stats output.
+    // It is spelled "[skim] <class> view: …", where the class names the mode
+    // (e.g. "structure view: bodies removed"), so the guard below matches the
+    // marker's shape rather than one mode's wording.
     let output = common::skim()
         .arg(&file_path)
         .assert()
@@ -157,7 +159,7 @@ fn test_no_stats_by_default() {
     for line in stderr_str.lines() {
         if line.contains("[skim]") {
             assert!(
-                line.contains("transformed view"),
+                line.contains(" view:"),
                 "unexpected [skim] line on stderr (not the ADR-011 lossy-view marker): {line:?}"
             );
         }

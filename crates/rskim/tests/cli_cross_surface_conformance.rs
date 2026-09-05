@@ -143,6 +143,36 @@ mod cross_surface {
         child.wait_with_output().expect("wrapper-with-stdin wait_with_output must succeed")
     }
 
+    /// Run skim on the EXPLICIT surface with piped stdin content.
+    ///
+    /// The wrapper variant above dispatches on `argv[0]`, which only works for
+    /// names in `WRAPPER_TARGETS`. META subcommands such as `log` are excluded
+    /// from that set by construction, so they are reachable only as
+    /// `skim <subcommand> …` — this helper.
+    fn run_explicit_with_stdin(
+        args: &[&str],
+        stdin_content: &str,
+        path: &str,
+        cache_dir: &Path,
+    ) -> Output {
+        let skim = skim_bin();
+        let mut cmd = Command::new(&skim);
+        cmd.args(args);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        base_env(&mut cmd, path, cache_dir);
+
+        let mut child = cmd.spawn().expect("explicit-with-stdin must be spawnable");
+        // Dropping the handle closes the pipe and sends EOF before we wait.
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(stdin_content.as_bytes())
+                .expect("write to child stdin must succeed");
+        }
+        child.wait_with_output().expect("explicit-with-stdin wait_with_output must succeed")
+    }
+
     /// Run the rewritten command returned by `skim rewrite`.
     ///
     /// Parses the rewritten string, asserts it starts with `skim`, and executes
@@ -922,9 +952,11 @@ mod cross_surface {
             "INFO: Application started\n",
         );
 
-        // "log" is a META subcommand — invoked directly as `skim log --json`.
-        // In wrapper mode argv[0]="log" dispatches to log::run(&["--json"], …).
-        let out = run_wrapper_with_stdin("log", &["--json"], log_input, &path, cache_dir.path());
+        // "log" is a META subcommand, so it is deliberately absent from
+        // WRAPPER_TARGETS (that set is KNOWN_SUBCOMMANDS minus META_SUBCOMMANDS)
+        // and has no argv[0] wrapper to invoke. The remedy under test belongs to
+        // the explicit surface, which is where `skim log --json` is reachable.
+        let out = run_explicit_with_stdin(&["log", "--json"], log_input, &path, cache_dir.path());
 
         // The process must succeed regardless of the lossy path.
         assert_eq!(
