@@ -377,7 +377,34 @@ pub(super) fn run_diff(
     // Handle empty diff — record zero-compression analytics so the DB stays
     // consistent with run_passthrough (which always records, even for no-op passes).
     if raw_diff.trim().is_empty() {
-        eprintln!("No changes");
+        // --json contract: stdout must always be valid JSON.  Git produced
+        // nothing (e.g. `--dirstat` or `--summary` on a root-files-only range);
+        // this is a successful parse of zero files, not an error.  Emit the
+        // same DiffResult schema as the non-empty path (files_changed + files)
+        // so consumers see a schema-consistent envelope regardless of whether
+        // the diff is empty.  The `raw` field is absent because no synthesized
+        // text belongs there — `raw` carries unparseable git output, and an
+        // empty diff is not unparseable.  Reencoded: no information is dropped.
+        match output_format {
+            OutputFormat::Json => {
+                let empty_result = DiffResult::new(vec![], String::new());
+                let json = serde_json::to_string_pretty(&empty_result)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize empty diff result: {e}"))?;
+                if exec::emit_json_envelope(
+                    &json,
+                    Completeness::Reencoded,
+                    "git",
+                    None,
+                    exec::LineTermination::Newline,
+                )? == exec::StdoutStatus::PipeClosed
+                {
+                    return Ok(exec::pipe_closed_exit());
+                }
+            }
+            OutputFormat::Text => {
+                eprintln!("No changes");
+            }
+        }
         // Move raw_diff: 1 allocation (clone) on the analytics path, 0 when
         // disabled (PF-018 resolution).
         super::finalize_git_output_passthrough(
