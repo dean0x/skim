@@ -377,7 +377,10 @@ fn arch3_mode_only_diff_json_emits_lossy_marker() {
 ///   accounts for subdirectories.  This hit the empty-diff guard in `run_diff`,
 ///   which printed "No changes" to stderr and returned with *nothing* on stdout
 ///   — violating the `--json` contract.  After the fix, the empty-diff guard
-///   checks `output_format` and emits `{"files":[],"raw":"No changes\n"}`.
+///   emits the parsed-schema envelope `{"files_changed":0,"files":[]}` — the
+///   same shape as a non-empty result — so consumers see a schema-consistent
+///   object.  The `raw` key is absent because an empty diff is a successful
+///   parse of zero files, not unparseable output.
 ///
 /// ## Why the original test was fragile
 ///
@@ -478,15 +481,21 @@ fn arch4_dirstat_json_produces_parseable_json() {
         val_b.is_object(),
         "arch4 case B: --dirstat --json output must be a JSON object\nvalue: {val_b:?}"
     );
-    // Verify the exact envelope shape for the empty-dirstat case.
+    // Verify the exact envelope shape for the empty-dirstat case: same schema
+    // as a non-empty parsed result — files_changed + files, no raw key.
+    assert_eq!(
+        val_b["files_changed"],
+        serde_json::json!(0),
+        "arch4 case B: 'files_changed' must be 0 for an empty dirstat"
+    );
     assert_eq!(
         val_b["files"],
         serde_json::json!([]),
         "arch4 case B: 'files' must be an empty array for an empty dirstat"
     );
-    assert_eq!(
-        val_b["raw"],
-        serde_json::json!("No changes\n"),
-        "arch4 case B: 'raw' must carry \"No changes\\n\" for an empty dirstat"
+    assert!(
+        val_b.get("raw").is_none(),
+        "arch4 case B: 'raw' key must be absent — an empty diff is a parsed \
+         result with zero files, not unparseable git output\nvalue: {val_b:?}"
     );
 }

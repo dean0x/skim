@@ -379,15 +379,16 @@ pub(super) fn run_diff(
     if raw_diff.trim().is_empty() {
         // --json contract: stdout must always be valid JSON.  Git produced
         // nothing (e.g. `--dirstat` or `--summary` on a root-files-only range);
-        // represent that as an empty file list so JSON consumers always get a
-        // parseable envelope.  Reencoded: no information is dropped — we
-        // faithfully represent that git returned an empty result.
+        // this is a successful parse of zero files, not an error.  Emit the
+        // same DiffResult schema as the non-empty path (files_changed + files)
+        // so consumers see a schema-consistent envelope regardless of whether
+        // the diff is empty.  The `raw` field is absent because no synthesized
+        // text belongs there — `raw` carries unparseable git output, and an
+        // empty diff is not unparseable.  Reencoded: no information is dropped.
         match output_format {
             OutputFormat::Json => {
-                let json = serde_json::to_string_pretty(&serde_json::json!({
-                    "files": [],
-                    "raw": "No changes\n"
-                }))
+                let empty_result = DiffResult::new(vec![], String::new());
+                let json = serde_json::to_string_pretty(&empty_result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize empty diff result: {e}"))?;
                 if exec::emit_json_envelope(
                     &json,
