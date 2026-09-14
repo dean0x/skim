@@ -389,7 +389,7 @@ pub(super) fn run_diff(
             OutputFormat::Json => {
                 let empty_result = DiffResult::new(vec![], String::new());
                 let json = serde_json::to_string_pretty(&empty_result)
-                .map_err(|e| anyhow::anyhow!("failed to serialize empty diff result: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("failed to serialize empty diff result: {e}"))?;
                 if exec::emit_json_envelope(
                     &json,
                     Completeness::Reencoded,
