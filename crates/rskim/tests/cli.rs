@@ -348,9 +348,14 @@ fn test_cli_explicit_language_override() {
 fn test_cli_minimal_mode() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.ts");
+    // `// regular comment` sits BELOW the function on purpose: a comment run
+    // contiguous from byte 0 is the module header and is preserved in every
+    // language under #476. Keeping it at the top would test header preservation
+    // rather than the stripping this test exists for — see
+    // test_cli_minimal_mode_preserves_module_header.
     fs::write(
         &file_path,
-        "// regular comment\n/**\n * JSDoc\n */\nfunction add(a: number, b: number): number {\n    // body comment\n    return a + b;\n}\n",
+        "/**\n * JSDoc\n */\nfunction add(a: number, b: number): number {\n    // body comment\n    return a + b;\n}\n\n// regular comment\n",
     )
     .unwrap();
 
@@ -372,14 +377,41 @@ fn test_cli_minimal_mode() {
 }
 
 #[test]
+fn test_cli_minimal_mode_preserves_module_header() {
+    // #476: the leading contiguous comment run is the module header and is
+    // preserved in every language, not just the four that used to be allowlisted.
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("header.ts");
+    fs::write(
+        &file_path,
+        "// Copyright header line\n\n// stripped after the blank line\nfunction add(a: number, b: number): number {\n    return a + b;\n}\n",
+    )
+    .unwrap();
+
+    common::skim()
+        .arg(&file_path)
+        .arg("--mode")
+        .arg("minimal")
+        .assert()
+        .success()
+        // Top-of-file header preserved
+        .stdout(predicate::str::contains("// Copyright header line"))
+        // A run after the blank-line header break is still stripped
+        .stdout(predicate::str::contains("// stripped after the blank line").not())
+        .stdout(predicate::str::contains("function add"));
+}
+
+#[test]
 fn test_cli_minimal_mode_stdin() {
+    // The comment sits BELOW the function on purpose — see the note in
+    // test_cli_minimal_mode.
     common::skim()
         .arg("-")
         .arg("--language")
         .arg("typescript")
         .arg("--mode")
         .arg("minimal")
-        .write_stdin("// strip this\nfunction test() { return 42; }")
+        .write_stdin("function test() { return 42; }\n\n// strip this\n")
         .assert()
         .success()
         .stdout(predicate::str::contains("function test"))

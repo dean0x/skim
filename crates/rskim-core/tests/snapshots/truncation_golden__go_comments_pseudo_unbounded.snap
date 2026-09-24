@@ -2,6 +2,9 @@
 source: crates/rskim-core/tests/truncation_golden.rs
 expression: "snap(GO_COMMENTS, Language::Go, TransformConfig::with_mode(Mode::Pseudo))"
 ---
+// FIXTURE: Go file with various comment types
+// TESTS: Minimal mode comment stripping
+
 package main
 
 

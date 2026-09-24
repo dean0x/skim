@@ -2,6 +2,9 @@
 source: crates/rskim-core/tests/truncation_golden.rs
 expression: "snap(GO_SIMPLE, Language::Go, TransformConfig::with_mode(Mode::Minimal))"
 ---
+// FIXTURE: Simple Go functions
+// TESTS: Basic function signature extraction
+
 package main
 
 import "fmt"

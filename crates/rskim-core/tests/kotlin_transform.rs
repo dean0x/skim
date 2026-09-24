@@ -215,7 +215,12 @@ fn test_kotlin_minimal_preserves_doc_comments() {
 
 #[test]
 fn test_kotlin_minimal_strips_regular_comments() {
-    let source = "// This is a regular comment\npackage com.example\n\nfun main() {\n    // inside body\n}\n";
+    // The comment sits BELOW the package declaration on purpose: a comment
+    // contiguous from byte 0 is the module header and is preserved in every
+    // language under #476, which would test header preservation rather than the
+    // stripping this test exists for. See
+    // test_kotlin_minimal_preserves_module_header for that half.
+    let source = "package com.example\n\n// This is a regular comment\nfun main() {\n    // inside body\n}\n";
     let result = transform(source, Language::Kotlin, Mode::Minimal).unwrap();
     assert!(
         !result.contains("regular comment"),
@@ -224,6 +229,18 @@ fn test_kotlin_minimal_strips_regular_comments() {
     assert!(
         result.contains("inside body"),
         "in-body comments should be preserved, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_kotlin_minimal_preserves_module_header() {
+    // #476: the leading contiguous comment run is the module header and is
+    // preserved in every language, not just the four that used to be allowlisted.
+    let source = "// Copyright header line\npackage com.example\n\nfun main() {\n}\n";
+    let result = transform(source, Language::Kotlin, Mode::Minimal).unwrap();
+    assert!(
+        result.contains("// Copyright header line"),
+        "top-of-file header comment must be preserved, got:\n{result}"
     );
 }
 

@@ -1030,15 +1030,12 @@ fn test_typescript_minimal_strips_regular_comments() {
     let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
     let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
 
-    // Should NOT contain regular comments
-    assert!(
-        !result.contains("// FIXTURE:"),
-        "Regular single-line comment should be stripped"
-    );
-    assert!(
-        !result.contains("// TESTS:"),
-        "Regular single-line comment should be stripped"
-    );
+    // Should NOT contain regular comments.
+    //
+    // The fixture's `// FIXTURE:`/`// TESTS:` lines are NOT asserted here: they
+    // are contiguous from byte 0, which makes them the module header, and #476
+    // preserves the module header in every language. Their preservation is
+    // pinned by test_typescript_minimal_preserves_module_header below.
     assert!(
         !result.contains("// This is a regular single-line comment"),
         "Regular comment should be stripped"
@@ -1054,6 +1051,24 @@ fn test_typescript_minimal_strips_regular_comments() {
     assert!(
         !result.contains("/* Regular block comment at module level"),
         "Module-level block comment should be stripped"
+    );
+}
+
+#[test]
+fn test_typescript_minimal_preserves_module_header() {
+    // #476: the leading contiguous comment run at the top of a file is the
+    // module header and is preserved in every language, not just the four that
+    // used to be allowlisted.
+    let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// FIXTURE:"),
+        "top-of-file header comment must be preserved, got:\n{result}"
+    );
+    assert!(
+        result.contains("// TESTS:"),
+        "the rest of the contiguous header run must be preserved, got:\n{result}"
     );
 }
 
@@ -1136,13 +1151,32 @@ fn test_javascript_minimal_strips_regular_comments() {
     let source = include_str!("../../../tests/fixtures/javascript/comments.js");
     let result = transform(source, Language::JavaScript, Mode::Minimal).unwrap();
 
+    // The fixture's `// FIXTURE:` line is the module header (contiguous from
+    // byte 0) and is preserved under #476 — pinned separately by
+    // test_javascript_minimal_preserves_module_header.
     assert!(
-        !result.contains("// FIXTURE:"),
+        !result.contains("// This is a regular single-line comment"),
         "Regular comment should be stripped"
     );
     assert!(
         !result.contains("/* This is a regular block comment"),
         "Regular block comment should be stripped"
+    );
+}
+
+#[test]
+fn test_javascript_minimal_preserves_module_header() {
+    // #476: leading contiguous comment run is the module header in every language.
+    let source = include_str!("../../../tests/fixtures/javascript/comments.js");
+    let result = transform(source, Language::JavaScript, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// FIXTURE:"),
+        "top-of-file header comment must be preserved, got:\n{result}"
+    );
+    assert!(
+        result.contains("// TESTS:"),
+        "the rest of the contiguous header run must be preserved, got:\n{result}"
     );
 }
 
@@ -1344,14 +1378,9 @@ fn test_go_minimal_strips_standalone_comments() {
     let source = include_str!("../../../tests/fixtures/go/comments.go");
     let result = transform(source, Language::Go, Mode::Minimal).unwrap();
 
-    assert!(
-        !result.contains("// FIXTURE:"),
-        "Standalone comment should be stripped"
-    );
-    assert!(
-        !result.contains("// TESTS:"),
-        "Standalone comment should be stripped"
-    );
+    // The fixture's `// FIXTURE:`/`// TESTS:` lines are the module header
+    // (contiguous from byte 0) and are preserved under #476 — pinned separately
+    // by test_go_minimal_preserves_module_header.
     assert!(
         !result.contains("// This is a standalone comment"),
         "Standalone comment should be stripped"
@@ -1371,6 +1400,22 @@ fn test_go_minimal_strips_standalone_comments() {
     assert!(
         !result.contains("// Standalone comment (STRIP)"),
         "Standalone comment should be stripped"
+    );
+}
+
+#[test]
+fn test_go_minimal_preserves_module_header() {
+    // #476: leading contiguous comment run is the module header in every language.
+    let source = include_str!("../../../tests/fixtures/go/comments.go");
+    let result = transform(source, Language::Go, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// FIXTURE:"),
+        "top-of-file header comment must be preserved, got:\n{result}"
+    );
+    assert!(
+        result.contains("// TESTS:"),
+        "the rest of the contiguous header run must be preserved, got:\n{result}"
     );
 }
 
@@ -1428,10 +1473,9 @@ fn test_java_minimal_strips_regular_comments() {
     let source = include_str!("../../../tests/fixtures/java/Comments.java");
     let result = transform(source, Language::Java, Mode::Minimal).unwrap();
 
-    assert!(
-        !result.contains("// FIXTURE:"),
-        "Regular comment should be stripped"
-    );
+    // The fixture's `// FIXTURE:`/`// TESTS:` lines are the module header
+    // (contiguous from byte 0) and are preserved under #476 — pinned separately
+    // by test_java_minimal_preserves_module_header.
     assert!(
         !result.contains("// This is a regular single-line comment"),
         "Regular single-line comment should be stripped"
@@ -1451,6 +1495,22 @@ fn test_java_minimal_strips_regular_comments() {
     assert!(
         !result.contains("// Regular comment (STRIP)"),
         "Regular comment should be stripped"
+    );
+}
+
+#[test]
+fn test_java_minimal_preserves_module_header() {
+    // #476: leading contiguous comment run is the module header in every language.
+    let source = include_str!("../../../tests/fixtures/java/Comments.java");
+    let result = transform(source, Language::Java, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// FIXTURE:"),
+        "top-of-file header comment must be preserved, got:\n{result}"
+    );
+    assert!(
+        result.contains("// TESTS:"),
+        "the rest of the contiguous header run must be preserved, got:\n{result}"
     );
 }
 
@@ -1555,13 +1615,47 @@ fn test_minimal_no_comments() {
 
 #[test]
 fn test_minimal_only_comments() {
+    // A file that is nothing but one contiguous comment run has no blank line
+    // and no non-comment node to terminate the module header, so the run IS the
+    // header in its entirety and is preserved (#476).
+    //
+    // This is the honest answer for an all-comments file: the alternative —
+    // stripping every line — returns an empty view of a file whose entire
+    // content is its header (a licence block, a notes file), which is exactly
+    // the information loss header preservation exists to prevent, and it would
+    // breach "compress, never truncate" (#317).
     let source = "// comment 1\n// comment 2\n// comment 3\n";
     let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
 
-    // All comments stripped, result should be mostly empty (just blank lines from normalization)
     assert!(
-        !result.contains("// comment"),
-        "All comments should be stripped"
+        result.contains("// comment 1"),
+        "an all-comments file is all module header and must be preserved in full, got:\n{result}"
+    );
+    assert!(
+        result.contains("// comment 2"),
+        "an all-comments file is all module header and must be preserved in full, got:\n{result}"
+    );
+    assert!(
+        result.contains("// comment 3"),
+        "an all-comments file is all module header and must be preserved in full, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_minimal_only_comments_strips_run_after_header_break() {
+    // Companion to the test above: "all comments" does not mean "all preserved".
+    // A blank line terminates the header, so a second run in a comments-only
+    // file is still stripped.
+    let source = "// header 1\n// header 2\n\n// stripped 1\n// stripped 2\n";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    assert!(
+        result.contains("// header 1") && result.contains("// header 2"),
+        "the leading run is the module header and must be preserved, got:\n{result}"
+    );
+    assert!(
+        !result.contains("// stripped"),
+        "a run after the blank-line header break must still be stripped, got:\n{result}"
     );
 }
 
