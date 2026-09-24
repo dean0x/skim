@@ -106,7 +106,7 @@ fn write_file_header(buf: &mut Vec<u8>, table: &WeightTable) -> anyhow::Result<(
     writeln!(
         buf,
         "//! Corpus: {} files, {} unique bigrams",
-        table.corpus_stats.total_files, table.corpus_stats.unique_bigrams
+        table.corpus_stats.total_files, table.corpus_stats.unique_ngrams
     )?;
     writeln!(buf, "//!")?;
     writeln!(
@@ -243,8 +243,8 @@ mod tests {
             generated_at: "unix:0".to_string(),
             corpus_stats: CorpusStats {
                 total_files: 10,
-                total_bigrams: 500,
-                unique_bigrams: 5,
+                total_ngrams: 500,
+                unique_ngrams: 5,
                 deduplicated_files: 0,
                 language_breakdown: vec![],
             },
@@ -286,8 +286,8 @@ mod tests {
             generated_at: "unix:0".to_string(),
             corpus_stats: CorpusStats {
                 total_files: 0,
-                total_bigrams: 0,
-                unique_bigrams: 0,
+                total_ngrams: 0,
+                unique_ngrams: 0,
                 deduplicated_files: 0,
                 language_breakdown: vec![],
             },
@@ -324,8 +324,8 @@ mod tests {
             generated_at: "unix:0".to_string(),
             corpus_stats: CorpusStats {
                 total_files: 10,
-                total_bigrams: 500,
-                unique_bigrams: 1,
+                total_ngrams: 500,
+                unique_ngrams: 1,
                 deduplicated_files: 0,
                 language_breakdown: vec![],
             },
@@ -357,8 +357,8 @@ mod tests {
             generated_at: "unix:0".to_string(),
             corpus_stats: CorpusStats {
                 total_files: 10,
-                total_bigrams: 500,
-                unique_bigrams: 1,
+                total_ngrams: 500,
+                unique_ngrams: 1,
                 deduplicated_files: 0,
                 language_breakdown: vec![],
             },

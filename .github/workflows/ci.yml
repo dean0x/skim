@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, feature/* ]
+    branches: [ main, 'feature/*', 'wave/**' ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, 'wave/**' ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0  # history-dependent tests (corpus harness, pinned-SHA JSON-content tests) need full history
+          # Full history required by two independent groups of history-dependent tests:
+          #   1. test_ac5_dog_food_risky_query_rs_matches_git_ground_truth compares skim's
+          #      --risky per-file commit counts against `git rev-list` ground truth on this
+          #      repository.  With the default fetch-depth: 1 CI gets a shallow clone
+          #      (git_total=1), which fails the non-vacuous >= 67 guard before the parity
+          #      assertions even run (CI run 33906188121, AD-407-11).
+          #   2. the corpus harness and the pinned-SHA JSON-content tests (#508) walk real
+          #      commit parents, which a depth-1 checkout cannot provide.
+          # All other jobs keep the default shallow fetch.
+          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

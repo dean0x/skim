@@ -27,5 +27,5 @@ mod reader;
 #[cfg(test)]
 pub(super) mod test_helpers;
 
-pub use builder::CochangeMatrixBuilder;
+pub use builder::{COUPLING_MAX_FILES, CochangeMatrixBuilder};
 pub use reader::CochangeMatrixReader;

@@ -205,8 +205,8 @@ fn main() -> anyhow::Result<()> {
         generated_at: "synthetic:2026-05-12".to_string(),
         corpus_stats: CorpusStats {
             total_files: fixture_files.len() as u32 + code_samples.len() as u32,
-            total_bigrams: combined_df.values().map(|&v| v as u64).sum(),
-            unique_bigrams: weights.len(),
+            total_ngrams: combined_df.values().map(|&v| v as u64).sum(),
+            unique_ngrams: weights.len(),
             deduplicated_files: 0,
             language_breakdown,
         },

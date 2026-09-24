@@ -8,6 +8,7 @@
 //! - Error types use thiserror for ergonomic, typed handling
 //! - CLI/binary code in `crates/rskim/src/cmd/search.rs` handles all I/O
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -242,7 +243,13 @@ impl FileChangeInfo {
 pub struct CommitInfo {
     /// Full 40-character hex SHA of the commit.
     pub hash: String,
-    /// Unix timestamp (seconds since epoch, UTC).
+    /// Unix timestamp of the commit's **author** date (seconds since epoch, UTC).
+    ///
+    /// This is the author clock, NOT the committer clock.  Note that the
+    /// `lookback_days` cutoff in [`TemporalSource::parse_history`] filters on the
+    /// **committer** date (via `gix Sorting::ByCommitTimeCutoff`) — see AD-407-3
+    /// and AD-407-4.  Callers that implement the 30-day window (e.g. `changes_30d`)
+    /// compare this field against `now - 30 * 86400`.
     pub timestamp: i64,
     /// Author name (from git `author.name`).
     pub author: String,
@@ -297,12 +304,31 @@ pub struct TemporalMetadata {
     pub is_shallow: bool,
     /// Number of commits included in this result (equals `commits.len()`).
     pub commit_count: usize,
+    /// True when the commit walk was cut short by a safety cap (`MAX_COMMITS` or
+    /// `MAX_VISITED_COMMITS`).  Temporal scores are computed over a truncated
+    /// history; hot/risky rankings may under-represent files that are active only
+    /// in the capped portion of history.
+    ///
+    /// The caps that set this flag also emit an unconditional `eprintln!` at
+    /// build time, so the fail-loud contract is satisfied on the build path.
+    /// `rebuild_temporal` additionally persists the flag to the `temporal.db`
+    /// meta table under `META_HISTORY_TRUNCATED`; nothing reads that row yet.
+    /// Surfacing it at query time via the DegradedReason SSOT, the way
+    /// `is_shallow` is surfaced (AD-414-14), is follow-up work and is out of
+    /// scope for #407 (AC-18/AC-20 pin `--stats --json` as unchanged).
+    ///
+    /// `#[serde(default)]` ensures deserialization of older serialised payloads
+    /// (before this field existed) succeeds, treating absent as `false`.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Output of [`TemporalSource::parse_history`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryResult {
-    /// Commits ordered from newest to oldest.
+    /// Non-merge commits ordered from newest to oldest by **author** timestamp
+    /// (`CommitInfo::timestamp`).  Merge commits are excluded — see AD-407-1
+    /// and AD-407-2.
     pub commits: Vec<CommitInfo>,
     /// Summary metadata about the history traversal.
     pub metadata: TemporalMetadata,
@@ -315,9 +341,16 @@ pub struct HistoryResult {
 pub trait TemporalSource: Send + Sync {
     /// Parse git history for the repository at `repo_path`.
     ///
-    /// Returns commits ordered from newest to oldest, filtered to those whose
-    /// author timestamp falls within the last `lookback_days` days.
-    /// When `lookback_days` is `0`, all history is returned (no time filter).
+    /// Returns **non-merge commits** only (full-DAG walk, parity with
+    /// `git log --no-merges` — see AD-407-1, AD-407-2), ordered from newest to
+    /// oldest by **author** timestamp (`CommitInfo::timestamp`).
+    ///
+    /// When `lookback_days` is non-zero, commits whose **committer** date
+    /// (not author date) is older than `now - lookback_days * 86400` are
+    /// excluded.  This matches `git log --since` semantics as implemented by
+    /// `gix Sorting::ByCommitTimeCutoff` — see AD-407-3.  `CommitInfo::timestamp`
+    /// always carries the author date regardless of which clock drives the cutoff
+    /// (AD-407-4).  When `lookback_days` is `0`, all history is returned.
     ///
     /// # Errors
     /// Returns [`SearchError::Git`] on any git-level failure (not a repo,
@@ -366,6 +399,13 @@ pub struct SearchQuery {
     /// Not serialized — applied at query construction time in the CLI layer.
     #[serde(skip)]
     pub file_filter: Option<std::collections::HashSet<FileId>>,
+
+    /// v5 positional search: require contiguous, ordered phrase match.
+    #[serde(default)]
+    pub phrase: bool,
+    /// v5 positional search: max word-token distance for `--near N` (unordered).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near: Option<u32>,
 }
 
 impl SearchQuery {
@@ -381,6 +421,8 @@ impl SearchQuery {
             offset: None,
             bm25f_config: None,
             file_filter: None,
+            phrase: false,
+            near: None,
         }
     }
 }
@@ -477,7 +519,57 @@ pub struct IndexStats {
 /// Implementations are expected to be thread-safe (`Send + Sync`) so they can
 /// be shared across worker threads in parallel search pipelines.
 pub trait SearchLayer: Send + Sync {
-    /// Execute a search query and return ranked results.
+    /// Execute a search query and return ranked candidates.
+    ///
+    /// # Contract — candidates, not guaranteed matches
+    ///
+    /// The returned `Vec<SearchResult>` contains **scored candidates** from the
+    /// inverted index.  Each candidate has at least one n-gram overlap with the
+    /// query, **but is NOT guaranteed to contain the literal query string** — the
+    /// n-gram index is a fast candidate generator, not a substring filter.
+    ///
+    /// Consumers that require exact substring membership MUST apply a verification
+    /// step after calling `search`.  [`query_substring_present`] is the shared
+    /// predicate used by both the CLI layer and the bench harness.
+    ///
+    /// # Limit / offset semantics
+    ///
+    /// - When `query.limit` is `Some(n)`, the returned slice contains at most `n`
+    ///   candidates.  When `None`, the implementation may apply a default cap.
+    /// - When `query.offset` is `Some(k)`, the first `k` candidates (in rank order)
+    ///   are skipped.  When `None`, no candidates are skipped.
+    ///
+    /// # Two-mode dispatch (AD-372-1)
+    ///
+    /// The `NgramIndexReader` implementation dispatches on query shape after
+    /// extracting trigrams:
+    ///
+    /// 1. **Short-query fallback** (< 3 bytes → zero trigrams, AD-355-7 / AD-372-4):
+    ///    emits the FULL filtered candidate set as score-0 entries (no internal
+    ///    `take`); the caller's verify-then-truncate-LAST step is the only gate.
+    ///
+    /// 2. **Exact-symbol mode** (single contiguous token, ≥ 3 bytes, no interior
+    ///    whitespace — detected by [`crate::ngram::is_single_token`]):
+    ///    generates candidates via AND-intersection of the query trigrams'
+    ///    posting lists (grep-exact, limit/size-independent).  Ranked by
+    ///    raw occurrence-count (length-norm-free, AD-372-6) so
+    ///    large-file definers are not buried by BM25F field-length normalization.
+    ///    Callers on the pure-lexical path MUST set `query.limit = None` so the
+    ///    complete intersection is forwarded to the verify-then-truncate-LAST
+    ///    step (AD-372-3).
+    ///
+    /// 3. **Multi-word / UNION mode** (two or more whitespace tokens): the
+    ///    existing BM25F UNION loop with `collect_scored_results`, unchanged from
+    ///    pre-#372.
+    ///
+    /// # Short-query semantics (AD-355-7 / AD-372-4)
+    ///
+    /// For queries shorter than 3 bytes, `extract_query_ngrams` returns an empty
+    /// n-gram set.  The `NgramIndexReader` implementation emits ALL indexed files
+    /// (filtered by `file_filter` + `lang_filter`) as score-0 candidates with
+    /// **no internal pre-truncation**.  Caller-specified `limit`, `file_filter`,
+    /// and `lang_filter` are honoured; offset+limit are applied by the caller
+    /// AFTER verification.
     ///
     /// # Errors
     /// Returns [`SearchError`] if the query is invalid or the index is corrupted.
@@ -562,6 +654,633 @@ pub trait FieldClassifier: Send + Sync {
 }
 
 // ============================================================================
+// Verification predicate
+// ============================================================================
+
+/// Return `true` iff every whitespace-delimited token in `query` appears as a
+/// case-sensitive substring somewhere in `content`.
+///
+/// # Purpose
+///
+/// This predicate is the **shared verification gate** used by both the rskim CLI
+/// layer (`rskim::cmd::search`) and the rskim-bench harness to determine whether
+/// a [`SearchLayer::search`] candidate actually contains the literal query string.
+///
+/// The n-gram index is a fast candidate generator — it surfaces files with at
+/// least one n-gram overlap with the query, but does NOT guarantee that the
+/// literal query string is present in the file.  This function is the substring
+/// filter that both:
+///
+/// 1. The CLI path (`resolve_paths_and_snippets_verified`) applies after calling
+///    `search()` to drop false-positive candidates before presenting results to
+///    the user.
+/// 2. The bench harness (`rskim-bench`) applies to the raw `reader.search()`
+///    output so that AC1/AC4 precision metrics are measured over the same
+///    verified candidate surface that users see, not the raw unverified output.
+///
+/// # Semantics
+///
+/// - **Multi-token queries** (e.g. `"foo bar"`) require ALL tokens to appear
+///   somewhere in the content (AND semantics).  Tokens are split on whitespace.
+/// - **Empty / whitespace-only query**: treated as "not present" (`false`).  An
+///   empty token set would vacuously satisfy `.all()` and let all candidates
+///   through; explicit handling prevents that.
+/// - **Case-sensitive**: matches are byte-exact.  This is intentional — code
+///   identifiers and symbol names are case-sensitive in all supported languages.
+///
+/// This fn is pure (no I/O, no side effects) and can be unit-tested in isolation.
+#[must_use]
+pub fn query_substring_present(content: &str, query: &str) -> bool {
+    // Split on whitespace; require every non-empty token to appear in content.
+    //
+    // Defense-in-depth: if the token set is empty (empty query OR whitespace-only
+    // query), `.all()` would return vacuously true and let all candidates through.
+    // An empty/whitespace-only query is treated as "no match" (false).
+    let mut tokens = query.split_whitespace().peekable();
+    if tokens.peek().is_none() {
+        return false;
+    }
+    tokens.all(|token| content.contains(token))
+}
+
+/// Compute a content-derived anchor byte range for a lexical search result.
+///
+/// Returns the byte range whose `.start` is passed to `byte_offset_to_line` to
+/// produce the `line_number` shown in `--json` and text output.  When `None`
+/// the caller falls back to an empty/snippet-less result.
+///
+/// # AD-396-2 — Tiered anchor-selection rule
+///
+/// **Single-token queries:** returns the first (lowest byte offset) occurrence
+/// of the token in `content`.  Single-token anchor behaviour is unchanged from
+/// pre-#396 and satisfies AC20.
+///
+/// **Multi-token queries — Tier 1 (preferred):** scan lines and return the
+/// byte offset on the EARLIEST line that simultaneously contains ALL
+/// whitespace-delimited query tokens as substrings.  Matches `git grep -e
+/// tok1 --and -e tok2` semantics; the reported `line_number` is the strongest
+/// possible anchor for agent consumers piping `path:line` into file reads.
+///
+/// **Multi-token queries — Tier 2 (fallback, no Tier-1 line exists):** anchor
+/// on the first occurrence of the RAREST (most-selective) token.  Selectivity
+/// is approximated by the MAX trigram IDF weight from the token's byte windows
+/// (`TRIGRAM_WEIGHTS` / `lookup_weight` — pure in-memory, zero I/O).
+/// Tie-breaks (deterministic, AC18): highest selectivity wins; ties broken by
+/// longest token; further ties by earliest (lowest byte offset) occurrence.
+/// Tokens shorter than 3 bytes receive `DEFAULT_WEIGHT` (1.0) since they
+/// cannot produce trigrams.
+///
+/// # AD-396-3 — Verify-gate equivalence (load-bearing, not cosmetic)
+///
+/// `substring_first_anchor(c, q).is_some()` MUST equal
+/// `query_substring_present(c, q)` for ALL inputs:
+/// - Empty / whitespace-only query → `None` / `false`.
+/// - Multi-token AND: `Some(_)` ONLY when EVERY token is present.
+///   Returning `Some` when only the first token is found would WIDEN the CLI
+///   verify gate and silently admit false-positive candidates (ADR-007).
+/// - Case-sensitive byte-exact (AC12).
+///
+/// # AD-396-4 — Bounded, allocation-free scan
+///
+/// One `str::find` per token per line (Tier 1) or one `str::find` per token
+/// total (Tier 2) — the same cost as `query_substring_present`. No unbounded
+/// collection of occurrence positions.
+///
+/// # Reported line semantics (coordinate with #397 / #423)
+///
+/// The returned range's `.start` byte is passed to `byte_offset_to_line` to
+/// produce a 1-indexed line number (start line of the match).  `line_range`
+/// at the call site is the single anchor line `{n, n+1}` (AD-393-6).
+#[must_use]
+pub fn substring_first_anchor(content: &str, query: &str) -> Option<Range<usize>> {
+    // AD-396-3: empty / whitespace-only → None
+    // (equivalence with query_substring_present's vacuous-.all() guard).
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // AND-of-tokens pre-check — return None when ANY token is absent.
+    // This keeps is_some() == query_substring_present() (AD-396-3 load-bearing):
+    // returning Some when only the first token is present would widen the gate.
+    if !tokens.iter().all(|t| content.contains(t)) {
+        return None;
+    }
+
+    // ── Single-token fast path (AC20: behaviour unchanged) ───────────────────
+    if tokens.len() == 1 {
+        let token = tokens[0];
+        // Safe: AND-check above confirmed presence.
+        let start = content.find(token)?;
+        return Some(start..start + token.len());
+    }
+
+    // ── Multi-token: Tier 1 — earliest line with ALL tokens (AD-396-2 §T1) ──
+    // Scan lines (split on '\n'; handles CRLF since byte_offset_to_line counts
+    // '\n' bytes and str::find is byte-exact within the line slice).
+    let mut byte_offset: usize = 0;
+    for line in content.split('\n') {
+        if tokens.iter().all(|t| line.contains(t)) {
+            // Earliest token start on this line → anchor byte (AD-396-4: one
+            // find per token, no occurrence collection).
+            let first_in_line = tokens
+                .iter()
+                .filter_map(|t| line.find(t))
+                .min()
+                .unwrap_or(0); // all() guarantees at least one find() succeeds
+            let global_start = byte_offset + first_in_line;
+            // Return a 1-byte range; only .start is consumed by the caller.
+            return Some(global_start..global_start + 1);
+        }
+        // Advance past line bytes + the '\n' separator.
+        byte_offset += line.len() + 1;
+    }
+
+    // ── Multi-token: Tier 2 — rarest-token fallback (AD-396-2 §T2) ──────────
+    // Select the token with the highest max-trigram IDF weight (most selective);
+    // tie-break by length then earliest occurrence (AC18: deterministic).
+    let rarest = tokens.iter().copied().max_by(|a, b| {
+        let sel_a = token_max_trigram_weight(a);
+        let sel_b = token_max_trigram_weight(b);
+        // Higher selectivity wins; ties → longer token wins;
+        // further ties → earliest (lower) occurrence wins.
+        // In max_by, "Greater" = keep left; reverse-compare positions so
+        // lower pos_a produces Greater (i.e. a wins when pos_a < pos_b).
+        sel_a
+            .partial_cmp(&sel_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.len().cmp(&b.len()))
+            .then_with(|| {
+                let pos_a = content.find(a).unwrap_or(usize::MAX);
+                let pos_b = content.find(b).unwrap_or(usize::MAX);
+                pos_b.cmp(&pos_a) // reverse: lower pos → Greater → a wins
+            })
+    })?;
+
+    // AND-check above confirmed presence; find() here cannot fail.
+    let start = content.find(rarest)?;
+    Some(start..start + rarest.len())
+}
+
+/// Approximate the selectivity of `token` using the MAX trigram IDF weight of
+/// its byte windows (`TRIGRAM_WEIGHTS` table, pure in-memory, AD-396-2 §T2).
+///
+/// - Tokens with `len < 3` cannot produce trigrams → `DEFAULT_WEIGHT` (1.0),
+///   the least-selective value, so they always lose Tier-2 tie-breaks.
+/// - `max` rather than mean: one very rare trigram makes the whole token
+///   highly selective — the correct signal for rarest-token anchor selection.
+#[inline]
+fn token_max_trigram_weight(token: &str) -> f32 {
+    let bytes = token.as_bytes();
+    if bytes.len() < 3 {
+        return crate::weights::DEFAULT_WEIGHT;
+    }
+    bytes
+        .windows(3)
+        .map(|w| {
+            // Reuse the canonical trigram encoder (single source of truth,
+            // PF-004-safe u32 widening) rather than re-inlining the shift.
+            let key = crate::ngram::Ngram::from_bytes(w[0], w[1], w[2]).key();
+            crate::weights::lookup_weight(key, crate::weights::TRIGRAM_WEIGHTS)
+        })
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
+// ============================================================================
+// Token-exact positional predicates (#393)
+// ============================================================================
+
+/// Collect the byte spans (start..end, exclusive end) of each maximal ASCII
+/// word run (`[A-Za-z0-9_]+`) in `s`.
+///
+/// # AD-393-3 / AD-393-4 (D10): Query tokenization parity
+///
+/// Uses `crate::lexical::is_word_byte` — the single shared word-boundary
+/// predicate — so that this function, `word_token_indices` (indexer/reader),
+/// and `extract_query_positional_tokens` (n-gram builder) all tokenize
+/// identically.  A change to any one site will automatically propagate to the
+/// others, preventing the silent-empty / false-positive divergence class that
+/// #393 was introduced to fix.
+///
+/// Punctuation and non-ASCII bytes are separators — `foo::bar` yields
+/// `[foo, bar]` exactly as the indexer does.
+///
+/// Returns an empty `Vec` for empty or whitespace-only input.
+fn collect_word_spans(s: &str) -> Vec<(usize, usize)> {
+    let bytes = s.as_bytes();
+    // Pre-size with a fraction of the byte length to avoid growth-from-zero on the
+    // hot verify path (AC15: up to MAX_VERIFY_SCAN_BYTES content per candidate).
+    // Mirrors the `word_token_indices` indexer which uses `with_capacity(bytes.len())`.
+    // A fraction of 8 assumes ~8-byte average token+separator width (reliability rule:
+    // prefer pre-sized collections).
+    let mut spans = Vec::with_capacity(bytes.len() / 8 + 1);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if crate::lexical::is_word_byte(bytes[i]) {
+            let start = i;
+            while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            spans.push((start, i));
+        } else {
+            i += 1;
+        }
+    }
+    spans
+}
+
+/// Count the number of word tokens in a query string using the same tokenizer
+/// (`collect_word_spans` / D10 / `is_word_byte`) as the positional predicates.
+///
+/// Punctuation characters (`.`, `:`, `-`, etc.) act as separators, so
+/// `"foo::bar"` has two tokens and `"foo.bar baz"` has three — matching what
+/// `phrase_tokens_present` and `near_tokens_present` see when they evaluate
+/// the query.  This is the authoritative word-count for CLI diagnostics such as
+/// `near_diagnostic_notice`.
+#[must_use]
+pub fn count_query_word_tokens(s: &str) -> usize {
+    collect_word_spans(s).len()
+}
+
+/// AD-393-3: Token-exact phrase predicate. Tokenizes doc content with the SAME
+/// `word_token_indices` semantics as the indexer (see `collect_word_spans`) and
+/// requires each doc token to EQUAL the query word at consecutive ordinals —
+/// killing the trigram-containment/superstring false positive
+/// (`encode` ≠ `encode_length`).
+///
+/// Returns the byte-range of the first verified occurrence (from the first matched
+/// token's start byte to the last matched token's end byte) for snippet re-anchor
+/// in [`crate::cmd::search::snippet`]; `None` when the phrase is absent.
+///
+/// # Semantics
+///
+/// - **Case-sensitive byte-exact**: consistent with `query_substring_present`
+///   (AD-355-3).
+/// - **Query tokenization via `collect_word_spans`** (D10): punctuation and
+///   non-ASCII bytes are separators in both content and query, so
+///   `--phrase 'foo bar'` and `--phrase 'foo::bar'` yield identical results
+///   against content `foo::bar()`.
+/// - **Consecutive ordinals required**: content token at ordinal K must equal
+///   query word 0, content token K+1 must equal query word 1, etc.  Non-word
+///   bytes between tokens (parentheses, colons, spaces) do not break a phrase.
+/// - **Empty / whitespace-only query**: returns `None` (defense-in-depth).
+///
+/// This function is pure (no I/O, no side effects). It is the single correctness
+/// authority for `--phrase` at the CLI gate.
+#[must_use]
+pub fn phrase_tokens_present(content: &str, query: &str) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    let k = q_words.len();
+    if c_words.len() < k {
+        return None; // content has fewer words than query
+    }
+
+    // For each starting position i in the content word list, check whether the
+    // next k content words are byte-equal to the k query words (in order).
+    // Content words at positions i, i+1, …, i+k-1 have consecutive token
+    // ordinals (0-indexed), so consecutive ordinal alignment is implicit.
+    for i in 0..=(c_words.len() - k) {
+        let mut ok = true;
+        for j in 0..k {
+            let (cs, ce) = c_words[i + j];
+            let (qs, qe) = q_words[j];
+            if content[cs..ce] != query[qs..qe] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            let byte_start = c_words[i].0;
+            let byte_end = c_words[i + k - 1].1;
+            return Some(byte_start..byte_end);
+        }
+    }
+    None
+}
+
+/// AD-393-4: Token-exact proximity predicate. Requires an assignment of one
+/// **exact** (byte-equal, case-sensitive) doc token per query word with ordinal
+/// span `(max − min) ≤ n`, matching `near_match`'s span definition.
+///
+/// Returns the anchor byte-range (leftmost to rightmost matched token) of the
+/// first valid window (full leftmost-to-rightmost span, ≤ n tokens apart),
+/// or `None` when no such assignment exists.
+///
+/// Note: the returned span covers the full distance from the leftmost to the
+/// rightmost matched token in the window (not the minimal possible sub-span).
+/// For example, `near_tokens_present("a a b", "a b", 2)` returns the range
+/// covering the full `a a b` span (the window whose right-end qualified first),
+/// not the minimal `a b` sub-span. This is intentional — the span drives snippet
+/// re-anchoring (AD-393-6), where the wider window is more useful.
+///
+/// # Semantics
+///
+/// - **Query tokenization via `collect_word_spans`** (D10): same as reader.
+/// - **Distinct doc-token positions** (D11): duplicate query words (e.g.
+///   `--near 3 'foo foo'`) require two DISTINCT content token ordinals. If the
+///   content has only one occurrence of `foo`, `near_tokens_present` returns
+///   `None`. Enforced by counting how many times each query word appears in the
+///   current window and requiring `window_count(w) ≥ query_count(w)` for all `w`.
+/// - **Unordered**: unlike `phrase_tokens_present`, the matched tokens need not
+///   appear in query order — only within span `n`.
+/// - **Short words fully supported**: works for words < 3 bytes since no trigrams
+///   are involved — pure byte-equality over word runs.
+/// - **Empty / whitespace-only query**: returns `None`.
+///
+/// This function is pure (no I/O, no side effects). It is the single correctness
+/// authority for `--near` at the CLI gate.
+#[must_use]
+pub fn near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    if c_words.is_empty() {
+        return None;
+    }
+
+    let n = n as usize;
+
+    // Build q_counts: for each unique query word, how many times it must appear
+    // in a valid window (handles D11 distinct-position rule for duplicates).
+    let mut q_counts: HashMap<&str, usize> = HashMap::new();
+    for &(qs, qe) in &q_words {
+        *q_counts.entry(&query[qs..qe]).or_insert(0) += 1;
+    }
+    let num_unique = q_counts.len();
+
+    // Single-pass early-out + relevant-word collection.
+    //
+    // Previous code walked c_words (num_unique + 1) times: once per unique query
+    // word for the early-out totals, then once more to build `relevant`.  We
+    // combine both goals in one O(content_words) pass:
+    //   • accumulate per-word occurrence totals while filtering relevant words
+    //   • apply the early-out check once after the pass (O(num_unique))
+    //
+    // This is most impactful on the all-short --near fallback path, where
+    // short_query_fallback makes every file a candidate and each is fully scanned.
+    let mut totals: HashMap<&str, usize> = HashMap::new();
+    // Pre-size to c_words.len() (upper bound — at most every content word is
+    // relevant). Avoids growth-from-zero on the all-short --near fallback path
+    // where every file in the corpus is a candidate (reliability rule: prefer
+    // pre-sized collections, AC15 hot-path guard).
+    let mut relevant = Vec::with_capacity(c_words.len());
+    for (ci, &(cs, ce)) in c_words.iter().enumerate() {
+        let cw = &content[cs..ce];
+        if q_counts.contains_key(cw) {
+            *totals.entry(cw).or_insert(0) += 1;
+            relevant.push((ci, cw));
+        }
+    }
+
+    // Early-out: if any query word doesn't appear enough times in content,
+    // no valid assignment is possible.
+    for (&qw, &qc) in &q_counts {
+        if totals.get(qw).copied().unwrap_or(0) < qc {
+            return None;
+        }
+    }
+
+    // Sliding window over relevant content words.
+    // win_counts[w] = how many times word w appears in the current window.
+    // `have` = number of unique query words where win_counts[w] >= q_counts[w].
+    let mut win_counts: HashMap<&str, usize> = HashMap::new();
+    let mut have = 0usize;
+    let mut left = 0usize;
+
+    for right in 0..relevant.len() {
+        let (right_ord, right_word) = relevant[right];
+        let prev = win_counts.get(right_word).copied().unwrap_or(0);
+        let need = q_counts[right_word];
+        *win_counts.entry(right_word).or_insert(0) += 1;
+        if prev + 1 == need {
+            have += 1; // this query word is now fully covered in the window
+        }
+
+        // Shrink window from the left while the ordinal span exceeds n.
+        // Ordinal span = content index of right element − content index of left element.
+        while left <= right {
+            let (left_ord, _) = relevant[left];
+            if right_ord - left_ord > n {
+                let (_, left_word) = relevant[left];
+                // left_word was inserted during the right-scan above (via
+                // `.entry().or_insert(0) += 1`). It must be present; `if let`
+                // is used here to satisfy `-D clippy::expect_used / unwrap_used`
+                // while documenting the always-Some invariant.
+                let lc = win_counts.get(left_word).copied().unwrap_or(0);
+                if let Some(cnt) = win_counts.get_mut(left_word) {
+                    *cnt -= 1;
+                }
+                // Decrement `have` ONLY on the covered→under-covered transition,
+                // i.e. when the pre-removal count was EXACTLY the required
+                // multiplicity (`lc == need`). This mirrors the add-path guard
+                // `prev + 1 == need`. The prior condition `lc - 1 < need` also
+                // fired for an already-under-covered duplicate word (`lc < need`),
+                // which both dropped valid matches (false negative for repeated
+                // query words such as `--near N 'a a a'`) and could UNDERFLOW
+                // `have` (usize) when two under-covered duplicates were evicted in
+                // a single shrink — a debug panic / release wrap.
+                let left_need = q_counts.get(left_word).copied().unwrap_or(0);
+                if lc == left_need {
+                    have -= 1; // this word is no longer fully covered
+                }
+                left += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Check: window covers all unique query words with required multiplicity?
+        if have == num_unique {
+            // Return byte range: from the leftmost to rightmost matched word.
+            // These are the content word positions at the window boundaries.
+            let (left_ord, _) = relevant[left];
+            let byte_start = c_words[left_ord].0;
+            let byte_end = c_words[right_ord].1;
+            return Some(byte_start..byte_end);
+        }
+    }
+    None
+}
+
+/// Greedy fixed-ceiling scan for ordered proximity matching.
+///
+/// For each base ordinal in `d[0]` (ascending), attempts to assign a strictly-ascending
+/// ordinal from `d[j]` for `j = 1..k-1`, all within the fixed ceiling
+/// `base.saturating_add(n_span)`. Returns `(base_ord, last_ord)` for the leftmost
+/// valid assignment, or `None` when no valid assignment exists.
+///
+/// **Sync note**: the analogous counting variant `count_phrase_near_alignments`
+/// (reader.rs) operates over `u32` token positions widened to `u64` and counts all
+/// valid assignments rather than returning a range. The two must be kept in sync;
+/// the AC-403-2 identity test suite (positional_verify.rs) is the oracle guard.
+/// Widening difference: `u32`→`u64` in reader.rs, `u32`→`usize` here (usize is the
+/// natural domain for in-memory word-ordinal indices).
+fn greedy_phrase_near_scan(d: &[Vec<usize>], n_span: usize) -> Option<(usize, usize)> {
+    debug_assert!(d.len() >= 2, "caller ensures k >= 2 before delegating here");
+    for &base in &d[0] {
+        // Fixed ceiling: once the base is chosen, ceiling = base + n_span is
+        // immutable for this attempt. Saturating add prevents usize overflow for
+        // very large n (e.g. u32::MAX cast to usize on 32-bit platforms).
+        let ceiling = base.saturating_add(n_span);
+        let mut prev = base;
+        let mut last_ord = base;
+        let mut ok = true;
+        for d_j in &d[1..] {
+            // partition_point(|&p| p <= prev) → index of first p strictly greater
+            // than prev. d_j is sorted ascending, so this is O(log |d_j|).
+            let pos = d_j.partition_point(|&p| p <= prev);
+            match d_j.get(pos) {
+                Some(&p) if p <= ceiling => {
+                    prev = p;
+                    last_ord = p;
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            return Some((base, last_ord));
+        }
+    }
+    None
+}
+
+/// AD-403-2: Ordered proximity predicate. Requires an assignment of one exact
+/// (byte-equal, case-sensitive) doc token per query word at STRICTLY ASCENDING
+/// ordinals (query order enforced), with total ordinal span
+/// `(last_ordinal − first_ordinal) ≤ n`.
+///
+/// Returns the byte range of the LEFTMOST valid base position with the leftmost
+/// valid continuation at each step (`first_matched_token.start ..
+/// last_matched_token.end`), or `None` when no valid assignment exists.
+///
+/// This is the single correctness authority for `--phrase --near N` at the CLI gate.
+///
+/// # Contract (D-1 sign-off 2026-07-15)
+///
+/// - **Ordered + total span ≤ N**: unlike bare `--near N` (unordered, total span),
+///   this predicate additionally requires STRICTLY ASCENDING ordinals — query word
+///   order is enforced. Same N budget as `near_tokens_present` (AD-393-4).
+/// - **MONOTONE**: results of `--phrase --near N` are a strict subset of bare
+///   `--near N` results (ordering is an added constraint only). Adding `--phrase`
+///   may only narrow the result set, never grow it.
+/// - **IDENTITY**: for a k-word query, `phrase_near_tokens_present(c, q, k-1)`
+///   returns the same `Option<Range>` as `phrase_tokens_present(c, q)`. K distinct
+///   strictly-ascending positions with total span ≤ k−1 forces them consecutive.
+///   This identity is **predicate-level** (gate / file-membership): the verify gate
+///   guarantees that the untruncated result set is identical for `--phrase` and
+///   `--phrase --near(k-1)`. It does NOT extend to reader-level rank order: when the
+///   query contains sub-3-byte words, `count_phrase_near_alignments` (reader.rs) uses
+///   a looser span bound than `count_phrase_alignments` (the exact ordinal offsets),
+///   so files may rank differently under the two paths. With a tight `--limit`, the
+///   surviving set post-verify can differ. See the D-1 rank-identity scope note in
+///   `count_phrase_near_alignments` (reader.rs) and the regression fixture
+///   `ac403_2_d1_rank_identity_gap_short_word` in positional_verify.rs.
+/// - **ALGORITHM (greedy, no DP)**: Under total span, the ceiling `p0 + N` is
+///   FIXED once the base is chosen. Greedy smallest-valid-next is therefore complete
+///   (no DP needed). Proof: greedy's `p_j` is pointwise minimal over all valid
+///   assignments sharing base `p0`; if any valid assignment satisfies
+///   `p_{k-1} ≤ p0 + N`, greedy's does. Cross-check on the discriminating example:
+///   `alpha xx beta xx gamma`, query "alpha beta gamma", ordinals 0,2,4, span=4.
+///   Greedy at N=4: takes alpha@0 → beta@2 → gamma@4, and 4 ≤ 0+4, MATCH.
+///   At N=2: gamma@4 > 0+2, NO MATCH. Agrees with ground truth at both ends.
+/// - **ANCHOR RULE (user-visible)**: returns the LEFTMOST base (smallest d[0]
+///   position that admits a valid assignment), with the leftmost valid continuation
+///   at each step. This drives the AD-393-6 snippet re-anchor (line_number /
+///   line_range / snippet.lines[].is_match in `--json` output). Nondeterminism
+///   here would be user-visible across binary versions.
+/// - **5 MiB limit**: inherits the MAX_VERIFY_SCAN_BYTES boundary; a match
+///   straddling that offset is a false negative. A wide `--near N` window makes
+///   this more reachable than for `--phrase` alone.
+/// - **Why not delegate from `phrase_tokens_present`**: that function is an
+///   allocation-free early-exit sliding scan. This predicate materializes per-word
+///   position state and cannot early-exit as cheaply. Delegating would regress the
+///   most-used positional hot path (CLAUDE.md: prefer &str slices over allocation in
+///   hot paths). The two coexist; the identity property above is the oracle guard.
+///   `phrase_tokens_present` stays BYTE-UNCHANGED.
+/// - **Intentional duplication of the greedy scan**: `greedy_phrase_near_scan` above
+///   (ordinal/usize domain, returns a byte range) is deliberately separate from
+///   `count_phrase_near_alignments` in reader.rs (token-position/u32→u64 domain,
+///   counts all valid assignments). The two must be kept in sync; the AC-403-2
+///   identity test suite (positional_verify.rs) is the oracle guard. See the mirror
+///   note in `count_phrase_near_alignments`.
+///
+/// Coexists with AD-393-4's total-span rule for bare `--near` — N has one meaning
+/// CLI-wide. Extends AD-393-3 / AD-393-4.
+///
+/// # Semantics
+///
+/// - **Case-sensitive byte-exact** (AD-355-3): consistent with sibling predicates.
+/// - **Query tokenization via `collect_word_spans`** (D10): same as reader and
+///   indexer — punctuation and non-ASCII are separators.
+/// - **Empty / whitespace-only query**: returns `None`.
+/// - **Empty content**: returns `None`.
+#[must_use]
+pub fn phrase_near_tokens_present(content: &str, query: &str, n: u32) -> Option<Range<usize>> {
+    let q_words = collect_word_spans(query);
+    if q_words.is_empty() {
+        return None; // empty/whitespace-only query
+    }
+    let c_words = collect_word_spans(content);
+    if c_words.is_empty() {
+        return None;
+    }
+
+    let k = q_words.len();
+
+    // Single O(k + C) pass: build a HashSet of query words for O(1) membership
+    // checks, then scan content once and record ordinals only for query words
+    // actually found.  Without pre-population, word_positions.get(absent_word)
+    // returns None, which is the correct absent-word early-out signal below.
+    let q_word_set: std::collections::HashSet<&str> =
+        q_words.iter().map(|&(qs, qe)| &query[qs..qe]).collect();
+    let mut word_positions: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (ci, &(cs, ce)) in c_words.iter().enumerate() {
+        let cw = &content[cs..ce];
+        if q_word_set.contains(cw) {
+            word_positions.entry(cw).or_default().push(ci);
+        }
+    }
+
+    // Build d[j] = sorted ordinals for query word j; early-out if any absent.
+    // Ordinals are already in ascending order (enumerated sequentially above).
+    let mut d: Vec<Vec<usize>> = Vec::with_capacity(k);
+    for &(qs, qe) in &q_words {
+        let qw = &query[qs..qe];
+        let positions = word_positions.get(qw)?; // None → query word absent from content
+        d.push(positions.clone());
+    }
+
+    // k == 1: any occurrence of the single word is a valid match with span 0.
+    // Return the leftmost (first in d[0], which is the first occurrence).
+    if k == 1 {
+        let base = d[0][0];
+        let (cs, ce) = c_words[base];
+        return Some(cs..ce);
+    }
+
+    // Greedy fixed-ceiling scan (section 3.4 of plan; see greedy_phrase_near_scan).
+    // Widening: n is u32; cast to usize (the ordinal domain). saturating_add guards
+    // against overflow when n is very large (e.g. u32::MAX on 64-bit is safe; on a
+    // hypothetical 32-bit target it would saturate to usize::MAX, which is correct).
+    let n_span = n as usize;
+    greedy_phrase_near_scan(&d, n_span).map(|(base, last_ord)| {
+        // Leftmost base, leftmost continuation at each step → deterministic anchor.
+        let (cs, _) = c_words[base];
+        let (_, ce) = c_words[last_ord];
+        cs..ce
+    })
+}
+
+// ============================================================================
 // Error Types
 // ============================================================================
 
@@ -614,6 +1333,28 @@ pub enum SearchError {
     /// no rusqlite types leak into this enum.
     #[error("Database error: {0}")]
     Database(String),
+
+    /// The SQLite file is not a valid database (SQLITE_NOTADB) or is structurally
+    /// corrupt (SQLITE_CORRUPT).
+    ///
+    /// Distinguished from [`SearchError::Database`] so callers can trigger a
+    /// bounded discard-and-recreate rather than treating all open failures alike
+    /// (AD-414-2).  The inner string carries the rusqlite error message verbatim
+    /// for context; no structured rusqlite types are exposed.
+    #[error("Database corrupt: {0}")]
+    DatabaseCorrupt(String),
+
+    /// The `temporal.db` was written by a newer schema version than this binary
+    /// supports (forward-compat guard, `PRAGMA user_version`, AD-414-11).
+    ///
+    /// Refusal is the correct action: overwriting a newer-schema DB would
+    /// silently corrupt data or lose columns that a newer binary expects.
+    /// The user should upgrade skim rather than delete the file.
+    #[error(
+        "Database schema version {found} is newer than supported version {supported}; \
+         upgrade skim to open this database"
+    )]
+    UnsupportedSchemaVersion { found: i64, supported: i64 },
 
     /// AST processing error (e.g. grammar load failure for a tree-sitter language).
     ///
@@ -739,6 +1480,8 @@ mod tests {
             offset: Some(5),
             bm25f_config: None,
             file_filter: None,
+            phrase: false,
+            near: None,
         };
         assert_eq!(q.text, "find_me");
         assert_eq!(q.lang, Some(rskim_core::Language::Rust));
@@ -1218,4 +1961,163 @@ mod tests {
         // offsets 0 (line 1) and 2 (line 2) on "a\nb\nc"
         assert_eq!(compute_line_range(b"a\nb\nc", &[0..1, 2..3]), 1..3);
     }
+
+    // ========================================================================
+    // query_substring_present — unit tests (PF-007: discriminating observables)
+    // ========================================================================
+
+    /// Single token present in content → true.
+    /// Discriminating: would fail if the function returned vacuously true.
+    #[test]
+    fn test_query_substring_present_single_token_found() {
+        assert!(
+            query_substring_present("fn authenticate(token: &str) -> bool", "authenticate"),
+            "token present in content → true"
+        );
+    }
+
+    /// Single token absent from content → false.
+    /// Discriminating: guards against always-true implementation.
+    #[test]
+    fn test_query_substring_present_single_token_absent() {
+        assert!(
+            !query_substring_present("fn parse_config(s: &str) -> Option<String>", "authenticate"),
+            "token absent from content → false"
+        );
+    }
+
+    /// All tokens of a multi-word query present → true (AND semantics).
+    #[test]
+    fn test_query_substring_present_multi_token_all_found() {
+        let content = "pub fn authenticate(token: &str) -> bool { token.len() > 0 }";
+        assert!(
+            query_substring_present(content, "authenticate token"),
+            "all tokens present → true"
+        );
+    }
+
+    /// One token of a multi-word query absent → false.
+    /// Discriminating: would pass if OR semantics were used instead of AND.
+    #[test]
+    fn test_query_substring_present_multi_token_one_absent() {
+        let content = "pub fn authenticate(s: &str) -> bool { true }";
+        assert!(
+            !query_substring_present(content, "authenticate token"),
+            "one token absent → false (AND semantics required)"
+        );
+    }
+
+    /// Empty query → false (defense-in-depth: vacuous .all() guard).
+    /// Discriminating: without the empty-check, .all() on an empty iterator returns true.
+    #[test]
+    fn test_query_substring_present_empty_query_returns_false() {
+        assert!(
+            !query_substring_present("fn main() {}", ""),
+            "empty query must return false (vacuous-.all() guard)"
+        );
+    }
+
+    /// Whitespace-only query → false (same defense as empty query).
+    #[test]
+    fn test_query_substring_present_whitespace_query_returns_false() {
+        assert!(
+            !query_substring_present("fn main() {}", "   "),
+            "whitespace-only query must return false"
+        );
+    }
+
+    /// Case-sensitive: "Auth" does not match "auth".
+    /// Discriminating: would fail if case-insensitive matching were used.
+    #[test]
+    fn test_query_substring_present_case_sensitive() {
+        let content = "pub fn authenticate(s: &str) {}";
+        assert!(
+            !query_substring_present(content, "Authenticate"),
+            "match is case-sensitive; 'Authenticate' must not match 'authenticate'"
+        );
+        assert!(
+            query_substring_present(content, "authenticate"),
+            "exact-case 'authenticate' must match"
+        );
+    }
+
+    /// D10 / AD-393-3: `collect_word_spans` and `word_token_indices` MUST produce
+    /// identical token boundaries — they both use `is_word_byte` as their single
+    /// shared word-boundary predicate.
+    ///
+    /// This test sweeps a corpus covering: plain words, separator punctuation (`::`),
+    /// underscores, digits, leading/trailing separators, non-ASCII bytes, and mixed
+    /// content.  For each input it asserts that the word *strings* extracted by
+    /// `collect_word_spans` exactly agree with the word *strings* extracted by
+    /// slicing `word_token_indices` ordinals — proving byte-for-byte token parity.
+    ///
+    /// A future change to the word-byte rule in either function (e.g. adding `-` or
+    /// Unicode word chars) without updating the other would fail this test before
+    /// any index-build or CLI-query could silently diverge.
+    #[test]
+    fn collect_word_spans_agrees_with_word_token_indices() {
+        let corpus: &[&str] = &[
+            "foo::bar",
+            "encode_varint",
+            "let x = 42;",
+            "fn main() {}",
+            "  leading spaces",
+            "trailing spaces  ",
+            "caf\u{00e9}bar", // non-ASCII separator between ASCII words
+            "",
+            "   ",
+            "a b c",
+            "abc123_def",
+            ":: :: ::",
+            "foo",
+            "x",
+            "a1_b2_c3",
+        ];
+
+        for &s in corpus {
+            // Derive word strings from collect_word_spans.
+            let spans = collect_word_spans(s);
+            let from_spans: Vec<&str> = spans.iter().map(|&(st, en)| &s[st..en]).collect();
+
+            // Derive word strings from word_token_indices by grouping bytes by ordinal.
+            let indices = crate::lexical::word_token_indices(s);
+            let bytes = s.as_bytes();
+            let mut from_indices: Vec<&str> = Vec::new();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if crate::lexical::is_word_byte(bytes[i]) {
+                    let start = i;
+                    while i < bytes.len() && crate::lexical::is_word_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    // The indices produced by word_token_indices must be monotone
+                    // within this word run.
+                    let span_indices = &indices[start..i];
+                    let same_token = span_indices.windows(2).all(|w| w[0] == w[1]);
+                    assert!(
+                        same_token,
+                        "word_token_indices must be constant within a word run for {:?}; got {:?}",
+                        s, span_indices
+                    );
+                    from_indices.push(&s[start..i]);
+                } else {
+                    i += 1;
+                }
+            }
+
+            assert_eq!(
+                from_spans, from_indices,
+                "D10 parity failure for input {:?}: collect_word_spans={from_spans:?}, word_token_indices={from_indices:?}",
+                s
+            );
+        }
+    }
+
+    // Anchor unit tests (AD-396-2/3/4, PF-007) for substring_first_anchor,
+    // byte_offset_to_line, and query_substring_present live in
+    // crates/rskim/src/cmd/search/snippet_tests.rs (mod anchor_unit_tests).
+    // Those functions are public rskim_search exports; the tests run in the rskim
+    // binary test suite, which does not exhibit the dyld startup hang that affects
+    // the rskim-search lib test binary on this machine (see memory note
+    // rskim-search-testbinary-startup-hang for root cause).
 }

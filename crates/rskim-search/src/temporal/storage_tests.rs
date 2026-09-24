@@ -55,6 +55,27 @@ fn schema_version_is_2() {
     assert_eq!(db.schema_version().unwrap(), 2);
 }
 
+/// AC26 companion pin — `storage::CURRENT_VERSION == 2`.
+///
+/// This is the companion to `test_ac26_no_on_disk_format_version_is_bumped` in
+/// `rskim/src/cmd/search/index_tests.rs`, which pins the five format-version constants
+/// visible from `rskim` but cannot reach `rskim-search::temporal::storage::CURRENT_VERSION`
+/// (it is `const`, not `pub`).  Together they form one logical test: no on-disk format
+/// version is bumped by #413, so existing indexes do not trigger a user-visible rebuild.
+///
+/// Discriminating: bump `CURRENT_VERSION` (even to 3 then back) and this fails,
+/// alerting the developer that doing so would force every user's `temporal.db` to
+/// re-migrate on the next query.
+#[test]
+fn ac26_current_version_pin() {
+    assert_eq!(
+        super::CURRENT_VERSION,
+        2,
+        "AC26: CURRENT_VERSION must stay 2 — bumping it forces every user's temporal.db \
+         to re-migrate on the next query, not only previously-unresolvable roots"
+    );
+}
+
 #[test]
 fn open_idempotent() {
     let dir = TempDir::new().unwrap();
@@ -350,8 +371,158 @@ fn sync_rejects_over_capacity() {
             changes_90d: 0,
         })
         .collect();
-    let err = db.sync(&big, &[], &[], "head").unwrap_err();
+    let err = db.sync(&big, &[], &[], "head", false).unwrap_err();
     assert!(matches!(err, SearchError::CapacityExceeded(_)));
+}
+
+/// AD-407-9 (capacity ripple): `sync` MUST degrade co-changes gracefully when
+/// the co-change slice exceeds `MAX_ROWS_PER_TABLE`, rather than returning
+/// `CapacityExceeded` and rolling back the whole transaction (which would also
+/// lose hotspot and risk data).
+///
+/// The fix sorts the co-change rows by Jaccard score descending and keeps only
+/// the top `MAX_ROWS_PER_TABLE` pairs.  This test verifies three things:
+/// 1. `sync` returns `Ok(())` on an over-capacity co-change slice.
+/// 2. The co-change table contains exactly `MAX_ROWS_PER_TABLE` rows afterwards.
+/// 3. The row with the highest Jaccard score is present; the absolute lowest
+///    (jaccard ≈ 0.0) is absent (it was the one dropped).
+#[test]
+fn sync_cochanges_degrades_gracefully_over_capacity() {
+    let (_dir, db) = temp_db();
+    // 500,001 rows with strictly increasing Jaccard scores.
+    // Row 0 (jaccard = 0/500001 ≈ 0.0) is the one that must be dropped;
+    // row 500,000 (jaccard = 500000/500001 ≈ 1.0) is the one that must be kept.
+    // file_a = "a{n:07}", file_b = "z{n:07}" satisfies the file_a < file_b invariant.
+    let total = 500_001_usize;
+    let cochanges: Vec<CochangeRow> = (0..total)
+        .map(|n| CochangeRow {
+            file_a: format!("a{n:07}"),
+            file_b: format!("z{n:07}"),
+            count: 1,
+            jaccard: (n as f64) / (total as f64),
+        })
+        .collect();
+    // (1) sync must succeed even though cochanges exceeds 500,000 rows.
+    db.sync(&[], &[], &cochanges, "deadbeef", false)
+        .expect("sync must not fail on an oversized co-change set (degrade, not error)");
+    // (2) Exactly MAX_ROWS_PER_TABLE rows must be in the table.
+    let stored = db.load_cochanges().unwrap();
+    assert_eq!(
+        stored.len(),
+        500_000,
+        "co-change table must contain exactly MAX_ROWS_PER_TABLE rows after degradation"
+    );
+    // (3) The highest-Jaccard row (n=500,000) must be present; the lowest (n=0)
+    //     must be absent — it was the one sacrificed during degradation.
+    assert!(
+        stored.iter().any(|r| r.file_a == "a0500000"),
+        "highest-Jaccard row must be retained"
+    );
+    assert!(
+        stored.iter().all(|r| r.file_a != "a0000000"),
+        "lowest-Jaccard row (jaccard≈0.0) must have been dropped"
+    );
+}
+
+/// AD-407-9 (capacity ripple): `cochange_top_n` MUST order rows by
+/// `(jaccard desc, file_a asc, file_b asc)` so the set of rows that survives
+/// truncation is a function of the data alone.
+///
+/// Why the tie-break matters: Jaccard is a ratio of small integers, so equal
+/// scores at the truncation boundary are common.  Ordering on score alone leaves
+/// the surviving rows at the mercy of `sort_unstable_by`'s arbitrary handling of
+/// equal elements, so two builds of the same repository could write different
+/// co-change tables — a nondeterministic cache artifact that ADR-007's dog-food
+/// pass compares against ground truth (PF-012: determinism via a stable key).
+///
+/// Discriminating: drop the two `.then_with(...)` clauses from `cochange_top_n`
+/// and the equal-jaccard block below is no longer guaranteed to come back in
+/// `file_a` order, so the `expected` comparison fails.  Feeding the same rows in
+/// reverse input order and requiring an identical result is what makes this a
+/// determinism assertion rather than a restatement of the sort call.
+#[test]
+fn cochange_top_n_orders_deterministically_on_jaccard_ties() {
+    let row = |a: &str, b: &str, j: f64| CochangeRow {
+        file_a: a.to_string(),
+        file_b: b.to_string(),
+        count: 1,
+        jaccard: j,
+    };
+
+    // Three rows share jaccard 0.5; one is strictly higher and one strictly lower,
+    // so the tie-break is exercised in the middle of a real score ordering.
+    let rows = vec![
+        row("m.rs", "z.rs", 0.5),
+        row("a.rs", "b.rs", 0.9),
+        row("c.rs", "d.rs", 0.5),
+        row("c.rs", "e.rs", 0.5),
+        row("y.rs", "z.rs", 0.1),
+    ];
+
+    let expected = [
+        ("a.rs", "b.rs"), // highest jaccard
+        ("c.rs", "d.rs"), // tie at 0.5 → file_a asc, then file_b asc
+        ("c.rs", "e.rs"),
+        ("m.rs", "z.rs"),
+        ("y.rs", "z.rs"), // lowest jaccard
+    ];
+
+    let actual: Vec<(String, String)> = super::storage_ops::cochange_top_n(&rows)
+        .into_iter()
+        .map(|r| (r.file_a, r.file_b))
+        .collect();
+    let actual_refs: Vec<(&str, &str)> = actual
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    assert_eq!(
+        actual_refs,
+        expected.as_slice(),
+        "cochange_top_n must order by (jaccard desc, file_a asc, file_b asc)"
+    );
+
+    // Same multiset, different input order → byte-identical output order.
+    let mut reversed = rows.clone();
+    reversed.reverse();
+    let reversed_out: Vec<(String, String)> = super::storage_ops::cochange_top_n(&reversed)
+        .into_iter()
+        .map(|r| (r.file_a, r.file_b))
+        .collect();
+    assert_eq!(
+        reversed_out, actual,
+        "cochange_top_n output must not depend on input order — the surviving \
+         rows after truncation must be a function of the data alone (PF-012)"
+    );
+}
+
+/// AD-407-9 (capacity ripple): `store_cochanges` MUST degrade gracefully when
+/// the row slice exceeds `MAX_ROWS_PER_TABLE`, retaining the highest-Jaccard
+/// pairs rather than returning `CapacityExceeded`.
+#[test]
+fn store_cochanges_degrades_gracefully_over_capacity() {
+    let (_dir, db) = temp_db();
+    let total = 500_001_usize;
+    let rows: Vec<CochangeRow> = (0..total)
+        .map(|n| CochangeRow {
+            file_a: format!("a{n:07}"),
+            file_b: format!("z{n:07}"),
+            count: 1,
+            jaccard: (n as f64) / (total as f64),
+        })
+        .collect();
+    // store_cochanges must return Ok, not CapacityExceeded.
+    db.store_cochanges(&rows)
+        .expect("store_cochanges must not fail on an oversized slice");
+    let stored = db.load_cochanges().unwrap();
+    assert_eq!(
+        stored.len(),
+        500_000,
+        "co-change table must be capped at MAX_ROWS_PER_TABLE"
+    );
+    assert!(
+        stored.iter().all(|r| r.file_a != "a0000000"),
+        "lowest-Jaccard row must have been dropped"
+    );
 }
 
 // ============================================================================
@@ -673,6 +844,87 @@ fn top_risks_empty_returns_empty() {
 }
 
 // ============================================================================
+// #378 AC10 / AD-378-4: top_risks deterministic tie-break
+// ============================================================================
+
+/// AC10: rows with EQUAL risk_score are ordered by total_commits DESC.
+///
+/// Falsifiable: the higher-total_commits row MUST sort first even though both
+/// share an identical risk_score.
+#[test]
+fn top_risks_tie_break_by_total_commits_desc() {
+    let (_dir, db) = temp_db();
+    db.store_risks(&[
+        RiskRow {
+            file_path: "low_volume.rs".to_string(),
+            risk_score: 0.5,
+            total_commits: 3,
+            fix_commits: 1,
+            fix_density: 0.33,
+        },
+        RiskRow {
+            file_path: "high_volume.rs".to_string(),
+            risk_score: 0.5, // identical risk_score
+            total_commits: 40,
+            fix_commits: 12,
+            fix_density: 0.30,
+        },
+    ])
+    .unwrap();
+
+    let results = db.top_risks(10).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].file_path, "high_volume.rs",
+        "on equal risk_score, higher total_commits (40) must sort first (AC10)"
+    );
+    assert_eq!(results[1].file_path, "low_volume.rs");
+}
+
+/// AC10: rows with EQUAL risk_score AND total_commits are ordered by file_path
+/// ASC (lexicographic), and ordering is stable across repeated calls.
+#[test]
+fn top_risks_tie_break_by_path_asc_and_stable() {
+    let (_dir, db) = temp_db();
+    // Insert in non-sorted order to prove the ORDER BY (not insertion order) wins.
+    db.store_risks(&[
+        RiskRow {
+            file_path: "zebra.rs".to_string(),
+            risk_score: 0.21,
+            total_commits: 1,
+            fix_commits: 1,
+            fix_density: 1.0,
+        },
+        RiskRow {
+            file_path: "alpha.rs".to_string(),
+            risk_score: 0.21, // identical risk_score
+            total_commits: 1, // identical total_commits
+            fix_commits: 1,
+            fix_density: 1.0,
+        },
+        RiskRow {
+            file_path: "mango.rs".to_string(),
+            risk_score: 0.21,
+            total_commits: 1,
+            fix_commits: 1,
+            fix_density: 1.0,
+        },
+    ])
+    .unwrap();
+
+    let expected = ["alpha.rs", "mango.rs", "zebra.rs"];
+    // Stability: identical ordering across multiple calls.
+    for _ in 0..3 {
+        let results = db.top_risks(10).unwrap();
+        let paths: Vec<&str> = results.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(
+            paths, expected,
+            "equal (risk_score,total_commits) ties must order by file_path ASC, stably (AC10)"
+        );
+    }
+}
+
+// ============================================================================
 // Group 9: Regression — UNION ALL indexed cochange query (storage_ops:156)
 // ============================================================================
 
@@ -793,6 +1045,88 @@ fn top_coldspots_usize_max_does_not_overflow() {
 // ============================================================================
 // Group 11: Schema v2 migration (Step 3)
 // ============================================================================
+//
+// ============================================================================
+// Group 12: Regression — cochange tiebreak ORDER BY file_a ASC, file_b ASC
+// ============================================================================
+
+/// Regression: `cochanges_for_file` must apply `file_a ASC, file_b ASC` as a
+/// secondary tiebreak and NOT rely on UNION arm-1-first incidental order.
+///
+/// The query is a `UNION ALL` of two index scans:
+///   arm 1: `file_a = ?` — returns hub-as-file_a rows via the PK index
+///   arm 2: `file_b = ?` — returns hub-as-file_b rows via the secondary index
+///
+/// Without `file_a ASC, file_b ASC` the SQLite sort is undefined for equal-
+/// jaccard rows; in practice it preserves materialization order (arm 1 before
+/// arm 2).  So the arm-2 row `aaa.rs/hub.rs` (file_a="aaa.rs") would appear
+/// AFTER the arm-1 rows `hub.rs/mmm.rs` and `hub.rs/zzz.rs` (file_a="hub.rs"),
+/// even though "aaa.rs" < "hub.rs" lexically.
+///
+/// **Falsifiability**: removing `file_a ASC, file_b ASC` from the ORDER BY in
+/// `storage_ops::cochanges_for_file` would cause `results[0].file_a` to equal
+/// "hub.rs" (arm-1-first order), breaking the assertion below.
+#[test]
+fn cochanges_for_file_tiebreak_crosses_union_arms() {
+    let (_dir, db) = temp_db();
+
+    // All rows have jaccard=0.5 — fully tied on the primary sort key.
+    // Lexical order: "aaa.rs" < "hub.rs" < "mmm.rs" < "zzz.rs".
+    //
+    // Insert the arm-1 rows FIRST so they get lower rowids and SQLite
+    // materialises them before the arm-2 row during the UNION ALL.  Without the
+    // `file_a ASC, file_b ASC` tiebreak, that incidental materialization order
+    // would survive into the final result, placing hub.rs/* before aaa.rs/hub.rs.
+    db.store_cochanges(&[
+        CochangeRow {
+            // arm-1 hit (hub is file_a)
+            file_a: "hub.rs".to_string(),
+            file_b: "mmm.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+        CochangeRow {
+            // arm-1 hit (hub is file_a)
+            file_a: "hub.rs".to_string(),
+            file_b: "zzz.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+        CochangeRow {
+            // arm-2 hit (hub is file_b); file_a="aaa.rs" < "hub.rs" so the
+            // tiebreak ORDER BY must promote this row before the arm-1 rows.
+            file_a: "aaa.rs".to_string(),
+            file_b: "hub.rs".to_string(),
+            count: 1,
+            jaccard: 0.5,
+        },
+    ])
+    .unwrap();
+
+    let results = db.cochanges_for_file("hub.rs").unwrap();
+    assert_eq!(results.len(), 3, "all three rows must be returned");
+
+    // Expected ORDER BY jaccard DESC, file_a ASC, file_b ASC:
+    //   [0] aaa.rs/hub.rs  — file_a="aaa.rs" < "hub.rs"
+    //   [1] hub.rs/mmm.rs  — file_b="mmm.rs" < "zzz.rs" within equal file_a
+    //   [2] hub.rs/zzz.rs
+    assert_eq!(
+        results[0].file_a, "aaa.rs",
+        "file_a ASC tiebreak must promote the arm-2 row (aaa.rs/hub.rs) before \
+         arm-1 rows (hub.rs/*); without the tiebreak, UNION arm-1-first incidental \
+         order would return hub.rs first"
+    );
+    assert_eq!(results[0].file_b, "hub.rs");
+    assert_eq!(results[1].file_a, "hub.rs");
+    assert_eq!(
+        results[1].file_b, "mmm.rs",
+        "file_b ASC must order mmm.rs before zzz.rs within the same file_a"
+    );
+    assert_eq!(results[2].file_a, "hub.rs");
+    assert_eq!(results[2].file_b, "zzz.rs");
+}
+
+//
 
 #[test]
 fn v1_database_migrates_to_v2_on_reopen() {
@@ -831,5 +1165,142 @@ fn v1_database_migrates_to_v2_on_reopen() {
         db.schema_version().unwrap(),
         2,
         "v1 database should be migrated to v2 on reopen"
+    );
+}
+
+// ============================================================================
+// Group 9: Typed error classification (T-1 / T-2 — #414 Step 1)
+// ============================================================================
+
+/// T-1 (#414 AC-Step-1): garbage bytes (not a SQLite file) must produce
+/// `SearchError::DatabaseCorrupt`, not a generic `Database` error.
+///
+/// `TemporalDb::open` calls `Connection::open` which triggers a WAL pragma;
+/// that WAL `query_row` is the first SQLite operation on the corrupt file and
+/// returns `SQLITE_NOTADB` / `ErrorCode::NotADatabase`.  `classify_sqlite_err`
+/// must promote this to the `DatabaseCorrupt` variant so callers can
+/// distinguish "safe to discard and recreate" from "transient lock/I/O failure"
+/// (AD-414-2).
+#[test]
+fn t1_corrupt_file_returns_database_corrupt() {
+    use crate::types::SearchError;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("corrupt.db");
+    // Write 1024 bytes of 0xAB — deterministic, clearly not SQLite (PF-012).
+    std::fs::write(&path, vec![0xABu8; 1024]).unwrap();
+
+    let result = TemporalDb::open(&path);
+    assert!(result.is_err(), "corrupt file must fail to open");
+    match result.unwrap_err() {
+        SearchError::DatabaseCorrupt(msg) => {
+            // The error message should contain the rusqlite description.
+            assert!(
+                !msg.is_empty(),
+                "T-1: DatabaseCorrupt message must be non-empty"
+            );
+        }
+        other => panic!("T-1: expected SearchError::DatabaseCorrupt, got {other:?}"),
+    }
+}
+
+/// T-2 (#414 AC-Step-1): a future-schema DB must return
+/// `SearchError::UnsupportedSchemaVersion { found, supported }`, not a
+/// generic `Database` string.
+///
+/// The typed variant allows callers to emit an actionable message naming the
+/// exact versions without string-matching the error text (G-5 / AD-414-11).
+#[test]
+fn t2_future_schema_returns_unsupported_schema_version() {
+    use crate::types::SearchError;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("future.db");
+
+    // Stamp user_version = 99 — guaranteed > CURRENT_VERSION (2).
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+    }
+
+    let result = TemporalDb::open(&path);
+    assert!(result.is_err(), "future-schema DB must fail to open");
+    match result.unwrap_err() {
+        SearchError::UnsupportedSchemaVersion { found, supported } => {
+            assert_eq!(found, 99, "T-2: `found` must reflect the stamped version");
+            assert_eq!(
+                supported,
+                super::CURRENT_VERSION,
+                "T-2: `supported` must equal CURRENT_VERSION"
+            );
+        }
+        other => panic!("T-2: expected SearchError::UnsupportedSchemaVersion, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// Group 14: #407 TEMPORAL_DATA_VERSION == 2 pins (AC-10, AC-11)
+// ============================================================================
+
+/// T-10 (#407 AC-10): pin `TEMPORAL_DATA_VERSION == 2`.
+///
+/// AD-407-5: version 2 attests that the temporal data was produced by a
+/// full-DAG walk (`.first_parent_only()` removed from `parse_history`).
+/// A DB carrying `data_version = "1"` (first-parent-only walk) is stale
+/// and triggers one self-heal rebuild on the next query via the AD-408-4
+/// mechanism.  Changing this to 1 here means the bump regressed.
+#[test]
+fn test_temporal_data_version_is_two() {
+    assert_eq!(
+        super::TEMPORAL_DATA_VERSION,
+        2,
+        "T-10 (AC-10): TEMPORAL_DATA_VERSION must be 2 after the #407 full-DAG bump \
+         (AD-407-5); a value of 1 means the bump regressed and pre-#407 DBs will \
+         not be self-healed"
+    );
+}
+
+/// T-11 (#407 AC-10): `sync` MUST write `data_version = "2"` unconditionally.
+///
+/// `write_version_meta_in_tx` encodes `TEMPORAL_DATA_VERSION.to_string()` as
+/// the `data_version` meta row alongside `git_head`.  After the #407 bump
+/// the encoded value must be `"2"` so that `temporal_db_is_stale`'s Check 2
+/// (AD-408-4, `stored < current`) reports stale for any DB written by a
+/// pre-#407 binary.
+#[test]
+fn test_sync_writes_data_version_two() {
+    let (_dir, db) = temp_db();
+    db.sync(
+        &[],
+        &[],
+        &[],
+        "deadbeef01deadbeef01deadbeef01deadbeef01",
+        false,
+    )
+    .unwrap();
+    let version = db.get_meta(super::META_DATA_VERSION).unwrap();
+    assert_eq!(
+        version,
+        Some("2".to_string()),
+        "T-11 (AC-10): sync must write data_version = \"2\" after the #407 bump \
+         (write_version_meta_in_tx encodes TEMPORAL_DATA_VERSION.to_string())"
+    );
+}
+
+/// T-12 (#407 AC-11 NEGATIVE): `schema_version()` MUST still return 2.
+///
+/// #407 uses the AD-408-4 data-version self-heal, NOT a PRAGMA user_version
+/// schema migration.  `CURRENT_VERSION` stays 2; `run_migrations` gains no
+/// v3 block.  A bump to 3 here would force every user's `temporal.db` to
+/// re-migrate on the next query, which is the wrong mechanism for a data-only
+/// population change.  Guards against accidentally adding a migration block.
+#[test]
+fn test_schema_version_unchanged_at_two() {
+    let (_dir, db) = temp_db();
+    assert_eq!(
+        db.schema_version().unwrap(),
+        2,
+        "T-12 (AC-11): schema_version must remain 2 — #407 uses the AD-408-4 \
+         data-version self-heal, not a PRAGMA user_version migration"
     );
 }

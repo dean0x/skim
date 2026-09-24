@@ -17,7 +17,7 @@
 //! v2 extends `AstFileMetaEntry` from 5 to 15 bytes, adds `avg_max_depth` in
 //! previously-reserved header bytes [38..42], and stores synthetic n-grams from
 //! the AST Pattern Library alongside real n-grams. All v1 indexes must be
-//! rebuilt (`skim search index --rebuild`). Auto-rebuild is wired in Wave 3f/3g.
+//! rebuilt (`skim search --rebuild`). Auto-rebuild is wired in Wave 3f/3g.
 //!
 //! # Public API
 //!

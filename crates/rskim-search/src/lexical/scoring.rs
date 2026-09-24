@@ -86,6 +86,57 @@ pub fn bm25f_score(
     idf * (tf_weighted / (tf_weighted + k1))
 }
 
+/// Per-field-saturated BM25F scorer for the exact-symbol query path.
+///
+/// # AD-411-3
+///
+/// Formula:  `score = idf × Σ_f boost_f × (tf_f / (tf_f + k1))`
+///
+/// Unlike [`bm25f_score`] (which saturates the *weighted sum*), this function
+/// saturates each field contribution independently.  As `tf_f → ∞`, field `f`
+/// asymptotes to its boost (`boost_f × 1`).  A single high-boost definition
+/// occurrence therefore dominates any number of low-boost call-site occurrences:
+///
+/// ```text
+/// 1 FnSig (boost=8): 8 × (1 / 2.2) ≈ 3.64
+/// 52 FnBody (boost=1): 1 × (52 / 53.2) ≈ 0.98   → def wins
+/// ```
+///
+/// `idf = 1.0` is the conventional choice for the exact-symbol path (single
+/// term; ranking-neutral uniform scale across all documents for that term).
+///
+/// `field_b = 0` (set by [`BM25FConfig::for_exact_symbol`]) means `field_lengths`
+/// and `avg_field_lengths` are irrelevant here; the function ignores them.
+///
+/// # Arguments
+///
+/// * `idf` — inverse document frequency; use `1.0` on the exact-symbol path.
+/// * `field_tfs` — per-field whole-token occurrence counts for this document.
+/// * `config` — BM25F config; must have `field_b = [0; 8]` for exact-symbol use.
+#[must_use]
+pub fn bm25f_per_field_saturated_score(
+    idf: f64,
+    field_tfs: &[f32; FIELD_COUNT],
+    config: &BM25FConfig,
+) -> f64 {
+    let k1 = f64::from(config.k1);
+    let mut score: f64 = 0.0;
+    for (i, &tf_val) in field_tfs.iter().enumerate() {
+        let boost = f64::from(config.field_boosts[i]);
+        if boost == 0.0 {
+            continue;
+        }
+        let tf = f64::from(tf_val);
+        if tf == 0.0 {
+            continue;
+        }
+        // Per-field saturation: this field's contribution is capped at `boost`
+        // as tf → ∞ (denominator tf + k1 grows with tf, ratio → 1).
+        score += boost * (tf / (tf + k1));
+    }
+    idf * score
+}
+
 /// Return the [`SearchField`] with the highest term frequency in this document.
 ///
 /// When multiple fields share the maximum TF (including ties at zero), the

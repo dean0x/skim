@@ -1,0 +1,32 @@
+{
+  "mode": "blast-radius",
+  "target": "file1.ts",
+  "total": 5,
+  "results": [
+    {
+      "path": "file3.ts",
+      "jaccard": 0.2,
+      "count": 1
+    },
+    {
+      "path": "file4.ts",
+      "jaccard": 0.2,
+      "count": 1
+    },
+    {
+      "path": "file5.ts",
+      "jaccard": 0.2,
+      "count": 1
+    },
+    {
+      "path": "file6.ts",
+      "jaccard": 0.16666666666666666,
+      "count": 1
+    },
+    {
+      "path": "file2.ts",
+      "jaccard": 0.14285714285714285,
+      "count": 1
+    }
+  ]
+}

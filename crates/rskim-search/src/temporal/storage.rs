@@ -31,6 +31,17 @@ pub use storage_types::{CochangeRow, HotspotRow, RiskRow};
 #[path = "storage_ops.rs"]
 mod storage_ops;
 
+/// Minimum Jaccard similarity for co-change read-query results.
+///
+/// This constant is the single source of truth for the Jaccard filter that the
+/// co-change read query applies (`cochanges_for_file`). Write-side code that
+/// pre-filters emitted rows MUST use the same threshold so stored and queried
+/// values stay consistent (Decision O-D).
+///
+/// Value: 0.10 — empirically determined via co-change validation benchmark
+/// (#191); see `storage_ops::MIN_JACCARD_THRESHOLD` doc for rationale.
+pub const MIN_COCHANGE_JACCARD: f64 = storage_ops::MIN_JACCARD_THRESHOLD;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -55,6 +66,91 @@ pub const META_LAST_UPDATED: &str = "last_updated";
 /// Key storing the git HEAD SHA at the time of the last [`TemporalDb::sync`].
 pub const META_GIT_HEAD: &str = "git_head";
 
+/// Key storing the canonical git repository toplevel path at the time of the
+/// last [`TemporalDb::sync`] for an adopted subdirectory root (AD-413-16).
+///
+/// Written after `sync` completes (a second transaction on purpose — process
+/// death between the two leaves the anchor absent, which is the adopt-and-record
+/// case, never a false refusal). An absent row means "built before #413" and is
+/// adopted rather than refused.
+///
+/// No schema bump required: `meta` is a key/value table and `CURRENT_VERSION`
+/// and `TEMPORAL_DATA_VERSION` remain unchanged (AC26).
+pub const META_GIT_TOPLEVEL: &str = "git_toplevel";
+
+/// Version number attesting that the temporal data was written by a binary
+/// whose `rebuild_temporal` applies the **ghost filter** (v1, #408) AND walks
+/// the **full commit DAG** (not first-parent-only) (v2, #407).
+///
+/// AD-408-3: This const is the single source of truth for the self-heal
+/// contract: the data-version attests "written by a binary whose
+/// `rebuild_temporal` applies the ghost filter (v1, #408) AND walks the full
+/// commit DAG (v2, #407)." Written **unconditionally**
+/// in [`TemporalDb::sync`] — the only version-attesting write path (same
+/// choke point as `META_GIT_HEAD`), so the empty-history DB also carries it
+/// and the no-rebuild-loop invariant is preserved. Bump this const to force a
+/// future global rebuild of all `temporal.db` files on the next query.
+///
+/// AD-407-5: Bumped from 1 to 2 by ticket #407 (full-DAG walk). This is the
+/// AD-408-4 data-version self-heal mechanism — **NOT a PRAGMA user_version
+/// schema migration**. `CURRENT_VERSION` stays 2; `run_migrations` gains no
+/// v3 block. A `temporal.db` carrying `data_version = "1"` (produced by the
+/// pre-#407 first-parent-only walk) is stale and triggers one self-heal rebuild
+/// on the next query that writes `data_version = "2"`.
+///
+/// **One case where the self-heal is not one-shot:** when
+/// `temporal.db.build_backoff` contains the current HEAD+shallow pair,
+/// `rebuild_temporal_with_source` returns `Ok(())` immediately without calling
+/// `parse_history`. The DB remains at `data_version = "1"` until the sentinel
+/// clears (HEAD advances, shallow state changes, or explicit `--rebuild`).
+/// This is intentional: the sentinel prevents retrying a known-failing parse
+/// on every query while HEAD is stationary.
+///
+/// Note: a future caller using `store_*` / `set_meta(git_head)` directly
+/// would produce a DB with a HEAD but no `data_version` row — perpetually
+/// flagged stale. [`TemporalDb::sync`] is the only version-attesting write
+/// path; do not bypass it.
+pub const TEMPORAL_DATA_VERSION: u16 = 2;
+
+/// Meta table key storing the [`TEMPORAL_DATA_VERSION`] value.
+///
+/// Written unconditionally inside [`TemporalDb::sync`] alongside
+/// [`META_GIT_HEAD`] and [`META_LAST_UPDATED`] (AD-408-3).
+pub const META_DATA_VERSION: &str = "data_version";
+
+/// Meta table key storing whether the repository was shallow at build time.
+///
+/// AD-414-14: written as `"1"` when the `.git/shallow` file exists at
+/// `TemporalDb::sync` time (indicating a `git clone --depth N`).  When the
+/// stored value is `"1"` but `.git/shallow` is subsequently absent (because
+/// `git fetch --unshallow` ran), the shallow→full transition triggers a
+/// staleness rebuild so the now-reachable history is ingested.
+///
+/// Absent row (DBs written before AD-414-14 was implemented) means the check
+/// is skipped — no spurious rebuilds on upgrade.
+pub const META_IS_SHALLOW: &str = "is_shallow";
+
+/// Meta key that records whether the last build's commit walk was truncated by
+/// a safety cap (`MAX_COMMITS` or `MAX_VISITED_COMMITS`).
+///
+/// Value is `"1"` when truncated, `"0"` otherwise.  Written by
+/// `rebuild_temporal` via [`crate::temporal::storage_ops::TemporalDb::set_meta`]
+/// after a successful [`crate::temporal::storage_ops::TemporalDb::sync`], mapping
+/// [`crate::types::TemporalMetadata::truncated`] into the persistent meta table.
+/// Absent row means not truncated (builds before this field existed).
+///
+/// **Current scope — write-only.**  Nothing reads this key yet: the caps that
+/// set it are already announced by an unconditional `eprintln!` at build time
+/// (`WalkBudget` in `git_parser.rs`), so the fail-loud contract is met on the
+/// build path.  This row exists so the condition survives the build and can be
+/// inspected in an existing `temporal.db`.  Surfacing it at query time — a
+/// `DegradedReason` variant plus a `--stats --json` key, the way `is_shallow`
+/// is surfaced (AD-414-14) — is deliberately NOT part of #407: it would add a
+/// key to `--stats --json`, which AC-18/AC-20 pin as unchanged by this ticket.
+/// Tracked as follow-up work; do not document a query-time guarantee here until
+/// a reader exists.
+pub const META_HISTORY_TRUNCATED: &str = "history_truncated";
+
 // ============================================================================
 // Error helper
 // ============================================================================
@@ -65,6 +161,30 @@ pub const META_GIT_HEAD: &str = "git_head";
 #[inline]
 pub(super) fn db_err(e: impl std::fmt::Display) -> SearchError {
     SearchError::Database(e.to_string())
+}
+
+/// Classify a rusqlite error into the most specific [`SearchError`] variant.
+///
+/// Returns [`SearchError::DatabaseCorrupt`] for `SQLITE_NOTADB`
+/// (`ErrorCode::NotADatabase`) and `SQLITE_CORRUPT` (`ErrorCode::DatabaseCorrupt`),
+/// which signal that the file is structurally invalid and can be safely discarded
+/// and recreated (AD-414-2, bounded self-heal).  All other errors fall through to
+/// [`SearchError::Database`] so the distinction is tight and never misclassifies a
+/// transient I/O failure or a lock-contention error as corruption.
+///
+/// Verified against `rusqlite = "0.31"` / `libsqlite3-sys 0.28` where both
+/// `ErrorCode::NotADatabase` (SQLITE_NOTADB = 26) and `ErrorCode::DatabaseCorrupt`
+/// (SQLITE_CORRUPT = 11) exist as named variants.
+pub(super) fn classify_sqlite_err(e: &rusqlite::Error) -> SearchError {
+    use rusqlite::ErrorCode;
+    match e {
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(f.code, ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt) =>
+        {
+            SearchError::DatabaseCorrupt(e.to_string())
+        }
+        _ => SearchError::Database(e.to_string()),
+    }
 }
 
 // ============================================================================
@@ -84,13 +204,16 @@ pub(super) fn db_err(e: impl std::fmt::Display) -> SearchError {
 fn run_migrations(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(db_err)?;
+        .map_err(|e| classify_sqlite_err(&e))?;
 
     if version > CURRENT_VERSION {
-        return Err(SearchError::Database(format!(
-            "database schema version {version} is newer than supported version \
-             {CURRENT_VERSION}; upgrade rskim-search to open this database"
-        )));
+        // AD-414-11: return the typed variant so callers can distinguish a
+        // forward-compat refusal (upgrade skim) from an I/O error (retry later)
+        // or structural corruption (discard and recreate).
+        return Err(SearchError::UnsupportedSchemaVersion {
+            found: version,
+            supported: CURRENT_VERSION,
+        });
     }
 
     if version < 1 {
@@ -129,7 +252,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
             COMMIT;",
         )
-        .map_err(db_err)?;
+        .map_err(|e| classify_sqlite_err(&e))?;
     }
 
     if version < 2 {
@@ -146,7 +269,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
 
             COMMIT;",
         )
-        .map_err(db_err)?;
+        .map_err(|e| classify_sqlite_err(&e))?;
     }
 
     Ok(())
@@ -187,10 +310,16 @@ impl TemporalDb {
     ///
     /// # Errors
     ///
-    /// Returns [`SearchError::Database`] if the file cannot be opened, the
-    /// WAL pragma fails, or the migrations fail (including forward-compat guard).
+    /// - [`SearchError::DatabaseCorrupt`] if the file is not a valid SQLite
+    ///   database or its pages are internally inconsistent (`SQLITE_NOTADB` /
+    ///   `SQLITE_CORRUPT`); the caller may safely discard and recreate the file.
+    /// - [`SearchError::UnsupportedSchemaVersion`] if the stored
+    ///   `PRAGMA user_version` is newer than this build supports (forward-compat
+    ///   guard, AD-414-11); the file must **not** be overwritten — upgrade skim.
+    /// - [`SearchError::Database`] for everything else, including WAL-pragma
+    ///   failure, lock-contention, and unexpected migration errors.
     pub fn open(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(db_path).map_err(db_err)?;
+        let conn = Connection::open(db_path).map_err(|e| classify_sqlite_err(&e))?;
 
         // Restrict file permissions to owner-only on Unix.
         #[cfg(unix)]
@@ -208,18 +337,56 @@ impl TemporalDb {
         }
 
         conn.busy_timeout(Duration::from_millis(5_000))
-            .map_err(db_err)?;
+            .map_err(|e| classify_sqlite_err(&e))?;
 
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-            .map_err(db_err)?;
+            .map_err(|e| classify_sqlite_err(&e))?;
         if journal_mode.to_lowercase() != "wal" {
             return Err(SearchError::Database(format!(
                 "failed to enable WAL mode; journal_mode is '{journal_mode}'"
             )));
         }
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
-            .map_err(db_err)?;
+            .map_err(|e| classify_sqlite_err(&e))?;
+
+        run_migrations(&conn)?;
+
+        Ok(Self { conn })
+    }
+
+    /// Open an existing `temporal.db` for read-write WITHOUT creating a new file.
+    ///
+    /// Identical to [`Self::open`] except it uses
+    /// `SQLITE_OPEN_READ_WRITE` without `SQLITE_OPEN_CREATE`, so a file that
+    /// was deleted between the caller's existence check and this call is NOT
+    /// silently recreated as an empty schema-2 DB.  Returns `Err` if the file
+    /// does not exist or cannot be opened.
+    ///
+    /// Used by the parse-failure branch of `rebuild_temporal_with_source` to
+    /// update `META_IS_SHALLOW` in an existing DB without the TOCTOU side
+    /// effect of creating a phantom DB (P3-5 / 2026-09-03).
+    pub fn open_existing(db_path: &Path) -> Result<Self> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| classify_sqlite_err(&e))?;
+
+        conn.busy_timeout(Duration::from_millis(5_000))
+            .map_err(|e| classify_sqlite_err(&e))?;
+
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(|e| classify_sqlite_err(&e))?;
+        if journal_mode.to_lowercase() != "wal" {
+            return Err(SearchError::Database(format!(
+                "failed to enable WAL mode; journal_mode is '{journal_mode}'"
+            )));
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")
+            .map_err(|e| classify_sqlite_err(&e))?;
 
         run_migrations(&conn)?;
 
@@ -239,6 +406,30 @@ impl TemporalDb {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(db_err)
     }
+
+    // ========================================================================
+    // Meta access through an already-open connection
+    // ========================================================================
+
+    /// Read a single TEXT value from the `meta` table of this open connection.
+    ///
+    /// Used by callers that need to read meta through an already-open connection
+    /// to avoid opening a second SQLite connection for the same data.
+    /// Returns `None` when the key is absent or the query fails.
+    ///
+    /// Currently used by `rskim::cmd::search::temporal_state::anchor_state_on_db`
+    /// to read `META_GIT_TOPLEVEL` through the connection the caller already
+    /// holds, avoiding a second read-only open of the same file
+    /// (Finding 4 / AD-413-16).
+    pub fn read_meta(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
 }
 
 // ============================================================================
@@ -246,7 +437,7 @@ impl TemporalDb {
 // ============================================================================
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "storage_tests.rs"]
 mod tests;
 

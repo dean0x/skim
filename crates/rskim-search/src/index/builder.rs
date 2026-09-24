@@ -12,15 +12,34 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use super::format::{
-    FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, POSTING_ENTRY_SIZE, PostingEntry,
-    SKIDX_ENTRY_SIZE, SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry,
-    encode_file_meta, encode_header, encode_posting, lang_to_id,
+    FILE_META_SIZE, FORMAT_VERSION, FileMetaEntry, PostingEntry, SKIDX_ENTRY_SIZE,
+    SKIDX_HEADER_SIZE, SKIDX_MAGIC, SkidxEntry, SkidxHeader, encode_entry, encode_file_meta,
+    encode_header, encode_postings_varint, lang_to_id,
 };
 use super::reader::NgramIndexReader;
 use crate::{
     FIELD_COUNT, FileId, LayerBuilder, Result, SearchError, SearchField, SearchLayer,
     io_util::atomic_write,
 };
+
+/// Capacity-hint upper bound (bytes per posting entry) for the postings buffer
+/// in [`NgramIndexBuilder::serialize_index`].
+///
+/// A v7 entry is `[varint delta_doc_id][u8 field_id][varint delta_position]
+/// [varint delta_token_position][varint delta_token_length]`.  The maximum
+/// varint width is 5 bytes each (35-bit span for a u32), giving
+/// 5 + 1 + 5 + 5 + 5 = 21 bytes as the strict upper bound.  We use 12 as a
+/// generous over-estimate of the typical entry (~2.15x the measured v7 average
+/// of ~5.57 bytes/entry on a diverse 1000-file corpus) to avoid reallocation
+/// during index build.  After encoding, `postings_buf.shrink_to_fit()` releases
+/// the unused capacity before CRC computation and `atomic_write`, so peak RSS
+/// reflects the actual encoded size rather than the upper-bound estimate.
+/// The buffer is build-time only.
+///
+/// Framing: this is a zero-realloc-during-encode / peak-RSS trade-off.
+/// The excess capacity is held only for the duration of the encode loop;
+/// `shrink_to_fit` reclaims it immediately after.
+const VARINT_UPPER_BOUND_PER_ENTRY: usize = 12;
 
 // ============================================================================
 // Public builder struct
@@ -37,8 +56,8 @@ use crate::{
 pub struct NgramIndexBuilder {
     /// Directory where `index.skidx` and `index.skpost` will be written.
     output_dir: PathBuf,
-    /// Accumulated postings: bigram key → list of (doc_id, field_id, position).
-    postings: HashMap<u16, Vec<PostingEntry>>,
+    /// Accumulated postings: trigram key → list of (doc_id, field_id, position).
+    postings: HashMap<u32, Vec<PostingEntry>>,
     /// Per-file metadata in insertion order (indexed by sequential file_index).
     file_meta: Vec<FileMetaEntry>,
     /// Guard against duplicate FileIds.
@@ -138,13 +157,31 @@ impl NgramIndexBuilder {
             field_lengths,
         });
 
-        // Scan every 2-byte window, resolving the field via a linearly advancing
-        // pointer through field_map.  Because positions increase monotonically and
-        // field_map is sorted ascending, a single forward scan is O(n + m) instead
-        // of the O(n log m) cost of calling binary search once per window.
+        // Scan every 3-byte window (trigram), resolving the field via a linearly
+        // advancing pointer through field_map.  Because positions increase
+        // monotonically and field_map is sorted ascending, a single forward scan
+        // is O(n + m) instead of O(n log m).
+        //
+        // AD-355-5 / PF-004: widen each byte to u32 before shift arithmetic to
+        // prevent u8 overflow: `u32::from(b) << k`, never `b << k`.
         let bytes = content.as_bytes();
+
+        // AD-411-7: obtain per-byte token ordinal AND per-byte token length in a
+        // single O(n) pass so that both arrays are always derived from the same
+        // traversal of is_word_byte.  This is the SSOT fix: word-run boundaries
+        // are defined once inside word_token_indices_and_lengths (tokenize.rs),
+        // not in a separate inline loop here.
+        //
+        // token_of_byte[i]     — word-token ordinal for posting.token_position
+        // token_length_of_byte[i] — run length for posting.token_length (0 for
+        //   non-word bytes, which are never the start byte of a query trigram)
+        let (token_of_byte, token_length_of_byte) =
+            crate::lexical::word_token_indices_and_lengths(content);
+        debug_assert_eq!(token_of_byte.len(), content.len());
+        debug_assert_eq!(token_length_of_byte.len(), content.len());
+
         let mut range_idx = 0usize;
-        for (pos, window) in bytes.windows(2).enumerate() {
+        for (pos, window) in bytes.windows(3).enumerate() {
             // Advance past any ranges that have ended before `pos`.
             while range_idx < field_map.len() && field_map[range_idx].0.end <= pos {
                 range_idx += 1;
@@ -154,11 +191,17 @@ impl NgramIndexBuilder {
             } else {
                 SearchField::Other.discriminant()
             };
-            let key = (u16::from(window[0]) << 8) | u16::from(window[1]);
+            let token_position = token_of_byte[pos];
+            let token_length = token_length_of_byte[pos];
+            // PF-004: widen to u32 before shifting — never shift on a bare u8.
+            let key =
+                (u32::from(window[0]) << 16) | (u32::from(window[1]) << 8) | u32::from(window[2]);
             self.postings.entry(key).or_default().push(PostingEntry {
                 doc_id: id.0,
                 field_id,
                 position: pos as u32,
+                token_position,
+                token_length,
             });
         }
 
@@ -255,7 +298,7 @@ impl LayerBuilder for NgramIndexBuilder {
         for list in self.postings.values_mut() {
             list.sort_unstable();
         }
-        let mut sorted_keys: Vec<u16> = self.postings.keys().copied().collect();
+        let mut sorted_keys: Vec<u32> = self.postings.keys().copied().collect();
         sorted_keys.sort_unstable();
 
         // Serialise everything into the two on-disk buffers.
@@ -265,10 +308,20 @@ impl LayerBuilder for NgramIndexBuilder {
         let post_path = self.output_dir.join("index.skpost");
         let idx_path = self.output_dir.join("index.skidx");
 
+        // Invalidate any prior validity marker BEFORE writing fresh files
+        // (#376, AD-376-4).  The (len, mtime, checksum) signature already
+        // self-invalidates on rewrite, but unlinking defensively means a
+        // partial or aborted rebuild can never leave a stale marker that would
+        // validate the wrong bytes on the next open.
+        crate::validity::unlink_marker_best_effort(&self.output_dir.join("index.skverify"));
+
         // Atomic writes: .skpost first, .skidx second (commit point).
         atomic_write(&self.output_dir, &post_path, &postings_buf)?;
         atomic_write(&self.output_dir, &idx_path, &skidx_buf)?;
 
+        // Verify-back open re-validates the freshly-written bytes and stamps a
+        // new index.skverify (AD-376-3 / AC8) so the first post-build query
+        // skips the redundant full CRC32.
         let reader = NgramIndexReader::open(&self.output_dir)?;
         Ok(Box::new(reader))
     }
@@ -277,43 +330,60 @@ impl LayerBuilder for NgramIndexBuilder {
 impl NgramIndexBuilder {
     /// Serialise postings, entries, file metadata, and header into the two
     /// on-disk byte buffers: `(postings_buf, skidx_buf)`.
+    ///
+    /// # AD-LXPOST-1
+    ///
+    /// Postings are encoded using v5 delta+varint compression (see
+    /// [`encode_postings_varint`]).  Each posting list is sorted ascending by
+    /// `(doc_id, field_id, position)` before encoding so that each
+    /// `delta_doc_id` and `delta_position` is a forward, non-wrapping step
+    /// within its `(doc_id, field_id)` run.
     fn serialize_index(
         &self,
-        sorted_keys: &[u16],
+        sorted_keys: &[u32],
         avg_doc_length: f32,
         avg_field_lengths: [f32; FIELD_COUNT],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        // Serialise posting lists and build the entry table.
-        let total_posting_bytes: usize = self
+        // Serialise posting lists using v7 variable-length (delta+varint) codec.
+        // Pre-size at VARINT_UPPER_BOUND_PER_ENTRY (= 12) per entry.  This is
+        // ~2.15x the measured v7 average of ~5.57 bytes/entry — a deliberate
+        // peak-memory/zero-realloc trade-off (see constant comment above).  The
+        // strict worst-case is 21 bytes/entry; 12 avoids that extra headroom
+        // while still guaranteeing zero reallocations in practice.
+        let estimated_capacity: usize = self
             .postings
             .values()
-            .map(|v| v.len() * POSTING_ENTRY_SIZE)
+            .map(|v| v.len() * VARINT_UPPER_BOUND_PER_ENTRY)
             .fold(0usize, usize::saturating_add);
-        let mut postings_buf: Vec<u8> = Vec::with_capacity(total_posting_bytes);
+        let mut postings_buf: Vec<u8> = Vec::with_capacity(estimated_capacity);
         let mut entries: Vec<SkidxEntry> = Vec::with_capacity(sorted_keys.len());
 
         for key in sorted_keys {
             let list = &self.postings[key];
             let offset = postings_buf.len() as u64;
-            let byte_len = list.len().checked_mul(POSTING_ENTRY_SIZE).ok_or_else(|| {
-                SearchError::IndexCorrupted(format!(
-                    "posting list for key {key:#06x} overflows usize"
-                ))
-            })?;
+            // Encode this posting list with delta+varint (AD-LXPOST-1, FORMAT_VERSION v7).
+            // The list is already sorted by (doc_id, field_id, position) — the caller
+            // (build()) calls list.sort_unstable() before reaching here.
+            encode_postings_varint(list, &mut postings_buf);
+            let byte_len = postings_buf.len() as u64 - offset;
             let length = u32::try_from(byte_len).map_err(|_| {
                 SearchError::IndexCorrupted(format!(
-                    "posting list for key {key:#06x} exceeds u32::MAX bytes ({byte_len})"
+                    "posting list for key {key:#010x} exceeds u32::MAX bytes ({byte_len})"
                 ))
             })?;
-            for p in list {
-                postings_buf.extend_from_slice(&encode_posting(p));
-            }
             entries.push(SkidxEntry {
                 ngram_key: *key,
                 posting_offset: offset,
                 posting_length: length,
             });
         }
+
+        // Release the over-allocated capacity before CRC and write.
+        // shrink_to_fit reclaims the VARINT_UPPER_BOUND_PER_ENTRY slack so peak
+        // RSS during CRC computation and atomic_write reflects the encoded size,
+        // not the upper-bound estimate.  Build-time only — the buffer is dropped
+        // after atomic_write returns.
+        postings_buf.shrink_to_fit();
 
         // Serialise file metadata.
         let mut meta_buf: Vec<u8> = Vec::with_capacity(self.file_meta.len() * FILE_META_SIZE);
@@ -327,8 +397,20 @@ impl NgramIndexBuilder {
             entries_buf.extend_from_slice(&encode_entry(e));
         }
 
-        // CRC32 over entries + file metadata.
+        // CRC32 over postings + entries + file metadata (#364: integrity guard).
+        //
+        // v4 posting integrity: the old fixed-stride guard
+        // (is_multiple_of(POSTING_ENTRY_SIZE)) was removed because varint byte
+        // counts are not a multiple of 9.  Folding postings_buf into the CRC
+        // replaces that structural guard with a value-integrity check: a
+        // bit-flip inside a posting blob that would otherwise produce wrong-but-
+        // bounded (doc_id, position) values and silently mis-rank results is now
+        // detected in NgramIndexReader::open before any query can run.
+        //
+        // Ordering: postings first, then entries, then meta — must match the
+        // verification order in NgramIndexReader::open (reader.rs).
         let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&postings_buf);
         hasher.update(&entries_buf);
         hasher.update(&meta_buf);
         let checksum = hasher.finalize();

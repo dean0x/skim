@@ -75,7 +75,7 @@ filetime = "0.2"
 crossbeam-channel = "0.5"
 static_assertions = "1.1"
 trybuild = "1.0"
-gix = { version = "0.72", default-features = false, features = ["max-performance-safe", "blob-diff"] }
+gix = { version = "0.72", default-features = false, features = ["max-performance-safe", "blob-diff", "index"] }
 quick-xml = "0.37"
 # Optional synchronous HTTP client for rskim-tokens net-anthropic feature.
 # Uses rustls for TLS (transitive via ureq 3.x); json feature not needed — net.rs uses serde_json directly.

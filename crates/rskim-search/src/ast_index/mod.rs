@@ -29,6 +29,8 @@
 //! let weight = ast_bigram_idf(Language::Rust, bigram);
 //! ```
 
+pub mod ast_cache;
+pub mod coverage;
 mod extract;
 mod linearize;
 mod ngram;
@@ -51,9 +53,17 @@ pub(crate) mod structural;
 /// with a raw `u16`.
 pub type NodeKindId = u16;
 
+pub use ast_cache::{
+    AstNgramCache, CACHE_FILENAME as AST_CACHE_FILENAME,
+    CACHE_FORMAT_VERSION as AST_CACHE_FORMAT_VERSION, CachedAstEntry,
+};
+pub use coverage::{
+    AST_COVERAGE_EXCLUDED_SAMPLE_CAP, AstCoverage, AstExcludedFile, CoverageEntry, ast_coverage,
+};
 pub use extract::{
     AstBigramEntry, AstNgramSet, AstTrigramEntry, extract_ast_ngrams,
-    extract_ast_ngrams_with_metrics, extract_ast_ngrams_with_weights,
+    extract_ast_ngrams_with_lines, extract_ast_ngrams_with_metrics,
+    extract_ast_ngrams_with_weights, synthetic_key_present,
 };
 pub use linearize::{LinearNode, LinearizeResult, linearize_source};
 pub use ngram::{
@@ -65,4 +75,9 @@ pub use query::{
     AST_BM25_B, AST_BM25_K1, AstPostingSource, AstQuery, AstQueryEngine, parse_ast_query,
 };
 pub use store::{AstFileMetaEntry, AstIndexBuilder, AstIndexReader, AstPosting};
-pub use structural::StructuralMetrics;
+// AD-394-3: `is_synthetic_id` re-exported as the single public source of truth
+// for "is this NodeKindId a synthetic marker ID" — avoids callers (both within
+// this crate and in `rskim`'s CLI tests) re-deriving the `>= BUCKET_LABEL_BASE`
+// threshold from a duplicated magic number. `structural` itself stays
+// `pub(crate)`; this is a deliberate, narrow re-export of one predicate.
+pub use structural::{StructuralMetrics, is_synthetic_id};

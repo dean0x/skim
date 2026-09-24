@@ -22,7 +22,12 @@ use crate::{CochangeStats, FileId, HistoryResult, Result, SearchError, io_util::
 ///
 /// Commits that touch more than this many files are bulk refactors / merges
 /// that would pollute the coupling signal.
-pub(crate) const COUPLING_MAX_FILES: usize = 50;
+///
+/// Exposed as `pub` (not `pub(crate)`) so `rskim-search` consumers (e.g.
+/// `rskim`'s temporal builder) can import the single canonical value instead
+/// of re-declaring it (Decision O-D: avoid new rskim-search public surface by
+/// reusing what exists).
+pub const COUPLING_MAX_FILES: usize = 50;
 
 /// Maximum number of distinct co-change pairs the builder will accumulate.
 ///
