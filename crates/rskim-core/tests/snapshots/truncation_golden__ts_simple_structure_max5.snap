@@ -4,5 +4,5 @@ expression: "snap(TS_SIMPLE, Language::TypeScript,\nTransformConfig::with_mode(M
 ---
 // ... (5 lines truncated)
 export function add(a: number, b: number): number  {...}
-// ... (1 line truncated)
+// ... (3 lines truncated)
 export function greet(name: string): string  {...}

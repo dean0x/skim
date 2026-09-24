@@ -26,14 +26,58 @@ pub(crate) struct NodeSpan {
     pub transformed_range: Range<usize>,
     /// tree-sitter node kind string (for priority scoring)
     pub node_kind: &'static str,
+    /// Line range in the ORIGINAL SOURCE that this span puts on screen
+    /// (0-indexed, exclusive end), or `None` when the producer does not know it.
+    ///
+    /// ARCHITECTURE: this is a DISCLOSURE coordinate and nothing else. Only the
+    /// elision-marker counts read it; selection, layout, the marker-presence
+    /// decisions in [`count_markers`] and the ADR-016 `max_lines` bound are all
+    /// decided in `transformed_range`'s space and are untouched by it.
+    ///
+    /// It cannot REPLACE `transformed_range`, because the two spaces are not
+    /// affine: structure mode collapses many source lines onto one output line,
+    /// and types mode inserts blank separator lines that exist in output space
+    /// and in no source line at all. A bound enforced in source space would
+    /// therefore not be the `head -N` bound ADR-016 requires. Both coordinates
+    /// have to travel together -- PF-033 rule 1: enforce the bound ONCE, in ONE
+    /// space, and hand the other space along rather than re-deriving it from
+    /// rendered output that no longer distinguishes content from marker.
+    ///
+    /// CONTRACT: the range's LENGTH is what the marker arithmetic consumes -- it
+    /// is the number of source lines this span actually shows the reader. Its
+    /// `start` is the source line the span's first output line came from.
+    pub source_range: Option<Range<usize>>,
 }
 
 impl NodeSpan {
-    /// Create a new NodeSpan
+    /// Create a NodeSpan that knows only its transformed-output range.
+    ///
+    /// Retained for producers that have no source-line information to give (and
+    /// for the unit tests below). A selection containing even one such span
+    /// degrades to transformed-space marker counts -- wrong but bounded, and
+    /// identical to the pre-fix behaviour -- rather than breaking the build or
+    /// mixing two coordinate spaces inside one set of markers.
     pub fn new(transformed_range: Range<usize>, node_kind: &'static str) -> Self {
         Self {
             transformed_range,
             node_kind,
+            source_range: None,
+        }
+    }
+
+    /// Create a NodeSpan that also knows which SOURCE lines it puts on screen.
+    ///
+    /// `source_range` is 0-indexed with an exclusive end; see the field's
+    /// CONTRACT note for what its length must mean.
+    pub fn with_source(
+        transformed_range: Range<usize>,
+        node_kind: &'static str,
+        source_range: Range<usize>,
+    ) -> Self {
+        Self {
+            transformed_range,
+            node_kind,
+            source_range: Some(source_range),
         }
     }
 
@@ -89,7 +133,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     }
 
     // Truncation is needed: evaluate the lazy count exactly once, now.
-    let source_line_count = Some(source_line_count_fn());
+    let source_line_count = source_line_count_fn();
 
     // If no spans provided, fall back to simple line truncation.
     // (The spans-empty path was previously the first check to avoid a redundant
@@ -97,7 +141,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     // happened. The double traversal inside simple_line_truncate is acceptable
     // for this fallback path, which is reached only by unusual inputs.)
     if spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Filter out empty spans and spans beyond the actual line count
@@ -107,7 +151,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
         .collect();
 
     if valid_spans.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Fast-path: single span starting at line 0 — no inter-span gaps, no priority
@@ -116,7 +160,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     // all of which emit NodeSpan::new(0..line_count, "source_file").
     // E3: pass source_line_count so the marker states omitted SOURCE lines.
     if valid_spans.len() == 1 && valid_spans[0].transformed_range.start == 0 {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Score and sort spans: priority desc, position asc (tie-break)
@@ -215,7 +259,7 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     let selected: Vec<&NodeSpan> = selected.into_iter().map(|(_, s)| s).collect();
 
     if selected.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Build output with omission markers between gaps.
@@ -224,14 +268,46 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     let make_marker =
         |omitted: usize| elision_marker_line(Some(language), omitted, ElidedSide::Truncated, hint);
 
+    // ADR-011 (2026-09-24 amendment): the counts below are stated in SOURCE-line
+    // space -- how many lines of the user's own file the view does not show. The
+    // AST-span modes (structure, signatures, types) previously counted lines of
+    // the TRANSFORMED output instead, which is a fact about a text the reader
+    // never asked for and cannot see; on a 2,589-line file that understated the
+    // hidden lines by up to ~20x. full/minimal/pseudo were already correct only
+    // because their single 0..n span short-circuits onto `simple_line_truncate`,
+    // which has carried the source count since E3.
+    //
+    // PF-033 rule 1 -- ONE coordinate space per render: source space is used only
+    // when EVERY selected span carries a source range. One unmigrated producer
+    // degrades the whole selection back to transformed space rather than mixing
+    // two spaces inside one set of markers, which is the coordinate collision
+    // that PF-033 records as a defect in its own right.
+    let source_spaced = selected.iter().all(|s| s.source_range.is_some());
+    let source_total = source_line_count;
+
     // Cow: content lines borrow from `lines`, markers are owned Strings.
     let mut result_lines: Vec<Cow<'_, str>> = Vec::with_capacity(max_lines + 1);
     let mut last_end: usize = 0;
+    // Source-space shadow of `last_end`: the first source line not yet accounted
+    // for. Read ONLY by the marker counts; it never reaches selection, layout or
+    // the ADR-016 bound. Every subtraction against it saturates, so a mis-stated
+    // source range yields a wrong-but-bounded count, never a `usize` underflow
+    // printed to an agent as if it were fact.
+    let mut last_source_end: usize = 0;
     let mut content_count: usize = 0;
 
     // Leading marker: content before the first selected span
     if selected[0].transformed_range.start > 0 {
-        let omitted = selected[0].transformed_range.start;
+        let omitted = if source_spaced {
+            selected[0]
+                .source_range
+                .as_ref()
+                .map_or(selected[0].transformed_range.start, |r| {
+                    r.start.saturating_sub(last_source_end)
+                })
+        } else {
+            selected[0].transformed_range.start
+        };
         result_lines.push(Cow::Owned(make_marker(omitted)));
     }
 
@@ -255,13 +331,33 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
         if start > last_end && last_end > 0 {
             if remaining_after_gap <= 1 {
                 // Fold: a single marker covers the gap AND the full span content.
-                let omitted = end.saturating_sub(last_end); // gap lines + span lines
+                let omitted = if source_spaced {
+                    span.source_range
+                        .as_ref()
+                        .map_or(end.saturating_sub(last_end), |r| {
+                            // gap source lines + this span's own source lines
+                            r.end.saturating_sub(last_source_end)
+                        })
+                } else {
+                    end.saturating_sub(last_end) // gap lines + span lines
+                };
                 result_lines.push(Cow::Owned(make_marker(omitted)));
                 // Advance past the entire span so trailing marker is not double-counted.
                 last_end = end;
+                if let Some(r) = span.source_range.as_ref() {
+                    last_source_end = r.end;
+                }
                 continue; // skip content-addition loop for this span
             }
-            let omitted = start - last_end;
+            let omitted = if source_spaced {
+                span.source_range
+                    .as_ref()
+                    .map_or(start.saturating_sub(last_end), |r| {
+                        r.start.saturating_sub(last_source_end)
+                    })
+            } else {
+                start.saturating_sub(last_end)
+            };
             result_lines.push(Cow::Owned(make_marker(omitted)));
         }
 
@@ -282,6 +378,22 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
         // Track where we actually stopped emitting (span_end, not the full span end).
         // This ensures the trailing marker fires when the span was clamped.
         last_end = span_end;
+
+        // Advance the source cursor in step with `last_end`. A span emitted in
+        // full accounts for its whole source range; a span the budget clamped
+        // accounts only for the prefix it actually put on screen, and never past
+        // its own source end. Erring short here makes the trailing marker report
+        // MORE hidden lines, which is the safe direction for a class-1
+        // disclosure: under-reporting is the defect being fixed.
+        if let Some(r) = span.source_range.as_ref() {
+            last_source_end = if span_end >= end {
+                r.end
+            } else {
+                r.start
+                    .saturating_add(span_end.saturating_sub(start))
+                    .min(r.end)
+            };
+        }
     }
 
     // Safety: if no content lines fit (e.g. max_lines=1 with a leading marker consuming
@@ -289,12 +401,16 @@ pub(crate) fn truncate_to_lines<F: FnOnce() -> usize>(
     // 1 content line.  Without this guard the output would be pure elision markers with
     // zero visible code — confusing and unhelpful for agents.
     if content_count == 0 && !lines.is_empty() {
-        return simple_line_truncate(text, language, max_lines, hint, source_line_count);
+        return simple_line_truncate(text, language, max_lines, hint, Some(source_line_count));
     }
 
     // Trailing marker: content after the last emitted line
     if last_end < lines.len() {
-        let omitted = lines.len() - last_end;
+        let omitted = if source_spaced {
+            source_total.saturating_sub(last_source_end)
+        } else {
+            lines.len().saturating_sub(last_end)
+        };
         result_lines.push(Cow::Owned(make_marker(omitted)));
     }
 
