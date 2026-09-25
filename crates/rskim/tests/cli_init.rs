@@ -2237,6 +2237,161 @@ fn test_init_without_a_declaration_still_takes_the_skip_path() {
 }
 
 // ============================================================================
+// `skim init --dev`
+// ============================================================================
+
+/// Run `skim init` in `sandbox`, with `--dev` when asked, and return stdout.
+///
+/// `current_dir(sandbox.home())` keeps `install_search_integration` from finding
+/// the repository this test binary runs from: with no `.git` above the sandbox
+/// there is no project root, so no search hooks are installed and no background
+/// index build is spawned.
+fn run_init(sandbox: &Sandbox, dev: bool) -> String {
+    let mut cmd = sandbox.skim();
+    cmd.args(["init", "--agent", "claude-code", "--no-guidance"]);
+    if dev {
+        cmd.arg("--dev");
+    }
+    cmd.arg("--no-wrappers");
+    let out = cmd.current_dir(sandbox.home()).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "init must succeed, got:\n{stdout}");
+    stdout
+}
+
+/// `--dev` writes the declaration, and writes the manifest OVER it.
+///
+/// The manifest coverage is what makes the declaration meaningful:
+/// `honour_dev_declaration` requires `ScriptIntegrity::Verified`, so a marker
+/// the hash did not cover could be appended by anyone holding a write handle to
+/// the script and would buy a self-asserted exemption (PF-016). Proven by the
+/// re-run below rather than by re-hashing here: a manifest that did not cover
+/// the marker classifies as `Tampered`, which takes the repair path and prints
+/// "Repaired" instead of skipping.
+#[test]
+fn test_init_dev_writes_a_manifest_covered_declaration() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, true);
+
+    let script_path = sandbox.claude_config().join("hooks/skim-rewrite.sh");
+    let script = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        script.contains("SKIM_HOOK_DEV"),
+        "`--dev` must write the declaration:\n{script}"
+    );
+    assert!(
+        script.contains("export SKIM_HOOK_BINARY=") && script.contains("export SKIM_HOOK_COMMIT="),
+        "a dev install is still a pinned install carrying its real commit:\n{script}"
+    );
+
+    let second = run_init(&sandbox, true);
+    assert!(
+        !second.contains("Repaired"),
+        "the manifest must cover the declaration, or the re-run repairs a tamper:\n{second}"
+    );
+}
+
+/// THE FAST-PATH MEASUREMENT. A repeat `skim init --dev` must reach
+/// "Already up to date", which requires EVERY fast-path term to hold —
+/// including `mode_matches` (the script declares what the command asked for) and
+/// `integrity_verified` (the manifest covers the declaration). A full reinstall
+/// here would rewrite the script, back up `settings.json`, and re-run guidance.
+#[test]
+fn test_init_dev_twice_takes_the_already_up_to_date_fast_path() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, true);
+    let second = run_init(&sandbox, true);
+
+    assert!(
+        second.contains("Already up to date"),
+        "a repeat dev install must take the fast path:\n{second}"
+    );
+    assert!(
+        !sandbox.claude_config().join("settings.json.bak").exists(),
+        "the fast path must not reach the settings backup"
+    );
+}
+
+/// The revert, through the flag's ABSENCE. There is no `--undev`: re-running the
+/// installer without `--dev` is the undo, and the transition is reported rather
+/// than performed silently (ADR-014 — dev mode is a property of the command).
+#[test]
+fn test_init_without_dev_reverts_and_reports_the_transition() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, true);
+
+    let reverted = run_init(&sandbox, false);
+    assert!(
+        reverted.contains("dev-pinned -> pinned"),
+        "the revert must be reported, not silent:\n{reverted}"
+    );
+
+    let script_path = sandbox.claude_config().join("hooks/skim-rewrite.sh");
+    let script = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        !script.contains("SKIM_HOOK_DEV"),
+        "a plain `skim init` must strip the declaration:\n{script}"
+    );
+
+    // And the reverted install is itself steady state — the revert does not
+    // leave something that reinstalls forever.
+    let third = run_init(&sandbox, false);
+    assert!(
+        third.contains("Already up to date"),
+        "a reverted install must settle on the fast path:\n{third}"
+    );
+}
+
+/// The forward transition is reported the same way, so the output never has to
+/// be read as "v2.14.0 -> v2.14.0" to learn what changed.
+#[test]
+fn test_init_dev_reports_the_switch_from_strict() {
+    let sandbox = Sandbox::new();
+    run_init(&sandbox, false);
+
+    let switched = run_init(&sandbox, true);
+    assert!(
+        switched.contains("pinned -> dev-pinned"),
+        "switching to dev must be reported:\n{switched}"
+    );
+}
+
+/// `--dev` must fan out to EVERY detected agent, exactly like any other
+/// `skim init`. Narrowing it would defeat the feature: several agents' hooks pin
+/// the same binary, so leaving three strict while one is dev keeps `skim doctor`
+/// at exit 1 and the developer is no better off.
+#[test]
+fn test_init_dev_fans_out_to_every_detected_agent() {
+    let sandbox = Sandbox::new();
+    let claude = sandbox.claude_config();
+    let gemini = sandbox.config_dir(".gemini");
+
+    // No `--agent`: auto-detect mode, which is the fan-out path.
+    let out = sandbox
+        .skim()
+        .args(["init", "--no-guidance", "--no-wrappers", "--dev"])
+        .current_dir(sandbox.home())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "fan-out init must succeed:\n{stdout}");
+
+    for config in [&claude, &gemini] {
+        let script = fs::read_to_string(config.join("hooks/skim-rewrite.sh")).unwrap_or_else(|e| {
+            panic!(
+                "{} must have a hook script: {e}\n{stdout}",
+                config.display()
+            )
+        });
+        assert!(
+            script.contains("SKIM_HOOK_DEV"),
+            "every detected agent must get the dev declaration, {} did not:\n{script}",
+            config.display()
+        );
+    }
+}
+
+// ============================================================================
 // Fix: --project --wrappers mutual exclusion
 // ============================================================================
 

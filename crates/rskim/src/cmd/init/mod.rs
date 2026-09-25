@@ -99,6 +99,13 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         uninstall: false,
         force: false,
         no_guidance: false,
+        // `skim doctor` is not an install and has no `--dev` to read, so it asks
+        // for nothing. This value never reaches a mode decision: `hook_facts`
+        // calls `hook_is_current`/`pin_is_current`, never `mode_matches`, and the
+        // mode doctor REPORTS is the one the installed script declares
+        // (`detected.hook_mode`, gated by `honour_dev_declaration`). Keeping the
+        // two apart is the whole reason `mode_matches` is a separate predicate.
+        dev: false,
         agent: Some(agent),
         wrappers: None,
         permissions: None,
@@ -232,6 +239,16 @@ pub(super) fn command() -> clap::Command {
                 .long("force")
                 .action(clap::ArgAction::SetTrue)
                 .help("Force operation (e.g., uninstall tampered hook)"),
+        )
+        .arg(
+            clap::Arg::new("dev")
+                .long("dev")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Install a dev-pinned hook: keep the real commit but waive the \
+                     commit-staleness check, so an in-place rebuild no longer forces a \
+                     full reinstall. Omit the flag to revert to a strict install.",
+                ),
         )
         .arg(
             clap::Arg::new("wrappers")

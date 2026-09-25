@@ -88,7 +88,7 @@ impl HookProtocol for CopilotCliHook {
     }
 
     fn generate_script(&self, version: &str, binary_path: &str) -> String {
-        super::generate_hook_script(version, "copilot", binary_path)
+        super::generate_hook_script(version, "copilot", binary_path, super::HookMode::Strict)
     }
 
     // -------------------------------------------------------------------------

@@ -394,6 +394,23 @@ fn hook_status_line(
     let hook_version = facts.hook_version.as_deref().unwrap_or("?");
     let hook_commit_str = facts.hook_commit.as_deref().unwrap_or("?");
 
+    // Whether this install's dev declaration may be acted on — the same single
+    // rule `skim init` and the staleness section route through, never a second
+    // reading of the marker (PF-016).
+    let dev_pinned =
+        crate::cmd::hooks::honour_dev_declaration(facts.hook_mode, &facts.script_integrity);
+    // Empty for every strict install, which is what keeps the lines below
+    // byte-identical to what they were before dev mode existed. When non-empty it
+    // carries BOTH commits: `commit {hook_commit_str}` earlier in the line is the
+    // one the install froze, and this is the one the running binary was built
+    // from — their distance is how old the dev install is, which is the whole
+    // reason the commit field keeps its real value instead of a placeholder.
+    let dev_note = if dev_pinned {
+        format!("  dev-pinned (binary commit {compiled_commit})")
+    } else {
+        String::new()
+    };
+
     // Gate on integrity first — verdict is derived from the manifest, not from
     // the hook bytes that a tamper would modify.
     //
@@ -493,7 +510,7 @@ fn hook_status_line(
         return (
             false,
             append_advisory(format!(
-                "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}  \
+                "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str}){dev_note}  pin: {pin}  \
                  [binary pin mismatch (hook: {pin}, running: {running})] — \
                  run `./target/release/skim init --yes` to update"
             )),
@@ -501,11 +518,20 @@ fn hook_status_line(
     }
 
     // Fully current (with or without manifest).
+    //
+    // A dev install lands here — the commit gate it waived is the one that would
+    // otherwise have diverted it — and must NOT render as `✓`. The whole point of
+    // a visible dev install is that it cannot masquerade as a clean one: the
+    // waiver bought exit 0, not a clean bill of health. `⚠` plus the literal
+    // `dev-pinned` is also what makes `skim doctor | grep dev-pinned` usable as a
+    // one-line CI guard, and the pin-mismatch branch above carries the same note
+    // so that guard cannot be defeated by a second clone.
     let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
+    let glyph = if dev_pinned { "⚠" } else { "✓" };
     (
         false,
         append_advisory(format!(
-            "  ✓ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}"
+            "  {glyph} {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str}){dev_note}  pin: {pin}"
         )),
     )
 }
@@ -1261,6 +1287,147 @@ mod tests {
         assert!(
             line.contains('✓'),
             "healthy state must show checkmark: {line}"
+        );
+    }
+
+    // ---- hook_status_line: dev-pinned rendering ----
+    //
+    // The fixtures below all use hook commit `abc1234` with running commit
+    // `9f8e7d6`. That divergence with `hook_is_current: true` IS the dev
+    // scenario: the waiver is what let a commit mismatch stay "current", so the
+    // line must show both values rather than imply they agree.
+
+    /// A dev install reaches the same terminal branch a healthy strict install
+    /// does — the commit gate it waived is the one that would have diverted it —
+    /// and must not be rendered the same way. It keeps exit 0 (no drift) but
+    /// loses the `✓`: the waiver bought a green exit code, not a clean bill of
+    /// health, and a dev install that looks clean is the failure this rendering
+    /// exists to prevent.
+    #[test]
+    fn test_hook_status_line_dev_pinned_warns_and_never_checks() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(!drift, "a dev-pinned hook must not force exit 1: {line}");
+        assert!(
+            line.contains('⚠') && !line.contains('✓'),
+            "a dev install must render as a warning, never as healthy: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "`skim doctor | grep dev-pinned` is the CI guard; the literal must appear: {line}"
+        );
+    }
+
+    /// Both SHAs on one line: the commit the install froze and the commit the
+    /// running binary was built from. Their distance is how old the dev install
+    /// is — the readable form of ADR-014's ruling that dev mode keeps the REAL
+    /// commit instead of writing a placeholder into the field.
+    #[test]
+    fn test_hook_status_line_dev_pinned_prints_both_commits() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        let (_, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(
+            line.contains("commit abc1234"),
+            "the installed commit must be shown: {line}"
+        );
+        assert!(
+            line.contains("binary commit 9f8e7d6"),
+            "the running binary's commit must be shown alongside it: {line}"
+        );
+    }
+
+    /// A dev install in the wrong clone must still be greppable. The pin-mismatch
+    /// branch returns before the terminal one, so without the note on both
+    /// branches the CI guard would silently miss exactly the multi-clone case the
+    /// pin exists for.
+    #[test]
+    fn test_hook_status_line_dev_pinned_survives_a_pin_mismatch() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        facts.pin_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(!drift, "pin mismatch is advisory (C-1), dev or not: {line}");
+        assert!(
+            line.contains("binary pin mismatch"),
+            "the pin verdict must not be swallowed by the dev note: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "the dev note must survive the pin-mismatch branch: {line}"
+        );
+    }
+
+    /// PF-016: the declaration is a line in the hook script, so it is only acted
+    /// on when the manifest verifies. Deleting the sidecar yields `NoManifest`,
+    /// which doctor deliberately does NOT treat as drift — so a "not Tampered"
+    /// gate would let anyone holding a write handle to the script self-assert dev
+    /// mode. This pins that the rendering refuses it.
+    #[test]
+    fn test_hook_status_line_dev_declaration_needs_a_verified_manifest() {
+        for integrity in [
+            crate::cmd::integrity::ScriptIntegrity::NoManifest,
+            crate::cmd::integrity::ScriptIntegrity::Tampered,
+            crate::cmd::integrity::ScriptIntegrity::Unreadable,
+        ] {
+            let label = format!("{integrity:?}");
+            let mut facts = make_installed_facts(integrity);
+            facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+            let (_, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+            assert!(
+                !line.contains("dev-pinned"),
+                "a declaration under {label} must not be honoured: {line}"
+            );
+        }
+    }
+
+    /// THE INVARIANT, on the doctor side: without a credible dev declaration the
+    /// rendering is what it always was. Asserted as an equality against the
+    /// strict column rather than by spot-checking substrings, across every
+    /// integrity state — so any future edit that leaks dev-mode text, a glyph or
+    /// a spacing change into the strict path fails here.
+    #[test]
+    fn test_hook_status_line_strict_column_is_unchanged_by_dev_mode() {
+        // `ScriptIntegrity` is deliberately not `Clone`, so each side of the pair
+        // gets a freshly constructed value from the same factory.
+        type MakeIntegrity = fn() -> crate::cmd::integrity::ScriptIntegrity;
+        let unhonoured: [(&str, MakeIntegrity); 3] = [
+            ("NoManifest", || {
+                crate::cmd::integrity::ScriptIntegrity::NoManifest
+            }),
+            ("Tampered", || {
+                crate::cmd::integrity::ScriptIntegrity::Tampered
+            }),
+            ("Unreadable", || {
+                crate::cmd::integrity::ScriptIntegrity::Unreadable
+            }),
+        ];
+
+        for (label, make) in unhonoured {
+            let strict = make_installed_facts(make());
+            let mut dev = make_installed_facts(make());
+            dev.hook_mode = crate::cmd::hooks::HookMode::Dev;
+
+            assert_eq!(
+                hook_status_line(&strict, "claude-code", "2.11.0", "9f8e7d6"),
+                hook_status_line(&dev, "claude-code", "2.11.0", "9f8e7d6"),
+                "an unhonoured declaration under {label} must be invisible"
+            );
+        }
+
+        // Verified is the one cell where they must DIFFER — otherwise the feature
+        // does nothing and the equalities above would pass vacuously.
+        let strict = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        let mut dev = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        dev.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        assert_ne!(
+            hook_status_line(&strict, "claude-code", "2.11.0", "9f8e7d6"),
+            hook_status_line(&dev, "claude-code", "2.11.0", "9f8e7d6"),
+            "a credible dev declaration must change the line"
         );
     }
 

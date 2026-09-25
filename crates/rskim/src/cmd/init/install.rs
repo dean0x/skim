@@ -474,15 +474,19 @@ fn run_install_single(
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
-    // The install mode this invocation asks for. There is no `--dev` flag yet, so
-    // no invocation can request dev mode and every call below reads `false`; the
-    // flag that varies it is the next commit's.
+    // The install mode this invocation asks for.
     //
-    // The term is wired now because the WAIVER lands now. Without it, a hook
-    // script that declares dev mode would survive a plain `skim init` — dev mode
-    // would become sticky state, the opposite of ADR-014's ruling that it is a
-    // property of the COMMAND and needs no undo flag.
-    let dev_requested = false;
+    // Read straight off the flag, with no memory of the installed state: the
+    // ABSENCE of `--dev` is itself a request, for a strict install. That is what
+    // makes a plain `skim init` revert a dev-pinned hook (`mode_matches` below
+    // sees Dev ≠ Strict, blocks the fast path, and `create_hook_script`
+    // regenerates without the marker), and why ADR-014 needs no `--undev`.
+    //
+    // It fans out to every detected agent for free: `agent_flags_for_auto_detect`
+    // builds each agent's flags with `..*flags`. That is required, not incidental
+    // — several agents' hooks pin the SAME binary, so leaving three strict while
+    // one is dev keeps `skim doctor` at exit 1 and fixes nothing.
+    let dev_requested = flags.dev;
 
     // Gate the fast path on integrity, not just manifest presence.
     //
@@ -843,6 +847,38 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
 // Hook script generation (B7)
 // ============================================================================
 
+/// Human-readable name for an install mode, as the install output spells it.
+fn mode_label(mode: crate::cmd::hooks::HookMode) -> &'static str {
+    match mode {
+        crate::cmd::hooks::HookMode::Strict => "pinned",
+        crate::cmd::hooks::HookMode::Dev => "dev-pinned",
+    }
+}
+
+/// `Some("<old> -> <new>")` when this invocation changes the install mode.
+///
+/// `None` when it does not — including every invocation made without `--dev`
+/// against a script that carries no marker, which is both sides `Strict`. That
+/// is why adding this cannot change any output for anyone who has not opted in.
+///
+/// The revert direction (`dev-pinned -> pinned`) is the one with no flag behind
+/// it: dev-ness is a property of the COMMAND, so omitting `--dev` asks for
+/// strict and gets it, with no `--undev` to remember (ADR-014).
+///
+/// Both ends are rendered by [`mode_label`], so the two directions cannot end up
+/// spelling the same mode differently.
+fn mode_transition(installed: crate::cmd::hooks::HookMode, dev_requested: bool) -> Option<String> {
+    let requested = crate::cmd::hooks::HookMode::requested(dev_requested);
+    if installed == requested {
+        return None;
+    }
+    Some(format!(
+        "{} -> {}",
+        mode_label(installed),
+        mode_label(requested)
+    ))
+}
+
 /// Write (or knowingly skip writing) the agent's hook script.
 ///
 /// `dev_requested` is the mode this invocation asks for. It is a term of the
@@ -922,6 +958,19 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
                     );
                 }
             }
+        } else if let Some(transition) = mode_transition(state.hook_mode, dev_requested) {
+            // The install mode changed. Reported instead of the version pair
+            // because that pair is `(v2.14.0 -> v2.14.0)` on exactly this path —
+            // a revert does not move the version, so the version message would
+            // print a no-op and hide the only thing that actually changed.
+            //
+            // Unreachable without `--dev`: with no flag and no marker in any
+            // generated script, both sides of the comparison are `Strict`.
+            println!(
+                "  {} Updated: {} ({transition})",
+                check_mark(true),
+                script_path.display()
+            );
         } else {
             // Different version — will overwrite
             if let Some(old_ver) = &state.hook_version {
@@ -955,14 +1004,28 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
     // validates that version and agent_cli_name are shell-safe and panics if not —
     // both values are &'static str from AgentKind::cli_name() and
     // compile-time CARGO_PKG_VERSION, so this is safe.
-    let script_content =
-        generate_hook_script(&state.skim_version, state.agent_cli_name, &binary_path_str);
+    //
+    // The mode comes from `HookMode::requested`, the same mapping `mode_matches`
+    // used above to decide whether this write was needed at all. If the two
+    // disagreed, `skim init --dev` would write one artefact, judge it wrong on
+    // the next run, and reinstall forever.
+    let script_content = generate_hook_script(
+        &state.skim_version,
+        state.agent_cli_name,
+        &binary_path_str,
+        crate::cmd::hooks::HookMode::requested(dev_requested),
+    );
 
     atomic_write_executable(&hooks_dir, &script_path, &script_content)?;
 
     // Compute and store SHA-256 hash for integrity verification (#57).
     // Errors are propagated with `?` — silently installing without tamper
     // detection (e.g. on a read-only hooks dir) is worse than a hard error.
+    //
+    // The hash is taken from the finished file, so it covers the dev declaration
+    // too. That is what makes `honour_dev_declaration`'s Verified requirement
+    // mean something: a marker is only honoured when the manifest written over it
+    // still verifies (PF-016).
     let hash = crate::cmd::integrity::compute_file_hash(&script_path)?;
     crate::cmd::integrity::write_hash_manifest(
         &state.hook_config_dir,
@@ -2129,6 +2192,112 @@ mod tests {
             .expect("second call (idempotent) must not error");
     }
 
+    // ---- mode_transition ----
+
+    /// THE INVARIANT, on the install-output side. Without `--dev` the requested
+    /// mode is `Strict`, and no generated script carries the marker, so the only
+    /// reachable cell is strict→strict — `None`, which leaves the pre-existing
+    /// version message as the sole output of this branch.
+    #[test]
+    fn test_mode_transition_is_silent_for_a_strict_install() {
+        assert_eq!(
+            super::mode_transition(crate::cmd::hooks::HookMode::Strict, false),
+            None,
+            "a strict install asked to stay strict must print nothing new"
+        );
+    }
+
+    /// The revert. No flag drives it: omitting `--dev` IS the request for strict,
+    /// which is why ADR-014 needs no `--undev`.
+    #[test]
+    fn test_mode_transition_reports_the_revert_to_strict() {
+        assert_eq!(
+            super::mode_transition(crate::cmd::hooks::HookMode::Dev, false).as_deref(),
+            Some("dev-pinned -> pinned"),
+        );
+    }
+
+    #[test]
+    fn test_mode_transition_reports_the_switch_to_dev() {
+        assert_eq!(
+            super::mode_transition(crate::cmd::hooks::HookMode::Strict, true).as_deref(),
+            Some("pinned -> dev-pinned"),
+        );
+    }
+
+    /// Re-running with the same request is not a transition, so `skim init --dev`
+    /// twice does not claim to have changed something.
+    #[test]
+    fn test_mode_transition_is_silent_when_dev_is_already_installed() {
+        assert_eq!(
+            super::mode_transition(crate::cmd::hooks::HookMode::Dev, true),
+            None
+        );
+    }
+
+    // ---- agent_flags_for_auto_detect: --dev fan-out pin ----
+
+    /// INVARIANT: `--dev` reaches EVERY detected agent, including the one the
+    /// permissions fan-out deliberately excludes.
+    ///
+    /// Narrowing it would defeat the feature rather than contain it: several
+    /// agents' hooks pin the same binary, so a dev install that covered only one
+    /// of them would leave the rest reporting a stale commit and `skim doctor`
+    /// still at exit 1. The Codex carve-out below is about CONSENT for a
+    /// permission grant, which dev mode is not — it writes no permission entry
+    /// and grants no access.
+    #[test]
+    fn test_dev_fans_out_to_every_agent_including_codex() {
+        let base_flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            dev: true,
+            agent: None,
+            wrappers: None,
+            permissions: Some(true),
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+
+        for agent in [
+            AgentKind::ClaudeCode,
+            AgentKind::GeminiCli,
+            AgentKind::CodexCli,
+        ] {
+            let per_agent = super::agent_flags_for_auto_detect(agent, &base_flags);
+            assert!(
+                per_agent.dev,
+                "{agent:?} must inherit the dev request from the fan-out"
+            );
+        }
+    }
+
+    /// The other direction: an install made WITHOUT `--dev` never asks any agent
+    /// for dev mode, so the fan-out cannot manufacture one.
+    #[test]
+    fn test_no_dev_request_fans_out_as_strict() {
+        let base_flags = super::super::flags::InitFlags {
+            project: false,
+            yes: false,
+            dry_run: false,
+            uninstall: false,
+            force: false,
+            no_guidance: false,
+            dev: false,
+            agent: None,
+            wrappers: None,
+            permissions: None,
+            permissions_tier: super::super::flags::PermissionsTier::Seed,
+        };
+
+        for agent in [AgentKind::ClaudeCode, AgentKind::CodexCli] {
+            assert!(!super::agent_flags_for_auto_detect(agent, &base_flags).dev);
+        }
+    }
+
     // ---- agent_flags_for_auto_detect: Codex permissions exclusion pin ----
 
     /// INVARIANT: Codex must never receive permissions in auto-detect mode.
@@ -2145,6 +2314,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: Some(true),
@@ -2184,6 +2354,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: None,
@@ -2207,6 +2378,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: Some(false),
@@ -2232,6 +2404,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: Some(false),
@@ -2253,6 +2426,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: Some(true),
@@ -2279,6 +2453,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: None,

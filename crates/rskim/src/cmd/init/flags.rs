@@ -53,6 +53,21 @@ pub(super) struct InitFlags {
     pub(super) uninstall: bool,
     pub(super) force: bool,
     pub(super) no_guidance: bool,
+    /// Install a DEV-PINNED hook: the script keeps its real commit but declares
+    /// [`crate::cmd::hooks::HOOK_DEV_MARKER`], which waives the commit-equality
+    /// gate so an in-place rebuild no longer forces a full reinstall and no
+    /// longer makes `skim doctor` exit 1 (ADR-014's amendment).
+    ///
+    /// A property of the INVOCATION, never sticky state: the absence of `--dev`
+    /// is itself a request — for a strict install — so a plain `skim init`
+    /// reverts a dev-pinned hook. That is why there is no `--undev`, and why
+    /// this is a plain `bool` rather than an `Option<bool>` like `wrappers` and
+    /// `permissions`, whose `None` means "neither flag was given, decide later".
+    ///
+    /// `--dev --force` is the re-stamp: `force` already blocks the fast path
+    /// unconditionally, which is the override ADR-014 designated, so no second
+    /// spelling of it is added here.
+    pub(super) dev: bool,
     /// Target agent for installation.
     ///
     /// `None` means auto-detect: scan installed agents and install to the first one found.
@@ -280,6 +295,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
     let mut uninstall = false;
     let mut force = false;
     let mut no_guidance = false;
+    let mut dev = false;
     let mut agent: Option<AgentKind> = None;
     let mut wrappers: Option<bool> = None;
     let mut permissions: Option<bool> = None;
@@ -314,6 +330,10 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
             "--uninstall" => uninstall = true,
             "--force" => force = true,
             "--no-guidance" => no_guidance = true,
+            // No `--no-dev` counterpart: omitting `--dev` already IS the request
+            // for a strict install, and a second spelling of the default would
+            // suggest the flag is sticky state that needs undoing.
+            "--dev" => dev = true,
             "--wrappers" => {
                 if wrappers == Some(false) {
                     anyhow::bail!(
@@ -414,6 +434,7 @@ pub(super) fn parse_flags(args: &[String]) -> anyhow::Result<InitFlags> {
         uninstall,
         force,
         no_guidance,
+        dev,
         agent,
         wrappers,
         permissions,
@@ -522,6 +543,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: Some(AgentKind::Cursor),
             wrappers: None,
             permissions: None,
@@ -539,6 +561,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: None,
@@ -630,6 +653,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: Some(AgentKind::Cursor),
             wrappers: None,
             permissions: None,
@@ -654,6 +678,7 @@ mod tests {
             uninstall: false,
             force: false,
             no_guidance: false,
+            dev: false,
             agent: None,
             wrappers: None,
             permissions: None,
@@ -728,6 +753,48 @@ mod tests {
             err.contains("mutually exclusive"),
             "error must mention mutual exclusion: {err}"
         );
+    }
+
+    // ---- --dev ----
+
+    #[test]
+    fn test_parse_flags_dev_true() {
+        let flags = parse_flags(&["--dev".to_string()]).unwrap();
+        assert!(flags.dev, "--dev must request a dev-pinned install");
+    }
+
+    /// The absence of the flag is a request for a STRICT install, not an absence
+    /// of opinion — which is what makes a plain `skim init` revert a dev-pinned
+    /// hook rather than leave it alone. Hence `bool`, not `Option<bool>`.
+    #[test]
+    fn test_parse_flags_dev_absent_is_false() {
+        let flags = parse_flags(&["--yes".to_string()]).unwrap();
+        assert!(
+            !flags.dev,
+            "omitting --dev must read as a request for a strict install"
+        );
+    }
+
+    /// ADR-014 designated `--force` as the single supported override, so
+    /// `--dev --force` IS the re-stamp and no `--restamp` spelling is added.
+    #[test]
+    fn test_parse_flags_dev_and_force_compose() {
+        let flags = parse_flags(&["--dev".to_string(), "--force".to_string()]).unwrap();
+        assert!(flags.dev && flags.force);
+    }
+
+    /// There is deliberately no `--undev` / `--no-dev`: a second spelling of the
+    /// default would imply the flag is sticky state that needs undoing. Pinned as
+    /// a parse error so adding one is a conscious act.
+    #[test]
+    fn test_parse_flags_rejects_a_no_dev_counterpart() {
+        for spelling in ["--no-dev", "--undev"] {
+            let result = parse_flags(&[spelling.to_string()]);
+            assert!(
+                result.is_err(),
+                "{spelling} must not exist: re-running without --dev is the revert"
+            );
+        }
     }
 
     // ---- DetectionEnv::resolve ----

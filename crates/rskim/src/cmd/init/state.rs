@@ -172,13 +172,12 @@ impl DetectedState {
     /// rather than sticky state (ADR-014): re-running the installer without the
     /// flag finds a mismatch here and rewrites the script back to strict, so no
     /// undo flag is needed.
+    /// The `bool → HookMode` mapping is [`HookMode::requested`], shared with
+    /// `install::create_hook_script`'s generator call: the predicate that decides
+    /// a rewrite is needed and the generator that performs it must read the flag
+    /// the same way, or `skim init --dev` writes a script it then judges wrong.
     pub(super) fn mode_matches(&self, dev_requested: bool) -> bool {
-        let requested = if dev_requested {
-            HookMode::Dev
-        } else {
-            HookMode::Strict
-        };
-        self.hook_mode == requested
+        self.hook_mode == HookMode::requested(dev_requested)
     }
 }
 
@@ -1269,13 +1268,13 @@ mod tests {
     /// display layer, never the acquisition layer).
     #[test]
     fn test_dev_marker_is_invisible_to_every_script_parser() {
-        let strict = crate::cmd::hooks::generate_hook_script(
-            "2.11.0",
-            "claude-code",
-            "/path/with spaces/target/release/skim",
-        );
-        let marker = crate::cmd::hooks::HOOK_DEV_MARKER;
-        let dev = format!("{strict}{marker}\n");
+        const PIN: &str = "/path/with spaces/target/release/skim";
+        let strict =
+            crate::cmd::hooks::generate_hook_script("2.11.0", "claude-code", PIN, HookMode::Strict);
+        // The real dev bytes, not a hand-appended marker: the generator's
+        // placement is part of what must be invisible.
+        let dev =
+            crate::cmd::hooks::generate_hook_script("2.11.0", "claude-code", PIN, HookMode::Dev);
 
         // Guard against a vacuous pass: the parsers must actually be finding
         // values, or the equalities below would be two `None`s agreeing
@@ -1287,7 +1286,7 @@ mod tests {
         );
         assert_eq!(
             parse_binary_pin_from_script(&dev).as_deref(),
-            Some("/path/with spaces/target/release/skim"),
+            Some(PIN),
             "a dev-pinned script must still carry a parseable binary pin"
         );
         assert!(
@@ -1329,10 +1328,10 @@ mod tests {
     /// nothing about the path that reaches it).
     #[test]
     fn test_detect_state_records_the_declared_hook_mode() {
-        for (declared, expected) in [
-            ("", HookMode::Strict),
-            (crate::cmd::hooks::HOOK_DEV_MARKER, HookMode::Dev),
-        ] {
+        // Driven through the mode the GENERATOR was asked for, so this covers the
+        // whole path `skim init --dev` takes: flag → generator → installed bytes
+        // → detect_state → recorded mode.
+        for expected in [HookMode::Strict, HookMode::Dev] {
             let dir = tempfile::TempDir::new().unwrap();
             let hooks_dir = dir.path().join("hooks");
             std::fs::create_dir_all(&hooks_dir).unwrap();
@@ -1340,10 +1339,11 @@ mod tests {
                 "2.11.0",
                 "claude-code",
                 "/usr/local/bin/skim",
+                expected,
             );
             std::fs::write(
                 hooks_dir.join(super::super::helpers::HOOK_SCRIPT_NAME),
-                format!("{generated}{declared}\n"),
+                generated,
             )
             .unwrap();
 
@@ -1354,6 +1354,7 @@ mod tests {
                 uninstall: false,
                 force: false,
                 no_guidance: false,
+                dev: false,
                 agent: Some(crate::cmd::session::AgentKind::ClaudeCode),
                 wrappers: None,
                 permissions: None,
@@ -1407,15 +1408,15 @@ mod tests {
             let hooks_dir = dir.path().join("hooks");
             std::fs::create_dir_all(&hooks_dir).unwrap();
             let script_path = hooks_dir.join(super::super::helpers::HOOK_SCRIPT_NAME);
+            // Every script here is generated IN dev mode: the point is that the
+            // declaration alone never moves the integrity verdict.
             let generated = crate::cmd::hooks::generate_hook_script(
                 "2.11.0",
                 "claude-code",
                 "/usr/local/bin/skim",
+                HookMode::Dev,
             );
-            // Every script here carries the dev marker: the point is that the
-            // marker alone never moves the integrity verdict.
-            let marker = crate::cmd::hooks::HOOK_DEV_MARKER;
-            std::fs::write(&script_path, format!("{generated}{marker}\n")).unwrap();
+            std::fs::write(&script_path, generated).unwrap();
 
             if write_manifest {
                 let hash = crate::cmd::integrity::compute_file_hash(&script_path).unwrap();
@@ -1440,6 +1441,7 @@ mod tests {
                 uninstall: false,
                 force: false,
                 no_guidance: false,
+                dev: false,
                 agent: Some(crate::cmd::session::AgentKind::ClaudeCode),
                 wrappers: None,
                 permissions: None,

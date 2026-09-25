@@ -512,6 +512,72 @@ fn test_doctor_dev_marker_with_verified_manifest_waives_commit_gate() {
     );
 }
 
+/// `skim init --dev` end to end, through the flag rather than a hand-edited
+/// script: the installed hook must declare dev mode and `skim doctor` must
+/// render it as `dev-pinned`, never as `✓`.
+///
+/// `current_dir(home)` keeps `install_search_integration` out of the repository
+/// the test runs from — with no `.git` above the sandbox it finds no project
+/// root and spawns no background index build.
+#[test]
+fn test_doctor_renders_a_dev_flag_install_as_dev_pinned() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    common::skim_sandboxed(home)
+        .args([
+            "init",
+            "--dev",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .assert()
+        .success();
+
+    let script = std::fs::read_to_string(hook_script_path(home)).unwrap();
+    assert!(
+        script.contains(DEV_MARKER_LINE),
+        "`--dev` must write the declaration into the installed script:\n{script}"
+    );
+    assert!(
+        !script.contains("export SKIM_HOOK_COMMIT=dev"),
+        "the commit field must keep the REAL build identity (ADR-014):\n{script}"
+    );
+
+    let out = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The one-line CI guard: `skim doctor | grep dev-pinned`.
+    assert!(
+        stdout.contains("dev-pinned"),
+        "doctor must name a dev install as such:\n{stdout}"
+    );
+    let hook_line = stdout
+        .lines()
+        .find(|l| l.contains("claude-code") && l.contains("installed"))
+        .unwrap_or_else(|| panic!("doctor must report the claude-code hook:\n{stdout}"));
+    assert!(
+        hook_line.contains('⚠') && !hook_line.contains('✓'),
+        "a dev install must not masquerade as a clean one: {hook_line}"
+    );
+    // Both SHAs on the line: the one the install froze and the one the running
+    // binary was built from. Their distance is how old the dev install is.
+    assert!(
+        hook_line.contains("binary commit"),
+        "the running binary's commit must appear beside the installed one: {hook_line}"
+    );
+}
+
 // ============================================================================
 // Wrapper drift detection — Item 2 (#488)
 // ============================================================================
