@@ -12,6 +12,8 @@
 //!   or every corpus for the aggregate) into RATCHET values.
 //! - [`RATCHET_METRICS`] defines each RATCHET metric's good direction and
 //!   tolerance; [`compare_ratchet`] applies them for the gate and `bless`.
+//!   Each entry with no oracle also ratchets its full-list row count
+//!   ([`ORACLE_LESS_ROWS`]).
 //!
 //! No function here imports skim's own search code: every expectation comes
 //! from the oracle (`oracle.rs`) over the oracle's universe.
@@ -663,6 +665,9 @@ pub struct CorpusSamples {
     pub tracked_text: u64,
     pub idents: Vec<IdentSample>,
     pub concepts: Vec<ConceptSample>,
+    /// Full-list row count of each entry with no oracle
+    /// ([`PlannedQuery::oracle`] is `None`), by id.
+    pub oracle_less_rows: BTreeMap<String, u64>,
 }
 
 // ============================================================================
@@ -742,7 +747,9 @@ const fn reference(name: &'static str, tolerance: Tolerance) -> MetricDef {
     def(name, Direction::Neutral, tolerance, "baseline")
 }
 
-/// Every RATCHET metric (tolerance 0 except bytes at ±3%).
+/// Every fixed RATCHET metric (tolerance 0 except bytes at ±3%). The
+/// per-entry family [`ORACLE_LESS_ROWS`] is defined by
+/// [`ORACLE_LESS_ROWS_DEF`].
 pub const RATCHET_METRICS: &[MetricDef] = &[
     def(
         "universe.delta",
@@ -842,9 +849,31 @@ pub const RATCHET_METRICS: &[MetricDef] = &[
     ),
 ];
 
-/// The definition of the RATCHET metric `name`.
+/// Name prefix of the per-entry RATCHET values `oracle_less.full_rows.<id>`:
+/// the full-list row count of each entry with no oracle (`--ast`,
+/// `--blast-radius`, a standalone temporal arm).
+pub const ORACLE_LESS_ROWS: &str = "oracle_less.full_rows.";
+
+/// The definition every `oracle_less.full_rows.<id>` value shares. No oracle
+/// judges those lists' size, so a shrink is a regression (blessing it needs
+/// a reason) and a growth an improvement; either way the gate asks for a
+/// bless. An empty list is a harness error before it gets here
+/// (`pipeline::require_oracle_less_rows`).
+pub static ORACLE_LESS_ROWS_DEF: MetricDef = def(
+    "oracle_less.full_rows.<id>",
+    Direction::HigherBetter,
+    Tolerance::Exact,
+    "ratchet (no oracle)",
+);
+
+/// The definition of the RATCHET metric `name` (a fixed metric, or an
+/// `oracle_less.full_rows.<id>` value).
 pub fn metric_def(name: &str) -> Option<&'static MetricDef> {
-    RATCHET_METRICS.iter().find(|d| d.name == name)
+    RATCHET_METRICS.iter().find(|d| d.name == name).or_else(|| {
+        name.strip_prefix(ORACLE_LESS_ROWS)
+            .is_some_and(|id| !id.is_empty())
+            .then_some(&ORACLE_LESS_ROWS_DEF)
+    })
 }
 
 /// How a RATCHET value moved against its baseline.
@@ -942,7 +971,9 @@ type RankOf = fn(&IdentSample) -> Option<u64>;
 
 /// RATCHET values pooled over `samples` (one corpus, or every corpus for
 /// the aggregate), rounded to 4 decimal places. `ident.*` / `concept.*` /
-/// `bytes.*` are present only when the pool has entries of that kind.
+/// `bytes.*` are present only when the pool has entries of that kind, and
+/// `oracle_less.full_rows.<id>` once per entry with no oracle in the pool
+/// (ids are corpus-prefixed, so the aggregate keeps them apart).
 pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
     put(
@@ -976,6 +1007,13 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
         put_concept_values(&mut out, &concepts);
     }
     put_text_byte_values(&mut out, &idents, &concepts);
+    for (id, &rows) in samples.iter().flat_map(|s| s.oracle_less_rows.iter()) {
+        put(
+            &mut out,
+            &format!("{ORACLE_LESS_ROWS}{id}"),
+            Some(rows as f64),
+        );
+    }
     out
 }
 
@@ -1135,6 +1173,7 @@ pub fn evaluate(
     let mut idents = Vec::new();
     let mut concepts = Vec::new();
     let mut unindexed_hits = BTreeMap::new();
+    let mut oracle_less_rows = BTreeMap::new();
 
     for (q, obs) in plan.iter().zip(observations) {
         anyhow::ensure!(
@@ -1144,10 +1183,15 @@ pub fn evaluate(
             q.id
         );
         let gt = q.oracle.as_ref().map(|o| ground_truth(universe.files(), o));
-        if let Some(o) = &q.oracle {
-            let hits = ground_truth(universe.unindexed_text_files(), o).len();
-            if hits > 0 {
-                unindexed_hits.insert(q.id.clone(), hits as u64);
+        match &q.oracle {
+            Some(o) => {
+                let hits = ground_truth(universe.unindexed_text_files(), o).len();
+                if hits > 0 {
+                    unindexed_hits.insert(q.id.clone(), hits as u64);
+                }
+            }
+            None => {
+                oracle_less_rows.insert(q.id.clone(), u64::try_from(obs.full.rows.len())?);
             }
         }
 
@@ -1184,6 +1228,7 @@ pub fn evaluate(
             tracked_text: u64::try_from(coverage.tracked_text)?,
             idents,
             concepts,
+            oracle_less_rows,
         },
         unindexed_hits,
     })

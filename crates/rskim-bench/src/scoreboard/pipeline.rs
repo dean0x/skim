@@ -7,11 +7,12 @@
 //! Every `Err` here is a harness error (exit 2): a missing or invalid data
 //! file, clone verification, golden integrity (including a ledger entry that
 //! can never apply), a skim crash / timeout / unparsable output, a temporal
-//! ranking skim reports it cannot apply (see [`require_temporal_data`]), or
-//! a corpus that changed under the run. Gate failures are not errors — they are
-//! recorded in the report's `gate` section.
+//! ranking skim reports it cannot apply (see [`require_temporal_data`]), an
+//! empty list for an entry with no oracle (see [`require_oracle_less_rows`]),
+//! or a corpus that changed under the run. Gate failures are not errors —
+//! they are recorded in the report's `gate` section.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -31,7 +32,7 @@ use crate::scoreboard::report::{
     AggregateReport, CorpusInfo, CorpusReport, CoverageReport, LatencyReport, LatencyStats,
     REPORT_SCHEMA, Report, SkippedByReason, UniverseReport, round4, tally,
 };
-use crate::scoreboard::runner::{SkimRunner, Timing};
+use crate::scoreboard::runner::{EntryObservation, SkimRunner, Timing};
 use crate::scoreboard::types::StatsSnapshot;
 use crate::scoreboard::universe::Universe;
 
@@ -241,6 +242,7 @@ fn run_corpus(
         observations.push(observed.observation);
         timings.push((q.id.clone(), observed.timings));
     }
+    require_oracle_less_rows(&plan, &observations)?;
 
     let after = source.verify_untouched(spec, &root)?;
     anyhow::ensure!(
@@ -294,6 +296,49 @@ pub fn require_temporal_data(plan: &[PlannedQuery], stats: &StatsSnapshot) -> an
         ranked.len(),
         if ranked.len() == 1 { "y" } else { "ies" },
         ranked.join(", ")
+    )
+}
+
+/// Refuse to score an entry with no oracle whose full list is empty.
+///
+/// An entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` /
+/// `--cold` / `--risky` run) has no ground truth: its checks compare skim's
+/// answers only with each other, and an empty list satisfies every one of
+/// them. If the structural (or temporal) layer broke and returned nothing,
+/// the ledgered `order.score_monotone` failures (#547) would "XPASS" and ask
+/// for a promotion that bakes the breakage into the ledger and the baseline.
+/// So it is a harness error, never a gate result. A list that shrinks
+/// without emptying moves its `oracle_less.full_rows.<id>` RATCHET value.
+///
+/// # Errors
+///
+/// Some entry with no oracle has an empty full list; the message names those
+/// entries.
+pub fn require_oracle_less_rows(
+    plan: &[PlannedQuery],
+    observations: &[EntryObservation],
+) -> anyhow::Result<()> {
+    let empty: BTreeSet<&str> = observations
+        .iter()
+        .filter(|o| o.full.rows.is_empty())
+        .map(|o| o.id.as_str())
+        .collect();
+    let vacuous: Vec<&str> = plan
+        .iter()
+        .filter(|q| q.oracle.is_none() && empty.contains(q.id.as_str()))
+        .map(|q| q.id.as_str())
+        .collect();
+    if vacuous.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "skim returned an empty full list for {} golden entr{} with no oracle ({}): with no \
+         ground truth, an empty list passes every check that runs on it, so a broken structural \
+         or temporal layer would read as a pass, and a ledgered failure as fixed; fix skim, or \
+         replace the entry with one that matches on this corpus",
+        vacuous.len(),
+        if vacuous.len() == 1 { "y" } else { "ies" },
+        vacuous.join(", ")
     )
 }
 
@@ -485,6 +530,74 @@ mod tests {
             plan_of("[[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n");
         require_temporal_data(&lexical_only, &stats_with(Some("missing"))).unwrap();
         require_temporal_data(&lexical_only, &stats_with(None)).unwrap();
+    }
+
+    /// An observation whose full list has `rows` rows.
+    fn observed(id: &str, rows: usize) -> EntryObservation {
+        use crate::scoreboard::types::{ResultPage, ResultRow, VerifyMode};
+        EntryObservation {
+            id: id.to_string(),
+            full: ResultPage {
+                rows: (0..rows)
+                    .map(|i| ResultRow {
+                        path: format!("src/{i}.rs"),
+                        score: 1.0,
+                        line: None,
+                        snippet: Vec::new(),
+                    })
+                    .collect(),
+                has_more: false,
+                verify_mode: VerifyMode::Substring,
+                degraded: Vec::new(),
+            },
+            sweeps: Vec::new(),
+            limited: Vec::new(),
+            text: None,
+        }
+    }
+
+    #[test]
+    fn an_empty_list_without_an_oracle_is_a_harness_error() {
+        // plan order: [[lexical]] first, then the [[prefix]] entries.
+        let plan = plan_of(
+            "[[prefix]]\nid = \"skim-F002\"\nflags = [\"--ast\", \"match-with-arms\", \"--hot\"]\nlimits = [5]\n\
+             [[prefix]]\nid = \"skim-F003\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n\
+             [[prefix]]\nid = \"skim-F004\"\nflags = [\"--blast-radius\", \"src/a.rs\"]\nlimits = [5]\n\
+             [[prefix]]\nid = \"skim-F005\"\nquery = \"fn\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n\
+             [[prefix]]\nid = \"skim-F006\"\nflags = [\"--hot\"]\nlimits = [5]\n\
+             [[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n",
+        );
+        assert_eq!(plan.iter().filter(|q| q.oracle.is_none()).count(), 5);
+
+        // An empty list is fine where an oracle judges it (a zero-hit entry).
+        let healthy = [
+            observed("skim-Z01", 0),
+            observed("skim-F002", 3),
+            observed("skim-F003", 1),
+            observed("skim-F004", 2),
+            observed("skim-F005", 4),
+            observed("skim-F006", 9),
+        ];
+        require_oracle_less_rows(&plan, &healthy).unwrap();
+
+        let broken = [
+            observed("skim-Z01", 0),
+            observed("skim-F002", 3),
+            observed("skim-F003", 0),
+            observed("skim-F004", 0),
+            observed("skim-F005", 0),
+            observed("skim-F006", 0),
+        ];
+        let err = require_oracle_less_rows(&plan, &broken)
+            .expect_err("an empty list without an oracle passes every check vacuously");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "{msg}");
+        for id in ["skim-F003", "skim-F004", "skim-F005", "skim-F006"] {
+            assert!(msg.contains(id), "{id} has no oracle and no rows: {msg}");
+        }
+        for id in ["skim-F002", "skim-Z01"] {
+            assert!(!msg.contains(id), "{id} is not vacuous: {msg}");
+        }
     }
 
     #[test]

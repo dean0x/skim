@@ -23,15 +23,15 @@ It is the **required merge gate for search PRs** (owner decision 2026-09-25, ADR
 | Class | Checks | Rule |
 |---|---|---|
 | **HARD** (per query) | `lexical.recall`, `lexical.precision` (skim's full list = oracle ground truth on the indexed universe) · `lexical.silent_fn` (a ground-truth file is missing and `degraded[]` is empty) · `lexical.verify_mode` · `pagination.complete` / `.disjoint` / `.ordered` / `.has_more_honest` · `order.prefix_consistent` · `order.score_monotone` | Tolerance 0. A failure passes only if it is ledgered (XFAIL). |
-| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
+| **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `oracle_less.full_rows.<id>`, the full-list row count of each entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` / `--cold` / `--risky` run); a shrink is a regression | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
 | **INFO** (never gated) | Latency p50/p95 · `unindexed_hits` · the oracle's per-reason skip breakdown · the "beats baseline" column | none |
 
 A changed golden file, corpus pin, or HARD outcome (for example `xfail -> pass`) also means "bless required".
 
 What it does **not** cover yet, where manual adversarial dog-food (ADR-007) is still required:
 
-- AST structural precision and recall (`--ast` patterns): #541. `--ast` entries are checked only for ordering and
-  pagination.
+- AST structural precision and recall (`--ast` patterns): #541. `--ast` entries are checked only for ordering,
+  pagination and their row count (an empty list is a harness error; any other change to the count needs a bless).
 - The temporal arms (`--hot` / `--cold` / `--risky` / `--blast-radius`) against `git log`: #542.
 - Any new query flag or arm, until it has golden entries here.
 
@@ -72,7 +72,7 @@ cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/ski
 |---|---|
 | `0` | Gate passed (`check`), the run finished (`run`), or the baseline was written (`bless`). |
 | `1` | Gate failure (`check`), or `bless` refused. |
-| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
+| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), an empty full list for an entry with no oracle (it would pass every check vacuously), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
 
 On a gate failure, stderr prints one `FAIL <check> [<ids>]: <message>` line per failure, and `report.md` lists them
 under "Gate failures".

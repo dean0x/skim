@@ -483,6 +483,7 @@ fn samples(idents: Vec<IdentSample>) -> CorpusSamples {
         tracked_text: 10,
         idents,
         concepts: Vec::new(),
+        oracle_less_rows: BTreeMap::new(),
     }
 }
 
@@ -534,6 +535,42 @@ fn beating_a_baseline_follows_the_metric_direction() {
         beats_baseline("universe.delta", &r),
         None,
         "no baseline to beat"
+    );
+}
+
+#[test]
+fn row_counts_of_entries_without_an_oracle_ratchet_per_entry() {
+    let mut a = samples(Vec::new());
+    a.oracle_less_rows = BTreeMap::from([("a-F002".to_string(), 7), ("a-F003".to_string(), 12)]);
+    let r = ratchet_values(&[&a]);
+    assert_eq!(r["oracle_less.full_rows.a-F002"], 7.0);
+    assert_eq!(r["oracle_less.full_rows.a-F003"], 12.0);
+    for name in r.keys() {
+        assert!(metric_def(name).is_some(), "{name} has no MetricDef");
+    }
+
+    // A shrink is a regression (blessing it needs a reason); growth is an
+    // improvement; either way the value moved, so the gate asks for a bless.
+    let name = "oracle_less.full_rows.a-F003";
+    assert_eq!(compare_ratchet(name, 12.0, 11.0), RatchetChange::Regressed);
+    assert_eq!(compare_ratchet(name, 12.0, 13.0), RatchetChange::Improved);
+    assert_eq!(compare_ratchet(name, 12.0, 12.0), RatchetChange::Unchanged);
+    assert!(
+        metric_def("oracle_less.full_rows.").is_none(),
+        "the metric names an entry"
+    );
+
+    // The aggregate keeps each corpus's entries apart (ids are corpus-prefixed).
+    let mut b = samples(Vec::new());
+    b.oracle_less_rows = BTreeMap::from([("b-F003".to_string(), 4)]);
+    let agg = ratchet_values(&[&a, &b]);
+    assert_eq!(agg["oracle_less.full_rows.a-F003"], 12.0);
+    assert_eq!(agg["oracle_less.full_rows.b-F003"], 4.0);
+    assert!(
+        !ratchet_values(&[&samples(Vec::new())])
+            .keys()
+            .any(|k| k.starts_with("oracle_less.")),
+        "no entry without an oracle, no row-count metric"
     );
 }
 
@@ -641,6 +678,51 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     assert_eq!((c.p5, c.p10), (0.5, 0.5));
     assert_eq!((c.p5_baseline_alpha, c.p5_baseline_count), (1.0, 1.0));
     assert_eq!(c.text_bytes, 17);
+}
+
+#[test]
+fn evaluate_records_the_full_list_size_of_entries_without_an_oracle() {
+    let repo = FixtureRepo::new();
+    repo.write("a.rs", "x\n");
+    let commit = repo.commit_all("init");
+    let universe = Universe::compute(repo.root(), &GitIsolation::new(repo.home())).unwrap();
+    let golden = parse_golden(&format!(
+        "corpus = \"skim\"\ncommit = \"{commit}\"\n\
+         [[lexical]]\nid = \"skim-X01\"\nquery = \"x\"\ncategory = \"short\"\n\
+         [[prefix]]\nid = \"skim-F003\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [2]\n"
+    ))
+    .unwrap();
+    let plan = plan(&golden).unwrap();
+    let stats = StatsSnapshot {
+        file_count: 1,
+        skipped_by_reason: BTreeMap::new(),
+        temporal_state: None,
+    };
+    let structural = rows(&["a.rs", "b.rs", "c.rs"]);
+    let observations = vec![
+        EntryObservation {
+            id: "skim-X01".to_string(),
+            full: page(rows(&["a.rs"]), false),
+            sweeps: Vec::new(),
+            limited: Vec::new(),
+            text: None,
+        },
+        EntryObservation {
+            id: "skim-F003".to_string(),
+            full: page(structural.clone(), false),
+            sweeps: Vec::new(),
+            limited: vec![(2, page(structural[..2].to_vec(), true))],
+            text: None,
+        },
+    ];
+
+    let e = evaluate(&universe, &stats, &plan, &observations).unwrap();
+
+    assert_eq!(
+        e.samples.oracle_less_rows,
+        BTreeMap::from([("skim-F003".to_string(), 3)]),
+        "only the entry without an oracle is counted"
+    );
 }
 
 #[test]

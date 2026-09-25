@@ -90,6 +90,11 @@ id = "fixture-F001"
 query = "fn"
 flags = ["--hot"]
 limits = [1]
+
+[[prefix]]
+id = "fixture-F002"
+flags = ["--ast", "god-function"]
+limits = [1]
 "#
     )
 }
@@ -100,6 +105,9 @@ const CONCEPT: (&str, &str, &[&str]) = ("fixture-C01", "build lock", &[]);
 const LEXICAL: (&str, &str, &[&str]) = ("fixture-X01", "marker", &[]);
 const PAGINATION: (&str, &str, &[&str]) = ("fixture-G001", "fn", &[]);
 const PREFIX: (&str, &str, &[&str]) = ("fixture-F001", "fn", &["--hot"]);
+/// Standalone `--ast`: no query (the stub keys it on the empty string) and
+/// no oracle.
+const AST: (&str, &str, &[&str]) = ("fixture-F002", "", &["--ast", "god-function"]);
 const PAGE_LIMIT: u32 = 2;
 const PREFIX_LIMIT: u32 = 1;
 const FULL_LIMIT: u32 = 1_000_000;
@@ -201,6 +209,23 @@ fn page_json(query: &str, rows: &[Row], offset: usize, total_len: usize, has_mor
         "results": results,
     })
     .to_string()
+}
+
+/// A standalone `--ast` page (`crates/rskim-search/src/compound/output.rs`):
+/// rows carry `score`, `line` and a one-line `snippet` string.
+fn ast_page_json(rows: &[(Row, f64)], has_more: bool) -> String {
+    let results: Vec<Value> = rows
+        .iter()
+        .map(|(r, score)| {
+            json!({
+                "path": r.path,
+                "score": score,
+                "line": r.line,
+                "snippet": r.content,
+            })
+        })
+        .collect();
+    json!({"total": rows.len(), "has_more": has_more, "results": results}).to_string()
 }
 
 /// skim's text format (`query.rs::format_text_output`) for the first 20 rows.
@@ -411,6 +436,37 @@ impl Harness {
         self.write_response(query, flags, "text.txt", &text_output(query, rows));
     }
 
+    /// Rows for the standalone `--ast` entry, scored `scores` in rank order
+    /// (at most two rows). With no oracle, any structural match set will do.
+    fn ast_rows(&self, scores: &[f64]) -> Vec<(Row, f64)> {
+        let rows = self.correct_rows(IDENT.1, Some(DEF_PATH));
+        assert!(
+            scores.len() <= rows.len(),
+            "the fixture has {} rows",
+            rows.len()
+        );
+        rows.into_iter().zip(scores.iter().copied()).collect()
+    }
+
+    /// Serve the standalone `--ast` entry: `scored` as its full list, and the
+    /// full list's first rows as its `--limit` page.
+    fn write_ast(&self, scored: &[(Row, f64)]) {
+        let (_, q, f) = AST;
+        self.write_response(
+            q,
+            f,
+            &format!("l{FULL_LIMIT}_o0.json"),
+            &ast_page_json(scored, false),
+        );
+        let n = (PREFIX_LIMIT as usize).min(scored.len());
+        self.write_response(
+            q,
+            f,
+            &format!("l{PREFIX_LIMIT}_o0.json"),
+            &ast_page_json(&scored[..n], n < scored.len()),
+        );
+    }
+
     fn write_ident(&self, rows: &[Row]) {
         let (_, q, f) = IDENT;
         self.write_full(q, f, rows);
@@ -437,6 +493,8 @@ impl Harness {
         let rows = self.correct_rows(q, None);
         self.write_full(q, f, &rows);
         self.write_limited(q, f, &rows, PREFIX_LIMIT);
+
+        self.write_ast(&self.ast_rows(&[2.0, 1.0]));
     }
 
     /// Serve the lexical entry's full list without one ground-truth file
@@ -959,6 +1017,81 @@ fn a_temporal_ranking_skim_reports_as_degraded_is_a_harness_error() {
         !h.report_path().exists(),
         "a harness error writes no report"
     );
+}
+
+/// A standalone `--ast` entry has no oracle, so an empty full list satisfies
+/// every check that runs on it. If skim's structural layer broke and returned
+/// nothing, a ledgered `order.score_monotone` (#547 on the real corpora) would
+/// "XPASS" and ask for a promotion that bakes the breakage into the ledger and
+/// the baseline. It is a harness error naming the corpus and the entry.
+#[test]
+fn an_empty_list_without_an_oracle_is_a_harness_error_not_an_xpass() {
+    let h = Harness::new();
+    // Scores rise down the list: the #547 shape, ledgered.
+    h.write_ast(&h.ast_rows(&[1.0, 2.0]));
+    h.write_ledger(
+        r##"[[xfail]]
+issue = "#9003"
+check = "order.score_monotone"
+ids = ["fixture-F002"]
+note = "fixture"
+"##,
+    );
+    h.bless_current();
+    assert_eq!(
+        outcome(&h.report(), "fixture-F002", "order.score_monotone").as_deref(),
+        Some("xfail")
+    );
+    h.write_ast(&[]);
+    fs::remove_file(h.report_path()).unwrap();
+
+    let check = h.check();
+
+    assert_exit(&check, 2);
+    let err = stderr(&check);
+    assert!(err.contains("corpus fixture"), "{err}");
+    assert!(err.contains("fixture-F002"), "{err}");
+    assert!(err.contains("empty"), "{err}");
+    assert!(!err.contains("XPASS"), "{err}");
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
+}
+
+/// With no oracle to judge a `--ast` list, its row count is a RATCHET value:
+/// a silent shrink fails the gate, and blessing it needs a reason.
+#[test]
+fn a_shrinking_list_without_an_oracle_is_a_ratchet_regression() {
+    let h = Harness::new();
+    h.bless_current();
+    let metric = "oracle_less.full_rows.fixture-F002";
+    assert_eq!(h.report()["corpora"][0]["ratchet"][metric], 2.0);
+
+    h.write_ast(&h.ast_rows(&[2.0]));
+    let check = h.check();
+
+    assert_exit(&check, 1);
+    let failures = gate_failures(&h.report());
+    assert!(
+        failures
+            .iter()
+            .any(|(kind, check, _, message)| kind == "ratchet"
+                && check == metric
+                && message.contains("regressed")),
+        "{failures:#?}"
+    );
+    let refused = h.bless(None);
+    assert_exit(&refused, 1);
+    let err = stderr(&refused);
+    assert!(err.contains(metric), "{err}");
+    assert!(err.contains("--accept-regression"), "{err}");
+
+    assert_exit(
+        &h.bless(Some("fixture: one structural match removed on purpose")),
+        0,
+    );
+    assert_exit(&h.check(), 0);
 }
 
 #[test]
