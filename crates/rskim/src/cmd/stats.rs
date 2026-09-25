@@ -174,25 +174,83 @@ fn run_json(
         "tokens_saved": summary.tokens_saved,
     });
 
+    // PF-037, second instance and it inverts the usual shape: the DEGENERATE-CASE
+    // guard exists and is correct on the text path — `render_delivered` returns
+    // early on `rows == 0` because "rendering it as 0 would be a claim" — and was
+    // simply absent here. `DeliveredSavings` derives a plain `Serialize` with no
+    // `skip_serializing_if`, so `--json` published `{"rows": 0, "tokens": 0,
+    // "first_day": null}`: the exact claim the human-readable surface refuses,
+    // made to the consumer that parses rather than reads. Measured live on the
+    // author's database (zero rows with `notice_tokens IS NOT NULL`), so this was
+    // shipping today, not latent.
+    //
+    // The unmeasured case is made UNREPRESENTABLE by omitting the key, which is
+    // the only encoding a consumer cannot mistake for a measured zero. The guard
+    // lives here rather than as a `skip_serializing_if` on the struct because
+    // PF-037's lesson is that the contract is per-RENDERER: a whole-object guard
+    // is a property of what THIS surface will assert, not of the type. (A
+    // per-FIELD absence is a different question and does belong on the struct —
+    // `DeliveredSavings::reset_at` carries one.)
+    let delivered_json = if summary.delivered.rows > 0 {
+        Some(serde_json::to_value(&summary.delivered)?)
+    } else {
+        None
+    };
+
+    // PF-037 once more, in the direction the guard above creates. Absence is
+    // the right encoding for "not yet measured" — and it makes a RESET series
+    // byte-identical to a never-measured one, collapsing two states into one
+    // exactly as `{"rows": 0}` did. The reset is the thing that explains why
+    // `delivered` is missing, so it has to survive `delivered` being missing.
+    //
+    // It is published as its OWN key rather than as a stub `delivered` object,
+    // because any object carrying `rows`/`tokens` publishes a measured zero —
+    // the claim the guard above exists to refuse. The two are mutually
+    // exclusive by construction and a consumer reads exactly one of them: with
+    // rows, the mark rides inside `delivered.reset_at` via serde on the struct;
+    // without rows, it is this key. Neither state emits both, so the mark never
+    // appears at two nesting levels.
+    let delivered_reset_json = match (summary.delivered.rows, summary.delivered.reset_at) {
+        (0, Some(at)) => Some(at),
+        _ => None,
+    };
+
+    // `delivered` nests INSIDE `summary`, beside `tokens_lost` and
+    // `avg_savings_pct_compressed`. The three are one disclosure story, and
+    // reading them from two nesting levels is a cost paid by every consumer
+    // forever. Moving it is free exactly now, because the series has zero
+    // measured rows anywhere, so nothing can yet depend on the old placement.
+    let mut summary_json = serde_json::json!({
+        "invocations": summary.invocations,
+        "raw_tokens": summary.raw_tokens,
+        "compressed_tokens": summary.compressed_tokens,
+        "tokens_saved": summary.tokens_saved,
+        "tokens_lost": summary.tokens_lost,
+        "avg_savings_pct": summary.avg_savings_pct,
+        "avg_savings_pct_compressed": summary.avg_savings_pct_compressed,
+        "compressed_invocations": summary.compressed_invocations,
+        "expansion_invocations": summary.expansion_invocations,
+        "weighted_savings_pct": weighted_pct,
+    });
+    // Total by construction: the literal above is an object, and the `Some` arm
+    // is the `rows > 0` case. Neither pattern can fail, and neither can panic.
+    if let (serde_json::Value::Object(map), Some(value)) = (&mut summary_json, delivered_json) {
+        map.insert("delivered".to_string(), value);
+    }
+    // Named for the `analytics_meta` key it comes from, so a reader chasing the
+    // value has the row to look at.
+    if let (serde_json::Value::Object(map), Some(at)) = (&mut summary_json, delivered_reset_json) {
+        map.insert("delivered_series_reset_at".to_string(), at.into());
+    }
+
     let root = serde_json::json!({
         // Three series, kept apart on purpose — see `AnalyticsSummary`.
         // `tokens_saved` and `avg_savings_pct` keep their exact prior meaning so
         // existing consumers are not silently re-based; `tokens_lost` covers the
         // same full history because it needs only raw/compressed; `delivered`
         // ships its own window because it cannot cover rows recorded before
-        // disclosure measurement began.
-        "summary": {
-            "invocations": summary.invocations,
-            "raw_tokens": summary.raw_tokens,
-            "compressed_tokens": summary.compressed_tokens,
-            "tokens_saved": summary.tokens_saved,
-            "tokens_lost": summary.tokens_lost,
-            "avg_savings_pct": summary.avg_savings_pct,
-            "avg_savings_pct_changed": summary.avg_savings_pct_changed,
-            "changed_invocations": summary.changed_invocations,
-            "weighted_savings_pct": weighted_pct,
-        },
-        "delivered": summary.delivered,
+        // disclosure measurement began — and is ABSENT, not zero, until one is.
+        "summary": summary_json,
         "daily": daily,
         "by_command": by_command,
         "by_language": by_language,
@@ -372,12 +430,26 @@ fn render_summary(
     // this line reads 11,983,387 against an 80,238,562 headline — the headline
     // is 17.6% above the true net.
     if summary.tokens_lost > 0 {
-        let net = summary.tokens_saved.saturating_sub(summary.tokens_lost);
+        // Widened to i64 and left UNCLAMPED. Computed in u64 with
+        // `saturating_sub`, an expansion-dominated `--since` window renders as
+        // `net 0` — which reintroduces, one line below, the exact clamp the
+        // `Tokens lost:` line two lines above was added to disclose. The reader
+        // would be told the headline hides expansion and then handed a net that
+        // hides it again, on the same screen. The sibling
+        // `DeliveredSavings::tokens` is `i64` and unclamped for this reason:
+        // the sign is the finding.
+        //
+        // `unwrap_or(i64::MAX)` is unreachable on real data (both operands are
+        // SUMs over i64 columns, already floored at 0 by `query_summary`) and is
+        // the saturating, non-panicking form. Both operands land in
+        // `[0, i64::MAX]`, so the subtraction itself cannot overflow.
+        let net = i64::try_from(summary.tokens_saved).unwrap_or(i64::MAX)
+            - i64::try_from(summary.tokens_lost).unwrap_or(i64::MAX);
         writeln!(
             w,
             "  Tokens lost:  {}  (expansion the line above drops; net {})",
             tokens::format_number(summary.tokens_lost as usize),
-            tokens::format_number(net as usize),
+            signed_tokens(net),
         )?;
     }
     if session_stats.distinct_sessions > 0 {
@@ -399,18 +471,39 @@ fn render_summary(
     // invocation where skim served exactly what it was given: a no-op
     // contributes a 0% sample to an average about compression. Both means are
     // shown with the row counts they were taken over, so neither can be quoted
-    // without its population. On the author's corpus they read 13.4% and 36.0%
-    // — a 22.5-point gap that is purely a question of which rows were counted.
-    if summary.invocations > 0 && summary.changed_invocations < summary.invocations {
+    // without its population.
+    //
+    // The narrow population is "rows that COMPRESSED", not "rows that changed".
+    // The latter was false: `savings_pct` is floored at zero at WRITE time, so
+    // every EXPANDING row entered a mean labelled "over the rows that changed"
+    // as a 0% SAVING rather than as the loss it was. Measured on the author's
+    // corpus (69,258 rows, 2026-09-25): that mean printed 35.96% over 25,682
+    // changed rows, of which 7,037 were expansions contributing a floored 0%
+    // each; over the 18,645 rows that actually compressed it reads 49.54%. The
+    // excluded population is now COUNTED on the next line rather than folded in
+    // as zeros — the same disclosure the `tokens_lost` line makes in token
+    // space, one statistic later.
+    if summary.invocations > 0 && summary.compressed_invocations < summary.invocations {
         writeln!(w)?;
         writeln!(
             w,
-            "  Per-invocation mean: {:.1}% over all {} \u{2014} {:.1}% over the {} that changed",
+            "  Per-invocation mean: {:.1}% over all {} \u{2014} {:.1}% over the {} that compressed",
             summary.avg_savings_pct,
             tokens::format_number(summary.invocations as usize),
-            summary.avg_savings_pct_changed,
-            tokens::format_number(summary.changed_invocations as usize),
+            summary.avg_savings_pct_compressed,
+            tokens::format_number(summary.compressed_invocations as usize),
         )?;
+        // Only when there is a population to name. A mean that excludes rows
+        // silently is the defect one line above; a mean that excludes rows and
+        // says how many is a statistic.
+        if summary.expansion_invocations > 0 {
+            writeln!(
+                w,
+                "    excludes {} that expanded; savings_pct is floored at 0 on write, \
+                 so they cannot enter a mean about saving",
+                tokens::format_number(summary.expansion_invocations as usize),
+            )?;
+        }
     }
     render_delivered(w, &summary.delivered)?;
     writeln!(w)?;
@@ -431,13 +524,70 @@ fn render_summary(
 /// the delivered-cost block in `analytics::schema`. The boundary is row-level
 /// NULL-ness, and that is what the line now says.
 ///
-/// Silent when nothing has been measured yet — zero rows is "not yet measured",
-/// and rendering it as `0` would be a claim.
+/// # Zero rows is not a single state
+///
+/// It used to mean exactly one thing — "not yet measured" — and silence was the
+/// whole contract, because rendering it as `0` would be a claim. It means one
+/// of THREE things, and all three are now distinguishable:
+///
+/// 1. NEVER MEASURED. The normal state of a fresh database, of an upgraded one
+///    before its first measured invocation, of `stats --clear`, and of a 90-day
+///    prune. Stays silent, for the original reason.
+/// 2. RESET by a foreign rebuild that dropped the delivered-cost columns and
+///    had them re-added empty. `analytics::schema` marks this in
+///    `analytics_meta` under `delivered_series_reset_at` precisely so the loss
+///    stays recoverable, and [`crate::analytics::DeliveredSavings::reset_at`]
+///    now carries that mark here. Printed — as a cause, with no number
+///    attached, because the measurements it explains are gone.
+/// 3. EVERY MEASUREMENT UNTOKENISABLE — [`crate::analytics::DeliveredSavings`]'s
+///    `unmeasured_notice_rows` is non-zero while `rows` is zero. Disclosures
+///    were emitted and their cost could not be counted, so the series is EMPTY
+///    rather than UNOPENED. That is a different claim about a different cause,
+///    and it is printed.
+///
+/// (2) and (3) are independent and can hold together — a reset series can then
+/// accumulate only untokenisable disclosures — so both are printed rather than
+/// chained on an `else`.
+///
+/// Per PF-037 this contract is per-RENDERER: `run_json` carries the same
+/// disclosure, because a guard that lives on one surface is a guard the other
+/// surface does not have.
 fn render_delivered(
     w: &mut dyn Write,
     delivered: &crate::analytics::DeliveredSavings,
 ) -> anyhow::Result<()> {
     if delivered.rows == 0 {
+        // Case (2). Named as a CAUSE and nothing more: no figure is printed,
+        // because the reset is exactly the event that means there is none. The
+        // alternative — staying silent — reports it as case (1), "nothing
+        // measured yet", which is the one reading that is wrong here.
+        if let Some(reset_at) = delivered.reset_at {
+            writeln!(w)?;
+            writeln!(
+                w,
+                "  Delivered series: RESET{} — a `token_savings` rebuild dropped the \
+                 delivered-cost columns and every measurement in them",
+                age_suffix(reset_at),
+            )?;
+            writeln!(
+                w,
+                "    the figure resumes from the next measured invocation; nothing before \
+                 the reset is recoverable"
+            )?;
+        }
+        // Case (3). Silence here would report it as case (1), "nothing measured
+        // yet", which names a different cause. Deliberately avoids the
+        // `Delivered saved:` headline — no total is being asserted, and the
+        // headline is what a reader scans for one.
+        if delivered.unmeasured_notice_rows > 0 {
+            writeln!(w)?;
+            writeln!(
+                w,
+                "  Delivered series: empty, not unopened — {} run(s) emitted a disclosure \
+                 whose token cost could not be measured",
+                tokens::format_number(delivered.unmeasured_notice_rows as usize),
+            )?;
+        }
         return Ok(());
     }
     let window = match (&delivered.first_day, &delivered.last_day) {
@@ -447,34 +597,137 @@ fn render_delivered(
         // say so rather than printing a bare number with no window.
         _ => "window unknown".to_string(),
     };
-    // Rendered signed. Clamping a negative total to 0 here would be the same
-    // dishonesty the `tokens_lost` line exists to undo, one series later.
-    let magnitude = tokens::format_number(delivered.tokens.unsigned_abs() as usize);
-    let value = if delivered.tokens < 0 {
-        format!("-{magnitude}")
-    } else {
-        magnitude
-    };
     writeln!(w)?;
+    // Rendered signed via `signed_tokens`. Clamping a negative total to 0 here
+    // would be the same dishonesty the `tokens_lost` line exists to undo, one
+    // series later.
+    //
+    // The qualifier names the COHORT as well as the window. Disclosing only the
+    // window leaves the one reading of this number that is wrong: as a
+    // whole-corpus delivered total. `notice_tokens IS NOT NULL` is reachable
+    // only through `analytics::record_file_ops`, the single recording path that
+    // builds a non-default `Delivery`, and it hard-codes `CommandType::File`;
+    // `record_fire_and_forget` and `try_record_command_with_counts` pass
+    // `Delivery::default()` and write NULL. So the series structurally excludes
+    // git, build, test, log, db, infra, pkg and heatmap — roughly 90% of recent
+    // invocations, and the highest-savings cohorts among them (PF-036
+    // Resolution (C): price a cost against the population that can carry it,
+    // never against a denominator containing rows the effect cannot reach).
     writeln!(
         w,
-        "  Delivered saved: {} over {} disclosure-measured rows, {} (not comparable above)",
-        value,
+        "  Delivered saved: {} over {} disclosure-measured file reads, {} (not comparable above)",
+        signed_tokens(delivered.tokens),
         tokens::format_number(delivered.rows as usize),
         window,
+    )?;
+    writeln!(
+        w,
+        "    file cohort only — subcommand output (git/build/test/log/db/infra/pkg/heatmap) \
+         is not disclosure-measured"
     )?;
     writeln!(
         w,
         "    after charging {} tokens of stderr disclosure the same runs emitted",
         tokens::format_number(delivered.notice_tokens as usize),
     )?;
+    // The total above blends two populations with opposite cost profiles: a
+    // raw-served run saved nothing and still paid for the disclosure saying so,
+    // and can only push the figure DOWN; a transformed run is the one the
+    // headline is about. Printing the split is the first time `served` is read
+    // by anything at all (PF-036's amendment: recording a column is not
+    // measuring it).
+    //
+    // All three counts are printed, always, including zeros — they PARTITION
+    // the rows above, so they must be seen to add up. `served_other` is not a
+    // fault state: a cache hit and `Mode::Full` both record no serving decision
+    // inside a perfectly measured row.
+    writeln!(
+        w,
+        "    served {} raw, {} transformed, {} no decision recorded (of {})",
+        tokens::format_number(delivered.served_raw as usize),
+        tokens::format_number(delivered.served_transformed as usize),
+        tokens::format_number(delivered.served_other as usize),
+        tokens::format_number(delivered.rows as usize),
+    )?;
+    // The drop has a sign, and it is the favourable one: every such row was
+    // going to contribute a COST, so excluding it moves the total UP. Counted
+    // rather than silently absorbed, per the field's own contract.
+    if delivered.unmeasured_notice_rows > 0 {
+        writeln!(
+            w,
+            "    {} row(s) emitted a disclosure that could not be tokenised and are \
+             excluded; the total above is biased upward",
+            tokens::format_number(delivered.unmeasured_notice_rows as usize),
+        )?;
+    }
     if delivered.tokens < 0 {
         writeln!(
             w,
             "    net NEGATIVE: the disclosures cost more than the transforms saved"
         )?;
     }
+    // A reset is not only a zero-rows condition. Once measurement resumes the
+    // window above opens at the first NEW row, which looks exactly like a
+    // young series — so without this line the window silently understates what
+    // the database once held. Said here because `reset_at` reaches `--json`
+    // through serde on this same struct, and a disclosure one surface carries
+    // and the other drops is PF-037 in the other direction.
+    if let Some(reset_at) = delivered.reset_at {
+        writeln!(
+            w,
+            "    the window opens at a RESET{}, not at the start of recording — \
+             a `token_savings` rebuild dropped everything before it",
+            age_suffix(reset_at),
+        )?;
+    }
     Ok(())
+}
+
+/// Format a signed token count as its magnitude with an explicit leading `-`.
+///
+/// Shared by the `Tokens lost:` net and the delivered total so the two cannot
+/// drift. Both are quantities whose SIGN is the finding, and both are one
+/// careless `as usize` — or one `u64::saturating_sub` — away from rendering a
+/// loss as a saving. `unsigned_abs` is total, including at `i64::MIN`.
+fn signed_tokens(value: i64) -> String {
+    let magnitude = tokens::format_number(value.unsigned_abs() as usize);
+    if value < 0 {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    }
+}
+
+/// How long ago `at` (Unix seconds) was, as a suffix to splice into a sentence,
+/// or an empty string when the question has no honest answer.
+///
+/// # Why an age and not a date
+///
+/// A calendar date here would mean carrying a `civil_from_days` implementation
+/// for one line of output, and the sibling window (`first_day`/`last_day`) gets
+/// its day strings from SQLite's `date(…,'unixepoch')` rather than from any
+/// Rust date code — so a hand-rolled formatter would also be a SECOND way this
+/// file renders time. An age answers the only question the reset line raises
+/// ("how much history did I lose?") with integer division and no calendar.
+///
+/// Returns `""` rather than guessing when the mark is in the FUTURE. That is
+/// reachable without anything being wrong with skim — `unix_now` in
+/// `analytics::schema` reads the system clock, so a machine whose clock was
+/// corrected backwards after a reset has one — and "in -3 days" is worse than
+/// a line that simply does not date itself. The reset itself is still reported;
+/// only its age is withheld.
+fn age_suffix(at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let Some(elapsed) = now.checked_sub(at).filter(|e| *e >= 0) else {
+        return String::new();
+    };
+    match elapsed / crate::analytics::SECONDS_PER_DAY as i64 {
+        0 => " today".to_string(),
+        1 => " 1 day ago".to_string(),
+        days => format!(" {days} days ago"),
+    }
 }
 
 fn render_by_category(
@@ -845,16 +1098,38 @@ mod tests {
                     tokens_saved: 70_000,
                     avg_savings_pct: 70.0,
                     // 5,000 tokens of expansion sit under the `tokens_saved`
-                    // clamp, and 30 of the 42 rows actually changed.
+                    // clamp, spread over 3 rows; 30 of the 42 rows actually
+                    // compressed and paid; the remaining 9 were no-ops.
+                    //
+                    // `expansion_invocations` is NOT 0 here. `tokens_lost` is the
+                    // SUM and `expansion_invocations` the COUNT of the same
+                    // predicate (`compressed_tokens > raw_tokens`), so a positive
+                    // `tokens_lost` over zero rows is an unreachable state, and a
+                    // fixture asserting one would leave the exclusion disclosure
+                    // this branch adds with no coverage at all.
                     tokens_lost: 5_000,
-                    changed_invocations: 30,
-                    avg_savings_pct_changed: 98.0,
+                    expansion_invocations: 3,
+                    compressed_invocations: 30,
+                    avg_savings_pct_compressed: 98.0,
                     delivered: crate::analytics::DeliveredSavings {
                         rows: 12,
                         tokens: 64_500,
                         notice_tokens: 500,
+                        // Whole series: every measurement was tokenisable.
+                        unmeasured_notice_rows: 0,
                         first_day: Some("2026-03-24".to_string()),
                         last_day: Some("2026-03-25".to_string()),
+                        // Partitions `rows`: 7 + 4 + 1 = 12. A fixture whose
+                        // three buckets did not add up would let a renderer
+                        // that drops one of them still pass.
+                        served_raw: 7,
+                        served_transformed: 4,
+                        served_other: 1,
+                        // Never reset: the window opens where recording began,
+                        // so the general-purpose fixture asserts no reset line
+                        // and every test built on it stays about the series
+                        // rather than about its history.
+                        reset_at: None,
                     },
                 },
                 daily: vec![
@@ -1371,9 +1646,10 @@ mod tests {
             "delivered total must carry its window; got:\n{out}"
         );
         assert!(
-            out.contains("disclosure-measured rows"),
-            "and must qualify which rows it covers — the series spans only rows \
-             carrying a disclosure measurement, not a schema version; got:\n{out}"
+            out.contains("disclosure-measured file reads"),
+            "and must qualify which rows it covers — the series spans only FILE \
+             rows carrying a disclosure measurement, not a schema version and not \
+             the whole corpus; got:\n{out}"
         );
         assert!(
             out.contains("not comparable above"),
@@ -1394,6 +1670,361 @@ mod tests {
         assert!(
             !out.contains("Delivered saved"),
             "an unmeasured series must not be rendered as a measured zero; got:\n{out}"
+        );
+    }
+
+    /// PF-037: the guard above is per-RENDERER, so the JSON path needs its own.
+    ///
+    /// The mirror of `delivered_series_is_silent_before_any_measured_row`, and
+    /// the one that was missing: the text path has refused to print an
+    /// unmeasured series since the series was added, while `--json` published
+    /// `{"rows": 0, "tokens": 0, "first_day": null}` — the same claim, to the
+    /// consumer that parses rather than reads. Measured live on the author's
+    /// database (zero rows with `notice_tokens IS NOT NULL`), so this was the
+    /// shipping behaviour, not a latent one.
+    ///
+    /// DISCRIMINATING: serialise `delivered` unconditionally and this fails.
+    #[test]
+    fn delivered_key_is_absent_from_json_before_any_measured_row() {
+        let store = MockStore::empty();
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        assert!(
+            parsed["summary"].get("delivered").is_none(),
+            "an unmeasured series must be ABSENT, not a measured zero — a \
+             `\"delivered\": {{\"rows\": 0, \"tokens\": 0}}` is indistinguishable \
+             from a real zero to every consumer; got:\n{output}"
+        );
+        assert!(
+            parsed.get("delivered").is_none(),
+            "and must not reappear at the top level either; got:\n{output}"
+        );
+    }
+
+    /// Measured, the series IS published — nested with its siblings.
+    ///
+    /// The guard is a degenerate-case guard, not a suppression: the failure
+    /// mode of over-correcting is a series that never publishes at all.
+    /// Placement is asserted too, because `tokens_lost`,
+    /// `avg_savings_pct_compressed` and `delivered` are one disclosure story
+    /// and a consumer should not read them from two nesting levels.
+    #[test]
+    fn delivered_is_published_inside_summary_once_measured() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let delivered = &parsed["summary"]["delivered"];
+        assert!(
+            delivered.is_object(),
+            "a measured series must be published; got:\n{output}"
+        );
+        assert_eq!(delivered["rows"], 12);
+        assert_eq!(delivered["tokens"], 64_500);
+        assert_eq!(delivered["notice_tokens"], 500);
+        assert_eq!(delivered["unmeasured_notice_rows"], 0);
+        assert_eq!(delivered["first_day"], "2026-03-24");
+        assert!(
+            parsed.get("delivered").is_none(),
+            "and lives ONLY under `summary`, not at both levels; got:\n{output}"
+        );
+    }
+
+    /// Zero rows AFTER A RESET is a different state from zero rows before any
+    /// measurement, and the dashboard names the cause rather than the number.
+    ///
+    /// `reset_at` is written to `analytics_meta` only when all three
+    /// delivered-cost columns REAPPEAR on an already-reconciled database — i.e.
+    /// only when something dropped them, taking every measurement with them.
+    ///
+    /// DISCRIMINATING, twice: restore the bare `if rows == 0 { return }` and a
+    /// destroyed series reports as a never-opened one; and print a figure here
+    /// and the renderer asserts a total over rows that no longer exist.
+    #[test]
+    fn a_reset_series_names_the_reset_and_still_asserts_no_total() {
+        let summary = crate::analytics::AnalyticsSummary {
+            invocations: 10,
+            raw_tokens: 1000,
+            tokens_saved: 500,
+            delivered: crate::analytics::DeliveredSavings {
+                rows: 0,
+                reset_at: Some(1_790_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(
+            out.contains("RESET") && out.contains("resumes from the next measured invocation"),
+            "a reset series must name its cause and say where the figure picks \
+             up; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Delivered saved"),
+            "but must assert no total — every row it would have covered is \
+             gone; got:\n{out}"
+        );
+    }
+
+    /// The two zero-row causes are independent and both are printed.
+    ///
+    /// A reset series can then accumulate only untokenisable disclosures.
+    /// DISCRIMINATING: chain the two branches on an `else` and the reset hides
+    /// the emptiness, or the emptiness hides the reset, depending which way the
+    /// chain falls.
+    #[test]
+    fn a_reset_and_an_untokenisable_only_series_are_both_reported() {
+        let summary = crate::analytics::AnalyticsSummary {
+            delivered: crate::analytics::DeliveredSavings {
+                rows: 0,
+                unmeasured_notice_rows: 4,
+                reset_at: Some(1_790_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(out.contains("RESET"), "the reset is a cause; got:\n{out}");
+        assert!(
+            out.contains("empty, not unopened") && out.contains("4 run(s)"),
+            "and so is the untokenisable population — neither excuses dropping \
+             the other; got:\n{out}"
+        );
+    }
+
+    /// PF-037: the reset disclosure is per-RENDERER, so `--json` carries it too.
+    ///
+    /// The `delivered` guard makes a zero-row series ABSENT, which is right and
+    /// which is also what makes a RESET indistinguishable from "never
+    /// measured" to a parsing consumer — the same two-states-into-one collapse
+    /// the guard exists to prevent, one level out.
+    ///
+    /// DISCRIMINATING: drop the standalone key and the JSON surface for a
+    /// destroyed series is byte-identical to the JSON for a fresh install.
+    #[test]
+    fn json_publishes_a_reset_even_though_the_series_itself_is_absent() {
+        let mut store = MockStore::empty();
+        store.summary.delivered.reset_at = Some(1_790_000_000);
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        assert!(
+            parsed["summary"].get("delivered").is_none(),
+            "an unmeasured series stays absent — the reset does not license \
+             publishing a measured zero; got:\n{output}"
+        );
+        assert_eq!(
+            parsed["summary"]["delivered_series_reset_at"], 1_790_000_000_i64,
+            "but the cause of the absence must be published; got:\n{output}"
+        );
+    }
+
+    /// A measured series carries its reset INSIDE `delivered`, and never at two
+    /// levels at once.
+    ///
+    /// The struct field and the standalone key are mutually exclusive by
+    /// construction; a consumer reads exactly one of them.
+    ///
+    /// DISCRIMINATING: publish the standalone key unconditionally and the mark
+    /// appears twice, which is the nesting-level cost
+    /// `delivered_is_published_inside_summary_once_measured` already refuses
+    /// for the series itself.
+    #[test]
+    fn a_measured_reset_series_carries_its_mark_in_exactly_one_place() {
+        let mut store = MockStore::with_data();
+        store.summary.delivered.reset_at = Some(1_790_000_000);
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        assert_eq!(
+            parsed["summary"]["delivered"]["reset_at"],
+            1_790_000_000_i64
+        );
+        assert!(
+            parsed["summary"].get("delivered_series_reset_at").is_none(),
+            "one mark, one place; got:\n{output}"
+        );
+    }
+
+    /// An unreset series publishes no `reset_at` key at all.
+    ///
+    /// DISCRIMINATING: drop `skip_serializing_if` on the field and every
+    /// measured series ships `"reset_at": null` — a field to test, in the
+    /// renderer whose sibling guard exists because publishing an absent state
+    /// as a concrete value is what consumers misread (PF-037).
+    #[test]
+    fn an_unreset_series_publishes_no_reset_key() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        assert!(
+            parsed["summary"]["delivered"].get("reset_at").is_none(),
+            "an unreset series must publish no key, not a null; got:\n{output}"
+        );
+        assert!(
+            !output.contains("reset_at"),
+            "and the string must not carry it anywhere either; got:\n{output}"
+        );
+    }
+
+    /// The reset line dates itself when it honestly can, and does not when it
+    /// cannot.
+    ///
+    /// A mark in the FUTURE is reachable without anything being wrong with
+    /// skim: `analytics::schema::unix_now` reads the system clock, so a machine
+    /// corrected backwards after a reset has one.
+    ///
+    /// DISCRIMINATING: drop the `filter(|e| *e >= 0)` and the future case
+    /// renders as `-N days ago`, or — with unsigned arithmetic — as an
+    /// enormous positive age. Both date the reset with a number that is not a
+    /// measurement.
+    #[test]
+    fn age_suffix_reports_only_an_age_it_can_defend() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs() as i64;
+        let day = crate::analytics::SECONDS_PER_DAY as i64;
+
+        assert_eq!(age_suffix(now), " today");
+        assert_eq!(
+            age_suffix(now - day),
+            " 1 day ago",
+            "singular, not `1 days`"
+        );
+        assert_eq!(age_suffix(now - 3 * day), " 3 days ago");
+        assert_eq!(
+            age_suffix(now + 10 * day),
+            "",
+            "a mark in the future is a clock the renderer cannot vouch for, so \
+             it reports the reset and withholds only the age"
+        );
+    }
+
+    /// The renamed population keys reach JSON, not only the dashboard.
+    ///
+    /// `avg_savings_pct_changed` was a false label — floored-to-zero expansions
+    /// entered it as 0% savings — so the JSON key carrying it had to be renamed
+    /// with the statistic, and the excluded population published beside it.
+    #[test]
+    fn json_publishes_the_compressed_population_and_its_exclusions() {
+        let store = MockStore::with_data();
+        let output = capture(|w| run_json(w, &store, None, None));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&output).expect("output should be valid JSON");
+        let summary = &parsed["summary"];
+        assert_eq!(summary["avg_savings_pct_compressed"], 98.0);
+        assert_eq!(summary["compressed_invocations"], 30);
+        assert_eq!(summary["expansion_invocations"], 3);
+        assert_eq!(summary["tokens_lost"], 5_000);
+        assert!(
+            summary.get("avg_savings_pct_changed").is_none()
+                && summary.get("changed_invocations").is_none(),
+            "the false label must be gone, not shipped alongside its \
+             replacement; got:\n{output}"
+        );
+    }
+
+    /// Zero rows is three states, and the untokenisable one is not silence.
+    ///
+    /// DISCRIMINATING: restore the bare `if rows == 0 { return }` and this
+    /// fails — an empty-because-untokenisable series would be reported as
+    /// never-measured, which names a different cause.
+    #[test]
+    fn an_untokenisable_only_series_says_it_is_empty_not_unopened() {
+        let summary = crate::analytics::AnalyticsSummary {
+            invocations: 10,
+            raw_tokens: 1000,
+            tokens_saved: 500,
+            delivered: crate::analytics::DeliveredSavings {
+                rows: 0,
+                unmeasured_notice_rows: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(
+            out.contains("empty, not unopened") && out.contains("4 run(s)"),
+            "zero rows with untokenisable measurements is a different state from \
+             nothing measured, and must say so; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Delivered saved"),
+            "but still asserts no total — there is none; got:\n{out}"
+        );
+    }
+
+    /// A measured series discloses the rows that fell out of it.
+    #[test]
+    fn a_measured_series_counts_its_untokenisable_dropouts() {
+        let summary = crate::analytics::AnalyticsSummary {
+            invocations: 10,
+            raw_tokens: 1000,
+            tokens_saved: 500,
+            delivered: crate::analytics::DeliveredSavings {
+                rows: 12,
+                tokens: 64_500,
+                notice_tokens: 500,
+                unmeasured_notice_rows: 7,
+                first_day: Some("2026-03-24".to_string()),
+                last_day: Some("2026-03-25".to_string()),
+                served_raw: 7,
+                served_transformed: 4,
+                served_other: 1,
+                reset_at: None,
+            },
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(
+            out.contains("could not be tokenised") && out.contains("biased upward"),
+            "the drop has a favourable sign, so the total must name it rather \
+             than absorb it; got:\n{out}"
+        );
+    }
+
+    /// The delivered total is split by what the guard actually served, and the
+    /// split is shown to add up.
+    ///
+    /// `served` was written on every measured row and read by no production
+    /// query — PF-036's amendment ("recording a column is not measuring it").
+    /// This is its first reader, and the split matters because the two
+    /// populations have opposite cost profiles: a raw-served run saved nothing
+    /// and still paid for the disclosure that said so.
+    ///
+    /// DISCRIMINATING: drop any one of the three and the printed counts no
+    /// longer reconcile with the row count on the line above, which is the
+    /// state `served_other` exists to make impossible.
+    #[test]
+    fn the_delivered_total_is_split_by_what_was_served() {
+        let out = render_one(&MockStore::with_data().summary);
+        assert!(
+            out.contains("7 raw, 4 transformed, 1 no decision recorded (of 12)"),
+            "the serving split must be printed, and must be visibly a partition \
+             of the rows above; got:\n{out}"
+        );
+    }
+
+    /// The delivered total names its COHORT, not only its window.
+    ///
+    /// DISCRIMINATING: drop the cohort line and this fails. The window alone
+    /// leaves the one reading of the number that is wrong — as a whole-corpus
+    /// delivered total — when `notice_tokens IS NOT NULL` is reachable only
+    /// through `record_file_ops`, which hard-codes `CommandType::File`.
+    #[test]
+    fn delivered_total_names_the_cohort_it_covers() {
+        let out = render_one(&MockStore::with_data().summary);
+        assert!(
+            out.contains("file cohort only"),
+            "the series excludes git/build/test/log/db/infra/pkg/heatmap — \
+             structurally, not incidentally — and must say so; got:\n{out}"
+        );
+        assert!(
+            out.contains("not disclosure-measured"),
+            "and must say WHY those cohorts are absent; got:\n{out}"
         );
     }
 
@@ -1423,6 +2054,81 @@ mod tests {
         );
         assert!(out.contains("70.0%") && out.contains("98.0%"), "both means");
         assert!(out.contains("42") && out.contains("30"), "both populations");
+        assert!(
+            out.contains("that compressed"),
+            "the narrow population is the rows that COMPRESSED; \"that changed\" \
+             folded floored-to-zero expansions in as 0% savings; got:\n{out}"
+        );
+        assert!(
+            !out.contains("that changed"),
+            "and the false label must be gone, not merely supplemented; got:\n{out}"
+        );
+    }
+
+    /// The narrowed mean names the population it drops, not just the one it keeps.
+    ///
+    /// DISCRIMINATING: delete the `expansion_invocations > 0` line and this
+    /// fails — which is the point, because a mean that silently excludes a
+    /// quarter of its candidate rows is the defect the rename was made to fix,
+    /// relocated rather than removed.
+    #[test]
+    fn the_narrowed_mean_counts_the_expansions_it_excludes() {
+        let out = render_one(&MockStore::with_data().summary);
+        assert!(
+            out.contains("excludes 3 that expanded"),
+            "the excluded population must be counted; got:\n{out}"
+        );
+        assert!(
+            out.contains("floored at 0 on write"),
+            "and the reason must be given — an expansion is unrecoverable from \
+             savings_pct, which is why it cannot be averaged in; got:\n{out}"
+        );
+    }
+
+    /// No expansions means no exclusion line — the disclosure is not boilerplate.
+    #[test]
+    fn a_corpus_with_no_expansions_prints_no_exclusion_line() {
+        let summary = crate::analytics::AnalyticsSummary {
+            invocations: 10,
+            raw_tokens: 1000,
+            tokens_saved: 500,
+            compressed_invocations: 4,
+            avg_savings_pct_compressed: 50.0,
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(
+            out.contains("Per-invocation mean"),
+            "the mean itself is still printed; got:\n{out}"
+        );
+        assert!(
+            !out.contains("that expanded"),
+            "nothing was excluded, so nothing may be claimed excluded; got:\n{out}"
+        );
+    }
+
+    /// An expansion-dominated window renders a NEGATIVE net, never `0`.
+    ///
+    /// DISCRIMINATING: restore `tokens_saved.saturating_sub(tokens_lost)` and
+    /// this fails — the u64 clamp printed `net 0`, reintroducing one line below
+    /// the very clamp `Tokens lost:` was added two lines above to disclose.
+    #[test]
+    fn an_expansion_dominated_net_is_rendered_negative_not_zero() {
+        let summary = crate::analytics::AnalyticsSummary {
+            invocations: 10,
+            raw_tokens: 1000,
+            compressed_tokens: 4000,
+            tokens_saved: 500,
+            tokens_lost: 3_500,
+            expansion_invocations: 6,
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(
+            out.contains("net -3,000"),
+            "the net must carry its sign; a clamped `net 0` hides exactly what \
+             the line exists to disclose; got:\n{out}"
+        );
     }
 
     // ========================================================================

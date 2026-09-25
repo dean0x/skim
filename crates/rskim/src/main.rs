@@ -1405,6 +1405,9 @@ fn record_file_analytics(
             language,
             parse_tier,
             notice,
+            // Single-file: the marker is per-file, so `notice: None` here is a
+            // measured zero rather than the batch regime's "not measured".
+            notice_measured: true,
             served,
         }],
         analytics::FileOpCommon {
