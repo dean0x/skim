@@ -13,6 +13,7 @@
 //! - [`metrics`]  — pure IR metric functions (MRR, Precision@K)
 //! - [`qrel`]     — relevance judgment generation from symbol extraction
 //! - [`report`]   — JSON and Markdown report generation
+//! - [`scoreboard`] — search scoreboard: end-to-end retrieval-quality gate (#203)
 //! - [`split`]    — deterministic train/test split
 //! - [`tuning`]   — coordinate descent parameter search
 //! - [`types`]    — shared data types
@@ -24,6 +25,7 @@ pub mod harness;
 pub mod metrics;
 pub mod qrel;
 pub mod report;
+pub mod scoreboard;
 pub mod split;
 pub mod tuning;
 pub mod types;
