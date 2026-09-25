@@ -1137,6 +1137,83 @@ fn a_shrinking_list_without_an_oracle_is_a_ratchet_regression() {
     assert_exit(&h.check(), 0);
 }
 
+/// A file listed twice is invisible to the set-based checks (recall,
+/// precision) and to `order.score_monotone` (the list never rises), so it
+/// needs its own HARD check.
+#[test]
+fn a_path_listed_twice_in_a_full_list_fails_unique_paths() {
+    let h = Harness::new();
+    h.bless_current();
+
+    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
+    rows.insert(1, rows[0].clone());
+    let (_, q, f) = IDENT;
+    h.write_full(q, f, &rows);
+    let check = h.check();
+
+    assert_exit(&check, 1);
+    let err = stderr(&check);
+    assert!(err.contains("results.unique_paths"), "{err}");
+    assert!(err.contains("fixture-L01"), "{err}");
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, "fixture-L01", "results.unique_paths").as_deref(),
+        Some("fail")
+    );
+    let failures = gate_failures(&report);
+    assert!(
+        failures
+            .iter()
+            .any(|(kind, check, ids, message)| kind == "unledgered"
+                && check == "results.unique_paths"
+                && ids == &["fixture-L01".to_string()]
+                && message.contains(DEF_PATH)),
+        "{failures:#?}"
+    );
+}
+
+/// Every entry kind — ident, concept, lexical, pagination, a `--hot` prefix
+/// and a standalone `--ast` prefix — is checked for a repeated path.
+#[test]
+fn a_repeated_last_row_fails_unique_paths_on_every_entry_kind() {
+    let h = Harness::new();
+    h.bless_current();
+
+    for (_, q, f) in [CONCEPT, LEXICAL, PAGINATION, PREFIX] {
+        let mut rows = h.correct_rows(q, None);
+        rows.push(rows.last().unwrap().clone());
+        h.write_full(q, f, &rows);
+    }
+    let mut rows = h.correct_rows(IDENT.1, Some(DEF_PATH));
+    rows.push(rows.last().unwrap().clone());
+    h.write_full(IDENT.1, IDENT.2, &rows);
+    let mut scored = h.ast_rows(&[2.0, 1.0]);
+    scored.push(scored.last().unwrap().clone());
+    let (_, q, f) = AST;
+    h.write_response(
+        q,
+        f,
+        &format!("l{FULL_LIMIT}_o0.json"),
+        &ast_page_json(&scored, false),
+    );
+    let check = h.check();
+
+    assert_exit(&check, 1);
+    let failures = gate_failures(&h.report());
+    let unique: Vec<&Vec<String>> = failures
+        .iter()
+        .filter(|(kind, check, _, _)| kind == "unledgered" && check == "results.unique_paths")
+        .map(|(_, _, ids, _)| ids)
+        .collect();
+    let every_id: Vec<String> = [IDENT, CONCEPT, LEXICAL, PAGINATION, PREFIX, AST]
+        .iter()
+        .map(|(id, _, _)| id.to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(unique, vec![&every_id], "{failures:#?}");
+}
+
 #[test]
 fn golden_gen_prints_integrity_clean_ident_candidates() {
     let h = Harness::new();

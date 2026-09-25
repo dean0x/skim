@@ -416,6 +416,9 @@ pub enum CheckId {
     /// `score` is non-increasing down a full list without a temporal sort or
     /// `--blast-radius`.
     OrderScoreMonotone,
+    /// No path appears twice within one list: the full list, a `--limit`
+    /// list, or one page of a sweep.
+    ResultsUniquePaths,
 }
 
 impl CheckId {
@@ -431,6 +434,7 @@ impl CheckId {
         CheckId::PaginationHasMoreHonest,
         CheckId::OrderPrefixConsistent,
         CheckId::OrderScoreMonotone,
+        CheckId::ResultsUniquePaths,
     ];
 
     /// The dotted name used in reports and the ledger.
@@ -446,6 +450,7 @@ impl CheckId {
             CheckId::PaginationHasMoreHonest => "pagination.has_more_honest",
             CheckId::OrderPrefixConsistent => "order.prefix_consistent",
             CheckId::OrderScoreMonotone => "order.score_monotone",
+            CheckId::ResultsUniquePaths => "results.unique_paths",
         }
     }
 
@@ -463,7 +468,8 @@ impl CheckId {
             | CheckId::LexicalPrecision
             | CheckId::LexicalSilentFn
             | CheckId::LexicalVerifyMode
-            | CheckId::OrderScoreMonotone => true,
+            | CheckId::OrderScoreMonotone
+            | CheckId::ResultsUniquePaths => true,
         }
     }
 }
@@ -760,7 +766,7 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", check.as_str()));
             assert_eq!(serde_json::from_str::<CheckId>(&json).unwrap(), *check);
         }
-        assert_eq!(CheckId::ALL.len(), 10);
+        assert_eq!(CheckId::ALL.len(), 11);
         assert!("lexical.recal".parse::<CheckId>().is_err());
     }
 
@@ -772,6 +778,15 @@ mod tests {
         assert!(!CheckId::OrderPrefixConsistent.applies_to(EntryKind::Pagination));
         assert!(CheckId::OrderScoreMonotone.applies_to(EntryKind::Prefix));
         assert!(CheckId::LexicalRecall.applies_to(EntryKind::Concept));
+        for kind in [
+            EntryKind::Ident,
+            EntryKind::Concept,
+            EntryKind::Lexical,
+            EntryKind::Pagination,
+            EntryKind::Prefix,
+        ] {
+            assert!(CheckId::ResultsUniquePaths.applies_to(kind), "{kind:?}");
+        }
     }
 
     #[test]

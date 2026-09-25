@@ -91,7 +91,8 @@ impl PlannedQuery {
     /// - `pagination.*`: `[[pagination]]` entries;
     /// - `order.prefix_consistent`: `[[prefix]]` entries;
     /// - `order.score_monotone`: the list is ranked by `score` (no temporal
-    ///   sort, no `--blast-radius`).
+    ///   sort, no `--blast-radius`);
+    /// - `results.unique_paths`: every entry (every list it fetches).
     pub fn runs(&self, check: CheckId) -> bool {
         match check {
             CheckId::LexicalRecall | CheckId::LexicalPrecision | CheckId::LexicalSilentFn => {
@@ -104,6 +105,7 @@ impl PlannedQuery {
             | CheckId::PaginationHasMoreHonest => self.kind == EntryKind::Pagination,
             CheckId::OrderPrefixConsistent => self.kind == EntryKind::Prefix,
             CheckId::OrderScoreMonotone => !self.flags.has_rank_override(),
+            CheckId::ResultsUniquePaths => true,
         }
     }
 
@@ -316,6 +318,37 @@ pub fn check_score_monotone(rows: &[ResultRow]) -> CheckOutcome {
     ))
 }
 
+/// `results.unique_paths`: no path appears twice within one list — the full
+/// list, each `--limit` list, and each page of each sweep (a path on two
+/// different pages is `pagination.disjoint`). A repeated row is invisible to
+/// the set-based checks (recall, precision), and `order.score_monotone`
+/// passes a repeat that ties.
+pub fn check_unique_paths(
+    full: &[ResultRow],
+    sweeps: &[Sweep],
+    limited: &[(u32, ResultPage)],
+) -> CheckOutcome {
+    let limited_lists = limited
+        .iter()
+        .map(|(limit, page)| (format!("limit {limit}"), page.rows.as_slice()));
+    let sweep_pages = sweeps.iter().flat_map(|s| {
+        s.pages.iter().map(move |p| {
+            (
+                format!("L={} offset {}", s.limit, p.offset),
+                p.page.rows.as_slice(),
+            )
+        })
+    });
+    let problems: Vec<String> = std::iter::once(("full list".to_string(), full))
+        .chain(limited_lists)
+        .chain(sweep_pages)
+        .filter_map(|(list, rows)| {
+            duplicate_problem(&paths(rows)).map(|problem| format!("{list}: {problem}"))
+        })
+        .collect();
+    outcome_of(&problems)
+}
+
 /// The four pagination outcomes of one entry (all limits).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaginationOutcomes {
@@ -402,7 +435,8 @@ fn completeness_problem(full_set: &BTreeSet<&str>, shown: &[&str]) -> Option<Str
     (!parts.is_empty()).then(|| parts.join("; "))
 }
 
-/// `pagination.disjoint` for one sweep: files shown more than once.
+/// Files shown more than once in `shown` (`pagination.disjoint` over one
+/// sweep's pages, `results.unique_paths` over one list).
 fn duplicate_problem(shown: &[&str]) -> Option<String> {
     let mut seen = BTreeSet::new();
     let dups: BTreeSet<&str> = shown.iter().copied().filter(|p| !seen.insert(*p)).collect();
@@ -1254,6 +1288,9 @@ fn run_check(
         CheckId::PaginationHasMoreHonest => pagination()?.has_more_honest.clone(),
         CheckId::OrderPrefixConsistent => check_prefix(&obs.full.rows, &obs.limited),
         CheckId::OrderScoreMonotone => check_score_monotone(&obs.full.rows),
+        CheckId::ResultsUniquePaths => {
+            check_unique_paths(&obs.full.rows, &obs.sweeps, &obs.limited)
+        }
     })
 }
 

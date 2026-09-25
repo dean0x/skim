@@ -89,6 +89,7 @@ fn ident_concept_and_lexical_entries_run_the_lexical_checks_and_score_monotone()
         CheckId::LexicalSilentFn,
         CheckId::LexicalVerifyMode,
         CheckId::OrderScoreMonotone,
+        CheckId::ResultsUniquePaths,
     ];
     assert_eq!(
         checks_of(
@@ -123,6 +124,7 @@ fn a_temporal_pagination_entry_runs_pagination_and_lexical_checks_but_not_score_
             CheckId::PaginationDisjoint,
             CheckId::PaginationOrdered,
             CheckId::PaginationHasMoreHonest,
+            CheckId::ResultsUniquePaths,
         ]
     );
 }
@@ -140,6 +142,7 @@ fn a_text_plus_ast_entry_has_no_oracle_checks() {
             CheckId::PaginationOrdered,
             CheckId::PaginationHasMoreHonest,
             CheckId::OrderScoreMonotone,
+            CheckId::ResultsUniquePaths,
         ]
     );
 }
@@ -150,11 +153,15 @@ fn standalone_prefix_entries_check_prefix_and_monotonicity_only_where_score_rank
         checks_of(
             "[[prefix]]\nid = \"skim-F001\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n"
         ),
-        vec![CheckId::OrderPrefixConsistent, CheckId::OrderScoreMonotone]
+        vec![
+            CheckId::OrderPrefixConsistent,
+            CheckId::OrderScoreMonotone,
+            CheckId::ResultsUniquePaths
+        ]
     );
     assert_eq!(
         checks_of("[[prefix]]\nid = \"skim-F002\"\nflags = [\"--hot\"]\nlimits = [5]\n"),
-        vec![CheckId::OrderPrefixConsistent]
+        vec![CheckId::OrderPrefixConsistent, CheckId::ResultsUniquePaths]
     );
     let g = golden_with("[[prefix]]\nid = \"skim-F002\"\nflags = [\"--hot\"]\nlimits = [5]\n");
     let q = &plan(&g).unwrap()[0];
@@ -241,6 +248,58 @@ fn score_must_not_increase_down_the_list() {
     let o = check_score_monotone(&[row("a", 3.0), row("b", 1.0), row("c", 2.0)]);
     assert!(is_fail(&o));
     assert!(detail(&o).contains("rank 3"), "{}", detail(&o));
+}
+
+// --- unique paths -------------------------------------------------------------------
+
+#[test]
+fn lists_without_a_repeated_path_pass_unique_paths() {
+    let full = rows(&["a", "b", "c"]);
+    let limited = [(2, page(rows(&["a", "b"]), true))];
+    assert!(check_unique_paths(&full, &[honest_sweep(&["a", "b", "c"], 2)], &limited).is_pass());
+    assert!(check_unique_paths(&[], &[], &[]).is_pass());
+}
+
+#[test]
+fn a_path_repeated_in_the_full_list_fails_unique_paths_naming_it() {
+    // A tie: the list never rises, so score monotonicity lets it through.
+    let full = vec![row("a", 2.0), row("a", 2.0), row("b", 1.0)];
+    assert!(check_score_monotone(&full).is_pass());
+    let o = check_unique_paths(&full, &[], &[]);
+    assert!(is_fail(&o));
+    assert_eq!(detail(&o), "full list: 1 file(s) shown more than once: a");
+}
+
+#[test]
+fn a_path_repeated_on_a_limited_list_or_one_page_fails_unique_paths_naming_the_list() {
+    let full = rows(&["a", "b", "c", "d"]);
+    let limited = [
+        (2, page(rows(&["a", "b"]), true)),
+        (3, page(rows(&["a", "b", "b"]), true)),
+    ];
+    let mut sweep = honest_sweep(&["a", "b", "c", "d"], 2);
+    sweep.pages[1].page.rows[1] = row("c", 1.0);
+    let o = check_unique_paths(&full, &[sweep], &limited);
+    let d = detail(&o);
+    assert!(is_fail(&o));
+    assert!(
+        d.contains("limit 3: 1 file(s) shown more than once: b"),
+        "{d}"
+    );
+    assert!(
+        d.contains("L=2 offset 2: 1 file(s) shown more than once: c"),
+        "{d}"
+    );
+    assert!(!d.contains("limit 2") && !d.contains("full list"), "{d}");
+}
+
+#[test]
+fn a_path_on_two_different_pages_is_left_to_pagination_disjoint() {
+    let full = rows(&["a", "b", "c", "d"]);
+    let mut sweep = honest_sweep(&["a", "b", "c", "d"], 2);
+    sweep.pages[1].page.rows[0] = row("b", 2.0);
+    assert!(check_unique_paths(&full, std::slice::from_ref(&sweep), &[]).is_pass());
+    assert!(is_fail(&check_pagination(&full, &[sweep]).disjoint));
 }
 
 // --- pagination -------------------------------------------------------------------
@@ -650,6 +709,7 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     };
     assert!(outcome("skim-L01", CheckId::LexicalRecall).is_pass());
     assert!(outcome("skim-L01", CheckId::LexicalPrecision).is_pass());
+    assert!(outcome("skim-L01", CheckId::ResultsUniquePaths).is_pass());
     assert!(is_fail(&outcome("skim-C01", CheckId::LexicalPrecision)));
     let sorted = {
         let mut s = e.outcomes.clone();
