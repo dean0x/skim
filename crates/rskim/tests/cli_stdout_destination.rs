@@ -252,12 +252,21 @@ mod destination {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn hook");
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(payload.to_string().as_bytes())
-                .expect("write hook stdin");
+            let mut stdin = child.stdin.take().expect("hook stdin");
+            // A hook that short-circuits before reading stdin (SKIM_PASSTHROUGH=1,
+            // AwarenessOnly agents) may exit before this write lands, so EPIPE is
+            // an expected outcome here, not a failure; `assert_cmd` discards stdin
+            // write errors for the same reason. The exit status and stdout are
+            // still asserted below.
+            if let Err(e) = stdin.write_all(payload.to_string().as_bytes()) {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "write hook stdin: {e}"
+                );
+            }
+            // Close stdin before waiting, or a hook that does read it blocks on EOF.
+            drop(stdin);
             let out = child.wait_with_output().expect("hook must exit");
             assert!(out.status.success(), "hook must exit 0");
             String::from_utf8_lossy(&out.stdout).into_owned()
