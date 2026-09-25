@@ -39,6 +39,30 @@ pub enum Language {
     Bash,
 }
 
+/// The 1-indexed SOURCE line that the `--last-lines` window's first OUTPUT line
+/// puts on screen, read off the transform's own line map.
+///
+/// `line_map[i]` is the source line of pre-truncation output line `i`, with `0`
+/// meaning "this output line annotates no source line" -- a synthetic separator,
+/// or a line a producer's map never described. Scanning forward from `start` for
+/// the first non-zero entry is therefore exactly right for a positional claim:
+/// if the window opens on a synthetic line, the first source line the reader can
+/// actually SEE is the next annotated one, and everything above that line is
+/// above the window.
+///
+/// `None` means the map cannot answer (absent, or no annotated line at or after
+/// `start`). The caller must then fall back rather than invent a source-space
+/// number -- a fabricated positional claim is worse than the wrong-but-documented
+/// arithmetic it would replace (ADR-011 class 1: the count is a claim about the
+/// user's file, not a spare slot to fill).
+fn window_first_source_line(line_map: Option<&[usize]>, start: usize) -> Option<usize> {
+    line_map?
+        .get(start..)?
+        .iter()
+        .copied()
+        .find(|&source_line| source_line > 0)
+}
+
 impl Language {
     /// Detect language from file extension
     ///
@@ -325,11 +349,21 @@ impl Language {
     /// source line map. All branching logic (passthrough detection, serde delegation,
     /// parser creation, max_lines/last_lines truncation) lives in a single place.
     ///
-    /// Line-map computation is gated behind `config.line_numbers`: when that flag is
-    /// `false`, the delegate skips all line-map allocation and returns `None` at zero
-    /// extra cost. Any new line-map logic added to `transform_source_with_line_map`
-    /// MUST therefore be placed inside a `if config.line_numbers { … }` guard so that
-    /// callers that do not need line numbers (i.e. this function) pay no overhead.
+    /// Line-map computation is gated behind `config.line_numbers` OR
+    /// `config.last_lines`: with neither set, the delegate skips all line-map
+    /// allocation and returns `None` at zero extra cost. Any new line-map logic
+    /// added to `transform_source_with_line_map` MUST therefore sit behind one of
+    /// those two guards so that callers that need neither pay no overhead.
+    ///
+    /// `last_lines` is in that gate because the map is an INPUT there, not only a
+    /// `-n` output: the tail marker's `(N lines above)` is a positional claim about
+    /// the SOURCE, and the map is the only thing that knows which source line the
+    /// retained window opens on. Gating the map on `line_numbers` alone made the
+    /// honest count reachable only when the caller happened to ask for line numbers,
+    /// and silently served the output-space fallback to everyone else (PF-033 rule
+    /// 4 -- the coordinate collision this function's `last_lines` branch exists to
+    /// remove). The map is still DROPPED before returning when `line_numbers` is
+    /// false, so the public contract below is unchanged.
     ///
     /// # Errors
     /// Returns parsing or transformation errors specific to the language.
@@ -404,25 +438,52 @@ impl Language {
         let tree = parser.parse(source)?;
         let parse_errors = tree.root_node().has_error();
 
-        let (result, line_map) =
-            match crate::transform::transform_tree_with_line_map(source, &tree, self, config) {
-                Ok(v) => v,
-                // A structural safety cap overflowed — a legitimate but very large
-                // file (e.g. a machine-generated weight table) that we cannot
-                // compress without exceeding the cap. Rather than failing the
-                // command, degrade to a lossless raw passthrough (honoring
-                // max_lines/last_lines so a `head`-style request still yields a
-                // window, not the whole file). (#317: compress, never truncate;
-                // if we can't compress, cleanly passthrough.) The passthrough
-                // branch handles its own truncation and returns early, so the
-                // last_lines post-processing below is correctly bypassed.
-                Err(e) if e.is_complexity_limit() => {
-                    let (content, _has_errors, line_map) =
-                        self.transform_passthrough_with_line_map(source, config)?;
-                    return Ok((content, false, line_map, true)); // degraded: AST cap hit
-                }
-                Err(e) => return Err(e),
-            };
+        // The tail marker's count is resolved from the transform's own line map
+        // (see the `last_lines` branch below), so `--last-lines` needs that map
+        // whether or not the caller asked for `-n`. `transform_tree_with_line_map`
+        // produces one only when `line_numbers` is set, so ask it for one here.
+        //
+        // PF-033 rule 4: this is the PRODUCER half of the source-space migration.
+        // Moving the consumer alone left the honest count reachable only on the
+        // `-n` path and served the output-space fallback silently everywhere else
+        // -- the same arithmetic the branch below exists to replace, now hidden
+        // behind a flag no caller of the truncation goldens sets.
+        //
+        // The two producer variants are the same code: `transform_*_with_spans`
+        // delegates to `transform_*_with_spans_and_line_map` and drops the map, and
+        // no transform reads `line_numbers`, so the TEXT and the spans are
+        // byte-identical either way. Only the map's presence changes, and it is
+        // dropped again before returning when the caller did not ask for it.
+        let map_config = (config.last_lines.is_some() && !config.line_numbers).then(|| {
+            let mut with_map = config.clone();
+            with_map.line_numbers = true;
+            with_map
+        });
+        let transform_config = map_config.as_ref().unwrap_or(config);
+
+        let (result, line_map) = match crate::transform::transform_tree_with_line_map(
+            source,
+            &tree,
+            self,
+            transform_config,
+        ) {
+            Ok(v) => v,
+            // A structural safety cap overflowed — a legitimate but very large
+            // file (e.g. a machine-generated weight table) that we cannot
+            // compress without exceeding the cap. Rather than failing the
+            // command, degrade to a lossless raw passthrough (honoring
+            // max_lines/last_lines so a `head`-style request still yields a
+            // window, not the whole file). (#317: compress, never truncate;
+            // if we can't compress, cleanly passthrough.) The passthrough
+            // branch handles its own truncation and returns early, so the
+            // last_lines post-processing below is correctly bypassed.
+            Err(e) if e.is_complexity_limit() => {
+                let (content, _has_errors, line_map) =
+                    self.transform_passthrough_with_line_map(source, config)?;
+                return Ok((content, false, line_map, true)); // degraded: AST cap hit
+            }
+            Err(e) => return Err(e),
+        };
 
         // Apply last_lines truncation as a post-processing step (B5: pass elision_hint).
         //
@@ -433,19 +494,47 @@ impl Language {
         // (ADR-011 class 1). PF-033 rule 1: hand the truncator the source-space
         // count rather than letting it re-derive one from the rendered output,
         // which no longer distinguishes content from marker.
+        //
+        // PF-033 rule 4 (regression-02): handing it `Some(source.lines().count())`
+        // satisfied rule 1 for the TOTAL and then let the truncator finish the sum
+        // in the wrong space — `source_total - (retained OUTPUT lines)` — which
+        // over-reports "N lines above" by however many source lines the transform
+        // collapsed inside the retained window. The marker's claim is POSITIONAL,
+        // so it is resolved positionally: the line map already knows which source
+        // line the window's first output line came from, and everything above that
+        // line is what is above the window.
         let (result, line_map) = if let Some(n) = config.last_lines {
-            let truncated = crate::transform::truncate::simple_last_line_truncate(
-                &result,
-                self,
-                n,
-                config.elision_hint.as_deref(),
-                Some(source.lines().count()),
-            )?;
-            let final_map = if let Some(ref map) = line_map {
-                // Reconcile the line map after last_lines truncation
-                let reconciled =
-                    crate::transform::reconcile_line_map_after_truncation(&result, &truncated, map);
-                Some(reconciled)
+            let source_line_count = source.lines().count();
+            let map_for_window = line_map.as_deref();
+            let (truncated, _start) =
+                crate::transform::truncate::simple_last_line_truncate_with_omitted(
+                    &result,
+                    self,
+                    n,
+                    config.elision_hint.as_deref(),
+                    |start, output_total| {
+                        window_first_source_line(map_for_window, start).map_or_else(
+                            || {
+                                // No annotated line at or after the window start:
+                                // keep the pre-existing arithmetic rather than
+                                // fabricate a positional claim. Wrong-but-bounded,
+                                // and identical to what shipped.
+                                let retained = output_total.saturating_sub(start);
+                                source_line_count.saturating_sub(retained)
+                            },
+                            // 1-indexed source line -> count of lines above it.
+                            |first| first.saturating_sub(1),
+                        )
+                    },
+                )?;
+            // Reconcile the line map after last_lines truncation -- but only when
+            // the caller actually wants a map back. When the map was requested
+            // solely to resolve the marker's count above, reconciling it would be
+            // work whose only consumer is the drop below.
+            let final_map = if config.line_numbers {
+                line_map.as_ref().map(|map| {
+                    crate::transform::reconcile_line_map_after_truncation(&result, &truncated, map)
+                })
             } else {
                 None
             };
@@ -453,6 +542,15 @@ impl Language {
         } else {
             (result, line_map)
         };
+
+        // `source_line_map` is documented as `None` whenever `line_numbers` is
+        // false, and the map above may have been requested purely to resolve the
+        // tail marker's positional count. Enforce the contract ONCE, here, rather
+        // than leaving it to depend on which branch produced the value: the
+        // `final_map` gate above is then only an optimisation (skip a reconcile
+        // nobody reads), and a future producer that starts asking for a map for
+        // some other reason cannot leak one through this return.
+        let line_map = line_map.filter(|_| config.line_numbers);
 
         Ok((result, parse_errors, line_map, false)) // normal tree-sitter transform, not degraded
     }
@@ -636,7 +734,11 @@ impl Language {
 pub enum Mode {
     /// Keep structure only - strip all implementation bodies
     ///
-    /// Token reduction: ~70-80%
+    /// Token reduction: ~60-80% — the only measured figure is 60.3%, on the
+    /// production TypeScript codebase in README's reduction tables. The range is
+    /// stated wide enough to contain it. No CI gate defends the range either way:
+    /// the only reduction ratio any test asserts is `> 0.30`, on the JSON and
+    /// YAML structure-mode fixtures.
     ///
     /// Keeps:
     /// - Function/method signatures
@@ -680,9 +782,16 @@ pub enum Mode {
     Full,
 
     /// Minimal cleanup - strip non-doc comments, normalize blank lines;
-    /// module header comments preserved in Python, Ruby, SQL, and Bash
+    /// module header comments preserved in every language (#476)
     ///
-    /// Token reduction: ~15-30%
+    /// Token reduction: unverified — no figure has been measured for this mode.
+    /// The `15-30%` this doc used to state was never derived from a measurement and
+    /// nothing defends it: the only reduction ratios the suite asserts are two
+    /// structure-mode `> 0.30` checks on the JSON and YAML fixtures. It also has a
+    /// counter-example — a file whose only comments are its module header now
+    /// reduces by 0%, because #476 preserves that header in every language
+    /// (`tests/fixtures/sql/simple.sql` is such a file). See the module header of
+    /// `crate::transform::minimal` for the full provenance.
     ///
     /// Keeps:
     /// - All code (function bodies, implementations, variables, imports)
@@ -690,11 +799,11 @@ pub enum Mode {
     /// - Comments inside function bodies
     /// - Shebangs (`#!/usr/bin/env python3`)
     /// - Module header comments (SPDX, `# frozen_string_literal:`, provenance lines) in
-    ///   Python, Ruby, SQL, and Bash only — stripped in all other languages
+    ///   every language (#476) — the leading run of comments at the top of the file
     ///
     /// Removes:
     /// - Regular single-line comments (`//`, `#`) at module/class level
-    ///   (except module header comments in Python, Ruby, SQL, and Bash)
+    ///   (except module header comments, preserved in every language — #476)
     /// - Regular block comments (`/* */`) at module/class level
     /// - Trailing whitespace left by comment removal
     /// - Excessive blank lines (3+ consecutive -> 2)
@@ -705,7 +814,12 @@ pub enum Mode {
 
     /// Pseudo mode - strips syntactic noise while preserving logic flow
     ///
-    /// Token reduction: ~30-50%
+    /// Token reduction: unverified — no figure has been measured for this mode.
+    /// ADR-008's archaeology traces the `30-50%` this doc used to state to the
+    /// original pseudo-mode commit (04b5f9f, #70), copied into six files and never
+    /// re-derived, and ADR-007's own text says "no CI gate defends pseudo's 30-50%
+    /// reduction target". See the module header of `crate::transform::pseudo` for
+    /// why no single number can carry this mode across languages any more.
     ///
     /// Produces pseudocode-like output by removing type annotations, visibility
     /// modifiers, decorators, semicolons, and other syntactic noise while keeping
@@ -756,11 +870,13 @@ impl Mode {
 
     /// Returns the aggressiveness ordering for cascade purposes
     ///
-    /// Higher values mean more aggressive token reduction:
+    /// Higher values mean more aggressive token reduction. The percentages below
+    /// are targets, not measurements; only structure mode has a measured figure
+    /// (60.3%, README's reduction tables):
     /// - Full(0): No transformation, 0% reduction
-    /// - Minimal(1): Strip non-doc comments (module header comments preserved in Python, Ruby, SQL, Bash), ~15-30% reduction
-    /// - Pseudo(2): Strip syntactic noise, ~30-50% reduction
-    /// - Structure(3): Strip bodies, ~70-80% reduction
+    /// - Minimal(1): Strip non-doc comments (module header comments preserved in every language, #476), reduction unverified
+    /// - Pseudo(2): Strip syntactic noise, reduction unverified
+    /// - Structure(3): Strip bodies, ~60-80% reduction (measured 60.3%)
     /// - Signatures(4): Signatures only, ~85-92% reduction
     /// - Types(5): Types only, ~90-95% reduction
     pub fn aggressiveness(self) -> u8 {

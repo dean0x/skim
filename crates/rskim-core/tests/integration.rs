@@ -1131,6 +1131,19 @@ fn test_typescript_minimal_preserves_all_code() {
     assert!(result.contains("export const VERSION"));
 }
 
+/// The 3+-to-2 blank cap over the real fixture, aimed at the run the fixture
+/// itself was written to exercise.
+///
+/// `comments.ts` has two blank runs a reader could confuse:
+///
+/// * lines 3 and 6, which become adjacent once the two `(STRIP)` comments
+///   between them are removed. That is the body's FIRST run, so
+///   `fold_leading_blank_run` — not `trim_and_normalize` — owns it and folds it
+///   to a single blank. A bare `!contains("\n\n\n\n")` is satisfied by that fold
+///   alone, which is why this test names the run it is actually about.
+/// * lines 48-51 above `export const VERSION`, which the fixture's own comment
+///   labels "there are 4+ blank lines above (normalize to 2)". That run is not
+///   first, the fold leaves it alone, and the cap is what shapes it.
 #[test]
 fn test_typescript_minimal_normalizes_blank_lines() {
     let source = include_str!("../../../tests/fixtures/typescript/comments.ts");
@@ -1140,7 +1153,15 @@ fn test_typescript_minimal_normalizes_blank_lines() {
     // Check that there are no 3+ consecutive blank lines
     assert!(
         !result.contains("\n\n\n\n"),
-        "Should normalize 4+ consecutive blank lines"
+        "Should normalize 4+ consecutive blank lines, got:\n{result}"
+    );
+    // The capped run, named: `}` closes `export interface Config` on line 47 and
+    // `export const VERSION` is line 54, with four blank lines and one stripped
+    // module-level comment between them.
+    assert!(
+        result.contains("}\n\n\nexport const VERSION"),
+        "the run above `export const VERSION` must be capped at exactly two \
+         blank lines, got:\n{result}"
     );
 }
 
@@ -1659,18 +1680,54 @@ fn test_minimal_only_comments_strips_run_after_header_break() {
     );
 }
 
+/// `trim_and_normalize`'s 3+-to-2 blank cap, measured on a run the leading-blank
+/// fold does not own.
+///
+/// The fixture deliberately opens with a SINGLE blank run: `fold_leading_blank_run`
+/// collapses the body's first blank run to one line and declines a run that is
+/// already one line, so the four-blank run below it reaches `trim_and_normalize`
+/// untouched and the cap is what the assertion measures.
+///
+/// This test previously used `"const a = 1;\n\n\n\n\nconst b = 2;\n"` — whose
+/// only blank run IS the first one. Once the fold landed, that input was
+/// collapsed to a single blank before the cap ever ran, so `!contains("\n\n\n\n")`
+/// passed on the fold's work and the cap this test is named for was no longer
+/// exercised. The fold is covered on its own below.
 #[test]
 fn test_minimal_blank_line_normalization() {
+    let source = "const a = 1;\n\nconst b = 2;\n\n\n\n\nconst c = 3;\n";
+    let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
+
+    // 4 blank lines in the LATER run should be capped at 2.
+    assert!(
+        !result.contains("\n\n\n\n"),
+        "4+ consecutive blank lines should be normalized, got:\n{result:?}"
+    );
+    assert!(
+        result.contains("const b = 2;\n\n\nconst c = 3;"),
+        "the capped run must be exactly two blank lines, got:\n{result:?}"
+    );
+    // The first run is a single blank and must survive the fold untouched.
+    assert!(
+        result.contains("const a = 1;\n\nconst b = 2;"),
+        "a first run that is already one blank line has nothing to fold, got:\n{result:?}"
+    );
+}
+
+/// The companion to the test above: the body's FIRST blank run folds to one line.
+///
+/// Keeps the original fixture of `test_minimal_blank_line_normalization` so the
+/// input that used to reach the cap is still covered — by the rule that now
+/// actually governs it.
+#[test]
+fn test_minimal_leading_blank_run_folds_to_one_line() {
     let source = "const a = 1;\n\n\n\n\nconst b = 2;\n";
     let result = transform(source, Language::TypeScript, Mode::Minimal).unwrap();
 
-    // 5 blank lines should be normalized to 2
     assert!(
-        !result.contains("\n\n\n\n"),
-        "4+ consecutive blank lines should be normalized"
+        result.contains("const a = 1;\n\nconst b = 2;"),
+        "the body's first blank run folds to a single blank line, got:\n{result:?}"
     );
-    assert!(result.contains("const a = 1;"));
-    assert!(result.contains("const b = 2;"));
 }
 
 #[test]

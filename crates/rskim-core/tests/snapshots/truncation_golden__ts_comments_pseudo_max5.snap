@@ -5,5 +5,5 @@ expression: "snap(TS_COMMENTS, Language::TypeScript,\nTransformConfig::with_mode
 // FIXTURE: TypeScript file with various comment types
 // TESTS: Minimal mode comment stripping
 
-
+/**
 // ... (50 lines truncated)

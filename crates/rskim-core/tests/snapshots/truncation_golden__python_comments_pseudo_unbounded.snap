@@ -6,7 +6,6 @@ expression: "snap(PYTHON_COMMENTS, Language::Python,\nTransformConfig::with_mode
 # FIXTURE: Python file with various comment types
 # TESTS: Minimal mode comment stripping
 
-
 def add(x, y) -> int:
     """Add two numbers together.
 

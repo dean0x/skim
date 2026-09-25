@@ -697,16 +697,38 @@ fn test_cut_inside_side_fence_not_relabelled_as_literal() {
 
 /// Extract the elided line count from an elision marker line.
 ///
-/// Handles every marker spelling `elision_marker_line` produces:
-/// `// ... (N lines truncated)`, `# ... (1 line truncated)`,
-/// `<!-- ... (N lines truncated) -->` and the #511 `; cut inside ...` variants.
+/// Every spelling `rskim_core::elision_marker_line` produces is
+/// `<prefix> ... (<N> line|lines <side>)[ — <hint>]<suffix>`, where `<side>` is
+/// one of SIX values -- and the `above` half of that list is what the previous
+/// version of this helper did not know:
+///
+/// | side text                                | produced by                    |
+/// |------------------------------------------|--------------------------------|
+/// | `truncated`                              | `--max-lines` / `--tokens`     |
+/// | `above`                                  | `--last-lines`                 |
+/// | `truncated; cut inside a string literal` | `--max-lines`, #511 fail-safe  |
+/// | `truncated; cut inside a code fence`     | idem, Markdown                 |
+/// | `above; cut inside a string literal`     | `--last-lines`, #511 fail-safe |
+/// | `above; cut inside a code fence`         | idem, Markdown                 |
+///
+/// Requiring the substring `truncated` therefore returned `None` for all three
+/// `above` forms, and [`split_markers_and_content`] counted those markers as
+/// EMITTED CONTENT -- an off-by-one in the accounting identity for any caller
+/// that reached a `--last-lines` output, silently, in the direction that makes a
+/// broken view look correct. The test is now on the side text's first word, which
+/// is `truncated` or `above` for every one of the six.
+///
 /// Returns `None` for ordinary content lines, which is how callers separate
 /// emitted content from markers.
 fn marker_count(line: &str) -> Option<usize> {
     let after = line.split_once("... (")?.1;
     let (num, rest) = after.split_once(' ')?;
     // Guard against a content line that merely happens to contain "... (".
-    if !rest.starts_with("line") || !rest.contains("truncated") {
+    // `rest` is `line <side>)…` or `lines <side>)…`; anything else is content.
+    let side = rest
+        .strip_prefix("lines ")
+        .or_else(|| rest.strip_prefix("line "))?;
+    if !side.starts_with("truncated") && !side.starts_with("above") {
         return None;
     }
     num.parse::<usize>().ok()
@@ -750,6 +772,24 @@ fn ts_eight_functions() -> String {
 fn ts_six_interfaces() -> String {
     (1..=6)
         .map(|i| format!("interface I{i} {{\n  a: number;\n}}\n\n\n\n"))
+        .collect()
+}
+
+/// 4 TypeScript interfaces, each 3 code lines, with NO gutter between them.
+///
+/// The discriminating sibling of [`ts_six_interfaces`]: that fixture's 3-blank
+/// gutter forces every SOURCE gap to 3, which is what lets it tell the two
+/// coordinate spaces apart -- and also what makes it structurally unable to
+/// observe the case where the source gap is ZERO.
+///
+/// Source layout (0-indexed rows): `IN` starts at row `3*(N-1)`, so I1@0, I2@3,
+/// I3@6, I4@9 -- 12 source lines, every definition source-ADJACENT to the next.
+/// Types mode still joins with "\n\n", so the transformed output is 4*3 + 3
+/// synthetic separators = 15 lines: a 1-line TRANSFORMED gap sitting over a
+/// 0-line SOURCE gap, at every join.
+fn ts_adjacent_interfaces() -> String {
+    (1..=4)
+        .map(|i| format!("interface I{i} {{\n  a: number;\n}}\n"))
         .collect()
 }
 
@@ -876,6 +916,143 @@ fn types_max_lines_gap_and_trailing_markers_are_in_source_space() {
         "every source line must be either SHOWN or counted in a marker.\n  \
          reconstructed = {reconstructed} (markers {marker_total} + emitted {emitted})\n  \
          expected      = 36 source lines\nGot:\n{out}"
+    );
+}
+
+/// types + --max-lines over SOURCE-ADJACENT definitions: no marker may claim that
+/// zero lines are missing.
+///
+/// This is the case [`types_max_lines_gap_and_trailing_markers_are_in_source_space`]
+/// structurally cannot see. Its fixture's 3-blank gutter makes every source gap 3,
+/// so the source count and the transformed count are both non-zero and the bug
+/// hides. Remove the gutter and the two disagree at the only value that matters:
+///
+///   * spans transformed `0..3, 4..7, 8..11, 12..15` (the `\n\n` join inserts a
+///     synthetic separator that belongs to NO source line), source
+///     `0..3, 3..6, 6..9, 9..12`.
+///   * the transformed gap is 1 at every join; the SOURCE gap is 0 at every join.
+///
+/// Pre-fix, presence was decided in transformed space (`start > last_end`) while
+/// the count was already in source space, so the builder emitted
+/// `// ... (0 lines truncated) — SKIM_PASSTHROUGH=1 for full output` twice: an
+/// ADR-011 class-1 disclosure that discloses nothing, spending 2 of the 12 lines
+/// ADR-016 allows on a claim of zero. This is the shape PF-033 rule 4 names -- a
+/// count that is right about a gap the predicate got wrong -- and it is a
+/// REGRESSION, not an inherited wart: before the counts moved to source space
+/// those two markers read `(1 line truncated)`, which was wrong about the space
+/// but at least disclosed the separator it had counted.
+///
+/// The accounting identity cannot catch it on its own (9 emitted + 0 + 0 + 3 = 12
+/// reconciles perfectly), which is why the zero-claim assertion is stated
+/// directly.
+#[test]
+fn types_max_lines_never_claims_zero_lines_truncated() {
+    let source = ts_adjacent_interfaces();
+    assert_eq!(
+        source.lines().count(),
+        12,
+        "fixture must have exactly 12 source lines"
+    );
+
+    let out = xform(
+        &source,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Types)
+            .with_max_lines(12)
+            .with_elision_hint("SKIM_PASSTHROUGH=1 for full output"),
+    );
+
+    assert!(
+        !out.contains("(0 line"),
+        "a marker that discloses nothing is an ADR-016 budget line spent on a \
+         false claim: presence must follow the SOURCE count, not the transformed \
+         gap.\nGot:\n{out}"
+    );
+    assert_eq!(
+        out.lines().count(),
+        12,
+        "ADR-016: --max-lines 12 must still yield at most 12 lines total, markers \
+         included.\nGot:\n{out}"
+    );
+    assert!(
+        out.contains("interface I1") && out.contains("interface I3"),
+        "suppressing the empty markers must return their budget lines to CONTENT, \
+         not strand them.\nGot:\n{out}"
+    );
+
+    // The identity is the independent check on the count that survives: whatever
+    // the trim loop settles on, every source line is either shown or counted.
+    let (marker_total, emitted) = split_markers_and_content(&out);
+    let reconstructed = marker_total + emitted;
+    assert_eq!(
+        reconstructed, 12,
+        "every source line must be either SHOWN or counted in a marker.\n  \
+         reconstructed = {reconstructed} (markers {marker_total} + emitted {emitted})\n  \
+         expected      = 12 source lines\nGot:\n{out}"
+    );
+}
+
+/// signatures + --max-lines: the source lines the view discloses NOWHERE, pinned
+/// to the exact amount so the gap is tracked rather than invisible.
+///
+/// This is the self-retiring exclusion for the second half of the coordinate
+/// migration, in the same shape as `ACCOUNTING_EXCLUSIONS` below: an explicit
+/// named number rather than a tolerance band, so fixing the defect turns THIS
+/// test red and forces whoever fixed it to delete the entry.
+///
+/// # The gap
+///
+/// `transform_signatures_with_spans_and_line_map` joins signatures with `"\n"` and
+/// advances `current_output_line += line_count` with no separator, so consecutive
+/// spans are CONTIGUOUS in transformed space. The builder's gap predicate asks
+/// `start > last_end`, which is therefore never true for signatures, and the
+/// function bodies between two selected signatures are shown nowhere and counted
+/// in no marker. Measured on this fixture at `--max-lines 5`: 4 signatures
+/// emitted, trailing marker 19, so `4 + 19 = 23` of 32 source lines are accounted
+/// for and 9 (the bodies and blanks of f1-f4: rows 1-3, 5-7, 9-11) are not.
+///
+/// # Why it is tracked and not yet fixed
+///
+/// Firing the gap marker on a SOURCE gap that the transformed cursor cannot see is
+/// the right fix, and it is not landable in isolation: `extract_markdown_headers_with_spans`
+/// builds spans that are contiguous in exactly the same way AND understate their
+/// rendered output (each header text carries a trailing newline, so 6 headers
+/// render 13 output lines while their spans claim 8 -- see the
+/// `md_simple_structure_max5` entry in `ACCOUNTING_EXCLUSIONS`). Under the source
+/// gap predicate, `md_simple_structure_max5` fires three new gap markers and its
+/// view collapses to one header, one blank line and two markers inside the same
+/// 5-line budget. The markdown producer has to be repaired first; the two defects
+/// share one code path but not one root cause.
+#[test]
+fn signatures_max_lines_undisclosed_source_lines_are_pinned() {
+    // source_line_count - (markers + emitted), as measured today.
+    const UNDISCLOSED: usize = 9;
+    let documented = UNDISCLOSED;
+
+    let source = ts_eight_functions();
+    let source_total = source.lines().count();
+    assert_eq!(
+        source_total, 32,
+        "fixture must have exactly 32 source lines"
+    );
+
+    let out = xform(
+        &source,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Signatures).with_max_lines(5),
+    );
+    let (marker_total, emitted) = split_markers_and_content(&out);
+    let reconstructed = marker_total + emitted;
+    let shortfall = source_total.saturating_sub(reconstructed);
+
+    assert_eq!(
+        shortfall, documented,
+        "documented shortfall no longer matches. If you made the gap marker fire \
+         on a SOURCE gap the transformed cursor cannot see, delete this test and \
+         assert the identity instead. If you did not, the accounting regressed.\n  \
+         reconstructed  = {reconstructed} (markers {marker_total} + emitted {emitted})\n  \
+         expected       = {source_total} source lines\n  \
+         documented gap = {documented}\nGot:\n{out}"
     );
 }
 
@@ -1103,6 +1280,374 @@ fn structure_accounting_exclusions_still_fail_by_documented_amount() {
              difference     = {difference}\n  \
              documented gap = {documented}\n  \
              cause          = {cause}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// `--last-lines`: the tail marker's POSITIONAL claim, pinned per golden cell
+// ----------------------------------------------------------------------------
+//
+// # Why this table exists (testing-03)
+//
+// `git show --stat 8ee640b` -- the commit that moved the `--last-lines` elision
+// count into source space -- lists `types.rs` plus four snapshots and NO test
+// source, while its `--max-lines` sibling `efac056` added the invariants above.
+// The goldens cannot stand in for them: truncation_golden.rs says so in its own
+// header ("capture TODAY'S output -- including any known bugs ... They are NOT
+// behavioural assertions", "Do not cite 'no snapshots moved' as evidence that a
+// change is correct"), and two of the five values it blessed were wrong.
+//
+// # Why the claim asserted here is POSITIONAL and not the accounting identity
+//
+// The tail marker reads `(N lines ABOVE)`. That is a statement about a position,
+// not a budget: N is the number of source lines that lie above the first source
+// line the window shows. The accounting identity `markers + emitted == source`
+// is NOT equivalent to it and must not be substituted for it, in either
+// direction:
+//
+//   * it passes on a wrong value -- `md_simple_structure_last10` satisfies
+//     28 + 9 == 37 while the first line it shows is source line 9, so the true
+//     count is 8. An identity-only test would have blessed the defect.
+//   * it FAILS on the right value -- `python_simple_structure_last10` correctly
+//     reports 10 above, and 10 + 9 == 19 against 21 source lines. The missing 2
+//     are lines the mode collapses INSIDE the retained window (`greet_user`'s
+//     body). The tail path has no gap markers at all, so nothing discloses them;
+//     that is the `--last-lines` mirror of the signatures gap pinned by
+//     `signatures_max_lines_undisclosed_source_lines_are_pinned`, and it is
+//     recorded per case in `undisclosed_inside_window` rather than hidden inside
+//     a marker count that happens to absorb it.
+//
+// So: assert the positional claim, and pin the internal shortfall explicitly.
+
+struct LastLinesCase {
+    /// Matches the truncation_golden snapshot name, so a failure here points
+    /// straight at the golden that covers the same cell.
+    name: &'static str,
+    source: &'static str,
+    language: Language,
+    mode: Mode,
+    last_lines: usize,
+    /// 1-indexed SOURCE line of the first line the retained window shows,
+    /// derived by hand from the fixture and the mode's unbounded golden.
+    first_shown_source_line: usize,
+    /// Source lines inside the retained window that the mode collapses and no
+    /// marker mentions. `0` where the window is verbatim.
+    undisclosed_inside_window: usize,
+}
+
+/// Every `*_last10` golden cell that actually truncates.
+///
+/// `ts_simple_structure_last10` is absent on purpose: TypeScript's structure
+/// output is 8 lines, so `--last-lines 10` does not truncate and emits no marker.
+const LAST_LINES_CASES: &[LastLinesCase] = &[
+    // Structure output is 28 lines; the window opens on output line 19, the `}`
+    // closing `type Computer interface` at source line 26.
+    LastLinesCase {
+        name: "go_simple_structure_last10",
+        source: GO_SIMPLE,
+        language: Language::Go,
+        mode: Mode::Structure,
+        last_lines: 10,
+        first_shown_source_line: 26,
+        undisclosed_inside_window: 0,
+    },
+    // Pseudo output is 34 lines -- one per source line -- so the window is the
+    // verbatim tail from source line 26.
+    LastLinesCase {
+        name: "go_simple_pseudo_last10",
+        source: GO_SIMPLE,
+        language: Language::Go,
+        mode: Mode::Pseudo,
+        last_lines: 10,
+        first_shown_source_line: 26,
+        undisclosed_inside_window: 0,
+    },
+    // Structure output is 26 lines; the window opens on `pub trait Compute {`,
+    // source line 26.
+    LastLinesCase {
+        name: "rust_simple_structure_last10",
+        source: RUST_SIMPLE,
+        language: Language::Rust,
+        mode: Mode::Structure,
+        last_lines: 10,
+        first_shown_source_line: 26,
+        undisclosed_inside_window: 0,
+    },
+    LastLinesCase {
+        name: "rust_simple_pseudo_last10",
+        source: RUST_SIMPLE,
+        language: Language::Rust,
+        mode: Mode::Pseudo,
+        last_lines: 10,
+        first_shown_source_line: 26,
+        undisclosed_inside_window: 0,
+    },
+    // Structure output is 17 lines; the window opens on output line 8,
+    // `def greet_user(name: str) -> str:` at source line 11. Source lines
+    // 12-14, 18 and 21 are collapsed to ` {...}` placeholders inside the
+    // window: 11 source lines in, 9 output lines out, so 2 are undisclosed.
+    LastLinesCase {
+        name: "python_simple_structure_last10",
+        source: PYTHON_SIMPLE,
+        language: Language::Python,
+        mode: Mode::Structure,
+        last_lines: 10,
+        first_shown_source_line: 11,
+        undisclosed_inside_window: 2,
+    },
+    // Pseudo output is 21 lines -- one per source line -- window from line 13.
+    LastLinesCase {
+        name: "python_simple_pseudo_last10",
+        source: PYTHON_SIMPLE,
+        language: Language::Python,
+        mode: Mode::Pseudo,
+        last_lines: 10,
+        first_shown_source_line: 13,
+        undisclosed_inside_window: 0,
+    },
+    // Pseudo output is 13 lines -- one per source line -- window from line 5
+    // (a blank line, which is still a line the reader sees).
+    LastLinesCase {
+        name: "ts_simple_pseudo_last10",
+        source: TS_SIMPLE,
+        language: Language::TypeScript,
+        mode: Mode::Pseudo,
+        last_lines: 10,
+        first_shown_source_line: 5,
+        undisclosed_inside_window: 0,
+    },
+    // Markdown Pseudo is the identity passthrough: 37 output lines, window from
+    // source line 29 (`Setext Style H1`).
+    LastLinesCase {
+        name: "md_simple_pseudo_last10",
+        source: MD_SIMPLE,
+        language: Language::Markdown,
+        mode: Mode::Pseudo,
+        last_lines: 10,
+        first_shown_source_line: 29,
+        undisclosed_inside_window: 0,
+    },
+    // Structure output is 13 lines; the window opens on `### Subsection 1.1`,
+    // source line 9. Source lines 10-37 minus the 9 shown leave 20 undisclosed
+    // inside the window. EXCLUDED below -- the marker states 28, not 8.
+    LastLinesCase {
+        name: "md_simple_structure_last10",
+        source: MD_SIMPLE,
+        language: Language::Markdown,
+        mode: Mode::Structure,
+        last_lines: 10,
+        first_shown_source_line: 9,
+        undisclosed_inside_window: 20,
+    },
+];
+
+/// Cells whose tail marker is still positionally wrong, each with the value it
+/// actually states and why. Same self-retiring contract as
+/// `ACCOUNTING_EXCLUSIONS`: fix the cause and
+/// `last_lines_exclusions_still_fail_by_documented_amount` goes red, naming the
+/// entry to delete, after which the main assertion covers the cell unchanged.
+struct LastLinesExclusion {
+    name: &'static str,
+    /// The count the marker states today.
+    actual_above: usize,
+    cause: &'static str,
+}
+
+const LAST_LINES_EXCLUSIONS: &[LastLinesExclusion] = &[LastLinesExclusion {
+    name: "md_simple_structure_last10",
+    actual_above: 28,
+    cause: "the count is resolved from the transform's line map, and markdown's is \
+            the one that cannot answer: extract_markdown_headers_with_spans sets \
+            line_count from `text.lines().count()` while each header text carries a \
+            trailing newline, so 6 headers render 13 output lines but push only 8 map \
+            entries (1 per ATX heading, 2 per setext). The window opens at output \
+            line 4, and map[4] is the FIFTH entry -- source line 29, the setext H1 -- \
+            rather than source line 9. 29-1 = 28 happens to equal the pre-fix \
+            output-space arithmetic, so this cell is byte-unchanged; it is wrong for \
+            a different reason now. Same producer defect as the \
+            `md_simple_structure_max5` entry in ACCOUNTING_EXCLUSIONS, and it must be \
+            fixed in structure.rs, not here.",
+}];
+
+fn last_lines_accounting(case: &LastLinesCase) -> (usize, usize, usize) {
+    let out = xform(
+        case.source,
+        case.language,
+        TransformConfig::with_mode(case.mode).with_last_lines(case.last_lines),
+    );
+    let (marker_total, emitted) = split_markers_and_content(&out);
+    (marker_total, emitted, case.source.lines().count())
+}
+
+/// The tail marker states exactly the number of source lines above the window.
+///
+/// This is the assertion whose absence let 8ee640b bless two wrong values.
+#[test]
+fn last_lines_marker_counts_the_source_lines_above_the_window() {
+    for case in LAST_LINES_CASES {
+        if LAST_LINES_EXCLUSIONS.iter().any(|e| e.name == case.name) {
+            continue;
+        }
+        let (marker_total, _emitted, _source_total) = last_lines_accounting(case);
+        let expected = case.first_shown_source_line.saturating_sub(1);
+        let name = case.name;
+        let first = case.first_shown_source_line;
+        assert_eq!(
+            marker_total, expected,
+            "{name}: `(N lines above)` is a POSITIONAL claim. The window's first \
+             line is source line {first}, so exactly {expected} source lines lie \
+             above it.\n  \
+             stated   = {marker_total}\n  \
+             expected = {expected}\n  \
+             A value equal to `source_total - (retained output lines)` means the \
+             count is being finished in output space again (PF-033 rule 4)."
+        );
+    }
+}
+
+/// ADR-016 tail mirror: `--last-lines N` yields N lines total, marker included.
+#[test]
+fn last_lines_emits_n_lines_total_marker_included() {
+    for case in LAST_LINES_CASES {
+        let out = xform(
+            case.source,
+            case.language,
+            TransformConfig::with_mode(case.mode).with_last_lines(case.last_lines),
+        );
+        let total = out.lines().count();
+        let name = case.name;
+        let n = case.last_lines;
+        assert_eq!(
+            total, n,
+            "{name}: ADR-016 -- --last-lines {n} must yield {n} lines total, the \
+             leading marker included.\nGot {total}:\n{out}"
+        );
+    }
+}
+
+/// Every source line is SHOWN, counted in the tail marker, or named in the
+/// case's `undisclosed_inside_window`.
+///
+/// The third bucket is the tail path's missing inline disclosure, and pinning it
+/// is what keeps it from being absorbed silently into the marker count (which is
+/// exactly how `python_simple_structure_last10` came to read 12).
+#[test]
+fn last_lines_accounts_for_every_source_line_or_names_the_gap() {
+    for case in LAST_LINES_CASES {
+        if LAST_LINES_EXCLUSIONS.iter().any(|e| e.name == case.name) {
+            continue;
+        }
+        let (marker_total, emitted, source_total) = last_lines_accounting(case);
+        let reconstructed = marker_total + emitted + case.undisclosed_inside_window;
+        let name = case.name;
+        let inside = case.undisclosed_inside_window;
+        assert_eq!(
+            reconstructed, source_total,
+            "{name}: every source line must be SHOWN, counted in the tail marker, \
+             or named in undisclosed_inside_window.\n  \
+             reconstructed = {reconstructed} (markers {marker_total} + emitted \
+             {emitted} + undisclosed-inside {inside})\n  \
+             expected      = {source_total} source lines"
+        );
+    }
+}
+
+/// Guard: an exclusion name that matches no case would silently exclude nothing.
+#[test]
+fn last_lines_exclusions_name_real_cases() {
+    for excl in LAST_LINES_EXCLUSIONS {
+        let name = excl.name;
+        assert!(
+            LAST_LINES_CASES.iter().any(|c| c.name == name),
+            "exclusion {name:?} names no case in LAST_LINES_CASES -- a typo or a \
+             stale rename would make the exclusion a no-op"
+        );
+    }
+}
+
+/// Guard: each excluded cell must STILL state exactly its documented value.
+#[test]
+fn last_lines_exclusions_still_fail_by_documented_amount() {
+    for excl in LAST_LINES_EXCLUSIONS {
+        let Some(case) = LAST_LINES_CASES.iter().find(|c| c.name == excl.name) else {
+            continue; // covered by last_lines_exclusions_name_real_cases
+        };
+        let (marker_total, _emitted, _source_total) = last_lines_accounting(case);
+        let name = case.name;
+        let documented = excl.actual_above;
+        let truth = case.first_shown_source_line.saturating_sub(1);
+        let cause = excl.cause;
+        assert_eq!(
+            marker_total, documented,
+            "{name}: documented value no longer matches. If you FIXED the \
+             underlying defect the marker now states {truth}; delete this entry \
+             and `last_lines_marker_counts_the_source_lines_above_the_window` \
+             will cover the cell. If you did not, the count regressed.\n  \
+             stated     = {marker_total}\n  \
+             documented = {documented}\n  \
+             truth      = {truth}\n  \
+             cause      = {cause}"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------------
+// A bounded pseudo view must not spend its budget on blank lines
+// ----------------------------------------------------------------------------
+//
+// # The defect
+//
+// Stripping a module-level comment removes whole lines, so the blank line above
+// the comment ends up adjacent to the blank line below it. Neither was written
+// next to the other -- the run is removal residue, and since #476 preserved the
+// module header in every language it sits directly under that header: the first
+// thing a bounded view spends its budget on. `--max-lines 5` over
+// `tests/fixtures/typescript/comments.ts` spent TWO of its four content slots on
+// blank lines and put no body on screen at all.
+//
+// # Why "at most one blank" and not "at least one non-comment line"
+//
+// The review that found this asked for the stronger assertion -- that a bounded
+// pseudo view show at least one non-blank, non-comment line. That assertion is
+// UNREACHABLE for these fixtures, and writing it would pin a fiction: the first
+// body content in `comments.ts` is a six-line JSDoc block that pseudo preserves
+// by contract (ADR-007/ADR-008), so `export function add(...)` is the seventh
+// line of the body and no blank-line policy fits it into four slots. Recovering
+// the slot is the whole of what the fix can do; what it must never do is spend
+// the recovered slot on another blank.
+//
+// So this pins the defect that actually occurred -- budget spent on blanks --
+// and pins it as a BOUND (<= 1) rather than an equality, because one blank line
+// is the separation the header is entitled to and a fixture whose header run is
+// already a single blank has nothing to fold.
+
+/// A five-line pseudo view spends at most one of its slots on a blank line.
+///
+/// Marker lines are excluded from the count: the trailing elision marker is the
+/// disclosure, not content the reader could have had instead.
+#[test]
+fn bounded_pseudo_view_spends_at_most_one_slot_on_blank_lines() {
+    for (name, source, language) in [
+        ("ts_comments", TS_COMMENTS, Language::TypeScript),
+        ("rust_comments", RUST_COMMENTS, Language::Rust),
+        ("python_comments", PYTHON_COMMENTS, Language::Python),
+        ("go_comments", GO_COMMENTS, Language::Go),
+    ] {
+        let out = xform(
+            source,
+            language,
+            TransformConfig::with_mode(Mode::Pseudo).with_max_lines(5),
+        );
+        let blanks = out
+            .lines()
+            .filter(|l| !l.contains("truncated"))
+            .filter(|l| l.trim().is_empty())
+            .count();
+        assert!(
+            blanks <= 1,
+            "{name}: a 5-line pseudo view may spend at most one of its slots on a \
+             blank line, spent {blanks}:\n{out}"
         );
     }
 }

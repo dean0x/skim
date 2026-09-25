@@ -3,13 +3,30 @@
 //! ARCHITECTURE: Strip non-doc comments at module/class level while keeping all code intact.
 //! Preserves doc comments, comments inside function bodies, and shebangs.
 //!
-//! Token reduction target: 15-30%
+//! # Token reduction
+//!
+//! There is no figure for this mode, because none has been measured. The "15-30%"
+//! target this header used to state was never derived from a measurement, and nothing
+//! defends it: no test asserts a percentage for minimal mode (the only ratio
+//! assertions in the suite are two structure-mode checks on the JSON and YAML
+//! fixtures, and the minimal-mode tests assert only that the output is smaller than
+//! the input). ADR-007 and ADR-008 record the same provenance for pseudo's companion
+//! "30-50%" — an unsourced target copied out of an early commit and never re-derived.
+//!
+//! It also has a known counter-example. A file whose only comments are its module
+//! header now reduces by 0%, because #476 preserves that header in every language
+//! rather than in four; `tests/fixtures/sql/simple.sql` is exactly that file, which is
+//! why `test_sql_minimal_reduces_tokens` had to be repointed at `comments.sql`.
+//!
+//! Do not restate a number here until one exists and something that runs in CI
+//! defends it; a target nothing measures reads as a measurement.
 
 use crate::transform::literals::{
     collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges,
 };
 use crate::transform::utils::is_function_scope_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
+use std::ops::Range;
 use tree_sitter::{Node, Tree};
 
 /// Maximum AST recursion depth to prevent stack overflow attacks
@@ -101,6 +118,13 @@ pub(crate) fn transform_minimal(
     let protected = map_ranges_to_output(&literal_ranges, &final_ranges);
 
     let after_removal = remove_ranges(source, &final_ranges)?;
+    // Fold the residue a stripped module-level comment leaves: the blank lines that
+    // flanked it are now adjacent, directly under the header #476 preserves, where a
+    // bounded view would spend its budget on them (ADR-016 makes `--max-lines N`
+    // exact, so the truncator cannot recover the slot). Minimal mode carries no line
+    // map through this function — `transform_tree_with_line_map` derives one by text
+    // matching afterwards — so only the text and the literal ranges move here.
+    let (after_removal, protected) = fold_leading_blank_run(after_removal, protected);
     let normalized = trim_and_normalize(&after_removal, &protected);
 
     Ok(normalized)
@@ -861,6 +885,179 @@ pub(crate) fn trim_and_normalize(source: &str, protected: &[(usize, usize)]) -> 
     result
 }
 
+/// The residue [`fold_leading_blank_run_with_line_map`] removes: every blank line of
+/// the body's first blank run except the first.
+#[derive(Debug)]
+struct LeadingBlankFold {
+    /// Line indices dropped from the body, 0-based, half-open.
+    lines: Range<usize>,
+    /// Byte range dropped from the body, half-open.
+    bytes: Range<usize>,
+}
+
+/// Fold the body's first blank-line run down to a single blank line.
+///
+/// ARCHITECTURE: stripping a module-level comment removes whole lines, so the blank
+/// line above the comment ends up adjacent to the blank line below it.  Neither was
+/// written next to the other — the run is removal residue.  Since #476 preserved the
+/// module header in every language, that residue sits directly under the header, which
+/// is the first thing a bounded view spends its budget on: `--max-lines 5` over
+/// `tests/fixtures/typescript/comments.ts` spent two of its four content slots on blank
+/// lines and put no body on screen at all.
+///
+/// The saving has to be made here, in the transform that produces the lines.
+/// `--max-lines N` is an exact bound (ADR-016), so the truncator cannot buy the slot
+/// back, and by the time it runs the output is a flat line vector in which residue and
+/// authored spacing are indistinguishable.
+///
+/// Scope, deliberately narrow:
+/// - Only the FIRST blank run that follows content is folded.  Every later run keeps
+///   `trim_and_normalize`'s 3+-to-2 cap, so body spacing below the header is untouched.
+/// - It folds to one blank line, not zero, so the header keeps its separation from the
+///   body.
+/// - A blank line whose position lies inside `protected` is inside a multi-line string
+///   literal and is never folded — the same blank test `trim_and_normalize` applies.
+///
+/// Known limitation: the pass cannot tell residue from an authored double blank line,
+/// so a body that opens with two authored blanks loses one.  Confining the rule to the
+/// first run bounds that to a single line per file.
+///
+/// ORDERING: this runs BEFORE `trim_and_normalize` and `normalize_line_map_blanks`, and
+/// folds the text, the line map and the protected ranges together.  Those two functions
+/// mirror each other line-for-line (PF-019) and neither is told about this rule, so
+/// folding upstream of both is what keeps them in sync.
+///
+/// Returns its inputs unchanged when no fold applies, so the common case allocates
+/// nothing.
+pub(crate) fn fold_leading_blank_run_with_line_map(
+    text: String,
+    line_map: Vec<usize>,
+    protected: Vec<(usize, usize)>,
+) -> (String, Vec<usize>, Vec<(usize, usize)>) {
+    let Some(fold) = find_leading_blank_fold(&text, &protected) else {
+        return (text, line_map, protected);
+    };
+
+    // A folded line is unprotected by construction (see `find_leading_blank_fold`), so
+    // no literal range can straddle the cut and the shift below is a clean partition.
+    debug_assert!(
+        protected
+            .iter()
+            .all(|&(s, e)| e <= fold.bytes.start || s >= fold.bytes.end),
+        "no literal range may straddle a folded blank line"
+    );
+
+    let shift = fold.bytes.end - fold.bytes.start;
+
+    let mut folded_text = String::with_capacity(text.len() - shift);
+    folded_text.push_str(&text[..fold.bytes.start]);
+    folded_text.push_str(&text[fold.bytes.end..]);
+
+    // The map carries one entry per line of `text`; drop the entries for the lines the
+    // fold removed so the two stay one-for-one.  The clamp keeps a caller that threads
+    // a shorter map (the no-map form below passes an empty one) from panicking.
+    let mut folded_map = line_map;
+    let drain_end = fold.lines.end.min(folded_map.len());
+    let drain_start = fold.lines.start.min(drain_end);
+    folded_map.drain(drain_start..drain_end);
+
+    let folded_protected = protected
+        .into_iter()
+        .map(|(s, e)| {
+            if s >= fold.bytes.end {
+                (s - shift, e - shift)
+            } else {
+                (s, e)
+            }
+        })
+        .collect();
+
+    (folded_text, folded_map, folded_protected)
+}
+
+/// [`fold_leading_blank_run_with_line_map`] for callers that keep no line map.
+///
+/// Minimal mode derives its map by text matching after the transform returns, so it has
+/// none to fold; the empty vector threaded through drains to nothing and is discarded.
+pub(crate) fn fold_leading_blank_run(
+    text: String,
+    protected: Vec<(usize, usize)>,
+) -> (String, Vec<(usize, usize)>) {
+    let (text, _empty, protected) =
+        fold_leading_blank_run_with_line_map(text, Vec::new(), protected);
+    (text, protected)
+}
+
+/// Locate the tail of the body's first blank-line run — every blank line after the
+/// first one.
+///
+/// Returns `None` when the body has no blank run after its first content line, or when
+/// that run is a single blank line and there is nothing to fold.  Blank lines BEFORE the
+/// first content line are left alone: `trim_and_normalize` already drops those entirely.
+fn find_leading_blank_fold(text: &str, protected: &[(usize, usize)]) -> Option<LeadingBlankFold> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut pos = 0usize;
+    let mut line_idx = 0usize;
+    let mut seen_content = false;
+    // Blank lines counted so far in the body's first blank run.
+    let mut blanks_in_run = 0usize;
+    // First line of the run's tail, set when the run's second blank line is reached.
+    let mut tail: Option<(usize, usize)> = None;
+
+    while pos < n {
+        let line_start = pos;
+
+        // Locate the newline that terminates this line.
+        let nl = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+        // CRLF: the `\r` belongs to the line ending, not to the content.
+        let has_cr = nl > line_start && bytes[nl - 1] == b'\r';
+        let content_end = if has_cr { nl - 1 } else { nl };
+
+        // The blank test is `trim_and_normalize`'s, byte for byte: every byte is
+        // unprotected whitespace, and the line's own position is not inside a literal.
+        let mut trim_end = content_end;
+        while trim_end > line_start {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+        let is_blank = trim_end == line_start && !in_protected(line_start, protected);
+
+        if is_blank && seen_content {
+            // The run's FIRST blank line survives the fold; every later one is residue.
+            blanks_in_run += 1;
+            if blanks_in_run == 2 {
+                tail = Some((line_idx, line_start));
+            }
+        } else if !is_blank {
+            if blanks_in_run > 0 {
+                // The first run is closed; every later run is out of scope.
+                return tail.map(|(l, b)| LeadingBlankFold {
+                    lines: l..line_idx,
+                    bytes: b..line_start,
+                });
+            }
+            seen_content = true;
+        }
+
+        pos = if nl < n { nl + 1 } else { n };
+        line_idx += 1;
+    }
+
+    // The run reaches the end of the body.
+    tail.map(|(l, b)| LeadingBlankFold {
+        lines: l..line_idx,
+        bytes: b..n,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // acceptable in tests
 mod tests {
@@ -1417,6 +1614,79 @@ mod tests {
         let input = "hello   \n\n\n\n\nworld  \n";
         let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "hello\n\n\nworld\n");
+    }
+
+    // ========================================================================
+    // fold_leading_blank_run — the residue a stripped comment leaves (#476)
+    // ========================================================================
+
+    #[test]
+    fn test_fold_leading_blank_run_folds_two_blanks_to_one() {
+        let (text, protected) = fold_leading_blank_run("a\n\n\nb\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\nb\n");
+        assert!(protected.is_empty());
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_leaves_a_single_blank_alone() {
+        let (text, _) = fold_leading_blank_run("a\n\nb\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\nb\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_touches_only_the_first_run() {
+        // Later runs keep trim_and_normalize's 3+-to-2 cap: spacing below the header
+        // is out of scope, so the fold can never cost more than one line per file.
+        let (text, _) = fold_leading_blank_run("a\n\n\nb\n\n\nc\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\nb\n\n\nc\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_ignores_blanks_before_the_first_content_line() {
+        // trim_and_normalize drops those entirely, so claiming them here would make the
+        // fold mistake the body's real first run for a later one and skip it.
+        let (text, _) = fold_leading_blank_run("\n\na\n\n\nb\n".to_string(), Vec::new());
+        assert_eq!(text, "\n\na\n\nb\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_folds_a_run_that_ends_the_body() {
+        let (text, _) = fold_leading_blank_run("a\n\n\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_never_folds_inside_a_literal() {
+        // A blank line inside a multi-line string is not blank by trim_and_normalize's
+        // test, and the fold applies the same one.
+        // Bytes: a=0 \n=1 \n=2 \n=3 b=4 \n=5 — the two inner newlines are literal body.
+        let (text, protected) = fold_leading_blank_run("a\n\n\nb\n".to_string(), vec![(2, 4)]);
+        assert_eq!(text, "a\n\n\nb\n");
+        assert_eq!(protected, vec![(2, 4)]);
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_shifts_protected_ranges_past_the_cut() {
+        // Bytes: a=0 \n=1 \n=2 \n=3 "=4 x=5 "=6 \n=7 — the literal body `x` is [5..6).
+        let (text, protected) = fold_leading_blank_run("a\n\n\n\"x\"\n".to_string(), vec![(5, 6)]);
+        assert_eq!(text, "a\n\n\"x\"\n");
+        assert_eq!(
+            protected,
+            vec![(4, 5)],
+            "one byte was cut before the range, so it moves down by one"
+        );
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_drops_the_matching_line_map_entry() {
+        // One entry per line: "a", blank, blank, "b".
+        let (text, map, _) = fold_leading_blank_run_with_line_map(
+            "a\n\n\nb\n".to_string(),
+            vec![1, 2, 7, 8],
+            Vec::new(),
+        );
+        assert_eq!(text, "a\n\nb\n");
+        assert_eq!(map, vec![1, 2, 8], "the folded line's entry goes with it");
     }
 
     #[test]

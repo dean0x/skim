@@ -17,7 +17,23 @@
 //! the strip list.
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
-//! Token reduction target: 30-50%
+//! # Token reduction
+//!
+//! There is no figure for this mode, because none has been measured. The "30-50%"
+//! target this header used to state was never derived from a measurement: ADR-008's
+//! 2026-08-26 archaeology traces it to the original pseudo-mode commit (04b5f9f, #70),
+//! where it was copied into several files and never re-derived, and ADR-007 records
+//! that no CI gate defends it.
+//!
+//! It is also not a figure one number could carry any more, because the rule sets
+//! diverged. Rust and Go both have an empty `strip_kinds`, empty `strip_keywords` and
+//! `strip_self_param: false`, so Rust pseudo removes only statement semicolons and
+//! non-doc comments, and Go pseudo removes only non-doc comments. Rust is this
+//! repository's own dominant file type, so the mode's headline behaviour here is close
+//! to `minimal`'s.
+//!
+//! Do not restate a number here until one exists per language and something that runs
+//! in CI defends it; a target nothing measures reads as a measurement.
 //!
 //! # Traversal rule (PF-020)
 //!
@@ -49,7 +65,7 @@ use tree_sitter::{Node, Tree};
 use super::minimal::{
     CommentClassification, MAX_AST_DEPTH, MAX_AST_NODES, adjust_range_for_line_removal,
     build_newline_table, compute_go_doc_comment_starts, compute_header_end_byte,
-    is_removable_comment, remove_ranges, trim_and_normalize,
+    fold_leading_blank_run_with_line_map, is_removable_comment, remove_ranges, trim_and_normalize,
 };
 use super::{compute_line_map_from_removed_ranges, normalize_line_map_blanks};
 use crate::transform::utils::is_function_scope_kind;
@@ -441,6 +457,11 @@ pub(crate) fn transform_pseudo_with_spans(
 ///
 /// `normalize_line_map_blanks` mirrors both rules on the line map so the map stays
 /// in sync with the final output text.
+///
+/// A third line-dropping rule, `fold_leading_blank_run_with_line_map`, runs BEFORE
+/// both of them and folds the body's first blank run to one line.  It is applied to
+/// the text and the map in the same call, so it needs no mirror — and putting it
+/// upstream is what lets the two mirrored functions stay unaware of it.
 pub(crate) fn transform_pseudo_with_spans_and_line_map(
     source: &str,
     tree: &Tree,
@@ -517,6 +538,19 @@ pub(crate) fn transform_pseudo_with_spans_and_line_map(
     // Returns the collapsed string AND the protected ranges in output coordinates
     // (needed by trim_and_normalize and normalize_line_map_blanks).
     let (result, protected_after_collapse) = collapse_whitespace(&result, &protected_in_result);
+    // Fold the residue a stripped module-level comment leaves behind: the blank lines
+    // that flanked it are now adjacent, directly under the header #476 preserves, where
+    // a bounded view spends its budget on them. The fold happens here because
+    // `--max-lines N` is exact (ADR-016) — the truncator cannot recover a slot, and it
+    // sees a flat line vector in which residue and authored spacing look the same.
+    // Text, line map and protected ranges move together, upstream of both
+    // trim_and_normalize and normalize_line_map_blanks, so those two stay mirrored.
+    let (result, line_map_after_removal, protected_after_collapse) =
+        fold_leading_blank_run_with_line_map(
+            result,
+            line_map_after_removal,
+            protected_after_collapse,
+        );
     // trim_and_normalize may drop lines when there are 3+ consecutive blanks.
     // Capture the text before that step so normalize_line_map_blanks can replay
     // the same logic to keep the line map in sync.
@@ -1063,6 +1097,80 @@ mod tests {
         let tree = parser.parse(source).unwrap();
         let config = TransformConfig::with_mode(Mode::Pseudo);
         transform_pseudo(source, &tree, language, &config).unwrap()
+    }
+
+    // ========================================================================
+    // Leading blank-run fold (#476 stripped-comment residue)
+    // ========================================================================
+
+    #[test]
+    fn test_pseudo_leading_blank_residue_costs_one_line_not_two() {
+        // Stripping the two module-level comments makes the blank line above them
+        // adjacent to the blank line below them — neither was written next to the
+        // other. Since #476 preserves the module header in every language, that pair
+        // now sits directly under the header, and `--max-lines N` is an exact bound
+        // (ADR-016), so two residue blanks are two slots that show the reader nothing.
+        let source = concat!(
+            "// FIXTURE: header\n",
+            "// TESTS: header\n",
+            "\n",
+            "// strip me\n",
+            "/* strip me too */\n",
+            "\n",
+            "/**\n",
+            " * doc (KEEP)\n",
+            " */\n",
+            "export function add(x: number): number {\n",
+            "    return x;\n",
+            "}\n",
+        );
+        let result = transform(source, Language::TypeScript);
+        let lines: Vec<&str> = result.lines().collect();
+
+        assert_eq!(lines[0], "// FIXTURE: header");
+        assert_eq!(lines[1], "// TESTS: header");
+        assert_eq!(
+            lines[2], "",
+            "one blank line still separates the header from the body: {result}"
+        );
+        assert_eq!(
+            lines[3], "/**",
+            "the header/body gap must cost one line, not two: {result}"
+        );
+    }
+
+    #[test]
+    fn test_pseudo_leading_blank_fold_keeps_the_line_map_in_step() {
+        // The fold drops a line from the text, so the map has to lose the same entry —
+        // otherwise every `-n` annotation below the fold names the wrong source line.
+        let source = concat!(
+            "// FIXTURE: header\n",
+            "\n",
+            "// strip me\n",
+            "\n",
+            "export const VERSION = \"1.0.0\";\n",
+        );
+        let mut parser = Parser::new(Language::TypeScript).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let config = TransformConfig::with_mode(Mode::Pseudo);
+        let (text, _spans, line_map) =
+            transform_pseudo_with_spans_and_line_map(source, &tree, Language::TypeScript, &config)
+                .unwrap();
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            line_map.len(),
+            "one map entry per output line: {lines:?} vs {line_map:?}"
+        );
+        let version_idx = lines
+            .iter()
+            .position(|l| l.contains("VERSION"))
+            .expect("the const must survive the transform");
+        assert_eq!(
+            line_map[version_idx], 5,
+            "the const is source line 5; got {line_map:?} for {lines:?}"
+        );
     }
 
     // ========================================================================
