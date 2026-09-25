@@ -272,19 +272,92 @@ pub(crate) struct BuildResult {
     /// byte-identical for every builder that does not populate it: the field is
     /// absent, not `[]`. `default` is the deserialisation counterpart, so an
     /// envelope written before this field existed still round-trips.
+    ///
+    /// **This is the ONLY channel warnings travel on.** `error_messages` carries
+    /// errors and nothing else; it does not double as a warning channel, and a
+    /// consumer reading it for a warning distribution gets an empty list.
+    ///
+    /// Read `warnings_rolled_up` before reading these strings: above
+    /// `cmd::build::cargo::WARNING_DETAIL_MAX` they are by-lint-code COUNTS,
+    /// not per-warning diagnostics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) warning_messages: Vec<String>,
+    /// `true` when `warning_messages` holds the by-lint-code ROLL-UP
+    /// (`"dead_code: 51 occurrence(s)"`) instead of one diagnostic per warning.
+    ///
+    /// Every warning is still COUNTED — the buckets sum to `warnings` by
+    /// construction — but the per-warning message text and `file:line`
+    /// locations are not present. That is the actionable half, so the fact has
+    /// to reach two readers: a `--json` consumer (via this field) and
+    /// `cmd::build::run_parsed_command`, which names the dropped class in its
+    /// ADR-011 class-1 marker. Set only through
+    /// [`WarningChannel::RollUp`], so it cannot disagree with the content it
+    /// describes.
+    ///
+    /// Skipped when `false` so the envelope stays byte-identical for every
+    /// builder below the bound; `default` covers envelopes written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) warnings_rolled_up: bool,
     #[serde(default, skip_serializing)]
     rendered: String,
 }
 
+/// `skip_serializing_if` predicate for a `bool` that defaults to `false`.
+///
+/// Serde hands the predicate a reference, so `std::ops::Not::not` (which takes
+/// `bool` by value) does not fit the slot.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Which representation of a build's warnings a parser chose.
+///
+/// The variant IS the disclosure fact, so [`BuildResult`] cannot end up
+/// claiming detail while holding a roll-up: there is no way to set
+/// `warnings_rolled_up` except by picking a variant, and each variant carries
+/// its own strings. That is the point — the previous shape passed the messages
+/// and the fact as two independent values, which is a state pair that can
+/// disagree.
+///
+/// It also removes the transposition hazard the old six-argument constructor
+/// had: `error_messages` and `warning_messages` were adjacent `Vec<String>`
+/// parameters, so swapping them compiled silently and mislabelled every
+/// diagnostic in the build. Warnings now arrive through their own single-slot
+/// method with a distinct type.
+#[derive(Debug, Clone)]
+pub(crate) enum WarningChannel {
+    /// One rendered diagnostic per warning: message text plus `file:line`.
+    Detail(Vec<String>),
+    /// By-lint-code counts, standing in for the per-warning diagnostics above
+    /// `cmd::build::cargo::WARNING_DETAIL_MAX`. Complete as a count, silent on
+    /// messages and locations.
+    RollUp(Vec<String>),
+}
+
+impl WarningChannel {
+    /// Split into the strings and the "is this the roll-up" fact.
+    fn into_parts(self) -> (Vec<String>, bool) {
+        match self {
+            Self::Detail(messages) => (messages, false),
+            Self::RollUp(buckets) => (buckets, true),
+        }
+    }
+}
+
 impl BuildResult {
-    /// Create a new BuildResult with pre-computed rendered output
+    /// Create a new BuildResult with pre-computed rendered output.
     ///
-    /// Carries no warning diagnostics. Parsers that extract them call
-    /// [`BuildResult::with_warning_messages`] instead — the 5-argument shape is
-    /// kept so builders with nothing to add are not forced to spell an empty
-    /// vector, and so their serialized envelope is provably unchanged.
+    /// Carries no warning diagnostics. Parsers that extract them chain
+    /// [`BuildResult::with_warnings`], which takes ONE argument, so builders
+    /// with nothing to add are not forced to spell an empty vector and their
+    /// serialized envelope is provably unchanged.
+    ///
+    /// `error_messages` is the only `Vec<String>` this constructor takes, and
+    /// that is deliberate: it previously sat next to a same-typed
+    /// `warning_messages` parameter, where a transposition compiled silently
+    /// and relabelled every diagnostic in the build. See [`WarningChannel`].
     pub(crate) fn new(
         success: bool,
         warnings: usize,
@@ -292,78 +365,73 @@ impl BuildResult {
         duration_ms: Option<u64>,
         error_messages: Vec<String>,
     ) -> Self {
-        Self::with_warning_messages(
+        let mut result = Self {
             success,
             warnings,
             errors,
             duration_ms,
             error_messages,
-            Vec::new(),
-        )
+            warning_messages: Vec::new(),
+            warnings_rolled_up: false,
+            rendered: String::new(),
+        };
+        let rendered = result.render();
+        result.rendered = rendered;
+        result
     }
 
-    /// [`BuildResult::new`] plus formatted warning diagnostics.
+    /// Attach the build's warning diagnostics, in whichever representation the
+    /// parser chose.
     ///
-    /// Mirrors the `TestResult::with_context` precedent: the extra channel gets
-    /// its own constructor rather than a sixth positional argument on `new`.
-    pub(crate) fn with_warning_messages(
-        success: bool,
-        warnings: usize,
-        errors: usize,
-        duration_ms: Option<u64>,
-        error_messages: Vec<String>,
-        warning_messages: Vec<String>,
-    ) -> Self {
-        let rendered = Self::render(
-            success,
-            warnings,
-            errors,
-            duration_ms,
-            &error_messages,
-            &warning_messages,
-        );
-        Self {
+    /// Takes a [`WarningChannel`] rather than a bare `Vec<String>` so the
+    /// strings and the `warnings_rolled_up` disclosure fact are set together
+    /// from one value and cannot drift apart.
+    ///
+    /// Re-renders: `rendered` is computed eagerly by [`BuildResult::new`], and
+    /// warnings are part of that output on success AND failure.
+    #[must_use]
+    pub(crate) fn with_warnings(mut self, warnings: WarningChannel) -> Self {
+        let (messages, rolled_up) = warnings.into_parts();
+        self.warning_messages = messages;
+        self.warnings_rolled_up = rolled_up;
+        let rendered = self.render();
+        self.rendered = rendered;
+        self
+    }
+
+    /// Recompute rendered field if empty (e.g., after deserialization)
+    pub(crate) fn ensure_rendered(&mut self) {
+        if self.rendered.is_empty() {
+            let rendered = self.render();
+            self.rendered = rendered;
+        }
+    }
+
+    /// Render from `&self` rather than from six positional arguments.
+    ///
+    /// The argument list this replaces ended in two adjacent `&[String]`
+    /// parameters — the same transposition hazard as the old constructor, one
+    /// level down. Reading the fields by name removes it outright.
+    fn render(&self) -> String {
+        use std::fmt::Write;
+
+        let Self {
             success,
             warnings,
             errors,
             duration_ms,
             error_messages,
             warning_messages,
-            rendered,
-        }
-    }
+            ..
+        } = self;
 
-    /// Recompute rendered field if empty (e.g., after deserialization)
-    pub(crate) fn ensure_rendered(&mut self) {
-        if self.rendered.is_empty() {
-            self.rendered = Self::render(
-                self.success,
-                self.warnings,
-                self.errors,
-                self.duration_ms,
-                &self.error_messages,
-                &self.warning_messages,
-            );
-        }
-    }
-
-    fn render(
-        success: bool,
-        warnings: usize,
-        errors: usize,
-        duration_ms: Option<u64>,
-        error_messages: &[String],
-        warning_messages: &[String],
-    ) -> String {
-        use std::fmt::Write;
-
-        let status = if success { "OK" } else { "FAILED" };
+        let status = if *success { "OK" } else { "FAILED" };
         let mut output = format!("{status} warnings: {warnings} errors: {errors}");
         if let Some(ms) = duration_ms {
-            let _ = write!(output, " {}ms", format_with_commas(ms));
+            let _ = write!(output, " {}ms", format_with_commas(*ms));
         }
 
-        if !success {
+        if !*success {
             for msg in error_messages {
                 let _ = write!(output, "\n {msg}");
             }
@@ -1502,14 +1570,10 @@ mod tests {
 
     #[test]
     fn test_build_result_json_includes_populated_warning_messages() {
-        let result = BuildResult::with_warning_messages(
-            true,
-            1,
-            0,
-            None,
-            vec![],
-            vec!["warning[dead_code]: unused variable: `x` in src/lib.rs:3".to_string()],
-        );
+        let result =
+            BuildResult::new(true, 1, 0, None, vec![]).with_warnings(WarningChannel::Detail(vec![
+                "warning[dead_code]: unused variable: `x` in src/lib.rs:3".to_string(),
+            ]));
         let json = serde_json::to_string(&result).unwrap();
         assert!(
             json.contains("warning_messages"),
@@ -1529,7 +1593,48 @@ mod tests {
         let mut result: BuildResult = serde_json::from_str(legacy).unwrap();
         result.ensure_rendered();
         assert!(result.warning_messages.is_empty());
+        assert!(
+            !result.warnings_rolled_up,
+            "an envelope with no disclosure flag must read as 'not rolled up'"
+        );
         assert_eq!(format!("{result}"), "OK warnings: 0 errors: 0");
+    }
+
+    /// The disclosure flag is skipped while false, so every builder below the
+    /// bound keeps a byte-identical envelope — the same contract
+    /// `warning_messages` has.
+    #[test]
+    fn test_build_result_json_omits_warnings_rolled_up_when_false() {
+        let result =
+            BuildResult::new(true, 1, 0, None, vec![]).with_warnings(WarningChannel::Detail(vec![
+                "warning: unused import in src/lib.rs:1".to_string(),
+            ]));
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("warnings_rolled_up"),
+            "a detail-channel result must not carry the flag: {json}"
+        );
+    }
+
+    /// Picking [`WarningChannel::RollUp`] is the ONLY way to set the flag, and
+    /// it sets it — the content and the claim about the content come from one
+    /// value, so they cannot disagree.
+    #[test]
+    fn test_build_result_rollup_channel_sets_the_disclosure_flag() {
+        let result = BuildResult::new(true, 51, 0, None, vec![]).with_warnings(
+            WarningChannel::RollUp(vec!["dead_code: 51 occurrence(s)".to_string()]),
+        );
+        assert!(result.warnings_rolled_up);
+
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("\"warnings_rolled_up\":true"),
+            "a roll-up must announce itself to --json consumers: {json}"
+        );
+
+        let mut deserialized: BuildResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{result}"), format!("{deserialized}"));
     }
 
     /// Warning diagnostics render on a GREEN build — they are the only
@@ -1537,17 +1642,11 @@ mod tests {
     /// grouped-code workaround this channel replaces.
     #[test]
     fn test_build_result_renders_warning_messages_on_success() {
-        let result = BuildResult::with_warning_messages(
-            true,
-            2,
-            0,
-            None,
-            vec![],
-            vec![
+        let result =
+            BuildResult::new(true, 2, 0, None, vec![]).with_warnings(WarningChannel::Detail(vec![
                 "warning[dead_code]: unused variable: `x` in src/main.rs:5".to_string(),
                 "warning[dead_code]: unused variable: `y` in src/lib.rs:3".to_string(),
-            ],
-        );
+            ]));
         let display = format!("{result}");
         assert_eq!(
             display,
@@ -1560,14 +1659,16 @@ mod tests {
     /// On a failing build both channels render, errors first.
     #[test]
     fn test_build_result_renders_errors_before_warnings_on_failure() {
-        let result = BuildResult::with_warning_messages(
+        let result = BuildResult::new(
             false,
             1,
             1,
             None,
             vec!["error[E0499]: cannot borrow `s` in src/main.rs:5".to_string()],
-            vec!["warning: unused import in src/main.rs:1".to_string()],
-        );
+        )
+        .with_warnings(WarningChannel::Detail(vec![
+            "warning: unused import in src/main.rs:1".to_string(),
+        ]));
         let display = format!("{result}");
         let err_at = display.find("error[E0499]").expect("error rendered");
         let warn_at = display.find("warning: unused").expect("warning rendered");

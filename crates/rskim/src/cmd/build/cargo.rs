@@ -22,7 +22,7 @@ use regex::Regex;
 use super::run_parsed_command;
 use crate::cmd::{combine_output, inject_flag_before_separator, user_has_flag};
 use crate::output::ParseResult;
-use crate::output::canonical::BuildResult;
+use crate::output::canonical::{BuildResult, WarningChannel};
 use crate::runner::CommandOutput;
 
 // ============================================================================
@@ -280,6 +280,31 @@ fn format_diagnostic(level: &str, code: &str, msg_text: &str, location: &str) ->
 /// can emit hundreds). Reusing it keeps one answer to one question rather than
 /// two build handlers disagreeing about when a warning list stops being a list
 /// a reader reads and becomes a wall they skim for the distribution.
+///
+/// # The FIGURE is shared with docker's `MAX_WARNINGS`; the SEMANTICS are not
+///
+/// Borrow the number, never the disclosure behaviour. Above their common bound
+/// the two parsers do opposite things to the reader, and each owes a different
+/// obligation:
+///
+/// - **This bound AGGREGATES.** `warning_messages` becomes the by-lint-code
+///   roll-up, whose buckets sum to the build's total warning count by
+///   construction (see [`UNCODED_WARNING_KEY`]). No warning leaves the
+///   accounting, so nothing is elided in the #317 sense and no
+///   `output::elision_marker` is owed. What the roll-up *does* drop is the
+///   per-warning message text and `file:line` location, which is why
+///   [`summarise_warnings`] reports the switch back to its caller — the
+///   ADR-011 class-1 marker has to name that, or it describes a smaller loss
+///   than the one it fired for.
+/// - **`docker::build::MAX_WARNINGS` TRUNCATES.** Its collector is
+///   `if warnings.len() < MAX_WARNINGS { warnings.push(msg) }` — the 51st line
+///   onward is dropped on the floor with no count kept and nothing in the
+///   output saying it existed. That is a silent #317 loss and owes an
+///   unconditional elision marker with exact counts.
+///
+/// Aggregation with complete counts and truncation are not the same act. A
+/// third parser borrowing "50" has to decide which of the two it is building
+/// before it copies either one's disclosure behaviour.
 const WARNING_DETAIL_MAX: usize = 50;
 
 /// Bucket label for warnings rustc emitted without a lint code.
@@ -290,6 +315,22 @@ const WARNING_DETAIL_MAX: usize = 50;
 /// warning has no lint key to group under, so it gets an explicit bucket rather
 /// than silently vanishing from the totals.
 const UNCODED_WARNING_KEY: &str = "(no lint code)";
+
+/// What [`summarise_warnings`] chose, and the one fact its caller cannot
+/// re-derive afterwards.
+struct WarningSummary {
+    /// The ONE representation served — per-warning detail or the roll-up —
+    /// wrapped in the variant that says which. Never both, never a mix.
+    channel: WarningChannel,
+    /// Warnings the parser saw, captured BEFORE any roll-up replaced their
+    /// detail.
+    ///
+    /// Not recoverable from `channel` afterwards: a roll-up's bucket count is
+    /// the number of distinct lint codes, not the number of warnings, so
+    /// `messages.len()` would under-report the moment the switch fires. This is
+    /// the figure the `warnings: N` header and the marker both quote.
+    total: usize,
+}
 
 /// Choose the ONE representation of this build's warnings.
 ///
@@ -308,19 +349,53 @@ const UNCODED_WARNING_KEY: &str = "(no lint code)";
 /// in exactly one bucket, the buckets sum to the total (see
 /// [`UNCODED_WARNING_KEY`]), and the `warnings: N` header states that total
 /// independently. Aggregation with complete counts is not elision, so this path
-/// owes no marker.
+/// owes no *elision* marker.
 ///
 /// It is also the more useful form at scale: a 200-warning run tells a reader
 /// its distribution in a handful of lines and its locations in none, which is
 /// what a reader at that volume is actually asking.
+///
+/// # What the switch DOES owe: [`WarningChannel::RollUp`]
+///
+/// "Its locations in none" is the part a reader has to be told. The counts
+/// survive the roll-up; the per-warning message text and `file:line` do not,
+/// and those are the actionable half. A served line reading
+/// `warning[dead_code]: unused variable: v17 in src/lib.rs:17` becomes
+/// `dead_code: 51 occurrence(s)`.
+///
+/// The class-1 marker that fires on the same path
+/// (`output::diagnostics_summary_marker`, from `cmd::build::run_parsed_command`'s
+/// `Keep` arm) is what tells the reader. Its base clause names cargo's *fixed*
+/// discard set — source snippets, help/note lines, explain hints — and above
+/// this bound it appends the roll-up in as many words: `; N warnings rolled up
+/// to lint-code counts, per-warning messages and locations dropped`.
+///
+/// It needed a `rolled_up_warnings` argument to say that. Without one it named
+/// the fixed set alone: the reader was told snippets went, and nothing told
+/// them the warning text and locations went with them. ADR-011's 2026-09-24
+/// amendment ranks that failure *below* saying nothing — a marker naming the
+/// wrong class sends the reader looking for content they were not served —
+/// which is why the bound discloses itself rather than relying on the fixed
+/// clause to cover it.
+///
+/// So the CHOICE is returned, not just the result: the roll-up arrives wrapped
+/// in [`WarningChannel::RollUp`], which sets `BuildResult::warnings_rolled_up`
+/// and lets the marker name what this bound actually dropped.
 fn summarise_warnings(
     detailed: Vec<String>,
     warning_codes: &BTreeMap<String, usize>,
-) -> Vec<String> {
-    if detailed.len() <= WARNING_DETAIL_MAX {
-        return detailed;
+) -> WarningSummary {
+    let total = detailed.len();
+    if total <= WARNING_DETAIL_MAX {
+        return WarningSummary {
+            channel: WarningChannel::Detail(detailed),
+            total,
+        };
     }
-    roll_up_warning_codes(warning_codes, detailed.len())
+    WarningSummary {
+        channel: WarningChannel::RollUp(roll_up_warning_codes(warning_codes, total)),
+        total,
+    }
 }
 
 /// By-lint-code roll-up whose counts sum to `total` by construction.
@@ -348,10 +423,21 @@ fn roll_up_warning_codes(warning_codes: &BTreeMap<String, usize>, total: usize) 
 /// of returning a freshly heap-allocated struct per message. For large builds
 /// with hundreds of `compiler-message` events this eliminates all per-iteration
 /// allocation for `Vec<String>` and `BTreeMap<String, usize>`.
+///
+/// # There are no separate counters, by design
+///
+/// Every `error` level pushes exactly one line to `error_messages` and every
+/// `warning` level exactly one to `warning_messages`, from the same match arm,
+/// so the vectors' lengths ARE the counts and the caller reads `.len()`.
+///
+/// Do not add `errors: &mut usize` / `warnings: &mut usize` parameters back.
+/// A counter incremented beside each push is a second source for a fact the
+/// vectors already carry, and the only thing that can hold the two in step is
+/// an assertion — which, as a `debug_assert!`, is compiled out of exactly the
+/// release builds users run. Deriving the counts keeps the invariant true by
+/// construction instead, with nothing to defend it.
 fn process_compiler_message(
     json: &serde_json::Value,
-    errors: &mut usize,
-    warnings: &mut usize,
     error_messages: &mut Vec<String>,
     warning_messages: &mut Vec<String>,
     warning_codes: &mut BTreeMap<String, usize>,
@@ -381,11 +467,9 @@ fn process_compiler_message(
 
     match level {
         "error" => {
-            *errors += 1;
             error_messages.push(format_diagnostic("error", code, msg_text, &location));
         }
         "warning" => {
-            *warnings += 1;
             warning_messages.push(format_diagnostic("warning", code, msg_text, &location));
             if !code.is_empty() {
                 *warning_codes.entry(code.to_string()).or_insert(0) += 1;
@@ -403,8 +487,6 @@ fn process_compiler_message(
 /// - `{"reason":"compiler-message",...}` entries to count warnings/errors
 /// - `{"reason":"build-finished","success":true/false}` for final status
 fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
-    let mut warnings: usize = 0;
-    let mut errors: usize = 0;
     let mut error_messages: Vec<String> = Vec::new();
     let mut warning_messages: Vec<String> = Vec::new();
     let mut warning_codes: BTreeMap<String, usize> = BTreeMap::new();
@@ -426,8 +508,6 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
             Some("compiler-message") => {
                 process_compiler_message(
                     &json,
-                    &mut errors,
-                    &mut warnings,
                     &mut error_messages,
                     &mut warning_messages,
                     &mut warning_codes,
@@ -449,30 +529,27 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
         return None;
     }
 
-    // Every "warning" level pushes exactly one diagnostic line, so the vector's
-    // length IS the warning count. `summarise_warnings` relies on that to keep
-    // the roll-up's buckets summing to the total.
-    debug_assert_eq!(
-        warning_messages.len(),
-        warnings,
-        "every warning must contribute exactly one diagnostic line"
-    );
+    // Counts ARE the vectors' lengths: every "error"/"warning" level pushes
+    // exactly one diagnostic line (see `process_compiler_message`), so each
+    // figure has exactly one source and cannot disagree with itself.
+    let errors = error_messages.len();
 
     // ONE representation of the warnings — per-warning detail or the
     // by-lint-code roll-up, chosen in a single place so both can never render.
     // `error_messages` carries errors only; it no longer doubles as a warning
     // channel.
-    let warning_messages = summarise_warnings(warning_messages, &warning_codes);
+    //
+    // `summarise_warnings` captures the true warning total before it may
+    // replace the detail, which is why the count is read off its return value
+    // and not off `warning_messages` afterwards: above the bound that vector
+    // holds one entry per lint CODE.
+    let warnings = summarise_warnings(warning_messages, &warning_codes);
 
     let duration_ms = None; // Cargo doesn't report build duration in JSON
-    Some(ParseResult::Full(BuildResult::with_warning_messages(
-        success,
-        warnings,
-        errors,
-        duration_ms,
-        error_messages,
-        warning_messages,
-    )))
+    Some(ParseResult::Full(
+        BuildResult::new(success, warnings.total, errors, duration_ms, error_messages)
+            .with_warnings(warnings.channel),
+    ))
 }
 
 /// Tier 2: Regex-based fallback parsing on stderr.
@@ -653,6 +730,140 @@ mod tests {
         }
     }
 
+    /// Synthesise a cargo NDJSON stream carrying `warnings` warnings AND
+    /// `errors` errors, plus the `build-finished` line tier 1 requires.
+    fn ndjson_with(warnings: usize, errors: usize) -> String {
+        use serde_json::json;
+        let mut out = String::new();
+        for i in 0..warnings {
+            out.push_str(
+                &json!({
+                    "reason": "compiler-message",
+                    "message": {
+                        "level": "warning",
+                        "message": format!("unused variable: `v{i}`"),
+                        "code": {"code": "dead_code"},
+                        "spans": [
+                            {"file_name": "src/lib.rs", "line_start": i, "is_primary": true}
+                        ]
+                    }
+                })
+                .to_string(),
+            );
+            out.push('\n');
+        }
+        for i in 0..errors {
+            out.push_str(
+                &json!({
+                    "reason": "compiler-message",
+                    "message": {
+                        "level": "error",
+                        "message": "mismatched types",
+                        "code": {"code": "E0308"},
+                        "spans": [
+                            {"file_name": "src/main.rs", "line_start": i, "is_primary": true}
+                        ]
+                    }
+                })
+                .to_string(),
+            );
+            out.push('\n');
+        }
+        out.push_str(&json!({"reason": "build-finished", "success": errors == 0}).to_string());
+        out.push('\n');
+        out
+    }
+
+    /// `error_messages` is ERRORS ONLY, on both sides of the bound.
+    ///
+    /// Declaring an end state, not describing an accident. On main this field
+    /// unconditionally carried one `"<code>: N occurrence(s)"` entry per lint
+    /// code, so a `skim cargo clippy --json` consumer could read the warning
+    /// distribution out of it. It cannot any more: warnings travel on
+    /// `warning_messages`, and BELOW the bound the roll-up is never built at
+    /// all, so `error_messages` on a green clippy run is empty where it used to
+    /// have entries.
+    ///
+    /// The above-bound half of that is already pinned by
+    /// `test_tier1_clippy_warning_codes_grouped_above_the_detail_bound`. The
+    /// below-bound half — the common case, every run under 51 warnings — was
+    /// not, which is the drift this test closes. A roll-up leaking back into
+    /// `error_messages` must fail here, not in a consumer.
+    #[test]
+    fn test_error_messages_carries_errors_only() {
+        for (warnings, errors) in [(3usize, 0usize), (3, 2), (WARNING_DETAIL_MAX + 1, 2)] {
+            let output = make_output_full(&ndjson_with(warnings, errors), "", Some(0));
+            let result = parse(&output);
+            let ParseResult::Full(build_result) = &result else {
+                panic!(
+                    "expected Full for ({warnings}, {errors}), got {:?}",
+                    result.tier_name()
+                );
+            };
+
+            assert_eq!(
+                build_result.error_messages.len(),
+                errors,
+                "error_messages must hold exactly the errors: {:?}",
+                build_result.error_messages
+            );
+            assert!(
+                build_result
+                    .error_messages
+                    .iter()
+                    .all(|m| m.starts_with("error")),
+                "every error_messages entry must be an error diagnostic: {:?}",
+                build_result.error_messages
+            );
+            assert!(
+                !build_result
+                    .error_messages
+                    .iter()
+                    .any(|m| m.contains("occurrence(s)")),
+                "the by-lint-code roll-up must never travel in error_messages: {:?}",
+                build_result.error_messages
+            );
+            assert_eq!(
+                build_result.warnings, warnings,
+                "the warning TOTAL is reported whichever representation was chosen"
+            );
+        }
+    }
+
+    /// The roll-up announces itself, so the ADR-011 class-1 marker can name
+    /// what this bound dropped.
+    ///
+    /// Above the bound the reader loses per-warning message text and
+    /// `file:line` locations. `diagnostics_summary_marker` otherwise names only
+    /// cargo's fixed discard set (source snippets, help/note lines, explain
+    /// hints) and would leave that unsaid — the misstatement ADR-011's
+    /// 2026-09-24 amendment ranks below omission.
+    #[test]
+    fn test_rollup_is_disclosed_on_the_build_result() {
+        let below = make_output_full(&ndjson_with(WARNING_DETAIL_MAX, 0), "", Some(0));
+        let ParseResult::Full(below) = parse(&below) else {
+            panic!("expected Full below the bound");
+        };
+        assert!(
+            !below.warnings_rolled_up,
+            "at the bound the per-warning detail is served, so nothing is rolled up"
+        );
+
+        let above = make_output_full(&ndjson_with(WARNING_DETAIL_MAX + 1, 0), "", Some(0));
+        let ParseResult::Full(above) = parse(&above) else {
+            panic!("expected Full above the bound");
+        };
+        assert!(
+            above.warnings_rolled_up,
+            "above the bound the roll-up replaced the detail and must say so"
+        );
+        assert_eq!(
+            above.warnings,
+            WARNING_DETAIL_MAX + 1,
+            "the marker quotes this total, so it must survive the roll-up"
+        );
+    }
+
     /// The wholesale switch owes no ADR-011 class-1 marker only because the
     /// roll-up accounts for every warning. A codeless warning has no lint key
     /// to group under, so it gets an explicit bucket instead of vanishing from
@@ -729,24 +940,15 @@ mod tests {
         // A JSON object with no "message" field must return false and leave
         // all accumulators untouched.
         let json = serde_json::json!({"reason": "compiler-message"});
-        let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
         let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(
-            &json,
-            &mut errors,
-            &mut warnings,
-            &mut msgs,
-            &mut warn_msgs,
-            &mut codes,
-        );
+        let ok = process_compiler_message(&json, &mut msgs, &mut warn_msgs, &mut codes);
 
         assert!(!ok, "should return false for missing message key");
-        assert_eq!(errors, 0);
-        assert_eq!(warnings, 0);
         assert!(msgs.is_empty());
+        assert!(warn_msgs.is_empty());
         assert!(codes.is_empty());
     }
 
@@ -761,24 +963,15 @@ mod tests {
             Some("src/main.rs"),
             Some(42),
         );
-        let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
         let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(
-            &json,
-            &mut errors,
-            &mut warnings,
-            &mut msgs,
-            &mut warn_msgs,
-            &mut codes,
-        );
+        let ok = process_compiler_message(&json, &mut msgs, &mut warn_msgs, &mut codes);
 
         assert!(ok, "should return true for valid compiler-message");
-        assert_eq!(errors, 1);
-        assert_eq!(warnings, 0);
         assert_eq!(msgs.len(), 1);
+        assert!(warn_msgs.is_empty(), "an error is not a warning");
         assert_eq!(msgs[0], "error[E0308]: mismatched types in src/main.rs:42");
         assert!(
             codes.is_empty(),
@@ -791,30 +984,22 @@ mod tests {
         // An error with neither a code nor a span should fall back to the
         // plain "error: <message>" format.
         let json = make_compiler_message("error", "internal compiler error", None, None, None);
-        let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
         let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(
-            &json,
-            &mut errors,
-            &mut warnings,
-            &mut msgs,
-            &mut warn_msgs,
-            &mut codes,
-        );
+        let ok = process_compiler_message(&json, &mut msgs, &mut warn_msgs, &mut codes);
 
         assert!(ok);
-        assert_eq!(errors, 1);
+        assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], "error: internal compiler error");
     }
 
     #[test]
     fn test_process_compiler_message_warning_with_code() {
-        // A warning event with a lint code should increment the warning counter
-        // and record the code in the warning_codes map, but add nothing to
-        // error_messages.
+        // A warning event with a lint code should push exactly one warning
+        // diagnostic and record the code in the warning_codes map, but add
+        // nothing to error_messages.
         let json = make_compiler_message(
             "warning",
             "unused variable: `x`",
@@ -822,23 +1007,13 @@ mod tests {
             Some("src/lib.rs"),
             Some(10),
         );
-        let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
         let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(
-            &json,
-            &mut errors,
-            &mut warnings,
-            &mut msgs,
-            &mut warn_msgs,
-            &mut codes,
-        );
+        let ok = process_compiler_message(&json, &mut msgs, &mut warn_msgs, &mut codes);
 
         assert!(ok);
-        assert_eq!(errors, 0);
-        assert_eq!(warnings, 1);
         assert!(msgs.is_empty(), "warnings should not add to error_messages");
         assert_eq!(codes.get("dead_code"), Some(&1));
         // E-4: the warning is rendered by the SAME function as an error, into
@@ -853,25 +1028,16 @@ mod tests {
 
     #[test]
     fn test_process_compiler_message_warning_without_code() {
-        // A warning with no lint code should still increment the warning counter
-        // but leave warning_codes empty.
+        // A warning with no lint code still pushes exactly one warning
+        // diagnostic but leaves warning_codes empty.
         let json = make_compiler_message("warning", "unused import", None, None, None);
-        let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
         let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(
-            &json,
-            &mut errors,
-            &mut warnings,
-            &mut msgs,
-            &mut warn_msgs,
-            &mut codes,
-        );
+        let ok = process_compiler_message(&json, &mut msgs, &mut warn_msgs, &mut codes);
 
         assert!(ok);
-        assert_eq!(warnings, 1);
         assert!(codes.is_empty());
         assert!(msgs.is_empty());
         assert_eq!(
@@ -961,22 +1127,14 @@ mod tests {
     fn test_process_compiler_message_reports_primary_span_location() {
         // Regression for E-2: before the fix this rendered `… in src/main.rs:4`.
         let json = e0499_multi_span_message();
-        let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
         let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(
-            &json,
-            &mut errors,
-            &mut warnings,
-            &mut msgs,
-            &mut warn_msgs,
-            &mut codes,
-        );
+        let ok = process_compiler_message(&json, &mut msgs, &mut warn_msgs, &mut codes);
 
         assert!(ok);
-        assert_eq!(errors, 1);
+        assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0],
             "error[E0499]: cannot borrow `s` as mutable more than once at a time in src/main.rs:5",
