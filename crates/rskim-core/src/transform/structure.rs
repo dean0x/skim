@@ -469,7 +469,21 @@ fn build_spans_from_top_level_nodes(
         let static_kind = to_static_node_kind(kind);
 
         if start_line < end_line {
-            spans.push(NodeSpan::new(start_line..end_line, static_kind));
+            // ADR-011 source-space marker counts. Structure mode's body
+            // replacement text contains no newlines, so every output line is
+            // exactly one source line -- the invariant
+            // `compute_source_line_map_from_offset_map` already documents. The
+            // span therefore SHOWS `end_line - start_line` source lines, the
+            // first being the node's own start row; the collapsed body lines in
+            // between are hidden from the reader and are correctly counted as
+            // omitted by the surrounding gap/trailing markers.
+            let source_first_line = child.start_position().row;
+            let source_shown = end_line.saturating_sub(start_line);
+            spans.push(NodeSpan::with_source(
+                start_line..end_line,
+                static_kind,
+                source_first_line..source_first_line.saturating_add(source_shown),
+            ));
         }
     }
 
@@ -622,9 +636,15 @@ pub(crate) fn extract_markdown_headers_with_spans(
         .into_iter()
         .map(|(text, kind, source_start_line)| {
             let line_count = text.lines().count().max(1);
-            spans.push(NodeSpan::new(
+            // ADR-011 source-space marker counts: the header text is verbatim
+            // source, so this span shows `line_count` consecutive source lines
+            // starting at `source_start_line` (1-indexed here, 0-indexed in the
+            // span). This mirrors the source_line_map built just below.
+            let source_first_line = source_start_line.saturating_sub(1);
+            spans.push(NodeSpan::with_source(
                 current_output_line..current_output_line + line_count,
                 kind,
+                source_first_line..source_first_line.saturating_add(line_count),
             ));
             // Map each output line to consecutive source lines from source_start_line.
             // ATX headings are always 1 line; setext headings span 2 lines (text + underline).

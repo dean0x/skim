@@ -15,10 +15,10 @@
 //! differs from the binary being tested (e.g. `target/release/skim` on PATH
 //! vs `target/debug/skim` running the test). To prevent this spurious exit-1,
 //! tests that assert exit-0 MUST pass a controlled PATH that puts the test
-//! binary's directory first via `hermetic_path()`.
+//! binary's directory first via `common::hermetic_path()`.
 //!
 //! Tests asserting exit-1 (`test_doctor_exits_1_and_names_tamper_...`) also
-//! use `hermetic_path()` for consistency and to ensure the asserted drift comes
+//! use `common::hermetic_path()` for consistency and to ensure the asserted drift comes
 //! only from the tampered hook, not PATH state.
 
 use std::io::Write;
@@ -31,18 +31,6 @@ use std::os::unix::fs::PermissionsExt;
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Return a PATH string with the test binary's parent directory prepended.
-///
-/// This ensures `skim doctor`'s $PATH scan finds only the test binary as the
-/// winning `skim` entry, preventing spurious PATH-drift exit-1s on machines
-/// where a release build (`target/release/skim`) also appears on PATH.
-fn hermetic_path() -> String {
-    let bin = common::skim_bin();
-    let bin_dir = bin.parent().expect("skim binary has a parent directory");
-    let system_path = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{}", bin_dir.display(), system_path)
-}
 
 /// Install the skim hook into a sandboxed home directory.
 ///
@@ -57,7 +45,7 @@ fn do_sandboxed_init(home: &std::path::Path) {
             "--no-guidance",
             "--no-wrappers",
         ])
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 }
@@ -70,6 +58,100 @@ fn hook_script_path(home: &std::path::Path) -> std::path::PathBuf {
 /// Path to the SHA-256 manifest inside the sandbox.
 fn manifest_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".claude/hooks/skim-claude-code.sha256")
+}
+
+// ============================================================================
+// Dev-pinned hook helpers (commit-gate waiver)
+// ============================================================================
+
+/// The dev declaration an installed hook script carries.
+///
+/// Duplicated from `cmd::hooks::HOOK_DEV_MARKER`, which is `pub(crate)` inside a
+/// bin-only crate and therefore unreachable from an integration test. The
+/// duplication is deliberate and load-bearing: this literal is the on-disk
+/// contract, so a test that imported the constant would follow the production
+/// spelling wherever it moved and could never fail on a format change.
+const DEV_MARKER_LINE: &str = "export SKIM_HOOK_DEV=1";
+
+/// A short SHA that is not any real build of skim.
+const STALE_COMMIT: &str = "0ddba11";
+
+/// Rewrite the installed hook script's commit pin to [`STALE_COMMIT`], optionally
+/// appending the dev declaration.
+///
+/// Returns `false` when the binary was built without an embedded commit
+/// (`SKIM_HOOK_COMMIT=unknown`): `hook_is_current()` skips the commit check
+/// entirely for those builds, so there is no gate for a waiver to act on and the
+/// caller must skip rather than assert a vacuous pass.
+fn age_hook_script(home: &std::path::Path, declare_dev: bool) -> bool {
+    let script = hook_script_path(home);
+    let original = std::fs::read_to_string(&script).expect("hook script must exist after init");
+
+    if original.contains("export SKIM_HOOK_COMMIT=unknown") {
+        return false;
+    }
+
+    let mut aged = String::new();
+    for line in original.lines() {
+        if line.starts_with("export SKIM_HOOK_COMMIT=") {
+            aged.push_str(&format!("export SKIM_HOOK_COMMIT={STALE_COMMIT}\n"));
+        } else {
+            aged.push_str(line);
+            aged.push('\n');
+        }
+    }
+    if declare_dev {
+        aged.push_str(DEV_MARKER_LINE);
+        aged.push('\n');
+    }
+    std::fs::write(&script, aged).expect("rewriting the hook script must succeed");
+    true
+}
+
+/// Hex SHA-256 of a file, via whichever system hasher is available.
+///
+/// Returns `None` when neither `sha256sum` (coreutils) nor `shasum` (macOS) is
+/// on PATH. `rskim` is a bin-only crate, so its `sha2` dependency is not linked
+/// into integration tests and the digest cannot be computed in-process.
+fn system_sha256(path: &std::path::Path) -> Option<String> {
+    let candidates: [(&str, &[&str]); 2] = [("sha256sum", &[]), ("shasum", &["-a", "256"])];
+    for (program, args) in candidates {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .arg(path)
+            .output();
+        if let Ok(o) = out
+            && o.status.success()
+        {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Some(hex) = text.split_whitespace().next()
+                && hex.len() == 64
+                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Some(hex.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Re-stamp the manifest over the script's CURRENT bytes so integrity classifies
+/// as `Verified` again after [`age_hook_script`] edited it.
+///
+/// Returns `false` when no system hasher is available (see [`system_sha256`]).
+fn restamp_manifest(home: &std::path::Path) -> bool {
+    let script = hook_script_path(home);
+    let Some(hex) = system_sha256(&script) else {
+        return false;
+    };
+    // Format is fixed by `cmd::integrity::write_hash_manifest`:
+    // `sha256:<hex>  <script_name>\n`.
+    std::fs::write(
+        manifest_path(home),
+        format!("sha256:{hex}  skim-rewrite.sh\n"),
+    )
+    .expect("writing the manifest must succeed");
+    true
 }
 
 // ============================================================================
@@ -95,12 +177,12 @@ fn test_doctor_exits_0_after_clean_init() {
 
     // current_dir(home): the sandbox dir is not a git repo, so the
     // staleness-vs-HEAD check inside doctor skips and cannot cause exit 1.
-    // hermetic_path(): ensures the test binary wins on $PATH so that the PATH
+    // common::hermetic_path(): ensures the test binary wins on $PATH so that the PATH
     // scan section does not report drift from an unrelated release build.
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 }
@@ -134,11 +216,11 @@ fn test_doctor_exits_1_and_names_tamper_after_hook_modification() {
     drop(file);
 
     // Doctor must exit 1 AND say "tampered" in stdout.
-    // hermetic_path() ensures drift comes only from the tamper, not PATH state.
+    // common::hermetic_path() ensures drift comes only from the tamper, not PATH state.
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .failure() // exit 1
         .stdout(predicates::prelude::predicate::str::contains("tampered"));
@@ -200,7 +282,7 @@ fn test_doctor_exits_0_on_binary_pin_mismatch() {
             "--no-guidance",
             "--no-wrappers",
         ])
-        .env("PATH", hermetic_path());
+        .env("PATH", common::hermetic_path());
     })
     .success();
 
@@ -209,7 +291,7 @@ fn test_doctor_exits_0_on_binary_pin_mismatch() {
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success() // exit 0 — pin mismatch is advisory only (C-1 fix)
         .stdout(predicates::prelude::predicate::str::contains(
@@ -236,11 +318,11 @@ fn test_doctor_exits_0_when_no_manifest() {
     std::fs::remove_file(&manifest).unwrap();
 
     // NoManifest → advisory, not drift → exit 0.
-    // hermetic_path() prevents PATH drift from an unrelated release build.
+    // common::hermetic_path() prevents PATH drift from an unrelated release build.
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 }
@@ -304,9 +386,196 @@ fn test_doctor_does_not_exit_1_for_absent_sha() {
     common::skim_sandboxed(home_path)
         .arg("doctor")
         .current_dir(git_path)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success(); // must exit 0 regardless of compiled_commit value
+}
+
+// ============================================================================
+// Dev-pinned hooks: the commit-gate waiver
+// ============================================================================
+
+/// THE security test for the waiver: a dev declaration on a script whose
+/// manifest is absent must NOT waive the commit gate.
+///
+/// This is the only route a hand-edited script has to the currency branch at
+/// all. Editing the script alone yields `Tampered`, which `hook_status_line`
+/// returns early on — but `NoManifest` deliberately FALLS THROUGH to the pin and
+/// currency checks, and deleting `skim-claude-code.sha256` is what produces it.
+/// PF-016 records that `Tampered` → `NoManifest` downgrade as hardening that was
+/// rejected twice and left open, so anyone who can write the hook file can reach
+/// this branch. If the waiver were gated on "not `Tampered`" rather than on
+/// `Verified` specifically, those same two edits would buy a self-asserted
+/// exemption from the check that says which build is running.
+#[test]
+fn test_doctor_dev_marker_without_manifest_does_not_waive_commit_gate() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+
+    if !age_hook_script(home, true) {
+        return; // tarball build: no commit check exists to waive
+    }
+    // The downgrade: delete the sidecar so integrity reads NoManifest.
+    std::fs::remove_file(manifest_path(home)).unwrap();
+
+    common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .assert()
+        .failure() // exit 1 — the stale commit is still drift
+        .stdout(predicates::prelude::predicate::str::contains(
+            "commit mismatch",
+        ));
+}
+
+/// The control for the test above, and the one that proves the aging is real: a
+/// stale commit with a VERIFIED manifest and NO dev declaration still exits 1.
+///
+/// Without this, the negative test could be passing because `age_hook_script`
+/// never produced a stale state, and the positive test below could be passing
+/// because the manifest re-stamp alone silences the currency branch.
+#[test]
+fn test_doctor_stale_commit_without_dev_marker_is_still_drift() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+
+    if !age_hook_script(home, false) {
+        return; // tarball build
+    }
+    if !restamp_manifest(home) {
+        return; // no system hasher available
+    }
+
+    common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .assert()
+        .failure() // exit 1 — a verified manifest does not waive anything by itself
+        .stdout(predicates::prelude::predicate::str::contains(
+            "commit mismatch",
+        ));
+}
+
+/// The waiver, end to end: a dev declaration on a script whose manifest VERIFIES
+/// makes a stale commit stop contributing to exit 1.
+///
+/// Differs from the control above by exactly one line in the script, so the
+/// change in verdict is attributable to the declaration and nothing else. This
+/// is the acquisition-path proof for the waiver — `hook_is_current`'s own unit
+/// table says the predicate is right, and says nothing about whether the CLI
+/// ever reaches it with real inputs (PF-015).
+#[test]
+fn test_doctor_dev_marker_with_verified_manifest_waives_commit_gate() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+
+    if !age_hook_script(home, true) {
+        return; // tarball build
+    }
+    if !restamp_manifest(home) {
+        return; // no system hasher available
+    }
+
+    let out = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        out.status.success(),
+        "a dev-pinned, manifest-verified hook must not exit 1 for a stale commit, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("commit mismatch"),
+        "the commit gate must be waived, not merely demoted in the exit code:\n{stdout}"
+    );
+    // The waiver is scoped to the commit: the hook is still reported, still
+    // pinned, and the REAL commit it was installed at is still printed, so the
+    // age of a dev install stays visible (ADR-014 keeps the real SHA on purpose).
+    assert!(
+        stdout.contains(STALE_COMMIT),
+        "the installed commit must still be reported, not hidden by the waiver:\n{stdout}"
+    );
+}
+
+/// `skim init --dev` end to end, through the flag rather than a hand-edited
+/// script: the installed hook must declare dev mode and `skim doctor` must
+/// render it as `dev-pinned`, never as `✓`.
+///
+/// `current_dir(home)` keeps `install_search_integration` out of the repository
+/// the test runs from — with no `.git` above the sandbox it finds no project
+/// root and spawns no background index build.
+#[test]
+fn test_doctor_renders_a_dev_flag_install_as_dev_pinned() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    common::skim_sandboxed(home)
+        .args([
+            "init",
+            "--dev",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .assert()
+        .success();
+
+    let script = std::fs::read_to_string(hook_script_path(home)).unwrap();
+    assert!(
+        script.contains(DEV_MARKER_LINE),
+        "`--dev` must write the declaration into the installed script:\n{script}"
+    );
+    assert!(
+        !script.contains("export SKIM_HOOK_COMMIT=dev"),
+        "the commit field must keep the REAL build identity (ADR-014):\n{script}"
+    );
+
+    let out = common::skim_sandboxed(home)
+        .arg("doctor")
+        .current_dir(home)
+        .env("PATH", common::hermetic_path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // The one-line CI guard: `skim doctor | grep dev-pinned`.
+    assert!(
+        stdout.contains("dev-pinned"),
+        "doctor must name a dev install as such:\n{stdout}"
+    );
+    let hook_line = stdout
+        .lines()
+        .find(|l| l.contains("claude-code") && l.contains("installed"))
+        .unwrap_or_else(|| panic!("doctor must report the claude-code hook:\n{stdout}"));
+    assert!(
+        hook_line.contains('⚠') && !hook_line.contains('✓'),
+        "a dev install must not masquerade as a clean one: {hook_line}"
+    );
+    // Both SHAs on the line: the one the install froze and the one the running
+    // binary was built from. Their distance is how old the dev install is.
+    assert!(
+        hook_line.contains("binary commit"),
+        "the running binary's commit must appear beside the installed one: {hook_line}"
+    );
 }
 
 // ============================================================================
@@ -361,7 +630,7 @@ fn test_doctor_exits_1_on_wrapper_target_mismatch() {
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path());
+        .env("PATH", common::hermetic_path());
     })
     .success();
 
@@ -377,7 +646,7 @@ fn test_doctor_exits_1_on_wrapper_target_mismatch() {
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .failure() // exit 1 — wrapper target mismatch is drift
         .stdout(predicates::prelude::predicate::str::contains(
@@ -407,7 +676,7 @@ fn test_doctor_exits_0_with_correct_wrappers() {
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 
@@ -415,7 +684,7 @@ fn test_doctor_exits_0_with_correct_wrappers() {
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success(); // exit 0 — correct wrappers do not produce drift
 }
@@ -450,7 +719,7 @@ fn test_doctor_foreign_symlink_is_advisory_not_exit_1() {
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 
@@ -475,7 +744,7 @@ fn test_doctor_foreign_symlink_is_advisory_not_exit_1() {
     let out = common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .output()
         .unwrap();
 

@@ -200,8 +200,10 @@ fn render_and_format<'a>(
             false,
         );
         // D3 (issue #510): carry raw hunk content so --json consumers get the
-        // full patch body.  Reconstruct each hunk header from the parsed fields
-        // (old/new start + count) and append the original patch lines verbatim.
+        // full patch body.  Each hunk header is rebuilt from the parsed fields
+        // (old/new start + count) by `render::hunk_header` — the crate's single
+        // spelling of that line, shared with both text hunk walks — and the
+        // original patch lines are appended verbatim.
         //
         // This is what lets the emit site below declare
         // [`Completeness::Reencoded`] — all hunk content is faithfully carried
@@ -210,11 +212,7 @@ fn render_and_format<'a>(
             use std::fmt::Write as _;
             let mut buf = String::new();
             for hunk in &file_diff.hunks {
-                let _ = writeln!(
-                    buf,
-                    "@@ -{},{} +{},{} @@",
-                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-                );
+                let _ = writeln!(buf, "{}", render::hunk_header(hunk));
                 for line in &hunk.patch_lines {
                     buf.push_str(line);
                     buf.push('\n');

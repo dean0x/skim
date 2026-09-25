@@ -280,16 +280,24 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
 
     // B3 / ADR-011 class 1: emit lossy-view marker unconditionally when any
     // file's view differs from raw bytes.  Previously gated on `SKIM_REWRITTEN_FROM`.
-    if view_differs_count > 0 {
-        let mode_str = format!("{:?}", options.process.mode).to_lowercase();
-        if let Some(marker) = crate::output::lossy_view_marker(
+    //
+    // ONE marker for the whole run, so there is exactly one disclosure cost to
+    // charge — and the same `EmittedNotice` is both printed here and handed to
+    // the analytics block below, which is what makes the charged cost the
+    // emitted cost rather than a reconstruction of it.
+    let mode_str = format!("{:?}", options.process.mode).to_lowercase();
+    let aggregate_notice = if view_differs_count > 0 {
+        crate::output::emitted_notice_cost(
             crate::output::rewrite_origin().as_deref(),
             &mode_str,
             view_differs_count,
             total_paths,
-        ) {
-            eprintln!("{marker}");
-        }
+        )
+    } else {
+        None
+    };
+    if let Some(notice) = &aggregate_notice {
+        eprint!("{}", notice.line());
     }
 
     if options.process.show_stats && total_original_tokens > 0 {
@@ -315,12 +323,31 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             .unwrap_or_default()
             .display()
             .to_string();
-        let mode = format!("{:?}", options.process.mode).to_lowercase();
+
+        // The aggregate marker is ONE line of stderr for the whole run, so it
+        // is charged to exactly ONE row: the first whose view differed.
+        // `Option::take` makes that structural — the second differing row finds
+        // `None` and cannot be charged again.
+        //
+        // The alternatives are both wrong in a way that would not show up in
+        // any aggregate: attaching it to every differing row charges the run N
+        // times for one emission, and splitting it N ways records per-file
+        // costs that were never emitted and do not sum back cleanly under
+        // integer division.
+        let mut unattributed_notice = aggregate_notice;
 
         let rows: Vec<crate::analytics::FileOpRow> = results
             .into_iter()
             .filter_map(|(path, result)| {
                 let pr = result.ok()?; // skip Err entries
+                // Same predicate that fed `view_differs_count`, over the same
+                // Ok rows, so whenever a marker was emitted some row claims it.
+                let notice = if pr.view_differs {
+                    unattributed_notice.take()
+                } else {
+                    None
+                };
+                let served = pr.served;
                 let counts = match (pr.original_tokens, pr.transformed_tokens) {
                     (Some(raw), Some(comp)) => {
                         // --show-stats (or count-carrying cache hit): counts already known.
@@ -345,12 +372,14 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                     original_cmd: format!("skim {}", path.display()),
                     language: pr.language.map(|l| l.as_str().to_string()),
                     parse_tier: pr.parse_tier.map(str::to_string),
+                    notice,
+                    served,
                 })
             })
             .collect();
 
         let common = crate::analytics::FileOpCommon {
-            mode: Some(mode),
+            mode: Some(mode_str),
             project_path: cwd,
             session_id: options.session_id.clone(),
         };

@@ -35,7 +35,7 @@ impl HookProtocol for ClaudeCodeHook {
     }
 
     fn generate_script(&self, version: &str, binary_path: &str) -> String {
-        super::generate_hook_script(version, "claude-code", binary_path)
+        super::generate_hook_script(version, "claude-code", binary_path, super::HookMode::Strict)
     }
 }
 

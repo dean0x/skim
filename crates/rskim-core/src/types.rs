@@ -425,15 +425,21 @@ impl Language {
             };
 
         // Apply last_lines truncation as a post-processing step (B5: pass elision_hint).
-        // source_line_count=None: `result` is tree-sitter output; source-space counts
-        // for the last_lines path are not critical here (it shows the tail of output).
+        //
+        // E5: the tree-sitter transform restructures the text exactly as the serde
+        // transforms do — structure/signatures/types collapse whole bodies — so
+        // `result` has far fewer lines than `source`. The marker must state SOURCE
+        // lines omitted so agents know the true scope of what they cannot see
+        // (ADR-011 class 1). PF-033 rule 1: hand the truncator the source-space
+        // count rather than letting it re-derive one from the rendered output,
+        // which no longer distinguishes content from marker.
         let (result, line_map) = if let Some(n) = config.last_lines {
             let truncated = crate::transform::truncate::simple_last_line_truncate(
                 &result,
                 self,
                 n,
                 config.elision_hint.as_deref(),
-                None,
+                Some(source.lines().count()),
             )?;
             let final_map = if let Some(ref map) = line_map {
                 // Reconcile the line map after last_lines truncation

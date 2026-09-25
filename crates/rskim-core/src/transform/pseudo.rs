@@ -11,8 +11,10 @@
 //! For Python, parameter and variable type annotations are still stripped.
 //! TypeScript preserves parameter type annotations (ADR-007); only decorator,
 //! `readonly`, and `abstract` are stripped alongside variable/property `type_annotation`.
-//! Rust strips lifetimes, type parameters, where clauses, and attribute items only;
-//! `mutable_specifier` is preserved as it is part of the function's API surface.
+//! Rust strips nothing via `strip_kinds`: lifetimes, type/generic parameters, where
+//! clauses, and attribute items are all preserved as API surface, extending the same
+//! rationale that already kept `visibility_modifier` and `mutable_specifier` out of
+//! the strip list.
 //! Uses the same collect-ranges-then-remove pattern as minimal.rs.
 //!
 //! Token reduction target: 30-50%
@@ -208,15 +210,16 @@ fn consume_trailing_whitespace(source: &[u8], end: usize) -> usize {
 /// Returns true for node kinds that act as inline modifiers preceding another token.
 ///
 /// When these kinds are stripped, the trailing space between the modifier and the next
-/// token should also be consumed. For example, stripping `'a` from `&'a str` should
-/// produce `&str` (not `& str`), and stripping `mut` from `&mut self` should produce
-/// `& self`.
+/// token should also be consumed. For example, stripping `readonly` from
+/// `readonly foo: string` should produce `foo: string` (not ` foo: string`).
 ///
 /// Type annotations and decorators are NOT inline modifiers — their trailing spaces
 /// may belong to surrounding syntax (e.g., `: number = 42`).
 fn is_inline_modifier_kind(kind: &str) -> bool {
     // `mutable_specifier` was removed because it is no longer stripped (E2.4).
-    matches!(kind, "lifetime" | "readonly" | "abstract")
+    // `lifetime` was removed for the same reason: Rust's strip_kinds no longer
+    // strips lifetimes, so this predicate is never consulted for that kind.
+    matches!(kind, "readonly" | "abstract")
 }
 
 /// Per-language rules for what constitutes "noise" in pseudo mode
@@ -269,17 +272,13 @@ fn get_pseudo_rules(language: Language) -> PseudoRules {
             strip_self_param: true,
         },
         Language::Rust => PseudoRules {
-            strip_kinds: &[
-                // "visibility_modifier" intentionally NOT listed — pub/pub(crate)/pub(super)
-                // convey API surface and re-export intent; preserving them matches the
-                // decision to keep visibility in pseudo output (A4 contract).
-                "lifetime",
-                "type_parameters",
-                "where_clause",
-                "attribute_item",
-                // "mutable_specifier" intentionally NOT listed — `&mut self` and `&mut T`
-                // convey mutation intent and are part of the function's API surface (E2.4).
-            ],
+            // No node kinds are stripped here. Lifetimes, type/generic parameters,
+            // where clauses and attribute items are API surface, not syntactic noise —
+            // extending the same A4 contract that already excluded
+            // "visibility_modifier" (pub/pub(crate)/pub(super) convey API surface and
+            // re-export intent) and "mutable_specifier" (`&mut self`/`&mut T` convey
+            // mutation intent, E2.4) from this list.
+            strip_kinds: &[],
             strip_keywords: &[],
             strip_semicolons: true,
             strip_self_param: false,
@@ -1310,34 +1309,41 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_pseudo_strips_lifetimes_and_type_params() {
+    fn test_rust_pseudo_preserves_lifetimes_and_type_params() {
+        // Lifetimes and generic type parameters are API surface, not noise —
+        // preserved in pseudo mode (extends the A4 contract, mirrors ADR-007).
         let source = "pub fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {\n    if x.len() > y.len() { x } else { y }\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("<'a>"),
-            "type parameters should be stripped"
+            result.contains("<'a>"),
+            "generic lifetime parameters must be preserved, got: {result}"
         );
-        // Lifetimes in the body might remain in some nodes, but the key is
-        // that the type_parameters on the function are stripped
     }
 
     #[test]
-    fn test_rust_pseudo_strips_attributes() {
+    fn test_rust_pseudo_preserves_attributes() {
+        // Attribute items (`#[derive(...)]`) are API surface, not noise — preserved
+        // in pseudo mode (extends the A4 contract, mirrors ADR-007).
         let source = "#[derive(Debug)]\npub struct Point {\n    pub x: i32,\n    pub y: i32,\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("#[derive(Debug)]"),
-            "attribute should be stripped"
+            result.contains("#[derive(Debug)]"),
+            "attribute must be preserved, got: {result}"
         );
         assert!(result.contains("struct Point"), "struct preserved");
     }
 
     #[test]
-    fn test_rust_pseudo_strips_where_clause() {
+    fn test_rust_pseudo_preserves_where_clause() {
+        // Where clauses are API surface, not noise — preserved in pseudo mode
+        // (extends the A4 contract, mirrors ADR-007).
         let source =
             "fn process<T>(value: T) where T: Clone + Debug {\n    println!(\"{:?}\", value);\n}\n";
         let result = transform(source, Language::Rust);
-        assert!(!result.contains("where"), "where clause should be stripped");
+        assert!(
+            result.contains("where"),
+            "where clause must be preserved, got: {result}"
+        );
         assert!(result.contains("fn process"), "function preserved");
     }
 
@@ -1367,6 +1373,29 @@ mod tests {
         assert!(
             !result.contains("& self"),
             "mutable_specifier must not be stripped, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_rust_pseudo_preserved_generics_reparse_without_error() {
+        // Preserving lifetimes, generic type parameters, where clauses and
+        // attribute items (this change) must not corrupt the output into
+        // something that fails to re-parse as valid Rust. The fixture uses only
+        // item declarations plus a single bare-expression function body — no
+        // statement-level `;` appears anywhere, so `strip_semicolons` (which
+        // makes `use`/`let` statements unparseable independently of this
+        // change, per pseudo.rs's semicolon-stripping rule) cannot be the
+        // source of any parse error observed here (PF-025: this assertion is
+        // scoped to what THIS change touches, not a general no-corruption claim).
+        let source = "#[derive(Debug, Clone)]\npub struct Container<'a, T> where T: Clone {\n    pub value: &'a T,\n}\n\nimpl<'a, T> Container<'a, T> where T: Clone {\n    pub fn get(&self) -> &T {\n        self.value\n    }\n}\n";
+        let result = transform(source, Language::Rust);
+
+        let mut parser = Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(&result).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "pseudo output preserving lifetimes/generics/where-clauses/attributes \
+             must re-parse as valid Rust with no error nodes, got: {result}"
         );
     }
 
@@ -1734,23 +1763,19 @@ mod tests {
     }
 
     #[test]
-    fn test_rust_pseudo_lifetime_no_space() {
-        // BUG 6: Stripping lifetime from `&'a str` left `& str` (extra space).
-        // Return type is preserved (A4), with lifetime stripped inside it: `-> &str`.
+    fn test_rust_pseudo_preserves_lifetime_intact() {
+        // Lifetimes are preserved as API surface (no longer stripped), so `&'a str`
+        // must survive intact, including in the return type position.
         let source = "pub fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {\n    if x.len() > y.len() { x } else { y }\n}\n";
         let result = transform(source, Language::Rust);
         assert!(
-            !result.contains("& str"),
-            "lifetime removal should not leave extra space in references, got: {result}"
+            result.contains("&'a str"),
+            "reference-with-lifetime must be preserved intact, got: {result}"
         );
+        // Return type preserved with lifetime intact: -> &'a str
         assert!(
-            result.contains("&str"),
-            "reference types should be clean, got: {result}"
-        );
-        // Return type preserved with lifetime stripped: -> &str (not -> &'a str)
-        assert!(
-            result.contains("-> &str"),
-            "return type must be preserved with lifetime stripped, got: {result}"
+            result.contains("-> &'a str"),
+            "return type must be preserved with lifetime intact, got: {result}"
         );
     }
 
@@ -1875,7 +1900,6 @@ mod tests {
 
     #[test]
     fn test_is_inline_modifier_kind_positives() {
-        assert!(is_inline_modifier_kind("lifetime"));
         // `mutable_specifier` removed from is_inline_modifier_kind (E2.4) —
         // it is no longer in the strip list so the trailing-space consumer is moot.
         assert!(is_inline_modifier_kind("readonly"));
@@ -1885,6 +1909,9 @@ mod tests {
     #[test]
     fn test_is_inline_modifier_kind_negatives() {
         assert!(!is_inline_modifier_kind("mutable_specifier")); // E2.4: no longer inline modifier
+        // Rust's strip_kinds no longer strips lifetimes, so this predicate is never
+        // consulted for that kind (see is_inline_modifier_kind's own comment).
+        assert!(!is_inline_modifier_kind("lifetime"));
         assert!(!is_inline_modifier_kind("type_annotation"));
         assert!(!is_inline_modifier_kind("decorator"));
         assert!(!is_inline_modifier_kind("identifier"));

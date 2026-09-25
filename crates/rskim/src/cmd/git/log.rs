@@ -14,8 +14,8 @@ use super::run_passthrough;
 ///
 /// Flag-aware passthrough: if user has `--format` or `--pretty` (custom
 /// format strings that cannot be parsed generically), pass through unmodified.
-/// `--oneline` is handled by stripping it and injecting the handler's own
-/// `--format` flag instead.
+/// `--oneline` is handled by stripping it and injecting the equivalent
+/// `--format` flag instead — see `injected_log_format`.
 ///
 /// Large-output degrade (ADR-002 / reliability-01 / #317): when `git log`
 /// output exceeds the 64 MiB pipe cap, this function emits the bytes read so
@@ -32,17 +32,17 @@ pub(super) fn run_log(
         return run_passthrough(global_flags, "log", args, show_stats, rec);
     }
 
-    // Strip --oneline — handler injects its own --format flag.
+    // Strip --oneline — handler injects the equivalent --format flag.
     let stripped_args: Vec<String> = args
         .iter()
-        .filter(|a| a.as_str() != "--oneline")
+        .filter(|a| !is_oneline_flag(a.as_str()))
         .cloned()
         .collect();
 
     let (filtered_args, output_format) = extract_output_format(&stripped_args);
 
     let mut full_args: Vec<String> = global_flags.to_vec();
-    full_args.extend(["log".to_string(), "--format=%h %s (%cr) <%an>".to_string()]);
+    full_args.extend(["log".to_string(), injected_log_format(args).to_string()]);
     full_args.extend_from_slice(&filtered_args);
 
     let label = super::build_analytics_label("log", args, show_stats, rec.enabled);
@@ -217,6 +217,55 @@ pub(super) fn run_log(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `--format` injected when the user asked for no particular density.
+///
+/// One line per commit: abbreviated hash, subject, relative date, author.
+const LOG_FORMAT_DEFAULT: &str = "--format=%h %s (%cr) <%an>";
+
+/// `--format` injected when the user asked for `--oneline`.
+///
+/// `git log --oneline` is `--pretty=oneline --abbrev-commit`, i.e. the
+/// abbreviated hash, a space, the subject, and nothing else.  This string
+/// reproduces those bytes exactly.
+const LOG_FORMAT_ONELINE: &str = "--format=%h %s";
+
+/// Recognise `--oneline` as the user's own token.
+///
+/// The strip filter and the injected-format choice MUST read argv through this
+/// one predicate.  Stripping a density flag and then ignoring the density it
+/// asked for is exactly the defect `injected_log_format` exists to prevent,
+/// and two independent scans are how such a pair drifts apart.
+fn is_oneline_flag(arg: &str) -> bool {
+    arg == "--oneline"
+}
+
+/// Choose the `--format` string injected in place of the user's argv flags.
+///
+/// The handler replaces the user's formatting flags with one of its own so the
+/// output has a parseable shape.  When the user asked for `--oneline`, injecting
+/// the richer default makes skim's view **denser than the one the user
+/// requested**, and the ADR-001 net-savings guard cannot catch it: that guard
+/// baselines against the *injected* command's output, so it compares skim's
+/// render to skim's own inflated raw (PF-024).  Measured on this repository,
+/// `skim git log --oneline -6` emitted 670 bytes where `git log --oneline -6`
+/// emits 496 — a 35% expansion by a wrapper whose purpose is compression — with
+/// the guard present and correctly electing raw.
+///
+/// Honouring the requested density makes the injected command's output
+/// byte-identical to the user's own, so the raw-fallback body *is* the user's
+/// command output and the view can no longer exceed what it compresses.
+///
+/// This is deliberately not a second `git log` invocation (the `raw_override`
+/// treatment `git status` gets): `git log` is unbounded by history, so a second
+/// invocation can be arbitrarily expensive.
+fn injected_log_format(args: &[String]) -> &'static str {
+    if args.iter().any(|a| is_oneline_flag(a.as_str())) {
+        LOG_FORMAT_ONELINE
+    } else {
+        LOG_FORMAT_DEFAULT
+    }
+}
+
 /// Return `true` when `line` matches the `%h`-format commit-header shape:
 /// a non-empty lowercase hex prefix followed by a space.
 ///
@@ -259,6 +308,67 @@ fn parse_log(output: &str) -> GitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // injected format density tests
+    // ========================================================================
+
+    /// Regression: `skim git log --oneline` must not serve a denser view than
+    /// `--oneline` asked for.  The ADR-001 guard cannot catch this — it
+    /// baselines against the injected command's own output (PF-024) — so the
+    /// injected format is where the density has to be honoured.
+    #[test]
+    fn injected_log_format_honours_oneline_density() {
+        let args = vec!["--oneline".to_string(), "-6".to_string()];
+        assert_eq!(injected_log_format(&args), LOG_FORMAT_ONELINE);
+    }
+
+    #[test]
+    fn injected_log_format_defaults_when_oneline_absent() {
+        let args = vec!["-6".to_string()];
+        assert_eq!(injected_log_format(&args), LOG_FORMAT_DEFAULT);
+    }
+
+    /// Pin the density claim itself, not just the string: `git log --oneline`
+    /// emits an abbreviated hash and a subject, so the injected equivalent must
+    /// carry no additional placeholder.
+    #[test]
+    fn oneline_format_adds_no_field_beyond_hash_and_subject() {
+        assert_eq!(LOG_FORMAT_ONELINE, "--format=%h %s");
+        for placeholder in ["%cr", "%an", "%ae", "%cd", "%d", "%b"] {
+            assert!(
+                !LOG_FORMAT_ONELINE.contains(placeholder),
+                "--oneline must not be enriched with {placeholder}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_oneline_flag_matches_the_bare_token_only() {
+        assert!(is_oneline_flag("--oneline"));
+        assert!(!is_oneline_flag("--oneline=1"));
+        assert!(!is_oneline_flag("--online"));
+        assert!(!is_oneline_flag("-o"));
+    }
+
+    /// The strip filter and the format choice must agree on what `--oneline`
+    /// is: a token removed from argv whose requested density is then ignored is
+    /// precisely the defect.
+    #[test]
+    fn oneline_is_both_stripped_and_honoured() {
+        let args = vec!["--oneline".to_string(), "-6".to_string()];
+        let stripped: Vec<&str> = args
+            .iter()
+            .filter(|a| !is_oneline_flag(a.as_str()))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(stripped, vec!["-6"], "--oneline is stripped from argv");
+        assert_eq!(
+            injected_log_format(&args),
+            LOG_FORMAT_ONELINE,
+            "and the format it asked for is what replaces it"
+        );
+    }
 
     // ========================================================================
     // is_commit_line tests

@@ -147,3 +147,106 @@ fn test_build_make_real_execution_success() {
         .success()
         .stdout(predicate::str::contains("OK warnings:"));
 }
+
+// ============================================================================
+// ADR-011 class-1 disclosure: the diagnostic-summary marker
+// ============================================================================
+
+/// The marker fires IF AND ONLY IF the compressed summary is what reached the
+/// reader.
+///
+/// Deliberately written as a biconditional. Which branch the net-savings guard
+/// takes is a SIZE verdict, and a test that pinned one branch could be made to
+/// pass by resizing the payload (PF-027's fixture-resize route) rather than by
+/// the gate being correct. Here stdout says which branch ran and stderr must
+/// agree with it, so no payload size can make the assertion pass falsely.
+///
+/// On the `Keep` branch the reader loses each diagnostic's body — tsc's related
+/// spans and following context — and the marker discloses it. On the
+/// `Passthrough` branch the child's own bytes reach the reader intact, so a
+/// marker there would claim a loss that did not occur.
+#[cfg(unix)]
+#[test]
+fn test_diagnostics_marker_fires_exactly_when_the_summary_is_served() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let tsc_stderr = concat!(
+        "src/index.ts(10,5): error TS2304: Cannot find name 'foo'.\n",
+        "src/api/client.ts(22,11): error TS2345: Argument of type 'string' is not \
+         assignable to parameter of type 'number'.\n",
+        "src/api/client.ts(48,3): error TS2551: Property 'requset' does not exist on \
+         type 'Client'. Did you mean 'request'?\n",
+    );
+    common::make_stub(dir.path(), "tsc", "", tsc_stderr, 2);
+
+    let out = skim_cmd()
+        .env("PATH", common::stub_path(dir.path()))
+        .args(["tsc", "--noEmit"])
+        .output()
+        .expect("skim runs");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let summary_served = stdout.contains("FAILED warnings: 0 errors: 3");
+    let marker_emitted = stderr.contains("diagnostics summarised");
+
+    assert_eq!(
+        summary_served, marker_emitted,
+        "class-1 disclosure must be emitted exactly when the summary replaces \
+         raw.\nstdout: {stdout:?}\nstderr: {stderr:?}"
+    );
+
+    if marker_emitted {
+        assert!(
+            stderr.contains("3 diagnostics"),
+            "marker must carry the exact count: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("SKIM_PASSTHROUGH=1"),
+            "class-1 marker must carry the escape hatch: {stderr:?}"
+        );
+    }
+}
+
+/// Gate (1): a build with nothing to report drops no diagnostic bodies, so the
+/// summary line IS the whole truth and no marker is emitted — even on the
+/// `Keep` branch, where something WAS compressed away.
+#[cfg(unix)]
+#[test]
+fn test_zero_diagnostics_emits_no_marker_on_the_keep_branch() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    // Same shape as `test_build_make_real_execution_success`: build-step noise
+    // the make parser strips, and no diagnostics at all.
+    let noisy = concat!(
+        "gcc -O2 -c src/foo.c -o build/foo.o\n",
+        "gcc -O2 -c src/bar.c -o build/bar.o\n",
+        "gcc -O2 -c src/baz.c -o build/baz.o\n",
+        "gcc -O2 -c src/qux.c -o build/qux.o\n",
+        "gcc -O2 -c src/quux.c -o build/quux.o\n",
+        "gcc build/foo.o build/bar.o build/baz.o build/qux.o build/quux.o -o myapp\n",
+        "Build complete.\n",
+    );
+    common::make_stub(dir.path(), "make", noisy, "", 0);
+
+    let out = skim_cmd()
+        .env("PATH", common::stub_path(dir.path()))
+        .args(["make", "all"])
+        .output()
+        .expect("skim runs");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The invariant under test — true on either branch when the count is zero.
+    assert!(
+        !stderr.contains("diagnostics summarised"),
+        "no diagnostics means no diagnostic bodies were dropped: {stderr:?}"
+    );
+    // Coverage check, not the invariant: if this fails the payload no longer
+    // reaches the `Keep` branch and the test needs a different one — it does not
+    // mean the marker gate regressed.
+    assert!(
+        stdout.contains("OK warnings: 0 errors: 0"),
+        "payload no longer exercises the Keep branch; pick another: {stdout:?}"
+    );
+}

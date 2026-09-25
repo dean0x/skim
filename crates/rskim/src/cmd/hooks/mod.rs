@@ -35,6 +35,7 @@ pub(crate) mod cursor;
 pub(crate) mod gemini;
 
 use super::session::AgentKind;
+use crate::cmd::integrity::ScriptIntegrity;
 
 /// Whether an agent supports real hooks or awareness-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,13 @@ pub(crate) trait HookProtocol {
     fn parse_input(&self, json: &serde_json::Value) -> Option<HookInput>;
     fn format_response(&self, rewritten_command: &str) -> serde_json::Value;
 
+    /// Render this agent's hook script in the DEFAULT (strict) install mode.
+    ///
+    /// Test-only, and deliberately not parameterised by [`HookMode`]: the
+    /// production writer is `init::install::create_hook_script`, which calls
+    /// [`generate_hook_script`] with the mode the invocation requested. A second
+    /// mode-carrying entry point would be a second place for `--dev` to be got
+    /// wrong, for a method no production path reaches.
     #[allow(dead_code)] // Used in tests only
     fn generate_script(&self, version: &str, binary_path: &str) -> String;
 
@@ -515,6 +523,110 @@ pub(crate) fn shell_single_quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+// ============================================================================
+// Hook mode
+// ============================================================================
+
+/// The one line an installed hook script carries to declare that it was
+/// installed in dev mode.
+///
+/// This constant is the only place the marker text exists. [`parse_mode_from_script`]
+/// matches it, and any generator that later emits it must interpolate this
+/// constant rather than repeat the literal — the same single-source-of-truth
+/// discipline `cmd::init::script_has_pinned_marker` applies to
+/// `SKIM_HOOK_BINARY`, so the written and recognised forms cannot drift apart.
+///
+/// A dev-pinned script keeps its REAL `SKIM_HOOK_COMMIT`. The marker declares
+/// *whether the commit check applies*, never *which build wrote the script*:
+/// writing a placeholder into the commit field instead would destroy the
+/// build-identity handshake of ADR-004 and make a three-week-old dev install
+/// indistinguishable from one made five minutes ago.
+pub(crate) const HOOK_DEV_MARKER: &str = "export SKIM_HOOK_DEV=1";
+
+/// How an installed hook script asks to be treated.
+///
+/// `Strict` is the absence of a declaration, so every script written before
+/// this type existed — and every script whose marker is malformed — reads as
+/// `Strict`. Only an exact match reaches the other variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookMode {
+    /// Normal install: the commit pin is authoritative.
+    Strict,
+    /// Dev-pinned install: the script declares [`HOOK_DEV_MARKER`].
+    Dev,
+}
+
+impl HookMode {
+    /// The mode an invocation REQUESTS, from the `--dev` flag.
+    ///
+    /// The single place the `bool → HookMode` mapping lives, so the predicate
+    /// that decides whether the installed script needs rewriting
+    /// (`DetectedState::mode_matches`) and the generator that writes it
+    /// ([`generate_hook_script`]) cannot disagree about what `--dev` asked for.
+    /// If they ever did, `skim init --dev` would write one artefact and then
+    /// immediately judge it wrong — a reinstall on every single run.
+    pub(crate) fn requested(dev_requested: bool) -> Self {
+        if dev_requested {
+            HookMode::Dev
+        } else {
+            HookMode::Strict
+        }
+    }
+}
+
+/// Read the [`HookMode`] that an installed hook script declares.
+///
+/// Recognises exactly [`HOOK_DEV_MARKER`], compared after trimming the line,
+/// and nothing else. Any other spelling — `=0`, a quoted value, a commented-out
+/// copy, trailing tokens — yields [`HookMode::Strict`], so a malformed marker
+/// degrades to the enforcing side rather than the waiving one.
+///
+/// Deliberately additive: the marker is a line no other script parser looks at,
+/// so a binary that has never heard of this function reads a dev-pinned script's
+/// version, binary pin and commit exactly as it reads a strict one.
+///
+/// Recognising the declaration is NOT the same as honouring it. The marker lives
+/// in the hook script, which is precisely the artefact a tamper edits, so every
+/// caller must clear its own integrity gate before acting on the result (PF-016).
+/// [`honour_dev_declaration`] is that gate, and [`generate_hook_script`] does not
+/// write the marker.
+pub(crate) fn parse_mode_from_script(contents: &str) -> HookMode {
+    if contents.lines().any(|line| line.trim() == HOOK_DEV_MARKER) {
+        HookMode::Dev
+    } else {
+        HookMode::Strict
+    }
+}
+
+/// Whether an installed hook script's mode declaration may be ACTED ON.
+///
+/// [`parse_mode_from_script`] answers "what does the script say"; this answers
+/// "is the script entitled to say it". Every consumer of a dev declaration goes
+/// through here, so the integrity requirement exists in exactly one place and a
+/// second consumer cannot ship with a weaker one.
+///
+/// # Why the gate is `Verified` specifically, not "anything but `Tampered`"
+///
+/// The declaration is a line in the hook script — the artefact a tamper edits —
+/// so a gate the writer of that file can also satisfy is not a gate at all. The
+/// obvious weaker spelling, "not `Tampered`", is reachable by exactly the attack
+/// PF-016 records as deliberately left open: `skim doctor`'s integrity match
+/// returns early for `Tampered` and `Unreadable` but lets `NoManifest` FALL
+/// THROUGH to the pin and currency checks, and anyone who can append a line to
+/// the script can also delete `{hooks}/skim-{agent}.sha256`. Append the marker,
+/// delete the sidecar, and the verdict is `NoManifest` — which under a "not
+/// `Tampered`" gate would waive the commit check and silence the one signal that
+/// says which build is running, turning a declared property into a self-asserted
+/// one. `Unreadable` is refused for the same reason: a script that cannot be
+/// hashed declares nothing.
+///
+/// This mirrors the shape `skim init` already uses — `install::run_install_single`
+/// computes `integrity_verified` as `matches!(…, ScriptIntegrity::Verified)`, so
+/// all three non-`Verified` states block the fast path there too.
+pub(crate) fn honour_dev_declaration(mode: HookMode, integrity: &ScriptIntegrity) -> bool {
+    matches!(mode, HookMode::Dev) && matches!(integrity, ScriptIntegrity::Verified)
+}
+
 /// Generate a standard hook script for an agent.
 ///
 /// Shared by all RealHook agents. The script pins the absolute, canonicalized
@@ -530,15 +642,34 @@ pub(crate) fn shell_single_quote(s: &str) -> String {
 /// removed or unavailable, the hook still runs using whatever `skim` is on PATH,
 /// and the binary-mismatch check in hook mode will log a warning to hook.log.
 ///
+/// # `mode`
+///
+/// [`HookMode::Dev`] adds exactly one line, [`HOOK_DEV_MARKER`], and changes
+/// nothing else — the version, the binary pin and the REAL commit are written
+/// identically in both modes, because the marker declares *whether the commit
+/// check applies*, never *which build wrote the script* (ADR-004's
+/// build-identity handshake is preserved, ADR-014's amendment).
+///
+/// Under [`HookMode::Strict`] the interpolated line is the empty string, so the
+/// output is byte-for-byte what this function produced before the parameter
+/// existed. That identity is the whole of the "nothing changes without `--dev`"
+/// invariant on the write side.
+///
+/// The marker is placed inside the region the SHA-256 manifest covers — the
+/// manifest is computed from the finished file by `create_hook_script` — which
+/// is what makes [`honour_dev_declaration`]'s `Verified` requirement meaningful:
+/// a declaration a tamperer could append without invalidating the hash would not
+/// be a declaration at all (PF-016).
+///
 /// # Panics
 ///
 /// Panics if `version` or `agent_cli_name` contain shell-unsafe characters.
 /// `binary_path` is single-quoted in the script, so it is safe for any path.
-#[allow(dead_code)] // Called by per-agent generate_script() impls, which are test-only
 pub(crate) fn generate_hook_script(
     version: &str,
     agent_cli_name: &str,
     binary_path: &str,
+    mode: HookMode,
 ) -> String {
     assert!(
         version
@@ -570,6 +701,13 @@ pub(crate) fn generate_hook_script(
         "git_commit contains unsafe characters for shell interpolation: {git_commit}"
     );
     let quoted = shell_single_quote(binary_path);
+    // Empty under `Strict`, so the format! below collapses to exactly the
+    // pre-`mode` output. Built from HOOK_DEV_MARKER rather than repeating the
+    // literal, so the written and the recognised forms cannot drift apart.
+    let dev_declaration = match mode {
+        HookMode::Strict => String::new(),
+        HookMode::Dev => format!("{HOOK_DEV_MARKER}\n"),
+    };
     format!(
         "#!/usr/bin/env bash\n\
          # skim-hook v{version}\n\
@@ -577,6 +715,7 @@ pub(crate) fn generate_hook_script(
          export SKIM_HOOK_VERSION=\"{version}\"\n\
          export SKIM_HOOK_BINARY={quoted}\n\
          export SKIM_HOOK_COMMIT={git_commit}\n\
+         {dev_declaration}\
          if [ -x \"$SKIM_HOOK_BINARY\" ]; then\n\
            exec \"$SKIM_HOOK_BINARY\" rewrite --hook --agent {agent_cli_name}\n\
          fi\n\
@@ -644,7 +783,12 @@ mod tests {
 
     #[test]
     fn test_generate_hook_script_structure() {
-        let script = generate_hook_script("1.2.3", "test-agent", "/usr/local/bin/skim");
+        let script = generate_hook_script(
+            "1.2.3",
+            "test-agent",
+            "/usr/local/bin/skim",
+            HookMode::Strict,
+        );
         assert!(script.starts_with("#!/usr/bin/env bash\n"));
         assert!(script.contains("# skim-hook v1.2.3"));
         assert!(script.contains("skim init --agent test-agent"));
@@ -684,7 +828,12 @@ mod tests {
 
     #[test]
     fn test_generate_hook_script_path_with_spaces() {
-        let script = generate_hook_script("2.0.0", "claude", "/path/with spaces/skim");
+        let script = generate_hook_script(
+            "2.0.0",
+            "claude",
+            "/path/with spaces/skim",
+            HookMode::Strict,
+        );
         // Single-quoted path must appear in the script.
         assert!(
             script.contains("'/path/with spaces/skim'"),
@@ -719,13 +868,261 @@ mod tests {
     #[test]
     #[should_panic(expected = "version contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_version() {
-        generate_hook_script("1.0.0$(evil)", "test-agent", "/usr/local/bin/skim");
+        generate_hook_script(
+            "1.0.0$(evil)",
+            "test-agent",
+            "/usr/local/bin/skim",
+            HookMode::Strict,
+        );
     }
 
     #[test]
     #[should_panic(expected = "agent_cli_name contains unsafe characters")]
     fn test_generate_hook_script_rejects_unsafe_agent_name() {
-        generate_hook_script("1.0.0", "agent;rm -rf /", "/usr/local/bin/skim");
+        generate_hook_script(
+            "1.0.0",
+            "agent;rm -rf /",
+            "/usr/local/bin/skim",
+            HookMode::Strict,
+        );
+    }
+
+    // ---- generate_hook_script: HookMode ----
+
+    /// Render both modes for the same inputs, so every test below compares two
+    /// scripts that differ in nothing except the mode.
+    fn script_pair() -> (String, String) {
+        const VERSION: &str = "2.11.0";
+        const AGENT: &str = "claude-code";
+        const PIN: &str = "/usr/local/bin/skim";
+        (
+            generate_hook_script(VERSION, AGENT, PIN, HookMode::Strict),
+            generate_hook_script(VERSION, AGENT, PIN, HookMode::Dev),
+        )
+    }
+
+    /// `HookMode::requested` is the only `bool → HookMode` mapping, so the
+    /// predicate deciding whether to rewrite and the generator doing the writing
+    /// cannot disagree about what `--dev` asked for.
+    #[test]
+    fn test_hook_mode_requested_maps_the_flag() {
+        assert_eq!(HookMode::requested(false), HookMode::Strict);
+        assert_eq!(HookMode::requested(true), HookMode::Dev);
+    }
+
+    /// PRODUCER/CONSUMER: what `--dev` writes is what commit 16's parser reads.
+    /// Driven through both real functions rather than the literal, so placing the
+    /// marker somewhere the parser cannot see it fails here.
+    #[test]
+    fn test_dev_mode_output_round_trips_through_the_parser() {
+        let (strict, dev) = script_pair();
+        assert_eq!(
+            parse_mode_from_script(&dev),
+            HookMode::Dev,
+            "a script generated in dev mode must read back as Dev"
+        );
+        assert_eq!(
+            parse_mode_from_script(&strict),
+            HookMode::Strict,
+            "the same inputs without dev mode must read back as Strict"
+        );
+    }
+
+    /// THE INVARIANT, on the write side: `--dev` adds exactly one line and
+    /// changes nothing else. Deleting the marker's own bytes from the dev output
+    /// must reproduce the strict output byte-for-byte — which is also why the
+    /// strict path is unreachable-by-accident: under `Strict` the interpolated
+    /// declaration is the empty string, so there is no other difference to find.
+    #[test]
+    fn test_dev_output_is_strict_output_plus_exactly_the_marker_line() {
+        let (strict, dev) = script_pair();
+        assert_eq!(
+            dev.replace(&format!("{HOOK_DEV_MARKER}\n"), ""),
+            strict,
+            "dev mode must add the marker line and change nothing else"
+        );
+        assert_eq!(
+            dev.lines().count(),
+            strict.lines().count() + 1,
+            "dev mode must add exactly one line"
+        );
+    }
+
+    /// ADR-014 (a): a dev install keeps its REAL build identity. The marker
+    /// declares whether the commit check applies, never which build wrote the
+    /// script, so a placeholder in the commit field would make a three-week-old
+    /// dev install indistinguishable from one made five minutes ago.
+    #[test]
+    fn test_dev_mode_keeps_the_real_version_binary_and_commit_lines() {
+        let (strict, dev) = script_pair();
+        for line in strict.lines() {
+            assert!(
+                dev.lines().any(|l| l == line),
+                "dev mode dropped or rewrote a strict line: {line}"
+            );
+        }
+        let commit_line = |s: &str| {
+            s.lines()
+                .find(|l| l.starts_with("export SKIM_HOOK_COMMIT="))
+                .map(str::to_owned)
+        };
+        assert!(commit_line(&strict).is_some(), "strict must pin a commit");
+        assert_eq!(
+            commit_line(&dev),
+            commit_line(&strict),
+            "the dev script must carry the same real commit, never a placeholder"
+        );
+    }
+
+    /// The declaration must sit where the hash covers it. `create_hook_script`
+    /// hashes the finished file, so "covered" is equivalent to "present in the
+    /// generator's output" — pinned here because a marker appended after the
+    /// manifest was written would be reachable by any process that can write the
+    /// script, defeating `honour_dev_declaration`'s `Verified` gate (PF-016).
+    #[test]
+    fn test_dev_marker_is_part_of_the_generated_body_not_an_afterthought() {
+        let (_, dev) = script_pair();
+        assert!(
+            dev.lines().any(|l| l.trim() == HOOK_DEV_MARKER),
+            "the marker must be emitted by the generator, so the manifest covers it"
+        );
+        let marker_at = dev.find(HOOK_DEV_MARKER).expect("marker present");
+        let exec_at = dev.find("exec ").expect("script must exec something");
+        assert!(
+            marker_at < exec_at,
+            "the declaration belongs with the exports, ahead of the exec lines"
+        );
+    }
+
+    // ---- parse_mode_from_script ----
+
+    /// A script generated WITHOUT `--dev` declares nothing, so it must read as
+    /// `Strict`. Asserted against the real generator rather than a hand-written
+    /// fixture: this is the line that makes a future generator change visible
+    /// instead of silent (PF-015 — a fixture-shaped test pins the display layer,
+    /// never the acquisition layer).
+    #[test]
+    fn test_generated_script_declares_strict_mode() {
+        let script = generate_hook_script(
+            "2.11.0",
+            "claude-code",
+            "/usr/local/bin/skim",
+            HookMode::Strict,
+        );
+        assert_eq!(
+            parse_mode_from_script(&script),
+            HookMode::Strict,
+            "the strict generator writes no dev marker, so its output must read as Strict"
+        );
+        assert!(
+            !script.contains("SKIM_HOOK_DEV"),
+            "the strict generator must not mention the dev marker at all"
+        );
+    }
+
+    #[test]
+    fn test_parse_mode_from_script_exact_marker_is_dev() {
+        let script = generate_hook_script(
+            "2.11.0",
+            "claude-code",
+            "/usr/local/bin/skim",
+            HookMode::Strict,
+        );
+        let dev = format!("{script}{HOOK_DEV_MARKER}\n");
+        assert_eq!(parse_mode_from_script(&dev), HookMode::Dev);
+    }
+
+    /// Position is not part of the grammar: the marker is recognised wherever it
+    /// sits, because a generator may place it before or after the exports.
+    #[test]
+    fn test_parse_mode_from_script_marker_position_is_irrelevant() {
+        let first = format!("{HOOK_DEV_MARKER}\n#!/usr/bin/env bash\nexec skim\n");
+        let last = format!("#!/usr/bin/env bash\nexec skim\n{HOOK_DEV_MARKER}\n");
+        assert_eq!(parse_mode_from_script(&first), HookMode::Dev);
+        assert_eq!(parse_mode_from_script(&last), HookMode::Dev);
+    }
+
+    /// Leading and trailing whitespace is trimmed before comparison, matching
+    /// the `trim_start` tolerance the sibling script parsers already apply.
+    #[test]
+    fn test_parse_mode_from_script_tolerates_surrounding_whitespace() {
+        let padded = format!("#!/usr/bin/env bash\n  \t{HOOK_DEV_MARKER}  \nexec skim\n");
+        assert_eq!(parse_mode_from_script(&padded), HookMode::Dev);
+    }
+
+    /// Every near miss must land on `Strict`. The waiving side of this enum is
+    /// reachable only by an exact match, so a mangled, partial or commented-out
+    /// marker fails toward enforcement rather than away from it.
+    #[test]
+    fn test_parse_mode_from_script_near_misses_are_strict() {
+        let near_misses = [
+            "export SKIM_HOOK_DEV=0",
+            "export SKIM_HOOK_DEV=",
+            "export SKIM_HOOK_DEV=true",
+            "export SKIM_HOOK_DEV=\"1\"",
+            "export SKIM_HOOK_DEV='1'",
+            "# export SKIM_HOOK_DEV=1",
+            "export SKIM_HOOK_DEV=1 # dev",
+            "export SKIM_HOOK_DEV=11",
+            "export SKIM_HOOK_DEVX=1",
+            "SKIM_HOOK_DEV=1",
+            "echo export SKIM_HOOK_DEV=1",
+        ];
+        for line in near_misses {
+            let script = format!("#!/usr/bin/env bash\n{line}\nexec skim\n");
+            assert_eq!(
+                parse_mode_from_script(&script),
+                HookMode::Strict,
+                "near miss must not be read as a dev declaration: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_mode_from_script_empty_is_strict() {
+        assert_eq!(parse_mode_from_script(""), HookMode::Strict);
+    }
+
+    // ---- honour_dev_declaration ----
+
+    /// The full 2×4 grid. Exactly ONE cell honours the declaration, and the test
+    /// enumerates the other seven rather than spot-checking, so a future widening
+    /// of the gate — to "not Tampered", or to any state a tamperer can reach —
+    /// fails here instead of silently shipping (PF-016).
+    #[test]
+    fn test_honour_dev_declaration_requires_dev_and_verified() {
+        let grid = [
+            (HookMode::Dev, ScriptIntegrity::Verified, true),
+            (HookMode::Dev, ScriptIntegrity::NoManifest, false),
+            (HookMode::Dev, ScriptIntegrity::Tampered, false),
+            (HookMode::Dev, ScriptIntegrity::Unreadable, false),
+            (HookMode::Strict, ScriptIntegrity::Verified, false),
+            (HookMode::Strict, ScriptIntegrity::NoManifest, false),
+            (HookMode::Strict, ScriptIntegrity::Tampered, false),
+            (HookMode::Strict, ScriptIntegrity::Unreadable, false),
+        ];
+
+        for (mode, integrity, expected) in grid {
+            assert_eq!(
+                honour_dev_declaration(mode, &integrity),
+                expected,
+                "honour_dev_declaration({mode:?}, {integrity:?}) must be {expected}"
+            );
+        }
+    }
+
+    /// The specific attack PF-016 leaves open, spelled out on its own so the
+    /// reason this cell is `false` survives a refactor of the grid above:
+    /// appending the marker to a script and deleting its `.sha256` sidecar
+    /// yields `NoManifest`, which doctor deliberately does NOT treat as drift.
+    /// A "not Tampered" gate would waive the commit check for anyone holding a
+    /// write handle to the script.
+    #[test]
+    fn test_honour_dev_declaration_refuses_no_manifest_downgrade() {
+        assert!(
+            !honour_dev_declaration(HookMode::Dev, &ScriptIntegrity::NoManifest),
+            "deleting the manifest must not become a way to self-assert dev mode"
+        );
     }
 
     /// git_commit is embedded UNQUOTED in the hook script, so the safety predicate

@@ -1,8 +1,9 @@
 //! Token analytics persistence layer.
 //!
 //! Records token savings from every skim invocation into a local SQLite
-//! database (`~/.cache/skim/analytics.db`) and provides query functions
-//! for the `skim stats` dashboard.
+//! database (`{cache_dir}/skim/analytics.db` — `~/.cache/skim` on Linux,
+//! `~/Library/Caches/skim` on macOS, per `dirs::cache_dir`) and provides query
+//! functions for the `skim stats` dashboard.
 //!
 //! ## Design
 //!
@@ -27,6 +28,7 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::output::Served;
 use crate::tokens;
 
 // ============================================================================
@@ -91,6 +93,31 @@ impl CommandType {
     }
 }
 
+/// What an invocation delivered to the reader beyond its stdout body.
+///
+/// `Default` is all-`None`, which is the correct value for every path that
+/// cannot measure these: the subcommand recording path, cache hits, and
+/// `Mode::Full` runs where the guard never ran. `None` persists as SQL NULL and
+/// stays distinguishable from a measured `0` — a run that emitted no disclosure
+/// is a different fact from a run whose disclosure was never counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Delivery {
+    /// cl100k cost of the stderr disclosure this invocation actually emitted,
+    /// measured on the emitted bytes by [`crate::output::EmittedNotice`].
+    ///
+    /// `Some(0)` means "measured: this run emitted no disclosure, or emitted it
+    /// against a sibling row". `None` means the cost was never established —
+    /// the subcommand path, which charges a different marker family, and the
+    /// tokeniser-unavailable case. The delivered series selects on this being
+    /// non-NULL, so the distinction decides which rows it covers.
+    pub(crate) notice_tokens: Option<usize>,
+    /// Byte cost of that same disclosure, terminator included.
+    pub(crate) notice_bytes: Option<usize>,
+    /// Which view the ADR-001 guard served. `None` where no guard decision was
+    /// taken, never a default guess.
+    pub(crate) served: Option<Served>,
+}
+
 /// A single token savings measurement.
 pub(crate) struct TokenSavingsRecord {
     pub(crate) timestamp: i64,
@@ -108,19 +135,96 @@ pub(crate) struct TokenSavingsRecord {
     /// recorded before schema v3 have NULL and are excluded from per-session
     /// average calculations.
     pub(crate) session_id: Option<String>,
+    /// `Delivery::default()` on every path that takes no such measurement.
+    pub(crate) delivery: Delivery,
 }
 
 // ============================================================================
 // Query result types
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// The delivered-savings series, inseparable from the window it covers.
+///
+/// `first_day`/`last_day`/`rows` are fields of this struct rather than
+/// something the dashboard may look up separately, because the one way this
+/// number
+/// misleads is being read as if it spanned the same history as
+/// [`AnalyticsSummary::tokens_saved`]. It cannot: only rows carrying a
+/// disclosure measurement have `notice_tokens`, so the window opens where that
+/// measurement began and the series is structurally incomparable with anything
+/// older. Bundling the window with the value makes printing one without the
+/// other require deleting code.
+///
+/// The boundary is row-level NULL-ness, NOT a schema version — this build
+/// stamps no `user_version` for those columns (see the delivered-cost block in
+/// [`super::schema`]), so nothing anywhere needs to consult one to know where
+/// this series opens.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub(crate) struct DeliveredSavings {
+    /// Rows carrying a disclosure measurement. Zero means "not yet measured",
+    /// which is not the same as "measured zero saving".
+    pub(crate) rows: u64,
+    /// `raw - compressed - notice`, summed and **unclamped** — signed, because
+    /// a disclosure can cost more than the transform saved, and on 9.3%–10.7%
+    /// of saving file rows it does.
+    pub(crate) tokens: i64,
+    /// Disclosure cost alone, so the correction is legible next to the total.
+    pub(crate) notice_tokens: u64,
+    /// Earliest contributing row, as a UTC day. `None` when `rows == 0`.
+    ///
+    /// Formatted by SQLite's `date(timestamp,'unixepoch')`, the same bucketing
+    /// `query_daily` uses — and, like it, UTC rather than local time (PF-036).
+    /// Consistency with the series next to it matters more here than agreeing
+    /// with the wall clock.
+    pub(crate) first_day: Option<String>,
+    /// Latest contributing row, as a UTC day. `None` when `rows == 0`.
+    pub(crate) last_day: Option<String>,
+}
+
+/// Aggregate summary.
+///
+/// # Three series, never one blended number
+///
+/// A single figure spanning a schema change is how a 90-day series stops
+/// meaning anything, so the summary carries three and keeps them apart:
+///
+/// - [`Self::tokens_saved`] — the CONTINUITY series. Clamped per row
+///   (`ELSE 0`), definition untouched, comparable across all retained history.
+/// - [`Self::tokens_lost`] — retro-computable from `raw_tokens` and
+///   `compressed_tokens` alone, so it covers the same full history at no cost
+///   in comparability. It is the exact quantity the clamp above discards.
+/// - [`Self::delivered`] — disclosure-measured rows ONLY, and carries its own
+///   window so it cannot be silently compared against older history.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub(crate) struct AnalyticsSummary {
     pub(crate) invocations: u64,
     pub(crate) raw_tokens: u64,
     pub(crate) compressed_tokens: u64,
+    /// CONTINUITY SERIES — deliberately unchanged, clamp included.
     pub(crate) tokens_saved: u64,
+    /// CONTINUITY SERIES — deliberately unchanged, no-op rows included.
     pub(crate) avg_savings_pct: f64,
+    /// Token expansion the `tokens_saved` clamp discards, summed over the same
+    /// rows. Reported beside it so the clamp stops hiding and starts
+    /// disclosing.
+    ///
+    /// Measured on the author's 90-day corpus (68,326 rows): `tokens_saved`
+    /// reads 80,238,562 while 11,983,387 tokens of real expansion sit under the
+    /// clamp across 6,983 rows — the headline is **+17.6% over the true net**
+    /// of 68,255,175.
+    pub(crate) tokens_lost: u64,
+    /// Rows where the view actually changed (`raw_tokens <> compressed_tokens`).
+    pub(crate) changed_invocations: u64,
+    /// [`Self::avg_savings_pct`] over changed rows only.
+    ///
+    /// The all-rows mean is diluted by no-ops — invocations where skim served
+    /// exactly what it was given, each contributing a 0% sample to an average
+    /// about compression. On the 90-day corpus 42,844 of 68,326 rows are
+    /// no-ops, and the two means read **13.41%** and **35.96%**: a 22.5-point
+    /// gap that is entirely an artefact of which rows were counted.
+    pub(crate) avg_savings_pct_changed: f64,
+    /// The delivered series over disclosure-measured rows, window attached.
+    pub(crate) delivered: DeliveredSavings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -325,13 +429,9 @@ impl AnalyticsConfig {
 /// under test.
 pub(crate) trait AnalyticsStore {
     fn query_summary(&self, _since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
-        Ok(AnalyticsSummary {
-            invocations: 0,
-            raw_tokens: 0,
-            compressed_tokens: 0,
-            tokens_saved: 0,
-            avg_savings_pct: 0.0,
-        })
+        // All-zero with an empty delivered window — the honest shape for
+        // "no rows", which is what a mock that does not override this has.
+        Ok(AnalyticsSummary::default())
     }
     fn query_daily(&self, _since: Option<i64>) -> anyhow::Result<Vec<DailyStats>> {
         Ok(vec![])
@@ -440,8 +540,8 @@ impl AnalyticsDb {
             &r.original_cmd
         };
         self.conn.execute(
-            "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO token_savings (timestamp, command_type, original_cmd, raw_tokens, compressed_tokens, savings_pct, duration_ms, project_path, mode, language, parse_tier, session_id, notice_tokens, notice_bytes, served)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 r.timestamp,
                 r.command_type.as_str(),
@@ -455,24 +555,56 @@ impl AnalyticsDb {
                 r.language,
                 r.parse_tier,
                 r.session_id,
+                // `Option` maps to SQL NULL, preserving "not measured in this
+                // regime" as its own value rather than collapsing it onto 0.
+                r.delivery.notice_tokens.map(|n| n as i64),
+                r.delivery.notice_bytes.map(|n| n as i64),
+                r.delivery.served.map(Served::as_str),
             ],
         )?;
         Ok(())
     }
 
-    /// Query aggregate summary.
+    /// Query aggregate summary — all three series in one pass.
+    ///
+    /// # The `ELSE 0` clamp stays, and is now disclosed
+    ///
+    /// Column 5 floors `tokens_saved` per row, consistent with
+    /// `query_by_command`/`query_by_language`/`query_by_mode`. It is NOT
+    /// removed: it is the definition the existing 90-day series was built on,
+    /// and changing it would re-base every historical comparison rather than
+    /// correct one. What was wrong was not the clamp but its silence — the
+    /// discarded expansion was unrecoverable from the summary. Column 6 is that
+    /// same quantity, computed from the same two columns over the same rows, so
+    /// it covers the full retained history and the reader can see both the
+    /// clamped headline and what the clamp cost. `tokens_saved - tokens_lost`
+    /// is the true net.
+    ///
+    /// Columns 7–8 answer defect 2 the same way: the diluted all-rows mean is
+    /// left alone and the undiluted one is reported beside it.
+    ///
+    /// Columns 9–13 are the delivered series and its window. They select on
+    /// `notice_tokens IS NOT NULL`, so rows predating disclosure measurement —
+    /// which have no delivered measurement rather than a zero one — are
+    /// excluded from the value AND from the window that labels it. That row
+    /// predicate is the only boundary; no schema version is read here or
+    /// anywhere else on this path.
     pub(crate) fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
         let (where_clause, params) = since_clause(since);
-        // Fifth column: per-row floored tokens_saved — consistent with
-        // query_by_command/query_by_lang/query_by_mode.  Rows where
-        // compressed_tokens > raw_tokens (expansion) contribute 0 to tokens_saved
-        // while their true counts remain in raw_tokens/compressed_tokens columns.
         let sql = format!(
             "SELECT COUNT(*), \
              COALESCE(SUM(raw_tokens), 0), \
              COALESCE(SUM(compressed_tokens), 0), \
              COALESCE(AVG(savings_pct), 0), \
-             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0) \
+             COALESCE(SUM(CASE WHEN raw_tokens > compressed_tokens THEN raw_tokens - compressed_tokens ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN compressed_tokens > raw_tokens THEN compressed_tokens - raw_tokens ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN raw_tokens <> compressed_tokens THEN 1 ELSE 0 END), 0), \
+             COALESCE(AVG(CASE WHEN raw_tokens <> compressed_tokens THEN savings_pct END), 0), \
+             COALESCE(SUM(CASE WHEN notice_tokens IS NOT NULL THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN notice_tokens IS NOT NULL THEN raw_tokens - compressed_tokens - notice_tokens ELSE 0 END), 0), \
+             COALESCE(SUM(notice_tokens), 0), \
+             date(MIN(CASE WHEN notice_tokens IS NOT NULL THEN timestamp END), 'unixepoch'), \
+             date(MAX(CASE WHEN notice_tokens IS NOT NULL THEN timestamp END), 'unixepoch') \
              FROM token_savings {where_clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -482,6 +614,14 @@ impl AnalyticsDb {
             let compressed_tokens: i64 = row.get(2)?;
             let avg_savings_pct: f64 = row.get(3)?;
             let tokens_saved: i64 = row.get(4)?;
+            let tokens_lost: i64 = row.get(5)?;
+            let changed_invocations: u64 = row.get(6)?;
+            let avg_savings_pct_changed: f64 = row.get(7)?;
+            let delivered_rows: u64 = row.get(8)?;
+            let delivered_tokens: i64 = row.get(9)?;
+            let notice_tokens: i64 = row.get(10)?;
+            let first_day: Option<String> = row.get(11)?;
+            let last_day: Option<String> = row.get(12)?;
             Ok(AnalyticsSummary {
                 invocations,
                 raw_tokens: raw_tokens as u64,
@@ -489,6 +629,17 @@ impl AnalyticsDb {
                 // .max(0) is defensive; CASE WHEN already floors per-row.
                 tokens_saved: tokens_saved.max(0) as u64,
                 avg_savings_pct,
+                tokens_lost: tokens_lost.max(0) as u64,
+                changed_invocations,
+                avg_savings_pct_changed,
+                delivered: DeliveredSavings {
+                    rows: delivered_rows,
+                    // NOT clamped: the sign is the finding.
+                    tokens: delivered_tokens,
+                    notice_tokens: notice_tokens.max(0) as u64,
+                    first_day,
+                    last_day,
+                },
             })
         })?;
         Ok(row)
@@ -1054,6 +1205,10 @@ fn record_fire_and_forget(
             language: None,
             parse_tier,
             session_id,
+            // Subcommand path: the file-read lossy-view disclosure does not
+            // exist here, and commit 14's build-family marker is deliberately
+            // NOT charged. Nothing was measured, so nothing is claimed.
+            delivery: Delivery::default(),
         };
         persist_record(&record);
     }));
@@ -1129,6 +1284,26 @@ pub(crate) struct FileOpRow {
     pub(crate) original_cmd: String,
     pub(crate) language: Option<String>,
     pub(crate) parse_tier: Option<String>,
+    /// The disclosure this row is charged, carried as the emitted bytes
+    /// themselves rather than as a number derived from them.
+    ///
+    /// A multi-file run emits ONE aggregate marker for the whole run, so
+    /// exactly one row in the batch carries it — `multi.rs` attaches it to the
+    /// first differing row — and the rest carry `None`. Splitting it N ways
+    /// would invent per-file costs that were never emitted, and attaching it to
+    /// every row would charge the run N times for one line of stderr.
+    ///
+    /// `None` here records a marginal cost of ZERO, not an unknown one: this
+    /// recorder only ever handles file ops, and a file op always knows whether
+    /// its run disclosed anything. [`record_file_ops`] is where that is turned
+    /// into `Some(0)`.
+    ///
+    /// Tokenised on the background thread, never here: see
+    /// [`crate::output::EmittedNotice::tokens`].
+    pub(crate) notice: Option<crate::output::EmittedNotice>,
+    /// Which view the guard served for this file, when a guard decision was
+    /// taken at all.
+    pub(crate) served: Option<Served>,
 }
 
 /// Shared metadata common to all rows in a single file-op invocation.
@@ -1136,6 +1311,28 @@ pub(crate) struct FileOpCommon {
     pub(crate) mode: Option<String>,
     pub(crate) project_path: String,
     pub(crate) session_id: Option<String>,
+}
+
+/// `(notice_tokens, notice_bytes)` for one file-op row.
+///
+/// Inside the file-op recorder, "no notice" is a measured **zero**, not an
+/// unknown: every file-op path knows whether its run emitted a disclosure, and
+/// a batch's non-carrying rows genuinely bore no marginal cost. `None` is
+/// reserved for the one case that really is unmeasured — the tokeniser failing
+/// — so `notice_tokens IS NOT NULL` selects every measured file-op row rather
+/// than only the lossy ones. That narrower population would bias the delivered
+/// series upward by dropping exactly the raw-served rows that saved nothing.
+///
+/// Byte cost never fails, so it is `Some` on both arms; tokenisation can, and
+/// when it does the row records "not measured" instead of a zero it did not
+/// measure.
+fn file_op_notice_cost(
+    notice: Option<&crate::output::EmittedNotice>,
+) -> (Option<usize>, Option<usize>) {
+    match notice {
+        None => (Some(0), Some(0)),
+        Some(n) => (n.tokens(), Some(n.bytes())),
+    }
 }
 
 /// Record file-op analytics for one or more files, off the main thread.
@@ -1172,12 +1369,26 @@ pub(crate) fn record_file_ops(enabled: bool, rows: Vec<FileOpRow>, common: FileO
                         (raw_tok, comp_tok)
                     }
                 };
+                // The cost is measured off the very String the
+                // emitter wrote to stderr, so this is the emitted cost rather
+                // than a second estimate of it — and it is tokenised HERE, on
+                // the background thread, keeping BPE off the main path.
+                //
+                let (notice_tokens, notice_bytes) = file_op_notice_cost(r.notice.as_ref());
+                let delivery = Delivery {
+                    notice_tokens,
+                    notice_bytes,
+                    served: r.served,
+                };
                 Some(TokenSavingsRecord {
                     timestamp: ts,
                     command_type: CommandType::File,
                     original_cmd: r.original_cmd,
                     raw_tokens: raw,
                     compressed_tokens: comp,
+                    // Unchanged: the continuity series keeps its definition.
+                    // The disclosure is recorded in `delivery`, never folded
+                    // into `compressed_tokens`.
                     savings_pct: savings_percentage(raw, comp),
                     duration_ms: 0,
                     project_path: common.project_path.clone(),
@@ -1185,6 +1396,7 @@ pub(crate) fn record_file_ops(enabled: bool, rows: Vec<FileOpRow>, common: FileO
                     language: r.language,
                     parse_tier: r.parse_tier,
                     session_id: common.session_id.clone(),
+                    delivery,
                 })
             })
             .collect();
@@ -1281,6 +1493,7 @@ pub(crate) fn try_record_command_with_counts(
             language: None,
             parse_tier: rec.parse_tier.map(str::to_string),
             session_id: rec.session_id.map(str::to_string),
+            delivery: Delivery::default(),
         },
     );
 }
@@ -1320,6 +1533,7 @@ mod tests {
             language: Some("rust".to_string()),
             parse_tier: None,
             session_id: None,
+            delivery: Delivery::default(),
         }
     }
 
@@ -2081,18 +2295,44 @@ mod tests {
         );
     }
 
-    /// AD-AN-4: verify schema version is 3 after all migrations.
+    /// A freshly created database can store a delivered measurement.
+    ///
+    /// The subject is the property, not an integer: `test_db` goes through the
+    /// real [`AnalyticsDb::open`] entry point — WAL, busy timeout, permissions,
+    /// `run_migrations` — so this pins that a brand-new DB opened the way
+    /// production opens one ends up with the delivered-cost columns actually
+    /// present. `schema::tests` covers the same landing point against a bare
+    /// in-memory connection; this covers it through the constructor callers
+    /// actually use.
+    ///
+    /// It deliberately asserts NO `user_version`. This build claims no schema
+    /// number for these columns — see the delivered-cost block in `schema.rs`
+    /// for the collision with `ticket/305` and `ticket/306` that makes claiming
+    /// one unsafe — and nothing downstream reads one: `query_summary` selects
+    /// the delivered series on `notice_tokens IS NOT NULL`, row by row, and
+    /// derives its window from MIN/MAX over that same predicate. Column
+    /// presence is the property the series depends on, so column presence is
+    /// what this pins.
+    ///
+    /// The `5` in `schema::tests::foreign_lineage_v5_db_gains_columns_and_keeps_its_version`
+    /// is a different subject entirely — another lineage's rung, asserted to
+    /// survive us untouched — and is unaffected by this.
     #[test]
-    fn test_schema_version_is_3() {
+    fn test_fresh_db_has_delivered_columns_through_constructor() {
         let (db, _tmp) = test_db();
-        let version: i64 = db
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
+        let mut stmt = db.conn.prepare("PRAGMA table_info(token_savings)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(
-            version, 3,
-            "schema version should be 3 after all migrations"
-        );
+        for (name, _) in schema::V4_COLUMNS {
+            assert!(
+                cols.iter().any(|c| c == name),
+                "a freshly opened analytics DB must carry the delivered-cost \
+                 column {name} after run_migrations; got {cols:?}"
+            );
+        }
     }
 
     // ========================================================================
@@ -2307,6 +2547,7 @@ mod tests {
             language: None,
             parse_tier: None,
             session_id: None,
+            delivery: Delivery::default(),
         };
         db.record(&record).unwrap();
 
@@ -2408,6 +2649,7 @@ mod tests {
                 language: None,
                 parse_tier: None,
                 session_id: None,
+                delivery: Delivery::default(),
             };
             db.record(&r).unwrap();
         }
@@ -2430,5 +2672,240 @@ mod tests {
         // Call both queries to ensure they do not panic with expansion-heavy data.
         db.query_daily(None).unwrap();
         db.query_by_command(None).unwrap();
+    }
+
+    // ========================================================================
+    // Delivered cost, and the three series
+    // ========================================================================
+
+    /// The recorded cost is the EMITTED cost: both come from the same
+    /// `EmittedNotice`, so this asserts the stored bytes against the very line
+    /// `write_result_and_stats` would have written.
+    #[test]
+    fn delivered_cost_round_trips_from_the_emitted_line() {
+        let (db, _tmp) = test_db();
+
+        let notice = crate::output::emitted_notice_cost(Some("cat"), "structure", 1, 1)
+            .expect("a differing view owes a marker");
+        let mut r = sample_record();
+        r.delivery = Delivery {
+            notice_tokens: notice.tokens(),
+            notice_bytes: Some(notice.bytes()),
+            served: Some(Served::Transformed),
+        };
+        db.record(&r).unwrap();
+
+        let (bytes, toks, served): (i64, i64, String) = db
+            .conn
+            .query_row(
+                "SELECT notice_bytes, notice_tokens, served FROM token_savings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(bytes as usize, notice.line().len());
+        assert_eq!(toks as usize, notice.tokens().unwrap());
+        assert_eq!(served, "transformed");
+    }
+
+    /// NULL survives the round trip as NULL. A path that took no measurement
+    /// must not become a row claiming it measured zero.
+    #[test]
+    fn unmeasured_delivery_stays_null() {
+        let (db, _tmp) = test_db();
+        db.record(&sample_record()).unwrap();
+
+        let (bytes, toks, served): (Option<i64>, Option<i64>, Option<String>) = db
+            .conn
+            .query_row(
+                "SELECT notice_bytes, notice_tokens, served FROM token_savings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((bytes, toks, served), (None, None, None));
+    }
+
+    /// The clamp stays and the expansion it drops is now reported beside it.
+    ///
+    /// DISCRIMINATING: delete the `tokens_lost` column from `query_summary` and
+    /// the 400 tokens of expansion become unrecoverable from the summary again
+    /// — which is the whole defect, since `tokens_saved` alone reads 900 for a
+    /// corpus whose true net is 500.
+    #[test]
+    fn expansion_is_reported_beside_the_clamped_headline() {
+        let (db, _tmp) = test_db();
+
+        let mut saving = sample_record();
+        saving.raw_tokens = 1000;
+        saving.compressed_tokens = 100;
+        db.record(&saving).unwrap();
+
+        let mut expanding = sample_record();
+        expanding.timestamp += 1;
+        expanding.raw_tokens = 100;
+        expanding.compressed_tokens = 500;
+        db.record(&expanding).unwrap();
+
+        let s = db.query_summary(None).unwrap();
+        assert_eq!(s.tokens_saved, 900, "continuity series keeps its clamp");
+        assert_eq!(s.tokens_lost, 400, "and the clamp no longer hides");
+        assert_eq!(
+            s.tokens_saved - s.tokens_lost,
+            500,
+            "the true net must be recoverable from the summary alone"
+        );
+    }
+
+    /// Both means are reported, each with the population it was taken over.
+    ///
+    /// DISCRIMINATING: drop `avg_savings_pct_changed` and the only mean left is
+    /// the one no-ops drag toward zero — 40% here, where compression that
+    /// actually ran averaged 80%.
+    #[test]
+    fn noop_dilution_is_visible_in_both_means() {
+        let (db, _tmp) = test_db();
+
+        for i in 0..2i64 {
+            let mut noop = sample_record();
+            noop.timestamp += i;
+            noop.raw_tokens = 500;
+            noop.compressed_tokens = 500; // served exactly what it was given
+            noop.savings_pct = 0.0;
+            db.record(&noop).unwrap();
+        }
+        for i in 2..4i64 {
+            let mut changed = sample_record();
+            changed.timestamp += i;
+            changed.raw_tokens = 1000;
+            changed.compressed_tokens = 200;
+            changed.savings_pct = 80.0;
+            db.record(&changed).unwrap();
+        }
+
+        let s = db.query_summary(None).unwrap();
+        assert_eq!(s.invocations, 4);
+        assert_eq!(s.changed_invocations, 2);
+        assert!((s.avg_savings_pct - 40.0).abs() < 1e-6, "diluted mean");
+        assert!(
+            (s.avg_savings_pct_changed - 80.0).abs() < 1e-6,
+            "undiluted mean"
+        );
+    }
+
+    /// The delivered series covers only disclosure-measured rows, and says so
+    /// by carrying their window.
+    ///
+    /// DISCRIMINATING: widen the selection from `notice_tokens IS NOT NULL` to
+    /// all rows and the unmeasured row both changes the value and back-dates
+    /// the window onto history that was never measured this way.
+    #[test]
+    fn delivered_series_excludes_unmeasured_rows_and_carries_its_window() {
+        let (db, _tmp) = test_db();
+
+        // An unmeasured row: real savings, no delivered measurement.
+        let mut old = sample_record();
+        old.timestamp = 1_700_000_000; // 2023-11-14 UTC
+        old.raw_tokens = 1000;
+        old.compressed_tokens = 100;
+        db.record(&old).unwrap();
+
+        // A measured row whose disclosure eats most of the saving.
+        let mut new = sample_record();
+        new.timestamp = 1_711_300_000; // 2024-03-24 UTC
+        new.raw_tokens = 130;
+        new.compressed_tokens = 100;
+        new.delivery = Delivery {
+            notice_tokens: Some(25),
+            notice_bytes: Some(90),
+            served: Some(Served::Transformed),
+        };
+        db.record(&new).unwrap();
+
+        let s = db.query_summary(None).unwrap();
+        assert_eq!(s.tokens_saved, 930, "both rows feed the continuity series");
+        assert_eq!(s.delivered.rows, 1, "only the measured row feeds delivered");
+        assert_eq!(s.delivered.tokens, 5, "130 - 100 - 25");
+        assert_eq!(s.delivered.notice_tokens, 25);
+        assert_eq!(s.delivered.first_day.as_deref(), Some("2024-03-24"));
+        assert_eq!(s.delivered.last_day.as_deref(), Some("2024-03-24"));
+    }
+
+    /// The delivered series is signed, because the disclosure can outweigh the
+    /// transform — measured at 9.3%–10.7% of saving file rows on the author's
+    /// corpus. Clamping it here would recreate, in the new series, exactly the
+    /// blindness the old one had.
+    #[test]
+    fn delivered_series_keeps_a_negative_sign() {
+        let (db, _tmp) = test_db();
+
+        let mut r = sample_record();
+        r.raw_tokens = 110;
+        r.compressed_tokens = 100; // a 10-token saving
+        r.delivery = Delivery {
+            notice_tokens: Some(25), // bought with a 25-token disclosure
+            notice_bytes: Some(90),
+            served: Some(Served::Transformed),
+        };
+        db.record(&r).unwrap();
+
+        let s = db.query_summary(None).unwrap();
+        assert_eq!(s.tokens_saved, 10, "the old series still calls this a win");
+        assert_eq!(
+            s.delivered.tokens, -15,
+            "delivered context grew; the sign must survive"
+        );
+    }
+
+    /// A file-op row with no marker is charged a measured zero, not a NULL.
+    ///
+    /// DISCRIMINATING: return `(None, None)` on the `None` arm and every
+    /// raw-served row drops out of `notice_tokens IS NOT NULL`, leaving the
+    /// delivered series computed over lossy rows only — biased upward by
+    /// exactly the rows that saved nothing.
+    #[test]
+    fn absent_marker_is_a_measured_zero_not_an_unknown() {
+        assert_eq!(file_op_notice_cost(None), (Some(0), Some(0)));
+    }
+
+    /// One aggregate marker is charged to exactly one row of a batch.
+    ///
+    /// Distributes the run's single `EmittedNotice` the way `multi.rs` does —
+    /// `Option::take` on the first differing row — and sums what each row would
+    /// record. The batch total must equal ONE emission: not N, and not a
+    /// per-file fraction that fails to sum back under integer division.
+    ///
+    /// No database: `record_file_ops` writes through `AnalyticsDb::open_default`,
+    /// which targets the developer's real analytics DB unless the environment
+    /// is redirected, so the arithmetic is verified on the pure costing
+    /// function instead.
+    #[test]
+    fn a_batch_is_charged_for_one_marker_not_n() {
+        let notice =
+            crate::output::emitted_notice_cost(Some("cat"), "structure", 3, 3).expect("marker");
+        let cost = notice.tokens().expect("tokeniser");
+        let bytes = notice.bytes();
+        let mut unattributed = Some(notice);
+
+        // Three rows; the first differing one takes the marker.
+        let charged: Vec<(Option<usize>, Option<usize>)> = (0..3)
+            .map(|_| {
+                let taken = unattributed.take();
+                file_op_notice_cost(taken.as_ref())
+            })
+            .collect();
+
+        let total_tokens: usize = charged.iter().filter_map(|(t, _)| *t).sum();
+        let total_bytes: usize = charged.iter().filter_map(|(_, b)| *b).sum();
+
+        assert_eq!(charged.len(), 3);
+        assert_eq!(total_tokens, cost, "three rows, one emission, one charge");
+        assert_eq!(total_bytes, bytes, "and one line of stderr, counted once");
+        assert_eq!(
+            charged[1],
+            (Some(0), Some(0)),
+            "a non-carrying row is measured at zero, not left unmeasured"
+        );
     }
 }

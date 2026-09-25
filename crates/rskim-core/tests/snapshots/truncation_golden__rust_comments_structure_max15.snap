@@ -4,9 +4,9 @@ expression: "snap(RUST_COMMENTS, Language::Rust,\nTransformConfig::with_mode(Mod
 ---
 // ... (11 lines truncated)
 pub fn add(a: i32, b: i32) -> i32  {...}
-// ... (4 lines truncated)
+// ... (8 lines truncated)
 pub struct Calculator {
     /// Field doc comment (KEEP)
     value: i32,
 }
-// ... (22 lines truncated)
+// ... (27 lines truncated)

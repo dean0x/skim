@@ -62,6 +62,7 @@ That same 80-file project that wouldn't fit? Now you can ask: *"Explain the enti
 - Two-layer rule system with declarative prefix-swap and custom argument handlers
 - One command installs the hook for automatic, invisible context savings
 - Round-trip safe: commands with newlines, heredocs, or command substitution are never rewritten; piped commands are refused too, with one exception — `<cmd> | cat` (bare `cat`, sole consumer, no redirects) rewrites its source, because bare `cat` renders a stream for a reader rather than consuming its bytes
+- Dev installs (`skim init --dev`): while working on skim itself, the hook's commit pin goes stale the moment you rebuild at a new commit, which forces a full reinstall on the next `skim init` and makes `skim doctor` exit 1 for being behind HEAD — neither of which rebuilding can fix, because HEAD keeps moving. `--dev` marks the installed hook as dev-pinned: the real commit is still recorded, and only the commit-staleness check is waived, so repeat installs take the already-up-to-date fast path and doctor stops failing. Version and binary-path checks are unchanged, and the waiver applies only to a hook whose SHA-256 manifest verifies. Dev mode is a property of the command, not stored state — running `skim init` **without** `--dev` reverts the hook to a strict install and reports `dev-pinned -> pinned`, so there is no `--undev`; `skim init --dev --force` re-stamps one in place
 - PATH wrappers (`skim init --wrappers`) now apply a force-raw sidecar marker (set by the PreToolUse hook when it identifies a pipeline shape where compression would cause byte loss) and an `fstat`/`isatty` gate (which serves raw bytes when stdout is a regular file, socket, or non-terminal character device). Together these partially close the compression-into-piped-consumer window (#319). Two holes remain (#514): (1) a same-tool concurrent command can clear a live marker, and (2) when no PreToolUse hook fires at all the wrapper falls back to `fstat`-only behaviour with no pipeline-shape awareness. Use `SKIM_PASSTHROUGH=1` when byte-exact output is required in those cases
 
 ### Test Output Compression
@@ -626,7 +627,8 @@ cargo bench
 - Three-tier degradation: Structured → Regex → Passthrough
 
 ✅ **Agent Integration:**
-- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`)
+- `skim init` — hook installation for Claude Code, Cursor, Codex, Gemini, Copilot, Crush; optional consent-gated permission seeding (`--permissions`); dev-pinned installs for skim development (`--dev`)
+- `skim doctor` — install health check: which `skim` on `$PATH` wins, per-agent hook state (version, commit, binary pin, tamper verdict), wrapper targets, and staleness vs. repo HEAD. Exit 0 healthy / 1 on drift, so it works as a CI pre-flight. A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)` — never `✓` — printing both the commit the install froze and the commit the running binary was built from, so `skim doctor | grep dev-pinned` is a one-line guard against shipping a dev install
 - `skim rewrite` — command rewriting engine with `--hook` mode
 - MCP server mode for agent-native workflows
 

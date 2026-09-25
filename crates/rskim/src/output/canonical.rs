@@ -265,12 +265,26 @@ pub(crate) struct BuildResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) duration_ms: Option<u64>,
     pub(crate) error_messages: Vec<String>,
+    /// Formatted per-warning diagnostics, rendered by the same function that
+    /// renders `error_messages` (see `cmd::build::cargo::format_diagnostic`).
+    ///
+    /// `skip_serializing_if = "Vec::is_empty"` keeps the `--json` envelope
+    /// byte-identical for every builder that does not populate it: the field is
+    /// absent, not `[]`. `default` is the deserialisation counterpart, so an
+    /// envelope written before this field existed still round-trips.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warning_messages: Vec<String>,
     #[serde(default, skip_serializing)]
     rendered: String,
 }
 
 impl BuildResult {
     /// Create a new BuildResult with pre-computed rendered output
+    ///
+    /// Carries no warning diagnostics. Parsers that extract them call
+    /// [`BuildResult::with_warning_messages`] instead — the 5-argument shape is
+    /// kept so builders with nothing to add are not forced to spell an empty
+    /// vector, and so their serialized envelope is provably unchanged.
     pub(crate) fn new(
         success: bool,
         warnings: usize,
@@ -278,13 +292,43 @@ impl BuildResult {
         duration_ms: Option<u64>,
         error_messages: Vec<String>,
     ) -> Self {
-        let rendered = Self::render(success, warnings, errors, duration_ms, &error_messages);
+        Self::with_warning_messages(
+            success,
+            warnings,
+            errors,
+            duration_ms,
+            error_messages,
+            Vec::new(),
+        )
+    }
+
+    /// [`BuildResult::new`] plus formatted warning diagnostics.
+    ///
+    /// Mirrors the `TestResult::with_context` precedent: the extra channel gets
+    /// its own constructor rather than a sixth positional argument on `new`.
+    pub(crate) fn with_warning_messages(
+        success: bool,
+        warnings: usize,
+        errors: usize,
+        duration_ms: Option<u64>,
+        error_messages: Vec<String>,
+        warning_messages: Vec<String>,
+    ) -> Self {
+        let rendered = Self::render(
+            success,
+            warnings,
+            errors,
+            duration_ms,
+            &error_messages,
+            &warning_messages,
+        );
         Self {
             success,
             warnings,
             errors,
             duration_ms,
             error_messages,
+            warning_messages,
             rendered,
         }
     }
@@ -298,6 +342,7 @@ impl BuildResult {
                 self.errors,
                 self.duration_ms,
                 &self.error_messages,
+                &self.warning_messages,
             );
         }
     }
@@ -308,6 +353,7 @@ impl BuildResult {
         errors: usize,
         duration_ms: Option<u64>,
         error_messages: &[String],
+        warning_messages: &[String],
     ) -> String {
         use std::fmt::Write;
 
@@ -321,6 +367,14 @@ impl BuildResult {
             for msg in error_messages {
                 let _ = write!(output, "\n {msg}");
             }
+        }
+
+        // Warning diagnostics render on success AND failure. Errors are gated on
+        // `!success` because a green build has none; warnings are the only
+        // diagnostics a green build *does* have, and suppressing them is exactly
+        // what forced the grouped-code workaround this channel replaces.
+        for msg in warning_messages {
+            let _ = write!(output, "\n {msg}");
         }
 
         output
@@ -1431,6 +1485,93 @@ mod tests {
         let mut deserialized: BuildResult = serde_json::from_str(&json).unwrap();
         deserialized.ensure_rendered();
         assert_eq!(format!("{original}"), format!("{deserialized}"));
+    }
+
+    /// The `--json` shape stays byte-identical for every builder that carries no
+    /// warning diagnostics: `skip_serializing_if = "Vec::is_empty"` means the key
+    /// is ABSENT, not `"warning_messages":[]`.
+    #[test]
+    fn test_build_result_json_omits_empty_warning_messages() {
+        let result = BuildResult::new(false, 0, 1, None, vec!["error: boom".to_string()]);
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            !json.contains("warning_messages"),
+            "empty warning_messages must not appear in the envelope: {json}"
+        );
+    }
+
+    #[test]
+    fn test_build_result_json_includes_populated_warning_messages() {
+        let result = BuildResult::with_warning_messages(
+            true,
+            1,
+            0,
+            None,
+            vec![],
+            vec!["warning[dead_code]: unused variable: `x` in src/lib.rs:3".to_string()],
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("warning_messages"),
+            "populated warning_messages must serialize: {json}"
+        );
+
+        let mut deserialized: BuildResult = serde_json::from_str(&json).unwrap();
+        deserialized.ensure_rendered();
+        assert_eq!(format!("{result}"), format!("{deserialized}"));
+    }
+
+    /// An envelope written before the field existed must still deserialize —
+    /// that is what `#[serde(default)]` buys.
+    #[test]
+    fn test_build_result_deserializes_legacy_envelope_without_warning_messages() {
+        let legacy = r#"{"success":true,"warnings":0,"errors":0,"error_messages":[]}"#;
+        let mut result: BuildResult = serde_json::from_str(legacy).unwrap();
+        result.ensure_rendered();
+        assert!(result.warning_messages.is_empty());
+        assert_eq!(format!("{result}"), "OK warnings: 0 errors: 0");
+    }
+
+    /// Warning diagnostics render on a GREEN build — they are the only
+    /// diagnostics a green build has, and suppressing them is what forced the
+    /// grouped-code workaround this channel replaces.
+    #[test]
+    fn test_build_result_renders_warning_messages_on_success() {
+        let result = BuildResult::with_warning_messages(
+            true,
+            2,
+            0,
+            None,
+            vec![],
+            vec![
+                "warning[dead_code]: unused variable: `x` in src/main.rs:5".to_string(),
+                "warning[dead_code]: unused variable: `y` in src/lib.rs:3".to_string(),
+            ],
+        );
+        let display = format!("{result}");
+        assert_eq!(
+            display,
+            "OK warnings: 2 errors: 0\n \
+             warning[dead_code]: unused variable: `x` in src/main.rs:5\n \
+             warning[dead_code]: unused variable: `y` in src/lib.rs:3"
+        );
+    }
+
+    /// On a failing build both channels render, errors first.
+    #[test]
+    fn test_build_result_renders_errors_before_warnings_on_failure() {
+        let result = BuildResult::with_warning_messages(
+            false,
+            1,
+            1,
+            None,
+            vec!["error[E0499]: cannot borrow `s` in src/main.rs:5".to_string()],
+            vec!["warning: unused import in src/main.rs:1".to_string()],
+        );
+        let display = format!("{result}");
+        let err_at = display.find("error[E0499]").expect("error rendered");
+        let warn_at = display.find("warning: unused").expect("warning rendered");
+        assert!(err_at < warn_at, "errors must render first: {display:?}");
     }
 
     // ========================================================================

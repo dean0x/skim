@@ -34,6 +34,15 @@ pub(crate) struct ProcessOptions {
     pub(crate) trunc: TruncationOptions,
     /// Whether to annotate output with source line numbers (`--line-numbers` / `-n`)
     pub(crate) line_numbers: bool,
+    /// Whether this file is one input of a multi-file run (explicit file list,
+    /// directory walk, or glob expansion).
+    ///
+    /// Batch runs emit ONE aggregate lossy-view marker for the whole run
+    /// (`multi.rs`), not one per file, so the marginal disclosure cost the
+    /// ADR-001 guard should charge a single file is zero. Single-file and stdin
+    /// runs emit their own marker from `write_result_and_stats` and must pay
+    /// for it. See [`view_notice_absolute`].
+    pub(crate) batch: bool,
 }
 
 /// Result of processing a file
@@ -48,6 +57,19 @@ pub(crate) struct ProcessResult {
     pub(crate) transformed_tokens: Option<usize>,
     /// Whether the output guardrail was triggered (compressed > raw)
     pub(crate) guardrail_triggered: bool,
+    /// Which view the ADR-001 guard actually served — the analytics-facing
+    /// reading of [`Self::guardrail_triggered`].
+    ///
+    /// `Some` only where a guard decision was genuinely taken. `None` on the
+    /// three paths where `guardrail_triggered: false` is a constructor default
+    /// rather than a verdict: a cache hit (the guard ran at write time, not
+    /// now), `Mode::Full` (the guard is skipped outright), and the
+    /// unknown-language passthrough degrade (ADR-002 returns before the guard).
+    /// Recording `Transformed` on those would claim a measurement nobody took —
+    /// and would rebuild, in a new column, the same confusion `parse_tier`
+    /// already causes by being computed before the decision it appears to
+    /// describe.
+    pub(crate) served: Option<crate::output::Served>,
     /// Parse quality tier: "full", "degraded", or "passthrough".
     ///
     /// - "passthrough" — Mode::Full, no transformation applied
@@ -75,6 +97,26 @@ pub(crate) struct ProcessResult {
     /// marker layer to emit a stderr notice on hook-rewritten file reads.
     /// Always `false` when the origin env var is absent (non-hook invocations).
     pub(crate) view_differs: bool,
+}
+
+/// Which view the ADR-001 guard served, from its own verdict.
+///
+/// `guardrail_triggered` already carries this fact and has since the guard
+/// existed; it was simply never recorded, leaving the analytics corpus with no
+/// way to tell a transform from a passthrough except by token identity.
+///
+/// `None` for [`Mode::Full`], where both guard call sites skip the decision
+/// outright — there is no verdict, and a fabricated `Transformed` there would
+/// be the same category of error as reading `parse_tier` as a selection.
+fn served_from_guard(mode: Mode, guardrail_triggered: bool) -> Option<crate::output::Served> {
+    if mode == Mode::Full {
+        return None;
+    }
+    Some(if guardrail_triggered {
+        crate::output::Served::Raw
+    } else {
+        crate::output::Served::Transformed
+    })
 }
 
 /// Determine the parse quality tier from the mode, parse-error flag, and degraded flag.
@@ -190,16 +232,122 @@ pub(crate) fn write_result_and_stats(
     // now fires for any lossy read (direct or hook-rewritten).  Not gated by
     // `SKIM_DEBUG` — this is a loss-bearing marker (class 1), not a no-loss
     // fallback banner (class 2).
-    if let Some(marker) = crate::output::lossy_view_marker(
-        crate::output::rewrite_origin().as_deref(),
-        mode_str,
-        if result.view_differs { 1 } else { 0 },
-        1,
-    ) {
-        eprintln!("{marker}");
+    //
+    // Routed through `emitted_notice_cost` and written with `eprint!` (the
+    // terminator is part of the measured line). `record_file_analytics` calls
+    // the same constructor with the same inputs, so the cost it stores is the
+    // cost this line put on the wire rather than a second estimate of it.
+    if let Some(notice) = single_file_notice(mode_str, result.view_differs) {
+        eprint!("{}", notice.line());
     }
 
     Ok(())
+}
+
+/// The lossy-view disclosure a single-input run emits, if any.
+///
+/// The single constructor for that line, shared by the site that PRINTS it
+/// ([`write_result_and_stats`]) and the site that CHARGES it
+/// (`main::record_file_analytics`). Both pass the same three inputs — process
+/// environment, mode spelling, and whether the view differed — so the two
+/// cannot disagree without this function being wrong for both.
+pub(crate) fn single_file_notice(
+    mode_str: &str,
+    view_differs: bool,
+) -> Option<crate::output::EmittedNotice> {
+    crate::output::emitted_notice_cost(
+        crate::output::rewrite_origin().as_deref(),
+        mode_str,
+        if view_differs { 1 } else { 0 },
+        1,
+    )
+}
+
+/// The lossy-view marker this invocation would print if the guard keeps the
+/// compressed view — ignoring the differential rule.
+///
+/// This is the string [`write_result_and_stats`] will emit verbatim: same
+/// origin, same mode spelling, same single-file `(1, 1)` counts. Building it
+/// here rather than re-deriving a cost keeps the charge and the emission from
+/// drifting apart — a stale per-mode cost table would be a silently wrong guard
+/// verdict with no failing test and no visible diff (PF-027 genus).
+///
+/// `None` in two cases, both structural:
+///
+/// - **`Mode::Full`** — `process_file` / `process_stdin` skip the guard
+///   entirely for full mode, so there is no decision for a disclosure to move.
+/// - **Batch runs** — `multi.rs` emits ONE aggregate marker after all files,
+///   so no single file's guard verdict adds a marker to the run. (A glob or
+///   directory that matches exactly one file still pays for one marker while
+///   being charged zero; that is the known edge of "aggregate", and it errs
+///   toward compression rather than toward double-counting.)
+fn view_notice_absolute(options: &ProcessOptions) -> Option<String> {
+    // Ordered so the batch hot path returns before reading the environment.
+    if options.batch || options.mode == Mode::Full {
+        return None;
+    }
+    let mode_str = format!("{:?}", options.mode).to_lowercase();
+    let origin = crate::output::rewrite_origin();
+    crate::output::lossy_view_marker(origin.as_deref(), &mode_str, 1, 1)
+}
+
+/// The **differential** disclosure cost of the guard choosing the compressed
+/// view over raw (ADR-001 amendment 2026-09-24):
+///
+/// ```text
+/// overhead = cost(notice if Keep) - cost(notice if Passthrough)
+/// ```
+///
+/// There is exactly one path on which the raw branch also prints a marker:
+/// when a `--max-lines` / `--last-lines` bound is set and the raw text has more
+/// lines than the bound, `enforce_line_bounds` truncates the raw text the
+/// guardrail served, `view_differs` becomes true, and
+/// [`write_result_and_stats`] prints a marker built from the same
+/// `(origin, mode_str, 1, 1)` — byte-identical to the one the compressed branch
+/// would print. Its differential cost is therefore zero and this function
+/// returns `None`.
+///
+/// Charging the absolute cost there would double-count the disclosure and push
+/// bounded reads toward raw on the strength of a notice both branches emit —
+/// the defect tracked as #519. Expressing the rule as a differential makes that
+/// resolution fall out of the definition instead of being a special case.
+///
+/// The predicate is exact, not an estimate: both truncators
+/// (`simple_line_truncate`, `simple_last_line_truncate_with_start`) and the
+/// unknown-language fallback [`passthrough_with_truncation`] are no-ops
+/// precisely when `lines <= n`, and the text `enforce_line_bounds` receives on
+/// the guardrail-triggered path IS `raw`.
+fn prospective_view_notice(options: &ProcessOptions, raw: &str) -> Option<String> {
+    let notice = view_notice_absolute(options)?;
+    // `enforce_line_bounds` checks max_lines first, then last_lines.
+    if let Some(n) = options.trunc.max_lines.or(options.trunc.last_lines)
+        && raw.lines().count() > n
+    {
+        return None;
+    }
+    Some(notice)
+}
+
+/// Byte length of the prospective lossy-view marker, for the cache key.
+///
+/// The decision the cache stores now depends on the disclosure, and the
+/// disclosure depends on [`crate::output::rewrite_origin`] and on batch-ness —
+/// **neither of which is otherwise in the key**. Without this, `cat foo.ts`
+/// (origin `cat`, 124-byte marker) and `skim foo.ts --mode=pseudo` (direct,
+/// 90-byte marker) hash to the same key and serve each other's stdout whenever
+/// that 34-byte difference straddles the guard's threshold.
+///
+/// The **absolute** length is used, not the differential: the bound-vs-raw
+/// branch in [`prospective_view_notice`] is a pure function of `trunc` (already
+/// keyed) and the file content (pinned by path + mtime, already keyed), so it
+/// can never produce a collision. Using the absolute length can at worst split
+/// one output across two keys — extra work, never wrong bytes.
+///
+/// Keying on LENGTH rather than on the text covers origin, batch-ness and mode
+/// in one field, and makes a future label edit self-invalidating: change the
+/// marker wording and every warm entry whose verdict could move misses.
+fn view_notice_cache_bytes(options: &ProcessOptions) -> usize {
+    view_notice_absolute(options).map_or(0, |marker| marker.len())
 }
 
 /// Try to return a result from cache, handling token recount when needed.
@@ -215,8 +363,13 @@ fn try_cached_result(
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(path, options.mode, &options.trunc, options.line_numbers)
-    else {
+    let Some(hit) = cache::read_cache(
+        path,
+        options.mode,
+        &options.trunc,
+        options.line_numbers,
+        view_notice_cache_bytes(options),
+    ) else {
         return Ok(None);
     };
 
@@ -283,6 +436,10 @@ fn try_cached_result(
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered: false,
+        // No guard ran on THIS invocation; the `false` above is a default, not
+        // a verdict, and the cached bytes may well be the raw file the guard
+        // elected at write time (see the `cache_hit_view_differs` note above).
+        served: None,
         parse_tier: None, // tier was not recorded at cache-write time
         language: cache_lang,
         stdin_raw: None,
@@ -709,6 +866,8 @@ fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> Process
         original_tokens: None,
         transformed_tokens: None,
         guardrail_triggered: false,
+        // ADR-002 degrade returns before the guard: no decision was taken.
+        served: None,
         parse_tier: Some("passthrough"),
         language: None,
         stdin_raw,
@@ -835,13 +994,28 @@ pub(crate) fn process_stdin(
     // may have selected a mode that, after elision markers, is still larger than raw).
     // The clone is intentional: disclosure affects view selection and we need `buffer`
     // intact as the raw baseline for view_differs and the transparency marker.
+    //
+    // ADR-001 amendment 2026-09-24: the guard is charged the stderr disclosure
+    // that keeping the compressed view would cost the reader, so a view that
+    // cannot pay for its own marker serves raw instead.
     let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
-        let outcome = crate::output::guardrail::apply_to_stderr(buffer.clone(), transformed)?;
+        let view_notice = prospective_view_notice(&options, &buffer);
+        let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
+            buffer.clone(),
+            transformed,
+            view_notice.as_deref(),
+        )?;
         let triggered = outcome.was_triggered();
         (outcome.into_output(), triggered)
     } else {
         (transformed, false)
     };
+
+    // What the reader actually receives, read off the verdict that decided it.
+    // `None` for Mode::Full: the branch above skips the guard entirely, so
+    // there is no decision to record (and a full-mode label can cost context
+    // without ever having moved a guard verdict — ADR-001, 2026-09-24).
+    let served = served_from_guard(options.mode, guardrail_triggered);
 
     // consistency-7: apply --max-lines / --last-lines to stdin when the guardrail
     // served raw (the compressed path already applies the bound via the core
@@ -925,6 +1099,7 @@ pub(crate) fn process_stdin(
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
+        served,
         parse_tier,
         language: Some(language),
         stdin_raw,
@@ -983,13 +1158,26 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // The clone is intentional: disclosure affects view selection and we need
     // `contents` intact as the raw baseline for view_differs and the transparency
     // marker below.
+    //
+    // ADR-001 amendment 2026-09-24: the guard is charged the stderr disclosure
+    // that keeping the compressed view would cost the reader, so a view that
+    // cannot pay for its own marker serves raw instead.
     let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
-        let outcome = crate::output::guardrail::apply_to_stderr(contents.clone(), result)?;
+        let view_notice = prospective_view_notice(&options, &contents);
+        let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
+            contents.clone(),
+            result,
+            view_notice.as_deref(),
+        )?;
         let triggered = outcome.was_triggered();
         (outcome.into_output(), triggered)
     } else {
         (result, false)
     };
+
+    // See `served_from_guard`: recorded from the verdict, never inferred from
+    // `parse_tier`, which is computed above — before this decision exists.
+    let served = served_from_guard(options.mode, guardrail_triggered);
 
     // Post-guardrail line-bound enforcement (#317 / ADR-002 / PF-033).
     //
@@ -1082,6 +1270,9 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
             // consistency-2: store the authoritative view_differs so the
             // cache-hit path does not have to re-derive it from the mode.
             view_differs,
+            // The guard's verdict — and therefore these bytes — depend on the
+            // disclosure's size, which is not otherwise in the key.
+            notice_bytes: view_notice_cache_bytes(&options),
         });
     }
 
@@ -1092,6 +1283,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
+        served,
         parse_tier,
         language,
         stdin_raw: None,
@@ -1294,6 +1486,7 @@ mod tests {
             show_stats,
             trunc: TruncationOptions::default(),
             line_numbers: false,
+            batch: false,
         }
     }
 
@@ -1438,6 +1631,152 @@ mod tests {
         assert!(
             unknown.ends_with(&format!("# ... (3 lines truncated) — {ELISION_HINT}\n")),
             "unknown language falls back to the neutral `#` prefix: {unknown:?}"
+        );
+    }
+
+    // ========================================================================
+    // Prospective view notice — ADR-001 amendment 2026-09-24
+    // ========================================================================
+
+    fn notice_opts(mode: Mode, trunc: TruncationOptions, batch: bool) -> ProcessOptions {
+        ProcessOptions {
+            mode,
+            explicit_lang: None,
+            use_cache: false,
+            show_stats: false,
+            trunc,
+            line_numbers: false,
+            batch,
+        }
+    }
+
+    /// `Mode::Full` skips the guard entirely, so there is no verdict for a
+    /// disclosure to move — and nothing for the cache key to separate.
+    #[test]
+    fn view_notice_absolute_is_none_for_full_mode() {
+        let opts = notice_opts(Mode::Full, TruncationOptions::default(), false);
+        assert!(
+            view_notice_absolute(&opts).is_none(),
+            "full mode never reaches the guard"
+        );
+        assert_eq!(view_notice_cache_bytes(&opts), 0);
+    }
+
+    /// `multi.rs` emits ONE aggregate marker per run, so no single file's
+    /// verdict adds a marker: the marginal cost to charge it is zero.
+    #[test]
+    fn view_notice_absolute_is_none_for_batch_runs() {
+        let opts = notice_opts(Mode::Pseudo, TruncationOptions::default(), true);
+        assert!(
+            view_notice_absolute(&opts).is_none(),
+            "a batch file pays no marginal disclosure"
+        );
+        assert_eq!(view_notice_cache_bytes(&opts), 0);
+    }
+
+    /// A single-file read pays for its own marker, and the cache key carries
+    /// exactly that marker's byte length — not an independently maintained
+    /// number that could drift from it.
+    #[test]
+    fn view_notice_cache_bytes_matches_the_marker_it_charges() {
+        let opts = notice_opts(Mode::Pseudo, TruncationOptions::default(), false);
+        let marker = view_notice_absolute(&opts).expect("a single-file pseudo read discloses");
+        assert_eq!(
+            view_notice_cache_bytes(&opts),
+            marker.len(),
+            "the key must carry the length of the marker the guard is charged"
+        );
+        assert!(
+            marker.contains("pseudo"),
+            "the charged marker names the requested mode: {marker:?}"
+        );
+    }
+
+    /// THE DIFFERENTIAL RULE.
+    ///
+    /// When a line bound is set and raw exceeds it, the Passthrough branch
+    /// truncates the raw text the guardrail served (`enforce_line_bounds`),
+    /// which makes `view_differs` true and prints a byte-identical marker of
+    /// its own. Both branches disclose, so the differential is zero. Charging
+    /// the absolute cost here would double-count — that is #519.
+    #[test]
+    fn prospective_notice_is_none_when_bound_truncates_raw() {
+        let raw = "one\ntwo\nthree\nfour\nfive\n"; // 5 lines
+        let head = notice_opts(
+            Mode::Pseudo,
+            TruncationOptions {
+                max_lines: Some(2),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(
+            prospective_view_notice(&head, raw).is_none(),
+            "--max-lines cuts raw too, so both branches disclose"
+        );
+        let tail = notice_opts(
+            Mode::Pseudo,
+            TruncationOptions {
+                last_lines: Some(2),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(
+            prospective_view_notice(&tail, raw).is_none(),
+            "--last-lines cuts raw too, so both branches disclose"
+        );
+    }
+
+    /// The mirror: a bound that does NOT cut leaves the raw branch silent, so
+    /// the compressed branch's marker is a real differential cost.
+    #[test]
+    fn prospective_notice_is_charged_when_bound_does_not_cut() {
+        let raw = "one\ntwo\n"; // 2 lines — inside the bound
+        let opts = notice_opts(
+            Mode::Pseudo,
+            TruncationOptions {
+                max_lines: Some(10),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(
+            prospective_view_notice(&opts, raw).is_some(),
+            "raw fits the bound, stays silent, and pays nothing — so the \
+             compressed view's marker is a cost only it incurs"
+        );
+    }
+
+    /// The boundary is exact, not an estimate: `simple_line_truncate`,
+    /// `simple_last_line_truncate_with_start` and `passthrough_with_truncation`
+    /// are all no-ops at `lines <= n` and all cut at `lines > n`.
+    #[test]
+    fn prospective_notice_boundary_is_exact_at_the_bound() {
+        let three = "one\ntwo\nthree\n";
+        let at_bound = notice_opts(
+            Mode::Pseudo,
+            TruncationOptions {
+                max_lines: Some(3),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(
+            prospective_view_notice(&at_bound, three).is_some(),
+            "lines == n: the truncator is a no-op, so raw discloses nothing"
+        );
+        let over_bound = notice_opts(
+            Mode::Pseudo,
+            TruncationOptions {
+                max_lines: Some(2),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(
+            prospective_view_notice(&over_bound, three).is_none(),
+            "lines > n: raw is cut and discloses too"
         );
     }
 }

@@ -217,6 +217,9 @@ struct EmitInputs<'a> {
     source_lines: &'a [&'a str],
     ln_width: usize,
     markers: &'a HunkLineMarkers,
+    /// Whether an AST breadcrumb locates anything for this file's language.
+    /// See [`breadcrumbs_carry_information`].
+    breadcrumbs: bool,
 }
 
 impl<'a> EmitInputs<'a> {
@@ -226,14 +229,78 @@ impl<'a> EmitInputs<'a> {
         source_lines: &'a [&'a str],
         ln_width: usize,
         markers: &'a HunkLineMarkers,
+        breadcrumbs: bool,
     ) -> Self {
         Self {
             hunks,
             source_lines,
             ln_width,
             markers,
+            breadcrumbs,
         }
     }
+
+    /// Whether any hunk's new-side window covers `line`.
+    ///
+    /// A line inside a window is one git itself printed — as `+` or as context
+    /// — so it is never skim's own addition, whatever role a caller claims for
+    /// it.  This is what keeps the `~` glyph truthful: `render_default_scoped`
+    /// schedules breadcrumbs strictly outside every window, but the
+    /// structure/full walk emits a container header wherever the AST puts it,
+    /// and that header is frequently a context line of the hunk below it.
+    ///
+    /// Hunks are sorted by `new_start` and do not overlap on the new side, so
+    /// the only candidate is the last hunk starting at or before `line` —
+    /// `O(log H)`.
+    fn hunk_covers(&self, line: usize) -> bool {
+        let idx = self.hunks.partition_point(|h| h.new_start <= line);
+        idx.checked_sub(1).is_some_and(|i| {
+            let h = &self.hunks[i];
+            line < h.new_start.saturating_add(h.new_count)
+        })
+    }
+}
+
+/// Whether an AST breadcrumb tells the reader anything for `lang`.
+///
+/// The breadcrumb's whole job is to name the declaration a hunk sits inside,
+/// so the reader can place a change that the hunk window alone does not locate.
+///
+/// Markdown cannot do that job.  Its top-level AST children are `section` nodes
+/// rooted at a heading, so `find_changed_node_ranges` resolves every changed
+/// line in a conventional single-H1 document to the one section spanning the
+/// file, and the breadcrumb is that H1 — for every hunk, identically.  The
+/// render has already printed the file path one line above it, which is the
+/// same fact, so the breadcrumb restates what the reader just read and spends
+/// ADR-001 budget doing it.  Suppressing it is a strict improvement on both
+/// axes: fewer bytes and nothing lost.
+///
+/// This is a Markdown-specific carve-out, not a general heuristic: in every
+/// other supported language a top-level node is a function, type or class whose
+/// header genuinely varies per hunk.
+fn breadcrumbs_carry_information(lang: Language) -> bool {
+    !matches!(lang, Language::Markdown)
+}
+
+/// Why a source line is being emitted.
+///
+/// The distinction exists because a breadcrumb is **skim's own addition** — a
+/// declaration header pulled in from outside every hunk window.  Rendered with
+/// the leading space a context line uses, it is indistinguishable from a line
+/// git actually printed, so the reader cannot tell which parts of the view came
+/// from the diff and which skim synthesised.
+///
+/// [`EmitRole::Breadcrumb`] swaps that leading space for `~`.  It is a
+/// one-character substitution on a line that is emitted either way, so the
+/// ADR-001 budget is unchanged — zero net bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitRole {
+    /// A line the diff's own content carries: a body line the structure/full
+    /// walk fills in around hunks, or a container's closing brace.
+    SourceLine,
+    /// A declaration header skim pulled in from outside every hunk window so
+    /// the following hunk can be placed.
+    Breadcrumb,
 }
 
 /// Mutable per-file render state for the structure/full path.
@@ -428,7 +495,10 @@ fn source_matches_diff(source_lines: &[&str], hunks: &[DiffHunk<'_>]) -> bool {
 ///
 /// Language validation and serde-based filtering happen in the caller
 /// (`render_diff_file`), so `parser` is guaranteed to match the file's
-/// language.
+/// language — which is also why the breadcrumb policy
+/// ([`breadcrumbs_carry_information`]) reads `parser.language()` rather than
+/// re-detecting from the path: the two can then never disagree about which
+/// language this file is.
 fn try_ast_render(
     file_diff: &FileDiff<'_>,
     global_flags: &[String],
@@ -495,7 +565,13 @@ fn try_ast_render(
 
     // B2: EmitInputs is built once and shared by both branches so
     // render_default_scoped can route breadcrumbs through emit_source_line.
-    let inputs = EmitInputs::new(&file_diff.hunks, &source_lines, ln_width, &markers);
+    let inputs = EmitInputs::new(
+        &file_diff.hunks,
+        &source_lines,
+        ln_width,
+        &markers,
+        breadcrumbs_carry_information(parser.language()),
+    );
 
     if diff_mode != DiffMode::Default {
         let changed_lines = build_changed_lines(&file_diff.hunks);
@@ -565,7 +641,7 @@ fn render_changed_only(
     // adjacent ranges share one hunk.  Created here (per-file) so it resets
     // correctly for each FileDiff without leaking across file boundaries.
     let markers = HunkLineMarkers::from_hunks(hunks);
-    let inputs = EmitInputs::new(hunks, source_lines, ln_width, &markers);
+    let inputs = EmitInputs::new(hunks, source_lines, ln_width, &markers, true);
     let mut state = RenderState::default();
 
     for (idx, range) in changed_ranges.iter().enumerate() {
@@ -573,7 +649,13 @@ fn render_changed_only(
         if let Some(ref ctx) = range.parent_context
             && emitted_parent_headers.insert(ctx.header_line)
         {
-            emit_source_line(output, ctx.header_line, &inputs, &mut state);
+            emit_source_line(
+                output,
+                ctx.header_line,
+                EmitRole::Breadcrumb,
+                &inputs,
+                &mut state,
+            );
         }
 
         // Clip the render range to exclude parent boundary lines that are
@@ -608,7 +690,13 @@ fn render_changed_only(
                 .get(&ctx.header_line)
                 .is_some_and(|&last_idx| last_idx == idx);
             if is_last {
-                emit_source_line(output, ctx.close_line, &inputs, &mut state);
+                emit_source_line(
+                    output,
+                    ctx.close_line,
+                    EmitRole::SourceLine,
+                    &inputs,
+                    &mut state,
+                );
             }
         }
     }
@@ -622,8 +710,17 @@ fn render_changed_only(
 ///      breadcrumb.  This constraint ensures the breadcrumb's line is always
 ///      OUTSIDE the hunk window — the hunk never re-emits it.
 ///   2. Walks hunks in document order.  Before each hunk, emits any scheduled
-///      breadcrumbs.  Then walks ALL hunk patch lines (in-node AND orphan) in
-///      one pass.
+///      breadcrumbs, then the hunk's boundary header ([`write_hunk_boundary`]),
+///      then ALL of its patch lines (in-node AND orphan) in one pass.
+///
+/// **Per-hunk layout:** `[breadcrumb…] @@ -a,b +c,d @@ [patch lines…]`.  The
+/// breadcrumb precedes the header because it names the enclosing declaration
+/// and its line number is strictly below the hunk's window; the header then
+/// states where the following lines start.  Both are skim additions, and both
+/// are distinguishable from real source: the breadcrumb by its `~` prefix
+/// ([`EmitRole`]), the header by having no line number at all.
+///
+/// A single-hunk file gets no header — see [`write_hunk_boundary`] for why.
 ///
 /// **Three bugs eliminated by this design:**
 ///   - Bug 1 (duplicate context): breadcrumb no longer emitted mid-hunk (only
@@ -661,7 +758,17 @@ fn render_default_scoped(
     // -------------------------------------------------------------------------
     let mut schedule: HashMap<usize, usize> = HashMap::new();
 
-    for range in changed_ranges {
+    // Markdown opts out of breadcrumbs entirely (`breadcrumbs_carry_information`).
+    // Withholding the ranges leaves the schedule empty, so Phase 2's breadcrumb
+    // loop has nothing to emit — the suppression lives in one place rather than
+    // as a second condition at the emission site.
+    let scheduled: &[ChangedNodeRange] = if inputs.breadcrumbs {
+        changed_ranges
+    } else {
+        &[]
+    };
+
+    for range in scheduled {
         // `breadcrumb_line` is always >= 1 (tree-sitter row + 1, see comments
         // in `render_changed_only`).  Use `checked_sub` defensively.
         let breadcrumb_line = range
@@ -730,8 +837,18 @@ fn render_default_scoped(
             // de-duplication and updates it on success — no separate HashSet
             // needed.  The schedule already maps each breadcrumb_line to
             // exactly one hunk, so no duplicate breadcrumb can appear here.
-            emit_source_line(output, breadcrumb_line, inputs, state);
+            emit_source_line(output, breadcrumb_line, EmitRole::Breadcrumb, inputs, state);
         }
+
+        // --- Hunk boundary ---
+        //
+        // Without it the reader cannot tell where one hunk ends and the next
+        // begins: consecutive hunks run together as one numbered stream whose
+        // only clue is a jump in the line numbers, which is also what a
+        // duplicate or a backward jump looks like.  Re-emitting git's own
+        // boundary makes the structure explicit again.  On a single-hunk file
+        // there is no next hunk, and `write_hunk_boundary` says so.
+        write_hunk_boundary(output, inputs.hunks, hunk_idx);
 
         // --- Hunk patch lines (single pass, no clipping) ---
         //
@@ -894,7 +1011,7 @@ fn render_container_with_mode(
     let node_end = node.end_position().row + 1;
 
     // Emit parent header — cursor-gated and marker-stamped (C1c).
-    emit_source_line(output, node_start, inputs, state);
+    emit_source_line(output, node_start, EmitRole::Breadcrumb, inputs, state);
 
     // Walk the container's members.
     //
@@ -936,7 +1053,7 @@ fn render_container_with_mode(
     // Emit closing brace — cursor-gated, so a member that already rendered the
     // brace line (the body's own `}` token) does not produce a duplicate.
     if node_end > node_start {
-        emit_source_line(output, node_end, inputs, state);
+        emit_source_line(output, node_end, EmitRole::SourceLine, inputs, state);
     }
 }
 
@@ -1019,7 +1136,7 @@ fn render_unchanged_node(
             // (the measured `d7407d6c` case, where every module-doc line from
             // the second onward appeared twice).
             for line_num in node_start..=node_end {
-                emit_source_line(output, line_num, inputs, state);
+                emit_source_line(output, line_num, EmitRole::SourceLine, inputs, state);
             }
         }
         DiffMode::Structure => {
@@ -1179,7 +1296,7 @@ fn render_node_with_hunks(
     if relevant_hunks.is_empty() {
         // No hunks overlap — show as unchanged context with new-file line numbers
         for line_num in node_start..=node_end {
-            emit_source_line(output, line_num, inputs, state);
+            emit_source_line(output, line_num, EmitRole::SourceLine, inputs, state);
         }
         return;
     }
@@ -1190,7 +1307,13 @@ fn render_node_with_hunks(
         // Output unchanged source lines before this hunk's position.
         // Context lines: use new-file line number.
         while current_new_line < hunk.new_start && current_new_line <= node_end {
-            emit_source_line(output, current_new_line, inputs, state);
+            emit_source_line(
+                output,
+                current_new_line,
+                EmitRole::SourceLine,
+                inputs,
+                state,
+            );
             current_new_line += 1;
         }
 
@@ -1204,7 +1327,13 @@ fn render_node_with_hunks(
 
     // Output remaining unchanged source lines to end of node
     while current_new_line <= node_end {
-        emit_source_line(output, current_new_line, inputs, state);
+        emit_source_line(
+            output,
+            current_new_line,
+            EmitRole::SourceLine,
+            inputs,
+            state,
+        );
         current_new_line += 1;
     }
 }
@@ -1230,6 +1359,7 @@ fn render_node_with_hunks(
 fn emit_source_line(
     output: &mut String,
     line_no: usize,
+    role: EmitRole,
     inputs: &EmitInputs<'_>,
     state: &mut RenderState,
 ) {
@@ -1245,14 +1375,80 @@ fn emit_source_line(
 
     let ln_width = inputs.ln_width;
     let marker = inputs.markers.new_side(line_no);
-    if marker == Marker::Added {
-        let _ = writeln!(output, "+{line_no:>ln_width$} {line}");
-    } else {
-        let _ = writeln!(output, " {line_no:>ln_width$} {line}");
-    }
+    // Two rules, in this order:
+    //
+    // 1. `+` outranks the role.  Marker fidelity (C1d) is a correctness control
+    //    — a line the diff added must render as added — and the breadcrumb
+    //    glyph is a display distinction, so the glyph yields, never the marker.
+    // 2. `~` claims "skim pulled this line in", so it may only be written for a
+    //    line no hunk window covers.  `render_default_scoped` guarantees that by
+    //    construction; the structure/full walk does not, and a container header
+    //    there is frequently a context line the hunk below it already carries.
+    let prefix = match (marker, role) {
+        (Marker::Added, _) => '+',
+        (_, EmitRole::Breadcrumb) if !inputs.hunk_covers(line_no) => '~',
+        _ => ' ',
+    };
+    let _ = writeln!(output, "{prefix}{line_no:>ln_width$} {line}");
 
     state.cursor.last_new = line_no;
     state.emissions.push((Axis::New, line_no, marker));
+}
+
+/// The `@@ -old,count +new,count @@` header line for one hunk, without its
+/// trailing newline.
+///
+/// **Single spelling, by design.** This is the one place in the crate that
+/// renders a hunk header; `mod.rs`'s `--json` patch body and
+/// [`write_hunk_boundary`] both call it.  A second spelling of the same
+/// rendering is the defect class that produced this repo's double-header bugs —
+/// two sites drift, and a size-based guard (ADR-001) cannot see the drift
+/// because a header is small.
+///
+/// It is deliberately NOT routed through [`emit_source_line`]: a hunk header is
+/// not a source line.  It carries no file line number, so it takes part in
+/// neither the [`EmittedCursor`] de-duplication nor the [`verify_ast_render`]
+/// emission trace — exactly as `\ No newline at end of file` does not.
+///
+/// Counts are always spelled out, including the `,1` git omits for
+/// single-line ranges, so the rendering is a function of the parsed
+/// [`DiffHunk`] fields alone and never of the bytes git happened to print.
+pub(super) fn hunk_header(hunk: &DiffHunk<'_>) -> String {
+    let (old_start, old_count) = (hunk.old_start, hunk.old_count);
+    let (new_start, new_count) = (hunk.new_start, hunk.new_count);
+    format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@")
+}
+
+/// Write the boundary header opening `hunks[idx]` into the TEXT view — if a
+/// boundary is something this file has.
+///
+/// # The policy, decided once
+///
+/// The header exists to mark where one hunk ends and the next begins.  A
+/// boundary is a relation *between* two hunks; a file with one hunk has no
+/// next, so the header's marginal contribution to the reader is nil.  The
+/// positional information it would otherwise carry is already in the view —
+/// every rendered line is stamped with its own source line number — so on a
+/// single-hunk file the header is pure ADR-001 cost for nothing.
+///
+/// Both text hunk walks ([`render_default_scoped`] and [`render_raw_hunks`])
+/// route through here rather than testing the count themselves, so the rule is
+/// stated once and cannot drift between the AST view and its fallback.
+///
+/// # Why `mod.rs`'s `--json` patch body does NOT use this
+///
+/// That body is a *reconstructed unified patch*, not a reading aid: `@@` is
+/// structural there, a patch missing it is malformed, and the
+/// [`Completeness::Reencoded`](crate::output::fidelity::Completeness)
+/// declaration on that envelope rests on every hunk's content being carried.
+/// It calls [`hunk_header`] directly and unconditionally.
+fn write_hunk_boundary(output: &mut String, hunks: &[DiffHunk<'_>], idx: usize) {
+    if hunks.len() < 2 {
+        return;
+    }
+    if let Some(hunk) = hunks.get(idx) {
+        let _ = writeln!(output, "{}", hunk_header(hunk));
+    }
 }
 
 /// Record one patch-line emission on the axis its marker implies.
@@ -1448,7 +1644,11 @@ fn verify_ast_render(emissions: &[Emission], hunks: &[DiffHunk<'_>]) -> Result<(
 /// the appropriate file line number after each prefix character.
 fn render_raw_hunks(file_diff: &FileDiff<'_>, header: &str, ln_width: usize) -> String {
     let mut output = header.to_string();
-    for hunk in &file_diff.hunks {
+    for (idx, hunk) in file_diff.hunks.iter().enumerate() {
+        // Same boundary obligation as the AST walk, through the same policy —
+        // this path serves multi-hunk files too (added/deleted files,
+        // unsupported languages, and every AST-render bail-out).
+        write_hunk_boundary(&mut output, &file_diff.hunks, idx);
         let mut current_new_line = hunk.new_start;
         let mut current_old_line = hunk.old_start;
         for line in &hunk.patch_lines {
@@ -2243,7 +2443,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2303,7 +2503,7 @@ mod tests {
         let changed_ranges: Vec<super::super::types::ChangedNodeRange> = vec![];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2365,7 +2565,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2448,7 +2648,7 @@ mod tests {
         ];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2497,7 +2697,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2734,7 +2934,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2818,7 +3018,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -2886,7 +3086,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -3342,7 +3542,7 @@ mod tests {
         }];
 
         let markers = HunkLineMarkers::from_hunks(&hunks);
-        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
         let mut state = RenderState::default();
         let mut output = String::new();
         render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
@@ -3362,6 +3562,447 @@ mod tests {
         assert!(
             output.contains("old_val"),
             "removed content must appear:\n{output}"
+        );
+    }
+
+    // ========================================================================
+    // Hunk headers + breadcrumb role (commit 9)
+    // ========================================================================
+
+    /// Two hunks, one source file.  Both hunk boundaries must be visible.
+    fn two_hunk_fixture() -> (Vec<&'static str>, Vec<DiffHunk<'static>>) {
+        let source_lines = vec![
+            "fn outer() {",    // 1 — breadcrumb
+            "    let a = 1;",  // 2
+            "    let b = 22;", // 3 (changed, hunk 1)
+            "    let c = 3;",  // 4
+            "    let d = 4;",  // 5
+            "    let e = 5;",  // 6
+            "    let f = 6;",  // 7
+            "    let g = 77;", // 8 (changed, hunk 2)
+            "    let h = 8;",  // 9
+            "}",               // 10
+        ];
+        let hunks = vec![
+            DiffHunk {
+                old_start: 2,
+                old_count: 3,
+                new_start: 2,
+                new_count: 3,
+                patch_lines: vec![
+                    "     let a = 1;",
+                    "-    let b = 2;",
+                    "+    let b = 22;",
+                    "     let c = 3;",
+                ],
+            },
+            DiffHunk {
+                old_start: 7,
+                old_count: 3,
+                new_start: 7,
+                new_count: 3,
+                patch_lines: vec![
+                    "     let f = 6;",
+                    "-    let g = 7;",
+                    "+    let g = 77;",
+                    "     let h = 8;",
+                ],
+            },
+        ];
+        (source_lines, hunks)
+    }
+
+    fn one_range_over_whole_fn() -> Vec<ChangedNodeRange> {
+        vec![ChangedNodeRange {
+            start: 1,
+            end: 10,
+            parent_context: None,
+        }]
+    }
+
+    /// `hunk_header` spells every count explicitly, including the `,1` git
+    /// omits for a single-line range, so the rendering is a function of the
+    /// parsed fields and never of the bytes git happened to print.
+    #[test]
+    fn hunk_header_spells_counts_explicitly() {
+        let hunk = DiffHunk {
+            old_start: 42,
+            old_count: 1,
+            new_start: 42,
+            new_count: 1,
+            patch_lines: vec![],
+        };
+        assert_eq!(hunk_header(&hunk), "@@ -42,1 +42,1 @@");
+    }
+
+    /// The budget arithmetic in `cli_git_diff_budget.rs` rests on a bounded
+    /// per-hunk cost.  A four-digit line number on both sides is the widest
+    /// shape a 100 KB-capped AST file can produce, and it must still fit.
+    #[test]
+    fn hunk_header_cost_is_bounded_per_hunk() {
+        let hunk = DiffHunk {
+            old_start: 9999,
+            old_count: 9999,
+            new_start: 9999,
+            new_count: 9999,
+            patch_lines: vec![],
+        };
+        // +1 for the newline the emission sites add.
+        let cost = hunk_header(&hunk).len() + 1;
+        assert!(
+            cost <= 29,
+            "a hunk header must stay a cheap decoration; got {cost} B: {}",
+            hunk_header(&hunk)
+        );
+    }
+
+    /// Every hunk gets its own header in the Default walk, so the reader can
+    /// see where one hunk ends and the next begins.
+    #[test]
+    fn render_default_scoped_emits_one_header_per_hunk() {
+        let (source_lines, hunks) = two_hunk_fixture();
+        let changed_ranges = one_range_over_whole_fn();
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers, true);
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
+
+        let headers: Vec<&str> = output.lines().filter(|l| l.starts_with("@@")).collect();
+        assert_eq!(
+            headers,
+            vec!["@@ -2,3 +2,3 @@", "@@ -7,3 +7,3 @@"],
+            "one header per hunk, in document order:\n{output}"
+        );
+        // The header must precede its own hunk's lines, not trail them.
+        let first_header = output.find("@@ -2,3").expect("header 1");
+        let first_change = output.find("let b = 22;").expect("hunk 1 content");
+        assert!(
+            first_header < first_change,
+            "the header must open its hunk:\n{output}"
+        );
+    }
+
+    /// The header carries no line number, so it must stay out of the emission
+    /// trace — exactly as `\ No newline at end of file` does.  A header that
+    /// registered an emission would corrupt the cursor and the verifier.
+    #[test]
+    fn hunk_headers_are_not_recorded_as_emissions() {
+        let (source_lines, hunks) = two_hunk_fixture();
+        let changed_ranges = one_range_over_whole_fn();
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers, true);
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
+
+        assert!(
+            verify_ast_render(&state.emissions, &hunks).is_ok(),
+            "headers must not disturb the verifier;\nemissions: {:?}\n{output}",
+            state.emissions
+        );
+        let numbered = output
+            .lines()
+            .filter(|l| {
+                l.starts_with('+') || l.starts_with('-') || l.starts_with(' ') || l.starts_with('~')
+            })
+            .count();
+        assert_eq!(
+            numbered,
+            state.emissions.len(),
+            "every line-numbered emission is traced, and only those:\n{output}"
+        );
+    }
+
+    /// A breadcrumb is skim's own addition, not a line git printed.  It renders
+    /// with `~` where a real context line renders with a space — one character
+    /// for one character, so the ADR-001 budget is untouched.
+    #[test]
+    fn breadcrumb_renders_with_tilde_at_no_byte_cost() {
+        let (source_lines, hunks) = two_hunk_fixture();
+        let changed_ranges = one_range_over_whole_fn();
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers, true);
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        render_default_scoped(&mut output, &changed_ranges, &inputs, &mut state);
+
+        assert!(
+            output.contains("~ 1 fn outer() {"),
+            "the breadcrumb must be marked `~`, not passed off as context:\n{output}"
+        );
+        assert!(
+            !output.contains("  1 fn outer() {"),
+            "no context-prefixed copy of the breadcrumb may survive:\n{output}"
+        );
+        // Zero net bytes: the tilde replaced a space on a line that was emitted
+        // either way.
+        let breadcrumb = output
+            .lines()
+            .find(|l| l.contains("fn outer()"))
+            .expect("breadcrumb line");
+        assert_eq!(
+            breadcrumb.len(),
+            format!(" {:>2} {}", 1, source_lines[0]).len(),
+            "the breadcrumb must be the same width as a context line: {breadcrumb:?}"
+        );
+    }
+
+    /// `~` is a display distinction; `+` is a correctness control (C1d).  When
+    /// the diff says a breadcrumb line was added, the `+` wins.
+    #[test]
+    fn breadcrumb_never_overrides_an_added_marker() {
+        let source_lines = vec!["fn outer() {", "    let a = 1;", "}"];
+        // The container header itself is the added line.
+        let hunks = vec![DiffHunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            patch_lines: vec!["+fn outer() {"],
+        }];
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        emit_source_line(&mut output, 1, EmitRole::Breadcrumb, &inputs, &mut state);
+
+        assert_eq!(
+            output, "+1 fn outer() {\n",
+            "an added line must render `+` even in the breadcrumb role"
+        );
+    }
+
+    /// A boundary is a relation between two hunks.  With one hunk there is no
+    /// next, so the header marks nothing the reader could use — and the
+    /// position it would carry is already on every line, which is stamped with
+    /// its own source line number.  It is suppressed outright rather than
+    /// emitted and paid for out of the ADR-001 budget.
+    #[test]
+    fn a_single_hunk_file_gets_no_boundary_header() {
+        let (source_lines, hunks) = two_hunk_fixture();
+        let one = vec![hunks[0].clone()];
+        let markers = HunkLineMarkers::from_hunks(&one);
+        let inputs = EmitInputs::new(&one, &source_lines, 2, &markers, true);
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        render_default_scoped(&mut output, &one_range_over_whole_fn(), &inputs, &mut state);
+
+        assert!(
+            !output.contains("@@"),
+            "a lone hunk has no boundary to mark:\n{output}"
+        );
+        // Non-vacuity: the hunk's own content is still served in full.
+        assert!(
+            output.contains("let b = 22;") && output.contains("let b = 2;"),
+            "suppressing the header must not suppress the hunk:\n{output}"
+        );
+    }
+
+    /// The same rule on the raw-hunk fallback, so the AST view and its fallback
+    /// cannot disagree about what a boundary is.
+    #[test]
+    fn raw_hunk_fallback_suppresses_the_header_for_a_lone_hunk() {
+        let (_, hunks) = two_hunk_fixture();
+        let file_diff = FileDiff {
+            path: "src/mod.rs".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Modified,
+            hunks: vec![hunks[0].clone()],
+        };
+        let rendered = render_raw_hunks(&file_diff, "src/mod.rs (modified)\n", 2);
+        assert!(
+            !rendered.contains("@@"),
+            "a lone hunk has no boundary to mark:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("let b = 22;"),
+            "the hunk's content must still be served:\n{rendered}"
+        );
+    }
+
+    /// The suppression is a property of the TEXT view, not of the header.
+    ///
+    /// `mod.rs`'s `--json` body is a reconstructed unified patch where `@@` is
+    /// structural — a patch missing it is malformed — so it calls
+    /// [`hunk_header`] directly and must keep its header at every hunk count.
+    /// Pinning both halves on the same lone hunk is what stops the policy from
+    /// migrating into `hunk_header` and silently breaking that envelope.
+    #[test]
+    fn the_policy_lives_in_the_text_view_not_in_hunk_header() {
+        let (_, hunks) = two_hunk_fixture();
+        let lone = vec![hunks[0].clone()];
+
+        // The spelling is unconditional: `--json` still gets its header.
+        assert_eq!(hunk_header(&lone[0]), "@@ -2,3 +2,3 @@");
+
+        // The text view's boundary emitter, on the same lone hunk, writes nothing.
+        let mut out = String::new();
+        write_hunk_boundary(&mut out, &lone, 0);
+        assert!(out.is_empty(), "lone hunk must get no boundary: {out:?}");
+
+        // …and writes it once the file actually has a boundary.
+        let mut out = String::new();
+        write_hunk_boundary(&mut out, &hunks, 0);
+        assert_eq!(out, "@@ -2,3 +2,3 @@\n");
+    }
+
+    /// `~` claims the line is skim's own addition.  When a hunk window already
+    /// covers it, git printed it and the claim would be false — so the glyph
+    /// yields to the ordinary context space.
+    ///
+    /// This is the structure/full container-header case: that walk emits the
+    /// header wherever the AST puts it, which is often inside the hunk below.
+    #[test]
+    fn breadcrumb_glyph_yields_to_a_line_the_hunk_already_covers() {
+        let (source_lines, hunks) = two_hunk_fixture();
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 2, &markers, true);
+
+        // Line 2 is a context line of hunk 1 (`@@ -2,3 +2,3 @@`).
+        assert!(inputs.hunk_covers(2), "fixture precondition");
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        emit_source_line(&mut output, 2, EmitRole::Breadcrumb, &inputs, &mut state);
+        assert_eq!(
+            output, "  2     let a = 1;\n",
+            "a line inside a hunk window is git's, not skim's — no `~`"
+        );
+
+        // Line 1 precedes every window, so the claim holds there.
+        assert!(!inputs.hunk_covers(1), "fixture precondition");
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        emit_source_line(&mut output, 1, EmitRole::Breadcrumb, &inputs, &mut state);
+        assert_eq!(output, "~ 1 fn outer() {\n");
+    }
+
+    /// A pure-deletion hunk has a zero-width new-side window and covers nothing.
+    #[test]
+    fn hunk_covers_is_empty_for_a_zero_count_window() {
+        let source_lines = vec!["fn keep() {}"];
+        let hunks = vec![DiffHunk {
+            old_start: 3,
+            old_count: 1,
+            new_start: 3,
+            new_count: 0,
+            patch_lines: vec!["-"],
+        }];
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let inputs = EmitInputs::new(&hunks, &source_lines, 1, &markers, true);
+        for line in 1..=5 {
+            assert!(
+                !inputs.hunk_covers(line),
+                "line {line} must not be covered by a zero-count new-side window"
+            );
+        }
+    }
+
+    /// Markdown's breadcrumb is the enclosing H1, which the file-header line
+    /// above it has already told the reader.  It is suppressed outright — not
+    /// re-styled — so it costs no ADR-001 budget at all.
+    #[test]
+    fn markdown_suppresses_the_breadcrumb_entirely() {
+        let source_lines = vec![
+            "# Title",     // 1 — the H1 breadcrumb
+            "",            // 2
+            "Some prose.", // 3
+            "",            // 4
+            "More prose.", // 5
+        ];
+        let hunks = vec![DiffHunk {
+            old_start: 3,
+            old_count: 1,
+            new_start: 3,
+            new_count: 1,
+            patch_lines: vec!["-Old prose.", "+Some prose."],
+        }];
+        let changed_ranges = vec![ChangedNodeRange {
+            start: 1,
+            end: 5,
+            parent_context: None,
+        }];
+        let markers = HunkLineMarkers::from_hunks(&hunks);
+        let mut state = RenderState::default();
+        let mut output = String::new();
+        render_default_scoped(
+            &mut output,
+            &changed_ranges,
+            &EmitInputs::new(&hunks, &source_lines, 1, &markers, false),
+            &mut state,
+        );
+        assert!(
+            !output.contains("# Title"),
+            "Markdown must emit no breadcrumb at all:\n{output}"
+        );
+
+        // Control: the same fixture WITH breadcrumbs enabled does emit it, so
+        // the assertion above is about the suppression and not about a fixture
+        // that never had a breadcrumb to begin with.
+        let mut control_state = RenderState::default();
+        let mut control = String::new();
+        render_default_scoped(
+            &mut control,
+            &changed_ranges,
+            &EmitInputs::new(&hunks, &source_lines, 1, &markers, true),
+            &mut control_state,
+        );
+        assert!(
+            control.contains("# Title"),
+            "control: a breadcrumb-enabled render must emit it:\n{control}"
+        );
+    }
+
+    /// `breadcrumbs_carry_information` is a Markdown-only carve-out.  A general
+    /// heuristic here would silently strip context from real code.
+    #[test]
+    fn only_markdown_opts_out_of_breadcrumbs() {
+        assert!(!breadcrumbs_carry_information(Language::Markdown));
+        for lang in [
+            Language::Rust,
+            Language::TypeScript,
+            Language::Python,
+            Language::Go,
+            Language::Java,
+        ] {
+            assert!(
+                breadcrumbs_carry_information(lang),
+                "{lang:?} must keep its breadcrumbs"
+            );
+        }
+    }
+
+    /// The raw-hunk fallback serves multi-hunk files too, and inherits the same
+    /// boundary obligation — through the same single `hunk_header` spelling.
+    #[test]
+    fn render_raw_hunks_emits_one_header_per_hunk() {
+        let file_diff = FileDiff {
+            path: "src/mod.ts".to_string(),
+            old_path: None,
+            status: DiffFileStatus::Added,
+            hunks: vec![
+                DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 2,
+                    patch_lines: vec!["+const A = 1;", "+const B = 2;"],
+                },
+                DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 10,
+                    new_count: 1,
+                    patch_lines: vec!["+const C = 3;"],
+                },
+            ],
+        };
+        let rendered = render_raw_hunks(&file_diff, "src/mod.ts (added)\n", 2);
+        let headers: Vec<&str> = rendered.lines().filter(|l| l.starts_with("@@")).collect();
+        assert_eq!(
+            headers,
+            vec!["@@ -0,0 +1,2 @@", "@@ -0,0 +10,1 @@"],
+            "raw-hunk fallback must open each hunk with its header:\n{rendered}"
         );
     }
 }

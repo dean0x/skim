@@ -677,3 +677,432 @@ fn test_cut_inside_side_fence_not_relabelled_as_literal() {
     // If no cut-inside message, the output simply ends before the fence closes —
     // that is also correct (the fence may fit within max_lines).
 }
+
+// ============================================================================
+// (f) Source-space elision counts on the AST multi-span path (ADR-011
+//     2026-09-24 amendment)
+// ============================================================================
+//
+// The span-based modes (structure, signatures, types) used to build their
+// elision markers from the TRANSFORMED line count -- a fact about a text the
+// reader never asked for and cannot see. The fix gives each NodeSpan a
+// `source_range` and states every marker count in SOURCE-line space.
+//
+// The `structure` half of that fix is covered by the truncation_golden matrix.
+// The `signatures` and `types` halves are NOT: no signatures or types golden in
+// that matrix is long enough to truncate at all, so both producers shipped with
+// zero executing coverage. Under this repo's no-compiler rule for agents
+// (PF-034) untested code is exactly where defects survive, so the two tests
+// below drive those producers directly with hand-computed expectations.
+
+/// Extract the elided line count from an elision marker line.
+///
+/// Handles every marker spelling `elision_marker_line` produces:
+/// `// ... (N lines truncated)`, `# ... (1 line truncated)`,
+/// `<!-- ... (N lines truncated) -->` and the #511 `; cut inside ...` variants.
+/// Returns `None` for ordinary content lines, which is how callers separate
+/// emitted content from markers.
+fn marker_count(line: &str) -> Option<usize> {
+    let after = line.split_once("... (")?.1;
+    let (num, rest) = after.split_once(' ')?;
+    // Guard against a content line that merely happens to contain "... (".
+    if !rest.starts_with("line") || !rest.contains("truncated") {
+        return None;
+    }
+    num.parse::<usize>().ok()
+}
+
+/// Split an output into (sum of marker counts, number of emitted content lines).
+/// Blank lines count as emitted content -- they are lines the reader can see.
+fn split_markers_and_content(out: &str) -> (usize, usize) {
+    let mut marker_total = 0usize;
+    let mut emitted = 0usize;
+    for line in out.lines() {
+        match marker_count(line) {
+            Some(n) => marker_total += n,
+            None => emitted += 1,
+        }
+    }
+    (marker_total, emitted)
+}
+
+/// 8 TypeScript functions, each 3 code lines followed by 1 blank line.
+///
+/// Source layout (0-indexed rows): `fN` starts at row `4*(N-1)`, so
+/// f1@0, f2@4, f3@8, f4@12, f5@16, f6@20, f7@24, f8@28 -- 32 source lines.
+/// Signatures mode emits one line per function (the body is excluded), so the
+/// transformed output is 8 lines and each span shows exactly 1 source line.
+fn ts_eight_functions() -> String {
+    (1..=8)
+        .map(|i| format!("function f{i}(a: number): number {{\n  return a + {i};\n}}\n\n"))
+        .collect()
+}
+
+/// 6 TypeScript interfaces, each 3 code lines followed by 3 blank lines.
+///
+/// Source layout (0-indexed rows): `IN` starts at row `6*(N-1)`, so
+/// I1@0, I2@6, I3@12, I4@18, I5@24, I6@30 -- 36 source lines.
+/// Types mode emits each interface verbatim (3 lines) joined by "\n\n", so the
+/// transformed output is 6*3 + 5 synthetic separators = 23 lines. The 3-blank
+/// gutter makes the SOURCE gap between interfaces (3 lines) differ from the
+/// TRANSFORMED gap (1 synthetic separator), which is what makes this fixture
+/// able to tell the two coordinate spaces apart.
+fn ts_six_interfaces() -> String {
+    (1..=6)
+        .map(|i| format!("interface I{i} {{\n  a: number;\n}}\n\n\n\n"))
+        .collect()
+}
+
+/// signatures + --max-lines: the trailing marker counts SOURCE lines.
+///
+/// Derivation (by hand -- no snapshot, no tooling):
+///   * 8 spans, all `function_declaration` (priority 4), transformed 0..1 .. 7..8.
+///   * Greedy at max_lines=5 selects spans 0-4 (5 lines); count_markers adds the
+///     trailing marker, so 5+1 > 5 and the trim loop drops the highest-position
+///     span (span 4). Selection settles on spans 0-3.
+///   * 4 content lines are emitted; last_source_end lands on f4's source range
+///     end = 13.
+///   * Trailing marker = source_total(32) - 13 = 19.
+///
+/// Pre-fix this marker read `lines.len() - last_end` = 8 - 4 = 4 -- an
+/// output-space count, understating the hidden source lines by nearly 5x.
+#[test]
+fn signatures_max_lines_marker_is_in_source_space() {
+    let source = ts_eight_functions();
+    assert_eq!(
+        source.lines().count(),
+        32,
+        "fixture must have exactly 32 source lines"
+    );
+
+    let out = xform(
+        &source,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Signatures).with_max_lines(5),
+    );
+    let lines: Vec<&str> = out.lines().collect();
+
+    assert_eq!(
+        lines.len(),
+        5,
+        "ADR-016: --max-lines 5 must yield 5 lines total, marker included.\nGot:\n{out}"
+    );
+    assert!(
+        lines[0].contains("function f1") && lines[3].contains("function f4"),
+        "the four highest-position-surviving signatures must be f1..f4.\nGot:\n{out}"
+    );
+    assert!(
+        !out.contains("function f5"),
+        "f5 was trimmed and must not appear.\nGot:\n{out}"
+    );
+    assert!(
+        out.contains("// ... (19 lines truncated)"),
+        "signatures trailing marker must count SOURCE lines: source_total(32) \
+         - last_source_end(13) = 19.\nGot:\n{out}"
+    );
+    assert!(
+        !out.contains("(4 lines truncated)"),
+        "4 is the pre-fix OUTPUT-space count (8 output lines - 4 emitted); its \
+         presence means the signatures producer never migrated to \
+         NodeSpan::with_source.\nGot:\n{out}"
+    );
+}
+
+/// types + --max-lines: BOTH gap markers and the trailing marker count SOURCE
+/// lines, and every source line is accounted for exactly once.
+///
+/// Derivation (by hand):
+///   * 6 spans, all `interface_declaration` (priority 5). Transformed ranges
+///     0..3, 4..7, 8..11, 12..15, 16..19, 20..23 -- non-contiguous because types
+///     mode inserts one synthetic blank separator between defs.
+///   * Greedy at max_lines=12 selects I1-I4 (12 lines); count_markers finds 3
+///     gaps + 1 trailing = 4, so 12+4 > 12 and the trim loop drops I4.
+///     Selection settles on I1, I2, I3.
+///   * Source ranges are 0..3, 6..9, 12..15. Gap markers are therefore
+///     6-3 = 3 and 12-9 = 3; the trailing marker is 36-15 = 21.
+///
+/// Pre-fix those same three markers read 1, 1 and 12: the gaps counted the
+/// single SYNTHETIC separator line (which exists in no source file at all) and
+/// the tail counted transformed lines.
+#[test]
+fn types_max_lines_gap_and_trailing_markers_are_in_source_space() {
+    let source = ts_six_interfaces();
+    assert_eq!(
+        source.lines().count(),
+        36,
+        "fixture must have exactly 36 source lines"
+    );
+
+    let out = xform(
+        &source,
+        Language::TypeScript,
+        TransformConfig::with_mode(Mode::Types).with_max_lines(12),
+    );
+
+    assert_eq!(
+        out.lines().count(),
+        12,
+        "ADR-016: --max-lines 12 must yield 12 lines total, markers included.\nGot:\n{out}"
+    );
+
+    let gap_markers = out
+        .lines()
+        .filter(|l| l.contains("(3 lines truncated)"))
+        .count();
+    assert_eq!(
+        gap_markers, 2,
+        "both gap markers must count the 3 SOURCE lines between interfaces, not \
+         the 1 synthetic separator line.\nGot:\n{out}"
+    );
+    assert!(
+        out.contains("// ... (21 lines truncated)"),
+        "types trailing marker must count SOURCE lines: source_total(36) \
+         - last_source_end(15) = 21.\nGot:\n{out}"
+    );
+    assert!(
+        !out.contains("(1 line truncated)"),
+        "'1 line truncated' is the pre-fix gap value -- the width of the synthetic \
+         separator that types mode inserts, which corresponds to no source line \
+         whatsoever.\nGot:\n{out}"
+    );
+
+    // The accounting identity holds exactly for this case: types spans are
+    // separated in transformed space, so every gap fires a marker and no hidden
+    // source line escapes disclosure.
+    let (marker_total, emitted) = split_markers_and_content(&out);
+    let reconstructed = marker_total + emitted;
+    assert_eq!(
+        reconstructed, 36,
+        "every source line must be either SHOWN or counted in a marker.\n  \
+         reconstructed = {reconstructed} (markers {marker_total} + emitted {emitted})\n  \
+         expected      = 36 source lines\nGot:\n{out}"
+    );
+}
+
+// ----------------------------------------------------------------------------
+// The accounting identity, pinned across the whole structure golden matrix
+// ----------------------------------------------------------------------------
+//
+// INVARIANT: when --max-lines truncates, every line of the user's source file
+// is either SHOWN in the output or counted inside an elision marker. Formally
+//
+//     sum(marker counts) + emitted output lines == source line count
+//
+// This is the property the source-space fix establishes, and it is strictly
+// stronger than "the numbers changed as expected": a golden records whatever
+// the code produced when it was blessed, bugs included, whereas this identity
+// states the contract independently of any blessed output.
+//
+// `emitted` counts blank lines too -- a blank line in the output is a line the
+// reader can see.
+
+const TS_SIMPLE: &str = include_str!("../../../tests/fixtures/typescript/simple.ts");
+const MD_SIMPLE: &str = include_str!("../../../tests/fixtures/markdown/simple.md");
+const RUST_COMMENTS: &str = include_str!("../../../tests/fixtures/rust/comments.rs");
+const PYTHON_COMMENTS: &str = include_str!("../../../tests/fixtures/python/comments.py");
+const GO_COMMENTS: &str = include_str!("../../../tests/fixtures/go/comments.go");
+const TS_COMMENTS: &str = include_str!("../../../tests/fixtures/typescript/comments.ts");
+
+struct StructureCase {
+    /// Matches the truncation_golden snapshot name, so a failure here points
+    /// straight at the golden that covers the same cell.
+    name: &'static str,
+    source: &'static str,
+    language: Language,
+    max_lines: usize,
+}
+
+/// Every (fixture x bound) cell of the structure golden matrix that actually
+/// truncates. Cells that fit inside their bound emit no marker and are outside
+/// this invariant's scope.
+const STRUCTURE_CASES: &[StructureCase] = &[
+    StructureCase {
+        name: "rust_simple_structure_max5",
+        source: RUST_SIMPLE,
+        language: Language::Rust,
+        max_lines: 5,
+    },
+    StructureCase {
+        name: "rust_simple_structure_max15",
+        source: RUST_SIMPLE,
+        language: Language::Rust,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "rust_comments_structure_max15",
+        source: RUST_COMMENTS,
+        language: Language::Rust,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "ts_simple_structure_max5",
+        source: TS_SIMPLE,
+        language: Language::TypeScript,
+        max_lines: 5,
+    },
+    StructureCase {
+        name: "ts_comments_structure_max15",
+        source: TS_COMMENTS,
+        language: Language::TypeScript,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "go_simple_structure_max5",
+        source: GO_SIMPLE,
+        language: Language::Go,
+        max_lines: 5,
+    },
+    StructureCase {
+        name: "go_simple_structure_max15",
+        source: GO_SIMPLE,
+        language: Language::Go,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "go_comments_structure_max15",
+        source: GO_COMMENTS,
+        language: Language::Go,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "python_simple_structure_max5",
+        source: PYTHON_SIMPLE,
+        language: Language::Python,
+        max_lines: 5,
+    },
+    StructureCase {
+        name: "python_simple_structure_max15",
+        source: PYTHON_SIMPLE,
+        language: Language::Python,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "python_comments_structure_max15",
+        source: PYTHON_COMMENTS,
+        language: Language::Python,
+        max_lines: 15,
+    },
+    StructureCase {
+        name: "md_simple_structure_max5",
+        source: MD_SIMPLE,
+        language: Language::Markdown,
+        max_lines: 5,
+    },
+];
+
+/// Cells that do NOT yet satisfy the identity, each with its cause and the exact
+/// shortfall measured today.
+///
+/// This is deliberately an explicit, named list rather than a tolerance band: a
+/// tolerance would also swallow the next regression. Each entry is pinned by
+/// `structure_accounting_exclusions_still_fail_by_documented_amount` below, so
+/// when either defect is fixed THAT test fails and forces whoever fixed it to
+/// delete the entry -- at which point the main assertion tightens over the cell
+/// automatically. Neither defect is fixable without changing which lines are
+/// shown or whether a marker appears, which is why they are tracked separately.
+struct AccountingExclusion {
+    name: &'static str,
+    /// source_line_count - (sum of markers + emitted lines), as measured today.
+    shortfall: usize,
+    cause: &'static str,
+}
+
+const ACCOUNTING_EXCLUSIONS: &[AccountingExclusion] = &[
+    AccountingExclusion {
+        name: "md_simple_structure_max5",
+        shortfall: 21,
+        cause: "extract_markdown_headers_with_spans understates transformed_range: each \
+                header_text carries a trailing newline, so texts.join(\"\\n\") renders 13 \
+                output lines for 6 headers whose spans claim only 8. The spans therefore \
+                claim to cover 4 headers when only 2 are on screen, and the source-space \
+                cursor runs ahead of what the reader actually sees.",
+    },
+    AccountingExclusion {
+        name: "ts_simple_structure_max5",
+        shortfall: 3,
+        cause: "marker PRESENCE is still decided in transformed space. The last selected \
+                span ends at the output's final line, so `last_end < lines.len()` is false \
+                and no trailing marker fires -- even though source lines 11-13 (the greet \
+                function body) are hidden. The count that would have been emitted is \
+                correct; the marker simply never fires.",
+    },
+];
+
+fn structure_accounting(case: &StructureCase) -> (usize, usize, usize) {
+    let out = xform(
+        case.source,
+        case.language,
+        TransformConfig::with_mode(Mode::Structure).with_max_lines(case.max_lines),
+    );
+    let (marker_total, emitted) = split_markers_and_content(&out);
+    (marker_total, emitted, case.source.lines().count())
+}
+
+/// Every structure cell that truncates accounts for every source line exactly.
+#[test]
+fn structure_truncation_accounts_for_every_source_line() {
+    for case in STRUCTURE_CASES {
+        if ACCOUNTING_EXCLUSIONS.iter().any(|e| e.name == case.name) {
+            continue;
+        }
+        let (marker_total, emitted, source_total) = structure_accounting(case);
+        let reconstructed = marker_total + emitted;
+        let difference = (reconstructed as i64) - (source_total as i64);
+        let name = case.name;
+        assert_eq!(
+            reconstructed, source_total,
+            "{name}: source-space accounting is broken. Every source line must be either \
+             SHOWN in the output or counted inside an elision marker.\n  \
+             reconstructed = {reconstructed} (markers {marker_total} + emitted {emitted})\n  \
+             expected      = {source_total} source lines\n  \
+             difference    = {difference}"
+        );
+    }
+}
+
+/// Guard: an exclusion name that matches no case would silently exclude nothing
+/// (or, after a rename, silently exclude the wrong thing).
+#[test]
+fn structure_accounting_exclusions_name_real_cases() {
+    for excl in ACCOUNTING_EXCLUSIONS {
+        let name = excl.name;
+        assert!(
+            STRUCTURE_CASES.iter().any(|c| c.name == name),
+            "exclusion {name:?} names no case in STRUCTURE_CASES -- a typo or a stale \
+             rename would make the exclusion a no-op"
+        );
+    }
+}
+
+/// Guard: each excluded cell must STILL fail by exactly its documented amount.
+///
+/// This is what makes the exclusion list self-retiring. Fix either underlying
+/// defect and this test goes red, naming the entry to delete; the main
+/// assertion above then covers the cell with no further edit.
+#[test]
+fn structure_accounting_exclusions_still_fail_by_documented_amount() {
+    for excl in ACCOUNTING_EXCLUSIONS {
+        let Some(case) = STRUCTURE_CASES.iter().find(|c| c.name == excl.name) else {
+            continue; // covered by structure_accounting_exclusions_name_real_cases
+        };
+        let (marker_total, emitted, source_total) = structure_accounting(case);
+        let reconstructed = marker_total + emitted;
+        let shortfall = source_total.saturating_sub(reconstructed);
+        let difference = (reconstructed as i64) - (source_total as i64);
+        let name = case.name;
+        let documented = excl.shortfall;
+        let cause = excl.cause;
+        assert_eq!(
+            shortfall, documented,
+            "{name}: documented shortfall no longer matches. If you FIXED the underlying \
+             defect, delete this entry from ACCOUNTING_EXCLUSIONS -- \
+             structure_truncation_accounts_for_every_source_line will then cover this \
+             cell. If you did not, the accounting regressed.\n  \
+             reconstructed  = {reconstructed} (markers {marker_total} + emitted {emitted})\n  \
+             expected       = {source_total} source lines\n  \
+             difference     = {difference}\n  \
+             documented gap = {documented}\n  \
+             cause          = {cause}"
+        );
+    }
+}

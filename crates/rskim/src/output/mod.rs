@@ -613,6 +613,93 @@ pub(crate) fn compressed_output_hint(code: i32) -> String {
     format!("[skim] compressed output (exit {code}). {ELISION_HINT}.")
 }
 
+/// Diagnostic-summary marker for the build family (ADR-011 class 1 —
+/// unconditional).
+///
+/// Build parsers reduce each compiler diagnostic to a single line
+/// (`error[E0499]: cannot borrow … in src/main.rs:5`). Everything else the tool
+/// attached to that diagnostic is discarded: the source snippet / caret frame,
+/// the `note:` and `help:` children, and the trailing `rustc --explain`
+/// pointer, which arrives at `level: "failure-note"` and matches no arm of the
+/// parser's level match. Measured on rustc 1.96.0 via `cargo build
+/// --message-format=json`: one E0499 carries a 316-byte `rendered` frame and
+/// two `help`/`note` children, of which the served line keeps 83 bytes.
+///
+/// # Why a class-1 marker, not a class-2 banner
+///
+/// It fires only on the net-savings guard's `Keep` branch — the branch where
+/// the reader is served the summary *instead of* the child's own bytes. On the
+/// `Passthrough` branch raw carries every one of those dropped parts, so a
+/// marker there would claim a loss that did not occur. Class 1 is unconditional
+/// and NOT gated by `SKIM_DEBUG`; do not re-conflate it with the debug-gated
+/// raw-fallback banners.
+///
+/// `diagnostics` is the exact count the parser reported (`errors + warnings`),
+/// so the reader can size what is missing. The caller suppresses the marker
+/// entirely when the count is zero: a build with no diagnostics has no
+/// diagnostic bodies to drop, and the summary line is then the whole truth.
+///
+/// The parenthetical names the classes of per-diagnostic body the build parsers
+/// discard; a tool that emits none of a given kind simply has none to drop.
+///
+/// ```text
+/// [skim] cargo: 2 diagnostics summarised (source snippets, help/note lines, explain hints dropped) — SKIM_PASSTHROUGH=1 for full output
+/// ```
+pub(crate) fn diagnostics_summary_marker(program: &str, diagnostics: usize) -> String {
+    // Routed through `remedy_for` so the printed remedy stays the narrowest one
+    // reachable from this invocation (ADR-011 class 1). Build output is text and
+    // the passthrough gate execs the user's literal argv, so this resolves to the
+    // canonical `ELISION_HINT`.
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool: program,
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    let unit = if diagnostics == 1 {
+        "diagnostic"
+    } else {
+        "diagnostics"
+    };
+    format!(
+        "[skim] {program}: {diagnostics} {unit} summarised \
+         (source snippets, help/note lines, explain hints dropped) \u{2014} {remedy}"
+    )
+}
+
+#[cfg(test)]
+mod diagnostics_summary_marker_tests {
+    use super::*;
+
+    #[test]
+    fn test_marker_names_tool_count_class_and_remedy() {
+        let m = diagnostics_summary_marker("cargo", 2);
+        assert_eq!(
+            m,
+            "[skim] cargo: 2 diagnostics summarised \
+             (source snippets, help/note lines, explain hints dropped) \
+             \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+    }
+
+    /// ADR-011 class 1: the marker must carry an exact count and the escape
+    /// hatch, and must name the elided CLASS rather than only asserting
+    /// "not raw".
+    #[test]
+    fn test_marker_carries_exact_count_and_hint() {
+        let m = diagnostics_summary_marker("tsc", 17);
+        assert!(m.contains("17 diagnostics"), "exact count: {m}");
+        assert!(m.contains(ELISION_HINT), "class-1 remedy: {m}");
+        assert!(m.contains("source snippets"), "elided class: {m}");
+    }
+
+    #[test]
+    fn test_marker_singular_for_one_diagnostic() {
+        let m = diagnostics_summary_marker("cargo", 1);
+        assert!(m.contains("1 diagnostic summarised"), "{m}");
+        assert!(!m.contains("1 diagnostics"), "{m}");
+    }
+}
+
 // ============================================================================
 // Rewrite transparency (hook-rewritten file reads)
 // ============================================================================
@@ -637,25 +724,45 @@ pub(crate) fn rewrite_origin() -> Option<String> {
     }
 }
 
-/// Map a mode name to a human-readable class description (B4 / ADR-011 class 1).
+/// Map a mode name to the ELIDED CLASS — what is gone from the served view.
 ///
-/// The class label names what was elided so the reader knows what information
-/// they are missing without needing to know skim internals.
+/// Returns the class clause ONLY, not a full label: [`lossy_view_marker`] names
+/// the mode itself, exactly once. Before this table's contract changed, the
+/// origin form named the mode twice (`transformed view (cat → skim
+/// --mode=pseudo): pseudo view: …`) because each arm carried its own `… view:`
+/// prefix.
+///
+/// # Accuracy (ADR-011 class 1)
+///
+/// A class-1 marker that misstates the elided class is worse than one that
+/// omits it: it sends the reader back for content they already have. Two arms
+/// were affirmatively false, verified against `docs/modes.md` and empirically
+/// on `tests/fixtures/python/mixed_priority.py`:
+///
+/// - `pseudo` claimed "bodies removed" and removes no body in any language. It
+///   strips parameter annotations, decorators, Rust lifetimes/generics/
+///   where-clauses/attributes, and statement semicolons.
+/// - `minimal` claimed "bodies removed" and removes no body either. It strips
+///   non-doc comments.
+/// - `signatures` carried `structure`'s clause verbatim and under-disclosed:
+///   it also drops imports, classes, type definitions and module constants.
+///
+/// `structure` is the only mode that removes bodies, so its clause is unchanged.
 ///
 /// Made `pub(crate)` by D1 so downstream callers (e.g. `fidelity::remedy_for`
 /// contexts) can name the elided class without duplicating the label table.
 pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
     match mode_str {
-        "pseudo" => "pseudo view: bodies and syntactic detail removed",
-        "minimal" => "minimal view: comments and bodies removed",
-        "structure" => "structure view: bodies removed",
-        "signatures" => "signatures view: bodies removed",
-        "types" => "types view: non-type declarations removed",
+        "pseudo" => "annotations, decorators removed",
+        "minimal" => "non-doc comments removed",
+        "structure" => "bodies removed",
+        "signatures" => "all but signatures removed",
+        "types" => "all but types removed",
         // `full` reaches this table only when a line bound elided part of the
         // file (`head`/`tail` rewrites): the served lines are verbatim, so the
         // class names the range, not a transformation.
-        "full" => "line-sliced view: content verbatim, lines outside the range omitted",
-        _ => "transformed view",
+        "full" => "lines outside range omitted",
+        _ => "content removed",
     }
 }
 
@@ -670,19 +777,24 @@ pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
 ///
 /// # Marker format
 ///
+/// This function is the sole place the mode is named, and it names it once.
+/// The origin form carries it inside the reproduced command; the direct form
+/// carries it in a `<mode> view:` prefix. [`mode_class_label`] contributes only
+/// the class clause.
+///
 /// With hook-rewrite origin (e.g. `SKIM_REWRITTEN_FROM=cat`):
 /// ```text
-/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// [skim] transformed view (cat → skim --mode=pseudo): annotations, decorators removed — SKIM_PASSTHROUGH=1 for full output
 /// ```
 ///
 /// Without origin (explicit `skim file.ts --mode=pseudo`):
 /// ```text
-/// [skim] pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// [skim] pseudo view: annotations, decorators removed — SKIM_PASSTHROUGH=1 for full output
 /// ```
 ///
 /// Multi-file (with or without origin):
 /// ```text
-/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: 2/3 files — SKIM_PASSTHROUGH=1 for raw output
+/// [skim] transformed view (cat → skim --mode=pseudo): annotations, decorators removed: 2/3 files — SKIM_PASSTHROUGH=1 for full output
 /// ```
 pub(crate) fn lossy_view_marker(
     origin: Option<&str>,
@@ -718,11 +830,145 @@ pub(crate) fn lossy_view_marker(
             "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}: {differing}/{total} files{suffix}"
         ),
         // Direct invocation, single file
-        (None, n) if n <= 1 => format!("[skim] {class}{suffix}"),
+        (None, n) if n <= 1 => format!("[skim] {mode_str} view: {class}{suffix}"),
         // Direct invocation, multi-file
-        (None, _) => format!("[skim] {class}: {differing}/{total} files{suffix}"),
+        (None, _) => format!("[skim] {mode_str} view: {class}: {differing}/{total} files{suffix}"),
     };
     Some(marker)
+}
+
+// ============================================================================
+// Delivered cost — what the reader actually received
+// ============================================================================
+
+/// Which view the ADR-001 net-savings guard actually served.
+///
+/// Recorded from the guard's own verdict, never inferred. The only signal a
+/// database without these columns can offer is token identity
+/// (`raw_tokens == compressed_tokens`),
+/// and the field that *looks* like it answers this — `parse_tier` — answers a
+/// different question: [`crate::process::parse_tier_from`] is evaluated BEFORE
+/// the guard runs, and its call site says so in as many words ("the parse tier
+/// reflects the transformation, not the final selection").
+///
+/// Measured on the author's 90-day corpus (68,326 rows, 2026-06-27 → 2026-09-25):
+/// of the 6,020 `command_type='file'` rows labelled `parse_tier='full'`, 2,154
+/// — **35.8%** — carry `raw_tokens == compressed_tokens`, i.e. are guard
+/// Passthroughs wearing a transform's label. Both that figure and the 37.9%
+/// reported from an earlier snapshot are estimates of the same quantity through
+/// the same proxy; this enum is what replaces the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// The guard elected raw: the reader received the source's own bytes.
+    Raw,
+    /// The guard kept the compressed view: the reader received a transform.
+    Transformed,
+}
+
+impl Served {
+    /// Stable DB spelling for the `served` column.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Transformed => "transformed",
+        }
+    }
+}
+
+/// The exact stderr disclosure an invocation emits, carried as the bytes that
+/// go on the wire so its cost cannot be a second estimate of itself.
+///
+/// [`EmittedNotice::line`] is what the emitter writes; [`EmittedNotice::bytes`]
+/// and [`EmittedNotice::tokens`] measure that same `String`. There is no
+/// separate cost model to drift out of step with the text — the failure mode a
+/// const per-mode cost table would have (PF-027 genus: silently wrong, no
+/// failing test, no visible diff).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmittedNotice {
+    /// Terminator included. The emitter writes this verbatim with `eprint!`;
+    /// folding the `\n` in here rather than leaving it to `eprintln!` is what
+    /// makes the measured string and the written string the same string, so the
+    /// reader is charged for the byte they actually receive.
+    line: String,
+}
+
+impl EmittedNotice {
+    /// The exact bytes to write to stderr. Emit with `eprint!`, not `eprintln!`
+    /// — the terminator is already here, and that is the point.
+    pub(crate) fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// Byte cost of the disclosure as emitted.
+    pub(crate) fn bytes(&self) -> usize {
+        self.line.len()
+    }
+
+    /// cl100k token cost of the disclosure as emitted.
+    ///
+    /// `None` when the tokeniser is unavailable — which is a measurement
+    /// failure, not a cost of zero, and is stored as SQL NULL so the two stay
+    /// distinguishable.
+    ///
+    /// Not cached: the only caller is the analytics background thread, which
+    /// asks once per row. Computing it eagerly in [`emitted_notice_cost`] would
+    /// put a BPE call on the main thread for every lossy read, including the
+    /// runs that never record.
+    pub(crate) fn tokens(&self) -> Option<usize> {
+        crate::tokens::count_tokens(&self.line).ok()
+    }
+}
+
+/// The disclosure this invocation emits, and therefore charges the reader.
+///
+/// Arguments are [`lossy_view_marker`]'s, and `None` propagates from it: no
+/// differing view, no marker, no cost.
+///
+/// # Why one function with two callers
+///
+/// `write_result_and_stats` emits it and `record_file_analytics` records it.
+/// Before this existed the recorded cost did not exist at all — `compressed_tokens`
+/// counts the stdout body and stops there, so every lossy file read understated
+/// what it put in the reader's context by the width of its own disclosure.
+/// Routing both through here makes the recorded number the emitted number by
+/// construction rather than by a second derivation that agrees today.
+///
+/// # Size of this defect, stated honestly
+///
+/// This is the **smallest of the three** analytics defects fixed alongside it,
+/// and it is worth naming the gap rather than letting the fix imply importance.
+/// Measured on the 90-day corpus (68,326 rows). Every single-file marker
+/// variant was tokenised: the emitted cost spans **23–34 cl100k tokens**
+/// (77–126 bytes) — 23–25 for a direct `skim <file>`, 31–34 once a hook origin
+/// puts `cat → skim --mode=…` in the line.
+///
+/// - Excluding this notice moves the headline by **−0.134% to −0.198%**
+///   (4,670 single-`file` rows whose view differs × 23–34 tokens, against an
+///   80,238,562-token headline). Triage reported −0.14%, which is this band's
+///   direct-invocation end.
+/// - The `ELSE 0` clamp in `query_summary` hides **11,983,387** tokens of real
+///   expansion, making the same headline **+17.6% over truth**.
+/// - `AVG(savings_pct)` over all rows reads 13.41% where the same average over
+///   rows that actually changed reads 35.96% — a **22.5-point** dilution by
+///   42,844 no-op rows.
+///
+/// So the defect that prompted this work is ~120× smaller than the largest one
+/// standing beside it, by headline movement. Shipping it alone would have
+/// corrected 0.14% and left 17.6% in place. What it is *not* small in is sign:
+/// the notice exceeds the whole saving on **9.3%–10.7%** of saving file rows
+/// (422–487 of 4,550), which turns a recorded win into a real loss — a fact no
+/// aggregate can show, and the reason this is worth recording per row rather
+/// than subtracting in the dashboard.
+pub(crate) fn emitted_notice_cost(
+    origin: Option<&str>,
+    mode_str: &str,
+    differing: usize,
+    total: usize,
+) -> Option<EmittedNotice> {
+    let marker = lossy_view_marker(origin, mode_str, differing, total)?;
+    Some(EmittedNotice {
+        line: format!("{marker}\n"),
+    })
 }
 
 /// Lossy-view marker for `--json` command output (D1 / ADR-011 class 1 —
@@ -841,6 +1087,73 @@ mod lossy_json_view_marker_tests {
 }
 
 #[cfg(test)]
+mod emitted_notice_cost_tests {
+    use super::*;
+
+    /// The measured line is the emitted line: marker plus the one terminator
+    /// `eprint!("{}", notice.line())` puts on the wire.
+    #[test]
+    fn line_is_the_marker_plus_its_terminator() {
+        let marker = lossy_view_marker(None, "structure", 1, 1).expect("marker");
+        let notice = emitted_notice_cost(None, "structure", 1, 1).expect("notice");
+
+        assert_eq!(notice.line(), format!("{marker}\n"));
+        assert_eq!(notice.bytes(), marker.len() + 1);
+    }
+
+    /// The terminator costs exactly one cl100k token.
+    ///
+    /// `fidelity::decide_with_notice` charges the TRIMMED marker and documents
+    /// the wire cost as "one byte and one token higher". This pins that claim
+    /// from the emitting side, so the guard's charge and the recorded cost
+    /// cannot drift apart by an unexamined newline.
+    #[test]
+    fn terminator_costs_exactly_one_token() {
+        for mode in ["structure", "pseudo", "minimal", "signatures", "types"] {
+            for origin in [None, Some("cat")] {
+                let marker = lossy_view_marker(origin, mode, 1, 1).expect("marker");
+                let trimmed = crate::tokens::count_tokens(&marker).expect("tokeniser");
+                let emitted = emitted_notice_cost(origin, mode, 1, 1)
+                    .expect("notice")
+                    .tokens()
+                    .expect("tokeniser");
+                assert_eq!(
+                    emitted,
+                    trimmed + 1,
+                    "{mode}/{origin:?}: emitted cost must be the trimmed cost plus one terminator"
+                );
+            }
+        }
+    }
+
+    /// No differing view, no marker, no cost — `None` propagates rather than
+    /// becoming a zero-cost notice that a recorder would store as a measured 0.
+    #[test]
+    fn identical_view_has_no_notice_at_all() {
+        assert!(emitted_notice_cost(None, "structure", 0, 1).is_none());
+        assert!(emitted_notice_cost(Some("cat"), "pseudo", 0, 3).is_none());
+    }
+
+    /// The multi-file marker is one line for the whole run, and costs one line.
+    #[test]
+    fn multi_file_notice_is_a_single_line() {
+        let notice = emitted_notice_cost(Some("cat"), "structure", 2, 3).expect("notice");
+        assert_eq!(
+            notice.line().matches('\n').count(),
+            1,
+            "an aggregate marker is one line; charging it to one row must charge one line"
+        );
+        assert!(notice.line().contains("2/3 files"));
+    }
+
+    #[test]
+    fn served_spellings_are_stable() {
+        assert_eq!(Served::Raw.as_str(), "raw");
+        assert_eq!(Served::Transformed.as_str(), "transformed");
+    }
+}
+
+#[cfg(test)]
 mod lossy_view_marker_tests {
     use super::*;
 
@@ -855,10 +1168,23 @@ mod lossy_view_marker_tests {
         );
         assert!(marker.contains("cat"), "must name origin");
         assert!(marker.contains("pseudo"), "must name mode");
-        assert!(marker.contains("bodies"), "B4: must name elided class");
+        assert!(
+            marker.contains("annotations, decorators removed"),
+            "B4: must name the class pseudo actually elides; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("bodies"),
+            "pseudo keeps every body — the marker must not claim otherwise; got: {marker:?}"
+        );
         assert!(
             marker.contains("SKIM_PASSTHROUGH=1"),
             "must carry remedy hint"
+        );
+        // The mode is named exactly once: inside the reproduced command.
+        assert_eq!(
+            marker.matches("pseudo").count(),
+            1,
+            "the mode must be named exactly once; got: {marker:?}"
         );
     }
 
@@ -880,12 +1206,28 @@ mod lossy_view_marker_tests {
         // B3: fires without SKIM_REWRITTEN_FROM — no "transformed view" header.
         let result = lossy_view_marker(None, "pseudo", 1, 1);
         let marker = result.expect("differing=1 must produce a marker");
-        // B4: class label is the primary identifier for direct invocations.
-        assert!(marker.contains("pseudo"), "must name mode class");
-        assert!(marker.contains("bodies"), "B4: must name elided class");
+        // B4: the direct form carries the mode in a `<mode> view:` prefix, since
+        // there is no reproduced command to carry it.
+        assert!(
+            marker.starts_with("[skim] pseudo view: "),
+            "direct form must name the mode once, as a prefix; got: {marker:?}"
+        );
+        assert!(
+            marker.contains("annotations, decorators removed"),
+            "B4: must name the class pseudo actually elides; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("bodies"),
+            "pseudo keeps every body — the marker must not claim otherwise; got: {marker:?}"
+        );
         assert!(
             marker.contains("SKIM_PASSTHROUGH=1"),
             "must carry remedy hint"
+        );
+        assert_eq!(
+            marker.matches("pseudo").count(),
+            1,
+            "the mode must be named exactly once; got: {marker:?}"
         );
     }
 
@@ -917,19 +1259,92 @@ mod lossy_view_marker_tests {
         assert_eq!(REWRITE_ORIGIN_ENV, "SKIM_REWRITTEN_FROM");
     }
 
+    /// The class clause must name what is GONE — the property ADR-011 asks for.
+    ///
+    /// Replaces a `label.len() > "transformed view".len()` floor that measured
+    /// nothing useful. Length is not correlated with disclosure: the floor
+    /// passed for any 17 characters of noise, and it REJECTED the correct
+    /// 14-character answer (`structure` -> `"bodies removed"`), so it could not
+    /// have survived this commit's accuracy fix regardless.
+    ///
+    /// The three assertions below are the properties ADR-011 actually names:
+    /// every known mode owns an arm, the clause states that something is gone,
+    /// and it says WHAT — a clause that only restates the mode ("pseudo view")
+    /// is explicitly ruled insufficient.
     #[test]
-    fn test_mode_class_labels_cover_all_known_modes() {
-        // Ensure mode_class_label returns meaningful strings for all known modes.
-        for mode in &["pseudo", "minimal", "structure", "signatures", "types"] {
+    fn test_mode_class_label_names_the_elided_class() {
+        let fallback = super::mode_class_label("__nonexistent__");
+
+        for mode in &[
+            "pseudo",
+            "minimal",
+            "structure",
+            "signatures",
+            "types",
+            "full",
+        ] {
             let label = super::mode_class_label(mode);
+
+            // 1. Every known mode owns an arm; none falls through to the catch-all.
+            assert_ne!(
+                label, fallback,
+                "mode {mode} must not fall through to the {fallback:?} catch-all"
+            );
+
+            // 2. The clause names an ELISION: it says something is gone.
             assert!(
-                !label.is_empty(),
-                "class label must be non-empty for mode {mode}"
+                label.ends_with(" removed") || label.ends_with(" omitted"),
+                "ADR-011: the clause for {mode} must name an elision; got: {label:?}"
+            );
+
+            // 3. It names WHAT is gone. A bare verb names no class, and a clause
+            //    that only restates the mode name carries no information the
+            //    marker does not already print beside it.
+            let subject = label
+                .rsplit_once(' ')
+                .expect("an elision clause has a subject before its verb")
+                .0;
+            assert!(
+                !subject.is_empty(),
+                "ADR-011: the clause for {mode} must name the elided subject; got: {label:?}"
             );
             assert!(
-                label.len() > "transformed view".len(),
-                "B4: class label must be more descriptive than 'transformed view' for mode {mode}"
+                !subject.eq_ignore_ascii_case(mode),
+                "ADR-011: the clause for {mode} must name the elided class, not restate \
+                 the mode name; got: {label:?}"
             );
+        }
+    }
+
+    /// Two modes that elide different things must not share a clause.
+    ///
+    /// RED at efac056: `signatures` carried `structure`'s `"bodies removed"`
+    /// verbatim, so the marker disclosed only the bodies. Measured on
+    /// `tests/fixtures/python/mixed_priority.py` (37 lines), `--mode=signatures`
+    /// emits 5 `def` lines: it also drops the imports, both classes, every
+    /// docstring and both module constants.
+    ///
+    /// This is the assertion the replaced length floor was structurally unable
+    /// to make — two identical labels both cleared the floor.
+    #[test]
+    fn test_mode_class_labels_are_distinct_per_mode() {
+        const MODES: [&str; 6] = [
+            "pseudo",
+            "minimal",
+            "structure",
+            "signatures",
+            "types",
+            "full",
+        ];
+
+        for (i, a) in MODES.iter().enumerate() {
+            for b in &MODES[i + 1..] {
+                assert_ne!(
+                    super::mode_class_label(a),
+                    super::mode_class_label(b),
+                    "modes {a} and {b} elide different things and must not share a class clause"
+                );
+            }
         }
     }
 
@@ -937,22 +1352,113 @@ mod lossy_view_marker_tests {
     /// `"transformed view"` catch-all instead of a dedicated description.
     ///
     /// Today: `mode_class_label("full")` returns `"transformed view"`.
-    /// After fix: returns `"line-sliced view: content verbatim, lines outside the range omitted"`.
+    /// After fix: returns the `full` class clause.
     ///
-    /// This is a new `"full"` match arm in the `mode_class_label` match —
-    /// do NOT edit `test_mode_class_labels_cover_all_known_modes` (it covers the
-    /// five non-full modes and is intentionally separate from this test).
+    /// The clause was `"line-sliced view: content verbatim, lines outside the
+    /// range omitted"` until the table's contract narrowed to the elided class
+    /// alone; `lossy_view_marker` now supplies the `full view:` prefix, and the
+    /// "content verbatim" half restated what `full` means rather than naming
+    /// anything elided.
     #[test]
     fn test_mode_class_label_full_has_dedicated_arm() {
         let label = super::mode_class_label("full");
         let fallback = super::mode_class_label("__nonexistent__");
         assert_eq!(
-            label, "line-sliced view: content verbatim, lines outside the range omitted",
+            label, "lines outside range omitted",
             "full mode must have a dedicated class label, got: {label:?}"
         );
         assert_ne!(
             label, fallback,
             "full mode label must differ from the default fallback ({fallback:?})"
+        );
+    }
+
+    /// Ceiling: the exact byte and cl100k-token cost of all 14 composed markers
+    /// (7 class clauses x direct/origin form).
+    ///
+    /// Every one of these is an ADR-011 class-1 disclosure — unconditional — so
+    /// its cost is paid on every lossy read. ADR-001's net-savings guard is a
+    /// SIZE comparison, which makes the marker's own size load-bearing: on a
+    /// small file it can decide whether skim serves the transform or falls back
+    /// to raw (ADR-008 measured 186 B raw -> 166 B stdout plus a 277 B stderr
+    /// marker = net +257 B, +138%). Pinning the costs here makes a future label
+    /// edit show its guard consequence as a visible diff instead of silently
+    /// moving that decision.
+    ///
+    /// # What is pinned, exactly
+    ///
+    /// The `String` [`lossy_view_marker`] returns. `process.rs` emits it with
+    /// `eprintln!`, so the cost ON THE WIRE is one byte and one cl100k token
+    /// more than every number below (measured, not assumed).
+    ///
+    /// The origin column is held at `cat` for all seven rows so a row-to-row
+    /// diff isolates the class clause rather than the origin word. A
+    /// `head`/`tail` origin is one byte longer: `full` — the only mode that
+    /// reaches this table via `head`/`tail` — costs 119 B / 32 t in its
+    /// production origin form.
+    ///
+    /// The last row exercises the `_` fallback arm. No production `mode_str`
+    /// reaches it (`multi.rs` derives the string from a closed mode enum), so
+    /// `"unknown"` is a documented 7-character stand-in: the row pins the cost
+    /// of the fallback CLAUSE, with the mode-name contribution held fixed.
+    ///
+    /// Token counts are cl100k_base via `tokens::count_tokens`, the same
+    /// encoding `--show-stats` reports.
+    #[test]
+    fn test_lossy_view_marker_composed_cost_ceiling() {
+        // (mode_str, direct bytes, direct tokens, origin bytes, origin tokens)
+        const COSTS: &[(&str, usize, usize, usize, usize)] = &[
+            ("pseudo", 90, 24, 124, 32),
+            ("minimal", 84, 24, 118, 32),
+            ("structure", 76, 22, 110, 30),
+            ("signatures", 89, 24, 123, 33),
+            ("types", 79, 24, 113, 32),
+            ("full", 84, 24, 118, 32),
+            ("unknown", 75, 22, 109, 30),
+        ];
+
+        for &(mode, direct_bytes, direct_tokens, origin_bytes, origin_tokens) in COSTS {
+            let direct =
+                lossy_view_marker(None, mode, 1, 1).expect("differing=1 must produce a marker");
+            let origin = lossy_view_marker(Some("cat"), mode, 1, 1)
+                .expect("differing=1 must produce a marker");
+
+            assert_eq!(
+                direct.len(),
+                direct_bytes,
+                "direct marker bytes moved for {mode}: {direct:?}"
+            );
+            assert_eq!(
+                origin.len(),
+                origin_bytes,
+                "origin marker bytes moved for {mode}: {origin:?}"
+            );
+            assert_eq!(
+                crate::tokens::count_tokens(&direct).expect("cl100k count is infallible"),
+                direct_tokens,
+                "direct marker tokens moved for {mode}: {direct:?}"
+            );
+            assert_eq!(
+                crate::tokens::count_tokens(&origin).expect("cl100k count is infallible"),
+                origin_tokens,
+                "origin marker tokens moved for {mode}: {origin:?}"
+            );
+        }
+    }
+
+    /// The `head`/`tail` origin word is one byte longer than `cat`, and `full`
+    /// only ever reaches the marker table through those two rewrites — so this
+    /// is `full`'s real production cost, pinned beside the `cat`-normalised
+    /// table above.
+    #[test]
+    fn test_lossy_view_marker_full_head_origin_cost() {
+        let m = lossy_view_marker(Some("head"), "full", 1, 1)
+            .expect("differing=1 must produce a marker");
+        assert_eq!(m.len(), 119, "head-origin full marker bytes moved: {m:?}");
+        assert_eq!(
+            crate::tokens::count_tokens(&m).expect("cl100k count is infallible"),
+            32,
+            "head-origin full marker tokens moved: {m:?}"
         );
     }
 }
