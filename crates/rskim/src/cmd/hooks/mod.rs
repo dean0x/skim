@@ -35,6 +35,7 @@ pub(crate) mod cursor;
 pub(crate) mod gemini;
 
 use super::session::AgentKind;
+use crate::cmd::integrity::ScriptIntegrity;
 
 /// Whether an agent supports real hooks or awareness-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,13 +563,43 @@ pub(crate) enum HookMode {
 /// Recognising the declaration is NOT the same as honouring it. The marker lives
 /// in the hook script, which is precisely the artefact a tamper edits, so every
 /// caller must clear its own integrity gate before acting on the result (PF-016).
-/// No caller acts on it yet, and [`generate_hook_script`] does not write it.
+/// [`honour_dev_declaration`] is that gate, and [`generate_hook_script`] does not
+/// write the marker.
 pub(crate) fn parse_mode_from_script(contents: &str) -> HookMode {
     if contents.lines().any(|line| line.trim() == HOOK_DEV_MARKER) {
         HookMode::Dev
     } else {
         HookMode::Strict
     }
+}
+
+/// Whether an installed hook script's mode declaration may be ACTED ON.
+///
+/// [`parse_mode_from_script`] answers "what does the script say"; this answers
+/// "is the script entitled to say it". Every consumer of a dev declaration goes
+/// through here, so the integrity requirement exists in exactly one place and a
+/// second consumer cannot ship with a weaker one.
+///
+/// # Why the gate is `Verified` specifically, not "anything but `Tampered`"
+///
+/// The declaration is a line in the hook script — the artefact a tamper edits —
+/// so a gate the writer of that file can also satisfy is not a gate at all. The
+/// obvious weaker spelling, "not `Tampered`", is reachable by exactly the attack
+/// PF-016 records as deliberately left open: `skim doctor`'s integrity match
+/// returns early for `Tampered` and `Unreadable` but lets `NoManifest` FALL
+/// THROUGH to the pin and currency checks, and anyone who can append a line to
+/// the script can also delete `{hooks}/skim-{agent}.sha256`. Append the marker,
+/// delete the sidecar, and the verdict is `NoManifest` — which under a "not
+/// `Tampered`" gate would waive the commit check and silence the one signal that
+/// says which build is running, turning a declared property into a self-asserted
+/// one. `Unreadable` is refused for the same reason: a script that cannot be
+/// hashed declares nothing.
+///
+/// This mirrors the shape `skim init` already uses — `install::run_install_single`
+/// computes `integrity_verified` as `matches!(…, ScriptIntegrity::Verified)`, so
+/// all three non-`Verified` states block the fast path there too.
+pub(crate) fn honour_dev_declaration(mode: HookMode, integrity: &ScriptIntegrity) -> bool {
+    matches!(mode, HookMode::Dev) && matches!(integrity, ScriptIntegrity::Verified)
 }
 
 /// Generate a standard hook script for an agent.
@@ -861,6 +892,48 @@ mod tests {
     #[test]
     fn test_parse_mode_from_script_empty_is_strict() {
         assert_eq!(parse_mode_from_script(""), HookMode::Strict);
+    }
+
+    // ---- honour_dev_declaration ----
+
+    /// The full 2×4 grid. Exactly ONE cell honours the declaration, and the test
+    /// enumerates the other seven rather than spot-checking, so a future widening
+    /// of the gate — to "not Tampered", or to any state a tamperer can reach —
+    /// fails here instead of silently shipping (PF-016).
+    #[test]
+    fn test_honour_dev_declaration_requires_dev_and_verified() {
+        let grid = [
+            (HookMode::Dev, ScriptIntegrity::Verified, true),
+            (HookMode::Dev, ScriptIntegrity::NoManifest, false),
+            (HookMode::Dev, ScriptIntegrity::Tampered, false),
+            (HookMode::Dev, ScriptIntegrity::Unreadable, false),
+            (HookMode::Strict, ScriptIntegrity::Verified, false),
+            (HookMode::Strict, ScriptIntegrity::NoManifest, false),
+            (HookMode::Strict, ScriptIntegrity::Tampered, false),
+            (HookMode::Strict, ScriptIntegrity::Unreadable, false),
+        ];
+
+        for (mode, integrity, expected) in grid {
+            assert_eq!(
+                honour_dev_declaration(mode, &integrity),
+                expected,
+                "honour_dev_declaration({mode:?}, {integrity:?}) must be {expected}"
+            );
+        }
+    }
+
+    /// The specific attack PF-016 leaves open, spelled out on its own so the
+    /// reason this cell is `false` survives a refactor of the grid above:
+    /// appending the marker to a script and deleting its `.sha256` sidecar
+    /// yields `NoManifest`, which doctor deliberately does NOT treat as drift.
+    /// A "not Tampered" gate would waive the commit check for anyone holding a
+    /// write handle to the script.
+    #[test]
+    fn test_honour_dev_declaration_refuses_no_manifest_downgrade() {
+        assert!(
+            !honour_dev_declaration(HookMode::Dev, &ScriptIntegrity::NoManifest),
+            "deleting the manifest must not become a way to self-assert dev mode"
+        );
     }
 
     /// git_commit is embedded UNQUOTED in the hook script, so the safety predicate

@@ -54,8 +54,8 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     println!();
 
     // 3. Hooks
-    let hook_drift = print_hook_section(compiled_version, compiled_commit)?;
-    if hook_drift {
+    let hooks = print_hook_section(compiled_version, compiled_commit)?;
+    if hooks.drift {
         drift = true;
     }
     println!();
@@ -72,7 +72,12 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     println!();
 
     // 6. Staleness vs. repo HEAD
-    let staleness_drift = print_staleness_section(compiled_commit);
+    //
+    // Keyed on what the INSTALLED HOOKS declare (gathered in section 3), never on
+    // a flag: `skim doctor` takes no `--dev`, so the installed state is the only
+    // input it has. When no hook is dev-pinned this is `false` and the section
+    // behaves exactly as it always has.
+    let staleness_drift = print_staleness_section(compiled_commit, hooks.any_dev_pinned);
     if staleness_drift {
         drift = true;
     }
@@ -505,10 +510,30 @@ fn hook_status_line(
     )
 }
 
-/// Print the hooks section and return true if any drift is detected.
-fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::Result<bool> {
+/// What the hooks section observed, for the sections that follow it.
+struct HookSectionVerdict {
+    /// True when at least one agent's hook contributes drift (exit 1).
+    drift: bool,
+    /// True when at least one INSTALLED hook credibly declares dev mode.
+    ///
+    /// "Credibly" is [`crate::cmd::hooks::honour_dev_declaration`]: the script
+    /// must declare the marker AND its manifest must verify. This is what the
+    /// staleness section keys off — `print_staleness_section` reads the compiled
+    /// commit and nothing about the install, so without this it could not see a
+    /// dev declaration at all.
+    any_dev_pinned: bool,
+}
+
+/// Print the hooks section and report what it observed.
+fn print_hook_section(
+    compiled_version: &str,
+    compiled_commit: &str,
+) -> anyhow::Result<HookSectionVerdict> {
     println!("Hooks");
-    let mut any_drift = false;
+    let mut verdict = HookSectionVerdict {
+        drift: false,
+        any_dev_pinned: false,
+    };
 
     for &agent in AgentKind::all_supported() {
         let facts = match crate::cmd::init::hook_facts(agent) {
@@ -520,10 +545,19 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
             }
         };
 
+        // A hook that is not registered never fires, so its script's declaration
+        // governs nothing — the mode is only honoured for an install that is
+        // actually wired up.
+        if facts.hook_installed
+            && crate::cmd::hooks::honour_dev_declaration(facts.hook_mode, &facts.script_integrity)
+        {
+            verdict.any_dev_pinned = true;
+        }
+
         let (drift, line) =
             hook_status_line(&facts, agent.cli_name(), compiled_version, compiled_commit);
         if drift {
-            any_drift = true;
+            verdict.drift = true;
         }
         println!("{line}");
 
@@ -533,7 +567,7 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
         }
     }
 
-    Ok(any_drift)
+    Ok(verdict)
 }
 
 // ============================================================================
@@ -720,6 +754,38 @@ fn print_cache_section() {
 // Staleness vs. repo HEAD
 // ============================================================================
 
+/// An unparseable `git rev-list --count` result is not evidence of being up to
+/// date, so it is treated as at least one commit behind — preserving the
+/// `unwrap_or(true)` this branch used before the verdict was extracted.
+const UNPARSEABLE_COUNT_IS_BEHIND: u64 = 1;
+
+/// Decide the glyph and drift contribution for a behind-HEAD count.
+///
+/// Pure, so the policy is testable without a git repository — the surrounding
+/// section is four bounded subprocesses deep and cannot be unit-tested at all.
+///
+/// # Why dev mode demotes this to advisory
+///
+/// A behind-HEAD count is the one provenance signal whose own recommended remedy
+/// cannot clear it: `cargo build --release` re-stamps the binary at the commit it
+/// was built from, and HEAD moves again on the next commit, so for anyone
+/// mid-feature the count is never zero and `skim doctor` is permanently red. That
+/// is ADR-014's own rule — a provenance signal that cannot be repaired by the
+/// command it recommends is worse than no signal — applied to the check that
+/// breaks it. Demoted, not deleted: the line still prints the count, so the
+/// information survives and only its exit-code authority is withdrawn.
+///
+/// `dev_mode` comes from what the INSTALLED HOOKS declare, never from a flag:
+/// `skim doctor` has no `--dev` to read. When it is `false` every output of this
+/// function is what the section printed before it existed.
+fn staleness_verdict(commits_behind: u64, dev_mode: bool) -> (&'static str, bool) {
+    match (commits_behind, dev_mode) {
+        (0, _) => ("✓", false),
+        (_, false) => ("✗", true),
+        (_, true) => ("⚠", false),
+    }
+}
+
 /// Print the staleness section and return true if drift is detected.
 ///
 /// Staleness algorithm (B4):
@@ -729,8 +795,13 @@ fn print_cache_section() {
 ///   3. `git rev-list <sha>..HEAD --count` — number of commits between the
 ///      compiled SHA and HEAD.
 ///
+/// `dev_mode` demotes a non-zero count to an advisory (see [`staleness_verdict`]).
+/// It is the only term this section takes from the install, and every earlier
+/// gate — git present, inside a repo, SHA reachable — is evaluated before it,
+/// so a dev-pinned hook changes nothing about which branch is reached.
+///
 /// Every git invocation is bounded by [`SUBPROCESS_TIMEOUT`].
-fn print_staleness_section(compiled_commit: &str) -> bool {
+fn print_staleness_section(compiled_commit: &str, dev_mode: bool) -> bool {
     println!("Staleness  (binary vs. repo HEAD)");
 
     if compiled_commit == "unknown" {
@@ -834,19 +905,23 @@ fn print_staleness_section(compiled_commit: &str) -> bool {
     .flatten();
 
     match count_str.as_deref() {
-        Some("0") | Some("") => {
-            println!("  ✓  up to date  (commit {compiled_commit} is HEAD)");
-            false
-        }
-        Some(n) => {
-            let drift = n.parse::<u64>().map(|v| v >= 1).unwrap_or(true);
-            if drift {
+        Some(raw) => {
+            // An empty result is `git rev-list` reporting nothing in the range.
+            let behind = if raw.is_empty() {
+                0
+            } else {
+                raw.parse::<u64>().unwrap_or(UNPARSEABLE_COUNT_IS_BEHIND)
+            };
+            let (glyph, drift) = staleness_verdict(behind, dev_mode);
+            if behind == 0 {
+                println!("  {glyph}  up to date  (commit {compiled_commit} is HEAD)");
+            } else {
+                // `raw`, not `behind`: an unparseable count must still be shown
+                // verbatim rather than replaced by the fallback it was mapped to.
                 println!(
-                    "  ✗  {n} commit(s) behind HEAD  \
+                    "  {glyph}  {raw} commit(s) behind HEAD  \
                      (rebuild: cargo build -p rskim --release)"
                 );
-            } else {
-                println!("  ✓  up to date  (commit {compiled_commit} is HEAD)");
             }
             drift
         }
@@ -1340,6 +1415,73 @@ mod tests {
         assert!(
             info.commit.is_none(),
             "non-skim binary must yield commit: None (--version has no 'skim ' prefix, --commit rejected)"
+        );
+    }
+
+    // ---- staleness_verdict ----
+
+    /// The invariant that makes this feature invisible to everyone who has not
+    /// opted in: with `dev_mode = false` every cell is what the section printed
+    /// and returned before `staleness_verdict` existed — `✓`/no-drift at zero,
+    /// `✗`/drift at any non-zero count.
+    #[test]
+    fn test_staleness_verdict_strict_is_unchanged_from_pre_dev_behaviour() {
+        assert_eq!(staleness_verdict(0, false), ("✓", false));
+        for behind in [1u64, 2, 7, 4096, u64::MAX] {
+            assert_eq!(
+                staleness_verdict(behind, false),
+                ("✗", true),
+                "a strict install {behind} commits behind HEAD must still be drift"
+            );
+        }
+    }
+
+    /// Dev mode demotes a non-zero count to an advisory: the glyph changes and
+    /// the drift contribution goes away, so this section stops forcing exit 1.
+    #[test]
+    fn test_staleness_verdict_dev_demotes_behind_head_to_advisory() {
+        for behind in [1u64, 2, 7, 4096, u64::MAX] {
+            assert_eq!(
+                staleness_verdict(behind, true),
+                ("⚠", false),
+                "a dev-pinned install {behind} commits behind HEAD must be advisory"
+            );
+        }
+    }
+
+    /// Dev mode demotes; it never promotes. An up-to-date binary reports exactly
+    /// the same thing in both modes, so turning dev on cannot make a healthy
+    /// install look worse.
+    #[test]
+    fn test_staleness_verdict_up_to_date_is_identical_in_both_modes() {
+        assert_eq!(staleness_verdict(0, true), staleness_verdict(0, false));
+        assert_eq!(staleness_verdict(0, true), ("✓", false));
+    }
+
+    /// Dev mode waives the exit code, never the information: the count is still
+    /// reported, so `⚠` is only ever reachable alongside a printed count. This
+    /// pins that no input makes the function claim "up to date" for a non-zero
+    /// count in either mode.
+    #[test]
+    fn test_staleness_verdict_never_reports_current_when_behind() {
+        for dev_mode in [false, true] {
+            let (glyph, _) = staleness_verdict(1, dev_mode);
+            assert_ne!(
+                glyph, "✓",
+                "a binary behind HEAD must never render as up to date (dev_mode: {dev_mode})"
+            );
+        }
+    }
+
+    /// The fallback the print path maps an unparseable `git rev-list --count`
+    /// onto must land on the drift side under strict mode, preserving the
+    /// `unwrap_or(true)` it replaced.
+    #[test]
+    fn test_unparseable_count_fallback_is_drift_under_strict_mode() {
+        assert_eq!(
+            staleness_verdict(UNPARSEABLE_COUNT_IS_BEHIND, false),
+            ("✗", true),
+            "an unreadable count must not read as up to date"
         );
     }
 

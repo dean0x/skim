@@ -2108,6 +2108,135 @@ fn test_init_repairs_tampered_hook_not_launders() {
 }
 
 // ============================================================================
+// Dev mode is a property of the COMMAND, not sticky state (ADR-014)
+// ============================================================================
+
+/// The dev declaration an installed hook script carries.
+///
+/// Duplicated from `cmd::hooks::HOOK_DEV_MARKER`, which is `pub(crate)` inside a
+/// bin-only crate and unreachable from an integration test. The duplication is
+/// the point: this literal is the on-disk contract, so a test that followed the
+/// production constant could never fail on a format change.
+const DEV_MARKER_LINE: &str = "export SKIM_HOOK_DEV=1";
+
+/// Install a hook, then leave it with NO integrity manifest — and, when
+/// `declare_dev`, with the dev declaration appended.
+///
+/// Deleting the manifest is what makes this pair discriminating. With a manifest
+/// present, appending the marker yields `Tampered`, and the pre-existing repair
+/// path regenerates the script for a reason that has nothing to do with the
+/// mode — so a passing test would prove nothing about `mode_matches`. With the
+/// manifest gone the verdict is `NoManifest`, whose `create_hook_script` arm
+/// SKIPS the write and re-stamps the on-disk bytes; the mode term is then the
+/// only thing that can send the same script down the regeneration path instead.
+fn install_then_declare(sandbox: &Sandbox, declare_dev: bool) -> std::path::PathBuf {
+    let config = sandbox.claude_config();
+    sandbox
+        .skim()
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .assert()
+        .success();
+
+    let script_path = config.join("hooks/skim-rewrite.sh");
+    if declare_dev {
+        let current = fs::read_to_string(&script_path).unwrap();
+        fs::write(&script_path, format!("{current}{DEV_MARKER_LINE}\n")).unwrap();
+    }
+    fs::remove_file(config.join("hooks/skim-claude-code.sha256")).unwrap();
+    script_path
+}
+
+/// `skim init` with no dev request must STRIP a dev declaration from the
+/// installed script.
+///
+/// This is the counterweight to the commit-gate waiver and the reason
+/// `mode_matches` exists as its own term: without it, a script that declares dev
+/// mode survives every subsequent `skim init`, so the declaration becomes sticky
+/// state and the feature would need an undo flag. ADR-014 rules that dev mode is
+/// a property of the COMMAND — re-running the installer without the flag reverts
+/// to strict pinning.
+#[test]
+fn test_init_without_dev_request_strips_a_dev_declaration() {
+    let sandbox = Sandbox::new();
+    let script_path = install_then_declare(&sandbox, true);
+
+    let declared = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        declared.contains("SKIM_HOOK_DEV"),
+        "setup must leave the declaration in the script"
+    );
+
+    let out = sandbox
+        .skim()
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "init must succeed, got:\n{stdout}");
+    let reverted = fs::read_to_string(&script_path).unwrap();
+    assert!(
+        !reverted.contains("SKIM_HOOK_DEV"),
+        "a plain `skim init` must rewrite the script back to strict, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Skipped"),
+        "the mode mismatch must send the script down the write path, not the \
+         skip-and-re-stamp path, got:\n{stdout}"
+    );
+}
+
+/// The control: identical setup MINUS the declaration takes the skip path.
+///
+/// Without this, the test above could be passing because a missing manifest
+/// alone forces a rewrite — which would make `mode_matches` unobservable and the
+/// assertion vacuous.
+#[test]
+fn test_init_without_a_declaration_still_takes_the_skip_path() {
+    let sandbox = Sandbox::new();
+    let script_path = install_then_declare(&sandbox, false);
+
+    let out = sandbox
+        .skim()
+        .args([
+            "init",
+            "--yes",
+            "--agent",
+            "claude-code",
+            "--no-guidance",
+            "--no-wrappers",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(out.status.success(), "init must succeed, got:\n{stdout}");
+    assert!(
+        stdout.contains("Skipped"),
+        "a strict script with no manifest must be skipped and re-stamped, not \
+         rewritten — otherwise the test above proves nothing, got:\n{stdout}"
+    );
+    assert!(
+        script_path.exists(),
+        "the script must survive the self-heal"
+    );
+}
+
+// ============================================================================
 // Fix: --project --wrappers mutual exclusion
 // ============================================================================
 

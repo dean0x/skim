@@ -62,15 +62,10 @@ pub(crate) struct HookFacts {
     /// Install mode the hook script declares — strict, or dev-pinned.
     ///
     /// Projected across the module boundary so `skim doctor` can reach what the
-    /// INSTALLED HOOK declares without re-reading the script. Nothing reads it
-    /// yet: `hook_status_line` still branches only on integrity, pin and
-    /// currency, so doctor's output and exit code are byte-identical whether or
-    /// not a hook declares dev mode.
-    ///
-    /// Any future reader must sit BEHIND the `script_integrity` gate — the
+    /// INSTALLED HOOK declares without re-reading the script. Doctor pairs it
+    /// with `script_integrity` through `hooks::honour_dev_declaration` — the
     /// declaration lives in the hook script, which is the artefact a tamper
-    /// edits (PF-016).
-    #[allow(dead_code)] // wired ahead of its reader; no caller consults the mode yet
+    /// edits, so it is never read on its own (PF-016).
     pub(crate) hook_mode: crate::cmd::hooks::HookMode,
     /// Whether the hook is fully current (version + pinned binary + commit all match).
     pub(crate) hook_is_current: bool,
@@ -122,20 +117,14 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         .join("hooks")
         .join(helpers::HOOK_SCRIPT_NAME);
 
-    // Integrity is derived from the SHA-256 manifest (independent of the script
-    // bytes), so a tampered script cannot influence this verdict (PF-016).
+    // Integrity comes from `detect_state`, which derives it from the SHA-256
+    // manifest (independent of the script bytes), so a tampered script cannot
+    // influence this verdict (PF-016).
     //
-    // Verification: `detected.hook_config_dir` is the same directory that
-    // `create_hook_script` in `install.rs` passes to `write_hash_manifest`
-    // (`write_hash_manifest(&state.hook_config_dir, state.agent_cli_name, ...)`).
-    // This alignment holds for every agent — including Copilot, whose
-    // `hook_config_dir` redirects to `~/.copilot/` via `HookProtocol::hook_config_dir`.
-    let script_integrity = crate::cmd::integrity::classify_script_integrity(
-        &detected.hook_config_dir,
-        agent.cli_name(),
-        &hook_script_path,
-    );
-
+    // Taken from the detected state rather than reclassified here so that the
+    // verdict doctor REPORTS is the same one `hook_is_current` above consulted
+    // when deciding whether to waive the commit gate. A second classification
+    // could disagree with the first, and the disagreement would be invisible.
     Ok(HookFacts {
         hook_installed: detected.hook_installed,
         hook_version: detected.hook_version,
@@ -146,7 +135,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         hook_is_current: is_current,
         pin_is_current: pin_current,
         hook_script_path,
-        script_integrity,
+        script_integrity: detected.script_integrity,
     })
 }
 

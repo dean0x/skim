@@ -115,9 +115,14 @@ fn print_dual_scope_warning(warning: &str) {
     println!();
 }
 
-fn print_install_summary(state: &DetectedState, agent: AgentKind) {
+/// Print what the install is about to do.
+///
+/// `dev_requested` mirrors the term `create_hook_script` uses to decide whether
+/// it will actually rewrite the script, so the summary cannot claim a no-op that
+/// the write path then performs (or the reverse).
+fn print_install_summary(state: &DetectedState, agent: AgentKind, dev_requested: bool) {
     println!("  Summary:");
-    if !state.hook_installed || !state.hook_is_current() {
+    if !state.hook_installed || !state.hook_is_current() || !state.mode_matches(dev_requested) {
         let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
         let protocol = protocol_for_agent(agent);
@@ -469,6 +474,16 @@ fn run_install_single(
     let guidance_current = is_guidance_current(agent, flags, &state.skim_version, &env);
     let permissions_blocked = permissions_blocks_fast_path(flags, agent, perm_dir);
 
+    // The install mode this invocation asks for. There is no `--dev` flag yet, so
+    // no invocation can request dev mode and every call below reads `false`; the
+    // flag that varies it is the next commit's.
+    //
+    // The term is wired now because the WAIVER lands now. Without it, a hook
+    // script that declares dev mode would survive a plain `skim init` — dev mode
+    // would become sticky state, the opposite of ADR-014's ruling that it is a
+    // property of the COMMAND and needs no undo flag.
+    let dev_requested = false;
+
     // Gate the fast path on integrity, not just manifest presence.
     //
     // Variant decisions:
@@ -485,16 +500,18 @@ fn run_install_single(
     // - Unreadable → fast path BLOCKED (fail-closed): cannot verify the script,
     //                so fall through. create_hook_script also bails on Unreadable
     //                with an actionable error, so both gates agree — no stuck state.
-    let integrity_verified = {
-        use crate::cmd::integrity::{ScriptIntegrity, classify_script_integrity};
-        let script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
-        matches!(
-            classify_script_integrity(&state.hook_config_dir, state.agent_cli_name, &script_path),
-            ScriptIntegrity::Verified
-        )
-    };
+    //
+    // Read from the detected state rather than reclassified here: `hook_is_current`
+    // consults the same field to decide whether a dev declaration waives the commit
+    // gate, and a gate that waives must never be computed from a different read
+    // than the gate that admits.
+    let integrity_verified = matches!(
+        state.script_integrity,
+        crate::cmd::integrity::ScriptIntegrity::Verified
+    );
     if state.hook_installed
         && state.hook_is_current()
+        && state.mode_matches(dev_requested)
         && guidance_current
         && !permissions_blocked
         && !flags.force
@@ -518,7 +535,7 @@ fn run_install_single(
     }
 
     let global = !flags.project;
-    print_install_summary(&state, agent);
+    print_install_summary(&state, agent, dev_requested);
 
     if flags.dry_run {
         // Dry-run writes nothing, so consent is not required to DISPLAY what
@@ -561,6 +578,7 @@ fn run_install_single(
         &env,
         grant_permissions,
         flags.permissions_tier,
+        dev_requested,
     )?;
 
     // Install shell wrappers (global scope only — wrappers are per-user, not per-project).
@@ -634,9 +652,10 @@ fn execute_install(
     env: &InstructionEnv,
     grant_permissions: bool,
     tier: PermissionsTier,
+    dev_requested: bool,
 ) -> anyhow::Result<()> {
     // B7: Create hook script
-    create_hook_script(state)?;
+    create_hook_script(state, dev_requested)?;
 
     // Legacy migration: if this is Cursor, clean skim entries from settings.json
     // before writing to the correct hooks.json. This removes stale entries that
@@ -824,7 +843,14 @@ fn find_git_root_from_cwd() -> Option<std::path::PathBuf> {
 // Hook script generation (B7)
 // ============================================================================
 
-fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
+/// Write (or knowingly skip writing) the agent's hook script.
+///
+/// `dev_requested` is the mode this invocation asks for. It is a term of the
+/// idempotence check below and not merely of the caller's fast path: an
+/// installed script that declares a mode this command did not ask for is not the
+/// artefact this command produces, so skipping the write would leave the
+/// declaration in place and make dev mode sticky state (ADR-014).
+fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Result<()> {
     let hooks_dir = state.hook_config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
 
@@ -841,7 +867,7 @@ fn create_hook_script(state: &DetectedState) -> anyhow::Result<()> {
     // Check if existing script is current (idempotent).
     // Uses the already-detected hook state rather than re-reading the script.
     if script_path.exists() {
-        if state.hook_is_current() {
+        if state.hook_is_current() && state.mode_matches(dev_requested) {
             // Script is current — but only self-heal the manifest when integrity
             // passes. A Tampered verdict means the on-disk bytes are unknown;
             // hashing and writing them would launder the divergence, making a
@@ -1805,6 +1831,7 @@ mod tests {
             hook_binary_pin: None,
             hook_uses_pinned_binary: false,
             hook_mode: crate::cmd::hooks::HookMode::Strict,
+            script_integrity: crate::cmd::integrity::ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name,
