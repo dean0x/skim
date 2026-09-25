@@ -17,11 +17,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           # Full history required by two independent groups of history-dependent tests:
-          #   1. test_ac5_dog_food_risky_query_rs_matches_git_ground_truth compares skim's
+          #   1. test_ac5_dog_food_risky_matches_git_ground_truth compares skim's
           #      --risky per-file commit counts against `git rev-list` ground truth on this
-          #      repository.  With the default fetch-depth: 1 CI gets a shallow clone
-          #      (git_total=1), which fails the non-vacuous >= 67 guard before the parity
-          #      assertions even run (CI run 33906188121, AD-407-11).
+          #      repository, including commits reachable only off the first-parent chain.
+          #      A shallow clone truncates that ground truth (git_total=1 in CI run
+          #      33906188121), so the test skips there instead of verifying (AD-407-11).
           #   2. the corpus harness and the pinned-SHA JSON-content tests (#508) walk real
           #      commit parents, which a depth-1 checkout cannot provide.
           # All other jobs keep the default shallow fetch.
@@ -49,7 +49,7 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run cargo tests
-        run: cargo test --all-features
+        run: cargo test --all-features --no-fail-fast
 
       - name: Run cargo doc tests
         run: cargo test --doc
