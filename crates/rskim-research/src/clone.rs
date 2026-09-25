@@ -116,20 +116,70 @@ pub fn extract_repo_name(url: &str) -> anyhow::Result<String> {
 /// Timeout for any single `git` subprocess (seconds).
 const GIT_SUBPROCESS_TIMEOUT_SECS: u64 = 300;
 
-/// Spawn a child process, hand it to a wait closure on a background thread,
-/// and enforce a hard deadline.  Returns `Err` if spawning fails, the wait
-/// closure returns an error, or the deadline expires.
+/// How long a timed-out call waits, after the kill, for the wait closure to
+/// hand back. The kill closes every pipe the child's process group held, so
+/// the closure normally returns at once; past this grace its thread is left
+/// to finish on its own rather than block the caller.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Spawn `cmd` as the leader of a new process group (Unix), so a timeout can
+/// kill it together with every descendant it started.
+fn spawn_in_own_group(
+    cmd: &mut std::process::Command,
+    label: &str,
+) -> anyhow::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().with_context(|| format!("spawning {label}"))
+}
+
+/// SIGKILL the process group `child_id` leads (see [`spawn_in_own_group`]),
+/// and the child itself. Unix only.
+#[cfg(unix)]
+fn kill_process_tree(child_id: u32) {
+    let Ok(pid) = libc::pid_t::try_from(child_id) else {
+        return;
+    };
+    // SAFETY: kill(2) takes no pointers. A negative pid addresses the process
+    // group whose id is `pid`: the child leads it (process_group(0)), so this
+    // reaches every descendant that did not move to a group of its own. A
+    // group or process that is already gone makes the call fail harmlessly.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+/// Kill the process tree rooted at `child_id` (`taskkill /T` on Windows).
+#[cfg(not(unix))]
+fn kill_process_tree(child_id: u32) {
+    // TerminateProcess via taskkill is the portable option without the
+    // `Child` handle, which the wait thread owns.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &child_id.to_string()])
+        .status();
+}
+
+/// Hand a child spawned by [`spawn_in_own_group`] to a wait closure on a
+/// background thread, and enforce a hard deadline. Returns `Err` if the
+/// wait closure returns an error or the deadline expires.
 ///
 /// The wait strategy is parameterised so callers can use either `Child::wait`
 /// (discard output) or `Child::wait_with_output` (capture stdout/stderr)
-/// without duplicating the spawn/channel/kill/join boilerplate.
+/// without duplicating the channel/kill/join boilerplate.
 ///
-/// # Platform notes
+/// # Deadline
 ///
-/// On timeout the child is killed via SIGKILL (Unix) or `taskkill /F` (Windows)
-/// using the pid captured before the child is moved onto the background thread.
-/// The background thread is then joined; because the process has already been
-/// killed this join completes immediately.
+/// On timeout the child's whole process group is killed (SIGKILL on Unix,
+/// `taskkill /F /T` on Windows) using the pid captured before the child moved
+/// onto the background thread. A descendant that inherited the child's
+/// stdout/stderr would otherwise keep the pipes open and the output reader
+/// blocked until it exits. The call then waits at most [`KILL_GRACE`] for the
+/// thread: it returns within `timeout_secs` plus that grace whatever the
+/// process tree does, and its error reports the time it actually took.
 fn run_with_timeout<F, T>(
     child: std::process::Child,
     label: &str,
@@ -141,10 +191,11 @@ where
     T: Send + 'static,
 {
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    let start = Instant::now();
     // Capture the pid before moving `child` onto the background thread so we
-    // can send SIGKILL without needing the `Child` handle back from the thread.
+    // can kill it without needing the `Child` handle back from the thread.
     let child_id = child.id();
     let (tx, rx) = mpsc::channel();
     let handle = std::thread::spawn(move || {
@@ -155,46 +206,35 @@ where
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => Err(anyhow::anyhow!("{label} wait error: {e}")),
         Err(_timeout) => {
-            // Kill the process using its pid via a platform-appropriate signal.
-            // `std::process::Command` does not give us back the `Child` after
-            // handing it to the thread, so we use the raw pid.
-            #[cfg(unix)]
-            {
-                // SAFETY: kill(2) is always safe to call with a valid pid.
-                unsafe {
-                    libc::kill(child_id as libc::pid_t, libc::SIGKILL);
-                }
+            kill_process_tree(child_id);
+            // Join only a thread that has finished: one still blocked on a
+            // pipe held by a process outside the killed group is detached
+            // (dropping its handle) instead of stretching the deadline.
+            if rx.recv_timeout(KILL_GRACE).is_ok() {
+                let _ = handle.join();
             }
-            #[cfg(not(unix))]
-            {
-                // On Windows, TerminateProcess via taskkill is the safest
-                // portable option available without the Child handle.
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &child_id.to_string()])
-                    .status();
-            }
-            // Join the background thread: the killed process exits quickly, so
-            // this does not block indefinitely.  Joining prevents the thread
-            // from becoming permanently detached after SIGKILL.
-            let _ = handle.join();
-            anyhow::bail!("{label} timed out after {timeout_secs}s");
+            anyhow::bail!(
+                "{label} timed out after {timeout_secs}s: killed its process group and gave up after {:.1}s",
+                start.elapsed().as_secs_f64()
+            );
         }
     }
 }
 
-/// Spawn a `git` command and wait for it to finish, killing it if it exceeds
-/// `GIT_SUBPROCESS_TIMEOUT_SECS`.  Returns `Ok(true)` on success, `Ok(false)`
-/// on non-zero exit, and `Err` if the process could not be spawned or the
-/// timeout expired.
+/// Spawn a `git` command and wait for it to finish, killing it (and its
+/// process group) if it exceeds `GIT_SUBPROCESS_TIMEOUT_SECS`. Returns
+/// `Ok(true)` on success, `Ok(false)` on non-zero exit, and `Err` if the
+/// process could not be spawned or the timeout expired.
 pub fn git_run_with_timeout(mut cmd: std::process::Command, label: &str) -> anyhow::Result<bool> {
-    let child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    let child = spawn_in_own_group(&mut cmd, label)?;
     run_with_timeout(child, label, GIT_SUBPROCESS_TIMEOUT_SECS, |mut c| {
         c.wait().map(|s| s.success())
     })
 }
 
-/// Spawn a `git` command and wait for its output, killing it if it exceeds
-/// `timeout_secs`.  Returns the captured [`std::process::Output`] on success.
+/// Spawn a command and wait for its output, killing it (and its process
+/// group) if it exceeds `timeout_secs`. Returns the captured
+/// [`std::process::Output`] on success.
 ///
 /// Unlike [`git_run_with_timeout`], this variant uses `wait_with_output()` on
 /// the background thread so that stdout/stderr are captured for the caller.
@@ -204,7 +244,7 @@ pub fn git_output_with_timeout(
     label: &str,
     timeout_secs: u64,
 ) -> anyhow::Result<std::process::Output> {
-    let child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    let child = spawn_in_own_group(&mut cmd, label)?;
     run_with_timeout(child, label, timeout_secs, |c| c.wait_with_output())
 }
 
@@ -1637,5 +1677,75 @@ mod tests {
 
         let msg = format!("{err:#}");
         assert!(msg.contains("hasDotgit"), "{msg}");
+    }
+
+    /// Whether `pid` stops existing within `within` (polled every 50 ms).
+    #[cfg(unix)]
+    fn gone_within(pid: libc::pid_t, within: std::time::Duration) -> bool {
+        let step = std::time::Duration::from_millis(50);
+        let polls = within.as_millis() / step.as_millis();
+        (0..=polls).any(|_| {
+            // SAFETY: kill(2) with signal 0 only probes whether `pid` exists.
+            let gone = unsafe { libc::kill(pid, 0) } != 0;
+            if !gone {
+                std::thread::sleep(step);
+            }
+            gone
+        })
+    }
+
+    /// A timed-out child is killed with its whole process group, and the
+    /// call returns on time even though a grandchild inherited the child's
+    /// stdout/stderr pipes (the reader would otherwise wait for its EOF).
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_the_process_group_and_returns_within_the_bound() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 30 & echo $! > \"$1\"; sleep 30")
+            .arg("sh")
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let timeout = Duration::from_secs(1);
+
+        let start = Instant::now();
+        let err = git_output_with_timeout(cmd, "sleepers", timeout.as_secs())
+            .expect_err("a 30 s command must time out after 1 s");
+        let elapsed = start.elapsed();
+
+        let slack = Duration::from_secs(3);
+        let msg = format!("{err:#}");
+        assert!(
+            elapsed < timeout + slack,
+            "returned after {elapsed:?}, over the {timeout:?} bound: {msg}"
+        );
+        assert!(msg.contains("sleepers timed out after 1s"), "{msg}");
+        let reported: Option<f64> = msg
+            .split("gave up after ")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .and_then(|n| n.parse().ok());
+        assert!(
+            reported.is_some_and(|r| {
+                r >= timeout.as_secs_f64() && r <= elapsed.as_secs_f64() + 0.05
+            }),
+            "the message must report the real elapsed time ({elapsed:?} measured): {msg}"
+        );
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            gone_within(grandchild, Duration::from_secs(5)),
+            "grandchild {grandchild} outlived the timeout"
+        );
     }
 }
