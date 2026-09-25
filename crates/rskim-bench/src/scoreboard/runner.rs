@@ -15,8 +15,9 @@
 //! - **Exit status**: stdout must parse as the arm's JSON envelope. A
 //!   non-zero exit with a parsable envelope is accepted (a future no-match
 //!   exit code must not read as a crash); a signal, a timeout, non-JSON
-//!   stdout, or a malformed envelope is an error, which the scoreboard
-//!   reports as a harness error (exit 2), never as a regression.
+//!   stdout, a malformed envelope, or a `degraded[]` page for an entry that
+//!   ranks by temporal data is an error, which the scoreboard reports as a
+//!   harness error (exit 2), never as a regression.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -394,9 +395,10 @@ impl SkimRunner {
     ///
     /// # Errors
     ///
-    /// Any call error, or an oracle-less (`--ast` / `--blast-radius`)
+    /// Any call error; an oracle-less (`--ast` / `--blast-radius`)
     /// pagination entry whose full list exceeds `min(limits) × (MAX_PAGES −
-    /// 1)` — golden integrity cannot bound those in advance.
+    /// 1)` — golden integrity cannot bound those in advance; or an entry
+    /// that ranks by temporal data whose pages report `degraded[]`.
     pub fn observe(&self, root: &Path, q: &PlannedQuery) -> anyhow::Result<Observed> {
         let mut timings = Vec::new();
         let query = q.query.as_deref();
@@ -440,14 +442,16 @@ impl SkimRunner {
             (false, _) => None,
         };
 
+        let observation = EntryObservation {
+            id: q.id.clone(),
+            full,
+            sweeps,
+            limited,
+            text,
+        };
+        ensure_ranking_applied(q, &observation)?;
         Ok(Observed {
-            observation: EntryObservation {
-                id: q.id.clone(),
-                full,
-                sweeps,
-                limited,
-                text,
-            },
+            observation,
             timings,
         })
     }
@@ -465,6 +469,41 @@ impl SkimRunner {
         let out = rskim_research::clone::git_output_with_timeout(cmd, label, self.timeout_secs)
             .with_context(|| format!("running {} ({label})", self.bin.display()))?;
         Ok((out, start.elapsed().as_secs_f64() * 1000.0))
+    }
+}
+
+/// An entry that ranks by skim's temporal data (a temporal sort or
+/// `--blast-radius`) must not come back with `degraded[]` on any page: skim
+/// then served a fallback order, and scoring it would judge that order as
+/// if it were the requested ranking.
+///
+/// # Errors
+///
+/// `q` uses temporal data and a page reports a degraded subsystem.
+fn ensure_ranking_applied(q: &PlannedQuery, observation: &EntryObservation) -> anyhow::Result<()> {
+    if !q.flags.uses_temporal_data() {
+        // Without a requested ranking, degraded[] feeds lexical.silent_fn.
+        return Ok(());
+    }
+    let sweep_pages = observation
+        .sweeps
+        .iter()
+        .flat_map(|s| s.pages.iter().map(|p| &p.page));
+    let limited_pages = observation.limited.iter().map(|(_, page)| page);
+    let mut pages = std::iter::once(&observation.full)
+        .chain(sweep_pages)
+        .chain(limited_pages);
+    match pages.find_map(|p| p.degraded.first()) {
+        None => Ok(()),
+        Some(d) => anyhow::bail!(
+            "skim did not apply the requested ranking: degraded[] reports {} {} \
+             (requested {}, applied {}), so the entry's ordering checks would judge a \
+             fallback order",
+            d.subsystem,
+            d.reason,
+            d.requested.as_deref().unwrap_or("?"),
+            d.applied.as_deref().unwrap_or("?")
+        ),
     }
 }
 
@@ -603,6 +642,87 @@ mod tests {
             assert_eq!(envs.get(removed), Some(&None), "{removed} must be removed");
         }
         assert_eq!(cmd.get_program(), OsStr::new("skim"));
+    }
+
+    #[test]
+    fn a_ranked_entry_whose_ranking_skim_did_not_apply_is_an_error() {
+        use crate::scoreboard::types::{Degraded, VerifyMode};
+
+        let golden = crate::scoreboard::golden::parse_golden(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n\
+             [[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n\
+             [[pagination]]\nid = \"skim-G007\"\nquery = \"build lock\"\nflags = [\"--hot\"]\nlimits = [3]\n\
+             [[prefix]]\nid = \"skim-F001\"\nquery = \"fn\"\nflags = [\"--hot\"]\nlimits = [5]\n",
+        )
+        .unwrap();
+        let plan = crate::scoreboard::metrics::plan(&golden).unwrap();
+        let (plain, swept, prefix) = (&plan[0], &plan[1], &plan[2]);
+
+        let temporal = Degraded {
+            subsystem: "temporal".to_string(),
+            reason: "unsupported_version".to_string(),
+            requested: Some("hot".to_string()),
+            applied: Some("lexical".to_string()),
+        };
+        let page = |degraded: Vec<Degraded>| ResultPage {
+            rows: Vec::new(),
+            has_more: false,
+            verify_mode: VerifyMode::Substring,
+            degraded,
+        };
+        let observation = |q: &PlannedQuery, full, sweeps, limited| EntryObservation {
+            id: q.id.clone(),
+            full,
+            sweeps,
+            limited,
+            text: None,
+        };
+        let sweep = |p: ResultPage| {
+            vec![Sweep {
+                limit: 3,
+                pages: vec![SweepPage { offset: 0, page: p }],
+            }]
+        };
+
+        // Nothing degraded: fine.
+        let clean = observation(prefix, page(vec![]), vec![], vec![(5, page(vec![]))]);
+        ensure_ranking_applied(prefix, &clean).unwrap();
+
+        // Degraded on the full list, a limited page, or a sweep page: an error
+        // naming the entry and skim's reason, never a scored result.
+        for (q, obs) in [
+            (
+                prefix,
+                observation(prefix, page(vec![temporal.clone()]), vec![], vec![]),
+            ),
+            (
+                prefix,
+                observation(
+                    prefix,
+                    page(vec![]),
+                    vec![],
+                    vec![(5, page(vec![temporal.clone()]))],
+                ),
+            ),
+            (
+                swept,
+                observation(
+                    swept,
+                    page(vec![]),
+                    sweep(page(vec![temporal.clone()])),
+                    vec![],
+                ),
+            ),
+        ] {
+            let err = ensure_ranking_applied(q, &obs).expect_err("a degraded ranking");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("unsupported_version"), "{msg}");
+            assert!(msg.contains("lexical"), "{msg}");
+        }
+
+        // Without a requested ranking, degraded[] is lexical.silent_fn's input.
+        let lexical = observation(plain, page(vec![temporal]), vec![], vec![]);
+        ensure_ranking_applied(plain, &lexical).unwrap();
     }
 
     #[test]

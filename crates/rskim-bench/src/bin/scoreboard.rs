@@ -18,8 +18,9 @@
 //!   `bless` exits 0 when it wrote the baseline).
 //! - `1` — gate failure (`check`), or `bless` refused.
 //! - `2` — harness error: clone verification, golden integrity, an invalid
-//!   data file, a skim crash / timeout / unparsable output, a corpus changed
-//!   by the run. A harness error is never reported as a regression.
+//!   data file, a skim crash / timeout / unparsable output, temporal data
+//!   skim reports unusable for entries that rank by it, a corpus changed by
+//!   the run. A harness error is never reported as a regression.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

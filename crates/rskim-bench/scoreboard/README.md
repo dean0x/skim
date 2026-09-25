@@ -72,7 +72,7 @@ cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/ski
 |---|---|
 | `0` | Gate passed (`check`), the run finished (`run`), or the baseline was written (`bless`). |
 | `1` | Gate failure (`check`), or `bless` refused. |
-| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
+| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
 
 On a gate failure, stderr prints one `FAIL <check> [<ids>]: <message>` line per failure, and `report.md` lists them
 under "Gate failures".
@@ -214,8 +214,9 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
   A PR outside these paths skips the job, and GitHub reports a skipped job as passing.
 - **Binary.** Build Check uploads its release `skim` as the `skim-release` artifact (kept 1 day). The scoreboard
   downloads it and restores the exec bit.
-- **Fail closed.** If Build Check or change detection fails, the scoreboard job still runs, and its first step fails
-  it. A failed build can never turn into a green skip.
+- **Fail closed.** If change detection fails, or Build Check fails on a run that touches a search path, the
+  scoreboard job still runs, and its first step fails it. A failed build can never turn a search PR's gate into a
+  green skip.
 - **Caches.** The corpora are cached under a key on `corpora.toml`'s hash, and are saved only by a successful run.
   The scoreboard's cargo build has its own key prefix (`cargo-build-scoreboard-`).
 - **Output.** `report.md` goes to the job's step summary. `report.json` + `report.md` are uploaded as the

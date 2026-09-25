@@ -568,6 +568,7 @@ fn evaluate_scores_a_fixture_corpus_end_to_end() {
     let stats = StatsSnapshot {
         file_count: 3,
         skipped_by_reason: BTreeMap::new(),
+        temporal_state: None,
     };
 
     let mut ident_rows = vec![row("src/b.rs", 2.0), row("src/a.rs", 1.0)];
@@ -656,6 +657,7 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
     let stats = StatsSnapshot {
         file_count: 1,
         skipped_by_reason: BTreeMap::new(),
+        temporal_state: None,
     };
     assert!(evaluate(&universe, &stats, &plan, &[]).is_err());
 }

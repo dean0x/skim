@@ -521,6 +521,13 @@ impl QueryFlags {
         self.temporal.is_some() || self.blast_radius.is_some()
     }
 
+    /// Whether skim serves these flags from its temporal data (`temporal.db`):
+    /// a temporal sort, or `--blast-radius`'s co-change peers. Without that
+    /// data skim falls back to another order.
+    pub fn uses_temporal_data(&self) -> bool {
+        self.temporal.is_some() || self.blast_radius.is_some()
+    }
+
     /// The oracle query for `query`'s full result set, or `None` when that
     /// set is not a lexical predicate (`--ast` intersects with structural
     /// matches; `--blast-radius` adds co-change peers).
@@ -1025,6 +1032,14 @@ limits = [5, 20]
         assert_eq!(f.match_mode(), MatchMode::PhraseNear { span: 4 });
         assert_eq!(f.verify_mode(), VerifyMode::PhraseNear);
         assert!(f.has_rank_override(), "a temporal sort re-orders the list");
+        assert!(f.uses_temporal_data(), "--hot is served from temporal.db");
+        assert!(
+            flags(&["--blast-radius", "src/a.rs"])
+                .unwrap()
+                .uses_temporal_data(),
+            "co-change peers are served from temporal.db"
+        );
+        assert!(!flags(&["--ast", "try-catch"]).unwrap().uses_temporal_data());
         let q = f.oracle_query("auto refresh stale").unwrap().unwrap();
         assert_eq!(q.mode(), MatchMode::PhraseNear { span: 4 });
 
@@ -1032,6 +1047,7 @@ limits = [5, 20]
         let q = lang.oracle_query("rskim-core").unwrap().unwrap();
         assert!(q.matches("Cargo.toml", "rskim-core") && !q.matches("a.md", "rskim-core"));
         assert!(!lang.has_rank_override());
+        assert!(!lang.uses_temporal_data());
 
         // The full set of an AST or blast-radius query is not a lexical predicate.
         assert!(

@@ -274,6 +274,10 @@ pub struct StatsSnapshot {
     /// Persisted (producer-phase) skips by reason, zero counts absent —
     /// compare with [`crate::scoreboard::universe::Universe::persisted_skipped_by_reason`].
     pub skipped_by_reason: BTreeMap<String, u64>,
+    /// `temporal_state`: the health of skim's temporal data (`"ready"`, or
+    /// `"empty"` / `"corrupt"` / `"newer-schema"` / `"missing"`). `None` when
+    /// the key is absent.
+    pub temporal_state: Option<String>,
 }
 
 impl StatsSnapshot {
@@ -282,7 +286,8 @@ impl StatsSnapshot {
     /// # Errors
     ///
     /// Returns an error for non-JSON output, skim's `{"error": …}` envelope
-    /// (no index), a missing `file_count`, or a non-integer count.
+    /// (no index), a missing `file_count`, a non-integer count, or a
+    /// `temporal_state` that is not a string.
     pub fn parse(stdout: &[u8]) -> anyhow::Result<Self> {
         let value: Value =
             serde_json::from_slice(stdout).context("skim --stats stdout is not valid JSON")?;
@@ -308,6 +313,7 @@ impl StatsSnapshot {
         Ok(StatsSnapshot {
             file_count,
             skipped_by_reason,
+            temporal_state: opt_str(obj, "temporal_state")?.map(str::to_string),
         })
     }
 }
@@ -723,6 +729,18 @@ mod tests {
     fn stats_snapshot_without_skips_has_an_empty_breakdown() {
         let s = StatsSnapshot::parse(br#"{"file_count":3}"#).unwrap();
         assert!(s.skipped_by_reason.is_empty());
+    }
+
+    #[test]
+    fn stats_snapshot_reads_the_temporal_state_when_present() {
+        let ready = StatsSnapshot::parse(br#"{"file_count":3,"temporal_state":"ready"}"#).unwrap();
+        assert_eq!(ready.temporal_state.as_deref(), Some("ready"));
+        let refused =
+            StatsSnapshot::parse(br#"{"file_count":3,"temporal_state":"newer-schema"}"#).unwrap();
+        assert_eq!(refused.temporal_state.as_deref(), Some("newer-schema"));
+        let absent = StatsSnapshot::parse(br#"{"file_count":3}"#).unwrap();
+        assert_eq!(absent.temporal_state, None);
+        assert!(StatsSnapshot::parse(br#"{"file_count":3,"temporal_state":2}"#).is_err());
     }
 
     #[test]

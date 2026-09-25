@@ -314,10 +314,19 @@ impl Harness {
         let path = self.stub_path();
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        let stats = json!({
+        self.write_stats(Some("ready"));
+    }
+
+    /// The stub's `--stats --json` answer: the fixture universe, plus
+    /// `temporal_state` (`None` leaves the key out).
+    fn write_stats(&self, temporal_state: Option<&str>) {
+        let mut stats = json!({
             "file_count": self.universe.len(),
             "skipped_by_reason": self.universe.persisted_skipped_by_reason(),
         });
+        if let Some(state) = temporal_state {
+            stats["temporal_state"] = json!(state);
+        }
         fs::write(self.stub_dir.path().join("stats.json"), stats.to_string()).unwrap();
     }
 
@@ -887,6 +896,69 @@ fn unparsable_skim_output_is_a_harness_error() {
     let err = stderr(&check);
     assert!(err.contains("fixture-X01"), "{err}");
     assert!(err.contains("JSON"), "{err}");
+}
+
+/// skim refuses its temporal data (here: a `temporal.db` written by a newer
+/// skim) and says so in `--stats`, so `--hot` is not applied. A ledgered
+/// `--hot` check then "passes" on the fallback order; the gate must not call
+/// that an XPASS ("promote: remove the ledger entry"), which would bake the
+/// broken temporal layer into the ledger and the baseline.
+#[test]
+fn unusable_temporal_data_is_a_harness_error_not_an_xpass() {
+    let h = Harness::new();
+    h.bless_current();
+    h.write_ledger(
+        r##"[[xfail]]
+issue = "#9002"
+check = "order.prefix_consistent"
+ids = ["fixture-F001"]
+note = "fixture"
+"##,
+    );
+    h.write_stats(Some("newer-schema"));
+    fs::remove_file(h.report_path()).unwrap();
+
+    let check = h.check();
+
+    assert_exit(&check, 2);
+    let err = stderr(&check);
+    assert!(err.contains("newer-schema"), "{err}");
+    assert!(err.contains("fixture-F001"), "{err}");
+    assert!(!err.contains("XPASS"), "{err}");
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
+}
+
+/// A `--hot` query whose JSON discloses that the temporal ranking was not
+/// applied (`degraded[]`) cannot be scored as a `--hot` result.
+#[test]
+fn a_temporal_ranking_skim_reports_as_degraded_is_a_harness_error() {
+    let h = Harness::new();
+    let (_, q, f) = PREFIX;
+    let rows = h.correct_rows(q, None);
+    let mut body: Value = serde_json::from_str(&page_json(q, &rows, 0, rows.len(), false)).unwrap();
+    body["degraded"] = json!([{
+        "subsystem": "temporal",
+        "reason": "missing",
+        "requested": "hot",
+        "applied": "lexical",
+        "message": "temporal.db is missing; --hot not applied",
+        "remediation": "skim search --rebuild",
+    }]);
+    h.write_response(q, f, &format!("l{FULL_LIMIT}_o0.json"), &body.to_string());
+
+    let check = h.check();
+
+    assert_exit(&check, 2);
+    let err = stderr(&check);
+    assert!(err.contains("fixture-F001"), "{err}");
+    assert!(err.contains("degraded"), "{err}");
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
 }
 
 #[test]

@@ -6,8 +6,9 @@
 //!
 //! Every `Err` here is a harness error (exit 2): a missing or invalid data
 //! file, clone verification, golden integrity (including a ledger entry that
-//! can never apply), a skim crash / timeout / unparsable output, or a corpus
-//! that changed under the run. Gate failures are not errors — they are
+//! can never apply), a skim crash / timeout / unparsable output, a temporal
+//! ranking skim reports it cannot apply (see [`require_temporal_data`]), or
+//! a corpus that changed under the run. Gate failures are not errors — they are
 //! recorded in the report's `gate` section.
 
 use std::collections::BTreeMap;
@@ -228,6 +229,7 @@ fn run_corpus(
     progress(name, "skim search --build");
     runner.build(&root)?;
     let stats = runner.stats(&root)?;
+    require_temporal_data(&plan, &stats)?;
 
     progress(name, &format!("running {} golden entries", plan.len()));
     let mut observations = Vec::with_capacity(plan.len());
@@ -253,6 +255,46 @@ fn run_corpus(
         samples: eval.samples,
         latency: latency_stats(&timings),
     })
+}
+
+/// `--stats --json` `temporal_state` when skim's temporal data is usable.
+const TEMPORAL_READY: &str = "ready";
+
+/// Require usable temporal data when some planned entry ranks by it
+/// ([`crate::scoreboard::golden::QueryFlags::uses_temporal_data`]).
+///
+/// Without it skim serves a fallback order and says so only in `--stats`
+/// and, on the text arms, in `degraded[]` (the standalone `--ast` arm cannot
+/// carry `degraded[]`, #483). Scoring that order would misreport the broken
+/// temporal layer: a ledgered `--hot` check can "XPASS" and ask for a
+/// promotion that bakes the breakage into the ledger and the baseline. So it
+/// is a harness error, never a gate result.
+///
+/// # Errors
+///
+/// Some entry ranks by temporal data and `temporal_state` is absent or not
+/// `"ready"`; the message names the state and those entries.
+pub fn require_temporal_data(plan: &[PlannedQuery], stats: &StatsSnapshot) -> anyhow::Result<()> {
+    let ranked: Vec<&str> = plan
+        .iter()
+        .filter(|q| q.flags.uses_temporal_data())
+        .map(|q| q.id.as_str())
+        .collect();
+    if ranked.is_empty() || stats.temporal_state.as_deref() == Some(TEMPORAL_READY) {
+        return Ok(());
+    }
+    let state = match stats.temporal_state.as_deref() {
+        Some(state) => format!("temporal_state {state:?}"),
+        None => "no temporal_state".to_string(),
+    };
+    anyhow::bail!(
+        "skim search --stats --json reports {state} after --build (needs {TEMPORAL_READY:?}): \
+         skim cannot apply the temporal ranking that {} golden entr{} ask for ({}), so their \
+         ordering checks would judge a fallback order",
+        ranked.len(),
+        if ranked.len() == 1 { "y" } else { "ies" },
+        ranked.join(", ")
+    )
 }
 
 /// Check golden integrity against the verified universe (ledger refs
@@ -389,6 +431,60 @@ mod tests {
             BTreeMap::from([("a-1".to_string(), 5.0), ("a-2".to_string(), 5.0)])
         );
         assert_eq!(latency_stats(&[]).wall_ms_p50, 0.0);
+    }
+
+    fn plan_of(entries: &str) -> Vec<PlannedQuery> {
+        let golden = crate::scoreboard::golden::parse_golden(&format!(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{entries}"
+        ))
+        .unwrap();
+        metrics::plan(&golden).unwrap()
+    }
+
+    fn stats_with(temporal_state: Option<&str>) -> StatsSnapshot {
+        StatsSnapshot {
+            file_count: 1,
+            skipped_by_reason: BTreeMap::new(),
+            temporal_state: temporal_state.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn entries_ranked_by_temporal_data_need_a_ready_temporal_layer() {
+        let ranked = plan_of(
+            "[[prefix]]\nid = \"skim-F001\"\nquery = \"fn\"\nflags = [\"--hot\"]\nlimits = [5]\n\
+             [[prefix]]\nid = \"skim-F002\"\nflags = [\"--ast\", \"match-with-arms\", \"--hot\"]\nlimits = [5]\n\
+             [[prefix]]\nid = \"skim-F004\"\nflags = [\"--blast-radius\", \"src/a.rs\"]\nlimits = [5]\n\
+             [[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n",
+        );
+        require_temporal_data(&ranked, &stats_with(Some("ready"))).unwrap();
+
+        // skim's documented not-ready states, and a stats envelope without the key.
+        for state in [
+            Some("newer-schema"),
+            Some("missing"),
+            Some("empty"),
+            Some("corrupt"),
+            None,
+        ] {
+            let err = require_temporal_data(&ranked, &stats_with(state))
+                .expect_err("temporal ordering cannot be judged without temporal data");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(state.unwrap_or("no temporal_state")), "{msg}");
+            for id in ["skim-F001", "skim-F002", "skim-F004"] {
+                assert!(msg.contains(id), "{id} ranks by temporal data: {msg}");
+            }
+            assert!(
+                !msg.contains("skim-X01"),
+                "a lexical entry is unaffected: {msg}"
+            );
+        }
+
+        // A corpus with no temporal entry does not depend on the temporal layer.
+        let lexical_only =
+            plan_of("[[lexical]]\nid = \"skim-X01\"\nquery = \"fn\"\ncategory = \"short\"\n");
+        require_temporal_data(&lexical_only, &stats_with(Some("missing"))).unwrap();
+        require_temporal_data(&lexical_only, &stats_with(None)).unwrap();
     }
 
     #[test]
