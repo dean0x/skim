@@ -1338,6 +1338,20 @@ fn process_single_arg(
 ///
 /// `file_path` is `Some` for single-file ops (re-read on background thread) and
 /// `None` for stdin (buffer already captured in `result.stdin_raw`).
+///
+/// # Delivered cost (schema v4)
+///
+/// The disclosure charged here is rebuilt by `process::single_file_notice` —
+/// the same constructor `write_result_and_stats` just used to PRINT it, from
+/// the same mode spelling and the same `view_differs` — so the recorded cost is
+/// the emitted cost by construction. It is not re-derived from a per-mode table
+/// or re-estimated from the mode name; those agree until the marker text
+/// changes and then disagree silently.
+///
+/// Both call sites pair `write_result_and_stats` with this function on adjacent
+/// lines (stdin at the `-` branch, files just below it), which is what makes
+/// "the notice that was emitted" and "the notice that was charged" the same
+/// event rather than two events that usually coincide.
 fn record_file_analytics(
     enabled: bool,
     result: process::ProcessResult,
@@ -1347,6 +1361,10 @@ fn record_file_analytics(
     cwd: String,
     file_path: Option<PathBuf>,
 ) {
+    // Read before `result` is partially moved below.
+    let notice = process::single_file_notice(&mode_str, result.view_differs);
+    let served = result.served;
+
     // Determine counts variant: Known when both token counts are already computed
     // (i.e. --show-stats ran, or a count-carrying cache hit); Tokenize otherwise.
     let counts = match (result.original_tokens, result.transformed_tokens) {
@@ -1386,6 +1404,8 @@ fn record_file_analytics(
             original_cmd: cmd.to_string(),
             language,
             parse_tier,
+            notice,
+            served,
         }],
         analytics::FileOpCommon {
             mode: Some(mode_str),

@@ -57,6 +57,19 @@ pub(crate) struct ProcessResult {
     pub(crate) transformed_tokens: Option<usize>,
     /// Whether the output guardrail was triggered (compressed > raw)
     pub(crate) guardrail_triggered: bool,
+    /// Which view the ADR-001 guard actually served — the analytics-facing
+    /// reading of [`Self::guardrail_triggered`].
+    ///
+    /// `Some` only where a guard decision was genuinely taken. `None` on the
+    /// three paths where `guardrail_triggered: false` is a constructor default
+    /// rather than a verdict: a cache hit (the guard ran at write time, not
+    /// now), `Mode::Full` (the guard is skipped outright), and the
+    /// unknown-language passthrough degrade (ADR-002 returns before the guard).
+    /// Recording `Transformed` on those would claim a measurement nobody took —
+    /// and would rebuild, in a new column, the same confusion `parse_tier`
+    /// already causes by being computed before the decision it appears to
+    /// describe.
+    pub(crate) served: Option<crate::output::Served>,
     /// Parse quality tier: "full", "degraded", or "passthrough".
     ///
     /// - "passthrough" — Mode::Full, no transformation applied
@@ -84,6 +97,26 @@ pub(crate) struct ProcessResult {
     /// marker layer to emit a stderr notice on hook-rewritten file reads.
     /// Always `false` when the origin env var is absent (non-hook invocations).
     pub(crate) view_differs: bool,
+}
+
+/// Which view the ADR-001 guard served, from its own verdict.
+///
+/// `guardrail_triggered` already carries this fact and has since the guard
+/// existed; it was simply never recorded, leaving the analytics corpus with no
+/// way to tell a transform from a passthrough except by token identity.
+///
+/// `None` for [`Mode::Full`], where both guard call sites skip the decision
+/// outright — there is no verdict, and a fabricated `Transformed` there would
+/// be the same category of error as reading `parse_tier` as a selection.
+fn served_from_guard(mode: Mode, guardrail_triggered: bool) -> Option<crate::output::Served> {
+    if mode == Mode::Full {
+        return None;
+    }
+    Some(if guardrail_triggered {
+        crate::output::Served::Raw
+    } else {
+        crate::output::Served::Transformed
+    })
 }
 
 /// Determine the parse quality tier from the mode, parse-error flag, and degraded flag.
@@ -199,16 +232,35 @@ pub(crate) fn write_result_and_stats(
     // now fires for any lossy read (direct or hook-rewritten).  Not gated by
     // `SKIM_DEBUG` — this is a loss-bearing marker (class 1), not a no-loss
     // fallback banner (class 2).
-    if let Some(marker) = crate::output::lossy_view_marker(
-        crate::output::rewrite_origin().as_deref(),
-        mode_str,
-        if result.view_differs { 1 } else { 0 },
-        1,
-    ) {
-        eprintln!("{marker}");
+    //
+    // Routed through `emitted_notice_cost` and written with `eprint!` (the
+    // terminator is part of the measured line). `record_file_analytics` calls
+    // the same constructor with the same inputs, so the cost it stores is the
+    // cost this line put on the wire rather than a second estimate of it.
+    if let Some(notice) = single_file_notice(mode_str, result.view_differs) {
+        eprint!("{}", notice.line());
     }
 
     Ok(())
+}
+
+/// The lossy-view disclosure a single-input run emits, if any.
+///
+/// The single constructor for that line, shared by the site that PRINTS it
+/// ([`write_result_and_stats`]) and the site that CHARGES it
+/// (`main::record_file_analytics`). Both pass the same three inputs — process
+/// environment, mode spelling, and whether the view differed — so the two
+/// cannot disagree without this function being wrong for both.
+pub(crate) fn single_file_notice(
+    mode_str: &str,
+    view_differs: bool,
+) -> Option<crate::output::EmittedNotice> {
+    crate::output::emitted_notice_cost(
+        crate::output::rewrite_origin().as_deref(),
+        mode_str,
+        if view_differs { 1 } else { 0 },
+        1,
+    )
 }
 
 /// The lossy-view marker this invocation would print if the guard keeps the
@@ -384,6 +436,10 @@ fn try_cached_result(
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered: false,
+        // No guard ran on THIS invocation; the `false` above is a default, not
+        // a verdict, and the cached bytes may well be the raw file the guard
+        // elected at write time (see the `cache_hit_view_differs` note above).
+        served: None,
         parse_tier: None, // tier was not recorded at cache-write time
         language: cache_lang,
         stdin_raw: None,
@@ -810,6 +866,8 @@ fn stdin_passthrough_result(buffer: String, options: &ProcessOptions) -> Process
         original_tokens: None,
         transformed_tokens: None,
         guardrail_triggered: false,
+        // ADR-002 degrade returns before the guard: no decision was taken.
+        served: None,
         parse_tier: Some("passthrough"),
         language: None,
         stdin_raw,
@@ -953,6 +1011,12 @@ pub(crate) fn process_stdin(
         (transformed, false)
     };
 
+    // What the reader actually receives, read off the verdict that decided it.
+    // `None` for Mode::Full: the branch above skips the guard entirely, so
+    // there is no decision to record (and a full-mode label can cost context
+    // without ever having moved a guard verdict — ADR-001, 2026-09-24).
+    let served = served_from_guard(options.mode, guardrail_triggered);
+
     // consistency-7: apply --max-lines / --last-lines to stdin when the guardrail
     // served raw (the compressed path already applies the bound via the core
     // transform; the raw path does not — PF-033 / ADR-016).
@@ -1035,6 +1099,7 @@ pub(crate) fn process_stdin(
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
+        served,
         parse_tier,
         language: Some(language),
         stdin_raw,
@@ -1109,6 +1174,10 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     } else {
         (result, false)
     };
+
+    // See `served_from_guard`: recorded from the verdict, never inferred from
+    // `parse_tier`, which is computed above — before this decision exists.
+    let served = served_from_guard(options.mode, guardrail_triggered);
 
     // Post-guardrail line-bound enforcement (#317 / ADR-002 / PF-033).
     //
@@ -1214,6 +1283,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
         original_tokens: orig_tokens,
         transformed_tokens: trans_tokens,
         guardrail_triggered,
+        served,
         parse_tier,
         language,
         stdin_raw: None,

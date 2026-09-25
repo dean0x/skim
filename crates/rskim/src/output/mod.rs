@@ -837,6 +837,139 @@ pub(crate) fn lossy_view_marker(
     Some(marker)
 }
 
+// ============================================================================
+// Delivered cost — what the reader actually received (analytics schema v4)
+// ============================================================================
+
+/// Which view the ADR-001 net-savings guard actually served.
+///
+/// Recorded from the guard's own verdict, never inferred. The only signal a
+/// pre-v4 database can offer is token identity (`raw_tokens == compressed_tokens`),
+/// and the field that *looks* like it answers this — `parse_tier` — answers a
+/// different question: [`crate::process::parse_tier_from`] is evaluated BEFORE
+/// the guard runs, and its call site says so in as many words ("the parse tier
+/// reflects the transformation, not the final selection").
+///
+/// Measured on the author's 90-day corpus (68,326 rows, 2026-06-27 → 2026-09-25):
+/// of the 6,020 `command_type='file'` rows labelled `parse_tier='full'`, 2,154
+/// — **35.8%** — carry `raw_tokens == compressed_tokens`, i.e. are guard
+/// Passthroughs wearing a transform's label. Both that figure and the 37.9%
+/// reported from an earlier snapshot are estimates of the same quantity through
+/// the same proxy; this enum is what replaces the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Served {
+    /// The guard elected raw: the reader received the source's own bytes.
+    Raw,
+    /// The guard kept the compressed view: the reader received a transform.
+    Transformed,
+}
+
+impl Served {
+    /// Stable DB spelling for the `served` column.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Transformed => "transformed",
+        }
+    }
+}
+
+/// The exact stderr disclosure an invocation emits, carried as the bytes that
+/// go on the wire so its cost cannot be a second estimate of itself.
+///
+/// [`EmittedNotice::line`] is what the emitter writes; [`EmittedNotice::bytes`]
+/// and [`EmittedNotice::tokens`] measure that same `String`. There is no
+/// separate cost model to drift out of step with the text — the failure mode a
+/// const per-mode cost table would have (PF-027 genus: silently wrong, no
+/// failing test, no visible diff).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmittedNotice {
+    /// Terminator included. The emitter writes this verbatim with `eprint!`;
+    /// folding the `\n` in here rather than leaving it to `eprintln!` is what
+    /// makes the measured string and the written string the same string, so the
+    /// reader is charged for the byte they actually receive.
+    line: String,
+}
+
+impl EmittedNotice {
+    /// The exact bytes to write to stderr. Emit with `eprint!`, not `eprintln!`
+    /// — the terminator is already here, and that is the point.
+    pub(crate) fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// Byte cost of the disclosure as emitted.
+    pub(crate) fn bytes(&self) -> usize {
+        self.line.len()
+    }
+
+    /// cl100k token cost of the disclosure as emitted.
+    ///
+    /// `None` when the tokeniser is unavailable — which is a measurement
+    /// failure, not a cost of zero, and is stored as SQL NULL so the two stay
+    /// distinguishable.
+    ///
+    /// Not cached: the only caller is the analytics background thread, which
+    /// asks once per row. Computing it eagerly in [`emitted_notice_cost`] would
+    /// put a BPE call on the main thread for every lossy read, including the
+    /// runs that never record.
+    pub(crate) fn tokens(&self) -> Option<usize> {
+        crate::tokens::count_tokens(&self.line).ok()
+    }
+}
+
+/// The disclosure this invocation emits, and therefore charges the reader.
+///
+/// Arguments are [`lossy_view_marker`]'s, and `None` propagates from it: no
+/// differing view, no marker, no cost.
+///
+/// # Why one function with two callers
+///
+/// `write_result_and_stats` emits it and `record_file_analytics` records it.
+/// Before this existed the recorded cost did not exist at all — `compressed_tokens`
+/// counts the stdout body and stops there, so every lossy file read understated
+/// what it put in the reader's context by the width of its own disclosure.
+/// Routing both through here makes the recorded number the emitted number by
+/// construction rather than by a second derivation that agrees today.
+///
+/// # Size of this defect, stated honestly
+///
+/// This is the **smallest of the three** analytics defects fixed alongside it,
+/// and it is worth naming the gap rather than letting the fix imply importance.
+/// Measured on the 90-day corpus (68,326 rows). Every single-file marker
+/// variant was tokenised: the emitted cost spans **23–34 cl100k tokens**
+/// (77–126 bytes) — 23–25 for a direct `skim <file>`, 31–34 once a hook origin
+/// puts `cat → skim --mode=…` in the line.
+///
+/// - Excluding this notice moves the headline by **−0.134% to −0.198%**
+///   (4,670 single-`file` rows whose view differs × 23–34 tokens, against an
+///   80,238,562-token headline). Triage reported −0.14%, which is this band's
+///   direct-invocation end.
+/// - The `ELSE 0` clamp in `query_summary` hides **11,983,387** tokens of real
+///   expansion, making the same headline **+17.6% over truth**.
+/// - `AVG(savings_pct)` over all rows reads 13.41% where the same average over
+///   rows that actually changed reads 35.96% — a **22.5-point** dilution by
+///   42,844 no-op rows.
+///
+/// So the defect that prompted this work is ~120× smaller than the largest one
+/// standing beside it, by headline movement. Shipping it alone would have
+/// corrected 0.14% and left 17.6% in place. What it is *not* small in is sign:
+/// the notice exceeds the whole saving on **9.3%–10.7%** of saving file rows
+/// (422–487 of 4,550), which turns a recorded win into a real loss — a fact no
+/// aggregate can show, and the reason this is worth recording per row rather
+/// than subtracting in the dashboard.
+pub(crate) fn emitted_notice_cost(
+    origin: Option<&str>,
+    mode_str: &str,
+    differing: usize,
+    total: usize,
+) -> Option<EmittedNotice> {
+    let marker = lossy_view_marker(origin, mode_str, differing, total)?;
+    Some(EmittedNotice {
+        line: format!("{marker}\n"),
+    })
+}
+
 /// Lossy-view marker for `--json` command output (D1 / ADR-011 class 1 —
 /// unconditional).
 ///
@@ -949,6 +1082,73 @@ mod lossy_json_view_marker_tests {
             !m.contains("SKIM_PASSTHROUGH=1"),
             "the narrow remedy must not be padded with the unreachable hatch; got: {m:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod emitted_notice_cost_tests {
+    use super::*;
+
+    /// The measured line is the emitted line: marker plus the one terminator
+    /// `eprint!("{}", notice.line())` puts on the wire.
+    #[test]
+    fn line_is_the_marker_plus_its_terminator() {
+        let marker = lossy_view_marker(None, "structure", 1, 1).expect("marker");
+        let notice = emitted_notice_cost(None, "structure", 1, 1).expect("notice");
+
+        assert_eq!(notice.line(), format!("{marker}\n"));
+        assert_eq!(notice.bytes(), marker.len() + 1);
+    }
+
+    /// The terminator costs exactly one cl100k token.
+    ///
+    /// `fidelity::decide_with_notice` charges the TRIMMED marker and documents
+    /// the wire cost as "one byte and one token higher". This pins that claim
+    /// from the emitting side, so the guard's charge and the recorded cost
+    /// cannot drift apart by an unexamined newline.
+    #[test]
+    fn terminator_costs_exactly_one_token() {
+        for mode in ["structure", "pseudo", "minimal", "signatures", "types"] {
+            for origin in [None, Some("cat")] {
+                let marker = lossy_view_marker(origin, mode, 1, 1).expect("marker");
+                let trimmed = crate::tokens::count_tokens(&marker).expect("tokeniser");
+                let emitted = emitted_notice_cost(origin, mode, 1, 1)
+                    .expect("notice")
+                    .tokens()
+                    .expect("tokeniser");
+                assert_eq!(
+                    emitted,
+                    trimmed + 1,
+                    "{mode}/{origin:?}: emitted cost must be the trimmed cost plus one terminator"
+                );
+            }
+        }
+    }
+
+    /// No differing view, no marker, no cost — `None` propagates rather than
+    /// becoming a zero-cost notice that a recorder would store as a measured 0.
+    #[test]
+    fn identical_view_has_no_notice_at_all() {
+        assert!(emitted_notice_cost(None, "structure", 0, 1).is_none());
+        assert!(emitted_notice_cost(Some("cat"), "pseudo", 0, 3).is_none());
+    }
+
+    /// The multi-file marker is one line for the whole run, and costs one line.
+    #[test]
+    fn multi_file_notice_is_a_single_line() {
+        let notice = emitted_notice_cost(Some("cat"), "structure", 2, 3).expect("notice");
+        assert_eq!(
+            notice.line().matches('\n').count(),
+            1,
+            "an aggregate marker is one line; charging it to one row must charge one line"
+        );
+        assert!(notice.line().contains("2/3 files"));
+    }
+
+    #[test]
+    fn served_spellings_are_stable() {
+        assert_eq!(Served::Raw.as_str(), "raw");
+        assert_eq!(Served::Transformed.as_str(), "transformed");
     }
 }
 

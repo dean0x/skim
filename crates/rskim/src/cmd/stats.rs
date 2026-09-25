@@ -175,14 +175,23 @@ fn run_json(
     });
 
     let root = serde_json::json!({
+        // Three series, kept apart on purpose — see `AnalyticsSummary`.
+        // `tokens_saved` and `avg_savings_pct` keep their exact prior meaning so
+        // existing consumers are not silently re-based; `tokens_lost` covers the
+        // same full history because it needs only raw/compressed; `delivered`
+        // ships its own window because it cannot cover anything before v4.
         "summary": {
             "invocations": summary.invocations,
             "raw_tokens": summary.raw_tokens,
             "compressed_tokens": summary.compressed_tokens,
             "tokens_saved": summary.tokens_saved,
+            "tokens_lost": summary.tokens_lost,
             "avg_savings_pct": summary.avg_savings_pct,
+            "avg_savings_pct_changed": summary.avg_savings_pct_changed,
+            "changed_invocations": summary.changed_invocations,
             "weighted_savings_pct": weighted_pct,
         },
+        "delivered": summary.delivered,
         "daily": daily,
         "by_command": by_command,
         "by_language": by_language,
@@ -355,6 +364,21 @@ fn render_summary(
         "  Tokens saved: {}",
         tokens::format_number(summary.tokens_saved as usize).green(),
     )?;
+    // Printed directly beneath `Tokens saved`, and only when there is something
+    // to disclose. This is the quantity the per-row `ELSE 0` clamp drops; the
+    // clamp is kept (it is the definition the whole retained series was built
+    // on) but it no longer gets to be silent. On the author's 90-day corpus
+    // this line reads 11,983,387 against an 80,238,562 headline — the headline
+    // is 17.6% above the true net.
+    if summary.tokens_lost > 0 {
+        let net = summary.tokens_saved.saturating_sub(summary.tokens_lost);
+        writeln!(
+            w,
+            "  Tokens lost:  {}  (expansion the line above drops; net {})",
+            tokens::format_number(summary.tokens_lost as usize),
+            tokens::format_number(net as usize),
+        )?;
+    }
     if session_stats.distinct_sessions > 0 {
         writeln!(
             w,
@@ -369,7 +393,81 @@ fn render_summary(
         render_bar(weighted_pct, SUMMARY_BAR_WIDTH),
         color_pct(weighted_pct)
     )?;
+    // The bar above is token-weighted (PF-036). The per-invocation mean is a
+    // different statistic, and the all-rows form of it is diluted by every
+    // invocation where skim served exactly what it was given: a no-op
+    // contributes a 0% sample to an average about compression. Both means are
+    // shown with the row counts they were taken over, so neither can be quoted
+    // without its population. On the author's corpus they read 13.4% and 36.0%
+    // — a 22.5-point gap that is purely a question of which rows were counted.
+    if summary.invocations > 0 && summary.changed_invocations < summary.invocations {
+        writeln!(w)?;
+        writeln!(
+            w,
+            "  Per-invocation mean: {:.1}% over all {} \u{2014} {:.1}% over the {} that changed",
+            summary.avg_savings_pct,
+            tokens::format_number(summary.invocations as usize),
+            summary.avg_savings_pct_changed,
+            tokens::format_number(summary.changed_invocations as usize),
+        )?;
+    }
+    render_delivered(w, &summary.delivered)?;
     writeln!(w)?;
+    Ok(())
+}
+
+/// The v4-forward delivered series — value and window, never one without the
+/// other.
+///
+/// Printing an unwindowed figure next to `Tokens saved` would invite exactly
+/// the comparison it cannot support: `tokens_saved` spans the full 90-day
+/// retention, this spans only rows written since schema v4 landed. The window
+/// is not a footnote, it is what makes the number readable at all, so it shares
+/// the line.
+///
+/// Silent when nothing has been measured yet — zero rows is "not yet measured",
+/// and rendering it as `0` would be a claim.
+fn render_delivered(
+    w: &mut dyn Write,
+    delivered: &crate::analytics::DeliveredSavings,
+) -> anyhow::Result<()> {
+    if delivered.rows == 0 {
+        return Ok(());
+    }
+    let window = match (&delivered.first_day, &delivered.last_day) {
+        (Some(first), Some(last)) if first == last => first.clone(),
+        (Some(first), Some(last)) => format!("{first}..{last}"),
+        // rows > 0 with no timestamps is not reachable through query_summary;
+        // say so rather than printing a bare number with no window.
+        _ => "window unknown".to_string(),
+    };
+    // Rendered signed. Clamping a negative total to 0 here would be the same
+    // dishonesty the `tokens_lost` line exists to undo, one series later.
+    let magnitude = tokens::format_number(delivered.tokens.unsigned_abs() as usize);
+    let value = if delivered.tokens < 0 {
+        format!("-{magnitude}")
+    } else {
+        magnitude
+    };
+    writeln!(w)?;
+    writeln!(
+        w,
+        "  Delivered saved: {} over {} rows, {} (v4+ only; not comparable above)",
+        value,
+        tokens::format_number(delivered.rows as usize),
+        window,
+    )?;
+    writeln!(
+        w,
+        "    after charging {} tokens of stderr disclosure the same runs emitted",
+        tokens::format_number(delivered.notice_tokens as usize),
+    )?;
+    if delivered.tokens < 0 {
+        writeln!(
+            w,
+            "    net NEGATIVE: the disclosures cost more than the transforms saved"
+        )?;
+    }
     Ok(())
 }
 
@@ -712,13 +810,7 @@ mod tests {
     impl MockStore {
         fn empty() -> Self {
             Self {
-                summary: AnalyticsSummary {
-                    invocations: 0,
-                    raw_tokens: 0,
-                    compressed_tokens: 0,
-                    tokens_saved: 0,
-                    avg_savings_pct: 0.0,
-                },
+                summary: AnalyticsSummary::default(),
                 daily: vec![],
                 by_command: vec![],
                 by_language: vec![],
@@ -746,6 +838,18 @@ mod tests {
                     compressed_tokens: 30_000,
                     tokens_saved: 70_000,
                     avg_savings_pct: 70.0,
+                    // 5,000 tokens of expansion sit under the `tokens_saved`
+                    // clamp, and 30 of the 42 rows actually changed.
+                    tokens_lost: 5_000,
+                    changed_invocations: 30,
+                    avg_savings_pct_changed: 98.0,
+                    delivered: crate::analytics::DeliveredSavings {
+                        rows: 12,
+                        tokens: 64_500,
+                        notice_tokens: 500,
+                        first_day: Some("2026-03-24".to_string()),
+                        last_day: Some("2026-03-25".to_string()),
+                    },
                 },
                 daily: vec![
                     DailyStats {
@@ -1232,6 +1336,85 @@ mod tests {
     }
 
     // ========================================================================
+    // Three series — comparability
+    // ========================================================================
+
+    fn render_one(summary: &crate::analytics::AnalyticsSummary) -> String {
+        let sessions = SessionStats {
+            distinct_sessions: 0,
+            total_tokens_saved: 0,
+            avg_tokens_per_session: 0.0,
+            untagged_invocations: 0,
+        };
+        let mut buf = Vec::new();
+        render_summary(&mut buf, summary, &sessions).expect("render should not fail");
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// The delivered figure never appears without the window it covers.
+    ///
+    /// DISCRIMINATING: drop the window from `render_delivered` and this fails —
+    /// which is the point, because an unwindowed delivered total sitting under
+    /// a 90-day `Tokens saved` invites exactly the comparison it cannot support.
+    #[test]
+    fn delivered_total_is_never_printed_without_its_window() {
+        let out = render_one(&MockStore::with_data().summary);
+        assert!(out.contains("Delivered saved"), "delivered series missing");
+        assert!(
+            out.contains("2026-03-24..2026-03-25"),
+            "delivered total must carry its window; got:\n{out}"
+        );
+        assert!(
+            out.contains("v4+ only"),
+            "and must say it is not comparable with the total above; got:\n{out}"
+        );
+    }
+
+    /// Nothing measured yet is not the same as zero delivered savings.
+    #[test]
+    fn delivered_series_is_silent_before_any_v4_row() {
+        let summary = crate::analytics::AnalyticsSummary {
+            invocations: 10,
+            raw_tokens: 1000,
+            tokens_saved: 500,
+            ..Default::default()
+        };
+        let out = render_one(&summary);
+        assert!(
+            !out.contains("Delivered saved"),
+            "an unmeasured series must not be rendered as a measured zero; got:\n{out}"
+        );
+    }
+
+    /// The clamped headline is printed with the expansion it drops.
+    #[test]
+    fn expansion_is_disclosed_next_to_the_clamped_headline() {
+        let out = render_one(&MockStore::with_data().summary);
+        assert!(out.contains("Tokens saved"), "headline missing");
+        assert!(
+            out.contains("Tokens lost"),
+            "the clamp must disclose what it drops; got:\n{out}"
+        );
+        // 70,000 clamped headline less 5,000 of hidden expansion.
+        assert!(
+            out.contains("65,000"),
+            "the true net must be on the line; got:\n{out}"
+        );
+    }
+
+    /// Neither mean can be quoted without the population it was taken over.
+    #[test]
+    fn both_means_are_printed_with_their_row_counts() {
+        let out = render_one(&MockStore::with_data().summary);
+        assert!(
+            out.contains("Per-invocation mean"),
+            "no-op dilution must be visible; got:\n{out}"
+        );
+        assert!(out.contains("70.0%") && out.contains("98.0%"), "both means");
+        assert!(out.contains("42") && out.contains("30"), "both populations");
+    }
+
+    // ========================================================================
     // Weighted savings % tests
     // ========================================================================
 
@@ -1252,10 +1435,7 @@ mod tests {
         // When raw_tokens == 0, weighted_pct should be 0.0 (no division by zero)
         let summary = crate::analytics::AnalyticsSummary {
             invocations: 1,
-            raw_tokens: 0,
-            compressed_tokens: 0,
-            tokens_saved: 0,
-            avg_savings_pct: 0.0,
+            ..Default::default()
         };
         let empty_sessions = SessionStats {
             distinct_sessions: 0,
