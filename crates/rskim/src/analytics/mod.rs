@@ -93,8 +93,7 @@ impl CommandType {
     }
 }
 
-/// What an invocation delivered to the reader beyond its stdout body
-/// (schema v4).
+/// What an invocation delivered to the reader beyond its stdout body.
 ///
 /// `Default` is all-`None`, which is the correct value for every path that
 /// cannot measure these: the subcommand recording path, cache hits, and
@@ -136,8 +135,7 @@ pub(crate) struct TokenSavingsRecord {
     /// recorded before schema v3 have NULL and are excluded from per-session
     /// average calculations.
     pub(crate) session_id: Option<String>,
-    /// Schema v4. `Delivery::default()` on every path that takes no such
-    /// measurement.
+    /// `Delivery::default()` on every path that takes no such measurement.
     pub(crate) delivery: Delivery,
 }
 
@@ -145,21 +143,26 @@ pub(crate) struct TokenSavingsRecord {
 // Query result types
 // ============================================================================
 
-/// The v4-forward delivered-savings series, inseparable from the window it
-/// covers.
+/// The delivered-savings series, inseparable from the window it covers.
 ///
 /// `first_day`/`last_day`/`rows` are fields of this struct rather than
 /// something the dashboard may look up separately, because the one way this
 /// number
 /// misleads is being read as if it spanned the same history as
-/// [`AnalyticsSummary::tokens_saved`]. It cannot: no row written before schema
-/// v4 carries `notice_tokens`, so its window opens the day this shipped and the
-/// series is structurally incomparable with anything older. Bundling the window
-/// with the value makes printing one without the other require deleting code.
+/// [`AnalyticsSummary::tokens_saved`]. It cannot: only rows carrying a
+/// disclosure measurement have `notice_tokens`, so the window opens where that
+/// measurement began and the series is structurally incomparable with anything
+/// older. Bundling the window with the value makes printing one without the
+/// other require deleting code.
+///
+/// The boundary is row-level NULL-ness, NOT a schema version — this build
+/// stamps no `user_version` for those columns (see the delivered-cost block in
+/// [`super::schema`]), so nothing anywhere needs to consult one to know where
+/// this series opens.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub(crate) struct DeliveredSavings {
-    /// Rows carrying a v4 measurement. Zero means "not yet measured", which is
-    /// not the same as "measured zero saving".
+    /// Rows carrying a disclosure measurement. Zero means "not yet measured",
+    /// which is not the same as "measured zero saving".
     pub(crate) rows: u64,
     /// `raw - compressed - notice`, summed and **unclamped** — signed, because
     /// a disclosure can cost more than the transform saved, and on 9.3%–10.7%
@@ -190,8 +193,8 @@ pub(crate) struct DeliveredSavings {
 /// - [`Self::tokens_lost`] — retro-computable from `raw_tokens` and
 ///   `compressed_tokens` alone, so it covers the same full history at no cost
 ///   in comparability. It is the exact quantity the clamp above discards.
-/// - [`Self::delivered`] — v4-forward ONLY, and carries its own window so it
-///   cannot be silently compared against pre-v4 history.
+/// - [`Self::delivered`] — disclosure-measured rows ONLY, and carries its own
+///   window so it cannot be silently compared against older history.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub(crate) struct AnalyticsSummary {
     pub(crate) invocations: u64,
@@ -220,7 +223,7 @@ pub(crate) struct AnalyticsSummary {
     /// no-ops, and the two means read **13.41%** and **35.96%**: a 22.5-point
     /// gap that is entirely an artefact of which rows were counted.
     pub(crate) avg_savings_pct_changed: f64,
-    /// The v4-forward delivered series, window attached.
+    /// The delivered series over disclosure-measured rows, window attached.
     pub(crate) delivered: DeliveredSavings,
 }
 
@@ -580,10 +583,12 @@ impl AnalyticsDb {
     /// Columns 7–8 answer defect 2 the same way: the diluted all-rows mean is
     /// left alone and the undiluted one is reported beside it.
     ///
-    /// Columns 9–13 are the v4-forward delivered series and its window. They
-    /// select on `notice_tokens IS NOT NULL`, so pre-v4 rows — which have no
-    /// delivered measurement rather than a zero one — are excluded from the
-    /// value AND from the window that labels it.
+    /// Columns 9–13 are the delivered series and its window. They select on
+    /// `notice_tokens IS NOT NULL`, so rows predating disclosure measurement —
+    /// which have no delivered measurement rather than a zero one — are
+    /// excluded from the value AND from the window that labels it. That row
+    /// predicate is the only boundary; no schema version is read here or
+    /// anywhere else on this path.
     pub(crate) fn query_summary(&self, since: Option<i64>) -> anyhow::Result<AnalyticsSummary> {
         let (where_clause, params) = since_clause(since);
         let sql = format!(
@@ -1314,8 +1319,8 @@ pub(crate) struct FileOpCommon {
 /// unknown: every file-op path knows whether its run emitted a disclosure, and
 /// a batch's non-carrying rows genuinely bore no marginal cost. `None` is
 /// reserved for the one case that really is unmeasured — the tokeniser failing
-/// — so `notice_tokens IS NOT NULL` selects every v4 file-op row rather than
-/// only the lossy ones. That narrower population would bias the delivered
+/// — so `notice_tokens IS NOT NULL` selects every measured file-op row rather
+/// than only the lossy ones. That narrower population would bias the delivered
 /// series upward by dropping exactly the raw-served rows that saved nothing.
 ///
 /// Byte cost never fails, so it is `Some` on both arms; tokenisation can, and
@@ -1364,7 +1369,7 @@ pub(crate) fn record_file_ops(enabled: bool, rows: Vec<FileOpRow>, common: FileO
                         (raw_tok, comp_tok)
                     }
                 };
-                // Schema v4. The cost is measured off the very String the
+                // The cost is measured off the very String the
                 // emitter wrote to stderr, so this is the emitted cost rather
                 // than a second estimate of it — and it is tokenised HERE, on
                 // the background thread, keeping BPE off the main path.
@@ -2290,38 +2295,44 @@ mod tests {
         );
     }
 
-    /// A freshly created database ends at the top of the migration ladder.
+    /// A freshly created database can store a delivered measurement.
     ///
-    /// The subject is the property, not the integer: `test_db` goes through the
+    /// The subject is the property, not an integer: `test_db` goes through the
     /// real [`AnalyticsDb::open`] entry point — WAL, busy timeout, permissions,
     /// `run_migrations` — so this pins that a brand-new DB opened the way
-    /// production opens one climbs every rung. `schema::tests` covers the same
-    /// landing point against a bare in-memory connection; this covers it
-    /// through the constructor callers actually use.
+    /// production opens one ends up with the delivered-cost columns actually
+    /// present. `schema::tests` covers the same landing point against a bare
+    /// in-memory connection; this covers it through the constructor callers
+    /// actually use.
     ///
-    /// Named for the property so the name cannot go stale the way
-    /// `test_schema_version_is_3` did. The integer below is what changes.
+    /// It deliberately asserts NO `user_version`. This build claims no schema
+    /// number for these columns — see the delivered-cost block in `schema.rs`
+    /// for the collision with `ticket/305` and `ticket/306` that makes claiming
+    /// one unsafe — and nothing downstream reads one: `query_summary` selects
+    /// the delivered series on `notice_tokens IS NOT NULL`, row by row, and
+    /// derives its window from MIN/MAX over that same predicate. Column
+    /// presence is the property the series depends on, so column presence is
+    /// what this pins.
     ///
-    /// SCHEMA-LADDER-TOP: this literal and the two in `schema::tests`
-    /// (`fresh_db_migrates_to_v4_with_delivered_columns`,
-    /// `rerun_adds_nothing_and_holds_the_version`) are the three places that
-    /// encode this build's top rung. The `5` in
-    /// `foreign_lineage_v5_db_gains_columns_and_keeps_its_version` is NOT one
-    /// of them — it stands for another lineage's number and must not be bumped
-    /// alongside these. See the v4 block in `schema.rs` for the open collision
-    /// between this branch, `ticket/305` and `ticket/306`.
+    /// The `5` in `schema::tests::foreign_lineage_v5_db_gains_columns_and_keeps_its_version`
+    /// is a different subject entirely — another lineage's rung, asserted to
+    /// survive us untouched — and is unaffected by this.
     #[test]
-    fn test_fresh_db_lands_on_migration_ladder_top() {
+    fn test_fresh_db_has_delivered_columns_through_constructor() {
         let (db, _tmp) = test_db();
-        let version: i64 = db
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
+        let mut stmt = db.conn.prepare("PRAGMA table_info(token_savings)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(
-            version, 4,
-            "a freshly opened analytics DB must land on the ladder's top rung \
-             after run_migrations; v4 adds the delivered-cost columns"
-        );
+        for (name, _) in schema::V4_COLUMNS {
+            assert!(
+                cols.iter().any(|c| c == name),
+                "a freshly opened analytics DB must carry the delivered-cost \
+                 column {name} after run_migrations; got {cols:?}"
+            );
+        }
     }
 
     // ========================================================================
@@ -2664,7 +2675,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Schema v4 — delivered cost, and the three series
+    // Delivered cost, and the three series
     // ========================================================================
 
     /// The recorded cost is the EMITTED cost: both come from the same
@@ -2783,23 +2794,24 @@ mod tests {
         );
     }
 
-    /// The v4 series covers only v4 rows, and says so by carrying their window.
+    /// The delivered series covers only disclosure-measured rows, and says so
+    /// by carrying their window.
     ///
     /// DISCRIMINATING: widen the selection from `notice_tokens IS NOT NULL` to
-    /// all rows and the pre-v4 row both changes the value and back-dates the
-    /// window onto history that was never measured this way.
+    /// all rows and the unmeasured row both changes the value and back-dates
+    /// the window onto history that was never measured this way.
     #[test]
-    fn delivered_series_excludes_pre_v4_rows_and_carries_its_window() {
+    fn delivered_series_excludes_unmeasured_rows_and_carries_its_window() {
         let (db, _tmp) = test_db();
 
-        // A pre-v4 row: real savings, no delivered measurement.
+        // An unmeasured row: real savings, no delivered measurement.
         let mut old = sample_record();
         old.timestamp = 1_700_000_000; // 2023-11-14 UTC
         old.raw_tokens = 1000;
         old.compressed_tokens = 100;
         db.record(&old).unwrap();
 
-        // A v4 row whose disclosure eats most of the saving.
+        // A measured row whose disclosure eats most of the saving.
         let mut new = sample_record();
         new.timestamp = 1_711_300_000; // 2024-03-24 UTC
         new.raw_tokens = 130;

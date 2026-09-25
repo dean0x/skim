@@ -838,13 +838,14 @@ pub(crate) fn lossy_view_marker(
 }
 
 // ============================================================================
-// Delivered cost — what the reader actually received (analytics schema v4)
+// Delivered cost — what the reader actually received
 // ============================================================================
 
 /// Which view the ADR-001 net-savings guard actually served.
 ///
 /// Recorded from the guard's own verdict, never inferred. The only signal a
-/// pre-v4 database can offer is token identity (`raw_tokens == compressed_tokens`),
+/// database without these columns can offer is token identity
+/// (`raw_tokens == compressed_tokens`),
 /// and the field that *looks* like it answers this — `parse_tier` — answers a
 /// different question: [`crate::process::parse_tier_from`] is evaluated BEFORE
 /// the guard runs, and its call site says so in as many words ("the parse tier

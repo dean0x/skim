@@ -1339,7 +1339,7 @@ fn process_single_arg(
 /// `file_path` is `Some` for single-file ops (re-read on background thread) and
 /// `None` for stdin (buffer already captured in `result.stdin_raw`).
 ///
-/// # Delivered cost (schema v4)
+/// # Delivered cost
 ///
 /// The disclosure charged here is rebuilt by `process::single_file_notice` —
 /// the same constructor `write_result_and_stats` just used to PRINT it, from

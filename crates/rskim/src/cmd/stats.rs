@@ -179,7 +179,8 @@ fn run_json(
         // `tokens_saved` and `avg_savings_pct` keep their exact prior meaning so
         // existing consumers are not silently re-based; `tokens_lost` covers the
         // same full history because it needs only raw/compressed; `delivered`
-        // ships its own window because it cannot cover anything before v4.
+        // ships its own window because it cannot cover rows recorded before
+        // disclosure measurement began.
         "summary": {
             "invocations": summary.invocations,
             "raw_tokens": summary.raw_tokens,
@@ -416,14 +417,19 @@ fn render_summary(
     Ok(())
 }
 
-/// The v4-forward delivered series — value and window, never one without the
-/// other.
+/// The delivered series — value and window, never one without the other.
 ///
 /// Printing an unwindowed figure next to `Tokens saved` would invite exactly
 /// the comparison it cannot support: `tokens_saved` spans the full 90-day
-/// retention, this spans only rows written since schema v4 landed. The window
-/// is not a footnote, it is what makes the number readable at all, so it shares
-/// the line.
+/// retention, this spans only rows that carry a disclosure measurement
+/// (`notice_tokens IS NOT NULL`), which begins where that measurement began.
+/// The window is not a footnote, it is what makes the number readable at all,
+/// so it shares the line.
+///
+/// The qualifier is stated as the measurement condition rather than as a schema
+/// version, because this build stamps no `user_version` for those columns — see
+/// the delivered-cost block in `analytics::schema`. The boundary is row-level
+/// NULL-ness, and that is what the line now says.
 ///
 /// Silent when nothing has been measured yet — zero rows is "not yet measured",
 /// and rendering it as `0` would be a claim.
@@ -452,7 +458,7 @@ fn render_delivered(
     writeln!(w)?;
     writeln!(
         w,
-        "  Delivered saved: {} over {} rows, {} (v4+ only; not comparable above)",
+        "  Delivered saved: {} over {} disclosure-measured rows, {} (not comparable above)",
         value,
         tokens::format_number(delivered.rows as usize),
         window,
@@ -1365,14 +1371,19 @@ mod tests {
             "delivered total must carry its window; got:\n{out}"
         );
         assert!(
-            out.contains("v4+ only"),
+            out.contains("disclosure-measured rows"),
+            "and must qualify which rows it covers — the series spans only rows \
+             carrying a disclosure measurement, not a schema version; got:\n{out}"
+        );
+        assert!(
+            out.contains("not comparable above"),
             "and must say it is not comparable with the total above; got:\n{out}"
         );
     }
 
     /// Nothing measured yet is not the same as zero delivered savings.
     #[test]
-    fn delivered_series_is_silent_before_any_v4_row() {
+    fn delivered_series_is_silent_before_any_measured_row() {
         let summary = crate::analytics::AnalyticsSummary {
             invocations: 10,
             raw_tokens: 1000,
