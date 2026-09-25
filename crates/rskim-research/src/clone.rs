@@ -482,11 +482,21 @@ const OWNERSHIP_MARKER: &str = "skim-scoreboard-pinned-clone";
 /// Security args shared by the network-bound git subprocesses of a
 /// pinned-history clone: suppress credential prompts (fail fast on auth
 /// errors) and reject corrupted or malicious objects.
-const PINNED_CLONE_SECURITY_ARGS: [&str; 4] = [
+///
+/// Transfer fsck runs `index-pack --strict`, which promotes every fsck
+/// warning to an error. Exactly one message id is downgraded:
+/// `zeroPaddedFilemode` (a tree mode written as `040000` by old git
+/// versions). It is cosmetic, and real corpora carry it: pallets/flask's
+/// history does (object `0b404df8…`), so a strict clone of flask fails.
+/// Every other check, including `hasDotgit` and the other path checks,
+/// stays fatal.
+const PINNED_CLONE_SECURITY_ARGS: [&str; 6] = [
     "-c",
     "credential.helper=",
     "-c",
     "transfer.fsckObjects=true",
+    "-c",
+    "fetch.fsck.zeroPaddedFilemode=ignore",
 ];
 
 /// Environment variables that would redirect a `git -C <dest> …` command at a
@@ -801,7 +811,7 @@ fn clone_pinned_history_once(url: &str, commit: &str, dest: &Path) -> anyhow::Re
     if !clone_out.status.success() {
         anyhow::bail!(
             "git clone --no-checkout failed for {url}: {}",
-            first_line_lossy(&clone_out.stderr)
+            last_lines_lossy(&clone_out.stderr)
         );
     }
 
@@ -822,7 +832,7 @@ fn clone_pinned_history_once(url: &str, commit: &str, dest: &Path) -> anyhow::Re
     if !fetch_out.status.success() {
         anyhow::bail!(
             "commit {commit} is not reachable in {url}: git fetch origin {commit} failed: {}",
-            first_line_lossy(&fetch_out.stderr)
+            last_lines_lossy(&fetch_out.stderr)
         );
     }
 
@@ -889,6 +899,26 @@ fn run_captured(
 /// Trimmed stdout of a git command, decoded lossily.
 fn stdout_trimmed(out: &std::process::Output) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Most lines of git stderr quoted by [`last_lines_lossy`].
+const STDERR_TAIL_LINES: usize = 4;
+
+/// The last [`STDERR_TAIL_LINES`] non-empty lines of a byte buffer, lossily
+/// decoded and joined with ` | `. Used for clone and fetch failures, where
+/// git prints progress (`Cloning into …`) first and the cause last.
+fn last_lines_lossy(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "(no output)".to_string();
+    }
+    let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
+    lines.get(start..).unwrap_or_default().join(" | ")
 }
 
 /// First non-empty line of a byte buffer (typically git's stderr), lossily
@@ -1512,5 +1542,94 @@ mod tests {
             .expect_err("an unknown commit must fail, not loop");
 
         assert!(err.to_string().contains("not reachable"), "{err}");
+    }
+
+    /// Lowercase hex SHA → raw 20 bytes (for hand-built tree objects).
+    fn sha_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Write `bytes` as a tree object without git's own checks
+    /// (`hash-object --literally`), returning its SHA.
+    fn literal_tree(repo: &Path, home: &Path, bytes: &[u8]) -> String {
+        let file = repo.join(".git").join("literal-tree");
+        std::fs::write(&file, bytes).unwrap();
+        let sha = fixture_git_ok(
+            repo,
+            home,
+            &[
+                "hash-object",
+                "-t",
+                "tree",
+                "--literally",
+                "-w",
+                file.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_file(&file).unwrap();
+        sha
+    }
+
+    /// A fixture remote whose only commit (on `main`) has a hand-built root
+    /// tree with one entry `<mode> <name>` pointing at a normal subtree that
+    /// holds `f.txt`. Returns `(home, repo, commit)`.
+    fn remote_with_root_entry(
+        mode: &str,
+        name: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, String) {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let (h, r) = (home.path(), repo.path());
+        fixture_git_ok(r, h, &["init", "--quiet"]);
+
+        let blob_file = r.join(".git").join("blob-src");
+        std::fs::write(&blob_file, "zero padded history\n").unwrap();
+        let blob = fixture_git_ok(r, h, &["hash-object", "-w", blob_file.to_str().unwrap()]);
+
+        let mut sub = b"100644 f.txt\0".to_vec();
+        sub.extend(sha_bytes(&blob));
+        let subtree = literal_tree(r, h, &sub);
+
+        let mut root = format!("{mode} {name}\0").into_bytes();
+        root.extend(sha_bytes(&subtree));
+        let root_tree = literal_tree(r, h, &root);
+
+        let commit = fixture_git_ok(r, h, &["commit-tree", &root_tree, "-m", "legacy tree"]);
+        fixture_git_ok(r, h, &["update-ref", "refs/heads/main", &commit]);
+        (home, repo, commit)
+    }
+
+    #[test]
+    fn ensure_clones_a_history_with_zero_padded_file_modes() {
+        // pallets/flask's history carries trees written with `040000`
+        // directory modes. Strict transfer fsck rejects them unless that one
+        // benign message id is downgraded.
+        let (_home, repo, commit) = remote_with_root_entry("040000", "sub");
+        let url = format!("file://{}", repo.path().display());
+        let (_parent, dest) = fresh_dest();
+
+        ensure_pinned_history_clone_from(&url, &commit, &dest).unwrap();
+
+        assert_eq!(state(&dest, &commit), PinnedCloneState::Reusable);
+        assert!(dest.join("sub").join("f.txt").is_file());
+    }
+
+    #[test]
+    fn ensure_keeps_every_other_fsck_check_and_reports_gits_own_error() {
+        // A tree entry named `.git` (hasDotgit) must still abort the clone,
+        // and the error must carry git's fsck message, not the leading
+        // "Cloning into ..." progress line.
+        let (_home, repo, commit) = remote_with_root_entry("40000", ".git");
+        let url = format!("file://{}", repo.path().display());
+        let (_parent, dest) = fresh_dest();
+
+        let err = ensure_pinned_history_clone_from(&url, &commit, &dest)
+            .expect_err("a .git tree entry must fail transfer fsck");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("hasDotgit"), "{msg}");
     }
 }
