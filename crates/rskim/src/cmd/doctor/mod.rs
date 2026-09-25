@@ -6,6 +6,20 @@
 //! Exit codes:
 //!   0 = healthy (no drift detected)
 //!   1 = drift (unpinned hook, path/version/commit mismatch, or ≥1 commit behind HEAD)
+//!
+//! A hook that credibly declares dev mode (ADR-019 — `HOOK_DEV_MARKER` plus a
+//! `ScriptIntegrity::Verified` manifest) narrows that second row: the
+//! commit-equality gate is waived and a behind-HEAD count is demoted to an
+//! advisory `⚠` that still prints, so those two conditions stop contributing to
+//! exit 1. That demotion is clone-wide rather than per-agent — one agent's
+//! declaration demotes the behind-HEAD verdict for the entire run; see
+//! `HookSectionVerdict::any_dev_pinned` for the scope and why it is drawn
+//! there. A version mismatch, an unpinned hook and a tampered or unreadable
+//! script are drift regardless of mode; a binary-pin mismatch was already
+//! advisory for every mode (ADR-014). Every hook line a credible declaration can
+//! reach — advisory or drift — carries the literal `dev-pinned`, which is what
+//! makes `skim doctor | grep dev-pinned` a usable one-line CI guard even when
+//! the exit code is 1.
 
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
@@ -468,11 +482,21 @@ fn hook_status_line(
     };
 
     // NoManifest / Verified: check pin format and currency.
+    //
+    // Both branches below interpolate `{dev_note}`, and the two integrity
+    // branches above deliberately do not: `dev_pinned` is
+    // `honour_dev_declaration`, which requires `Verified`, so under `Tampered`
+    // and `Unreadable` the note is empty BY CONSTRUCTION and printing it there
+    // would imply a state no input can reach. These two are the drift verdicts a
+    // dev install can actually reach — a version mismatch is not waived by the
+    // marker, and neither is an unpinned script — and they are exactly where the
+    // `skim doctor | grep dev-pinned` guard would otherwise go silent: it would
+    // miss the dev install at the one moment the exit code is 1.
     if !facts.hook_uses_pinned_binary {
         return (
             true,
             append_advisory(format!(
-                "  ✗ {agent_cli_name}  installed (v{hook_version})  unpinned — \
+                "  ✗ {agent_cli_name}  installed (v{hook_version}){dev_note}  unpinned — \
                  run `./target/release/skim init --yes` to pin"
             )),
         );
@@ -489,12 +513,15 @@ fn hook_status_line(
             format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
         } else {
             // Pinned format confirmed + version matches → commit must differ.
+            // Unreachable while `dev_pinned` holds: the waiver is precisely the
+            // commit-equality gate (ADR-019), so a credible dev declaration that
+            // reaches this branch reached it on the version term.
             format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
         };
         return (
             true,
             append_advisory(format!(
-                "  ✗ {agent_cli_name}  installed  pin: {pin}  [{reason}]  — \
+                "  ✗ {agent_cli_name}  installed{dev_note}  pin: {pin}  [{reason}]  — \
                  run `./target/release/skim init --yes` to update"
             )),
         );
@@ -524,8 +551,12 @@ fn hook_status_line(
     // a visible dev install is that it cannot masquerade as a clean one: the
     // waiver bought exit 0, not a clean bill of health. `⚠` plus the literal
     // `dev-pinned` is also what makes `skim doctor | grep dev-pinned` usable as a
-    // one-line CI guard, and the pin-mismatch branch above carries the same note
-    // so that guard cannot be defeated by a second clone.
+    // one-line CI guard — which is why every branch a credible declaration can
+    // reach carries the note, not just this one: the pin-mismatch branch (a
+    // second clone), the unpinned branch, and the currency branch (a version
+    // mismatch, which the marker does not waive and which exits 1). A guard that
+    // goes quiet on the drift verdicts is a guard that answers "is this machine
+    // on a dev pin?" wrongly at exactly the moment the answer matters.
     let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
     let glyph = if dev_pinned { "⚠" } else { "✓" };
     (
@@ -547,6 +578,33 @@ struct HookSectionVerdict {
     /// staleness section keys off — `print_staleness_section` reads the compiled
     /// commit and nothing about the install, so without this it could not see a
     /// dev declaration at all.
+    ///
+    /// # Scope: clone-wide, not per-agent
+    ///
+    /// This is an OR across every supported agent, so ONE agent's dev pin demotes
+    /// [`staleness_verdict`] for the WHOLE RUN — including for hooks belonging to
+    /// other agents, and, on a machine that keeps parallel clones, for hooks
+    /// pinned to a different binary than the one being asked. A dev pin in one
+    /// clone's Cursor hook therefore silences the behind-HEAD signal that would
+    /// otherwise cover another clone's Claude hook. Only this section is affected:
+    /// [`hook_status_line`] is computed per agent, so each hook's own line still
+    /// reports that hook's own verdict, and `skim doctor | grep dev-pinned` names
+    /// exactly the agents that declare it.
+    ///
+    /// # Why it is not narrowed to the agent pinning the running binary
+    ///
+    /// Because the narrower rule would have to gate on
+    /// `HookFacts::pin_is_current`, and that field is deliberately a
+    /// display-without-gate signal (PF-015): ADR-014 holds binary provenance
+    /// advisory, never enforcing, and the pin-mismatch branch of
+    /// [`hook_status_line`] returns `⚠`/no-drift for exactly that reason.
+    /// Gating an exit code on it would promote the one signal both decisions
+    /// agreed to keep advisory. It would also flip a reachable state from exit 0
+    /// to exit 1 — a hook dev-pinned from another clone while this checkout is
+    /// behind HEAD — which is a contract change the demotion's own documentation
+    /// (README, CLAUDE.md) does not describe. The behind-HEAD count is measured
+    /// once, for the cwd repository, and is not a per-agent quantity to begin
+    /// with, so there is no per-agent verdict for a narrowed rule to key off.
     any_dev_pinned: bool,
 }
 
@@ -812,6 +870,31 @@ fn staleness_verdict(commits_behind: u64, dev_mode: bool) -> (&'static str, bool
     }
 }
 
+/// The parenthetical printed beside a non-zero behind-HEAD count.
+///
+/// Paired with [`staleness_verdict`] and extracted for the same reason: the
+/// surrounding section is four bounded subprocesses deep, so the policy is only
+/// testable once it is out of it.
+///
+/// # Why the dev arm does not name the rebuild
+///
+/// `cargo build --release` is the remedy that clears this count for a strict
+/// install, and it is exactly the remedy a dev pin cannot use: the same argument
+/// [`staleness_verdict`] demotes the glyph for — the binary re-stamps at the
+/// commit it was built from and HEAD moves again on the next commit — also means
+/// the rebuild cannot make the line go away for anyone mid-feature. Printing it
+/// anyway would be an ineffective hatch advertised next to the signal it cannot
+/// clear, which is the shape ADR-011 forbids for elision markers, one layer over.
+/// The dev arm therefore states what the line IS (advisory) rather than offering
+/// a command that does not close it.
+fn behind_head_remedy(dev_mode: bool) -> &'static str {
+    if dev_mode {
+        "advisory only for a dev pin — the count returns on the next commit"
+    } else {
+        "rebuild: cargo build -p rskim --release"
+    }
+}
+
 /// Print the staleness section and return true if drift is detected.
 ///
 /// Staleness algorithm (B4):
@@ -944,10 +1027,8 @@ fn print_staleness_section(compiled_commit: &str, dev_mode: bool) -> bool {
             } else {
                 // `raw`, not `behind`: an unparseable count must still be shown
                 // verbatim rather than replaced by the fallback it was mapped to.
-                println!(
-                    "  {glyph}  {raw} commit(s) behind HEAD  \
-                     (rebuild: cargo build -p rskim --release)"
-                );
+                let remedy = behind_head_remedy(dev_mode);
+                println!("  {glyph}  {raw} commit(s) behind HEAD  ({remedy})");
             }
             drift
         }
@@ -997,6 +1078,8 @@ fn print_help() {
     println!("  All skim entries on $PATH with version and commit (→ marks the winner)");
     println!("  Hook installation state for each supported agent");
     println!("      Shows: path, version, commit, pinned binary, current/stale status");
+    println!("      A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)`,");
+    println!("      never as `✓` — `skim doctor | grep dev-pinned` is the CI guard");
     println!("  Wrapper directory (~/.skim/bin) status and symlink count");
     println!("  Cache directory and analytics DB paths");
     println!("  Staleness vs. HEAD (run from the skim source directory for accurate results)");
@@ -1004,6 +1087,9 @@ fn print_help() {
     println!("Exit codes:");
     println!("  0 = healthy");
     println!("  1 = drift (unpinned hook, version/commit mismatch, or ≥1 commit behind HEAD)");
+    println!("      — except when a hook is dev-pinned: behind-HEAD becomes advisory");
+    println!("      (⚠, exit 0) and the commit check is waived. Version mismatch,");
+    println!("      unpinned, tampered and unreadable stay drift.");
 }
 
 // ============================================================================
@@ -1362,6 +1448,57 @@ mod tests {
         );
     }
 
+    /// documentation-13: the CI guard is `skim doctor | grep dev-pinned`, and the
+    /// one verdict it used to miss is the one that also exits 1. A dev pin does
+    /// NOT waive the version check (ADR-019 — commit equality and nothing else),
+    /// so a dev-pinned hook at the wrong version lands on the `✗` currency branch.
+    ///
+    /// RED before this: that line read `✗ … [version mismatch]` with no
+    /// `dev-pinned` token, so a CI job asking "is this machine on a dev pin?" got
+    /// "no" at precisely the moment the build was failing because of one.
+    #[test]
+    fn test_hook_status_line_dev_pinned_survives_a_version_mismatch() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        facts.hook_is_current = false;
+        // Compiled version differs from the fixture's hook version.
+        let (drift, line) = hook_status_line(&facts, "claude-code", "9.9.9", "9f8e7d6");
+
+        assert!(
+            drift,
+            "a version mismatch is drift, dev or not — the waiver is commit-only: {line}"
+        );
+        assert!(
+            line.contains("version mismatch"),
+            "the currency verdict must not be swallowed by the dev note: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "the CI guard must still see the dev pin on a drift verdict: {line}"
+        );
+    }
+
+    /// The same hole on the pin-format branch: an unpinned script is drift
+    /// regardless of mode, and a credible declaration on one must still be
+    /// greppable.
+    #[test]
+    fn test_hook_status_line_dev_pinned_survives_an_unpinned_script() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        facts.hook_uses_pinned_binary = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(drift, "an unpinned hook is drift, dev or not: {line}");
+        assert!(
+            line.contains("unpinned"),
+            "the pin-format verdict must survive the dev note: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "the CI guard must still see the dev pin on a drift verdict: {line}"
+        );
+    }
+
     /// PF-016: the declaration is a line in the hook script, so it is only acted
     /// on when the manifest verifies. Deleting the sidecar yields `NoManifest`,
     /// which doctor deliberately does NOT treat as drift — so a "not Tampered"
@@ -1623,6 +1760,42 @@ mod tests {
     fn test_staleness_verdict_up_to_date_is_identical_in_both_modes() {
         assert_eq!(staleness_verdict(0, true), staleness_verdict(0, false));
         assert_eq!(staleness_verdict(0, true), ("✓", false));
+    }
+
+    /// documentation-19: the strict arm is byte-for-byte the parenthetical the
+    /// section printed before the remedy became a function, so nobody who has not
+    /// opted in sees a changed line.
+    #[test]
+    fn test_behind_head_remedy_strict_still_names_the_rebuild() {
+        assert_eq!(
+            behind_head_remedy(false),
+            "rebuild: cargo build -p rskim --release"
+        );
+    }
+
+    /// documentation-19: a dev pin must not be handed the one remedy that cannot
+    /// clear its count — `staleness_verdict` demotes the glyph for exactly that
+    /// reason, and a line reading `⚠ 7 commit(s) behind HEAD (rebuild: …)` would
+    /// re-advertise the hatch the demotion exists because of.
+    #[test]
+    fn test_behind_head_remedy_dev_does_not_advertise_the_rebuild() {
+        let remedy = behind_head_remedy(true);
+        assert!(
+            !remedy.contains("cargo build"),
+            "a dev pin's remedy must not name a command that cannot clear the count: {remedy}"
+        );
+        assert!(
+            remedy.contains("advisory"),
+            "the dev arm must say what the line is instead: {remedy}"
+        );
+    }
+
+    /// The two arms must stay distinguishable: collapsing them (in either
+    /// direction) silently restores the mismatch between the printed remedy and
+    /// what the dev path can achieve.
+    #[test]
+    fn test_behind_head_remedy_arms_differ() {
+        assert_ne!(behind_head_remedy(true), behind_head_remedy(false));
     }
 
     /// Dev mode waives the exit code, never the information: the count is still

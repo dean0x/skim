@@ -107,12 +107,17 @@ where
 // Sandbox env-var plan (PF-017)
 // ============================================================================
 //
-// These four tables are the *whole* contract for what a sandboxed invocation
-// may see. Every environment variable the production crate reads must appear
-// in exactly one of them, and `cli_init.rs` carries a test that scans
-// `crates/rskim/src` and fails when a newly-added read is in none of them —
-// PF-017's lesson was that a hand-maintained enumeration is always incomplete,
-// so this one is checked against the source rather than trusted.
+// These four tables are the *whole* contract for what environment a sandboxed
+// invocation may see. Every environment variable the shipped binary reads must
+// appear in exactly one of them, and `cli_init.rs` carries a test that scans
+// every crate linked into the `skim` binary and fails when a newly-added read
+// is in none of them — PF-017's lesson was that a hand-maintained enumeration
+// is always incomplete, so this one is checked against the source rather than
+// trusted.
+//
+// Environment is not the only axis: `skim init` resolves a project root by
+// walking ancestors of the process working directory, which no variable here
+// can redirect. `skim_sandboxed_with_bin` pins that too — see its own docs.
 
 /// Env vars redirected into the sandbox home, as `(var, path relative to home)`.
 ///
@@ -141,9 +146,10 @@ pub const SANDBOX_PINNED_VARS: &[(&str, &str)] = &[
 
 /// Env vars stripped from the child so host session state cannot leak in.
 ///
-/// Each of these has a safe default that resolves *inside* the sandbox once
-/// `HOME` is redirected, so removal is strictly safer than passing a host value
-/// through. Removal also means the variable cannot silently satisfy an
+/// Each of these is safe in its absence — either it has a default that resolves
+/// *inside* the sandbox once `HOME` is redirected, or the feature it unlocks is
+/// one no test wants reached — so removal is strictly safer than passing a host
+/// value through. Removal also means the variable cannot silently satisfy an
 /// assertion: a host `SKIM_PASSTHROUGH=1`, for instance, makes hook mode
 /// return empty stdout, which several hook tests assert as their success case.
 pub const SANDBOX_REMOVED_VARS: &[&str] = &[
@@ -162,7 +168,7 @@ pub const SANDBOX_REMOVED_VARS: &[&str] = &[
     "SKIM_CURSOR_DB_PATH",      // session-provider transcript DB (Cursor)
     "SKIM_GEMINI_DIR",          // session-provider transcript dir (Gemini)
     "SKIM_CRUSH_DIR",           // session-provider transcript dir (Crush)
-    "CARGO_BIN_EXE_skim",       // cargo-test bin path; shipped skim never reads it
+    "ANTHROPIC_API_KEY",        // rskim-tokens credential; a host key reaches the live API
 ];
 
 /// Env vars deliberately inherited from the host.
@@ -195,13 +201,31 @@ pub fn sandbox_var_path(home: &std::path::Path, relative: &str) -> std::path::Pa
 /// [`SANDBOX_PINNED_VARS`] and [`SANDBOX_REMOVED_VARS`] so that the tables are
 /// the only place the contract is written down.
 ///
-/// Tests may chain additional `.env(...)` calls to add or override vars; a
-/// chained call applied after this one wins.
+/// # The working directory is part of the sandbox
+///
+/// No environment variable can confine `skim init`'s *last* step. A successful
+/// install ends in `install_search_integration`, which resolves its project root
+/// with a 64-step ancestor walk from `std::env::current_dir()` and, on a hit,
+/// writes `post-commit`, `post-merge` and `post-checkout` into that repository's
+/// `.git/hooks` and spawns a detached `skim search --build`. Left at the cwd
+/// cargo supplies (`crates/rskim`), that walk lands on the skim clone the test
+/// binary was built from: the suite installs real git hooks into the developer's
+/// working copy, and `SKIM_CACHE_DIR` cannot contain it because `.git/hooks` is
+/// outside every path [`SANDBOX_REDIRECTED_VARS`] names.
+///
+/// Pinning the cwd to the sandbox home closes that axis for every caller at
+/// once: the home is a bare `TempDir` with no `.git` above it, so the walk
+/// returns `None` and the installer skips search integration entirely.
+///
+/// Tests may chain additional `.env(...)` or `.current_dir(...)` calls to add or
+/// override; a chained call applied after this one wins, which is how the
+/// `--project` tests point the install at a directory of their own.
 pub fn skim_sandboxed_with_bin(
     home: &std::path::Path,
     bin: &std::path::Path,
 ) -> assert_cmd::Command {
     let mut c = assert_cmd::Command::new(bin);
+    c.current_dir(home);
     for (var, relative) in SANDBOX_REDIRECTED_VARS {
         c.env(var, sandbox_var_path(home, relative));
     }

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::flags::{DetectionEnv, InitFlags};
+use super::flags::DetectionEnv;
 use super::helpers::HOOK_SCRIPT_NAME;
 use crate::cmd::hooks::{
     HookMode, HookProtocol, honour_dev_declaration, parse_mode_from_script, protocol_for_agent,
@@ -160,9 +160,10 @@ impl DetectedState {
     /// installed script the artefact this binary would produce", which is decided
     /// entirely by what is on disk. `mode_matches` asks "is it the artefact this
     /// COMMAND was asked to produce", which needs the request — and `skim doctor`
-    /// never has one: `init::hook_facts` builds `InitFlags` with defaults, so
-    /// folding this term into `hook_is_current` would evaluate it against
-    /// `dev_requested = false` on doctor's path and report every dev-pinned hook
+    /// never has one: `init::hook_facts` hands [`detect_state`] an install scope
+    /// and nothing else, so there is no request anywhere on that path. Folding
+    /// this term into `hook_is_current` would therefore have to invent
+    /// `dev_requested = false` for doctor and report every dev-pinned hook
     /// as stale with a commit mismatch — exit 1 on precisely the installs the
     /// waiver exists to keep green, which is the whole feature defeated by a
     /// predicate that cannot see the difference between "nobody asked for dev"
@@ -181,24 +182,42 @@ impl DetectedState {
     }
 }
 
+/// Detect the installed hook state for `agent` at the given install scope.
+///
+/// `project` is that scope — `true` for a project-level install (`<cwd>/.claude`
+/// and friends), `false` for the global one. It is the whole of what detection
+/// needs: it picks the config directory (through [`DetectionEnv::resolve`] and
+/// `HookProtocol::hook_config_dir`) and, by negation, the directory
+/// [`check_dual_scope`] looks in. Everything else reported here is read off the
+/// artefacts found there.
+///
+/// # Why the scope and not `&InitFlags`
+///
+/// So that a caller which is not performing an install cannot spell a request it
+/// is not making. `skim doctor` reaches detection through
+/// [`super::hook_facts`], and it has no `--dev`, `--force` or `--uninstall` to
+/// answer for; handed the whole struct it would have to supply all three, and a
+/// supplied `dev: false` would carry a correctness obligation on its own
+/// NON-USE — dischargeable only by a comment, and silent the moment detection
+/// grew a second read. One `bool` leaves nothing to fabricate and nothing to
+/// keep true. The argument order mirrors [`DetectionEnv::resolve`], and the two
+/// parameter types differ, so a transposed call is a compile error rather than a
+/// silent scope flip.
 pub(super) fn detect_state(
-    flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    project: bool,
     env: &DetectionEnv,
 ) -> anyhow::Result<DetectedState> {
     let skim_binary = super::helpers::resolve_skim_binary()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = env.resolve(agent, flags.project)?;
+    let config_dir = env.resolve(agent, project)?;
     let protocol = protocol_for_agent(agent);
 
     // Compute the hook artifact directory via the protocol seam.
     // For all agents except Copilot CLI this equals config_dir (passthrough).
     // For Copilot CLI it redirects to ~/.copilot (or $COPILOT_CONFIG_DIR).
-    let hook_config_dir = protocol.hook_config_dir(
-        &config_dir,
-        flags.project,
-        env.override_for(agent).is_some(),
-    );
+    let hook_config_dir =
+        protocol.hook_config_dir(&config_dir, project, env.override_for(agent).is_some());
 
     let settings_path = config_dir.join(protocol.config_filename());
     let settings_exists = settings_path.exists();
@@ -263,7 +282,7 @@ pub(super) fn detect_state(
     };
 
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags, agent, env)?;
+    let dual_scope_warning = check_dual_scope(agent, project, env)?;
 
     // Reuse the already-read hook script contents for pinned-binary detection.
     let hook_uses_pinned_binary = hook_script_contents
@@ -416,11 +435,11 @@ fn scan_existing_hooks(
 /// producing a false positive. A Copilot-aware dual-scope check can be added if
 /// needed in a future subtask.
 pub(super) fn check_dual_scope(
-    flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    project: bool,
     env: &DetectionEnv,
 ) -> anyhow::Result<Option<String>> {
-    let other_dir = if flags.project {
+    let other_dir = if project {
         // Installing project-level, check global
         env.resolve(agent, false)?
     } else {
@@ -446,16 +465,8 @@ pub(super) fn check_dual_scope(
         return Ok(None);
     }
 
-    let scope = if flags.project {
-        "globally"
-    } else {
-        "in project"
-    };
-    let uninstall_scope = if flags.project {
-        "--global"
-    } else {
-        "--project"
-    };
+    let scope = if project { "globally" } else { "in project" };
+    let uninstall_scope = if project { "--global" } else { "--project" };
     let path = other_settings.display();
     Ok(Some(format!(
         "skim hook is also installed {scope} ({path})\n  \
@@ -1232,9 +1243,9 @@ mod tests {
     /// verified hook at a stale commit is CURRENT (waived) while simultaneously
     /// NOT matching a strict request. Folding the mode term into
     /// `hook_is_current` would collapse these two into one answer, and
-    /// `skim doctor` — which builds `InitFlags` with defaults and can only ever
-    /// pass `dev_requested = false` — would then report every dev-pinned install
-    /// as stale and exit 1.
+    /// `skim doctor` — whose path carries no request at all, so the folded term
+    /// could only ever be evaluated against `dev_requested = false` — would then
+    /// report every dev-pinned install as stale and exit 1.
     #[test]
     fn test_mode_matches_and_hook_is_current_are_independent() {
         let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
@@ -1347,19 +1358,6 @@ mod tests {
             )
             .unwrap();
 
-            let flags = InitFlags {
-                project: false,
-                yes: false,
-                dry_run: false,
-                uninstall: false,
-                force: false,
-                no_guidance: false,
-                dev: false,
-                agent: Some(crate::cmd::session::AgentKind::ClaudeCode),
-                wrappers: None,
-                permissions: None,
-                permissions_tier: super::super::flags::PermissionsTier::Seed,
-            };
             // Every axis points into the TempDir: detection only ever reads, but
             // it must not read the developer's real config either (PF-017).
             let env = DetectionEnv {
@@ -1373,7 +1371,7 @@ mod tests {
             };
 
             let state =
-                detect_state(&flags, crate::cmd::session::AgentKind::ClaudeCode, &env).unwrap();
+                detect_state(crate::cmd::session::AgentKind::ClaudeCode, false, &env).unwrap();
 
             assert_eq!(
                 state.hook_mode, expected,
@@ -1434,19 +1432,6 @@ mod tests {
                 std::fs::write(&script_path, format!("{current}# edited\n")).unwrap();
             }
 
-            let flags = InitFlags {
-                project: false,
-                yes: false,
-                dry_run: false,
-                uninstall: false,
-                force: false,
-                no_guidance: false,
-                dev: false,
-                agent: Some(crate::cmd::session::AgentKind::ClaudeCode),
-                wrappers: None,
-                permissions: None,
-                permissions_tier: super::super::flags::PermissionsTier::Seed,
-            };
             let env = DetectionEnv {
                 home_dir: Some(dir.path().to_path_buf()),
                 claude_config_dir: Some(dir.path().to_path_buf()),
@@ -1458,7 +1443,7 @@ mod tests {
             };
 
             let state =
-                detect_state(&flags, crate::cmd::session::AgentKind::ClaudeCode, &env).unwrap();
+                detect_state(crate::cmd::session::AgentKind::ClaudeCode, false, &env).unwrap();
 
             assert_eq!(
                 state.hook_mode,

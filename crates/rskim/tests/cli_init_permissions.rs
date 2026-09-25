@@ -9,12 +9,63 @@
 //!
 //! ## Isolation
 //!
-//! Each test uses its own `TempDir` + per-agent `*_CONFIG_DIR` env override so
-//! that no test touches real agent config directories.
+//! Every invocation here runs a REAL install, so every invocation goes through
+//! [`common::skim_sandboxed`] — the single authoritative sandbox env block
+//! (PF-017).  A per-agent `*_CONFIG_DIR` override alone does not isolate an
+//! install: it names one directory and leaves `HOME` — and therefore
+//! `~/.skim/bin`, `~/.cache/skim`, every *other* agent's config directory, and
+//! the guidance files under it — resolving to the developer's own.  The working
+//! directory is part of the sandbox for the same reason: a successful install
+//! ends in `install_search_integration`, which walks up from the process cwd and
+//! writes `post-commit`/`post-merge`/`post-checkout` into the first repository it
+//! finds.  Left at the cwd cargo supplies, that is this clone.
+//!
+//! The sandbox already points every `*_CONFIG_DIR` inside that home, so these
+//! tests name the directory an assertion is about with [`agent_config_dir`]
+//! rather than re-setting the variable by hand.  A hand-rolled override of a
+//! variable the sandbox owns is the shape `cli_init.rs`'s own guard rejects —
+//! it is how PF-017 was re-opened the second time — and it is unnecessary here:
+//! resolving the path through `common::SANDBOX_REDIRECTED_VARS` keeps the table
+//! the single place the mapping is written down.
 
 use predicates::prelude::*;
 use tempfile::TempDir;
 mod common;
+
+/// The directory the sandbox points `var` at, created so it exists.
+///
+/// Creation is not incidental.  `detect_installed_agents` counts an agent only
+/// when its override "points to an existing directory", so an uncreated path
+/// reads as "that agent is not installed" — the difference between exercising
+/// the fan-out and exercising nothing.  Resolving through the sandbox table
+/// (rather than joining a literal) means the install writes where the sandbox
+/// says it writes, with no second copy of the mapping to drift.
+/// A directory inside the sandbox home that reads as a git project root.
+///
+/// `find_git_root_from_cwd` walks ancestors for a path with a `.git` entry and
+/// returns the first hit, so an empty `.git` directory satisfies it — no git
+/// invocation, and nothing outside the sandbox is reachable.
+///
+/// Copilot needs this: the I-25 pre-check returns before `confirm_grant` when
+/// the cwd is not in a repository, so a Copilot consent test run from the bare
+/// sandbox home would assert "nothing was written" about the git-root skip
+/// instead of about the TTY gate it names.
+fn git_project_dir(home: &TempDir) -> std::path::PathBuf {
+    let project = home.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).expect("project .git must be creatable");
+    project
+}
+
+fn agent_config_dir(home: &TempDir, var: &str) -> std::path::PathBuf {
+    let relative = common::SANDBOX_REDIRECTED_VARS
+        .iter()
+        .find(|(name, _)| *name == var)
+        .map(|(_, relative)| *relative)
+        .unwrap_or_else(|| panic!("{var} is not a sandbox-redirected variable"));
+    let dir = common::sandbox_var_path(home.path(), relative);
+    std::fs::create_dir_all(&dir).expect("agent config dir must be creatable");
+    dir
+}
 
 // ============================================================================
 // Non-TTY refusal: --permissions without a TTY must not write anything
@@ -27,21 +78,21 @@ mod common;
 /// self-grant. This test verifies it fires on the integration path.
 #[test]
 fn test_permissions_non_tty_writes_nothing_claude() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
-    common::skim()
+    common::skim_sandboxed(home.path())
         .args(["init", "--agent", "claude", "--permissions"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .assert()
         .success();
 
     // No sidecar must be written.
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written when stdin is not a TTY"
     );
     // settings.json must not gain a permissions.allow array.
-    let settings_path = tmp.path().join("settings.json");
+    let settings_path = cfg.join("settings.json");
     if settings_path.exists() {
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -63,9 +114,10 @@ fn test_permissions_non_tty_writes_nothing_claude() {
 /// Non-TTY refusal applies for Gemini CLI too.
 #[test]
 fn test_permissions_non_tty_writes_nothing_gemini() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "GEMINI_CONFIG_DIR");
 
-    common::skim()
+    common::skim_sandboxed(home.path())
         .args([
             "init",
             "--agent",
@@ -73,12 +125,11 @@ fn test_permissions_non_tty_writes_nothing_gemini() {
             "--permissions",
             "--no-guidance",
         ])
-        .env("GEMINI_CONFIG_DIR", tmp.path())
         .assert()
         .success();
 
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written for Gemini on non-TTY"
     );
 }
@@ -86,9 +137,15 @@ fn test_permissions_non_tty_writes_nothing_gemini() {
 /// Non-TTY refusal applies for Copilot CLI too.
 #[test]
 fn test_permissions_non_tty_writes_nothing_copilot() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "COPILOT_CONFIG_DIR");
+    // Run from a git project (inside the sandbox) so the I-25 git-root
+    // pre-check passes and the invocation actually reaches the consent gate
+    // this test is about. From the bare sandbox home it would return earlier,
+    // and the assertion below would hold for the wrong reason.
+    let project = git_project_dir(&home);
 
-    common::skim()
+    common::skim_sandboxed(home.path())
         .args([
             "init",
             "--agent",
@@ -96,16 +153,16 @@ fn test_permissions_non_tty_writes_nothing_copilot() {
             "--permissions",
             "--no-guidance",
         ])
-        .env("COPILOT_CONFIG_DIR", tmp.path())
+        .current_dir(&project)
         .assert()
         .success();
 
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written for Copilot on non-TTY"
     );
     assert!(
-        !tmp.path().join("permissions-config.json").exists(),
+        !cfg.join("permissions-config.json").exists(),
         "permissions-config.json must NOT be written for Copilot on non-TTY"
     );
 }
@@ -120,11 +177,11 @@ fn test_permissions_non_tty_writes_nothing_copilot() {
 /// - Write NO sidecar or any other file.
 #[test]
 fn test_permissions_dry_run_enumerates_8_claude_entries() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
-    let out = common::skim()
+    let out = common::skim_sandboxed(home.path())
         .args(["init", "--agent", "claude", "--permissions", "--dry-run"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .output()
         .expect("skim must run");
 
@@ -132,7 +189,7 @@ fn test_permissions_dry_run_enumerates_8_claude_entries() {
 
     // No sidecar written on dry-run.
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "dry-run must not write a sidecar"
     );
     // No settings.json written on dry-run (only the hook dry-run output appears).
@@ -177,11 +234,11 @@ fn test_permissions_dry_run_enumerates_8_claude_entries() {
 /// cause, and (c) interactive re-run remedy.
 #[test]
 fn test_permissions_non_tty_explicit_request_prints_notice() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
-    let out = common::skim()
+    let out = common::skim_sandboxed(home.path())
         .args(["init", "--agent", "claude", "--permissions"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .output()
         .expect("skim must run");
 
@@ -193,7 +250,7 @@ fn test_permissions_non_tty_explicit_request_prints_notice() {
 
     // Must not write sidecar.
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written when non-TTY refuses consent"
     );
 
@@ -218,11 +275,11 @@ fn test_permissions_non_tty_explicit_request_prints_notice() {
 /// Same as above — --yes cannot bypass consent.
 #[test]
 fn test_permissions_non_tty_yes_flag_prints_notice() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
-    let out = common::skim()
+    let out = common::skim_sandboxed(home.path())
         .args(["init", "--agent", "claude", "--permissions", "--yes"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .output()
         .expect("skim must run");
 
@@ -234,7 +291,7 @@ fn test_permissions_non_tty_yes_flag_prints_notice() {
 
     // Must not write sidecar.
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written when --yes refuses consent non-interactively"
     );
 
@@ -261,16 +318,16 @@ fn test_permissions_non_tty_yes_flag_prints_notice() {
 
 #[test]
 fn test_no_permissions_flag_skips_seeding() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
-    common::skim()
+    common::skim_sandboxed(home.path())
         .args(["init", "--agent", "claude", "--no-permissions"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .assert()
         .success();
 
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "--no-permissions must not write a sidecar"
     );
 }
@@ -281,11 +338,14 @@ fn test_no_permissions_flag_skips_seeding() {
 
 #[test]
 fn test_permissions_and_project_flags_conflict() {
-    let tmp = TempDir::new().unwrap();
+    // No agent config directory: the conflict is rejected while parsing flags,
+    // before anything is written, so there is nothing to assert about a
+    // directory.  The sandbox stays because it is what contains the damage if
+    // that rejection ever regresses — the install would otherwise proceed.
+    let home = TempDir::new().unwrap();
 
-    common::skim()
+    common::skim_sandboxed(home.path())
         .args(["init", "--agent", "claude", "--permissions", "--project"])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .assert()
         .failure()
         .stderr(
@@ -358,9 +418,11 @@ fn contract_read_only_subcommands_absent_from_rewrite_dispatch() {
 /// of silently returning `Ok(true)` (fabricated consent).
 #[test]
 fn test_permissions_mirror_empty_proposals_no_prompt_no_write() {
-    let tmp = TempDir::new().unwrap(); // empty dir — no allow-list entries to mirror
+    let home = TempDir::new().unwrap();
+    // Empty dir — no allow-list entries to mirror.
+    let cfg = agent_config_dir(&home, "CLAUDE_CONFIG_DIR");
 
-    let out = common::skim()
+    let out = common::skim_sandboxed(home.path())
         .args([
             "init",
             "--agent",
@@ -369,7 +431,6 @@ fn test_permissions_mirror_empty_proposals_no_prompt_no_write() {
             "--permissions-tier",
             "mirror",
         ])
-        .env("CLAUDE_CONFIG_DIR", tmp.path())
         .output()
         .expect("skim must run");
 
@@ -380,12 +441,12 @@ fn test_permissions_mirror_empty_proposals_no_prompt_no_write() {
 
     // (b) No sidecar must be written.
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written when mirror proposals are empty"
     );
 
     // (b) No permissions entries in settings.json.
-    let settings_path = tmp.path().join("settings.json");
+    let settings_path = cfg.join("settings.json");
     if settings_path.exists() {
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -424,10 +485,11 @@ fn test_permissions_mirror_empty_proposals_no_prompt_no_write() {
 /// (the hook + settings registration still complete).
 #[test]
 fn test_permissions_copilot_non_git_skip() {
-    let copilot_cfg = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let copilot_cfg = agent_config_dir(&home, "COPILOT_CONFIG_DIR");
     let non_git_dir = TempDir::new().unwrap(); // not inside any git repository
 
-    let out = common::skim()
+    let out = common::skim_sandboxed(home.path())
         .args([
             "init",
             "--agent",
@@ -435,7 +497,9 @@ fn test_permissions_copilot_non_git_skip() {
             "--permissions",
             "--no-guidance",
         ])
-        .env("COPILOT_CONFIG_DIR", copilot_cfg.path())
+        // Chained AFTER the sandbox, so it wins.  Kept explicit because the
+        // non-git cwd is this test's subject, not merely its isolation — the
+        // sandbox home would satisfy the precondition silently.
         .current_dir(non_git_dir.path())
         .output()
         .expect("skim must run");
@@ -447,7 +511,7 @@ fn test_permissions_copilot_non_git_skip() {
 
     // No sidecar written.
     assert!(
-        !copilot_cfg.path().join("skim-permissions.json").exists(),
+        !copilot_cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must NOT be written outside a git repo"
     );
 
@@ -472,19 +536,28 @@ fn test_permissions_copilot_non_git_skip() {
 /// successfully (it silently excludes Codex, not an error).
 #[test]
 fn test_permissions_auto_detect_with_codex_override_succeeds() {
-    let tmp = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let cfg = agent_config_dir(&home, "CODEX_CONFIG_DIR");
 
-    // Run with --permissions and CODEX_CONFIG_DIR set (so Codex is "detected").
-    // Codex should be silently excluded from permissions fan-out.
-    common::skim()
+    // Run with --permissions and only the Codex config directory created, so
+    // Codex is the one agent that is "detected".  It must then be silently
+    // excluded from the permissions fan-out.
+    //
+    // This is the site with the largest blast radius in the file and the reason
+    // the sandbox is not optional here: with no `--agent`, the install fans out
+    // over every agent auto-detect returns.  `detect_installed_agents` restricts
+    // that fan-out to overridden directories that EXIST, and the sandbox points
+    // every one of those overrides inside this TempDir — so the detected set is
+    // {Codex} by construction, rather than whatever the machine running the
+    // suite happens to have installed.
+    common::skim_sandboxed(home.path())
         .args(["init", "--permissions", "--no-guidance"])
-        .env("CODEX_CONFIG_DIR", tmp.path())
         .assert()
         .success();
 
     // No permissions sidecar must be written (Codex excluded + non-TTY consent).
     assert!(
-        !tmp.path().join("skim-permissions.json").exists(),
+        !cfg.join("skim-permissions.json").exists(),
         "skim-permissions.json must not be written for Codex in auto-detect mode"
     );
 }

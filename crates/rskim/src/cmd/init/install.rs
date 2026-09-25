@@ -15,6 +15,39 @@ use crate::cmd::hooks::copilot::SKIM_JSON_NAME;
 use crate::cmd::hooks::{generate_hook_script, protocol_for_agent};
 use crate::cmd::session::{AgentKind, InstructionEnv};
 
+// ============================================================================
+// The write-decision predicate
+// ============================================================================
+
+impl DetectedState {
+    /// Whether the installed hook is the artefact THIS INVOCATION would write.
+    ///
+    /// The single predicate every WRITE DECISION consults, and the reason there
+    /// is one: three sites in this file ask the same question from three angles —
+    /// [`print_install_summary`] ("will we write?"), the fast path in
+    /// `run_install_single` ("can we skip?") and [`create_hook_script`]'s
+    /// idempotence check ("do we write?"). They must agree, or the installer
+    /// either announces a no-op it then performs or reinstalls on every run. Spelt
+    /// as a conjunction at each site, they agreed only by inspection.
+    ///
+    /// # Why it lives here and not on `DetectedState` in `state.rs`
+    ///
+    /// Its visibility IS the asymmetry it has to protect. `init::hook_facts` —
+    /// `skim doctor`'s path — must keep calling the NARROWER
+    /// [`DetectedState::hook_is_current`] alone, because doctor has no `--dev` to
+    /// read and so has no request to match: conjoining the mode term there would
+    /// evaluate it against `dev_requested = false`, report every dev-pinned hook
+    /// as stale and exit 1 on precisely the installs the waiver exists to keep
+    /// green (ADR-019; `state.rs` pins the two predicates' independence directly).
+    /// Defined in this module, this method is not reachable from `init/mod.rs` at
+    /// all, so that is a compiler property rather than a comment repeated three
+    /// times — and `hook_is_current` stays the name of the narrower,
+    /// provenance-only question a reader can still ask.
+    fn matches_request(&self, dev_requested: bool) -> bool {
+        self.hook_is_current() && self.mode_matches(dev_requested)
+    }
+}
+
 /// Verify that the target agent appears to be installed on this system.
 ///
 /// Checks for the expected config directory. If the agent's config dir
@@ -117,12 +150,12 @@ fn print_dual_scope_warning(warning: &str) {
 
 /// Print what the install is about to do.
 ///
-/// `dev_requested` mirrors the term `create_hook_script` uses to decide whether
-/// it will actually rewrite the script, so the summary cannot claim a no-op that
-/// the write path then performs (or the reverse).
+/// Reads the same [`DetectedState::matches_request`] the write path decides on,
+/// so the summary cannot claim a no-op that `create_hook_script` then performs
+/// (or the reverse).
 fn print_install_summary(state: &DetectedState, agent: AgentKind, dev_requested: bool) {
     println!("  Summary:");
-    if !state.hook_installed || !state.hook_is_current() || !state.mode_matches(dev_requested) {
+    if !state.hook_installed || !state.matches_request(dev_requested) {
         let hook_script_path = state.hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME);
         println!("    * Create hook script: {}", hook_script_path.display());
         let protocol = protocol_for_agent(agent);
@@ -453,7 +486,7 @@ fn run_install_single(
     det_env: &DetectionEnv,
 ) -> anyhow::Result<std::process::ExitCode> {
     let env = InstructionEnv::from_process();
-    let state = detect_state(flags, agent, det_env)?;
+    let state = detect_state(agent, flags.project, det_env)?;
 
     // The directory where permissions sidecar and config live.
     // Copilot CLI: hook_config_dir (~/.copilot). All others: config_dir.
@@ -478,9 +511,9 @@ fn run_install_single(
     //
     // Read straight off the flag, with no memory of the installed state: the
     // ABSENCE of `--dev` is itself a request, for a strict install. That is what
-    // makes a plain `skim init` revert a dev-pinned hook (`mode_matches` below
+    // makes a plain `skim init` revert a dev-pinned hook (`matches_request` below
     // sees Dev ≠ Strict, blocks the fast path, and `create_hook_script`
-    // regenerates without the marker), and why ADR-014 needs no `--undev`.
+    // regenerates without the marker), and why ADR-019 needs no `--undev`.
     //
     // It fans out to every detected agent for free: `agent_flags_for_auto_detect`
     // builds each agent's flags with `..*flags`. That is required, not incidental
@@ -514,8 +547,7 @@ fn run_install_single(
         crate::cmd::integrity::ScriptIntegrity::Verified
     );
     if state.hook_installed
-        && state.hook_is_current()
-        && state.mode_matches(dev_requested)
+        && state.matches_request(dev_requested)
         && guidance_current
         && !permissions_blocked
         && !flags.force
@@ -911,11 +943,13 @@ fn mode_transition(installed: crate::cmd::hooks::HookMode, dev_requested: bool) 
 
 /// Write (or knowingly skip writing) the agent's hook script.
 ///
-/// `dev_requested` is the mode this invocation asks for. It is a term of the
-/// idempotence check below and not merely of the caller's fast path: an
-/// installed script that declares a mode this command did not ask for is not the
-/// artefact this command produces, so skipping the write would leave the
-/// declaration in place and make dev mode sticky state (ADR-014).
+/// `dev_requested` is the mode this invocation asks for, and the idempotence
+/// check below consults [`DetectedState::matches_request`] — the same predicate
+/// the caller's fast path and the summary use — rather than re-spelling the
+/// conjunction. It is a term HERE and not merely in the caller: an installed
+/// script that declares a mode this command did not ask for is not the artefact
+/// this command produces, so skipping the write would leave the declaration in
+/// place and make dev mode sticky state (ADR-019).
 fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Result<()> {
     let hooks_dir = state.hook_config_dir.join("hooks");
     let script_path = hooks_dir.join(HOOK_SCRIPT_NAME);
@@ -933,7 +967,7 @@ fn create_hook_script(state: &DetectedState, dev_requested: bool) -> anyhow::Res
     // Check if existing script is current (idempotent).
     // Uses the already-detected hook state rather than re-reading the script.
     if script_path.exists() {
-        if state.hook_is_current() && state.mode_matches(dev_requested) {
+        if state.matches_request(dev_requested) {
             // Script is current — but only self-heal the manifest when integrity
             // passes. A Tampered verdict means the on-disk bytes are unknown;
             // hashing and writing them would launder the divergence, making a

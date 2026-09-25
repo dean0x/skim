@@ -91,28 +91,21 @@ pub(crate) struct HookFacts {
 /// (`project: false`), which is the scope that fires for every session.
 /// Returns an error only if the config-dir resolver itself fails (e.g.,
 /// cannot determine home directory).
+///
+/// The scope is the only thing passed because it is the only thing detection
+/// takes: `skim doctor` is not an install and has no `--dev`, `--force` or
+/// `--uninstall` to answer for, so `state::detect_state`'s signature leaves this
+/// path nothing to fabricate and no non-use to keep true.
+///
+/// Doctor consults `DetectedState::hook_is_current` alone, never the
+/// installer's mode-aware conjunction: it has no request to match, so pairing
+/// the two would judge every dev-pinned hook against `dev_requested = false`,
+/// report it stale and exit 1 on exactly the installs the waiver keeps green
+/// (ADR-019). That predicate is defined privately in `init::install` and is not
+/// reachable from this module, so the asymmetry is a compiler property.
 pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Result<HookFacts> {
-    let init_flags = flags::InitFlags {
-        project: false,
-        yes: false,
-        dry_run: false,
-        uninstall: false,
-        force: false,
-        no_guidance: false,
-        // `skim doctor` is not an install and has no `--dev` to read, so it asks
-        // for nothing. This value never reaches a mode decision: `hook_facts`
-        // calls `hook_is_current`/`pin_is_current`, never `mode_matches`, and the
-        // mode doctor REPORTS is the one the installed script declares
-        // (`detected.hook_mode`, gated by `honour_dev_declaration`). Keeping the
-        // two apart is the whole reason `mode_matches` is a separate predicate.
-        dev: false,
-        agent: Some(agent),
-        wrappers: None,
-        permissions: None,
-        permissions_tier: flags::PermissionsTier::Seed,
-    };
     let env = DetectionEnv::from_process();
-    let detected = state::detect_state(&init_flags, agent, &env)?;
+    let detected = state::detect_state(agent, false, &env)?;
 
     // Evaluate hook_is_current() and pin_is_current() before partially moving
     // out of `detected`. Both queries read struct fields, so they must be called

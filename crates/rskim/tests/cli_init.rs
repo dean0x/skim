@@ -8,12 +8,25 @@
 //! no `--agent` removes wrapper symlinks from `~/.skim/bin` and guidance files
 //! from `~/.gemini` and `~/.copilot` for every configured agent (PF-017).
 //!
+//! A successful `skim init` also ends by walking ancestors of the process
+//! working directory for a project root and installing git hooks into it, so an
+//! invocation left at the cwd cargo supplies writes `post-commit`, `post-merge`
+//! and `post-checkout` into the skim clone this test binary was built from. That
+//! axis belongs to no environment variable and is closed in the sandbox builder
+//! itself.
+//!
 //! Every invocation in this file is therefore built by [`Sandbox`], which owns a
 //! `TempDir` and routes through `common::skim_sandboxed`. The convention is not
-//! left to memory: [`test_every_invocation_in_this_file_is_sandboxed`] scans this
-//! file's own source and fails on any unsandboxed constructor, and
-//! [`test_sandbox_env_block_classifies_every_env_var_the_crate_reads`] scans
-//! `crates/rskim/src` and fails when a newly-added env read has no sandbox entry.
+//! left to memory — three guards turn it into a failure:
+//!
+//! - [`test_every_invocation_in_this_file_is_sandboxed`] scans this file's own
+//!   source for unsandboxed constructors and for the cwd pin;
+//! - [`test_every_init_test_file_is_sandboxed`] scans every installer test file
+//!   ([`INSTALLER_TEST_PREFIXES`] — `cli_init*` and `cli_integrity*`), so a
+//!   sibling cannot escape the convention this file documents;
+//! - [`test_sandbox_env_block_classifies_every_env_var_the_binary_reads`] scans
+//!   every crate linked into the `skim` binary and fails when a newly-added env
+//!   read has no sandbox entry.
 //!
 //! Non-interactive tests pass `--yes`.
 
@@ -99,8 +112,18 @@ impl Sandbox {
     ///
     /// This is the single call site of `common::skim_sandboxed` in this file,
     /// and the guard test asserts it stays that way.
+    ///
+    /// The cwd pin is deliberate redundancy, not an oversight: the shared
+    /// builder already sets it, and this restatement is the line
+    /// [`test_every_invocation_in_this_file_is_sandboxed`] can see and pin, so
+    /// the axis cannot regress in this file on its own. It is worth restating
+    /// because an unpinned cwd is not a read of the developer's home directory
+    /// but a write to their repository — `skim init` ends by walking ancestors
+    /// of the cwd for a project root and installing git hooks into it.
     fn skim(&self) -> Command {
-        common::skim_sandboxed(self.home())
+        let mut cmd = common::skim_sandboxed(self.home());
+        cmd.current_dir(self.home());
+        cmd
     }
 
     /// [`Sandbox::skim`] with the `init` subcommand already applied.
@@ -2085,13 +2108,13 @@ fn test_init_repairs_tampered_hook_not_launders() {
     // Step 5: `skim doctor` must now report Verified (not Tampered).
     // This confirms that the manifest was recomputed from the repaired content.
     //
-    // We run doctor from the sandbox home (not a git repo) and prepend the
-    // test binary's directory to PATH so the PATH scan does not spuriously
-    // report drift from an unrelated release build.
+    // `Sandbox::skim` already runs doctor from the sandbox home, which is not a
+    // git repo, so the staleness-vs-HEAD check skips. Prepend the test binary's
+    // directory to PATH so the PATH scan does not spuriously report drift from
+    // an unrelated release build.
     let doctor_out = sandbox
         .skim()
         .arg("doctor")
-        .current_dir(sandbox.home())
         .env("PATH", common::hermetic_path())
         .output()
         .unwrap();
@@ -2242,10 +2265,12 @@ fn test_init_without_a_declaration_still_takes_the_skip_path() {
 
 /// Run `skim init` in `sandbox`, with `--dev` when asked, and return stdout.
 ///
-/// `current_dir(sandbox.home())` keeps `install_search_integration` from finding
-/// the repository this test binary runs from: with no `.git` above the sandbox
-/// there is no project root, so no search hooks are installed and no background
-/// index build is spawned.
+/// Nothing is done here to keep `install_search_integration` away from the
+/// repository this test binary runs from: [`Sandbox::skim`] pins the cwd to the
+/// sandbox home for every invocation in this file, so with no `.git` above the
+/// sandbox there is no project root, no search hooks are installed and no
+/// background index build is spawned. This used to be applied at three call
+/// sites and missed at the other thirty-odd.
 fn run_init(sandbox: &Sandbox, dev: bool) -> String {
     let mut cmd = sandbox.skim();
     cmd.args(["init", "--agent", "claude-code", "--no-guidance"]);
@@ -2253,7 +2278,7 @@ fn run_init(sandbox: &Sandbox, dev: bool) -> String {
         cmd.arg("--dev");
     }
     cmd.arg("--no-wrappers");
-    let out = cmd.current_dir(sandbox.home()).output().unwrap();
+    let out = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "init must succeed, got:\n{stdout}");
     stdout
@@ -2370,7 +2395,6 @@ fn test_init_dev_fans_out_to_every_detected_agent() {
     let out = sandbox
         .skim()
         .args(["init", "--no-guidance", "--no-wrappers", "--dev"])
-        .current_dir(sandbox.home())
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -2438,48 +2462,58 @@ fn test_init_project_and_wrappers_is_rejected() {
 // PF-017's durable lesson is that sandboxing an installer's own tests is a
 // convention, and a convention that must be remembered is one that will be
 // forgotten: five days after the first fix shipped, a new test hand-rolled its
-// own env block and dropped two variables from it. The two tests below turn the
-// convention into a failure. They guard different things and neither subsumes
-// the other — the first catches a test that escapes the sandbox, the second
-// catches a sandbox that has stopped covering the program.
+// own env block and dropped two variables from it. The tests below turn the
+// convention into a failure. They guard different things and none subsumes the
+// others — the first catches a test in THIS file that escapes the sandbox, the
+// second catches one in any installer test file (`cli_init*`/`cli_integrity*`),
+// and the last catches a sandbox that has stopped covering the program.
 
-/// Guard: every `skim` invocation in this file is built by [`Sandbox`].
+/// The invocation-builder spellings that escape the sandbox, and what each one
+/// does wrong.
+///
+/// Every needle is assembled from fragments. Spelled out whole, a needle would
+/// match its own text in this file — which both file-scanning guards read as
+/// data — and they would fail on themselves rather than on a real violation.
+const ESCAPING_NEEDLES: &[(&str, &str)] = &[
+    (
+        concat!("common::", "skim()"),
+        "builds an UNSANDBOXED command against the real $HOME",
+    ),
+    (
+        concat!("common::", "skim_with_analytics"),
+        "writes to a caller-chosen analytics DB rather than the sandbox's",
+    ),
+    (
+        concat!("cargo", "_bin"),
+        "resolves the binary directly, skipping the sandbox env block",
+    ),
+    (
+        concat!("Command", "::new("),
+        "constructs a bare command that inherits the host environment",
+    ),
+];
+
+/// Guard: every `skim` invocation in this file is built by [`Sandbox`], and that
+/// constructor still pins the working directory.
 ///
 /// `skim init --uninstall` with no `--agent` removes wrapper symlinks and
 /// guidance files for every configured agent, so an unsandboxed invocation here
 /// does not read the developer's home directory — it deletes from it. There is
-/// no consent gate on that path to catch the mistake later.
+/// no consent gate on that path to catch the mistake later. The cwd is the same
+/// class of hazard reached through a different door: `skim init` writes git hooks
+/// into whatever repository encloses the cwd, which no `$HOME` redirect covers.
 #[test]
 fn test_every_invocation_in_this_file_is_sandboxed() {
-    // `include_str!` embeds this file's own source, so each needle is assembled
-    // from fragments: spelled out whole, a needle would match its own text here
-    // and the guard would fail on itself rather than on a real violation.
     let source = include_str!("cli_init.rs");
 
-    let forbidden = [
-        (
-            concat!("common::", "skim()"),
-            "builds an UNSANDBOXED command against the real $HOME",
-        ),
-        (
-            concat!("common::", "skim_with_analytics"),
-            "writes to a caller-chosen analytics DB rather than the sandbox's",
-        ),
-        (
-            concat!("common::", "skim_sandboxed_with_bin"),
-            "is the low-level builder — go through Sandbox::skim",
-        ),
-        (
-            concat!("cargo", "_bin"),
-            "resolves the binary directly, skipping the sandbox env block",
-        ),
-        (
-            concat!("Command", "::new("),
-            "constructs a bare command that inherits the host environment",
-        ),
-    ];
+    /// Sandboxed, but the wrong layer: legitimate elsewhere, so it is a rule
+    /// about this file rather than an escape [`ESCAPING_NEEDLES`] can carry.
+    const WRONG_LAYER: (&str, &str) = (
+        concat!("common::", "skim_sandboxed_with_bin"),
+        "is the low-level builder — go through Sandbox::skim",
+    );
 
-    for (needle, why) in forbidden {
+    for (needle, why) in ESCAPING_NEEDLES.iter().copied().chain([WRONG_LAYER]) {
         assert!(
             !source.contains(needle),
             "cli_init.rs uses `{needle}`, which {why}. Build every invocation \
@@ -2487,6 +2521,21 @@ fn test_every_invocation_in_this_file_is_sandboxed() {
              `skim init --uninstall` DELETES real agent config (PF-017)."
         );
     }
+
+    // The cwd axis, pinned at this file's chokepoint. No environment variable
+    // can confine it: a successful `skim init` ends by walking ancestors of the
+    // process cwd for a project root and writing git hooks into it, so an
+    // invocation left at the cargo-supplied cwd installs real post-commit,
+    // post-merge and post-checkout hooks into the skim clone this test binary
+    // was built from. Assembled from fragments for the same reason as the
+    // needles above — spelled whole, this assertion would satisfy itself.
+    let cwd_pin = concat!("cmd.current_dir(self.", "home());");
+    assert!(
+        source.contains(cwd_pin),
+        "`Sandbox::skim` must pin the cwd to the sandbox home (`{cwd_pin}`), \
+         which has no `.git` above it. Without the pin every install in this \
+         file reaches the repository the test binary runs from."
+    );
 
     // Exactly one call to the sandboxed constructor: the one in `Sandbox::skim`.
     // A second call site is a second sandbox definition waiting to drift.
@@ -2510,19 +2559,223 @@ fn test_every_invocation_in_this_file_is_sandboxed() {
     }
 }
 
+/// An installer test file that still contains unsandboxed invocations, with the
+/// exact number measured today.
+///
+/// An explicit, named list rather than a narrowed scan: a scan that quietly
+/// covers one file is how the escape survived in the first place. Each entry is
+/// pinned by [`test_sandbox_exclusions_still_measure_their_documented_count`],
+/// so it cannot outlive the invocations it excuses.
+struct SandboxExclusion {
+    /// File name directly under `crates/rskim/tests`.
+    file: &'static str,
+    /// The needle, spelled exactly as [`ESCAPING_NEEDLES`] assembles it.
+    needle: &'static str,
+    /// Occurrences measured today — a pin, not an upper bound.
+    count: usize,
+    /// What the invocations reach, and why they are not fixed here.
+    reason: &'static str,
+}
+
+const SANDBOX_EXCLUSIONS: &[SandboxExclusion] = &[SandboxExclusion {
+    file: "cli_init_copilot_migrate.rs",
+    needle: concat!("common::", "skim()"),
+    count: 3,
+    reason: "installs and uninstalls Copilot artifacts with only \
+             COPILOT_CONFIG_DIR redirected, so guidance files, wrapper \
+             symlinks and the cache outside that one directory are still \
+             the developer's own",
+}];
+
+/// Guard: every installer test file is sandboxed, not just this one.
+///
+/// "Installer test file" is [`INSTALLER_TEST_PREFIXES`], which is `cli_init*`
+/// **and** `cli_integrity*` — the test keeps its historical name, but its scope
+/// is whatever that list says.
+///
+/// The predecessor of this test scanned `include_str!("cli_init.rs")` — its own
+/// source — while its failure message universalised from it ("Build every
+/// invocation with `Sandbox::skim()`"). It was therefore structurally blind to
+/// its siblings, which is where the unsandboxed invocations actually were:
+/// eleven in `cli_init_permissions.rs` and three in
+/// `cli_init_copilot_migrate.rs`, every one an installer pointed at the
+/// developer's real `$HOME`. The eleven are closed — that file is now covered
+/// by this guard with no exclusion — and the three remain in
+/// [`SANDBOX_EXCLUSIONS`].
+///
+/// The scan that replaced it inherited a narrower blindness: it matched on the
+/// name `cli_init`, and `cli_integrity.rs` — an install/tamper/uninstall suite —
+/// is not named that. Its two unsandboxed invocations are closed and the prefix
+/// list now covers the file, again with no exclusion.
+#[test]
+fn test_every_init_test_file_is_sandboxed() {
+    let tests_root = tests_root();
+    let files = init_test_files(&tests_root);
+    assert!(
+        files.len() >= 4,
+        "found {} installer test sources under {} (prefixes: {:?}), expected at \
+         least the four that exist today — a filter that stopped matching must \
+         not let this guard pass vacuously",
+        files.len(),
+        tests_root.display(),
+        INSTALLER_TEST_PREFIXES
+    );
+
+    // Assembled from fragments like the needles: spelled whole in a message,
+    // this would be a second call site of the sandboxed builder as far as
+    // `test_every_invocation_in_this_file_is_sandboxed` can tell.
+    let builder = concat!("common::", "skim_sandboxed(home)");
+
+    for path in &files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| panic!("{} has no file name", path.display()));
+        let body = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+        for (needle, why) in ESCAPING_NEEDLES.iter().copied() {
+            if SANDBOX_EXCLUSIONS
+                .iter()
+                .any(|e| e.file == name && e.needle == needle)
+            {
+                continue; // pinned by the self-retiring guard below
+            }
+            let found = body.matches(needle).count();
+            assert_eq!(
+                found, 0,
+                "{name} uses `{needle}` {found}×, which {why}. Route every \
+                 invocation through `{builder}` with a `TempDir` home: a global \
+                 `skim init --uninstall` DELETES real agent config, and a \
+                 successful `skim init` writes git hooks into whatever \
+                 repository encloses the cwd (PF-017)."
+            );
+        }
+    }
+
+    // The cwd axis is closed for all of them at once in the shared builder —
+    // including the files excluded above, which is why the exclusions are about
+    // `$HOME` and not about the repository. Assembled from fragments so this
+    // assertion cannot be satisfied by its own text.
+    let shared_path = tests_root.join("common/mod.rs");
+    let shared = fs::read_to_string(&shared_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", shared_path.display()));
+    let shared_cwd_pin = concat!("c.current_dir(", "home);");
+    assert!(
+        shared.contains(shared_cwd_pin),
+        "`skim_sandboxed_with_bin` must pin the cwd to the sandbox home \
+         (`{shared_cwd_pin}`). Without it every sandboxed install inherits the \
+         cargo cwd and writes post-commit, post-merge and post-checkout hooks \
+         into the skim clone the test binary was built from."
+    );
+}
+
+/// Guard: each [`SANDBOX_EXCLUSIONS`] entry still measures exactly its count.
+///
+/// This is what makes the list self-retiring. Sandbox one more invocation and
+/// this test goes red naming the entry to update; sandbox the last one and the
+/// entry must be deleted, at which point
+/// [`test_every_init_test_file_is_sandboxed`] covers the file with no further
+/// edit. The pin also makes a typo impossible to ignore: a misspelled needle
+/// measures zero and fails here, rather than silently excluding nothing.
+#[test]
+fn test_sandbox_exclusions_still_measure_their_documented_count() {
+    let tests_root = tests_root();
+    for excl in SANDBOX_EXCLUSIONS {
+        let (file, needle, count, reason) = (excl.file, excl.needle, excl.count, excl.reason);
+        assert!(
+            ESCAPING_NEEDLES.iter().any(|(n, _)| *n == needle),
+            "the exclusion for {file} names `{needle}`, which is not one of the \
+             needles test_every_init_test_file_is_sandboxed checks — the entry \
+             excludes nothing"
+        );
+        let path = tests_root.join(file);
+        let body = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let found = body.matches(needle).count();
+        assert_eq!(
+            found, count,
+            "{file} now contains `{needle}` {found}×, not the {count} pinned in \
+             SANDBOX_EXCLUSIONS ({reason}). If you sandboxed some of them, \
+             update the count; if you sandboxed all of them, DELETE this entry \
+             — test_every_init_test_file_is_sandboxed then covers the file."
+        );
+    }
+}
+
+/// `crates/rskim/tests` — the directory the file-scanning guards walk.
+fn tests_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"))
+}
+
+/// Name prefixes of the integration test files that drive the installer.
+///
+/// A prefix list rather than a single prefix, because the first scoping of this
+/// guard used `cli_init` alone — and `cli_integrity.rs`, which installs, tampers
+/// and uninstalls throughout, does not start with it. The two names share
+/// `cli_int` and diverge one character later, which is close enough to read as
+/// covered and is not. That file ran `skim init` against the developer's real
+/// `$HOME`, with one agent config directory redirected and nothing else, for as
+/// long as the filter was written that way.
+///
+/// A prefix is still the right shape for the entries themselves: a new
+/// `cli_init_*.rs` or `cli_integrity_*.rs` file is covered the moment it is
+/// added, which is the failure mode these guards exist to prevent. Widening this
+/// list — rather than adding a [`SANDBOX_EXCLUSIONS`] entry — is also the rule
+/// for the next file found outside it: an exclusion records a hole, a prefix
+/// closes one.
+const INSTALLER_TEST_PREFIXES: &[&str] = &["cli_init", "cli_integrity"];
+
+/// The installer integration test files, via the bounded walk.
+fn init_test_files(tests_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = rust_sources_under(tests_root)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    INSTALLER_TEST_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(*prefix))
+                })
+        })
+        .collect();
+    files.sort();
+    files
+}
+
 /// Guard: the sandbox env block still accounts for every variable the program
 /// reads.
 ///
 /// A hand-maintained enumeration of overrides is always incomplete (PF-017), so
 /// this checks the enumeration against the source rather than trusting it: each
-/// env var `crates/rskim/src` reads must be redirected, pinned, removed, or
+/// env var the shipped binary reads must be redirected, pinned, removed, or
 /// explicitly inherited. Adding an env read without classifying it fails here.
 ///
-/// Scope is the binary crate because that is where all env access lives —
-/// `rskim-core` is a pure transform library with no I/O side effects. A read
-/// added there would escape this guard, which is the cost of the narrow scope.
+/// # Scope: every crate linked into the binary
+///
+/// `rskim` itself, its unconditional library dependencies (`rskim-core`,
+/// `rskim-compress`, `rskim-search`, `rskim-tokens`) and the two the `proxy`
+/// feature adds (`rskim-contract`, `rskim-proxy`), because release builds enable
+/// it. Scanning the binary crate alone was not enough, and the justification for
+/// doing so named one of the five other crates it links: `rskim-search`'s index
+/// reader reads `SKIM_DEBUG` and `rskim-tokens` reads `ANTHROPIC_API_KEY`, both
+/// invisible to that scope. `rskim-research` and `rskim-bench` are deliberately
+/// out — neither is linked into the binary, so a read there cannot reach a
+/// sandboxed invocation.
+///
+/// # `#[cfg(test)]` is out of scope
+///
+/// A variable only a unit test reads is not one the shipped binary reads, and
+/// demanding a sandbox entry for it produces a false classification rather than
+/// a real one: `CARGO_BIN_EXE_skim`, read only by this workspace's own test
+/// modules, was filed in `SANDBOX_REMOVED_VARS` under a contract ("a host value
+/// would leak session state into a test") that does not describe a cargo harness
+/// variable, because that was the cheapest way to satisfy this guard. Both
+/// shapes of test-only code are skipped: an inline `#[cfg(test)]` item, and a
+/// whole file declared `#[cfg(test)] mod …;` by its parent.
 #[test]
-fn test_sandbox_env_block_classifies_every_env_var_the_crate_reads() {
+fn test_sandbox_env_block_classifies_every_env_var_the_binary_reads() {
     /// Indirect reads (`env::var(SOMETHING)`) whose argument is neither a string
     /// literal nor a resolvable `const`. `name` is the `|name: &str|` parameter
     /// of the `read` closures in `DetectionEnv::from_process` and
@@ -2530,12 +2783,39 @@ fn test_sandbox_env_block_classifies_every_env_var_the_crate_reads() {
     /// are covered by the `read("…")` pattern below.
     const EXPECTED_INDIRECT_READS: &[&str] = &["name"];
 
-    let src_root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
-    let sources = rust_sources_under(src_root);
+    /// Crate directories under the workspace `crates/`, per the scope note.
+    const LINKED_CRATES: &[&str] = &[
+        "rskim",
+        "rskim-core",
+        "rskim-compress",
+        "rskim-search",
+        "rskim-tokens",
+        "rskim-contract",
+        "rskim-proxy",
+    ];
+
+    /// Reads that are unambiguously production code, used to detect a
+    /// `#[cfg(test)]` skip that has begun swallowing live source. Skipping too
+    /// much is the one failure of that scan which makes this guard weaker
+    /// instead of noisier, so it gets an explicit tripwire.
+    const PRODUCTION_SENTINELS: &[&str] = &["SKIM_CACHE_DIR", "CLAUDE_CONFIG_DIR"];
+
+    let crates_root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let mut sources = Vec::new();
+    for crate_name in LINKED_CRATES {
+        let src_root = crates_root.join(crate_name).join("src");
+        assert!(
+            src_root.is_dir(),
+            "{} is not a directory — a renamed or moved crate must not silently \
+             shrink this guard's scope",
+            src_root.display()
+        );
+        sources.extend(rust_sources_under(&src_root));
+    }
     assert!(
         !sources.is_empty(),
         "found no Rust sources under {} — the guard would pass vacuously",
-        src_root.display()
+        crates_root.display()
     );
 
     // Two passes: consts first, because a read may resolve a const defined in
@@ -2549,10 +2829,23 @@ fn test_sandbox_env_block_classifies_every_env_var_the_crate_reads() {
         bodies.push(body);
     }
 
+    let test_only = test_only_module_files(&sources, &bodies);
     let mut names = BTreeSet::new();
     let mut unresolved = BTreeSet::new();
-    for body in &bodies {
+    for (path, body) in sources.iter().zip(&bodies) {
+        if test_only.contains(path) {
+            continue;
+        }
         collect_env_reads(body, &consts, &mut names, &mut unresolved);
+    }
+
+    for sentinel in PRODUCTION_SENTINELS {
+        assert!(
+            names.contains(*sentinel),
+            "`{sentinel}` is read by production code but was not collected. The \
+             `#[cfg(test)]` skip is over-reaching and swallowing live source, \
+             which would let this guard pass by finding nothing."
+        );
     }
 
     let unexpected: Vec<&String> = unresolved
@@ -2593,8 +2886,8 @@ fn test_sandbox_env_block_classifies_every_env_var_the_crate_reads() {
         .collect();
     assert!(
         unclassified.is_empty(),
-        "env var(s) read by crates/rskim/src with no sandbox entry: \
-         {unclassified:?}. Add each to exactly one table in tests/common/mod.rs \
+        "env var(s) read by a crate linked into the skim binary with no sandbox \
+         entry: {unclassified:?}. Add each to exactly one table in tests/common/mod.rs \
          — SANDBOX_REDIRECTED_VARS if it names a path that could reach real user \
          state, SANDBOX_REMOVED_VARS if a host value would leak session state \
          into a test, SANDBOX_PINNED_VARS if tests need a fixed value, or \
@@ -2671,6 +2964,11 @@ fn collect_string_consts(source: &str, out: &mut BTreeMap<String, String>) {
 
 /// Extract env-var names read by `source` into `names`, and the arguments of
 /// reads that could not be resolved to a name into `unresolved`.
+///
+/// Reads inside a `#[cfg(test)]` item are not collected: they are not reads the
+/// shipped binary makes, so requiring a sandbox classification for one asks for a
+/// fiction. See [`cfg_test_regions`] for what counts as such an item, and
+/// [`test_only_module_files`] for the whole-file case this cannot see.
 fn collect_env_reads(
     source: &str,
     consts: &BTreeMap<String, String>,
@@ -2683,8 +2981,13 @@ fn collect_env_reads(
     const READ_CLOSURE: &str = "read(";
     const PATTERNS: &[&str] = &["env::var(", "env::var_os(", READ_CLOSURE];
 
+    let test_regions = cfg_test_regions(source);
+
     for pattern in PATTERNS {
         for (idx, _) in source.match_indices(pattern) {
+            if test_regions.iter().any(|region| region.contains(&idx)) {
+                continue;
+            }
             let rest = &source[idx + pattern.len()..];
             if let Some(quoted) = rest.strip_prefix('"') {
                 let name = quoted.split('"').next().unwrap_or_default();
@@ -2716,4 +3019,196 @@ fn has_env_var_shape(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// The leading whitespace of `line`.
+fn indent_of(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+/// Byte ranges of the `#[cfg(test)]` items in `source`.
+///
+/// Only the exact attribute `#[cfg(test)]`, alone on its line, is recognised.
+/// `#[cfg(any(test, feature = "harness"))]` is deliberately NOT treated as
+/// test-only: that item compiles into a production build whenever the feature is
+/// enabled, so a read inside it still needs a sandbox entry.
+///
+/// Where an item ends is decided by lines, not by counting braces. A brace
+/// counter would have to lex string literals and comments, or it ends a region
+/// early on a `{` inside a fixture string — and the analogous mistake in the
+/// other direction silently hides production code. Two rules cover every shape
+/// in this workspace:
+///
+/// - an item whose first line ends in `;` (`mod tests;`, `use …;`) is that one
+///   line, so a bodyless declaration cannot swallow the items that follow it;
+/// - anything else opens a block, which ends at the first line whose indent
+///   equals the attribute's and whose first character is `}`.
+///
+/// Both rules fail toward ending a region early, which makes the caller scan
+/// more source rather than less. An unterminated block runs to the end of the
+/// file, which is where `mod tests { … }` sits in every file here, and
+/// `PRODUCTION_SENTINELS` is the tripwire for that one unsafe direction.
+fn cfg_test_regions(source: &str) -> Vec<std::ops::Range<usize>> {
+    /// The only attribute spelling that means "test builds only".
+    const CFG_TEST: &str = "#[cfg(test)]";
+    /// Upper bound on regions per file — two orders of magnitude above the
+    /// largest file in the workspace, so a scan that fails to terminate on real
+    /// input panics instead of growing without limit.
+    const MAX_REGIONS: usize = 4096;
+
+    /// What the scan is waiting for. Each variant carries the item's indent.
+    enum State {
+        /// Outside any `#[cfg(test)]` item.
+        Idle,
+        /// Saw the attribute; waiting for the item's first line to learn whether
+        /// it is a bodyless declaration or a block.
+        Pending(String),
+        /// Inside a block; waiting for its closing brace.
+        InBlock(String),
+    }
+
+    let mut regions: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut state = State::Idle;
+    let mut start = 0usize;
+    let mut offset = 0usize;
+
+    // `split_inclusive` keeps the line terminator, so `offset` stays an exact
+    // byte offset whatever the line endings are, and `trim_end` drops any `\r`.
+    for raw in source.split_inclusive('\n') {
+        let line_start = offset;
+        offset += raw.len();
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        state = match std::mem::replace(&mut state, State::Idle) {
+            State::Idle if trimmed == CFG_TEST => {
+                assert!(
+                    regions.len() < MAX_REGIONS,
+                    "more than {MAX_REGIONS} `{CFG_TEST}` items in one file — the \
+                     scan is not terminating on real input"
+                );
+                start = line_start;
+                State::Pending(indent_of(line).to_string())
+            }
+            State::Idle => State::Idle,
+            // Further attributes, comments and blank lines belong to the same
+            // item: `#[cfg(test)]` / `#[path = "x_tests.rs"]` / `mod tests;`.
+            State::Pending(indent)
+                if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") =>
+            {
+                State::Pending(indent)
+            }
+            State::Pending(_) if trimmed.ends_with(';') => {
+                regions.push(start..offset);
+                State::Idle
+            }
+            State::Pending(indent) => State::InBlock(indent),
+            State::InBlock(indent)
+                if indent_of(line) == indent.as_str() && trimmed.starts_with('}') =>
+            {
+                regions.push(start..offset);
+                State::Idle
+            }
+            State::InBlock(indent) => State::InBlock(indent),
+        };
+    }
+    if !matches!(state, State::Idle) {
+        regions.push(start..source.len());
+    }
+    regions
+}
+
+/// Source files whose whole content is a module their parent declares
+/// `#[cfg(test)]`.
+///
+/// [`cfg_test_regions`] structurally cannot see these: the gate is written at
+/// the `mod` declaration in the parent, so the module file itself carries no
+/// `#[cfg(test)]` anywhere in it. `cmd/search/index_tests.rs` is the case that
+/// matters — two reads of the cargo-supplied `CARGO_BIN_EXE_skim` that the
+/// shipped binary never makes.
+///
+/// A declaration whose resolved path is not among `sources` is ignored rather
+/// than asserted on: `#[path]` resolution and the `mod.rs`-versus-plain-module
+/// rules are subtle, and a resolution miss must fail toward scanning a file,
+/// never toward skipping one.
+fn test_only_module_files(
+    sources: &[std::path::PathBuf],
+    bodies: &[String],
+) -> BTreeSet<std::path::PathBuf> {
+    const CFG_TEST: &str = "#[cfg(test)]";
+    const PATH_ATTR: &str = "#[path = \"";
+
+    let known: BTreeSet<&std::path::Path> = sources.iter().map(|path| path.as_path()).collect();
+    let mut out = BTreeSet::new();
+
+    for (path, body) in sources.iter().zip(bodies) {
+        let Some(dir) = path.parent() else { continue };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let mut pending = false;
+        let mut path_attr: Option<&str> = None;
+
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if !pending {
+                if trimmed == CFG_TEST {
+                    pending = true;
+                    path_attr = None;
+                }
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix(PATH_ATTR) {
+                path_attr = rest.split('"').next();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                continue; // any other attribute on the same item
+            }
+            // The item itself. Only a bodyless `mod NAME;` gates another FILE;
+            // an inline `mod tests {` is `cfg_test_regions`' job.
+            if let Some(name) = bodyless_module_name(trimmed) {
+                let resolved = match path_attr {
+                    // `#[path]` on a module outside an inline block resolves
+                    // against the declaring file's own directory.
+                    Some(relative) => dir.join(relative),
+                    // Otherwise `mod.rs` and `lib.rs` declare siblings, and any
+                    // other file declares children of its own subdirectory.
+                    None if stem == "mod" || stem == "lib" => dir.join(format!("{name}.rs")),
+                    None => dir.join(stem).join(format!("{name}.rs")),
+                };
+                if known.contains(resolved.as_path()) {
+                    out.insert(resolved);
+                }
+            }
+            pending = false;
+        }
+    }
+    out
+}
+
+/// The module name in a bodyless declaration (`pub(crate) mod test_utils;`).
+///
+/// `None` for an inline module (`mod tests {`) and for every other item, because
+/// only a bodyless declaration names a separate file.
+fn bodyless_module_name(trimmed: &str) -> Option<&str> {
+    let mut tokens = trimmed.split_whitespace();
+    let first = tokens.next()?;
+    if first != "mod" {
+        // A visibility token may precede it: `pub`, `pub(crate)`, `pub(super)`.
+        if !first.starts_with("pub") || tokens.next()? != "mod" {
+            return None;
+        }
+    }
+    let name = tokens.next()?.strip_suffix(';')?;
+    if tokens.next().is_some() || name.is_empty() {
+        return None;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(name)
 }

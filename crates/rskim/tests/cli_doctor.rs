@@ -5,9 +5,14 @@
 //! `~/.gemini/GEMINI.md`, `~/.skim/bin/`, or any other real home-dir state
 //! (PF-017 avoids PF-017).
 //!
-//! The cwd for all `skim doctor` invocations is set to the sandbox home
-//! directory (which is NOT a git repository) so the staleness-vs-HEAD check
-//! inside doctor skips deterministically and cannot cause spurious exit-1s.
+//! The default cwd for every invocation is the sandbox home directory (which is
+//! NOT a git repository), pinned by `common::skim_sandboxed` itself; the one test
+//! that needs a repository chains its own `current_dir`. For `skim doctor` the
+//! default makes the staleness-vs-HEAD check skip deterministically and cannot
+//! cause spurious exit-1s. For `skim init` it matters more: a successful install
+//! ends by walking ancestors of the cwd for a project root and writing
+//! `post-commit`, `post-merge` and `post-checkout` into that repository — at the
+//! cargo-supplied cwd, the skim clone this test binary was built from.
 //!
 //! ## PATH isolation
 //!
@@ -36,6 +41,11 @@ use std::os::unix::fs::PermissionsExt;
 ///
 /// Uses `--agent claude-code --no-guidance --no-wrappers` to avoid interactive
 /// prompts and to confine mutations to the known `.claude/hooks/` path.
+///
+/// The cwd pin is deliberate redundancy: `common::skim_sandboxed` already sets
+/// it, and it is restated at this file's only install site because the hooks
+/// `install_search_integration` writes when the cwd encloses a repository land in
+/// the developer's working copy, outside every directory the sandbox owns.
 fn do_sandboxed_init(home: &std::path::Path) {
     common::skim_sandboxed(home)
         .args([
@@ -45,6 +55,7 @@ fn do_sandboxed_init(home: &std::path::Path) {
             "--no-guidance",
             "--no-wrappers",
         ])
+        .current_dir(home)
         .env("PATH", common::hermetic_path())
         .assert()
         .success();
@@ -82,7 +93,11 @@ const STALE_COMMIT: &str = "0ddba11";
 /// Returns `false` when the binary was built without an embedded commit
 /// (`SKIM_HOOK_COMMIT=unknown`): `hook_is_current()` skips the commit check
 /// entirely for those builds, so there is no gate for a waiver to act on and the
-/// caller must skip rather than assert a vacuous pass.
+/// caller must skip rather than assert a vacuous pass. Callers announce that skip
+/// on stderr, and
+/// [`hook_script_records_a_resolvable_commit_so_the_dev_tests_are_not_skipped`]
+/// fails unconditionally when this branch becomes reachable, so the skip cannot
+/// quietly retire the suite.
 fn age_hook_script(home: &std::path::Path, declare_dev: bool) -> bool {
     let script = hook_script_path(home);
     let original = std::fs::read_to_string(&script).expect("hook script must exist after init");
@@ -395,6 +410,49 @@ fn test_doctor_does_not_exit_1_for_absent_sha() {
 // Dev-pinned hooks: the commit-gate waiver
 // ============================================================================
 
+/// The floor under the three tests below: the installed hook must record a
+/// commit that `hook_is_current` can actually compare.
+///
+/// Three of the four dev-pin tests in this section skip themselves when the
+/// installed script says `export SKIM_HOOK_COMMIT=unknown`, and the skip is
+/// correct — a build with no embedded commit has no gate for a waiver to act on.
+/// What it is not is visible: Rust has no skip verdict, so a bare `return;`
+/// reports as a pass, and `SKIM_GIT_COMMIT` falls back to `"unknown"` whenever
+/// `build.rs` cannot run `git rev-parse`. The security test for the waiver, its
+/// control and the positive case then all disappear at once and the report shows
+/// three passes.
+///
+/// This test has no skip path, which is the whole point: whatever retires the
+/// three — a hook template that stops stamping a commit, or a build that loses
+/// its git metadata — fails here by name instead of passing silently three times.
+/// A source-tarball build with no `.git` will therefore fail this test; that is
+/// the intended signal, not a false positive, because on such a build the
+/// ADR-019 coverage genuinely is not running.
+#[test]
+fn hook_script_records_a_resolvable_commit_so_the_dev_tests_are_not_skipped() {
+    let home = TempDir::new().unwrap();
+    let home = home.path();
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    do_sandboxed_init(home);
+
+    let script =
+        std::fs::read_to_string(hook_script_path(home)).expect("hook script must exist after init");
+
+    assert!(
+        script.contains("export SKIM_HOOK_COMMIT="),
+        "the installed hook must stamp a commit pin at all — without it there is \
+         no commit for `skim doctor` to compare:\n{script}"
+    );
+    assert!(
+        !script.contains("export SKIM_HOOK_COMMIT=unknown"),
+        "the installed hook records `unknown` as its commit, which makes \
+         `age_hook_script` return false and silently retires the three dev-pin \
+         tests in this section. Either this build lost its embedded commit or the \
+         hook template stopped stamping one:\n{script}"
+    );
+}
+
 /// THE security test for the waiver: a dev declaration on a script whose
 /// manifest is absent must NOT waive the commit gate.
 ///
@@ -416,7 +474,15 @@ fn test_doctor_dev_marker_without_manifest_does_not_waive_commit_gate() {
     do_sandboxed_init(home);
 
     if !age_hook_script(home, true) {
-        return; // tarball build: no commit check exists to waive
+        // A bare `return;` is a PASS in the test report, so say so on stderr:
+        // this is the security case for the waiver, and its absence must be
+        // readable rather than inferred from a green run.
+        eprintln!(
+            "SKIPPED test_doctor_dev_marker_without_manifest_does_not_waive_commit_gate: \
+             the build embeds no commit (SKIM_HOOK_COMMIT=unknown), so there is no \
+             commit gate for the waiver to act on"
+        );
+        return;
     }
     // The downgrade: delete the sidecar so integrity reads NoManifest.
     std::fs::remove_file(manifest_path(home)).unwrap();
@@ -447,10 +513,20 @@ fn test_doctor_stale_commit_without_dev_marker_is_still_drift() {
     do_sandboxed_init(home);
 
     if !age_hook_script(home, false) {
-        return; // tarball build
+        eprintln!(
+            "SKIPPED test_doctor_stale_commit_without_dev_marker_is_still_drift: \
+             the build embeds no commit (SKIM_HOOK_COMMIT=unknown), so the script \
+             cannot be aged"
+        );
+        return;
     }
     if !restamp_manifest(home) {
-        return; // no system hasher available
+        eprintln!(
+            "SKIPPED test_doctor_stale_commit_without_dev_marker_is_still_drift: \
+             neither sha256sum nor shasum is on PATH, so the manifest cannot be \
+             re-stamped over the aged script"
+        );
+        return;
     }
 
     common::skim_sandboxed(home)
@@ -481,10 +557,20 @@ fn test_doctor_dev_marker_with_verified_manifest_waives_commit_gate() {
     do_sandboxed_init(home);
 
     if !age_hook_script(home, true) {
-        return; // tarball build
+        eprintln!(
+            "SKIPPED test_doctor_dev_marker_with_verified_manifest_waives_commit_gate: \
+             the build embeds no commit (SKIM_HOOK_COMMIT=unknown), so the script \
+             cannot be aged"
+        );
+        return;
     }
     if !restamp_manifest(home) {
-        return; // no system hasher available
+        eprintln!(
+            "SKIPPED test_doctor_dev_marker_with_verified_manifest_waives_commit_gate: \
+             neither sha256sum nor shasum is on PATH, so the manifest cannot be \
+             re-stamped over the aged script"
+        );
+        return;
     }
 
     let out = common::skim_sandboxed(home)

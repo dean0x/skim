@@ -222,8 +222,8 @@ skim src/                        # all files in directory recursively
 skim <file> --max-lines 50       # cap output with AST-aware truncation
 skim <file> --tokens 500         # fit output within a token budget
 
-# Modes (most to least content):
-# full → pseudo → structure (default) → minimal → signatures → types
+# Modes (most to least content; also the --tokens escalation order):
+# full → minimal → pseudo → structure (default) → signatures → types
 skim <file> --mode=types         # type definitions only
 skim <file> --mode=signatures    # function/method signatures only
 skim <file> --mode=pseudo        # logic without syntactic noise
@@ -468,12 +468,16 @@ pub(super) fn print_help() {
     println!("    export SKIM_SESSION_ID=\"<your-session-id>\"  # optional, for analytics");
     println!();
     println!("Examples:");
-    println!("  skim init                          Install for Claude Code (recommended)");
+    // One entry, not two: a bare `skim init` is a single command whose effect on
+    // an already-dev-pinned hook is the revert (ADR-019 — dev-ness is a property
+    // of the invocation, so the absence of `--dev` IS the revert request). Listing
+    // it twice with two descriptions read as two different commands.
+    println!("  skim init                          Install for Claude Code (recommended);");
+    println!("                                     also reverts a dev-pinned hook to strict");
     println!("  skim init --agent cursor           Install for Cursor");
     println!("  skim init --agent gemini           Install for Gemini CLI");
     println!("  skim init --project                Install project-level hook");
     println!("  skim init --dev                    Install a dev-pinned hook");
-    println!("  skim init                          Revert a dev-pinned hook to strict");
     println!("  skim init --dev --force            Re-stamp a dev-pinned hook");
     println!("  skim init --wrappers               Install with PATH wrappers");
     println!("  skim init --no-wrappers            Install without PATH wrappers");
@@ -555,6 +559,44 @@ mod tests {
         assert!(content.contains("Heatmap"));
         assert!(content.contains("skim heatmap"));
         assert!(content.contains("risk"));
+    }
+
+    /// documentation-14: the guidance's mode ordering is the one output claim in
+    /// this template an agent ACTS on — it picks `--mode` from it — so it is
+    /// pinned against the code's own total order rather than proofread.
+    ///
+    /// `Mode::Full.cascade_from_here()` is that order: the same sequence
+    /// `Mode::aggressiveness` numbers 0..5, and the sequence the `--tokens`
+    /// cascade walks. The RED this replaces shipped `minimal` as LESS content
+    /// than `structure`, so an agent asking for a smaller view got a larger one —
+    /// the worst failure available to a token-budget tool.
+    #[test]
+    fn test_guidance_mode_ordering_is_the_codes_own_order() {
+        let content = guidance_content("2.1.0");
+        let line = content
+            .lines()
+            .skip_while(|l| !l.starts_with("# Modes ("))
+            .nth(1)
+            .expect("the guidance must carry a mode-ordering line under its header");
+
+        let listed: Vec<&str> = line
+            .trim_start_matches("# ")
+            .split('→')
+            // `structure (default)` — the parenthetical is an annotation, not a
+            // mode name, so compare the first token of each cell.
+            .filter_map(|cell| cell.split_whitespace().next())
+            .collect();
+
+        let expected: Vec<&str> = rskim_core::Mode::Full
+            .cascade_from_here()
+            .iter()
+            .map(|m| m.name())
+            .collect();
+
+        assert_eq!(
+            listed, expected,
+            "guidance mode order must equal Mode::Full.cascade_from_here(): {line}"
+        );
     }
 
     #[test]

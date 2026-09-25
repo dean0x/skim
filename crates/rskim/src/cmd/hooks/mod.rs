@@ -588,8 +588,9 @@ impl HookMode {
 /// Recognising the declaration is NOT the same as honouring it. The marker lives
 /// in the hook script, which is precisely the artefact a tamper edits, so every
 /// caller must clear its own integrity gate before acting on the result (PF-016).
-/// [`honour_dev_declaration`] is that gate, and [`generate_hook_script`] does not
-/// write the marker.
+/// [`honour_dev_declaration`] is that gate. [`generate_hook_script`] writes the
+/// marker only for [`HookMode::Dev`], inside the region the SHA-256 manifest
+/// covers.
 pub(crate) fn parse_mode_from_script(contents: &str) -> HookMode {
     if contents.lines().any(|line| line.trim() == HOOK_DEV_MARKER) {
         HookMode::Dev
@@ -607,22 +608,46 @@ pub(crate) fn parse_mode_from_script(contents: &str) -> HookMode {
 ///
 /// # Why the gate is `Verified` specifically, not "anything but `Tampered`"
 ///
-/// The declaration is a line in the hook script — the artefact a tamper edits —
-/// so a gate the writer of that file can also satisfy is not a gate at all. The
-/// obvious weaker spelling, "not `Tampered`", is reachable by exactly the attack
-/// PF-016 records as deliberately left open: `skim doctor`'s integrity match
-/// returns early for `Tampered` and `Unreadable` but lets `NoManifest` FALL
-/// THROUGH to the pin and currency checks, and anyone who can append a line to
-/// the script can also delete `{hooks}/skim-{agent}.sha256`. Append the marker,
-/// delete the sidecar, and the verdict is `NoManifest` — which under a "not
-/// `Tampered`" gate would waive the commit check and silence the one signal that
-/// says which build is running, turning a declared property into a self-asserted
-/// one. `Unreadable` is refused for the same reason: a script that cannot be
-/// hashed declares nothing.
+/// Because `NoManifest` is reachable by deleting one file. `skim doctor`'s
+/// integrity match returns early for `Tampered` and `Unreadable` but lets
+/// `NoManifest` FALL THROUGH to the pin and currency checks (PF-016 records that
+/// fall-through as deliberate), so under a "not `Tampered`" gate a script whose
+/// `{hooks}/skim-{agent}.sha256` has simply gone missing — deleted by a cleanup
+/// script, lost to a partial restore, or never written by a pre-manifest install
+/// — would carry a marker straight into a waived commit check. `Verified` is the
+/// spelling under which the declaration and the bytes it was hashed with are
+/// known to be the same pair; `Unreadable` is refused for the same reason, since
+/// a script that cannot be hashed declares nothing. The property being bought is
+/// that the waiver cannot be reached by ACCIDENT.
 ///
-/// This mirrors the shape `skim init` already uses — `install::run_install_single`
-/// computes `integrity_verified` as `matches!(…, ScriptIntegrity::Verified)`, so
-/// all three non-`Verified` states block the fast path there too.
+/// # What this gate is NOT
+///
+/// It is not an adversarial control, and must not be read as tamper-proofing.
+/// The manifest is an unsigned `sha256:<hex>  <name>` line that
+/// `integrity::manifest_path` places in the same `hooks/` directory as the
+/// script, and [`crate::cmd::integrity::classify_script_integrity`] compares the
+/// two with no key, no signature and no out-of-band anchor. Anyone who can append
+/// `export SKIM_HOOK_DEV=1` to the script can recompute and rewrite the sidecar
+/// in the same breath, so `Verified` is not adversarially stronger than
+/// "not `Tampered`" — it raises the bar from one command to two,
+/// which is the shape PF-016 itself rejected when it refused to close a fail-open
+/// with a gate whose input the attacker also controls.
+///
+/// That is not a hole to plug here. Write access to the hook script is already
+/// arbitrary code execution on every agent tool call, so the waiver grants an
+/// actor holding it nothing they did not have; there is no privilege to escalate.
+/// The signal a future maintainer might want is a declaration anchored OUT OF
+/// BAND — recorded under the skim cache root, keyed to the running binary's
+/// canonical path plus commit, so that a write handle on `hooks/` cannot forge
+/// it. Deliberately not implemented: it would buy an adversarial property nothing
+/// in this design currently claims, and claiming it without building it is the
+/// failure this section exists to avoid.
+///
+/// The `Verified` spelling mirrors the shape `skim init` already uses —
+/// `install::run_install_single` computes `integrity_verified` as
+/// `matches!(…, ScriptIntegrity::Verified)`, so all three non-`Verified` states
+/// block the fast path there too, and the gate that waives is never the more
+/// permissive of the two.
 pub(crate) fn honour_dev_declaration(mode: HookMode, integrity: &ScriptIntegrity) -> bool {
     matches!(mode, HookMode::Dev) && matches!(integrity, ScriptIntegrity::Verified)
 }
