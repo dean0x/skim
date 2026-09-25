@@ -59,6 +59,19 @@ pub(crate) struct HookFacts {
     pub(crate) hook_binary_pin: Option<String>,
     /// Whether the hook uses the pinned-binary format (exports `SKIM_HOOK_BINARY`).
     pub(crate) hook_uses_pinned_binary: bool,
+    /// Install mode the hook script declares — strict, or dev-pinned.
+    ///
+    /// Projected across the module boundary so `skim doctor` can reach what the
+    /// INSTALLED HOOK declares without re-reading the script. Nothing reads it
+    /// yet: `hook_status_line` still branches only on integrity, pin and
+    /// currency, so doctor's output and exit code are byte-identical whether or
+    /// not a hook declares dev mode.
+    ///
+    /// Any future reader must sit BEHIND the `script_integrity` gate — the
+    /// declaration lives in the hook script, which is the artefact a tamper
+    /// edits (PF-016).
+    #[allow(dead_code)] // wired ahead of its reader; no caller consults the mode yet
+    pub(crate) hook_mode: crate::cmd::hooks::HookMode,
     /// Whether the hook is fully current (version + pinned binary + commit all match).
     pub(crate) hook_is_current: bool,
     /// Whether the hook's recorded binary pin points to the same canonical path
@@ -129,6 +142,7 @@ pub(crate) fn hook_facts(agent: crate::cmd::session::AgentKind) -> anyhow::Resul
         hook_commit: detected.hook_commit,
         hook_binary_pin: detected.hook_binary_pin,
         hook_uses_pinned_binary: detected.hook_uses_pinned_binary,
+        hook_mode: detected.hook_mode,
         hook_is_current: is_current,
         pin_is_current: pin_current,
         hook_script_path,

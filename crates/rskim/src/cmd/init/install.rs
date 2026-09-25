@@ -1804,6 +1804,7 @@ mod tests {
             hook_commit: None,
             hook_binary_pin: None,
             hook_uses_pinned_binary: false,
+            hook_mode: crate::cmd::hooks::HookMode::Strict,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name,

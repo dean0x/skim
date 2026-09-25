@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::flags::{DetectionEnv, InitFlags};
 use super::helpers::HOOK_SCRIPT_NAME;
-use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
+use crate::cmd::hooks::{HookMode, HookProtocol, parse_mode_from_script, protocol_for_agent};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -31,6 +31,13 @@ pub(super) struct DetectedState {
     pub(super) hook_binary_pin: Option<String>,
     /// Whether the hook script uses the pinned binary format (exports `SKIM_HOOK_BINARY`).
     pub(super) hook_uses_pinned_binary: bool,
+    /// Install mode the hook script declares (`HOOK_DEV_MARKER`).
+    ///
+    /// `HookMode::Strict` when the script is absent or carries no marker.
+    /// Recorded here, consulted by nothing: the currency predicates below still
+    /// read the commit pin unconditionally, so parsing a dev declaration changes
+    /// no verdict on its own.
+    pub(super) hook_mode: HookMode,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
@@ -210,6 +217,13 @@ pub(super) fn detect_state(
     let hook_binary_pin = hook_script_contents
         .as_deref()
         .and_then(parse_binary_pin_from_script);
+    // Read from the same pre-read script text as the three parsers above, so a
+    // script cannot yield a mode and a pin that came from different reads.
+    // An absent script declares nothing, which is `Strict`.
+    let hook_mode = hook_script_contents
+        .as_deref()
+        .map(parse_mode_from_script)
+        .unwrap_or(HookMode::Strict);
 
     Ok(DetectedState {
         skim_binary,
@@ -223,6 +237,7 @@ pub(super) fn detect_state(
         hook_commit,
         hook_binary_pin,
         hook_uses_pinned_binary,
+        hook_mode,
         dual_scope_warning,
         existing_hooks,
         agent_cli_name: agent.cli_name(),
@@ -824,6 +839,7 @@ mod tests {
             hook_commit: Some("aaaaaaaastale".to_string()),
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
+            hook_mode: HookMode::Strict,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name: "claude-code",
@@ -859,6 +875,7 @@ mod tests {
             hook_commit,
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
+            hook_mode: HookMode::Strict,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name: "claude-code",
@@ -982,6 +999,140 @@ mod tests {
         );
     }
 
+    // ---- hook mode: the dev marker is additive ----
+
+    /// The dev marker must be INVISIBLE to every parser that reads an installed
+    /// hook script. A binary that has never heard of `HookMode` has to read a
+    /// dev-pinned script's version, commit and binary pin exactly as it reads a
+    /// strict one — that is what makes the extra line purely additive, and what
+    /// makes an older binary's verdict (and its rewrite back to strict) safe.
+    ///
+    /// Driven through the real `generate_hook_script` output rather than a
+    /// hand-written fixture, so the parsers are exercised on the bytes
+    /// `skim init` actually writes (PF-015: a fixture-shaped test pins the
+    /// display layer, never the acquisition layer).
+    #[test]
+    fn test_dev_marker_is_invisible_to_every_script_parser() {
+        let strict = crate::cmd::hooks::generate_hook_script(
+            "2.11.0",
+            "claude-code",
+            "/path/with spaces/target/release/skim",
+        );
+        let marker = crate::cmd::hooks::HOOK_DEV_MARKER;
+        let dev = format!("{strict}{marker}\n");
+
+        // Guard against a vacuous pass: the parsers must actually be finding
+        // values, or the equalities below would be two `None`s agreeing
+        // (PF-016 — an empty finding set is not a clean bill of health).
+        assert_eq!(
+            parse_version_from_script(&dev).as_deref(),
+            Some("2.11.0"),
+            "a dev-pinned script must still carry a parseable version"
+        );
+        assert_eq!(
+            parse_binary_pin_from_script(&dev).as_deref(),
+            Some("/path/with spaces/target/release/skim"),
+            "a dev-pinned script must still carry a parseable binary pin"
+        );
+        assert!(
+            parse_commit_from_script(&dev).is_some(),
+            "a dev-pinned script must still carry a parseable commit"
+        );
+
+        assert_eq!(
+            parse_version_from_script(&strict),
+            parse_version_from_script(&dev),
+            "the dev marker must not change the parsed hook version"
+        );
+        assert_eq!(
+            parse_commit_from_script(&strict),
+            parse_commit_from_script(&dev),
+            "the dev marker must not change the parsed commit — a dev install keeps its REAL commit"
+        );
+        assert_eq!(
+            parse_binary_pin_from_script(&strict),
+            parse_binary_pin_from_script(&dev),
+            "the dev marker must not change the parsed binary pin"
+        );
+        assert_eq!(
+            uses_pinned_binary(&strict),
+            uses_pinned_binary(&dev),
+            "the dev marker must not change pinned-format detection"
+        );
+        assert!(
+            uses_pinned_binary(&dev),
+            "a dev-pinned script is still a pinned script"
+        );
+    }
+
+    /// The mode has to come from the ACQUISITION layer, not just the parser:
+    /// `detect_state` reads the installed script and records what it declares.
+    /// Without this, `parse_mode_from_script` could be perfect while nothing on
+    /// the path from the CLI ever calls it (PF-015 — enumerate the gates between
+    /// the entry point and the predicate; a predicate's own unit test proves
+    /// nothing about the path that reaches it).
+    #[test]
+    fn test_detect_state_records_the_declared_hook_mode() {
+        for (declared, expected) in [
+            ("", HookMode::Strict),
+            (crate::cmd::hooks::HOOK_DEV_MARKER, HookMode::Dev),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hooks_dir = dir.path().join("hooks");
+            std::fs::create_dir_all(&hooks_dir).unwrap();
+            let generated = crate::cmd::hooks::generate_hook_script(
+                "2.11.0",
+                "claude-code",
+                "/usr/local/bin/skim",
+            );
+            std::fs::write(
+                hooks_dir.join(super::super::helpers::HOOK_SCRIPT_NAME),
+                format!("{generated}{declared}\n"),
+            )
+            .unwrap();
+
+            let flags = InitFlags {
+                project: false,
+                yes: false,
+                dry_run: false,
+                uninstall: false,
+                force: false,
+                no_guidance: false,
+                agent: Some(crate::cmd::session::AgentKind::ClaudeCode),
+                wrappers: None,
+                permissions: None,
+                permissions_tier: super::super::flags::PermissionsTier::Seed,
+            };
+            // Every axis points into the TempDir: detection only ever reads, but
+            // it must not read the developer's real config either (PF-017).
+            let env = DetectionEnv {
+                home_dir: Some(dir.path().to_path_buf()),
+                claude_config_dir: Some(dir.path().to_path_buf()),
+                cursor_config_dir: Some(dir.path().to_path_buf()),
+                gemini_config_dir: Some(dir.path().to_path_buf()),
+                copilot_config_dir: Some(dir.path().to_path_buf()),
+                codex_config_dir: Some(dir.path().to_path_buf()),
+                crush_config_dir: Some(dir.path().to_path_buf()),
+            };
+
+            let state =
+                detect_state(&flags, crate::cmd::session::AgentKind::ClaudeCode, &env).unwrap();
+
+            assert_eq!(
+                state.hook_mode, expected,
+                "detect_state must record the mode the installed script declares"
+            );
+            // The pin must survive the same read, so the mode is demonstrably
+            // acquired from the script the rest of the facts came from — not
+            // from a second, divergent source.
+            assert_eq!(
+                state.hook_binary_pin.as_deref(),
+                Some("/usr/local/bin/skim"),
+                "the pin must be parsed from the same script text as the mode"
+            );
+        }
+    }
+
     // ---- parse_version_from_script ----
 
     #[test]
@@ -1023,6 +1174,7 @@ mod tests {
             hook_commit: None,
             hook_binary_pin: pin,
             hook_uses_pinned_binary: true,
+            hook_mode: HookMode::Strict,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name: "claude-code",
