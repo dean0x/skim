@@ -100,53 +100,130 @@ where
     unreachable!("loop exits only via return or panic")
 }
 
+// ============================================================================
+// Sandbox env-var plan (PF-017)
+// ============================================================================
+//
+// These four tables are the *whole* contract for what a sandboxed invocation
+// may see. Every environment variable the production crate reads must appear
+// in exactly one of them, and `cli_init.rs` carries a test that scans
+// `crates/rskim/src` and fails when a newly-added read is in none of them —
+// PF-017's lesson was that a hand-maintained enumeration is always incomplete,
+// so this one is checked against the source rather than trusted.
+
+/// Env vars redirected into the sandbox home, as `(var, path relative to home)`.
+///
+/// An empty relative path means the home directory itself. Each entry closes a
+/// path by which a child process could otherwise reach real user state — note
+/// that these are the *agents' own* variable names, not `SKIM_`-prefixed ones.
+pub const SANDBOX_REDIRECTED_VARS: &[(&str, &str)] = &[
+    ("HOME", ""), // every `dirs::home_dir()` lookup, incl. wrapper + cache defaults
+    ("CLAUDE_CONFIG_DIR", ".claude"), // Claude Code hook / settings / guidance
+    ("CURSOR_CONFIG_DIR", ".cursor"), // Cursor config dir — read by `DetectionEnv`
+    ("GEMINI_CONFIG_DIR", ".gemini"), // Gemini CLI hook / settings / guidance
+    ("COPILOT_CONFIG_DIR", ".copilot"), // Copilot CLI hook / settings / guidance
+    ("CODEX_CONFIG_DIR", ".codex"), // Codex hook/settings path — `DetectionEnv`
+    ("CODEX_HOME", ".codex"), // Codex guidance path — `InstructionEnv`, a DIFFERENT var
+    ("CRUSH_CONFIG_DIR", ".crush"), // Crush CLI hook / settings / guidance
+    ("SKIM_WRAPPERS_DIR", ".skim/bin"), // `~/.skim/bin` wrapper symlinks
+    ("SKIM_CACHE_DIR", ".cache/skim"), // parser cache, hook.log, force-raw sidecars
+    ("SKIM_ANALYTICS_DB", ".cache/skim/analytics.db"), // outranks SKIM_CACHE_DIR
+];
+
+/// Env vars pinned to a fixed value so assertions are deterministic.
+pub const SANDBOX_PINNED_VARS: &[(&str, &str)] = &[
+    ("SKIM_DISABLE_ANALYTICS", "1"), // no rows written to any analytics DB
+    ("NO_COLOR", "1"),               // deterministic, color-free output
+];
+
+/// Env vars stripped from the child so host session state cannot leak in.
+///
+/// Each of these has a safe default that resolves *inside* the sandbox once
+/// `HOME` is redirected, so removal is strictly safer than passing a host value
+/// through. Removal also means the variable cannot silently satisfy an
+/// assertion: a host `SKIM_PASSTHROUGH=1`, for instance, makes hook mode
+/// return empty stdout, which several hook tests assert as their success case.
+pub const SANDBOX_REMOVED_VARS: &[&str] = &[
+    "SKIM_REWRITTEN_FROM",      // rewrite-origin tag; drives the lossy-view marker
+    "SKIM_PASSTHROUGH",         // would bypass compression and short-circuit hook mode
+    "SKIM_HOOK_VERSION",        // hook handshake value — a host value fakes version drift
+    "SKIM_HOOK_BINARY",         // hook binary pin — a host value fakes path drift
+    "SKIM_HOOK_COMMIT",         // hook commit pin — a host value fakes commit drift
+    "SKIM_HOOK_AUDIT",          // would append JSON lines to a hook-audit log
+    "SKIM_SESSION_ID",          // analytics session attribution + sidecar keying
+    "SKIM_DEBUG",               // adds raw-fallback banners that break stderr assertions
+    "SKIM_INPUT_COST_PER_MTOK", // cost estimates must use the documented default
+    "SKIM_PROJECTS_DIR",        // session-provider transcript dir (Claude)
+    "SKIM_CODEX_SESSIONS_DIR",  // session-provider transcript dir (Codex)
+    "SKIM_COPILOT_DIR",         // session-provider transcript dir (Copilot)
+    "SKIM_CURSOR_DB_PATH",      // session-provider transcript DB (Cursor)
+    "SKIM_GEMINI_DIR",          // session-provider transcript dir (Gemini)
+    "SKIM_CRUSH_DIR",           // session-provider transcript dir (Crush)
+];
+
+/// Env vars deliberately inherited from the host.
+///
+/// `PATH` cannot be sandboxed: the child must still resolve `sh`, `git` and the
+/// other real tools it shells out to. [`hermetic_path`] is the opt-in control
+/// for the one behaviour that depends on PATH *content* — `skim doctor`'s scan
+/// for which `skim` wins — and tests that assert on it pass it explicitly.
+pub const SANDBOX_INHERITED_VARS: &[&str] = &["PATH"];
+
+/// Resolve a [`SANDBOX_REDIRECTED_VARS`] entry against a sandbox home.
+pub fn sandbox_var_path(home: &std::path::Path, relative: &str) -> std::path::PathBuf {
+    if relative.is_empty() {
+        home.to_path_buf()
+    } else {
+        home.join(relative)
+    }
+}
+
 /// Build a sandboxed command for the given skim binary path.
 ///
 /// This is the **single authoritative source** for the sandbox env-var block
-/// used by `skim init`, `skim init --uninstall`, and `skim doctor` tests.
-/// Both `skim_sandboxed` and any test that must run a non-default binary
-/// (e.g. a copied binary for pin-mismatch coverage) must route through here
-/// rather than hand-rolling their own env block (PF-017).
+/// used by `skim init`, `skim init --uninstall`, `skim doctor`, and
+/// `skim rewrite --hook` tests. Both `skim_sandboxed` and any test that must
+/// run a non-default binary (e.g. a copied binary for pin-mismatch coverage)
+/// must route through here rather than hand-rolling their own env block: a
+/// hand-rolled block drops entries and re-opens the leak (PF-017).
 ///
-/// Sets every agent config-dir override that the installer reads, so the
-/// invocation cannot escape the TempDir sandbox even if the developer has
-/// exported `CODEX_HOME` or `CRUSH_CONFIG_DIR` in their shell:
+/// The env block is driven entirely by [`SANDBOX_REDIRECTED_VARS`],
+/// [`SANDBOX_PINNED_VARS`] and [`SANDBOX_REMOVED_VARS`] so that the tables are
+/// the only place the contract is written down.
 ///
-/// - `HOME` — redirects all `dirs::home_dir()` lookups in the child process.
-/// - `CLAUDE_CONFIG_DIR` — Claude Code hook / settings / guidance.
-/// - `SKIM_CACHE_DIR` — parser cache, analytics DB, and hook.log.
-/// - `SKIM_WRAPPERS_DIR` — `~/.skim/bin/` wrapper symlink directory.
-/// - `GEMINI_CONFIG_DIR` — Gemini CLI hook / settings / guidance.
-/// - `COPILOT_CONFIG_DIR` — Copilot CLI hook / settings / guidance.
-/// - `CODEX_HOME` — Codex CLI config directory.
-/// - `CRUSH_CONFIG_DIR` — Crush CLI config directory.
-/// - `SKIM_DISABLE_ANALYTICS=1` — no rows written to any analytics DB.
-/// - `NO_COLOR=1` — deterministic, color-free output for assertions.
-///
-/// Also removes env vars that carry real-session state (`SKIM_REWRITTEN_FROM`,
-/// `SKIM_PASSTHROUGH`, `SKIM_HOOK_VERSION`, `SKIM_HOOK_BINARY`).
-///
-/// Tests may chain additional `.env(...)` calls to add or override vars.
+/// Tests may chain additional `.env(...)` calls to add or override vars; a
+/// chained call applied after this one wins.
 pub fn skim_sandboxed_with_bin(
     home: &std::path::Path,
     bin: &std::path::Path,
 ) -> assert_cmd::Command {
     let mut c = assert_cmd::Command::new(bin);
-    c.env("HOME", home)
-        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
-        .env("SKIM_CACHE_DIR", home.join(".cache/skim"))
-        .env("SKIM_WRAPPERS_DIR", home.join(".skim").join("bin"))
-        .env("GEMINI_CONFIG_DIR", home.join(".gemini"))
-        .env("COPILOT_CONFIG_DIR", home.join(".copilot"))
-        .env("CODEX_HOME", home.join(".codex"))
-        .env("CRUSH_CONFIG_DIR", home.join(".crush"))
-        .env("SKIM_DISABLE_ANALYTICS", "1")
-        .env("NO_COLOR", "1")
-        .env_remove("SKIM_REWRITTEN_FROM")
-        .env_remove("SKIM_PASSTHROUGH")
-        .env_remove("SKIM_HOOK_VERSION")
-        .env_remove("SKIM_HOOK_BINARY");
+    for (var, relative) in SANDBOX_REDIRECTED_VARS {
+        c.env(var, sandbox_var_path(home, relative));
+    }
+    for (var, value) in SANDBOX_PINNED_VARS {
+        c.env(var, value);
+    }
+    for var in SANDBOX_REMOVED_VARS {
+        c.env_remove(var);
+    }
     c
+}
+
+/// Return a `PATH` with the cargo-built skim binary's directory prepended.
+///
+/// `skim doctor` scans `$PATH` and reports drift when the binary that WINS on
+/// PATH differs from the binary under test (e.g. a `target/release/skim` left
+/// over from another build). Tests that assert a doctor exit code must pass
+/// this so the verdict comes from the condition under test, not PATH state.
+///
+/// Deliberately *not* part of the sandbox env block — see
+/// [`SANDBOX_INHERITED_VARS`] for why `PATH` is inherited rather than replaced.
+pub fn hermetic_path() -> String {
+    let bin = skim_bin();
+    let bin_dir = bin.parent().expect("skim binary has a parent directory");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{}", bin_dir.display(), system_path)
 }
 
 /// Build a `skim` command sandboxed against a temporary home directory.
@@ -154,9 +231,11 @@ pub fn skim_sandboxed_with_bin(
 /// Thin delegation to `skim_sandboxed_with_bin` using the default cargo-built
 /// binary. All sandbox env-var documentation lives on that function.
 ///
-/// Use this for any `skim init`, `skim init --uninstall`, or `skim doctor`
-/// invocation.  Tests may chain additional `.env(...)` calls to add or
-/// override specific vars after calling this helper.
+/// Use this for any `skim init`, `skim init --uninstall`, `skim doctor`, or
+/// `skim rewrite --hook` invocation — the last of those because the force-raw
+/// sidecar is PPID-keyed and bleeds between tests in a shared nextest runner
+/// unless `SKIM_CACHE_DIR` is per-test.  Tests may chain additional `.env(...)`
+/// calls to add or override specific vars after calling this helper.
 pub fn skim_sandboxed(home: &std::path::Path) -> assert_cmd::Command {
     skim_sandboxed_with_bin(home, &skim_bin())
 }

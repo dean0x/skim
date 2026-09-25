@@ -15,10 +15,10 @@
 //! differs from the binary being tested (e.g. `target/release/skim` on PATH
 //! vs `target/debug/skim` running the test). To prevent this spurious exit-1,
 //! tests that assert exit-0 MUST pass a controlled PATH that puts the test
-//! binary's directory first via `hermetic_path()`.
+//! binary's directory first via `common::hermetic_path()`.
 //!
 //! Tests asserting exit-1 (`test_doctor_exits_1_and_names_tamper_...`) also
-//! use `hermetic_path()` for consistency and to ensure the asserted drift comes
+//! use `common::hermetic_path()` for consistency and to ensure the asserted drift comes
 //! only from the tampered hook, not PATH state.
 
 use std::io::Write;
@@ -31,18 +31,6 @@ use std::os::unix::fs::PermissionsExt;
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Return a PATH string with the test binary's parent directory prepended.
-///
-/// This ensures `skim doctor`'s $PATH scan finds only the test binary as the
-/// winning `skim` entry, preventing spurious PATH-drift exit-1s on machines
-/// where a release build (`target/release/skim`) also appears on PATH.
-fn hermetic_path() -> String {
-    let bin = common::skim_bin();
-    let bin_dir = bin.parent().expect("skim binary has a parent directory");
-    let system_path = std::env::var("PATH").unwrap_or_default();
-    format!("{}:{}", bin_dir.display(), system_path)
-}
 
 /// Install the skim hook into a sandboxed home directory.
 ///
@@ -57,7 +45,7 @@ fn do_sandboxed_init(home: &std::path::Path) {
             "--no-guidance",
             "--no-wrappers",
         ])
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 }
@@ -95,12 +83,12 @@ fn test_doctor_exits_0_after_clean_init() {
 
     // current_dir(home): the sandbox dir is not a git repo, so the
     // staleness-vs-HEAD check inside doctor skips and cannot cause exit 1.
-    // hermetic_path(): ensures the test binary wins on $PATH so that the PATH
+    // common::hermetic_path(): ensures the test binary wins on $PATH so that the PATH
     // scan section does not report drift from an unrelated release build.
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 }
@@ -134,11 +122,11 @@ fn test_doctor_exits_1_and_names_tamper_after_hook_modification() {
     drop(file);
 
     // Doctor must exit 1 AND say "tampered" in stdout.
-    // hermetic_path() ensures drift comes only from the tamper, not PATH state.
+    // common::hermetic_path() ensures drift comes only from the tamper, not PATH state.
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .failure() // exit 1
         .stdout(predicates::prelude::predicate::str::contains("tampered"));
@@ -200,7 +188,7 @@ fn test_doctor_exits_0_on_binary_pin_mismatch() {
             "--no-guidance",
             "--no-wrappers",
         ])
-        .env("PATH", hermetic_path());
+        .env("PATH", common::hermetic_path());
     })
     .success();
 
@@ -209,7 +197,7 @@ fn test_doctor_exits_0_on_binary_pin_mismatch() {
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success() // exit 0 — pin mismatch is advisory only (C-1 fix)
         .stdout(predicates::prelude::predicate::str::contains(
@@ -236,11 +224,11 @@ fn test_doctor_exits_0_when_no_manifest() {
     std::fs::remove_file(&manifest).unwrap();
 
     // NoManifest → advisory, not drift → exit 0.
-    // hermetic_path() prevents PATH drift from an unrelated release build.
+    // common::hermetic_path() prevents PATH drift from an unrelated release build.
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 }
@@ -304,7 +292,7 @@ fn test_doctor_does_not_exit_1_for_absent_sha() {
     common::skim_sandboxed(home_path)
         .arg("doctor")
         .current_dir(git_path)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success(); // must exit 0 regardless of compiled_commit value
 }
@@ -361,7 +349,7 @@ fn test_doctor_exits_1_on_wrapper_target_mismatch() {
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path());
+        .env("PATH", common::hermetic_path());
     })
     .success();
 
@@ -377,7 +365,7 @@ fn test_doctor_exits_1_on_wrapper_target_mismatch() {
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .failure() // exit 1 — wrapper target mismatch is drift
         .stdout(predicates::prelude::predicate::str::contains(
@@ -407,7 +395,7 @@ fn test_doctor_exits_0_with_correct_wrappers() {
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 
@@ -415,7 +403,7 @@ fn test_doctor_exits_0_with_correct_wrappers() {
     common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success(); // exit 0 — correct wrappers do not produce drift
 }
@@ -450,7 +438,7 @@ fn test_doctor_foreign_symlink_is_advisory_not_exit_1() {
             "--no-guidance",
             "--wrappers",
         ])
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .assert()
         .success();
 
@@ -475,7 +463,7 @@ fn test_doctor_foreign_symlink_is_advisory_not_exit_1() {
     let out = common::skim_sandboxed(home)
         .arg("doctor")
         .current_dir(home)
-        .env("PATH", hermetic_path())
+        .env("PATH", common::hermetic_path())
         .output()
         .unwrap();
 
