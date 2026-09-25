@@ -20,13 +20,30 @@
 //! - [`golden`] — golden-set schema, query flags, loading, integrity.
 //! - [`types`] — what a skim invocation returns (rows, pages, stats) and the
 //!   HARD-check vocabulary.
+//! - [`runner`] — runs the skim CLI as a sandboxed, time-bounded subprocess:
+//!   build, stats, full lists, pagination sweeps, prefix lists, text runs.
+//! - [`metrics`] — which checks run on which entry ([`metrics::plan`]), the
+//!   pure HARD checks, and the RATCHET measurements and aggregates.
+//! - [`gate`] — the `known_failures.toml` ledger (XFAIL / XPASS) and the
+//!   gate verdict against `baseline.json`.
+//! - [`baseline`] — `baseline.json` and `bless`.
+//! - [`report`] — `report.json` (deterministic apart from `latency`) and
+//!   `report.md` (the step summary).
+//! - [`pipeline`] — one run end to end; the `scoreboard` binary
+//!   (`src/bin/scoreboard.rs`) is a thin CLI over it.
 //!
-//! The runner, metrics, gate, baseline, report and `scoreboard` binary build
-//! on these in later phases.
+//! Exit codes: `0` pass, `1` gate failure, `2` harness error (never reported
+//! as a regression).
 
+pub mod baseline;
 pub mod corpus;
+pub mod gate;
 pub mod golden;
+pub mod metrics;
 pub mod oracle;
+pub mod pipeline;
+pub mod report;
+pub mod runner;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 pub mod types;
