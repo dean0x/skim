@@ -8,7 +8,8 @@
 //!
 //! Golden integrity is a precondition, not a gate: the scoreboard maps any
 //! [`IntegrityViolation`] (or a load error) to a harness error, exit 2.
-//! `golden-gen` (candidate identifier generation) is a later phase.
+//! Candidate `[[ident]]` entries come from `golden-gen`
+//! ([`crate::scoreboard::golden_gen`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -42,6 +43,9 @@ pub struct DefSite {
 pub enum Origin {
     /// Curated from the 2026-09-25 seed benchmark.
     Seed,
+    /// Hand-picked for this corpus (not from the seed benchmark), with its
+    /// definition line verified at the pinned commit.
+    Curated,
     /// Produced by `golden-gen`, reviewed, then frozen.
     Generated,
 }
@@ -807,7 +811,7 @@ commit = "b8a0a79463382347820f1c2572bde37b68e87c76"   # must equal corpora.toml
 id = "skim-L01"
 query = "check_staleness"
 def = { path = "crates/rskim/src/cmd/search/staleness.rs", line = 321 }
-origin = "seed"            # seed | generated
+origin = "seed"            # seed | curated | generated
 
 [[concept]]                # ranking queries; relevance declared up front, never from skim output
 id = "skim-C01"
@@ -896,6 +900,22 @@ limits = [5, 20]
                 parse_golden(&format!("{}{body}", header())).is_err(),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn ident_origins_are_seed_curated_or_generated() {
+        for (raw, want) in [
+            ("seed", Origin::Seed),
+            ("curated", Origin::Curated),
+            ("generated", Origin::Generated),
+        ] {
+            let g = golden(&format!(
+                "{}[[ident]]\nid = \"skim-L1\"\nquery = \"q\"\n\
+                 def = {{ path = \"a.rs\", line = 1 }}\norigin = \"{raw}\"\n",
+                header()
+            ));
+            assert_eq!(g.idents[0].origin, want, "{raw}");
         }
     }
 
