@@ -211,8 +211,15 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
   change set (`git diff HEAD^1 HEAD` on the merge commit) touches one of:
   - `crates/rskim-search/`, `crates/rskim/src/cmd/search/`, `crates/rskim-core/`, `crates/rskim-bench/`,
     `crates/rskim-research/`;
+  - the `rskim` files outside `cmd/search/` that it depends on: `crates/rskim/src/cmd/mod.rs`
+    (`is_repo_relative_safe`, `resolve_cache_dir`), `crates/rskim/src/debug.rs` (`is_debug_enabled`),
+    `crates/rskim/src/analytics/mod.rs` (`AnalyticsConfig`), `crates/rskim/src/main.rs` (dispatch) and
+    `crates/rskim/Cargo.toml`;
   - the root `Cargo.toml` / `Cargo.lock`;
   - `.github/workflows/ci.yml`.
+
+  Adding a `crate::` import to `cmd/search/` from another `rskim` file means adding that file here and to
+  `SEARCH_PATHS` in the `changes` job.
 
   A PR outside these paths skips the job, and GitHub reports a skipped job as passing.
 - **Binary.** Build Check uploads its release `skim` as the `skim-release` artifact (kept 1 day). The scoreboard

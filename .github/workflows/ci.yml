@@ -312,7 +312,10 @@ jobs:
         run: |
           set -euo pipefail
           # Keep in sync with crates/rskim-bench/scoreboard/README.md ("CI").
-          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim-core/|crates/rskim-bench/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          # Beyond cmd/search/: the rskim files it imports from (cmd/mod.rs,
+          # debug.rs, analytics/mod.rs), the dispatch (main.rs), and the
+          # rskim manifest.
+          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
           case "$EVENT_NAME" in
             workflow_dispatch)
               search=true; reason="manual dispatch" ;;
