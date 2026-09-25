@@ -62,6 +62,10 @@ use crate::runner::CommandOutput;
 
 use super::combine_stdout_stderr;
 use crate::analytics::CommandType;
+// `run_tool_rerunnable` is taken from `cmd::execution` directly rather than the
+// `cmd` façade: it is a route-level opt-in used by this module alone, not part
+// of the handler-facing surface every family imports.
+use crate::cmd::execution::run_tool_rerunnable;
 use crate::cmd::{ToolRunConfig, run_tool};
 
 const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
@@ -84,14 +88,12 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // skim would expand rather than compress. `test_gh_minimal_payload_guard_
     // serves_raw_on_both_gate_branches` pins that (PF-011, and the #317 spirit).
     //
-    // Known residual (regression-3, coupled to architecture-8): every `gh`
-    // handler injects `--json <fields>` in prepare_args and no `gh` CONFIG arms
-    // `raw_override`, so when the guard elects the fallback it emits the
-    // *injected* command's stdout rather than what the user's own argv would
-    // have printed. Skipping the guard would trade that fidelity nuance on a
-    // fallback path for a guaranteed expansion on every small payload — the
-    // worse of the two. The real fix is arming `raw_override` here, which is
-    // architecture-8; do not flip this flag without doing that first.
+    // The guard's fallback body is supplied per-route by `run_tool_rerunnable`
+    // (see `route_rerunnable`), not by `raw_override`: this `CONFIG` is shared
+    // by every route including the non-idempotent `gh api`, and `raw_override`
+    // is eager — arming it here would cost a second network round trip on every
+    // `gh` invocation, including the ones where the guard keeps the compressed
+    // view and the captured bytes are discarded.
     skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
@@ -122,20 +124,23 @@ pub(crate) fn run(
     let action = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match (subcmd, action) {
-        ("issue", "view") => run_tool(
+        ("issue", "view") => run_tool_rerunnable(
             CONFIG,
             args,
             ctx,
             issue_view::prepare_args,
             issue_view::parse_impl,
         ),
-        ("pr", "view") => run_tool(
+        ("pr", "view") => run_tool_rerunnable(
             CONFIG,
             args,
             ctx,
             pr_view::prepare_args,
             pr_view::parse_impl,
         ),
+        // NOT rerunnable: `pr_checks::prepare_args` injects nothing, so the
+        // guard's fallback body is already the user's own command output.  A
+        // re-run would buy nothing and cost a round trip.
         ("pr", "checks") => run_tool(
             CONFIG,
             args,
@@ -143,7 +148,7 @@ pub(crate) fn run(
             pr_checks::prepare_args,
             pr_checks::parse_impl,
         ),
-        ("run", "view") => run_tool(
+        ("run", "view") => run_tool_rerunnable(
             CONFIG,
             args,
             ctx,
@@ -156,13 +161,18 @@ pub(crate) fn run(
             let watch_args = if args.len() > 2 { &args[2..] } else { &[] };
             run_watch::run_watch(watch_args, ctx)
         }
-        ("release", "view") => run_tool(
+        ("release", "view") => run_tool_rerunnable(
             CONFIG,
             args,
             ctx,
             release_view::prepare_args,
             release_view::parse_impl,
         ),
+        // NOT rerunnable, and not a judgement call about this particular
+        // endpoint: `gh api` issues whatever HTTP method its caller asked for
+        // (`--method POST`, `-X DELETE`), so a second run can create, mutate or
+        // delete a resource.  Re-running a non-idempotent command to improve a
+        // display is never an acceptable trade.
         ("api", _) => {
             // Strip the leading "api" token so run_tool sees the
             // remaining args only.  This lets use_stdin detection fire when
@@ -173,6 +183,16 @@ pub(crate) fn run(
             let api_args = if args.is_empty() { &[][..] } else { &args[1..] };
             run_tool(CONFIG, api_args, ctx, api::prepare_args, api::parse_impl)
         }
+        // The catch-all carries every other `gh` subcommand, including ones
+        // that mutate (`gh pr create`, `gh issue close`, `gh repo delete`), so
+        // it opts in per route via `route_rerunnable` rather than wholesale.
+        _ if route_rerunnable(subcmd, action) => run_tool_rerunnable(
+            CONFIG,
+            args,
+            ctx,
+            list::prepare_args,
+            parse_impl_with_auto_detect,
+        ),
         _ => run_tool(
             CONFIG,
             args,
@@ -181,6 +201,31 @@ pub(crate) fn run(
             parse_impl_with_auto_detect,
         ),
     }
+}
+
+/// Whether a catch-all route may have its command re-run to build the ADR-001
+/// guard's raw-fallback body (PF-024).
+///
+/// Two conditions must both hold, and this predicate is deliberately an
+/// allow-list of the pairs that satisfy them rather than a rule over verbs:
+///
+/// 1. **`list::prepare_args` actually injects something.** It appends
+///    `--json <fields>` for exactly `pr list`, `issue list` and `run list`;
+///    every other catch-all route reaches `gh` with the user's own argv, so its
+///    fallback body is already correct and a re-run would be pure cost.
+/// 2. **The command is read-only.** `gh <noun> list` enumerates; it creates,
+///    mutates and deletes nothing, so running it twice is indistinguishable
+///    from running it once.
+///
+/// A verb-shaped rule (`action == "list"`) would satisfy (2) but not (1), and
+/// would silently start re-running commands the moment a new injection is added
+/// elsewhere.  Keeping the list in lockstep with `list::prepare_args` is the
+/// point: if a `match` arm is added there, add it here.
+fn route_rerunnable(subcmd: &str, action: &str) -> bool {
+    matches!(
+        (subcmd, action),
+        ("pr", "list") | ("issue", "list") | ("run", "list")
+    )
 }
 
 // ============================================================================
@@ -327,6 +372,76 @@ mod tests {
             "gh CONFIG.expected_exit_codes must be &[8] — \
              gh exits 8 for pending/failing checks (a parseable result, not an error)"
         );
+    }
+
+    // --- route_rerunnable (PF-024) ---
+
+    /// Lockstep guard: a catch-all route may be re-run **iff**
+    /// `list::prepare_args` actually injects into it.
+    ///
+    /// The expectation is derived by running `prepare_args` and observing
+    /// whether it mutated the argv — not by restating the allow-list — so the
+    /// test cannot degenerate into a copy of the code it checks.  Add a `match`
+    /// arm to `list::prepare_args` without adding one here and this fails.
+    #[test]
+    fn rerunnable_catch_all_routes_are_exactly_the_injecting_ones() {
+        let candidates = [
+            ("pr", "list"),
+            ("issue", "list"),
+            ("run", "list"),
+            ("release", "list"),
+            ("workflow", "list"),
+            ("cache", "list"),
+            ("secret", "list"),
+            ("repo", "view"),
+            ("gist", "view"),
+        ];
+        for (subcmd, action) in candidates {
+            let mut args = vec![subcmd.to_string(), action.to_string()];
+            let before = args.clone();
+            list::prepare_args(&mut args);
+            let injected = args != before;
+            assert_eq!(
+                route_rerunnable(subcmd, action),
+                injected,
+                "`gh {subcmd} {action}`: a re-run is worth its round trip only \
+                 where prepare_args injected something (injected={injected})"
+            );
+        }
+    }
+
+    /// A route that changes state must never be re-run to improve a display.
+    ///
+    /// None of these reaches `route_rerunnable` through an injecting path
+    /// today; the assertion pins that a future widening — say to "every
+    /// `gh <noun> <verb>`" — cannot quietly pick them up.
+    #[test]
+    fn mutating_routes_are_never_rerunnable() {
+        for (subcmd, action) in [
+            ("pr", "create"),
+            ("pr", "merge"),
+            ("pr", "close"),
+            ("pr", "edit"),
+            ("issue", "create"),
+            ("issue", "close"),
+            ("issue", "edit"),
+            ("release", "create"),
+            ("release", "delete"),
+            ("repo", "delete"),
+            ("repo", "create"),
+            ("secret", "set"),
+            ("run", "cancel"),
+            ("run", "rerun"),
+            // `gh api` is dispatched before the catch-all, but it is the
+            // sharpest case: it issues whatever HTTP method it was given.
+            ("api", "repos/o/r/issues"),
+            ("api", "-XDELETE"),
+        ] {
+            assert!(
+                !route_rerunnable(subcmd, action),
+                "`gh {subcmd} {action}` is not idempotent and must never be re-run"
+            );
+        }
     }
 
     // --- extract_comments ---
