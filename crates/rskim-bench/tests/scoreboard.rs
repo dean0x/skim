@@ -870,6 +870,49 @@ fn a_ratchet_regression_needs_an_accepted_reason_to_bless() {
     assert_exit(&h.check(), 0);
 }
 
+/// Ledgering a check that the baseline blessed as `pass` downgrades it to
+/// `xfail`: the gate asks for a bless, and the bless needs a reason.
+#[test]
+fn a_newly_ledgered_failure_needs_an_accepted_reason_to_bless() {
+    let h = Harness::new();
+    h.bless_current();
+
+    h.drop_lexical_ground_truth_file();
+    h.write_ledger(
+        r##"[[xfail]]
+issue = "#9004"
+check = "lexical.recall"
+ids = ["fixture-X01"]
+
+[[xfail]]
+issue = "#9004"
+check = "lexical.silent_fn"
+ids = ["fixture-X01"]
+"##,
+    );
+    assert_exit(&h.check(), 1);
+
+    let refused = h.bless(None);
+    assert_exit(&refused, 1);
+    let err = stderr(&refused);
+    assert!(
+        err.contains("fixture/fixture-X01 lexical.recall: pass -> xfail"),
+        "{err}"
+    );
+    assert!(
+        err.contains("fixture/fixture-X01 lexical.silent_fn: pass -> xfail"),
+        "{err}"
+    );
+    assert!(err.contains("--accept-regression"), "{err}");
+
+    assert_exit(&h.bless(Some("fixture: #9004 filed")), 0);
+    let baseline: Value = serde_json::from_slice(&fs::read(h.baseline_path()).unwrap()).unwrap();
+    let accepted = baseline["accepted_regressions"].as_array().unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0]["reason"], "fixture: #9004 filed");
+    assert_exit(&h.check(), 0);
+}
+
 #[test]
 fn bless_refuses_a_report_with_unledgered_hard_failures() {
     let h = Harness::new();

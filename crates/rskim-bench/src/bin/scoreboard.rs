@@ -100,7 +100,9 @@ struct BlessArgs {
     #[arg(long, default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
 
-    /// Accept RATCHET regressions, recording this reason in the baseline.
+    /// Accept RATCHET regressions and HARD downgrades (pass -> xfail, a
+    /// blessed check that no longer runs), recording this reason in the
+    /// baseline.
     #[arg(long, value_name = "REASON")]
     accept_regression: Option<String>,
 }

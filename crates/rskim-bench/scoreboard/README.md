@@ -26,7 +26,9 @@ It is the **required merge gate for search PRs** (owner decision 2026-09-25, ADR
 | **RATCHET** (per corpus + aggregate) | `universe.delta`, `universe.skipped_by_reason_mismatch` · `coverage.tracked_text` · `ident.def_top1`, `ident.mrr`, `ident.anchor_eq_def`, `ident.def_line_in_snippet` · `concept.p5`, `concept.p10` · `bytes.text_median`, `bytes.text_p90`, `bytes.first_correct_median`, `bytes.first_correct_misses` · the baseline columns (`*.baseline_alpha`, `*.baseline_count`, `bytes.rg_*`) · `oracle_less.full_rows.<id>`, the full-list row count of each entry with no oracle (`--ast`, `--blast-radius`, a standalone `--hot` / `--cold` / `--risky` run); a shrink is a regression | A change in **either direction** fails with "bless required". Tolerance is 0 after rounding to 4 dp, except the byte medians and p90s at ±3%. |
 | **INFO** (never gated) | Latency p50/p95 · `unindexed_hits` · the oracle's per-reason skip breakdown · the "beats baseline" column | none |
 
-A changed golden file, corpus pin, or HARD outcome (for example `xfail -> pass`) also means "bless required".
+A changed golden file, corpus pin, or HARD outcome (for example `xfail -> pass`) also means "bless required". A
+HARD downgrade (`pass -> xfail`, or a blessed check, entry or corpus that no longer runs) is blessed like a RATCHET
+regression: only with `--accept-regression "<reason>"`.
 
 What it does **not** cover yet, where manual adversarial dog-food (ADR-007) is still required:
 
@@ -90,7 +92,7 @@ note = "query.rs:692 pool_was_capped"   # optional
 | Outcome | Gate | What to do |
 |---|---|---|
 | Ledgered failure (**XFAIL**) | passes | Nothing. The ticket tracks it. |
-| Unledgered failure (**FAIL**) | fails | Fix it. If it is a real bug you are not fixing in this PR, file a ticket first, then add an `[[xfail]]` entry with that number and the exact ids. |
+| Unledgered failure (**FAIL**) | fails | Fix it. If it is a real bug you are not fixing in this PR, file a ticket first, then add an `[[xfail]]` entry with that number and the exact ids, and re-bless with `--accept-regression "<reason>"`: a blessed `pass -> xfail` is a downgrade. |
 | Ledgered check that passes (**XPASS**) | fails, "promote" | Your change fixed it. Remove the id (or the whole entry) from `known_failures.toml`, then re-bless: `xfail -> pass` is a baseline change. |
 | RATCHET value moved | fails, "bless required" | Re-bless. Improvements need no reason. Regressions need `--accept-regression "<reason>"`, which is recorded in `accepted_regressions[]`. |
 
@@ -104,7 +106,8 @@ entry, is a golden-integrity error (exit 2), so a stale entry cannot silently XF
 - a partial (`--only`) report;
 - a report whose golden files differ from the ones on disk;
 - any `fail` or `xpass` record (fix the failure or ledger it first);
-- a RATCHET regression without `--accept-regression`.
+- a RATCHET regression or a HARD downgrade (`pass -> xfail`, or a blessed check, entry or corpus that no longer
+  runs) without `--accept-regression`.
 
 **Bless from the CI artifact**, because CI (ubuntu) is the platform that gates. Every `Search Scoreboard` run uploads
 a `scoreboard-report` artifact (`report.json` + `report.md`, kept for 30 days):

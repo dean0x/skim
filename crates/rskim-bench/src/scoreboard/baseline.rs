@@ -4,8 +4,8 @@
 //! - every HARD outcome (`pass` / `xfail`) by query id and check;
 //! - every RATCHET value, per corpus and aggregated;
 //! - each corpus's commit and golden-file SHA-256, and the golden-set hash;
-//! - `accepted_regressions[]`: every RATCHET regression a bless accepted,
-//!   with its reason.
+//! - `accepted_regressions[]`: every RATCHET regression and HARD downgrade a
+//!   bless accepted, with its reason.
 //!
 //! It holds no latency, binary version, paths or timestamps, so it changes
 //! only when a bless changes what is expected.
@@ -14,7 +14,8 @@
 //! artifact, so blessing needs no local run), the golden files on disk, and
 //! the existing baseline. It refuses a partial (`--only`) run, a report made
 //! from other golden files, any unledgered HARD failure, any XPASS, and any
-//! RATCHET regression that was not accepted with a reason.
+//! RATCHET regression or HARD downgrade (see [`hard_downgrades`]) that was
+//! not accepted with a reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -67,12 +68,12 @@ pub struct BaselineCorpus {
     pub ratchet: BTreeMap<String, f64>,
 }
 
-/// One accepted batch of RATCHET regressions.
+/// One accepted batch of HARD downgrades and RATCHET regressions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptedRegression {
     pub reason: String,
-    /// `"<scope>/<metric>: <baseline> -> <current>"`, sorted.
+    /// The [`hard_downgrades`] lines, then the [`regressions`] lines.
     pub regressions: Vec<String>,
 }
 
@@ -165,7 +166,8 @@ pub struct BlessInputs<'a> {
     /// SHA-256 of each corpus's golden file in the data dir, by corpus.
     pub golden_on_disk: &'a BTreeMap<String, String>,
     pub existing: Option<&'a Baseline>,
-    /// `--accept-regression "<reason>"`.
+    /// `--accept-regression "<reason>"`: accepts every HARD downgrade and
+    /// RATCHET regression in the report.
     pub accept_regression: Option<&'a str>,
 }
 
@@ -196,11 +198,11 @@ pub fn bless(inputs: &BlessInputs<'_>) -> BlessDecision {
     }
     reasons.extend(unblessable_hard_outcomes(report));
 
-    let regressions = inputs
-        .existing
-        .map(|b| regressions(b, report))
-        .unwrap_or_default();
-    let accepted = match (regressions.is_empty(), inputs.accept_regression) {
+    let (downgrades, ratchet) = inputs.existing.map_or_else(Default::default, |b| {
+        (hard_downgrades(b, report), regressions(b, report))
+    });
+    let nothing_regressed = downgrades.is_empty() && ratchet.is_empty();
+    let accepted = match (nothing_regressed, inputs.accept_regression) {
         (true, None) => None,
         (true, Some(_)) => {
             notes.push("--accept-regression ignored: nothing regressed".to_string());
@@ -208,17 +210,26 @@ pub fn bless(inputs: &BlessInputs<'_>) -> BlessDecision {
         }
         (false, Some(reason)) if !reason.trim().is_empty() => Some(AcceptedRegression {
             reason: reason.trim().to_string(),
-            regressions: regressions.clone(),
+            regressions: downgrades.iter().chain(&ratchet).cloned().collect(),
         }),
         (false, Some(_)) => {
             reasons.push("--accept-regression needs a non-blank reason".to_string());
             None
         }
         (false, None) => {
-            reasons.push(format!(
-                "RATCHET regression(s): {}; rerun bless with --accept-regression \"<reason>\" to accept them",
-                regressions.join("; ")
-            ));
+            const RERUN: &str = "rerun bless with --accept-regression \"<reason>\" to accept them";
+            if !downgrades.is_empty() {
+                reasons.push(format!(
+                    "HARD downgrade(s) (a blessed check now xfails or no longer runs): {}; {RERUN}",
+                    downgrades.join("; ")
+                ));
+            }
+            if !ratchet.is_empty() {
+                reasons.push(format!(
+                    "RATCHET regression(s): {}; {RERUN}",
+                    ratchet.join("; ")
+                ));
+            }
             None
         }
     };
@@ -317,6 +328,55 @@ fn unblessable_hard_outcomes(report: &Report) -> Vec<String> {
 
 fn join(set: &BTreeSet<&str>) -> String {
     set.iter().copied().collect::<Vec<_>>().join(", ")
+}
+
+/// Every blessed HARD check that `report` downgrades, as
+/// `"<corpus>/<id> <check>: <was> -> <now>"`:
+/// - `pass -> xfail`: a newly ledgered failure;
+/// - `<was> -> not run`: the golden entry, or the check on it, is gone;
+/// - for a complete report, `"<corpus>: …"` for each baseline corpus it no
+///   longer runs.
+///
+/// Upgrades (`xfail -> pass`) and new checks are not downgrades; current
+/// `fail` / `xpass` records are refused on their own.
+pub fn hard_downgrades(existing: &Baseline, report: &Report) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in &report.corpora {
+        let Some(b) = existing.corpora.get(&c.name) else {
+            continue;
+        };
+        let current: BTreeMap<(&str, &str), Outcome> = c
+            .checks
+            .iter()
+            .map(|r| ((r.id.as_str(), r.check.as_str()), r.outcome))
+            .collect();
+        for (id, checks) in &b.hard {
+            for (check, &was) in checks {
+                let now = match current.get(&(id.as_str(), check.as_str())) {
+                    None => "not run",
+                    Some(Outcome::Xfail) if was == HardState::Pass => "xfail",
+                    Some(_) => continue,
+                };
+                out.push(format!(
+                    "{}/{id} {check}: {} -> {now}",
+                    c.name,
+                    was.as_str()
+                ));
+            }
+        }
+    }
+    if report.complete {
+        let run: BTreeSet<&str> = report.corpora.iter().map(|c| c.name.as_str()).collect();
+        for (name, b) in &existing.corpora {
+            if !run.contains(name.as_str()) {
+                let blessed: usize = b.hard.values().map(BTreeMap::len).sum();
+                out.push(format!(
+                    "{name}: corpus no longer run ({blessed} blessed HARD check(s) -> not run)"
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// Every RATCHET value that moved in its bad direction beyond tolerance,
@@ -543,6 +603,138 @@ mod tests {
         // Accepted regressions are kept by later blesses.
         let again = blessed(decide(&worse, Some(&b), None));
         assert_eq!(again.accepted_regressions.len(), 1);
+    }
+
+    fn with_checks(checks: Vec<CheckRecord>) -> Report {
+        report(vec![corpus("skim", checks, 0.9)], 0.9)
+    }
+
+    #[test]
+    fn a_pass_that_becomes_a_ledgered_failure_needs_a_reason() {
+        let old = blessed(decide(
+            &with_checks(vec![record(
+                "skim-G001",
+                CheckId::PaginationComplete,
+                Outcome::Pass,
+            )]),
+            None,
+            None,
+        ));
+        let now = with_checks(vec![record(
+            "skim-G001",
+            CheckId::PaginationComplete,
+            Outcome::Xfail,
+        )]);
+
+        let why = refused(decide(&now, Some(&old), None));
+        assert!(
+            why.contains("skim/skim-G001 pagination.complete: pass -> xfail"),
+            "{why}"
+        );
+        assert!(why.contains("--accept-regression"), "{why}");
+        assert!(refused(decide(&now, Some(&old), Some(" "))).contains("non-blank"));
+
+        let b = blessed(decide(&now, Some(&old), Some("#544 filed")));
+        assert_eq!(
+            b.hard_state("skim", "skim-G001", "pagination.complete"),
+            Some(HardState::Xfail)
+        );
+        assert_eq!(
+            b.accepted_regressions,
+            vec![AcceptedRegression {
+                reason: "#544 filed".to_string(),
+                regressions: vec!["skim/skim-G001 pagination.complete: pass -> xfail".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_blessed_check_that_no_longer_runs_needs_a_reason() {
+        let old = blessed(decide(
+            &with_checks(vec![
+                record("skim-G001", CheckId::PaginationComplete, Outcome::Xfail),
+                record("skim-X01", CheckId::LexicalPrecision, Outcome::Pass),
+                record("skim-X01", CheckId::LexicalRecall, Outcome::Pass),
+                record("skim-X02", CheckId::LexicalRecall, Outcome::Pass),
+            ]),
+            None,
+            None,
+        ));
+        // skim-X02 and the ledgered skim-G001 left the golden set; skim-X01
+        // lost one of its checks.
+        let now = with_checks(vec![record(
+            "skim-X01",
+            CheckId::LexicalRecall,
+            Outcome::Pass,
+        )]);
+
+        let why = refused(decide(&now, Some(&old), None));
+        for lost in [
+            "skim/skim-G001 pagination.complete: xfail -> not run",
+            "skim/skim-X01 lexical.precision: pass -> not run",
+            "skim/skim-X02 lexical.recall: pass -> not run",
+        ] {
+            assert!(why.contains(lost), "{lost}: {why}");
+        }
+        assert!(why.contains("--accept-regression"), "{why}");
+
+        let b = blessed(decide(&now, Some(&old), Some("golden set trimmed")));
+        assert_eq!(b.accepted_regressions.len(), 1);
+        assert_eq!(b.accepted_regressions[0].regressions.len(), 3);
+        assert_eq!(b.hard_state("skim", "skim-X02", "lexical.recall"), None);
+    }
+
+    #[test]
+    fn a_corpus_that_is_no_longer_run_needs_a_reason() {
+        let mut old = blessed(decide(&with_checks(Vec::new()), None, None));
+        old.corpora.insert(
+            "zod".to_string(),
+            BaselineCorpus {
+                commit: "d".repeat(40),
+                golden_sha256: "g-zod".to_string(),
+                hard: BTreeMap::from([(
+                    "zod-X01".to_string(),
+                    BTreeMap::from([("lexical.recall".to_string(), HardState::Pass)]),
+                )]),
+                ratchet: BTreeMap::new(),
+            },
+        );
+        // A complete run without zod: corpora.toml dropped it.
+        let now = with_checks(Vec::new());
+
+        let why = refused(decide(&now, Some(&old), None));
+        assert!(why.contains("zod"), "{why}");
+        assert!(why.contains("not run"), "{why}");
+        assert!(why.contains("--accept-regression"), "{why}");
+
+        let b = blessed(decide(&now, Some(&old), Some("zod retired")));
+        assert!(!b.corpora.contains_key("zod"));
+        assert_eq!(b.accepted_regressions.len(), 1);
+    }
+
+    #[test]
+    fn upgrades_and_new_checks_bless_without_a_reason() {
+        let old = blessed(decide(
+            &with_checks(vec![record(
+                "skim-X01",
+                CheckId::LexicalRecall,
+                Outcome::Xfail,
+            )]),
+            None,
+            None,
+        ));
+        let now = with_checks(vec![
+            record("skim-X01", CheckId::LexicalRecall, Outcome::Pass),
+            record("skim-X02", CheckId::LexicalRecall, Outcome::Pass),
+            record("skim-G001", CheckId::PaginationComplete, Outcome::Xfail),
+        ]);
+
+        let b = blessed(decide(&now, Some(&old), None));
+        assert!(b.accepted_regressions.is_empty());
+        assert_eq!(
+            b.hard_state("skim", "skim-X01", "lexical.recall"),
+            Some(HardState::Pass)
+        );
     }
 
     #[test]
