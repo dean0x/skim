@@ -39,6 +39,81 @@ fn passthrough_skim() -> assert_cmd::Command {
 }
 
 // ============================================================================
+// Fixtures for the B3/B4 marker tests
+// ============================================================================
+//
+// A lossy-view marker exists only when the guard actually serves the compressed
+// view, so for any test asserting that a marker FIRES the fixture size is part
+// of the precondition, not decoration.
+//
+// Since the 2026-09-24 ADR-001 amendment the guard charges the stderr disclosure
+// the `Keep` branch is about to print:
+//
+//     Keep  iff  compressed + marker < raw   (in BOTH bytes and cl100k tokens)
+//
+// The previous fixtures here were 90-122 B — smaller than the 76-90 B markers
+// they were meant to trigger — so the guard served raw (losslessly and
+// correctly) and no marker fired. These are sized to clear it with >=2x margin.
+// `skim()` above removes `SKIM_REWRITTEN_FROM`, so both are direct-origin.
+
+/// Decorator- and type-dense TypeScript for `--mode=pseudo`, which strips
+/// decorators, declaration type annotations and semicolons but preserves bodies
+/// and parameter types (E1/ADR-008) — so the saving comes from annotation
+/// density, not from body removal.
+///
+/// Measured: raw 827 B / 179 t → pseudo 344 B / 77 t = saving 483 B / 102 t;
+/// margin +393 B / +78 t against the 90 B / 24 t direct marker (4.4x / 3.3x).
+const PSEUDO_FIXTURE: &str = r#"@Injectable({ scope: "singleton" })
+@Controller("/orders")
+export class OrderService {
+  @Inject("repository") private readonly repository: Repository<OrderEntity>;
+  @Inject("cache") private readonly cache: CacheStore<string, OrderEntity>;
+  @Inject("clock") private readonly clock: ClockProvider<Date>;
+  @Inject("logger") private readonly logger: StructuredLogger<LogRecord>;
+  @Inject("metrics") private readonly metrics: MetricsSink<Counter, Gauge>;
+  @Inject("tracer") private readonly tracer: TraceProvider<SpanContext>;
+  private readonly pending: Map<string, Array<OrderEntity>> = new Map();
+  private readonly failures: Record<string, ReadonlyArray<Error>> = {};
+
+  place(order: OrderEntity, region: string): number {
+    this.repository.save(order);
+    this.cache.set(order.id, order);
+    return order.total;
+  }
+}
+"#;
+
+/// Body-heavy TypeScript for `--mode=structure`, which replaces each method
+/// body with `{...}`.
+///
+/// Measured: raw 718 B / 193 t → structure 235 B / 58 t = saving 483 B / 135 t;
+/// margin +407 B / +113 t against the 76 B / 22 t direct marker (5.4x / 5.1x).
+const STRUCTURE_FIXTURE: &str = r#"export class InvoiceTotals {
+  private readonly rates: Map<string, number> = new Map();
+
+  register(region: string, rate: number): void {
+    if (rate < 0) { throw new RangeError(`negative rate for ${region}`); }
+    this.rates.set(region, rate);
+  }
+
+  totalFor(region: string, subtotal: number): number {
+    const rate = this.rates.get(region);
+    if (rate === undefined) { throw new Error(`unknown region ${region}`); }
+    const tax = subtotal * rate;
+    return Math.round((subtotal + tax) * 100) / 100;
+  }
+
+  summarise(): string {
+    const parts: string[] = [];
+    for (const [region, rate] of this.rates) {
+      parts.push(`${region}=${(rate * 100).toFixed(2)}%`);
+    }
+    return parts.join(", ");
+  }
+}
+"#;
+
+// ============================================================================
 // B1: Read-path passthrough — `SKIM_PASSTHROUGH=1 skim <file>`
 // ============================================================================
 
@@ -418,13 +493,10 @@ fn test_passthrough_yes_uppercase_activates_gate() {
 fn test_lossy_view_marker_fires_without_origin_tag() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
-    // TypeScript pseudo mode strips decorators and non-parameter type annotations.
-    // The @injectable() decorator is removed; the greet() parameter type is preserved (E1/ADR-008).
-    fs::write(
-        &file,
-        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
-    )
-    .unwrap();
+    // Pseudo strips decorators and non-parameter type annotations; parameter
+    // types are preserved (E1/ADR-008). Sized so the saving covers the marker
+    // the assertion below requires — see PSEUDO_FIXTURE.
+    fs::write(&file, PSEUDO_FIXTURE).unwrap();
 
     skim()
         .arg(&file)
@@ -444,12 +516,9 @@ fn test_lossy_view_marker_fires_without_origin_tag() {
 fn test_lossy_marker_fires_without_skim_debug() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
-    // Use a class with a decorator so pseudo mode strips content; greet() parameter type preserved (E1).
-    fs::write(
-        &file,
-        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
-    )
-    .unwrap();
+    // Decorator- and annotation-dense so pseudo mode strips enough for the guard
+    // to keep the compressed view — the marker this test asserts exists only then.
+    fs::write(&file, PSEUDO_FIXTURE).unwrap();
 
     // Explicitly remove SKIM_DEBUG — marker must still fire.
     skim()
@@ -499,13 +568,11 @@ fn test_no_loss_guardrail_emits_no_stderr_without_skim_debug() {
 fn test_lossy_marker_names_pseudo_class() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
-    // Use a class with a decorator so pseudo mode strips content and fires the lossy marker.
-    // The @injectable() decorator is removed; greet() parameter type is preserved (E1/ADR-008).
-    fs::write(
-        &file,
-        "@injectable()\nexport class UserService {\n  private name: string;\n  greet(name: string): string { return `Hi ${name}`; }\n}\n",
-    )
-    .unwrap();
+    // Decorators and declaration annotations are what pseudo strips (parameter
+    // types are preserved, E1/ADR-008), and there must be enough of them for the
+    // saving to cover the marker — otherwise the guard serves raw and no marker
+    // is emitted to name a class at all.
+    fs::write(&file, PSEUDO_FIXTURE).unwrap();
 
     skim()
         .arg(&file)
@@ -522,12 +589,10 @@ fn test_lossy_marker_names_pseudo_class() {
 fn test_lossy_marker_names_structure_class() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("lib.ts");
-    // A function with a non-trivial body so structure mode differs from raw.
-    fs::write(
-        &file,
-        "export function greet(name: string): string {\n  const msg = `Hi ${name}`;\n  return msg;\n}\n",
-    )
-    .unwrap();
+    // Bodies substantial enough that collapsing them to `{...}` pays for the
+    // marker; a single short function saved 39 B / 12 t against a 76 B / 22 t
+    // cost, so the guard served raw and there was no marker to name a class.
+    fs::write(&file, STRUCTURE_FIXTURE).unwrap();
 
     skim()
         .arg(&file)

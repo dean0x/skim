@@ -47,13 +47,31 @@ impl GuardrailOutcome {
 /// `Triggered { output: raw }`.
 ///
 /// Takes ownership of both strings to avoid cloning on the fast path.
+///
+/// Charge-nothing shim over [`apply_with_notice`]: prices the stdout bodies
+/// only. See [`crate::output::fidelity::decide`].
 pub(crate) fn apply(
     raw: String,
     compressed: String,
     writer: &mut impl Write,
 ) -> Result<GuardrailOutcome> {
-    use crate::output::fidelity::{FidelityDecision, decide};
-    match decide(&raw, &compressed) {
+    apply_with_notice(raw, compressed, None, writer)
+}
+
+/// [`apply`], charging the stderr disclosure that the `Passed` branch will
+/// emit against the compressed side (ADR-001 amendment 2026-09-24).
+///
+/// `notice` is the **differential** cost of choosing compressed — `None`
+/// whenever the raw branch would print a byte-identical notice of its own.
+/// See [`crate::output::fidelity::decide_with_notice`] for the rule.
+pub(crate) fn apply_with_notice(
+    raw: String,
+    compressed: String,
+    notice: Option<&str>,
+    writer: &mut impl Write,
+) -> Result<GuardrailOutcome> {
+    use crate::output::fidelity::{FidelityDecision, decide_with_notice};
+    match decide_with_notice(&raw, &compressed, notice) {
         FidelityDecision::Keep => Ok(GuardrailOutcome::Passed { output: compressed }),
         FidelityDecision::Passthrough => {
             writeln!(
@@ -68,11 +86,26 @@ pub(crate) fn apply(
 /// Convenience wrapper: apply the guardrail, writing the banner only when
 /// `SKIM_DEBUG=1` / `--debug` is active (ADR-011: no-data-loss banners are
 /// debug-gated; loss-bearing elision markers are unconditional).
+///
+/// Charge-nothing: routes through [`apply`], which prices the bodies only.
 pub(crate) fn apply_to_stderr(raw: String, compressed: String) -> Result<GuardrailOutcome> {
     if crate::debug::is_debug_enabled() {
         apply(raw, compressed, &mut io::stderr())
     } else {
         apply(raw, compressed, &mut io::sink())
+    }
+}
+
+/// [`apply_to_stderr`], charging the differential disclosure cost.
+pub(crate) fn apply_to_stderr_with_notice(
+    raw: String,
+    compressed: String,
+    notice: Option<&str>,
+) -> Result<GuardrailOutcome> {
+    if crate::debug::is_debug_enabled() {
+        apply_with_notice(raw, compressed, notice, &mut io::stderr())
+    } else {
+        apply_with_notice(raw, compressed, notice, &mut io::sink())
     }
 }
 
@@ -155,6 +188,43 @@ mod tests {
             "A4: tiny raw with larger compressed must trigger"
         );
         assert_eq!(outcome.into_output(), raw);
+    }
+
+    /// ADR-001 amendment 2026-09-24: a compressed view that cannot pay for its
+    /// own stderr disclosure falls back to raw — and says so on the debug
+    /// banner, which is what distinguishes "the guard decided" from "the
+    /// transform silently produced raw".
+    #[test]
+    fn notice_wider_than_saving_triggers_with_banner() {
+        let raw = "alpha beta gamma delta epsilon zeta eta theta".to_string(); // 44 B
+        let compressed = "alpha beta gamma delta".to_string(); // 22 B saving
+
+        // Body-only arithmetic keeps the 22-byte saving.
+        let mut uncharged = Vec::new();
+        let passed = apply(raw.clone(), compressed.clone(), &mut uncharged).unwrap();
+        assert!(!passed.was_triggered(), "uncharged: 22-byte saving is kept");
+        assert!(uncharged.is_empty(), "banner must not fire on Passed path");
+
+        // The production `pseudo` direct marker is 90 bytes — four times the
+        // saving. Charging it turns the same view into a net loss.
+        let notice = "x".repeat(90);
+        let mut charged = Vec::new();
+        let outcome =
+            apply_with_notice(raw.clone(), compressed, Some(&notice), &mut charged).unwrap();
+        assert!(
+            outcome.was_triggered(),
+            "a view that cannot pay for its own disclosure must serve raw"
+        );
+        assert_eq!(
+            outcome.into_output(),
+            raw,
+            "the raw bytes must be served verbatim"
+        );
+        let banner = String::from_utf8(charged).unwrap();
+        assert!(
+            banner.contains("[skim:guardrail]"),
+            "the fallback must be attributable to the guard, not silent; got: {banner}"
+        );
     }
 
     /// Empty raw + empty compressed: both trim to ""; comp_t.len() >= raw_t.len()

@@ -189,7 +189,70 @@ pub(crate) fn longest_nonwhitespace_run(s: &str) -> usize {
 ///
 /// When `count_token_pair` returns `(None, None)`, byte comparison alone
 /// decides. Strictly byte-shorter → `Keep`; never panics, never expands.
+///
+/// # Charge-nothing shim
+///
+/// This entry point prices the stdout bodies and nothing else. Callers that
+/// know the *stderr* disclosure the `Keep` branch will print must use
+/// [`decide_with_notice`] so the guard can charge it (ADR-001 amendment
+/// 2026-09-24). Keeping `decide` as a shim means a call site that has no
+/// notice — or has not been audited for one yet — cannot accidentally charge
+/// the wrong thing by omission.
 pub(crate) fn decide(raw: &str, compressed: &str) -> FidelityDecision {
+    decide_with_notice(raw, compressed, None)
+}
+
+/// [`decide`], with the stderr disclosure that the `Keep` branch would emit
+/// charged against the compressed side.
+///
+/// # Why the guard must see the notice (ADR-001 amendment 2026-09-24)
+///
+/// The guard decides `Keep` vs `Passthrough` by comparing **stdout** sizes, and
+/// has never seen the ADR-008 / ADR-011 class-1 marker the same invocation is
+/// about to print to stderr. Agent harnesses capture stderr into the same
+/// context window as stdout, so a 60-byte stdout saving bought with a 124-byte
+/// disclosure is a net loss the guard currently scores as a win.
+///
+/// # `notice` is the DIFFERENTIAL cost, not the absolute cost
+///
+/// The caller passes `Some(marker)` only when emitting that marker is a
+/// *consequence of choosing `Keep`*:
+///
+/// ```text
+/// overhead = cost(notice if Keep) - cost(notice if Passthrough)
+/// ```
+///
+/// On a path where the `Passthrough` branch prints a byte-identical marker of
+/// its own, the difference is zero and the caller passes `None`. Charging the
+/// absolute cost there would double-count — the defect tracked as #519 — and
+/// would push the guard toward raw on exactly the paths where raw is *also*
+/// disclosed. Making the caller supply a differential keeps #519's resolution a
+/// property of the rule rather than a special case bolted onto it.
+///
+/// # Trim symmetry
+///
+/// `raw` and `compressed` are trimmed before comparison, so the cost charged
+/// for the notice is likewise its trimmed length: the `String` built by
+/// [`crate::output::lossy_view_marker`], which carries no trailing newline.
+/// `process.rs` emits it with `eprintln!`, so the wire cost is one byte and one
+/// cl100k token higher — the same single terminator the trimmed stdout
+/// comparison already normalises away on both sides.
+///
+/// # Laziness
+///
+/// The notice is tokenised **only** on the token slow path, and only once the
+/// tokeniser has proved available for the bodies. The byte early-exit and both
+/// cap fallbacks return without ever tokenising it: when byte arithmetic alone
+/// settles the verdict, the token cost of the notice is not computed.
+///
+/// A const lookup table of per-mode token costs is deliberately **not** used: a
+/// stale entry would be a silently wrong guard verdict with no failing test and
+/// no visible diff (PF-027 genus). The live count cannot go stale.
+pub(crate) fn decide_with_notice(
+    raw: &str,
+    compressed: &str,
+    notice: Option<&str>,
+) -> FidelityDecision {
     /// 256 KiB — above this threshold skip tokenisation (performance cap).
     const TOKEN_SIZE_CAP: usize = 256 * 1024;
     /// 4 KiB — longest non-whitespace run above which skip tokenisation.
@@ -200,13 +263,20 @@ pub(crate) fn decide(raw: &str, compressed: &str) -> FidelityDecision {
     let raw_t = raw.trim();
     let comp_t = compressed.trim();
 
+    // The disclosure is part of what `Keep` costs the reader, so it is charged
+    // to the compressed side at EVERY exit — bytes here, tokens below. An exit
+    // that priced only the body would make the verdict depend on which exit
+    // happened to be taken rather than on what the reader actually receives.
+    let notice_bytes = notice.map_or(0, str::len);
+
     // Byte early-exit: not strictly shorter → Passthrough (conservative rule).
     // Covers empty-raw case (0 < 0 fails → Passthrough) and ties (n == n fails).
-    if comp_t.len() >= raw_t.len() {
+    if comp_t.len().saturating_add(notice_bytes) >= raw_t.len() {
         return FidelityDecision::Passthrough;
     }
 
-    // comp_t.len() < raw_t.len() — bytes say compressed is strictly shorter.
+    // comp_t.len() + notice < raw_t.len() — bytes say compressed is strictly
+    // smaller even after paying for its own disclosure.
     let over_size_cap = raw.len() > TOKEN_SIZE_CAP || compressed.len() > TOKEN_SIZE_CAP;
 
     let over_run_cap = !over_size_cap
@@ -214,22 +284,33 @@ pub(crate) fn decide(raw: &str, compressed: &str) -> FidelityDecision {
             || longest_nonwhitespace_run(compressed) > TOKEN_RUN_CAP);
 
     if over_size_cap || over_run_cap {
-        // Byte path: comp_t.len() < raw_t.len() was verified above → Keep.
+        // Byte path: the notice-charged byte comparison above already decided.
         return FidelityDecision::Keep;
     }
 
     // Token slow path: confirm the byte saving is also a token saving.
     match crate::process::count_token_pair(raw_t, comp_t) {
         (Some(raw_tok), Some(comp_tok)) => {
-            if comp_tok < raw_tok {
-                // Strictly fewer tokens — keep compressed.
-                FidelityDecision::Keep
-            } else {
-                // Token tie or token-expansion even though bytes were shorter → Passthrough.
-                FidelityDecision::Passthrough
+            // Lazy: the notice is tokenised here and nowhere else, so the
+            // byte-decided exits above never pay for it.
+            let notice_tok = match notice {
+                None => Some(0),
+                Some(text) => crate::tokens::count_tokens(text).ok(),
+            };
+            match notice_tok {
+                Some(cost) if comp_tok.saturating_add(cost) < raw_tok => FidelityDecision::Keep,
+                Some(_) => {
+                    // Token tie, token-expansion, or a saving the disclosure
+                    // swallows, even though bytes were shorter → Passthrough.
+                    FidelityDecision::Passthrough
+                }
+                // The bodies tokenised but the notice did not. Fall back to the
+                // byte verdict, which was computed WITH the notice charged and
+                // said Keep — the same rule the `(None, None)` arm below uses.
+                None => FidelityDecision::Keep,
             }
         }
-        // Tokeniser unavailable: byte comparison says comp_t.len() < raw_t.len() → Keep.
+        // Tokeniser unavailable: the notice-charged byte comparison decides.
         _ => FidelityDecision::Keep,
     }
 }
@@ -322,6 +403,146 @@ mod tests {
             decide(raw, compressed),
             FidelityDecision::Passthrough,
             "A2: byte tie must produce Passthrough (strictly-smaller rule)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Notice charging (ADR-001 amendment 2026-09-24)
+    // -----------------------------------------------------------------------
+
+    /// `decide` must remain a CHARGE-NOTHING shim. The A4 regression tests in
+    /// `guardrail.rs` and the ~30 `savings_decision` tests in `execution.rs`
+    /// reach the gate through it, and they pin body-only arithmetic.
+    ///
+    /// The same inputs flip once the notice is supplied, which is what makes
+    /// this a statement about `decide` rather than about the inputs.
+    #[test]
+    fn decide_is_charge_free_and_decide_with_notice_is_not() {
+        // Compressed is far shorter than raw in BOTH bytes and tokens.
+        let raw = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let compressed = "summary";
+        assert_eq!(
+            decide(raw, compressed),
+            FidelityDecision::Keep,
+            "decide() must price the bodies and nothing else"
+        );
+        assert_eq!(
+            decide_with_notice(raw, compressed, None),
+            decide(raw, compressed),
+            "decide() must be exactly decide_with_notice(.., None)"
+        );
+
+        // A disclosure wider than the saving turns the same win into a loss.
+        let notice = "x".repeat(raw.len());
+        assert_eq!(
+            decide_with_notice(raw, compressed, Some(&notice)),
+            FidelityDecision::Passthrough,
+            "a saving the disclosure swallows must not be kept"
+        );
+    }
+
+    /// The BYTE early exit charges the notice — the exit that never tokenises.
+    ///
+    /// Raw is above `TOKEN_SIZE_CAP`, so if the byte exit did not charge, the
+    /// cap fallback would return `Keep` without any token arithmetic ever
+    /// running. The verdict therefore isolates the byte charge at exit 1.
+    #[test]
+    fn notice_charged_at_byte_early_exit_above_size_cap() {
+        let raw = "x".repeat(512 * 1024);
+        let compressed = "x".repeat(512 * 1024 - 50); // 50-byte body saving
+        assert_eq!(
+            decide(&raw, &compressed),
+            FidelityDecision::Keep,
+            "uncharged: a 50-byte saving above the size cap is kept"
+        );
+        let notice = "n".repeat(100); // disclosure costs twice the saving
+        assert_eq!(
+            decide_with_notice(&raw, &compressed, Some(&notice)),
+            FidelityDecision::Passthrough,
+            "the byte early exit must price the notice, not just the body"
+        );
+    }
+
+    /// The CAP-FALLBACK exit prices the same thing as the byte exit.
+    ///
+    /// Both inputs exceed `TOKEN_RUN_CAP` (4 KiB of unbroken non-whitespace),
+    /// so the token slow path is skipped and the verdict rests entirely on the
+    /// notice-charged byte comparison. A notice inside the saving keeps; a
+    /// notice wider than the saving falls through to raw.
+    #[test]
+    fn notice_charged_on_run_cap_fallback_exit() {
+        let raw = "y".repeat(5000); // one 5000-byte run > TOKEN_RUN_CAP
+        let compressed = "y".repeat(4000); // 1000-byte body saving
+        let inside = "z".repeat(500);
+        assert_eq!(
+            decide_with_notice(&raw, &compressed, Some(&inside)),
+            FidelityDecision::Keep,
+            "a disclosure the saving covers is still a net win"
+        );
+        let wider = "z".repeat(1200);
+        assert_eq!(
+            decide_with_notice(&raw, &compressed, Some(&wider)),
+            FidelityDecision::Passthrough,
+            "the cap fallback must price the notice too, or the verdict \
+             depends on which exit was taken"
+        );
+    }
+
+    /// The TOKEN slow path charges the notice independently of the byte gate.
+    ///
+    /// Sizes are measured against cl100k, not assumed:
+    ///
+    /// | string                 | bytes | tokens |
+    /// |------------------------|-------|--------|
+    /// | `"a" * 3000` (raw)     |  3000 |    375 |
+    /// | `"a" * 100` (compressed)|  100 |     13 |
+    /// | 600 space-separated letters (notice) | 1199 | 600 |
+    ///
+    /// Bytes: 100 + 1199 = 1299 < 3000 — the byte gate PASSES with a 2.3x
+    /// margin, so this verdict can only come from the token arithmetic.
+    /// Tokens: 13 + 600 = 613 >= 375 — the disclosure costs 1.6x the whole raw
+    /// token count. Both margins are wide enough to survive a tokeniser
+    /// patch bump.
+    #[test]
+    fn notice_charged_on_token_slow_path() {
+        let raw = "a".repeat(3000);
+        let compressed = "a".repeat(100);
+        assert_eq!(
+            decide(&raw, &compressed),
+            FidelityDecision::Keep,
+            "uncharged: shorter in both bytes and tokens"
+        );
+
+        // Token-dense, byte-cheap: 600 single letters, ~1 token per 2 bytes.
+        let notice: String = "abcdefghijklmnopqrstuvwxyz"
+            .chars()
+            .cycle()
+            .take(600)
+            .map(String::from)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(notice.len(), 1199, "notice byte size moved");
+        assert!(
+            compressed.len() + notice.len() < raw.len(),
+            "precondition: the byte gate must PASS so the token gate decides"
+        );
+        assert_eq!(
+            decide_with_notice(&raw, &compressed, Some(&notice)),
+            FidelityDecision::Passthrough,
+            "a byte saving whose disclosure costs more TOKENS than it saves \
+             must not be kept"
+        );
+    }
+
+    /// An empty notice is indistinguishable from no notice at either exit.
+    #[test]
+    fn empty_notice_costs_nothing() {
+        let raw = "alpha beta gamma delta epsilon zeta eta theta";
+        let compressed = "summary";
+        assert_eq!(
+            decide_with_notice(raw, compressed, Some("")),
+            decide(raw, compressed),
+            "an empty disclosure must not move the verdict"
         );
     }
 

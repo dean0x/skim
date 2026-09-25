@@ -51,9 +51,41 @@ pub(crate) enum SavingsDecision {
 /// Thin wrapper over [`crate::output::fidelity::decide`] — the canonical
 /// unified gate (A2).  Keep compressed IFF strictly smaller in BOTH bytes AND
 /// tokens; tie → Passthrough.  See `output/fidelity.rs` for full semantics.
+///
+/// Charge-nothing: routes through [`crate::output::fidelity::decide`], which
+/// prices the stdout bodies only. See [`savings_decision_with_notice`] for the
+/// entry point that charges the stderr disclosure.
 pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
     use crate::output::fidelity::{FidelityDecision, decide};
     match decide(raw, compressed) {
+        FidelityDecision::Keep => SavingsDecision::Keep,
+        FidelityDecision::Passthrough => SavingsDecision::Passthrough,
+    }
+}
+
+/// [`savings_decision`], charging the stderr disclosure the `Keep` branch would
+/// emit (ADR-001 amendment 2026-09-24).
+///
+/// `notice` is the **differential** cost of choosing compressed — `None`
+/// wherever the raw branch would print a byte-identical notice of its own. See
+/// [`crate::output::fidelity::decide_with_notice`].
+///
+/// TODO(#519 follow-on): every command-path caller passes `None` today, and
+/// that is deliberate rather than pending wiring. The command path's disclosure
+/// accounting is incomplete in a second, larger way that the ADR-011 egress
+/// census already records: success-line synthesis in this module writes to
+/// stdout *after* the guard has committed, so those bytes sit outside every
+/// size accounting. Charging the stderr notice here without also closing the
+/// stdout hole would produce a partial accounting that reads as a complete one
+/// — worse than the honest gap, because it removes the reason to look again.
+/// Fix both together or neither.
+pub(crate) fn savings_decision_with_notice(
+    raw: &str,
+    compressed: &str,
+    notice: Option<&str>,
+) -> SavingsDecision {
+    use crate::output::fidelity::{FidelityDecision, decide_with_notice};
+    match decide_with_notice(raw, compressed, notice) {
         FidelityDecision::Keep => SavingsDecision::Keep,
         FidelityDecision::Passthrough => SavingsDecision::Passthrough,
     }
@@ -1232,7 +1264,12 @@ where
         // "expansion" relative to the user's command could pass the guard while
         // a genuine "compression" could fail it.
         let guard_raw: &str = raw_override.as_deref().unwrap_or(&output.stdout);
-        match savings_decision(guard_raw, &compressed_str) {
+        // ADR-001 amendment 2026-09-24: the uniform `_with_notice` signature is
+        // shipped here, but the command path deliberately charges nothing yet —
+        // see `savings_decision_with_notice` for why a stderr-only charge would
+        // make this accounting look complete while the success-line stdout hole
+        // (ADR-011 census) is still open.
+        match savings_decision_with_notice(guard_raw, &compressed_str, None) {
             SavingsDecision::Keep => {
                 if write_to_stdout(&compressed_str)? == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());

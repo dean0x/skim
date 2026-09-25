@@ -280,7 +280,45 @@ fn test_cache_invalidation_on_file_modification() {
 fn test_cache_different_modes() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("test.ts");
-    fs::write(&file_path, "function test() { return 42; }").unwrap();
+    // The subject is the CACHE KEY (signatures must not be served the structure
+    // entry), and "outputs differ" is the evidence for it. That evidence needs
+    // both modes to actually compress: the previous 30-byte fixture saved 8 B / 3 t
+    // under structure and 15 B / 6 t under signatures, both far under their
+    // 76 B / 22 t and 89 B / 24 t markers, so the ADR-001 guard served raw for
+    // BOTH — making the two outputs byte-identical and the assertion unfalsifiable
+    // no matter how the cache behaved.
+    //
+    // Measured on this fixture (raw 718 B / 193 t):
+    //   structure  → 235 B /  58 t: margin +407 B / +113 t (5.4x / 5.1x marker)
+    //   signatures → 115 B /  28 t: margin +514 B / +141 t (5.8x / 5.9x marker)
+    fs::write(
+        &file_path,
+        r#"export class InvoiceTotals {
+  private readonly rates: Map<string, number> = new Map();
+
+  register(region: string, rate: number): void {
+    if (rate < 0) { throw new RangeError(`negative rate for ${region}`); }
+    this.rates.set(region, rate);
+  }
+
+  totalFor(region: string, subtotal: number): number {
+    const rate = this.rates.get(region);
+    if (rate === undefined) { throw new Error(`unknown region ${region}`); }
+    const tax = subtotal * rate;
+    return Math.round((subtotal + tax) * 100) / 100;
+  }
+
+  summarise(): string {
+    const parts: string[] = [];
+    for (const [region, rate] of this.rates) {
+      parts.push(`${region}=${(rate * 100).toFixed(2)}%`);
+    }
+    return parts.join(", ");
+  }
+}
+"#,
+    )
+    .unwrap();
 
     // Run with structure mode
     let structure_output = common::skim()

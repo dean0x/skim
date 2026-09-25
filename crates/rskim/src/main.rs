@@ -1170,10 +1170,18 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
             token_budget: args.tokens,
         },
         line_numbers: args.line_numbers,
+        // Single-input default. The multi-file shapes below opt in, because
+        // `multi.rs` emits ONE aggregate lossy-view marker per run rather than
+        // one per file (ADR-001 amendment: the guard charges the disclosure a
+        // file's own verdict causes, and in a batch that is none).
+        batch: false,
     };
 
     let multi_options = multi::MultiFileOptions {
-        process: process_options,
+        process: process::ProcessOptions {
+            batch: true,
+            ..process_options
+        },
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,

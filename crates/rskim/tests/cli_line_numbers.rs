@@ -158,20 +158,38 @@ fn test_line_numbers_full_mode_identity_mapping() {
 fn test_line_numbers_structure_mode_skips_body_lines() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.ts");
-    // Source layout (6 lines):
+    // Source layout (12 lines):
     //   1: "// comment"
     //   2: "type A = string;"
     //   3: "function hello(name: string): void {"
-    //   4: "  console.log(name);"
-    //   5: "  return;"
-    //   6: "}"
-    // Structure mode collapses the body (lines 3-6: the "{...}") into
+    //   4-11: body statements
+    //   12: "}"
+    // Structure mode collapses the body (lines 3-12: the "{...}") into
     // " {...}" on the same line as the signature. The output therefore
     // has 3 lines, annotated with source lines 1, 2, 3 (not 1, 2, 3 sequentially
     // — the annotation for the signature must be 3, not 4 or 5 or 6).
+    //
+    // The body is LONG on purpose. Only lines 4+ were extended, so the asserted
+    // annotations (1, 2 and 3) are untouched, but the collapse now saves enough
+    // to cover the 76 B / 22 t marker the ADR-001 guard charges. At the original
+    // 6-line size the saving was 28 B / 7 t, so raw was served, the identity
+    // line-number map applied, and `{...}` never appeared — failing AC-2c.
+    // Measured: raw 353 B / 89 t → 63 B / 19 t, margin +214 B / +48 t.
     std::fs::write(
         &file,
-        "// comment\ntype A = string;\nfunction hello(name: string): void {\n  console.log(name);\n  return;\n}\n",
+        r#"// comment
+type A = string;
+function hello(name: string): void {
+  console.log(name);
+  const alpha = computeAlpha(name);
+  const beta = computeBeta(alpha, name);
+  const gamma = computeGamma(beta, alpha);
+  const delta = computeDelta(gamma, beta);
+  const epsilon = computeEpsilon(delta, gamma);
+  console.log(alpha, beta, gamma, delta, epsilon);
+  return;
+}
+"#,
     )
     .unwrap();
 
@@ -312,12 +330,27 @@ fn test_line_numbers_structure_mode_large_source_gap() {
     let file = dir.path().join("gap.ts");
 
     // Build source: collapsed preamble function, then 5 comments, then target function.
+    //
+    // Each function stays exactly 3 lines so the asserted source positions hold
+    // (first() at 1, comments at 4-8, gap() at 9). The saving is bought by making
+    // the single BODY line long rather than by adding lines — adding a third
+    // function would move `collapsed_lines.last()` off gap(), and lengthening the
+    // comments would not help because structure mode preserves them.
+    //
+    // At the original `  return;` size the saving was 14 B / 4 t against the
+    // 76 B / 22 t marker, so raw was served, no `{...}` was produced at all, and
+    // the `collapsed_lines.len() >= 2` assertion failed before the gap
+    // annotation was ever read.
+    // Measured: raw 495 B / 137 t → 69 B / 41 t, margin +350 B / +74 t.
+    const BODY: &str = "  const alpha = computeAlpha(); const beta = computeBeta(alpha); \
+                        const gamma = computeGamma(beta); const delta = computeDelta(gamma); \
+                        const epsilon = computeEpsilon(delta); const zeta = computeZeta(epsilon); return;";
     let mut content = String::new();
-    content.push_str("function first(): void {\n  return;\n}\n"); // lines 1-3 (collapsed)
+    content.push_str(&format!("function first(): void {{\n{BODY}\n}}\n")); // lines 1-3 (collapsed)
     for i in 1..=5 {
-        content.push_str(&format!("// comment {}\n", i)); // lines 4-8
+        content.push_str(&format!("// comment {i}\n")); // lines 4-8
     }
-    content.push_str("function gap(): void {\n  return;\n}\n"); // lines 9-11
+    content.push_str(&format!("function gap(): void {{\n{BODY}\n}}\n")); // lines 9-11
     std::fs::write(&file, &content).unwrap();
 
     let output = skim_cmd()
@@ -810,10 +843,41 @@ fn test_line_numbers_json_full_mode_applies_identity() {
 
 #[test]
 fn test_line_numbers_json_structure_mode_skips_annotation() {
-    // AC-15: Serde non-full modes skip line numbers because output is restructured
+    // AC-15: Serde non-full modes skip line numbers because output is restructured.
+    //
+    // The assertion below is unchanged and still correct; what had to change is the
+    // fixture, because the subject has a PRECONDITION the old fixture stopped
+    // establishing: the restructured view must actually be SERVED.
+    //
+    // `apply_line_numbers` falls back to the identity map whenever the guardrail
+    // triggered — and over raw bytes that fallback is right, not a defect: the
+    // output is the verbatim file, so line N really is line N. The old 36-byte
+    // fixture saved 4 B / 1 t against a 76 B / 22 t marker, so the ADR-001 guard
+    // served raw, the identity map applied, and `N\t` prefixes appeared exactly
+    // where AC-15 says they must not. Enlarging the values (structure mode keeps
+    // keys and drops values) restores the precondition rather than weakening the
+    // claim.
+    //
+    // Measured: raw 424 B / 118 t → structure 118 B / 33 t = saving 306 B / 85 t;
+    // margin +230 B / +63 t against the 76 B / 22 t direct marker (3.0x / 2.9x).
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("test.json");
-    std::fs::write(&file, r#"{"key": "value", "nested": {"a": 1}}"#).unwrap();
+    std::fs::write(
+        &file,
+        r#"{
+  "service": "order-processing-gateway",
+  "description": "Routes inbound order events to the regional fulfilment queues",
+  "maintainer": "platform-infrastructure@example.com",
+  "endpoint": "https://orders.internal.example.com/v2/events/ingest",
+  "region": "eu-west-1",
+  "nested": {
+    "retryPolicy": "exponential-backoff-with-full-jitter",
+    "deadLetterQueue": "arn:aws:sqs:eu-west-1:123456789012:orders-dlq"
+  }
+}
+"#,
+    )
+    .unwrap();
 
     let output = skim_cmd()
         .arg(file.to_str().unwrap())
@@ -965,9 +1029,27 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
     // Line 2:     return str(a)
     // Line 3: def bar(b: str) -> int:   (param stripped → `def bar(b) -> int:`)
     // Line 4:     return len(b)
+    //
+    // The heavily-annotated functions from line 5 on exist only to pay for the
+    // 90 B / 24 t pseudo marker the ADR-001 guard charges. Python pseudo keeps
+    // bodies, so annotation mass is the only saving available, and the original
+    // four-line file managed 10 B / 4 t — the guard served raw, so `def foo(a)`
+    // (the STRIPPED spelling) never appeared and the lookup returned None.
+    // They are appended AFTER line 4 so the asserted positions 1 and 3 are
+    // unchanged. Measured: raw 613 B / 155 t → 230 B / 65 t, margin +293 B / +66 t.
     std::fs::write(
         &file,
-        "def foo(a: int) -> str:\n    return str(a)\ndef bar(b: str) -> int:\n    return len(b)\n",
+        r#"def foo(a: int) -> str:
+    return str(a)
+def bar(b: str) -> int:
+    return len(b)
+def announce(subject: Mapping[str, Sequence[int]], predicate: Optional[Callable[[int], bool]], locale: Union[str, bytes, None], channel: Sequence[Mapping[str, float]]) -> str:
+    return str(subject)
+def dispatch(payload: Mapping[str, Sequence[bytes]], endpoint: Optional[Callable[[str], None]], retries: Union[int, float, None], timeout: Sequence[Mapping[str, float]]) -> str:
+    return str(payload)
+def reconcile(ledger: Mapping[str, Sequence[Decimal]], adjustments: Optional[Callable[[Decimal], Decimal]], window: Union[int, timedelta, None], sink: Sequence[Mapping[str, Decimal]]) -> str:
+    return str(ledger)
+"#,
     )
     .unwrap();
 
