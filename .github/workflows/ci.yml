@@ -5,6 +5,7 @@ on:
     branches: [ main, 'feature/*', 'wave/**' ]
   pull_request:
     branches: [ main, 'wave/**' ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -268,6 +269,18 @@ jobs:
           echo "fn main() {}" | ./target/release/skim - --language=rust
           grep -q "HTTP reverse proxy" <<< "$(./target/release/skim proxy --help 2>&1)"
 
+      # Hand the release binary to the Search Scoreboard job (#203). Artifacts
+      # drop the exec bit, so the consumer restores it. `overwrite`: a re-run
+      # of this job replaces the artifact instead of failing on the name.
+      - name: Upload release binary (Search Scoreboard input)
+        uses: actions/upload-artifact@v5
+        with:
+          name: skim-release
+          path: target/release/skim
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
       - name: "Default-features lint (proxy gated off — #352)"
         run: cargo clippy -p rskim --all-targets -- -D warnings
 
@@ -275,6 +288,166 @@ jobs:
         run: |
           cargo test -p rskim --bins registry::
           cargo test -p rskim --test cli_proxy_gating
+
+  # Change detection for the Search Scoreboard (#203). Plain git, no
+  # third-party action. A pull_request checkout is the merge commit, so HEAD^1
+  # is the base tip and `git diff HEAD^1 HEAD` is exactly the PR's change set
+  # (fetch-depth: 2 fetches both parents). Pushes to feature/* and wave/** say
+  # false: their pull_request run gates, and a push run would only duplicate it.
+  changes:
+    name: Detect Search Changes
+    runs-on: ubuntu-latest
+    outputs:
+      search: ${{ steps.classify.outputs.search }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+
+      - name: Classify the change set
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # Keep in sync with crates/rskim-bench/scoreboard/README.md ("CI").
+          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim-core/|crates/rskim-bench/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              search=true; reason="manual dispatch" ;;
+            push)
+              if [ "$GIT_REF" = "refs/heads/main" ]; then
+                search=true; reason="push to main"
+              else
+                search=false; reason="push to $GIT_REF (its pull_request run gates)"
+              fi ;;
+            pull_request)
+              changed="$RUNNER_TEMP/changed-files.txt"
+              # -z: no path quoting, so the anchored regex sees every path verbatim.
+              git diff --name-only -z HEAD^1 HEAD | tr '\0' '\n' > "$changed"
+              echo "$(wc -l < "$changed") changed file(s); search paths among them:"
+              matched=0
+              grep -E "$SEARCH_PATHS" "$changed" || matched=$?
+              case "$matched" in
+                0) search=true; reason="the pull request touches a search path" ;;
+                1) search=false; reason="the pull request touches no search path" ;;
+                *) echo "::error::grep failed with exit $matched"; exit "$matched" ;;
+              esac ;;
+            *)
+              search=true; reason="unclassified event $EVENT_NAME (fail closed: run the gate)" ;;
+          esac
+          echo "search=$search ($reason)"
+          echo "search=$search" >> "$GITHUB_OUTPUT"
+
+  # Search Scoreboard (#203): the end-to-end retrieval-quality gate, REQUIRED
+  # for search PRs (owner decision 2026-09-25, ADR-007 amendment). It drives
+  # this run's release skim (the Build Check artifact) against four pinned
+  # corpora and gates on crates/rskim-bench/scoreboard/{baseline.json,
+  # known_failures.toml}; see the README there. Keep `name:` stable: branch
+  # protection matches the check by name.
+  #
+  # `!cancelled()` removes the implicit success(), so the job RUNS when an
+  # upstream job failed, and its first step then fails it. A job skipped by
+  # `if:` reports success: that is fine for a PR outside the search paths, but
+  # a failed Build Check (or change detection) must never turn into a green skip.
+  scoreboard:
+    name: Search Scoreboard
+    needs: [build, changes]
+    if: (needs.changes.outputs.search == 'true' || needs.changes.result != 'success') && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Require a successful Build Check and change detection
+        if: needs.build.result != 'success' || needs.changes.result != 'success'
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: |
+          echo "::error title=Search Scoreboard::Build Check: $BUILD_RESULT; Detect Search Changes: $CHANGES_RESULT. The scoreboard gates this run's release binary, so it fails rather than skips."
+          exit 1
+
+      - uses: actions/checkout@v5
+
+      # Kept outside target/ on purpose: the target/ cache below must never
+      # carry a skim binary that a later run could mistake for its own build.
+      - name: Download release binary (Build Check artifact)
+        uses: actions/download-artifact@v5
+        with:
+          name: skim-release
+          path: ${{ runner.temp }}/skim-release
+
+      - name: Restore the exec bit
+        run: |
+          chmod +x "$RUNNER_TEMP/skim-release/skim"
+          "$RUNNER_TEMP/skim-release/skim" --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-scoreboard-${{ hashFiles('**/Cargo.lock') }}
+
+      # Full-history pinned clones (~115 MB). actions/cache saves only when the
+      # job succeeds, so a clone cut off mid-way (which the harness refuses to
+      # delete) is never cached.
+      - name: Cache scoreboard corpora
+        uses: actions/cache@v5
+        with:
+          path: .bench-corpus/scoreboard
+          key: ${{ runner.os }}-scoreboard-corpora-${{ hashFiles('crates/rskim-bench/scoreboard/corpora.toml') }}
+
+      - name: Build the scoreboard
+        run: cargo build -p rskim-bench --bin scoreboard
+
+      # Exit 0 pass, 1 gate failure, 2 harness error (never read as a regression).
+      - name: Run the scoreboard gate
+        id: check
+        run: target/debug/scoreboard check --skim-bin "$RUNNER_TEMP/skim-release/skim" --out scoreboard-out
+
+      - name: Publish the step summary
+        if: always() && steps.check.outcome != 'skipped'
+        env:
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+        run: |
+          if [ -f scoreboard-out/report.md ]; then
+            cat scoreboard-out/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "# Search scoreboard — no report"
+              echo
+              echo "The gate step ended with outcome \`$CHECK_OUTCOME\` and wrote no report.md (a harness error, exit 2, or a timeout writes none). See the \"Run the scoreboard gate\" step log."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Re-bless from this artifact: `scoreboard bless --from report.json`
+      # (crates/rskim-bench/scoreboard/README.md, "Blessing").
+      - name: Upload the scoreboard report
+        if: always() && steps.check.outcome != 'skipped'
+        uses: actions/upload-artifact@v5
+        with:
+          name: scoreboard-report
+          path: |
+            scoreboard-out/report.json
+            scoreboard-out/report.md
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
   # Scoped Windows proxy integration job (#303 AC17).
   #
