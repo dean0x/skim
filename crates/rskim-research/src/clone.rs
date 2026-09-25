@@ -456,6 +456,452 @@ pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// Pinned full-history clone (search scoreboard corpora, #203)
+// ============================================================================
+
+/// Timeout (seconds) for the network-bound steps of a pinned-history clone:
+/// `git clone` and the `git fetch origin <sha>` fallback. Matches
+/// [`GIT_SUBPROCESS_TIMEOUT_SECS`], which already bounds full clones elsewhere
+/// in this module.
+const PINNED_NETWORK_TIMEOUT_SECS: u64 = 300;
+
+/// Timeout (seconds) for the local steps of a pinned-history clone:
+/// `git checkout` and every reuse-verification command.
+const PINNED_LOCAL_TIMEOUT_SECS: u64 = 120;
+
+/// Maximum number of `git status` lines kept in a [`PinnedCloneState::Dirty`]
+/// verdict (diagnostics only; the verdict itself is decided on emptiness).
+const DIRTY_SAMPLE_MAX_LINES: usize = 20;
+
+/// Name of the ownership marker written inside `<dest>/.git/` once a clone
+/// created by [`ensure_pinned_history_clone`] exists. Living under `.git/`
+/// keeps it invisible to `git status`, so it never makes the tree "dirty".
+const OWNERSHIP_MARKER: &str = "skim-scoreboard-pinned-clone";
+
+/// Security args shared by the network-bound git subprocesses of a
+/// pinned-history clone: suppress credential prompts (fail fast on auth
+/// errors) and reject corrupted or malicious objects.
+const PINNED_CLONE_SECURITY_ARGS: [&str; 4] = [
+    "-c",
+    "credential.helper=",
+    "-c",
+    "transfer.fsckObjects=true",
+];
+
+/// Environment variables that would redirect a `git -C <dest> …` command at a
+/// different repository, index, or object store than the one at `dest` (they
+/// are set, for example, when this code runs inside a git hook). Every git
+/// subprocess spawned for a pinned clone removes them.
+const GIT_REDIRECT_ENV_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+];
+
+/// The state of a directory that should hold a pinned full-history clone, as
+/// judged by [`verify_pinned_clone`].
+///
+/// Only [`PinnedCloneState::Reusable`] means "use it as is"; every other
+/// variant names the first reuse condition that failed, so callers can report
+/// why a clone was rejected (or, after a scoreboard run, what skim changed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinnedCloneState {
+    /// `dest` is the root of a non-shallow repository, `HEAD` is the pinned
+    /// commit, and `git status` (including ignored files) is empty.
+    Reusable,
+    /// `dest` does not exist.
+    Missing,
+    /// `dest` exists but is not the root of its own git repository: not a
+    /// directory, a symlink, an empty or partial directory, or a directory
+    /// whose repository toplevel is somewhere else.
+    NotRepositoryRoot { detail: String },
+    /// `HEAD` does not resolve to the pinned commit (`actual` is `None` when
+    /// `HEAD` cannot be resolved at all).
+    HeadMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+    /// The repository is a shallow clone; the temporal layer needs full
+    /// history.
+    Shallow,
+    /// `git status --porcelain --untracked-files=all --ignored` is not empty.
+    /// `sample` holds its first lines.
+    Dirty { sample: String },
+}
+
+impl PinnedCloneState {
+    /// Whether the clone can be reused as is.
+    pub fn is_reusable(&self) -> bool {
+        matches!(self, PinnedCloneState::Reusable)
+    }
+}
+
+impl std::fmt::Display for PinnedCloneState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinnedCloneState::Reusable => write!(f, "reusable"),
+            PinnedCloneState::Missing => write!(f, "missing"),
+            PinnedCloneState::NotRepositoryRoot { detail } => {
+                write!(f, "not a repository root ({detail})")
+            }
+            PinnedCloneState::HeadMismatch { expected, actual } => match actual {
+                Some(actual) => write!(f, "HEAD is {actual}, expected {expected}"),
+                None => write!(f, "HEAD does not resolve, expected {expected}"),
+            },
+            PinnedCloneState::Shallow => write!(f, "shallow clone (full history required)"),
+            PinnedCloneState::Dirty { sample } => write!(f, "working tree not clean:\n{sample}"),
+        }
+    }
+}
+
+/// Ensure `dest` is a full-history clone of `url`, checked out (detached) at
+/// `commit`, reusing an existing clone when it is verifiably in that state.
+///
+/// # Reuse
+///
+/// An existing `dest` is reused, with no network access, only when
+/// [`verify_pinned_clone`] reports [`PinnedCloneState::Reusable`]:
+/// - `dest` is the toplevel of its own repository (repository discovery is
+///   fenced at `dest`'s parent, so an empty directory inside some other
+///   checkout never borrows that checkout's `HEAD`);
+/// - `git rev-parse HEAD` equals `commit`;
+/// - `git rev-parse --is-shallow-repository` is `false`;
+/// - `git status --porcelain --untracked-files=all --ignored` is empty.
+///
+/// `--ignored` is stricter than a plain `status`: a file skim (or anything
+/// else) writes into the corpus root is caught even when the corpus's own
+/// `.gitignore` or the user's global excludes would hide it.
+///
+/// Otherwise `dest` is deleted and re-cloned **once**. A failure of that one
+/// fresh clone (clone, fetch, checkout, or post-clone verification) is
+/// returned as `Err` with no further retry; the scoreboard maps it to a
+/// harness error, never to a regression.
+///
+/// # Deletion safety
+///
+/// `dest` is deleted only when it is an empty directory or carries the
+/// ownership marker a previous call wrote into `dest/.git/`. Any other
+/// non-reusable `dest` (say, a developer's own checkout that a mistyped
+/// `--corpus-dir` points at) is left untouched and reported as an error.
+///
+/// # Clone shape
+///
+/// `git clone --no-checkout` with no `--depth` and no `--filter`: a shallow or
+/// blobless clone would make the temporal layer fetch objects lazily. The
+/// commit is then checked out with `checkout --detach`. If the commit is not
+/// reachable from the cloned refs, `fetch origin <commit>` runs once and the
+/// checkout is retried once. Every git subprocess is bounded by a timeout.
+///
+/// # Errors
+///
+/// Returns an error if `url` does not start with `https://`, if `commit` is
+/// not a 40-character lowercase hex SHA, if a non-reusable `dest` is not
+/// owned by this function, if any git subprocess fails to spawn, times out or
+/// exits non-zero, or if the fresh clone fails verification.
+pub fn ensure_pinned_history_clone(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
+    if !url.starts_with("https://") {
+        anyhow::bail!("ensure_pinned_history_clone: url must start with 'https://', got: {url}");
+    }
+    ensure_pinned_history_clone_from(url, commit, dest)
+}
+
+/// Report the [`PinnedCloneState`] of `dest` against the pinned `commit`.
+///
+/// Read-only: it never modifies `dest`. The scoreboard runs it before its
+/// queries (through [`ensure_pinned_history_clone`]) and again after them, to
+/// prove skim wrote nothing into the corpus root.
+///
+/// # Errors
+///
+/// Returns an error if `commit` is not a 40-character lowercase hex SHA, if
+/// `dest` cannot be inspected, or if a git subprocess fails to spawn, times
+/// out, or fails in a way that says nothing about `dest` (for example
+/// `git status` itself erroring). A clean non-zero exit that answers a reuse
+/// question (not a repository, `HEAD` unresolvable) is a verdict, not an
+/// error.
+pub fn verify_pinned_clone(dest: &Path, commit: &str) -> anyhow::Result<PinnedCloneState> {
+    validate_pinned_commit(commit)?;
+
+    let meta = match std::fs::symlink_metadata(dest) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PinnedCloneState::Missing);
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(e).context(format!("inspecting {}", dest.display())));
+        }
+    };
+    if !meta.is_dir() {
+        return Ok(PinnedCloneState::NotRepositoryRoot {
+            detail: "not a directory (or a symlink)".to_string(),
+        });
+    }
+
+    let canonical = std::fs::canonicalize(dest)
+        .with_context(|| format!("canonicalizing {}", dest.display()))?;
+
+    let toplevel_out = run_pinned_git(&canonical, &["rev-parse", "--show-toplevel"])?;
+    if !toplevel_out.status.success() {
+        return Ok(PinnedCloneState::NotRepositoryRoot {
+            detail: first_line_lossy(&toplevel_out.stderr),
+        });
+    }
+    let toplevel = PathBuf::from(stdout_trimmed(&toplevel_out));
+    let toplevel_canonical = std::fs::canonicalize(&toplevel).unwrap_or(toplevel);
+    if toplevel_canonical != canonical {
+        return Ok(PinnedCloneState::NotRepositoryRoot {
+            detail: format!("repository toplevel is {}", toplevel_canonical.display()),
+        });
+    }
+
+    let head_out = run_pinned_git(&canonical, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let actual = head_out
+        .status
+        .success()
+        .then(|| stdout_trimmed(&head_out))
+        .filter(|s| !s.is_empty());
+    if actual.as_deref() != Some(commit) {
+        return Ok(PinnedCloneState::HeadMismatch {
+            expected: commit.to_string(),
+            actual,
+        });
+    }
+
+    let shallow_out = run_pinned_git(&canonical, &["rev-parse", "--is-shallow-repository"])?;
+    if !shallow_out.status.success() {
+        anyhow::bail!(
+            "git rev-parse --is-shallow-repository failed in {}: {}",
+            canonical.display(),
+            first_line_lossy(&shallow_out.stderr)
+        );
+    }
+    if stdout_trimmed(&shallow_out) != "false" {
+        return Ok(PinnedCloneState::Shallow);
+    }
+
+    let status_out = run_pinned_git(
+        &canonical,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+    )?;
+    if !status_out.status.success() {
+        anyhow::bail!(
+            "git status failed in {}: {}",
+            canonical.display(),
+            first_line_lossy(&status_out.stderr)
+        );
+    }
+    let status = String::from_utf8_lossy(&status_out.stdout);
+    if !status.trim().is_empty() {
+        let sample = status
+            .lines()
+            .take(DIRTY_SAMPLE_MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(PinnedCloneState::Dirty { sample });
+    }
+
+    Ok(PinnedCloneState::Reusable)
+}
+
+/// [`ensure_pinned_history_clone`] without the `https://` scheme check, so
+/// unit tests can point it at a local `file://` fixture remote. Private:
+/// production callers must go through the checked entry point.
+fn ensure_pinned_history_clone_from(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
+    validate_pinned_commit(commit)?;
+
+    let before = verify_pinned_clone(dest, commit)?;
+    if before.is_reusable() {
+        return Ok(());
+    }
+    if before != PinnedCloneState::Missing {
+        remove_owned_clone(dest, &before)?;
+    }
+
+    clone_pinned_history_once(url, commit, dest)?;
+
+    match verify_pinned_clone(dest, commit)? {
+        PinnedCloneState::Reusable => Ok(()),
+        after => anyhow::bail!(
+            "fresh clone of {url} at {commit} into {} failed verification: {after}",
+            dest.display()
+        ),
+    }
+}
+
+/// Require a full 40-character lowercase hex SHA — the form `git rev-parse`
+/// prints, so the reuse comparison is exact, and a form that can never be
+/// read as a git option (`--upload-pack=…`) or a revision expression.
+fn validate_pinned_commit(commit: &str) -> anyhow::Result<()> {
+    let ok = commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !ok {
+        anyhow::bail!("pinned commit must be a 40-character lowercase hex SHA, got: {commit:?}");
+    }
+    Ok(())
+}
+
+/// Delete a non-reusable `dest`, but only if it is an empty directory or
+/// carries the ownership marker (see [`OWNERSHIP_MARKER`]).
+fn remove_owned_clone(dest: &Path, state: &PinnedCloneState) -> anyhow::Result<()> {
+    let meta = std::fs::symlink_metadata(dest)
+        .with_context(|| format!("inspecting {}", dest.display()))?;
+
+    let is_empty_dir = meta.is_dir()
+        && std::fs::read_dir(dest)
+            .with_context(|| format!("listing {}", dest.display()))?
+            .next()
+            .is_none();
+    let is_owned = meta.is_dir() && dest.join(".git").join(OWNERSHIP_MARKER).is_file();
+
+    if !(is_empty_dir || is_owned) {
+        anyhow::bail!(
+            "refusing to delete {}: it is not reusable ({state}) and was not created by the \
+             scoreboard (no .git/{OWNERSHIP_MARKER} marker); remove it by hand or choose a \
+             different corpus directory",
+            dest.display()
+        );
+    }
+
+    std::fs::remove_dir_all(dest).with_context(|| format!("removing {}", dest.display()))
+}
+
+/// Clone `url` with full history (`--no-checkout`) into `dest`, mark it as
+/// owned, and check out `commit` detached — fetching the commit once
+/// explicitly if the clone did not bring it in. Exactly one attempt; the
+/// caller owns the "re-clone once" contract.
+fn clone_pinned_history_once(url: &str, commit: &str, dest: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent dir for {}", dest.display()))?;
+    }
+
+    let mut clone_cmd = std::process::Command::new("git");
+    clone_cmd
+        .args(PINNED_CLONE_SECURITY_ARGS)
+        .args(["clone", "--no-checkout", "--", url])
+        .arg(dest);
+    scrub_git_redirect_env(&mut clone_cmd);
+    let clone_out = run_captured(
+        clone_cmd,
+        "git clone --no-checkout (pinned history)",
+        PINNED_NETWORK_TIMEOUT_SECS,
+    )?;
+    if !clone_out.status.success() {
+        anyhow::bail!(
+            "git clone --no-checkout failed for {url}: {}",
+            first_line_lossy(&clone_out.stderr)
+        );
+    }
+
+    // Absolute from here on, so every later command gets a discovery fence.
+    let dest = std::fs::canonicalize(dest)
+        .with_context(|| format!("canonicalizing fresh clone {}", dest.display()))?;
+    let marker = dest.join(".git").join(OWNERSHIP_MARKER);
+    std::fs::write(&marker, format!("{url}\n{commit}\n"))
+        .with_context(|| format!("writing ownership marker {}", marker.display()))?;
+
+    if checkout_detached(&dest, commit)? {
+        return Ok(());
+    }
+
+    let mut fetch_args: Vec<&str> = PINNED_CLONE_SECURITY_ARGS.to_vec();
+    fetch_args.extend(["fetch", "origin", commit]);
+    let fetch_out = run_pinned_git_with_timeout(&dest, &fetch_args, PINNED_NETWORK_TIMEOUT_SECS)?;
+    if !fetch_out.status.success() {
+        anyhow::bail!(
+            "commit {commit} is not reachable in {url}: git fetch origin {commit} failed: {}",
+            first_line_lossy(&fetch_out.stderr)
+        );
+    }
+
+    if !checkout_detached(&dest, commit)? {
+        anyhow::bail!(
+            "git checkout --detach {commit} failed in {} after fetch",
+            dest.display()
+        );
+    }
+    Ok(())
+}
+
+/// `git checkout --detach <commit>` in `dest`. `Ok(false)` on a non-zero
+/// exit (typically: commit not present yet).
+fn checkout_detached(dest: &Path, commit: &str) -> anyhow::Result<bool> {
+    let out = run_pinned_git(dest, &["checkout", "--quiet", "--detach", commit])?;
+    Ok(out.status.success())
+}
+
+/// Run `git -C <dir> <args>` under [`PINNED_LOCAL_TIMEOUT_SECS`].
+fn run_pinned_git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    run_pinned_git_with_timeout(dir, args, PINNED_LOCAL_TIMEOUT_SECS)
+}
+
+/// Run `git -C <dir> <args>` with stdout/stderr captured, the redirecting
+/// `GIT_*` variables removed, and repository discovery fenced at `dir`'s
+/// parent (`GIT_CEILING_DIRECTORIES`), so a `dir` that is not itself a
+/// repository can never resolve to an enclosing one.
+fn run_pinned_git_with_timeout(
+    dir: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+) -> anyhow::Result<std::process::Output> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    scrub_git_redirect_env(&mut cmd);
+    match dir.parent().filter(|p| p.is_absolute()) {
+        Some(parent) => cmd.env("GIT_CEILING_DIRECTORIES", parent),
+        None => cmd.env_remove("GIT_CEILING_DIRECTORIES"),
+    };
+    let label = format!("git {} (pinned history)", args.join(" "));
+    run_captured(cmd, &label, timeout_secs)
+}
+
+/// Remove every [`GIT_REDIRECT_ENV_VARS`] entry from `cmd`'s environment.
+fn scrub_git_redirect_env(cmd: &mut std::process::Command) {
+    for var in GIT_REDIRECT_ENV_VARS {
+        cmd.env_remove(var);
+    }
+}
+
+/// Pipe stdout/stderr and run `cmd` through [`git_output_with_timeout`].
+fn run_captured(
+    mut cmd: std::process::Command,
+    label: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<std::process::Output> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    git_output_with_timeout(cmd, label, timeout_secs)
+}
+
+/// Trimmed stdout of a git command, decoded lossily.
+fn stdout_trimmed(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// First non-empty line of a byte buffer (typically git's stderr), lossily
+/// decoded, for compact error messages.
+fn first_line_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(no output)")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -665,5 +1111,406 @@ mod tests {
             corpus_dir: PathBuf::from("/tmp/corpus"),
         });
         // Verifying this compiles as a trait object is sufficient.
+    }
+
+    // ========================================================================
+    // ensure_pinned_history_clone / verify_pinned_clone (#203)
+    // ========================================================================
+
+    use std::process::Command;
+
+    /// A `git` command for building fixtures, isolated from the developer's
+    /// global and system config so fixture commits are deterministic (no
+    /// signing, hooks, or templates leak in).
+    fn fixture_git(dir: &Path, home: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(dir)
+            .env("HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args);
+        cmd
+    }
+
+    /// Run a fixture git command and return its trimmed stdout; panics (test
+    /// failure) when git fails, so a broken fixture never passes silently.
+    fn fixture_git_ok(dir: &Path, home: &Path, args: &[&str]) -> String {
+        let out = fixture_git(dir, home, args)
+            .output()
+            .expect("git must be installed to run the pinned-clone tests");
+        assert!(
+            out.status.success(),
+            "fixture git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A local fixture "remote": `first` and `second` on `main`, plus `off`, a
+    /// commit reachable only from `refs/pinned/off` (not from any branch or
+    /// tag), which a plain `git clone` does not bring in.
+    struct FixtureRemote {
+        home: tempfile::TempDir,
+        repo: tempfile::TempDir,
+        first: String,
+        second: String,
+        off: String,
+    }
+
+    impl FixtureRemote {
+        fn new() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let repo = tempfile::tempdir().unwrap();
+            let (h, r) = (home.path(), repo.path());
+            fixture_git_ok(r, h, &["init", "--quiet"]);
+            fixture_git_ok(
+                r,
+                h,
+                &["config", "uploadpack.allowReachableSHA1InWant", "true"],
+            );
+
+            std::fs::write(r.join("a.txt"), "one\n").unwrap();
+            fixture_git_ok(r, h, &["add", "a.txt"]);
+            fixture_git_ok(r, h, &["commit", "--quiet", "-m", "first"]);
+            let first = fixture_git_ok(r, h, &["rev-parse", "HEAD"]);
+
+            std::fs::write(r.join("b.txt"), "two\n").unwrap();
+            fixture_git_ok(r, h, &["add", "b.txt"]);
+            fixture_git_ok(r, h, &["commit", "--quiet", "-m", "second"]);
+            let second = fixture_git_ok(r, h, &["rev-parse", "HEAD"]);
+
+            fixture_git_ok(r, h, &["checkout", "--quiet", "--detach"]);
+            std::fs::write(r.join("c.txt"), "off-branch\n").unwrap();
+            fixture_git_ok(r, h, &["add", "c.txt"]);
+            fixture_git_ok(r, h, &["commit", "--quiet", "-m", "off"]);
+            let off = fixture_git_ok(r, h, &["rev-parse", "HEAD"]);
+            fixture_git_ok(r, h, &["update-ref", "refs/pinned/off", &off]);
+            fixture_git_ok(r, h, &["checkout", "--quiet", "main"]);
+
+            FixtureRemote {
+                home,
+                repo,
+                first,
+                second,
+                off,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("file://{}", self.repo.path().display())
+        }
+    }
+
+    /// Fresh destination path (not yet created) inside its own tempdir.
+    fn fresh_dest() -> (tempfile::TempDir, PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("corpus");
+        (parent, dest)
+    }
+
+    fn state(dest: &Path, commit: &str) -> PinnedCloneState {
+        verify_pinned_clone(dest, commit).unwrap()
+    }
+
+    #[test]
+    fn ensure_rejects_non_https_url() {
+        let (_parent, dest) = fresh_dest();
+        let err = ensure_pinned_history_clone("http://example.com/repo", &"a".repeat(40), &dest)
+            .expect_err("http:// must be rejected");
+        assert!(err.to_string().contains("https://"), "{err}");
+        assert!(!dest.exists(), "a rejected url must not create dest");
+    }
+
+    #[test]
+    fn ensure_rejects_malformed_commit_without_touching_dest() {
+        let (_parent, dest) = fresh_dest();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("keep.txt"), "user data").unwrap();
+
+        for bad in [
+            "B8A0A79463382347820F1C2572BDE37B68E87C76", // uppercase: rev-parse prints lowercase
+            "b8a0a79",                                  // abbreviated
+            "--upload-pack=touch /tmp/pwned",           // option-shaped
+            "HEAD",
+        ] {
+            let err = ensure_pinned_history_clone_from("file:///nonexistent", bad, &dest)
+                .expect_err("malformed commit must be rejected");
+            assert!(err.to_string().contains("40-character"), "{bad}: {err}");
+        }
+        assert!(
+            dest.join("keep.txt").exists(),
+            "dest must be left untouched"
+        );
+    }
+
+    #[test]
+    fn fresh_clone_is_full_history_detached_and_clean() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+
+        assert_eq!(state(&dest, &remote.second), PinnedCloneState::Reusable);
+        let h = remote.home.path();
+        assert_eq!(
+            fixture_git_ok(&dest, h, &["rev-list", "--count", "HEAD"]),
+            "2"
+        );
+        assert_eq!(
+            fixture_git_ok(&dest, h, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD",
+            "the pinned commit must be checked out detached"
+        );
+        assert!(dest.join("a.txt").is_file() && dest.join("b.txt").is_file());
+    }
+
+    #[test]
+    fn second_call_reuses_the_clone_without_touching_the_remote() {
+        let remote = FixtureRemote::new();
+        let url = remote.url();
+        let first = remote.first.clone();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&url, &first, &dest).unwrap();
+
+        // Invisible to `git status`; disappears if dest is deleted and re-cloned.
+        let sentinel = dest.join(".git").join("reuse-sentinel");
+        std::fs::write(&sentinel, "present").unwrap();
+        // With the remote gone, any re-clone attempt would fail.
+        drop(remote);
+
+        ensure_pinned_history_clone_from(&url, &first, &dest)
+            .expect("second call must reuse the clone, not contact the deleted remote");
+        assert!(sentinel.exists(), "reuse must not delete or recreate dest");
+    }
+
+    #[test]
+    fn verify_reports_missing_dest() {
+        let (_parent, dest) = fresh_dest();
+        assert_eq!(state(&dest, &"a".repeat(40)), PinnedCloneState::Missing);
+    }
+
+    #[test]
+    fn verify_rejects_wrong_head() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.first, &dest).unwrap();
+
+        assert_eq!(
+            state(&dest, &remote.second),
+            PinnedCloneState::HeadMismatch {
+                expected: remote.second.clone(),
+                actual: Some(remote.first.clone()),
+            }
+        );
+    }
+
+    #[test]
+    fn verify_rejects_shallow_clone_at_the_right_commit() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        let dest_str = dest.to_str().unwrap();
+        fixture_git_ok(
+            remote.home.path(),
+            remote.home.path(),
+            &["clone", "--quiet", "--depth", "1", &remote.url(), dest_str],
+        );
+
+        // HEAD is `second`, so shallowness is the only failing condition.
+        assert_eq!(state(&dest, &remote.second), PinnedCloneState::Shallow);
+    }
+
+    #[test]
+    fn verify_rejects_untracked_file() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+        std::fs::write(dest.join("written-by-skim.txt"), "x").unwrap();
+
+        assert!(matches!(
+            state(&dest, &remote.second),
+            PinnedCloneState::Dirty { sample } if sample.contains("written-by-skim.txt")
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_modified_tracked_file() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+        std::fs::write(dest.join("a.txt"), "changed\n").unwrap();
+
+        assert!(matches!(
+            state(&dest, &remote.second),
+            PinnedCloneState::Dirty { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_ignored_file_a_plain_status_would_hide() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+        std::fs::write(dest.join(".git").join("info").join("exclude"), "*.log\n").unwrap();
+        std::fs::write(dest.join("build.log"), "x").unwrap();
+
+        assert!(matches!(
+            state(&dest, &remote.second),
+            PinnedCloneState::Dirty { sample } if sample.contains("build.log")
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_empty_dir_nested_in_a_clean_repo_at_the_pinned_commit() {
+        // Without a discovery fence, `git -C <empty dir>` walks up and reports
+        // the ENCLOSING repo's HEAD — which here is the pinned commit, clean.
+        let remote = FixtureRemote::new();
+        let (_parent, outer) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &outer).unwrap();
+        let nested = outer.join("nested-corpus");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert!(matches!(
+            state(&nested, &remote.second),
+            PinnedCloneState::NotRepositoryRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_a_regular_file_as_dest() {
+        let (_parent, dest) = fresh_dest();
+        std::fs::write(&dest, "not a directory").unwrap();
+        assert!(matches!(
+            state(&dest, &"a".repeat(40)),
+            PinnedCloneState::NotRepositoryRoot { .. }
+        ));
+    }
+
+    #[test]
+    fn ensure_reclones_an_owned_clone_at_the_wrong_commit() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.first, &dest).unwrap();
+
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+
+        assert_eq!(state(&dest, &remote.second), PinnedCloneState::Reusable);
+    }
+
+    #[test]
+    fn ensure_reclones_an_owned_dirty_clone() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+        std::fs::write(dest.join("stray.txt"), "x").unwrap();
+
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+
+        assert_eq!(state(&dest, &remote.second), PinnedCloneState::Reusable);
+        assert!(!dest.join("stray.txt").exists());
+    }
+
+    #[test]
+    fn ensure_replaces_an_owned_shallow_clone_with_full_history() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        let h = remote.home.path();
+        fixture_git_ok(
+            h,
+            h,
+            &[
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                &remote.url(),
+                dest.to_str().unwrap(),
+            ],
+        );
+        // Simulate a clone this module created earlier.
+        std::fs::write(dest.join(".git").join(OWNERSHIP_MARKER), "owned").unwrap();
+
+        ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).unwrap();
+
+        assert_eq!(state(&dest, &remote.second), PinnedCloneState::Reusable);
+        assert_eq!(
+            fixture_git_ok(&dest, h, &["rev-list", "--count", "HEAD"]),
+            "2"
+        );
+    }
+
+    #[test]
+    fn ensure_refuses_to_delete_a_directory_it_does_not_own() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("precious.rs"), "fn main() {}\n").unwrap();
+
+        let err = ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest)
+            .expect_err("an unowned non-empty directory must not be deleted");
+
+        assert!(err.to_string().contains("refusing to delete"), "{err}");
+        assert!(dest.join("precious.rs").exists());
+    }
+
+    #[test]
+    fn ensure_refuses_to_replace_an_unowned_checkout() {
+        // e.g. a developer's own clone that a mistyped --corpus-dir points at.
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        let h = remote.home.path();
+        fixture_git_ok(
+            h,
+            h,
+            &["clone", "--quiet", &remote.url(), dest.to_str().unwrap()],
+        );
+        std::fs::write(dest.join("work-in-progress.rs"), "fn wip() {}\n").unwrap();
+
+        assert!(ensure_pinned_history_clone_from(&remote.url(), &remote.second, &dest).is_err());
+        assert!(dest.join("work-in-progress.rs").exists());
+    }
+
+    #[test]
+    fn ensure_clones_into_an_existing_empty_directory() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        ensure_pinned_history_clone_from(&remote.url(), &remote.first, &dest).unwrap();
+
+        assert_eq!(state(&dest, &remote.first), PinnedCloneState::Reusable);
+    }
+
+    #[test]
+    fn ensure_fetches_a_pinned_commit_that_no_branch_reaches() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+
+        ensure_pinned_history_clone_from(&remote.url(), &remote.off, &dest).unwrap();
+
+        assert_eq!(state(&dest, &remote.off), PinnedCloneState::Reusable);
+        assert!(dest.join("c.txt").is_file());
+    }
+
+    #[test]
+    fn ensure_fails_once_for_a_commit_the_remote_does_not_have() {
+        let remote = FixtureRemote::new();
+        let (_parent, dest) = fresh_dest();
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+
+        let err = ensure_pinned_history_clone_from(&remote.url(), absent, &dest)
+            .expect_err("an unknown commit must fail, not loop");
+
+        assert!(err.to_string().contains("not reachable"), "{err}");
     }
 }
