@@ -526,7 +526,10 @@ mod tests {
         let input = " \trefs/heads/main:refs/heads/main\te6bab99..13b30c2\nDone\n";
         let result = parse_push(input);
         assert!(
-            result.details.iter().any(|d| d.contains("e6bab99..13b30c2")),
+            result
+                .details
+                .iter()
+                .any(|d| d.contains("e6bab99..13b30c2")),
             "the ref range must be reported: {:?}",
             result.details
         );
