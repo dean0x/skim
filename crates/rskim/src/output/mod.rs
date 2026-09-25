@@ -637,25 +637,45 @@ pub(crate) fn rewrite_origin() -> Option<String> {
     }
 }
 
-/// Map a mode name to a human-readable class description (B4 / ADR-011 class 1).
+/// Map a mode name to the ELIDED CLASS — what is gone from the served view.
 ///
-/// The class label names what was elided so the reader knows what information
-/// they are missing without needing to know skim internals.
+/// Returns the class clause ONLY, not a full label: [`lossy_view_marker`] names
+/// the mode itself, exactly once. Before this table's contract changed, the
+/// origin form named the mode twice (`transformed view (cat → skim
+/// --mode=pseudo): pseudo view: …`) because each arm carried its own `… view:`
+/// prefix.
+///
+/// # Accuracy (ADR-011 class 1)
+///
+/// A class-1 marker that misstates the elided class is worse than one that
+/// omits it: it sends the reader back for content they already have. Two arms
+/// were affirmatively false, verified against `docs/modes.md` and empirically
+/// on `tests/fixtures/python/mixed_priority.py`:
+///
+/// - `pseudo` claimed "bodies removed" and removes no body in any language. It
+///   strips parameter annotations, decorators, Rust lifetimes/generics/
+///   where-clauses/attributes, and statement semicolons.
+/// - `minimal` claimed "bodies removed" and removes no body either. It strips
+///   non-doc comments.
+/// - `signatures` carried `structure`'s clause verbatim and under-disclosed:
+///   it also drops imports, classes, type definitions and module constants.
+///
+/// `structure` is the only mode that removes bodies, so its clause is unchanged.
 ///
 /// Made `pub(crate)` by D1 so downstream callers (e.g. `fidelity::remedy_for`
 /// contexts) can name the elided class without duplicating the label table.
 pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
     match mode_str {
-        "pseudo" => "pseudo view: bodies and syntactic detail removed",
-        "minimal" => "minimal view: comments and bodies removed",
-        "structure" => "structure view: bodies removed",
-        "signatures" => "signatures view: bodies removed",
-        "types" => "types view: non-type declarations removed",
+        "pseudo" => "annotations, decorators removed",
+        "minimal" => "non-doc comments removed",
+        "structure" => "bodies removed",
+        "signatures" => "all but signatures removed",
+        "types" => "all but types removed",
         // `full` reaches this table only when a line bound elided part of the
         // file (`head`/`tail` rewrites): the served lines are verbatim, so the
         // class names the range, not a transformation.
-        "full" => "line-sliced view: content verbatim, lines outside the range omitted",
-        _ => "transformed view",
+        "full" => "lines outside range omitted",
+        _ => "content removed",
     }
 }
 
@@ -670,19 +690,24 @@ pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
 ///
 /// # Marker format
 ///
+/// This function is the sole place the mode is named, and it names it once.
+/// The origin form carries it inside the reproduced command; the direct form
+/// carries it in a `<mode> view:` prefix. [`mode_class_label`] contributes only
+/// the class clause.
+///
 /// With hook-rewrite origin (e.g. `SKIM_REWRITTEN_FROM=cat`):
 /// ```text
-/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// [skim] transformed view (cat → skim --mode=pseudo): annotations, decorators removed — SKIM_PASSTHROUGH=1 for full output
 /// ```
 ///
 /// Without origin (explicit `skim file.ts --mode=pseudo`):
 /// ```text
-/// [skim] pseudo view: bodies and syntactic detail removed — SKIM_PASSTHROUGH=1 for raw output
+/// [skim] pseudo view: annotations, decorators removed — SKIM_PASSTHROUGH=1 for full output
 /// ```
 ///
 /// Multi-file (with or without origin):
 /// ```text
-/// [skim] transformed view (cat → skim --mode=pseudo): pseudo view: 2/3 files — SKIM_PASSTHROUGH=1 for raw output
+/// [skim] transformed view (cat → skim --mode=pseudo): annotations, decorators removed: 2/3 files — SKIM_PASSTHROUGH=1 for full output
 /// ```
 pub(crate) fn lossy_view_marker(
     origin: Option<&str>,
@@ -718,9 +743,9 @@ pub(crate) fn lossy_view_marker(
             "[skim] transformed view ({orig} \u{2192} skim --mode={mode_str}): {class}: {differing}/{total} files{suffix}"
         ),
         // Direct invocation, single file
-        (None, n) if n <= 1 => format!("[skim] {class}{suffix}"),
+        (None, n) if n <= 1 => format!("[skim] {mode_str} view: {class}{suffix}"),
         // Direct invocation, multi-file
-        (None, _) => format!("[skim] {class}: {differing}/{total} files{suffix}"),
+        (None, _) => format!("[skim] {mode_str} view: {class}: {differing}/{total} files{suffix}"),
     };
     Some(marker)
 }
@@ -855,10 +880,23 @@ mod lossy_view_marker_tests {
         );
         assert!(marker.contains("cat"), "must name origin");
         assert!(marker.contains("pseudo"), "must name mode");
-        assert!(marker.contains("bodies"), "B4: must name elided class");
+        assert!(
+            marker.contains("annotations, decorators removed"),
+            "B4: must name the class pseudo actually elides; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("bodies"),
+            "pseudo keeps every body — the marker must not claim otherwise; got: {marker:?}"
+        );
         assert!(
             marker.contains("SKIM_PASSTHROUGH=1"),
             "must carry remedy hint"
+        );
+        // The mode is named exactly once: inside the reproduced command.
+        assert_eq!(
+            marker.matches("pseudo").count(),
+            1,
+            "the mode must be named exactly once; got: {marker:?}"
         );
     }
 
@@ -880,12 +918,28 @@ mod lossy_view_marker_tests {
         // B3: fires without SKIM_REWRITTEN_FROM — no "transformed view" header.
         let result = lossy_view_marker(None, "pseudo", 1, 1);
         let marker = result.expect("differing=1 must produce a marker");
-        // B4: class label is the primary identifier for direct invocations.
-        assert!(marker.contains("pseudo"), "must name mode class");
-        assert!(marker.contains("bodies"), "B4: must name elided class");
+        // B4: the direct form carries the mode in a `<mode> view:` prefix, since
+        // there is no reproduced command to carry it.
+        assert!(
+            marker.starts_with("[skim] pseudo view: "),
+            "direct form must name the mode once, as a prefix; got: {marker:?}"
+        );
+        assert!(
+            marker.contains("annotations, decorators removed"),
+            "B4: must name the class pseudo actually elides; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("bodies"),
+            "pseudo keeps every body — the marker must not claim otherwise; got: {marker:?}"
+        );
         assert!(
             marker.contains("SKIM_PASSTHROUGH=1"),
             "must carry remedy hint"
+        );
+        assert_eq!(
+            marker.matches("pseudo").count(),
+            1,
+            "the mode must be named exactly once; got: {marker:?}"
         );
     }
 
@@ -917,19 +971,92 @@ mod lossy_view_marker_tests {
         assert_eq!(REWRITE_ORIGIN_ENV, "SKIM_REWRITTEN_FROM");
     }
 
+    /// The class clause must name what is GONE — the property ADR-011 asks for.
+    ///
+    /// Replaces a `label.len() > "transformed view".len()` floor that measured
+    /// nothing useful. Length is not correlated with disclosure: the floor
+    /// passed for any 17 characters of noise, and it REJECTED the correct
+    /// 14-character answer (`structure` -> `"bodies removed"`), so it could not
+    /// have survived this commit's accuracy fix regardless.
+    ///
+    /// The three assertions below are the properties ADR-011 actually names:
+    /// every known mode owns an arm, the clause states that something is gone,
+    /// and it says WHAT — a clause that only restates the mode ("pseudo view")
+    /// is explicitly ruled insufficient.
     #[test]
-    fn test_mode_class_labels_cover_all_known_modes() {
-        // Ensure mode_class_label returns meaningful strings for all known modes.
-        for mode in &["pseudo", "minimal", "structure", "signatures", "types"] {
+    fn test_mode_class_label_names_the_elided_class() {
+        let fallback = super::mode_class_label("__nonexistent__");
+
+        for mode in &[
+            "pseudo",
+            "minimal",
+            "structure",
+            "signatures",
+            "types",
+            "full",
+        ] {
             let label = super::mode_class_label(mode);
+
+            // 1. Every known mode owns an arm; none falls through to the catch-all.
+            assert_ne!(
+                label, fallback,
+                "mode {mode} must not fall through to the {fallback:?} catch-all"
+            );
+
+            // 2. The clause names an ELISION: it says something is gone.
             assert!(
-                !label.is_empty(),
-                "class label must be non-empty for mode {mode}"
+                label.ends_with(" removed") || label.ends_with(" omitted"),
+                "ADR-011: the clause for {mode} must name an elision; got: {label:?}"
+            );
+
+            // 3. It names WHAT is gone. A bare verb names no class, and a clause
+            //    that only restates the mode name carries no information the
+            //    marker does not already print beside it.
+            let subject = label
+                .rsplit_once(' ')
+                .expect("an elision clause has a subject before its verb")
+                .0;
+            assert!(
+                !subject.is_empty(),
+                "ADR-011: the clause for {mode} must name the elided subject; got: {label:?}"
             );
             assert!(
-                label.len() > "transformed view".len(),
-                "B4: class label must be more descriptive than 'transformed view' for mode {mode}"
+                !subject.eq_ignore_ascii_case(mode),
+                "ADR-011: the clause for {mode} must name the elided class, not restate \
+                 the mode name; got: {label:?}"
             );
+        }
+    }
+
+    /// Two modes that elide different things must not share a clause.
+    ///
+    /// RED at efac056: `signatures` carried `structure`'s `"bodies removed"`
+    /// verbatim, so the marker disclosed only the bodies. Measured on
+    /// `tests/fixtures/python/mixed_priority.py` (37 lines), `--mode=signatures`
+    /// emits 5 `def` lines: it also drops the imports, both classes, every
+    /// docstring and both module constants.
+    ///
+    /// This is the assertion the replaced length floor was structurally unable
+    /// to make — two identical labels both cleared the floor.
+    #[test]
+    fn test_mode_class_labels_are_distinct_per_mode() {
+        const MODES: [&str; 6] = [
+            "pseudo",
+            "minimal",
+            "structure",
+            "signatures",
+            "types",
+            "full",
+        ];
+
+        for (i, a) in MODES.iter().enumerate() {
+            for b in &MODES[i + 1..] {
+                assert_ne!(
+                    super::mode_class_label(a),
+                    super::mode_class_label(b),
+                    "modes {a} and {b} elide different things and must not share a class clause"
+                );
+            }
         }
     }
 
@@ -937,22 +1064,113 @@ mod lossy_view_marker_tests {
     /// `"transformed view"` catch-all instead of a dedicated description.
     ///
     /// Today: `mode_class_label("full")` returns `"transformed view"`.
-    /// After fix: returns `"line-sliced view: content verbatim, lines outside the range omitted"`.
+    /// After fix: returns the `full` class clause.
     ///
-    /// This is a new `"full"` match arm in the `mode_class_label` match —
-    /// do NOT edit `test_mode_class_labels_cover_all_known_modes` (it covers the
-    /// five non-full modes and is intentionally separate from this test).
+    /// The clause was `"line-sliced view: content verbatim, lines outside the
+    /// range omitted"` until the table's contract narrowed to the elided class
+    /// alone; `lossy_view_marker` now supplies the `full view:` prefix, and the
+    /// "content verbatim" half restated what `full` means rather than naming
+    /// anything elided.
     #[test]
     fn test_mode_class_label_full_has_dedicated_arm() {
         let label = super::mode_class_label("full");
         let fallback = super::mode_class_label("__nonexistent__");
         assert_eq!(
-            label, "line-sliced view: content verbatim, lines outside the range omitted",
+            label, "lines outside range omitted",
             "full mode must have a dedicated class label, got: {label:?}"
         );
         assert_ne!(
             label, fallback,
             "full mode label must differ from the default fallback ({fallback:?})"
+        );
+    }
+
+    /// Ceiling: the exact byte and cl100k-token cost of all 14 composed markers
+    /// (7 class clauses x direct/origin form).
+    ///
+    /// Every one of these is an ADR-011 class-1 disclosure — unconditional — so
+    /// its cost is paid on every lossy read. ADR-001's net-savings guard is a
+    /// SIZE comparison, which makes the marker's own size load-bearing: on a
+    /// small file it can decide whether skim serves the transform or falls back
+    /// to raw (ADR-008 measured 186 B raw -> 166 B stdout plus a 277 B stderr
+    /// marker = net +257 B, +138%). Pinning the costs here makes a future label
+    /// edit show its guard consequence as a visible diff instead of silently
+    /// moving that decision.
+    ///
+    /// # What is pinned, exactly
+    ///
+    /// The `String` [`lossy_view_marker`] returns. `process.rs` emits it with
+    /// `eprintln!`, so the cost ON THE WIRE is one byte and one cl100k token
+    /// more than every number below (measured, not assumed).
+    ///
+    /// The origin column is held at `cat` for all seven rows so a row-to-row
+    /// diff isolates the class clause rather than the origin word. A
+    /// `head`/`tail` origin is one byte longer: `full` — the only mode that
+    /// reaches this table via `head`/`tail` — costs 119 B / 32 t in its
+    /// production origin form.
+    ///
+    /// The last row exercises the `_` fallback arm. No production `mode_str`
+    /// reaches it (`multi.rs` derives the string from a closed mode enum), so
+    /// `"unknown"` is a documented 7-character stand-in: the row pins the cost
+    /// of the fallback CLAUSE, with the mode-name contribution held fixed.
+    ///
+    /// Token counts are cl100k_base via `tokens::count_tokens`, the same
+    /// encoding `--show-stats` reports.
+    #[test]
+    fn test_lossy_view_marker_composed_cost_ceiling() {
+        // (mode_str, direct bytes, direct tokens, origin bytes, origin tokens)
+        const COSTS: &[(&str, usize, usize, usize, usize)] = &[
+            ("pseudo", 90, 24, 124, 32),
+            ("minimal", 84, 24, 118, 32),
+            ("structure", 76, 22, 110, 30),
+            ("signatures", 89, 24, 123, 33),
+            ("types", 79, 24, 113, 32),
+            ("full", 84, 24, 118, 32),
+            ("unknown", 75, 22, 109, 30),
+        ];
+
+        for &(mode, direct_bytes, direct_tokens, origin_bytes, origin_tokens) in COSTS {
+            let direct =
+                lossy_view_marker(None, mode, 1, 1).expect("differing=1 must produce a marker");
+            let origin = lossy_view_marker(Some("cat"), mode, 1, 1)
+                .expect("differing=1 must produce a marker");
+
+            assert_eq!(
+                direct.len(),
+                direct_bytes,
+                "direct marker bytes moved for {mode}: {direct:?}"
+            );
+            assert_eq!(
+                origin.len(),
+                origin_bytes,
+                "origin marker bytes moved for {mode}: {origin:?}"
+            );
+            assert_eq!(
+                crate::tokens::count_tokens(&direct).expect("cl100k count is infallible"),
+                direct_tokens,
+                "direct marker tokens moved for {mode}: {direct:?}"
+            );
+            assert_eq!(
+                crate::tokens::count_tokens(&origin).expect("cl100k count is infallible"),
+                origin_tokens,
+                "origin marker tokens moved for {mode}: {origin:?}"
+            );
+        }
+    }
+
+    /// The `head`/`tail` origin word is one byte longer than `cat`, and `full`
+    /// only ever reaches the marker table through those two rewrites — so this
+    /// is `full`'s real production cost, pinned beside the `cat`-normalised
+    /// table above.
+    #[test]
+    fn test_lossy_view_marker_full_head_origin_cost() {
+        let m = lossy_view_marker(Some("head"), "full", 1, 1)
+            .expect("differing=1 must produce a marker");
+        assert_eq!(m.len(), 119, "head-origin full marker bytes moved: {m:?}");
+        assert_eq!(
+            crate::tokens::count_tokens(&m).expect("cl100k count is infallible"),
+            32,
+            "head-origin full marker tokens moved: {m:?}"
         );
     }
 }
