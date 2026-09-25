@@ -2,7 +2,20 @@
 //!
 //! ARCHITECTURE: Strip function/method bodies, keep structure.
 //!
-//! Token reduction target: 70-80%
+//! # Token reduction
+//!
+//! ~60-80% — the only measured figure is 60.3%, on the production TypeScript
+//! codebase in README's reduction tables (the table at the top and the
+//! Real-World Token Reduction table under Performance report the same run). The
+//! range is stated wide enough to contain it. The `70-80%` this header used to
+//! state EXCLUDES it, which made structure the one mode whose documented range
+//! did not admit its own benchmark; `CLAUDE.md` and `cmd/discover.rs` already
+//! used the wider form.
+//!
+//! No CI gate defends the range either way: the only reduction-ratio assertions
+//! in this crate's suite are two `> 0.30` checks on the JSON and YAML
+//! structure-mode fixtures. Do not narrow the range again until something that
+//! runs in CI measures it per language.
 
 use crate::transform::compute_line_starts;
 use crate::transform::minimal::{MAX_AST_DEPTH, MAX_AST_NODES};

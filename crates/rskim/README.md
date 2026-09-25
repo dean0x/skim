@@ -67,8 +67,8 @@ skim --clear-cache
 
 ## Features
 
-- **12 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, Markdown, JSON, YAML, TOML
-- **5 Transformation Modes**: Structure, Signatures, Types, Minimal, Full
+- **18 Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C, C++, C#, Ruby, SQL, Kotlin, Swift, Bash, Markdown, JSON, YAML, TOML
+- **6 Transformation Modes**: Structure, Signatures, Types, Full, Minimal, Pseudo
 - **Fast**: 14.6ms for 3000-line files (3x faster than target)
 - **Cached**: 40-50x speedup on repeated processing (enabled by default)
 - **Multi-file**: Glob patterns with parallel processing (`skim 'src/**/*.ts'`)
@@ -90,10 +90,11 @@ skim <FILE>
 ```bash
 Options:
   -m, --mode <MODE>         Transformation mode [default: structure]
-                            [possible values: structure, signatures, types, minimal, full]
+                            [possible values: structure, signatures, types, full, minimal, pseudo]
   -l, --language <LANGUAGE> Override language detection (alias: --lang)
                             [possible values: typescript, javascript, python, rust, go, java,
-                             c, cpp, markdown, json, yaml, toml]
+                             markdown, json, yaml, c, cpp, toml, csharp, ruby, sql, kotlin,
+                             swift, bash]
       --filename <PATH>     Hint filename for stdin language detection
       --tokens <N>          Target token budget (cascades through modes to fit)
       --max-lines <N>       Maximum output lines (AST-aware truncation)
@@ -108,9 +109,15 @@ Options:
 
 ## Transformation Modes
 
+Reduction figures below are targets, not gates. Structure mode's only measured
+value is 60.3%, on the production TypeScript codebase in the repository
+README's reduction tables, and the range is stated wide enough to contain it.
+No CI gate defends any of these ranges — the only reduction ratio the test
+suite asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
+
 ### Structure Mode (Default)
 
-Removes function bodies while preserving signatures (70-80% reduction).
+Removes function bodies while preserving signatures (60-80% reduction).
 
 ```bash
 skim file.ts
@@ -187,6 +194,28 @@ Returns original code unchanged (0% reduction).
 skim file.rs --mode full
 ```
 
+### Minimal Mode
+
+Strips non-doc comments at module and class level while keeping all code intact.
+Doc comments, comments inside function bodies, module header comments, and
+shebangs are preserved (reduction unverified — see the note above).
+
+```bash
+skim file.py --mode minimal
+```
+
+### Pseudo Mode
+
+Strips syntactic noise — type annotations, decorators, semicolons — while
+preserving logic flow, names, values, visibility modifiers, and function return
+types (reduction unverified — see the note above). What is stripped varies by
+language: TypeScript and Rust keep parameter types, and Rust removes only
+statement semicolons and non-doc comments.
+
+```bash
+skim file.ts --mode pseudo
+```
+
 ## Examples
 
 ### Explore a codebase
@@ -233,14 +262,20 @@ cat *.py | skim - --language=python
 
 | Language   | Extensions         | Auto-detected |
 |------------|--------------------|---------------|
-| TypeScript | `.ts`, `.tsx`      | ✅            |
-| JavaScript | `.js`, `.jsx`, `.mjs` | ✅         |
-| Python     | `.py`              | ✅            |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | ✅ |
+| JavaScript | `.js`, `.jsx`, `.cjs`, `.mjs` | ✅ |
+| Python     | `.py`, `.pyi`      | ✅            |
 | Rust       | `.rs`              | ✅            |
 | Go         | `.go`              | ✅            |
 | Java       | `.java`            | ✅            |
 | C          | `.c`, `.h`         | ✅            |
 | C++        | `.cpp`, `.hpp`, `.cc`, `.hh`, `.cxx`, `.hxx` | ✅ |
+| C#         | `.cs`              | ✅            |
+| Ruby       | `.rb`              | ✅            |
+| SQL        | `.sql`             | ✅            |
+| Kotlin     | `.kt`, `.kts`      | ✅            |
+| Swift      | `.swift`           | ✅            |
+| Bash       | `.sh`, `.bash`     | ✅            |
 | Markdown   | `.md`, `.markdown` | ✅            |
 | JSON       | `.json`            | ✅            |
 | YAML       | `.yaml`, `.yml`    | ✅            |

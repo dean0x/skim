@@ -877,8 +877,13 @@ fn run_show_file_content(
     // function bodies, which is unhelpful when the agent asked to read a
     // specific file at a specific ref — it needs to see the logic, not just
     // signatures.  Pseudo preserves logic flow while stripping syntactic noise
-    // (type annotations, visibility modifiers, etc.), giving ~30-50% reduction
-    // without hiding implementation detail the agent is trying to read.
+    // (type annotations, visibility modifiers, etc.) without hiding the
+    // implementation detail the agent is trying to read.  No reduction figure is
+    // stated here: the `~30-50%` this comment used to carry was an unsourced
+    // target, traced by ADR-008's archaeology to the original pseudo-mode commit
+    // (04b5f9f, #70), copied into six files and never re-derived, and ADR-007
+    // records that no CI gate defends it.  See the module header of
+    // `rskim-core/src/transform/pseudo.rs`.
     let config = TransformConfig::with_mode(Mode::Pseudo);
     let transformed = match rskim_core::transform(&raw, lang, config.mode) {
         Ok(t) => t,

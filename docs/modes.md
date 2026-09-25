@@ -7,17 +7,21 @@ Skim offers six transformation modes, each with different levels of aggressivene
 | Mode       | Token Reduction | What's Kept                              | What's Removed              |
 |------------|-----------------|------------------------------------------|-----------------------------|
 | Full       | 0%              | Everything (original source)             | Nothing                     |
-| Minimal    | 15-30%          | All code, doc comments, Python/Ruby/SQL/Bash module header comments | Non-doc comments; module headers stripped in Rust, C, TypeScript, Go, and all other languages |
-| Pseudo     | 30-50%          | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types | Parameter type annotations (Python only), generics in Rust/Java/Kotlin/Swift/C# (TypeScript preserves them), decorators, semicolons |
-| Structure  | 70-80%          | Signatures, types, classes, imports      | Function bodies             |
+| Minimal    | 15-30% †        | All code, doc comments, module header comments (every language) | Non-doc comments — module header comments are preserved in **every** language (#476) |
+| Pseudo     | 30-50% †        | Logic flow, names, values, visibility, return types, TypeScript/Rust parameter types, Rust lifetimes/generics/where-clauses/attributes | Parameter type annotations (Python only), generics in Java/Kotlin/Swift/C# (Rust and TypeScript preserve them; Go strips none of these), decorators, semicolons |
+| Structure  | 60-80% ‡        | Signatures, types, classes, imports      | Function bodies             |
 | Signatures | 85-92%          | Only callable signatures                 | Everything else             |
 | Types      | 90-95%          | Only type definitions                    | All code                    |
+
+† **Unverified targets, not measured figures.** Neither number was derived from a measurement, and no CI gate defends them — ADR-008's archaeology traces pseudo's "30-50%" to the original pseudo-mode commit (04b5f9f, #70), copied into six files and never re-derived, and ADR-007's own text says "no CI gate defends pseudo's 30-50% reduction target". Both modes have since been widened to preserve *more* content — module header comments are now kept in every language (#476), and Rust's pseudo mode strips only statement semicolons and non-doc comments — so treat these two rows as aspirational until they are re-measured. Minimal mode has a known counter-example: a file whose only comments are its module header now reduces by 0%, `tests/fixtures/sql/simple.sql` being exactly that file.
+
+‡ **Measured basis: 60.3%.** Structure mode is measured at 60.3% on a production TypeScript codebase (README's reduction tables). The range on the row above is stated wide enough to contain it. No CI gate defends the range either way: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
 ## Structure Mode (Default)
 
 ### Overview
 
-**Token reduction: 70-80%**
+**Token reduction: 60-80%** — the only measured figure is 60.3%, on the production TypeScript codebase in README's reduction tables, and the range is stated wide enough to contain it. No CI gate defends the range: the only reduction ratio any test asserts is `> 0.30`, on the JSON and YAML structure-mode fixtures.
 
 Structure mode is the default and most balanced mode. It keeps enough information to understand the codebase architecture while removing implementation details.
 
@@ -255,7 +259,7 @@ skim file.ts --mode full
 
 ### Overview
 
-**Token reduction: 30-50%**
+**Token reduction: unverified.** The "30-50%" this section used to state was never derived from a measurement: ADR-008's archaeology traces it to the original pseudo-mode commit (04b5f9f, #70), where it was copied into six files and never re-derived, and ADR-007's own text says "no CI gate defends pseudo's 30-50% reduction target". See the module header of `crates/rskim-core/src/transform/pseudo.rs` for why no single number can carry this mode across languages any more.
 
 Pseudo mode strips syntactic noise (Python parameter type annotations, decorators, semicolons) while preserving all logic flow and visibility modifiers. TypeScript and Rust parameter types are preserved as API surface (ADR-007). The result reads like pseudocode: you can follow the program's behavior without the ceremony of a statically-typed language.
 
@@ -268,15 +272,15 @@ Pseudo mode strips syntactic noise (Python parameter type annotations, decorator
 - Import statements
 - Visibility and export modifiers (`pub`, `export`, `public`, `private`, `protected`, `internal`, `fileprivate`, Swift `open`)
 - **Function return types** (`-> float`, `-> Result<T, E>`, `): Promise<User>`) — preserved as API surface
+- **Rust lifetimes (`<'a>`), type/generic parameters, where clauses, and attribute items (`#[derive(...)]`)** — preserved as API surface. ADR-007 decided that pseudo mode preserves *return types* because API surface is not syntactic noise; these four kinds are the same class, so the same reasoning extends to them and Rust's strip list is now empty apart from statement semicolons
 
 ### What's Removed
 
 - Parameter type annotations (`: int`, `: str`) — **Python only**; TypeScript and Rust both preserve parameter types as API surface (ADR-007). Return types are preserved in all languages (see above)
-- Rust-specific noise: lifetimes (`<'a>`), type parameters and where clauses, attribute items (`#[derive(...)]`)
 - Non-visibility keyword modifiers (`static`, `final`, Kotlin `open`)
 - Decorators (`@Override`, `@cache`)
 - Statement-terminating semicolons — preserved inside for-loop headers (`for (let i = 0; i < n; i++)`)
-- Non-doc comments at declaration/module scope — same as Minimal mode; Python/Ruby/SQL/Bash module header comments (SPDX, `frozen_string_literal`, provenance lines) are preserved; inline comments inside function bodies are also preserved (they document logic)
+- Non-doc comments at declaration/module scope — same as Minimal mode; module header comments (SPDX, `frozen_string_literal`, provenance lines) are preserved; inline comments inside function bodies are also preserved (they document logic)
 - Python `self`/`cls` first parameter
 
 ### Usage
@@ -329,7 +333,7 @@ def calculate(x, y) -> float:
 | TypeScript | Decorators, `readonly`, `abstract`, `;` — parameter and return types preserved (ADR-007) |
 | JavaScript | Decorators, `;`                                                                   |
 | Python     | Parameter type annotations, decorators, `self`/`cls` first param (return types preserved) |
-| Rust       | Lifetimes, type params, where clauses, attribute items, `;` — parameter and return types preserved |
+| Rust       | `;` only — lifetimes, type params, where clauses, attribute items, parameter and return types are all preserved |
 | Go         | Conservative (no stripping) — Go types are integral to understanding           |
 | Java       | Annotations, type params, `throws`, `;`                                        |
 | C          | `static`/`extern`/`const`/`volatile`, `;`                                      |
