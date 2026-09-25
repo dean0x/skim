@@ -227,6 +227,65 @@ pub(crate) fn emit_raw_passthrough(raw: &str) -> io::Result<(&'static str, Stdou
     Ok(("passthrough", status))
 }
 
+/// Emit a child's `stdout` and `stderr` raw, **each on its own descriptor** —
+/// fd 1 and fd 2. Returns the `"passthrough"` analytics tier string plus the
+/// [`StdoutStatus`], matching [`emit_raw_passthrough`]'s shape so the two sinks
+/// are interchangeable at a call site that holds one stream or two.
+///
+/// # Why this exists rather than one more `emit_raw_passthrough` call
+///
+/// [`emit_raw_passthrough`] takes a *single* string and writes it to stdout. A
+/// caller that holds two streams can only reach it by concatenating them first
+/// — and that concatenation silently relocates the child's stderr onto skim's
+/// stdout. The relocation is observable in both directions, and both are
+/// divergences from raw that no marker discloses: a `2>` capture comes back
+/// empty because the diagnostics went to fd 1, and `2>/dev/null` fails to
+/// silence diagnostics the raw tool sends to fd 2 while `>/dev/null` silences
+/// them completely.
+///
+/// # Measurement is not emission
+///
+/// Splitting here is an **emission** change only. Everything that *measures*
+/// the run keeps reading the merged stream via [`combine_output`]: the ADR-001
+/// net-savings baseline, the `--show-stats` token pair, and the analytics row.
+/// A caller must not swap this helper in and also re-baseline the guard — the
+/// compress/no-compress decision is defined over the combined bytes and does
+/// not change because they landed on two descriptors instead of one.
+///
+/// # Byte contract
+///
+/// No trailing-newline guard on *either* stream: these are the child's own
+/// bytes, so appending one would diverge from raw. This is deliberately the
+/// opposite of [`emit_raw_passthrough`], whose `true` guard is load-bearing at
+/// its own call sites.
+///
+/// stdout is written and flushed first, and its lock is released before stderr
+/// is acquired, so the two locks are never held at once. An empty `stderr` is
+/// skipped entirely rather than flushed.
+///
+/// A [`StdoutStatus::PipeClosed`] from *either* stream short-circuits: under
+/// `skim … 2>&1 | head` both descriptors are the same pipe, so a departed
+/// reader is the identical disposition on either. Callers must stop producing
+/// output and return [`pipe_closed_exit`] — never exit `1`.
+#[allow(clippy::disallowed_methods)] // IS the foundational raw-passthrough sink; cmd/mod.rs policy terminus
+pub(crate) fn emit_raw_passthrough_split(
+    stdout: &str,
+    stderr: &str,
+) -> io::Result<(&'static str, StdoutStatus)> {
+    {
+        let mut out = io::stdout().lock();
+        if classify_write(write_and_flush(&mut out, stdout, false))? == StdoutStatus::PipeClosed {
+            return Ok(("passthrough", StdoutStatus::PipeClosed));
+        }
+    }
+    if stderr.is_empty() {
+        return Ok(("passthrough", StdoutStatus::Written));
+    }
+    let mut err = io::stderr().lock();
+    let status = classify_write(write_and_flush(&mut err, stderr, false))?;
+    Ok(("passthrough", status))
+}
+
 // ----------------------------------------------------------------------------
 // Panic-free replacements for `print!` / `println!` / `eprint!` / `eprintln!`
 // ----------------------------------------------------------------------------
@@ -849,24 +908,15 @@ where
 /// The `SKIM_PASSTHROUGH=1` escape hatch over a *spawned* child uses
 /// [`stream_passthrough_raw`] instead, which reproduces this byte contract
 /// exactly while streaming.
-#[allow(clippy::disallowed_methods)] // Low-level raw passthrough; within the foundational output infrastructure
+///
+/// The two-descriptor write itself lives in [`emit_raw_passthrough_split`], so
+/// the build family's passthrough arms share this exact spelling rather than
+/// carrying a second copy of it.
 fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
     let code = output.exit_code.unwrap_or(1);
-    {
-        let mut out = io::stdout().lock();
-        match write_and_flush(&mut out, &output.stdout, false) {
-            Ok(()) => {}
-            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    if !output.stderr.is_empty() {
-        let mut err = io::stderr().lock();
-        match write_and_flush(&mut err, &output.stderr, false) {
-            Ok(()) => {}
-            Err(e) if is_broken_pipe(&e) => return Ok(pipe_closed_exit()),
-            Err(e) => return Err(e.into()),
-        }
+    let (_, status) = emit_raw_passthrough_split(&output.stdout, &output.stderr)?;
+    if status == StdoutStatus::PipeClosed {
+        return Ok(pipe_closed_exit());
     }
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }

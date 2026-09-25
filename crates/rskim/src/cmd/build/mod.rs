@@ -190,6 +190,15 @@ pub(super) fn run_parsed_command(
     // "raw" for build = stdout + stderr (both carry diagnostic content).
     // Hold as Cow to avoid an unconditional String clone: Borrowed when stderr
     // is empty (fast path), Owned only when both streams are non-empty.
+    //
+    // MEASUREMENT ONLY. This merged view is the ADR-001 guard baseline and the
+    // analytics/`--show-stats` input, and it must stay merged: what the user
+    // would have seen with skim bypassed entirely is both streams together.
+    // It is deliberately NOT what gets emitted — writing it to stdout is what
+    // put the child's stderr on skim's fd 1, so the raw-emission arms below
+    // hand `output.stdout` and `output.stderr` to `emit_raw_passthrough_split`
+    // instead. Separating the two leaves the compress/no-compress decision and
+    // every recorded token count exactly as they were.
     let raw_cow = super::combine_output(&output);
 
     // Net-savings guard (Cluster C / #317):
@@ -212,8 +221,15 @@ pub(super) fn run_parsed_command(
                 tier_name
             }
             crate::cmd::execution::SavingsDecision::Passthrough => {
-                // Emit raw verbatim (stdout+stderr combined, same as raw_cow).
-                let (tier, status) = crate::cmd::execution::emit_raw_passthrough(raw_cow.as_ref())?;
+                // Emit raw verbatim, each stream on the descriptor the child
+                // wrote it to. The guard compared against `raw_cow` (merged),
+                // but emitting `raw_cow` would relocate the child's stderr onto
+                // skim's stdout — the bytes are identical, the descriptors are
+                // not, and only the descriptors are observable to `2>`.
+                let (tier, status) = crate::cmd::execution::emit_raw_passthrough_split(
+                    &output.stdout,
+                    &output.stderr,
+                )?;
                 if status == crate::cmd::execution::StdoutStatus::PipeClosed {
                     return Ok(crate::cmd::execution::pipe_closed_exit());
                 }
@@ -221,14 +237,18 @@ pub(super) fn run_parsed_command(
             }
         }
     } else {
-        // Already passthrough — print as-is and skip guard.
-        if !content.is_empty()
-            && crate::cmd::execution::write_line_to_stdout(content)?
-                == crate::cmd::execution::StdoutStatus::PipeClosed
-        {
+        // Already passthrough — the parser re-encoded nothing, so serve the
+        // child's own bytes split across fd 1 / fd 2 rather than `content`,
+        // which every tier-3 parser builds by merging the two streams (and
+        // which `cargo fmt` additionally trims). Emitting the streams directly
+        // also drops the unconditional trailing newline `write_line_to_stdout`
+        // appended, so the forward is byte-faithful in both directions.
+        let (tier, status) =
+            crate::cmd::execution::emit_raw_passthrough_split(&output.stdout, &output.stderr)?;
+        if status == crate::cmd::execution::StdoutStatus::PipeClosed {
             return Ok(crate::cmd::execution::pipe_closed_exit());
         }
-        tier_name
+        tier
     };
 
     // Report token stats if requested. count_token_pair takes &str so we
@@ -238,32 +258,28 @@ pub(super) fn run_parsed_command(
         crate::process::report_token_stats(orig, comp, "");
     }
 
-    // Determine exit code from the parsed result
-    let exit_code = match &result {
-        ParseResult::Full(build_result) | ParseResult::Degraded(build_result, _) => {
-            if build_result.success {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ParseResult::Passthrough(_) => {
-            // Use the original process exit code
-            match output.exit_code {
-                Some(0) => ExitCode::SUCCESS,
-                _ => ExitCode::FAILURE,
-            }
-        }
-        ParseResult::RawPassthrough => {
-            // RawPassthrough: payload-less passthrough — use original process exit code,
-            // same semantics as Passthrough(_). Output was already emitted by the
-            // net-savings guard above (content() returns "" for this variant).
-            match output.exit_code {
-                Some(0) => ExitCode::SUCCESS,
-                _ => ExitCode::FAILURE,
-            }
-        }
+    // Exit code: `max(child, derived)`, the same shape
+    // `execution::run_parsed_command_with_fallback` uses (and the same
+    // `derive_exit` shape `cmd/test/cargo.rs` passes it).
+    //
+    // The child's own code is the floor. Collapsing the result to
+    // `ExitCode::SUCCESS`/`FAILURE` flattened every non-zero child exit to 1:
+    // `skim cargo check` on a crate that fails to compile reported 1 instead of
+    // cargo's 101, and `skim make` with no makefile reported 1 instead of
+    // make's 2 — callers keying on `$?` saw a code the raw tool never produced.
+    //
+    // The derived code is the floor's complement, not a replacement: a parser
+    // that saw failure still forces a non-zero exit when the child exited 0.
+    // Build parsers do produce that combination — gradle prints `BUILD FAILED`
+    // on a zero exit, and maven omits `BUILD SUCCESS` — so `max` is required
+    // here, and `unwrap_or(1)` keeps a signal kill (`None`) non-zero.
+    // Passthrough / RawPassthrough fall to `_`: they carry no parser verdict of
+    // their own, so the child's code is the whole answer.
+    let derived_exit = match &result {
+        ParseResult::Full(r) | ParseResult::Degraded(r, _) if !r.success => Some(1),
+        _ => None,
     };
+    let code = output.exit_code.unwrap_or(1).max(derived_exit.unwrap_or(0));
 
     // Record analytics (fire-and-forget, non-blocking).
     // Use effective_tier (may be "passthrough" if the net-savings guard fired).
@@ -277,5 +293,5 @@ pub(super) fn run_parsed_command(
         output.duration,
     );
 
-    Ok(exit_code)
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
