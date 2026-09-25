@@ -325,7 +325,34 @@ impl Report {
     }
 }
 
-/// Write `report.json` and `report.md` into `out_dir` (created if missing).
+/// The report file names `run` / `check` write into their output dir.
+pub const REPORT_JSON: &str = "report.json";
+pub const REPORT_MD: &str = "report.md";
+
+/// Remove the [`REPORT_JSON`] / [`REPORT_MD`] a previous run left in
+/// `out_dir`, before a run does any work: a run that stops on a harness error
+/// then leaves no report behind for `bless --from` to take as its own. A
+/// missing directory or file is fine.
+///
+/// # Errors
+///
+/// Returns an error if an existing report file cannot be removed.
+pub fn clear_outputs(out_dir: &Path) -> anyhow::Result<()> {
+    for name in [REPORT_JSON, REPORT_MD] {
+        let path = out_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("removing the previous {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write [`REPORT_JSON`] and [`REPORT_MD`] into `out_dir` (created if
+/// missing).
 ///
 /// # Errors
 ///
@@ -337,10 +364,10 @@ pub fn write_outputs(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("creating output dir {}", out_dir.display()))?;
-    let json_path = out_dir.join("report.json");
+    let json_path = out_dir.join(REPORT_JSON);
     std::fs::write(&json_path, report.to_json()?)
         .with_context(|| format!("writing {}", json_path.display()))?;
-    let md_path = out_dir.join("report.md");
+    let md_path = out_dir.join(REPORT_MD);
     std::fs::write(&md_path, render_markdown(report, baseline))
         .with_context(|| format!("writing {}", md_path.display()))?;
     Ok(())
@@ -617,5 +644,32 @@ mod tests {
                 xpass: 0
             }
         );
+    }
+
+    #[test]
+    fn clearing_outputs_removes_only_the_report_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [REPORT_JSON, REPORT_MD, "keep.txt"] {
+            std::fs::write(dir.path().join(name), "stale").unwrap();
+        }
+
+        clear_outputs(dir.path()).unwrap();
+
+        assert!(!dir.path().join(REPORT_JSON).exists());
+        assert!(!dir.path().join(REPORT_MD).exists());
+        assert!(dir.path().join("keep.txt").exists());
+        // Nothing left to clear, or no directory at all, is fine.
+        clear_outputs(dir.path()).unwrap();
+        clear_outputs(&dir.path().join("absent")).unwrap();
+    }
+
+    #[test]
+    fn a_report_path_that_cannot_be_removed_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(REPORT_JSON)).unwrap();
+
+        let err = clear_outputs(dir.path()).expect_err("a directory is not a report file");
+
+        assert!(format!("{err:#}").contains(REPORT_JSON), "{err:#}");
     }
 }

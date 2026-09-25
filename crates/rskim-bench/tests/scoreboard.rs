@@ -1017,7 +1017,6 @@ note = "fixture"
 "##,
     );
     h.write_stats(Some("newer-schema"));
-    fs::remove_file(h.report_path()).unwrap();
 
     let check = h.check();
 
@@ -1086,7 +1085,6 @@ note = "fixture"
         Some("xfail")
     );
     h.write_ast(&[]);
-    fs::remove_file(h.report_path()).unwrap();
 
     let check = h.check();
 
@@ -1212,6 +1210,40 @@ fn a_repeated_last_row_fails_unique_paths_on_every_entry_kind() {
         .into_iter()
         .collect();
     assert_eq!(unique, vec![&every_id], "{failures:#?}");
+}
+
+/// A harness error writes no report, and must not leave an older one
+/// behind either: `bless --from` would then bless a run that never passed.
+#[test]
+fn a_harness_error_leaves_no_stale_report_to_bless() {
+    let h = Harness::new();
+    assert_exit(&h.run(), 0);
+    let md = h.out_dir.path().join("report.md");
+    assert!(h.report_path().exists() && md.exists());
+    let (_, q, f) = LEXICAL;
+    h.write_response(
+        q,
+        f,
+        &format!("l{FULL_LIMIT}_o0.json"),
+        "skim search: boom\n",
+    );
+
+    let check = h.check();
+
+    assert_exit(&check, 2);
+    assert!(
+        !h.report_path().exists(),
+        "a stale report.json survived a harness error"
+    );
+    assert!(!md.exists(), "a stale report.md survived a harness error");
+    let bless = h.bless(None);
+    assert_ne!(
+        bless.status.code(),
+        Some(0),
+        "bless --from accepted a stale report:\n{}",
+        stderr(&bless)
+    );
+    assert!(!h.baseline_path().exists());
 }
 
 #[test]

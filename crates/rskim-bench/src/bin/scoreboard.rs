@@ -20,7 +20,9 @@
 //! - `2` — harness error: clone verification, golden integrity, an invalid
 //!   data file, a skim crash / timeout / unparsable output, temporal data
 //!   skim reports unusable for entries that rank by it, a corpus changed by
-//!   the run. A harness error is never reported as a regression.
+//!   the run. A harness error is never reported as a regression, and leaves
+//!   no `report.json` / `report.md` in `--out` (`run` / `check` remove the
+//!   previous ones first).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -34,7 +36,7 @@ use rskim_bench::scoreboard::corpus::{
 };
 use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
-use rskim_bench::scoreboard::report::{GateStatus, Report, total, write_outputs};
+use rskim_bench::scoreboard::report::{GateStatus, Report, clear_outputs, total, write_outputs};
 use rskim_bench::scoreboard::runner::{SkimRunner, SkimSandbox};
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 
@@ -146,6 +148,9 @@ fn main() -> ExitCode {
 }
 
 fn engine(args: &EngineArgs, mode: Mode) -> anyhow::Result<u8> {
+    // Before any work: a harness error below must not leave an older report
+    // in --out for `bless --from` to take as this run's.
+    clear_outputs(&args.out)?;
     let skim_bin = std::fs::canonicalize(&args.skim_bin).with_context(|| {
         format!(
             "skim binary {} not found (build it with `cargo build --release -p rskim`, or pass --skim-bin)",
