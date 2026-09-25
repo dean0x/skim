@@ -461,10 +461,10 @@ pub fn clone_with_history(url: &str, dest: &Path) -> anyhow::Result<()> {
 // ============================================================================
 
 /// Timeout (seconds) for the network-bound steps of a pinned-history clone:
-/// `git clone` and the `git fetch origin <sha>` fallback. Matches
-/// [`GIT_SUBPROCESS_TIMEOUT_SECS`], which already bounds full clones elsewhere
-/// in this module.
-const PINNED_NETWORK_TIMEOUT_SECS: u64 = 300;
+/// `git clone` and the `git fetch origin <sha>` fallback. Reuses
+/// [`GIT_SUBPROCESS_TIMEOUT_SECS`], the bound on full clones elsewhere in
+/// this module.
+const PINNED_NETWORK_TIMEOUT_SECS: u64 = GIT_SUBPROCESS_TIMEOUT_SECS;
 
 /// Timeout (seconds) for the local steps of a pinned-history clone:
 /// `git checkout` and every reuse-verification command.
@@ -682,19 +682,16 @@ pub fn verify_pinned_clone(dest: &Path, commit: &str) -> anyhow::Result<PinnedCl
         });
     }
 
-    let shallow_out = run_pinned_git(&canonical, &["rev-parse", "--is-shallow-repository"])?;
-    if !shallow_out.status.success() {
-        anyhow::bail!(
-            "git rev-parse --is-shallow-repository failed in {}: {}",
-            canonical.display(),
-            first_line_lossy(&shallow_out.stderr)
-        );
-    }
+    let shallow_out = run_pinned_git_ok(
+        &canonical,
+        &["rev-parse", "--is-shallow-repository"],
+        "git rev-parse --is-shallow-repository",
+    )?;
     if stdout_trimmed(&shallow_out) != "false" {
         return Ok(PinnedCloneState::Shallow);
     }
 
-    let status_out = run_pinned_git(
+    let status_out = run_pinned_git_ok(
         &canonical,
         &[
             "status",
@@ -702,14 +699,8 @@ pub fn verify_pinned_clone(dest: &Path, commit: &str) -> anyhow::Result<PinnedCl
             "--untracked-files=all",
             "--ignored",
         ],
+        "git status",
     )?;
-    if !status_out.status.success() {
-        anyhow::bail!(
-            "git status failed in {}: {}",
-            canonical.display(),
-            first_line_lossy(&status_out.stderr)
-        );
-    }
     let status = String::from_utf8_lossy(&status_out.stdout);
     if !status.trim().is_empty() {
         let sample = status
@@ -855,6 +846,24 @@ fn checkout_detached(dest: &Path, commit: &str) -> anyhow::Result<bool> {
 /// Run `git -C <dir> <args>` under [`PINNED_LOCAL_TIMEOUT_SECS`].
 fn run_pinned_git(dir: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> {
     run_pinned_git_with_timeout(dir, args, PINNED_LOCAL_TIMEOUT_SECS)
+}
+
+/// [`run_pinned_git`] for a step that must succeed: a non-zero exit is an
+/// error naming `what`, `dir`, and git's first stderr line.
+fn run_pinned_git_ok(
+    dir: &Path,
+    args: &[&str],
+    what: &str,
+) -> anyhow::Result<std::process::Output> {
+    let out = run_pinned_git(dir, args)?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{what} failed in {}: {}",
+            dir.display(),
+            first_line_lossy(&out.stderr)
+        );
+    }
+    Ok(out)
 }
 
 /// Run `git -C <dir> <args>` with stdout/stderr captured, the redirecting
@@ -1210,21 +1219,18 @@ mod tests {
                 &["config", "uploadpack.allowReachableSHA1InWant", "true"],
             );
 
-            std::fs::write(r.join("a.txt"), "one\n").unwrap();
-            fixture_git_ok(r, h, &["add", "a.txt"]);
-            fixture_git_ok(r, h, &["commit", "--quiet", "-m", "first"]);
-            let first = fixture_git_ok(r, h, &["rev-parse", "HEAD"]);
-
-            std::fs::write(r.join("b.txt"), "two\n").unwrap();
-            fixture_git_ok(r, h, &["add", "b.txt"]);
-            fixture_git_ok(r, h, &["commit", "--quiet", "-m", "second"]);
-            let second = fixture_git_ok(r, h, &["rev-parse", "HEAD"]);
+            // Write and commit one file; returns the new HEAD.
+            let commit_file = |name: &str, contents: &str, message: &str| {
+                std::fs::write(r.join(name), contents).unwrap();
+                fixture_git_ok(r, h, &["add", name]);
+                fixture_git_ok(r, h, &["commit", "--quiet", "-m", message]);
+                fixture_git_ok(r, h, &["rev-parse", "HEAD"])
+            };
+            let first = commit_file("a.txt", "one\n", "first");
+            let second = commit_file("b.txt", "two\n", "second");
 
             fixture_git_ok(r, h, &["checkout", "--quiet", "--detach"]);
-            std::fs::write(r.join("c.txt"), "off-branch\n").unwrap();
-            fixture_git_ok(r, h, &["add", "c.txt"]);
-            fixture_git_ok(r, h, &["commit", "--quiet", "-m", "off"]);
-            let off = fixture_git_ok(r, h, &["rev-parse", "HEAD"]);
+            let off = commit_file("c.txt", "off-branch\n", "off");
             fixture_git_ok(r, h, &["update-ref", "refs/pinned/off", &off]);
             fixture_git_ok(r, h, &["checkout", "--quiet", "main"]);
 
