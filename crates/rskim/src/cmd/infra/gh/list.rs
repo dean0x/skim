@@ -178,6 +178,26 @@ fn digits(bytes: &[u8], start: usize, len: usize) -> Option<i64> {
 /// prefix is guarded by a single length check and every other access goes
 /// through `get`. It has no side effects and reads no clock, so it is
 /// deterministic and directly unit-testable against malformed input.
+///
+/// # Lax day-of-month validation, BY DESIGN
+///
+/// The calendar guard is `1..=12` for the month and `1..=31` for the day in
+/// EVERY month, with no per-month table and no February/leap-year case. So
+/// `2026-02-31` and `2026-04-31` are accepted and resolve to a real instant a
+/// few days past the end of that month rather than being rejected. Totality
+/// and boundedness are preserved either way — `days_from_civil` is defined for
+/// any `(y, m, d)` triple — so the laxness costs correctness about WHICH DATES
+/// EXIST, and nothing else.
+///
+/// That is safe here and only here. The single consumer renders the result
+/// through [`format_elapsed`] as a display-only elapsed label next to a GitHub
+/// run, where a value a few days out is a slightly wrong `3d` that no logic
+/// branches on. A per-month table would be cost this caller cannot spend.
+///
+/// **Any reuse outside that display path must add real calendar validation
+/// first** — scheduling, expiry, retention windows, ordering against another
+/// clock, or anything a user or a branch acts on. Read this function as total
+/// and bounded, never as authoritative about the civil calendar.
 fn rfc3339_to_unix_secs(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     // Shortest accepted form is the 20-byte `YYYY-MM-DDTHH:MM:SSZ`. This one

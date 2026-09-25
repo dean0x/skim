@@ -93,7 +93,9 @@ const CONFIG: ToolRunConfig<'static> = ToolRunConfig {
     // by every route including the non-idempotent `gh api`, and `raw_override`
     // is eager — arming it here would cost a second network round trip on every
     // `gh` invocation, including the ones where the guard keeps the compressed
-    // view and the captured bytes are discarded.
+    // view and the captured bytes are discarded.  The re-run is gated twice: by
+    // the route (`route_rerunnable`) and, per invocation, by whether
+    // `prepare_args` actually injected anything.
     skip_net_savings_guard: false,
     synthesize_success_line: None,
     injected_format_flag: None,
@@ -221,6 +223,36 @@ pub(crate) fn run(
 /// would silently start re-running commands the moment a new injection is added
 /// elsewhere.  Keeping the list in lockstep with `list::prepare_args` is the
 /// point: if a `match` arm is added there, add it here.
+///
+/// # This predicate is necessary, not sufficient
+///
+/// Returning `true` buys the route *permission* to re-run, not a re-run.
+/// `execution::should_arm_raw_fallback` adds a second, per-invocation condition:
+/// `prepare_args` must have actually mutated the argv on this call.  So
+/// `gh pr list` is armed while `gh pr list --json number` is not —
+/// `inject_json_fields` leaves the latter alone, the child is already running the
+/// user's own command, and a re-run would be a second network round trip for
+/// bytes that cannot differ.  Condition (1) above is a statement about the route;
+/// the runtime check is the same statement about the *invocation*, which is the
+/// only one that can be exact.
+///
+/// # Why `run list` stays on the list
+///
+/// `gh run list` is the route whose compressed view is most often discarded, so
+/// it is also the route most often paying for a second invocation, and de-arming
+/// it has been proposed on that basis.  It is kept armed deliberately: de-arming
+/// does not remove the second call, it removes the *fidelity fix*.  The route
+/// would still inject `--json <9 fields>` and the guard would still elect raw —
+/// it would simply serve that machine-readable payload to a reader who typed
+/// `gh run list`, which is PF-024's original defect, and its 2026-09-24
+/// amendment names an empty `gh run list` as one of the two instances that
+/// motivated the fix.  Removing the second invocation *and* keeping the user's
+/// bytes requires not injecting for this route at all (a `list::prepare_args`
+/// change, and a capability removal), which needs a measurement of how often the
+/// guard actually elects raw here — the guard's baseline is the verbose injected
+/// JSON, which makes `Keep` more likely than the "unreachable compressed view"
+/// framing assumes.  Until that is measured, the fidelity fix stays and the cost
+/// is bounded by the per-invocation condition above.
 fn route_rerunnable(subcmd: &str, action: &str) -> bool {
     matches!(
         (subcmd, action),
@@ -383,6 +415,11 @@ mod tests {
     /// whether it mutated the argv — not by restating the allow-list — so the
     /// test cannot degenerate into a copy of the code it checks.  Add a `match`
     /// arm to `list::prepare_args` without adding one here and this fails.
+    ///
+    /// This pins the ROUTE-level condition only.  The per-invocation one — did
+    /// `prepare_args` inject on *this* call — lives in
+    /// `execution::should_arm_raw_fallback` and is pinned by
+    /// `arming_requires_an_actual_injection`.
     #[test]
     fn rerunnable_catch_all_routes_are_exactly_the_injecting_ones() {
         let candidates = [

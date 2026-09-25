@@ -52,40 +52,26 @@ pub(crate) enum SavingsDecision {
 /// unified gate (A2).  Keep compressed IFF strictly smaller in BOTH bytes AND
 /// tokens; tie → Passthrough.  See `output/fidelity.rs` for full semantics.
 ///
-/// Charge-nothing: routes through [`crate::output::fidelity::decide`], which
-/// prices the stdout bodies only. See [`savings_decision_with_notice`] for the
-/// entry point that charges the stderr disclosure.
+/// # The command path charges no stderr disclosure
+///
+/// [`crate::output::fidelity::decide`] prices the stdout bodies only, so the
+/// ADR-001 amendment of 2026-09-24 — charge the class-1 disclosure the `Keep`
+/// branch would emit against the decision — is **deliberately not applied on
+/// this path**, rather than pending wiring.
+///
+/// TODO(#519 follow-on): the command path's disclosure accounting is incomplete
+/// in a second, larger way that the ADR-011 egress census already records:
+/// success-line synthesis in this module writes to stdout *after* the guard has
+/// committed, so those bytes sit outside every size accounting.  Charging the
+/// stderr notice here without also closing the stdout hole would produce a
+/// partial accounting that reads as a complete one — worse than the honest gap,
+/// because it removes the reason to look again.  Fix both together or neither:
+/// [`crate::output::fidelity::decide_with_notice`] is the charging gate to reach
+/// for, and a `notice` parameter belongs on this signature only from the commit
+/// that first passes `Some` — not before it.
 pub(crate) fn savings_decision(raw: &str, compressed: &str) -> SavingsDecision {
     use crate::output::fidelity::{FidelityDecision, decide};
     match decide(raw, compressed) {
-        FidelityDecision::Keep => SavingsDecision::Keep,
-        FidelityDecision::Passthrough => SavingsDecision::Passthrough,
-    }
-}
-
-/// [`savings_decision`], charging the stderr disclosure the `Keep` branch would
-/// emit (ADR-001 amendment 2026-09-24).
-///
-/// `notice` is the **differential** cost of choosing compressed — `None`
-/// wherever the raw branch would print a byte-identical notice of its own. See
-/// [`crate::output::fidelity::decide_with_notice`].
-///
-/// TODO(#519 follow-on): every command-path caller passes `None` today, and
-/// that is deliberate rather than pending wiring. The command path's disclosure
-/// accounting is incomplete in a second, larger way that the ADR-011 egress
-/// census already records: success-line synthesis in this module writes to
-/// stdout *after* the guard has committed, so those bytes sit outside every
-/// size accounting. Charging the stderr notice here without also closing the
-/// stdout hole would produce a partial accounting that reads as a complete one
-/// — worse than the honest gap, because it removes the reason to look again.
-/// Fix both together or neither.
-pub(crate) fn savings_decision_with_notice(
-    raw: &str,
-    compressed: &str,
-    notice: Option<&str>,
-) -> SavingsDecision {
-    use crate::output::fidelity::{FidelityDecision, decide_with_notice};
-    match decide_with_notice(raw, compressed, notice) {
         FidelityDecision::Keep => SavingsDecision::Keep,
         FidelityDecision::Passthrough => SavingsDecision::Passthrough,
     }
@@ -645,10 +631,10 @@ pub(crate) struct ParsedCommandConfig<'a> {
 /// which is routinely larger than what they typed.  [`ParsedCommandConfig::raw_override`]
 /// already fixes this by carrying the user's own bytes, but it is **eager**: the
 /// bytes must exist when the config is built, so arming it costs a second
-/// invocation on *every* call — for `gh`, a second network round trip — while
-/// the guard keeps the compressed view (and discards those bytes) almost every
-/// time.  That is the trade `cmd/git/status.rs` accepts for a local `git`
-/// process and it does not transfer to a remote API.
+/// invocation on *every* call — for `gh`, a second network round trip — including
+/// the calls where the guard keeps the compressed view and those bytes are
+/// discarded unread.  That is the trade `cmd/git/status.rs` accepts for a local
+/// `git` process and it does not transfer to a remote API.
 ///
 /// `RawFallback` defers the cost instead.  Constructing one only copies argv;
 /// the child is spawned by [`RawFallback::resolve`], whose single call site is
@@ -661,22 +647,56 @@ pub(crate) struct ParsedCommandConfig<'a> {
 /// The guard's *baseline* and the `SKIM_PASSTHROUGH=1` hatch deliberately do
 /// **not** consult this type.  Both run on every invocation, so reading it there
 /// would reinstate the eager cost this type exists to avoid.  A handler that
-/// wants the user's bytes on those two paths must pay for `raw_override`.
+/// wants the user's bytes on those two paths must pay for `raw_override`.  The
+/// consequence — the guard measures one artifact and the `Passthrough` arm may
+/// serve another — is discharged at that arm, which re-pairs the analytics row
+/// and the exit status with the body it serves and discloses the substitution
+/// rather than letting it read as measured (PF-024 amendment 2026-09-25).
 ///
-/// # Only for read-only / idempotent commands
+/// # Caller obligations
 ///
-/// `resolve` re-executes what the user typed.  Arm it only where running the
-/// command twice is indistinguishable from running it once — never for a
-/// command that creates, mutates or deletes anything, and never for a generic
-/// escape hatch like `gh api`, which issues whatever HTTP method its caller
-/// asked for.
+/// Four.  The first three are properties of the *command* or of the surrounding
+/// config, so no field on this type can carry them:
 ///
-/// # PF-021
+/// 1. **Read-only / idempotent.** `resolve` re-executes what the user typed.
+///    Arm it only where running the command twice is indistinguishable from
+///    running it once — never for a command that creates, mutates or deletes
+///    anything, and never for a generic escape hatch like `gh api`, which issues
+///    whatever HTTP method its caller asked for.
 ///
-/// `resolve` buffers the child's output rather than streaming it.  That is
-/// sound here only because its consumer ([`emit_raw_passthrough`]) buffers the
-/// body anyway — the bytes are measured and written whole.  Do not reuse this
-/// type on a streaming sink.
+/// 2. **Something was actually injected.** When `prepare_args` leaves the argv
+///    alone — every `inject_json_fields` caller does when the user supplied
+///    `--json` themselves — the child already ran the user's own command, so
+///    `output.stdout` *is* their bytes and a re-run would spawn an identical
+///    command for nothing.  [`run_tool_inner`] enforces this by comparing the
+///    argv before and after `prepare_args`, not by trusting the route opt-in.
+///
+/// 3. **`forward_stderr: false`.** `resolve` returns the re-run's stdout and
+///    drops its stderr, which is never read on any path.  A `forward_stderr:
+///    true` family would therefore forward the *injected* run's diagnostics
+///    beside the *re-run's* body — two invocations' output presented as one, on
+///    the single branch that exists to show the user their own command.
+///    [`run_tool_inner`] carries a `debug_assert!` for this; pair the two
+///    streams before lifting it.
+///
+/// 4. **Not a streaming sink** (PF-021).  `resolve` buffers the child's output
+///    rather than streaming it.  That is sound only because its consumer
+///    ([`emit_raw_passthrough`]) buffers the body anyway — the bytes are measured
+///    and written whole.
+///
+/// # ANSI normalisation mirrors the primary path
+///
+/// The primary path rebinds `output` through [`crate::output::strip_ansi_cow`]
+/// on both streams unless [`ParsedCommandConfig::skip_ansi_strip`] is set.  A
+/// `resolve` that stripped nothing would put escape sequences in front of the
+/// reader on the `Passthrough` branch and nowhere else — a control that holds on
+/// one branch of the guard only, which PF-012 records as no control at all, and
+/// PF-006's tab-delimited parsers depend on the two branches agreeing.  The
+/// [`RawFallback::skip_ansi_strip`] field therefore mirrors the config flag and
+/// `resolve` applies the same rule.  It is a no-op for `gh` today
+/// (`skip_ansi_strip: true`, so both branches are un-stripped and already
+/// symmetric); the field exists so the symmetry survives the first family that
+/// sets it `false`.
 pub(crate) struct RawFallback<'a> {
     program: &'a str,
     /// The user's argv, captured **before** `prepare_args` injected anything.
@@ -686,6 +706,26 @@ pub(crate) struct RawFallback<'a> {
     /// tool uses as a wire protocol (e.g. `gh` exit 8 for pending checks) is
     /// still accepted as the user's output.
     expected_exit_codes: &'a [i32],
+    /// Mirrors [`ParsedCommandConfig::skip_ansi_strip`] so the re-run's bytes are
+    /// normalised exactly as the primary path normalises its own.  See the
+    /// type-level "ANSI normalisation" section.
+    skip_ansi_strip: bool,
+}
+
+/// What a resolved [`RawFallback`] hands back: the user's own command's stdout
+/// plus the exit code of the invocation that produced it.
+///
+/// The exit code travels *with* the bytes because the caller reports one status
+/// for one body.  The guard's `Passthrough` arm already holds a code derived
+/// from the injected run, and a `gh run list` whose runs changed state between
+/// the two calls would otherwise let the reported status and the visible text
+/// come from different invocations.
+struct ResolvedRaw {
+    /// The user's own command's stdout, normalised per
+    /// [`RawFallback::skip_ansi_strip`].
+    stdout: String,
+    /// The re-run's own exit code — `None` on a signal kill, as everywhere else.
+    exit_code: Option<i32>,
 }
 
 impl<'a> RawFallback<'a> {
@@ -695,31 +735,57 @@ impl<'a> RawFallback<'a> {
         args: &[String],
         env_overrides: &'a [(&'a str, &'a str)],
         expected_exit_codes: &'a [i32],
+        skip_ansi_strip: bool,
     ) -> Self {
         Self {
             program,
             args: args.to_vec(),
             env_overrides,
             expected_exit_codes,
+            skip_ansi_strip,
         }
     }
 
-    /// Run the user's literal command and return its stdout.
+    /// Run the user's literal command and return its stdout plus its exit code.
     ///
     /// Returns `None` when the re-run cannot stand in for the first one — spawn
     /// failure, or an exit the tool's parser was never designed for
     /// ([`ExitDisposition::UnexpectedFailure`]).  The caller then falls back to
-    /// the injected command's stdout, which is the pre-fix behaviour: worse
-    /// fidelity, but never *less* output than before (#317).
+    /// the injected command's stdout, which is the pre-fix behaviour — worse
+    /// fidelity, but never *less* output than before (#317) — and discloses that
+    /// substitution unconditionally, because the reader is then shown something
+    /// *different* from raw (ADR-011 class 1).
+    ///
+    /// **Both `None` paths log their reason.** The spawn failure used to be
+    /// `.ok()?`: silent at every verbosity, while the sibling unexpected-exit
+    /// path below was logged — so the one failure mode that silently reinstates
+    /// the fidelity defect this type exists to prevent was the one nothing
+    /// recorded.  PF-038: the log names the [`io::ErrorKind`] and the real OS
+    /// error and advertises no install hint — the tool plainly exists, the same
+    /// argv having just been run, and an agent shell can supply a tool as a
+    /// function with no execvp-reachable binary behind it.
     ///
     /// An empty stdout on an accepted exit is a real answer — an empty
-    /// `gh run list` prints nothing — and is returned as `Some("")`.
-    fn resolve(&self) -> Option<String> {
+    /// `gh run list` prints nothing — and is returned as an empty
+    /// [`ResolvedRaw::stdout`], not as `None`.
+    fn resolve(&self) -> Option<ResolvedRaw> {
         let runner = CommandRunner::new();
         let arg_refs: Vec<&str> = self.args.iter().map(String::as_str).collect();
-        let out = runner
-            .run_with_env(self.program, &arg_refs, self.env_overrides)
-            .ok()?;
+        let out = match runner.run_with_env(self.program, &arg_refs, self.env_overrides) {
+            Ok(out) => out,
+            Err(e) => {
+                crate::debug_log!(
+                    "[skim] raw fallback: re-running `{}` could not be spawned{}: {:#}; \
+                     emitting the injected command's output instead",
+                    self.program,
+                    spawn_error_kind(&e)
+                        .map(|kind| format!(" ({kind:?})"))
+                        .unwrap_or_default(),
+                    e
+                );
+                return None;
+            }
+        };
         if classify_exit(out.exit_code, self.expected_exit_codes)
             == ExitDisposition::UnexpectedFailure
         {
@@ -731,7 +797,32 @@ impl<'a> RawFallback<'a> {
             );
             return None;
         }
-        Some(out.stdout)
+        // Mirror the primary path's normalisation — see the type-level "ANSI
+        // normalisation" section for why the two branches must agree.
+        let stdout = if self.skip_ansi_strip {
+            out.stdout
+        } else {
+            crate::output::strip_ansi_cow(&out.stdout).into_owned()
+        };
+        Some(ResolvedRaw {
+            stdout,
+            exit_code: out.exit_code,
+        })
+    }
+}
+
+/// The [`io::ErrorKind`] behind a spawn failure, when `err` is one.
+///
+/// PF-038: spawn errors must be mapped by KIND — `NotFound` is the only kind that
+/// may advertise an install hint, and every other kind (`PermissionDenied`,
+/// `IsADirectory`, …) must surface the real OS error instead of a fixed
+/// "not installed" message.  Returns `None` for the non-spawn
+/// [`crate::runner::RunnerError`] variants (pipe capture, reader panic, I/O),
+/// whose own `Display` already names the condition.
+fn spawn_error_kind(err: &anyhow::Error) -> Option<io::ErrorKind> {
+    match err.downcast_ref::<crate::runner::RunnerError>()? {
+        crate::runner::RunnerError::SpawnFailed { source, .. } => Some(source.kind()),
+        _ => None,
     }
 }
 
@@ -930,19 +1021,22 @@ fn passthrough_raw(output: &CommandOutput) -> anyhow::Result<ExitCode> {
 /// # Why the escape hatch is the sink that most needed this
 ///
 /// The buffered form is downstream of `obtain_output` → `CommandRunner::run_with_env`
-/// → `runner::read_pipe`, which past [`crate::runner::MAX_OUTPUT_BYTES`] returns
-/// `Err("output exceeded … byte limit")` and **discards the entire accumulated
-/// buffer** — a genuine zero-output path.  `SKIM_PASSTHROUGH=1` shared it, so the
-/// documented remedy for "skim hid my output" returned *nothing at all* past
-/// 64 MiB.  That is the worst possible failure mode for an escape hatch: it is
-/// what a user runs precisely *because* compressed output hid something.
-/// Measured before this change on a 70 MiB producer: 0 bytes delivered, exit 1,
-/// `Error: output exceeded 67108864 byte limit`.
+/// → `runner::read_pipe_degrade`, which **caps** stdout at
+/// [`crate::runner::MAX_OUTPUT_BYTES`]: the bytes that fit are returned and an
+/// unconditional ADR-011 class-1 marker names the exact kept count.
+/// `SKIM_PASSTHROUGH=1` shares that ceiling, so the documented remedy for
+/// "skim hid my output" still stops at 64 MiB — disclosed, but stopped.  That
+/// lands hardest on an escape hatch: it is what a user runs precisely *because*
+/// compressed output hid something.  It was strictly worse before the degrade
+/// path, when `runner::read_pipe` returned `Err("output exceeded … byte
+/// limit")` and **discarded the entire accumulated buffer** — a genuine
+/// zero-output path.  Measured then, on a 70 MiB producer: 0 bytes delivered,
+/// exit 1, `Error: output exceeded 67108864 byte limit`.
 ///
 /// The pump has no ceiling at all (memory is O(chunk)), so the escape hatch is
-/// now lossless by construction rather than by an ADR-002-style degrade branch.
-/// It also fixes the lossy UTF-8 decode in `read_pipe`, which turned non-UTF-8
-/// tool bytes into U+FFFD, and the buffered latency that made
+/// lossless by construction rather than by a disclosed cap.  It also avoids the
+/// lossy UTF-8 decode both buffered readers perform, which turns non-UTF-8 tool
+/// bytes into U+FFFD, and the buffered latency that made
 /// `SKIM_PASSTHROUGH=1 skim find … | head` wait for the whole scan.
 ///
 /// # Exit contract
@@ -1124,7 +1218,7 @@ fn record_and_report(report: RecordReport<'_>) {
     // The common path (show_stats=false) is unchanged: token counting is deferred to
     // the background thread via try_record_command.
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&original_stdout, &compressed);
+        let (orig, comp) = crate::tokens::count_token_pair(&original_stdout, &compressed);
         crate::process::report_token_stats(orig, comp, "");
         if let (Some(raw_tokens), Some(comp_tokens)) = (orig, comp) {
             crate::analytics::try_record_command_with_counts(
@@ -1277,10 +1371,14 @@ where
             None => {
                 // Loss-bearing: the process was killed mid-write, so stdout may be
                 // partial.  Unconditional per ADR-011 — signal kill is data-loss class,
-                // not a lossless banner.  Carries the SKIM_PASSTHROUGH=1 hint so the
-                // agent can observe the discrepancy and request the full stream.
+                // not a lossless banner.  The remedy is interpolated from
+                // `ELISION_HINT` rather than spelled out: that constant is the
+                // single source of truth for every class-1 marker's escape
+                // hatch, and this site said "for raw output" where the constant
+                // says "for full output".
                 eprintln!(
-                    "[skim] {program} killed by signal; output may be partial — SKIM_PASSTHROUGH=1 for raw output"
+                    "[skim] {program} killed by signal; output may be partial — {}",
+                    crate::output::ELISION_HINT
                 );
             }
         }
@@ -1367,12 +1465,23 @@ where
     let _ = result.emit_markers(&mut io::stderr().lock());
     // max(child, derived): the stdin path fabricates child exit 0, so a
     // parser-derived failure code (e.g. cargo fail count > 0) wins (#317).
-    let code = output
-        .exit_code
-        .unwrap_or(1)
-        .max(derive_exit(&result).unwrap_or(0));
+    let derived_exit = derive_exit(&result).unwrap_or(0);
+    // `mut`: when the guard's `Passthrough` arm serves a RE-RUN's bytes instead
+    // of this child's, the status is re-paired with the invocation whose bytes
+    // the reader actually received.  See that arm.
+    let mut code = output.exit_code.unwrap_or(1).max(derived_exit);
     let label = format_analytics_label(family, program, &args.join(" "));
     let tier_name = result.tier_name();
+
+    // The raw artifact that corresponds to the bytes actually served, when that
+    // is NOT this child's stdout.  `None` means "served `output.stdout`", so the
+    // analytics row keeps using it.  Written only by the guard's `Passthrough`
+    // arm, and only when it substitutes a pre-captured or re-run body: the row
+    // must then compare the SERVED bytes against themselves and record a
+    // truthful 0, because a `raw_tokens`/`compressed_tokens` pair taken from two
+    // different commands' outputs is not a savings ratio at all (PF-024
+    // amendment 2026-09-25, consequence (1)).
+    let mut served_raw: Option<String> = None;
 
     // Net-savings guard (Cluster C / #317):
     // Serialize first without writing, so we can apply savings_decision
@@ -1437,13 +1546,20 @@ where
         // against what the user's literal command would have produced — so an
         // "expansion" relative to the user's command could pass the guard while
         // a genuine "compression" could fail it.
+        //
+        // `raw_fallback` is deliberately NOT consulted here.  Resolving it spawns
+        // the user's command (for `gh`, a second network round trip) and this
+        // guard runs on every invocation, so reading it here would reinstate the
+        // eager cost that type exists to defer.  The consequence — the baseline
+        // is this child's stdout while the `Passthrough` arm may serve another
+        // command's — is discharged on that arm rather than swept under this one.
         let guard_raw: &str = raw_override.as_deref().unwrap_or(&output.stdout);
-        // ADR-001 amendment 2026-09-24: the uniform `_with_notice` signature is
-        // shipped here, but the command path deliberately charges nothing yet —
-        // see `savings_decision_with_notice` for why a stderr-only charge would
-        // make this accounting look complete while the success-line stdout hole
-        // (ADR-011 census) is still open.
-        match savings_decision_with_notice(guard_raw, &compressed_str, None) {
+        // ADR-001 amendment 2026-09-24: the command path deliberately charges no
+        // stderr disclosure against this decision — see `savings_decision` for
+        // why a stderr-only charge would make a partial accounting read as a
+        // complete one while the success-line stdout hole (ADR-011 census) is
+        // still open.
+        match savings_decision(guard_raw, &compressed_str) {
             SavingsDecision::Keep => {
                 if write_to_stdout(&compressed_str)? == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
@@ -1461,27 +1577,90 @@ where
                 // PF-024: this is the ONE place `RawFallback` is resolved.  The
                 // guard has already elected to discard the compressed view, so
                 // the second run is paid only when its bytes are what the reader
-                // gets.  Its output is emitted verbatim — no ANSI strip — because
-                // these bytes ARE what the user's own terminal would have
-                // received; stripping them would make the "fallback" a third
-                // thing, neither compressed nor raw (#317).
+                // gets.  `resolve` normalises those bytes by the same
+                // `skip_ansi_strip` rule the primary path applied to its own, so
+                // the two branches of this guard cannot disagree about escape
+                // sequences (PF-012's shape, PF-006's consequence).
                 //
                 // Precedence: pre-captured bytes first (already paid for), then
                 // the deferred re-run, then the injected command's stdout.
-                let rerun: Option<String> = if raw_override.is_some() {
+                let rerun: Option<ResolvedRaw> = if raw_override.is_some() {
                     None
                 } else {
                     raw_fallback.as_ref().and_then(|f| f.resolve())
                 };
                 let emit_raw: &str = raw_override
                     .as_deref()
-                    .or(rerun.as_deref())
+                    .or(rerun.as_ref().map(|r| r.stdout.as_str()))
                     .unwrap_or(&output.stdout);
-                let (tier, status) = emit_raw_passthrough(emit_raw)?;
+
+                // MEASURE-ONE / SERVE-ANOTHER, handled where it happens (PF-024
+                // amendment 2026-09-25, consequence (1)).  `guard_raw` above is
+                // this child's stdout — the output of the argv skim INJECTED —
+                // while `emit_raw` may be a different command's.  ADR-001 bounds
+                // over-emission for the artifact it measured and for no other, so
+                // a substituted body is neither claimed as measured nor booked as
+                // a saving: `served_raw` re-points the analytics row at the bytes
+                // actually served, and the code below re-points the exit status.
+                if let Some(ref resolved) = rerun {
+                    // ADR-011 class 2 — a debug-gated BANNER, not a marker.  The
+                    // reader is getting their OWN command's output, so nothing is
+                    // lost and nothing differs from raw; what this discloses is an
+                    // ACCOUNTING gap — these bytes were never compared against the
+                    // compressed view the guard rejected — and an unconditional
+                    // notice on a lossless path is exactly the context tax ADR-011
+                    // gates.
+                    crate::debug_log!(
+                        "[skim] {program}: serving the re-run of your own argv (exit {:?}); \
+                         these bytes were not measured against the compressed view the \
+                         guard rejected.",
+                        resolved.exit_code
+                    );
+                    // `code` came from the invocation whose bytes were just
+                    // discarded.  Re-pair it with the invocation that supplied the
+                    // body, so a `gh run list` whose runs changed state between the
+                    // two calls cannot report one run's status over the other run's
+                    // text.  `raw_override` needs no pairing: those bytes were
+                    // captured by the handler, not produced by a second child here.
+                    code = resolved.exit_code.unwrap_or(1).max(derived_exit);
+                }
+                if raw_override.is_none() && raw_fallback.is_some() && rerun.is_none() {
+                    // ADR-011 class 1 — UNCONDITIONAL.  A fallback was owed and
+                    // could not be produced, so the reader is served the output of
+                    // the argv skim synthesised: not *less* than raw, but plainly
+                    // DIFFERENT from what the command they typed prints, which is
+                    // the half of ADR-011's test a debug-gated banner may not
+                    // cover.  (Before this branch existed the same substitution
+                    // happened with no notice at any verbosity.)  No count is
+                    // carried because nothing was elided — a different artifact
+                    // was served — so the marker names the class instead, as the
+                    // ADR-008 transparency marker does.
+                    //
+                    // The remedy is NOT `SKIM_PASSTHROUGH=1`: on an injecting
+                    // handler the hatch streams the INJECTED argv (PF-024), so it
+                    // would hand back the very artifact this line warns about, and
+                    // ADR-011 forbids advertising a hatch the invocation printing
+                    // it cannot use.  `remedy_for`'s narrow arm is the right shape
+                    // but is keyed on `OutputFormat::Json`; until it is widened to
+                    // cover "the hatch reproduces the wrong command", this literal
+                    // is the only remedy that is true here.
+                    eprintln!(
+                        "[skim] {program}: serving the output of the argv skim injected, \
+                         not of the `{program}` command you typed — the re-run that would \
+                         have produced your own bytes did not run (SKIM_DEBUG=1 for the \
+                         reason); run '{program}' directly for your own command's output"
+                    );
+                }
+
+                let served = emit_raw.to_owned();
+                if raw_override.is_some() || rerun.is_some() {
+                    served_raw = Some(served.clone());
+                }
+                let (tier, status) = emit_raw_passthrough(&served)?;
                 if status == StdoutStatus::PipeClosed {
                     return Ok(pipe_closed_exit());
                 }
-                (emit_raw.to_owned(), tier)
+                (served, tier)
             }
         }
     } else {
@@ -1528,7 +1707,11 @@ where
         show_stats,
         code,
         program,
-        original_stdout: output.stdout,
+        // The raw side of the row is the artifact that was SERVED, which is
+        // `output.stdout` unless the guard substituted a pre-captured or re-run
+        // body — in which case raw == compressed and the row records a truthful
+        // 0 instead of a ratio between two different commands' outputs.
+        original_stdout: served_raw.unwrap_or(output.stdout),
         compressed,
         rec,
         tier_name: effective_tier,
@@ -1697,6 +1880,31 @@ where
     run_tool_inner(config, args, ctx, prepare_args, parse_fn, false)
 }
 
+/// Whether the ADR-001 raw fallback should be armed for this invocation.
+///
+/// Two independent conditions, and both are necessary:
+///
+/// - `rerunnable` — the ROUTE's idempotence opt-in ([`run_tool_rerunnable`]).  A
+///   command that creates, mutates or deletes anything is never re-run to improve
+///   a display, whatever `prepare_args` did to its argv.
+/// - `prepared_args != user_args` — `prepare_args` actually injected something on
+///   THIS call.  When it did not (every `inject_json_fields` caller leaves the
+///   argv alone once the user supplied `--json` themselves), the child is about
+///   to run the command the user typed, so its stdout already *is* their bytes
+///   and a re-run would spawn an identical command — for `gh`, a second network
+///   round trip that cannot change a single byte of what the reader receives.
+///
+/// A pure predicate so the second condition is testable without a live command:
+/// the route opt-in is a static allow-list that a test can restate, but "did this
+/// invocation inject?" is a property of the argv pair and nothing else.
+fn should_arm_raw_fallback(
+    rerunnable: bool,
+    user_args: &[String],
+    prepared_args: &[String],
+) -> bool {
+    rerunnable && prepared_args != user_args
+}
+
 /// [`run_tool`] for a **read-only** route whose `prepare_args` injects a
 /// content-changing flag.
 ///
@@ -1708,7 +1916,13 @@ where
 /// tool, and `gh`'s single `CONFIG` serves both read-only and non-idempotent
 /// routes.
 ///
-/// **Caller obligation:** the command must be idempotent.  See [`RawFallback`].
+/// Calling this is a *permission*, not an instruction: `run_tool_inner` arms the
+/// fallback only when `prepare_args` actually mutated the argv for this
+/// invocation, so a route the user already steered (`gh pr list --json …`) pays
+/// for no second run even though it opted in here.
+///
+/// **Caller obligations:** the command must be idempotent, and the config must
+/// leave `forward_stderr` false.  See [`RawFallback`] for all four.
 pub(crate) fn run_tool_rerunnable<T>(
     config: ToolRunConfig<'_>,
     args: &[String],
@@ -1750,19 +1964,39 @@ where
         (None, _) => None,
     };
 
-    // Capture the user's argv BEFORE `prepare_args` injects anything.  Nothing
-    // is executed here — `RawFallback` holds the command, it does not run it.
-    let raw_fallback = rerunnable.then(|| {
+    let mut cmd_args = args.to_vec();
+    prepare_args(&mut cmd_args);
+
+    // Arm the ADR-001 raw fallback only where a second invocation can change
+    // what the reader gets.  `rerunnable` is the route's idempotence opt-in; the
+    // argv comparison is the second, independent condition (obligation 2 on
+    // `RawFallback`): when `prepare_args` left the argv alone — every
+    // `inject_json_fields` caller does when the user passed `--json` themselves —
+    // the child is about to run the command the user typed, so `output.stdout`
+    // already IS their bytes and a re-run would spawn an identical command for
+    // nothing.  PF-024's 2026-09-25 amendment: do not pay for bytes that cannot
+    // differ from the ones already in hand.
+    //
+    // Nothing is executed here.  `RawFallback` copies the user's argv (untouched
+    // by `prepare_args`, which mutates the `cmd_args` clone) and holds it.
+    debug_assert!(
+        !(rerunnable && config.forward_stderr),
+        "{}: run_tool_rerunnable with forward_stderr — `RawFallback::resolve` \
+         returns only the re-run's stdout, so the injected run's stderr would be \
+         forwarded beside the re-run's body (two invocations presented as one). \
+         Pair the streams before arming this combination.",
+        config.program
+    );
+    let raw_fallback = should_arm_raw_fallback(rerunnable, args, &cmd_args).then(|| {
         RawFallback::new(
             config.program,
             args,
             config.env_overrides,
             config.expected_exit_codes,
+            config.skip_ansi_strip,
         )
     });
 
-    let mut cmd_args = args.to_vec();
-    prepare_args(&mut cmd_args);
     let use_stdin = should_read_stdin(args);
     run_parsed_command_with_fallback(
         ParsedCommandConfig {
@@ -2875,8 +3109,25 @@ mod tests {
     // ========================================================================
 
     #[cfg(unix)]
+    fn sh_fallback_with<'a>(
+        script: &str,
+        expected: &'a [i32],
+        skip_ansi_strip: bool,
+    ) -> RawFallback<'a> {
+        RawFallback::new(
+            "sh",
+            &["-c".to_string(), script.to_string()],
+            &[],
+            expected,
+            skip_ansi_strip,
+        )
+    }
+
+    /// `skip_ansi_strip: true` is what `gh`'s `CONFIG` sets — the only production
+    /// caller today — so the unqualified helper exercises the shape that ships.
+    #[cfg(unix)]
     fn sh_fallback<'a>(script: &str, expected: &'a [i32]) -> RawFallback<'a> {
-        RawFallback::new("sh", &["-c".to_string(), script.to_string()], &[], expected)
+        sh_fallback_with(script, expected, true)
     }
 
     /// The whole point of the type: constructing it must not run anything.
@@ -2909,7 +3160,10 @@ mod tests {
     #[test]
     fn raw_fallback_returns_the_user_commands_stdout() {
         let fallback = sh_fallback("printf 'user bytes\\n'", &[]);
-        assert_eq!(fallback.resolve().as_deref(), Some("user bytes\n"));
+        assert_eq!(
+            fallback.resolve().map(|r| r.stdout).as_deref(),
+            Some("user bytes\n")
+        );
     }
 
     /// Empty output on a clean exit is a real answer — an empty `gh run list`
@@ -2919,7 +3173,7 @@ mod tests {
     #[test]
     fn raw_fallback_accepts_an_empty_but_successful_run() {
         let fallback = sh_fallback("exit 0", &[]);
-        assert_eq!(fallback.resolve().as_deref(), Some(""));
+        assert_eq!(fallback.resolve().map(|r| r.stdout).as_deref(), Some(""));
     }
 
     /// An exit the tool's parser was never designed for means the re-run is not
@@ -2929,9 +3183,8 @@ mod tests {
     #[test]
     fn raw_fallback_declines_an_unexpected_exit() {
         let fallback = sh_fallback("printf partial; exit 3", &[]);
-        assert_eq!(
-            fallback.resolve(),
-            None,
+        assert!(
+            fallback.resolve().is_none(),
             "an unexpected exit must not become the served body"
         );
     }
@@ -2942,13 +3195,104 @@ mod tests {
     #[test]
     fn raw_fallback_accepts_an_expected_nonzero_exit() {
         let fallback = sh_fallback("printf 'pending\\n'; exit 8", &[8]);
-        assert_eq!(fallback.resolve().as_deref(), Some("pending\n"));
+        assert_eq!(
+            fallback.resolve().map(|r| r.stdout).as_deref(),
+            Some("pending\n")
+        );
     }
 
     /// A missing binary cannot produce the user's output either.
     #[test]
     fn raw_fallback_declines_when_the_program_is_missing() {
-        let fallback = RawFallback::new("skim-no-such-program-b7f1", &[], &[], &[]);
-        assert_eq!(fallback.resolve(), None);
+        let fallback = RawFallback::new("skim-no-such-program-b7f1", &[], &[], &[], true);
+        assert!(fallback.resolve().is_none());
+    }
+
+    /// PF-012 / PF-006: the guard's `Passthrough` branch must normalise the
+    /// re-run's bytes exactly as the primary path normalised its own, or escape
+    /// sequences reach the reader on one branch of the guard and nowhere else.
+    ///
+    /// `gh` sets `skip_ansi_strip: true`, so today the mirror is a no-op on every
+    /// production route — which is precisely why it needs a test: without one the
+    /// asymmetry would ship invisibly with the first family that sets it `false`.
+    #[cfg(unix)]
+    #[test]
+    fn raw_fallback_mirrors_the_configs_ansi_strip() {
+        // The ESC bytes are literal in the argv rather than `printf` octal
+        // escapes, so the fixture does not depend on any shell's `printf`
+        // supporting `\033`.
+        let script = "printf 'a\u{1b}[31mb\u{1b}[0m\\n'";
+
+        let kept = sh_fallback_with(script, &[], true)
+            .resolve()
+            .expect("a clean exit must resolve")
+            .stdout;
+        assert!(
+            kept.contains('\u{1b}'),
+            "skip_ansi_strip: true must return the child's bytes untouched, as \
+             the primary path leaves its own: {kept:?}"
+        );
+
+        let stripped = sh_fallback_with(script, &[], false)
+            .resolve()
+            .expect("a clean exit must resolve")
+            .stdout;
+        assert_eq!(
+            stripped, "ab\n",
+            "skip_ansi_strip: false must strip, matching what the primary path \
+             did to `output.stdout` before the guard compared it"
+        );
+    }
+
+    /// The served body and the reported status must come from the SAME
+    /// invocation.  The guard's `Passthrough` arm re-pairs `code` with this
+    /// value, so a re-run whose exit differs from the injected run's cannot leave
+    /// one invocation's status in front of another invocation's text.
+    #[cfg(unix)]
+    #[test]
+    fn raw_fallback_carries_the_re_runs_own_exit_code() {
+        let resolved = sh_fallback("printf 'pending\\n'; exit 8", &[8])
+            .resolve()
+            .expect("an expected non-zero exit is a real answer");
+        assert_eq!(resolved.stdout, "pending\n");
+        assert_eq!(
+            resolved.exit_code,
+            Some(8),
+            "the exit code must travel with the bytes it produced"
+        );
+    }
+
+    // ========================================================================
+    // should_arm_raw_fallback — the per-invocation arming condition
+    // ========================================================================
+
+    fn owned_argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A second invocation can only change what the reader gets when
+    /// `prepare_args` actually injected something.  `gh pr list` injects and is
+    /// armed; the same route with the user's own `--json` is not, because
+    /// `inject_json_fields` leaves that argv alone — so the re-run would spawn a
+    /// command identical to the one whose bytes are already in hand.
+    #[test]
+    fn arming_requires_an_actual_injection() {
+        let user = owned_argv(&["pr", "list"]);
+        let injected = owned_argv(&["pr", "list", "--json", "number,title"]);
+        assert!(should_arm_raw_fallback(true, &user, &injected));
+        assert!(
+            !should_arm_raw_fallback(true, &user, &user),
+            "an un-mutated argv means the child is about to run the user's own \
+             command; a re-run would be a second round trip for the same bytes"
+        );
+    }
+
+    /// The route opt-in stays necessary: a non-idempotent route is never armed,
+    /// however much `prepare_args` injected into it.
+    #[test]
+    fn arming_requires_the_route_opt_in() {
+        let user = owned_argv(&["pr", "create", "--fill"]);
+        let injected = owned_argv(&["pr", "create", "--fill", "--json", "number"]);
+        assert!(!should_arm_raw_fallback(false, &user, &injected));
     }
 }
