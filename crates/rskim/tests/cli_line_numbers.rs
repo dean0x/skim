@@ -1031,12 +1031,12 @@ fn test_line_numbers_pseudo_python_def_signatures_get_prefix() {
     // Line 4:     return len(b)
     //
     // The heavily-annotated functions from line 5 on exist only to pay for the
-    // 90 B / 24 t pseudo marker the ADR-001 guard charges. Python pseudo keeps
+    // 128 B / 32 t pseudo marker the ADR-001 guard charges. Python pseudo keeps
     // bodies, so annotation mass is the only saving available, and the original
     // four-line file managed 10 B / 4 t — the guard served raw, so `def foo(a)`
     // (the STRIPPED spelling) never appeared and the lookup returned None.
     // They are appended AFTER line 4 so the asserted positions 1 and 3 are
-    // unchanged. Measured: raw 613 B / 155 t → 230 B / 65 t, margin +293 B / +66 t.
+    // unchanged. Measured: raw 613 B / 155 t → 230 B / 65 t, margin +255 B / +58 t.
     std::fs::write(
         &file,
         r#"def foo(a: int) -> str:

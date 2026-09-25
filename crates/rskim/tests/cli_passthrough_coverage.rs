@@ -51,7 +51,7 @@ fn passthrough_skim() -> assert_cmd::Command {
 //
 //     Keep  iff  compressed + marker < raw   (in BOTH bytes and cl100k tokens)
 //
-// The previous fixtures here were 90-122 B — smaller than the 76-90 B markers
+// The previous fixtures here were 90-122 B — smaller than the 76-128 B markers
 // they were meant to trigger — so the guard served raw (losslessly and
 // correctly) and no marker fired. These are sized to clear it with >=2x margin.
 // `skim()` above removes `SKIM_REWRITTEN_FROM`, so both are direct-origin.
@@ -62,7 +62,7 @@ fn passthrough_skim() -> assert_cmd::Command {
 /// density, not from body removal.
 ///
 /// Measured: raw 827 B / 179 t → pseudo 344 B / 77 t = saving 483 B / 102 t;
-/// margin +393 B / +78 t against the 90 B / 24 t direct marker (4.4x / 3.3x).
+/// margin +355 B / +70 t against the 128 B / 32 t direct marker (3.8x / 3.2x).
 const PSEUDO_FIXTURE: &str = r#"@Injectable({ scope: "singleton" })
 @Controller("/orders")
 export class OrderService {

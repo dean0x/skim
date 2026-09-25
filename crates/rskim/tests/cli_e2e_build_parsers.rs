@@ -94,14 +94,39 @@ fn test_cargo_no_subcmd_shows_help() {
 // Make: dispatch + help
 // ============================================================================
 
+/// Is `make` runnable here?  Fails the test outright when it is missing from an
+/// environment that is supposed to have it.
+///
+/// A bare `return` in a `#[test]` is recorded as **PASS**, so a tool-presence
+/// guard is a silent-pass branch: the case disappears from the suite and the
+/// report still reads green.  That is tolerable on a developer box without
+/// `make`, and not tolerable in CI, where every runner image skim's workflows
+/// use ships `make` — there, an absence is an environment fault to surface, not
+/// a portability case to absorb.
+///
+/// `CI` is the standard marker set by GitHub Actions (and by every other runner
+/// skim is exercised on), so it is what decides which of the two this is.
+fn make_is_available() -> bool {
+    if StdCommand::new("make").arg("--version").output().is_ok() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "`make` is not installed, but CI is set — the runner image is expected \
+         to provide it.  Skipping here would record this case as a silent PASS."
+    );
+    eprintln!("skipping: make not installed (local run; set CI=1 to make this fatal)");
+    false
+}
+
 #[test]
 fn test_build_make_dispatches_through_build_module() {
     // `skim make --help` is intercepted before spawning the real `make` binary,
-    // so this test is portable even on systems without `make` installed.
-    // The guard below documents that intent and protects against future changes
-    // that might remove the --help short-circuit.
-    if StdCommand::new("make").arg("--version").output().is_err() {
-        eprintln!("skipping: make not installed");
+    // so this case does not itself need `make` on a developer box.  The guard
+    // below documents that intent and protects against future changes that might
+    // remove the --help short-circuit; it is strict under CI for the reason on
+    // `make_is_available`, where `make` is part of the image.
+    if !make_is_available() {
         return;
     }
     skim_cmd().args(["make", "--help"]).assert().success();
@@ -118,8 +143,7 @@ fn test_build_make_real_execution_success() {
     // compressed "OK warnings: 0 errors: 0" is strictly smaller (fewer tokens)
     // than the raw output, so the net-savings guard keeps the compressed form.
     // This preserves the "build handler summarises success" test intent.
-    if StdCommand::new("make").arg("--version").output().is_err() {
-        eprintln!("skipping: make not installed");
+    if !make_is_available() {
         return;
     }
 
@@ -197,13 +221,35 @@ fn test_diagnostics_marker_fires_exactly_when_the_summary_is_served() {
     );
 
     if marker_emitted {
+        let marker = stderr
+            .lines()
+            .find(|line| line.contains("diagnostics summarised"))
+            .expect("marker_emitted is true, so the line exists");
+
         assert!(
-            stderr.contains("3 diagnostics"),
-            "marker must carry the exact count: {stderr:?}"
+            marker.contains("3 diagnostics"),
+            "marker must carry the exact count: {marker:?}"
+        );
+
+        // A class-1 marker must carry a remedy that is LITERALLY REACHABLE from
+        // the invocation printing it (ADR-011). For the build family that is not
+        // `SKIM_PASSTHROUGH=1`: `handler_visible_args` strips the leading
+        // subcommand token, so off a TTY `should_read_stdin` is true, the
+        // passthrough gate declines, and `cmd::build::run_parsed_command` has no
+        // passthrough branch of its own — the hatch is a measured no-op there
+        // (PF-039). `diagnostics_summary_marker` therefore passes
+        // `passthrough_reproduces_argv: false` unconditionally and
+        // `fidelity::remedy_for` returns the one remedy that is true.
+        assert!(
+            marker.contains("run 'tsc' directly for the full output"),
+            "class-1 marker must carry a REACHABLE remedy — for the build family \
+             that is running the tool itself, not the passthrough hatch: {marker:?}"
         );
         assert!(
-            stderr.contains("SKIM_PASSTHROUGH=1"),
-            "class-1 marker must carry the escape hatch: {stderr:?}"
+            !marker.contains("SKIM_PASSTHROUGH=1"),
+            "the passthrough hatch is a no-op for the build family off a TTY \
+             (PF-039); advertising it is the defect this remedy replaced: \
+             {marker:?}"
         );
     }
 }

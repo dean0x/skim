@@ -75,10 +75,54 @@ const TWO_COLUMN_BYTES: usize = 76;
 // Hermetic fixture
 // ============================================================================
 
+/// Git's config search path, pinned to nothing (PF-009).
+///
+/// Repo-local `git config` writes cannot make a fixture hermetic on their own:
+/// `git init` and every `git diff` still read `~/.gitconfig` and
+/// `/etc/gitconfig`, and several of the settings that live there move the exact
+/// bytes this file asserts on — `diff.noprefix` and `diff.mnemonicPrefix` change
+/// every hunk header's length, `diff.context` changes how many lines each hunk
+/// carries, `diff.external` replaces the diff wholesale, and
+/// `init.templateDir` / `core.hooksPath` would install the developer's own hooks
+/// into the fixture repo.  `TWO_COLUMN_BYTES` and the `served < raw` margins are
+/// byte-exact, so an unpinned search path is a red suite on someone else's
+/// machine, not tolerable drift.
+///
+/// `/dev/null` is a readable, empty config file, which is what makes it a valid
+/// value for the two path variables rather than merely an absent one.
+const HERMETIC_GIT_ENV: &[(&str, &str)] = &[
+    ("GIT_CONFIG_GLOBAL", "/dev/null"), // ~/.gitconfig
+    ("GIT_CONFIG_SYSTEM", "/dev/null"), // /etc/gitconfig
+    ("GIT_CONFIG_NOSYSTEM", "1"),       // belt-and-braces for older git
+];
+
+/// Env vars stripped because they do what a pinned config setting would do.
+///
+/// Closing `diff.external` in the config while leaving its environment twin open
+/// would pin nothing: `GIT_EXTERNAL_DIFF` replaces git's diff engine outright,
+/// and `GIT_DIFF_OPTS` injects flags into it.
+const HERMETIC_GIT_REMOVED: &[&str] = &["GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS"];
+
+/// A `git` command that cannot see the developer's configuration.
+///
+/// Every git invocation in this file — fixture setup AND the raw control —
+/// routes through here.  An unpinned control is worse than an unpinned subject:
+/// it is the baseline the assertions are measured against (PF-026).
+fn hermetic_git() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for (var, value) in HERMETIC_GIT_ENV {
+        cmd.env(var, value);
+    }
+    for var in HERMETIC_GIT_REMOVED {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 /// Run a git command in `dir`, asserting success with a step-labelled panic.
 fn git_in(dir: &std::path::Path, args: &[&str]) {
     let step = args.join(" ");
-    let out = std::process::Command::new("git")
+    let out = hermetic_git()
         .args(args)
         .current_dir(dir)
         .output()
@@ -94,8 +138,11 @@ fn git_in(dir: &std::path::Path, args: &[&str]) {
 /// `src/{name}`.
 ///
 /// PF-009: `-b main` plus repo-local `user.name`/`user.email`/`diff.algorithm`
-/// so the developer's global git config cannot move the byte counts this file
-/// asserts on.
+/// pin the settings this fixture depends on *positively*; [`hermetic_git`] is
+/// what stops the developer's global and system config from supplying anything
+/// else.  Repo-local writes alone do not make a fixture hermetic — they set the
+/// handful of keys they name and leave every other key readable from
+/// `~/.gitconfig`.
 fn two_commit_repo(
     name: &str,
     before: &str,
@@ -126,7 +173,7 @@ fn two_commit_repo(
 /// The control: what the reader would have got without skim at all.
 fn raw_diff(repo: &std::path::Path, name: &str) -> String {
     let spec = format!("src/{name}");
-    let out = std::process::Command::new("git")
+    let out = hermetic_git()
         .args(["diff", "--no-color", "HEAD~1..HEAD", "--", &spec])
         .current_dir(repo)
         .output()
@@ -143,6 +190,16 @@ fn served_diff(repo: &std::path::Path, name: &str) -> String {
     // every assertion below vacuously true.
     cmd.env_remove("SKIM_PASSTHROUGH");
     cmd.env_remove("SKIM_DEBUG");
+    // The subject spawns git too — `skim git diff` shells out, and the child
+    // inherits this environment.  Pinning the control and leaving the subject
+    // unpinned would compare two diffs produced under different configurations,
+    // which is a worse failure than leaving both unpinned.
+    for (var, value) in HERMETIC_GIT_ENV {
+        cmd.env(var, value);
+    }
+    for var in HERMETIC_GIT_REMOVED {
+        cmd.env_remove(var);
+    }
     let out = cmd
         .current_dir(repo)
         .args(["git", "diff", "HEAD~1..HEAD", "--", &spec])

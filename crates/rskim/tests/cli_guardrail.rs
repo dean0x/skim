@@ -1,7 +1,15 @@
 //! CLI tests for output guardrail (#53)
 //!
-//! Tests that the guardrail triggers when compressed output is larger than raw,
-//! and does not trigger for normal files or in full mode.
+//! Tests that the guardrail triggers when compressed output is not strictly
+//! smaller than raw, and does not trigger for well-compressing files or in full
+//! mode.  Size is not an exemption: the 256-byte floor was removed in A4, so
+//! tiny payloads are evaluated like any other (see `output/fidelity.rs`).
+//!
+//! Every negative assertion on `[skim:guardrail]` sets `SKIM_DEBUG=1`.  The
+//! banner is an ADR-011 class-2 no-loss raw-fallback notice routed to
+//! `io::sink()` with debug off, so asserting its absence without the variable
+//! observes nothing — the one exception is
+//! `test_guardrail_fires_silently_without_debug`, whose subject IS the gating.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -17,26 +25,53 @@ fn skim_cmd() -> Command {
     cmd
 }
 
+/// Tiny files are subject to the gate like any other payload (A4).
+///
+/// The 256-byte floor this test was originally written against is gone: per
+/// `output/fidelity.rs`, "the floor was a `guardrail.rs`-only exemption that
+/// skipped the guard for tiny payloads … every payload, regardless of size, is
+/// subject to the same conservative rule."  A 13-byte `const x = 1;` has no
+/// body to remove, so the structure view ties with raw — and a tie is
+/// Passthrough, not Pass.  Raw is served and the guard says so.
+///
+/// `SKIM_DEBUG=1` is load-bearing.  Per ADR-011 the `[skim:guardrail]` line is a
+/// class-2 no-loss raw-fallback banner routed to `io::sink()` with debug off, so
+/// the pre-existing `.not()` assertion here passed whether or not the guardrail
+/// fired — it could not observe the thing it named.  Opting in is what turns the
+/// stderr assertion into evidence, and the evidence contradicted the old name:
+/// measured against `target/debug/skim`, this fixture emits the banner.
 #[test]
-fn test_guardrail_skips_tiny_files() {
-    // Tiny files (< 256 bytes) should skip the guardrail entirely because
-    // transformation overhead is expected for small inputs.
+fn test_guardrail_evaluates_tiny_files_and_serves_raw() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("tiny.ts");
-    std::fs::write(&file, "const x = 1;\n").unwrap();
+    let source = "const x = 1;\n";
+    std::fs::write(&file, source).unwrap();
 
-    skim_cmd()
+    let assert = skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .arg(file.to_str().unwrap())
         .arg("--mode=structure")
         .arg("--no-cache")
         .assert()
         .success()
-        .stderr(predicate::str::contains("[skim:guardrail]").not());
+        .stderr(predicate::str::contains("[skim:guardrail]"));
+
+    // The guard served raw, so the reader loses nothing and no class-1 marker
+    // is owed — the banner is the ONLY thing that distinguishes this path from
+    // a transform that silently no-op'd.
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert_eq!(
+        stdout, source,
+        "a tie must serve the source verbatim (A2: tie -> Passthrough)"
+    );
 }
 
 #[test]
 fn test_guardrail_does_not_trigger_on_normal_file() {
     // A normal-sized file should compress well and not trigger the guardrail.
+    //
+    // SKIM_DEBUG=1 is load-bearing: the class-2 banner is invisible without it
+    // (ADR-011).  See `test_guardrail_evaluates_tiny_files_and_serves_raw`.
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("normal.ts");
     std::fs::write(
@@ -62,6 +97,7 @@ fn test_guardrail_does_not_trigger_on_normal_file() {
     .unwrap();
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .arg(file.to_str().unwrap())
         .arg("--mode=structure")
         .arg("--no-cache")
@@ -73,11 +109,15 @@ fn test_guardrail_does_not_trigger_on_normal_file() {
 #[test]
 fn test_guardrail_skipped_in_full_mode() {
     // Full mode should skip the guardrail entirely.
+    //
+    // SKIM_DEBUG=1 is load-bearing: the class-2 banner is invisible without it
+    // (ADR-011).  See `test_guardrail_evaluates_tiny_files_and_serves_raw`.
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("tiny.ts");
     std::fs::write(&file, "const x = 1;\n").unwrap();
 
     skim_cmd()
+        .env("SKIM_DEBUG", "1")
         .arg(file.to_str().unwrap())
         .arg("--mode=full")
         .arg("--no-cache")

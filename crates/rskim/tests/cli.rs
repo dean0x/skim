@@ -535,11 +535,11 @@ fn test_cli_minimal_mode() {
     // rather than the stripping this test exists for — see
     // test_cli_minimal_mode_preserves_module_header.
     // The stripped comment run is the ONLY saving minimal mode produces here, so
-    // one trailing comment (19 B / 4 t) could never cover the 84 B / 24 t marker
+    // one trailing comment (19 B / 4 t) could never cover the 108 B / 28 t marker
     // the ADR-001 guard charges — raw was served and `// regular comment`
     // survived. Comments are token-cheap relative to bytes, so the run is long
     // enough for the TOKEN margin to clear 2x as well.
-    // Measured: raw 693 B / 158 t → 109 B / 45 t, margin +544 B / +89 t.
+    // Measured: raw 693 B / 158 t → 109 B / 45 t, margin +520 B / +85 t.
     fs::write(
         &file_path,
         r#"/**
@@ -587,9 +587,9 @@ fn test_cli_minimal_mode_preserves_module_header() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("header.ts");
     // The run below the blank line is the only saving, so it has to be long
-    // enough to cover the 84 B / 24 t minimal marker; the original 123-byte
+    // enough to cover the 108 B / 28 t minimal marker; the original 123-byte
     // fixture saved 33 B / 7 t and was served raw, so the "stripped" line was
-    // still present. Margin +463 B / +78 t.
+    // still present. Margin +439 B / +74 t.
     fs::write(
         &file_path,
         r#"// Copyright header line
@@ -635,8 +635,8 @@ fn test_cli_minimal_mode_stdin() {
         .arg("--mode")
         .arg("minimal")
         // stdin is charged the marker exactly as a file read is, and the 45-byte
-        // original saved 15 B / 4 t against 84 B / 24 t — served raw, so
-        // `// strip this` survived. Margin +378 B / +62 t.
+        // original saved 15 B / 4 t against 108 B / 28 t — served raw, so
+        // `// strip this` survived. Margin +354 B / +58 t.
         // (None of the added lines may contain the literal `// strip this`, or
         // the negative predicate would match one of them instead.)
         .write_stdin(
@@ -1203,10 +1203,10 @@ fn test_cli_pseudo_mode_python() {
     let file_path = temp_dir.path().join("test.py");
     // Python pseudo strips parameter annotations and keeps bodies, so the saving
     // is annotation mass alone — the 57-byte original saved 5 B / 2 t against a
-    // 90 B / 24 t marker and was served raw, leaving `: str` in the output.
+    // 128 B / 32 t marker and was served raw, leaving `: str` in the output.
     // `greet` deliberately keeps its single parameter so the assertion
     // `contains("def greet(name)")` still matches after stripping; the other
-    // functions supply the mass. Margin +288 B / +64 t.
+    // functions supply the mass. Margin +250 B / +56 t.
     fs::write(
         &file_path,
         r#"def greet(name: str) -> str:
@@ -1271,9 +1271,9 @@ fn test_cli_pseudo_mode_stdin() {
         .arg("--mode=pseudo")
         // `x = 42` is the pseudo rewrite of `const x: number = 42;` — a string
         // that does not occur in the raw input, so the compressed view must be
-        // served. A single declaration saved 9 B / 3 t against a 90 B / 24 t
+        // served. A single declaration saved 9 B / 3 t against a 128 B / 32 t
         // marker; the extra declarations supply the annotation mass.
-        // Margin +268 B / +59 t.
+        // Margin +230 B / +51 t.
         .write_stdin(
             r#"export const x: number = 42;
 export const alpha: ReadonlyArray<Record<string, number>> = [];

@@ -735,9 +735,16 @@ fn t8_stdin_input_still_routes_to_the_buffered_path() {
 //
 // The escape hatch is the surface a user reaches for *because* compressed
 // output hid something.  Before A2 it was the least faithful sink skim had: it
-// buffered the child's whole stdout through `runner::read_pipe`, which
-// hard-errors at MAX_OUTPUT_BYTES and **discards the entire buffer** — so the
-// documented remedy for "skim hid my output" returned nothing at all.
+// buffered the child's whole stdout through `runner::read_pipe`, which at the
+// time hard-errored at MAX_OUTPUT_BYTES and discarded the entire accumulated
+// buffer — so the documented remedy for "skim hid my output" returned nothing
+// at all.  The buffered path has since been repaired too: stdout reads through
+// `read_pipe_degrade`, so it **caps** at MAX_OUTPUT_BYTES, delivering every
+// byte that fit plus an unconditional ADR-011 class-1 marker carrying the
+// exact kept-byte count.  `read_pipe` still discards its buffer, but it is
+// stderr-only now.  That shrinks the defect this tier closed without changing
+// the recommendation — a byte pump has no ceiling at all, and no lossy UTF-8
+// decode.
 //
 // Surface: every test below drives the **explicit subcommand** path
 // (`skim grep …`), reaching the handler through `cmd::dispatch`.  None of them
@@ -844,12 +851,15 @@ fn t10_escape_hatch_first_n_parity_and_exit_is_pipe_closed() {
 
 /// The escape hatch delivers output far past the buffered 64 MiB ceiling.
 ///
-/// **This is the headline fix.**  `runner::read_pipe` hard-errors at
-/// `MAX_OUTPUT_BYTES` and throws the accumulated buffer away, so before A2 this
-/// exact invocation produced `Error: output exceeded 67108864 byte limit`, exit
-/// 1, and **zero bytes of stdout** — measured, not theorised.  A byte pump has
-/// no ceiling at all: memory is O(chunk) because each chunk is written out
-/// before the next is read.
+/// **This is the headline fix.**  Before A2 this exact invocation produced
+/// `Error: output exceeded 67108864 byte limit`, exit 1, and **zero bytes of
+/// stdout** — measured, not theorised — because `runner::read_pipe` hard-errored
+/// at `MAX_OUTPUT_BYTES` and threw the accumulated buffer away.  The buffered
+/// path no longer loses everything: stdout reads through `read_pipe_degrade`,
+/// which **caps** at `MAX_OUTPUT_BYTES` and discloses the exact kept-byte count
+/// in an ADR-011 class-1 marker.  That lowers the stake without changing the
+/// verdict — a byte pump has no ceiling at all: memory is O(chunk) because each
+/// chunk is written out before the next is read.
 ///
 /// `#[ignore]` because it moves 70 MiB through a pipe; the always-run guard is
 /// the pure-function `pump` test in `cmd::stream_pump`
@@ -885,8 +895,8 @@ fn t11_escape_hatch_delivers_past_the_buffered_ceiling() {
     assert_eq!(
         delivered,
         EMITTED_MIB * MIB,
-        "every byte must be DELIVERED past the old 64 MiB ceiling — the buffered \
-         path discarded the whole buffer here and emitted nothing; stderr was: {errs:?}"
+        "every byte must be DELIVERED past the buffered 64 MiB ceiling — the \
+         buffered path caps here and delivers only what fit; stderr was: {errs:?}"
     );
     assert_eq!(status.code(), Some(0), "the stub exits 0");
     assert!(
@@ -1455,12 +1465,14 @@ fn t16_raw_passthrough_interleaved_stdout_and_stderr_does_not_deadlock() {
 
 /// `run_raw_passthrough` delivers output far past the buffered 64 MiB ceiling.
 ///
-/// **The headline defect-2 fix.**  `runner::read_pipe` hard-errors at
-/// `MAX_OUTPUT_BYTES` and throws the accumulated buffer away, so before this
-/// change `skim yarn build` on a 70 MiB log produced
-/// `Error: output exceeded 67108864 byte limit`, exit 1, and **zero bytes of
-/// stdout** — measured on this exact stub, not theorised.  A byte pump has no
-/// ceiling at all.
+/// **The headline defect-2 fix.**  Before this change `skim yarn build` on a
+/// 70 MiB log produced `Error: output exceeded 67108864 byte limit`, exit 1,
+/// and **zero bytes of stdout** — measured on this exact stub, not theorised —
+/// because `runner::read_pipe` hard-errored at `MAX_OUTPUT_BYTES` and threw the
+/// accumulated buffer away.  The buffered path **caps** instead now: stdout
+/// reads through `read_pipe_degrade`, delivering every byte that fit plus an
+/// ADR-011 class-1 marker naming the exact kept-byte count.  A byte pump still
+/// has no ceiling at all.
 ///
 /// `#[ignore]` because it moves 70 MiB through a pipe; the always-run guard is
 /// the pure-function `pump` test in `cmd::stream_pump`
@@ -1497,8 +1509,8 @@ fn t16_raw_passthrough_delivers_past_the_buffered_ceiling() {
     assert_eq!(
         delivered,
         EMITTED_MIB * MIB,
-        "every byte must be DELIVERED past the old 64 MiB ceiling — the buffered \
-         path discarded the whole buffer here and emitted nothing; stderr was: {errs:?}"
+        "every byte must be DELIVERED past the buffered 64 MiB ceiling — the \
+         buffered path caps here and delivers only what fit; stderr was: {errs:?}"
     );
     assert_eq!(status.code(), Some(0), "the stub exits 0");
     assert!(
