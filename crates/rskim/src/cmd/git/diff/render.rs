@@ -300,6 +300,11 @@ enum EmitRole {
     SourceLine,
     /// A declaration header skim pulled in from outside every hunk window so
     /// the following hunk can be placed.
+    ///
+    /// Rendered with a leading `~`.  That glyph is **not a diff marker**: git
+    /// never prints it, and a line carrying it is skim's own addition rather
+    /// than anything the diff said.  [`emit_source_line`] owns the full prefix
+    /// table and the reasoning behind it.
     Breadcrumb,
 }
 
@@ -617,6 +622,28 @@ fn try_ast_render(
 ///
 /// For nested nodes (inside a class/struct), emits the parent declaration
 /// header line before the changed child node.
+///
+/// # Why this takes a `Language` rather than hard-coding `breadcrumbs`
+///
+/// The breadcrumb-suppression policy has exactly one spelling —
+/// [`breadcrumbs_carry_information`] — and production reaches it at the single
+/// [`EmitInputs`] construction in `try_ast_render`.  This function used to
+/// build its own [`EmitInputs`] with that field hard-coded `true`, which made
+/// the value ~5 tests inject a SECOND, divergent copy of the policy: changing
+/// `breadcrumbs_carry_information` would leave every test here green while
+/// changing what production does.  Taking the language and calling the policy
+/// function is what makes that structurally impossible — there is now one
+/// spelling, and these tests read it.
+///
+/// **No test asserts the `false` value here, deliberately.**
+/// `EmitInputs::breadcrumbs` has exactly one consumer,
+/// [`render_default_scoped`], which this test-only path does not call; this
+/// path emits its parent header unconditionally through [`emit_source_line`].
+/// So the field is pure plumbing on this path, and a test pinning `false`
+/// could only assert that the parameter changes nothing — an assertion the
+/// defect satisfies, which is the trap PF-025 names.  If a future change makes
+/// [`emit_source_line`] consult `inputs.breadcrumbs`, pin both values THEN,
+/// against the behaviour that change introduces.
 #[cfg(test)]
 fn render_changed_only(
     output: &mut String,
@@ -624,6 +651,7 @@ fn render_changed_only(
     hunks: &[DiffHunk<'_>],
     source_lines: &[&str],
     ln_width: usize,
+    lang: Language,
 ) {
     // Track which parent headers we have already emitted
     let mut emitted_parent_headers: HashSet<usize> = HashSet::new();
@@ -641,7 +669,15 @@ fn render_changed_only(
     // adjacent ranges share one hunk.  Created here (per-file) so it resets
     // correctly for each FileDiff without leaking across file boundaries.
     let markers = HunkLineMarkers::from_hunks(hunks);
-    let inputs = EmitInputs::new(hunks, source_lines, ln_width, &markers, true);
+    // The SAME call production makes at `try_ast_render`'s constructor — not a
+    // second spelling of the policy.
+    let inputs = EmitInputs::new(
+        hunks,
+        source_lines,
+        ln_width,
+        &markers,
+        breadcrumbs_carry_information(lang),
+    );
     let mut state = RenderState::default();
 
     for (idx, range) in changed_ranges.iter().enumerate() {
@@ -1352,6 +1388,34 @@ fn render_node_with_hunks(
 ///   is skipped; it can be neither duplicated nor emitted out of order;
 /// - **marker fidelity** — a line the diff marks `+` renders as `+`, never as
 ///   pre-existing context (C1d).
+///
+/// # The four line prefixes in this view
+///
+/// `skim git diff` output carries one more prefix than a unified diff does.
+/// Three come straight from git and mean what they always mean; the fourth is
+/// skim's own and appears in no diff format:
+///
+/// | Prefix | Written by | Meaning |
+/// |--------|------------|---------|
+/// | `+`    | git        | this line was added |
+/// | `-`    | git        | this line was removed |
+/// | ` `    | git        | this line is diff context |
+/// | `~`    | **skim**   | a declaration header pulled in from OUTSIDE every hunk window, so the hunk below it can be placed.  git printed no such line. |
+///
+/// `~` exists so the reader can separate synthesised context from diff
+/// content.  Rendered with the space a context line uses, a breadcrumb is
+/// indistinguishable from something git actually said — the one thing a diff
+/// view must not get wrong — and an agent reading `~ 41 fn foo(...)` would
+/// otherwise have no way to learn the line is skim's.
+///
+/// It is a one-character substitution on a line emitted either way, so it
+/// costs ZERO net bytes against the ADR-001 budget.  The legend deliberately
+/// does NOT ship as a per-diff header line: that would cost bytes on every
+/// invocation of a view ADR-003 already records at 2-5x raw on large diffs,
+/// and the same budget is why [`write_hunk_boundary`] withholds its `@@` line
+/// on single-hunk files.  The reader-facing legend belongs in the docs —
+/// `README.md`'s `skim git diff` bullet and `CLAUDE.md`'s git-diff design
+/// constraint — not in the output.
 ///
 /// Out-of-range line numbers are ignored rather than panicking: node spans come
 /// from tree-sitter and hunk numbers from git, and the two can disagree at the
@@ -2097,7 +2161,14 @@ mod tests {
         ];
 
         let mut output = String::new();
-        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 2);
+        render_changed_only(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            2,
+            Language::TypeScript,
+        );
 
         // Each container header must appear exactly once.
         let foo_count = output
@@ -2221,7 +2292,14 @@ mod tests {
         ];
 
         let mut output = String::new();
-        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_changed_only(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            Language::Rust,
+        );
 
         // Each ADDED (+) changed line must appear exactly once.
         // Count lines starting with `+` that contain the target content.
@@ -2309,7 +2387,14 @@ mod tests {
         ];
 
         let mut output = String::new();
-        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_changed_only(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            Language::TypeScript,
+        );
 
         // Container header appears once.
         let header_count = output.lines().filter(|l| l.contains("class Foo {")).count();
@@ -2378,7 +2463,14 @@ mod tests {
         ];
 
         let mut output = String::new();
-        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_changed_only(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            Language::Rust,
+        );
 
         // Each deleted line must appear at most once.
         let del_a_count = output.lines().filter(|l| l.contains("deleted_a")).count();
@@ -2764,7 +2856,14 @@ mod tests {
         ];
 
         let mut output = String::new();
-        render_changed_only(&mut output, &changed_ranges, &hunks, &source_lines, 1);
+        render_changed_only(
+            &mut output,
+            &changed_ranges,
+            &hunks,
+            &source_lines,
+            1,
+            Language::Rust,
+        );
 
         // Both changed lines must appear exactly once (not suppressed by cursor).
         let alpha_count = output.lines().filter(|l| l.contains("fn alpha()")).count();

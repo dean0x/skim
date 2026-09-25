@@ -92,42 +92,113 @@ pub(crate) struct RemedyCtx<'a> {
     /// The tool whose output is being served (`"git"`, `"psql"`, `"eslint"`, …).
     /// Always a closed-vocabulary handler name, never user-supplied text.
     pub(crate) tool: &'a str,
-    /// The format the reader asked for.  Only [`OutputFormat::Json`] can make
-    /// the legacy hint false, because `--json` is the one skim-only flag that
-    /// is not stripped for every tool before the passthrough exec.
+    /// The format the reader asked for.  It is what a JSON caller derives
+    /// `passthrough_reproduces_argv` FROM (via
+    /// `cmd::dispatch::passthrough_strips_json`); it is not itself a reason the
+    /// hint can be false, because a text caller can be just as unable to reach
+    /// the hatch — see that field.
     pub(crate) output_format: OutputFormat,
-    /// `true` when `SKIM_PASSTHROUGH=1 skim <tool> <argv>` re-executes the real
-    /// tool with an argv it accepts — i.e. every skim-only flag in `argv` is
-    /// removed by `cmd::dispatch::strip_skim_flags` before exec.  Callers on the
-    /// JSON path derive this from `cmd::dispatch::passthrough_strips_json`.
+    /// `true` when `SKIM_PASSTHROUGH=1 skim <tool> <argv>` really does hand the
+    /// reader the full output.  Two independent ways for it to be `false`, and a
+    /// caller must consider both:
+    ///
+    /// 1. **The argv does not survive the strip.**  A skim-only flag that
+    ///    `cmd::dispatch::strip_skim_flags` leaves in place reaches the real tool
+    ///    and is rejected — bare `--json` for every tool but `git`.  Callers on
+    ///    the JSON path derive this from `cmd::dispatch::passthrough_strips_json`.
+    /// 2. **The gate never fires.**  `cmd/dispatch.rs`'s convergence gate
+    ///    declines whenever `handler_reads_stdin` is true, which off a TTY is
+    ///    every multi-level dispatcher (`cargo`, `dotnet`, `go`, `swift`), and
+    ///    `cmd/build/mod.rs::run_parsed_command` has no passthrough branch of its
+    ///    own — it always spawns and always summarises.  So
+    ///    `SKIM_PASSTHROUGH=1 skim cargo check` returns the compressed summary in
+    ///    exactly the agent harnesses and CI jobs that read the marker (PF-039,
+    ///    Active).  Text output, unreachable hatch: that combination is why this
+    ///    field, not `output_format`, is what [`remedy_for`] branches on.
     pub(crate) passthrough_reproduces_argv: bool,
 }
 
 /// Resolve the narrowest escape-hatch remedy that is **actually true** for the
 /// current invocation.
 ///
-/// # The narrow arm — `(Json, false)`
+/// # The narrow arm — `(_, false)`
 ///
-/// `strip_skim_flags` only removes bare `--json` for `git`; for every other tool
-/// `--json` is a *tool-owned* form (`gh pr list --json title`) that must survive
-/// the strip.  So `SKIM_PASSTHROUGH=1 skim psql --json` forwards `--json` to the
-/// real `psql`, which rejects it — the legacy hint would be a false remedy.  On
-/// that path the only true remedy is running the tool directly.
+/// Keyed on reachability alone, deliberately **not** on the format.  It was
+/// `(Json, false)` until consistency-01, which made `false` a no-op for every
+/// text caller: the build family's class-1 marker
+/// ([`crate::output::diagnostics_summary_marker`]) is text, cannot reach the
+/// hatch at all (PF-039), and still printed `SKIM_PASSTHROUGH=1` — an ADR-011
+/// class-1 marker advertising a remedy the invocation printing it cannot use.
+/// The JSON reason for unreachability has not gone anywhere: `strip_skim_flags`
+/// only removes bare `--json` for `git`, so `SKIM_PASSTHROUGH=1 skim psql --json`
+/// still forwards `--json` to the real `psql`, which rejects it.  Both reasons
+/// now converge on the one remedy that is literally true — run the tool itself.
 ///
 /// # The default arm
 ///
-/// Everything else returns the legacy `"SKIM_PASSTHROUGH=1 for full output"`
+/// A reachable hatch returns the legacy `"SKIM_PASSTHROUGH=1 for full output"`
 /// literal, which keeps the pinned marker assertions across the suite green.
+/// Widening the narrow arm moved no existing caller into it: the two
+/// `crate::output` file-read call sites pass `true`, and
+/// `cmd::execution::emit_json_envelope` passes `Json` with a bool it derives per
+/// tool, so its `(Json, false)` and `(Json, true)` results are byte-identical to
+/// before.
 pub(crate) fn remedy_for(ctx: &RemedyCtx<'_>) -> Cow<'static, str> {
     match (ctx.output_format, ctx.passthrough_reproduces_argv) {
         // ADR-011 class-1: the remedy must be literally reachable from the
-        // invocation that prints it.  `--json` survives the strip for this tool,
-        // so the passthrough exec would fail — name the only true remedy.
-        (OutputFormat::Json, false) => {
-            Cow::Owned(format!("run '{}' directly for the full output", ctx.tool))
-        }
+        // invocation that prints it.  The hatch does not work here — either the
+        // argv would not survive the strip, or the gate never fires for this
+        // handler — so name the only true remedy.
+        (_, false) => Cow::Owned(format!("run '{}' directly for the full output", ctx.tool)),
         _ => Cow::Borrowed("SKIM_PASSTHROUGH=1 for full output"),
     }
+}
+
+/// The ADR-011 class-1 elision marker for skim's buffered-pipe memory cap.
+///
+/// # What it discloses
+///
+/// [`crate::runner::CommandRunner::run_with_env`] accumulates a child's whole
+/// stdout in memory, so [`crate::runner::MAX_OUTPUT_BYTES`] is a memory-safety
+/// bound and stays. What changed is its *consequence*: the cap used to throw the
+/// entire accumulated buffer away and return an error, so a 70 MiB `yarn build`
+/// log reached the reader as `Error: output exceeded 67108864 byte limit`,
+/// exit 1, and **zero bytes** — strictly less than the raw tool produced, with
+/// nothing disclosed. That is the inverse of #317's compress-never-truncate
+/// MUST, whose one carve-out is an unavoidable safety bound that says so with
+/// exact counts. The reader now keeps every byte that fit; this line names the
+/// bound and the byte count it stopped at.
+///
+/// # Why the narrow remedy, on every call
+///
+/// `SKIM_PASSTHROUGH=1` is a measured no-op for the build family off a TTY
+/// (PF-039), and the buffered runner cannot tell a `cargo` from a `git`: it
+/// holds a program name and nothing else. ADR-011 forbids a class-1 marker from
+/// advertising a hatch the invocation printing it cannot use, so this asks
+/// [`remedy_for`] for the arm that is true for *every* program — run the tool
+/// itself. `OutputFormat::Text` is passed because the `(_, false)` arm ignores
+/// the format; it is not a claim about the caller's output format.
+///
+/// # Emission contract
+///
+/// Callers write the returned line with a bare `eprintln!`, never
+/// `crate::debug_log!`. It fires only when the reader was shown less than raw,
+/// which makes it ADR-011 class 1 — unconditional, and never silenceable by the
+/// absence of `SKIM_DEBUG`.
+pub(crate) fn output_cap_marker(program: &str, kept_bytes: usize, cap_bytes: usize) -> String {
+    let remedy = remedy_for(&RemedyCtx {
+        tool: program,
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: false,
+    });
+    super::elision_marker_unbounded_with_remedy(
+        &format!(
+            "the first {kept_bytes} bytes of '{program}' stdout \
+             (skim's {cap_bytes}-byte memory cap)"
+        ),
+        "output",
+        &remedy,
+    )
 }
 
 // ============================================================================
@@ -210,7 +281,7 @@ pub(crate) fn decide(raw: &str, compressed: &str) -> FidelityDecision {
 /// The guard decides `Keep` vs `Passthrough` by comparing **stdout** sizes, and
 /// has never seen the ADR-008 / ADR-011 class-1 marker the same invocation is
 /// about to print to stderr. Agent harnesses capture stderr into the same
-/// context window as stdout, so a 60-byte stdout saving bought with a 124-byte
+/// context window as stdout, so a 60-byte stdout saving bought with a 162-byte
 /// disclosure is a net loss the guard currently scores as a win.
 ///
 /// # `notice` is the DIFFERENTIAL cost, not the absolute cost
@@ -234,9 +305,11 @@ pub(crate) fn decide(raw: &str, compressed: &str) -> FidelityDecision {
 /// `raw` and `compressed` are trimmed before comparison, so the cost charged
 /// for the notice is likewise its trimmed length: the `String` built by
 /// [`crate::output::lossy_view_marker`], which carries no trailing newline.
-/// `process.rs` emits it with `eprintln!`, so the wire cost is one byte and one
-/// cl100k token higher — the same single terminator the trimmed stdout
-/// comparison already normalises away on both sides.
+/// The line that actually reaches stderr carries its own terminator
+/// ([`crate::output::EmittedNotice::line`], which the emitters write with
+/// `eprint!`), so the wire cost is one byte and one cl100k token higher — the
+/// same single terminator the trimmed stdout comparison already normalises away
+/// on both sides.
 ///
 /// # Laziness
 ///
@@ -289,7 +362,7 @@ pub(crate) fn decide_with_notice(
     }
 
     // Token slow path: confirm the byte saving is also a token saving.
-    match crate::process::count_token_pair(raw_t, comp_t) {
+    match crate::tokens::count_token_pair(raw_t, comp_t) {
         (Some(raw_tok), Some(comp_tok)) => {
             // Lazy: the notice is tokenised here and nowhere else, so the
             // byte-decided exits above never pay for it.
@@ -297,21 +370,52 @@ pub(crate) fn decide_with_notice(
                 None => Some(0),
                 Some(text) => crate::tokens::count_tokens(text).ok(),
             };
-            match notice_tok {
-                Some(cost) if comp_tok.saturating_add(cost) < raw_tok => FidelityDecision::Keep,
-                Some(_) => {
-                    // Token tie, token-expansion, or a saving the disclosure
-                    // swallows, even though bytes were shorter → Passthrough.
-                    FidelityDecision::Passthrough
-                }
-                // The bodies tokenised but the notice did not. Fall back to the
-                // byte verdict, which was computed WITH the notice charged and
-                // said Keep — the same rule the `(None, None)` arm below uses.
-                None => FidelityDecision::Keep,
-            }
+            verdict_from_token_costs(raw_tok, comp_tok, notice_tok)
         }
         // Tokeniser unavailable: the notice-charged byte comparison decides.
         _ => FidelityDecision::Keep,
+    }
+}
+
+/// The token-space verdict, once both stdout bodies have been counted.
+///
+/// Split out of [`decide_with_notice`] so every combination of counts is
+/// reachable from a test — in particular `notice_tok == None`, which no input
+/// can produce today (see below) and which was therefore the one path to `Keep`
+/// after the token gate had been consulted that nothing pinned.
+///
+/// # `None` → `Keep` is deliberate, not a fall-through
+///
+/// [`decide_with_notice`]'s byte early-exit has already fired by the time this
+/// runs, and it charged `notice.len()` to the compressed side — so bytes said
+/// "strictly smaller **even after** paying for its own disclosure". With no
+/// token cost for the notice in hand, that byte verdict is the only measurement
+/// there is, and it is the same rule the `(None, None)` body arm applies one
+/// line below the call. The alternative — `Passthrough`, matching the token-tie
+/// arm — would let a *measurement failure* on the disclosure overturn a verdict
+/// the disclosure was already charged against, which is not the rule any other
+/// exit of this function follows.
+///
+/// # Currently unreachable, deliberately kept
+///
+/// `crate::tokens::count_tokens` is `Ok(get_counter().count(text))` — infallible
+/// for every input — so `notice_tok` is never `None` in production, and
+/// `count_token_pair`'s `(None, None)` arm is unreachable for the same reason.
+/// Both arms stay because that signature is frozen as `Result` (`tokens.rs`
+/// AC15) and `Counter` has a heuristic fallback path: if counting ever becomes
+/// fallible, the rule must already be written down and pinned rather than
+/// inferred from whichever arm happens to be taken.
+fn verdict_from_token_costs(
+    raw_tok: usize,
+    comp_tok: usize,
+    notice_tok: Option<usize>,
+) -> FidelityDecision {
+    match notice_tok {
+        Some(cost) if comp_tok.saturating_add(cost) < raw_tok => FidelityDecision::Keep,
+        // Token tie, token-expansion, or a saving the disclosure swallows, even
+        // though bytes were shorter → Passthrough.
+        Some(_) => FidelityDecision::Passthrough,
+        None => FidelityDecision::Keep,
     }
 }
 
@@ -610,19 +714,47 @@ mod tests {
         );
     }
 
-    /// `remedy_for` default branch returns the exact legacy literal so pinned
-    /// test assertions are not broken by the new dispatch function.
+    /// `remedy_for`'s default branch — a REACHABLE hatch, whatever the format —
+    /// returns the exact legacy literal so pinned assertions across the suite
+    /// stay green.
+    ///
+    /// Held at `passthrough_reproduces_argv: true`.  Before consistency-01 this
+    /// case was spelled `(Text, false)` and still took the default arm, which is
+    /// precisely the no-op the widening removed.
     #[test]
     fn remedy_for_default_is_legacy_literal() {
         let ctx = RemedyCtx {
             tool: "npm",
             output_format: OutputFormat::Text,
-            passthrough_reproduces_argv: false,
+            passthrough_reproduces_argv: true,
         };
         assert_eq!(
             remedy_for(&ctx),
             "SKIM_PASSTHROUGH=1 for full output",
             "default remedy must match legacy literal to preserve pinned test assertions"
+        );
+    }
+
+    /// consistency-01: a TEXT caller that cannot reach the hatch takes the narrow
+    /// arm.  RED before the widening — `(Text, false)` returned the legacy hint,
+    /// which is the build family's case (PF-039: `SKIM_PASSTHROUGH=1 skim cargo
+    /// check` serves the compressed summary off a TTY) and made the class-1
+    /// marker advertise a remedy the invocation printing it cannot use.
+    #[test]
+    fn remedy_for_text_unreachable_hatch_narrows_to_direct_run() {
+        let ctx = RemedyCtx {
+            tool: "cargo",
+            output_format: OutputFormat::Text,
+            passthrough_reproduces_argv: false,
+        };
+        let remedy = remedy_for(&ctx);
+        assert_eq!(
+            remedy, "run 'cargo' directly for the full output",
+            "a text caller with no reachable hatch must name the tool"
+        );
+        assert!(
+            !remedy.contains("SKIM_PASSTHROUGH=1"),
+            "the narrow arm must NOT print a remedy that cannot work; got: {remedy:?}"
         );
     }
 
@@ -661,6 +793,119 @@ mod tests {
         assert!(
             !remedy.contains("SKIM_PASSTHROUGH=1"),
             "the narrow arm must NOT print a remedy that cannot work; got: {remedy:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reliability-02: the 64 MiB pipe-cap disclosure
+    // -----------------------------------------------------------------------
+
+    /// The whole class-1 contract in one string: the exact kept count, the exact
+    /// bound, the program, and a remedy that program can actually be given.
+    #[test]
+    fn output_cap_marker_carries_exact_counts_and_a_reachable_remedy() {
+        let marker = output_cap_marker("yarn", 67_100_672, 67_108_864);
+
+        assert_eq!(
+            marker,
+            "[skim] output elided beyond the first 67100672 bytes of 'yarn' stdout \
+             (skim's 67108864-byte memory cap) — run 'yarn' directly for the full output"
+        );
+    }
+
+    /// The hatch is a measured no-op for the build family off a TTY (PF-039),
+    /// and the buffered runner holds a program name and nothing else — so this
+    /// marker must never advertise it.
+    #[test]
+    fn output_cap_marker_never_advertises_the_passthrough_hatch() {
+        let marker = output_cap_marker("cargo", 1, 2);
+        assert!(
+            !marker.contains("SKIM_PASSTHROUGH"),
+            "a cap marker cannot promise a hatch it cannot verify; got: {marker:?}"
+        );
+        assert!(
+            marker.contains("run 'cargo' directly"),
+            "the remedy must name the tool; got: {marker:?}"
+        );
+    }
+
+    /// A marker that rounds its counts sends the reader back for bytes they
+    /// already have, or hides bytes they do not — ADR-011 requires the exact
+    /// numbers, so a distinctive non-round pair must survive verbatim.
+    #[test]
+    fn output_cap_marker_does_not_round_its_counts() {
+        let marker = output_cap_marker("git", 12_345, 67_890);
+        assert!(marker.contains("12345"), "kept count verbatim: {marker:?}");
+        assert!(marker.contains("67890"), "cap verbatim: {marker:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // regression-08: the token-space verdict, including the one arm no input
+    // can drive through `decide_with_notice`
+    // -----------------------------------------------------------------------
+
+    /// `(bodies counted, notice NOT counted)` → `Keep`, deliberately.
+    ///
+    /// This is the only path that reaches `Keep` after the token gate was
+    /// consulted and could not answer, and nothing pinned it. It is trusted
+    /// because the byte early-exit that ran before it charged `notice.len()` to
+    /// the compressed side and still found it strictly shorter — so the byte
+    /// verdict IS a notice-charged verdict, and it is the only measurement left.
+    /// `Passthrough` (the token-tie answer one arm up) would let a *measurement
+    /// failure on the disclosure* overturn a verdict the disclosure had already
+    /// been charged against.
+    ///
+    /// Pinned against `verdict_from_token_costs` rather than through
+    /// `decide_with_notice`, because no input can produce this state today:
+    /// `tokens::count_tokens` is `Ok(counter.count(text))` for every input.
+    #[test]
+    fn unmeasurable_notice_keeps_the_notice_charged_byte_verdict() {
+        assert_eq!(
+            verdict_from_token_costs(100, 40, None),
+            FidelityDecision::Keep,
+            "an unmeasurable notice must not overturn the notice-charged byte verdict"
+        );
+    }
+
+    /// A notice whose token cost swallows the token saving → `Passthrough`, the
+    /// same conservative rule the tie gets.
+    #[test]
+    fn notice_that_swallows_the_token_saving_passes_through() {
+        assert_eq!(
+            verdict_from_token_costs(100, 90, Some(10)),
+            FidelityDecision::Passthrough,
+            "90 + 10 == 100 is a tie, not a saving — strictly-smaller is the rule"
+        );
+        assert_eq!(
+            verdict_from_token_costs(100, 90, Some(11)),
+            FidelityDecision::Passthrough,
+            "one token past the tie is a net expansion"
+        );
+    }
+
+    /// A notice the token saving can pay for → `Keep`.
+    #[test]
+    fn notice_within_the_token_saving_keeps() {
+        assert_eq!(
+            verdict_from_token_costs(100, 90, Some(9)),
+            FidelityDecision::Keep,
+            "90 + 9 < 100: the saving survives its own disclosure"
+        );
+        assert_eq!(
+            verdict_from_token_costs(100, 99, Some(0)),
+            FidelityDecision::Keep,
+            "a caller with no notice is charged Some(0), never None"
+        );
+    }
+
+    /// The `saturating_add` is load-bearing: a pathological notice cost must not
+    /// wrap around into a false `Keep` (and must not panic in debug builds).
+    #[test]
+    fn notice_cost_saturates_instead_of_wrapping() {
+        assert_eq!(
+            verdict_from_token_costs(100, usize::MAX, Some(1)),
+            FidelityDecision::Passthrough,
+            "usize::MAX + 1 must saturate, not wrap to 0 and read as a saving"
         );
     }
 }

@@ -67,6 +67,36 @@ pub(crate) fn count_tokens(text: &str) -> Result<usize> {
     Ok(get_counter().count(text))
 }
 
+/// Count tokens for both original and transformed text, returning `(None, None)`
+/// when either count is unavailable.
+///
+/// Centralises the paired token-counting pattern used across the file-transform
+/// pipeline (`process.rs`), the fidelity gate (`output/fidelity.rs`) and every
+/// `--show-stats` call site under `cmd/`.
+///
+/// `(None, None)` is all-or-nothing deliberately: a ratio built from one real
+/// count and one missing one reads as a measurement but is not one.
+///
+/// # Why this lives here (architecture-07)
+///
+/// It used to live in `process.rs`. `output::fidelity` — the only caller outside
+/// `cmd/` — therefore reached back into the file-processing module for a helper
+/// that processes no files, while `process.rs` calls into `output` at five
+/// places. That left the `output` <-> `process` boundary with no direction:
+/// neither module could be read, tested or moved without the other. Pairing two
+/// [`count_tokens`] calls is a tokeniser concern and both sides already depend
+/// on this module, so the back-edge is gone and one direction remains:
+/// `process -> output -> tokens`.
+pub(crate) fn count_token_pair(
+    original: &str,
+    transformed: &str,
+) -> (Option<usize>, Option<usize>) {
+    match (count_tokens(original), count_tokens(transformed)) {
+        (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
+        _ => (None, None),
+    }
+}
+
 /// Statistics for token reduction
 #[derive(Debug, Clone)]
 pub(crate) struct TokenStats {
@@ -129,6 +159,31 @@ mod tests {
         let count = count_tokens(text).unwrap();
         assert!(count > 0);
         assert!(count < 10);
+    }
+
+    #[test]
+    fn count_token_pair_returns_some_for_valid_input() {
+        let (orig, trans) = count_token_pair("hello world", "hello");
+        assert!(orig.is_some(), "original tokens should be Some");
+        assert!(trans.is_some(), "transformed tokens should be Some");
+        assert!(
+            orig.unwrap() > trans.unwrap(),
+            "original should have more tokens than transformed"
+        );
+    }
+
+    #[test]
+    fn count_token_pair_returns_some_for_empty_strings() {
+        let (orig, trans) = count_token_pair("", "");
+        assert_eq!(orig, Some(0));
+        assert_eq!(trans, Some(0));
+    }
+
+    #[test]
+    fn count_token_pair_original_equals_transformed_for_identical_input() {
+        let text = "fn main() { println!(\"hello\"); }";
+        let (orig, trans) = count_token_pair(text, text);
+        assert_eq!(orig, trans);
     }
 
     #[test]

@@ -11,6 +11,27 @@
 //! All skim cache subsystems (parser cache, tee output, default analytics.db)
 //! resolve their root through [`cache_root`] / [`cache_root_from`] so that
 //! `SKIM_CACHE_DIR` reliably relocates ALL cache state.
+//!
+//! # Lifecycle: this cache is UNBOUNDED (known gap, not yet addressed)
+//!
+//! There is no size cap, no TTL and no sweep. Every distinct key writes a new
+//! `<sha256>.json` and nothing ever reclaims it. The only reclaim is an
+//! explicit `--clear-cache` ([`clear_cache`]); the `fs::remove_file` on the
+//! stale-entry branch of [`read_cache`] is effectively unreachable, because
+//! `mtime_secs` and `mode` are *inside* the key — a mismatch on either lands
+//! on a different filename, so the branch that deletes the superseded entry is
+//! never the one a real invocation reaches.
+//!
+//! The key's fan-out has grown, so orphans accrue faster than they used to:
+//! `line_numbers` and then `notice_bytes` joined the key, and `notice_bytes`
+//! alone takes three distinct values for one file (hook origin, direct, batch)
+//! — up to three orphans per edit rather than one. The
+//! `CACHE_SCHEMA_VERSION` 2 → 3 bump orphaned every warm entry once.
+//!
+//! Adding a bound is a new cache-lifecycle policy (eviction order, budget,
+//! when the sweep runs) and is deliberately **out of scope** here; this note
+//! exists so the next reader finds the gap written down rather than by
+//! surprise.
 
 use anyhow::Result;
 use rskim_core::Mode;
@@ -130,40 +151,66 @@ pub(crate) struct CacheHit {
     pub(crate) view_differs: Option<bool>,
 }
 
+/// Everything that identifies a cache entry.
+///
+/// **One** declaration of that identity, shared by the read side
+/// ([`read_cache`]), the write side (embedded in [`CacheWriteParams`]) and the
+/// hash itself ([`cache_key`]).  A component added here is in the key on
+/// *both* paths or on neither; it cannot be threaded into the write side while
+/// the read side keeps hashing the old shape.
+///
+/// [`cache_key`] is the one place in this module where a silent mistake is
+/// unrecoverable: a wrong key does not error, it serves **another
+/// invocation's stdout** (see `notice_bytes`).  That is why the identity is a
+/// named record rather than a run of positional arguments.
+///
+/// The file's modification time is deliberately **not** a field: it is not
+/// caller-supplied.  [`read_cache`] and [`write_cache`] each stat the file and
+/// hand the result to [`cache_key`], so no caller can pair a key with an mtime
+/// that disagrees with the entry it is about to read or write.
+pub(crate) struct CacheKeyParams<'a> {
+    /// Source file.  Canonicalised into the hash, so two paths naming the same
+    /// file share one entry.
+    pub(crate) path: &'a Path,
+    /// Transformation mode.
+    pub(crate) mode: Mode,
+    /// Truncation options (max_lines, last_lines, token_budget).
+    pub(crate) trunc: TruncationOptions,
+    /// Whether line numbers were applied.
+    ///
+    /// Line-numbered and unnumbered outputs are cached separately because they differ.
+    pub(crate) line_numbers: bool,
+    /// Byte length of the prospective lossy-view marker.
+    ///
+    /// The ADR-001 guard charges this disclosure against the compressed view, so
+    /// two invocations that differ only in rewrite origin or batch-ness can
+    /// produce different stdout for the same file. See [`cache_key`] and
+    /// `process::view_notice_cache_bytes`, which is the sole producer of this
+    /// value on the live path.
+    pub(crate) notice_bytes: usize,
+}
+
 /// Parameters for writing a cache entry.
 pub(crate) struct CacheWriteParams<'a> {
-    /// Path to the source file.
-    pub(crate) path: &'a Path,
-    /// Transformation mode used for the cache key.
-    pub(crate) mode: Mode,
+    /// What identifies this entry — the same record [`read_cache`] takes, so
+    /// the two sides cannot describe different entries.
+    pub(crate) key: CacheKeyParams<'a>,
     /// Transformed output to cache.
     pub(crate) content: &'a str,
     /// Original token count (if computed).
     pub(crate) original_tokens: Option<usize>,
     /// Transformed token count (if computed).
     pub(crate) transformed_tokens: Option<usize>,
-    /// Truncation options (max_lines, last_lines, token_budget) -- part of cache key.
-    pub(crate) trunc: TruncationOptions,
     /// Effective mode after cascade (diagnostic metadata only).
     pub(crate) effective_mode: Option<Mode>,
     /// Parse quality tier: "full", "degraded", or "passthrough" (diagnostic metadata).
     pub(crate) parse_tier: Option<String>,
-    /// Whether line numbers were applied — part of cache key.
-    ///
-    /// Line-numbered and unnumbered outputs are cached separately because they differ.
-    pub(crate) line_numbers: bool,
     /// Whether the served view differs from the raw file bytes.
     ///
     /// Computed from the authoritative byte comparison in `process_file` and stored
     /// here so the cache-hit path in `try_cached_result` can reproduce the correct
     /// answer without re-reading the file (consistency-2).
     pub(crate) view_differs: bool,
-    /// Byte length of the prospective lossy-view marker — part of the cache key.
-    ///
-    /// The ADR-001 guard charges this disclosure against the compressed view, so
-    /// two invocations that differ only in rewrite origin or batch-ness can
-    /// produce different stdout for the same file. See [`cache_key`].
-    pub(crate) notice_bytes: usize,
 }
 
 /// Returns the skim cache directory, creating it with owner-only permissions if it does not
@@ -211,8 +258,11 @@ pub(crate) fn get_cache_dir() -> Result<PathBuf> {
 /// as well. Every v2 entry was written by a guard that priced the body only.
 const CACHE_SCHEMA_VERSION: u32 = 3;
 
-/// Generate cache key from file path, mtime, mode, truncation options,
-/// line_numbers flag, and the prospective lossy-view notice size.
+/// Generate the cache key for the entry `p` identifies, as of `mtime`.
+///
+/// `mtime` is separate from [`CacheKeyParams`] because it is read from the
+/// filesystem by [`read_cache`] / [`write_cache`] immediately before this call,
+/// never supplied by a caller — see that type's note.
 ///
 /// `line_numbers` is included in the key because line-numbered and unnumbered outputs
 /// differ in content and should be cached independently.
@@ -221,8 +271,8 @@ const CACHE_SCHEMA_VERSION: u32 = 3;
 /// disclosure against the compressed view, and that disclosure's size depends
 /// on the rewrite origin (`SKIM_REWRITTEN_FROM`) and on whether the read is part
 /// of a batch — **neither of which appears anywhere else in this key**. Without
-/// it, `cat foo.ts` (rewritten to a `cat`-origin read whose marker costs 124 B)
-/// and `skim foo.ts --mode=pseudo` (direct, 90 B) hash identically and serve
+/// it, `cat foo.ts` (rewritten to a `cat`-origin read whose marker costs 162 B)
+/// and `skim foo.ts --mode=pseudo` (direct, 128 B) hash identically and serve
 /// each other's stdout wherever that 34-byte difference straddles the guard's
 /// threshold — a silent correctness bug with no error and no diagnostic.
 ///
@@ -233,30 +283,27 @@ const CACHE_SCHEMA_VERSION: u32 = 3;
 /// `CACHE_SCHEMA_VERSION` is included so that any change to the output format
 /// (a later phase of the fidelity overhaul) automatically invalidates all warm
 /// entries without needing to clear the cache manually.
-fn cache_key(
-    path: &Path,
-    mtime: SystemTime,
-    mode: Mode,
-    trunc: &TruncationOptions,
-    line_numbers: bool,
-    notice_bytes: usize,
-) -> Result<String> {
-    let canonical_path = path.canonicalize()?;
+fn cache_key(p: &CacheKeyParams<'_>, mtime: SystemTime) -> Result<String> {
+    let canonical_path = p.path.canonicalize()?;
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
 
     let opt_str = |opt: Option<usize>| opt.map_or("none".to_string(), |n| n.to_string());
 
+    // Bound out because inline format args take an identifier, not a field
+    // access. The hash input is byte-identical to the positional form this
+    // replaced, so warm v3 entries are not orphaned by the refactor.
+    let mode = p.mode;
     let hash_input = format!(
         "cache_schema_v{}|{}|{}|{:?}|{}|{}|{}|{}|{}",
         CACHE_SCHEMA_VERSION,
         canonical_path.display(),
         mtime_secs,
         mode,
-        opt_str(trunc.max_lines),
-        opt_str(trunc.last_lines),
-        opt_str(trunc.token_budget),
-        line_numbers as u8,
-        notice_bytes,
+        opt_str(p.trunc.max_lines),
+        opt_str(p.trunc.last_lines),
+        opt_str(p.trunc.token_budget),
+        p.line_numbers as u8,
+        p.notice_bytes,
     );
 
     let mut hasher = Sha256::new();
@@ -268,17 +315,11 @@ fn cache_key(
 /// Read cached output if valid (mtime matches).
 ///
 /// Returns a [`CacheHit`] on cache hit, `None` on miss.
-pub(crate) fn read_cache(
-    path: &Path,
-    mode: Mode,
-    trunc: &TruncationOptions,
-    line_numbers: bool,
-    notice_bytes: usize,
-) -> Option<CacheHit> {
-    let metadata = fs::metadata(path).ok()?;
+pub(crate) fn read_cache(p: &CacheKeyParams<'_>) -> Option<CacheHit> {
+    let metadata = fs::metadata(p.path).ok()?;
     let mtime = metadata.modified().ok()?;
 
-    let key = cache_key(path, mtime, mode, trunc, line_numbers, notice_bytes).ok()?;
+    let key = cache_key(p, mtime).ok()?;
     let cache_file = get_cache_dir().ok()?.join(format!("{key}.json"));
 
     let cache_content = fs::read_to_string(&cache_file).ok()?;
@@ -287,6 +328,7 @@ pub(crate) fn read_cache(
     // Belt-and-suspenders validation: verify mtime/mode match even though
     // they are already encoded in the cache key hash (guards against collisions).
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+    let mode = p.mode;
     let mode_str = format!("{mode:?}");
 
     if entry.mtime_secs == mtime_secs && entry.mode == mode_str {
@@ -304,24 +346,19 @@ pub(crate) fn read_cache(
 }
 
 /// Write transformed output to cache.
+///
+/// See the module-level **Lifecycle** note: nothing reclaims what this writes.
 pub(crate) fn write_cache(params: &CacheWriteParams<'_>) -> Result<()> {
-    let metadata = fs::metadata(params.path)?;
+    let metadata = fs::metadata(params.key.path)?;
     let mtime = metadata.modified()?;
 
-    let key = cache_key(
-        params.path,
-        mtime,
-        params.mode,
-        &params.trunc,
-        params.line_numbers,
-        params.notice_bytes,
-    )?;
+    let key = cache_key(&params.key, mtime)?;
     let cache_file = get_cache_dir()?.join(format!("{key}.json"));
 
     let mtime_secs = mtime.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
-    let mode = params.mode;
+    let mode = params.key.mode;
     let entry = CacheEntry {
-        path: params.path.display().to_string(),
+        path: params.key.path.display().to_string(),
         mtime_secs,
         mode: format!("{mode:?}"),
         content: params.content.to_string(),
@@ -372,6 +409,19 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// The common cache identity in these tests: no line numbers, no
+    /// disclosure. Tests that vary one of those build on it with `..`, so the
+    /// field they are exercising is the only one they name.
+    fn key_params(path: &Path, mode: Mode, trunc: TruncationOptions) -> CacheKeyParams<'_> {
+        CacheKeyParams {
+            path,
+            mode,
+            trunc,
+            line_numbers: false,
+            notice_bytes: 0,
+        }
+    }
 
     // ========================================================================
     // C2: single-source-of-truth contract
@@ -482,12 +532,12 @@ mod tests {
         let default_trunc = TruncationOptions::default();
 
         // Same inputs should produce same key
-        let key1 = cache_key(path, mtime, Mode::Structure, &default_trunc, false, 0).unwrap();
-        let key2 = cache_key(path, mtime, Mode::Structure, &default_trunc, false, 0).unwrap();
+        let key1 = cache_key(&key_params(path, Mode::Structure, default_trunc), mtime).unwrap();
+        let key2 = cache_key(&key_params(path, Mode::Structure, default_trunc), mtime).unwrap();
         assert_eq!(key1, key2);
 
         // Different mode should produce different key
-        let key3 = cache_key(path, mtime, Mode::Signatures, &default_trunc, false, 0).unwrap();
+        let key3 = cache_key(&key_params(path, Mode::Signatures, default_trunc), mtime).unwrap();
         assert_ne!(key1, key3);
 
         // Different max_lines should produce different key
@@ -495,11 +545,11 @@ mod tests {
             max_lines: Some(50),
             ..Default::default()
         };
-        let key4 = cache_key(path, mtime, Mode::Structure, &trunc_max, false, 0).unwrap();
+        let key4 = cache_key(&key_params(path, Mode::Structure, trunc_max), mtime).unwrap();
         assert_ne!(key1, key4);
 
         // Same max_lines should produce same key
-        let key5 = cache_key(path, mtime, Mode::Structure, &trunc_max, false, 0).unwrap();
+        let key5 = cache_key(&key_params(path, Mode::Structure, trunc_max), mtime).unwrap();
         assert_eq!(key4, key5);
 
         // Different token_budget should produce different key
@@ -507,11 +557,11 @@ mod tests {
             token_budget: Some(500),
             ..Default::default()
         };
-        let key6 = cache_key(path, mtime, Mode::Structure, &trunc_budget, false, 0).unwrap();
+        let key6 = cache_key(&key_params(path, Mode::Structure, trunc_budget), mtime).unwrap();
         assert_ne!(key1, key6);
 
         // Same token_budget should produce same key
-        let key7 = cache_key(path, mtime, Mode::Structure, &trunc_budget, false, 0).unwrap();
+        let key7 = cache_key(&key_params(path, Mode::Structure, trunc_budget), mtime).unwrap();
         assert_eq!(key6, key7);
 
         // Different max_lines + token_budget combination
@@ -520,7 +570,7 @@ mod tests {
             token_budget: Some(500),
             ..Default::default()
         };
-        let key8 = cache_key(path, mtime, Mode::Structure, &trunc_both, false, 0).unwrap();
+        let key8 = cache_key(&key_params(path, Mode::Structure, trunc_both), mtime).unwrap();
         assert_ne!(key4, key8);
         assert_ne!(key6, key8);
 
@@ -529,15 +579,22 @@ mod tests {
             last_lines: Some(10),
             ..Default::default()
         };
-        let key9 = cache_key(path, mtime, Mode::Structure, &trunc_last, false, 0).unwrap();
+        let key9 = cache_key(&key_params(path, Mode::Structure, trunc_last), mtime).unwrap();
         assert_ne!(key1, key9);
 
         // Same last_lines should produce same key
-        let key10 = cache_key(path, mtime, Mode::Structure, &trunc_last, false, 0).unwrap();
+        let key10 = cache_key(&key_params(path, Mode::Structure, trunc_last), mtime).unwrap();
         assert_eq!(key9, key10);
 
         // Different line_numbers should produce different key
-        let key11 = cache_key(path, mtime, Mode::Structure, &default_trunc, true, 0).unwrap();
+        let key11 = cache_key(
+            &CacheKeyParams {
+                line_numbers: true,
+                ..key_params(path, Mode::Structure, default_trunc)
+            },
+            mtime,
+        )
+        .unwrap();
         assert_ne!(key1, key11);
     }
 
@@ -549,54 +606,50 @@ mod tests {
         let default_trunc = TruncationOptions::default();
 
         // Initially no cache
-        assert!(read_cache(&path, Mode::Structure, &default_trunc, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, default_trunc)).is_none());
 
         // Write to cache with token counts
         let content = "transformed output";
         write_cache(&CacheWriteParams {
-            path: &path,
-            mode: Mode::Structure,
+            key: key_params(&path, Mode::Structure, default_trunc),
             content,
             original_tokens: Some(100),
             transformed_tokens: Some(50),
-            trunc: default_trunc,
             effective_mode: None,
             parse_tier: None,
-            line_numbers: false,
             view_differs: false,
-            notice_bytes: 0,
         })
         .unwrap();
 
         // Read from cache
-        let hit = read_cache(&path, Mode::Structure, &default_trunc, false, 0).unwrap();
+        let hit = read_cache(&key_params(&path, Mode::Structure, default_trunc)).unwrap();
         assert_eq!(hit.content, content);
         assert_eq!(hit.original_tokens, Some(100));
         assert_eq!(hit.transformed_tokens, Some(50));
 
         // Different mode should not find cache
-        assert!(read_cache(&path, Mode::Signatures, &default_trunc, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Signatures, default_trunc)).is_none());
 
         // Different max_lines should not find cache
         let trunc_max = TruncationOptions {
             max_lines: Some(50),
             ..Default::default()
         };
-        assert!(read_cache(&path, Mode::Structure, &trunc_max, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, trunc_max)).is_none());
 
         // Different last_lines should not find cache
         let trunc_last = TruncationOptions {
             last_lines: Some(10),
             ..Default::default()
         };
-        assert!(read_cache(&path, Mode::Structure, &trunc_last, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, trunc_last)).is_none());
 
         // Different token_budget should not find cache
         let trunc_budget = TruncationOptions {
             token_budget: Some(500),
             ..Default::default()
         };
-        assert!(read_cache(&path, Mode::Structure, &trunc_budget, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, trunc_budget)).is_none());
     }
 
     #[test]
@@ -611,43 +664,39 @@ mod tests {
         };
 
         // No cache initially
-        assert!(read_cache(&path, Mode::Structure, &trunc, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, trunc)).is_none());
 
         // Write with token_budget
         write_cache(&CacheWriteParams {
-            path: &path,
-            mode: Mode::Structure,
+            key: key_params(&path, Mode::Structure, trunc),
             content: "budget-transformed output",
             original_tokens: Some(200),
             transformed_tokens: Some(80),
-            trunc,
             effective_mode: None,
             parse_tier: None,
-            line_numbers: false,
             view_differs: false,
-            notice_bytes: 0,
         })
         .unwrap();
 
         // Read with same token_budget succeeds
-        let hit = read_cache(&path, Mode::Structure, &trunc, false, 0).unwrap();
+        let hit = read_cache(&key_params(&path, Mode::Structure, trunc)).unwrap();
         assert_eq!(hit.content, "budget-transformed output");
         assert_eq!(hit.original_tokens, Some(200));
         assert_eq!(hit.transformed_tokens, Some(80));
 
         // Read without token_budget misses (different cache key)
         let default_trunc = TruncationOptions::default();
-        assert!(read_cache(&path, Mode::Structure, &default_trunc, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, default_trunc)).is_none());
 
         // Read with different token_budget misses
         let trunc_1000 = TruncationOptions {
             token_budget: Some(1000),
             ..Default::default()
         };
-        assert!(read_cache(&path, Mode::Structure, &trunc_1000, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, trunc_1000)).is_none());
 
         // Read with same budget + different mode misses
-        assert!(read_cache(&path, Mode::Signatures, &trunc, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Signatures, trunc)).is_none());
     }
 
     #[test]
@@ -663,22 +712,18 @@ mod tests {
 
         // Write with effective_mode set (simulates cascade escalation)
         write_cache(&CacheWriteParams {
-            path: &path,
-            mode: Mode::Structure,
+            key: key_params(&path, Mode::Structure, trunc),
             content: "escalated output",
             original_tokens: Some(150),
             transformed_tokens: Some(60),
-            trunc,
             effective_mode: Some(Mode::Signatures),
             parse_tier: None,
-            line_numbers: false,
             view_differs: true,
-            notice_bytes: 0,
         })
         .unwrap();
 
         // Read back succeeds (effective_mode is diagnostic-only, not part of CacheHit)
-        let hit = read_cache(&path, Mode::Structure, &trunc, false, 0).unwrap();
+        let hit = read_cache(&key_params(&path, Mode::Structure, trunc)).unwrap();
         assert_eq!(hit.content, "escalated output");
         assert_eq!(hit.original_tokens, Some(150));
         assert_eq!(hit.transformed_tokens, Some(60));
@@ -686,7 +731,7 @@ mod tests {
         // Verify the effective_mode field was serialized in the raw JSON
         let metadata = fs::metadata(&path).unwrap();
         let mtime = metadata.modified().unwrap();
-        let key = cache_key(&path, mtime, Mode::Structure, &trunc, false, 0).unwrap();
+        let key = cache_key(&key_params(&path, Mode::Structure, trunc), mtime).unwrap();
         let cache_file = get_cache_dir().unwrap().join(format!("{key}.json"));
         let raw_json = fs::read_to_string(&cache_file).unwrap();
         let raw: serde_json::Value = serde_json::from_str(&raw_json).unwrap();
@@ -715,20 +760,16 @@ mod tests {
 
         // Write to cache
         write_cache(&CacheWriteParams {
-            path: &path,
-            mode: Mode::Structure,
+            key: key_params(&path, Mode::Structure, default_trunc),
             content: "cached v1",
             original_tokens: None,
             transformed_tokens: None,
-            trunc: default_trunc,
             effective_mode: None,
             parse_tier: None,
-            line_numbers: false,
             view_differs: false,
-            notice_bytes: 0,
         })
         .unwrap();
-        let hit = read_cache(&path, Mode::Structure, &default_trunc, false, 0).unwrap();
+        let hit = read_cache(&key_params(&path, Mode::Structure, default_trunc)).unwrap();
         assert_eq!(hit.content, "cached v1");
 
         // Sleep to ensure mtime resolution (some filesystems have 1-second resolution)
@@ -742,7 +783,7 @@ mod tests {
         }
 
         // Cache should be invalidated (mtime changed)
-        assert!(read_cache(&path, Mode::Structure, &default_trunc, false, 0).is_none());
+        assert!(read_cache(&key_params(&path, Mode::Structure, default_trunc)).is_none());
     }
 
     /// A1: CACHE_SCHEMA_VERSION is folded into the hash key.
@@ -769,7 +810,7 @@ mod tests {
         let trunc = TruncationOptions::default();
 
         // Production key — uses `cache_schema_v{CACHE_SCHEMA_VERSION}|...`
-        let key_production = cache_key(path, mtime, Mode::Structure, &trunc, false, 0).unwrap();
+        let key_production = cache_key(&key_params(path, Mode::Structure, trunc), mtime).unwrap();
 
         // Simulate the pre-A1 hash: same inputs, NO version prefix.
         // If `key_production == key_legacy`, CACHE_SCHEMA_VERSION is absent
@@ -810,7 +851,7 @@ mod tests {
     ///
     /// That was harmless only while the two produced identical stdout. The
     /// ADR-001 guard now charges the stderr disclosure, and the two markers
-    /// cost different amounts (124 B with the origin, 90 B without), so a file
+    /// cost different amounts (162 B with the origin, 128 B without), so a file
     /// whose saving falls between them is legitimately COMPRESSED for one
     /// invocation and served RAW for the other. A shared key hands one
     /// invocation the other's stdout, with no error and no diagnostic.
@@ -838,11 +879,25 @@ mod tests {
 
         let orig_len = origin_notice.len();
         let dir_len = direct_notice.len();
-        let key_origin = cache_key(path, mtime, Mode::Pseudo, &trunc, false, orig_len).unwrap();
-        let key_direct = cache_key(path, mtime, Mode::Pseudo, &trunc, false, dir_len).unwrap();
+        let key_origin = cache_key(
+            &CacheKeyParams {
+                notice_bytes: orig_len,
+                ..key_params(path, Mode::Pseudo, trunc)
+            },
+            mtime,
+        )
+        .unwrap();
+        let key_direct = cache_key(
+            &CacheKeyParams {
+                notice_bytes: dir_len,
+                ..key_params(path, Mode::Pseudo, trunc)
+            },
+            mtime,
+        )
+        .unwrap();
         // A batch read of the same file is charged nothing (one aggregate
         // marker covers the whole run), so it is a third distinct verdict.
-        let key_batch = cache_key(path, mtime, Mode::Pseudo, &trunc, false, 0).unwrap();
+        let key_batch = cache_key(&key_params(path, Mode::Pseudo, trunc), mtime).unwrap();
 
         assert_ne!(
             key_origin, key_direct,

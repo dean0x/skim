@@ -175,22 +175,6 @@ pub(crate) fn apply_line_numbers(
     output
 }
 
-/// Count tokens for both original and transformed text, returning `(None, None)` on failure.
-///
-/// Centralises the paired token-counting pattern used across the processing pipeline.
-pub(crate) fn count_token_pair(
-    original: &str,
-    transformed: &str,
-) -> (Option<usize>, Option<usize>) {
-    match (
-        tokens::count_tokens(original),
-        tokens::count_tokens(transformed),
-    ) {
-        (Ok(orig), Ok(trans)) => (Some(orig), Some(trans)),
-        _ => (None, None),
-    }
-}
-
 /// Report token statistics to stderr if token counts are available
 pub(crate) fn report_token_stats(
     original_tokens: Option<usize>,
@@ -281,14 +265,30 @@ pub(crate) fn single_file_notice(
 ///   directory that matches exactly one file still pays for one marker while
 ///   being charged zero; that is the known edge of "aggregate", and it errs
 ///   toward compression rather than toward double-counting.)
+///
+/// # Built once, threaded down
+///
+/// Built ONCE per read, at the top of [`process_file`] / [`process_stdin`],
+/// and threaded down from there. Three sites need this value — the cache READ
+/// key, the ADR-001 guard charge, and the cache WRITE key — and they must
+/// agree on it: a read key and a write key that disagree do not error, they
+/// serve another invocation's stdout (see [`crate::cache::CacheKeyParams`]).
+/// One value threaded down makes that agreement structural; three derivations
+/// made it a coincidence of three identical expressions.
 fn view_notice_absolute(options: &ProcessOptions) -> Option<String> {
     // Ordered so the batch hot path returns before reading the environment.
+    // Do not hoist `rewrite_origin` above this check: it scans `environ`, and
+    // the <1s/100-files target depends on batch reads never paying for it.
     if options.batch || options.mode == Mode::Full {
         return None;
     }
-    let mode_str = format!("{:?}", options.mode).to_lowercase();
     let origin = crate::output::rewrite_origin();
-    crate::output::lossy_view_marker(origin.as_deref(), &mode_str, 1, 1)
+    // `Mode::name` is the canonical lowercase spelling — one match arm per
+    // variant in rskim-core, shared by this marker, `main.rs`, `multi.rs` and
+    // the analytics `mode` column, so no two of them can spell a mode
+    // differently. A divergence here would move a guard verdict AND split the
+    // cache key.
+    crate::output::lossy_view_marker(origin.as_deref(), options.mode.name(), 1, 1)
 }
 
 /// The **differential** disclosure cost of the guard choosing the compressed
@@ -317,10 +317,18 @@ fn view_notice_absolute(options: &ProcessOptions) -> Option<String> {
 /// unknown-language fallback [`passthrough_with_truncation`] are no-ops
 /// precisely when `lines <= n`, and the text `enforce_line_bounds` receives on
 /// the guardrail-triggered path IS `raw`.
-fn prospective_view_notice(options: &ProcessOptions, raw: &str) -> Option<String> {
-    let notice = view_notice_absolute(options)?;
+///
+/// `absolute` is the marker [`view_notice_absolute`] already built for this
+/// read, borrowed rather than rebuilt: the differential is a filter over that
+/// one value, not a second derivation of it.
+fn prospective_view_notice<'a>(
+    absolute: Option<&'a str>,
+    trunc: &TruncationOptions,
+    raw: &str,
+) -> Option<&'a str> {
+    let notice = absolute?;
     // `enforce_line_bounds` checks max_lines first, then last_lines.
-    if let Some(n) = options.trunc.max_lines.or(options.trunc.last_lines)
+    if let Some(n) = trunc.max_lines.or(trunc.last_lines)
         && raw.lines().count() > n
     {
         return None;
@@ -333,8 +341,8 @@ fn prospective_view_notice(options: &ProcessOptions, raw: &str) -> Option<String
 /// The decision the cache stores now depends on the disclosure, and the
 /// disclosure depends on [`crate::output::rewrite_origin`] and on batch-ness —
 /// **neither of which is otherwise in the key**. Without this, `cat foo.ts`
-/// (origin `cat`, 124-byte marker) and `skim foo.ts --mode=pseudo` (direct,
-/// 90-byte marker) hash to the same key and serve each other's stdout whenever
+/// (origin `cat`, 162-byte marker) and `skim foo.ts --mode=pseudo` (direct,
+/// 128-byte marker) hash to the same key and serve each other's stdout whenever
 /// that 34-byte difference straddles the guard's threshold.
 ///
 /// The **absolute** length is used, not the differential: the bound-vs-raw
@@ -346,8 +354,13 @@ fn prospective_view_notice(options: &ProcessOptions, raw: &str) -> Option<String
 /// Keying on LENGTH rather than on the text covers origin, batch-ness and mode
 /// in one field, and makes a future label edit self-invalidating: change the
 /// marker wording and every warm entry whose verdict could move misses.
-fn view_notice_cache_bytes(options: &ProcessOptions) -> usize {
-    view_notice_absolute(options).map_or(0, |marker| marker.len())
+///
+/// Measures the marker [`view_notice_absolute`] already built for this read.
+/// The cache READ key, the guard charge and the cache WRITE key are then the
+/// same number because they are the same value — not because three call sites
+/// happen to rebuild it identically.
+fn view_notice_cache_bytes(absolute: Option<&str>) -> usize {
+    absolute.map_or(0, str::len)
 }
 
 /// Try to return a result from cache, handling token recount when needed.
@@ -355,21 +368,26 @@ fn view_notice_cache_bytes(options: &ProcessOptions) -> usize {
 /// Returns `Some(ProcessResult)` on cache hit, `None` on cache miss.
 /// When stats are requested but the cached entry lacks token counts,
 /// the original file is read to compute them on the fly.
+///
+/// `notice_bytes` is [`view_notice_cache_bytes`] of the marker the caller
+/// built once for this read — the SAME number the cache write will use, which
+/// is the whole point of passing it in rather than re-deriving it here.
 fn try_cached_result(
     path: &Path,
     options: &ProcessOptions,
+    notice_bytes: usize,
 ) -> anyhow::Result<Option<ProcessResult>> {
     if !options.use_cache {
         return Ok(None);
     }
 
-    let Some(hit) = cache::read_cache(
+    let Some(hit) = cache::read_cache(&cache::CacheKeyParams {
         path,
-        options.mode,
-        &options.trunc,
-        options.line_numbers,
-        view_notice_cache_bytes(options),
-    ) else {
+        mode: options.mode,
+        trunc: options.trunc,
+        line_numbers: options.line_numbers,
+        notice_bytes,
+    }) else {
         return Ok(None);
     };
 
@@ -397,7 +415,7 @@ fn try_cached_result(
         match read_and_validate(path) {
             Ok(contents) => {
                 let (orig, trans) = if needs_recount {
-                    count_token_pair(&contents, &hit.content)
+                    tokens::count_token_pair(&contents, &hit.content)
                 } else {
                     (hit.original_tokens, hit.transformed_tokens)
                 };
@@ -999,11 +1017,15 @@ pub(crate) fn process_stdin(
     // that keeping the compressed view would cost the reader, so a view that
     // cannot pay for its own marker serves raw instead.
     let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
-        let view_notice = prospective_view_notice(&options, &buffer);
+        // Built once, as in `process_file`. stdin has no cache, so the guard
+        // charge is this value's only consumer — the construction stays the
+        // same so the two paths cannot price the same disclosure differently.
+        let view_notice = view_notice_absolute(&options);
+        let charged = prospective_view_notice(view_notice.as_deref(), &options.trunc, &buffer);
         let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
             buffer.clone(),
             transformed,
-            view_notice.as_deref(),
+            charged,
         )?;
         let triggered = outcome.was_triggered();
         (outcome.into_output(), triggered)
@@ -1065,7 +1087,7 @@ pub(crate) fn process_stdin(
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&buffer, &final_output)
+        tokens::count_token_pair(&buffer, &final_output)
     } else {
         (None, None)
     };
@@ -1109,7 +1131,19 @@ pub(crate) fn process_stdin(
 
 /// Process a single file and return transformed content with optional token statistics.
 pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Result<ProcessResult> {
-    if let Some(result) = try_cached_result(path, &options)? {
+    // ONE derivation for the whole read. The cache READ key below, the ADR-001
+    // guard charge, and the cache WRITE key at the end of this function all
+    // take their number from `notice_bytes`; deriving it three times made the
+    // two keys agree by coincidence rather than by construction, and a read
+    // key that disagrees with its write key serves another invocation's stdout
+    // with no error (`cache::CacheKeyParams`).
+    //
+    // `view_notice_absolute` short-circuits on batch/full BEFORE it reads the
+    // environment, so hoisting the call here costs a batch read nothing.
+    let view_notice = view_notice_absolute(&options);
+    let notice_bytes = view_notice_cache_bytes(view_notice.as_deref());
+
+    if let Some(result) = try_cached_result(path, &options, notice_bytes)? {
         return Ok(result);
     }
 
@@ -1163,11 +1197,11 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // that keeping the compressed view would cost the reader, so a view that
     // cannot pay for its own marker serves raw instead.
     let (final_output, guardrail_triggered) = if options.mode != Mode::Full {
-        let view_notice = prospective_view_notice(&options, &contents);
+        let charged = prospective_view_notice(view_notice.as_deref(), &options.trunc, &contents);
         let outcome = crate::output::guardrail::apply_to_stderr_with_notice(
             contents.clone(),
             result,
-            view_notice.as_deref(),
+            charged,
         )?;
         let triggered = outcome.was_triggered();
         (outcome.into_output(), triggered)
@@ -1248,7 +1282,7 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     // Only pay the tiktoken BPE cost on the main thread when --show-stats
     // is set. Analytics background threads compute their own token counts.
     let (orig_tokens, trans_tokens) = if options.show_stats {
-        count_token_pair(&contents, &final_output)
+        tokens::count_token_pair(&contents, &final_output)
     } else {
         (None, None)
     };
@@ -1258,21 +1292,24 @@ pub(crate) fn process_file(path: &Path, options: ProcessOptions) -> anyhow::Resu
     if options.use_cache {
         let effective_mode = (mode_used != options.mode).then_some(mode_used);
         let _ = cache::write_cache(&cache::CacheWriteParams {
-            path,
-            mode: options.mode,
+            key: cache::CacheKeyParams {
+                path,
+                mode: options.mode,
+                trunc: options.trunc,
+                line_numbers: options.line_numbers,
+                // The guard's verdict — and therefore these bytes — depend on
+                // the disclosure's size, which is not otherwise in the key.
+                // Same `notice_bytes` the read key above used.
+                notice_bytes,
+            },
             content: &final_output,
             original_tokens: orig_tokens,
             transformed_tokens: trans_tokens,
-            trunc: options.trunc,
             effective_mode,
             parse_tier: parse_tier.map(str::to_string),
-            line_numbers: options.line_numbers,
             // consistency-2: store the authoritative view_differs so the
             // cache-hit path does not have to re-derive it from the mode.
             view_differs,
-            // The guard's verdict — and therefore these bytes — depend on the
-            // disclosure's size, which is not otherwise in the key.
-            notice_bytes: view_notice_cache_bytes(&options),
         });
     }
 
@@ -1303,35 +1340,6 @@ pub(crate) fn read_source(path: &std::path::Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ========================================================================
-    // count_token_pair tests
-    // ========================================================================
-
-    #[test]
-    fn count_token_pair_returns_some_for_valid_input() {
-        let (orig, trans) = count_token_pair("hello world", "hello");
-        assert!(orig.is_some(), "original tokens should be Some");
-        assert!(trans.is_some(), "transformed tokens should be Some");
-        assert!(
-            orig.unwrap() > trans.unwrap(),
-            "original should have more tokens than transformed"
-        );
-    }
-
-    #[test]
-    fn count_token_pair_returns_some_for_empty_strings() {
-        let (orig, trans) = count_token_pair("", "");
-        assert_eq!(orig, Some(0));
-        assert_eq!(trans, Some(0));
-    }
-
-    #[test]
-    fn count_token_pair_original_equals_transformed_for_identical_input() {
-        let text = "fn main() { println!(\"hello\"); }";
-        let (orig, trans) = count_token_pair(text, text);
-        assert_eq!(orig, trans);
-    }
 
     // ========================================================================
     // report_token_stats tests
@@ -1650,16 +1658,52 @@ mod tests {
         }
     }
 
+    /// `Mode::name` is the canonical lowercase mode spelling, and the three
+    /// sites that used to derive it independently now read it: the lossy-view
+    /// marker (`view_notice_absolute`, which also feeds the cache key),
+    /// `main.rs`'s single-file `mode_str`, and `multi.rs`'s aggregate marker
+    /// and analytics rows.
+    ///
+    /// This pins it against the `format!("{:?}", mode).to_lowercase()` those
+    /// sites used before, so the substitution is byte-identical for every
+    /// variant and a rename of `Mode::name`'s output fails HERE rather than by
+    /// silently moving a guard verdict and splitting the cache key.
+    #[test]
+    fn mode_name_is_the_canonical_lowercase_marker_spelling() {
+        for mode in [
+            Mode::Structure,
+            Mode::Signatures,
+            Mode::Types,
+            Mode::Full,
+            Mode::Minimal,
+            Mode::Pseudo,
+        ] {
+            assert_eq!(
+                mode.name(),
+                format!("{mode:?}").to_lowercase(),
+                "Mode::name must equal the Debug-lowercase spelling the marker, \
+                 the cache key and the analytics `mode` column were built on"
+            );
+        }
+    }
+
+    /// The live threading in miniature: build the absolute marker once, then
+    /// filter it through the differential rule — exactly what `process_file`
+    /// and `process_stdin` do. Returns an owned `String` so the borrow of the
+    /// intermediate does not escape into the caller's assertion.
+    fn prospective(opts: &ProcessOptions, raw: &str) -> Option<String> {
+        let absolute = view_notice_absolute(opts);
+        prospective_view_notice(absolute.as_deref(), &opts.trunc, raw).map(str::to_string)
+    }
+
     /// `Mode::Full` skips the guard entirely, so there is no verdict for a
     /// disclosure to move — and nothing for the cache key to separate.
     #[test]
     fn view_notice_absolute_is_none_for_full_mode() {
         let opts = notice_opts(Mode::Full, TruncationOptions::default(), false);
-        assert!(
-            view_notice_absolute(&opts).is_none(),
-            "full mode never reaches the guard"
-        );
-        assert_eq!(view_notice_cache_bytes(&opts), 0);
+        let absolute = view_notice_absolute(&opts);
+        assert!(absolute.is_none(), "full mode never reaches the guard");
+        assert_eq!(view_notice_cache_bytes(absolute.as_deref()), 0);
     }
 
     /// `multi.rs` emits ONE aggregate marker per run, so no single file's
@@ -1667,11 +1711,12 @@ mod tests {
     #[test]
     fn view_notice_absolute_is_none_for_batch_runs() {
         let opts = notice_opts(Mode::Pseudo, TruncationOptions::default(), true);
+        let absolute = view_notice_absolute(&opts);
         assert!(
-            view_notice_absolute(&opts).is_none(),
+            absolute.is_none(),
             "a batch file pays no marginal disclosure"
         );
-        assert_eq!(view_notice_cache_bytes(&opts), 0);
+        assert_eq!(view_notice_cache_bytes(absolute.as_deref()), 0);
     }
 
     /// A single-file read pays for its own marker, and the cache key carries
@@ -1682,7 +1727,7 @@ mod tests {
         let opts = notice_opts(Mode::Pseudo, TruncationOptions::default(), false);
         let marker = view_notice_absolute(&opts).expect("a single-file pseudo read discloses");
         assert_eq!(
-            view_notice_cache_bytes(&opts),
+            view_notice_cache_bytes(Some(marker.as_str())),
             marker.len(),
             "the key must carry the length of the marker the guard is charged"
         );
@@ -1711,7 +1756,7 @@ mod tests {
             false,
         );
         assert!(
-            prospective_view_notice(&head, raw).is_none(),
+            prospective(&head, raw).is_none(),
             "--max-lines cuts raw too, so both branches disclose"
         );
         let tail = notice_opts(
@@ -1723,7 +1768,7 @@ mod tests {
             false,
         );
         assert!(
-            prospective_view_notice(&tail, raw).is_none(),
+            prospective(&tail, raw).is_none(),
             "--last-lines cuts raw too, so both branches disclose"
         );
     }
@@ -1742,7 +1787,7 @@ mod tests {
             false,
         );
         assert!(
-            prospective_view_notice(&opts, raw).is_some(),
+            prospective(&opts, raw).is_some(),
             "raw fits the bound, stays silent, and pays nothing — so the \
              compressed view's marker is a cost only it incurs"
         );
@@ -1763,7 +1808,7 @@ mod tests {
             false,
         );
         assert!(
-            prospective_view_notice(&at_bound, three).is_some(),
+            prospective(&at_bound, three).is_some(),
             "lines == n: the truncator is a no-op, so raw discloses nothing"
         );
         let over_bound = notice_opts(
@@ -1775,7 +1820,7 @@ mod tests {
             false,
         );
         assert!(
-            prospective_view_notice(&over_bound, three).is_none(),
+            prospective(&over_bound, three).is_none(),
             "lines > n: raw is cut and discloses too"
         );
     }

@@ -85,7 +85,7 @@ pub(crate) fn run(
     }
 
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&cleaned, result.content());
+        let (orig, comp) = crate::tokens::count_token_pair(&cleaned, result.content());
         crate::process::report_token_stats(orig, comp, "");
     }
 

@@ -264,7 +264,7 @@ pub(super) fn finalize_git_output_owned(
     duration: std::time::Duration,
 ) {
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw, &output);
+        let (orig, comp) = crate::tokens::count_token_pair(&raw, &output);
         crate::process::report_token_stats(orig, comp, "");
     }
     crate::analytics::try_record_command(rec, raw, output, label, duration);
@@ -291,7 +291,7 @@ pub(super) fn finalize_git_output_passthrough(
 ) {
     if show_stats {
         // ALLOC NOTE: count_token_pair borrows; no allocation here.
-        let (orig, comp) = crate::process::count_token_pair(&raw, &raw);
+        let (orig, comp) = crate::tokens::count_token_pair(&raw, &raw);
         crate::process::report_token_stats(orig, comp, "");
     }
     if rec.enabled {
@@ -797,7 +797,7 @@ mod tests {
         duration: std::time::Duration,
     ) {
         if show_stats {
-            let (orig, comp) = crate::process::count_token_pair(raw, output);
+            let (orig, comp) = crate::tokens::count_token_pair(raw, output);
             crate::process::report_token_stats(orig, comp, "");
         }
         crate::analytics::try_record_command(

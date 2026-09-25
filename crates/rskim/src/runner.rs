@@ -19,6 +19,14 @@
 //! cap ([`MAX_OUTPUT_BYTES`]) is unchanged — this removes the TIME bound, not the
 //! MEMORY bound.
 //!
+//! # Degrade at the memory bound (#317 / ADR-011)
+//!
+//! A bound the reader cannot see is indistinguishable from skim losing data.
+//! Both capture paths therefore keep the bytes that fit and disclose the rest:
+//! [`CommandRunner::run_with_env`] emits the class-1 marker itself, and
+//! [`CommandRunner::run_stdout_degrade`] hands the flag to a caller that emits
+//! its own. Neither discards an accumulated buffer.
+//!
 //! # Kill-on-drop guard
 //!
 //! The spawned child is wrapped in [`ChildGuard`], whose `Drop` implementation
@@ -39,7 +47,16 @@ use std::{io, thread};
 #[derive(Debug, Clone)]
 #[must_use]
 pub(crate) struct CommandOutput {
-    /// Captured standard output (lossy UTF-8).
+    /// Captured standard output (lossy UTF-8), truncated to at most
+    /// [`MAX_OUTPUT_BYTES`].
+    ///
+    /// This type carries **no truncation flag**, which is why
+    /// [`CommandRunner::run_with_env`] discloses the cap itself rather than
+    /// reporting it here: roughly twenty struct-literal construction sites
+    /// across `cmd/` would have to change in lockstep to add a field, so the
+    /// disclosure lives at the one place that observes the loss.
+    /// [`CommandRunner::run_stdout_degrade`] returns the flag beside this
+    /// struct for the one caller that needs to branch on it.
     pub(crate) stdout: String,
     /// Captured standard error (lossy UTF-8).
     pub(crate) stderr: String,
@@ -93,7 +110,9 @@ pub(crate) enum RunnerError {
 /// the shell `timeout(1)` utility, the agent tool timeout, or `Ctrl-C`.
 ///
 /// The 64 MiB output cap ([`MAX_OUTPUT_BYTES`]) remains — only the TIME bound
-/// is removed, not the MEMORY bound.
+/// is removed, not the MEMORY bound. Past that cap stdout is delivered partial
+/// with an unconditional ADR-011 class-1 marker rather than discarded; see
+/// [`run_with_env`](Self::run_with_env).
 ///
 /// On any early-return path (size-cap, pipe failure, thread panic) the spawned
 /// child is automatically killed and reaped by the [`ChildGuard`] RAII wrapper
@@ -119,9 +138,34 @@ impl CommandRunner {
     /// Execute `program` with `args` and environment variable overrides,
     /// capturing stdout and stderr.
     ///
-    /// Reuses the same output-size cap and pipe-capture logic as
-    /// [`run`](Self::run). Pass an empty slice for `env_vars` when no
-    /// overrides are needed.
+    /// Pass an empty slice for `env_vars` when no overrides are needed.
+    ///
+    /// # Behaviour at the [`MAX_OUTPUT_BYTES`] cap (reliability-02)
+    ///
+    /// stdout **degrades**: the bytes that fit are returned and an ADR-011
+    /// class-1 elision marker naming the exact kept count goes to stderr.
+    /// Until this change stdout read through the hard-erroring [`read_pipe`],
+    /// which discarded the entire accumulated buffer, so a 70 MiB `yarn build`
+    /// log reached the reader as `Error: output exceeded 67108864 byte limit`,
+    /// exit 1, and zero bytes — strictly less than the raw tool produced, and
+    /// undisclosed. The cap itself is unchanged: it bounds memory, and a
+    /// buffering runner needs that bound. Only its consequence moved, from
+    /// total loss to disclosed partial delivery (#317).
+    ///
+    /// stderr keeps the hard-error cap, matching [`run_stdout_degrade`].
+    ///
+    /// # Exit code on the capped path
+    ///
+    /// The capped reader drops its pipe end, so the child dies on SIGPIPE and
+    /// `exit_code` reports that death — `None` when the process itself was
+    /// signalled, or `Some(141)` (128 + SIGPIPE) when a surviving shell wrapper
+    /// reports it — rather than whatever the child would have returned.
+    /// Callers that translate `None` into
+    /// "killed by signal; output may be partial" are reporting something true
+    /// here, not misreporting a success — the output *is* partial. Callers that
+    /// need to distinguish skim's cap from a genuine signal must use
+    /// [`run_stdout_degrade`], which hands the flag back instead of disclosing
+    /// it here.
     pub(crate) fn run_with_env(
         &self,
         program: &str,
@@ -160,19 +204,38 @@ impl CommandRunner {
             .ok_or(RunnerError::PipeCaptureFailed { pipe: "stderr" })?;
 
         // Spawn concurrent reader threads to prevent pipe deadlocks.
-        let stdout_handle = thread::spawn(move || read_pipe(child_stdout));
+        //
+        // stdout degrades at the cap (partial data + a flag); stderr keeps the
+        // hard-error cap.  Same split, and the same reasons, as
+        // [`run_stdout_degrade`]: stdout is the content the reader asked for and
+        // must never silently shrink to nothing, while a flooded stderr is a
+        // real problem worth surfacing as an error.
+        let stdout_handle = thread::spawn(move || read_pipe_degrade(child_stdout));
         let stderr_handle = thread::spawn(move || read_pipe(child_stderr));
 
         // Wait for child — no timeout; transparent wrapper must not impose a time cap.
+        // On the capped path the reader thread has already dropped its pipe end,
+        // so the child takes SIGPIPE on its next write and `wait()` unblocks.
         let status = child.0.wait()?;
 
         // Join reader threads — propagate panics as anyhow errors.
-        let stdout = stdout_handle
+        let (stdout, stdout_truncated) = stdout_handle
             .join()
             .map_err(|_| RunnerError::ReaderPanicked { pipe: "stdout" })??;
         let stderr = stderr_handle
             .join()
             .map_err(|_| RunnerError::ReaderPanicked { pipe: "stderr" })??;
+
+        // ADR-011 class 1 — loss-bearing, therefore unconditional and never
+        // routed through `debug_log!`.  This is the only place that knows the
+        // loss happened: `CommandOutput` cannot carry the flag out (see that
+        // type's note), so the disclosure is emitted where it is observed.
+        if stdout_truncated {
+            eprintln!(
+                "{}",
+                crate::output::fidelity::output_cap_marker(program, stdout.len(), MAX_OUTPUT_BYTES)
+            );
+        }
 
         let duration = start.elapsed();
 
@@ -377,7 +440,16 @@ pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// Valid UTF-8 is zero-copy (`Vec<u8>` moved into `String`); non-UTF-8 output
 /// (e.g., binary data from `/dev/zero`) falls back to lossy U+FFFD replacement.
 ///
-/// Returns an `io::Error` (kind `Other`) if the output exceeds the cap.
+/// Returns an `io::Error` (kind `Other`) if the output exceeds the cap, and
+/// **discards the accumulated buffer** when it does.
+///
+/// # Stderr only
+///
+/// Both capture methods now read *stdout* through [`read_pipe_degrade`]: for
+/// the content the reader asked for, discarding 64 MiB of real output is the
+/// #317 violation this module's degrade path exists to prevent. This hard-error
+/// form is kept deliberately for *stderr*, where a flood is a diagnostic
+/// problem worth surfacing as an error rather than serving 64 MiB of it.
 fn read_pipe<R: Read>(mut reader: R) -> io::Result<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
@@ -1131,10 +1203,28 @@ mod tests {
     }
 
     /// End-to-end coverage of the 64 MiB output-cap path through `run_with_env`
-    /// (ADR-008). Previously the cap was only exercised at the `read_pipe` unit
-    /// level; this drives a real child whose stdout exceeds the cap and asserts
-    /// the function surfaces the cap error *and returns* — i.e. it does not hang
-    /// or leak the child when a reader thread caps out.
+    /// (ADR-008 / reliability-02). Drives a real child whose stdout exceeds the
+    /// cap and asserts the reader is handed the bytes that fit — not an error,
+    /// and not nothing — while the call still returns rather than hanging or
+    /// leaking the child.
+    ///
+    /// # This test used to pin the defect
+    ///
+    /// It asserted `expect_err(..)` and `"byte limit"`, which is exactly what
+    /// was wrong: [`read_pipe`] discarded the whole accumulated buffer at the
+    /// cap, so 64 MiB of real output reached the reader as
+    /// `Error: output exceeded 67108864 byte limit`, exit 1, and zero bytes —
+    /// strictly less than the raw tool produced, which #317 forbids. The bound
+    /// is unchanged and still enforced (the upper assertion below); only its
+    /// consequence moved, from total loss to disclosed partial delivery.
+    ///
+    /// `exit_code` is deliberately unasserted: the child dies on SIGPIPE once
+    /// the capped reader drops its end, and whether that surfaces as a signal
+    /// kill or as a shell's `141` depends on whether `sh` exec'd `dd` in place.
+    ///
+    /// The marker text is a pure function pinned by
+    /// [`crate::output::fidelity::output_cap_marker`]'s own tests; seeing it
+    /// here would mean capturing the test process's own stderr.
     ///
     /// # Why this does not (and cannot) assert a live-child `ChildGuard` kill
     ///
@@ -1157,22 +1247,36 @@ mod tests {
     /// the test is bounded — never a 1-hour `sleep` hang.
     #[cfg(unix)]
     #[test]
-    fn run_with_env_surfaces_cap_error_without_hanging() {
+    fn run_with_env_delivers_partial_stdout_at_the_cap_without_hanging() {
         // 70 MiB > the 64 MiB MAX_OUTPUT_BYTES cap. `dd` is the child's last
         // command, so when the capped reader drops the pipe `dd` dies on SIGPIPE
         // and the shell exits — `wait()` returns without blocking.
         let runner = CommandRunner::new();
-        let result = runner.run_with_env(
-            "sh",
-            &["-c", "dd if=/dev/zero bs=1048576 count=70 2>/dev/null"],
-            &[],
+        let output = runner
+            .run_with_env(
+                "sh",
+                &["-c", "dd if=/dev/zero bs=1048576 count=70 2>/dev/null"],
+                &[],
+            )
+            .expect("exceeding the cap must degrade, not error — the reader keeps what fit");
+
+        // The bound still holds: this is a memory bound and removing it is not
+        // the fix.
+        assert!(
+            output.stdout.len() <= MAX_OUTPUT_BYTES,
+            "the {MAX_OUTPUT_BYTES}-byte memory bound must still hold; got {}",
+            output.stdout.len()
         );
 
-        let err =
-            result.expect_err("run_with_env must return Err when stdout exceeds the 64 MiB cap");
+        // And it is *nearly* full: the degrade stops on the first 8 KiB chunk
+        // that would cross the cap, so it can fall short by at most one chunk.
+        // The 64 KiB margin is slack against short pipe reads, not a real
+        // expectation — the property under test is "~64 MiB delivered", against
+        // the zero bytes the discarding form produced.
         assert!(
-            err.to_string().contains("byte limit"),
-            "error must mention the byte limit, got: {err}"
+            output.stdout.len() >= MAX_OUTPUT_BYTES - 64 * 1024,
+            "the reader must receive the bytes that fit, not a discarded buffer; got {}",
+            output.stdout.len()
         );
     }
 }

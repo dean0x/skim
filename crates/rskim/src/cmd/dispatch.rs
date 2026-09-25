@@ -483,13 +483,18 @@ pub(crate) fn run_inherited_passthrough(program: &str, args: &[String]) -> ExitC
 /// `execution::stream_passthrough_raw` were built to close (PF-006: this was the
 /// missed sibling surface of that pair):
 ///
-/// - **Total loss past 64 MiB.** [`crate::runner::read_pipe`] hard-errors at
-///   `MAX_OUTPUT_BYTES` and **discards the entire accumulated buffer**, so a
-///   70 MiB `yarn build` log produced `Error: output exceeded 67108864 byte
-///   limit`, exit 1, and zero bytes — measured, not theorised.  The pump has no
-///   ceiling on stdout (memory is O(chunk)), so ADR-002's "oversized input
-///   degrades losslessly rather than hard-erroring" is satisfied by construction.
-/// - **Lossy UTF-8.** `read_pipe` decodes with
+/// - **A 64 MiB ceiling on stdout.** `CommandRunner::run_with_env` reads stdout
+///   through `runner::read_pipe_degrade`, which at `MAX_OUTPUT_BYTES`
+///   **keeps every byte that fit** and emits an unconditional ADR-011 class-1
+///   marker naming the exact kept count.  The cut is disclosed, but it is still
+///   a cut.  It was total loss before that degrade path:
+///   [`crate::runner::read_pipe`] hard-errored and discarded the whole
+///   accumulated buffer, so a 70 MiB `yarn build` log produced `Error: output
+///   exceeded 67108864 byte limit`, exit 1, and zero bytes — measured, not
+///   theorised.  The pump has no ceiling on stdout at all (memory is O(chunk)),
+///   so ADR-002's "oversized input degrades losslessly rather than
+///   hard-erroring" is satisfied by construction rather than by a disclosed cap.
+/// - **Lossy UTF-8.** Both buffered readers decode with
 ///   `String::from_utf8(..).unwrap_or_else(lossy)`, so non-UTF-8 tool bytes
 ///   reached the reader as U+FFFD — skim showing something *different* from raw
 ///   with no marker (#317).  The pump never decodes.

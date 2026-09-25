@@ -143,7 +143,7 @@ pub(crate) fn run(
     // Issue 4: compute token counts before analytics to avoid re-tokenizing in
     // the background thread (avoids copying up to 64 MiB via raw_input.to_string()).
     let duration = start.elapsed();
-    let (raw_tokens, compressed_tokens) = crate::process::count_token_pair(raw_input, &compressed);
+    let (raw_tokens, compressed_tokens) = crate::tokens::count_token_pair(raw_input, &compressed);
 
     if flags.show_stats {
         crate::process::report_token_stats(raw_tokens, compressed_tokens, "");

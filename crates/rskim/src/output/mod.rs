@@ -617,13 +617,14 @@ pub(crate) fn compressed_output_hint(code: i32) -> String {
 /// unconditional).
 ///
 /// Build parsers reduce each compiler diagnostic to a single line
-/// (`error[E0499]: cannot borrow … in src/main.rs:5`). Everything else the tool
-/// attached to that diagnostic is discarded: the source snippet / caret frame,
-/// the `note:` and `help:` children, and the trailing `rustc --explain`
-/// pointer, which arrives at `level: "failure-note"` and matches no arm of the
-/// parser's level match. Measured on rustc 1.96.0 via `cargo build
-/// --message-format=json`: one E0499 carries a 316-byte `rendered` frame and
-/// two `help`/`note` children, of which the served line keeps 83 bytes.
+/// (`error[E0499]: cannot borrow … in src/main.rs:5`) and discard the rest of
+/// what the tool attached to it. WHICH parts those are differs per parser —
+/// [`diagnostic_class_for`] holds the verified per-family answer. For cargo,
+/// measured on rustc 1.96.0 via `cargo build --message-format=json`: one E0499
+/// carries a 316-byte `rendered` source-snippet frame and two `help`/`note`
+/// children, of which the served line keeps 83 bytes, and the trailing
+/// `rustc --explain` pointer arrives at `level: "failure-note"` and matches no
+/// arm of the parser's level match.
 ///
 /// # Why a class-1 marker, not a class-2 banner
 ///
@@ -639,31 +640,140 @@ pub(crate) fn compressed_output_hint(code: i32) -> String {
 /// entirely when the count is zero: a build with no diagnostics has no
 /// diagnostic bodies to drop, and the summary line is then the whole truth.
 ///
-/// The parenthetical names the classes of per-diagnostic body the build parsers
-/// discard; a tool that emits none of a given kind simply has none to drop.
+/// The parenthetical comes from [`diagnostic_class_for`], keyed on the program,
+/// because this one marker serves five parsers with five different discard sets.
+/// It was hard-coded to rustc's classes, so `skim make` announced "help/note
+/// lines, explain hints dropped" — three classes `make` never emits — and said
+/// nothing about what its own parser had dropped. "A tool that emits none of a
+/// given kind simply has none to drop" was the hedge that made that look
+/// acceptable; ADR-011's 2026-09-24 amendment judges a marker by what the reader
+/// is TOLD, and naming absent classes is the misstatement it ranks *below*
+/// omission.
+///
+/// # Remedy (consistency-01)
+///
+/// `remedy_for` is called with `passthrough_reproduces_argv: false`. That is the
+/// honest value here, and the reason its narrow arm had to widen past `Json`:
+/// `SKIM_PASSTHROUGH=1` is a measured NO-OP for the build family off a TTY
+/// (PF-039, Active). The convergence gate in `cmd/dispatch.rs` declines while
+/// `handler_reads_stdin` is true — which off a TTY is every multi-level
+/// dispatcher, `cargo` included — and `cmd/build/mod.rs`'s `run_parsed_command`
+/// has no passthrough branch of its own: it always spawns and always
+/// summarises. Every agent harness and CI job reads this marker from
+/// exactly that non-TTY position, so the canonical hint would be a class-1
+/// marker advertising a hatch the invocation printing it cannot use.
+///
+/// # The warning roll-up is a SECOND elided class
+///
+/// [`diagnostic_class_for`] names what a parser discards from EVERY diagnostic.
+/// `rolled_up_warnings` names a loss that fires only above a volume bound:
+/// `cmd::build::cargo::WARNING_DETAIL_MAX` (50). Above it, `summarise_warnings`
+/// replaces the per-warning diagnostics wholesale with by-lint-code counts, so
+/// `warning[dead_code]: unused variable: v17 in src/lib.rs:17` is served as
+/// `dead_code: 51 occurrence(s)`. Every warning is still COUNTED — the buckets
+/// sum to the total by construction — but the message text and the `file:line`
+/// locations are gone, and those are the actionable half.
+///
+/// Without this clause the marker named cargo's fixed discard set and stopped,
+/// so a reader at that volume was told snippets went and told NOTHING about the
+/// warning text and locations that went with them. ADR-011's 2026-09-24
+/// amendment ranks a marker that misstates its elided class *below* one that
+/// omits it, because naming the wrong class sends the reader looking for
+/// content they were not served — and "snippets dropped" is exactly that when
+/// the messages went too.
+///
+/// It is appended INSIDE the class parenthetical rather than beside it, which
+/// keeps that parenthetical's single meaning: everything in it is what the
+/// reader did not get. A second parenthetical would split one answer across two
+/// and invite reading the roll-up as a property of the summary rather than as
+/// another thing missing from it.
+///
+/// `0` means no roll-up happened, and the clause is then absent entirely —
+/// including its `; ` separator. Below the bound every warning keeps its
+/// message and location, so the clause would be a false claim of loss on the
+/// same footing as the `diagnostics == 0` suppression above. The count is never
+/// `1` when present (the bound is 50), so the plural needs no agreement arm.
 ///
 /// ```text
-/// [skim] cargo: 2 diagnostics summarised (source snippets, help/note lines, explain hints dropped) — SKIM_PASSTHROUGH=1 for full output
+/// [skim] cargo: 2 diagnostics summarised (source snippets, help/note lines, explain hints dropped) — run 'cargo' directly for the full output
+/// [skim] cargo: 53 diagnostics summarised (source snippets, help/note lines, explain hints dropped; 51 warnings rolled up to lint-code counts, per-warning messages and locations dropped) — run 'cargo' directly for the full output
 /// ```
-pub(crate) fn diagnostics_summary_marker(program: &str, diagnostics: usize) -> String {
-    // Routed through `remedy_for` so the printed remedy stays the narrowest one
-    // reachable from this invocation (ADR-011 class 1). Build output is text and
-    // the passthrough gate execs the user's literal argv, so this resolves to the
-    // canonical `ELISION_HINT`.
+pub(crate) fn diagnostics_summary_marker(
+    program: &str,
+    diagnostics: usize,
+    rolled_up_warnings: usize,
+) -> String {
     let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
         tool: program,
         output_format: OutputFormat::Text,
-        passthrough_reproduces_argv: true,
+        passthrough_reproduces_argv: false,
     });
     let unit = if diagnostics == 1 {
         "diagnostic"
     } else {
         "diagnostics"
     };
+    let class = diagnostic_class_for(program);
+    let roll_up = if rolled_up_warnings > 0 {
+        format!(
+            "; {rolled_up_warnings} warnings rolled up to lint-code counts, \
+             per-warning messages and locations dropped"
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "[skim] {program}: {diagnostics} {unit} summarised \
-         (source snippets, help/note lines, explain hints dropped) \u{2014} {remedy}"
+        "[skim] {program}: {diagnostics} {unit} summarised ({class}{roll_up}) \u{2014} {remedy}"
     )
+}
+
+/// The classes of per-diagnostic body a given build parser discards.
+///
+/// Keyed on the program because `cmd::build::run_parsed_command` is the single
+/// sink for five parsers whose discard sets do not overlap, and naming one
+/// parser's classes for another tool's output misstates the elision (ADR-011
+/// class 1). Each arm was read off that parser rather than inferred:
+///
+/// - **cargo** — `cargo.rs::format_diagnostic` renders `level[code]: msg in
+///   file:line` and keeps nothing else: the `rendered` source-snippet/caret
+///   frame, the `help:`/`note:` children and the `rustc --explain` pointer
+///   (which arrives at `level: "failure-note"` and matches no arm of the level
+///   match) are all dropped.
+/// - **tsc** — `tsc.rs::TSC_ERROR_RE` keeps `TSxxxx: msg (file:line)` per
+///   matching line. The captured column is discarded, and so is every line the
+///   pattern does not match: the indented related-information lines, the
+///   trailing `Found N errors.` summary, and errors carrying no file position.
+///   Source snippets are NOT in that list — the regex only matches tsc's
+///   non-pretty form, which emits none.
+/// - **make** — `make.rs::try_tier1_diagnostics` keeps GCC/Clang diagnostic
+///   lines, make failure lines and linker errors. The compiler's source-snippet
+///   and caret-frame lines do not match `GCC_DIAGNOSTIC_RE` and go, together
+///   with the compiler invocation command lines, `Entering/Leaving directory`,
+///   archiver lines and CMake `[ 25%]` progress lines.
+/// - **gradle/gradlew** — `gradle.rs::try_tier1_diagnostics` keeps FAILED task
+///   names (re-rendered as `Task :x FAILED`), Java/Kotlin diagnostics and the
+///   build verdict. The `> Task :x UP-TO-DATE|FROM-CACHE|SKIPPED` progress
+///   stream, the `* What went wrong:` / `* Try:` guidance blocks and exception
+///   stack traces match nothing and are dropped — which is why this arm names
+///   progress LINES rather than "task outcomes": a failed task's outcome does
+///   reach the reader, as a summary line.
+/// - **mvn/mvnw/maven** — `maven.rs::try_tier1_diagnostics` keeps every
+///   `[ERROR]` and `[WARNING]` line, so a maven stack trace (which arrives
+///   `[ERROR]`-prefixed) SURVIVES — the reason this arm does not claim stack
+///   traces the way gradle's does. What it drops is the `[INFO]` stream: module
+///   and phase context, the reactor summary, plugin progress.
+///
+/// The `_` arm is defensive. `cmd/build/mod.rs`'s dispatcher routes only the
+/// eight names above, so no production call reaches it.
+fn diagnostic_class_for(program: &str) -> &'static str {
+    match program {
+        "cargo" => "source snippets, help/note lines, explain hints dropped",
+        "tsc" => "related-info lines, columns and the error summary dropped",
+        "make" => "source snippets, compiler invocations and progress lines dropped",
+        "gradle" | "gradlew" => "task progress lines, stack traces and failure guidance dropped",
+        "mvn" | "mvnw" | "maven" => "[INFO] module and phase context dropped",
+        _ => "per-diagnostic detail lines dropped",
+    }
 }
 
 #[cfg(test)]
@@ -672,31 +782,144 @@ mod diagnostics_summary_marker_tests {
 
     #[test]
     fn test_marker_names_tool_count_class_and_remedy() {
-        let m = diagnostics_summary_marker("cargo", 2);
+        let m = diagnostics_summary_marker("cargo", 2, 0);
         assert_eq!(
             m,
             "[skim] cargo: 2 diagnostics summarised \
              (source snippets, help/note lines, explain hints dropped) \
-             \u{2014} SKIM_PASSTHROUGH=1 for full output"
+             \u{2014} run 'cargo' directly for the full output"
         );
     }
 
-    /// ADR-011 class 1: the marker must carry an exact count and the escape
-    /// hatch, and must name the elided CLASS rather than only asserting
-    /// "not raw".
+    /// ADR-011 class 1: the marker must carry an exact count, name the elided
+    /// CLASS rather than only asserting "not raw", and print a remedy that is
+    /// literally reachable — which for the build family is NOT
+    /// `SKIM_PASSTHROUGH=1` (PF-039, consistency-01).
     #[test]
-    fn test_marker_carries_exact_count_and_hint() {
-        let m = diagnostics_summary_marker("tsc", 17);
+    fn test_marker_carries_exact_count_class_and_reachable_remedy() {
+        let m = diagnostics_summary_marker("tsc", 17, 0);
         assert!(m.contains("17 diagnostics"), "exact count: {m}");
-        assert!(m.contains(ELISION_HINT), "class-1 remedy: {m}");
-        assert!(m.contains("source snippets"), "elided class: {m}");
+        assert!(
+            m.contains("related-info lines"),
+            "tsc's own elided class, not cargo's: {m}"
+        );
+        assert!(
+            m.ends_with("run 'tsc' directly for the full output"),
+            "the remedy must be one this invocation can actually use: {m}"
+        );
+        assert!(
+            !m.contains(ELISION_HINT),
+            "PF-039: the build family cannot reach the passthrough hatch: {m}"
+        );
+    }
+
+    /// consistency-06: each parser family gets its OWN class clause.
+    ///
+    /// RED before this: one hard-coded parenthetical meant `skim make` and
+    /// `skim tsc` announced rustc's `help/note` and `--explain` classes, which
+    /// neither tool emits, and disclosed nothing their parsers had dropped.
+    #[test]
+    fn test_marker_class_is_per_parser_family() {
+        let cargo = diagnostics_summary_marker("cargo", 1, 0);
+        let make = diagnostics_summary_marker("make", 1, 0);
+        let tsc = diagnostics_summary_marker("tsc", 1, 0);
+        let gradle = diagnostics_summary_marker("gradlew", 1, 0);
+        let maven = diagnostics_summary_marker("mvnw", 1, 0);
+
+        assert!(cargo.contains("explain hints"), "{cargo}");
+        assert!(!make.contains("explain hints"), "make emits none: {make}");
+        assert!(!tsc.contains("explain hints"), "tsc emits none: {tsc}");
+        assert!(
+            !tsc.contains("source snippets"),
+            "the tsc regex only matches the non-pretty form, which has none: {tsc}"
+        );
+        assert!(make.contains("compiler invocations"), "{make}");
+        assert!(gradle.contains("stack traces"), "{gradle}");
+        assert!(
+            !maven.contains("stack traces"),
+            "maven keeps [ERROR]-prefixed stack frames: {maven}"
+        );
+        assert!(maven.contains("[INFO]"), "{maven}");
+    }
+
+    /// Every spelling `cmd/build/mod.rs` routes reaches its family's clause —
+    /// the aliases must not fall through to the defensive arm.
+    #[test]
+    fn test_diagnostic_class_covers_every_routed_spelling() {
+        let fallback = diagnostic_class_for("__unrouted__");
+        for program in [
+            "cargo", "tsc", "make", "gradle", "gradlew", "mvn", "mvnw", "maven",
+        ] {
+            assert_ne!(
+                diagnostic_class_for(program),
+                fallback,
+                "{program} is routed by the dispatcher and must own a clause"
+            );
+        }
+        assert_eq!(
+            diagnostic_class_for("gradle"),
+            diagnostic_class_for("gradlew"),
+            "the wrapper spelling is the same parser"
+        );
+        assert_eq!(
+            diagnostic_class_for("mvn"),
+            diagnostic_class_for("maven"),
+            "every maven spelling shares one parser and one clause"
+        );
     }
 
     #[test]
     fn test_marker_singular_for_one_diagnostic() {
-        let m = diagnostics_summary_marker("cargo", 1);
+        let m = diagnostics_summary_marker("cargo", 1, 0);
         assert!(m.contains("1 diagnostic summarised"), "{m}");
         assert!(!m.contains("1 diagnostics"), "{m}");
+    }
+
+    /// The by-lint-code roll-up is disclosed, inside the one parenthetical.
+    ///
+    /// RED before this: above `cmd::build::cargo::WARNING_DETAIL_MAX` the
+    /// parser replaced every warning's message and `file:line` with a bucket
+    /// count, and the marker still named only cargo's fixed discard set — the
+    /// misstatement ADR-011's 2026-09-24 amendment ranks below omission.
+    ///
+    /// `53 = 51 warnings + 2 errors`: `diagnostics` is the full count and
+    /// `rolled_up_warnings` is the warning subset, so the two are deliberately
+    /// different numbers in this fixture. A test using one value for both would
+    /// pass even if the call site passed the wrong one.
+    #[test]
+    fn test_marker_discloses_the_warning_roll_up() {
+        let rolled = diagnostics_summary_marker("cargo", 53, 51);
+        assert_eq!(
+            rolled,
+            "[skim] cargo: 53 diagnostics summarised \
+             (source snippets, help/note lines, explain hints dropped; \
+             51 warnings rolled up to lint-code counts, \
+             per-warning messages and locations dropped) \
+             \u{2014} run 'cargo' directly for the full output"
+        );
+    }
+
+    /// Below the bound the clause is absent — separator included.
+    ///
+    /// Every warning still carries its message and location there, so a clause
+    /// claiming otherwise is a false claim of loss, on the same footing as the
+    /// `diagnostics == 0` suppression. The `ends_with` assertion is what pins
+    /// the `; ` separator to the clause rather than to the parenthetical: a
+    /// dangling `dropped; )` would satisfy a bare `!contains("rolled up")`.
+    #[test]
+    fn test_marker_omits_the_roll_up_clause_below_the_bound() {
+        let plain = diagnostics_summary_marker("cargo", 53, 0);
+        assert!(
+            !plain.contains("rolled up"),
+            "no roll-up happened, so nothing may claim one: {plain}"
+        );
+        assert!(
+            plain.ends_with(
+                "(source snippets, help/note lines, explain hints dropped) \
+                 \u{2014} run 'cargo' directly for the full output"
+            ),
+            "the absent clause must leave no separator behind: {plain}"
+        );
     }
 }
 
@@ -735,26 +958,66 @@ pub(crate) fn rewrite_origin() -> Option<String> {
 /// # Accuracy (ADR-011 class 1)
 ///
 /// A class-1 marker that misstates the elided class is worse than one that
-/// omits it: it sends the reader back for content they already have. Two arms
-/// were affirmatively false, verified against `docs/modes.md` and empirically
-/// on `tests/fixtures/python/mixed_priority.py`:
+/// omits it: it sends the reader back for content they already have. Every arm
+/// below is verified against `transform/pseudo.rs::get_pseudo_rules`,
+/// `transform/minimal.rs::is_removable_comment` and `docs/modes.md` — not
+/// against one fixture, because what `pseudo` removes is a property of the
+/// LANGUAGE as much as of the mode:
 ///
-/// - `pseudo` claimed "bodies removed" and removes no body in any language. It
-///   strips parameter annotations, decorators, Rust lifetimes/generics/
-///   where-clauses/attributes, and statement semicolons.
-/// - `minimal` claimed "bodies removed" and removes no body either. It strips
-///   non-doc comments.
+/// - `pseudo` removes NO body in any language, and exactly one class in EVERY
+///   language: non-doc comments. Beyond that it varies. TypeScript drops
+///   decorators, `readonly`/`abstract`, variable/property annotations and
+///   semicolons; JavaScript drops decorators and semicolons; Python drops
+///   decorators, parameter/variable annotations and the `self`/`cls` receiver;
+///   Java, C#, Kotlin and Swift drop annotations, generics and non-visibility
+///   modifiers; C and C++ drop linkage and cv-qualifier keywords (C++ also
+///   access specifiers and template parameter lists); Rust and SQL drop
+///   statement semicolons and nothing else; **Go, Ruby and Bash drop nothing at
+///   all beyond comments**. That last group is why the clause says "any syntax
+///   noise" instead of naming constructs: `"annotations, decorators removed"`
+///   was affirmatively false for seven of the fifteen tree-sitter languages, and
+///   worst for Rust, which HAS attributes and generics and keeps every one of
+///   them (`753976d` emptied Rust's `strip_kinds`; see also ADR-007 for return
+///   types, E1/ADR-008 for TypeScript parameter annotations — Python's are still
+///   stripped, its grammar spelling both positions `type`).
+/// - `minimal` removes no body either, and removes comments under the very same
+///   `is_removable_comment` rules `pseudo` uses: doc comments, shebangs,
+///   comments inside function bodies and — since #476, in EVERY language, not
+///   just the four that used to be allowlisted — the module-header comment run
+///   all survive. The clause names the header exception because that is the one
+///   a reader goes hunting for (SPDX, licence, provenance) and would otherwise
+///   re-read raw to find; the in-body exception is recorded here rather than on
+///   the wire. Both modes carry the same comment wording on purpose: two arms
+///   that described the same rule differently would read as two rules.
 /// - `signatures` carried `structure`'s clause verbatim and under-disclosed:
 ///   it also drops imports, classes, type definitions and module constants.
 ///
 /// `structure` is the only mode that removes bodies, so its clause is unchanged.
 ///
+/// # Language-agnostic by signature, per-language in truth
+///
+/// The honest class is a property of `(mode, language)`, but nothing can hand
+/// this table a language today: every caller arrives through
+/// [`lossy_view_marker`], whose inputs are a mode STRING and counts —
+/// `process.rs::single_file_notice` holds only `(mode_str, view_differs)`, and
+/// `multi.rs` emits ONE aggregate marker for a batch that may mix languages. So
+/// `pseudo`'s arm is worded to be true for all fifteen languages rather than
+/// precise for one. Threading `Option<Language>` from `ProcessResult` through
+/// `single_file_notice` / `emitted_notice_cost` / `lossy_view_marker` into this
+/// table is the strictly better disclosure (Rust would read "…and statement
+/// semicolons removed"; Go would read comments only), and it touches
+/// `process.rs`, `main.rs` and `multi.rs` — which is why it is not done here.
+///
 /// Made `pub(crate)` by D1 so downstream callers (e.g. `fidelity::remedy_for`
 /// contexts) can name the elided class without duplicating the label table.
 pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
     match mode_str {
-        "pseudo" => "annotations, decorators removed",
-        "minimal" => "non-doc comments removed",
+        // "any syntax noise" is the conditional half: it is zero for Go, Ruby
+        // and Bash, semicolons for Rust and SQL, and a per-language list
+        // elsewhere. Naming those constructs unconditionally is the defect this
+        // arm replaces.
+        "pseudo" => "non-doc comments below the module header and any syntax noise removed",
+        "minimal" => "non-doc comments below the module header removed",
         "structure" => "bodies removed",
         "signatures" => "all but signatures removed",
         "types" => "all but types removed",
@@ -784,17 +1047,17 @@ pub(crate) fn mode_class_label(mode_str: &str) -> &'static str {
 ///
 /// With hook-rewrite origin (e.g. `SKIM_REWRITTEN_FROM=cat`):
 /// ```text
-/// [skim] transformed view (cat → skim --mode=pseudo): annotations, decorators removed — SKIM_PASSTHROUGH=1 for full output
+/// [skim] transformed view (cat → skim --mode=pseudo): non-doc comments below the module header and any syntax noise removed — SKIM_PASSTHROUGH=1 for full output
 /// ```
 ///
 /// Without origin (explicit `skim file.ts --mode=pseudo`):
 /// ```text
-/// [skim] pseudo view: annotations, decorators removed — SKIM_PASSTHROUGH=1 for full output
+/// [skim] pseudo view: non-doc comments below the module header and any syntax noise removed — SKIM_PASSTHROUGH=1 for full output
 /// ```
 ///
 /// Multi-file (with or without origin):
 /// ```text
-/// [skim] transformed view (cat → skim --mode=pseudo): annotations, decorators removed: 2/3 files — SKIM_PASSTHROUGH=1 for full output
+/// [skim] transformed view (cat → skim --mode=pseudo): non-doc comments below the module header and any syntax noise removed: 2/3 files — SKIM_PASSTHROUGH=1 for full output
 /// ```
 pub(crate) fn lossy_view_marker(
     origin: Option<&str>,
@@ -847,7 +1110,7 @@ pub(crate) fn lossy_view_marker(
 /// database without these columns can offer is token identity
 /// (`raw_tokens == compressed_tokens`),
 /// and the field that *looks* like it answers this — `parse_tier` — answers a
-/// different question: [`crate::process::parse_tier_from`] is evaluated BEFORE
+/// different question: `parse_tier_from` is evaluated BEFORE
 /// the guard runs, and its call site says so in as many words ("the parse tier
 /// reflects the transformation, not the final selection").
 ///
@@ -938,14 +1201,17 @@ impl EmittedNotice {
 /// This is the **smallest of the three** analytics defects fixed alongside it,
 /// and it is worth naming the gap rather than letting the fix imply importance.
 /// Measured on the 90-day corpus (68,326 rows). Every single-file marker
-/// variant was tokenised: the emitted cost spans **23–34 cl100k tokens**
-/// (77–126 bytes) — 23–25 for a direct `skim <file>`, 31–34 once a hook origin
-/// puts `cat → skim --mode=…` in the line.
+/// variant was tokenised: the emitted cost spans **23–41 cl100k tokens**
+/// (77–163 bytes) — 23–33 for a direct `skim <file>`, 31–41 once a hook origin
+/// puts `cat → skim --mode=…` in the line. The top of that band moved when
+/// [`mode_class_label`]'s `pseudo` and `minimal` clauses were corrected
+/// (rust-02 / consistency-13); the floor is `structure`, which did not move.
 ///
-/// - Excluding this notice moves the headline by **−0.134% to −0.198%**
-///   (4,670 single-`file` rows whose view differs × 23–34 tokens, against an
+/// - Excluding this notice moves the headline by **−0.134% to −0.239%**
+///   (4,670 single-`file` rows whose view differs × 23–41 tokens, against an
 ///   80,238,562-token headline). Triage reported −0.14%, which is this band's
-///   direct-invocation end.
+///   direct-invocation floor; the corpus rows themselves were recorded under the
+///   narrower pre-correction band, so the widened top is forward-looking.
 /// - The `ELSE 0` clamp in `query_summary` hides **11,983,387** tokens of real
 ///   expansion, making the same headline **+17.6% over truth**.
 /// - `AVG(savings_pct)` over all rows reads 13.41% where the same average over
@@ -1169,8 +1435,16 @@ mod lossy_view_marker_tests {
         assert!(marker.contains("cat"), "must name origin");
         assert!(marker.contains("pseudo"), "must name mode");
         assert!(
-            marker.contains("annotations, decorators removed"),
-            "B4: must name the class pseudo actually elides; got: {marker:?}"
+            marker.contains("non-doc comments below the module header"),
+            "B4: must name the class pseudo elides in EVERY language; got: {marker:?}"
+        );
+        assert!(
+            marker.contains("any syntax noise removed"),
+            "B4: must name the per-language class, conditionally; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("annotations") && !marker.contains("decorators"),
+            "rust-02: must not name constructs Rust and Go keep; got: {marker:?}"
         );
         assert!(
             !marker.contains("bodies"),
@@ -1213,8 +1487,16 @@ mod lossy_view_marker_tests {
             "direct form must name the mode once, as a prefix; got: {marker:?}"
         );
         assert!(
-            marker.contains("annotations, decorators removed"),
-            "B4: must name the class pseudo actually elides; got: {marker:?}"
+            marker.contains("non-doc comments below the module header"),
+            "B4: must name the class pseudo elides in EVERY language; got: {marker:?}"
+        );
+        assert!(
+            marker.contains("any syntax noise removed"),
+            "B4: must name the per-language class, conditionally; got: {marker:?}"
+        );
+        assert!(
+            !marker.contains("annotations") && !marker.contains("decorators"),
+            "rust-02: must not name constructs Rust and Go keep; got: {marker:?}"
         );
         assert!(
             !marker.contains("bodies"),
@@ -1385,11 +1667,25 @@ mod lossy_view_marker_tests {
     /// edit show its guard consequence as a visible diff instead of silently
     /// moving that decision.
     ///
+    /// # Two rows moved (rust-02 / consistency-13)
+    ///
+    /// `pseudo` went 90 → 128 B (24 → 32 t) direct and 124 → 162 B (32 → 40 t)
+    /// origin; `minimal` went 84 → 108 B (24 → 28 t) and 118 → 142 B
+    /// (32 → 36 t). Both clauses stopped naming classes their mode removes zero
+    /// of in some languages and started naming the one it removes in all of
+    /// them, which the ADR-011 amendment ranks above terseness for a class-1
+    /// marker. The guard consequence runs in the safe direction: because
+    /// `fidelity::decide_with_notice` charges the notice, a wider disclosure
+    /// makes a marginal small file fall back to RAW — the reader then receives
+    /// more content, never less.
+    ///
     /// # What is pinned, exactly
     ///
-    /// The `String` [`lossy_view_marker`] returns. `process.rs` emits it with
-    /// `eprintln!`, so the cost ON THE WIRE is one byte and one cl100k token
-    /// more than every number below (measured, not assumed).
+    /// The `String` [`lossy_view_marker`] returns. The line that reaches stderr
+    /// carries its own terminator ([`EmittedNotice::line`], which `process.rs`
+    /// and `multi.rs` write with `eprint!`), so the cost ON THE WIRE is one byte
+    /// and one cl100k token more than every number below (measured, not
+    /// assumed).
     ///
     /// The origin column is held at `cat` for all seven rows so a row-to-row
     /// diff isolates the class clause rather than the origin word. A
@@ -1408,8 +1704,8 @@ mod lossy_view_marker_tests {
     fn test_lossy_view_marker_composed_cost_ceiling() {
         // (mode_str, direct bytes, direct tokens, origin bytes, origin tokens)
         const COSTS: &[(&str, usize, usize, usize, usize)] = &[
-            ("pseudo", 90, 24, 124, 32),
-            ("minimal", 84, 24, 118, 32),
+            ("pseudo", 128, 32, 162, 40),
+            ("minimal", 108, 28, 142, 36),
             ("structure", 76, 22, 110, 30),
             ("signatures", 89, 24, 123, 33),
             ("types", 79, 24, 113, 32),

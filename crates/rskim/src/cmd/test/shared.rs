@@ -237,7 +237,7 @@ where
     };
 
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw_output, result.content());
+        let (orig, comp) = crate::tokens::count_token_pair(&raw_output, result.content());
         crate::process::report_token_stats(orig, comp, "");
     }
 

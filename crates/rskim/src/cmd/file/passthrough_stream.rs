@@ -124,10 +124,17 @@ pub(super) fn run_passthrough_streamed(
             }
             None => {
                 // Loss-bearing: killed mid-write, so stdout may be partial.
-                // Unconditional per ADR-011 class 1.
+                // Unconditional per ADR-011 class 1.  The remedy is
+                // interpolated from `ELISION_HINT` rather than spelled out:
+                // that constant is the single source of truth for every
+                // class-1 marker's escape hatch, and this site said "for raw
+                // output" where the constant says "for full output".  The
+                // buffered twin in `cmd/execution.rs` interpolates the same
+                // constant, so the two sinks stay byte-identical here too.
                 eprintln!(
-                    "[skim] {} killed by signal; output may be partial — SKIM_PASSTHROUGH=1 for raw output",
-                    spec.program
+                    "[skim] {} killed by signal; output may be partial — {}",
+                    spec.program,
+                    crate::output::ELISION_HINT
                 );
             }
         }

@@ -1243,9 +1243,14 @@ fn process_single_arg(
     // produces a `Message` error with no source, which `chain()` cannot walk.
     //
     // consistency-3: the remedy line in the multi-file marker says
-    // "SKIM_PASSTHROUGH=1 for raw output", so every shape the marker can fire
-    // for must also work in passthrough mode.  Directories and globs are handled
-    // here so the remedy is literally reachable from any invocation that prints it.
+    // "SKIM_PASSTHROUGH=1 for full output" — `lossy_view_marker` resolves its
+    // remedy through `fidelity::remedy_for` with
+    // `passthrough_reproduces_argv: true`, which returns the canonical
+    // `output::ELISION_HINT` (pinned whole by
+    // `cli_transparency::test_multi_file_aggregate_marker_emitted_once`).
+    // Either way the marker names a hatch, so every shape it can fire for must
+    // also work in passthrough mode.  Directories and globs are handled here so
+    // the remedy is literally reachable from any invocation that prints it.
     if cmd::is_passthrough_mode() {
         use std::io::Write as _;
         let stdout = std::io::stdout();
@@ -1289,7 +1294,12 @@ fn process_single_arg(
         .unwrap_or_default()
         .display()
         .to_string();
-    let mode_str = format!("{:?}", Mode::from(args.mode)).to_lowercase();
+    // `Mode::name` is the canonical lowercase spelling (one match arm per
+    // variant in rskim-core). The marker `write_result_and_stats` prints, the
+    // cost `record_file_analytics` charges, the analytics `mode` column, and
+    // the guard charge inside `process::view_notice_absolute` all read it, so
+    // none of them can spell a mode differently from the others.
+    let mode_str = Mode::from(args.mode).name().to_string();
 
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
