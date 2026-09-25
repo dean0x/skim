@@ -162,6 +162,7 @@ pub const SANDBOX_REMOVED_VARS: &[&str] = &[
     "SKIM_CURSOR_DB_PATH",      // session-provider transcript DB (Cursor)
     "SKIM_GEMINI_DIR",          // session-provider transcript dir (Gemini)
     "SKIM_CRUSH_DIR",           // session-provider transcript dir (Crush)
+    "CARGO_BIN_EXE_skim",       // cargo-test bin path; shipped skim never reads it
 ];
 
 /// Env vars deliberately inherited from the host.
