@@ -211,27 +211,26 @@ probes of the already-built debug binary. The serial validation pass is the real
 
 | Issue | File:Line | Reason | Tracked |
 |-------|-----------|--------|---------|
-| architecture-02 | crates/rskim/src/output/fidelity.rs:202 | Collapsing 8 guard entry points to 3 changes every call site at once | (pending) |
-| architecture-03 | crates/rskim/src/output/mod.rs:861 | Moving `Served` across the presentation/persistence boundary | (pending) |
-| architecture-06 | crates/rskim/src/cmd/infra/gh/mod.rs:127 | `CONFIG` → `config_for(route)` touches every gh route module | (pending) |
-| architecture-08 | crates/rskim/src/cmd/git/diff/render.rs:621 | Deleting the test-only renderer; parameterised instead this round | (pending) |
-| architecture-09 | crates/rskim-core/src/transform/truncate.rs:60 | `source_range` as a required field touches every `NodeSpan` producer | (pending) |
-| architecture-10 | crates/rskim/src/cache.rs:239 | Closing the key gap means tokenising on the cache-key path | (pending) |
-| complexity-02 | crates/rskim/src/output/fidelity.rs:201 | Same shim-collapse as architecture-02 | (pending) |
-| complexity-03 | crates/rskim/src/process.rs:254 | Redesign of the cost-accounting surface | (pending) |
-| complexity-11 | crates/rskim/src/output/mod.rs:648 | `NoticeClass` type for the ADR-011 taxonomy (80 prose citations, 18 files) | (pending) |
-| complexity-14 | crates/rskim/src/cmd/git/diff/render.rs | Seven touched files at 2,400–4,000 lines | (pending) |
-| complexity-16 | crates/rskim/src/cmd/git/diff/render.rs:1359 | `emit_source_line` at 5 params, 9 call sites | (pending) |
-| complexity-17 | crates/rskim/src/cmd/infra/gh/run_watch.rs:264 | Reordering the suffix-heuristic chain risks pinned parse behaviour | (pending) |
-| database-10 | crates/rskim/src/analytics/schema.rs:72 | Only a table rebuild restores NOT NULL — the very operation whose hazard is documented | (pending) |
-| database-11 | crates/rskim/src/cmd/stats.rs:120 | Deriving the window label from the prune policy moves every dashboard figure | (pending) |
-| database-12 | crates/rskim/src/cmd/stats.rs:120 | PF-036 self-measurement exclusion moves every number at once | (pending) |
-| performance-04 | crates/rskim/src/cmd/git/diff/render.rs:1445 | Revisiting the enrichment budget is an ADR-003 conversation | (pending) |
-| performance-06 | crates/rskim/src/analytics/schema.rs:193 | Retiring the per-open reconcile depends on settling `user_version` | (pending) |
-| reliability-07 | crates/rskim/src/cache.rs:212 | Adding a cache bound is a new lifecycle policy | (pending) |
-| reliability-11 | crates/rskim/src/cmd/git/diff/render.rs:1445 | Changing `MIN_RAW_SIZE_FOR_GUARDRAIL` is an ADR-001 decision | (pending) |
+| architecture-02 | crates/rskim/src/output/fidelity.rs:202 | Collapsing 8 guard entry points to 3 changes every call site at once | #563 |
+| architecture-03 | crates/rskim/src/output/mod.rs:861 | Moving `Served` across the presentation/persistence boundary | #564 |
+| architecture-06 | crates/rskim/src/cmd/infra/gh/mod.rs:127 | `CONFIG` → `config_for(route)` touches every gh route module | #564 |
+| architecture-08 | crates/rskim/src/cmd/git/diff/render.rs:621 | Deleting the test-only renderer; parameterised instead this round | #569 |
+| architecture-09 | crates/rskim-core/src/transform/truncate.rs:60 | `source_range` as a required field touches every `NodeSpan` producer | #569 |
+| architecture-10 | crates/rskim/src/cache.rs:239 | Closing the key gap means tokenising on the cache-key path | #567 |
+| complexity-03 | crates/rskim/src/process.rs:254 | Redesign of the cost-accounting surface | #563 |
+| complexity-11 | crates/rskim/src/output/mod.rs:648 | `NoticeClass` type for the ADR-011 taxonomy (80 prose citations, 18 files) | #563 |
+| complexity-14 | crates/rskim/src/cmd/git/diff/render.rs | Seven touched files at 2,400–4,000 lines | #569 |
+| complexity-16 | crates/rskim/src/cmd/git/diff/render.rs:1359 | `emit_source_line` at 5 params, 9 call sites | #569 |
+| complexity-17 | crates/rskim/src/cmd/infra/gh/run_watch.rs:264 | Reordering the suffix-heuristic chain risks pinned parse behaviour | #569 |
+| database-10 | crates/rskim/src/analytics/schema.rs:72 | Only a table rebuild restores NOT NULL — the very operation whose hazard is documented | #566 |
+| database-11 | crates/rskim/src/cmd/stats.rs:120 | Deriving the window label from the prune policy moves every dashboard figure | #566 |
+| database-12 | crates/rskim/src/cmd/stats.rs:120 | PF-036 self-measurement exclusion moves every number at once | #566 |
+| performance-04 | crates/rskim/src/cmd/git/diff/render.rs:1445 | Revisiting the enrichment budget is an ADR-003 conversation | #568 |
+| performance-06 | crates/rskim/src/analytics/schema.rs:193 | Retiring the per-open reconcile depends on settling `user_version` | #566 |
+| reliability-07 | crates/rskim/src/cache.rs:212 | Adding a cache bound is a new lifecycle policy | #567 |
+| reliability-11 | crates/rskim/src/cmd/git/diff/render.rs:1445 | Changing `MIN_RAW_SIZE_FOR_GUARDRAIL` is an ADR-001 decision | #568 |
 
-### Newly discovered, recommended for the deferred set
+### Newly discovered — now tracked (#563 #564 #565 #569 #570)
 
 - **`structure.rs`'s Markdown header extractor emits 8 line-map entries for 13 output lines.** This
   single producer defect blocks three separate things: the real `signatures` gap-marker fix
