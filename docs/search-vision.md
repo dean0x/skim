@@ -55,6 +55,15 @@ Performance targets (sub-50 ms queries, fast incremental updates) matter, but th
 | Co-change (blast radius) | Precision/recall on real PRs, trending up |
 | Tokens to first correct answer | Fewer than `rg` |
 
+### How it runs
+
+The scoreboard lives in [`crates/rskim-bench/scoreboard/`](../crates/rskim-bench/scoreboard/README.md) (#203): an end-to-end harness that drives the release `skim` binary against four pinned, full-history corpora (skim, ripgrep, flask, zod) and checks every answer against an independent in-process oracle (`rg -F` semantics over the same file universe, no `rg` dependency).
+
+- **Required gate.** The `Search Scoreboard` CI job runs on every PR that touches search code; a search PR merges only with it green.
+- **HARD checks** must pass per query: recall = precision = 1, zero silent misses, honest pagination, prefix consistency, score order. **RATCHET** metrics (definition top-1, MRR, anchor = definition, P@k vs baselines, output bytes) cannot move in either direction without an explicit re-bless of `baseline.json`. Latency is informational.
+- **Known failures are ledgered, never hidden.** Each entry in `known_failures.toml` names its ticket; fixing the bug turns the entry into an XPASS, which fails the gate until the entry is removed.
+- **Manual adversarial dog-food (ADR-007)** remains only for capabilities the scoreboard does not cover yet: structural precision until #541, temporal parity until #542.
+
 A change to retrieval or ranking merges only if the scoreboard does not regress.
 
 ## Non-goals
