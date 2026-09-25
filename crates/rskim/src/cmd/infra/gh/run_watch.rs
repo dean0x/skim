@@ -16,6 +16,17 @@
 //! 3. Job failure (`Failure`, `Failed`) → emit `✗ {name} [FAILED]`.
 //! 4. Progress/noise lines (dots, percentages, unchanged status) → suppressed.
 //! 5. Error lines → passed through.
+//! 6. Job lines beyond [`MAX_STREAM_JOBS`] → suppressed AND disclosed at EOF
+//!    with a loud elision marker (#317; ADR-011 class 1, unconditional).
+//!
+//! # Job identity (canonicalisation)
+//!
+//! `gh run watch` re-prints the entire job list on every refresh, and each
+//! entry carries a ticking ` in <duration>` and a trailing ` (ID <n>)`.  The
+//! HashMap is therefore keyed on [`canonical_job_name`] — the entry with both
+//! tails removed — so one job is one key for the life of the stream.  Keying
+//! on the raw entry minted a fresh key per frame, which re-emitted every job
+//! on every frame and drove the map into the cap.
 //!
 //! # Non-retention design (AD-STR-4)
 //!
@@ -45,7 +56,17 @@ use super::streaming::{
 ///
 /// gh run watch may expand matrices to many jobs.  Capping at 64 prevents
 /// unbounded HashMap growth on pathological matrix configurations.
+///
+/// The cap is a hard bound on what the reader is shown, so reaching it is
+/// disclosed: see [`RunWatchParser::capped_lines`] and `finalize`.
 pub(super) const MAX_STREAM_JOBS: usize = 64;
+
+/// Maximum byte length of a `gh` elapsed-time token (`45s`, `1m20s`, `1h2m3s`).
+///
+/// An explicit upper bound on [`is_duration_token`]'s scan: anything longer is
+/// not a duration, so the check exits without walking the tail of a line whose
+/// contents skim does not control.
+const MAX_DURATION_TOKEN_LEN: usize = 16;
 
 // ============================================================================
 // Public entry point
@@ -110,6 +131,93 @@ pub(super) fn run_watch(args: &[String], ctx: &crate::cmd::RunContext) -> anyhow
 // Parser implementation
 // ============================================================================
 
+// ============================================================================
+// Job-name canonicalisation
+// ============================================================================
+
+/// `true` when `s` is a `gh`-style elapsed-time token.
+///
+/// Accepts ASCII digits and the unit letters `h`/`m`/`s`/`d` only, requires at
+/// least one digit, and requires the token to END in a unit — so `45s`,
+/// `1m20s` and `1h2m3s` match while a job name fragment like `staging` or
+/// `progress` does not.  Pure, allocation-free, and bounded by
+/// [`MAX_DURATION_TOKEN_LEN`].
+fn is_duration_token(s: &str) -> bool {
+    if s.is_empty() || s.len() > MAX_DURATION_TOKEN_LEN {
+        return false;
+    }
+    let mut has_digit = false;
+    for byte in s.bytes() {
+        match byte {
+            b'0'..=b'9' => has_digit = true,
+            b'h' | b'm' | b's' | b'd' => {}
+            _ => return false,
+        }
+    }
+    has_digit && s.ends_with(['h', 'm', 's', 'd'])
+}
+
+/// Strip a trailing ` (ID <digits>)` token from a job entry.
+///
+/// Only a parenthesised run of ASCII digits introduced by the literal
+/// `" (ID "` is removed, so a matrix leg like `build (ubuntu-latest)` — which
+/// also ends in `)` — is left intact.  Returns a borrowed slice; nothing is
+/// allocated.
+fn strip_trailing_id(name: &str) -> &str {
+    const ID_OPEN: &str = " (ID ";
+    let trimmed = name.trim_end();
+    if !trimmed.ends_with(')') {
+        return name;
+    }
+    let Some(open) = trimmed.rfind(ID_OPEN) else {
+        return name;
+    };
+    // `trimmed` ends with ')', so it is non-empty and `len - 1` is in bounds
+    // and on a char boundary; `get` keeps the slice total regardless.
+    let Some(inner) = trimmed.get(open + ID_OPEN.len()..trimmed.len() - 1) else {
+        return name;
+    };
+    if inner.is_empty() || !inner.bytes().all(|b| b.is_ascii_digit()) {
+        return name;
+    }
+    trimmed[..open].trim_end()
+}
+
+/// Strip a trailing ` in <duration>` token from a job entry.
+///
+/// The tail after the last `" in "` must be a full [`is_duration_token`], so a
+/// job genuinely named `check in staging` keeps its name.  Returns a borrowed
+/// slice; nothing is allocated.
+fn strip_trailing_elapsed(name: &str) -> &str {
+    const IN_SEP: &str = " in ";
+    let trimmed = name.trim_end();
+    let Some(at) = trimmed.rfind(IN_SEP) else {
+        return name;
+    };
+    let Some(tail) = trimmed.get(at + IN_SEP.len()..) else {
+        return name;
+    };
+    if !is_duration_token(tail) {
+        return name;
+    }
+    trimmed[..at].trim_end()
+}
+
+/// Reduce a `gh run watch` job entry to the part that identifies the job.
+///
+/// Every frame re-prints the whole job list with a ticking elapsed time, so
+/// `build (ubuntu-latest) in 7s (ID 987654321)` and
+/// `build (ubuntu-latest) in 14s (ID 987654321)` are the SAME job.  Keying the
+/// HashMap on the full string made each frame mint a fresh entry, which both
+/// re-emitted every job on every frame and grew the map until
+/// [`MAX_STREAM_JOBS`] silently swallowed the rest of the run.
+///
+/// The ID is stripped before the duration because `gh` prints them in that
+/// order (`… in 1m2s (ID 42)`).
+fn canonical_job_name(name: &str) -> &str {
+    strip_trailing_elapsed(strip_trailing_id(name))
+}
+
 /// Job status as tracked by the streaming parser.
 #[derive(Debug, Clone, PartialEq)]
 enum JobStatus {
@@ -127,6 +235,9 @@ pub(super) struct RunWatchParser {
     jobs: HashMap<String, JobStatus>,
     totals: StreamTotals,
     any_failure: bool,
+    /// Job status lines dropped because [`MAX_STREAM_JOBS`] was already
+    /// reached.  Latched here and disclosed once by `finalize` (#317).
+    capped_lines: usize,
 }
 
 impl RunWatchParser {
@@ -135,6 +246,7 @@ impl RunWatchParser {
             jobs: HashMap::new(),
             totals: StreamTotals::default(),
             any_failure: false,
+            capped_lines: 0,
         }
     }
 
@@ -152,6 +264,8 @@ impl RunWatchParser {
     ///    do not strip "In progress" when the detected status is `Completed`).
     ///    This prevents job names like `"X-ray test"` from being misclassified
     ///    or truncated.
+    /// 3. Reduce what remains to [`canonical_job_name`], so the returned name
+    ///    is the job's identity rather than this frame's snapshot of it.
     fn try_parse_job_line(&self, line: &str) -> Option<(String, JobStatus)> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -186,19 +300,26 @@ impl RunWatchParser {
             JobStatus::InProgress => &["In progress"],
             JobStatus::Queued => &["Queued", "Waiting"],
         };
-        let mut name = rest.trim().to_string();
+        let mut name: &str = rest.trim();
         for suffix in status_suffixes {
             if let Some(stripped) = name.strip_suffix(suffix) {
-                name = stripped.trim().to_string();
+                name = stripped.trim();
                 break;
             }
         }
+
+        // Drop the per-frame tails so the same job keeps one identity across
+        // frames.  Runs AFTER the status-suffix strip because the two tails
+        // appear in opposite orders: the pipe form ends with the status word
+        // (`build Completed`), the live form ends with the ID
+        // (`build in 1m2s (ID 42)`).
+        let name = canonical_job_name(name);
 
         if name.is_empty() {
             return None;
         }
 
-        Some((name, status))
+        Some((name.to_string(), status))
     }
 }
 
@@ -219,8 +340,11 @@ impl StreamingParser for RunWatchParser {
 
         // Try to parse a job status transition.
         if let Some((name, new_status)) = self.try_parse_job_line(line) {
-            // Cap at MAX_STREAM_JOBS.
+            // Cap at MAX_STREAM_JOBS.  The cap is an unavoidable bound on an
+            // unbounded stream, so it is LATCHED and disclosed at EOF rather
+            // than applied silently (#317).
             if self.jobs.len() >= MAX_STREAM_JOBS && !self.jobs.contains_key(&name) {
+                self.capped_lines = self.capped_lines.saturating_add(1);
                 return None;
             }
 
@@ -247,7 +371,32 @@ impl StreamingParser for RunWatchParser {
         None // Suppress noise
     }
 
-    /// Emit a final summary line at EOF.
+    /// Emit a final summary line at EOF, plus the cap disclosure if one is due.
+    ///
+    /// # `{completed}/{total}`, not `{total}/{total}`
+    ///
+    /// The no-failure branch previously reported `{total}/{total}`, which
+    /// claims every job succeeded the moment the parser knows how many there
+    /// are — a stream that ends with jobs still queued or in progress (the
+    /// normal shape when the reader detaches, or when `gh` is interrupted)
+    /// reported them all as successes.  `completed` is the count actually
+    /// observed reaching `Completed`, and is what both branches now report.
+    ///
+    /// # Cap disclosure (#317, ADR-011 class 1)
+    ///
+    /// When [`MAX_STREAM_JOBS`] suppressed job lines, the reader was shown
+    /// strictly less than the raw tool, so the marker is LOSS-BEARING: it is
+    /// ADR-011 class 1 and therefore UNCONDITIONAL — never `SKIM_DEBUG`-gated.
+    /// It is built by `output::elision_marker_unbounded` so it carries the
+    /// mandated `SKIM_PASSTHROUGH=1` remedy, and it uses the *unbounded*
+    /// constructor because the run's true job total is unknowable here: the
+    /// suppressed names are precisely the ones that were never retained.  The
+    /// exact figure that IS known — how many status lines were dropped — is
+    /// carried in the marker.
+    ///
+    /// The marker rides on stdout beside the summary, matching the sibling
+    /// bound in this module (`streaming::read_line_lossy` appends the 64 KiB
+    /// line-cap marker inline the same way).
     fn finalize(self: Box<Self>) -> Option<String> {
         let completed = self
             .jobs
@@ -260,18 +409,27 @@ impl StreamingParser for RunWatchParser {
             .filter(|s| **s == JobStatus::Failed)
             .count();
         let total = self.jobs.len();
+        let suppressed = self.capped_lines;
 
-        if total == 0 {
-            return None;
-        }
-
-        let summary = if failed > 0 {
+        let mut out = if total == 0 {
+            String::new()
+        } else if failed > 0 {
             format!("Run complete: {completed}/{total} succeeded, {failed} FAILED")
         } else {
-            format!("Run complete: {total}/{total} succeeded")
+            format!("Run complete: {completed}/{total} succeeded")
         };
 
-        Some(summary)
+        if suppressed > 0 {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&crate::output::elision_marker_unbounded(
+                &format!("the {MAX_STREAM_JOBS}-job cap ({suppressed} status lines suppressed)"),
+                "jobs",
+            ));
+        }
+
+        if out.is_empty() { None } else { Some(out) }
     }
 
     fn totals(&self) -> StreamTotals {
@@ -356,6 +514,38 @@ mod tests {
         assert!(summary.contains("FAILED"), "summary: {summary}");
     }
 
+    /// Characterisation pin for the failure branch of `finalize`, written
+    /// BEFORE the `{completed}/{total}` fix to the success branch.
+    ///
+    /// The failure branch already reported `completed` correctly; the success
+    /// branch reported `total/total`.  Fixing one must not disturb the other,
+    /// so the exact string the failure branch produces is pinned here: three
+    /// jobs, two completed, one failed → `2/3 succeeded, 1 FAILED`.  A change
+    /// that "unifies" the two branches by regressing this one fails here
+    /// rather than in review.
+    #[test]
+    fn test_finalize_failure_branch_reports_completed_not_total() {
+        let mut p = make_parser();
+        p.on_line("  ✓ build Completed");
+        p.on_line("  ✓ docs Completed");
+        p.on_line("  X test Failed");
+        let summary = Box::new(p).finalize().expect("three jobs must summarise");
+        assert_eq!(summary, "Run complete: 2/3 succeeded, 1 FAILED");
+    }
+
+    /// The failure branch must not count in-progress or queued jobs as
+    /// succeeded either: one completed, one failed, one still running is
+    /// `1/3 succeeded, 1 FAILED` — not `2/3`.
+    #[test]
+    fn test_finalize_failure_branch_excludes_unfinished_jobs() {
+        let mut p = make_parser();
+        p.on_line("  ✓ build Completed");
+        p.on_line("  X test Failed");
+        p.on_line("  * deploy In progress");
+        let summary = Box::new(p).finalize().expect("three jobs must summarise");
+        assert_eq!(summary, "Run complete: 1/3 succeeded, 1 FAILED");
+    }
+
     #[test]
     fn test_finalize_empty_no_output() {
         let p = make_parser();
@@ -372,6 +562,182 @@ mod tests {
         // Next job should be suppressed (cap reached).
         let out = p.on_line("  * overflow_job In progress");
         assert!(out.is_none(), "should suppress when cap reached");
+    }
+
+    // ---- Cap disclosure (#317 / ADR-011 class 1) ----
+
+    /// The cap is a hard bound on what the reader sees, so it must never be
+    /// silent.  The marker is loss-bearing (class 1): unconditional, carrying
+    /// the exact number of suppressed lines and the `SKIM_PASSTHROUGH=1`
+    /// remedy.
+    #[test]
+    fn test_cap_suppression_is_disclosed_with_exact_counts() {
+        let mut p = make_parser();
+        for i in 0..MAX_STREAM_JOBS {
+            p.on_line(&format!("  ✓ job{i} Completed"));
+        }
+        // Three distinct jobs beyond the cap, one of them repeated.
+        assert!(p.on_line("  * overflow_a In progress").is_none());
+        assert!(p.on_line("  * overflow_b In progress").is_none());
+        assert!(p.on_line("  * overflow_a In progress").is_none());
+        assert!(p.on_line("  * overflow_c In progress").is_none());
+
+        let out = Box::new(p).finalize().expect("capped run must summarise");
+        assert!(
+            out.contains("[skim]"),
+            "cap must emit an elision marker: {out}"
+        );
+        assert!(
+            out.contains("4 status lines suppressed"),
+            "marker must carry the exact suppressed-line count: {out}"
+        );
+        assert!(
+            out.contains("64-job cap"),
+            "marker must name the bound: {out}"
+        );
+        assert!(
+            out.contains("SKIM_PASSTHROUGH=1"),
+            "class-1 marker must carry the remedy: {out}"
+        );
+        assert!(
+            out.starts_with("Run complete:"),
+            "summary must still lead: {out}"
+        );
+    }
+
+    /// The marker fires ONLY when the cap actually suppressed something.  A
+    /// run that stays under the cap must not pay for a notice about a bound it
+    /// never reached.
+    #[test]
+    fn test_no_cap_marker_when_cap_never_reached() {
+        let mut p = make_parser();
+        p.on_line("  ✓ build Completed");
+        p.on_line("  ✓ test Completed");
+        let out = Box::new(p).finalize().unwrap();
+        assert!(!out.contains("[skim]"), "no cap reached: {out}");
+        assert_eq!(out, "Run complete: 2/2 succeeded");
+    }
+
+    // ---- finalize counts completions, not job slots ----
+
+    /// `finalize` must report how many jobs actually COMPLETED.  Before the
+    /// fix the no-failure branch printed `{total}/{total}`, so a stream that
+    /// ended with every job still in progress reported them all as successes.
+    #[test]
+    fn test_finalize_does_not_count_unfinished_jobs_as_succeeded() {
+        let mut p = make_parser();
+        p.on_line("  * build In progress");
+        p.on_line("  * test In progress");
+        p.on_line("  ✓ lint Completed");
+        let summary = Box::new(p).finalize().expect("three jobs must summarise");
+        assert_eq!(summary, "Run complete: 1/3 succeeded");
+    }
+
+    /// A run that ends with nothing completed must say so, not claim a clean
+    /// sweep.  This is the shape the live 70-job matrix produced: every job
+    /// still in progress, summarised as `64/64 succeeded`.
+    #[test]
+    fn test_finalize_reports_zero_when_nothing_completed() {
+        let mut p = make_parser();
+        p.on_line("  * build In progress");
+        p.on_line("  * test In progress");
+        let summary = Box::new(p).finalize().expect("two jobs must summarise");
+        assert_eq!(summary, "Run complete: 0/2 succeeded");
+    }
+
+    // ---- Job-name canonicalisation ----
+
+    /// The defect this fixes: one job re-printed across frames with a ticking
+    /// elapsed time must occupy ONE map slot and emit ONE line per real
+    /// transition — not one per frame.
+    #[test]
+    fn test_ticking_frames_do_not_mint_a_new_job_per_frame() {
+        let mut p = make_parser();
+        let first = p.on_line("* build (ubuntu-latest) in 7s (ID 987654321)");
+        assert!(first.is_some(), "first sighting must emit");
+        assert_eq!(first.unwrap(), "⏳ build (ubuntu-latest)");
+
+        // Nine more frames, each with a different elapsed time.
+        for secs in [14, 21, 28, 35, 42, 49, 56, 63, 70] {
+            assert!(
+                p.on_line(&format!(
+                    "* build (ubuntu-latest) in {secs}s (ID 987654321)"
+                ))
+                .is_none(),
+                "frame at {secs}s must be suppressed as unchanged"
+            );
+        }
+
+        // The real transition still emits, exactly once.
+        let done = p.on_line("✓ build (ubuntu-latest) in 1m17s (ID 987654321)");
+        assert_eq!(done.unwrap(), "✓ build (ubuntu-latest)");
+        assert!(
+            p.on_line("✓ build (ubuntu-latest) in 1m17s (ID 987654321)")
+                .is_none()
+        );
+
+        let summary = Box::new(p).finalize().unwrap();
+        assert_eq!(summary, "Run complete: 1/1 succeeded");
+    }
+
+    #[test]
+    fn test_canonical_job_name_strips_id_and_elapsed() {
+        assert_eq!(
+            canonical_job_name("build (ubuntu-latest) in 1m2s (ID 987654321)"),
+            "build (ubuntu-latest)"
+        );
+        assert_eq!(canonical_job_name("test in 45s"), "test");
+        assert_eq!(canonical_job_name("test (ID 42)"), "test");
+        assert_eq!(canonical_job_name("test"), "test");
+    }
+
+    /// Canonicalisation must not eat legitimate name content.  A matrix leg
+    /// ends in `)` without being an ID, and a job name may contain the word
+    /// `in` followed by something that is not a duration.
+    #[test]
+    fn test_canonical_job_name_preserves_legitimate_names() {
+        for name in [
+            "build (ubuntu-latest)",
+            "check in staging",
+            "deploy (ID prod)",
+            "release (ID )",
+            "migrate in database",
+            "X-ray test",
+            "build In progress",
+        ] {
+            assert_eq!(canonical_job_name(name), name, "must not rewrite {name:?}");
+        }
+    }
+
+    #[test]
+    fn test_duration_token_recognition() {
+        for good in ["45s", "1m20s", "1h2m3s", "2d", "0s"] {
+            assert!(is_duration_token(good), "must accept {good}");
+        }
+        for bad in [
+            "",
+            "staging",
+            "s",
+            "ms",
+            "12",
+            "1m20",
+            "1x2s",
+            "-5s",
+            "1234567890123456789s",
+        ] {
+            assert!(!is_duration_token(bad), "must reject {bad}");
+        }
+    }
+
+    /// Only the LAST ` (ID …)` is removed; an earlier parenthesised group that
+    /// happens to look like one stays in the name.
+    #[test]
+    fn test_canonical_job_name_strips_only_the_trailing_id() {
+        assert_eq!(
+            canonical_job_name("job (ID 5) (ID 6)"),
+            "job (ID 5)",
+            "only the trailing ID token is a frame-varying tail"
+        );
     }
 
     #[test]
