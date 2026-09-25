@@ -200,6 +200,143 @@ fn parse(output: &CommandOutput) -> ParseResult<BuildResult> {
     ParseResult::Passthrough(combined)
 }
 
+/// Select the span rustc marked as the diagnostic's own error site.
+///
+/// A rustc diagnostic carries one or more spans and marks exactly one of them
+/// `"is_primary": true` — the location its rendered header points at
+/// (`--> file:line:col`). **The array is not ordered primary-first.** Measured
+/// on rustc 1.96.0 against real `--message-format=json` output:
+///
+/// ```text
+/// E0499 "cannot borrow `s` as mutable more than once at a time"
+///   spans[0] is_primary=false src/main.rs:4  "first mutable borrow occurs here"
+///   spans[1] is_primary=true  src/main.rs:5  "second mutable borrow occurs here"
+///   spans[2] is_primary=false src/main.rs:6  "first borrow later used here"
+/// ```
+///
+/// Taking `spans.first()` there reports line 4 — the *other* borrow — while
+/// rustc's own header says `src/main.rs:5`. E0382 (`borrow of moved value`)
+/// has the same shape, pointing at the move instead of the use-after-move.
+///
+/// Fallback: a diagnostic with no primary span is possible in principle — the
+/// JSON schema does not forbid it — and reporting *some* location beats
+/// reporting none, so an all-secondary list falls back to the first element.
+/// An empty list yields `None` and the caller renders the message locationless.
+fn primary_span(spans: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    spans
+        .iter()
+        .find(|span| {
+            span.get("is_primary")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| spans.first())
+}
+
+/// Render a span as `file:line`, substituting placeholders for absent keys.
+fn span_location(span: &serde_json::Value) -> String {
+    let file = span
+        .get("file_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
+    format!("{file}:{line}")
+}
+
+/// Render one compiler diagnostic into its single-line form.
+///
+/// This is the ONLY spelling of that rendering: the error path and the warning
+/// path both call it, so the two cannot drift. Two hand-maintained spellings of
+/// one rendering is the defect class that produced this repo's earlier
+/// double-header bugs — the `level` token is a parameter precisely so a second
+/// copy is never needed.
+///
+/// Shapes (`level` is rustc's own token — `error` or `warning`):
+///
+/// ```text
+/// error[E0308]: mismatched types in src/main.rs:42
+/// error[E0308]: mismatched types
+/// error: internal compiler error in src/main.rs:42
+/// error: internal compiler error
+/// ```
+fn format_diagnostic(level: &str, code: &str, msg_text: &str, location: &str) -> String {
+    match (code.is_empty(), location.is_empty()) {
+        (false, false) => format!("{level}[{code}]: {msg_text} in {location}"),
+        (false, true) => format!("{level}[{code}]: {msg_text}"),
+        (true, false) => format!("{level}: {msg_text} in {location}"),
+        (true, true) => format!("{level}: {msg_text}"),
+    }
+}
+
+/// Maximum number of warnings rendered as individual diagnostics.
+///
+/// Above this the build's warnings are rendered as the by-lint-code roll-up
+/// instead — never both (see [`summarise_warnings`]).
+///
+/// 50 is not a new number. It is the crate's existing bound for how many
+/// warning items a build-family parser enumerates before it stops:
+/// `cmd::infra::docker::build::MAX_WARNINGS`, which caps a docker build's
+/// `WARNING:` lines at the same figure for the same reason (`pip`/`npm`/`apt`
+/// can emit hundreds). Reusing it keeps one answer to one question rather than
+/// two build handlers disagreeing about when a warning list stops being a list
+/// a reader reads and becomes a wall they skim for the distribution.
+const WARNING_DETAIL_MAX: usize = 50;
+
+/// Bucket label for warnings rustc emitted without a lint code.
+///
+/// The roll-up's counts MUST sum to the build's total warning count, or the
+/// wholesale switch in [`summarise_warnings`] would drop warnings the reader is
+/// never told about and would owe an ADR-011 class-1 elision marker. A codeless
+/// warning has no lint key to group under, so it gets an explicit bucket rather
+/// than silently vanishing from the totals.
+const UNCODED_WARNING_KEY: &str = "(no lint code)";
+
+/// Choose the ONE representation of this build's warnings.
+///
+/// Returns either the per-warning diagnostics or the by-lint-code roll-up.
+/// Never both, never a mix: one return value, one branch, so "rendered twice"
+/// is not a state this function can produce. That is the whole point. Before it
+/// existed the roll-up was pushed into `error_messages` while the per-warning
+/// detail went to `warning_messages`, and the two were gated independently — so
+/// a failing clippy run printed every warning twice, in two spellings.
+///
+/// # Why a wholesale switch and not a truncated list
+///
+/// Truncating the detailed list at the bound would drop warnings the reader is
+/// never told about — a #317 violation unless it carries an ADR-011 class-1
+/// marker with exact counts. The roll-up drops no warning: each one is counted
+/// in exactly one bucket, the buckets sum to the total (see
+/// [`UNCODED_WARNING_KEY`]), and the `warnings: N` header states that total
+/// independently. Aggregation with complete counts is not elision, so this path
+/// owes no marker.
+///
+/// It is also the more useful form at scale: a 200-warning run tells a reader
+/// its distribution in a handful of lines and its locations in none, which is
+/// what a reader at that volume is actually asking.
+fn summarise_warnings(
+    detailed: Vec<String>,
+    warning_codes: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    if detailed.len() <= WARNING_DETAIL_MAX {
+        return detailed;
+    }
+    roll_up_warning_codes(warning_codes, detailed.len())
+}
+
+/// By-lint-code roll-up whose counts sum to `total` by construction.
+fn roll_up_warning_codes(warning_codes: &BTreeMap<String, usize>, total: usize) -> Vec<String> {
+    let coded: usize = warning_codes.values().sum();
+    let mut rolled: Vec<String> = warning_codes
+        .iter()
+        .map(|(code, count)| format!("{code}: {count} occurrence(s)"))
+        .collect();
+    let uncoded = total.saturating_sub(coded);
+    if uncoded > 0 {
+        rolled.push(format!("{UNCODED_WARNING_KEY}: {uncoded} occurrence(s)"));
+    }
+    rolled
+}
+
 /// Extract counts, formatted messages, and warning codes from a single
 /// `{"reason":"compiler-message",...}` JSON object, accumulating results into
 /// the caller's mutable accumulators.
@@ -216,6 +353,7 @@ fn process_compiler_message(
     errors: &mut usize,
     warnings: &mut usize,
     error_messages: &mut Vec<String>,
+    warning_messages: &mut Vec<String>,
     warning_codes: &mut BTreeMap<String, usize>,
 ) -> bool {
     let Some(message) = json.get("message") else {
@@ -232,37 +370,23 @@ fn process_compiler_message(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Extract primary span location (file:line)
+    // Report the span rustc marked primary, not whichever span happens to be
+    // first — see `primary_span` for the measured E0499 / E0382 counterexamples.
     let location = message
         .get("spans")
         .and_then(|v| v.as_array())
-        .and_then(|spans| spans.first())
-        .map(|span| {
-            let file = span
-                .get("file_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let line = span.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0);
-            format!("{file}:{line}")
-        })
+        .and_then(|spans| primary_span(spans.as_slice()))
+        .map(span_location)
         .unwrap_or_default();
 
     match level {
         "error" => {
             *errors += 1;
-            let formatted = if !code.is_empty() && !location.is_empty() {
-                format!("error[{code}]: {msg_text} in {location}")
-            } else if !code.is_empty() {
-                format!("error[{code}]: {msg_text}")
-            } else if !location.is_empty() {
-                format!("error: {msg_text} in {location}")
-            } else {
-                format!("error: {msg_text}")
-            };
-            error_messages.push(formatted);
+            error_messages.push(format_diagnostic("error", code, msg_text, &location));
         }
         "warning" => {
             *warnings += 1;
+            warning_messages.push(format_diagnostic("warning", code, msg_text, &location));
             if !code.is_empty() {
                 *warning_codes.entry(code.to_string()).or_insert(0) += 1;
             }
@@ -282,6 +406,7 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
     let mut warnings: usize = 0;
     let mut errors: usize = 0;
     let mut error_messages: Vec<String> = Vec::new();
+    let mut warning_messages: Vec<String> = Vec::new();
     let mut warning_codes: BTreeMap<String, usize> = BTreeMap::new();
     let mut found_build_finished = false;
     let mut success = false;
@@ -304,6 +429,7 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
                     &mut errors,
                     &mut warnings,
                     &mut error_messages,
+                    &mut warning_messages,
                     &mut warning_codes,
                 );
             }
@@ -323,22 +449,29 @@ fn try_tier1_json(stdout: &str) -> Option<ParseResult<BuildResult>> {
         return None;
     }
 
-    // For clippy: append grouped warning code summaries to error_messages.
-    // These are only rendered when `!success` (see BuildResult::render), so on
-    // a successful clippy run they are silently carried but not displayed.
-    // Acceptable for v1 — a dedicated `warning_messages` field can be added if
-    // we need to render warnings on success in the future.
-    for (code, count) in &warning_codes {
-        error_messages.push(format!("{code}: {count} occurrence(s)"));
-    }
+    // Every "warning" level pushes exactly one diagnostic line, so the vector's
+    // length IS the warning count. `summarise_warnings` relies on that to keep
+    // the roll-up's buckets summing to the total.
+    debug_assert_eq!(
+        warning_messages.len(),
+        warnings,
+        "every warning must contribute exactly one diagnostic line"
+    );
+
+    // ONE representation of the warnings — per-warning detail or the
+    // by-lint-code roll-up, chosen in a single place so both can never render.
+    // `error_messages` carries errors only; it no longer doubles as a warning
+    // channel.
+    let warning_messages = summarise_warnings(warning_messages, &warning_codes);
 
     let duration_ms = None; // Cargo doesn't report build duration in JSON
-    Some(ParseResult::Full(BuildResult::new(
+    Some(ParseResult::Full(BuildResult::with_warning_messages(
         success,
         warnings,
         errors,
         duration_ms,
         error_messages,
+        warning_messages,
     )))
 }
 
@@ -436,35 +569,128 @@ mod tests {
         }
     }
 
+    /// Synthesise a cargo NDJSON stream carrying `n` `dead_code` warnings plus
+    /// the `build-finished` line tier 1 requires.
+    ///
+    /// Built inline rather than as a fixture file. The roll-up's domain starts
+    /// ABOVE `WARNING_DETAIL_MAX`, and `tests/fixtures/cmd/build/clippy_warnings.json`
+    /// deliberately carries two warnings — it pins the DETAIL domain and must
+    /// keep doing so, so it is the wrong file to grow.
+    fn clippy_ndjson_with_warnings(n: usize) -> String {
+        use serde_json::json;
+        let mut out = String::new();
+        for i in 0..n {
+            let msg = json!({
+                "reason": "compiler-message",
+                "message": {
+                    "level": "warning",
+                    "message": format!("unused variable: `v{i}`"),
+                    "code": {"code": "dead_code"},
+                    "spans": [
+                        {"file_name": "src/lib.rs", "line_start": i, "is_primary": true}
+                    ]
+                }
+            });
+            out.push_str(&msg.to_string());
+            out.push('\n');
+        }
+        out.push_str(&json!({"reason": "build-finished", "success": true}).to_string());
+        out.push('\n');
+        out
+    }
+
+    /// The by-lint-code roll-up still exists. What changed is that it now has a
+    /// DEFINED DOMAIN — it is what `warning_messages` carries above
+    /// `WARNING_DETAIL_MAX`, *in place of* the per-warning lines rather than
+    /// alongside them, and it no longer travels in `error_messages`.
+    ///
+    /// Re-aimed rather than deleted: the roll-up is still the subject, and the
+    /// roll-up is what changed.
     #[test]
-    fn test_tier1_clippy_warning_codes_grouped() {
-        let stdout = load_fixture("build", "clippy_warnings.json");
+    fn test_tier1_clippy_warning_codes_grouped_above_the_detail_bound() {
+        let n = WARNING_DETAIL_MAX + 1;
+        let stdout = clippy_ndjson_with_warnings(n);
         let output = make_output_full(&stdout, "", Some(0));
         let result = parse(&output);
 
-        if let ParseResult::Full(build_result) = &result {
-            // Warning codes should be grouped and appended to error_messages
+        let ParseResult::Full(build_result) = &result else {
+            panic!("expected Full, got {:?}", result.tier_name());
+        };
+        assert_eq!(build_result.warnings, n);
+        assert_eq!(
+            build_result.warning_messages,
+            vec![format!("dead_code: {n} occurrence(s)")],
+            "above the bound the roll-up REPLACES the per-warning lines"
+        );
+        assert!(
+            build_result.error_messages.is_empty(),
+            "the roll-up no longer travels in error_messages: {:?}",
+            build_result.error_messages
+        );
+    }
+
+    /// The defect this ruling targets: both representations rendering for the
+    /// same warnings. Enforced structurally inside `summarise_warnings` (one
+    /// return value, one branch); pinned here from the outside on both sides of
+    /// the bound, since a structural guarantee is only as good as the caller
+    /// that honours it.
+    #[test]
+    fn test_warning_representations_are_mutually_exclusive() {
+        for n in [WARNING_DETAIL_MAX, WARNING_DETAIL_MAX + 1] {
+            let output = make_output_full(&clippy_ndjson_with_warnings(n), "", Some(0));
+            let result = parse(&output);
+            let ParseResult::Full(build_result) = &result else {
+                panic!("expected Full for n={n}, got {:?}", result.tier_name());
+            };
+            let rendered = format!("{build_result}");
+            let has_detail = rendered.contains("warning[dead_code]: unused variable:");
+            let has_rollup = rendered.contains("occurrence(s)");
             assert!(
-                build_result
-                    .error_messages
-                    .iter()
-                    .any(|m| m.contains("dead_code")),
-                "expected warning code 'dead_code' in error_messages, got: {:?}",
-                build_result.error_messages
+                has_detail ^ has_rollup,
+                "exactly one representation may render (n={n}, detail={has_detail}, \
+                 rollup={has_rollup}): {rendered:?}"
             );
-            // The fixture has 2 dead_code warnings, so the grouped entry
-            // should reflect the count
-            assert!(
-                build_result
-                    .error_messages
-                    .iter()
-                    .any(|m| m.contains("2 occurrence(s)")),
-                "expected '2 occurrence(s)' in error_messages, got: {:?}",
-                build_result.error_messages
-            );
-        } else {
-            panic!("expected Full result");
         }
+    }
+
+    /// The wholesale switch owes no ADR-011 class-1 marker only because the
+    /// roll-up accounts for every warning. A codeless warning has no lint key
+    /// to group under, so it gets an explicit bucket instead of vanishing from
+    /// the totals — without which "nothing is elided" would be false.
+    #[test]
+    fn test_rollup_counts_account_for_every_warning() {
+        let total = WARNING_DETAIL_MAX + 3;
+        let mut codes = BTreeMap::new();
+        codes.insert("dead_code".to_string(), total - 2);
+
+        let rolled = roll_up_warning_codes(&codes, total);
+
+        let summed: usize = rolled
+            .iter()
+            .filter_map(|line| line.split(": ").nth(1))
+            .filter_map(|tail| tail.split(' ').next())
+            .filter_map(|n| n.parse::<usize>().ok())
+            .sum();
+        assert_eq!(
+            summed, total,
+            "roll-up buckets must sum to the warning total: {rolled:?}"
+        );
+        assert!(
+            rolled
+                .iter()
+                .any(|l| l.starts_with("(no lint code): 2 occurrence(s)")),
+            "codeless warnings need their own bucket: {rolled:?}"
+        );
+    }
+
+    #[test]
+    fn test_rollup_omits_uncoded_bucket_when_every_warning_has_a_code() {
+        let mut codes = BTreeMap::new();
+        codes.insert("dead_code".to_string(), 51usize);
+
+        let rolled = roll_up_warning_codes(&codes, 51);
+
+        assert_eq!(rolled, vec!["dead_code: 51 occurrence(s)".to_string()]);
     }
 
     // ========================================================================
@@ -484,7 +710,7 @@ mod tests {
             .map(|c| json!({"code": c}))
             .unwrap_or(serde_json::Value::Null);
         let spans = match (file, line_start) {
-            (Some(f), Some(l)) => json!([{"file_name": f, "line_start": l}]),
+            (Some(f), Some(l)) => json!([{"file_name": f, "line_start": l, "is_primary": true}]),
             _ => json!([]),
         };
         json!({
@@ -505,9 +731,17 @@ mod tests {
         let json = serde_json::json!({"reason": "compiler-message"});
         let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
+        let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+        let ok = process_compiler_message(
+            &json,
+            &mut errors,
+            &mut warnings,
+            &mut msgs,
+            &mut warn_msgs,
+            &mut codes,
+        );
 
         assert!(!ok, "should return false for missing message key");
         assert_eq!(errors, 0);
@@ -529,9 +763,17 @@ mod tests {
         );
         let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
+        let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+        let ok = process_compiler_message(
+            &json,
+            &mut errors,
+            &mut warnings,
+            &mut msgs,
+            &mut warn_msgs,
+            &mut codes,
+        );
 
         assert!(ok, "should return true for valid compiler-message");
         assert_eq!(errors, 1);
@@ -551,9 +793,17 @@ mod tests {
         let json = make_compiler_message("error", "internal compiler error", None, None, None);
         let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
+        let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+        let ok = process_compiler_message(
+            &json,
+            &mut errors,
+            &mut warnings,
+            &mut msgs,
+            &mut warn_msgs,
+            &mut codes,
+        );
 
         assert!(ok);
         assert_eq!(errors, 1);
@@ -574,15 +824,31 @@ mod tests {
         );
         let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
+        let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+        let ok = process_compiler_message(
+            &json,
+            &mut errors,
+            &mut warnings,
+            &mut msgs,
+            &mut warn_msgs,
+            &mut codes,
+        );
 
         assert!(ok);
         assert_eq!(errors, 0);
         assert_eq!(warnings, 1);
         assert!(msgs.is_empty(), "warnings should not add to error_messages");
         assert_eq!(codes.get("dead_code"), Some(&1));
+        // E-4: the warning is rendered by the SAME function as an error, into
+        // its own channel — same `[code]: msg in file:line` shape, `warning`
+        // where an error says `error`.
+        assert_eq!(
+            warn_msgs,
+            vec!["warning[dead_code]: unused variable: `x` in src/lib.rs:10".to_string()],
+            "warning must be rendered through format_diagnostic"
+        );
     }
 
     #[test]
@@ -592,14 +858,230 @@ mod tests {
         let json = make_compiler_message("warning", "unused import", None, None, None);
         let (mut errors, mut warnings) = (0usize, 0usize);
         let mut msgs: Vec<String> = Vec::new();
+        let mut warn_msgs: Vec<String> = Vec::new();
         let mut codes: BTreeMap<String, usize> = BTreeMap::new();
 
-        let ok = process_compiler_message(&json, &mut errors, &mut warnings, &mut msgs, &mut codes);
+        let ok = process_compiler_message(
+            &json,
+            &mut errors,
+            &mut warnings,
+            &mut msgs,
+            &mut warn_msgs,
+            &mut codes,
+        );
 
         assert!(ok);
         assert_eq!(warnings, 1);
         assert!(codes.is_empty());
         assert!(msgs.is_empty());
+        assert_eq!(
+            warn_msgs,
+            vec!["warning: unused import".to_string()],
+            "a codeless, spanless warning still renders through format_diagnostic"
+        );
+    }
+
+    // ========================================================================
+    // E-2: primary span selection
+    // ========================================================================
+
+    /// Real rustc payload shape, captured from `cargo build --message-format=json`
+    /// on rustc 1.96.0 for:
+    ///
+    /// ```ignore
+    /// let a = &mut s;   // line 4 — secondary, "first mutable borrow occurs here"
+    /// let b = &mut s;   // line 5 — PRIMARY,   "second mutable borrow occurs here"
+    /// a.push('x');      // line 6 — secondary, "first borrow later used here"
+    /// ```
+    ///
+    /// rustc's own header reads `--> src/main.rs:5:13`. `spans.first()` reports
+    /// line 4 — the other borrow, not the error site.
+    fn e0499_multi_span_message() -> serde_json::Value {
+        use serde_json::json;
+        json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "message": "cannot borrow `s` as mutable more than once at a time",
+                "code": {"code": "E0499"},
+                "spans": [
+                    {"file_name": "src/main.rs", "line_start": 4, "is_primary": false,
+                     "label": "first mutable borrow occurs here"},
+                    {"file_name": "src/main.rs", "line_start": 5, "is_primary": true,
+                     "label": "second mutable borrow occurs here"},
+                    {"file_name": "src/main.rs", "line_start": 6, "is_primary": false,
+                     "label": "first borrow later used here"}
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn test_primary_span_prefers_is_primary_over_first() {
+        let msg = e0499_multi_span_message();
+        let spans = msg["message"]["spans"].as_array().expect("spans array");
+
+        let chosen = primary_span(spans.as_slice()).expect("a span is selected");
+        assert_eq!(
+            span_location(chosen),
+            "src/main.rs:5",
+            "must report the is_primary span (rustc's own `--> src/main.rs:5:13`), not spans[0]"
+        );
+    }
+
+    #[test]
+    fn test_primary_span_falls_back_to_first_when_none_primary() {
+        // Nothing in the JSON schema forbids an all-secondary span list.
+        // Reporting *some* location beats reporting none.
+        let spans = vec![
+            serde_json::json!({"file_name": "a.rs", "line_start": 7, "is_primary": false}),
+            serde_json::json!({"file_name": "b.rs", "line_start": 9, "is_primary": false}),
+        ];
+        let chosen = primary_span(&spans).expect("fallback selects the first span");
+        assert_eq!(span_location(chosen), "a.rs:7");
+    }
+
+    #[test]
+    fn test_primary_span_missing_is_primary_key_falls_back() {
+        // Absent key is not "primary" — it must not be read as true.
+        let spans = vec![
+            serde_json::json!({"file_name": "a.rs", "line_start": 7}),
+            serde_json::json!({"file_name": "b.rs", "line_start": 9, "is_primary": true}),
+        ];
+        let chosen = primary_span(&spans).expect("selects the explicit primary");
+        assert_eq!(span_location(chosen), "b.rs:9");
+    }
+
+    #[test]
+    fn test_primary_span_empty_list_is_none() {
+        assert!(primary_span(&[]).is_none());
+    }
+
+    #[test]
+    fn test_process_compiler_message_reports_primary_span_location() {
+        // Regression for E-2: before the fix this rendered `… in src/main.rs:4`.
+        let json = e0499_multi_span_message();
+        let (mut errors, mut warnings) = (0usize, 0usize);
+        let mut msgs: Vec<String> = Vec::new();
+        let mut warn_msgs: Vec<String> = Vec::new();
+        let mut codes: BTreeMap<String, usize> = BTreeMap::new();
+
+        let ok = process_compiler_message(
+            &json,
+            &mut errors,
+            &mut warnings,
+            &mut msgs,
+            &mut warn_msgs,
+            &mut codes,
+        );
+
+        assert!(ok);
+        assert_eq!(errors, 1);
+        assert_eq!(
+            msgs[0],
+            "error[E0499]: cannot borrow `s` as mutable more than once at a time in src/main.rs:5",
+            "the reported location must be the primary span, not spans[0]"
+        );
+    }
+
+    // ========================================================================
+    // E-4: one rendering shared by the error and warning paths
+    // ========================================================================
+
+    #[test]
+    fn test_format_diagnostic_covers_all_four_shapes() {
+        assert_eq!(
+            format_diagnostic("error", "E0308", "mismatched types", "src/main.rs:42"),
+            "error[E0308]: mismatched types in src/main.rs:42"
+        );
+        assert_eq!(
+            format_diagnostic("error", "E0308", "mismatched types", ""),
+            "error[E0308]: mismatched types"
+        );
+        assert_eq!(
+            format_diagnostic("error", "", "internal compiler error", "src/main.rs:42"),
+            "error: internal compiler error in src/main.rs:42"
+        );
+        assert_eq!(
+            format_diagnostic("error", "", "internal compiler error", ""),
+            "error: internal compiler error"
+        );
+    }
+
+    #[test]
+    fn test_format_diagnostic_error_and_warning_differ_only_in_level() {
+        // The anti-drift property: one rendering, two levels. If a second
+        // spelling is ever introduced this assertion is what breaks.
+        let err = format_diagnostic("error", "E0499", "cannot borrow", "src/main.rs:5");
+        let warn = format_diagnostic("warning", "E0499", "cannot borrow", "src/main.rs:5");
+        assert_eq!(
+            err.strip_prefix("error"),
+            warn.strip_prefix("warning"),
+            "error and warning renderings must differ only in the level token"
+        );
+    }
+
+    #[test]
+    fn test_tier1_warning_messages_rendered_on_successful_build() {
+        // A green build's warnings are its only diagnostics. Before E-4 they were
+        // dropped entirely: `error_messages` carried a grouped code count that
+        // `BuildResult::render` suppresses when `success`.
+        let stdout = load_fixture("build", "clippy_warnings.json");
+        let output = make_output_full(&stdout, "", Some(0));
+        let result = parse(&output);
+
+        let ParseResult::Full(build_result) = &result else {
+            panic!("expected Full result, got {:?}", result.tier_name());
+        };
+        assert!(build_result.success, "fixture is a successful clippy run");
+        assert_eq!(
+            build_result.warning_messages.len(),
+            2,
+            "both warnings must be carried: {:?}",
+            build_result.warning_messages
+        );
+        assert!(
+            build_result
+                .warning_messages
+                .iter()
+                .all(|m| m.starts_with("warning")),
+            "warning diagnostics must carry the `warning` level token: {:?}",
+            build_result.warning_messages
+        );
+        let rendered = format!("{build_result}");
+        for msg in &build_result.warning_messages {
+            assert!(
+                rendered.contains(msg.as_str()),
+                "warning {msg:?} must appear in the rendered output, got: {rendered:?}"
+            );
+        }
+        // The DETAIL domain: two warnings is far below `WARNING_DETAIL_MAX`, so
+        // the by-lint-code roll-up must be absent. This fixture is the pin for
+        // this side of the bound.
+        assert!(
+            !rendered.contains("occurrence(s)"),
+            "the roll-up must not render alongside the per-warning lines: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_tier2_regex_carries_no_warning_messages() {
+        // Tier 2 has no structured warning payload to format, so it stays on the
+        // 5-argument constructor — one of the 15 builders whose serialized shape
+        // is unchanged.
+        let stderr = "warning: unused variable\nerror[E0308]: mismatched types\n";
+        let output = make_output_full("", stderr, Some(101));
+        let result = parse(&output);
+
+        let ParseResult::Degraded(build_result, _) = &result else {
+            panic!("expected Degraded, got {:?}", result.tier_name());
+        };
+        assert!(build_result.warning_messages.is_empty());
+        let json = serde_json::to_string(build_result).expect("serializes");
+        assert!(
+            !json.contains("warning_messages"),
+            "absent field must not appear in the JSON envelope: {json}"
+        );
     }
 
     #[test]

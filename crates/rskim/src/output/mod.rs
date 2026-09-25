@@ -613,6 +613,93 @@ pub(crate) fn compressed_output_hint(code: i32) -> String {
     format!("[skim] compressed output (exit {code}). {ELISION_HINT}.")
 }
 
+/// Diagnostic-summary marker for the build family (ADR-011 class 1 —
+/// unconditional).
+///
+/// Build parsers reduce each compiler diagnostic to a single line
+/// (`error[E0499]: cannot borrow … in src/main.rs:5`). Everything else the tool
+/// attached to that diagnostic is discarded: the source snippet / caret frame,
+/// the `note:` and `help:` children, and the trailing `rustc --explain`
+/// pointer, which arrives at `level: "failure-note"` and matches no arm of the
+/// parser's level match. Measured on rustc 1.96.0 via `cargo build
+/// --message-format=json`: one E0499 carries a 316-byte `rendered` frame and
+/// two `help`/`note` children, of which the served line keeps 83 bytes.
+///
+/// # Why a class-1 marker, not a class-2 banner
+///
+/// It fires only on the net-savings guard's `Keep` branch — the branch where
+/// the reader is served the summary *instead of* the child's own bytes. On the
+/// `Passthrough` branch raw carries every one of those dropped parts, so a
+/// marker there would claim a loss that did not occur. Class 1 is unconditional
+/// and NOT gated by `SKIM_DEBUG`; do not re-conflate it with the debug-gated
+/// raw-fallback banners.
+///
+/// `diagnostics` is the exact count the parser reported (`errors + warnings`),
+/// so the reader can size what is missing. The caller suppresses the marker
+/// entirely when the count is zero: a build with no diagnostics has no
+/// diagnostic bodies to drop, and the summary line is then the whole truth.
+///
+/// The parenthetical names the classes of per-diagnostic body the build parsers
+/// discard; a tool that emits none of a given kind simply has none to drop.
+///
+/// ```text
+/// [skim] cargo: 2 diagnostics summarised (source snippets, help/note lines, explain hints dropped) — SKIM_PASSTHROUGH=1 for full output
+/// ```
+pub(crate) fn diagnostics_summary_marker(program: &str, diagnostics: usize) -> String {
+    // Routed through `remedy_for` so the printed remedy stays the narrowest one
+    // reachable from this invocation (ADR-011 class 1). Build output is text and
+    // the passthrough gate execs the user's literal argv, so this resolves to the
+    // canonical `ELISION_HINT`.
+    let remedy = fidelity::remedy_for(&fidelity::RemedyCtx {
+        tool: program,
+        output_format: OutputFormat::Text,
+        passthrough_reproduces_argv: true,
+    });
+    let unit = if diagnostics == 1 {
+        "diagnostic"
+    } else {
+        "diagnostics"
+    };
+    format!(
+        "[skim] {program}: {diagnostics} {unit} summarised \
+         (source snippets, help/note lines, explain hints dropped) \u{2014} {remedy}"
+    )
+}
+
+#[cfg(test)]
+mod diagnostics_summary_marker_tests {
+    use super::*;
+
+    #[test]
+    fn test_marker_names_tool_count_class_and_remedy() {
+        let m = diagnostics_summary_marker("cargo", 2);
+        assert_eq!(
+            m,
+            "[skim] cargo: 2 diagnostics summarised \
+             (source snippets, help/note lines, explain hints dropped) \
+             \u{2014} SKIM_PASSTHROUGH=1 for full output"
+        );
+    }
+
+    /// ADR-011 class 1: the marker must carry an exact count and the escape
+    /// hatch, and must name the elided CLASS rather than only asserting
+    /// "not raw".
+    #[test]
+    fn test_marker_carries_exact_count_and_hint() {
+        let m = diagnostics_summary_marker("tsc", 17);
+        assert!(m.contains("17 diagnostics"), "exact count: {m}");
+        assert!(m.contains(ELISION_HINT), "class-1 remedy: {m}");
+        assert!(m.contains("source snippets"), "elided class: {m}");
+    }
+
+    #[test]
+    fn test_marker_singular_for_one_diagnostic() {
+        let m = diagnostics_summary_marker("cargo", 1);
+        assert!(m.contains("1 diagnostic summarised"), "{m}");
+        assert!(!m.contains("1 diagnostics"), "{m}");
+    }
+}
+
 // ============================================================================
 // Rewrite transparency (hook-rewritten file reads)
 // ============================================================================

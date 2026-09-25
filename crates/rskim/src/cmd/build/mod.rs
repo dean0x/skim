@@ -207,6 +207,15 @@ pub(super) fn run_parsed_command(
     //
     // "raw" baseline = combine_output (stdout+stderr) to match what the user
     // would see if skim were bypassed entirely.
+
+    // Diagnostics the parser summarised, for the ADR-011 class-1 disclosure in
+    // the `Keep` arm below. Read from the parsed result rather than the rendered
+    // text so the count is the parser's own, not a re-scan of its output.
+    let diagnostics = match &result {
+        ParseResult::Full(r) | ParseResult::Degraded(r, _) => r.errors + r.warnings,
+        ParseResult::Passthrough(_) | ParseResult::RawPassthrough => 0,
+    };
+
     let content = result.content();
     let tier_name = result.tier_name();
     let effective_tier = if tier_name != "passthrough" {
@@ -217,6 +226,34 @@ pub(super) fn run_parsed_command(
                         == crate::cmd::execution::StdoutStatus::PipeClosed
                 {
                     return Ok(crate::cmd::execution::pipe_closed_exit());
+                }
+                // ADR-011 class-1 disclosure, gated on TWO conditions.
+                //
+                // (1) `diagnostics > 0`: a build with nothing to report drops no
+                //     diagnostic bodies, so the summary line IS the whole truth
+                //     and a marker would be a false claim of loss.
+                // (2) This arm only. On the `Passthrough` arm below the child's
+                //     own bytes reach the reader with every snippet, `help:` line
+                //     and explain hint intact — disclosing a loss there would
+                //     describe something that did not happen.
+                //
+                // Unconditional by class: loss-bearing, therefore NOT gated on
+                // SKIM_DEBUG. A closed stdout pipe returns above, so the marker
+                // is never printed to a reader who has already departed.
+                //
+                // NOT charged against the guard. `savings_decision` above prices
+                // the stdout bodies only, exactly as it did before this marker
+                // existed, so the compress/no-compress verdict and every recorded
+                // token count are untouched. `savings_decision_with_notice` is the
+                // entry point that would charge it, and its single caller passes
+                // `None` deliberately: the command path's stdout accounting still
+                // has the success-line hole the ADR-011 census recorded, and a
+                // stderr-only charge would make a partial accounting read as a
+                // complete one. Charge both together or neither.
+                if diagnostics > 0 {
+                    let _ = crate::cmd::execution::write_line_to_stderr(
+                        &crate::output::diagnostics_summary_marker(program, diagnostics),
+                    );
                 }
                 tier_name
             }
