@@ -4,9 +4,11 @@
 //!
 //! The scoreboard drives the release `skim` binary as a subprocess against
 //! pinned real-world corpora and checks its output against oracles that are
-//! independent of skim's own code: nothing under this module imports
+//! independent of skim's own code: nothing that scores skim imports
 //! `rskim_search::query_substring_present`, `rskim_core::Language`, or an
-//! `rskim-search` tokenizer.
+//! `rskim-search` tokenizer. The one `rskim_core::Language` user is
+//! [`golden_gen`], which proposes golden entries for human review and passes
+//! the enum to the symbol extractor as a dispatch key only.
 //!
 //! # Modules
 //!
@@ -18,6 +20,9 @@
 //!   lang) and the in-process baselines (alphabetical, occurrence-count,
 //!   simulated `rg -n -F`).
 //! - [`golden`] — golden-set schema, query flags, loading, integrity.
+//! - [`golden_gen`] — `golden-gen`: candidate `[[ident]]` entries (a
+//!   reviewed proposal; uses `rskim_core::Language` only as the symbol
+//!   extractor's dispatch key, never scores skim).
 //! - [`types`] — what a skim invocation returns (rows, pages, stats) and the
 //!   HARD-check vocabulary.
 //! - [`runner`] — runs the skim CLI as a sandboxed, time-bounded subprocess:
@@ -39,6 +44,7 @@ pub mod baseline;
 pub mod corpus;
 pub mod gate;
 pub mod golden;
+pub mod golden_gen;
 pub mod metrics;
 pub mod oracle;
 pub mod pipeline;

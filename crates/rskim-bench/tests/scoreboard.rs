@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use rskim_bench::scoreboard::MAX_PAGES;
+use rskim_bench::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
 use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use rskim_bench::scoreboard::test_support::FixtureRepo;
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
@@ -877,11 +878,67 @@ fn unparsable_skim_output_is_a_harness_error() {
 }
 
 #[test]
-fn golden_gen_is_not_available_until_phase_3() {
+fn golden_gen_prints_integrity_clean_ident_candidates() {
     let h = Harness::new();
-    let out = h.scoreboard(&["golden-gen", "--corpus", "fixture"]);
+    let out = h.scoreboard(&[
+        "golden-gen",
+        "--corpus",
+        "fixture",
+        "--corpus-dir",
+        h.corpus_dir.path().to_str().unwrap(),
+        "--data-dir",
+        h.data_dir.path().to_str().unwrap(),
+    ]);
+    assert_exit(&out, 0);
+
+    // stdout is a proposal: `[[ident]]` entries to paste under a golden header.
+    let proposal = String::from_utf8(out.stdout).unwrap();
+    let golden = parse_golden(&format!(
+        "corpus = \"fixture\"\ncommit = \"{}\"\n{proposal}",
+        h.commit
+    ))
+    .unwrap();
+    let mut got: Vec<(&str, &str, u32)> = golden
+        .idents
+        .iter()
+        .map(|e| (e.query.as_str(), e.def.path.as_str(), e.def.line))
+        .collect();
+    got.sort_unstable();
+    // refresh / BuildLock / acquire occur in one file only (ground truth < 2).
+    assert_eq!(
+        got,
+        vec![
+            ("check_staleness", "src/staleness.rs", 2),
+            ("marker", "src/marker.rs", 2)
+        ]
+    );
+    assert!(golden.idents.iter().all(|e| e.origin == Origin::Generated));
+    let violations = check_integrity(
+        &golden,
+        &IntegrityContext {
+            corpus: "fixture",
+            commit: &h.commit,
+            universe: Some(&h.universe),
+            ledger: &[],
+        },
+    );
+    assert!(violations.is_empty(), "{violations:?}");
+}
+
+#[test]
+fn golden_gen_names_the_known_corpora_for_an_unknown_one() {
+    let h = Harness::new();
+    let out = h.scoreboard(&[
+        "golden-gen",
+        "--corpus",
+        "nope",
+        "--corpus-dir",
+        h.corpus_dir.path().to_str().unwrap(),
+        "--data-dir",
+        h.data_dir.path().to_str().unwrap(),
+    ]);
     assert_exit(&out, 2);
-    assert!(stderr(&out).contains("phase 3"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("known: fixture"), "{}", stderr(&out));
 }
 
 #[test]

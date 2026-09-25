@@ -22,7 +22,7 @@
 //! - **Size** — at most [`MAX_FILE_BYTES`], checked at walk time (`walk.rs:359`).
 //! - **Encoding** — strict UTF-8 (producer phase).
 //! - **Minified gate** — producer phase, skipped for json / yaml / yml /
-//!   toml (`index.rs:880-881`); see [`is_minified`].
+//!   toml (`index.rs:880-881`); see `is_minified`.
 //!
 //! Git runs under a [`GitIsolation`]: the same isolated `HOME` the skim
 //! subprocess gets, with `GIT_CONFIG_NOSYSTEM=1`, so global excludes cannot
@@ -112,7 +112,7 @@ const INDEXABLE_EXTENSIONS: &[&str] = &[
 
 /// The isolated git environment shared by the oracle and the skim subprocess:
 /// `HOME` points at a scoreboard-owned directory, `GIT_CONFIG_NOSYSTEM=1`,
-/// and [`ISOLATION_REMOVED_ENV`] is cleared.
+/// and `ISOLATION_REMOVED_ENV` is cleared.
 ///
 /// Apply the same instance to the skim command (see [`GitIsolation::apply`])
 /// so both sides resolve global excludes from the same empty `HOME`.
@@ -133,7 +133,7 @@ impl GitIsolation {
     }
 
     /// Set `HOME` and `GIT_CONFIG_NOSYSTEM=1` on `cmd` and remove every
-    /// variable in [`ISOLATION_REMOVED_ENV`].
+    /// variable in `ISOLATION_REMOVED_ENV`.
     pub fn apply(&self, cmd: &mut Command) {
         cmd.env("HOME", &self.home).env("GIT_CONFIG_NOSYSTEM", "1");
         for var in ISOLATION_REMOVED_ENV {

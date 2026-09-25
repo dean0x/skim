@@ -9,7 +9,7 @@
 //! scoreboard run   [--skim-bin P] [--corpus-dir D] [--data-dir D] [--only NAME] [--out DIR]
 //! scoreboard check [same flags]           # run + gate against baseline.json / known_failures.toml
 //! scoreboard bless --from report.json [--data-dir D] [--accept-regression "<reason>"]
-//! scoreboard golden-gen --corpus NAME     # phase 3
+//! scoreboard golden-gen --corpus NAME [--corpus-dir D] [--data-dir D]   # TOML proposal on stdout
 //! ```
 //!
 //! # Exit codes
@@ -28,10 +28,14 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use rskim_bench::scoreboard::baseline::{Baseline, BlessDecision, BlessInputs, bless};
-use rskim_bench::scoreboard::corpus::{DEFAULT_CORPUS_DIR, GitCorpusSource};
+use rskim_bench::scoreboard::corpus::{
+    CorpusSource, DEFAULT_CORPUS_DIR, GitCorpusSource, load_corpora,
+};
+use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
 use rskim_bench::scoreboard::report::{GateStatus, Report, total, write_outputs};
 use rskim_bench::scoreboard::runner::{SkimRunner, SkimSandbox};
+use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 
 const EXIT_PASS: u8 = 0;
 const EXIT_GATE_FAIL: u8 = 1;
@@ -57,7 +61,8 @@ enum Command {
     Check(EngineArgs),
     /// Rewrite baseline.json from a report.json (e.g. the CI artifact).
     Bless(BlessArgs),
-    /// Emit candidate identifier entries for one corpus (phase 3 of #203).
+    /// Print candidate `[[ident]]` entries for one corpus (a proposal to review
+    /// and freeze in `golden/<corpus>.toml`; never run in CI).
     GoldenGen(GoldenGenArgs),
 }
 
@@ -224,11 +229,53 @@ fn bless_command(args: &BlessArgs) -> anyhow::Result<u8> {
 }
 
 fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
-    anyhow::bail!(
-        "golden-gen is implemented in phase 3 of #203 and is not available in this build \
-         (corpus {:?}, corpus dir {}, data dir {})",
-        args.corpus,
-        args.corpus_dir.display(),
-        args.data_dir.display()
-    )
+    let data = DataDir::new(&args.data_dir);
+    let specs = load_corpora(&data.corpora())?;
+    let spec = specs
+        .iter()
+        .find(|s| s.name == args.corpus)
+        .with_context(|| {
+            let known: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+            format!(
+                "--corpus {:?}: no such corpus in {} (known: {})",
+                args.corpus,
+                data.corpora().display(),
+                known.join(", ")
+            )
+        })?;
+
+    let source = GitCorpusSource::new(&args.corpus_dir);
+    let root = source.materialize(spec)?;
+    let state = source.verify_untouched(spec, &root)?;
+    anyhow::ensure!(
+        state.is_reusable(),
+        "{} is not a verified clone at {}: {state}",
+        root.display(),
+        spec.commit
+    );
+
+    // The oracle's git calls run under an empty HOME, as in `run`.
+    let home = tempfile::Builder::new()
+        .prefix("skim-scoreboard-golden-gen-")
+        .tempdir()
+        .context("creating the isolated HOME")?;
+    let universe = Universe::compute(&root, &GitIsolation::new(home.path()))?;
+    let candidates = golden_gen::generate(&spec.name, &universe, golden_gen::GENERATED_PER_CORPUS)?;
+
+    println!(
+        "# golden-gen proposal for corpus {} at {} ({} of {} requested; review, then freeze in golden/{}.toml)",
+        spec.name,
+        spec.commit,
+        candidates.len(),
+        golden_gen::GENERATED_PER_CORPUS,
+        spec.name
+    );
+    print!("{}", golden_gen::render_toml(&spec.name, &candidates));
+    eprintln!(
+        "scoreboard: golden-gen {}: {} candidate(s) over {} universe file(s)",
+        spec.name,
+        candidates.len(),
+        universe.len()
+    );
+    Ok(EXIT_PASS)
 }
