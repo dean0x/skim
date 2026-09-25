@@ -5,7 +5,9 @@
 //! **Streaming build**:
 //! 1. `discover_project_root(cwd)` → walk up to `.git`, fall back to cwd
 //! 2. Resolve cache dir: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/`
-//! 3. `walk_metadata(root, max_files)` → metadata-only WalkEntry list (sorted)
+//! 3. `walk_metadata(root, max_files, Some(cache_dir))` → metadata-only WalkEntry
+//!    list (sorted); on a git root it unions git-tracked files the ignore-walk
+//!    skipped, re-entering the same top-K selection (#402)
 //! 4. Producer thread: for each entry, reads content, computes SHA-256, applies
 //!    2-tier SHA cache, classifies; sends ProcessedFile on bounded channel
 //! 5. Consumer thread: receives ProcessedFile, calls add_file_classified, inserts
@@ -23,29 +25,33 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use anyhow::Context as _;
 use clap::Parser;
 use rskim_search::{
-    AstIndexBuilder, AstNgramSet, FileId, LayerBuilder, NgramIndexBuilder, StructuralMetrics,
+    AstIndexBuilder, AstNgramCache, CachedAstEntry, FileId, LayerBuilder, NgramIndexBuilder,
     classify_source, extract_ast_ngrams_with_metrics, linearize_source,
 };
 
 use super::manifest::{FileManifest, ManifestEntry, decode_field_map, encode_field_map};
 use super::staleness::read_git_head;
-use super::types::{IndexConfig, IndexResult, ProcessedFile, SkipReason, WalkEntry};
-use super::walk::{
-    ReadOutcome, discover_project_root, is_minified, open_and_read, sha256_hex, walk_metadata,
+use super::types::{
+    IndexConfig, IndexResult, ProcessedFile, ProducerSkips, SkipReason, SkippedEntry, WalkEntry,
 };
+use super::walk::{
+    MAX_SKIP_REASONS, ReadOutcome, discover_project_root, minified_metric, normalize_rel_path,
+    open_and_read, sha256_hex, walk_metadata,
+};
+// Re-export so `mod.rs` (and index_tests.rs via super::) continue to reach the
+// function as `index::resolve_search_cache_dir`.  The definition moved to walk.rs
+// to break the former bidirectional import cycle (finding: walk-index-cyclic-coupling).
+pub(super) use super::walk::resolve_search_cache_dir;
 
 // ============================================================================
 // Public entry point
 // ============================================================================
 
-/// Run the `skim search index` subcommand.
+/// Run the index builder.
 ///
 /// Accepted flags:
 /// - `--root=<PATH>` or `--root <PATH>` — explicit project root (default: cwd)
@@ -53,11 +59,33 @@ use super::walk::{
 /// - `--max-files=<N>` — override the 50,000 file cap (must be ≥ 1)
 /// - `-h` / `--help` — print help text and exit
 ///
+/// # AD-375-2 — `index::run` / `IndexCli` are retained, not deleted (applies ADR-001).
+///
+/// As of #375, `skim search index` as a positional subcommand was removed —
+/// `index` is now treated as a query term, not a build trigger.  This function
+/// is therefore no longer reachable from the `search::run` dispatcher.  It is
+/// intentionally kept because:
+///
+/// 1. **`index_tests.rs` calls it directly** (`use super::run`) — deleting this
+///    function or `IndexCli` would fail to compile the 37 builder tests.
+/// 2. **`run_build`** (in `mod.rs`) delegates to `build_index()` (defined below),
+///    which is the same build pipeline — `index::run` is the test seam for that
+///    pipeline.
+///
+/// Do NOT delete this function or `IndexCli` as "dead code" — it is the primary
+/// test entry point for the build pipeline.
+///
 /// # Errors
 ///
 /// Returns `Err` only for fatal I/O failures. User-facing errors (unsupported
 /// languages, too-large files) are counted and reported to stderr but do not
 /// cause a non-zero exit code.
+// AD-375-2: clippy's dead_code lint fires here because the only non-test caller
+// (the `search::run` positional intercept) was removed by #375.  The function is
+// live from `index_tests.rs` (`use super::run`) but that is a #[cfg(test)] module,
+// which clippy-with-dead_code does not count as a live caller.  We suppress rather
+// than delete (see the rustdoc above).
+#[allow(dead_code)]
 pub(super) fn run(
     args: &[String],
     _analytics: &crate::analytics::AnalyticsConfig,
@@ -77,10 +105,13 @@ pub(super) fn run(
     let result = build_index(&config)?;
 
     eprintln!(
-        "skim search index: indexed {} files ({} skipped, {} cache hits) in {:.1}s",
+        "skim search: indexed {} files ({} skipped, {} field-map hits, \
+         {} AST reused, {} AST re-extracted) in {:.1}s",
         result.file_count,
         result.skipped,
         result.cache_hits,
+        result.ast_cache_hits,
+        result.ast_reextracted,
         result.duration.as_secs_f64(),
     );
 
@@ -118,9 +149,14 @@ struct IndexCli {
 }
 
 impl IndexCli {
+    // AD-375-2: same suppression as `run` above — used by index_tests.rs via
+    // IndexCli::try_parse_from + into_config, invisible to dead_code lint.
+    #[allow(dead_code)]
     fn into_config(self) -> anyhow::Result<IndexConfig> {
         let effective_root = match self.root {
-            Some(r) => r.canonicalize().unwrap_or(r),
+            Some(r) => r.canonicalize().map_err(|e| {
+                anyhow::anyhow!("--root {}: {e}. Pass the directory to index.", r.display())
+            })?,
             None => {
                 let cwd = std::env::current_dir()?;
                 discover_project_root(&cwd)?
@@ -154,13 +190,12 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 ///
 /// # Concurrency
 ///
-/// Acquires an exclusive advisory lock on `{cache_dir}/.skim-build.lock` before
-/// running the pipeline, with a 120-second deadline. If another process holds
-/// the lock, the call polls every 200 ms and prints a one-time notice to stderr
-/// so the user knows why it is waiting. After 120 s the call returns an error
-/// rather than blocking indefinitely. This serialises all callers — `skim init`
-/// background spawn, git-hook `--update`, and direct `--build` / `--rebuild` —
-/// protecting `index.skidx` and `index.skfiles` from concurrent writes.
+/// Acquires the shared advisory build lock via [`super::build_lock::acquire`]
+/// before running the pipeline. Both `build_index` (this function) and
+/// `rebuild_temporal` use the SAME lock so concurrent skim processes serialise
+/// correctly against both the lexical/AST write and the temporal write. The
+/// lock polls every 200 ms for up to 120 s, prints a one-time notice, then
+/// returns an error if the deadline expires.
 ///
 /// The lock is released when the returned [`IndexResult`] (or the `Err`) drops,
 /// i.e. at the end of this function. The lock file itself is never deleted so
@@ -168,56 +203,53 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 pub(super) fn build_index(config: &IndexConfig) -> anyhow::Result<IndexResult> {
     let pipeline = Pipeline::new(config)?;
 
-    // Acquire the advisory build lock before touching index files.
-    let lock_path = pipeline.cache_dir.join(".skim-build.lock");
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open build lock: {}", lock_path.display()))?;
+    // Acquire the shared advisory build lock. The single bounded implementation
+    // lives in `build_lock::acquire` so that both the lexical build (here) and
+    // the temporal rebuild (called from staleness.rs) use ONE lock loop with
+    // consistent wait message and deadline. The lock is held for the duration of
+    // `pipeline.run()` and released when `_lock` drops at function end.
+    // (applies ADR-006: serialises concurrent skim processes)
+    let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
 
-    // Bounded lock acquisition: poll every 200 ms for up to 120 s.
-    // `try_lock()` returns Err(TryLockError::WouldBlock) when another process
-    // holds the lock, and Err(TryLockError::Error(_)) on a real OS error.
-    // Drop-based release is preserved — `lock_file` drops at function end.
-    const LOCK_POLL_MS: u64 = 200;
-    const LOCK_DEADLINE_SECS: u64 = 120;
-    let deadline = Instant::now() + Duration::from_secs(LOCK_DEADLINE_SECS);
-    let mut noticed = false;
-    loop {
-        match lock_file.try_lock() {
-            Ok(()) => break, // lock acquired
-            Err(std::fs::TryLockError::WouldBlock) => {
-                // Another process holds the lock.
-                if !noticed {
-                    eprintln!(
-                        "skim search index: waiting for concurrent build to finish \
-                         (lock: {}) …",
-                        lock_path.display()
-                    );
-                    noticed = true;
-                }
-                if Instant::now() >= deadline {
-                    return Err(anyhow::anyhow!(
-                        "another skim build has held {} for >{} s; \
-                         if no build is running, delete the lock file and retry",
-                        lock_path.display(),
-                        LOCK_DEADLINE_SECS,
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(LOCK_POLL_MS));
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(anyhow::anyhow!(e))
-                    .with_context(|| "failed to acquire exclusive build lock");
-            }
-        }
+    pipeline.run()
+}
+
+/// Build the index, but re-check staleness AFTER acquiring the build lock and
+/// SKIP the pipeline if `still_stale()` returns `false` (AD-379-8).
+///
+/// # Stampede collapse
+///
+/// Several concurrent `skim search` processes that all observe a dirty working
+/// tree will queue on the advisory build lock. Without this re-check each would
+/// rebuild in turn (a thundering herd). Here the FIRST waiter to acquire the
+/// lock rebuilds; every subsequent waiter, upon acquiring the lock, calls
+/// `still_stale()` — which re-runs the cheap staleness check against the
+/// now-refreshed manifest — observes a Current index, and returns `Ok(None)`
+/// WITHOUT running a second pipeline. This collapses N rebuilds into one.
+///
+/// The predicate is evaluated INSIDE the lock (after acquisition, before the
+/// pipeline) so the re-check observes the committed state of any peer that
+/// rebuilt before us. Acquiring the lock here and delegating to `pipeline.run()`
+/// (which does NOT re-acquire) keeps a single lock hold for the whole critical
+/// section — re-entering `build_index` would self-block on the advisory lock.
+///
+/// Returns `Ok(Some(result))` when a build ran, `Ok(None)` when it was skipped
+/// because a peer already refreshed the index.
+pub(super) fn build_index_rechecked(
+    config: &IndexConfig,
+    still_stale: impl FnOnce() -> bool,
+) -> anyhow::Result<Option<IndexResult>> {
+    let pipeline = Pipeline::new(config)?;
+
+    // Single lock hold for the whole critical section (re-check + build).
+    let _lock = super::build_lock::acquire("skim search index", &pipeline.cache_dir)?;
+
+    // Post-lock re-check (AD-379-8): a peer may have rebuilt while we waited.
+    if !still_stale() {
+        return Ok(None);
     }
 
-    // Lock is held for the duration of the build. `lock_file` drops (and
-    // releases the lock) when this function returns.
-    pipeline.run()
+    pipeline.run().map(Some)
 }
 
 /// Orchestrates the index build pipeline as discrete, testable stages.
@@ -246,6 +278,10 @@ pub(super) struct ConsumeResult {
     pub(super) file_count: u32,
     /// Number of files whose cached `field_map` was reused (SHA match).
     pub(super) cache_hits: u32,
+    /// Number of files whose AST n-grams were served from `ast_index.skcache`.
+    pub(super) ast_cache_hits: u32,
+    /// Number of files whose AST n-grams were freshly extracted.
+    pub(super) ast_reextracted: u32,
 }
 
 impl<'cfg> Pipeline<'cfg> {
@@ -277,44 +313,42 @@ impl<'cfg> Pipeline<'cfg> {
         let debug_enabled = crate::debug::is_debug_enabled();
 
         // Stage 1: Metadata-only walk (no content reading).
-        let (walk_entries, walk_skip_count) = self.walk()?;
+        let (walk_entries, walk_skips) = self.walk()?;
 
         if walk_entries.is_empty() {
-            // Nothing to index — flush empty lexical + AST indexes and manifest
-            // so that `check_staleness` can find `index.skidx` and treat the
-            // project as indexed rather than returning `NoIndex` on every query.
-            let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-            let _layer = builder.build()?;
-            // Also build an empty AST index so self-heal doesn't trigger
-            // immediately after an empty-project build.
-            let ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
-                .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
-            ast_builder
-                .build()
-                .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
-            let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
-            manifest.set_git_head(read_git_head(&self.config.root));
-            manifest.save()?;
-            return Ok(IndexResult {
-                file_count: 0,
-                skipped: to_u32_capped(walk_skip_count),
-                cache_hits: 0,
-                duration: self.start.elapsed(),
-            });
+            let walk_skip_count = walk_skips.len();
+            let skip_sample = build_skip_sample(walk_skips, vec![]);
+            return self.flush_empty(walk_skip_count, skip_sample);
         }
 
-        // Stage 2: Load the manifest for incremental builds, then spawn producer.
+        // Stage 2: Load the manifest and the AST cache for incremental builds,
+        // then spawn producer.
         let manifest = self.load_manifest()?;
-        let (producer_handle, rx, producer_skips) =
-            Self::spawn_producer(walk_entries, manifest, self.config.force, debug_enabled);
+        // Load the prior AST n-gram cache.  On --force, skip the cache entirely
+        // (--force must re-extract everything, AC11).
+        // `with_dir` on the force path creates an empty cache that knows where
+        // to write its skcache — the same pattern as `FileManifest::new`.
+        let ast_cache = if self.config.force {
+            AstNgramCache::with_dir(&self.cache_dir)
+        } else {
+            AstNgramCache::load(&self.cache_dir)
+        };
+        let (producer_handle, rx) = Self::spawn_producer(
+            walk_entries,
+            manifest,
+            ast_cache,
+            self.config.force,
+            debug_enabled,
+        );
 
         // Stage 3: Consume processed files, build lexical + AST indexes.
         let mut builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
-        // AST index (#199): build alongside lexical so both share the same FileId
-        // sequence (correctness-critical — see FileId contract in ast_index/builder.rs).
+        // AST index (#199 + #290): build alongside lexical so both share the same
+        // FileId sequence (correctness-critical — see FileId contract in
+        // ast_index/builder.rs).  Incremental cache (#290): unchanged files reuse
+        // their cached AstNgramSet from ast_index.skcache instead of re-extracting.
         // NOTE: both builders retain posting lists until build(); memory scales with
         // file count (~tens of MB at 10k files) — tracked in #273 for chunked builds.
-        // Re-extract all files each refresh (no incremental cache) — tracked in #290.
         let mut ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
             .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
         let mut new_manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
@@ -324,17 +358,22 @@ impl<'cfg> Pipeline<'cfg> {
         // On the abort path, `rx` is consumed (dropped inside `consume`) before we reach
         // the join, so the producer's `tx.send()` has already returned `Err` and the
         // producer thread has already exited — no deadlock risk. (applies ADR-006)
+        let mut new_ast_cache = AstNgramCache::with_dir(&self.cache_dir);
         let consume_result = Self::consume(
             &mut builder,
             &mut ast_builder,
             &mut new_manifest,
+            &mut new_ast_cache,
             rx,
             debug_enabled,
         );
 
         // Always join the producer first so a worker-thread panic is surfaced
         // regardless of whether consume succeeded or aborted (ADR-006 desync).
-        producer_handle.join().map_err(|e| {
+        // AD-395-2: `JoinHandle<ProducerSkips>` — the join establishes the
+        // happens-before edge that makes the producer's local Vecs safe to read
+        // here (replaces the prior `Arc<AtomicU32>` load comment).
+        let producer_skips = producer_handle.join().map_err(|e| {
             anyhow::anyhow!(
                 "producer thread panicked: {:?}",
                 e.downcast_ref::<String>()
@@ -347,6 +386,8 @@ impl<'cfg> Pipeline<'cfg> {
         let ConsumeResult {
             file_count,
             cache_hits,
+            ast_cache_hits,
+            ast_reextracted,
         } = consume_result?;
 
         // Commit ordering (crash-safety):
@@ -363,15 +404,24 @@ impl<'cfg> Pipeline<'cfg> {
         // the consume loop. Abort before any write so the old manifest survives
         // and the next query self-heals. (applies ADR-006)
         //
+        // AD-395-2: skip inserts do NOT touch `new_manifest.entries` so the
+        // manifest_count == file_count guard and the FileId↔sorted_paths invariant
+        // are preserved — skips live in the separate `skipped_entries` map.
+        //
         // Why the comparison holds for realistic projects: `manifest_count` is the
-        // number of unique BTreeMap keys (normalized rel-path strings), and
-        // `file_count` is the number of successful `add_file_classified` calls.
-        // They agree when every successfully-indexed file has a distinct normalized
-        // path key — the invariant upheld by `walk_metadata`'s sorted, deduped
-        // output. A mismatch would require two walk entries to normalize to the
-        // same path key, which cannot happen on case-sensitive file-systems and is
-        // a data-corruption signal on case-insensitive ones; hence this guard is
-        // intentionally defensive rather than a common-case check.
+        // number of unique BTreeMap keys (normalized rel-path strings produced by
+        // normalize_rel_path), and `file_count` is the number of successful
+        // `add_file_classified` calls. They agree when every successfully-indexed
+        // file has a distinct normalized path key — the invariant upheld by
+        // `walk_metadata`'s sort (AD-373-1: byte-wise normalized-string order,
+        // matching the manifest BTreeMap<String> resolution side exactly).
+        // Dedup is implicit in BTreeMap::insert (last writer wins); the walker
+        // does NOT dedup entries — a duplicate walk entry would silently collapse
+        // to one BTreeMap key, causing manifest_count < file_count and triggering
+        // this guard. A mismatch would require two walk entries to normalize to the
+        // same path key, which cannot happen on case-sensitive file-systems (two
+        // distinct paths ⇒ two distinct keys) and is a data-corruption signal on
+        // case-insensitive ones; hence this guard is intentionally defensive.
         let manifest_count = new_manifest.entry_count();
         if manifest_count != file_count as usize {
             return Err(anyhow::anyhow!(
@@ -381,34 +431,68 @@ impl<'cfg> Pipeline<'cfg> {
             ));
         }
 
+        // Insert content-skip entries into the manifest skip section BEFORE
+        // save() — they live in a SEPARATE map (see AD-395-2/4 comment above).
+        for skip_entry in &producer_skips.skip_set {
+            new_manifest.insert_skip(skip_entry.clone());
+        }
+
         let _layer = builder.build()?;
         ast_builder
             .build()
             .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
 
+        // Commit ordering (applies ADR-006):
+        // Write the AST n-gram cache AFTER ast_builder.build() and BEFORE
+        // new_manifest.save().  A write failure here returns Err so the
+        // manifest is never saved — the next query self-heals via full rebuild.
+        // The skcache is advisory: a stale entry cannot be served because the
+        // manifest SHA is the sole cache-key authority; a skcache entry present
+        // without a matching manifest SHA is simply unused on the next build.
+        new_ast_cache
+            .save()
+            .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
+
         // Record the current git HEAD in the manifest so staleness detection
         // can compare it on the next query without spawning a git subprocess.
         new_manifest.set_git_head(read_git_head(&self.config.root));
+        // AD-405-7: compute coverage BEFORE save() — new_manifest is fully
+        // populated here (all insert() calls are done) so the count is exact.
+        // Zero extra I/O: the manifest is already in memory (AC-405-12).
+        let ast_coverage = new_manifest.ast_coverage();
         new_manifest.save()?;
 
-        // `producer_handle.join()` above is the happens-before edge: the atomic
-        // load below is only valid after join() returns. Moving this load before
-        // the join would make `producer_skips` racy.
-        let total_skipped =
-            to_u32_capped(walk_skip_count).saturating_add(producer_skips.load(Ordering::Relaxed));
+        // Merge walk-phase skips + producer sample, sort by stable key, truncate
+        // to MAX_SKIP_REASONS (AD-395-2 / AD-395-6 / PF-012).
+        // Use the exact uncapped producer counter (not sample.len()) so the
+        // headline skip number and "...and N more" are always the true total.
+        let total_skipped = to_u32_capped(walk_skips.len())
+            .saturating_add(to_u32_capped(producer_skips.skipped_total));
+        let skip_sample = build_skip_sample(walk_skips, producer_skips.sample);
 
         Ok(IndexResult {
             file_count,
             skipped: total_skipped,
+            skip_sample,
             cache_hits,
+            ast_cache_hits,
+            ast_reextracted,
             duration: self.start.elapsed(),
+            ast_coverage,
         })
     }
 
-    /// Stage 1: walk the project root and return `(entries, skip_count)`.
-    fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, usize)> {
-        let (entries, skips) = walk_metadata(&self.config.root, self.config.effective_max_files())?;
-        Ok((entries, skips.len()))
+    /// Stage 1: walk the project root and return `(entries, walk_skips)`.
+    ///
+    /// Returns the FULL walk skip `Vec` (not reduced to `.len()`) so `run()`
+    /// can merge it into the producer sample (AD-395-2).
+    fn walk(&self) -> anyhow::Result<(Vec<WalkEntry>, Vec<SkipReason>)> {
+        let (entries, skips) = walk_metadata(
+            &self.config.root,
+            self.config.effective_max_files(),
+            Some(&self.cache_dir),
+        )?;
+        Ok((entries, skips))
     }
 
     /// Stage 2a: load or create the [`FileManifest`] based on `--force`.
@@ -423,30 +507,84 @@ impl<'cfg> Pipeline<'cfg> {
         }
     }
 
+    /// Flush empty lexical + AST indexes, an empty skcache, and an empty manifest
+    /// when the project has no indexable files.
+    ///
+    /// Called when `walk_entries` is empty so that `check_staleness` can find
+    /// `index.skidx` and treat the project as indexed (rather than returning
+    /// `NoIndex` on every query).  Writing an empty skcache preserves the
+    /// "self-pruning, rebuilt from scratch each build" invariant — without it, a
+    /// stale skcache from a prior non-empty build would persist on disk.
+    fn flush_empty(
+        self,
+        walk_skip_count: usize,
+        skip_sample: Vec<SkipReason>,
+    ) -> anyhow::Result<IndexResult> {
+        let builder = NgramIndexBuilder::new(self.cache_dir.clone())?;
+        let _layer = builder.build()?;
+        // Build an empty AST index so self-heal doesn't trigger immediately.
+        let ast_builder = AstIndexBuilder::new(self.cache_dir.clone())
+            .map_err(|e| anyhow::anyhow!("failed to create AST index builder: {e}"))?;
+        ast_builder
+            .build()
+            .map_err(|e| anyhow::anyhow!("AST index build failed: {e}"))?;
+        // Write an empty skcache to maintain the self-pruning invariant.
+        AstNgramCache::with_dir(&self.cache_dir)
+            .save()
+            .map_err(|e| anyhow::anyhow!("AST cache save failed: {e}"))?;
+        let mut manifest = FileManifest::new(self.config.root.clone(), self.cache_dir.clone());
+        manifest.set_git_head(read_git_head(&self.config.root));
+        // AD-405-7: empty manifest → all counts zero, coverage is clean.
+        let ast_coverage = manifest.ast_coverage();
+        manifest.save()?;
+        Ok(IndexResult {
+            file_count: 0,
+            skipped: to_u32_capped(walk_skip_count),
+            skip_sample,
+            cache_hits: 0,
+            ast_cache_hits: 0,
+            ast_reextracted: 0,
+            duration: self.start.elapsed(),
+            ast_coverage,
+        })
+    }
+
     /// Stage 2b: spawn the producer thread.
     ///
-    /// Returns a join handle, the receiving end of the bounded channel, and a
-    /// shared skip counter that the producer increments on read/classify errors.
+    /// AD-395-2: The single-threaded producer accumulates a bounded typed
+    /// `SkipReason` display sample plus a `(path,mtime,size,reason:PersistedSkipReason)`
+    /// skip-set and returns them via `JoinHandle<ProducerSkips>` — no `Mutex`
+    /// needed because the producer is single-threaded.  The skip-set only
+    /// contains DETERMINISTIC content-skips (Minified / NonUtf8 / TooLarge);
+    /// `ReadError` is included in the display sample but NOT persisted (OD-395-4).
+    ///
+    /// `ast_cache` is moved into the producer thread and consulted for each
+    /// file: a SHA match in the cache attaches the cached payload to the
+    /// `ProcessedFile.ast_cached` field so the consumer skips `derive_ast_entry`.
     fn spawn_producer(
         walk_entries: Vec<WalkEntry>,
         manifest: FileManifest,
+        ast_cache: AstNgramCache,
         force: bool,
         debug_enabled: bool,
     ) -> (
-        std::thread::JoinHandle<()>,
+        std::thread::JoinHandle<ProducerSkips>,
         crossbeam_channel::Receiver<ProcessedFile>,
-        Arc<AtomicU32>,
     ) {
         let (tx, rx) = crossbeam_channel::bounded::<ProcessedFile>(CHANNEL_CAPACITY);
-        let producer_skips = Arc::new(AtomicU32::new(0));
-        let skips = Arc::clone(&producer_skips);
 
-        // Both `walk_entries` and `manifest` are moved into the producer thread.
-        // `Vec<WalkEntry>` and `FileManifest` must be `Send`; the compiler
-        // enforces this at the `thread::spawn` call site.
+        // AD-395-2: single-threaded producer — accumulate locally, no Arc/Mutex.
         let handle = std::thread::spawn(move || {
+            let mut sample: Vec<SkipReason> = Vec::new();
+            let mut skip_set: Vec<SkippedEntry> = Vec::new();
+            // AD-395-2: exact, uncapped count of every producer-phase skip.
+            // Independent of `sample` (which is capped at MAX_SKIP_REASONS)
+            // so that IndexResult.skipped and "...and N more" always report
+            // the true total, even in large monorepos with >10 000 skips.
+            let mut skipped_total: usize = 0;
+
             for entry in &walk_entries {
-                match read_and_classify(entry, &manifest, force, debug_enabled) {
+                match read_and_classify(entry, &manifest, &ast_cache, force, debug_enabled) {
                     Ok(pf) => {
                         // Send blocks when channel is full — backpressure limits peak memory.
                         if tx.send(pf).is_err() {
@@ -454,15 +592,42 @@ impl<'cfg> Pipeline<'cfg> {
                             break;
                         }
                     }
-                    Err(_reason) => {
-                        skips.fetch_add(1, Ordering::Relaxed);
+                    Err(reason) => {
+                        // Count every skip exactly (uncapped) before any sample logic.
+                        skipped_total += 1;
+                        // Collect a DETERMINISTIC skip entry for manifest persistence
+                        // (AD-395-2 / OD-395-4): only Minified, NonUtf8, TooLarge.
+                        if let Some(disc) = reason.persist_discriminant() {
+                            // skip_set is naturally <= max_files (every entry was an
+                            // accepted WalkEntry), so MAX_MANIFEST_ENTRIES is the bound.
+                            if skip_set.len() < super::manifest::MAX_MANIFEST_ENTRIES {
+                                let rel_path = normalize_rel_path(&entry.rel_path);
+                                skip_set.push(SkippedEntry {
+                                    path: rel_path,
+                                    mtime: entry.mtime,
+                                    size: entry.size,
+                                    reason: disc,
+                                });
+                            }
+                        }
+                        // Add to display sample (bounded; CapReached once cap hit).
+                        if sample.len() < MAX_SKIP_REASONS {
+                            sample.push(reason);
+                        } else if !matches!(sample.last(), Some(SkipReason::CapReached)) {
+                            sample.push(SkipReason::CapReached);
+                        }
                     }
                 }
             }
             // `tx` dropped here closes the channel, signalling EOF to consumer.
+            ProducerSkips {
+                skipped_total,
+                sample,
+                skip_set,
+            }
         });
 
-        (handle, rx, producer_skips)
+        (handle, rx)
     }
 
     /// Stage 3: consume [`ProcessedFile`]s from `rx`, index each one in BOTH
@@ -491,19 +656,26 @@ impl<'cfg> Pipeline<'cfg> {
     /// 1. `next_file_id` only advances after a successful `add_file_classified`.
     ///    A lexical-builder error causes a `continue` — the file is excluded from
     ///    BOTH indexes, keeping them in sync.
-    /// 2. AST entries are ALWAYS inserted (even on linearization error) via an
-    ///    empty `AstNgramSet` + zero node_count + default metrics. This preserves
+    /// 2. AST entries are ALWAYS inserted (even on linearization error or cache
+    ///    hit) via exactly one `add_file_ngrams` call per file. This preserves
     ///    the AST builder's "every file gets exactly one call" contract and prevents
     ///    FileId desync between the lexical and AST indexes.
+    /// 3. `new_ast_cache` accumulates payloads for all files in this build (hits
+    ///    re-inserted from the prior cache, misses inserted after extraction).
+    ///    The caller writes it atomically after `ast_builder.build()` and before
+    ///    `new_manifest.save()`. (applies ADR-006)
     pub(super) fn consume(
         builder: &mut NgramIndexBuilder,
         ast_builder: &mut AstIndexBuilder,
         new_manifest: &mut FileManifest,
+        new_ast_cache: &mut AstNgramCache,
         rx: crossbeam_channel::Receiver<ProcessedFile>,
         debug_enabled: bool,
     ) -> anyhow::Result<ConsumeResult> {
         let mut next_file_id: u32 = 0;
         let mut cache_hits: u32 = 0;
+        let mut ast_cache_hits: u32 = 0;
+        let mut ast_reextracted: u32 = 0;
 
         for pf in rx {
             // Fail-soft: a lexical builder error on one file must not abort a
@@ -516,7 +688,7 @@ impl<'cfg> Pipeline<'cfg> {
             ) {
                 if debug_enabled {
                     eprintln!(
-                        "skim search index [debug]: add_file_classified failed for {:?}: {e}",
+                        "skim search [debug]: add_file_classified failed for {:?}: {e}",
                         pf.rel_path
                     );
                 }
@@ -525,11 +697,28 @@ impl<'cfg> Pipeline<'cfg> {
                 continue;
             }
 
-            // AST index: derive n-grams (step 2 of 4-step loop contract).
-            // Fail-soft: on ANY error, returns an empty aligned entry so AST FileIds
-            // stay in sync with lexical FileIds. NEVER skips — see derive_ast_entry.
-            let (ast_set, ast_metrics, ast_node_count) =
-                derive_ast_entry(&pf.content, pf.lang, &pf.rel_path, debug_enabled);
+            // AST index: resolve payload from cache (hit) or derive fresh (miss).
+            // The invariant: EVERY file that passes the lexical stage gets exactly
+            // ONE `add_file_ngrams` call — hit or miss. NEVER skip. (applies ADR-006)
+            //
+            // `pf.sha256` is borrowed here so it can be moved into the ManifestEntry
+            // below without a redundant heap clone — the SHA is a 64-char hex string
+            // that only needs to be allocated once per file. (applies ADR-003)
+            let is_hit = pf.ast_cached.is_some();
+            let entry = resolve_ast_entry(
+                new_ast_cache,
+                &pf.sha256,
+                pf.ast_cached,
+                &pf.content,
+                pf.lang,
+                &pf.rel_path,
+                debug_enabled,
+            );
+            if is_hit {
+                ast_cache_hits = ast_cache_hits.saturating_add(1);
+            } else {
+                ast_reextracted = ast_reextracted.saturating_add(1);
+            }
 
             // Add the AST entry for this file. The lexical entry for the SAME
             // FileId was already accepted, so an error here means the indexes are
@@ -538,13 +727,13 @@ impl<'cfg> Pipeline<'cfg> {
             // old manifest survives and the next query self-heals via a full
             // rebuild. Silently continuing would advance next_file_id and cascade
             // the desync into a committed-but-corrupt index. See the FileId-
-            // alignment invariant in the function doc.
+            // alignment invariant in the function doc. (applies ADR-006)
             if let Err(e) = ast_builder.add_file_ngrams(
                 FileId(next_file_id),
                 pf.lang,
-                &ast_set,
-                ast_node_count,
-                ast_metrics,
+                &entry.ngrams,
+                entry.node_count,
+                entry.metrics,
             ) {
                 return Err(anyhow::anyhow!(
                     "AST index desync: add_file_ngrams failed for {:?} at FileId {}: {e} \
@@ -561,7 +750,7 @@ impl<'cfg> Pipeline<'cfg> {
             let Some(next) = next_file_id.checked_add(1) else {
                 if debug_enabled {
                     eprintln!(
-                        "skim search index [debug]: next_file_id overflows u32; \
+                        "skim search [debug]: next_file_id overflows u32; \
                          flushing {} files and stopping",
                         next_file_id
                     );
@@ -573,13 +762,16 @@ impl<'cfg> Pipeline<'cfg> {
                 cache_hits = cache_hits.saturating_add(1);
             }
 
-            let path_key = pf.rel_path.to_string_lossy().replace('\\', "/");
+            // AD-373-2 (ref): use normalize_rel_path so the manifest key is
+            // byte-identical to the walk sort key (walk.rs). Single source of truth.
+            let path_key = normalize_rel_path(&pf.rel_path);
             new_manifest.insert(ManifestEntry {
                 path: path_key,
                 sha256: pf.sha256,
                 lang: pf.lang.as_str().to_string(),
                 field_map: encode_field_map(&pf.field_map),
                 mtime: pf.mtime,
+                size: pf.size,
             });
             // `pf.content` dropped here — memory released immediately.
         }
@@ -587,6 +779,8 @@ impl<'cfg> Pipeline<'cfg> {
         Ok(ConsumeResult {
             file_count: next_file_id,
             cache_hits,
+            ast_cache_hits,
+            ast_reextracted,
         })
     }
 }
@@ -595,21 +789,72 @@ impl<'cfg> Pipeline<'cfg> {
 // Streaming producer helper
 // ============================================================================
 
+/// Resolve the AST n-gram payload for one file into `new_ast_cache`, returning
+/// a shared borrow of the stored entry.
+///
+/// # Responsibility
+///
+/// This helper extracts the multi-branch AST cache hit/miss logic from the
+/// consume loop so `consume()` reads as a flat sequence of four steps:
+/// lexical-add → resolve-ast → ast-add → advance.
+///
+/// # Cache semantics
+///
+/// - **Hit** (`cached.is_some()`): the owned `CachedAstEntry` arrived with the
+///   `ProcessedFile`; insert it into `new_ast_cache` so it survives to the next
+///   build, then return a borrow.  Uses `get_or_insert` (Entry API) so the SHA
+///   key is hashed only once — no insert-then-re-probe double-hash. (applies ADR-003)
+///
+/// - **Miss** (`cached.is_none()`): run `derive_ast_entry` (fail-soft: always
+///   returns a valid, possibly empty triple), construct a `CachedAstEntry`, insert
+///   it, and return a borrow.  Empty entries for data-format files are valid cache
+///   entries, not corrupt. (applies ADR-003)
+///
+/// # AC7 poison-check note
+///
+/// A zero-count entry from the cache reaching `add_file_ngrams` will trigger the
+/// desync abort in `add_file_ngrams`'s `check_count_nonzero` guard (applies
+/// ADR-006).  That path is not handled here — `resolve_ast_entry` is intentionally
+/// unaware of it, keeping responsibilities separate.
+fn resolve_ast_entry<'cache>(
+    new_ast_cache: &'cache mut AstNgramCache,
+    sha_key: &str,
+    cached: Option<CachedAstEntry>,
+    content: &str,
+    lang: rskim_core::Language,
+    rel_path: &std::path::Path,
+    debug_enabled: bool,
+) -> &'cache CachedAstEntry {
+    // Cache miss: full extraction (fail-soft: always returns a valid entry).
+    // Empty entries for data-format files are valid cache entries, not corrupt.
+    let entry = cached.unwrap_or_else(|| derive_ast_entry(content, lang, rel_path, debug_enabled));
+    // Entry API: hashes sha_key once, inserts if absent, returns &CachedAstEntry.
+    // Eliminates the insert-then-lookup double-probe.
+    // `sha_key` is borrowed from the caller's `ProcessedFile.sha256`; `.to_string()`
+    // here allocates the HashMap key string only when an insertion is needed.
+    // The caller can then move `pf.sha256` into the ManifestEntry without a clone.
+    new_ast_cache.get_or_insert(sha_key.to_string(), entry)
+}
+
 /// Read a file's content, apply 2-tier SHA cache logic, and produce a
 /// [`ProcessedFile`] — or a [`SkipReason`] if the file should be excluded.
 ///
 /// Cache tiers:
-/// - SHA match → reuse `field_map` from manifest (cache hit, no classify call).
-/// - SHA mismatch or `--force` → run `classify_source` (cache miss).
+/// - SHA match → reuse `field_map` from manifest (lexical cache hit, no
+///   classify call); also attaches the AST payload from `ast_cache` when
+///   available (AST cache hit, no `derive_ast_entry` call in consumer).
+/// - SHA mismatch or `--force` → run `classify_source`; `ast_cached` is `None`
+///   so the consumer calls `derive_ast_entry`.
 ///
 /// Mtime is stored in the manifest for forward-looking aggressive-mode support
 /// (where mtime mismatch could skip SHA entirely) but is not read here — SHA is
-/// the sole cache authority in safe mode.
+/// the sole cache authority in safe mode. (applies ADR-003)
 ///
 /// Called by the producer thread for each [`WalkEntry`].
 fn read_and_classify(
     entry: &WalkEntry,
     manifest: &FileManifest,
+    ast_cache: &AstNgramCache,
     force: bool,
     debug: bool,
 ) -> Result<ProcessedFile, SkipReason> {
@@ -632,26 +877,41 @@ fn read_and_classify(
     };
 
     // Minification check (tree-sitter languages only).
-    if !entry.lang.is_serde_based() && is_minified(&content) {
-        return Err(SkipReason::Minified(entry.abs_path.clone()));
+    if !entry.lang.is_serde_based()
+        && let Some(avg_line_bytes) = minified_metric(&content)
+    {
+        return Err(SkipReason::Minified {
+            path: entry.abs_path.clone(),
+            avg_line_bytes,
+        });
     }
 
-    // Always compute SHA — it is the correctness guarantee.
+    // Always compute SHA — it is the correctness guarantee for both the
+    // lexical and AST caches.  Content SHA-256 is the sole cache authority;
+    // mtime is never consulted for cache decisions. (applies ADR-003)
     let sha = sha256_hex(content.as_bytes());
 
-    // 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
-    let path_key = entry.rel_path.to_string_lossy().replace('\\', "/");
+    // Lexical 2-tier SHA cache: SHA match → hit, mismatch/--force → miss.
+    // AD-373-2 (ref): use normalize_rel_path so the lookup key is byte-identical
+    // to the manifest key and the walk sort key. Single source of truth.
+    let path_key = normalize_rel_path(&entry.rel_path);
 
     let (field_map, cache_hit) = if !force
         && let Some(cached) = manifest.lookup(&path_key)
         && cached.sha256 == sha
     {
-        // SHA match → reuse field_map (cache hit).
+        // SHA match → reuse field_map (lexical cache hit).
         (decode_field_map(&cached.field_map), true)
     } else {
         // Cache miss or --force → classify.
         (run_classify(&content, entry.lang, debug), false)
     };
+
+    // AST cache lookup: independent of the lexical cache hit/miss.
+    // On --force, ast_cache is empty so lookup always returns None (AC11).
+    // A SHA-match-but-cache-absent case (e.g. first build after version bump,
+    // or a corrupt entry) returns None here → consumer re-extracts. (AC5)
+    let ast_cached = ast_cache.lookup(&sha).cloned();
 
     Ok(ProcessedFile {
         rel_path: entry.rel_path.clone(),
@@ -659,8 +919,10 @@ fn read_and_classify(
         content,
         sha256: sha,
         mtime: entry.mtime,
+        size: entry.size,
         field_map,
         cache_hit,
+        ast_cached,
     })
 }
 
@@ -674,6 +936,78 @@ fn read_and_classify(
 /// approximate values for display when the file count exceeds 4 billion.
 fn to_u32_capped(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Merge walk-phase skips and producer-phase skips into a bounded,
+/// stable-key-sorted sample suitable for display (AD-395-6 / PF-012).
+///
+/// Sort order: content-skips (Minified / NonUtf8 / TooLarge, priority 0) sort
+/// before UnsupportedLanguage (priority 1), ReadError (priority 2), and
+/// CapReached (priority 3, last).  Within the same priority tier, entries are
+/// sorted by path string (ascending).
+///
+/// Content-skips get the lowest priority value so they float to the top of the
+/// displayed sample.  Without this ordering, a repo with many unsupported
+/// extensions would push the Minified-bundle notice (the primary diagnostic
+/// this feature was built to surface — AD-395-6 / AC4) past the `cap` cutoff
+/// in `format_skip_sample`, burying it in the "...and N more" tail.
+///
+/// The merged vec is truncated to `MAX_SKIP_REASONS` before returning.
+pub(super) fn build_skip_sample(
+    walk_skips: Vec<SkipReason>,
+    producer_skips: Vec<SkipReason>,
+) -> Vec<SkipReason> {
+    /// Display priority: lower value = shown earlier in the sample.
+    fn display_priority(r: &SkipReason) -> u8 {
+        match r {
+            // Content-skips are the primary diagnostic — surface them first.
+            SkipReason::Minified { .. } | SkipReason::NonUtf8(_) | SkipReason::TooLarge { .. } => 0,
+            SkipReason::UnsupportedLanguage(_) => 1,
+            SkipReason::ReadError { .. } => 2,
+            SkipReason::CapReached => 3,
+        }
+    }
+
+    let mut merged: Vec<SkipReason> = walk_skips.into_iter().chain(producer_skips).collect();
+    // Primary: display priority (content-skips first). Secondary: path ascending.
+    // CapReached has no path (sort_key → None) so it always sorts last within its tier.
+    merged.sort_by(|a, b| {
+        let pri_cmp = display_priority(a).cmp(&display_priority(b));
+        if pri_cmp != std::cmp::Ordering::Equal {
+            return pri_cmp;
+        }
+        match (a.sort_key(), b.sort_key()) {
+            (Some(pa), Some(pb)) => pa.cmp(pb),
+            (None, None) => std::cmp::Ordering::Equal,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+        }
+    });
+    merged.truncate(MAX_SKIP_REASONS);
+    merged
+}
+
+/// Format a bounded skip sample for stderr display (AD-395-6).
+///
+/// Returns a string with up to `cap` rendered reason lines followed by
+/// `"...and N more"` when the `total` exceeds the number shown.  Order is
+/// preserved (callers pass a pre-sorted slice).
+///
+/// `total` is the TRUE total skip count (≥ `reasons.len()`).  In production
+/// callers pass `result.skipped as usize` so the "and N more" figure reflects
+/// the uncapped count from the exact `ProducerSkips.skipped_total` counter
+/// (AD-395-2).  In unit-tests that exercise the formatting only, passing
+/// `reasons.len()` is correct (no hidden additional skips).
+///
+/// Exposed `pub(super)` for unit-testing (AC5 / PF-007 — no test-file-
+/// generation, pure function).
+pub(super) fn format_skip_sample(reasons: &[SkipReason], cap: usize, total: usize) -> String {
+    let shown = reasons.len().min(cap);
+    let mut lines: Vec<String> = reasons[..shown].iter().map(|r| r.to_string()).collect();
+    if total > shown {
+        lines.push(format!("...and {} more", total - shown));
+    }
+    lines.join("\n")
 }
 
 /// Call `classify_source` and return the field_map.
@@ -693,7 +1027,7 @@ fn run_classify(
         Err(e) => {
             if debug {
                 eprintln!(
-                    "skim search index [debug]: classify_source failed for {:?}: {e}",
+                    "skim search [debug]: classify_source failed for {:?}: {e}",
                     lang.as_str()
                 );
             }
@@ -704,13 +1038,13 @@ fn run_classify(
 
 /// Derive the AST n-gram entry for one file.
 ///
-/// Returns `(AstNgramSet, StructuralMetrics, node_count)`.
+/// Returns a [`CachedAstEntry`] ready to store in `new_ast_cache`.
 ///
 /// # Error policy (fail-soft)
 ///
 /// On ANY error (grammar load failure, linearization error, or an Ok-but-empty
 /// result for non-tree-sitter languages / large files / empty content), this
-/// function returns an empty-but-valid triple so the caller can still insert an
+/// function returns an empty-but-valid entry so the caller can still insert an
 /// ALIGNED EMPTY ENTRY into the AST builder. It never panics and never propagates
 /// an error — doing so would either abort the whole build (wrong for a per-file
 /// parse error) or skip the AST call entirely (which desynchronises FileIds).
@@ -725,56 +1059,32 @@ fn derive_ast_entry(
     lang: rskim_core::Language,
     rel_path: &Path,
     debug: bool,
-) -> (AstNgramSet, StructuralMetrics, u32) {
-    match linearize_source(content, lang) {
-        Ok(lin) if !lin.nodes.is_empty() => {
-            let (set, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
-            // Applies PF-004: explicit try_from, not `as u32`.
-            let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
-            (set, metrics, node_count)
-        }
-        Ok(_empty) => {
-            // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB,
-            // empty source, or parse-only-error result — empty aligned entry.
-            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
-        }
+) -> CachedAstEntry {
+    let lin = match linearize_source(content, lang) {
+        Ok(lin) if !lin.nodes.is_empty() => lin,
+        Ok(_) => return CachedAstEntry::default(),
         Err(e) => {
-            // Grammar load failure (SearchError::Ast) — only unrecoverable
-            // error path from linearize_source. Still return empty aligned entry
-            // so FileIds stay in sync with the lexical index.
             if debug {
                 eprintln!(
-                    "skim search index [debug]: linearize_source failed for {:?}: {e}",
+                    "skim search [debug]: linearize_source failed for {:?}: {e}",
                     rel_path
                 );
             }
-            (AstNgramSet::default(), StructuralMetrics::default(), 0u32)
+            return CachedAstEntry::default();
         }
+    };
+    // Non-tree-sitter lang (JSON/YAML/TOML), file >100KiB, empty source,
+    // parse-only-error, or grammar load failure returns early above —
+    // only non-empty linearizations reach here. FileIds stay in sync with
+    // the lexical index for all cases.
+    let (ngrams, metrics) = extract_ast_ngrams_with_metrics(&lin.nodes, lang);
+    // Applies PF-004: explicit try_from, not `as u32`.
+    let node_count = u32::try_from(lin.nodes.len()).unwrap_or(u32::MAX);
+    CachedAstEntry {
+        ngrams,
+        metrics,
+        node_count,
     }
-}
-
-/// Resolve the per-project search cache directory.
-///
-/// Path: `{base_cache}/search/{sha256(canonical_root)[..16]}/`
-///
-/// The base cache dir is resolved via `SKIM_CACHE_DIR` (if set) or
-/// `~/.cache/skim/`.
-pub(super) fn resolve_search_cache_dir(root: &Path) -> anyhow::Result<PathBuf> {
-    let base = crate::cmd::resolve_cache_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to resolve skim cache directory"))?;
-
-    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let hash = project_root_hash(&canonical);
-
-    Ok(base.join("search").join(hash))
-}
-
-/// Compute a 16-char hex prefix of the SHA-256 of the canonical project root path.
-///
-/// Used as a stable directory name in the search cache.
-fn project_root_hash(canonical_root: &Path) -> String {
-    let input = canonical_root.to_string_lossy();
-    sha256_hex(input.as_bytes())[..16].to_string()
 }
 
 // ============================================================================

@@ -5,10 +5,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::HashSet;
+
 use rskim_core::Language;
 
 use super::*;
-use crate::ast_index::structural::BUCKET_LABEL_BASE;
+use crate::ast_index::structural::is_synthetic_id;
 use crate::ast_index::{AstBigram, AstTrigram, DEFAULT_AST_WEIGHT, linearize_source, vocab_lookup};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -21,14 +23,35 @@ fn unit_trigram_weight(_: AstTrigram) -> f32 {
     1.0
 }
 
-/// Build a `LinearNode` with given kind_id and depth.
+/// Build a `LinearNode` with given kind_id and depth. `start_line`/`start_byte`
+/// (AD-394-6) default to 0 — these structural tests only assert on n-gram keys
+/// and metrics, never on recovered line/byte positions.
 fn node(kind_id: u16, depth: u16) -> LinearNode {
-    LinearNode { kind_id, depth }
+    LinearNode {
+        kind_id,
+        depth,
+        ..Default::default()
+    }
 }
 
 /// Collect bigram keys from a result set for membership assertions.
 fn bigram_keys(set: &AstNgramSet) -> Vec<u32> {
     set.bigrams.iter().map(|e| e.ngram.key()).collect()
+}
+
+/// Collect the u32 keys of all SYNTHETIC bigrams in `set` (i.e., those whose
+/// parent or child ID satisfies `is_synthetic_id`). Used by B_S1 parity tests
+/// to build the "expected present" set from `extract_ast_ngrams_with_metrics`
+/// before asserting that `synthetic_key_present` agrees.
+fn synthetic_bigram_key_set(set: &AstNgramSet) -> HashSet<u32> {
+    set.bigrams
+        .iter()
+        .filter(|e| {
+            let (p, c) = e.ngram.decode();
+            is_synthetic_id(p) || is_synthetic_id(c)
+        })
+        .map(|e| e.ngram.key())
+        .collect()
 }
 
 // ── F1: Empty input ───────────────────────────────────────────────────────────
@@ -697,9 +720,8 @@ fn trigram_count_accumulates_for_repeated_triple() {
 // This test runs both functions on the same input (a multi-node tree that
 // exercises gap-fill, siblings, and depth nesting) and asserts that the real
 // bigrams and trigrams match exactly after filtering out all synthetic markers
-// (parent or child ID >= BUCKET_LABEL_BASE = 64900).
+// via `is_synthetic_id` (AD-394-3: parent or child ID >= BUCKET_LABEL_BASE = 64900).
 //
-// Filtering: a bigram is synthetic when parent >= 64900 OR child >= 64900.
 // Trigrams cannot be synthetic (synthetic IDs never appear in trigram slots).
 
 #[test]
@@ -721,7 +743,7 @@ fn metrics_path_real_ngrams_match_weights_path() {
 
     let is_real_bigram = |e: &AstBigramEntry| {
         let (parent, child) = e.ngram.decode();
-        parent < BUCKET_LABEL_BASE && child < BUCKET_LABEL_BASE
+        !is_synthetic_id(parent) && !is_synthetic_id(child)
     };
 
     let mut weights_bigram_keys: Vec<u32> = weights_result
@@ -786,7 +808,7 @@ fn metrics_path_u16_max_depth_no_panic_max_depth_recorded() {
 
     let is_real_bigram = |e: &AstBigramEntry| {
         let (parent, child) = e.ngram.decode();
-        parent < BUCKET_LABEL_BASE && child < BUCKET_LABEL_BASE
+        !is_synthetic_id(parent) && !is_synthetic_id(child)
     };
     let real_bigrams: Vec<_> = result
         .bigrams
@@ -1000,5 +1022,156 @@ fn weight_set_once_count_accumulates() {
     assert_eq!(
         entry.count, 3,
         "count must equal number of occurrences (accumulates independently of weight)"
+    );
+}
+
+// ── B_S1: synthetic_key_present parity with extract_ast_ngrams_with_metrics ──
+//
+// `synthetic_key_present` (AC11 / #419) is a hand-optimized early-exit variant
+// of the `run_extraction` traversal loop. This test pins the equivalence:
+// for any synthetic bigram key, `synthetic_key_present` must agree with whether
+// `extract_ast_ngrams_with_metrics` emits that key in its bigrams set.
+//
+// This is the analogue of `metrics_path_real_ngrams_match_weights_path` (B_M1)
+// for the third traversal path — without it a future reorder in `run_extraction`
+// not mirrored in `synthetic_key_present` would pass CI while silently breaking
+// the ADR-006 single-source-of-truth guarantee.
+//
+// Covers two scenarios:
+// - PRESENT: DEEP_NODE → bucket_label(0) is emitted by a depth-4 node stream
+//   and `synthetic_key_present` must return `true`.
+// - ABSENT: DEEP_NODE → bucket_label(1) requires depth >= 6, so a depth-4
+//   stream must yield `false` from both paths.
+
+#[test]
+fn synthetic_key_present_agrees_with_extract_ast_ngrams_with_metrics_bs1() {
+    use crate::ast_index::structural::{DEEP_NODE, bucket_label};
+
+    // A node stream that exercises depth 4 (DEPTH_EDGES[0] = 4) but not depth 6.
+    // Kind IDs are well below BUCKET_LABEL_BASE — real vocab range.
+    let nodes = [
+        node(10, 0), // root
+        node(20, 1), // depth 1
+        node(30, 2), // depth 2
+        node(40, 3), // depth 3
+        node(50, 4), // depth 4 → triggers DEEP_NODE → bucket_label(0)
+    ];
+
+    let (emitted, _metrics) = extract_ast_ngrams_with_metrics(&nodes, Language::Rust);
+
+    // Collect synthetic bigram keys from the full extraction path.
+    let emitted_synthetic_keys = synthetic_bigram_key_set(&emitted);
+
+    // ── PRESENT case ─────────────────────────────────────────────────────────
+    // bucket_label(0) corresponds to DEPTH_EDGES[0] = 4; must be in emitted set.
+    let present_target = AstBigram::encode(DEEP_NODE, bucket_label(0));
+
+    assert!(
+        emitted_synthetic_keys.contains(&present_target.key()),
+        "extract_ast_ngrams_with_metrics must emit DEEP_NODE→bucket_label(0) \
+         for a depth-4 node stream (parity guard precondition)"
+    );
+    assert!(
+        super::synthetic_key_present(&nodes, Language::Rust, present_target),
+        "synthetic_key_present must return true for DEEP_NODE→bucket_label(0) \
+         on a depth-4 stream — parity with extract_ast_ngrams_with_metrics (B_S1)"
+    );
+
+    // ── ABSENT case ───────────────────────────────────────────────────────────
+    // bucket_label(1) corresponds to DEPTH_EDGES[1] = 6; NOT reached by depth 4.
+    let absent_target = AstBigram::encode(DEEP_NODE, bucket_label(1));
+
+    assert!(
+        !emitted_synthetic_keys.contains(&absent_target.key()),
+        "extract_ast_ngrams_with_metrics must NOT emit DEEP_NODE→bucket_label(1) \
+         for a depth-4 stream (requires depth >= 6; parity guard precondition)"
+    );
+    assert!(
+        !super::synthetic_key_present(&nodes, Language::Rust, absent_target),
+        "synthetic_key_present must return false for DEEP_NODE→bucket_label(1) \
+         on a depth-4 stream — parity with extract_ast_ngrams_with_metrics (B_S1)"
+    );
+}
+
+/// B_S1 (close-path): `synthetic_key_present` agrees with
+/// `extract_ast_ngrams_with_metrics` for EMPTY_BODY markers emitted via
+/// `close_depth` — NOT the `emit_depth_buckets` early-exit path covered by the
+/// depth-bucket variant above.
+///
+/// LARGE_BODY, EMPTY_BODY, and MANY_PARAMS are all emitted inside `close_depth`
+/// (when a subtree's children have been fully accumulated). The depth-bucket B_S1
+/// variant above covers only the `emit_depth_buckets` early-exit checkpoint;
+/// this variant extends coverage to the close-path checkpoint, locking in
+/// `synthetic_key_present`'s parity guarantee for the four patterns beyond
+/// deep-nesting (reviewer finding: docstring claimed "for any synthetic bigram
+/// key" but only the depth-bucket path was exercised).
+///
+/// Uses EMPTY_BODY → function_item as a representative close-path marker:
+/// - PRESENT: `function_item` at depth 0 + `block` at depth 1 with 0 counted
+///   children → `EMPTY_BODY → fn_item_id` fires in close_depth at end-of-stream.
+/// - ABSENT: same structure but with one counted child inside the block → count
+///   is non-zero → EMPTY_BODY is not emitted.
+#[test]
+fn synthetic_key_present_agrees_with_extract_ast_ngrams_for_empty_body_bs1_close_path() {
+    use crate::ast_index::structural::EMPTY_BODY;
+
+    let fn_item_id = vocab_lookup("function_item").expect("function_item must be in shared vocab");
+    let block_id = vocab_lookup("block").expect("block must be in shared vocab");
+
+    // ── PRESENT: empty block body → EMPTY_BODY → fn_item_id ─────────────────
+    // Sentinel nodes (kind_id=0) at depth 2 are excluded by is_counted_child
+    // (kind_id == 0 check fails), so the block has 0 counted children and
+    // EMPTY_BODY fires at close_depth when the stream ends.
+    let nodes_empty = [
+        node(fn_item_id, 0), // function_item — FUNCTION_KIND_IDS member
+        node(block_id, 1),   // block — BODY_KIND_IDS member
+        node(0, 2),          // sentinel: not counted (kind_id == 0)
+        node(0, 2),          // sentinel: not counted
+    ];
+
+    let (emitted, _metrics) = extract_ast_ngrams_with_metrics(&nodes_empty, Language::Rust);
+
+    let emitted_synthetic_keys = synthetic_bigram_key_set(&emitted);
+
+    // B_S1 close-path precondition: full path must emit the target bigram.
+    let present_target = AstBigram::encode(EMPTY_BODY, fn_item_id);
+    assert!(
+        emitted_synthetic_keys.contains(&present_target.key()),
+        "extract_ast_ngrams_with_metrics must emit EMPTY_BODY→function_item \
+         for a function_item with an empty block body (B_S1 close-path precondition)"
+    );
+    // Parity assertion: synthetic_key_present must agree.
+    assert!(
+        super::synthetic_key_present(&nodes_empty, Language::Rust, present_target),
+        "synthetic_key_present must return true for EMPTY_BODY→function_item \
+         on an empty-block stream — parity with extract_ast_ngrams_with_metrics \
+         (B_S1 close-path; covers EMPTY_BODY/LARGE_BODY/MANY_PARAMS emit path \
+         via close_depth, complementing the depth-bucket checkpoint above)"
+    );
+
+    // ── ABSENT: one counted child → EMPTY_BODY must NOT fire ─────────────────
+    // fn_item_id at depth 2 is a real (non-synthetic) kind that is NOT in
+    // PUNCTUATION_KIND_IDS or COMMENT_KIND_IDS, so is_counted_child returns
+    // true for it. One counted child makes the block non-empty (count=1 ≠ 0).
+    let nodes_non_empty = [
+        node(fn_item_id, 0), // function_item
+        node(block_id, 1),   // block (BODY_KIND_IDS)
+        node(fn_item_id, 2), // counted child — real kind, not punct/comment
+    ];
+
+    let (emitted_ne, _) = extract_ast_ngrams_with_metrics(&nodes_non_empty, Language::Rust);
+
+    let emitted_ne_synthetic_keys = synthetic_bigram_key_set(&emitted_ne);
+
+    assert!(
+        !emitted_ne_synthetic_keys.contains(&present_target.key()),
+        "extract_ast_ngrams_with_metrics must NOT emit EMPTY_BODY→function_item \
+         for a non-empty block body (count=1; B_S1 close-path absent case)"
+    );
+    assert!(
+        !super::synthetic_key_present(&nodes_non_empty, Language::Rust, present_target),
+        "synthetic_key_present must return false for EMPTY_BODY→function_item \
+         on a non-empty block — parity with extract_ast_ngrams_with_metrics \
+         (B_S1 close-path absent case)"
     );
 }

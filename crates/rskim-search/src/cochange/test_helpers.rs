@@ -31,6 +31,7 @@ pub(super) fn make_history(commits: Vec<Vec<&str>>) -> HistoryResult {
         metadata: TemporalMetadata {
             is_shallow: false,
             commit_count: 0,
+            truncated: false,
         },
     }
 }

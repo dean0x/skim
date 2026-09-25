@@ -539,41 +539,17 @@ fn a14_overflow_header_huge_bigram_count() {
 
 /// Generate a representative Rust source module with `n_fns` functions.
 ///
-/// Each function has a real multi-statement body (not a one-liner) so the
-/// source-bytes-per-file are in the hundreds-to-low-thousands range, matching
-/// real-world Rust code.  One-liner micro-files are NOT a valid measure of
-/// index compactness because fixed per-file overhead (header, FileMetaEntry,
-/// per-distinct-key entry rows) dwarfs the tiny source — see the root-cause
-/// note in the QA failure report for A16.
+/// Delegates to the shared [`crate::test_corpus::gen_representative_rust_module`]
+/// helper (hoisted in #358 per quality.md reuse-over-new) so that both the AST
+/// index tests and the lexical index tests exercise the same corpus definition.
 fn gen_representative_rust_module(file_idx: usize, n_fns: usize) -> String {
-    let mut out = String::with_capacity(512 * n_fns);
-    out.push_str("use std::collections::HashMap;\n\n");
-    for f in 0..n_fns {
-        // Each function has a multi-statement body: variable bindings, a loop,
-        // and a conditional — producing several distinct AST node types and a
-        // realistic n-gram vocabulary.
-        out.push_str(&format!(
-            "pub fn process_{file_idx}_{f}(input: &[i32]) -> i32 {{\n\
-             \x20   let mut acc: i32 = 0;\n\
-             \x20   let mut count: i32 = 0;\n\
-             \x20   for &val in input.iter() {{\n\
-             \x20       acc = acc.wrapping_add(val);\n\
-             \x20       count += 1;\n\
-             \x20   }}\n\
-             \x20   if count == 0 {{\n\
-             \x20       return 0;\n\
-             \x20   }}\n\
-             \x20   acc / count\n\
-             }}\n\n"
-        ));
-    }
-    out
+    crate::test_corpus::gen_representative_rust_module(file_idx, n_fns)
 }
 
 #[test]
 fn ast_index_size_ratio() {
     // Build an index from 1000 representative Rust modules (4 functions each,
-    // ~480 bytes/file → ~480 KB total source).  Each function has a real
+    // ~1055 bytes/file → ~1.05 MB total source).  Each function has a real
     // multi-statement body so the corpus is representative of real-world Rust.
     //
     // WHY THE ORIGINAL <5% (0.05×) BOUND WAS WRONG
@@ -678,20 +654,20 @@ fn ast_index_size_ratio() {
 // probe is a cheap staleness check; the caller decides what to do with the value.
 // ============================================================================
 
-/// F9 positive: index_version returns Ok(FORMAT_VERSION) == Ok(2) for a real
-/// v2 index built by AstIndexBuilder.
+/// F9 positive: index_version returns Ok(FORMAT_VERSION) == Ok(3) for a real
+/// v3 index built by AstIndexBuilder (#405 bumped 2 -> 3).
 #[test]
-fn f9_index_version_returns_2_for_v2_index() {
+fn f9_index_version_returns_3_for_v3_index() {
     let (dir, _reader) = build_3_file_index();
     let version = AstIndexReader::index_version(dir.path()).unwrap();
     assert_eq!(
         version,
         super::super::format::FORMAT_VERSION,
-        "index_version must return FORMAT_VERSION (2) for a freshly built index"
+        "index_version must return FORMAT_VERSION (3) for a freshly built index"
     );
     assert_eq!(
-        version, 2u16,
-        "FORMAT_VERSION is expected to be 2 in this wave"
+        version, 3u16,
+        "FORMAT_VERSION is expected to be 3 in this wave (#405 size-cap bump)"
     );
 }
 
@@ -1057,5 +1033,563 @@ fn c3_non_ascending_doc_ids_returns_index_corrupted() {
     assert!(
         msg.contains("Index corrupted"),
         "expected IndexCorrupted for non-ascending doc_ids, got: {msg}"
+    );
+}
+
+// ============================================================================
+// AC2 (#286): file_lang_and_node_count matches file_meta, shares byte offsets
+// ============================================================================
+
+/// AC2: For every in-range doc_id, `file_lang_and_node_count(d)` returns
+/// `(file_meta(d).lang_id, file_meta(d).node_count)`.  For an out-of-range
+/// doc_id both return the same `Err(IndexCorrupted)` variant.
+///
+/// The byte offsets are read through the shared `decode_lang_and_node_count`
+/// helper in `format.rs`; this test guards against drift between the two
+/// code paths.
+#[test]
+fn ac2_file_lang_and_node_count_matches_file_meta_real_reader() {
+    let dir = tempdir().unwrap();
+    let bigram_key: u32 = 0x0001_0002;
+    let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+
+    // Four files with distinct languages and node counts.
+    let fixtures = [
+        (Language::Rust, 42u32),
+        (Language::Python, 100u32),
+        (Language::Go, 7u32),
+        (Language::TypeScript, 999u32),
+    ];
+    for (i, (lang, nc)) in fixtures.iter().enumerate() {
+        let set = make_bigram_set(bigram_key, 1);
+        builder
+            .add_file_ngrams(
+                FileId(i as u32),
+                *lang,
+                &set,
+                *nc,
+                crate::ast_index::StructuralMetrics::default(),
+            )
+            .unwrap();
+    }
+    let reader = builder.build().unwrap();
+
+    // In-range: (lang_id, node_count) must equal file_meta's fields.
+    for i in 0..fixtures.len() as u32 {
+        let doc_id = i;
+        let meta = reader.file_meta(doc_id).unwrap();
+        let (lang_id, nc) = reader.file_lang_and_node_count(doc_id).unwrap();
+        assert_eq!(
+            lang_id, meta.lang_id,
+            "lang_id mismatch for doc_id={doc_id}: file_lang_and_node_count={lang_id}, file_meta={}",
+            meta.lang_id
+        );
+        assert_eq!(
+            nc, meta.node_count,
+            "node_count mismatch for doc_id={doc_id}: file_lang_and_node_count={nc}, file_meta={}",
+            meta.node_count
+        );
+    }
+
+    // Out-of-range (file_count == 4, so doc_id=4 is OOB).
+    let oob = fixtures.len() as u32;
+    let err_meta = reader.file_meta(oob).unwrap_err();
+    let err_lite = reader.file_lang_and_node_count(oob).unwrap_err();
+    assert!(
+        matches!(err_meta, crate::SearchError::IndexCorrupted(_)),
+        "file_meta OOB should be IndexCorrupted: {err_meta:?}"
+    );
+    assert!(
+        matches!(err_lite, crate::SearchError::IndexCorrupted(_)),
+        "file_lang_and_node_count OOB should be IndexCorrupted: {err_lite:?}"
+    );
+}
+
+/// AC2 (format.rs): `decode_file_meta` and `decode_lang_and_node_count` must
+/// agree on `lang_id` and `node_count` for a known byte buffer.
+#[test]
+fn ac2_decode_helpers_agree_on_known_buffer() {
+    use super::super::format::{FILE_META_SIZE, decode_file_meta, decode_lang_and_node_count};
+
+    // Craft a valid 15-byte AstFileMetaEntry buffer.
+    // lang_id = 11 (Rust), node_count = 42 (LE: 42, 0, 0, 0).
+    let mut buf = [0u8; FILE_META_SIZE];
+    buf[0] = 11; // lang_id = Rust
+    buf[1..5].copy_from_slice(&42u32.to_le_bytes()); // node_count
+    buf[5..7].copy_from_slice(&3u16.to_le_bytes()); // max_depth
+    buf[7..9].copy_from_slice(&5u16.to_le_bytes()); // max_block_stmts
+    buf[9..11].copy_from_slice(&2u16.to_le_bytes()); // max_params
+    buf[11..15].copy_from_slice(&1u32.to_le_bytes()); // branch_count
+
+    let meta = decode_file_meta(&buf).unwrap();
+    let (lang_id, node_count) = decode_lang_and_node_count(&buf).unwrap();
+
+    assert_eq!(lang_id, meta.lang_id, "lang_id must agree");
+    assert_eq!(node_count, meta.node_count, "node_count must agree");
+    assert_eq!(lang_id, 11, "expected Rust lang_id=11");
+    assert_eq!(node_count, 42, "expected node_count=42");
+}
+
+// ===========================================================================
+// #376 — validity-marker caching for the AST reader (AD-376-5, AC11)
+// ===========================================================================
+//
+// The dual lexical+AST index is one coherent unit (ADR-006), so the AST reader
+// carries the SAME marker fast path as the lexical reader. These are the AC1 /
+// AC2 / AC5 / AC6 / AC8 analogues for `AstIndexReader::open`. NOTE: the AST CRC
+// covers the `.skidx` PAYLOAD (bytes [HEADER_SIZE..]); the marker also stats
+// `.skpost`. So payload corruption is induced on `ast_index.skidx` at byte
+// HEADER_SIZE (the first payload byte — never the checksum field at [44..48]).
+
+/// Build a one-file AST index (one bigram) directly into `dir`.
+fn build_marker_ast_index(dir: &std::path::Path) {
+    let bigram_key: u32 = 0x0001_0002;
+    let mut builder = AstIndexBuilder::new(dir.to_path_buf()).unwrap();
+    let set = make_bigram_set(bigram_key, 4);
+    builder
+        .add_file_ngrams(
+            FileId(0),
+            Language::Rust,
+            &set,
+            42,
+            StructuralMetrics::default(),
+        )
+        .unwrap();
+    builder.build().unwrap();
+}
+
+/// AC8 (AST): build() stamps ast_index.skverify, and a following open succeeds.
+#[test]
+fn ac8_ast_build_stamps_validity_marker() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    assert!(
+        dir.path().join("ast_index.skverify").exists(),
+        "AC8/AST: build() must stamp ast_index.skverify"
+    );
+    assert!(
+        AstIndexReader::open(dir.path()).is_ok(),
+        "AC8/AST: open() of freshly-built uncorrupted AST index must succeed"
+    );
+}
+
+/// AC1 (AST): a payload byte of ast_index.skidx flipped WITHOUT changing length,
+/// WITH mtime held, and WITHOUT touching the checksum field MUST still open Ok —
+/// the full CRC32 is provably skipped (the AST latency-floor regression sentinel).
+#[test]
+fn ac1_ast_fast_path_skips_crc_on_held_mtime_byteflip() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+
+    let idx_path = dir.path().join("ast_index.skidx");
+    let original_mtime =
+        filetime::FileTime::from_last_modification_time(&std::fs::metadata(&idx_path).unwrap());
+
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    assert!(
+        idx.len() > HEADER_SIZE,
+        "AST skidx must have payload bytes for this test"
+    );
+    let len_before = idx.len();
+    // Flip the first payload byte; leave the checksum field [44..48] untouched.
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+    assert_eq!(
+        std::fs::metadata(&idx_path).unwrap().len() as usize,
+        len_before,
+        "precondition: byte-flip must not change skidx length"
+    );
+    filetime::set_file_mtime(&idx_path, original_mtime).unwrap();
+
+    assert!(
+        AstIndexReader::open(dir.path()).is_ok(),
+        "AC1/AST: held-mtime payload byte-flip must be served via the fast path \
+         (full CRC32 skipped) — the optimization was deleted"
+    );
+}
+
+/// AC2 (AST): corrupt the payload AND bump skidx mtime → marker miss → full
+/// CRC32 catches it with 'checksum mismatch'.
+#[test]
+fn ac2_ast_marker_miss_on_mtime_bump_reverifies() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+    let bumped = filetime::FileTime::from_unix_time(32_500_000_000, 0);
+    filetime::set_file_mtime(&idx_path, bumped).unwrap();
+
+    let err = AstIndexReader::open(dir.path())
+        .expect_err("AC2/AST: mtime-bumped corruption must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC2/AST: marker-miss must re-verify and report 'checksum mismatch': {err}"
+    );
+}
+
+/// AC2 (AST, marker-absent): deleting ast_index.skverify forces a full CRC32.
+#[test]
+fn ac2_ast_marker_absent_reverifies() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    std::fs::remove_file(dir.path().join("ast_index.skverify")).unwrap();
+
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+
+    let err = AstIndexReader::open(dir.path())
+        .expect_err("AC2/AST: corruption with absent marker must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC2/AST: marker-absent must fall through to full CRC32: {err}"
+    );
+}
+
+/// AC6 (AST): a truncated / garbage / zero-length marker over an uncorrupted
+/// index MUST still open Ok (fall through to full CRC32).
+#[test]
+fn ac6_ast_bad_marker_falls_through_to_full_crc() {
+    for bad in [&b""[..], &b"x"[..], &b"truncated-not-52-bytes"[..]] {
+        let dir = tempdir().unwrap();
+        build_marker_ast_index(dir.path());
+        std::fs::write(dir.path().join("ast_index.skverify"), bad).unwrap();
+        assert!(
+            AstIndexReader::open(dir.path()).is_ok(),
+            "AC6/AST: bad marker ({} bytes) must fall through and open Ok",
+            bad.len()
+        );
+    }
+}
+
+/// AC5 (AST): rebuild with DIFFERENT content (a) opens reflecting new content,
+/// and (b) the stale marker must not serve corrupted post-rebuild bytes.
+#[test]
+fn ac5_ast_rebuild_invalidates_stale_marker() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    let first_len = std::fs::metadata(dir.path().join("ast_index.skidx"))
+        .unwrap()
+        .len();
+
+    // Rebuild with DIFFERENT content: add a trigram so the skidx layout grows.
+    {
+        let bigram_key: u32 = 0x0001_0002;
+        let trigram_key: u64 = 0x0001_0002_0003;
+        let mut builder = AstIndexBuilder::new(dir.path().to_path_buf()).unwrap();
+        let mut set = make_bigram_set(bigram_key, 7);
+        set.trigrams.push(AstTrigramEntry {
+            ngram: AstTrigram(trigram_key),
+            weight: DEFAULT_AST_WEIGHT,
+            count: 3,
+        });
+        builder
+            .add_file_ngrams(
+                FileId(0),
+                Language::Rust,
+                &set,
+                90,
+                StructuralMetrics::default(),
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    let second_len = std::fs::metadata(dir.path().join("ast_index.skidx"))
+        .unwrap()
+        .len();
+    assert_ne!(
+        first_len, second_len,
+        "precondition: rebuild must change skidx size"
+    );
+
+    // (a) New content opens Ok.
+    assert!(
+        AstIndexReader::open(dir.path()).is_ok(),
+        "AC5(a)/AST: rebuilt index must open Ok reflecting new content"
+    );
+
+    // (b) Corrupt post-rebuild skidx payload + bump mtime → caught by full CRC.
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut idx = std::fs::read(&idx_path).unwrap();
+    idx[HEADER_SIZE] ^= 0xFF;
+    std::fs::write(&idx_path, &idx).unwrap();
+    let bumped = filetime::FileTime::from_unix_time(32_500_000_000, 0);
+    filetime::set_file_mtime(&idx_path, bumped).unwrap();
+
+    let err = AstIndexReader::open(dir.path())
+        .expect_err("AC5(b)/AST: post-rebuild corruption must fail open()");
+    assert!(
+        format!("{err}").contains("checksum mismatch"),
+        "AC5(b)/AST: stale marker must not serve corrupted post-rebuild bytes: {err}"
+    );
+}
+
+/// AC3 (AST): lookup results identical between a cold open (marker absent → full
+/// CRC) and the marker-fast open the cold open re-stamps.
+#[test]
+fn ac3_ast_lookup_identical_cold_vs_fast() {
+    let dir = tempdir().unwrap();
+    build_marker_ast_index(dir.path());
+    let bigram_key: u32 = 0x0001_0002;
+
+    std::fs::remove_file(dir.path().join("ast_index.skverify")).unwrap();
+    let reader_cold = AstIndexReader::open(dir.path()).unwrap();
+    let cold = reader_cold.lookup_bigram(AstBigram(bigram_key)).unwrap();
+
+    assert!(
+        dir.path().join("ast_index.skverify").exists(),
+        "AST cold open must re-stamp the marker"
+    );
+    let reader_fast = AstIndexReader::open(dir.path()).unwrap();
+    let fast = reader_fast.lookup_bigram(AstBigram(bigram_key)).unwrap();
+
+    assert_eq!(
+        cold, fast,
+        "AC3/AST: bigram lookups must be identical between cold and fast opens"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T-8..T-13  (#414): AstIndexReader::index_integrity probe
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Mirrors t3..t7 in index/reader_tests.rs (lexical_index_integrity) plus an
+// additional scenario for the E-9 postings-zero branch.
+
+/// T-8 (#414): a healthy freshly-built AST index with postings must pass the
+/// integrity probe with `Ok(FORMAT_VERSION)`.
+#[test]
+fn t8_ast_integrity_probe_healthy_index_returns_ok() {
+    use crate::ast_index::store::format::FORMAT_VERSION;
+
+    let dir = tempdir().unwrap();
+    {
+        let bigram_key: u32 = 0x0001_0002;
+        let mut builder =
+            crate::ast_index::store::builder::AstIndexBuilder::new(dir.path().to_path_buf())
+                .unwrap();
+        builder
+            .add_file_ngrams(
+                crate::FileId(0),
+                Language::Rust,
+                &make_bigram_set(bigram_key, 1),
+                10,
+                crate::ast_index::StructuralMetrics::default(),
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    let version = AstIndexReader::index_integrity(dir.path()).unwrap();
+    assert_eq!(
+        version, FORMAT_VERSION,
+        "T-8: healthy AST index must return FORMAT_VERSION from integrity probe"
+    );
+}
+
+/// T-9 (#414): a file with bad magic bytes must be detected as `IndexCorrupted`.
+///
+/// Writes 48 bytes of 0xFF — wrong magic, clearly corrupt.
+#[test]
+fn t9_ast_integrity_probe_bad_magic_returns_corrupted() {
+    use crate::ast_index::store::format::HEADER_SIZE;
+
+    let dir = tempdir().unwrap();
+    // Write HEADER_SIZE bytes of 0xFF — wrong magic, clearly corrupt.
+    std::fs::write(
+        dir.path().join("ast_index.skidx"),
+        vec![0xFFu8; HEADER_SIZE],
+    )
+    .unwrap();
+    let err = AstIndexReader::index_integrity(dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, crate::SearchError::IndexCorrupted(_)),
+        "T-9: bad magic must yield IndexCorrupted, got {msg}"
+    );
+    assert!(
+        msg.contains("bad magic"),
+        "T-9: error must name bad magic, got {msg}"
+    );
+}
+
+/// T-10 (#414 FX-BODY-A analogue): truncated `ast_index.skpost` must be
+/// detected by the integrity probe as `IndexCorrupted` naming the skpost
+/// size mismatch.
+///
+/// Build a healthy index, then truncate `ast_index.skpost` to half its size.
+#[test]
+fn t10_ast_integrity_probe_truncated_skpost_returns_corrupted() {
+    let dir = tempdir().unwrap();
+    {
+        let bigram_key: u32 = 0xABCD_1234;
+        let mut builder =
+            crate::ast_index::store::builder::AstIndexBuilder::new(dir.path().to_path_buf())
+                .unwrap();
+        builder
+            .add_file_ngrams(
+                crate::FileId(0),
+                Language::Rust,
+                &make_bigram_set(bigram_key, 2),
+                20,
+                crate::ast_index::StructuralMetrics::default(),
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    // Truncate ast_index.skpost to half its size.
+    let post_path = dir.path().join("ast_index.skpost");
+    let full_len = std::fs::metadata(&post_path).unwrap().len();
+    let half_len = full_len / 2;
+    if half_len < full_len {
+        let data = std::fs::read(&post_path).unwrap();
+        std::fs::write(&post_path, &data[..half_len as usize]).unwrap();
+    }
+    let err = AstIndexReader::index_integrity(dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, crate::SearchError::IndexCorrupted(_)),
+        "T-10: truncated skpost must yield IndexCorrupted, got {msg}"
+    );
+    assert!(
+        msg.contains("skpost"),
+        "T-10: error must mention skpost, got {msg}"
+    );
+}
+
+/// T-11 (#414 FX-BODY-C analogue): a missing `ast_index.skpost` (when
+/// `postings_file_size > 0`) must be detected by the integrity probe as
+/// `IndexCorrupted` naming the absent file.
+#[test]
+fn t11_ast_integrity_probe_missing_skpost_returns_corrupted() {
+    let dir = tempdir().unwrap();
+    {
+        let bigram_key: u32 = 0x1111_2222;
+        let mut builder =
+            crate::ast_index::store::builder::AstIndexBuilder::new(dir.path().to_path_buf())
+                .unwrap();
+        builder
+            .add_file_ngrams(
+                crate::FileId(0),
+                Language::Python,
+                &make_bigram_set(bigram_key, 3),
+                30,
+                crate::ast_index::StructuralMetrics::default(),
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+    // Remove ast_index.skpost entirely.
+    std::fs::remove_file(dir.path().join("ast_index.skpost")).unwrap();
+    let err = AstIndexReader::index_integrity(dir.path()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        matches!(err, crate::SearchError::IndexCorrupted(_)),
+        "T-11: absent skpost (postings_file_size > 0) must yield IndexCorrupted, got {msg}"
+    );
+    assert!(
+        msg.contains("missing"),
+        "T-11: error must mention 'missing', got {msg}"
+    );
+    assert!(
+        msg.contains("ast_index.skpost"),
+        "T-11: error must name the absent file, got {msg}"
+    );
+}
+
+/// T-12 (AD-414-6 guard, #414): `index_integrity` must return
+/// `Ok(future_version)` for a **foreign-format** AST index — i.e. one whose
+/// version field does not equal `FORMAT_VERSION` — WITHOUT performing any size
+/// validation against it.
+///
+/// Rationale: future-format files have an unknown header layout, so size checks
+/// calibrated against the current header encoding would produce false
+/// `IndexCorrupted` errors that block `check_staleness` from triggering the
+/// expected automatic rebuild.
+#[test]
+fn t12_ast_integrity_probe_future_version_returns_ok_without_size_check() {
+    use crate::ast_index::store::format::{FORMAT_VERSION, SKAX_MAGIC};
+
+    let dir = tempdir().unwrap();
+    {
+        let bigram_key: u32 = 0xDEAD_BEEF;
+        let mut builder =
+            crate::ast_index::store::builder::AstIndexBuilder::new(dir.path().to_path_buf())
+                .unwrap();
+        builder
+            .add_file_ngrams(
+                crate::FileId(0),
+                Language::Rust,
+                &make_bigram_set(bigram_key, 1),
+                5,
+                crate::ast_index::StructuralMetrics::default(),
+            )
+            .unwrap();
+        builder.build().unwrap();
+    }
+
+    // Rewrite the version field in ast_index.skidx to a future version.
+    let idx_path = dir.path().join("ast_index.skidx");
+    let mut data = std::fs::read(&idx_path).unwrap();
+    // Sanity: the first 4 bytes must be the magic we expect.
+    assert_eq!(&data[0..4], SKAX_MAGIC, "magic mismatch in test setup");
+    // Sanity: current version must be FORMAT_VERSION.
+    let cur = u16::from_le_bytes([data[4], data[5]]);
+    assert_eq!(cur, FORMAT_VERSION, "version mismatch in test setup");
+
+    let future_version: u16 = FORMAT_VERSION + 1;
+    let fv_bytes = future_version.to_le_bytes();
+    data[4] = fv_bytes[0];
+    data[5] = fv_bytes[1];
+    std::fs::write(&idx_path, &data).unwrap();
+
+    // AD-414-6: must return Ok(future_version) — not Err — even though the
+    // rest of the header encoding is calibrated for FORMAT_VERSION.
+    let result = AstIndexReader::index_integrity(dir.path());
+    assert!(
+        matches!(result, Ok(v) if v == future_version),
+        "T-12/AD-414-6: foreign-version AST file must yield Ok({future_version}), got {result:?}"
+    );
+}
+
+/// T-13 (#414 E-9 guard): an AST index with `postings_file_size == 0` in the
+/// header must pass the integrity probe even when `ast_index.skpost` is absent,
+/// because the probe must skip the post-file check for the zero case.
+///
+/// This covers the `if expected_post == 0 { return Ok(version); }` branch that
+/// is intentionally absent from `lexical_index_integrity`.
+///
+/// The precondition is constructed directly: build a no-ngram index (header
+/// records postings_file_size == 0) then remove the .skpost file that the
+/// builder wrote, so the probe sees the header-says-zero / file-absent state
+/// that E-9 must handle without touching what the builder always writes.
+#[test]
+fn t13_ast_integrity_probe_zero_postings_skips_post_check() {
+    use crate::ast_index::store::format::FORMAT_VERSION;
+
+    let dir = tempdir().unwrap();
+    // Build an index with NO ngrams — header records postings_file_size == 0.
+    {
+        let builder =
+            crate::ast_index::store::builder::AstIndexBuilder::new(dir.path().to_path_buf())
+                .unwrap();
+        builder.build().unwrap();
+    }
+
+    // Construct the E-9 precondition directly: remove the .skpost the builder
+    // wrote so the on-disk state is header-says-zero / file-absent, which is
+    // exactly the state E-9 must handle.
+    let post_path = dir.path().join("ast_index.skpost");
+    std::fs::remove_file(&post_path)
+        .expect("T-13 setup: builder must have written ast_index.skpost");
+
+    // The probe must succeed (E-9: postings_file_size == 0 skips post-file check).
+    let version = AstIndexReader::index_integrity(dir.path()).unwrap();
+    assert_eq!(
+        version, FORMAT_VERSION,
+        "T-13/E-9: AST index with postings_file_size==0 and absent .skpost must return FORMAT_VERSION"
     );
 }

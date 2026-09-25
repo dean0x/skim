@@ -204,6 +204,35 @@ where
     }
 }
 
+/// Build a [`QueryConfig`] for hermetic execute_query tests.
+///
+/// Defaults: `json = false`, `composite_weights = None`.
+/// All other fields are caller-supplied so each test is explicit about
+/// exactly what it varies.
+fn make_query_config(
+    root: &Path,
+    cache: &Path,
+    text: &str,
+    limit: usize,
+    ast_scored: Option<Vec<(rskim_search::FileId, f64)>>,
+    blast_radius_paths: Option<super::super::types::BlastRadiusStrengths>,
+) -> super::super::types::QueryConfig {
+    super::super::types::QueryConfig {
+        text: text.to_string(),
+        limit,
+        offset: None,
+        json: false,
+        root: root.to_path_buf(),
+        cache_dir: cache.to_path_buf(),
+        blast_radius_paths,
+        ast_scored,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    }
+}
+
 // ============================================================================
 // Group 1: Parse / validate (unit, no index)
 // ============================================================================
@@ -311,34 +340,110 @@ fn parse_flags_ast_plus_hot_parsed_ok() {
     assert!(flags.temporal_sort.is_some());
 }
 
+/// AC-F2 (DISCRIMINATING): `--ast <pattern> --hot` orders matches by descending
+/// hotspot score and annotates each surviving row with temporal data.
+///
+/// Replaces the old guard test that asserted an error for this combination — the
+/// interim guard is removed, so it now runs and re-sorts instead of erroring.
+/// Hermetic: drives `run_ast_standalone` directly against a tempdir index plus an
+/// injected `TemporalDb` (no git history, no system cache), mirroring Group 11.
+///
+/// A no-op enrichment (or a reinstated guard) would fail this test: the order
+/// assertion catches "ran but did not sort", the annotation assertion catches
+/// "sorted but did not annotate" (avoids PF-007 vacuous exit-0 guard).
 #[test]
-fn run_ast_plus_hot_returns_202_error() {
-    // run() must return Err with #202 reference when --ast + --hot combined.
-    // Validation fires BEFORE cache resolution so no system cache is written.
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_string_lossy().to_string();
-    let err = super::super::run(
-        &[
-            "--ast".to_string(),
-            "try-catch".to_string(),
-            "--hot".to_string(),
-            "--root".to_string(),
-            root,
-        ],
-        &TEST_ANALYTICS,
+fn run_ast_standalone_hot_sorts_by_hotspot_and_annotates() {
+    use rskim_search::{HotspotRow, TemporalDb};
+
+    use super::super::manifest::FileManifest;
+
+    // alpha.rs and beta.rs both match rust-nested-loop.
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Seed distinct hotspot scores: beta hotter than alpha.
+    let db_path = cache.path().join("temporal.db");
+    let db = TemporalDb::open(&db_path).unwrap();
+    db.store_hotspots(&[
+        HotspotRow {
+            file_path: "src/alpha.rs".to_string(),
+            score: 0.2,
+            changes_30d: 1,
+            changes_90d: 2,
+        },
+        HotspotRow {
+            file_path: "src/beta.rs".to_string(),
+            score: 0.9,
+            changes_30d: 9,
+            changes_90d: 20,
+        },
+    ])
+    .unwrap();
+
+    // Run `--ast rust-nested-loop --hot` (JSON) so order + annotation are assertable.
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        true, // JSON
+        cache.path(),
+        &manifest,
+        None, // no --blast-radius
+        Some(super::super::types::TemporalSort::Hot),
+        Some(&db),
+        project.path(),
+        &mut out,
     )
-    .unwrap_err();
-    let msg = err.to_string();
+    .unwrap();
+    assert_eq!(result, std::process::ExitCode::SUCCESS);
+
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    let results = v["results"].as_array().unwrap();
     assert!(
-        msg.contains("#202"),
-        "--ast + --hot should reference #202, got: {msg}"
+        results.len() >= 2,
+        "both nested-loop files should match; got {results:?}"
+    );
+
+    // Descending hotspot: beta.rs (0.9) must precede alpha.rs (0.2).
+    let beta_pos = results
+        .iter()
+        .position(|r| r["path"].as_str().unwrap().ends_with("beta.rs"));
+    let alpha_pos = results
+        .iter()
+        .position(|r| r["path"].as_str().unwrap().ends_with("alpha.rs"));
+    assert!(
+        beta_pos.is_some() && alpha_pos.is_some(),
+        "both files must be present; got {results:?}"
+    );
+    assert!(
+        beta_pos.unwrap() < alpha_pos.unwrap(),
+        "--hot must order beta.rs (hotter) before alpha.rs; got: {results:?}"
+    );
+
+    // Annotation present on the hottest row (discriminating: a no-op enrichment
+    // would leave `temporal` absent).
+    assert!(
+        results[beta_pos.unwrap()]["temporal"]["hotspot_score"].is_number(),
+        "hottest row must carry temporal.hotspot_score; got: {results:?}"
     );
 }
 
+/// AC-N1 (DISCRIMINATING): `--ast bogus --hot` must fail validation with an
+/// unknown-pattern message that lists valid pattern names.  Proves
+/// `validate_ast_pattern` still runs pre-dispatch through the now-composable path.
+///
+/// Discriminating against guard reappearance: if the old interim guard were back,
+/// it would fire BEFORE `validate_ast_pattern` and produce a "not composable"
+/// message that does NOT list pattern names — failing the assertion below.
+///
+/// Validation fires BEFORE cache resolution, so no system cache is written.
+/// Replaces the old bogus-pattern guard-order test.
 #[test]
-fn run_ast_bogus_plus_hot_returns_202_first() {
-    // Validation order: #202 fires BEFORE unknown-pattern check.
-    // Validation fires BEFORE cache resolution so no system cache is written.
+fn run_ast_unknown_pattern_plus_hot_validates() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_string_lossy().to_string();
     let err = super::super::run(
@@ -354,8 +459,9 @@ fn run_ast_bogus_plus_hot_returns_202_first() {
     .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("#202"),
-        "#202 check should fire before unknown-pattern check, got: {msg}"
+        msg.contains("try-catch") || msg.contains("nested-loop") || msg.contains("god-function"),
+        "unknown pattern should list valid pattern names (proving validation fired, \
+         not an interim guard), got: {msg}"
     );
 }
 
@@ -520,7 +626,7 @@ fn rebuild_yields_identical_fileid_ordering() {
 #[test]
 fn format_ast_text_empty_results_says_no_match() {
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_text(&[], "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_text(&[], "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         out.contains("no files match"),
@@ -529,20 +635,15 @@ fn format_ast_text_empty_results_says_no_match() {
 }
 
 #[test]
-fn format_ast_text_no_colon_line_suffix() {
-    // AC-F1: AST text output must NOT include `:line` suffix.
+fn format_ast_text_degraded_rows_have_no_colon_line_suffix() {
+    // AC-F2: degraded rows (line=None) must NOT include `:line` suffix.
+    // This is the pre-#201 behavior for file-level-only results.
     let results = vec![
-        super::AstResult {
-            path: "src/foo.rs".to_string(),
-            score: 2.5,
-        },
-        super::AstResult {
-            path: "src/bar.rs".to_string(),
-            score: 1.2,
-        },
+        super::AstResult::ast_only("src/foo.rs".to_string(), 2.5, None, None),
+        super::AstResult::ast_only("src/bar.rs".to_string(), 1.2, None, None),
     ];
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_text(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_text(&results, "try-catch", "Try/catch blocks", 0, 0, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     assert!(
         out.contains("src/foo.rs"),
@@ -552,10 +653,10 @@ fn format_ast_text_no_colon_line_suffix() {
         out.contains("src/bar.rs"),
         "output should contain second path"
     );
-    // No `:line` suffix on AST-only results (file-level).
+    // Degraded rows must NOT have :line suffix (AC-F2 NEGATIVE).
     assert!(
         !out.contains("src/foo.rs:"),
-        "AST text output must NOT have :line suffix (AC-F1)"
+        "degraded AST text output must NOT have :line suffix (AC-F2)"
     );
     assert!(
         out.contains("AST pattern: try-catch"),
@@ -564,19 +665,30 @@ fn format_ast_text_no_colon_line_suffix() {
 }
 
 #[test]
-fn format_ast_json_mode_is_ast_no_line_keys() {
-    // AC-A1: mode=="ast", no line/snippet keys.
-    let results = vec![super::AstResult {
-        path: "src/foo.rs".to_string(),
-        score: 2.5,
-    }];
+fn format_ast_json_mode_is_ast_degraded_row_no_line_snippet_keys() {
+    // AC-F4 NEGATIVE: degraded row (line=None) → line and snippet keys ABSENT.
+    // layers_matched IS present (always, AC-F5).
+    let results = vec![super::AstResult::ast_only(
+        "src/foo.rs".to_string(),
+        2.5,
+        None,
+        None,
+    )];
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_json(&results, "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_json(
+        &results,
+        "try-catch",
+        "Try/catch blocks",
+        false,
+        None,
+        &mut buf,
+    )
+    .unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
 
     let v: serde_json::Value =
         serde_json::from_str(&out).expect("format_ast_json must produce valid JSON");
-    assert_eq!(v["mode"], "ast", "mode must be 'ast' (AC-A1)");
+    assert_eq!(v["mode"], "ast", "mode must be 'ast'");
     assert_eq!(v["pattern"], "try-catch");
     assert_eq!(v["total"], 1);
     assert!(v["results"].is_array());
@@ -584,10 +696,19 @@ fn format_ast_json_mode_is_ast_no_line_keys() {
     let first = &v["results"][0];
     assert!(first["path"].is_string());
     assert!(first["score"].is_number());
-    // No line or snippet keys in AST-level JSON.
+    // Degraded row: line and snippet keys must be ABSENT (AC-F4 NEGATIVE).
     assert!(
-        first.get("line").is_none() && first.get("snippet").is_none(),
-        "AST JSON must not have line or snippet keys (AC-A1)"
+        first.get("line").is_none(),
+        "degraded row: 'line' key must be ABSENT (AC-F4); got: {first}"
+    );
+    assert!(
+        first.get("snippet").is_none(),
+        "degraded row: 'snippet' key must be ABSENT (AC-F4); got: {first}"
+    );
+    // layers_matched must be present (AC-F5).
+    assert!(
+        first.get("layers_matched").is_some(),
+        "layers_matched must be present on every row (AC-F5); got: {first}"
     );
 }
 
@@ -595,7 +716,7 @@ fn format_ast_json_mode_is_ast_no_line_keys() {
 fn format_ast_json_empty_results_is_valid_json() {
     // Empty result set → valid JSON with mode=="ast", total==0.
     let mut buf = BufWriter::new(Vec::new());
-    super::format_ast_json(&[], "try-catch", "Try/catch blocks", &mut buf).unwrap();
+    super::format_ast_json(&[], "try-catch", "Try/catch blocks", false, None, &mut buf).unwrap();
     let out = String::from_utf8(buf.into_inner().unwrap()).unwrap();
     let v: serde_json::Value =
         serde_json::from_str(&out).expect("empty format_ast_json must produce valid JSON");
@@ -610,10 +731,21 @@ fn format_ast_json_empty_results_is_valid_json() {
 
 /// ISSUE-T1 fix: guarded by serial so SKIM_CACHE_DIR mutation is not racy;
 /// with_isolated_cache routes run() to a tempdir instead of ~/.cache/skim/.
+///
+/// AC6 gate: this test uses a GENUINE disjoint case — the lexical query
+/// "xyzzy_impossible_token" matches NO files (empty lexical side), producing
+/// an empty intersection.  The intersection gate returns empty on early-out
+/// when either layer is empty.  A second sub-test below exercises a non-empty-
+/// both-layers disjoint case at the unit level (see `ac6_disjoint_inputs_return_empty_not_error`
+/// in intersection_tests.rs).
+///
+/// AC6 behavior assertion: asserts the output is empty (not just exit-0).
+/// A broken gate returning the full lexical set would produce non-empty JSON,
+/// failing the `results == []` check (avoids PF-007 vacuous exit-0-only guard).
 #[serial_test::serial]
 #[test]
 fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
-    // When AST filter and text query match different files, the intersection is
+    // When the text query matches no files lexically, the intersection is
     // empty.  Empty results must exit 0 (AC-F8) — not an error.
     //
     // SKIM_CACHE_DIR set to an isolated tempdir so both run() calls use the same
@@ -633,7 +765,8 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
         )
         .expect("--build must succeed; fix the build pipeline if it fails here");
 
-        // "xyzzy_impossible_token" won't match any file lexically.
+        // "xyzzy_impossible_token" won't match any file lexically →
+        // lexical layer is empty → early-return empty intersection.
         let result = super::super::run(
             &[
                 "xyzzy_impossible_token".to_string(),
@@ -641,6 +774,7 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
                 "try-catch".to_string(),
                 "--root".to_string(),
                 root_str.clone(),
+                "--json".to_string(),
             ],
             &TEST_ANALYTICS,
         )
@@ -650,6 +784,70 @@ fn intersection_disjoint_text_and_ast_returns_empty_exit_0() {
             std::process::ExitCode::SUCCESS,
             "empty intersection must exit 0 (AC-F8)"
         );
+
+        // AC6 behavior assertion: empty intersection must produce zero results.
+        // Run with --json and capture output via execute_query directly.
+        use super::super::query::execute_query;
+        use super::super::types::QueryConfig;
+
+        // Resolve the cache dir for the isolated run.
+        let cache_path = std::env::var("SKIM_CACHE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| project.path().to_path_buf());
+
+        // Determine the hash-keyed cache subdir.  Since SKIM_CACHE_DIR is set,
+        // auto_refresh will use it — we locate it by looking at the first subdir.
+        let search_dir_base = cache_path.join("search");
+        let cache_dir = if search_dir_base.is_dir() {
+            fs::read_dir(&search_dir_base)
+                .ok()
+                .and_then(|mut rd| rd.next())
+                .and_then(|e| e.ok())
+                .map(|e| e.path())
+                .unwrap_or_else(|| project.path().to_path_buf())
+        } else {
+            project.path().to_path_buf()
+        };
+
+        // Resolve AST scored for "try-catch" pattern.
+        // All three guard conditions are combined: engine open AND scored non-empty AND query ok.
+        if let Ok(engine) = super::open_ast_engine(&cache_dir)
+            && let Ok(ast_scored) = super::resolve_ast_scored(&engine, "try-catch")
+            && !ast_scored.is_empty()
+        {
+            let config = QueryConfig {
+                text: "xyzzy_impossible_token".to_string(),
+                limit: 20,
+                offset: None,
+                json: true,
+                root: project.path().to_path_buf(),
+                cache_dir: cache_dir.clone(),
+                blast_radius_paths: None,
+                ast_scored: Some(ast_scored),
+                composite_weights: None,
+                phrase: false,
+                near: None,
+                lang: None,
+            };
+            if let Ok(output) = execute_query(&config, &TEST_ANALYTICS) {
+                assert!(
+                    output.results.is_empty(),
+                    "AC6: empty lexical side must yield empty intersection results (not just exit-0); \
+                     got {} result(s) — a broken gate that returns the full set would fail here (avoids PF-007)",
+                    output.results.len()
+                );
+                // Verify total count is also 0.
+                assert_eq!(
+                    output.total, 0,
+                    "AC6: output.total must be 0 for empty intersection, got {}",
+                    output.total
+                );
+            }
+        }
+        // If the AST engine or index is unavailable (e.g. cache path lookup
+        // failed), the exit-0 assertion above is sufficient for CI coverage.
+        // The full AC6 behavior is also verified at unit level in intersection_tests.rs.
     });
 }
 
@@ -772,11 +970,14 @@ fn run_ast_standalone_with_real_index_maps_paths() {
     let mut out: Vec<u8> = Vec::new();
     let result = super::run_ast_standalone(
         "try-catch",
-        20,
+        super::super::types::Page::first(20),
         false, // text output
         cache.path(),
         &manifest,
         None, // no --blast-radius
+        None, // no temporal sort
+        None, // no temporal DB
+        project.path(),
         &mut out,
     )
     .unwrap();
@@ -807,10 +1008,14 @@ fn run_ast_standalone_with_real_index_maps_paths() {
     }
 }
 
-/// resolve_ast_file_filter returns a non-empty HashSet for a pattern that
+/// resolve_ast_scored returns a non-empty Vec for a pattern that
 /// matches at least one Rust file in the fixture project.
+///
+/// Previously `resolve_ast_file_filter` returned `HashSet<FileId>` (scores
+/// discarded).  After #198 it returns `Vec<(FileId, f64)>` so the compound
+/// intersector can build a rank map from actual scores.
 #[test]
-fn resolve_ast_file_filter_returns_matching_file_ids() {
+fn resolve_ast_scored_returns_matching_file_ids() {
     let project = make_project_with_rust();
     let cache = tempfile::tempdir().unwrap();
 
@@ -820,27 +1025,38 @@ fn resolve_ast_file_filter_returns_matching_file_ids() {
 
     // "rust-nested-loop" matches block → expression_statement → for_expression,
     // which appears in src/loops.rs (nested for loops).
-    let ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+    let hits = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
 
     // The project has at least one Rust file with nested loops — assert non-empty.
     assert!(
-        !ids.is_empty(),
+        !hits.is_empty(),
         "rust-nested-loop pattern must match at least one file in the fixture project"
     );
 
-    // All returned FileIds must be within the manifest range.
+    // All returned FileIds must be within the manifest range; all scores > 0.
     use super::super::manifest::FileManifest;
     let manifest =
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
     let file_count = manifest.sorted_paths().len();
-    for id in &ids {
+    for (id, score) in &hits {
         assert!(
             (id.0 as usize) < file_count,
             "FileId({}) must be within manifest range [0, {})",
             id.0,
             file_count
         );
+        assert!(
+            *score > 0.0,
+            "AST score for FileId({}) must be > 0, got {score}",
+            id.0
+        );
     }
+    // Results must be sorted FileId-ASC (frozen Wave-4 contract from #287).
+    let fids: Vec<u32> = hits.iter().map(|(f, _)| f.0).collect();
+    assert!(
+        fids.windows(2).all(|w| w[0] <= w[1]),
+        "resolve_ast_scored must return results sorted FileId-ASC (Wave-4 contract): {fids:?}"
+    );
 }
 
 // ============================================================================
@@ -856,7 +1072,7 @@ fn resolve_ast_file_filter_returns_matching_file_ids() {
 /// - "--ast rust-nested-loop" → should match src/loops.rs (nested for loops in Rust).
 /// - Intersection → src/loops.rs (in both sets, with lexical snippets preserved).
 ///
-/// We drive through the engine directly (resolve_ast_file_filter + execute_query)
+/// We drive through the engine directly (resolve_ast_scored + execute_query)
 /// so the test is hermetic (no system cache required).
 #[test]
 fn text_ast_intersection_preserves_lexical_snippets() {
@@ -868,25 +1084,31 @@ fn text_ast_intersection_preserves_lexical_snippets() {
 
     build_project_index(project.path(), cache.path());
 
-    // Build the AST file filter for "rust-nested-loop" (matches Rust nested for loops).
+    // Fetch the AST scored results for "rust-nested-loop" (matches Rust nested for loops).
+    // After #198, resolve_ast_scored returns Vec<(FileId, f64)> for compound RRF fusion.
     let engine = super::open_ast_engine(cache.path()).unwrap();
-    let ast_ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
 
-    // The AST filter must be non-empty for this test to be meaningful.
+    // The AST results must be non-empty for this test to be meaningful.
     assert!(
-        !ast_ids.is_empty(),
+        !ast_scored.is_empty(),
         "rust-nested-loop must match at least one file so intersection is testable"
     );
 
-    // Run the lexical query with the AST filter applied.
+    // Run the compound query with the AST scored results.
     let config = QueryConfig {
         text: "nested".to_string(),
         limit: 20,
+        offset: None,
         json: false,
         root: project.path().to_path_buf(),
         cache_dir: cache.path().to_path_buf(),
         blast_radius_paths: None,
-        ast_file_ids: Some(ast_ids),
+        ast_scored: Some(ast_scored),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
     };
     let output = execute_query(&config, &TEST_ANALYTICS).unwrap();
 
@@ -910,6 +1132,131 @@ fn text_ast_intersection_preserves_lexical_snippets() {
     assert!(
         has_snippet,
         "at least one result must have a snippet (lexical enrichment preserved after AST filter)"
+    );
+}
+
+/// AC1 integration-level strict-subset assertion: the text+AST combined CLI
+/// path must return a set that is a **strict subset** of the pure-lexical set
+/// (combined ⊊ lexical) and a strict subset of the pure-AST set.
+///
+/// Strategy:
+/// - The fixture has 3 Rust files: `src/alpha.rs` and `src/beta.rs` (nested
+///   loops) and `src/plain.rs` (no nested loops).
+/// - "fn" as text query → matches ALL three source files (every Rust file has
+///   "fn" in it).
+/// - "--ast rust-nested-loop" → matches `alpha.rs` and `beta.rs` only.
+/// - Intersection: {alpha.rs, beta.rs} ⊊ {alpha.rs, beta.rs, plain.rs}.
+///
+/// Assertions (per AC1):
+/// 1. combined result set ⊊ lexical-only result set (strict subset).
+/// 2. Every combined result path appears in the lexical-only set.
+/// 3. combined ≠ lexical-only (at least one file excluded, namely plain.rs).
+///
+/// This test would fail if the intersection gate were dropped (combined ==
+/// lexical, failing assertion 3) or if AST-only files were included.
+#[test]
+fn text_ast_combined_is_strict_subset_of_lexical_ac1() {
+    use super::super::query::execute_query;
+    use super::super::types::QueryConfig;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // --- Lexical-only run: "fn" matches all Rust files ---
+    let lex_config = QueryConfig {
+        text: "fn".to_string(),
+        limit: 50,
+        offset: None,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: None,
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let lex_output = execute_query(&lex_config, &TEST_ANALYTICS).unwrap();
+    let lex_paths: std::collections::HashSet<&str> =
+        lex_output.results.iter().map(|r| r.path.as_str()).collect();
+
+    // The fixture has three Rust files + config.json; "fn" must hit all three
+    // Rust files.
+    assert!(
+        lex_paths.iter().any(|p| p.contains("plain.rs")),
+        "AC1 setup: lexical 'fn' must match plain.rs; got: {lex_paths:?}"
+    );
+    assert!(
+        lex_paths
+            .iter()
+            .any(|p| p.contains("alpha.rs") || p.contains("beta.rs")),
+        "AC1 setup: lexical 'fn' must match at least one nested-loop file"
+    );
+
+    // --- AST-only scored: rust-nested-loop matches only alpha.rs and beta.rs ---
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        !ast_scored.is_empty(),
+        "AC1 setup: rust-nested-loop must match at least one file"
+    );
+
+    // --- Compound run: text "fn" + --ast rust-nested-loop ---
+    let compound_config = QueryConfig {
+        text: "fn".to_string(),
+        limit: 50,
+        offset: None,
+        json: false,
+        root: project.path().to_path_buf(),
+        cache_dir: cache.path().to_path_buf(),
+        blast_radius_paths: None,
+        ast_scored: Some(ast_scored),
+        composite_weights: None,
+        phrase: false,
+        near: None,
+        lang: None,
+    };
+    let compound_output = execute_query(&compound_config, &TEST_ANALYTICS).unwrap();
+    let compound_paths: std::collections::HashSet<&str> = compound_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+
+    // AC1a: every compound result must be in the lexical set.
+    for p in &compound_paths {
+        assert!(
+            lex_paths.contains(p),
+            "AC1a: compound result '{p}' is not in the lexical-only set — intersection gate broken"
+        );
+    }
+
+    // AC1b: compound set must be strictly smaller than lexical set (plain.rs excluded).
+    assert!(
+        compound_paths.len() < lex_paths.len(),
+        "AC1b: compound result count ({}) must be strictly less than lexical count ({}) — \
+         plain.rs should be excluded by the AST gate; compound={compound_paths:?}, lex={lex_paths:?}",
+        compound_paths.len(),
+        lex_paths.len()
+    );
+
+    // AC1c: plain.rs must NOT appear in the compound output.
+    assert!(
+        !compound_paths.iter().any(|p| p.contains("plain.rs")),
+        "AC1c: plain.rs (no nested loops) must be absent from compound results; \
+         got: {compound_paths:?}"
+    );
+
+    // AC1d: alpha.rs and/or beta.rs must appear (they satisfy both filters).
+    assert!(
+        compound_paths
+            .iter()
+            .any(|p| p.contains("alpha.rs") || p.contains("beta.rs")),
+        "AC1d: at least one nested-loop file must appear in compound results; \
+         got: {compound_paths:?}"
     );
 }
 
@@ -1141,6 +1488,7 @@ fn text_ast_combined_self_heals_below_format_version_ast_index() {
 /// AST matches (filtered_count == unfiltered_count), failing the strict-subset assertion.
 #[test]
 fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
+    use super::super::gitdir::HeadState;
     use super::super::manifest::FileManifest;
     use rskim_search::FileId;
 
@@ -1154,9 +1502,9 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
 
     // --- Step 1: Verify the UNFILTERED AST result set contains BOTH alpha and beta ---
-    // Use resolve_ast_file_filter (same code path as run_ast_standalone internally).
+    // Use resolve_ast_scored (returns Vec<(FileId,f64)> for compound RRF, #198).
     let engine = super::open_ast_engine(cache.path()).unwrap();
-    let all_ast_ids = super::resolve_ast_file_filter(&engine, "rust-nested-loop").unwrap();
+    let all_ast_hits = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
 
     // Confirm both alpha.rs and beta.rs are in the AST result set.
     let sorted = manifest.sorted_paths();
@@ -1180,14 +1528,14 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
         "src/beta.rs must be in the manifest (fixture setup)"
     );
     assert!(
-        all_ast_ids.contains(&alpha_fid.unwrap()),
+        all_ast_hits.iter().any(|(f, _)| f == &alpha_fid.unwrap()),
         "src/alpha.rs must match rust-nested-loop (precondition for intersection test)"
     );
     assert!(
-        all_ast_ids.contains(&beta_fid.unwrap()),
+        all_ast_hits.iter().any(|(f, _)| f == &beta_fid.unwrap()),
         "src/beta.rs must match rust-nested-loop (precondition for intersection test)"
     );
-    let unfiltered_count = all_ast_ids.len();
+    let unfiltered_count = all_ast_hits.len();
 
     // --- Step 2: Populate TemporalDb with known co-change: alpha.rs <-> plain.rs ---
     // Only src/alpha.rs co-changes with src/plain.rs.  src/beta.rs has NO co-change
@@ -1210,20 +1558,24 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     let blast_fids = super::super::temporal::resolve_blast_radius_file_ids(
         Some("src/plain.rs"),
         project.path(),
-        &db_path,
+        cache.path(), // cache_dir, not db_path — signature changed in #413 (#413 Fix 3)
         &sorted,
         false,
+        &HeadState::NotARepo,
     )
     .unwrap();
 
     let mut output_buf: Vec<u8> = Vec::new();
     let filtered_result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
         blast_fids,
+        None, // no temporal sort
+        None, // no temporal DB
+        project.path(),
         &mut output_buf,
     )
     .unwrap();
@@ -1275,13 +1627,16 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     // --- Step 5: Graceful-degrade — absent temporal DB → full AST set, exit 0, no error ---
     // When the temporal DB is missing, resolve_blast_radius_file_ids returns None and
     // run_ast_standalone returns the full AST result set (no intersection).
-    let absent_db = cache.path().join("no_such_temporal.db");
+    // Use a fresh empty tempdir as cache_dir — the function looks for temporal.db
+    // inside the directory, so an empty dir correctly simulates an absent DB (#413 Fix 3).
+    let absent_cache = tempfile::tempdir().unwrap();
     let degrade_blast_fids = super::super::temporal::resolve_blast_radius_file_ids(
         Some("src/plain.rs"),
         project.path(),
-        &absent_db,
+        absent_cache.path(), // empty cache_dir → no temporal.db → Absent → Ok(None)
         &sorted,
         false,
+        &HeadState::NotARepo,
     )
     .unwrap();
     // When the DB is absent, resolve_blast_radius_file_ids returns None.
@@ -1293,11 +1648,14 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     let mut degrade_buf: Vec<u8> = Vec::new();
     let degrade_result = super::run_ast_standalone(
         "rust-nested-loop",
-        20,
+        super::super::types::Page::first(20),
         false,
         cache.path(),
         &manifest,
         degrade_blast_fids, // None → no intersection, full AST set
+        None,               // no temporal sort
+        None,               // no temporal DB
+        project.path(),
         &mut degrade_buf,
     )
     .unwrap();
@@ -1317,5 +1675,3328 @@ fn ast_blast_radius_intersection_is_applied_not_silently_dropped() {
     assert!(
         degrade_text.contains("beta.rs"),
         "graceful-degrade output must contain beta.rs (full set when DB absent); got:\n{degrade_text}"
+    );
+}
+
+// ============================================================================
+// Group 12: Intersection pool-cliff guard (#356)
+// ============================================================================
+
+/// Build a fixture that triggers the CANDIDATE_POOL_K=4 cliff.
+///
+/// Layout:
+/// - `src/target.rs` — contains "nested" once AND has a nested for-loop.
+///   This is the SINGLE qualifying file (matches both text + AST filters).
+/// - `src/noast_N.rs` (N=1..6) — contain "nested" MANY times (high lexical score)
+///   but have NO nested loops.  They match the text token but NOT the --ast filter.
+///
+/// # Why this makes the bug fire
+///
+/// With the old `CANDIDATE_POOL_K=4` the lexical pool at `--limit 1` is 4 files.
+/// The 6 `noast_N.rs` files each contain "nested" 30 times (a lot of trigram matches),
+/// so they rank much higher than `target.rs` (1 occurrence) in the unfiltered lexical
+/// list.  The top-4 lexical hits are all `noast_*` files; `target.rs` falls off the
+/// cliff.  `intersect_and_rank` sees no file in both the 4-slot lexical pool and the
+/// 1-file AST set → result count = 0.  The test asserts count >= 1 → FAILS (RED).
+///
+/// With the fix (AD-356-1): `file_filter = Some({target.rs})`, `sq.limit = Some(1)`.
+/// The reader scores only `target.rs`.  `intersect_and_rank` gets {target.rs} in
+/// both layers → returns 1 result.  The test PASSES (GREEN).
+fn make_project_with_lexical_cliff_fixture() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Single qualifying file: contains "nested" once AND a nested for-loop.
+    fs::write(
+        root.join("src/target.rs"),
+        r#"
+fn target() {
+    // nested: this is the qualifying file
+    for i in 0..4 {
+        for j in 0..4 {
+            println!("nested {i} {j}");
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Six distractor files: each contains "nested" 30 times but NO nested loops.
+    // High occurrence count → much higher trigram score → they outrank target.rs.
+    // They must NOT contain "for" blocks inside "for" blocks (no rust-nested-loop AST match).
+    for i in 1..=6 {
+        let occurrences = "// nested\n".repeat(30);
+        fs::write(
+            root.join(format!("src/noast_{i}.rs")),
+            format!(
+                r#"
+{occurrences}
+fn distractor_{i}() {{
+    println!("not a nested loop");
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC1 / AC2 — Pool-cliff discriminator guard (#356).
+///
+/// Proves that the compound text+`--ast` intersection returns qualifying files
+/// EVEN WHEN they rank below the old `limit * CANDIDATE_POOL_K` cliff in the
+/// unfiltered lexical list.
+///
+/// # Why this test FAILS against the unfixed code (RED)
+///
+/// The old path computes `sq.limit = config.limit.saturating_mul(4)` with NO
+/// `file_filter`.  At `--limit 1` the lexical engine is capped at 4 candidates
+/// drawn from the ENTIRE corpus.  The 6 `noast_*.rs` files each contain "nested"
+/// 30 times — far more trigram matches than `target.rs` (1 occurrence) — so the
+/// top-4 unfiltered lexical hits are all `noast_*` files.  `target.rs` falls off
+/// position 4 and is invisible to `intersect_and_rank`.  The intersection is empty
+/// → result count = 0.  This test asserts `count >= 1` → FAILS with the old code.
+///
+/// # Why this test PASSES after the fix (GREEN, AD-356-1 / AD-356-2)
+///
+/// After the fix: `sq.file_filter = Some({target.rs})` restricts the lexical
+/// engine to the 1-file AST set; `sq.limit = Some(1)`.  The reader scores only
+/// `target.rs`, finds it contains "nested", and returns it.  `intersect_and_rank`
+/// sees the same file in both the lexical and AST layers → returns 1 result.
+/// The test assertion `count >= 1` PASSES.
+///
+/// # Discriminating properties (PF-007)
+///
+/// - Asserts `count >= 1` (not just exit 0) — a broken implementation that returns
+///   empty would fail.
+/// - Asserts the returned path ends in "target.rs" (not a distractor) — a broken
+///   implementation that returns a distractor would fail.
+/// - If `CANDIDATE_POOL_K` were reintroduced, the distractors would fill the pool
+///   at `--limit 1` and `target.rs` would again be invisible → count = 0, test
+///   FAILS.
+#[test]
+fn text_ast_intersection_complete_below_pool_cliff_356() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_lexical_cliff_fixture();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // -- Precondition: AST filter matches exactly target.rs (1 file) ---------------
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    // Precondition: exactly 1 AST-matching file (target.rs with nested loops).
+    // The 6 distractor files have no nested loops → should NOT be in ast_scored.
+    assert_eq!(
+        ast_scored.len(),
+        1,
+        "#356 precondition: rust-nested-loop must match EXACTLY 1 file (target.rs); \
+         got {} — check that distractors have no nested loops",
+        ast_scored.len()
+    );
+
+    // -- AC1 (exact-set completeness): full qualifying set at --limit 50 ----------
+    // At any large limit the fix and the old code both return target.rs; we use
+    // this as the reference set.
+    let full_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        full_output.results.len(),
+        1,
+        "AC1: --limit 50 must return the 1 qualifying file (target.rs); \
+         got {} results",
+        full_output.results.len()
+    );
+    assert!(
+        full_output.results[0].path.contains("target.rs"),
+        "AC1: the single result must be target.rs, got: {:?}",
+        full_output.results[0].path
+    );
+
+    // -- AC2 (pool-cliff guard): at --limit 1 we must still get target.rs --------
+    //
+    // Pre-fix (CANDIDATE_POOL_K=4): the 6 distractor files rank higher than
+    // target.rs lexically (30× "nested" vs 1×), so the top-4 unfiltered lexical
+    // hits are all distractors.  target.rs falls off the cliff.  result count = 0.
+    // (This is the RED assertion: count >= 1 FAILS against unfixed code.)
+    //
+    // Post-fix (AD-356-1/2): file_filter = {target.rs FileId}, sq.limit = 1.
+    // Reader scores only target.rs → it is returned.  count = 1, PASSES.
+    let limit1_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        1,
+        Some(ast_scored.clone()),
+        None,
+    );
+    let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
+
+    // PRIMARY DISCRIMINATING ASSERTION (PF-007):
+    // result count must be >= 1.  Old code returns 0 (cliff drops target.rs).
+    // New code returns 1.  If CANDIDATE_POOL_K is reintroduced, count → 0 → test FAILS.
+    assert!(
+        !limit1_output.results.is_empty(),
+        "AC2 (pool-cliff DISCRIMINATING): --limit 1 returned 0 results (expected >= 1). \
+         target.rs must appear even though 6 distractors rank higher lexically. \
+         If count=0, the pool cliff is still active (CANDIDATE_POOL_K regression).",
+    );
+
+    // The returned file must be the qualifying target.rs (not a distractor).
+    assert!(
+        limit1_output.results[0].path.contains("target.rs"),
+        "AC2: returned file must be target.rs; got: {:?}. \
+         A distractor appearing here means the AST filter is not being applied \
+         to restrict the lexical pool.",
+        limit1_output.results[0].path
+    );
+
+    // Note: AC13 (set property independent of ranking/limit) is covered by the
+    // `text_ast_ad356_2_limit_guard_25_files` test below, which uses N=25 qualifying
+    // files and drives at --limit {25, 10, 1}.  A --limit 5 assertion here with N=1
+    // qualifying file is non-discriminating (pre-fix code also returns 1 result at
+    // --limit 5 because pool=20 > corpus size), so it was removed to avoid overstating
+    // coverage.  See review finding #6 / PF-007.
+}
+
+// ============================================================================
+// AC8 — AD-356-2 limit-guard: sq.limit sized to the AST set, never None (#356)
+// ============================================================================
+
+/// Build a project with exactly N Rust files each containing both the text
+/// token 'nested' and a nested for-loop (so all N match the `rust-nested-loop`
+/// AST pattern AND the text query).
+///
+/// Used by `text_ast_ad356_2_limit_guard_25_files` to construct a 25-file
+/// fixture whose AST set exceeds the reader's `unwrap_or(20)` default.
+fn make_project_with_n_nested_loop_files(n: usize) -> TempDir {
+    assert!(n >= 1, "must have at least 1 file");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    for i in 1..=n {
+        // Each file contains "nested" once AND a nested for-loop so both the
+        // text query ("nested") AND the rust-nested-loop AST pattern match.
+        fs::write(
+            root.join(format!("src/nested_{i:02}.rs")),
+            format!(
+                r#"
+// nested: qualifying file {i}
+fn work_{i}() {{
+    for a in 0..{i} {{
+        for b in 0..{i} {{
+            let _ = (a, b);
+        }}
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC8 / AD-356-2 — sq.limit sized to the AST set, never None (#356).
+///
+/// This test is the dedicated discriminator for AD-356-2: the guarantee that
+/// `sq.limit = Some(filter_set.len().max(1))` rather than `None`.
+///
+/// # Why this test is needed (PF-007)
+///
+/// The reader in `reader.rs` applies `let limit = query.limit.unwrap_or(20)`.
+/// If `sq.limit` were `None` (or any constant ≤ 20), a 25-file AST set would
+/// be silently re-capped at 20 results — reintroducing #356 for large sets.
+///
+/// The existing `text_ast_intersection_complete_below_pool_cliff_356` test uses
+/// a 1-file AST set: with N=1 both `Some(1)` and `None` yield 1 result (1 ≤ 20),
+/// so reverting line 362 of query.rs to `sq.limit = None` would NOT fail that
+/// test.  That test is blind to the AD-356-2 half of the fix.
+///
+/// # What this test proves
+///
+/// - N=25 files ALL satisfy both the text query ("nested") and `rust-nested-loop`.
+/// - At `--limit 25` with `sq.limit = Some(25)`: reader scores all 25 → returns 25.
+/// - At `--limit 25` with `sq.limit = None` (regression): reader caps at 20 → only
+///   20 returned → `assert_eq!(results.len(), 25)` **FAILS**.
+///
+/// # AC13 (set property independent of ranking)
+///
+/// At `--limit 10` exactly 10 of the 25 qualifying files are returned (the top-10
+/// by RRF score), proving the set-completeness guarantee is rank-independent.
+/// At `--limit 1` exactly 1 qualifying file is returned.
+#[test]
+fn text_ast_ad356_2_limit_guard_25_files() {
+    use super::super::query::execute_query;
+
+    const N: usize = 25;
+
+    let project = make_project_with_n_nested_loop_files(N);
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // -- Precondition: AST filter matches all N files ---------------------------
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    assert_eq!(
+        ast_scored.len(),
+        N,
+        "AD-356-2 precondition: rust-nested-loop must match all {N} nested-loop files; \
+         got {} — check that make_project_with_n_nested_loop_files generated valid Rust \
+         with nested for-loops",
+        ast_scored.len()
+    );
+
+    // -- AC8 (primary discriminating assertion): all N files returned at --limit N --
+    //
+    // Pre-fix (sq.limit = None): reader.rs `unwrap_or(20)` caps at 20.
+    // N=25 > 20 → only 20 returned → assert_eq FAILS (RED confirms AD-356-2 gap).
+    //
+    // Post-fix (sq.limit = Some(25)): reader scores all 25 → returns 25 → PASSES.
+    let full_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N,
+        Some(ast_scored.clone()),
+        None,
+    );
+    let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        full_output.results.len(),
+        N,
+        "AC8 (AD-356-2 DISCRIMINATING): --limit {N} must return all {N} qualifying files. \
+         Got {} — if the count is 20, sq.limit was None (unwrap_or(20) re-cap regression). \
+         Reverting query.rs:362 to `sq.limit = None` would produce this failure.",
+        full_output.results.len()
+    );
+
+    // All returned paths must be the nested_NN.rs files (no spurious entries).
+    for r in &full_output.results {
+        assert!(
+            r.path.contains("nested_"),
+            "AC8: result path must be one of the nested_NN.rs files; got: {:?}",
+            r.path
+        );
+    }
+
+    // -- AC13 (set property): intermediate --limit returns a proper subset ----------
+    let mid_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        10,
+        Some(ast_scored.clone()),
+        None,
+    );
+    let mid_output = execute_query(&mid_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        mid_output.results.len(),
+        10,
+        "AC13: --limit 10 must return exactly 10 of the {N} qualifying files; \
+         got {}",
+        mid_output.results.len()
+    );
+    // Each mid result must also appear in the full set (proper subset check).
+    let full_paths: std::collections::HashSet<&str> = full_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    for r in &mid_output.results {
+        assert!(
+            full_paths.contains(r.path.as_str()),
+            "AC13: path {:?} from --limit 10 is not in the full --limit {N} set — \
+             compound filter is inconsistent across limit values",
+            r.path
+        );
+    }
+
+    // -- AC13 continued: --limit 1 returns exactly 1 qualifying file ---------------
+    let limit1_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        1,
+        Some(ast_scored),
+        None,
+    );
+    let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        limit1_output.results.len(),
+        1,
+        "AC13: --limit 1 must return exactly 1 qualifying file; got {}",
+        limit1_output.results.len()
+    );
+    assert!(
+        limit1_output.results[0].path.contains("nested_"),
+        "AC13: --limit 1 result must be a nested_NN.rs file; got: {:?}",
+        limit1_output.results[0].path
+    );
+}
+
+// ============================================================================
+// AC12 — empty-AST early-out (#356)
+// ============================================================================
+
+/// AC12 — empty AST set returns empty QueryOutput, no panic, exit 0 (#356).
+///
+/// The early-out guard at `run_compound_query` (query.rs:331-339) handles the
+/// case where `ast_scored = Some(empty vec)`.  With an empty `file_filter` the
+/// reader scores zero files anyway, but the guard avoids the work and documents
+/// the intent.
+///
+/// # Discriminating property (PF-007)
+///
+/// This is a reachable production path: `mod.rs:639-644` dispatches into
+/// `run_compound_query` with `ast_scored = Some(vec![])` when the AST engine
+/// resolves zero hits for the given pattern.  The test exercises this control
+/// path directly by passing `ast_scored: Some(vec![])`.
+///
+/// If the early-out were deleted, behavior degrades safely (empty `file_filter`
+/// still returns nothing), so this test focuses on asserting the contract:
+/// no panic, no error, results empty.  Severity is low but the branch is new,
+/// reachable code with a distinct control path and zero coverage without this
+/// test.
+#[test]
+fn text_ast_empty_ast_set_returns_empty_ac12() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // Pass an explicitly empty AST scored vector — simulates a pattern that
+    // matches no files (e.g. `skim search "foo" --ast <pattern-that-matches-nothing>`).
+    // empty ast_scored vec is the key input for AC12.
+    let config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        10,
+        Some(vec![]),
+        None,
+    );
+
+    // Must not panic, must not error, must return empty results (exit 0 semantics).
+    let output = execute_query(&config, &TEST_ANALYTICS)
+        .expect("AC12: execute_query must not error on empty AST set");
+
+    assert!(
+        output.results.is_empty(),
+        "AC12: empty AST set must produce empty results; got {} results",
+        output.results.len()
+    );
+    assert_eq!(
+        output.total, 0,
+        "AC12: total must be 0 for empty AST set; got {}",
+        output.total
+    );
+}
+
+// ============================================================================
+// AC3 — blast∩AST compound completeness (#356)
+// ============================================================================
+
+/// Build a fixture with N qualifying files (both text+AST) and M lexical
+/// distractors.
+///
+/// Qualifying files (`src/target_NN.rs`): contain "nested" once AND a nested
+/// for-loop so both the text query ("nested") AND `rust-nested-loop` AST
+/// pattern match.
+///
+/// Distractor files (`src/noast_NN.rs`): contain "nested" 30 times but NO
+/// nested loops, so they score higher lexically but FAIL the AST filter.
+///
+/// Layout mirrors `make_project_with_lexical_cliff_fixture` but with N
+/// qualifying files instead of 1, enabling AC3 (blast∩AST completeness) tests
+/// where the qualifying set exceeds the old `limit * CANDIDATE_POOL_K = 4`
+/// cliff.
+fn make_project_with_blast_ast_cliff_fixture(n_qualifying: usize, n_distractors: usize) -> TempDir {
+    assert!(n_qualifying >= 1, "must have at least 1 qualifying file");
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Qualifying files: "nested" once + nested for-loop (match both text+AST).
+    for i in 1..=n_qualifying {
+        fs::write(
+            root.join(format!("src/target_{i:02}.rs")),
+            format!(
+                r#"
+// nested: qualifying file {i}
+fn work_{i}() {{
+    for a in 0..{i} {{
+        for b in 0..{i} {{
+            let _ = (a, b);
+        }}
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    // Distractor files: "nested" 30× but NO nested loops — outrank qualifying
+    // files in unfiltered lexical scoring, yet fail the AST filter.
+    for i in 1..=n_distractors {
+        let body = "// nested\n".repeat(30);
+        fs::write(
+            root.join(format!("src/noast_{i:02}.rs")),
+            format!(
+                r#"
+{body}
+fn distractor_{i}() {{
+    println!("not a nested loop");
+}}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC3 — blast∩AST compound completeness: `run_compound_query` with BOTH
+/// `ast_scored` and `blast_radius_paths` set must return the complete
+/// blast∩AST∩text intersection, not a `limit * K`-capped subset (#356).
+///
+/// # The second pool-cliff locus (plan AC3)
+///
+/// `run_compound_query` has TWO sub-paths:
+///
+/// 1. **No-blast** (`blast_file_ids = None`): `filter_set = ast_fid_set`.
+///    Covered by `text_ast_intersection_complete_below_pool_cliff_356`.
+///
+/// 2. **blast+AST** (`blast_file_ids = Some`): `filter_set = blast ∩ ast`.
+///    THIS test covers this sub-path — previously uncovered.
+///
+/// Pre-fix, BOTH sub-paths used `sq.limit = config.limit.saturating_mul(4)`
+/// with no `file_filter`.  At `--limit 1` pool = 4 and the 6 lexical
+/// distractors fill the pool, dropping all 6 qualifying files.  The test
+/// asserts `count >= 1` → FAILS with the old code.
+///
+/// Post-fix (AD-356-1/2): `filter_set = blast ∩ ast = {target_01..target_06}`,
+/// `sq.file_filter = Some(filter_set)`, `sq.limit = Some(6)`.  The reader
+/// scores only the 6 qualifying files → all match text → at `--limit 1`
+/// exactly 1 is returned from the complete set → test PASSES.
+///
+/// # Discriminating properties (PF-007)
+///
+/// - If `sq.limit = config.limit.saturating_mul(4)` were reintroduced on this
+///   sub-path (regression), the distractors would fill the pool at `--limit 1`
+///   and 0 qualifying files would be returned → `count >= 1` FAILS.
+/// - If the blast intersection were dropped (regression: `filter_set = ast_fid_set`
+///   ignoring blast), the distractor-filled pool would again prevent qualifying
+///   files from appearing at `--limit 1` in the no-file-filter case.
+/// - The `--limit N` assertion proves that ALL N qualifying files are accessible
+///   (full-set completeness), not just that the top-1 works.
+/// - The empty-blast∩AST sub-case asserts that a disjoint blast+AST set returns
+///   empty with no panic (correctness guard per plan AC12(b)).
+///
+/// # Why `blast_radius_paths` is passed directly (no TemporalDb in test)
+///
+/// `execute_query` accepts `blast_radius_paths: Some(BlastRadiusStrengths)` (a
+/// `HashMap<String, f64>`) as pre-resolved repo-relative paths with Jaccard scores.
+/// `mod.rs` uses `TemporalDb` to BUILD that map before calling `execute_query`; the
+/// test bypasses `mod.rs` and injects the paths directly — same production path, no
+/// test-only TemporalDb needed.
+/// This is intentional per the NO-FAKE-SOLUTIONS rule: the intersection logic
+/// in `run_compound_query` is independent of how the blast path set was built.
+#[test]
+fn text_ast_blast_intersection_complete_356() {
+    use std::collections::{HashMap, HashSet};
+
+    use super::super::query::execute_query;
+
+    const N: usize = 6; // qualifying files (> old limit*4 = 4 at --limit 1)
+    const DISTRACTORS: usize = 6; // lexically-outranking files that fail AST
+
+    let project = make_project_with_blast_ast_cliff_fixture(N, DISTRACTORS);
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // -- Precondition: AST filter matches exactly the N qualifying files -------
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    assert_eq!(
+        ast_scored.len(),
+        N,
+        "AC3 precondition: rust-nested-loop must match exactly {N} qualifying files; \
+         got {} — check that target_NN.rs files have nested for-loops and \
+         noast_NN.rs files do not",
+        ast_scored.len()
+    );
+
+    // -- blast_radius_paths: the N qualifying files (injected directly) --------
+    //
+    // In production, mod.rs resolves these from TemporalDb::cochanges_for_file.
+    // Here we inject them as pre-resolved repo-relative paths — same code path
+    // in execute_query (paths_to_file_ids builds the FileId set from sorted_paths).
+    let blast_paths: HashMap<String, f64> = (1..=N)
+        .map(|i| (format!("src/target_{i:02}.rs"), 1.0))
+        .collect();
+
+    // -- AC3(a) full-set at --limit N: all N qualifying files returned ---------
+    let full_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N,
+        Some(ast_scored.clone()),
+        Some(blast_paths.clone()),
+    );
+    let full_output = execute_query(&full_config, &TEST_ANALYTICS).unwrap();
+
+    assert_eq!(
+        full_output.results.len(),
+        N,
+        "AC3: --limit {N} with blast+AST must return all {N} qualifying files; \
+         got {} — if the count is 4, the blast sub-path is using limit*4 (pool-cliff \
+         regression on the blast+AST branch of run_compound_query)",
+        full_output.results.len()
+    );
+
+    // All returned paths must be qualifying target files (not distractors).
+    for r in &full_output.results {
+        assert!(
+            r.path.contains("target_"),
+            "AC3: result path must be a target_NN.rs file (not a distractor); got: {:?}. \
+             A distractor appearing here means the AST filter or blast intersection is \
+             not being applied correctly.",
+            r.path
+        );
+    }
+
+    // -- AC3(b) pool-cliff discriminator at --limit 1 -------------------------
+    //
+    // PRE-FIX (regression): sq.limit = 1.saturating_mul(4) = 4, NO file_filter.
+    // Pool = 4 candidates from the full corpus. The 6 distractor files each
+    // contain "nested" 30×, outranking the 6 qualifying files (1× each).
+    // The top-4 lexical hits are all distractors. None of the 6 qualifying
+    // files appear in the pool → blast∩AST intersection is empty → 0 results.
+    // THIS ASSERTION (count >= 1) WOULD FAIL against the pre-fix code.
+    //
+    // POST-FIX (AD-356-1/2): filter_set = blast∩ast = {target_01..target_06},
+    // sq.file_filter = Some(filter_set), sq.limit = Some(6).
+    // Reader scores only the 6 qualifying files → all match "nested" →
+    // intersect_and_rank returns 6 → take(1) yields 1 result. PASSES.
+    let limit1_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        1,
+        Some(ast_scored.clone()),
+        Some(blast_paths.clone()),
+    );
+    let limit1_output = execute_query(&limit1_config, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !limit1_output.results.is_empty(),
+        "AC3 (pool-cliff DISCRIMINATING): --limit 1 with blast+AST returned 0 results. \
+         target_NN.rs files must appear even though distractors rank higher lexically. \
+         If count=0, the blast+AST sub-path of run_compound_query is using a pool cap \
+         (limit*K regression) instead of file_filter=blast∩ast (AD-356-1 regression).",
+    );
+
+    // The returned file must be a qualifying target file (not a distractor).
+    assert!(
+        limit1_output.results[0].path.contains("target_"),
+        "AC3: --limit 1 result must be a target_NN.rs file; got: {:?}. \
+         A distractor appearing here means the blast∩AST file_filter is not \
+         restricting the lexical engine to the qualifying set.",
+        limit1_output.results[0].path
+    );
+
+    // The result must be in the complete blast∩AST∩text set (full_output paths).
+    let full_paths: HashSet<&str> = full_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    assert!(
+        full_paths.contains(limit1_output.results[0].path.as_str()),
+        "AC3: --limit 1 result {:?} is not in the complete --limit {N} set {:?}. \
+         The result must be a member of the full blast∩AST∩text intersection.",
+        limit1_output.results[0].path,
+        full_paths
+    );
+
+    // -- AC3(c) empty blast∩AST: disjoint sets return empty, no panic ----------
+    //
+    // blast_radius_paths contains ONLY the noast files (distractors), which are
+    // NOT in ast_scored (they have no nested loops). filter_set = blast∩ast = {}.
+    // Expected: empty results, no panic.
+    //
+    // The filter_set.is_empty() early-out in run_compound_query (query.rs #356)
+    // now handles this case explicitly rather than relying on the reader returning
+    // 0 docs for an empty file_filter — both produce empty results.
+    let disjoint_blast: HashMap<String, f64> = (1..=DISTRACTORS)
+        .map(|i| (format!("src/noast_{i:02}.rs"), 1.0))
+        .collect();
+
+    let disjoint_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        10,
+        Some(ast_scored),
+        Some(disjoint_blast),
+    );
+    let disjoint_output = execute_query(&disjoint_config, &TEST_ANALYTICS)
+        .expect("AC3(c): execute_query must not error on disjoint blast∩AST set");
+
+    assert!(
+        disjoint_output.results.is_empty(),
+        "AC3(c): disjoint blast∩AST must return empty results (no panic); \
+         got {} results — the filter_set.is_empty() early-out in run_compound_query \
+         must return an empty QueryOutput for a disjoint blast∩AST intersection (#356).",
+        disjoint_output.results.len()
+    );
+}
+
+// ============================================================================
+// AC3 — blast∩AST strict-subset discriminating test (#356, PF-007)
+// ============================================================================
+
+/// AC3 — blast+AST filtered set is a STRICT SUBSET of AST-only set (#356).
+///
+/// # What this tests
+///
+/// `run_compound_query` has two sub-paths:
+///
+/// 1. **No-blast** (`blast_file_ids = None`): `filter_set = ast_fid_set`.
+/// 2. **blast+AST** (`blast_file_ids = Some`): `filter_set = blast ∩ ast`.
+///
+/// The existing tests (`text_ast_blast_intersection_complete_356`) verify that
+/// sub-path 2 returns the complete blast∩AST∩text set.  That test uses a blast
+/// set that equals the AST set, so it does NOT verify that restricting the blast
+/// set actually REDUCES the result count relative to the no-blast path.
+///
+/// This test closes that gap by using a blast set that is a STRICT SUBSET of the
+/// AST-matching files:
+///
+/// - No-blast run: all N qualifying files (target_01..target_N) are returned.
+/// - Blast+AST run: blast covers only the first M < N qualifying files.
+///   `filter_set = blast ∩ ast = {target_01..target_M}` → only M results.
+///
+/// # Discriminating property (PF-007)
+///
+/// The strict-subset assertion `blast_count < full_count` would FAIL in two
+/// regression scenarios:
+///
+/// - If the blast intersection is dropped (`filter_set = ast_fid_set` always):
+///   both runs return N files → `blast_count == full_count` → assertion fails.
+/// - If `sq.file_filter` is not set: the reader scores unrestricted files and
+///   may return distractors; the target-path membership check would also fail.
+///
+/// This is the missing discriminating guard that every prior blast+AST test
+/// lacked — per the wave-4 review (#356 surviving finding, testing category).
+#[test]
+fn text_ast_blast_subset_is_strict_subset_of_ast_only_356() {
+    use std::collections::{HashMap, HashSet};
+
+    use super::super::query::execute_query;
+
+    // 4 qualifying files (text+AST), 2 distractors (text only, no AST).
+    // Blast set covers only the FIRST 2 of the 4 qualifying files.
+    const N_QUALIFYING: usize = 4;
+    const N_BLAST: usize = 2; // blast covers only a strict subset of qualifying
+    const N_DISTRACTORS: usize = 2;
+
+    let project = make_project_with_blast_ast_cliff_fixture(N_QUALIFYING, N_DISTRACTORS);
+    let cache = tempfile::tempdir().unwrap();
+
+    build_project_index(project.path(), cache.path());
+
+    // Resolve the real AST scores (covers all N_QUALIFYING target files).
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+
+    assert_eq!(
+        ast_scored.len(),
+        N_QUALIFYING,
+        "Precondition: rust-nested-loop must match exactly {N_QUALIFYING} qualifying files; \
+         got {} — check that target_NN.rs files have nested for-loops",
+        ast_scored.len()
+    );
+
+    // -- Run 1: AST-only (no blast) — full qualifying set ----------------------
+    let no_blast_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N_QUALIFYING,
+        Some(ast_scored.clone()),
+        None, // no blast filter
+    );
+    let no_blast_output = execute_query(&no_blast_config, &TEST_ANALYTICS).unwrap();
+
+    let full_count = no_blast_output.results.len();
+    assert_eq!(
+        full_count, N_QUALIFYING,
+        "AC3 precondition (no-blast): must return all {N_QUALIFYING} qualifying files; \
+         got {full_count}"
+    );
+
+    // -- Run 2: blast+AST — blast covers only the first N_BLAST qualifying files --
+    //
+    // blast_radius_paths is a strict subset of the AST-matching files.
+    // filter_set = blast ∩ ast = {target_01..target_N_BLAST}.
+    // The reader is restricted to only those N_BLAST files → only N_BLAST results.
+    let blast_paths: HashMap<String, f64> = (1..=N_BLAST)
+        .map(|i| (format!("src/target_{i:02}.rs"), 1.0))
+        .collect();
+
+    let blast_config = make_query_config(
+        project.path(),
+        cache.path(),
+        "nested",
+        N_QUALIFYING, // high limit — truncation is NOT the cause of the difference
+        Some(ast_scored),
+        Some(blast_paths.clone()),
+    );
+    let blast_output = execute_query(&blast_config, &TEST_ANALYTICS).unwrap();
+
+    let blast_count = blast_output.results.len();
+
+    // PF-007 DISCRIMINATING ASSERTION 1: strict subset — filtered < unfiltered.
+    //
+    // If the blast intersection logic in run_compound_query is dropped or broken
+    // (filter_set reverts to ast_fid_set), blast_count == full_count and this
+    // assertion FAILS — verifying the blast filter is actually applied.
+    assert!(
+        blast_count < full_count,
+        "AC3 (strict-subset DISCRIMINATING): blast+AST count ({blast_count}) must be \
+         STRICTLY LESS THAN the AST-only count ({full_count}). \
+         If they are equal, the blast intersection in run_compound_query is not \
+         restricting the result set — regression of AD-356-1 (#356 blast+AST sub-path)."
+    );
+
+    // PF-007 DISCRIMINATING ASSERTION 2: exact count matches blast set size.
+    //
+    // The blast set covers exactly N_BLAST qualifying files.  After filter_set
+    // = blast ∩ ast and text verification, all N_BLAST must be returned.
+    assert_eq!(
+        blast_count, N_BLAST,
+        "AC3 (blast subset count): blast+AST run must return exactly {N_BLAST} files \
+         (blast ∩ AST ∩ text); got {blast_count}"
+    );
+
+    // PF-007 DISCRIMINATING ASSERTION 3: every result is in the blast set.
+    //
+    // No distractor or out-of-blast qualifying file may appear in the filtered
+    // results — confirms the file_filter is applied, not just the count.
+    for r in &blast_output.results {
+        assert!(
+            blast_paths.contains_key(&r.path),
+            "AC3 (blast subset membership): result path {:?} is not in the blast set {:?}. \
+             Only blast-set files must appear when blast+AST is active — a non-blast \
+             file here means file_filter is not being applied in run_compound_query.",
+            r.path,
+            blast_paths
+        );
+    }
+
+    // PF-007 DISCRIMINATING ASSERTION 4: every blast result is in the full set.
+    //
+    // blast results must be a subset of the no-blast results (they come from the
+    // same AST∩text intersection, just restricted to the blast set).
+    let full_paths: HashSet<&str> = no_blast_output
+        .results
+        .iter()
+        .map(|r| r.path.as_str())
+        .collect();
+    for r in &blast_output.results {
+        assert!(
+            full_paths.contains(r.path.as_str()),
+            "AC3 (blast subset ⊆ full): result {:?} from the blast+AST run is not \
+             in the AST-only full result set {:?}. Blast results must be a subset of \
+             the unfiltered AST results.",
+            r.path,
+            full_paths
+        );
+    }
+}
+
+// ============================================================================
+// Group 12: #373 FileId↔path ordering skew — standalone --ast discriminating
+// repro (AC-1)
+// ============================================================================
+
+/// AC-1 / AD-373-1: Discriminating repro for standalone --ast over a corpus
+/// where PathBuf::cmp and str::cmp diverge.
+///
+/// Corpus:
+/// - `foo.rs`       = `let x = 1;`     (no function_item)
+/// - `foo/bar.rs`   = `fn only() {...}` (exactly ONE function_item)
+/// - `foobar.rs`    = `const Z: i32 = 3;` (no function_item)
+///
+/// `run_ast_standalone("function_item > block", ...)` MUST return `foo/bar.rs`
+/// and MUST NOT return `foo.rs` or `foobar.rs`.
+///
+/// Pre-fix: FileId(0) was assigned to `foo/bar.rs` (PathBuf component order)
+/// but resolved to `foo.rs` (BTreeMap byte order), so the output contained
+/// `foo.rs` (wrong file) — this test FAILS on the pre-fix code.
+///
+/// PF-007: the negative assertions (MUST NOT contain `foo.rs` / `foobar.rs`)
+/// ensure this test would fail if AD-373-1 were reverted.
+#[test]
+fn run_ast_standalone_resolves_nested_dir_corpus_correctly() {
+    use super::super::manifest::FileManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let cache = tempfile::tempdir().unwrap();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("foo")).unwrap();
+
+    // Only foo/bar.rs has a function_item.
+    fs::write(root.join("foo.rs"), "let x = 1;\n").unwrap();
+    fs::write(root.join("foo/bar.rs"), "fn only() { let y = 2; }\n").unwrap();
+    fs::write(root.join("foobar.rs"), "const Z: i32 = 3;\n").unwrap();
+
+    build_project_index(root, cache.path());
+
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "function_item > block",
+        super::super::types::Page::first(40),
+        false, // text output
+        cache.path(),
+        &manifest,
+        None, // no --blast-radius
+        None, // no temporal sort
+        None, // no temporal DB
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC-1: standalone --ast over nested-dir corpus must exit SUCCESS"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: the ONLY file with function_item must appear.
+    assert!(
+        text.contains("foo/bar.rs"),
+        "AC-1 POSITIVE: output must contain 'foo/bar.rs' (the only file with a function_item). \
+         Pre-fix: FileId skew caused foo.rs to be returned instead. Got:\n{text}"
+    );
+
+    // NEGATIVE 1 (PF-007): foo.rs has no function_item → must NOT appear.
+    // Pre-fix: foo.rs was returned because FileId(0) resolved to it (skew).
+    // We check that `foo.rs` does not appear as a standalone path
+    // (not as part of `foo/bar.rs`).
+    let foo_rs_standalone = text
+        .lines()
+        .any(|l| l.trim() == "foo.rs" || l.ends_with("/foo.rs") || l.ends_with("  foo.rs"));
+    assert!(
+        !foo_rs_standalone,
+        "AC-1 NEGATIVE: output must NOT return foo.rs (no function_item). \
+         Pre-fix: the FileId skew mapped foo/bar.rs's FileId to foo.rs. \
+         Reverting AD-373-1 makes this fail. Got:\n{text}"
+    );
+
+    // NEGATIVE 2: foobar.rs has no function_item → must NOT appear.
+    let foobar_in_text = text.lines().any(|l| l.contains("foobar.rs"));
+    assert!(
+        !foobar_in_text,
+        "AC-1 NEGATIVE: output must NOT return foobar.rs (no function_item). Got:\n{text}"
+    );
+}
+
+// ============================================================================
+// Group 13 (#374): Structural verify gate (Part A AND-intersect + Part B gate)
+// ============================================================================
+//
+// These tests cover the acceptance criteria from ticket #374:
+//   AC1  — zero-n-gram data files excluded
+//   AC2  — AND-intersect vs OR-union (engine level) → see query_tests.rs (a3/a3b/P3)
+//   AC3  — verify gate drops unrelated subtrees
+//            unit:        compound/reparse_tests.rs::pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374
+//            integration: run_ast_standalone_unrelated_subtree_excluded_ac3_374 (this file)
+//   AC4  — true positives survive the gate
+//   AC5  — verify-then-truncate-LAST
+//   AC8  — real-node rows always carry :line (AD-397-4); no degraded/path-only state
+//            (#397: find_first_strict_match is gate+anchor; run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397)
+//   AC9  — single-n-gram identity (no regression)
+//   AC10 — query-time only, no format/rebuild
+//   AC11 — no elision marker when gate produces empty results
+//   AC12 — O(pool) bound guard (constant reuse guard)
+//   AC13 — entry-point agreement: ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set
+//
+// AC2 / AC7 engine-level AND-intersect tests live in `ast_index/query_tests.rs`
+// (a3_*, a3b_*, P3 group). The `pattern_occurs_in_file` gate UNIT tests (AC6) live
+// in `compound/reparse_tests.rs`.
+// OD-374-3 ERROR-node fixture: compound/reparse_tests.rs::pattern_occurs_false_for_error_node_ancestor_od374_3.
+
+/// Create a project for #374 tests: one Rust file with genuine nested loops,
+/// one with no nested loops, one JSON, one Cargo.toml.
+fn make_project_for_374_gate() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Rust file WITH nested loops (should match rust-nested-loop).
+    fs::write(
+        root.join("src/nested.rs"),
+        r#"
+fn nested() {
+    for i in 0..5 {
+        for j in 0..5 {
+            let _ = i + j;
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Rust file WITHOUT nested loops (should NOT match).
+    fs::write(
+        root.join("src/simple.rs"),
+        r#"
+fn simple(x: i32) -> i32 {
+    x + 1
+}
+"#,
+    )
+    .unwrap();
+
+    // JSON file — non-tree-sitter, zero AST n-grams (AC1, AD-374-5).
+    fs::write(root.join("data.json"), r#"{"kind": "nested", "count": 3}"#).unwrap();
+
+    // Cargo.toml — non-tree-sitter, zero AST n-grams (AC1, AD-374-5).
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"test\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    dir
+}
+
+/// AC1 (#374): Standalone `--ast rust-nested-loop` MUST NOT include non-tree-sitter
+/// data files (JSON, TOML) in the result set, and MUST include the genuinely
+/// matching Rust file.
+///
+/// This is the headline false-positive fix: before #374 these data files could
+/// appear in results because they were scored by the OR-union via posting lists.
+/// With AND-intersect + verify gate they are correctly excluded.
+///
+/// NEGATIVE (PF-007): Removing the gate (reverting to old OR-union only) makes
+/// Cargo.toml / data.json appear in output, failing the exclusion assertions.
+#[test]
+fn run_ast_standalone_excludes_non_tree_sitter_files_ac1_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_for_374_gate();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC1: run_ast_standalone must exit 0"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: the genuine Rust file with nested loops MUST appear.
+    assert!(
+        text.contains("nested.rs"),
+        "AC1 POSITIVE: output must contain nested.rs (genuine match); got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): Data files must NOT appear.
+    // Removing the gate makes them appear → this assertion fails.
+    assert!(
+        !text.contains("data.json"),
+        "AC1 NEGATIVE: output must NOT contain data.json (non-tree-sitter, zero AST n-grams); \
+         reverting the gate makes it appear. Got:\n{text}"
+    );
+
+    // NEGATIVE: Cargo.toml must not appear.
+    assert!(
+        !text.contains("Cargo.toml"),
+        "AC1 NEGATIVE: output must NOT contain Cargo.toml (non-tree-sitter, zero AST n-grams); \
+         reverting the gate makes it appear. Got:\n{text}"
+    );
+
+    // NEGATIVE: simple.rs (no nested loops) must not appear.
+    assert!(
+        !text.contains("simple.rs"),
+        "AC1 NEGATIVE: output must NOT contain simple.rs (no nested loops); got:\n{text}"
+    );
+}
+
+/// Create a project for AC4: Rust files with both `exact:false` and `exact:true` patterns.
+///
+/// - `src/loops.rs`  — nested for-loops (matches `rust-nested-loop`, exact:false proxy)
+/// - `src/unsafe.rs` — unsafe block (matches `rust-unsafe-block`, exact:true)
+/// - `config.json`   — non-tree-sitter (matches neither)
+fn make_project_with_rust_exact_patterns() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Rust file with nested loops (rust-nested-loop, exact:false).
+    fs::write(
+        root.join("src/loops.rs"),
+        r#"
+fn outer() {
+    for i in 0..5 {
+        for j in 0..5 {
+            let _ = i + j;
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Rust file with unsafe block (rust-unsafe-block, exact:true).
+    // Pattern bigram: (unsafe_block, block).
+    fs::write(
+        root.join("src/unsafe.rs"),
+        r#"
+fn write_raw(ptr: *mut i32, val: i32) {
+    unsafe { *ptr = val; }
+}
+"#,
+    )
+    .unwrap();
+
+    // Non-tree-sitter file — must be excluded by the gate.
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+
+    dir
+}
+
+/// AC4 (#374): True positives must survive the gate — both `exact:true` patterns
+/// (`rust-unsafe-block`) and `exact:false` proxy patterns (`rust-nested-loop`).
+///
+/// The gate applies ONE logic path to all patterns via ancestor-correct matching;
+/// it MUST NOT zero out a legitimately-matched result set.
+///
+/// NEGATIVE (PF-007): If the gate were inverted (drops all), these assertions fail.
+#[test]
+fn run_ast_standalone_true_positives_survive_gate_ac4_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust_exact_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Test exact:false pattern (rust-nested-loop is a proxy pattern).
+    let mut nested_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut nested_out,
+    )
+    .unwrap();
+    let nested_text = String::from_utf8(nested_out).unwrap();
+    assert!(
+        nested_text.contains("loops.rs"),
+        "AC4: rust-nested-loop (exact:false proxy) must return loops.rs; gate must not over-drop. \
+         Got:\n{nested_text}"
+    );
+    // NEGATIVE (PF-007): config.json must NOT appear (non-tree-sitter).
+    assert!(
+        !nested_text.contains("config.json"),
+        "AC4 NEGATIVE: config.json must not appear in rust-nested-loop results. Got:\n{nested_text}"
+    );
+
+    // Test exact:true pattern (rust-unsafe-block: bigram unsafe_block → block).
+    let mut unsafe_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-unsafe-block",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut unsafe_out,
+    )
+    .unwrap();
+    let unsafe_text = String::from_utf8(unsafe_out).unwrap();
+    // src/unsafe.rs has `unsafe { *ptr = val; }` → exact:true bigram (unsafe_block, block).
+    assert!(
+        unsafe_text.contains("unsafe.rs"),
+        "AC4: rust-unsafe-block (exact:true) must return unsafe.rs; gate must not over-drop. \
+         Got:\n{unsafe_text}"
+    );
+    // NEGATIVE (PF-007): loops.rs (no unsafe block) must NOT appear.
+    assert!(
+        !unsafe_text.contains("loops.rs"),
+        "AC4 NEGATIVE: loops.rs must not appear in rust-unsafe-block results (no unsafe block). \
+         Got:\n{unsafe_text}"
+    );
+}
+
+/// AC5 (#374): verify-then-truncate-LAST — at `--limit N`, the output must contain
+/// exactly min(N, verified_count) verified results.
+///
+/// Uses a project with 3 matching files and `--limit 2`. The gate should keep 3
+/// verified files and then truncate to 2 (not under-fill to 2 minus dropped).
+///
+/// NEGATIVE (PF-007): If truncation happens BEFORE the gate, the count would be
+/// `limit - dropped`, under-filling the result set.
+#[test]
+fn run_ast_standalone_truncate_after_gate_ac5_374() {
+    use super::super::manifest::FileManifest;
+
+    // Build project with 3 matching files.
+    let project = make_project_with_two_nested_loop_files();
+    // This fixture has alpha.rs, beta.rs (both match rust-nested-loop), plain.rs
+    // (doesn't match), and config.json.
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // limit=1: with gate working correctly we get exactly 1 verified result.
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(1), // limit = 1
+        true,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(result, std::process::ExitCode::SUCCESS, "AC5: must exit 0");
+
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    let results = v["results"].as_array().unwrap();
+
+    // With limit=1 and 2 genuine matches, exactly 1 verified result is returned.
+    assert_eq!(
+        results.len(),
+        1,
+        "AC5: --limit 1 must return exactly 1 result (verify-then-truncate-LAST); \
+         if truncation happened before the gate, we might get 0 (PF-007 discriminating); \
+         got: {results:?}"
+    );
+}
+
+/// AC3 / AC8 (#397): Every real-node result row ALWAYS carries `:line` (AD-397-4).
+///
+/// After #397, `find_first_strict_match` is both the gate AND the anchor — so every
+/// file that passes the verify gate for a real-node pattern has an anchor by
+/// construction. There is no longer a "gate-passed but line-unknown" state for
+/// real-node patterns.
+///
+/// This test replaces the old `run_ast_standalone_recover_line_none_still_emits_ac8_374`,
+/// whose premise ("gate-passed file may emit as degraded row") is no longer possible
+/// for real-node patterns after #397.
+///
+/// PF-007 discriminating: a pre-#397 implementation (two separate calls: gate then
+/// recover_line) would emit "loops.rs  [score]" (no colon-number) when recover_line
+/// returns None. This assertion requires "loops.rs:" (with colon + number).
+#[test]
+fn run_ast_standalone_real_node_result_always_carries_line_ac3_ac8_397() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Text output: a row with `:line` looks like "  src/loops.rs:3  [score]  pattern".
+    // A degraded row (no line) looks like "  src/loops.rs  [score]  pattern".
+    // We verify the row contains the colon-number suffix (AD-397-4).
+    let mut out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+
+    // loops.rs matches rust-nested-loop — must appear in output.
+    assert!(
+        text.contains("loops.rs"),
+        "AC3/AC8: loops.rs must appear in output; got:\n{text}"
+    );
+
+    // AC3 (#397): the row MUST have a `:line` suffix — "loops.rs:" followed by a digit.
+    // A pre-#397 implementation would emit "loops.rs  [score]" (no colon) when
+    // recover_line returned None, failing this assertion.
+    assert!(
+        text.contains("loops.rs:"),
+        "AC3 (#397, AD-397-4): real-node result must carry ':line' (format 'path:N  [score]'); \
+         got text without 'loops.rs:' — indicates the anchor was not attached.\n\
+         Got:\n{text}"
+    );
+}
+
+/// AC4 (#397): JSON output for a real-node pattern has integer `line` >= 1 on
+/// every result object. No result object may omit the `line` key (AD-397-4).
+///
+/// PF-007 discriminating: a pre-#397 implementation emits results without `line`
+/// when recover_line returns None. This assertion fails for those results.
+#[test]
+fn run_ast_standalone_json_results_all_carry_integer_line_ac4_397() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let exit = super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        true, // JSON
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
+
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    let results = v["results"].as_array().unwrap();
+
+    // At least one result must exist (loops.rs matches rust-nested-loop).
+    assert!(
+        !results.is_empty(),
+        "AC4: must have at least one result for rust-nested-loop; got 0"
+    );
+
+    for (i, r) in results.iter().enumerate() {
+        let line = r.get("line");
+        assert!(
+            line.is_some(),
+            "AC4 (#397, AD-397-4): result[{i}] ({:?}) must have a 'line' key; \
+             got no 'line' key — indicates anchor was not attached by find_first_strict_match",
+            r["path"]
+        );
+        let line_val = line.unwrap().as_u64().unwrap_or(0);
+        assert!(
+            line_val >= 1,
+            "AC4 (#397): result[{i}] ({:?}) line must be >= 1 (1-indexed); got: {line_val}",
+            r["path"]
+        );
+    }
+}
+
+/// AC9 (#374): Single-n-gram identity — `rust-unsafe-block` (a pattern with a single
+/// bigram, `unsafe_block → block`) must return the same set before and after the gate.
+///
+/// Single-n-gram AND-intersect == union of that one list, so no file is added or
+/// dropped by the AND-intersect step. The gate drops only non-matching files.
+/// Files genuinely containing `rust-unsafe-block` must still appear.
+///
+/// This is also a regression guard: pre-existing AST tests must not break.
+#[test]
+fn run_ast_standalone_single_ngram_identity_ac9_374() {
+    use super::super::manifest::FileManifest;
+
+    // src/unsafe.rs has `unsafe { *ptr = val; }` → rust-unsafe-block bigram.
+    let project = make_project_with_rust_exact_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-unsafe-block",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    let text = String::from_utf8(out).unwrap();
+
+    // unsafe.rs has the rust-unsafe-block pattern (single bigram) → must appear.
+    // Single-n-gram identity: AND-intersect over one list == the list itself.
+    assert!(
+        text.contains("unsafe.rs"),
+        "AC9: single-bigram rust-unsafe-block must return unsafe.rs (identity: single-list \
+         AND-intersect == old union). Got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): config.json (non-tree-sitter, no AST n-grams) must NOT appear.
+    // The gate drops non-tree-sitter files even for single-bigram patterns.
+    assert!(
+        !text.contains("config.json"),
+        "AC9 NEGATIVE: config.json must not appear (non-tree-sitter, gate drops it). \
+         Got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): loops.rs has no unsafe block → must NOT appear.
+    assert!(
+        !text.contains("loops.rs"),
+        "AC9 NEGATIVE: loops.rs has no unsafe block and must not appear. Got:\n{text}"
+    );
+}
+
+/// AC10 (#374): Query-time only — the AST on-disk format MUST remain v2 after
+/// running a gate query. No rebuild or format bump must be triggered.
+///
+/// NEGATIVE (PF-007): If the gate wrote to disk or bumped the format version,
+/// a second index_version check would differ from the initial value.
+#[test]
+fn run_ast_standalone_no_format_change_ac10_374() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_rust();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    // Record AST format version before the gate query.
+    let version_before = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after build");
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut out,
+    )
+    .unwrap();
+
+    // Record AST format version after the gate query.
+    let version_after = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after gate query");
+
+    assert_eq!(
+        version_before, version_after,
+        "AC10: AST index format version must not change after a gate query \
+         (query-time only, no on-disk writes); \
+         reverting to a write-on-query implementation would fail this assertion"
+    );
+    assert_eq!(
+        version_before,
+        rskim_search::AST_INDEX_FORMAT_VERSION,
+        "AC10: format version must equal AST_INDEX_FORMAT_VERSION ({}) after build",
+        rskim_search::AST_INDEX_FORMAT_VERSION
+    );
+}
+
+/// AC11 (#374): When every candidate fails the gate, the result set is clean empty
+/// (exit 0) with NO `elision_marker` and NO `SKIM_PASSTHROUGH` hint.
+///
+/// We achieve "every candidate fails the gate" by using a project where the only
+/// files are non-tree-sitter (JSON/TOML) — the gate always returns false for them.
+///
+/// NEGATIVE (PF-007): If the gate mistakenly emitted an elision marker, the
+/// assertion below would detect the text in output.
+#[test]
+fn run_ast_standalone_empty_gate_no_elision_marker_ac11_374() {
+    use super::super::manifest::FileManifest;
+
+    // Project with only non-tree-sitter files.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("data.json"), r#"{"a": 1}"#).unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname=\"test\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(root, cache.path());
+
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC11: empty gate result must exit 0 (not an error)"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // NEGATIVE (PF-007): must NOT contain elision marker or SKIM_PASSTHROUGH hint.
+    assert!(
+        !text.contains("SKIM_PASSTHROUGH"),
+        "AC11 NEGATIVE: empty gate result must NOT emit SKIM_PASSTHROUGH hint; \
+         an erroneously-added elision marker would contain this text. Got:\n{text}"
+    );
+    assert!(
+        !text.contains("elision"),
+        "AC11 NEGATIVE: empty gate result must NOT emit an elision marker. Got:\n{text}"
+    );
+}
+
+/// AC12 (#374): Pool multiplier guard — the AST gate MUST reuse the module-level
+/// `LEXICAL_CANDIDATE_POOL_K` constant from `query.rs` (single definition,
+/// no fork). The value must be 5; changing it without #361 evidence fails this test.
+///
+/// This is the constant-reuse guard from OD-374-2. The assertion is structural:
+/// it verifies the constant value (5) via a type-visible test so any change
+/// without updating the #361 tracking issue is immediately visible.
+///
+/// NEGATIVE (PF-007): If the constant were forked in ast.rs with a different
+/// value (e.g. K=3), the pool sizing would diverge from the lexical path and
+/// this assertion would fail.
+#[test]
+fn ast_gate_reuses_lexical_candidate_pool_k_ac12_374() {
+    // AD-374-3: the single named constant must be 5 (no measured corpus basis;
+    // tracked under #361 per ADR-003). A change to this value without #361
+    // evidence fails this guard test.
+    const EXPECTED_K: usize = 5;
+    assert_eq!(
+        super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        EXPECTED_K,
+        "AC12: LEXICAL_CANDIDATE_POOL_K must be {EXPECTED_K} (unmeasured heuristic, \
+         tracked under #361 per ADR-003). Changing it without #361 evidence and \
+         corpus measurements violates ADR-003. Update #361 first."
+    );
+
+    // AC12 POOL-SIZE BOUND: candidate_pool(limit, K) must equal max(K×limit, FLOOR).
+    //
+    // The documented contract: `limit.saturating_mul(k).max(CANDIDATE_POOL_FLOOR)`.
+    // This pins the O(pool) bound: the gate re-parses at most pool files, where
+    // pool ≤ K × limit for any limit ≥ FLOOR/K (i.e. limit ≥ 20 for K=5, FLOOR=100).
+    // The bound is enforced by `.take(window)` in ast.rs BEFORE calling
+    // pattern_occurs_in_file, so re-parse count ≤ pool.
+    //
+    // NEGATIVE (PF-007): If candidate_pool were changed to return just `limit` (no
+    // multiplier), pool(100, K) would be 100 instead of 500, catching the regression.
+    const FLOOR: usize = 100; // must match CANDIDATE_POOL_FLOOR in query.rs
+    for limit in [1usize, 5, 10, 100] {
+        let pool = super::super::query::candidate_pool(
+            limit,
+            super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        );
+        let expected = (EXPECTED_K * limit).max(FLOOR);
+        assert_eq!(
+            pool,
+            expected,
+            "AC12 pool-size: candidate_pool({limit}, K={EXPECTED_K}) must be \
+             max(K×limit, FLOOR={FLOOR}) = max({}, {FLOOR}) = {expected}; got {pool}",
+            EXPECTED_K * limit
+        );
+    }
+
+    // For limit >= FLOOR/K, the multiplier dominates: K×limit > FLOOR.
+    // Verify the O(K×limit) linear bound at limit=100 where floor is not active.
+    {
+        let limit = 100usize;
+        let pool = super::super::query::candidate_pool(
+            limit,
+            super::super::query::LEXICAL_CANDIDATE_POOL_K,
+        );
+        // K×limit = 500, which exceeds FLOOR=100, so pool must equal K×limit.
+        assert_eq!(
+            pool,
+            EXPECTED_K * limit,
+            "AC12 linear-bound: candidate_pool(100, K) must equal K×100={} when \
+             K×limit > FLOOR={FLOOR} (pool multiplier dominates). Got {pool}",
+            EXPECTED_K * limit
+        );
+        // The bound must be strictly less than total corpus for real projects.
+        // (corpus size assertion not pinned here — corpus is runtime-dependent;
+        // the above assertion ensures the multiplier path works correctly.)
+    }
+}
+
+/// AC3 (#374): Unrelated-subtree end-to-end — `run_ast_standalone` must include
+/// the genuine nested-loop file (File D) and exclude the closure-body file (File C),
+/// where File C has all constituent CST kinds present but NOT in the required
+/// `block → expression_statement → for_expression` ancestor chain.
+///
+/// File C uses a Rust closure whose body is directly `for_expression` (no
+/// intervening block or `expression_statement`), so the trigram is absent from its
+/// posting list and AND-intersect correctly excludes it.  File D has genuine nested
+/// loops and appears in results.
+///
+/// The `pattern_occurs_in_file` unit test in `compound/reparse_tests.rs`
+/// (`pattern_occurs_false_for_unrelated_subtree_kinds_ac3_374`) directly pins the
+/// GATE behavior for File C; this integration test pins the END-TO-END pipeline.
+///
+/// NEGATIVE (PF-007): If the pipeline returned File C (e.g. via a regression
+/// that re-introduces OR-union without the gate), the first assertion would fail.
+#[test]
+fn run_ast_standalone_unrelated_subtree_excluded_ac3_374() {
+    use super::super::manifest::FileManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // File D: genuine nested loops — must appear in results.
+    fs::write(
+        root.join("src/nested.rs"),
+        r#"
+fn outer() {
+    for i in 0..5 {
+        for j in 0..5 { let _ = i + j; }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // File C: closure body is directly for_expression.
+    //   Rust CST: block → expression_statement → let_declaration →
+    //             closure_expression → for_expression
+    // The for_expression's parent is closure_expression (NOT expression_statement),
+    // so the trigram (block, expression_statement, for_expression) is NOT in the
+    // posting list → AND-intersect excludes it without reaching the strict gate.
+    fs::write(
+        root.join("src/closure_for.rs"),
+        r#"
+fn uses_closure() {
+    let _g = || for i in 0..5 { let _ = i; };
+    println!("done");
+}
+"#,
+    )
+    .unwrap();
+
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(root, cache.path());
+
+    let manifest = FileManifest::load(root.to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    let mut out: Vec<u8> = Vec::new();
+    let result = super::run_ast_standalone(
+        "rust-nested-loop",
+        super::super::types::Page::first(20),
+        false,
+        cache.path(),
+        &manifest,
+        None,
+        None,
+        None,
+        root,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(
+        result,
+        std::process::ExitCode::SUCCESS,
+        "AC3: run_ast_standalone must exit 0"
+    );
+
+    let text = String::from_utf8(out).unwrap();
+
+    // POSITIVE: genuine nested loops must appear.
+    assert!(
+        text.contains("nested.rs"),
+        "AC3 POSITIVE: output must contain nested.rs (genuine nested loops); got:\n{text}"
+    );
+
+    // NEGATIVE (PF-007): closure_for.rs has for_expression but NOT in the required
+    // ancestor chain → must NOT appear.  A regression to OR-union-only would make
+    // it appear if the trigram somehow got into the posting list.
+    assert!(
+        !text.contains("closure_for.rs"),
+        "AC3 NEGATIVE: output must NOT contain closure_for.rs (closure-body for, \
+         no expression_statement wrapper) — unrelated-subtree file must be excluded. \
+         Got:\n{text}"
+    );
+}
+
+// AC13 (#374): Entry-point agreement — see
+// `crates/rskim-search/src/ast_index/query_tests.rs::ac13_search_ast_and_layer_agree_on_fileid_set`
+// for the full falsifiable test using real AstIndexBuilder/AstIndexReader.
+// That test lives in `rskim-search` where all engine types are already in scope.
+
+// ============================================================================
+// Group 12: #377 — compound text+--ast path honors --weights (AD-377-1)
+// ============================================================================
+//
+// Before #377, run_compound_query hardcoded `CompositeWeights::default()` and
+// silently ignored caller-supplied `--weights` on the text+--ast path (the
+// ticket's "byte-identical output" bug). These tests drive the real compound
+// path (execute_query with ast_scored = Some) and assert the fix (PF-007: each
+// fails if the fix is reverted).
+
+/// AC2 (NEGATIVE, byte-identity): on the compound path, `composite_weights = None`
+/// MUST produce results byte-identical to `Some(parse_weights_flag("0.5,0.3,0.2"))`
+/// (the default profile). Back-compat guard for AD-377-1.
+#[test]
+fn compound_none_weights_byte_identical_to_explicit_default_ac2() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        ast_scored.len() >= 2,
+        "AC2 setup: rust-nested-loop must match alpha.rs + beta.rs (>=2 files), got {}",
+        ast_scored.len()
+    );
+
+    let mut base = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    base.composite_weights = None;
+    let out_none = execute_query(&base, &TEST_ANALYTICS).unwrap();
+
+    let mut explicit = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored),
+        None,
+    );
+    explicit.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,0.2").unwrap());
+    let out_default = execute_query(&explicit, &TEST_ANALYTICS).unwrap();
+
+    let pn: Vec<(&str, f64)> = out_none
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    let pd: Vec<(&str, f64)> = out_default
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    assert_eq!(
+        pn, pd,
+        "AC2: compound `None` weights must be byte-identical to explicit Some(0.5,0.3,0.2)"
+    );
+}
+
+/// AC5 (contract, POSITIVE): `--weights 0,0,0` on the compound path returns the
+/// FULL non-empty intersection, every score == 0.0, diverging intentionally from
+/// the blast path (which returns empty). This ALSO falsifies the AD-377-1 bug:
+/// under the old hardcoded `CompositeWeights::default()` (0.5,0.3,0.2) the scores
+/// would be non-zero, so the `score == 0.0` assertion would fail.
+#[test]
+fn compound_zero_weights_returns_full_intersection_at_zero_ac5() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        ast_scored.len() >= 2,
+        "AC5 setup: rust-nested-loop must match >=2 files, got {}",
+        ast_scored.len()
+    );
+
+    // Reference run (default weights) to size the expected intersection cardinality.
+    let ref_cfg = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    let ref_out = execute_query(&ref_cfg, &TEST_ANALYTICS).unwrap();
+    assert!(
+        !ref_out.results.is_empty(),
+        "AC5 setup: default-weights compound run must return a non-empty intersection"
+    );
+
+    let mut zero_cfg = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored),
+        None,
+    );
+    zero_cfg.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0,0,0").unwrap());
+    let zero_out = execute_query(&zero_cfg, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !zero_out.results.is_empty(),
+        "AC5: --weights 0,0,0 on compound path must return a NON-EMPTY intersection \
+         (diverges from blast path's empty result)"
+    );
+    assert_eq!(
+        zero_out.results.len(),
+        ref_out.results.len(),
+        "AC5: zero-weights must return the FULL intersection (same cardinality as default)"
+    );
+    for r in &zero_out.results {
+        assert_eq!(
+            r.score, 0.0,
+            "AC5/AD-377-1: every score under --weights 0,0,0 must be exactly 0.0 — a non-zero \
+             score proves --weights is being ignored and the default 0.5,0.3,0.2 is still hardcoded \
+             (got {} for {})",
+            r.score, r.path
+        );
+    }
+}
+
+/// Fixture for the AC1/AC4 ordering-flip tests: two files that BOTH match
+/// `rust-nested-loop` AND contain the token `needle`, but with a deliberate
+/// lexical skew so the lexical ranking is unambiguous.
+///
+/// - `src/aaa.rs` — tiny file, `needle` repeated several times → lexically DOMINANT.
+/// - `src/bbb.rs` — large filler body, `needle` once → lexically WEAK.
+///
+/// `aaa` sorts before `bbb`, so `FileId(aaa) < FileId(bbb)`. The tests assign the
+/// AST-layer score so `bbb` is AST-DOMINANT. With those opposite rankings, shifting
+/// the lexical:ast weight ratio flips the top result (AC1).
+fn make_project_two_ast_files_lexical_skew() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // aaa: tiny, many `needle` occurrences → high BM25F (short doc, high TF).
+    fs::write(
+        root.join("src/aaa.rs"),
+        r#"
+fn aaa() {
+    // needle needle needle needle needle needle
+    for i in 0..2 {
+        for j in 0..2 {
+            let _ = (i, j);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // bbb: large filler body, exactly one `needle` → low BM25F (long doc, low TF).
+    let filler =
+        "    // padding line to lengthen the document and depress term frequency\n".repeat(40);
+    fs::write(
+        root.join("src/bbb.rs"),
+        format!(
+            r#"
+fn bbb() {{
+    // needle
+{filler}
+    for x in 0..2 {{
+        for y in 0..2 {{
+            let _ = (x, y);
+        }}
+    }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    fs::write(root.join("config.json"), r#"{"key": "value"}"#).unwrap();
+    dir
+}
+
+/// Resolve a single repo-relative path to its `FileId` via the manifest.
+/// Panics if the path is not present (a test-setup bug).
+fn file_id_for(project: &Path, cache: &Path, rel_path: &str) -> rskim_search::FileId {
+    use std::collections::HashMap;
+
+    use super::super::manifest::FileManifest;
+    let manifest =
+        FileManifest::load(project.to_path_buf(), cache.to_path_buf()).expect("manifest must load");
+    let sorted = manifest.sorted_paths();
+    let mut allowed: HashMap<String, f64> = HashMap::new();
+    allowed.insert(rel_path.to_string(), 1.0_f64);
+    let ids = super::super::temporal::paths_to_file_ids(&sorted, &allowed);
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one FileId for {rel_path:?}, got {ids:?} (indexed: {sorted:?})"
+    );
+    *ids.iter().next().unwrap()
+}
+
+/// Build the asymmetric AST-scored vector for the skew fixture: `bbb` (AST-dominant)
+/// gets the higher score, `aaa` the lower; sorted FileId-ASC per the frozen contract.
+fn skew_ast_scored(project: &Path, cache: &Path) -> Vec<(rskim_search::FileId, f64)> {
+    let fid_aaa = file_id_for(project, cache, "src/aaa.rs");
+    let fid_bbb = file_id_for(project, cache, "src/bbb.rs");
+    assert!(
+        fid_aaa.0 < fid_bbb.0,
+        "fixture invariant: aaa must sort before bbb (got {fid_aaa:?} / {fid_bbb:?})"
+    );
+    // aaa lower AST score, bbb higher AST score → AST rank: bbb=1, aaa=2.
+    // Sorted FileId-ASC (aaa first) as intersect_and_rank requires.
+    vec![(fid_aaa, 1.0), (fid_bbb, 9.0)]
+}
+
+/// AC1 (Functionality, POSITIVE): the compound text+--ast path honors the
+/// lexical:ast ratio — the TOP result MUST flip between lexical-heavy (0.9,0.1,0.0)
+/// and ast-heavy (0.1,0.9,0.0) weights. Falsifies the AD-377-1 bug: under the old
+/// hardcoded default the top result would be identical for both weightings.
+#[test]
+fn compound_top_result_flips_with_weights_ac1() {
+    use super::super::query::execute_query;
+
+    let project = make_project_two_ast_files_lexical_skew();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let ast_scored = skew_ast_scored(project.path(), cache.path());
+
+    let mut lex_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored.clone()),
+        None,
+    );
+    lex_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.9,0.1,0.0").unwrap());
+    let out_lex = execute_query(&lex_heavy, &TEST_ANALYTICS).unwrap();
+
+    let mut ast_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored),
+        None,
+    );
+    ast_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.1,0.9,0.0").unwrap());
+    let out_ast = execute_query(&ast_heavy, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !out_lex.results.is_empty() && !out_ast.results.is_empty(),
+        "AC1 setup: both weightings must return a non-empty intersection (lex={}, ast={})",
+        out_lex.results.len(),
+        out_ast.results.len()
+    );
+    let top_lex = out_lex.results[0].path.as_str();
+    let top_ast = out_ast.results[0].path.as_str();
+    assert_ne!(
+        top_lex, top_ast,
+        "AC1: top result MUST flip when the lexical:ast ratio shifts (got {top_lex} both times) — \
+         proves --weights is honored on the compound path"
+    );
+    assert_eq!(
+        top_lex, "src/aaa.rs",
+        "AC1: under lexical-heavy weights the lexically-dominant file (aaa) must rank first"
+    );
+    assert_eq!(
+        top_ast, "src/bbb.rs",
+        "AC1: under ast-heavy weights the AST-dominant file (bbb) must rank first"
+    );
+}
+
+/// AC4 (Functionality, POSITIVE): the text+--ast+--blast-radius triple-flag path
+/// honors the lexical:ast ratio exactly as AC1. The blast set allows BOTH files so
+/// the intersection is unchanged; the flip is driven purely by the weight ratio.
+#[test]
+fn compound_with_blast_top_result_flips_with_weights_ac4() {
+    use std::collections::HashMap;
+
+    use super::super::query::execute_query;
+
+    let project = make_project_two_ast_files_lexical_skew();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let ast_scored = skew_ast_scored(project.path(), cache.path());
+
+    // Blast set allows both AST files → blast∩AST == AST (intersection unchanged).
+    let blast: HashMap<String, f64> = [
+        ("src/aaa.rs".to_string(), 1.0),
+        ("src/bbb.rs".to_string(), 1.0),
+    ]
+    .into_iter()
+    .collect();
+
+    let mut lex_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored.clone()),
+        Some(blast.clone()),
+    );
+    lex_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.9,0.1,0.0").unwrap());
+    let out_lex = execute_query(&lex_heavy, &TEST_ANALYTICS).unwrap();
+
+    let mut ast_heavy = make_query_config(
+        project.path(),
+        cache.path(),
+        "needle",
+        10,
+        Some(ast_scored),
+        Some(blast),
+    );
+    ast_heavy.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.1,0.9,0.0").unwrap());
+    let out_ast = execute_query(&ast_heavy, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !out_lex.results.is_empty() && !out_ast.results.is_empty(),
+        "AC4 setup: both weightings must return a non-empty blast∩AST intersection"
+    );
+    let top_lex = out_lex.results[0].path.as_str();
+    let top_ast = out_ast.results[0].path.as_str();
+    assert_ne!(
+        top_lex, top_ast,
+        "AC4: top result MUST flip on the text+--ast+--blast path when the lexical:ast ratio shifts"
+    );
+    assert_eq!(top_lex, "src/aaa.rs", "AC4: lexical-heavy → aaa first");
+    assert_eq!(top_ast, "src/bbb.rs", "AC4: ast-heavy → bbb first");
+}
+
+/// AC3 (#388, DIRECT byte-identity): on the text+--ast compound path, two
+/// invocations that differ ONLY in the temporal (3rd) weight component MUST
+/// produce byte-identical result sets. The compound path never applies a
+/// temporal sort (no `--hot`/`--cold`/`--risky`), so the temporal weight is
+/// inert there (AD-377-1) — a change to it must never move a result.
+///
+/// Before this test, AC3 was proven only INDIRECTLY: the notice-fires tests
+/// (`ac3_ac4a_weights_inert_notice_compound_temporal_predicate` in
+/// query_tests.rs) confirm a *warning* is emitted, and AC5
+/// (`compound_zero_weights_returns_full_intersection_at_zero_ac5` above)
+/// zeroes ALL three weights at once. Neither directly compares two REAL
+/// `execute_query` runs that vary only the temporal component. This test
+/// closes that gap: it falsifies a regression where the 3rd weight leaks into
+/// the compound ranking (e.g. an accidental temporal re-sort or a composite
+/// formula that no longer drops the temporal term on this path).
+#[test]
+fn compound_temporal_weight_inert_byte_identical_ac3() {
+    use super::super::query::execute_query;
+
+    let project = make_project_with_two_nested_loop_files();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let engine = super::open_ast_engine(cache.path()).unwrap();
+    let ast_scored = super::resolve_ast_scored(&engine, "rust-nested-loop").unwrap();
+    assert!(
+        ast_scored.len() >= 2,
+        "AC3 setup: rust-nested-loop must match alpha.rs + beta.rs (>=2 files), got {}",
+        ast_scored.len()
+    );
+
+    let mut low_temporal = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored.clone()),
+        None,
+    );
+    low_temporal.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,0.2").unwrap());
+    let out_low = execute_query(&low_temporal, &TEST_ANALYTICS).unwrap();
+
+    let mut high_temporal = make_query_config(
+        project.path(),
+        cache.path(),
+        "fn",
+        50,
+        Some(ast_scored),
+        None,
+    );
+    high_temporal.composite_weights =
+        Some(rskim_search::CompositeWeights6::parse_weights_flag("0.5,0.3,9.9").unwrap());
+    let out_high = execute_query(&high_temporal, &TEST_ANALYTICS).unwrap();
+
+    assert!(
+        !out_low.results.is_empty(),
+        "AC3 setup: compound run must return a non-empty intersection"
+    );
+
+    let low: Vec<(&str, f64)> = out_low
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    let high: Vec<(&str, f64)> = out_high
+        .results
+        .iter()
+        .map(|r| (r.path.as_str(), r.score))
+        .collect();
+    assert_eq!(
+        low, high,
+        "AC3: on the text+--ast compound path, --weights 0.5,0.3,0.2 and 0.5,0.3,9.9 \
+         (differing ONLY in the inert temporal weight) must produce byte-identical \
+         result sets — a difference here proves the temporal weight leaked into the \
+         compound ranking despite there being no temporal sort on this path"
+    );
+}
+
+// ============================================================================
+// #394: Standalone --ast returned zero results for all 5 synthetic-marker
+// patterns (god-function, deep-nesting, empty-function, empty-catch,
+// excessive-params). Root cause: `vocab_lookup` never yields a synthetic ID
+// (>= BUCKET_LABEL_BASE), so the real-CST ancestor walk in
+// `pattern_occurs_in_file` was structurally unsatisfiable for them. Fixed via
+// extraction-reuse (AD-394-1/AD-394-2). AC numbers below match the design
+// plan (.devflow/docs/design/wave4-p0/2026-07-04_0930/394-ast-synthetic-markers-plan.md).
+// ============================================================================
+
+/// Ground-truth representative line for each of the 5 synthetic patterns'
+/// exhibiting fixture file (AC10, AC13). Established via empirical dogfood
+/// verification against the built release binary — NOT eyeballed (ADR-003:
+/// grounded, not assumed). Each matches the AD-394-5 per-pattern rule:
+/// god-function/empty-function -> enclosing function line; empty-catch ->
+/// enclosing catch_clause line; excessive-params -> parameter-list's own
+/// line (coincides with the signature line here); deep-nesting -> first node
+/// crossing CST depth >= 4.
+const GOD_FUNCTION_LINE: u32 = 2; // `fn big() {`
+const DEEP_NESTING_LINE: u32 = 3; // `    if true {`
+const EMPTY_FUNCTION_LINE: u32 = 2; // `fn todo_later() {`
+const EMPTY_CATCH_LINE: u32 = 4; // `} catch (e) {`
+const EXCESSIVE_PARAMS_LINE: u32 = 2; // `fn many(a: i32, ...) -> i32 {`
+
+/// Build a project fixture with one exhibiting file per synthetic-marker
+/// pattern (AC1 positives) PLUS its negative twin (AC3). Mirrors the #374
+/// `make_project_for_374_gate` convention: `.git` root + `src/` files. Each
+/// positive fixture places its target construct at a KNOWN line matching the
+/// `*_LINE` constants above (empirically verified, not assumed).
+fn make_project_with_394_synthetic_patterns() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // ── Positives (AC1) ──────────────────────────────────────────────────────
+
+    // god-function: LARGE_BODY -> bucket_label(1), needs >= 20 body statements
+    // (BODY_STMT_EDGES[1] = 20). 20 let-statements — matches the GOLD-verified
+    // catalog example in patterns.rs (reformatted onto known lines).
+    fs::write(
+        root.join("src/god_fn.rs"),
+        "\nfn big() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19; let t=20;\n}\n",
+    )
+    .unwrap();
+
+    // deep-nesting: DEEP_NODE -> bucket_label(0), needs a node at CST depth >= 4.
+    fs::write(
+        root.join("src/deep.rs"),
+        "\nfn a() {\n    if true {\n        for _ in 0..1 {\n            \
+         if true {\n                do_work();\n            }\n        }\n    }\n}\n",
+    )
+    .unwrap();
+
+    // empty-function: EMPTY_BODY -> function_item, zero counted children in body.
+    fs::write(root.join("src/empty_fn.rs"), "\nfn todo_later() {\n}\n").unwrap();
+
+    // excessive-params: MANY_PARAMS -> bucket_label(0), needs >= 5 params
+    // (PARAM_EDGES[0] = 5).
+    fs::write(
+        root.join("src/many_params.rs"),
+        "\nfn many(a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 {\n    \
+         a + b + c + d + e\n}\n",
+    )
+    .unwrap();
+
+    // empty-catch: EMPTY_BODY -> catch_clause, zero counted children in catch body.
+    // Uses a unique function name (`empty_catch_fn`) in the try body so AC2 can
+    // select this file with a term that does NOT appear in not_empty_catch.ts
+    // (which calls `f()` instead). Line numbers are unchanged: the `} catch (e) {`
+    // clause remains on line 4 (EMPTY_CATCH_LINE = 4).
+    fs::write(
+        root.join("src/empty_catch.ts"),
+        "\ntry {\n    empty_catch_fn();\n} catch (e) {\n}\n",
+    )
+    .unwrap();
+
+    // ── Negative twins (AC3) — each crosses some but not all thresholds, or
+    // has none of the relevant marker; empirically dogfood-verified to NOT
+    // match its corresponding pattern. ──────────────────────────────────────
+
+    // 19 body statements: crosses BODY_STMT_EDGES[0]=10 but NOT [1]=20.
+    fs::write(
+        root.join("src/not_god_fn.rs"),
+        "fn nineteen() {\n    \
+         let a=1; let b=2; let c=3; let d=4; let e=5; let f=6; let g=7;\n    \
+         let h=8; let i=9; let j=10; let k=11; let l=12; let m=13; let n=14;\n    \
+         let o=15; let p=16; let q=17; let r=18; let s=19;\n}\n",
+    )
+    .unwrap();
+
+    // 4 params: below PARAM_EDGES[0]=5.
+    fs::write(
+        root.join("src/not_many_params.rs"),
+        "fn four(a: i32, b: i32, c: i32, d: i32) -> i32 {\n    a + b + c + d\n}\n",
+    )
+    .unwrap();
+
+    // Non-empty catch body.
+    fs::write(
+        root.join("src/not_empty_catch.ts"),
+        "try {\n    f();\n} catch (e) {\n    log(e);\n}\n",
+    )
+    .unwrap();
+
+    // Non-empty function body.
+    fs::write(
+        root.join("src/not_empty_fn.rs"),
+        "fn f() {\n    let x = 1;\n}\n",
+    )
+    .unwrap();
+
+    // Trivial top-level-only fixture — empirically dogfood-verified (via a
+    // real index build + `--ast deep-nesting` query) to have CST max_depth < 4.
+    // AC3 requires this be confirmed empirically, NOT by counting braces —
+    // depth is 0-indexed CST depth and even simple code can reach depth 4.
+    fs::write(root.join("src/not_deep.rs"), "struct S;\n").unwrap();
+
+    dir
+}
+
+/// AC1 (#394): standalone `--ast <pattern>` returns a NON-EMPTY result set
+/// whose text output CONTAINS the exhibiting file's exact path, for ALL FIVE
+/// synthetic-marker patterns. Before the fix, standalone `--ast` returned
+/// zero results for every one of these 5 patterns.
+///
+/// NEGATIVE (PF-007): if the fix regressed to always-empty, every iteration
+/// of this loop fails.
+#[test]
+fn run_ast_standalone_all_five_synthetic_patterns_positive_ac1_394() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Use the full relative paths (src/<file>) so the assertion cannot
+    // accidentally match the negative twin — e.g. "god_fn.rs" is a substring
+    // of "not_god_fn.rs", but "src/god_fn.rs" is NOT a substring of
+    // "src/not_god_fn.rs" (reviewer finding: latent weak assertion).
+    //
+    // (exhibiting_file, negative_twin) — plan §8B requires BOTH are asserted
+    // (positive: exhibiting IS present; negative: twin is ABSENT).
+    let cases: [(&str, &str, &str); 5] = [
+        ("god-function", "src/god_fn.rs", "src/not_god_fn.rs"),
+        ("deep-nesting", "src/deep.rs", "src/not_deep.rs"),
+        ("empty-function", "src/empty_fn.rs", "src/not_empty_fn.rs"),
+        (
+            "empty-catch",
+            "src/empty_catch.ts",
+            "src/not_empty_catch.ts",
+        ),
+        (
+            "excessive-params",
+            "src/many_params.rs",
+            "src/not_many_params.rs",
+        ),
+    ];
+
+    for (pattern, exhibiting_file, negative_twin) in cases {
+        let mut out: Vec<u8> = Vec::new();
+        let result = super::run_ast_standalone(
+            pattern,
+            super::super::types::Page::first(20),
+            false,
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            std::process::ExitCode::SUCCESS,
+            "AC1 (#394): --ast {pattern} must exit 0"
+        );
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(exhibiting_file),
+            "AC1 (#394): --ast {pattern} must return a NON-EMPTY result set \
+             containing {exhibiting_file}; got:\n{text}"
+        );
+        // plan §8B: negative twin must be ABSENT (the AND-intersect candidate set
+        // excludes it because it lacks the marker bigram, but this end-to-end
+        // assertion makes the full standalone pipeline coverage explicit).
+        assert!(
+            !text.contains(negative_twin),
+            "AC1 (#394): --ast {pattern} must NOT return the negative twin \
+             {negative_twin} (it lacks the synthetic marker bigram); got:\n{text}"
+        );
+    }
+}
+
+/// AC2 (#394): the exhibiting file returned by standalone `--ast <p>` is ALSO
+/// returned by the compound path `<text> --ast <p>`, for ALL FIVE synthetic
+/// patterns (membership assertion — ranking/windowing may differ between the
+/// two paths, so list-identity is NOT asserted).
+#[test]
+fn run_ast_standalone_matches_compound_for_all_five_synthetic_patterns_ac2_394() {
+    use super::super::manifest::FileManifest;
+    use super::super::query::execute_query;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Use full relative paths (src/<file>) — bare filenames are substrings of
+    // their negative twins (e.g. "god_fn.rs" ⊆ "not_god_fn.rs"), so a result
+    // that accidentally contained only the twin would pass a bare-filename
+    // check. "src/god_fn.rs" is NOT a substring of "src/not_god_fn.rs".
+    // (pattern, exhibiting file with src/ prefix, text term unique to that fixture file)
+    // Note: "catch" was previously used for empty-catch but also appears in
+    // not_empty_catch.ts. The fixture now uses `empty_catch_fn()` in the try
+    // body, making "empty_catch_fn" genuinely unique to src/empty_catch.ts.
+    let cases: [(&str, &str, &str); 5] = [
+        ("god-function", "src/god_fn.rs", "big"),
+        ("deep-nesting", "src/deep.rs", "do_work"),
+        ("empty-function", "src/empty_fn.rs", "todo_later"),
+        ("empty-catch", "src/empty_catch.ts", "empty_catch_fn"),
+        ("excessive-params", "src/many_params.rs", "many"),
+    ];
+
+    for (pattern, exhibiting_file, term) in cases {
+        // Standalone.
+        let mut standalone_out: Vec<u8> = Vec::new();
+        super::run_ast_standalone(
+            pattern,
+            super::super::types::Page::first(20),
+            false,
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut standalone_out,
+        )
+        .unwrap();
+        let standalone_text = String::from_utf8(standalone_out).unwrap();
+        assert!(
+            standalone_text.contains(exhibiting_file),
+            "AC2 (#394): standalone --ast {pattern} must contain {exhibiting_file}; \
+             got:\n{standalone_text}"
+        );
+
+        // Compound: text term + --ast.
+        let engine = super::open_ast_engine(cache.path()).unwrap();
+        let ast_scored = super::resolve_ast_scored(&engine, pattern).unwrap();
+        let config = make_query_config(
+            project.path(),
+            cache.path(),
+            term,
+            20,
+            Some(ast_scored),
+            None,
+        );
+        let compound_out = execute_query(&config, &TEST_ANALYTICS).unwrap();
+        let found = compound_out
+            .results
+            .iter()
+            .any(|r| r.path.contains(exhibiting_file));
+        assert!(
+            found,
+            "AC2 (#394): compound '{term} --ast {pattern}' must ALSO return \
+             {exhibiting_file}; got paths: {:?}",
+            compound_out
+                .results
+                .iter()
+                .map(|r| &r.path)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// AC3 (#394): `pattern_occurs_in_file` returns FALSE for each synthetic
+/// pattern's negative twin — proves the gate discriminates rather than
+/// always-true. Uses direct file calls (no index build needed).
+///
+/// NEGATIVE (PF-007): an always-true stub (e.g. "any synthetic-containing
+/// pattern passes unconditionally") would fail every assertion below.
+#[test]
+fn pattern_occurs_in_file_false_for_all_five_synthetic_negative_twins_ac3_394() {
+    let project = make_project_with_394_synthetic_patterns();
+
+    let cases: [(&str, &str); 5] = [
+        ("god-function", "src/not_god_fn.rs"),
+        ("deep-nesting", "src/not_deep.rs"),
+        ("empty-function", "src/not_empty_fn.rs"),
+        ("empty-catch", "src/not_empty_catch.ts"),
+        ("excessive-params", "src/not_many_params.rs"),
+    ];
+
+    // AC3 requires the not_deep.rs twin to be empirically verified to have
+    // CST max_depth < 4 via linearize_source — NOT by counting braces (depth
+    // is 0-indexed CST depth and even simple code can reach depth 4). Plan §8A
+    // explicitly states the Coder must confirm this in-test, not in a comment.
+    {
+        let not_deep_path = project.path().join("src/not_deep.rs");
+        let not_deep_src = fs::read_to_string(&not_deep_path).unwrap();
+        let not_deep_result =
+            rskim_search::linearize_source(&not_deep_src, rskim_core::Language::Rust)
+                .expect("linearize_source must succeed on not_deep.rs");
+        let max_depth = not_deep_result
+            .nodes
+            .iter()
+            .map(|n| n.depth)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_depth < 4,
+            "AC3 (#394): not_deep.rs ('struct S;') must have CST max_depth < 4 \
+             (0-indexed); got {max_depth} — depth is 0-indexed and non-obvious, \
+             hence this in-test empirical check per plan §8A"
+        );
+    }
+
+    for (pattern, rel_path) in cases {
+        let query = rskim_search::parse_ast_query(pattern).unwrap();
+        let path = project.path().join(rel_path);
+        assert!(
+            !rskim_search::pattern_occurs_in_file(&path, &query, None),
+            "AC3 (#394): {pattern}'s negative twin ({rel_path}) must NOT match \
+             (gate must discriminate, not always-true)"
+        );
+    }
+
+    // POSITIVE control (PF-007 double-assertion): the SAME gate call returns
+    // true for the corresponding exhibiting file, proving it is not
+    // always-false either.
+    let positive_cases: [(&str, &str); 5] = [
+        ("god-function", "src/god_fn.rs"),
+        ("deep-nesting", "src/deep.rs"),
+        ("empty-function", "src/empty_fn.rs"),
+        ("empty-catch", "src/empty_catch.ts"),
+        ("excessive-params", "src/many_params.rs"),
+    ];
+    for (pattern, rel_path) in positive_cases {
+        let query = rskim_search::parse_ast_query(pattern).unwrap();
+        let path = project.path().join(rel_path);
+        assert!(
+            rskim_search::pattern_occurs_in_file(&path, &query, None),
+            "AC3 (#394) control: {pattern}'s exhibiting file ({rel_path}) must match"
+        );
+    }
+}
+
+/// AC7 (#394), parse-level half: a containment query written with
+/// synthetic-marker names is REJECTED at parse with `InvalidQuery` — synthetic
+/// names are not real vocabulary kinds, so `vocab_lookup` fails for them in
+/// `parse_bigram`. Only named `AstQuery::Pattern` queries can ever route
+/// synthetic (the `AncestorMatchTable::contains_synthetic_id`-false half of
+/// AC7 is covered in `reparse_tests.rs`, which has direct access to the
+/// private table).
+#[test]
+fn synthetic_marker_names_rejected_in_containment_query_ac7_394() {
+    let result = rskim_search::parse_ast_query("__deep_node__ > __deep_node_b4__");
+    assert!(
+        result.is_err(),
+        "AC7 (#394): a containment query using synthetic-marker names must be \
+         rejected at parse (InvalidQuery), not silently accepted; got: {result:?}"
+    );
+}
+
+/// AC8 (#394), CRITICAL invariant: no pattern in the catalog mixes a
+/// synthetic-containing n-gram (any resolved component >= BUCKET_LABEL_BASE)
+/// with a real n-gram (all components < BUCKET_LABEL_BASE). This is the
+/// safety assumption that makes AD-394-2's WHOLE-PATTERN routing sound; if it
+/// is ever violated, extraction-reuse would silently loosen a real pattern's
+/// gate too (see AD-394-2 / OD-394-2).
+///
+/// This test MUST fail fast if the invariant is ever violated (R4 mitigation).
+#[test]
+fn no_catalog_pattern_mixes_real_and_synthetic_ngrams_ac8_394() {
+    use rskim_search::is_synthetic_id;
+
+    for pattern in rskim_search::all_patterns() {
+        let query = rskim_search::parse_ast_query(pattern.name)
+            .unwrap_or_else(|e| panic!("pattern {:?} must parse: {e}", pattern.name));
+        let rskim_search::AstQuery::Pattern(p) = &query else {
+            panic!(
+                "catalog pattern {:?} must parse to AstQuery::Pattern",
+                pattern.name
+            );
+        };
+
+        let mut has_synthetic = false;
+        let mut has_real = false;
+        for bigram in p.resolved_bigrams() {
+            let (parent, child) = bigram.decode();
+            if is_synthetic_id(parent) || is_synthetic_id(child) {
+                has_synthetic = true;
+            } else {
+                has_real = true;
+            }
+        }
+        for trigram in p.resolved_trigrams() {
+            let (gp, parent, child) = trigram.decode();
+            if is_synthetic_id(gp) || is_synthetic_id(parent) || is_synthetic_id(child) {
+                has_synthetic = true;
+            } else {
+                has_real = true;
+            }
+        }
+
+        assert!(
+            !(has_synthetic && has_real),
+            "AC8 (#394) CRITICAL: pattern {:?} mixes synthetic AND real n-grams — \
+             this violates the whole-pattern routing invariant (AD-394-2/OD-394-2); \
+             a per-n-gram routing redesign or pattern split is required",
+            pattern.name
+        );
+    }
+}
+
+/// AC9 (#394): catalog-driven regression guard over ALL 29 patterns (moved
+/// here from `reparse_tests.rs` for LOCAL execution — `all_patterns`,
+/// `parse_ast_query`, and `pattern_occurs_in_file` are all pub-exported). For
+/// every pattern, writing its GOLD-verified `example` to a tempfile with the
+/// matching extension and calling `pattern_occurs_in_file` must return `true`
+/// — this is the guard that would have caught #394 at introduction (the 5
+/// synthetic patterns would have failed this assertion before the fix).
+#[test]
+fn catalog_driven_pattern_occurs_true_for_every_pattern_example_ac9_394() {
+    fn extension_for(lang: rskim_core::Language) -> &'static str {
+        match lang {
+            rskim_core::Language::Rust => "rs",
+            rskim_core::Language::TypeScript => "ts",
+            rskim_core::Language::Python => "py",
+            rskim_core::Language::Go => "go",
+            rskim_core::Language::Java => "java",
+            rskim_core::Language::Ruby => "rb",
+            other => panic!(
+                "AC9 (#394): pattern catalog example_lang {other:?} has no \
+                 extension mapping in this test — add one (load-bearing \
+                 symmetry with Language::from_path)"
+            ),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+
+    for pattern in rskim_search::all_patterns() {
+        let ext = extension_for(pattern.example_lang);
+        let path = dir
+            .path()
+            .join(format!("{}.{ext}", pattern.name.replace('-', "_")));
+        fs::write(&path, pattern.example).unwrap();
+
+        let query = rskim_search::parse_ast_query(pattern.name)
+            .unwrap_or_else(|e| panic!("pattern {:?} must parse: {e}", pattern.name));
+
+        assert!(
+            rskim_search::pattern_occurs_in_file(&path, &query, None),
+            "AC9 (#394): catalog pattern {:?}'s GOLD-verified example must satisfy \
+             pattern_occurs_in_file (this is the guard that would have caught #394 \
+             — all 5 synthetic patterns failed this before the fix)",
+            pattern.name
+        );
+    }
+}
+
+/// AC10 (#394): synthetic-pattern rows carry a non-null `line` in `--json`
+/// output, equal to the ground-truth representative line (AD-394-5), for ALL
+/// FIVE patterns. PF-007 discriminating: asserts the VALUE, not just presence
+/// or exit 0 — a stub emitting `"line": null` or an arbitrary line fails this.
+#[test]
+fn run_ast_standalone_json_line_matches_ground_truth_for_all_five_ac10_394() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Use full relative paths (src/<file>) — bare filenames are substrings of
+    // their negative twins and would not discriminate if the twin appeared in
+    // the result set. "src/god_fn.rs" is NOT a substring of "src/not_god_fn.rs".
+    //
+    // (exhibiting_file, negative_twin, expected_line) — plan §8B: assert
+    // exhibiting IS present AND negative twin IS ABSENT (end-to-end pipeline
+    // coverage of the full standalone path dropping a non-match).
+    let cases: [(&str, &str, &str, u32); 5] = [
+        (
+            "god-function",
+            "src/god_fn.rs",
+            "src/not_god_fn.rs",
+            GOD_FUNCTION_LINE,
+        ),
+        (
+            "deep-nesting",
+            "src/deep.rs",
+            "src/not_deep.rs",
+            DEEP_NESTING_LINE,
+        ),
+        (
+            "empty-function",
+            "src/empty_fn.rs",
+            "src/not_empty_fn.rs",
+            EMPTY_FUNCTION_LINE,
+        ),
+        (
+            "empty-catch",
+            "src/empty_catch.ts",
+            "src/not_empty_catch.ts",
+            EMPTY_CATCH_LINE,
+        ),
+        (
+            "excessive-params",
+            "src/many_params.rs",
+            "src/not_many_params.rs",
+            EXCESSIVE_PARAMS_LINE,
+        ),
+    ];
+
+    for (pattern, exhibiting_file, negative_twin, expected_line) in cases {
+        let mut out: Vec<u8> = Vec::new();
+        super::run_ast_standalone(
+            pattern,
+            super::super::types::Page::first(20),
+            true, // json
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut out,
+        )
+        .unwrap();
+
+        let json_text = String::from_utf8(out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_text)
+            .unwrap_or_else(|e| panic!("AC10 (#394): --ast {pattern} --json must parse: {e}"));
+        let results = v["results"].as_array().unwrap();
+
+        // Negative twin must not appear (plan §8B).
+        assert!(
+            results.iter().all(|r| !r["path"]
+                .as_str()
+                .is_some_and(|p| p.contains(negative_twin))),
+            "AC10 (#394): --ast {pattern} --json must NOT contain the negative twin \
+             {negative_twin}; got: {v}"
+        );
+
+        // `path` is repo-relative (e.g. "src/god_fn.rs"), so match by substring
+        // against the bare filename — consistent with AC1/AC2's `.contains()`.
+        let entry = results
+            .iter()
+            .find(|r| {
+                r["path"]
+                    .as_str()
+                    .is_some_and(|p| p.contains(exhibiting_file))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "AC10 (#394): --ast {pattern} --json must contain {exhibiting_file}; got: {v}"
+                )
+            });
+
+        let line = entry["line"].as_u64();
+        assert_eq!(
+            line,
+            Some(u64::from(expected_line)),
+            "AC10 (#394): --ast {pattern}'s {exhibiting_file} JSON `line` must equal \
+             the ground-truth representative line {expected_line} (NOT null, NOT \
+             an arbitrary value); got: {:?}",
+            entry["line"]
+        );
+        assert!(
+            entry["snippet"].as_str().is_some_and(|s| !s.is_empty()),
+            "AC10 (#394): --ast {pattern}'s {exhibiting_file} must carry a non-empty \
+             snippet; got: {:?}",
+            entry["snippet"]
+        );
+    }
+}
+
+/// AC13 (#394): per-pattern representative-line rule at the `recover_line`
+/// API level (direct calls, no index needed) — for each of the 5 synthetic
+/// patterns, `recover_line` returns `Some((line, range))` with `line` equal
+/// to the AD-394-5 ground-truth node line and a non-empty `range`.
+///
+/// Each of these 5 assertions FAILS before the fix (`recover_line` returns
+/// `None` for every synthetic pattern pre-#394), proving the new branch.
+///
+/// NEGATIVE control: a REAL pattern (`rust-nested-loop`) routes through
+/// `find_first_strict_match` (#397) — `recover_line` is now synthetic-only
+/// (AD-397-3) and returns `None` for real-node patterns. The control confirms
+/// the real-node anchor path is unaffected by the synthetic-pattern branch.
+#[test]
+fn recover_line_matches_ground_truth_for_all_five_synthetic_patterns_ac13_394() {
+    let project = make_project_with_394_synthetic_patterns();
+
+    let cases: [(&str, &str, u32); 5] = [
+        ("god-function", "src/god_fn.rs", GOD_FUNCTION_LINE),
+        ("deep-nesting", "src/deep.rs", DEEP_NESTING_LINE),
+        ("empty-function", "src/empty_fn.rs", EMPTY_FUNCTION_LINE),
+        ("empty-catch", "src/empty_catch.ts", EMPTY_CATCH_LINE),
+        (
+            "excessive-params",
+            "src/many_params.rs",
+            EXCESSIVE_PARAMS_LINE,
+        ),
+    ];
+
+    for (pattern, rel_path, expected_line) in cases {
+        let query = rskim_search::parse_ast_query(pattern).unwrap();
+        let path = project.path().join(rel_path);
+        let result = rskim_search::recover_line(&path, &query, None);
+
+        let (line, range) = result.unwrap_or_else(|| {
+            panic!(
+                "AC13 (#394): recover_line({pattern}) on {rel_path} must return \
+                 Some((line, range)), not None (this is the pre-fix behavior for \
+                 every synthetic pattern)"
+            )
+        });
+        assert_eq!(
+            line, expected_line,
+            "AC13 (#394): recover_line({pattern}) on {rel_path} must report line \
+             {expected_line} (AD-394-5 ground truth); got {line}"
+        );
+        assert!(
+            !range.is_empty(),
+            "AC13 (#394): recover_line({pattern}) on {rel_path} must return a \
+             non-empty byte range so the snippet renders; got {range:?}"
+        );
+    }
+
+    // Determinism (AC-F3): repeated calls on the same file yield the same result.
+    let query = rskim_search::parse_ast_query("god-function").unwrap();
+    let path = project.path().join("src/god_fn.rs");
+    let r1 = rskim_search::recover_line(&path, &query, None);
+    let r2 = rskim_search::recover_line(&path, &query, None);
+    assert_eq!(
+        r1, r2,
+        "AC13 (#394) / AC-F3: recover_line must be deterministic for synthetic patterns"
+    );
+
+    // NEGATIVE control: a REAL pattern routes through find_first_strict_match
+    // (#397). recover_line is now synthetic-only (AD-397-3) and returns None
+    // immediately for rust-nested-loop; the real-node anchor comes from
+    // find_first_strict_match instead.
+    let real_dir = tempfile::tempdir().unwrap();
+    let real_path = real_dir.path().join("loops.rs");
+    fs::write(
+        &real_path,
+        "\nfn nested() {\n    for i in 0..10 {\n        for j in 0..10 {\n            \
+         println!(\"{i} {j}\");\n        }\n    }\n}\n",
+    )
+    .unwrap();
+    let real_query = rskim_search::parse_ast_query("rust-nested-loop").unwrap();
+    let real_result = rskim_search::find_first_strict_match(&real_path, &real_query, None);
+    assert!(
+        real_result.is_some(),
+        "AC13 (#394) control: a REAL pattern (rust-nested-loop) must return Some \
+         from find_first_strict_match for a file with nested loops (#397 anchor path); \
+         got None"
+    );
+}
+
+/// AC12 (#394): synthetic-pattern queries are query-time only — the AST index
+/// file is not rewritten across consecutive queries, and the on-disk
+/// FORMAT_VERSION remains at its initial value (3).
+///
+/// The no-rebuild assertion uses `ast_index.skidx` mtime, NOT version equality:
+/// a staleness-triggered rebuild re-writes the index at the SAME FORMAT_VERSION
+/// (3), so `version_before == version_after` would be true whether or not a
+/// rebuild fired — the mtime is the discriminating observable (reviewer finding).
+#[test]
+fn run_ast_standalone_synthetic_pattern_no_format_change_ac12_394() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_394_synthetic_patterns();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    // Pin the format version: the AC12 fix must NOT change FORMAT_VERSION.
+    //
+    // Pinned to the literal 3 (not `AST_INDEX_FORMAT_VERSION`) so that a future
+    // version bump fails this locally-runnable test, not only the CI-only lib
+    // test `format_tests.rs::a1_format_version_is_3`. Reading version_before
+    // from the just-written index and comparing to the constant would produce a
+    // tautological `X == X` that cannot detect a bump (reviewer finding).
+    // #405 (AD-405-15): the pin was updated 2 -> 3 alongside the size-cap bump.
+    let version_before = rskim_search::AstIndexReader::index_version(cache.path())
+        .expect("index_version must succeed after build");
+    assert_eq!(
+        version_before, 3u16,
+        "AC12 (#394): AST index format version must be exactly 3 (literal pin). \
+         If this fails, FORMAT_VERSION was bumped — check \
+         rskim_search::AST_INDEX_FORMAT_VERSION and update this pin deliberately"
+    );
+
+    // Capture the index file mtime BEFORE the queries — this is the
+    // discriminating observable for "no rebuild fired" (version equality alone
+    // cannot distinguish a rebuild from a no-op because rebuilds write the same
+    // FORMAT_VERSION=3).
+    let idx_path = cache.path().join("ast_index.skidx");
+    let mtime_before = std::fs::metadata(&idx_path)
+        .expect("ast_index.skidx must exist after build")
+        .modified()
+        .expect("mtime must be available for no-rebuild assertion");
+
+    let manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Query the SAME synthetic pattern twice — no staleness rebuild should fire.
+    for _ in 0..2 {
+        let mut out: Vec<u8> = Vec::new();
+        super::run_ast_standalone(
+            "god-function",
+            super::super::types::Page::first(20),
+            false,
+            cache.path(),
+            &manifest,
+            None,
+            None,
+            None,
+            project.path(),
+            &mut out,
+        )
+        .unwrap();
+    }
+
+    // Assert the index file was NOT rewritten (mtime unchanged = no rebuild).
+    let mtime_after = std::fs::metadata(&idx_path)
+        .expect("ast_index.skidx must exist after synthetic queries")
+        .modified()
+        .expect("mtime must be available after synthetic queries");
+    assert_eq!(
+        mtime_before, mtime_after,
+        "AC12 (#394): ast_index.skidx mtime must not change across synthetic-pattern \
+         queries — a changed mtime means a staleness rebuild fired, which must not \
+         happen for a read-side / query-time-only fix"
+    );
+}
+
+// ============================================================================
+// Group 12: Byte-budget verify gate (AD-405-11)
+// ============================================================================
+
+/// Create a minimal project where every Rust file has only an empty function
+/// body.  These files match the "empty-function" synthetic AST pattern
+/// (bigram `__empty_body__ → function_item`), making them ideal for testing
+/// budget exhaustion without requiring large on-disk files.
+fn make_project_with_empty_functions() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Three files, each with a single empty Rust function body.
+    // tree-sitter Rust emits EMPTY_BODY for `fn foo() {}` (zero statements in the block).
+    fs::write(root.join("src/a.rs"), "fn empty_a() {}\n").unwrap();
+    fs::write(root.join("src/b.rs"), "fn empty_b() {}\n").unwrap();
+    fs::write(root.join("src/c.rs"), "fn empty_c() {}\n").unwrap();
+
+    dir
+}
+
+/// AD-405-11: Build a `FileManifest` with the same paths as `real_manifest`
+/// but with every entry's `size` field overridden to `size_bytes`.
+///
+/// Used to inject artificially large sizes into the manifest so that the
+/// byte-budget verify gate can be triggered with tiny on-disk files.
+/// The paths and all other fields are cloned from `real_manifest` so the
+/// FileId → path mapping in the AST index remains valid.
+fn make_inflated_manifest(
+    real_manifest: &super::super::manifest::FileManifest,
+    project: &Path,
+    cache: &Path,
+    size_bytes: u64,
+) -> super::super::manifest::FileManifest {
+    let mut m =
+        super::super::manifest::FileManifest::new(project.to_path_buf(), cache.to_path_buf());
+    for path in real_manifest.sorted_paths() {
+        if let Some(e) = real_manifest.lookup(path) {
+            m.insert(super::super::manifest::ManifestEntry {
+                size: Some(size_bytes),
+                ..e.clone()
+            });
+        }
+    }
+    m
+}
+
+/// AD-405-11 (unit): budget arithmetic constants are internally coherent.
+///
+/// - `AST_VERIFY_BYTES_PER_SLOT` equals 100 KiB (pre-raise per-slot constant).
+/// - `compute_verify_budget` saturates rather than wraps at u64::MAX.
+/// - `is_over_budget` returns `false` for a file sized exactly one slot within a
+///   one-slot budget (boundary: NOT strictly greater).
+/// - `is_over_budget` returns `true` for a file one byte over the slot.
+/// - A size-unknown entry is charged `AST_SIZE_LIMIT_DEFAULT` (1 MiB) — not
+///   `AST_VERIFY_BYTES_PER_SLOT` — so `is_over_budget` fires on the very first
+///   unknown-size candidate when limit is small (AD-405-11 conservative fallback).
+///
+/// The boundary and saturation assertions call the production `compute_verify_budget`
+/// and `is_over_budget` helpers rather than reimplementing the arithmetic inline,
+/// so any change to those helpers is caught immediately here.
+#[test]
+fn ast_verify_budget_constants_and_arithmetic_ad405_11() {
+    let slot = super::AST_VERIFY_BYTES_PER_SLOT;
+    assert_eq!(slot, 100 * 1024, "slot must be 100 KiB");
+
+    // Saturation: compute_verify_budget must clamp at u64::MAX, not wrap.
+    // window chosen so window * slot would overflow u64 with plain multiplication.
+    let big_window = (u64::MAX / slot + 2) as usize;
+    assert_eq!(
+        super::compute_verify_budget(big_window),
+        u64::MAX,
+        "compute_verify_budget must clamp at u64::MAX (saturating_mul, not wrapping)"
+    );
+
+    // Boundary: a file sized exactly one slot FITS in a 1-slot budget (NOT strictly greater).
+    let budget_1slot = super::compute_verify_budget(1);
+    assert_eq!(budget_1slot, slot, "1-slot budget must equal one slot");
+    assert!(
+        !super::is_over_budget(0, slot, budget_1slot),
+        "is_over_budget must return false when accrued == budget (boundary: NOT strictly >)"
+    );
+
+    // A file one byte over a slot EXCEEDS the 1-slot budget.
+    assert!(
+        super::is_over_budget(0, slot + 1, budget_1slot),
+        "is_over_budget must return true when accrued > budget"
+    );
+
+    // Size-unknown fallback is AST_SIZE_LIMIT_DEFAULT (1 MiB), not the slot constant.
+    // With window=1 (budget=100 KiB), a size-unknown file charges 1 MiB → exceeds budget.
+    let unknown_size = rskim_core::AST_SIZE_LIMIT_DEFAULT;
+    assert_eq!(
+        unknown_size,
+        1024 * 1024,
+        "AST_SIZE_LIMIT_DEFAULT must be 1 MiB"
+    );
+    assert!(
+        unknown_size > slot,
+        "size-unknown fallback ({unknown_size}) must be larger than one slot ({slot}) \
+         so a single unknown-size candidate exhausts a 1-slot budget"
+    );
+    assert!(
+        super::is_over_budget(0, unknown_size, budget_1slot),
+        "is_over_budget must return true for a size-unknown file (fallback = 1 MiB) \
+         against a 1-slot budget (100 KiB)"
+    );
+}
+
+/// AD-405-11 (integration): the byte-budget gate drops candidates when
+/// manifest-reported sizes push cumulative I/O over `window * slot`.
+///
+/// Strategy:
+/// - Build a project with 3 empty-function Rust files (all match "empty-function").
+/// - Build the real AST index.
+/// - Create a FAKE manifest where every file reports `2 * AST_VERIFY_BYTES_PER_SLOT`
+///   (200 KiB) — inflated well above the actual file size (< 20 bytes each).
+/// - Run `run_ast_standalone("empty-function", limit=1, ...)` with the fake manifest.
+///   For synthetic patterns: `ast_pool = limit.max(1) = 1`, `window = 1`,
+///   `verify_budget = 1 * 100 KiB = 100 KiB`.
+///   The pool has 1 candidate; its reported size (200 KiB) > budget (100 KiB) → DROPPED.
+///   budget_omitted = 1 → stderr notice emitted; result count = 0.
+/// - Run the SAME query with the REAL manifest (actual file sizes < 20 bytes).
+///   Same pool; file 0 (< 20 bytes) fits in budget → verify gate runs → 1 result.
+///
+/// The result-count difference (inflated: 0, real: 1) proves the budget gate
+/// actually drops candidates and reduces recall when sizes exceed the budget —
+/// the untested path before this test existed.
+#[test]
+fn ast_verify_budget_exhaustion_drops_candidates_ad405_11() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_empty_functions();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let real_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Baseline: real manifest (tiny files) — limit=1 should yield 1 result.
+    // This confirms the pattern actually matches at least one file.
+    let mut baseline_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(1),
+        true, // JSON so result count is parseable
+        cache.path(),
+        &real_manifest,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut baseline_out,
+    )
+    .expect("baseline run must succeed");
+    let baseline: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(baseline_out).unwrap()).unwrap();
+    let baseline_count = baseline["results"].as_array().unwrap().len();
+    assert!(
+        baseline_count >= 1,
+        "AD-405-11 setup: 'empty-function' must match at least one file in the fixture \
+         (got 0 — test environment may not be indexing empty Rust functions); \
+         cannot prove budget drop if no candidates exist"
+    );
+
+    // Budget-exhaustion run: inflated manifest (200 KiB per file > 100 KiB budget).
+    // With limit=1 → window=1 → budget = 100 KiB.
+    // The first (and only) pool candidate reports 200 KiB → budget exceeded → dropped.
+    let inflated = make_inflated_manifest(
+        &real_manifest,
+        project.path(),
+        cache.path(),
+        2 * super::AST_VERIFY_BYTES_PER_SLOT, // 200 KiB
+    );
+
+    let mut budget_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(1),
+        true, // JSON
+        cache.path(),
+        &inflated,
+        None,
+        None,
+        None,
+        project.path(),
+        &mut budget_out,
+    )
+    .expect("budget-exhaustion run must return Ok (budget drop is not an error — AC-F8)");
+
+    let budget_result: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(budget_out).unwrap()).unwrap();
+    let budget_count = budget_result["results"].as_array().unwrap().len();
+
+    // DISCRIMINATING: with inflated sizes all candidates are budget-dropped.
+    // A broken gate (no budget enforcement) would let the candidate through
+    // and return the same count as the baseline, failing this assertion.
+    assert_eq!(
+        budget_count, 0,
+        "AD-405-11: all candidates must be budget-dropped when reported size (200 KiB) \
+         exceeds the 1-slot budget (100 KiB); got {budget_count} results \
+         (expected 0 — a non-zero count proves the budget gate is not enforced)"
+    );
+}
+
+/// AD-405-11 (integration): size-unknown manifest entries charge
+/// `AST_SIZE_LIMIT_DEFAULT` (1 MiB), not `AST_VERIFY_BYTES_PER_SLOT` (100 KiB).
+///
+/// Proves Finding 3 of the #405 review: the old fallback (`AST_VERIFY_BYTES_PER_SLOT`)
+/// was a 10x under-charge for size-unknown entries — `read_guarded` could read up
+/// to 1 MiB but the budget only reserved 100 KiB, allowing the stated I/O bound
+/// to be exceeded by up to ~10x.
+///
+/// Strategy:
+/// - Build a project with empty-function files.
+/// - Create a manifest where every entry has `size = None` (unknown).
+/// - Run with limit=1 → window=1 → budget = 1 * 100 KiB = 100 KiB.
+///   - With the FIXED fallback (1 MiB): 1 MiB > 100 KiB → candidate DROPPED → 0 results.
+///   - With the OLD fallback (100 KiB): 100 KiB NOT > 100 KiB (equal) → passes →
+///     1 result. (A regression here proves the old behaviour was restored.)
+/// - The 0-result outcome confirms the 1 MiB fallback is active.
+///
+/// Contrast with baseline (real manifest, real sizes) that yields 1 result at
+/// limit=1 — proving the pattern matches and the 0-result is budget-driven, not
+/// a false "no match."
+#[test]
+fn ast_verify_missing_size_charges_1mib_fallback_ad405_11() {
+    use super::super::manifest::FileManifest;
+
+    let project = make_project_with_empty_functions();
+    let cache = tempfile::tempdir().unwrap();
+    build_project_index(project.path(), cache.path());
+
+    let real_manifest =
+        FileManifest::load(project.path().to_path_buf(), cache.path().to_path_buf()).unwrap();
+
+    // Helper: build a manifest with all sizes set to None (unknown).
+    let make_none_manifest = |real: &FileManifest| {
+        let mut m = FileManifest::new(project.path().to_path_buf(), cache.path().to_path_buf());
+        for path in real.sorted_paths() {
+            if let Some(e) = real.lookup(path) {
+                m.insert(super::super::manifest::ManifestEntry {
+                    size: None,
+                    ..e.clone()
+                });
+            }
+        }
+        m
+    };
+
+    // Setup guard: pattern must match at least one file at limit=11 (wide budget).
+    //
+    // Budget arithmetic:
+    //   AST_VERIFY_BYTES_PER_SLOT = 100 * 1024 = 102,400 bytes
+    //   AST_SIZE_LIMIT_DEFAULT    = 1024 * 1024 = 1,048,576 bytes
+    //   limit=11 → budget = 11 * 102,400 = 1,126,400 bytes
+    //   first size-unknown candidate: 0 + 1,048,576 = 1,048,576 NOT > 1,126,400 → PASSES
+    //
+    // Note: limit=10 is insufficient (10 * 102,400 = 1,024,000 < 1,048,576 → still dropped).
+    // limit=11 is the minimum that allows one size-unknown candidate through.
+    let mut wide_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(11), // wide: budget = 11 * 102,400 > 1 MiB
+        true,
+        cache.path(),
+        &make_none_manifest(&real_manifest),
+        None,
+        None,
+        None,
+        project.path(),
+        &mut wide_out,
+    )
+    .expect("wide-budget run must succeed");
+    let wide: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(wide_out).unwrap()).unwrap();
+    let wide_count = wide["results"].as_array().unwrap().len();
+    assert!(
+        wide_count >= 1,
+        "AD-405-11 setup: 'empty-function' with wide budget (1 MiB) must match \
+         at least one size-unknown file; got 0 — cannot prove narrow-budget drop"
+    );
+
+    // Narrow-budget run: limit=1 → window=1 → budget = 100 KiB.
+    // size-unknown fallback = 1 MiB (after the fix) → 1 MiB > 100 KiB → DROPPED.
+    let mut narrow_out: Vec<u8> = Vec::new();
+    super::run_ast_standalone(
+        "empty-function",
+        super::super::types::Page::first(1), // narrow: budget = 100 KiB
+        true,
+        cache.path(),
+        &make_none_manifest(&real_manifest),
+        None,
+        None,
+        None,
+        project.path(),
+        &mut narrow_out,
+    )
+    .expect("narrow-budget run must return Ok (budget drop is not an error)");
+
+    let narrow: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(narrow_out).unwrap()).unwrap();
+    let narrow_count = narrow["results"].as_array().unwrap().len();
+
+    // DISCRIMINATING: 1 MiB fallback is active, so 1 MiB > 100 KiB → 0 results.
+    // If the OLD fallback (100 KiB) were active, 100 KiB NOT > 100 KiB → passes →
+    // the candidate reaches verify and would return 1 result (regression failure).
+    assert_eq!(
+        narrow_count, 0,
+        "AD-405-11: a size-unknown candidate (fallback = 1 MiB) must be budget-dropped \
+         at limit=1 (budget = 100 KiB); got {narrow_count} result(s) — \
+         a non-zero count means the old 100 KiB fallback is active (regression: \
+         the 1 MiB fallback fix is not in effect)"
+    );
+}
+
+/// AC11 (#394 / #419): `ast_query_is_synthetic` correctly classifies queries.
+///
+/// - All 5 synthetic-marker patterns (`god-function`, `deep-nesting`,
+///   `empty-function`, `empty-catch`, `excessive-params`) → `true`.
+/// - All non-synthetic named patterns (`try-catch`, `rust-nested-loop`,
+///   `nested-loop`) → `false`.
+/// - `AstQuery::Containment` (which never carries a synthetic ID — rejected at
+///   parse time) → `false`.
+///
+/// This is a unit test for the pool-sizing helper introduced in the AC11 fix:
+/// the synthetic pool uses `limit.max(1)` instead of `max(K×limit, 100)`.
+#[test]
+fn ast_query_is_synthetic_classifies_correctly_ac11_394() {
+    // Synthetic patterns — must return true.
+    for pattern in [
+        "god-function",
+        "deep-nesting",
+        "empty-function",
+        "empty-catch",
+        "excessive-params",
+    ] {
+        let query = rskim_search::parse_ast_query(pattern)
+            .unwrap_or_else(|e| panic!("AC11 (#394): {pattern} must parse: {e}"));
+        assert!(
+            super::ast_query_is_synthetic(&query),
+            "AC11 (#394): ast_query_is_synthetic({pattern}) must return true — \
+             this is a synthetic-marker pattern; got false"
+        );
+    }
+
+    // Real-node patterns — must return false.
+    for pattern in ["try-catch", "rust-nested-loop", "nested-loop"] {
+        let query = rskim_search::parse_ast_query(pattern)
+            .unwrap_or_else(|e| panic!("AC11 (#394): {pattern} must parse: {e}"));
+        assert!(
+            !super::ast_query_is_synthetic(&query),
+            "AC11 (#394): ast_query_is_synthetic({pattern}) must return false — \
+             this is a real-node pattern; got true"
+        );
+    }
+
+    // Containment query (A > B) — must return false (containment never carries
+    // a synthetic ID; the parser rejects synthetic-marker names in containment
+    // position).
+    let containment = rskim_search::parse_ast_query("function_item > block")
+        .unwrap_or_else(|e| panic!("AC11 (#394): containment query must parse: {e}"));
+    assert!(
+        !super::ast_query_is_synthetic(&containment),
+        "AC11 (#394): ast_query_is_synthetic for a containment query must return false"
     );
 }

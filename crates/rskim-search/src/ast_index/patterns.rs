@@ -37,6 +37,17 @@
 //!
 //! Patterns are queryable today but do NOT affect ranking — ranking integration
 //! is deferred to Wave 4 (structural-complexity scoring dimension).
+//!
+//! # AD-405-8: `"Exact:"` prefix — pattern precision, not corpus coverage
+//!
+//! Pattern descriptions that contain `"Exact:"` label **pattern precision**: the
+//! declared n-grams reliably identify the named construct in any indexed file that
+//! contains it.  This label is NOT a claim about corpus coverage.  Files must still
+//! pass `rskim_core::ast_size_limit(lang)` to be AST-indexed; files exceeding the
+//! cap are excluded from `--ast` results regardless of pattern precision.  Corpus
+//! coverage is reported separately via `AstCoverage`; pattern precision is a
+//! property of the n-gram set here.  The two concepts are orthogonal, so the
+//! `"Exact:"` label is intentionally left unchanged when the size cap changes.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;

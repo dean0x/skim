@@ -1,10 +1,9 @@
 ---
 feature: cmd-search
 name: Search CLI (skim search subcommand)
-description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, cochange_partner_paths."
+description: "Use when modifying the skim search CLI dispatch layer, adding new search flags or modes, changing how the lexical/AST/temporal indexes are built or queried from the CLI, updating the staleness/auto-refresh logic, changing the manifest sidecar format, or wiring together the rskim-search library features at the orchestration level. Keywords: skim search, cmd/search, mod.rs, index.rs, query.rs, staleness, manifest, ast, temporal, blast-radius, --hot, --cold, --risky, --ast, SearchAction, Flags, QueryConfig, IndexConfig, build_index, execute_query, execute_query_with_manifest, auto_refresh_if_stale, check_staleness, FileId, FileId-alignment, consume loop, CHANNEL_CAPACITY, .skim-build.lock, .skidx, .skfiles, binary manifest, SKFM, MANIFEST_FORMAT_VERSION, version_matches, manifest_stale, total-on-disk size, resolve_search_cache_dir, parse_flags, parse_temporal_flag, parse_limit_value, take_flag_value, TemporalSort, TemporalAnnotation, cochange, blast_radius_paths, ast_file_ids, run_ast_standalone, run_temporal_standalone, derive_ast_entry, search_ast, resolve_ast_file_filter, hooks.rs, install_search_hooks, remove_search_hooks, resolve_blast_radius_paths, resolve_blast_radius_file_ids, paths_to_file_ids, paths_to_scored_file_ids, cochange_partner_strengths, BlastRadiusStrengths, BlastRadiusResolution, SEED_STRENGTH, temporal_build, build_lock, AstNgramCache, CachedAstEntry, CompositeWeights6, --weights, layers_matched, AstResult, format_ast_json, format_ast_text, recover_line, read_line_at, resolve_git_dir, is_hex_sha, warn_skip, MIN_COCHANGE_JACCARD, LOCK_POLL_MS, LOCK_DEADLINE_SECS, stderr prefix, skim search:, skim search [debug]:, skim_bin_path, query_substring_present, run_compound_query, filter_set, disjoint blast radius, accumulate_posting_tfs, collect_scored_results, temporal_annotation_tag, shrink_to_fit, postings_buf, WorkingTreeDelta, WorkingTreeChanged, scan_working_tree, freshness_entries, temporal_db_is_stale, try_rebuild_temporal_nonfatal, ValidityMarker, validity, weights_inert_notice, wilson_lower_bound, risk_score_wilson_decay, AD-378, AD-379, AD-376, AD-377, AD-413-15, AD-413-16, AD-413-17, HeadState, git_head_state, resolve_common_dir, resolve_repo_toplevel, ReanchorPolicy, AnchorState, temporal_anchor_state, anchor_state_on_db, warn_if_temporal_unverifiable, warn_if_temporal_unverifiable_at, read_temporal_meta, RefreshOutcome, resolve_hooks_dir, SHARED_HOOKS_SCOPE_MSG, HooksOutcome, create_real_git_worktree, apply_scope_filter, record_temporal_anchor, gitdir.rs, temporal_state.rs."
 category: architecture
-directories:
-  - crates/rskim/src/cmd/search/
+directories: [crates/rskim/src/cmd/search/]
 referencedFiles:
   - crates/rskim/src/cmd/search/mod.rs
   - crates/rskim/src/cmd/search/index.rs
@@ -17,341 +16,1202 @@ referencedFiles:
   - crates/rskim/src/cmd/search/walk.rs
   - crates/rskim/src/cmd/search/snippet.rs
   - crates/rskim/src/cmd/search/hooks.rs
-created: 2026-06-09
-updated: 2026-06-12
-version: 4
+  - crates/rskim/src/cmd/search/temporal_build.rs
+  - crates/rskim/src/cmd/search/build_lock.rs
+  - crates/rskim/src/cmd/search/gitdir.rs
+  - crates/rskim/src/cmd/search/temporal_state.rs
+created: 2026-06-21
+updated: 2026-09-03
+version: 8
 ---
 
 # Search CLI (skim search subcommand)
 
 ## Overview
 
-`crates/rskim/src/cmd/search/` is the CLI orchestration layer for `skim search`. It is the only code that performs I/O, parses flags, coordinates the build pipeline, triggers auto-refresh, resolves paths, and formats output. All business logic — n-gram extraction, BM25F scoring, AST index construction, temporal risk scoring, co-change matrices — lives in the `rskim-search` library crate. This layer exists solely to wire those library features together into a cohesive user-facing command.
+`crates/rskim/src/cmd/search/` is the **CLI orchestration layer** for `skim
+search`. All I/O lives here. Business logic is in `rskim-search` (the library
+crate). This module owns:
 
-The module is split into eleven focused files: `mod.rs` (dispatch + hand-rolled flag parsing), `index.rs` (streaming pipeline), `query.rs` (search execution + formatters), `staleness.rs` (git-HEAD-based auto-refresh + AST self-heal), `types.rs` (pure data types), `ast.rs` (AST flag helpers), `temporal.rs` (temporal flag helpers + blast-radius resolution), `manifest.rs` (JSONL sidecar), `walk.rs` (file traversal), `snippet.rs` (context window extraction), and `hooks.rs` (git hook install/remove). The design rule is that I/O lives in `mod.rs`/`index.rs`/`query.rs` and helpers are pulled into the focused sub-modules — never scattered across files.
+- Flag parsing and dispatch (`mod.rs`)
+- Index build pipeline — streaming producer/consumer with crossbeam channel,
+  lexical + AST index building, manifest caching (`index.rs`)
+- Temporal index build — git history parsing, hotspot/risk scoring, co-change
+  matrix, SQLite persistence (`temporal_build.rs`)
+- Query execution — lexical BM25F, AST filter, composite RRF ranking (`query.rs`)
+- Staleness detection and auto-refresh (`staleness.rs`)
+- Blast-radius, temporal sort, AST result enrichment (`temporal.rs`)
+- AST structural query interface (`ast.rs`)
+- Manifest sidecar — file content hashes for incremental build (`manifest.rs`)
+- File walk and project root discovery (`walk.rs`)
+- Snippet extraction (`snippet.rs`)
+- Git hook installation with linked-worktree routing (`hooks.rs`)
+- Build mutex (`build_lock.rs`)
+- Git plumbing — HEAD resolution, linked-worktree gitdir, commondir, ancestor walk (`gitdir.rs`)
+- Temporal DB anchor management — repository anchor, staleness gate, unverifiable advisory (`temporal_state.rs`)
 
-## System Context
-
-`skim search` is invoked as a subcommand of the main `skim` binary. Its public entry point is `pub(crate) fn run(args: &[String], analytics: &AnalyticsConfig) -> anyhow::Result<ExitCode>` in `mod.rs`. The skim binary passes the slice of arguments that follow `search`.
-
-Cache layout: `~/.cache/skim/search/{sha256(canonical_root)[..16]}/` (per-project hash). Override via `SKIM_CACHE_DIR`. Key files inside:
-
-- `index.skidx` / `index.skfiles` — lexical n-gram index (built by `NgramIndexBuilder`)
-- `ast_index.skidx` / `ast_index.skpost` — AST structural index (built by `AstIndexBuilder`)
-- `index.skfiles` — JSONL sidecar (`FileManifest`)
-- `temporal.db` — SQLite temporal DB populated by `skim heatmap`
-- `.skim-build.lock` — advisory file-based lock for concurrent build safety
-
-## Component Architecture
-
-### Flag Parsing — hand-rolled, not clap
-
-`mod.rs` uses a manual `parse_flags()` loop rather than clap for the top-level `skim search` flags. This is intentional: `skim search index` (legacy subcommand) does use clap via `IndexCli`, but all other flags are hand-rolled so that positional query arguments are naturally accumulated into `query_parts`.
-
-`SearchAction` enum encodes the mutually exclusive modes (`Build`, `Rebuild`, `Update`, `Stats`, `InstallHooks`, `RemoveHooks`, `Query(String)`). The final `match flags.action` is the single dispatch point — adding a new mode means adding a variant and one match arm.
-
-Three private helpers in `parse_flags()`:
-
-- **`take_flag_value(arg, next_arg, flag)`**: handles both space-separated and equals form for flags that require a value (`--limit`, `--root`, `--ast`). Returns `(value, consumed_next)`. Caller advances `i` by one extra when `consumed_next` is `true`.
-- **`parse_limit_value(raw)`**: validates a `--limit` string — must be a positive integer ≥ 1. Returns `Err` for non-numeric or zero.
-- **`parse_temporal_flag(arg, next_arg, temporal_sort, blast_radius)`**: handles `--hot`, `--cold`, `--risky`, `--blast-radius`, and `--blast-radius=VALUE`. Returns `Ok(true)` when the next token was consumed. Mutually-exclusive sort flag check lives here.
-
-### Dispatch Ordering — validation before dispatch
-
-`run()` performs all validation in a fixed order before any dispatch:
-
-1. `"index"` prefix → immediately delegate to `index::run()` (legacy subcommand path)
-2. Empty args or `--help/-h` → print help (checked BEFORE `parse_flags` to avoid spurious errors)
-3. `--ast` + temporal sort (`--hot/--cold/--risky`) → `#202` error (not yet composable)
-4. `--ast` single-node pattern → `#283` error
-5. Unknown `--ast` pattern → library error (lists valid names)
-
-This ordering is tested and must not be changed without updating tests. Note: `--ast` + `--blast-radius` is NOT an error — `--blast-radius` is composable with `--ast` on the standalone path.
-
-### Streaming Build Pipeline — `index.rs`
-
-`build_index(config)` acquires `.skim-build.lock` (advisory file-based lock) with a **bounded poll loop** before delegating to `Pipeline::run()`.
-
-**Lock acquisition**: uses `try_lock()` (not unbounded `.lock()`) in a loop capped at 120 seconds (200 ms poll interval, ~9 iterations before deadline). Prints a one-time waiting notice to stderr on first `WouldBlock`. Returns an error on deadline expiry. Drop-based release is preserved — `lock_file` drops at function end. Never blocks indefinitely. `std::fs::TryLockError::WouldBlock` and `TryLockError::Error` are handled separately.
-
-The pipeline has three stages:
-
-1. **Walk** (`walk_metadata`) — metadata-only directory traversal; returns `Vec<WalkEntry>` sorted for determinism.
-2. **Producer thread** — reads content, computes SHA-256, applies 2-tier SHA cache, classifies fields; sends `ProcessedFile` on a `crossbeam_channel::bounded(CHANNEL_CAPACITY=64)` channel.
-3. **Consumer loop** (`Pipeline::consume`) — receives files, adds to both lexical and AST builders, inserts manifest entries, drops content immediately.
-
-**Commit ordering** (crash-safety invariant):
-```
-(1) builder.build()       → writes index.skidx + index.skfiles
-(2) ast_builder.build()   → writes ast_index.skpost then ast_index.skidx
-(3) new_manifest.save()   → records git HEAD (the commit point)
-```
-If AST build fails, `manifest.save()` is NEVER reached. The old manifest survives and the next query self-heals. "HEAD recorded ⟹ both indexes coherent" is the invariant.
-
-**Commit-boundary assertion** (before writes): the number of manifest entries (`manifest_count`) is compared to the consume loop's `file_count`. A mismatch aborts BEFORE any `build()` call. This is intentionally defensive — on case-sensitive filesystems the counts must match because each `WalkEntry` has a distinct rel-path key.
-
-**FileId-alignment invariant** (critical): the lexical builder and AST builder must receive exactly the same set of files in the same order. `next_file_id` only advances after a successful `add_file_classified`. A lexical builder error causes `continue` — the file is excluded from BOTH indexes. AST entries are always inserted (empty set on linearization error) so FileIds stay aligned. If `add_file_ngrams` fails after `add_file_classified` succeeded, the build aborts with an error and `manifest.save()` is skipped — preventing a committed-but-corrupt index (ADR-006).
-
-**`derive_ast_entry` helper** (index.rs private function): encapsulates per-file AST linearization and extraction. Returns `(AstNgramSet, StructuralMetrics, node_count)`. Deliberately infallible — on any error (grammar failure, linearization error, empty language) returns an empty-but-valid triple so the consume loop can always insert an aligned empty AST entry.
-
-**Producer join on abort**: the producer thread is joined BEFORE propagating any consume error. This surfaces worker-thread panics on both the success and abort paths, and ensures the producer's tx.send() has already returned Err before the lock is released (applies ADR-006, happens-before guarantee).
-
-**Happens-before note**: `producer_skips.load(Ordering::Relaxed)` is only valid after `producer_handle.join()` returns. Moving that load before `join()` would be a data race.
-
-### Staleness and Auto-Refresh — `staleness.rs`
-
-`check_staleness(cache_dir, project_root)` compares the git HEAD stored in the manifest against the current HEAD read from `.git/HEAD` (no git subprocess — pure file I/O). Handles ordinary repos, worktrees (`.git` file with `gitdir:` pointer), detached HEADs, and packed-refs.
-
-`StalenessCheck` outcomes:
-- `Current` — no action needed
-- `HeadChanged { stored, current }` — rebuild triggered (struct variant with fields)
-- `NoStoredHead` — rebuild triggered (old manifest or new git repo)
-- `NoIndex` — cold build triggered
-
-`resolve_git_dir(project_root)` is a helper in `staleness.rs` that resolves the `.git` directory — handles ordinary directories and worktree pointers (`gitdir:` file). Exposed as `pub(super)` and reused by `read_git_head`.
-
-**AST self-heal**: `check_staleness` runs an additional check before comparing HEADs. If `ast_index.skidx` is absent OR its format version (6-byte probe via `AstIndexReader::index_version`) is below `AST_INDEX_FORMAT_VERSION`, it returns `NoStoredHead` to force a full rebuild. This handles: post-format-upgrade (v1→v2), crash between `lexical.build()` and `ast.build()`, and first run after adding `--ast` to an existing install.
-
-`auto_refresh_if_stale(root, cache_dir, analytics)` is called at the start of every query path. It returns `(refreshed: bool, manifest: FileManifest)` so the caller never loads the manifest a second time.
-
-### Query Execution — `query.rs`
-
-**Two entry points**:
-
-- `execute_query(config, analytics)` — test-only entry point. Calls `execute_query_with_manifest(config, None, analytics)`. Annotated `#[cfg_attr(not(test), allow(dead_code))]`.
-- `execute_query_with_manifest(config, pre_loaded_manifest, analytics)` — production path. When `pre_loaded_manifest` is `Some`, skips `auto_refresh_if_stale` entirely (used by the combined text+`--ast` path in `run_query`, which already refreshed before opening the AST engine). When `None`, refreshes itself — this is the pure-lexical path.
-
-**`QueryConfig` fields** (in `types.rs`):
-- `text: String` — raw query text
-- `limit: usize` — max results
-- `json: bool` — JSON output mode
-- `root: PathBuf` — project root
-- `cache_dir: PathBuf` — cache dir
-- `blast_radius_paths: Option<HashSet<String>>` — optional set of allowed repo-relative path **strings** (resolved by `temporal::resolve_blast_radius_paths` in `mod.rs` before calling `execute_query_with_manifest`)
-- `ast_file_ids: Option<HashSet<FileId>>` — optional set of FileIds from an AST pattern query (resolved by `ast::resolve_ast_file_filter` before query)
-
-Steps in `execute_query_with_manifest`:
-1. Empty text → short-circuit immediately (no I/O).
-2. Refresh or use pre-loaded manifest.
-3. Open `NgramIndexReader` → wrap in `QueryEngine`.
-4. Build `SearchQuery`: set `limit` and `file_filter`.
-5. **File filter construction** — intersection of blast-radius FileIds (converted from `blast_radius_paths` using `sorted_paths()`) ∩ AST FileIds. Applied before `LIMIT` so the limit applies to the filtered set. Uses `u32::try_from(idx)` (applies PF-004: safe widening, never `as u32`).
-6. `engine.search(&sq)` → raw `Vec<SearchResult>` with FileIds.
-7. `resolve_paths_and_snippets` — maps FileId → path via `manifest.sorted_paths()`, extracts snippets.
-8. Return `QueryOutput`.
-
-After `execute_query_with_manifest`, `mod.rs` applies `apply_temporal_enrichment` (per-file DB lookups) if temporal sort flags are present.
-
-### AST Flag Helpers — `ast.rs`
-
-Four responsibilities:
-
-- `open_ast_engine(cache_dir)` — fails loud (Err) when `ast_index.skidx` is absent; gives build guidance in error message.
-- `validate_ast_pattern(raw)` — called at dispatch time BEFORE opening the index. Rejects `SingleNode` queries (`#283`) and unknown patterns. **Returns the parsed `AstQuery`** (not just `()`), so callers that also need the query object avoid a second `parse_ast_query` call. Callers that only need validation can use the `?` operator and discard with `let _ =`.
-- `resolve_ast_file_filter(engine, raw)` — **calls `search_ast` directly** (not through `SearchLayer`). Parses the pattern, calls `engine.search_ast(&query)`, returns `HashSet<FileId>` from the `Vec<(FileId, f64)>` result. No `SearchResult` construction, no `usize::MAX` sort, no `SearchLayer` overhead. The caller's `--limit` applies at intersection time inside the lexical engine.
-- `run_ast_standalone(raw_pattern, limit, json, cache_dir, manifest, blast_file_ids, w)` — standalone `--ast` dispatch (no text query). Accepts `blast_file_ids: Option<HashSet<FileId>>` (pre-resolved by the caller in `mod.rs` via `temporal::resolve_blast_radius_file_ids` — the parameter is pre-computed so this function has no DB access). Intersects with the AST result set BEFORE applying `--limit` (avoids PF-006 silent-drop). Warns on out-of-range FileIds rather than silently dropping them. Output sink `w: &mut impl Write` for testability.
-
-**`resolve_ast_file_filter` signature** (no `lang` parameter): language filtering at the AST layer was removed — the intersection with lexical results handles language narrowing implicitly.
-
-**`--ast + --blast-radius` on standalone path**: `mod.rs` resolves blast-radius into a `HashSet<FileId>` via `temporal::resolve_blast_radius_file_ids` BEFORE calling `run_ast_standalone`. The `blast_file_ids` parameter is `Option<HashSet<FileId>>` — `None` when `--blast-radius` was not set or the DB was absent. This keeps `run_ast_standalone` DB-free.
-
-**FileId warning in `run_ast_standalone`**: when `fid.0 as usize >= sorted.len()`, a warning is emitted to stderr. This is the fail-loud-ish counterpart on the read side (not silent drop).
-
-**Output-level only — no `:line` suffix**: standalone AST output is file-level. Results are formatted as `path  score: N.NNN` with no line number suffix.
-
-### Temporal Flag Helpers — `temporal.rs`
-
-Mirrors `ast.rs` in structure but also owns ALL blast-radius resolution logic. Key functions:
-
-- **`normalize_blast_radius_path(raw, project_root)`**: resolves user path to repo-relative. Algorithm: if absolute, check existence; if relative, try project-root-relative first, then CWD-relative fallback. Canonicalizes, strips root prefix, replaces `\\` with `/`.
-- **`cochange_partner_paths(partners, target)`**: extracts partner paths from co-change rows, handling both `file_a`/`file_b` directions via `cochange_partner` helper. Does NOT include the target file itself — callers add it separately.
-- **`resolve_blast_radius_paths(blast_radius, root, db_path, json)`**: resolves blast-radius to a `HashSet<String>` of repo-relative path strings. Opens `temporal.db`, normalizes the path, looks up co-change partners, includes the target file itself. Returns `Ok(None)` when `blast_radius` is `None` or DB is absent/corrupt (with JSON-aware warning). Used by `run_query` in `mod.rs` for the text+blast-radius path.
-- **`paths_to_file_ids(sorted_paths, allowed_paths)`**: converts a set of repo-relative path strings to FileIds by iterating `sorted_paths`. Applies PF-004 widening (`u32::try_from(idx)`). Emits a warning when result set is empty.
-- **`resolve_blast_radius_file_ids(blast_radius, root, db_path, sorted_paths, json)`**: unified resolver combining `resolve_blast_radius_paths` + `paths_to_file_ids`. Returns `Option<HashSet<FileId>>`. Used for the standalone `--ast --blast-radius` path from `mod.rs`.
-- **`open_temporal_db(db_path)`**: returns `None` when absent or corrupt (graceful degradation).
-- **`check_temporal_staleness(db, project_root)`**: spawns `git rev-parse HEAD` with 5-second timeout (distinct from the pure-file-I/O `staleness.rs::read_git_head`). Advisory only.
-- **`query_standalone`**: dispatches to `top_hotspots`, `top_coldspots`, `top_risks`, or `cochanges_for_file` based on the sort/blast-radius flags.
-- **`apply_temporal_enrichment`**: annotates `Vec<ResolvedResult>` with hotspot/risk scores and re-sorts. O(N) DB queries at default `--limit 20`.
-- **`resort_partners_by_temporal`**: pre-truncates to `limit*5` (clamped at 100) before per-file DB lookups for blast-radius + sort combination.
-
-**Blast-radius call sites** (three total, all ultimately use `temporal.rs` helpers):
-1. `mod.rs` standalone `--ast --blast-radius` path → calls `temporal::resolve_blast_radius_file_ids` → passes `Option<HashSet<FileId>>` to `run_ast_standalone`
-2. `mod.rs` `run_query` (text + blast-radius path) → calls `temporal::resolve_blast_radius_paths` → passes `Option<HashSet<String>>` in `QueryConfig::blast_radius_paths` → converted to FileIds inside `execute_query_with_manifest` via `paths_to_file_ids`
-3. `mod.rs` `run_temporal_standalone` (blast-radius only, no text/AST) → passes raw path to `temporal::query_standalone` → normalizes internally
-
-**Note on removed `resolve_blast_radius_filter`**: the old standalone function `resolve_blast_radius_filter` in `mod.rs` has been removed. Its logic is now split between `temporal::resolve_blast_radius_paths` (shared path resolution) and `temporal::paths_to_file_ids` (path→FileId conversion). The `mod.rs` test that formerly tested `resolve_blast_radius_filter` now tests `temporal::resolve_blast_radius_paths` directly.
-
-### Git Hook Management — `hooks.rs`
-
-New dedicated module (split out from `mod.rs`) for `--install-hooks` / `--remove-hooks`.
-
-- `install_search_hooks(project_root)` — for each of `post-commit`, `post-merge`, `post-checkout`: creates the hook with `#!/bin/sh` + skim block if absent, appends the skim block if the hook exists without markers. Idempotent — running twice is a no-op if markers already present.
-- `remove_search_hooks(project_root)` — strips the `# skim-search-start … # skim-search-end` block from each hook. Non-fatal: missing hooks silently skipped.
-- Hook block format: `# skim-search-start\nskim search --update 2>/dev/null &\n# skim-search-end`
-- Writes use atomic temp-file + rename pattern (via `tempfile::NamedTempFile`).
-- Unix: sets hook file permissions to executable (`chmod +x` equivalent).
-
-### Manifest Sidecar — `manifest.rs`
-
-JSONL file at `{cache_dir}/index.skfiles`. First line is a `ManifestHeader` (version, root path, optional `git_head`). Subsequent lines are `ManifestEntry` records (path, sha256, lang, field_map triples, mtime).
-
-The manifest serves three purposes:
-1. SHA-256 cache for incremental builds (avoids re-classifying unchanged files)
-2. FileId → path mapping for query resolution (via `sorted_paths()`)
-3. git HEAD storage for staleness detection
-
-Writes are atomic (temp file + rename). Wrong-root detection: if the stored root path in the header doesn't match the current project root, the entire manifest is discarded.
-
-## Combined text+`--ast` Path — Single Refresh Guarantee
-
-The combined text+`--ast` query path (`run_query`) calls `auto_refresh_if_stale` **exactly once**, before opening the AST engine:
+## Module Structure (complete)
 
 ```
-run_query():
-  resolve_blast_radius_paths() → blast_radius_paths (HashSet<String> or None)
-  auto_refresh_if_stale() → (refreshed, manifest)   // self-heal AST index if needed
-  open_ast_engine()                                   // safe: index guaranteed fresh
-  resolve_ast_file_filter()                           // AST FileIds
-  execute_query_with_manifest(pre_loaded=Some(manifest))  // skip redundant refresh
-  apply_temporal_enrichment()                         // if temporal sort active
+cmd/search/
+  mod.rs                — public entry: run(); parse_flags; SearchAction; Flags;
+                          run_query, run_temporal_standalone; help text; inline tests;
+                          skim_bin_path() test helper (single source for CARGO_BIN_EXE_skim
+                          fallback logic, used by all subprocess-spawning tests)
+  index.rs              — build_index; IndexPipeline; streaming producer+consumer;
+                          derive_ast_entry; resolve_search_cache_dir; Pipeline struct
+  query.rs              — execute_query_with_manifest; format_json_output; format_text_output;
+                          temporal_annotation_tag (array-of-options+flatten idiom, no mut Vec);
+                          weights_inert_notice; candidate_pool
+  gitdir.rs             — HeadState; git_head_state; read_git_head; resolve_git_dir;
+                          resolve_common_dir; resolve_repo_toplevel; is_hex_sha
+  temporal_state.rs     — ReanchorPolicy; AnchorState; temporal_anchor_state;
+                          anchor_state_on_db; read_temporal_meta (private);
+                          temporal_db_is_stale; warn_if_temporal_unverifiable;
+                          warn_if_temporal_unverifiable_at; try_rebuild_temporal_nonfatal
+  staleness.rs          — StalenessCheck; check_staleness; RefreshOutcome;
+                          auto_refresh_if_stale; WorkingTreeDelta; scan_working_tree;
+                          re-exports from gitdir + temporal_state (see sub-module layout);
+                          create_real_git_repo; create_real_git_repo_with_dates;
+                          create_real_git_worktree; plant_meta_raw (#[cfg(test)])
+  types.rs              — SearchAction, Flags, QueryConfig, IndexConfig, IndexResult,
+                          ResolvedResult, QueryOutput, WalkEntry, ProcessedFile, SkipReason,
+                          TemporalSort, TemporalAnnotation, SnippetLine, SnippetContext
+  ast.rs                — open_ast_engine; validate_ast_pattern; resolve_ast_scored;
+                          run_ast_standalone; read_line_at; pattern_description;
+                          re-exports: AstResult, format_ast_json, format_ast_text (from rskim_search)
+  temporal.rs           — open_temporal_db; resort_window; resolve_blast_radius_paths;
+                          resolve_blast_radius_file_ids; paths_to_file_ids; paths_to_scored_file_ids;
+                          cochange_partner_strengths; BlastRadiusResolution; BlastRadiusStrengths;
+                          SEED_STRENGTH; query_standalone; apply_temporal_enrichment;
+                          enrich_ast_results; format_temporal_text; format_temporal_json;
+                          normalize_blast_radius_path; check_temporal_staleness (#[cfg(test)] only)
+  temporal_build.rs     — rebuild_temporal; build_hotspot_rows; build_risk_rows;
+                          build_cochange_rows; current_epoch_secs; union_paths; warn_skip! macro
+  manifest.rs           — FileManifest: binary (v4, SKFM) sidecar caching sha256+field_map+mtime+size
+  walk.rs               — walk_metadata; discover_project_root; walk_and_read (test-only);
+                          normalize_rel_path (now pub(super) for scan_working_tree)
+  snippet.rs            — extract_snippet context window from file content;
+                          query_substring_present (thin delegate → rskim_search::query_substring_present)
+  hooks.rs              — resolve_hooks_dir (AD-413-15: routes to <commondir>/hooks for
+                          linked worktrees; gitdir/hooks for plain repos + submodules);
+                          install_search_hooks; remove_search_hooks
+                          (git post-commit/post-merge/post-checkout)
+  build_lock.rs         — acquire; acquire_bounded (inner testable impl); LOCK_POLL_MS=200;
+                          LOCK_DEADLINE_SECS=120; advisory .skim-build.lock mutex
+  *_tests.rs            — co-located test files included via #[path] for each module
 ```
 
-The `blast_radius_paths` (path strings) are passed in `QueryConfig` and converted to FileIds inside `execute_query_with_manifest` via `paths_to_file_ids(sorted_paths(), blast_radius_paths)`.
+## Stderr Prefix Convention
 
-## Component Interactions
+All stderr output from this module follows exactly two forms:
+
+- `"skim search:"` — always-on diagnostic (errors, warnings, non-debug info)
+- `"skim search [debug]:"` — debug-gated only (emitted when `SKIM_DEBUG=1`)
+
+**No sub-qualifiers** like `"skim search index:"` or `"skim search temporal:"`.
+Message bodies are self-describing. This was unified in the Wave-4 hardening pass
+(commit `f526729`). The `warn_skip!` macro in `temporal_build.rs` emits
+`"skim search [debug]:"` form. `ast.rs` uses `"skim search: AST result warning:"` for
+always-on AST file-ID out-of-range warnings. All four forms are consistent with this rule.
+
+## CLI Flag Surface
+
+Accepted flags for `skim search`:
+```
+--build            Build lexical+AST+temporal index incrementally
+--rebuild          Force full rebuild from scratch
+--update           Auto-refresh if stale (git HEAD changed)
+--stats [--json]   Show index statistics (now shows true on-disk sizes, #380)
+--install-hooks    Install git post-commit/merge/checkout hooks for auto-refresh
+                     (writes to <commondir>/hooks for linked worktrees, AD-413-15)
+--remove-hooks     Remove skim git hooks
+--json / -j        Output results as JSON
+--limit N / -n N   Max results (default: 20; equals form --limit=N supported)
+--root PATH        Override project root
+--ast PATTERN      AST structural filter (named pattern or containment query)
+--hot              Sort by hotspot score DESC
+--cold             Sort by hotspot score ASC
+--risky            Sort by Wilson+decay risk score DESC (#378)
+--blast-radius FILE Restrict to co-change partners of FILE
+--weights l,a,t    Composite RRF weights (N-signal UNION path, #200/#377)
+```
+
+Mutual exclusions: `--hot`, `--cold`, `--risky` are mutually exclusive (enforced
+in `parse_temporal_flag`).
+
+`--ast` composes freely with every temporal flag and with text queries (Wave 4/#202 complete).
+
+**`--weights` and `weights_inert_notice` (#377)**: when `--weights` is supplied,
+`query.rs::weights_inert_notice` checks whether the supplied signal weights are
+inert on the active path and, if so, emits a stderr notice. For example, supplying
+a non-zero temporal weight on a text+`--ast` path (where temporal ranking is not
+active) triggers: `"skim search: --weights temporal component is inert on --ast
+compound path (temporal not ranked here)"`. The notice function:
+
+```rust
+pub(super) fn weights_inert_notice(
+    weights: Option<CompositeWeights6>,
+    has_text: bool,
+    has_ast: bool,
+    has_blast: bool,
+) -> Option<&'static str>
+```
+
+Returns `None` when no inert notice applies. Called before dispatch in `mod.rs`;
+callers emit the notice to stderr if `Some`.
+
+**`--weights` ast component**: the `ast` weight (0.3 default) is **inert on the
+pure `--blast-radius` path**. That path fuses lexical + co-change (temporal)
+signals only — no AST layer is built there. The weight is reserved for the full
+text+AST+temporal compound dispatch (tracked in #339). It is NOT zero in the
+profile; it simply has no layer to apply to on this path.
+
+## Dispatch Flow (mod.rs)
 
 ```
-skim binary
-    └── cmd/search/mod.rs   ← parse_flags, SearchAction dispatch
-            ├── index.rs    ← build_index(config) [streaming pipeline]
-            │     ├── walk.rs          ← walk_metadata, open_and_read, sha256_hex
-            │     ├── manifest.rs      ← FileManifest (SHA cache + path map + HEAD)
-            │     ├── derive_ast_entry ← infallible per-file AST helper (index.rs private)
-            │     └── rskim-search     ← NgramIndexBuilder, AstIndexBuilder,
-            │                             classify_source, linearize_source,
-            │                             extract_ast_ngrams_with_metrics
-            ├── query.rs    ← execute_query_with_manifest(config, manifest_opt), formatters
-            │     ├── staleness.rs     ← auto_refresh_if_stale, check_staleness
-            │     ├── manifest.rs      ← sorted_paths() for FileId→path
-            │     ├── snippet.rs       ← extract_snippet
-            │     └── rskim-search     ← NgramIndexReader, QueryEngine, SearchQuery
-            ├── ast.rs      ← open_ast_engine, validate_ast_pattern (returns AstQuery),
-            │                  resolve_ast_file_filter (direct search_ast),
-            │                  run_ast_standalone (blast_file_ids: Option<HashSet<FileId>>, no DB access)
-            │     └── rskim-search     ← AstQueryEngine, AstIndexReader,
-            │                             parse_ast_query, search_ast
-            ├── temporal.rs ← normalize_blast_radius_path, cochange_partner_paths,
-            │                  resolve_blast_radius_paths (→ HashSet<String>),
-            │                  paths_to_file_ids (→ HashSet<FileId>),
-            │                  resolve_blast_radius_file_ids (unified path→FileId resolver),
-            │                  apply_temporal_enrichment, query_standalone,
-            │                  format_temporal_*, resort_partners_by_temporal,
-            │                  open_temporal_db, check_temporal_staleness
-            │     └── rskim-search     ← TemporalDb, HotspotRow, RiskRow, CochangeRow
-            └── hooks.rs    ← install_search_hooks, remove_search_hooks
-                              (marker-delimited blocks in .git/hooks/)
+run(args) → parse_flags(args) → validate --ast (validate_ast_pattern)
+                              → weights_inert_notice (emit to stderr if Some)
+         ↓
+SearchAction::Build     → run_build  (force=false)
+SearchAction::Rebuild   → run_build  (force=true)
+SearchAction::Update    → run_update
+SearchAction::Stats     → run_stats
+SearchAction::InstallHooks → run_install_hooks
+SearchAction::RemoveHooks  → run_remove_hooks
+SearchAction::Query(text) with text non-empty → run_query
+SearchAction::Query(_) with --ast but no text → run_ast_standalone arm
+  (ordered BEFORE temporal-only arm; --ast --hot lands here, not run_temporal_standalone)
+SearchAction::Query(_) with temporal flags only → run_temporal_standalone
+SearchAction::Query(_) empty otherwise → print_help
 ```
 
-## Constraints
+**Validation ordering is load-bearing**: `--ast` patterns are validated before
+dispatch regardless of flag combination. Single-node queries (`#283` error) and
+unknown pattern names return errors before any I/O.
 
-**Concurrent build safety**: all callers that write index files acquire `.skim-build.lock` (via bounded `try_lock()` poll loop with 120s deadline) before touching index files. Never write to `index.skidx` or `ast_index.skidx` without holding this lock.
+**--ast ordering**: the `if let Some(ref raw) = flags.ast` arm in the `match` is
+placed BEFORE the `flags.temporal_sort.is_some() || flags.blast_radius.is_some()`
+arm so that `--ast --hot` is handled by `run_ast_standalone` (which honours the
+AST filter), never silently by `run_temporal_standalone` (R1/GAP-6 invariant).
 
-**FileId contract**: FileId is a 0-based integer assigned to files in the order they appear in `manifest.sorted_paths()`. It must be stable across the entire build cycle. Never break the consumer loop's `continue`-on-lexical-error + always-insert-AST-entry pattern.
+## Index Build Pipeline (index.rs)
 
-**Graceful degradation**: missing `temporal.db` → warning + exit 0 (not error). Missing AST index → loud error (the user explicitly asked for `--ast`). Stale temporal data → warning on stderr, query proceeds.
+`build_index(config: &IndexConfig) -> anyhow::Result<IndexResult>`
 
-**Commit ordering**: manifest is always the last thing written. If any index build fails, `manifest.save()` must not be called. The presence of the manifest is the "both indexes are coherent" signal.
+The public entry acquires `build_lock::acquire("skim search index", &pipeline.cache_dir)`
+BEFORE calling `pipeline.run()`. The lock is released when the returned `IndexResult`
+(or `Err`) drops.
 
-**Validation order in `run()`**: the exact order (legacy subcommand, help, `--ast`+temporal, single-node, unknown pattern) is tested and must not change without updating the tests in `mod.rs`. `--ast` + `--blast-radius` (without temporal sort) is NOT in this error list — it is a valid combination.
+Pipeline stages:
+1. `walk_metadata` — enumerate supported files under `root`; skip ignored paths
+2. `load_manifest` — load binary (v4) sidecar for incremental caching
+3. Load `AstNgramCache` from `ast_index.skcache` (or `with_dir` on `--force`)
+4. Spawn producer thread: for each `WalkEntry`, call `read_and_classify` →
+   emit `ProcessedFile` into crossbeam channel (capacity: 64)
+5. Consumer loop (main thread):
+   - `resolve_ast_entry` — cache hit or `derive_ast_entry` (calls `linearize_source`
+     + `extract_ast_ngrams_with_metrics`)
+   - `NgramIndexBuilder::add_file_classified` (lexical index)
+   - `AstIndexBuilder::add_file_ngrams` (AST index)
+   - `FileManifest::insert` (sidecar update including mtime AND size, AD-379-2)
+6. After channel drain: write lexical index (`.skidx`), AST index, manifest, AST cache
 
-**`auto_refresh_if_stale` before any index open**: both `run_ast_standalone` dispatch (in `mod.rs`) and `run_query` (the combined text+`--ast` path) must call `auto_refresh_if_stale` BEFORE opening the AST engine. Opening the engine first breaks self-heal for the combined path.
+**File cap determinism fix (#379 / c1b8830)**: the walk now processes files in a
+deterministic order even when the file cap (`DEFAULT_MAX_FILES = 50,000`) is reached.
+Walk entries are sorted before being sent to the producer so the set of indexed files
+is stable across runs on the same tree.
 
-**`execute_query` is test-only**: production dispatch calls `execute_query_with_manifest` directly. Tests use `execute_query` (which delegates to `execute_query_with_manifest(config, None, analytics)`).
+**FileId alignment**: both builders receive files in the exact same order from the
+consumer loop, ensuring `FileId` values are consistent between the lexical and AST
+indexes. This is the CLI layer's responsibility — neither builder enforces alignment
+independently.
 
-**Blast-radius resolution is in `temporal.rs`**: `resolve_blast_radius_paths` and `resolve_blast_radius_file_ids` are in `temporal.rs`, not `mod.rs`. There is no `resolve_blast_radius_filter` function in `mod.rs` — that function was removed and its logic moved to the temporal helpers.
+**`resolve_ast_entry`**: checks the `AstNgramCache` by content SHA. Cache hit →
+returns cached `CachedAstEntry` (skips extraction). Miss → calls `derive_ast_entry`
+and inserts the new entry into the cache.
+
+`IndexResult` tracks: `file_count`, `skipped`, `cache_hits` (lexical), `ast_cache_hits`,
+`ast_reextracted`, `duration`.
+
+**`resolve_search_cache_dir`**: default path is
+`~/.cache/skim/search/<sha256_of_canonical_root>/`. The hash makes different project
+roots use separate cache dirs without conflicts. Now surfaces the resolved path in
+`--stats` output (#381).
+
+**`Pipeline` struct**: `Pipeline<'cfg>` holds `config`, `cache_dir`, and `start` (timer).
+`Pipeline::new(config)` resolves the cache dir and creates it. `Pipeline::run(self)` runs
+all three stages. `Pipeline::flush_empty(skip_count)` handles the early return when
+`walk_entries.is_empty()` (writes empty index, returns `IndexResult` with zeros).
+
+## Build Lock (build_lock.rs)
+
+Two-function design: `acquire` (production, uses hardcoded consts) delegates to
+`acquire_bounded` (testable inner impl with injectable `poll` and `deadline_after`).
+
+Constants:
+- `LOCK_POLL_MS = 200` — sleep between `try_lock` attempts
+- `LOCK_DEADLINE_SECS = 120` — maximum wait time before `Err`
+
+`acquire` returns `std::fs::File` holding the exclusive advisory lock via
+`lock_file.try_lock()`. The lock is released when the file is dropped.
+
+The same lock file (`.skim-build.lock` in `cache_dir`) is used by both
+`build_index` (lexical/AST build) and `rebuild_temporal` (temporal build), so
+concurrent skim processes serialise against ALL write operations.
+
+## Staleness and Auto-Refresh (staleness.rs)
+
+`check_staleness(cache_dir, root) -> (StalenessCheck, Option<FileManifest>)`
+
+Checks whether the index needs refreshing. Returns:
+- `StalenessCheck::Current` — HEAD matches (not `Fresh`)
+- `StalenessCheck::HeadChanged { stored, current }` — HEAD changed
+- `StalenessCheck::NoStoredHead` — manifest has no HEAD, or AST index absent/old
+- `StalenessCheck::NoIndex` — cold start, no `index.skidx`
+- `StalenessCheck::WorkingTreeChanged { changed, added, removed }` — HEAD unchanged
+  but working-tree metadata scan found edits/additions/deletions (#379)
+
+**Working-tree staleness scan (#379, AD-379-1/AD-379-2)**:
+
+`WorkingTreeChanged` is a new `StalenessCheck` variant. When the HEAD compare
+would yield `Current`, `check_staleness` runs `scan_working_tree(root, manifest,
+max_files)` to detect uncommitted edits, additions, and deletions.
+
+`scan_working_tree` uses `walk_metadata` (the same ignore-config walk the rebuild
+uses, so the scanned file set is exactly what a rebuild would index). For each walked
+file the normalized rel-path is the manifest key (`walk::normalize_rel_path`); the
+comparison checks:
+- **added** — path not present in manifest
+- **changed** — path present but mtime OR size differs
+
+Manifest paths not seen during the walk are counted as **removed**.
+
+This is a metadata-only scan (zero file content reads, zero SHA). A pre-#379
+manifest entry with `mtime: None` or `size: None` is treated as changed so the
+field is repopulated on the rebuild (AC10).
+
+`WorkingTreeDelta`:
+```rust
+pub(super) struct WorkingTreeDelta {
+    pub changed: usize,   // mtime or size differs
+    pub added: usize,     // on disk but not in manifest
+    pub removed: usize,   // in manifest but not on disk
+}
+impl WorkingTreeDelta {
+    pub fn is_dirty(self) -> bool { ... }
+}
+```
+
+AD-379-9: only aggregate counts are retained in `WorkingTreeDelta`, never a
+per-file path-set diff. Detailed per-path logging is a separate `--verbose`
+follow-up ticket.
+
+**`--stats --json` `.staleness` field (AD-414-10 / AD-414-16 extended)**:
+`StalenessCheck` implements `Display`; its string form is reported as `.staleness`
+in `--stats --json` output. The field is captured PRE-self-heal (alongside
+`git_head` and `temporal_state`) so it reflects the condition that triggered any
+rebuild. `StalenessCheck` has five variants, but only **four** are reportable
+here:
+
+| Display string | Variant |
+|---|---|
+| `"current"` | `StalenessCheck::Current` |
+| `"stale (no HEAD recorded)"` | `StalenessCheck::NoStoredHead` |
+| `"stale (HEAD changed: abc12345…→def67890…)"` | `StalenessCheck::HeadChanged` (embeds 8-char SHA prefixes + U+2026) |
+| `"stale (working tree changed: N modified, M added, K removed)"` | `StalenessCheck::WorkingTreeChanged` |
+
+**AD-414-23 — `"no index"` is NOT reachable from `--stats`.** `check_staleness`
+returns `NoIndex` on exactly one condition (`index.skidx` absent), and `run_stats`
+short-circuits that same condition *before* `gather_stats` runs, printing
+`{"error":"no index found","cache_dir":"<path>"}` (text mode: the two guidance
+lines) and exiting 1 — the #413 AC21 contract, which the #414 plan (Step 11 / C11)
+preserves as the shape `build_stats_json`'s early return was normalised *to*.
+`--stats` reports on an index; it never creates one. The AC-14 self-heal repairs a
+structurally broken index that already exists (F-Body-A/B/C); it is not a
+first-build path. Earlier revisions of CLAUDE.md, the CHANGELOG and this file
+claimed `"no index"` was observable — measured false at `dee5290` and corrected.
+A concurrent deleter racing between the `index.skidx` probe and `gather_stats`
+could still produce it; that is a TOCTOU window, not a contract.
+
+**AD-414-10 snapshot asymmetry (updated)**: `git_head`, `temporal_state`, AND
+`staleness` are captured from the PRE-self-heal state; all other fields
+(`file_count`, `skipped`, `ast_coverage`) are from the post-heal state. Reachable
+demonstration through the CLI: delete `index.skpost` from a healthy cache (keeping
+`index.skidx`) and `--stats --json` reports
+`staleness: "stale (no HEAD recorded)"` next to a post-heal `file_count > 0`,
+exit 0.
+
+**Temporal staleness (AD-TMP-2/AD-TMP-3)**:
+
+`temporal_db_is_stale(cache_dir, current_head, git_dir: Option<&Path>) -> bool`
+performs three checks against a single read-only SQLite open (no WAL pragma, no
+migrations): Check 1 — `META_GIT_HEAD` absent or mismatched; Check 2 (AD-408-4)
+— stored `data_version` absent or less than `TEMPORAL_DATA_VERSION`; Check 3
+(AD-414-14) — `meta.is_shallow == "1"` but the common-dir `shallow` file is gone
+(shallow→full unshallow detection). `git_dir` is the resolved commondir path, used
+only for Check 3 to locate the correct `shallow` file in linked worktrees.
+
+**AD-TMP-2**: temporal.db staleness is INDEPENDENT of lexical staleness (#357
+BUG B). The old code's `Current` early-return in `auto_refresh_if_stale` skipped
+the temporal hook, leaving temporal.db stale forever when the lexical index was
+current. `temporal_db_is_stale` fixes this.
+
+**AD-TMP-3**: production temporal staleness uses file-I/O HEAD comparison here,
+NOT `check_temporal_staleness` from `temporal.rs` — that helper is
+`#[cfg(test)]`-only.
+
+**Non-fatal temporal rebuild (`try_rebuild_temporal_nonfatal`)**:
+
+The single implementation of the D5 non-fatal-swallow contract that was
+previously duplicated in three structurally-divergent copies. Takes `root`,
+`cache_dir`, `head: Option<&str>`, and `debug_label`. Swallows `Err` from
+`rebuild_temporal` (per ADR-006/D5), emitting a debug-gated warning only.
+`None` head skips the rebuild (non-git dir).
+
+**Shared test helper (`create_real_git_repo`)**:
+
+A `#[cfg(test)] pub(super)` helper that creates a real git repository with
+commits. Canonical shared helper used by `staleness_tests.rs`,
+`temporal_build_tests.rs`, and `mod.rs` test modules — eliminates three
+near-verbatim copies that would otherwise drift. Returns the full 40-hex SHA
+of HEAD.
+
+**AST self-heal**: when the lexical index exists but `ast_index.skidx` is absent
+or has a format version below `rskim_search::AST_INDEX_FORMAT_VERSION`, returns
+`NoStoredHead` (triggering a full rebuild). The manifest is still returned so
+display consumers (e.g. `--stats`) show the real HEAD.
+
+**`resolve_git_dir(project_root) -> Option<PathBuf>`**: resolves `.git` directory.
+- If `.git` is a **directory**: returns it directly.
+- If `.git` is a **file** (linked worktree): parses `gitdir: <path>` pointer, returns resolved path.
+- Returns `None` when `.git` doesn't exist (bare repo, non-git dir). AD-413-11: bare repos and reftable repos are out of scope.
+- **Never walks up**: this function resolves ONE directory; ancestor discovery is in `git_head_state` and `walk::discover_project_root`.
+
+**`git_head_state(project_root) -> HeadState`** (#413): three-state HEAD classifier.
+- `resolved` — HEAD resolves to a commit SHA; includes linked worktrees (via `commondir` ladder: probe 1 = worktree-local loose ref, probe 2 = commondir loose ref, probe 3 = commondir `packed-refs`, probe 4 = worktree-private `packed-refs` (pre-#413 fallback, kept for monotonicity)) and subdirectory roots (adopted via nearest enclosing repo, AD-413-14).
+- `unresolved` — git dir found but HEAD could not be resolved (unborn branch, unsupported ref backend, corrupt HEAD).
+- `not_a_repo` — no `.git` entry at `project_root` or within `MAX_ANCESTORS`.
+Exposed in `--stats --json` as `git_head_state` key (AD-413-13). Per-worktree ref namespaces (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/`) are never redirected to the commondir.
+
+**AD-414-22 — `unresolved` on an EXPLICIT build arm is an empty history.**
+`try_rebuild_temporal_nonfatal` takes `&HeadState` (not the `Option<&str>` SHA it
+took before): three states need three answers and `Option` could only express two.
+`NotARepo` returns; `Resolved(sha)` takes the normal rebuild; `Unresolved` under
+`ReanchorPolicy::Allow` (`--build`/`--rebuild`/`--update`) calls
+`temporal_build::build_empty_temporal_for_unborn_head`, which re-reads history
+through `parse_history` (which returns `Ok(empty_result(is_shallow))` for an
+unborn HEAD — `git_parser.rs`, `is_unborn_error`), writes a zero-row `temporal.db`
+via the new `TemporalDb::sync_empty_unborn`, and emits the AC-16 case-(i) notice.
+Three properties are load-bearing:
+1. **No fabricated HEAD.** `sync_empty_unborn` *removes* the co-required
+   `git_head`/`data_version` pair rather than writing a placeholder (avoids
+   PF-016). An absent `git_head` is what makes `warn_if_temporal_unverifiable`
+   stay silent (its documented "unborn-branch no-loop case") and what makes
+   `temporal_db_is_stale` Check 1 rebuild automatically after the first commit.
+2. **Explicit arms only.** The quiet query path keeps `current_head == None`, so
+   no temporal code runs — the wave-wide loudness policy holds and there is no
+   unbounded per-query history re-walk (the backoff sentinel is keyed on a HEAD
+   that does not exist, so it cannot bound anything here).
+3. **Two guards keep non-unborn `Unresolved` out** (corrupt HEAD, reftable
+   backend, fs error): a `parse_history` `Err` returns without touching
+   `temporal.db` (F3 semantics — failing to read history is not the same fact as
+   having none), and a successful parse that yields commits returns too.
+Before AD-414-22, `--build` on a no-commit repo printed only `indexed N files`,
+created no `temporal.db`, and emitted no temporal notice at all — AC-16 case (i)
+was unreachable from every CLI arm (measured at `dee5290`; identical code at
+`041b302`, so this was a long-standing gap, not a regression from the F1–F9 batch).
+
+**`read_git_head(project_root) -> Option<String>`**: reads current git HEAD SHA.
+Resolution order: `resolve_git_dir` OR `resolve_repo_toplevel` → read `HEAD` → if symbolic ref, 4-probe ladder (AD-413-4/5, including `commondir`); path traversal guard (AD-413-6, `is_repo_relative_safe`); 40/64-hex raw SHA (detached HEAD). Returns `None` for unborn branch, reftable, corrupt HEAD.
+
+**`is_hex_sha(s) -> bool`**: accepts both 40-char (SHA-1) and 64-char (SHA-256)
+hex strings (for `extensions.objectFormat = sha256` repos).
+
+`auto_refresh_if_stale(root, cache_dir, analytics, reanchor: ReanchorPolicy) -> anyhow::Result<(RefreshOutcome, FileManifest, HeadState)>`
+
+The primary entry point used by all query paths. Returns `(outcome, manifest, head_state)`.
+
+**HEAD threading (O-A / #289)**: `git_head_state(root)` is called ONCE at function
+entry; the result is threaded into `rebuild_temporal`, `temporal_db_is_stale`, and
+returned as `HeadState` to callers (AD-413 Finding 2 — avoids a second full
+HEAD-ladder traversal on every query).
+
+**Self-heal ordering (applies ADR-006)**: in combined text+`--ast` queries and
+standalone `--ast` queries, `auto_refresh_if_stale` is called BEFORE opening the
+AST engine. A stale or absent AST index is rebuilt before the first query attempt.
+The manifest returned from `auto_refresh_if_stale` is threaded into
+`execute_query_with_manifest` so the combined path calls it exactly once.
+
+**`WorkingTreeChanged` rebuild**: the `auto_refresh_if_stale` logic rebuilds on
+`WorkingTreeChanged` (same path as `HeadChanged`), EXCEPT when the rebuild is
+triggered by the working-tree scan alone and `--update` was specified — in that
+case the rebuild proceeds. Callers should not distinguish `WorkingTreeChanged` from
+`HeadChanged` for rebuild purposes.
+
+**Decision O-B**: `check_temporal_staleness` is `#[cfg(test)]` only — it is NOT
+called from any production query path.
+
+**AD-413-16 — Repository anchor (`meta.git_toplevel`)**:
+
+Subdirectory roots adopt the nearest enclosing git repository (`resolve_repo_toplevel`).
+To prevent temporal data from one repository being silently served for a different
+repository after a root move or symlink, the adopted toplevel path is persisted as
+`meta.git_toplevel` in `temporal.db` and checked on every temporal query.
+
+`AnchorState` (in `temporal_state.rs`):
+- `NotAdopted` — root owns its own `.git` — gate returns immediately (zero DB reads, AC32).
+- `Absent` — no `temporal.db` or no `git_toplevel` row — adopt and record on the next build.
+- `Agrees` — persisted toplevel matches the live resolution — data is trustworthy.
+- `Differs { recorded: PathBuf, live: PathBuf }` — DIFFERENT repository — refuse to serve data.
+
+`temporal_anchor_state(cache_dir, root) -> AnchorState`: standalone check (opens a
+separate read-only SQLite connection). Used when no live DB handle is available.
+
+`anchor_state_on_db(db, root) -> AnchorState`: same check against an **already-open**
+`TemporalDb` — avoids a second SQLite open when the caller already holds the handle
+(used by `open_temporal_state` in `temporal.rs` to enforce the anchor-refusal guard
+in one funnel, AD-413-16 Finding 4).
+
+Query arms (`open_temporal_state` / `open_temporal_state_for`) refuse on `Differs`,
+returning `TemporalOpen::Unavailable { reason: DegradedReason::RepositoryMismatch }` —
+exit 0 with no rows served.
+Explicit build arms (`--build`/`--rebuild`/`--update`) pass `ReanchorPolicy::Allow` and
+re-anchor loudly on `Differs`.
+
+`ReanchorPolicy` (in `temporal_state.rs`): `Allow` (build arms) | `Refuse` (query and
+self-heal arms). Passed as `reanchor` into `auto_refresh_if_stale` and
+`try_rebuild_temporal_nonfatal` to gate the `record_temporal_anchor` write in
+`temporal_build.rs` (PF-017: a plain lexical query must NEVER silently retarget
+`temporal.db`).
+
+## Degraded-State Vocabulary (degraded.rs / temporal.rs)
+
+This is the central contract of `skim search` temporal flags (AD-414-1, OD-A).
+All types live in `crates/rskim/src/cmd/search/degraded.rs`; `temporal.rs`
+re-exports them so existing callers in `mod.rs`, `ast.rs`, and `temporal_build.rs`
+are unaffected.
+
+**`DegradedReason`** (enum, `pub(super)`) — the state the user or agent recognises.
+JSON values from `as_json_str()` are fixed contract strings (OD-A); never rename.
+Variants (in §2.3 precedence order):
+
+| Variant | JSON key | Meaning |
+|---|---|---|
+| `NotGitRepo` | `not_git_repo` | No ancestor `.git` |
+| `HeadUnresolved` | `head_unresolved` | git dir found but HEAD not resolvable |
+| `RepositoryMismatch` | `repository_mismatch` | DB anchored to a different repo (AD-413-16) |
+| `Missing` | `missing` | git repo + HEAD ok, but `temporal.db` absent |
+| `Corrupt` | `corrupt` | Structurally corrupt DB |
+| `UnsupportedVersion` | `unsupported_version` | DB schema newer than this build supports |
+| `Unreadable` | `unreadable` | Open failed for any other reason |
+| `Empty` | `empty` | DB open but zero rows for the requested dimension |
+| `NoRankedRows` | `no_ranked_rows` | Rows exist but none matched results carry a score |
+| `GhostFilter` | `ghost_filter` | All rows excluded by the on-disk ghost filter |
+
+**`TemporalUnavailable`** (struct) — pairs a `DegradedReason` with a `detail: String`
+carrying reason-specific context (path pair for `RepositoryMismatch`, count for
+`NoRankedRows`/`GhostFilter`, error text for `Unreadable`, `"shallow"` for
+`Empty` on a shallow clone, empty string otherwise).
+
+**`TemporalOpen`** (enum, `pub(super)`, in `temporal.rs`) — the return type of the
+query-arm DB-open funnel:
+- `Open(TemporalDb)` — DB is open and anchored; ready to serve rows.
+- `Unavailable(TemporalUnavailable)` — cannot serve; callers construct a
+  `DegradedJson` and continue with the lexical fallback (or return no rows on the
+  standalone temporal arm).
+
+**`open_temporal_state(root, cache_dir, head) -> TemporalOpen`** and
+**`open_temporal_state_for(root, cache_dir, head, sort) -> TemporalOpen`** — the single
+funnel for all temporal DB access at query time (AD-414-1 / AD-414-15). `_for` adds an
+emptiness probe for the requested `sort` dimension, promoting `Open` to
+`Unavailable { Empty }` when the DB has no rows for that dimension.
+
+**`DegradedJson`** (struct, `pub(super)`, serde `Serialize`) — the per-element shape
+inside the `degraded` JSON array (OD-A). Fields:
+- `subsystem` — always `"temporal"` in this ticket.
+- `reason` — `DegradedReason::as_json_str()` value.
+- `requested` — bare flag name (e.g. `"hot"`, `"blast-radius"`); no `--` prefix.
+  Use `TemporalSort::json_name()`, NOT `flag_name()` (RD-5 / AC-4 / AC-7).
+- `applied` — ranking actually served. Per-arm values (F2 / AD-414-19):
+  - `"lexical"` — text-query arms only: `run_query` (including text +
+    `--blast-radius` via `DegradedJson::for_blast_radius`); BM25F results
+    are served in lexical relevance order when temporal is unavailable.
+  - `"none"` — standalone temporal arm (`run_temporal_standalone`),
+    including standalone `--blast-radius FILE` without a text query; no
+    lexical ranking is computed and the JSON carries no `results` key,
+    so `"lexical"` is a false claim to a machine consumer on this arm.
+  - `"ast"` — reserved for #483 (standalone `--ast` degraded path); no
+    call site produces this value today.
+- `message` — identical to the stderr notice (SSOT via `degraded_notice`).
+- `remediation` — machine-readable advice string.
+
+The `degraded` JSON key (`Vec<DegradedJson>`, `skip_serializing_if = "Vec::is_empty"`)
+is absent on healthy queries and present with one element per degraded arm
+(AD-414-12). Callers emit it via `SearchOutput.degraded` in `types.rs`.
+
+**`Fallback`** (enum) — passed to `degraded_notice` to select the fallback tail:
+`Lexical` (BM25F order served), `Ast` (raw AST order served), `NoResults` (standalone
+temporal arm — no results returned).
+
+**`degraded_notice(u, flag, fallback) -> String`** — the ONLY builder of degraded-state
+notice text (AD-414-1). Every emit site prints or stores the string it returns.
+`flag` is the `--`-prefixed flag for the tail; pass `""` for the standalone temporal
+arm to return the base message verbatim (preserves byte-identical legacy assertions).
+
+**PF-016 caution**: do not pre-populate `reason` fields with default/empty values before
+classification — the key-absence guard in query arms depends on the field being absent
+on a clean result.
+
+## Temporal Index Build (temporal_build.rs)
+
+`rebuild_temporal(root, cache_dir, head, now_epoch) -> anyhow::Result<()>`
+
+Called from `try_rebuild_temporal_nonfatal` when the lexical index was refreshed:
+1. Single full-history walk: `GixSource::parse_history(root, 0)` → `HistoryResult`
+2. `compute_file_risk_scores` + `compute_file_temporal_stats` → per-file scores
+3. `build_cochange_rows(history)` → `Vec<CochangeRow>` (inline Jaccard, no external builder)
+4. `build_hotspot_rows` + `build_risk_rows` → `Vec<HotspotRow>` / `Vec<RiskRow>`
+4a. `apply_ghost_filter` — removes rows for files no longer on disk (AD-408-1).
+4b. **AD-413-17**: `apply_scope_filter` — when `root` is a proper subdirectory of the
+    git worktree toplevel, strip the scope prefix from all row paths and retain only
+    rows within the subtree. When `root == ghost_root` (plain repo), scope is `None`
+    and this step is a no-op. Non-UTF-8 path components skip the filter with a debug
+    notice rather than mangling the prefix. Cochange rows where only one side falls
+    within the scope are dropped (both-sides rule).
+5. `build_lock::acquire("skim search", cache_dir)` — acquire lock AFTER pure compute
+6. `TemporalDb::open(db_path)` + `db.sync(hotspots, risks, cochanges, head)` then
+   `record_temporal_anchor` (AD-413-16): writes `meta.git_toplevel` as a SECOND
+   transaction; process death between sync and anchor leaves Absent (not Differs),
+   so the next build adopts cleanly rather than refusing.
+
+**Build-backoff sentinel (`temporal.db.build_backoff`, AD-414-16 / AD-414-21)**:
+Guards against repeated `parse_history` failures re-walking git history on every
+silent query. Lifecycle:
+
+- **Explicit builds** (`BuildLoudness::Loud`: `--build`, `--rebuild`, and `--update`
+  when a rebuild is warranted) delete the sentinel at the START of the temporal
+  rebuild via `write_backoff_sentinel` / `backoff_sentinel_matches` (before the
+  backoff gate), so the user's explicit request always proceeds regardless of any
+  prior failure.
+- **Silent auto-refresh** (`BuildLoudness::Silent`) honours the sentinel:
+  `backoff_sentinel_matches(cache_dir, head, probed_shallow)` returns `true` when
+  the stored HEAD AND shallow state match the current invocation → rebuild skipped.
+- **Shallow-state change** (e.g. `git fetch --unshallow`): `probe_is_shallow_from_root`
+  returns `Option<bool>` (tri-state: `Some(true)`, `Some(false)`, `None` for unknown);
+  when the probed value differs from the stored value the gate reopens even when HEAD
+  has not moved.
+- Old single-line sentinels (no `\n` separator) never match `backoff_sentinel_matches`
+  and self-clear on the next explicit build (AD-414-21).
+
+**`parse_history` failure path (F3, AD-414-17)**:
+On `parse_history` failure the rebuild writes the build-backoff sentinel but does NOT
+write `META_GIT_HEAD` (no fabricated "fresh" state). If `temporal.db` already exists,
+`TemporalDb::open_existing(db_path)` (opens with `SQLITE_OPEN_READ_WRITE` without
+`SQLITE_OPEN_CREATE`) is used to update `META_IS_SHALLOW` using the probed tri-state
+value — only when the probe is conclusive (`Some(v)`). If the DB does not exist,
+`META_IS_SHALLOW` is not recorded (and Check 3 is not evaluable until the next
+successful sync).
+
+**`record_temporal_anchor` (F4, AD-414-18)**: the former `debug_assert_eq!` comparing
+`gix::discover` and `resolve_repo_toplevel` (two independent repo-discovery
+implementations) was replaced by a `crate::debug::is_debug_enabled()`-gated
+`eprintln!`, consistent with the module's own idiom. Release builds are unaffected; the
+assertion was compiled out in release and only enforced in debug/test.
+
+**`build_risk_rows` uses `risk_score_wilson_decay` (#378)**: computes
+`RiskRow.risk_score = risk_score_wilson_decay(scores[path].fix_density,
+stats[path].fix_commits, stats[path].total_commits)`. The Wilson lower bound
+suppresses small-sample files that previously saturated at 1.0 with the bare
+ratio.
+
+**`warn_skip!` macro**: all recoverable early-return arms use this macro to degrade
+gracefully (non-git dir, gix error, `CapacityExceeded`, sync failure). It emits a
+`"skim search [debug]:"` prefixed warning (debug-gated). This enforces D5 isolation
+("temporal failure MUST NOT fail lexical") from a single, auditable location.
+
+**`build_cochange_rows`**: pure function (no I/O). Accumulates per-file commit counts
+and canonical `(file_a < file_b)` pair counts directly from `HistoryResult`, computes
+Jaccard, and filters by `MIN_COCHANGE_JACCARD` (imported from `rskim_search`, not
+redeclared). Uses `union_paths` helper for the row-join pattern shared with hotspot/risk.
+
+**`MIN_COCHANGE_JACCARD`** and **`COUPLING_MAX_FILES`**: imported from `rskim_search`,
+not redeclared in this file (Decision O-D — single source of truth in rskim-search).
+
+**`current_epoch_secs()`**: returns current Unix timestamp in seconds; returns `0`
+on pre-epoch clocks (safe fallback, `#[must_use]`).
+
+## Temporal CLI Layer (temporal.rs)
+
+Functions called at query time from `mod.rs`:
+
+```rust
+pub(super) fn open_temporal_db(db_path: &Path) -> Option<TemporalDb>
+    // Returns None if file absent; never errors — graceful degradation
+
+pub(super) fn resort_window(limit: usize) -> usize
+    // Returns max(limit * 5, 100) for over-fetching before temporal re-sort (GAP-1)
+
+pub(super) fn normalize_blast_radius_path(raw: &str, root: &Path) -> anyhow::Result<String>
+    // Normalizes user-provided path: absolute as-is; relative tries root-first then CWD.
+    // Validates existence before canonicalize to get actionable "not found" errors.
+    // Strips root prefix; replaces \\ with / for Windows cross-platform consistency.
+
+pub(super) fn resolve_blast_radius_paths(
+    blast_radius: Option<&str>, root, cache_dir, json, head
+) -> anyhow::Result<BlastRadiusResolution>
+    // Normalizes path, opens db, queries cochanges_for_file, seeds target at SEED_STRENGTH (2.0).
+    // Returns BlastRadiusResolution::NotRequested (blast_radius None), ::Allowed(BlastRadiusStrengths),
+    // ::Filtered{allow, degraded} (RepositoryMismatch), or ::Degraded(u) (other unavailable).
+
+pub(super) fn resolve_blast_radius_file_ids(
+    blast_radius, root, cache_dir, sorted_paths: &[&str], json, head
+) -> anyhow::Result<Option<HashSet<FileId>>>
+    // Single resolver for the standalone --ast path's blast-radius.
+    // Calls resolve_blast_radius_paths → extracts BlastRadiusStrengths →
+    // uses paths_to_file_ids(sorted_paths, allowed_paths): ONE linear pass over
+    // sorted_paths with an O(1) map lookup per entry — O(n) in the indexed file
+    // count, not a binary search (AD-409-5).
+
+pub(super) fn apply_temporal_enrichment(
+    results: &mut [ResolvedResult], sort: TemporalSort, db
+) -> anyhow::Result<()>
+    // Annotates results with hotspot/risk scores then re-sorts by temporal signal
+
+pub(super) fn enrich_ast_results(
+    results: &mut [AstResult], sort: TemporalSort, db
+)
+    // Same as apply_temporal_enrichment but for run_ast_standalone's AstResult slice
+
+pub(super) fn query_standalone(
+    sort, blast_radius, limit, db, root
+) -> anyhow::Result<TemporalQueryOutput>
+    // Dispatches to top_hotspots / top_risks / top_coldspots / cochanges_for_file
+
+// TEST-ONLY — not part of production dispatch:
+#[cfg(test)]
+pub(super) fn check_temporal_staleness(db: &TemporalDb, project_root: &Path) -> Option<String>
+    // Used in temporal_build_tests.rs AC6 to verify stored HEAD matches current HEAD
+    // #[cfg(test)] on both this function and its read_git_head helper (spawns git process)
+```
+
+**GAP-1**: when a temporal sort is active, `resort_window(limit)` is used as the
+query limit (`max(limit*5, 100)`) so that temporally-hot files ranked beyond
+`--limit` in raw lexical/composite order can be promoted. After re-sort, results are
+truncated to `--limit`.
+
+**Blast-radius resolver (`resolve_blast_radius_file_ids`)**: the single resolver for
+the `--ast --blast-radius` path. It resolves co-change partners to `HashSet<FileId>`
+(using `sorted_paths` from the manifest) so `run_ast_standalone` can intersect AST
+results with the blast-radius set before truncation — avoiding PF-006 (silent
+feature-drop from post-truncation filter).
+
+## AST CLI Layer (ast.rs)
+
+```rust
+pub(super) fn open_ast_engine(cache_dir) -> anyhow::Result<AstQueryEngine<AstIndexReader>>
+    // Opens the AST index; fails loud if absent (fail-loud counterpart to temporal's graceful degrade)
+
+pub(super) fn validate_ast_pattern(raw: &str) -> anyhow::Result<AstQuery>
+    // Returns the parsed AstQuery so callers can reuse it (avoids second parse)
+    // Called in mod.rs before dispatch; also used inside run_ast_standalone
+    // SingleNode → error (#283); unknown pattern → lists available names
+
+pub(super) fn resolve_ast_scored(
+    engine: &AstQueryEngine<AstIndexReader>, raw: &str
+) -> anyhow::Result<Vec<(FileId, f64)>>
+    // Calls parse_ast_query → search_ast; returns FileId-ASC sorted scored vec
+    // Used by run_query text+--ast path
+
+pub(super) fn run_ast_standalone(
+    raw_pattern, limit, json, cache_dir, manifest,
+    blast_file_ids: Option<HashSet<FileId>>,  // pre-resolved by mod.rs
+    temporal_sort, temporal_db, root, w
+) -> anyhow::Result<ExitCode>
+    // Pure AST (no text query) standalone dispatch
+    // Truncation order:
+    //   1. blast-radius filter (FileId intersection) — BEFORE truncation
+    //   2. take bounded window (limit without sort; limit*5>=100 with sort)
+    //   3. temporal enrichment + re-sort (when both sort and db are Some)
+    //   4. truncate to limit — AFTER re-sort (AC-F4)
+    //   5. recover_line re-parse for each surviving file (line-span, AC-API3)
+```
+
+**Re-exports from `rskim_search`** (pub(super) in ast.rs):
+- `AstResult` — enriched row type for AST-only results
+- `format_ast_json` — JSON formatter for AST results
+- `format_ast_text` — text formatter for AST results
+- `recover_line` — line-span re-parse (bounded, fail-soft)
+
+**`run_ast_standalone` accepts `blast_file_ids: Option<HashSet<FileId>>`** (not raw
+path strings) — the pre-resolution happens in `mod.rs` via
+`temporal::resolve_blast_radius_file_ids`. The function is DB-free by design.
+
+**`read_line_at(abs_path, line_1indexed, max_bytes) -> Option<String>`**: reads a
+specific 1-indexed line from a file. Returns `None` on I/O error, non-UTF8,
+file exceeds `max_bytes`, or out-of-range line. Uses `rskim_search::MAX_REPARSE_FILE_BYTES`
+as the size guard in production calls.
+
+The CLI calls `search_ast` directly on `AstQueryEngine` (not through
+`SearchLayer::search`) to avoid `SearchResult` construction and `SearchLayer` overhead.
+
+## Query Execution (query.rs)
+
+`execute_query_with_manifest(config, pre_loaded_manifest, analytics) -> anyhow::Result<QueryOutput>`
+
+Accepts an optional pre-loaded manifest so the combined text+`--ast` path
+(which already called `auto_refresh_if_stale`) can skip a redundant refresh.
+When `pre_loaded_manifest` is `None`, the function calls `auto_refresh_if_stale`
+itself exactly once.
+
+**`execute_query`**: test-facing wrapper that calls `execute_query_with_manifest(config, None, analytics)`.
+Marked `#[cfg_attr(not(test), allow(dead_code))]`.
+
+The `ast_scored` field in `QueryConfig` carries `Vec<(FileId, f64)>` for RRF
+fusion. When `blast_radius_paths` and `ast_scored` are both set, the ranking is
+a 6-signal composite weighted-RRF (`CompositeWeights6`). When only text is set,
+it's pure BM25F lexical.
+
+**`candidate_pool(limit, k) -> usize`**: computes the over-fetch window for queries
+with offset (k = limit + offset). Returns `max(limit * 5, 100)` when a temporal
+sort is active; returns `limit + offset` otherwise. Centralises the window-sizing
+logic previously scattered across dispatch arms.
+
+**`weights_inert_notice` (#377)**: called before dispatch; returns a static string
+message when `--weights` supplies a non-zero weight for a signal that has no
+active layer on the current query path (e.g. temporal weight on the `--ast`
+compound path). Callers emit the message to stderr.
+
+**`run_compound_query` disjoint-set early-out**: when blast-radius and AST sets
+are both non-empty but share no files, `filter_set.is_empty()` triggers an
+explicit early return of an empty `QueryOutput` (total=0, results=[]). This
+replaces the previous approach of relying on the reader's `file_filter = Some(empty)`
+side-effect semantics. `sq.limit = Some(filter_set.len())` (no `.max(1)`) is safe
+because the early-out guarantees `filter_set.len() >= 1` at that point (ADR-003,
+#356).
+
+`ResolvedResult.layers_matched` tracks which signals contributed to a result:
+`["lexical"]`, `["lexical","ast"]`, etc. Absent on pure-lexical rows.
+
+**`score` field semantics**:
+- Single-token exact-symbol path (≥3 bytes, no whitespace, `is_single_token=true`): raw
+  occurrence count (length-norm-free, AD-372-6, #372). Large-file definers rank by how
+  many times the token appears, NOT by BM25F field-length normalization.
+- Multi-word / UNION lexical path (multi-token query): BM25F magnitude.
+- Composite UNION blast-radius path (#200): fused weighted-RRF score (small positive,
+  NOT BM25F magnitude). `field = "co_change_partner"` indicates temporal-only results.
+
+**Formatter content contract (Wave-4 F2 hardening)**:
+- Text output renders `path:line`, a 3-decimal score, and the snippet for matched rows.
+- JSON carries `mode`/`total`/`path`/`score` and **omits** `line`/`snippet` on
+  degraded (no-line) rows (additive-key contract — consumers must not assume these keys).
+
+## Manifest Sidecar (manifest.rs)
+
+`FileManifest`: a binary file (`index.skfiles`, format v4 with a `SKFM` magic
+header) storing content SHA-256, pre-classified `field_map`, mtime, AND size
+per indexed file. Used for **incremental builds** — if a file's SHA matches the
+cached entry, `field_map` is reused without re-classifying. (#380 binarized the
+former JSONL sidecar to shrink the on-disk footprint; v2/v3 JSONL manifests
+cold-start.)
+
+**New in #379**: `ManifestEntry` now stores `mtime: Option<u64>` AND `size: Option<u64>`
+(AD-379-2). Both fields are used by `scan_working_tree` for the working-tree
+staleness check. A `mtime: None` or `size: None` from a pre-#379 manifest entry is
+treated as changed so the fields are repopulated on the next rebuild (AC10).
+
+`stored_git_head()`: returns the git HEAD SHA stored in the manifest, used by
+staleness checking. This is the single source of truth for "what HEAD was the
+index built at?".
+
+`FileManifest::sorted_paths()`: returns a sorted `Vec<&str>` of all manifest
+paths, used by `paths_to_file_ids` for O(n log n) FileId resolution.
+
+`FileManifest::lookup(&str) -> Option<&ManifestEntry>`: used by `run_ast_standalone`
+to retrieve stored mtime for the stale guard in `recover_line`.
+
+`FileManifest::freshness_entries()`: new in #379. Returns an iterator of
+`(path: &str, mtime: Option<u64>, size: Option<u64>)` tuples for every indexed
+file. Used by `scan_working_tree` to compare on-disk metadata against the manifest.
+
+**`--stats` on-disk size (#380)**: `run_stats` now reads the actual on-disk sizes
+of `index.skidx`, `index.skpost`, `ast_index.skidx`, `ast_index.skpost`,
+`temporal.db`, etc. instead of deriving from entry counts. The resolved `cache_dir`
+path is also surfaced in the stats output (#381).
+
+**Binary v4 format (`SKFM` magic, #380)**: the manifest is now a compact binary
+format. v2/v3 JSONL manifests are detected by the lack of a valid `SKFM` header
+and cause a cold-start (manifest ignored, all files re-classified). Format has a
+12-byte fixed header (`SKFM` magic + format version + declared entry count) followed
+by length-prefixed binary entries. Security bounds:
+- `MAX_MANIFEST_ENTRIES = 60_000`
+- `MAX_MANIFEST_FILE_SIZE` reject oversized files up front
+- `MAX_FIELD_BYTES = 64 KiB` per field_map
+- `MAX_FIELD_MAP_TRIPLES = 1_000_000`
+All length reads use `AD-380-3`: `saturating try_from`, never `as u32`.
+
+## Validity Marker (rskim-search/src/validity.rs, #376)
+
+A new crate-private module (`pub(crate) mod validity`) in `rskim-search` provides
+`ValidityMarker` — a compact sidecar that caches a prior successful CRC32
+verification, skipping the per-query full-payload CRC32 on the hot path.
+
+Every `NgramIndexReader::open` / `AstIndexReader::open` re-hashes the entire
+posting blob before any query. On large corpora this dominated query latency
+(median 57 ms / p90 77 ms scaling with `.skpost` size). The marker moves that
+one-shot integrity check off the hot path.
+
+**Trust boundary (AD-376-2)**: The signature is `(idx_len, idx_mtime_ns,
+post_len, post_mtime_ns)` PLUS the header's already-stored `checksum` field.
+mtime + len detect any rewrite of either file; carrying the checksum means a
+marker minted for one index can never validate a file whose header advertises
+a different checksum.
+
+**Not a corruption detector**: the marker caches a prior successful CRC32 —
+it does NOT replace it. The full CRC32 remains the desync/mis-rank integrity
+guard. KNOWN LIMIT (AC1 of #376, PF-007): a content byte-flip that simultaneously
+preserves `len` AND `mtime` AND the header `checksum` field is served unverified
+(silent mis-rank). This is accepted and pinned in tests.
+
+**On-disk format** (52-byte fixed LE binary):
+```
+[0..8]   idx_len        u64 LE
+[8..24]  idx_mtime_ns   i128 LE  (nanoseconds from UNIX_EPOCH; signed for pre-epoch)
+[24..32] post_len       u64 LE
+[32..48] post_mtime_ns  i128 LE
+[48..52] checksum       u32 LE   (header.checksum field, NOT recomputed)
+```
+
+**Robustness (AC6)**: every read is best-effort — truncated, garbage, zero-length,
+or unreadable marker yields `None` and the caller falls through to the full CRC32.
+A failed marker write is swallowed; the next open re-verifies.
+
+The marker files are `index.skverify` (lexical) and `ast_index.skverify` (AST)
+in the cache directory. They are NOT listed in the `Cache Directory Layout` below
+but should be expected there.
+
+## Key Types (types.rs)
+
+```rust
+struct Flags {
+    action: SearchAction,
+    json: bool,
+    limit: usize,               // default 20
+    root_override: Option<PathBuf>,
+    temporal_sort: Option<TemporalSort>,  // Hot | Cold | Risky
+    blast_radius: Option<String>,
+    ast: Option<String>,
+    weights: Option<CompositeWeights6>,
+}
+
+struct QueryConfig {
+    text, limit, offset: Option<usize>, json, root, cache_dir,
+    blast_radius_paths: Option<BlastRadiusStrengths>,  // HashMap<String, f64>; seed at SEED_STRENGTH=2.0
+    ast_scored: Option<Vec<(FileId, f64)>>,   // FileId-ASC sorted
+    composite_weights: Option<CompositeWeights6>,
+}
+
+struct ResolvedResult {
+    path, score, field, line_number,
+    line_range: Option<Range<usize>>,
+    snippet: Option<SnippetContext>,
+    stale: bool,
+    match_positions: Vec<Range<usize>>,
+    temporal: Option<TemporalAnnotation>,
+    layers_matched: Vec<&'static str>,  // skip_serializing_if: empty
+}
+
+struct IndexResult {
+    file_count, skipped, cache_hits,
+    ast_cache_hits, ast_reextracted,
+    duration,
+}
+
+struct IndexConfig {
+    root, max_files: Option<usize>,
+    force: bool,
+    cache_dir_override: Option<PathBuf>,
+    // DEFAULT_MAX_FILES = 50_000 (associated const on IndexConfig)
+}
+
+// NEW in #379 (WalkEntry gains size field):
+struct WalkEntry {
+    abs_path, rel_path, lang,
+    mtime: Option<u64>,
+    size: Option<u64>,  // NEW: AD-379-2 working-tree staleness
+}
+
+// NEW in #379 (ProcessedFile gains size field):
+struct ProcessedFile {
+    rel_path, lang, content, sha256,
+    mtime: Option<u64>,
+    size: Option<u64>,  // NEW: AD-379-2
+    field_map, cache_hit, ast_cached,
+}
+```
+
+`TemporalAnnotation` in `types.rs` is `pub(super)` — has fields: `hotspot_score`,
+`risk_score`, `fix_density`, `cochange_jaccard`, `changes_30d`, `changes_90d`.
+
+`QueryConfig.offset: Option<usize>` is new (#372-AD-372-3): used on the pure-lexical
+exact-symbol path and threaded through to `resolve_paths_and_snippets_verified`.
+
+## Cache Directory Layout
+
+Default: `~/.cache/skim/search/<sha256_of_canonical_root>/`
+
+Files:
+- `index.skidx` — lexical n-gram index (NgramIndexBuilder output)
+- `index.skpost` — lexical posting lists
+- `index.skverify` — lexical validity marker (ValidityMarker sidecar, #376)
+- `index.skfiles` — incremental build manifest sidecar (binary v4, SKFM magic): SHA + field_map + mtime + size per file
+- `ast_index.skidx` — AST n-gram index header + metadata
+- `ast_index.skpost` — AST posting lists
+- `ast_index.skverify` — AST validity marker (ValidityMarker sidecar, #376)
+- `ast_index.skcache` — AST n-gram extraction cache by content SHA
+- `temporal.db` — SQLite temporal data (hotspots, risks, co-changes, meta)
+- `temporal.db.build_backoff` — build-backoff sentinel; two-line format
+  `<head>\n<shallow>` where `<shallow>` is `1` (shallow clone), `0` (not
+  shallow), or `?` (probe inconclusive, AD-414-21); written by
+  `write_backoff_sentinel`; checked by `backoff_sentinel_matches`; deleted
+  at the start of any explicit `--build`/`--rebuild`/`--update` temporal
+  rebuild (`BuildLoudness::Loud`, AD-414-16); old single-line sentinels
+  never match and self-clear
+- `.skim-build.lock` — build mutex file (`build_lock.rs`)
 
 ## Anti-Patterns
 
-**Adding I/O to `ast.rs` beyond what it already has.** New DB access for blast-radius belonged in the caller (`mod.rs`) and the shared helper (`temporal.rs`), not inside `run_ast_standalone`. The function receives pre-resolved `blast_file_ids: Option<HashSet<FileId>>` — keep it DB-free.
+- **Refreshing the index more than once per query path**: each dispatch arm
+  (`run_query`, `run_ast_standalone`) calls `auto_refresh_if_stale` exactly once.
+  The combined text+`--ast` path pre-loads the manifest and passes it to
+  `execute_query_with_manifest` to avoid a second refresh call.
 
-**Calling `manifest.save()` after a failed index build.** Any code path that calls `builder.build()` or `ast_builder.build()` and then calls `manifest.save()` regardless of success breaks the crash-safety invariant. The manifest must only be saved when ALL index writes succeed.
+- **Calling `auto_refresh_if_stale` AFTER opening the AST engine**: the self-heal
+  ordering in ADR-006 requires the refresh to happen BEFORE `open_ast_engine`.
+  A stale AST index must be rebuilt before the query engine is opened.
 
-**Adding temporal sort + `--ast` compound queries without resolving #202.** The current code explicitly errors on this combination. Do not silently degrade or ignore one of the flags.
+- **Using `paths_to_file_ids` or `paths_to_scored_file_ids` with a `sorted_paths` slice
+  that is not the manifest's own sorted order**: both functions derive `FileId(idx)` from
+  the *position* of each entry in the slice, so the slice must be exactly
+  `manifest.sorted_paths()`. Neither performs a binary search — each does ONE linear pass
+  over the slice with an O(1) map lookup per entry (AD-409-5) — so an unsorted or
+  re-ordered slice does not fail loudly; it silently yields wrong `FileId`s.
 
-**Constructing FileIds from `idx as u32` (applies PF-004).** Use `u32::try_from(idx)` everywhere FileId values are constructed from positional indexes. `paths_to_file_ids` in `temporal.rs` is the canonical example.
+- **Applying the blast-radius FileId filter AFTER truncating to `--limit`**: the
+  blast-radius intersection must happen before truncation (PF-006: silent
+  feature-drop). `run_ast_standalone` receives pre-resolved `blast_file_ids`
+  and intersects before truncation. `resolve_blast_radius_paths` in `run_query`
+  feeds `blast_radius_paths` into `QueryConfig` so it is applied inside the
+  search engine before LIMIT.
 
-**Breaking the `index.rs` consume loop's fail-soft / fail-loud contract.** Lexical errors are fail-soft: `continue` and skip the file from both indexes. AST errors after a successful lexical insert are fail-loud: `return Err(...)` to abort the build.
+- **Routing through `SearchLayer::search` for AST queries from the CLI**: the CLI
+  calls `search_ast` directly on `AstQueryEngine`. `SearchLayer::search` adds
+  overhead and is not the primary dispatch path.
 
-**Routing CLI AST queries through `SearchLayer::search` instead of `search_ast`.** `resolve_ast_file_filter` and `run_ast_standalone` call `engine.search_ast(&query)` directly. Using `SearchLayer::search` adds overhead and the `lang` filter is not needed.
+- **Treating `score` in `ResolvedResult` as always BM25F**: on the composite
+  UNION blast-radius path (`--blast-radius` with `CompositeWeights6`), `score`
+  is a weighted-RRF value (small positive, not a BM25F magnitude).
 
-**Calling `open_ast_engine` before `auto_refresh_if_stale` in the combined text+`--ast` path.** This was the root cause of regression #10. Always refresh before opening any index.
+- **Redeclaring `MIN_COCHANGE_JACCARD` or `COUPLING_MAX_FILES` in CLI code**:
+  these constants are imported from `rskim_search` (Decision O-D). `temporal_build.rs`
+  explicitly comments that it does NOT redeclare them.
 
-**Silently dropping out-of-range FileIds in AST result resolution.** `run_ast_standalone` warns on stderr when a FileId is beyond the manifest range. Do not revert to silent `filter_map`.
+- **Placing the `--ast` dispatch arm AFTER the temporal-only arm**: the `--ast`
+  arm must come first in the `match` so `--ast --hot` is handled by
+  `run_ast_standalone` (R1/GAP-6), not silently dropped to `run_temporal_standalone`.
 
-**Using `execute_query` in production dispatch (it is test-only).** Use `execute_query_with_manifest` with `pre_loaded_manifest = Some(manifest)` when you've already refreshed, or `None` for the pure-lexical path.
+- **Calling `check_temporal_staleness` from production code**: it is `#[cfg(test)]`
+  only. Adding a production call would break with a compile error.
 
-**Using unbounded lock acquisition on `.skim-build.lock`.** The build lock must use the bounded `try_lock()` poll loop with a 120-second deadline. Never use `.lock()` (blocks indefinitely).
+- **Using non-standard stderr prefixes**: all new stderr output must use exactly
+  `"skim search:"` or `"skim search [debug]:"`. No sub-qualifiers (e.g.
+  `"skim search index:"`) — message bodies are self-describing.
 
-**Calling `producer_skips.load()` before `producer_handle.join()`.** The atomic load is only valid after join() returns — join() is the happens-before edge.
+- **Reimplementing `query_substring_present` locally**: the canonical definition
+  lives in `rskim-search/src/types.rs` as `pub fn query_substring_present`. Both
+  the CLI verify gate (`snippet.rs`) and the bench harness (`rskim-bench`) delegate
+  to `rskim_search::query_substring_present`. Do not add a local copy.
 
-**Adding blast-radius DB access to `run_ast_standalone`.** The function is intentionally DB-free: blast-radius resolution is done in the caller (`mod.rs` → `temporal::resolve_blast_radius_file_ids`) and the result passed as `blast_file_ids`. Adding direct DB access to `ast.rs` would violate the module boundary.
+- **Duplicating the `CARGO_BIN_EXE_skim` fallback in new tests**: use the shared
+  `skim_bin_path()` helper defined in `mod.rs`'s test module.
+
+- **Duplicating the `create_real_git_repo` test helper**: use
+  `super::staleness::create_real_git_repo` from `staleness_tests.rs`,
+  `temporal_build_tests.rs`, and `mod.rs` test modules. Do not add another copy.
+
+- **Using bare `fix_density` ratio for `--risky` ranking in `build_risk_rows`**: always
+  call `risk_score_wilson_decay(decay_fix_factor, fix_commits, total_commits)` to
+  produce `RiskRow.risk_score`. The bare ratio saturates on tiny samples (#378).
+
+- **Reading `temporal.db` staleness by opening `TemporalDb::open` on the hot path**:
+  use `temporal_db_is_stale(cache_dir, current_head, git_dir)` which opens a minimal
+  read-only SQLite connection for three lightweight checks (HEAD match, data_version
+  gate, shallow→full probe — AD-414-14). The full `TemporalDb::open` runs WAL pragma
+  + two metadata syscalls + migration check.
 
 ## Gotchas
 
-**`skim search index` vs `skim search --build`**: the `"index"` prefix check in `run()` is a legacy subcommand path. It dispatches to `index.rs::run()` which uses clap for its own flag parsing. The parent `run()` does not call `parse_flags()` for this path.
+- **`StalenessCheck` now has a `WorkingTreeChanged` variant** (#379): `is_dirty()`
+  is NOT a method on `StalenessCheck` — it's on `WorkingTreeDelta`. The
+  `WorkingTreeChanged` case carries aggregate counts `{ changed, added, removed }`,
+  not a per-file diff. Matching exhaustively requires handling this new arm.
 
-**Help is checked before `parse_flags`**: `--help` / `-h` in the top-level handler is caught BEFORE calling `parse_flags`. If help appears anywhere in `args` alongside a subcommand, `print_help()` is called.
+- **`StalenessCheck` variant is `Current`, not `Fresh`**: the "up to date" variant
+  is `StalenessCheck::Current`. Code using `.is_stale()` or matching `Fresh` will
+  fail to compile.
 
-**Blast-radius includes the target file itself**: `resolve_blast_radius_paths` adds the normalized path for the target file to the `HashSet` of partners. Same behavior in the blast-radius arm of `query_standalone`. This is intentional.
+- **`build_lock.rs` has two public-to-module functions**: `acquire` (production path,
+  uses `LOCK_POLL_MS` and `LOCK_DEADLINE_SECS` consts) and `acquire_bounded` (inner
+  impl exposed for `build_lock_tests.rs` with injectable `poll`/`deadline_after`).
+  Both `build_index` (index.rs) and `rebuild_temporal` (temporal_build.rs) call
+  `acquire`, not `acquire_bounded`.
 
-**`sorted_paths()` order = FileId**: the manifest stores entries in a `BTreeMap<String, ManifestEntry>` keyed by path. `sorted_paths()` returns keys in sorted order. The NgramIndexBuilder assigns FileId 0 to the first file sent to `add_file_classified`, 1 to the second, and so on. These must stay in sync.
+- **`--weights` ast signal is inert on the `--blast-radius` path**: `CompositeWeights6`
+  has six signals; on the blast-radius composite path only lexical and temporal
+  (co-change) signals are active. The ast weight (0.3 default) has no AST posting
+  list to score against on that path.
 
-**AST self-heal and `NoStoredHead`**: `check_staleness` returns `NoStoredHead` (not a dedicated `AstStale` variant) when the AST index needs rebuilding. Callers that pattern-match on `NoStoredHead` to detect "no git HEAD" will also be triggered by an AST-stale condition.
+- **`validate_ast_pattern` returns `anyhow::Result<AstQuery>`** (not `Result<()>`):
+  the return value is the parsed query, enabling callers that need both validation
+  and the parsed query to avoid a second `parse_ast_query` call.
 
-**`temporal.rs::read_git_head` is subprocess-based**: unlike `staleness.rs::read_git_head` (pure file I/O), the temporal staleness check spawns `git rev-parse HEAD` with a 5-second timeout. These are two separate implementations for different callers. Do not unify them.
+- **`--ast` with temporal flags does NOT error** (Wave 4/#202 complete):
+  `--ast --hot`, `--ast --blast-radius`, etc. all work. The interim guard was removed.
 
-**`#289` temporal rebuild hook point**: `auto_refresh_if_stale` has a `TODO(#289)` comment immediately after the manifest load. When the temporal populate path is implemented, the call should go here (under the same `.skim-build.lock`, reusing the already-read HEAD).
+- **`run_ast_standalone` truncation order is strict**:
+  1. blast-radius filter; 2. take window; 3. temporal enrich+sort; 4. truncate to limit;
+  5. re-parse (recover_line). Re-parse runs AFTER truncation (at most `limit` files, AC-API3).
 
-**`--stats HEAD` field**: the `run_stats` handler reads the git HEAD from the manifest (not from the git repo), so it reflects the HEAD at the time of the last build, not the current HEAD. This is intentional — it shows the state the index was built from.
+- **`temporal_annotation_tag` uses array-of-options + flatten**: the mutable
+  `Vec::new()` + push pattern was replaced with `[t.hotspot_score.map(...), t.risk_score.map(...)]
+  .into_iter().flatten().collect()`. When adding new annotation fields, extend the
+  array — do not revert to the mutable-Vec pattern.
 
-**`derive_ast_entry` is infallible by design**: any error in linearization or extraction returns an empty triple. The consume loop then inserts an empty AST entry for that FileId. The only fail-loud path is when `add_file_ngrams` itself rejects the entry after a lexical success.
+- **`NgramIndexReader` scoring loop is split into helper methods** (`accumulate_posting_tfs`,
+  `collect_scored_results`): `accumulate_posting_tfs` handles the first sub-pass (TF
+  accumulation + blast-radius early-skip); `collect_scored_results` handles
+  defense-in-depth filter, sort, skip, take.
 
-**`cochange_partner_paths` does NOT include the target**: unlike `resolve_blast_radius_paths`, `cochange_partner_paths` itself does not include the target file. The caller (`resolve_blast_radius_paths`) inserts the normalized path with `allowed_paths.insert(normalized)` explicitly after calling `cochange_partner_paths`.
+- **`postings_buf.shrink_to_fit()` is called after the encode loop in the lexical
+  index builder**: initial `Vec::with_capacity` uses `VARINT_UPPER_BOUND_PER_ENTRY = 9`
+  bytes/entry (~2.5× the measured ~3.5 byte v4 average). After encoding,
+  `shrink_to_fit()` releases the excess.
 
-**`parse_temporal_flag` handles blast-radius equals form**: `--blast-radius=FILE` (equals form) is handled by a `starts_with` arm in `parse_temporal_flag`, not by `take_flag_value`. This is distinct from `--limit` and `--root` which use `take_flag_value` for both forms.
+- **`AstNgramCache` (`ast_index.skcache`)**: separate from the lexical manifest.
+  A file can have a manifest cache hit (field_map reused) but an AST cache miss
+  (new extraction) or vice versa.
 
-**`validate_ast_pattern` returns the parsed `AstQuery`**: as of the latest version, `validate_ast_pattern` returns `anyhow::Result<AstQuery>` (not `anyhow::Result<()>`). The `mod.rs` pre-dispatch call discards the result with the `?` operator; `run_ast_standalone` reuses the returned query to avoid a second `parse_ast_query` call.
+- **`resolve_hooks_dir` returns `Result<PathBuf, PathBuf>` not `Option`** (AD-413-18):
+  `Ok` carries the resolved hooks directory; `Err` carries the enclosing repository
+  path when the project root is a subdirectory of a repo but has no own `.git`
+  entry. The former `Result<PathBuf, Option<PathBuf>>` (with uninhabited `Err(None)`)
+  was removed. Repository-controlled paths emitted in error messages use `{:?}` to
+  escape control characters (AD-408 / F8).
 
-**`blast_radius_paths` in `QueryConfig` is `Option<HashSet<String>>`**: the lexical query path passes path strings, not FileIds, because `execute_query_with_manifest` converts them to FileIds internally using the manifest's `sorted_paths()` slice. This is distinct from the AST path where `blast_file_ids: Option<HashSet<FileId>>` are pre-resolved before calling `run_ast_standalone`.
+- **Build-backoff sentinel is a two-line file** (AD-414-21): `temporal.db.build_backoff`
+  stores `<head>\n<shallow>` (`0`/`1`/`?`). Old single-line sentinels (written before
+  the format change) contain no `\n` and never match `backoff_sentinel_matches`,
+  so they self-clear on the next explicit `--rebuild`. Do not read or write the file
+  directly — use `write_backoff_sentinel` / `backoff_sentinel_matches`.
 
-## Test Coverage Summary
+- **`resolve_git_dir` follows worktree `.git` files** (#413): if `.git` is a file
+  (linked worktree), parses `gitdir: <path>` pointer and returns the resolved worktree
+  gitdir. Relative paths are resolved relative to the directory containing the `.git` file.
+  `resolve_git_dir` resolves ONE directory and never walks up — ancestor discovery lives in
+  `git_head_state` (via `resolve_repo_toplevel` + `walk::discover_project_root`). The
+  `commondir` pointer (inside the worktree gitdir) further routes HEAD resolution to the
+  shared primary `.git` via a 4-probe ladder (AD-413-4/5); per-worktree namespaces
+  (`refs/bisect/`, `refs/worktree/`, `refs/rewritten/`) are NOT redirected. Bare repos and
+  reftable repos return `None` (AD-413-11; out of scope).
 
-Test files are co-located alongside each source file:
-- `ast_tests.rs` — validate_ast_pattern, parse_flags AST variants, standalone AST with real index, text+AST intersection, self-heal for below-FORMAT_VERSION, combined text+AST path self-heals when AST index absent, `--ast + --blast-radius` intersection
-- `query_tests.rs` — execute_query against real index
-- `staleness_tests.rs` — check_staleness variants, auto_refresh_if_stale
-- `index_tests.rs` — Pipeline::consume, derive_ast_entry, FileId-alignment invariant, ADR-006 abort path
-- `temporal_tests.rs` — normalize_blast_radius_path, apply_temporal_enrichment, query_standalone, resolve_blast_radius_paths (replaces old resolve_blast_radius_filter tests)
-- `hooks_tests.rs` — install/remove idempotency, hook block format
-- `manifest_tests.rs`, `walk_tests.rs`, `snippet_tests.rs` — focused unit tests
+- **The `*_tests.rs` files are co-located test modules** included via `#[path]`.
+  All `cmd/search/` modules follow this pattern.
+
+- **`skim search index`** is the legacy subcommand path removed in #375. The
+  modern path is `skim search --build` / `--rebuild`. The string "index" is now
+  treated as a text query.
+
+- **`run_build` stderr format** (mod.rs:908): `"skim search: indexed N files (M skipped, K cache hits) in Z.Zs"`.
+  (Not `K field-map hits` or `X AST reused, Y AST re-extracted` — those are internal counters not surfaced in this line.)
+
+- **Validity marker files (`index.skverify`, `ast_index.skverify`)**: generated by
+  `rskim-search::validity` on a successful verified open. Absent on the first open
+  (or after a rebuild that calls `unlink_marker_best_effort`). A bad marker yields
+  `None` and falls through to the full CRC32 — never a failure.
+
+- **Walk determinism at file cap (#379 / c1b8830)**: `walk_metadata` now returns
+  entries in a deterministic sorted order so the set of indexed files is stable
+  when the cap is reached. Pre-#379 the walk order was OS-dependent.
 
 ## Key Files
 
-- `crates/rskim/src/cmd/search/mod.rs` — entry point, flag parsing (`parse_flags`, `parse_limit_value`, `parse_temporal_flag`, `take_flag_value`), dispatch, all action handlers
-- `crates/rskim/src/cmd/search/index.rs` — `build_index`, `Pipeline::run/consume`, `derive_ast_entry`, `resolve_search_cache_dir`, FileId-alignment invariant, bounded lock acquisition
-- `crates/rskim/src/cmd/search/query.rs` — `execute_query_with_manifest`, `execute_query` (test-only), FileId filter construction (converts `blast_radius_paths` strings → FileIds via `paths_to_file_ids`), `format_text_output`, `format_json_output`
-- `crates/rskim/src/cmd/search/staleness.rs` — `check_staleness`, `auto_refresh_if_stale`, AST self-heal, git HEAD file I/O (pure, no subprocess), `resolve_git_dir`
-- `crates/rskim/src/cmd/search/types.rs` — `QueryConfig` (`blast_radius_paths: Option<HashSet<String>>`, `ast_file_ids: Option<HashSet<FileId>>`), `IndexConfig`, `ResolvedResult`, `QueryOutput`, `TemporalSort`, `TemporalAnnotation`, `WalkEntry`, `ProcessedFile`
-- `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`, `validate_ast_pattern` (returns `AstQuery`), `resolve_ast_file_filter`, `run_ast_standalone` (accepts `blast_file_ids: Option<HashSet<FileId>>`, no DB access)
-- `crates/rskim/src/cmd/search/temporal.rs` — `normalize_blast_radius_path`, `cochange_partner_paths`, `resolve_blast_radius_paths` (→ `HashSet<String>`), `paths_to_file_ids` (→ `HashSet<FileId>`), `resolve_blast_radius_file_ids` (unified), `apply_temporal_enrichment`, `query_standalone`, `resort_partners_by_temporal`, `open_temporal_db`, `check_temporal_staleness`
-- `crates/rskim/src/cmd/search/manifest.rs` — `FileManifest`, `ManifestEntry`, `ManifestHeader`, atomic write, wrong-root detection
-- `crates/rskim/src/cmd/search/hooks.rs` — `install_search_hooks`, `remove_search_hooks`, marker-delimited hook blocks
+- `crates/rskim/src/cmd/search/mod.rs` — dispatch hub; `parse_flags`;
+  `run_query`, `run_temporal_standalone`; help text
+- `crates/rskim/src/cmd/search/index.rs` — `build_index`; `Pipeline`; streaming producer/
+  consumer; `derive_ast_entry`; `resolve_search_cache_dir`; `Pipeline::flush_empty`
+- `crates/rskim/src/cmd/search/build_lock.rs` — `acquire`; `acquire_bounded`; advisory mutex
+- `crates/rskim/src/cmd/search/temporal_build.rs` — `rebuild_temporal`;
+  hotspot/risk/cochange row builders; `current_epoch_secs`; `warn_skip!` macro
+- `crates/rskim/src/cmd/search/temporal.rs` — `normalize_blast_radius_path`;
+  `resolve_blast_radius_paths`; `resolve_blast_radius_file_ids`; `paths_to_scored_file_ids`;
+  `cochange_partner_strengths`; `BlastRadiusResolution`; `BlastRadiusStrengths`; `SEED_STRENGTH`;
+  `apply_temporal_enrichment`; `enrich_ast_results`; `query_standalone`; formatters
+- `crates/rskim/src/cmd/search/ast.rs` — `open_ast_engine`;
+  `validate_ast_pattern`; `resolve_ast_scored`; `run_ast_standalone`;
+  `read_line_at`; re-exports `AstResult`/`format_ast_json`/`format_ast_text`
+- `crates/rskim/src/cmd/search/gitdir.rs` — `HeadState`; `git_head_state`;
+  `read_git_head`; `resolve_git_dir`; `resolve_common_dir`; `resolve_repo_toplevel`;
+  `is_hex_sha`
+- `crates/rskim/src/cmd/search/temporal_state.rs` — `ReanchorPolicy`; `AnchorState`;
+  `temporal_anchor_state`; `anchor_state_on_db`; `temporal_db_is_stale`;
+  `warn_if_temporal_unverifiable`; `try_rebuild_temporal_nonfatal`
+- `crates/rskim/src/cmd/search/staleness.rs` — `StalenessCheck`; `check_staleness`;
+  `RefreshOutcome`; `auto_refresh_if_stale`; `WorkingTreeDelta`; `scan_working_tree`;
+  re-exports from `gitdir` + `temporal_state`;
+  `create_real_git_repo`; `create_real_git_worktree` (#[cfg(test)])
+- `crates/rskim/src/cmd/search/query.rs` — `execute_query_with_manifest`;
+  `execute_query` (test-only); JSON/text formatters; `weights_inert_notice`;
+  `candidate_pool`
+- `crates/rskim/src/cmd/search/types.rs` — all shared data types (WalkEntry.size
+  and ProcessedFile.size added in #379; QueryConfig.offset added)
+- `crates/rskim/src/cmd/search/manifest.rs` — `FileManifest` binary (v4) sidecar;
+  `lookup`; `stored_git_head`; `sorted_paths`; `freshness_entries` (#379);
+  `encode_field_map`; `decode_field_map`
+- `crates/rskim/src/cmd/search/walk.rs` — `walk_metadata` (deterministic order at
+  cap, #379/c1b8830); `normalize_rel_path` (now pub(super))
+- `crates/rskim-search/src/validity.rs` — `ValidityMarker`; `MARKER_SIZE=52`;
+  `current_signature`; `read_marker`; `write_marker_best_effort`;
+  `unlink_marker_best_effort`
 
 ## Related
 
-- Feature knowledge: `ast-index` — the `AstIndexBuilder`, `AstIndexReader`, `AstQueryEngine`, `AstNgramSet`, `StructuralMetrics`, `AST_INDEX_FORMAT_VERSION`, `FORMAT_VERSION` probe, `search_ast` called directly by `ast.rs`
-- Feature knowledge: `temporal-scoring` — the `TemporalDb`, `HotspotRow`, `RiskRow`, `META_GIT_HEAD` used by `temporal.rs`; `top_hotspots`, `top_coldspots`, `top_risks`, `hotspot_for_file`, `risk_for_file`, `cochanges_for_file`
-- Feature knowledge: `cochange` — the `CochangeRow` and co-change data that backs `--blast-radius`
-- ADR-004: follow-up tickets filed before implementation — tracked deferrals: `#283` (single-node/unigram), `#202` (--ast+temporal compound), `#289` (temporal rebuild hook), `#290` (AST incremental build cache)
-- ADR-006: dual-index per-file desync aborts build before commit — the `consume` loop fail-loud-on-post-lexical-AST-error pattern and the `derive_ast_entry` infallible helper implement this decision
-- PF-004: u16→u32 widening before arithmetic — applied in `query.rs`, `ast.rs`, and `temporal.ts::paths_to_file_ids` when constructing `FileId(u32::try_from(idx)?)` from positional indexes
+- Feature: `ast-index` — `AstQueryEngine`, `AstIndexReader`, `parse_ast_query`,
+  `search_ast`, `AstNgramCache`, `CachedAstEntry`; the AST query engine that `ast.rs` wraps.
+- Feature: `temporal-scoring` — `TemporalDb`, `HotspotRow`, `RiskRow`,
+  `CochangeRow`, scoring functions including `wilson_lower_bound` and
+  `risk_score_wilson_decay` (#378); used by `temporal.rs` and `temporal_build.rs`.
+- Feature: `cochange` — `CochangeMatrixBuilder`, `CochangeMatrixReader`,
+  `COUPLING_MAX_FILES`; historic binary format path (now `build_cochange_rows` in
+  `temporal_build.rs` computes rows directly without the binary matrix step).
+- ADR-006: self-heal ordering — `auto_refresh_if_stale` BEFORE `open_ast_engine`.
+- PF-006: blast-radius filter must be applied BEFORE truncation to `--limit`.
+- PF-007: AD-376-1 — validity marker is NOT a corruption detector (known limit AC1).
+- Decision O-B: `check_temporal_staleness` is `#[cfg(test)]` only — intentionally
+  absent from all production query paths.
+- Decision O-D: `MIN_COCHANGE_JACCARD` and `COUPLING_MAX_FILES` are single-sourced
+  in rskim-search, never redeclared in CLI code.
+- ADR-003: resource bounds — skcache size limit, build lock deadline, CHANNEL_CAPACITY.
+- Issue #202: `--ast` composing with temporal flags — complete as of Wave 4.
+- Issue #200: `--weights` / `CompositeWeights6` / N-signal UNION blast-radius path.
+- Issue #201: `layers_matched` field; `AstResult` enriched type; `recover_line`
+  re-parse; `format_ast_json`/`format_ast_text` in rskim-search.
+- Issue #290: AST incremental build cache (`ast_index.skcache`); content-SHA-keyed.
+- Issue #283: single-node AST queries not yet supported.
+- Issue #339: `--weights` ast signal on the `--blast-radius` path (currently inert).
+- Issue #376: validity marker caching (`index.skverify`, `ast_index.skverify`).
+- Issue #377: `weights_inert_notice` for inert `--weights` signal detection.
+- Issue #378: Wilson+decay volume-weighted risk scoring (`risk_score_wilson_decay`).
+- Issue #379: working-tree staleness scan (`WorkingTreeChanged`, `scan_working_tree`,
+  `WalkEntry.size`, `ManifestEntry.size`, `freshness_entries`, walk determinism at cap).
+- Issue #380: binary v4 manifest (`SKFM`), true on-disk `--stats`, grounded size guard.
+- Issue #381: correct index location surfaced in `--stats`; canonicalize-fallback.

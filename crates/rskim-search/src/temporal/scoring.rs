@@ -76,6 +76,153 @@ pub fn decay_weight(elapsed_days: f64, half_life_days: f64) -> f64 {
     (-elapsed / half_life_days).exp().clamp(0.0, 1.0)
 }
 
+/// z-score for a two-sided 95% confidence interval (1.96).
+///
+/// Used by [`wilson_lower_bound`]. Fixed at 95% per AD-378-1 — Wilson is
+/// parameter-free at a chosen confidence level, so this is the only constant
+/// the volume-weighting formula needs (the old `VOLUME_REF` saturation
+/// reference is removed entirely).
+const WILSON_Z_95: f64 = 1.96;
+
+/// Wilson score-interval lower bound for a binomial proportion at 95% confidence.
+///
+/// Returns the lower bound of the [Wilson score interval](https://en.wikipedia.org/wiki/Binomial_proportion_confidence_interval#Wilson_score_interval)
+/// for `successes` out of `trials`, clamped to `[0.0, 1.0]`. This is the
+/// statistically correct way to rank a proportion (here: fix-commit density)
+/// **while accounting for sample size** — small samples are self-suppressed
+/// toward zero, large samples approach the raw ratio.
+///
+/// # Why Wilson (AD-378-1)
+///
+/// Ranking by a bare ratio `successes / trials` saturates on tiny samples: a
+/// 1-fix/1-commit file ties a 50-fix/50-commit file at `1.0`, burying genuinely
+/// fix-prone files (the #378 saturation bug). Wilson reduces a 1/1 to ~0.21 and
+/// a 50/50 to ~0.93 with **no tuned constant** — the only parameter is the
+/// confidence level (95%, [`WILSON_Z_95`]).
+///
+/// # Boundary semantics (AC4)
+///
+/// - `wilson_lower_bound(0, 0)` returns exactly `0.0` (no observations → no
+///   evidence of risk; avoids a `0/0` NaN).
+/// - `successes == 0` returns exactly `0.0` (the lower bound is clamped at 0).
+/// - `successes` is clamped to `trials` before computation so an out-of-range
+///   caller can never produce `p_hat > 1.0`.
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_search::wilson_lower_bound;
+///
+/// assert_eq!(wilson_lower_bound(0, 0), 0.0);
+/// assert_eq!(wilson_lower_bound(0, 5), 0.0);
+/// // A 1/1 sample is heavily discounted vs a 50/50 sample.
+/// assert!(wilson_lower_bound(1, 1) < wilson_lower_bound(50, 50));
+/// // Result is always a valid probability.
+/// let lb = wilson_lower_bound(3, 8);
+/// assert!((0.0..=1.0).contains(&lb));
+/// ```
+#[must_use]
+#[inline]
+pub fn wilson_lower_bound(successes: u32, trials: u32) -> f64 {
+    // No observations → no evidence; return 0.0 rather than 0/0 = NaN (AC4).
+    if trials == 0 {
+        return 0.0;
+    }
+    // Clamp successes <= trials so a malformed caller cannot yield p_hat > 1.0.
+    let successes = successes.min(trials);
+    let n = f64::from(trials);
+    let phat = f64::from(successes) / n;
+    let z = WILSON_Z_95;
+    let z2 = z * z;
+
+    // Wilson score interval lower bound:
+    //   (phat + z²/2n − z·sqrt(phat(1−phat)/n + z²/4n²)) / (1 + z²/n)
+    let denom = 1.0 + z2 / n;
+    let centre = phat + z2 / (2.0 * n);
+    let margin = z * (phat * (1.0 - phat) / n + z2 / (4.0 * n * n)).sqrt();
+    let lower = (centre - margin) / denom;
+
+    // Clamp into [0,1]: floating-point error near phat==0 can drift slightly
+    // negative, and the formula is bounded above by 1.0 analytically.
+    lower.clamp(0.0, 1.0)
+}
+
+/// Volume-weighted bug-fix risk score: decay-weighted fix proportion × Wilson-confidence proportion.
+///
+/// `risk_score = decay_fix_factor * wilson_lower_bound(fix_commits, total_commits)`.
+///
+/// This is the persisted `RiskRow.risk_score` used to rank files under
+/// `skim search --risky`. It is the product of two `[0.0, 1.0]` proportions
+/// (AD-378-1):
+///
+/// - `decay_fix_factor`: the **decay-weighted fix proportion** from
+///   [`compute_file_risk_scores`] (`FileRiskScores::fix_density`) =
+///   `Σ decay·is_fix / Σ decay` over the file's commits. Because the decay
+///   weight appears in **both** the numerator and denominator it largely
+///   cancels: this factor is the share of (recency-weighted) touches that were
+///   fixes, NOT a pure recency weight. In particular, for an all-fix file every
+///   touch is a fix so the factor is exactly `1.0` regardless of how old the
+///   commits are. Recency only shifts this factor when a file mixes fix and
+///   non-fix commits at different ages (a recent fix among older features
+///   raises it; an old fix among recent features lowers it).
+/// - [`wilson_lower_bound`]`(fix_commits, total_commits)`: the confidence-adjusted
+///   fix proportion read from the **raw** lifetime commit counts — *how much
+///   evidence* there is, in `[0.0, 1.0]`. Reading raw counts here (not the
+///   decay-weighted ratio) avoids a decay/raw-count sample-size mismatch. This
+///   is the factor that actually fixes the #378 saturation bug: it is what
+///   suppresses a tiny-sample file (a 1-fix/1-commit file whose
+///   `decay_fix_factor` is also `1.0`) below a high-volume one.
+///
+/// The product stays in `[0.0, 1.0]` (both factors are in `[0,1]`), preserving
+/// the `RiskRow::risk_score` doc contract and `{:.3}` formatting (AC3).
+///
+/// # Separation from `fix_density` (AD-378-3)
+///
+/// This is intentionally **distinct** from `RiskRow::fix_density`, which is the
+/// bare raw ratio `fix_commits / total_commits` shown in the `Fix%` column —
+/// note that even the `decay_fix_factor` input here (the *decay-weighted* fix
+/// proportion) is a different quantity from that raw ratio. For any file with
+/// `fix_commits != total_commits` the persisted `risk_score` and `fix_density`
+/// differ, proving the two-field separation (AC5).
+///
+/// # Grounding (AD-378-2)
+///
+/// The choice of Wilson+decay over the bare ratio is validated by a temporal
+/// predict-future-fixes backtest (ADR-003, tied to #361): risk is computed from
+/// commits before a cutoff `T`, each file is labelled by whether it received a
+/// fix-commit *after* `T` (reusing the heatmap fix-after-touch classifier
+/// [`is_fix_commit`]), and rankers are scored by precision@N / NDCG against the
+/// held-out future fixes. Wilson+decay MUST score >= the bare-ratio baseline
+/// (AC9; see `risk_score_wilson_decay_beats_bare_ratio_on_backtest` in the unit
+/// tests). The previously-used `VOLUME_REF` percentile grounding is removed
+/// along with the constant.
+///
+/// # Boundary semantics (AC4)
+///
+/// `risk_score_wilson_decay(_, _, 0)` returns exactly `0.0` (no commits → the
+/// Wilson factor is `0.0`, so the product is `0.0` regardless of the decay
+/// factor).
+///
+/// # Examples
+///
+/// ```rust
+/// use rskim_search::risk_score_wilson_decay;
+///
+/// // No commits → 0.0 regardless of decay factor.
+/// assert_eq!(risk_score_wilson_decay(0.9, 0, 0), 0.0);
+/// // With equal decay-weighted proportion (both all-fix → 1.0), a 1/1 file
+/// // ranks strictly below a 50/50 file because Wilson suppresses the tiny
+/// // sample (AC1).
+/// let small = risk_score_wilson_decay(1.0, 1, 1);
+/// let large = risk_score_wilson_decay(1.0, 50, 50);
+/// assert!(small < large);
+/// ```
+#[must_use]
+#[inline]
+pub fn risk_score_wilson_decay(decay_fix_factor: f64, fix_commits: u32, total_commits: u32) -> f64 {
+    decay_fix_factor * wilson_lower_bound(fix_commits, total_commits)
+}
+
 /// Compute per-file hotspot and bug-fix density scores from a git commit history.
 ///
 /// # Parameters

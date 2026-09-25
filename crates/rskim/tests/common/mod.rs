@@ -20,6 +20,9 @@
 //! every helper will trigger an "unused" warning without this attribute.
 #![allow(dead_code)]
 
+/// Shared git fixture helpers (hermetic `git_init`, `git_commit`, etc.).
+pub mod git_fixture;
+
 /// Build a `skim` command with analytics disabled — the safe default.
 ///
 /// Sets:

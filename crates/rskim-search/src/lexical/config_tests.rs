@@ -33,8 +33,8 @@ fn test_default_boosts() {
         "ImportExport boost"
     );
     assert!(
-        (cfg.field_boosts[4] - 1.0).abs() < f32::EPSILON,
-        "FunctionBody boost"
+        (cfg.field_boosts[4] - 2.0).abs() < f32::EPSILON,
+        "FunctionBody boost (AD-411-1 retuning: call-site identifiers now route here)"
     );
     assert!(
         (cfg.field_boosts[5] - 0.8).abs() < f32::EPSILON,
@@ -47,6 +47,56 @@ fn test_default_boosts() {
     assert!(
         (cfg.field_boosts[7] - 1.0).abs() < f32::EPSILON,
         "Other boost"
+    );
+}
+
+/// Multi-word query path uses `BM25FConfig::default()`.  Under AD-411-1,
+/// call-site identifiers now route to `FunctionBody` instead of the old
+/// unconditional `SymbolName`.  Assert the ordering invariant that preserves
+/// multi-word ranking quality: definitions (FnSig/TypeDef) rank above call
+/// sites (FnBody), and call sites rank above noise (Comment/StringLit).
+///
+/// Ordering: TypeDef(5) > FnSig(4) > SymbolName(3.5) > Import(3)
+///          > FnBody(2) > Other(1) > Comment(0.8) > StringLit(0.5)
+#[test]
+fn test_default_multi_word_ordering_invariants() {
+    let cfg = BM25FConfig::default();
+    let typedef = cfg.field_boosts[0]; // TypeDefinition
+    let fnsig = cfg.field_boosts[1]; // FunctionSignature
+    let symbol = cfg.field_boosts[2]; // SymbolName (degradation tier)
+    let import = cfg.field_boosts[3]; // ImportExport
+    let fnbody = cfg.field_boosts[4]; // FunctionBody (call sites)
+    let comment = cfg.field_boosts[5]; // Comment
+    let strlit = cfg.field_boosts[6]; // StringLiteral
+    let other = cfg.field_boosts[7]; // Other
+
+    assert!(
+        typedef > fnsig,
+        "TypeDef ({typedef}) must be above FnSig ({fnsig}) for multi-word"
+    );
+    assert!(
+        fnsig > symbol,
+        "FnSig ({fnsig}) must be above SymbolName ({symbol}) for multi-word"
+    );
+    assert!(
+        symbol > import,
+        "SymbolName ({symbol}) must be above Import ({import}) for multi-word"
+    );
+    assert!(
+        import > fnbody,
+        "Import ({import}) must be above FnBody ({fnbody}) for multi-word"
+    );
+    assert!(
+        fnbody > other,
+        "FnBody ({fnbody}) must be above Other ({other}): call-site identifiers outrank unclassified bytes (AD-411-1 retuning)"
+    );
+    assert!(
+        other > comment,
+        "Other ({other}) must be above Comment ({comment}) for multi-word"
+    );
+    assert!(
+        comment > strlit,
+        "Comment ({comment}) must be above StringLit ({strlit}) for multi-word"
     );
 }
 
@@ -145,24 +195,83 @@ fn test_serde_roundtrip() {
 }
 
 #[test]
-fn test_partial_eq() {
-    let a = BM25FConfig::default();
-    let b = BM25FConfig::default();
-    assert_eq!(a, b);
-
-    let c = BM25FConfig {
-        k1: 2.0,
-        ..BM25FConfig::default()
-    };
-    assert_ne!(a, c);
-}
-
-#[test]
 fn test_field_count_matches_search_field_variants() {
     // SearchField has 8 variants (0..=7). FIELD_COUNT must match.
     assert_eq!(
         FIELD_COUNT, 8,
         "FIELD_COUNT must equal the number of SearchField variants"
+    );
+}
+
+// -----------------------------------------------------------------------
+// BM25FConfig::for_exact_symbol (AD-411-4)
+// -----------------------------------------------------------------------
+
+/// `for_exact_symbol()` must pass validate() (all parameters in legal ranges).
+#[test]
+fn test_for_exact_symbol_validates() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    assert!(
+        cfg.validate().is_ok(),
+        "for_exact_symbol() must satisfy validate(); errors: {:?}",
+        cfg.validate()
+    );
+}
+
+/// field_b must be all 0.0 — no length normalisation on the exact-symbol path
+/// (preserves AD-372-6 length-norm-free property, OD-3/4 guarantee).
+#[test]
+fn test_for_exact_symbol_field_b_all_zero() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    for (i, &b) in cfg.field_b.iter().enumerate() {
+        assert_eq!(
+            b, 0.0,
+            "for_exact_symbol: field_b[{i}] must be 0.0 (length-norm-free), got {b}"
+        );
+    }
+}
+
+/// FunctionSignature boost (index 1) > TypeDefinition boost (index 0).
+/// Required so code definitions outrank Markdown headings (OD3, AC14).
+#[test]
+fn test_for_exact_symbol_fnsig_boost_greater_than_typedef_boost() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let fnsig = cfg.field_boosts[1]; // FunctionSignature
+    let typedef = cfg.field_boosts[0]; // TypeDefinition
+    assert!(
+        fnsig > typedef,
+        "FunctionSignature boost ({fnsig}) must exceed TypeDefinition boost ({typedef}) (OD3)"
+    );
+}
+
+/// FunctionSignature boost > SymbolName boost > FunctionBody boost.
+/// Ensures definition tier > degradation tier > call-site tier.
+#[test]
+fn test_for_exact_symbol_boost_ordering_invariants() {
+    let cfg = BM25FConfig::for_exact_symbol();
+    let fnsig = cfg.field_boosts[1]; // FunctionSignature
+    let symbol = cfg.field_boosts[2]; // SymbolName
+    let body = cfg.field_boosts[4]; // FunctionBody
+    assert!(
+        fnsig > symbol,
+        "FnSig boost ({fnsig}) must exceed SymbolName boost ({symbol})"
+    );
+    assert!(
+        symbol > body,
+        "SymbolName boost ({symbol}) must exceed FunctionBody boost ({body})"
+    );
+}
+
+/// `for_exact_symbol()` must return a DIFFERENT config from `Default`.
+/// (If they were identical the method would be dead code.)
+#[test]
+fn test_for_exact_symbol_differs_from_default() {
+    let exact = BM25FConfig::for_exact_symbol();
+    let def = BM25FConfig::default();
+    // At minimum, field_b differs (exact=0, default=0.75).
+    assert_ne!(
+        exact.field_b, def.field_b,
+        "for_exact_symbol field_b must differ from default"
     );
 }
 

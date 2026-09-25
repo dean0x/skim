@@ -1,0 +1,8 @@
+Hotspots (top 5, 90-day decay):
+  Score  30d  90d  Path
+  ─────  ───  ───  ────────────────────────────────
+  1.000      5    5  file1.ts
+  0.600      3    3  file2.ts
+  0.400      2    2  file6.ts
+  0.200      1    1  file3.ts
+  0.200      1    1  file5.ts
