@@ -313,9 +313,10 @@ jobs:
           set -euo pipefail
           # Keep in sync with crates/rskim-bench/scoreboard/README.md ("CI").
           # Beyond cmd/search/: the rskim files it imports from (cmd/mod.rs,
-          # debug.rs, analytics/mod.rs), the dispatch (main.rs), and the
-          # rskim manifest.
-          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          # debug.rs, analytics/mod.rs and the analytics/schema.rs and
+          # tokens.rs that module compiles in), the dispatch (main.rs), and
+          # the rskim manifest.
+          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
           case "$EVENT_NAME" in
             workflow_dispatch)
               search=true; reason="manual dispatch" ;;
@@ -328,7 +329,9 @@ jobs:
             pull_request)
               changed="$RUNNER_TEMP/changed-files.txt"
               # -z: no path quoting, so the anchored regex sees every path verbatim.
-              git diff --name-only -z HEAD^1 HEAD | tr '\0' '\n' > "$changed"
+              # --no-renames: a rename lists its source path too, so moving a
+              # file out of a search path still touches that path.
+              git diff --name-only --no-renames -z HEAD^1 HEAD | tr '\0' '\n' > "$changed"
               echo "$(wc -l < "$changed") changed file(s); search paths among them:"
               matched=0
               grep -E "$SEARCH_PATHS" "$changed" || matched=$?

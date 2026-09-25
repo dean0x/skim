@@ -208,13 +208,14 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
 
 - **When it runs.** The scoreboard always runs on `workflow_dispatch` and on pushes to `main`. It never runs on pushes
   to `feature/*` or `wave/**`, because their pull-request run gates. On a pull request it runs only if the PR's own
-  change set (`git diff HEAD^1 HEAD` on the merge commit) touches one of:
+  change set (`git diff --no-renames HEAD^1 HEAD` on the merge commit, so a file renamed out of a search path still
+  counts as touching it) touches one of:
   - `crates/rskim-search/`, `crates/rskim/src/cmd/search/`, `crates/rskim-core/`, `crates/rskim-bench/`,
     `crates/rskim-research/`;
   - the `rskim` files outside `cmd/search/` that it depends on: `crates/rskim/src/cmd/mod.rs`
     (`is_repo_relative_safe`, `resolve_cache_dir`), `crates/rskim/src/debug.rs` (`is_debug_enabled`),
-    `crates/rskim/src/analytics/mod.rs` (`AnalyticsConfig`), `crates/rskim/src/main.rs` (dispatch) and
-    `crates/rskim/Cargo.toml`;
+    `crates/rskim/src/analytics/mod.rs` (`AnalyticsConfig`) with the `crates/rskim/src/analytics/schema.rs` and
+    `crates/rskim/src/tokens.rs` it compiles in, `crates/rskim/src/main.rs` (dispatch) and `crates/rskim/Cargo.toml`;
   - the root `Cargo.toml` / `Cargo.lock`;
   - `.github/workflows/ci.yml`.
 
