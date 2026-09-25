@@ -55,8 +55,24 @@ pub mod test_support;
 pub mod types;
 pub mod universe;
 
+use std::path::Path;
+
 /// Hard bound on a pagination sweep: `--offset 0, L, 2L, …` stops when
 /// `has_more` is false or after this many pages. Golden integrity bounds each
 /// pagination entry's full count by `min(limits) × (MAX_PAGES − 1)` with the
 /// same constant.
 pub const MAX_PAGES: u32 = 64;
+
+/// Read an optional data file (`known_failures.toml`, `baseline.json`):
+/// `None` when it does not exist.
+///
+/// # Errors
+///
+/// Any read failure other than "not found".
+pub(crate) fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e).context(format!("reading {}", path.display()))),
+    }
+}

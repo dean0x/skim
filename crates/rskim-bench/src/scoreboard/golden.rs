@@ -310,7 +310,8 @@ pub fn golden_set_sha256<'a>(files: impl IntoIterator<Item = &'a LoadedGolden>) 
     hex(&hasher.finalize())
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `bytes`.
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 

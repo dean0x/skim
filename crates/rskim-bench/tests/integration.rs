@@ -464,7 +464,7 @@ fn extract_symbols_dispatch_integration() {
     );
     assert!(!go_symbols.is_empty(), "Go extraction should find symbols");
 
-    // TypeScript (.ts / .mts / .cts): should extract symbols (#203 wires it in)
+    // TypeScript (.ts / .mts / .cts): should extract symbols
     let ts_symbols = rskim_bench::extract::extract_symbols(
         Path::new("test.ts"),
         "function test() {}",

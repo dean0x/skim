@@ -77,6 +77,29 @@ pub fn load_corpora(path: &Path) -> anyhow::Result<Vec<CorpusSpec>> {
         .with_context(|| format!("validating {}", path.display()))
 }
 
+/// The corpus named `name`, given as the CLI flag `flag` (`--only`,
+/// `--corpus`).
+///
+/// # Errors
+///
+/// No corpus in `specs` (loaded from `corpora_path`) has that name; the
+/// error lists the known names.
+pub fn find_corpus<'a>(
+    specs: &'a [CorpusSpec],
+    name: &str,
+    flag: &str,
+    corpora_path: &Path,
+) -> anyhow::Result<&'a CorpusSpec> {
+    specs.iter().find(|s| s.name == name).with_context(|| {
+        let known: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        format!(
+            "{flag} {name:?}: no such corpus in {} (known: {})",
+            corpora_path.display(),
+            known.join(", ")
+        )
+    })
+}
+
 /// Materializes a corpus as a local repository root.
 pub trait CorpusSource {
     /// Make `spec` available locally and return its repository root.
@@ -97,6 +120,30 @@ pub trait CorpusSource {
     fn verify_untouched(&self, spec: &CorpusSpec, root: &Path) -> anyhow::Result<PinnedCloneState> {
         verify_pinned_clone(root, &spec.commit)
     }
+}
+
+/// Materialize `spec` through `source` and require a verified clone at its
+/// pinned commit. Returns the canonical repository root.
+///
+/// # Errors
+///
+/// Materialization fails, or the clone is not
+/// [`PinnedCloneState::Reusable`].
+pub fn materialize_verified(
+    source: &dyn CorpusSource,
+    spec: &CorpusSpec,
+) -> anyhow::Result<PathBuf> {
+    let materialized = source.materialize(spec)?;
+    let root = std::fs::canonicalize(&materialized)
+        .with_context(|| format!("canonicalizing {}", materialized.display()))?;
+    let state = source.verify_untouched(spec, &root)?;
+    anyhow::ensure!(
+        state.is_reusable(),
+        "{} is not a verified clone at {}: {state}",
+        root.display(),
+        spec.commit
+    );
+    Ok(root)
 }
 
 /// Production source: a full-history clone at `<corpus_dir>/<name>`, pinned

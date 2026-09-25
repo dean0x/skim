@@ -18,6 +18,8 @@
 //!   other non-files are dropped (`walk.rs:418-432`).
 //! - **Extension allow-list** — the oracle's own copy of
 //!   `Language::from_extension` (`crates/rskim-core/src/types.rs:55-80`),
+//!   shared with its `--lang` map
+//!   ([`crate::scoreboard::oracle::is_indexable_extension`]),
 //!   case-sensitive, extension only.
 //! - **Size** — at most [`MAX_FILE_BYTES`], checked at walk time (`walk.rs:359`).
 //! - **Encoding** — strict UTF-8 (producer phase).
@@ -40,6 +42,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Context;
+
+use crate::scoreboard::oracle::is_indexable_extension;
 
 /// Files larger than this are skipped at walk time (`walk.rs::MAX_FILE_BYTES`).
 pub const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
@@ -80,30 +84,6 @@ const ISOLATION_REMOVED_ENV: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
     "GIT_NAMESPACE",
-];
-
-/// The oracle's copy of `rskim_core::Language::from_extension`'s extension
-/// set (`crates/rskim-core/src/types.rs:55-80`). Deliberately duplicated so a
-/// change to skim's list shows up as a universe delta.
-const INDEXABLE_EXTENSIONS: &[&str] = &[
-    "ts", "tsx", "mts", "cts", // TypeScript
-    "js", "jsx", "cjs", "mjs", // JavaScript
-    "py", "pyi",  // Python
-    "rs",   // Rust
-    "go",   // Go
-    "java", // Java
-    "md", "markdown", // Markdown
-    "json",     // JSON
-    "yaml", "yml", // YAML
-    "c", "h", // C
-    "cpp", "cc", "cxx", "hpp", "hxx", "hh",   // C++
-    "toml", // TOML
-    "cs",   // C#
-    "rb",   // Ruby
-    "sql",  // SQL
-    "kt", "kts",   // Kotlin
-    "swift", // Swift
-    "sh", "bash", // Bash
 ];
 
 // ============================================================================
@@ -321,7 +301,7 @@ impl Universe {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let indexable = INDEXABLE_EXTENSIONS.contains(&ext);
+        let indexable = is_indexable_extension(ext);
         let fits = meta.len() <= MAX_FILE_BYTES;
 
         // Read only what the indexed or coverage universe needs.
@@ -424,23 +404,21 @@ impl Universe {
     /// the same shape as skim's `--stats --json` `skipped_by_reason`, for a
     /// direct equality check.
     pub fn persisted_skipped_by_reason(&self) -> BTreeMap<String, u64> {
-        count_reasons(
-            self.skipped
-                .iter()
-                .filter(|s| s.reason.phase() == SkipPhase::Producer),
-        )
+        count_reasons(self.producer_skips())
+    }
+
+    /// Producer-phase skips: the ones skim persists.
+    fn producer_skips(&self) -> impl Iterator<Item = &SkippedFile> {
+        self.skipped
+            .iter()
+            .filter(|s| s.reason.phase() == SkipPhase::Producer)
     }
 
     /// Files skim's walk accepts — indexed plus producer-phase skips — which
     /// is what skim's [`MAX_INDEXED_FILES`] cap counts (the cap is applied to
     /// walk entries, before content is read).
     pub fn walk_accepted_count(&self) -> usize {
-        self.indexed.len()
-            + self
-                .skipped
-                .iter()
-                .filter(|s| s.reason.phase() == SkipPhase::Producer)
-                .count()
+        self.indexed.len() + self.producer_skips().count()
     }
 
     /// Require the corpus to fit under skim's [`MAX_INDEXED_FILES`] cap, so

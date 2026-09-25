@@ -29,7 +29,7 @@ use clap::{Parser, Subcommand};
 
 use rskim_bench::scoreboard::baseline::{Baseline, BlessDecision, BlessInputs, bless};
 use rskim_bench::scoreboard::corpus::{
-    CorpusSource, DEFAULT_CORPUS_DIR, GitCorpusSource, load_corpora,
+    DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora, materialize_verified,
 };
 use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
@@ -231,28 +231,8 @@ fn bless_command(args: &BlessArgs) -> anyhow::Result<u8> {
 fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
     let data = DataDir::new(&args.data_dir);
     let specs = load_corpora(&data.corpora())?;
-    let spec = specs
-        .iter()
-        .find(|s| s.name == args.corpus)
-        .with_context(|| {
-            let known: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-            format!(
-                "--corpus {:?}: no such corpus in {} (known: {})",
-                args.corpus,
-                data.corpora().display(),
-                known.join(", ")
-            )
-        })?;
-
-    let source = GitCorpusSource::new(&args.corpus_dir);
-    let root = source.materialize(spec)?;
-    let state = source.verify_untouched(spec, &root)?;
-    anyhow::ensure!(
-        state.is_reusable(),
-        "{} is not a verified clone at {}: {state}",
-        root.display(),
-        spec.commit
-    );
+    let spec = find_corpus(&specs, &args.corpus, "--corpus", &data.corpora())?;
+    let root = materialize_verified(&GitCorpusSource::new(&args.corpus_dir), spec)?;
 
     // The oracle's git calls run under an empty HOME, as in `run`.
     let home = tempfile::Builder::new()

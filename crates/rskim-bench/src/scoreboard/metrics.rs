@@ -354,95 +354,17 @@ pub fn check_pagination(full: &[ResultRow], sweeps: &[Sweep]) -> PaginationOutco
             .iter()
             .flat_map(|p| p.page.rows.iter().map(|r| r.path.as_str()))
             .collect();
-        let shown_set: BTreeSet<&str> = shown.iter().copied().collect();
-
-        let never: Vec<&str> = full_set.difference(&shown_set).copied().collect();
-        let foreign: Vec<&str> = shown_set.difference(&full_set).copied().collect();
-        let mut parts = Vec::new();
-        if !never.is_empty() {
-            parts.push(format!(
-                "{} file(s) never shown: {}",
-                never.len(),
-                sample(never)
-            ));
+        if let Some(problem) = completeness_problem(&full_set, &shown) {
+            complete.push(format!("{tag}: {problem}"));
         }
-        if !foreign.is_empty() {
-            parts.push(format!(
-                "{} file(s) shown but not in the full list: {}",
-                foreign.len(),
-                sample(foreign)
-            ));
+        if let Some(problem) = duplicate_problem(&shown) {
+            disjoint.push(format!("{tag}: {problem}"));
         }
-        if !parts.is_empty() {
-            complete.push(format!("{tag}: {}", parts.join("; ")));
+        if let Some(problem) = order_problem(&full_paths, &shown) {
+            ordered.push(format!("{tag}: {problem}"));
         }
-
-        let mut seen = BTreeSet::new();
-        let dups: BTreeSet<&str> = shown.iter().copied().filter(|p| !seen.insert(*p)).collect();
-        if !dups.is_empty() {
-            disjoint.push(format!(
-                "{tag}: {} file(s) shown more than once: {}",
-                dups.len(),
-                sample(dups)
-            ));
-        }
-
-        if shown != full_paths {
-            let at = shown
-                .iter()
-                .zip(&full_paths)
-                .position(|(a, b)| a != b)
-                .unwrap_or_else(|| shown.len().min(full_paths.len()));
-            ordered.push(format!(
-                "{tag}: pages show {} row(s), the full list has {}; first difference at rank {} \
-                 (pages: {}, full list: {})",
-                shown.len(),
-                full_paths.len(),
-                at + 1,
-                shown.get(at).copied().unwrap_or("<end>"),
-                full_paths.get(at).copied().unwrap_or("<end>")
-            ));
-        }
-
-        let mut problems = Vec::new();
-        let empty_claims: Vec<u64> = sweep
-            .pages
-            .iter()
-            .filter(|p| p.page.has_more && p.page.rows.is_empty())
-            .map(|p| p.offset)
-            .collect();
-        if let Some(first) = empty_claims.first() {
-            problems.push(format!(
-                "{} empty page(s) claim has_more (first at offset {first})",
-                empty_claims.len()
-            ));
-        }
-        for p in &sweep.pages {
-            let rows = p.page.rows.len() as u64;
-            let reach = p.offset.saturating_add(rows);
-            if p.page.has_more && rows > 0 && reach >= total {
-                problems.push(format!(
-                    "page at offset {} reaches the end of the {total}-row list but claims has_more",
-                    p.offset
-                ));
-            }
-            if !p.page.has_more && reach < total {
-                problems.push(format!(
-                    "has_more is false at offset {} but the full list has {total} rows",
-                    p.offset
-                ));
-            }
-        }
-        match sweep.pages.last() {
-            None => problems.push("no page was fetched".to_string()),
-            Some(last) if last.page.has_more => problems.push(format!(
-                "sweep did not end within {MAX_PAGES} pages ({} fetched)",
-                sweep.pages.len()
-            )),
-            Some(_) => {}
-        }
-        if !problems.is_empty() {
-            honest.push(format!("{tag}: {}", problems.join("; ")));
+        if let Some(problem) = has_more_problem(sweep, total) {
+            honest.push(format!("{tag}: {problem}"));
         }
     }
 
@@ -452,6 +374,116 @@ pub fn check_pagination(full: &[ResultRow], sweeps: &[Sweep]) -> PaginationOutco
         ordered: outcome_of(&ordered),
         has_more_honest: outcome_of(&honest),
     }
+}
+
+/// `pagination.complete` for one sweep: full-list files the pages never
+/// show, and shown files the full list lacks.
+fn completeness_problem(full_set: &BTreeSet<&str>, shown: &[&str]) -> Option<String> {
+    let shown_set: BTreeSet<&str> = shown.iter().copied().collect();
+    let never: Vec<&str> = full_set.difference(&shown_set).copied().collect();
+    let foreign: Vec<&str> = shown_set.difference(full_set).copied().collect();
+    let mut parts = Vec::new();
+    if !never.is_empty() {
+        parts.push(format!(
+            "{} file(s) never shown: {}",
+            never.len(),
+            sample(never)
+        ));
+    }
+    if !foreign.is_empty() {
+        parts.push(format!(
+            "{} file(s) shown but not in the full list: {}",
+            foreign.len(),
+            sample(foreign)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+/// `pagination.disjoint` for one sweep: files shown more than once.
+fn duplicate_problem(shown: &[&str]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let dups: BTreeSet<&str> = shown.iter().copied().filter(|p| !seen.insert(*p)).collect();
+    (!dups.is_empty()).then(|| {
+        format!(
+            "{} file(s) shown more than once: {}",
+            dups.len(),
+            sample(dups)
+        )
+    })
+}
+
+/// `pagination.ordered` for one sweep: the concatenated pages differ from
+/// the full list.
+fn order_problem(full_paths: &[&str], shown: &[&str]) -> Option<String> {
+    if shown == full_paths {
+        return None;
+    }
+    let (rank, got, want) = first_difference(shown, full_paths);
+    Some(format!(
+        "pages show {} row(s), the full list has {}; first difference at rank {rank} \
+         (pages: {got}, full list: {want})",
+        shown.len(),
+        full_paths.len()
+    ))
+}
+
+/// `pagination.has_more_honest` for one sweep over a `total`-row full list.
+fn has_more_problem(sweep: &Sweep, total: u64) -> Option<String> {
+    let mut problems = Vec::new();
+    let empty_claims: Vec<u64> = sweep
+        .pages
+        .iter()
+        .filter(|p| p.page.has_more && p.page.rows.is_empty())
+        .map(|p| p.offset)
+        .collect();
+    if let Some(first) = empty_claims.first() {
+        problems.push(format!(
+            "{} empty page(s) claim has_more (first at offset {first})",
+            empty_claims.len()
+        ));
+    }
+    for p in &sweep.pages {
+        let rows = p.page.rows.len() as u64;
+        let reach = p.offset.saturating_add(rows);
+        if p.page.has_more && rows > 0 && reach >= total {
+            problems.push(format!(
+                "page at offset {} reaches the end of the {total}-row list but claims has_more",
+                p.offset
+            ));
+        }
+        if !p.page.has_more && reach < total {
+            problems.push(format!(
+                "has_more is false at offset {} but the full list has {total} rows",
+                p.offset
+            ));
+        }
+    }
+    match sweep.pages.last() {
+        None => problems.push("no page was fetched".to_string()),
+        Some(last) if last.page.has_more => problems.push(format!(
+            "sweep did not end within {MAX_PAGES} pages ({} fetched)",
+            sweep.pages.len()
+        )),
+        Some(_) => {}
+    }
+    (!problems.is_empty()).then(|| problems.join("; "))
+}
+
+/// Where two path lists first differ: the 1-based rank (the shorter list's
+/// end when one is a prefix of the other) and each list's path there
+/// (`<end>` past its end).
+fn first_difference<'a>(got: &[&'a str], want: &[&'a str]) -> (usize, &'a str, &'a str) {
+    let at = got
+        .iter()
+        .zip(want)
+        .position(|(a, b)| a != b)
+        .unwrap_or_else(|| got.len().min(want.len()));
+    (
+        at + 1,
+        got.get(at).copied().unwrap_or("<end>"),
+        want.get(at).copied().unwrap_or("<end>"),
+    )
 }
 
 /// `order.prefix_consistent`: each `--limit N` list equals the full list's
@@ -473,16 +505,9 @@ pub fn check_prefix(full: &[ResultRow], limited: &[(u32, ResultPage)]) -> CheckO
             .into_iter()
             .filter(|p| want_set.contains(**p))
             .count();
-        let at = got
-            .iter()
-            .zip(want)
-            .position(|(a, b)| a != b)
-            .unwrap_or_else(|| got.len().min(want.len()));
+        let (rank, got_at, want_at) = first_difference(&got, want);
         problems.push(format!(
-            "limit {limit}: {overlap}/{n} overlap with the full list's first {n}; rank {}: got {}, want {}",
-            at + 1,
-            got.get(at).copied().unwrap_or("<end>"),
-            want.get(at).copied().unwrap_or("<end>")
+            "limit {limit}: {overlap}/{n} overlap with the full list's first {n}; rank {rank}: got {got_at}, want {want_at}"
         ));
     }
     outcome_of(&problems)
@@ -566,14 +591,21 @@ pub fn precision_at_k(ranked: &[&str], k: usize, relevant: impl Fn(&str) -> bool
 /// `ceil(p · n)` of the sorted values, so the median of an even count is
 /// the lower middle value. `None` for no values.
 pub fn percentile(values: &[u64], p: f64) -> Option<f64> {
+    let values: Vec<f64> = values.iter().map(|&v| v as f64).collect();
+    percentile_f64(&values, p)
+}
+
+/// [`percentile`] over `f64` values (e.g. latency milliseconds), in
+/// [`f64::total_cmp`] order.
+pub fn percentile_f64(values: &[f64], p: f64) -> Option<f64> {
     let mut sorted = values.to_vec();
-    sorted.sort_unstable();
+    sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
     if n == 0 {
         return None;
     }
     let rank = ((p * n as f64).ceil() as usize).clamp(1, n);
-    sorted.get(rank - 1).map(|&v| v as f64)
+    sorted.get(rank - 1).copied()
 }
 
 /// Per-query measurements of one `[[ident]]` entry.
@@ -913,23 +945,20 @@ type RankOf = fn(&IdentSample) -> Option<u64>;
 /// `bytes.*` are present only when the pool has entries of that kind.
 pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
-    let mut put = |name: &str, value: Option<f64>| {
-        if let Some(v) = value {
-            out.insert(name.to_string(), round4(v));
-        }
-    };
-
     put(
+        &mut out,
         "universe.delta",
         Some(samples.iter().map(|s| s.universe_delta).sum::<i64>() as f64),
     );
     put(
+        &mut out,
         "universe.skipped_by_reason_mismatch",
         Some(samples.iter().map(|s| s.skipped_mismatch).sum::<u64>() as f64),
     );
     let indexed: u64 = samples.iter().map(|s| s.indexed_tracked).sum();
     let text: u64 = samples.iter().map(|s| s.tracked_text).sum();
     put(
+        &mut out,
         "coverage.tracked_text",
         Some(if text == 0 {
             1.0
@@ -940,79 +969,117 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
 
     let idents: Vec<&IdentSample> = samples.iter().flat_map(|s| s.idents.iter()).collect();
     if !idents.is_empty() {
-        // (top-1 metric, MRR metric, which ranking): skim, then both baselines.
-        let rankings: [(&str, &str, RankOf); 3] = [
-            ("ident.def_top1", "ident.mrr", |i| i.rank),
-            (
-                "ident.def_top1.baseline_alpha",
-                "ident.mrr.baseline_alpha",
-                |i| i.rank_baseline_alpha,
-            ),
-            (
-                "ident.def_top1.baseline_count",
-                "ident.mrr.baseline_count",
-                |i| i.rank_baseline_count,
-            ),
-        ];
-        for (top1, mrr, rank_of) in rankings {
-            put(top1, fraction(idents.iter().map(|i| rank_of(i) == Some(1))));
-            let rrs: Vec<f64> = idents
-                .iter()
-                .map(|i| rank_of(i).map_or(0.0, |r| 1.0 / r as f64))
-                .collect();
-            put(mrr, Some(crate::metrics::mrr(&rrs)));
-        }
-        put(
-            "ident.anchor_eq_def",
-            fraction(idents.iter().map(|i| i.anchor_eq_def)),
-        );
-        put(
-            "ident.def_line_in_snippet",
-            fraction(idents.iter().map(|i| i.def_line_in_snippet)),
-        );
-        let hits: Vec<u64> = idents
-            .iter()
-            .filter_map(|i| i.first_correct_bytes)
-            .collect();
-        put("bytes.first_correct_median", percentile(&hits, 0.5));
-        put(
-            "bytes.first_correct_misses",
-            Some(
-                idents
-                    .iter()
-                    .filter(|i| i.first_correct_bytes.is_none())
-                    .count() as f64,
-            ),
-        );
-        let rg: Vec<u64> = idents
-            .iter()
-            .filter_map(|i| i.rg_first_correct_bytes)
-            .collect();
-        put("bytes.rg_first_correct_median", percentile(&rg, 0.5));
+        put_ident_values(&mut out, &idents);
     }
-
     let concepts: Vec<&ConceptSample> = samples.iter().flat_map(|s| s.concepts.iter()).collect();
     if !concepts.is_empty() {
-        put("concept.p5", mean(concepts.iter().map(|c| c.p5)));
-        put("concept.p10", mean(concepts.iter().map(|c| c.p10)));
-        put(
-            "concept.p5.baseline_alpha",
-            mean(concepts.iter().map(|c| c.p5_baseline_alpha)),
-        );
-        put(
-            "concept.p10.baseline_alpha",
-            mean(concepts.iter().map(|c| c.p10_baseline_alpha)),
-        );
-        put(
-            "concept.p5.baseline_count",
-            mean(concepts.iter().map(|c| c.p5_baseline_count)),
-        );
-        put(
-            "concept.p10.baseline_count",
-            mean(concepts.iter().map(|c| c.p10_baseline_count)),
-        );
+        put_concept_values(&mut out, &concepts);
     }
+    put_text_byte_values(&mut out, &idents, &concepts);
+    out
+}
 
+/// Record `value`, rounded to 4 decimal places, under `name` (nothing for
+/// `None`).
+fn put(out: &mut BTreeMap<String, f64>, name: &str, value: Option<f64>) {
+    if let Some(v) = value {
+        out.insert(name.to_string(), round4(v));
+    }
+}
+
+/// `ident.*` and the definition-bound `bytes.*first_correct*` values.
+fn put_ident_values(out: &mut BTreeMap<String, f64>, idents: &[&IdentSample]) {
+    // (top-1 metric, MRR metric, which ranking): skim, then both baselines.
+    let rankings: [(&str, &str, RankOf); 3] = [
+        ("ident.def_top1", "ident.mrr", |i| i.rank),
+        (
+            "ident.def_top1.baseline_alpha",
+            "ident.mrr.baseline_alpha",
+            |i| i.rank_baseline_alpha,
+        ),
+        (
+            "ident.def_top1.baseline_count",
+            "ident.mrr.baseline_count",
+            |i| i.rank_baseline_count,
+        ),
+    ];
+    for (top1, mrr, rank_of) in rankings {
+        put(
+            out,
+            top1,
+            fraction(idents.iter().map(|i| rank_of(i) == Some(1))),
+        );
+        let rrs: Vec<f64> = idents
+            .iter()
+            .map(|i| rank_of(i).map_or(0.0, |r| 1.0 / r as f64))
+            .collect();
+        put(out, mrr, Some(crate::metrics::mrr(&rrs)));
+    }
+    put(
+        out,
+        "ident.anchor_eq_def",
+        fraction(idents.iter().map(|i| i.anchor_eq_def)),
+    );
+    put(
+        out,
+        "ident.def_line_in_snippet",
+        fraction(idents.iter().map(|i| i.def_line_in_snippet)),
+    );
+    let hits: Vec<u64> = idents
+        .iter()
+        .filter_map(|i| i.first_correct_bytes)
+        .collect();
+    put(out, "bytes.first_correct_median", percentile(&hits, 0.5));
+    put(
+        out,
+        "bytes.first_correct_misses",
+        Some(
+            idents
+                .iter()
+                .filter(|i| i.first_correct_bytes.is_none())
+                .count() as f64,
+        ),
+    );
+    let rg: Vec<u64> = idents
+        .iter()
+        .filter_map(|i| i.rg_first_correct_bytes)
+        .collect();
+    put(out, "bytes.rg_first_correct_median", percentile(&rg, 0.5));
+}
+
+/// `concept.*` values: mean precision at 5 / 10, skim and both baselines.
+fn put_concept_values(out: &mut BTreeMap<String, f64>, concepts: &[&ConceptSample]) {
+    put(out, "concept.p5", mean(concepts.iter().map(|c| c.p5)));
+    put(out, "concept.p10", mean(concepts.iter().map(|c| c.p10)));
+    put(
+        out,
+        "concept.p5.baseline_alpha",
+        mean(concepts.iter().map(|c| c.p5_baseline_alpha)),
+    );
+    put(
+        out,
+        "concept.p10.baseline_alpha",
+        mean(concepts.iter().map(|c| c.p10_baseline_alpha)),
+    );
+    put(
+        out,
+        "concept.p5.baseline_count",
+        mean(concepts.iter().map(|c| c.p5_baseline_count)),
+    );
+    put(
+        out,
+        "concept.p10.baseline_count",
+        mean(concepts.iter().map(|c| c.p10_baseline_count)),
+    );
+}
+
+/// `bytes.text_*` / `bytes.rg_text_*`: text-mode output size over every
+/// ranking entry (idents and concepts together), skim vs simulated rg.
+fn put_text_byte_values(
+    out: &mut BTreeMap<String, f64>,
+    idents: &[&IdentSample],
+    concepts: &[&ConceptSample],
+) {
     let text_bytes: Vec<u64> = idents
         .iter()
         .map(|i| i.text_bytes)
@@ -1023,11 +1090,10 @@ pub fn ratchet_values(samples: &[&CorpusSamples]) -> BTreeMap<String, f64> {
         .map(|i| i.rg_text_bytes)
         .chain(concepts.iter().map(|c| c.rg_text_bytes))
         .collect();
-    put("bytes.text_median", percentile(&text_bytes, 0.5));
-    put("bytes.text_p90", percentile(&text_bytes, 0.9));
-    put("bytes.rg_text_median", percentile(&rg_bytes, 0.5));
-    put("bytes.rg_text_p90", percentile(&rg_bytes, 0.9));
-    out
+    put(out, "bytes.text_median", percentile(&text_bytes, 0.5));
+    put(out, "bytes.text_p90", percentile(&text_bytes, 0.9));
+    put(out, "bytes.rg_text_median", percentile(&rg_bytes, 0.5));
+    put(out, "bytes.rg_text_p90", percentile(&rg_bytes, 0.9));
 }
 
 // ============================================================================

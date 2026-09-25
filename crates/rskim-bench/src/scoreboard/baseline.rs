@@ -23,6 +23,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::metrics::{RatchetChange, compare_ratchet};
+use crate::scoreboard::read_optional;
 use crate::scoreboard::report::{Outcome, Report};
 
 /// `baseline.json` schema version.
@@ -109,13 +110,9 @@ impl Baseline {
     ///
     /// Unreadable or unparsable file.
     pub fn load(path: &Path) -> anyhow::Result<Option<Self>> {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => Self::parse(&raw)
-                .with_context(|| format!("in {}", path.display()))
-                .map(Some),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::anyhow!(e).context(format!("reading {}", path.display()))),
-        }
+        read_optional(path)?
+            .map(|raw| Self::parse(&raw).with_context(|| format!("in {}", path.display())))
+            .transpose()
     }
 
     /// Pretty JSON plus a trailing newline.

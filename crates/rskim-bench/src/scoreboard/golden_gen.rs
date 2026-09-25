@@ -27,10 +27,9 @@ use std::path::Path;
 
 use anyhow::Context;
 use rskim_search::SearchField;
-use sha2::{Digest, Sha256};
 
 use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
-use crate::scoreboard::golden::DefSite;
+use crate::scoreboard::golden::{DefSite, hex_sha256};
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use crate::scoreboard::universe::Universe;
 
@@ -146,10 +145,7 @@ pub fn definition_sites<'a>(
 
 /// `sha256("<corpus>:<name>")` as lowercase hex.
 pub fn order_key(corpus: &str, name: &str) -> String {
-    Sha256::digest(format!("{corpus}:{name}").as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex_sha256(format!("{corpus}:{name}").as_bytes())
 }
 
 /// Pick up to `take` candidates from `sites` (see the module docs).

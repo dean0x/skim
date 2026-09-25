@@ -16,17 +16,22 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use crate::scoreboard::baseline::Baseline;
-use crate::scoreboard::corpus::{CorpusSource, CorpusSpec, load_corpora};
+use crate::scoreboard::corpus::{
+    CorpusSource, CorpusSpec, find_corpus, load_corpora, materialize_verified,
+};
 use crate::scoreboard::gate::{self, GateInputs, Ledger};
 use crate::scoreboard::golden::{
     IntegrityContext, LoadedGolden, check_integrity, golden_set_sha256, load_golden,
 };
-use crate::scoreboard::metrics::{self, CorpusSamples};
+use crate::scoreboard::metrics::{
+    self, CorpusEvaluation, CorpusSamples, PlannedQuery, percentile_f64,
+};
 use crate::scoreboard::report::{
     AggregateReport, CorpusInfo, CorpusReport, CoverageReport, LatencyReport, LatencyStats,
     REPORT_SCHEMA, Report, SkippedByReason, UniverseReport, round4, tally,
 };
 use crate::scoreboard::runner::{SkimRunner, Timing};
+use crate::scoreboard::types::StatsSnapshot;
 use crate::scoreboard::universe::Universe;
 
 // ============================================================================
@@ -94,17 +99,7 @@ impl Inputs {
         let all_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
         let corpora: Vec<CorpusSpec> = match only {
             None => specs,
-            Some(name) => {
-                let selected: Vec<CorpusSpec> =
-                    specs.into_iter().filter(|s| s.name == name).collect();
-                anyhow::ensure!(
-                    !selected.is_empty(),
-                    "--only {name:?}: no such corpus in {} (known: {})",
-                    data.corpora().display(),
-                    all_names.join(", ")
-                );
-                selected
-            }
+            Some(name) => vec![find_corpus(&specs, name, "--only", &data.corpora())?.clone()],
         };
         let complete = corpora.len() == all_names.len();
 
@@ -223,48 +218,12 @@ fn run_corpus(
 ) -> anyhow::Result<CorpusRun> {
     let name = spec.name.as_str();
     progress(name, "verifying the pinned clone");
-    let materialized = source.materialize(spec)?;
-    let root = std::fs::canonicalize(&materialized)
-        .with_context(|| format!("canonicalizing {}", materialized.display()))?;
-    let before = source.verify_untouched(spec, &root)?;
-    anyhow::ensure!(
-        before.is_reusable(),
-        "{} is not a verified clone at {}: {before}",
-        root.display(),
-        spec.commit
-    );
+    let root = materialize_verified(source, spec)?;
 
     progress(name, "computing the oracle universe");
     let universe = Universe::compute(&root, &runner.sandbox().git())?;
     universe.check_file_cap()?;
-
-    let names: Vec<&str> = inputs.all_names.iter().map(String::as_str).collect();
-    let refs = inputs.ledger.refs_for_corpus(name, &names);
-    let mut problems: Vec<String> = check_integrity(
-        &golden.file,
-        &IntegrityContext {
-            corpus: name,
-            commit: &spec.commit,
-            universe: Some(&universe),
-            ledger: &refs,
-        },
-    )
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-    let plan = if problems.is_empty() {
-        let plan = metrics::plan(&golden.file)?;
-        problems.extend(gate::unplanned_ledger_refs(&refs, &plan));
-        plan
-    } else {
-        Vec::new()
-    };
-    anyhow::ensure!(
-        problems.is_empty(),
-        "golden integrity failed ({} problem(s)):\n  {}",
-        problems.len(),
-        problems.join("\n  ")
-    );
+    let plan = checked_plan(spec, golden, inputs, &universe)?;
 
     progress(name, "skim search --build");
     runner.build(&root)?;
@@ -288,10 +247,65 @@ fn run_corpus(
     );
 
     let eval = metrics::evaluate(&universe, &stats, &plan, &observations)?;
-    let checks = gate::apply_ledger(&eval.outcomes, &inputs.ledger);
+    let report = corpus_report(spec, golden, &universe, &stats, &eval, &inputs.ledger)?;
+    Ok(CorpusRun {
+        report,
+        samples: eval.samples,
+        latency: latency_stats(&timings),
+    })
+}
+
+/// Check golden integrity against the verified universe (ledger refs
+/// included), then plan the entries; a ledger ref naming a check the plan
+/// never runs is an integrity problem too.
+fn checked_plan(
+    spec: &CorpusSpec,
+    golden: &LoadedGolden,
+    inputs: &Inputs,
+    universe: &Universe,
+) -> anyhow::Result<Vec<PlannedQuery>> {
+    let names: Vec<&str> = inputs.all_names.iter().map(String::as_str).collect();
+    let refs = inputs.ledger.refs_for_corpus(&spec.name, &names);
+    let mut problems: Vec<String> = check_integrity(
+        &golden.file,
+        &IntegrityContext {
+            corpus: &spec.name,
+            commit: &spec.commit,
+            universe: Some(universe),
+            ledger: &refs,
+        },
+    )
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    let plan = if problems.is_empty() {
+        let plan = metrics::plan(&golden.file)?;
+        problems.extend(gate::unplanned_ledger_refs(&refs, &plan));
+        plan
+    } else {
+        Vec::new()
+    };
+    anyhow::ensure!(
+        problems.is_empty(),
+        "golden integrity failed ({} problem(s)):\n  {}",
+        problems.len(),
+        problems.join("\n  ")
+    );
+    Ok(plan)
+}
+
+/// One corpus's report section, with the ledger applied to its outcomes.
+fn corpus_report(
+    spec: &CorpusSpec,
+    golden: &LoadedGolden,
+    universe: &Universe,
+    stats: &StatsSnapshot,
+    eval: &CorpusEvaluation,
+    ledger: &Ledger,
+) -> anyhow::Result<CorpusReport> {
     let coverage = universe.coverage();
-    let report = CorpusReport {
-        name: name.to_string(),
+    Ok(CorpusReport {
+        name: spec.name.clone(),
         commit: spec.commit.clone(),
         golden_sha256: golden.sha256.clone(),
         universe: UniverseReport {
@@ -308,19 +322,14 @@ fn run_corpus(
             tracked_text: u64::try_from(coverage.tracked_text)?,
             ratio: round4(coverage.ratio()),
         },
-        checks,
+        checks: gate::apply_ledger(&eval.outcomes, ledger),
         ratchet: metrics::ratchet_values(&[&eval.samples]),
         info: CorpusInfo {
             oracle_skipped_by_reason: universe.skipped_by_reason(),
-            unindexed_hits: eval.unindexed_hits,
+            unindexed_hits: eval.unindexed_hits.clone(),
             idents: eval.samples.idents.clone(),
             concepts: eval.samples.concepts.clone(),
         },
-    };
-    Ok(CorpusRun {
-        report,
-        samples: eval.samples,
-        latency: latency_stats(&timings),
     })
 }
 
@@ -343,26 +352,15 @@ fn latency_stats(entries: &[(String, Vec<Timing>)]) -> LatencyStats {
         .collect();
     LatencyStats {
         calls: timings.len() as u64,
-        wall_ms_p50: nearest_rank(&wall, 0.50).map_or(0.0, round4),
-        wall_ms_p95: nearest_rank(&wall, 0.95).map_or(0.0, round4),
-        duration_ms_p50: nearest_rank(&reported, 0.50),
-        duration_ms_p95: nearest_rank(&reported, 0.95),
+        wall_ms_p50: percentile_f64(&wall, 0.50).map_or(0.0, round4),
+        wall_ms_p95: percentile_f64(&wall, 0.95).map_or(0.0, round4),
+        duration_ms_p50: percentile_f64(&reported, 0.50),
+        duration_ms_p95: percentile_f64(&reported, 0.95),
         entries_wall_ms: entries
             .iter()
             .map(|(id, t)| (id.clone(), round4(t.iter().map(|t| t.wall_ms).sum())))
             .collect(),
     }
-}
-
-fn nearest_rank(values: &[f64], p: f64) -> Option<f64> {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let n = sorted.len();
-    if n == 0 {
-        return None;
-    }
-    let rank = ((p * n as f64).ceil() as usize).clamp(1, n);
-    sorted.get(rank - 1).copied()
 }
 
 #[cfg(test)]

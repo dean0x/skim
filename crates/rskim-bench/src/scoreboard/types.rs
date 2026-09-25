@@ -168,25 +168,15 @@ impl ResultPage {
             .context("skim output has no `results`")?
             .as_array()
             .context("`results` is not an array")?;
-        let rows = results
-            .iter()
-            .enumerate()
-            .map(|(i, row)| parse_row(arm, row).with_context(|| format!("results[{i}]")))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let rows = parse_each(results, "results", |row| parse_row(arm, row))?;
 
         let has_more = opt_bool(obj, "has_more")?.unwrap_or(false);
         let verify_mode = opt_str(obj, "verify_mode")?
             .map(VerifyMode::from_json_name)
             .unwrap_or(VerifyMode::Substring);
-        let degraded = match obj.get("degraded") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(v) => v
-                .as_array()
-                .context("`degraded` is not an array")?
-                .iter()
-                .enumerate()
-                .map(|(i, d)| parse_degraded(d).with_context(|| format!("degraded[{i}]")))
-                .collect::<anyhow::Result<Vec<_>>>()?,
+        let degraded = match opt(obj, "degraded", Value::as_array, "an array")? {
+            None => Vec::new(),
+            Some(entries) => parse_each(entries, "degraded", parse_degraded)?,
         };
 
         Ok(ResultPage {
@@ -332,38 +322,52 @@ fn as_object<'a>(value: &'a Value, what: &str) -> anyhow::Result<&'a Map<String,
         .with_context(|| format!("{what} is not a JSON object"))
 }
 
-/// A present, non-null key must be a string.
+/// An optional key: absent or `null` is `None`; a present value must be
+/// what `get` extracts (`what` names that type in the error).
+fn opt<'a, T>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+    get: impl Fn(&'a Value) -> Option<T>,
+    what: &str,
+) -> anyhow::Result<Option<T>> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => get(v)
+            .map(Some)
+            .with_context(|| format!("`{key}` is not {what}")),
+    }
+}
+
 fn opt_str<'a>(obj: &'a Map<String, Value>, key: &str) -> anyhow::Result<Option<&'a str>> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_str()
-            .map(Some)
-            .with_context(|| format!("`{key}` is not a string")),
-    }
+    opt(obj, key, Value::as_str, "a string")
 }
 
-/// A present, non-null key must be a boolean.
 fn opt_bool(obj: &Map<String, Value>, key: &str) -> anyhow::Result<Option<bool>> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_bool()
-            .map(Some)
-            .with_context(|| format!("`{key}` is not a boolean")),
-    }
+    opt(obj, key, Value::as_bool, "a boolean")
 }
 
-/// A present, non-null key must be an integer that fits `u32`.
+/// An integer that fits `u32`.
 fn opt_u32(obj: &Map<String, Value>, key: &str) -> anyhow::Result<Option<u32>> {
-    match obj.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .map(Some)
-            .with_context(|| format!("`{key}` is not a line number")),
-    }
+    opt(
+        obj,
+        key,
+        |v| v.as_u64().and_then(|n| u32::try_from(n).ok()),
+        "a line number",
+    )
+}
+
+/// Parse every element of the JSON array `what`, naming a failing element
+/// `what[i]`.
+fn parse_each<T>(
+    values: &[Value],
+    what: &str,
+    parse: impl Fn(&Value) -> anyhow::Result<T>,
+) -> anyhow::Result<Vec<T>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| parse(v).with_context(|| format!("{what}[{i}]")))
+        .collect()
 }
 
 // ============================================================================

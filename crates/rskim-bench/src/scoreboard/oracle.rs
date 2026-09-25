@@ -397,6 +397,12 @@ const LANGS: &[LangSpec] = &[
     },
 ];
 
+/// Whether `ext` (case-sensitive) belongs to some language in the table
+/// above — the oracle universe's extension allow-list.
+pub fn is_indexable_extension(ext: &str) -> bool {
+    LANGS.iter().any(|l| l.extensions.contains(&ext))
+}
+
 /// A `--lang` restriction: the set of file extensions of one language.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LangFilter {

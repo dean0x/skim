@@ -497,6 +497,18 @@ impl Harness {
         self.scoreboard(&args)
     }
 
+    fn golden_gen(&self, corpus: &str) -> Output {
+        self.scoreboard(&[
+            "golden-gen",
+            "--corpus",
+            corpus,
+            "--corpus-dir",
+            self.corpus_dir.path().to_str().unwrap(),
+            "--data-dir",
+            self.data_dir.path().to_str().unwrap(),
+        ])
+    }
+
     fn report(&self) -> Value {
         serde_json::from_slice(&fs::read(self.report_path()).unwrap()).unwrap()
     }
@@ -880,15 +892,7 @@ fn unparsable_skim_output_is_a_harness_error() {
 #[test]
 fn golden_gen_prints_integrity_clean_ident_candidates() {
     let h = Harness::new();
-    let out = h.scoreboard(&[
-        "golden-gen",
-        "--corpus",
-        "fixture",
-        "--corpus-dir",
-        h.corpus_dir.path().to_str().unwrap(),
-        "--data-dir",
-        h.data_dir.path().to_str().unwrap(),
-    ]);
+    let out = h.golden_gen("fixture");
     assert_exit(&out, 0);
 
     // stdout is a proposal: `[[ident]]` entries to paste under a golden header.
@@ -928,15 +932,7 @@ fn golden_gen_prints_integrity_clean_ident_candidates() {
 #[test]
 fn golden_gen_names_the_known_corpora_for_an_unknown_one() {
     let h = Harness::new();
-    let out = h.scoreboard(&[
-        "golden-gen",
-        "--corpus",
-        "nope",
-        "--corpus-dir",
-        h.corpus_dir.path().to_str().unwrap(),
-        "--data-dir",
-        h.data_dir.path().to_str().unwrap(),
-    ]);
+    let out = h.golden_gen("nope");
     assert_exit(&out, 2);
     assert!(stderr(&out).contains("known: fixture"), "{}", stderr(&out));
 }

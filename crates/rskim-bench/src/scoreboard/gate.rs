@@ -34,6 +34,7 @@ use serde::Deserialize;
 use crate::scoreboard::baseline::{Baseline, BaselineCorpus, HardState};
 use crate::scoreboard::golden::LedgerRef;
 use crate::scoreboard::metrics::{PlannedQuery, RatchetChange, compare_ratchet};
+use crate::scoreboard::read_optional;
 use crate::scoreboard::report::{
     CheckRecord, CorpusReport, FailureKind, GateFailure, GateReport, GateStatus, Outcome,
 };
@@ -122,10 +123,9 @@ impl Ledger {
     ///
     /// Unreadable or invalid file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => Self::parse(&raw).with_context(|| format!("in {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
-            Err(e) => Err(anyhow::anyhow!(e).context(format!("reading {}", path.display()))),
+        match read_optional(path)? {
+            Some(raw) => Self::parse(&raw).with_context(|| format!("in {}", path.display())),
+            None => Ok(Self::empty()),
         }
     }
 
@@ -256,14 +256,13 @@ pub struct GateInputs<'a> {
 pub fn evaluate(inputs: &GateInputs<'_>) -> GateReport {
     let mut failures = hard_failures(inputs.corpora);
     match inputs.baseline {
-        None => failures.push(GateFailure {
-            kind: FailureKind::Baseline,
-            check: None,
-            ids: Vec::new(),
-            message: "no baseline.json in the data dir; bless required \
-                      (scoreboard bless --from <report.json>)"
+        None => failures.push(bless_failure(
+            None,
+            Vec::new(),
+            "no baseline.json in the data dir; bless required \
+             (scoreboard bless --from <report.json>)"
                 .to_string(),
-        }),
+        )),
         Some(baseline) => failures.extend(baseline_failures(inputs, baseline)),
     }
     failures.sort_by(|a, b| {
