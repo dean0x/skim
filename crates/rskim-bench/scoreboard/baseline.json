@@ -492,6 +492,8 @@
         "ident.mrr": 1.0,
         "ident.mrr.baseline_alpha": 0.6625,
         "ident.mrr.baseline_count": 0.5616,
+        "oracle_less.full_rows.flask-F002": 3.0,
+        "oracle_less.full_rows.flask-F003": 18.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -993,6 +995,8 @@
         "ident.mrr": 0.9615,
         "ident.mrr.baseline_alpha": 0.4752,
         "ident.mrr.baseline_count": 0.67,
+        "oracle_less.full_rows.ripgrep-F002": 59.0,
+        "oracle_less.full_rows.ripgrep-F003": 10.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -1547,6 +1551,8 @@
         "ident.mrr": 1.0,
         "ident.mrr.baseline_alpha": 0.4029,
         "ident.mrr.baseline_count": 0.7472,
+        "oracle_less.full_rows.skim-F002": 270.0,
+        "oracle_less.full_rows.skim-F003": 82.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -2034,6 +2040,8 @@
         "ident.mrr": 0.88,
         "ident.mrr.baseline_alpha": 0.3738,
         "ident.mrr.baseline_count": 0.756,
+        "oracle_less.full_rows.zod-F002": 43.0,
+        "oracle_less.full_rows.zod-F003": 56.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -2062,6 +2070,14 @@
     "ident.mrr": 0.9626,
     "ident.mrr.baseline_alpha": 0.4767,
     "ident.mrr.baseline_count": 0.6854,
+    "oracle_less.full_rows.flask-F002": 3.0,
+    "oracle_less.full_rows.flask-F003": 18.0,
+    "oracle_less.full_rows.ripgrep-F002": 59.0,
+    "oracle_less.full_rows.ripgrep-F003": 10.0,
+    "oracle_less.full_rows.skim-F002": 270.0,
+    "oracle_less.full_rows.skim-F003": 82.0,
+    "oracle_less.full_rows.zod-F002": 43.0,
+    "oracle_less.full_rows.zod-F003": 56.0,
     "universe.delta": 0.0,
     "universe.skipped_by_reason_mismatch": 0.0
   },
