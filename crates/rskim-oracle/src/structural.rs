@@ -15,7 +15,8 @@
 //! agree with skim (the extension table, the AST-indexed language list, the
 //! size cap) it keeps its OWN copy with a citation, so a policy change on
 //! skim's side shows up as a scoreboard diff (the `oracle.rs` / `universe.rs`
-//! convention in `rskim-bench`).
+//! convention in `rskim-bench`, whose tests also check the extension table
+//! against the lexical oracle's copy, [`extension_classes`]).
 //!
 //! # Ground truth
 //!
@@ -315,6 +316,16 @@ pub fn classify(path: &str) -> LangClass {
             .map(|row| row.class)
     })
     .unwrap_or(UNKNOWN_EXTENSION)
+}
+
+/// Every extension of the oracle's extension table with its class, in table
+/// order (an extension not listed is [`classify`]'s unknown-extension class).
+/// `rskim-bench` checks it against the lexical oracle's copy of the same skim
+/// table.
+pub fn extension_classes() -> impl Iterator<Item = (&'static str, LangClass)> {
+    EXT_CLASSES
+        .iter()
+        .flat_map(|row| row.extensions.iter().map(move |&ext| (ext, row.class)))
 }
 
 // ============================================================================
