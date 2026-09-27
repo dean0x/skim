@@ -27,12 +27,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::MAX_PAGES;
+use crate::scoreboard::fmt::{round4, sample};
 use crate::scoreboard::golden::{DefSite, GoldenFile, PrecisionClass, QueryFlags};
 use crate::scoreboard::oracle::{
     LexicalQuery, MatchMode, baseline_alphabetical, baseline_occurrence_count, ground_truth,
     simulate_rg_fixed,
 };
-use crate::scoreboard::report::round4;
 use crate::scoreboard::runner::{EntryObservation, Sweep};
 use crate::scoreboard::structural_metrics::{
     EntryScore, StructuralEvidence, StructuralSample, StructuralTarget, score_entry, unscored_rows,
@@ -41,9 +41,6 @@ use crate::scoreboard::types::{
     Arm, CheckId, CheckOutcome, EntryKind, ResultPage, ResultRow, StatsSnapshot, VerifyMode,
 };
 use crate::scoreboard::universe::Universe;
-
-/// Paths quoted in a failure detail before "+N more".
-const SAMPLE_PATHS: usize = 5;
 
 // ============================================================================
 // Plan
@@ -283,21 +280,6 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
 
 fn paths(rows: &[ResultRow]) -> Vec<&str> {
     rows.iter().map(|r| r.path.as_str()).collect()
-}
-
-/// Up to [`SAMPLE_PATHS`] paths, then `(+N more)`.
-pub(crate) fn sample<'a>(items: impl IntoIterator<Item = &'a str>) -> String {
-    let items: Vec<&str> = items.into_iter().collect();
-    let shown = items
-        .iter()
-        .take(SAMPLE_PATHS)
-        .copied()
-        .collect::<Vec<_>>()
-        .join(", ");
-    match items.len().saturating_sub(SAMPLE_PATHS) {
-        0 => shown,
-        more => format!("{shown} (+{more} more)"),
-    }
 }
 
 /// Ground-truth files absent from `rows`, in ground-truth order.
@@ -1458,51 +1440,43 @@ pub fn evaluate(
     let mut structural_samples = Vec::new();
 
     for (q, obs) in paired(plan, observations)? {
-        let gt = q
-            .lexical_oracle()
-            .map(|o| ground_truth(universe.files(), o));
-        match &q.oracle {
-            Some(Oracle::Lexical(o)) => {
-                let hits = ground_truth(universe.unindexed_text_files(), o).len();
-                if hits > 0 {
-                    unindexed_hits.insert(q.id.clone(), hits as u64);
-                }
-            }
-            Some(Oracle::Structural(_)) => {}
-            None => {
-                oracle_less_rows.insert(q.id.clone(), u64::try_from(obs.full.rows.len())?);
-            }
-        }
-
+        let oracle = eval_oracle(q, obs, universe, structural)?;
         let pagination = (q.kind == EntryKind::Pagination)
             .then(|| check_pagination(&obs.full.rows, &obs.sweeps));
-        let structural_score = q
-            .structural_target()
-            .map(|t| score_entry(&q.id, t, &obs.full.rows, structural))
-            .transpose()
-            .with_context(|| q.id.clone())?;
         let inputs = CheckInputs {
-            gt: gt.as_deref(),
+            oracle: &oracle,
             pagination: pagination.as_ref(),
-            structural: structural_score.as_ref(),
         };
         for check in q.checks() {
             let outcome =
                 run_check(check, q, obs, &inputs).with_context(|| format!("{}: {check}", q.id))?;
             outcomes.push((q.id.clone(), check, outcome));
         }
-        if let Some(score) = structural_score {
-            structural_samples.push(score.sample);
-        }
 
+        let gt = oracle.ground_truth();
         match &q.target {
             Target::Definition(def) => {
-                idents.push(measure_ident(q, def, obs, universe, gt.as_deref())?);
+                idents.push(measure_ident(q, def, obs, universe, gt)?);
             }
             Target::Relevance(re) => {
-                concepts.push(measure_concept(q, re, obs, universe, gt.as_deref())?);
+                concepts.push(measure_concept(q, re, obs, universe, gt)?);
             }
             Target::None => {}
+        }
+
+        match oracle {
+            OracleEval::Lexical {
+                unindexed_hits: hits,
+                ..
+            } => {
+                if hits > 0 {
+                    unindexed_hits.insert(q.id.clone(), hits);
+                }
+            }
+            OracleEval::Structural(score) => structural_samples.push(score.sample),
+            OracleEval::None { full_rows } => {
+                oracle_less_rows.insert(q.id.clone(), full_rows);
+            }
         }
     }
     outcomes.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
@@ -1531,14 +1505,89 @@ pub fn evaluate(
     })
 }
 
+/// What an entry's oracle says about its full list, resolved once per entry
+/// by [`eval_oracle`]: the per-oracle-family seam of [`evaluate`]. The checks
+/// ([`run_check`]), the ranking measurements and the per-family tallies all
+/// read it, so a new oracle family (#542's temporal oracle) is one more
+/// variant here and one more arm of [`eval_oracle`]'s match.
+#[derive(Debug)]
+enum OracleEval {
+    /// A lexical oracle (`oracle.rs`).
+    Lexical {
+        /// Its ground truth over the universe.
+        gt: Vec<String>,
+        /// Its ground-truth hits among tracked text files outside the
+        /// indexed universe (INFO `unindexed_hits`).
+        unindexed_hits: u64,
+    },
+    /// The structural oracle (`[[ast]]`): the entry's structural HARD
+    /// outcomes and measurements.
+    Structural(EntryScore),
+    /// No oracle: the full list's row count, which ratchets instead
+    /// ([`ORACLE_LESS_ROWS`]).
+    None {
+        /// Rows in the entry's full list.
+        full_rows: u64,
+    },
+}
+
+impl OracleEval {
+    /// The lexical ground truth, if the entry has a lexical oracle.
+    fn ground_truth(&self) -> Option<&[String]> {
+        match self {
+            OracleEval::Lexical { gt, .. } => Some(gt),
+            OracleEval::Structural(_) | OracleEval::None { .. } => None,
+        }
+    }
+
+    /// The structural score, if the entry is an `[[ast]]` entry.
+    fn structural(&self) -> Option<&EntryScore> {
+        match self {
+            OracleEval::Structural(score) => Some(score),
+            OracleEval::Lexical { .. } | OracleEval::None { .. } => None,
+        }
+    }
+}
+
+/// Resolve `q`'s oracle for [`evaluate`], with one match on
+/// [`PlannedQuery::oracle`]: a lexical oracle's ground truth over `universe`
+/// (and its hits outside it), the structural score of an `[[ast]]` entry's
+/// rows against `structural`, or the full-list row count of an entry with no
+/// oracle.
+///
+/// # Errors
+///
+/// An `[[ast]]` entry the structural oracle has no query for, or whose
+/// pattern skim was not called with (named by the entry id); a count that
+/// does not fit a `u64`.
+fn eval_oracle(
+    q: &PlannedQuery,
+    obs: &EntryObservation,
+    universe: &Universe,
+    structural: &StructuralEvidence,
+) -> anyhow::Result<OracleEval> {
+    Ok(match &q.oracle {
+        Some(Oracle::Lexical(query)) => OracleEval::Lexical {
+            gt: ground_truth(universe.files(), query),
+            unindexed_hits: u64::try_from(
+                ground_truth(universe.unindexed_text_files(), query).len(),
+            )?,
+        },
+        Some(Oracle::Structural(target)) => OracleEval::Structural(
+            score_entry(&q.id, target, &obs.full.rows, structural).with_context(|| q.id.clone())?,
+        ),
+        None => OracleEval::None {
+            full_rows: u64::try_from(obs.full.rows.len())?,
+        },
+    })
+}
+
 /// What an entry's checks read besides its observation.
 struct CheckInputs<'a> {
-    /// The lexical ground truth.
-    gt: Option<&'a [String]>,
+    /// The entry's oracle, resolved once ([`eval_oracle`]).
+    oracle: &'a OracleEval,
     /// The pagination outcomes of a `[[pagination]]` entry.
     pagination: Option<&'a PaginationOutcomes>,
-    /// The structural outcomes of an `[[ast]]` entry.
-    structural: Option<&'a EntryScore>,
 }
 
 fn run_check(
@@ -1547,9 +1596,14 @@ fn run_check(
     obs: &EntryObservation,
     inputs: &CheckInputs<'_>,
 ) -> anyhow::Result<CheckOutcome> {
-    let gt = || inputs.gt.context("no oracle ground truth");
+    let gt = || {
+        inputs
+            .oracle
+            .ground_truth()
+            .context("no oracle ground truth")
+    };
     let pagination = || inputs.pagination.context("no pagination sweep");
-    let structural = || inputs.structural.context("no structural score");
+    let structural = || inputs.oracle.structural().context("no structural score");
     Ok(match check {
         CheckId::LexicalRecall => check_recall(&obs.full.rows, gt()?),
         CheckId::LexicalPrecision => check_precision(&obs.full.rows, gt()?),

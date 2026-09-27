@@ -3,19 +3,14 @@
 //! needs the catalog lives here, since the oracle crate never reads it.
 
 use std::collections::BTreeSet;
-use std::sync::LazyLock;
 
 use rskim_oracle::structural::{
     FileMatches, FileReport, INTENTS, LangClass, OracleLang, OracleScratch, PatternCoverage,
-    StructuralOracle, UNCLASSIFIED_REASON, UNCOVERED, extension_classes, query_sources,
+    UNCLASSIFIED_REASON, UNCOVERED, extension_classes, query_sources,
 };
 
 use super::*;
-use crate::scoreboard::test_support::catalog;
-
-/// Compiled once: `StructuralOracle` is `Sync`.
-static ORACLE: LazyLock<StructuralOracle> =
-    LazyLock::new(|| StructuralOracle::new().expect("every oracle query compiles"));
+use crate::scoreboard::test_support::{catalog, oracle};
 
 const TS_FAMILY: [OracleLang; 3] = [
     OracleLang::TypeScript,
@@ -39,7 +34,7 @@ fn report(lang: OracleLang, source: &str) -> FileReport {
         .find(|&(_, class)| class == LangClass::Oracle(lang))
         .map(|(ext, _)| ext)
         .unwrap_or_else(|| panic!("no extension for {lang}"));
-    match ORACLE.file_matches(&mut OracleScratch::new(), &format!("fixture.{ext}"), source) {
+    match oracle().file_matches(&mut OracleScratch::new(), &format!("fixture.{ext}"), source) {
         Ok(FileMatches::Scored(report)) => report,
         other => panic!("fixture.{ext} is not scored: {other:?}"),
     }

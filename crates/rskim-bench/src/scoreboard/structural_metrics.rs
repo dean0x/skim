@@ -32,9 +32,8 @@ use rskim_oracle::structural::{
 use serde::{Deserialize, Serialize};
 
 use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
+use crate::scoreboard::fmt::{round4, sample};
 use crate::scoreboard::golden::{GoldenFile, PrecisionClass};
-use crate::scoreboard::metrics::sample;
-use crate::scoreboard::report::round4;
 use crate::scoreboard::types::{AstCoverage, AstPage, CheckOutcome, ResultPage, ResultRow};
 
 // ============================================================================
@@ -205,16 +204,17 @@ fn is_in(row: &ResultRow, lang: OracleLang) -> bool {
     structural::classify(&row.path) == LangClass::Oracle(lang)
 }
 
-/// The rows of `page` whose file is in `lang` ([`is_in`]), in skim's order:
-/// an `[[ast]]` entry's full list.
+/// The rows of `page` whose file is in `lang` by the oracle's extension
+/// table (so `.tsx` is its own language), borrowed, in skim's order.
+pub fn lang_rows(page: &ResultPage, lang: OracleLang) -> impl Iterator<Item = &ResultRow> {
+    page.rows.iter().filter(move |r| is_in(r, lang))
+}
+
+/// The rows of `page` whose file is in `lang` ([`lang_rows`]), in skim's
+/// order: an `[[ast]]` entry's full list.
 pub fn rows_in(page: &ResultPage, lang: OracleLang) -> ResultPage {
     ResultPage {
-        rows: page
-            .rows
-            .iter()
-            .filter(|r| is_in(r, lang))
-            .cloned()
-            .collect(),
+        rows: lang_rows(page, lang).cloned().collect(),
         has_more: page.has_more,
         verify_mode: page.verify_mode.clone(),
         degraded: page.degraded.clone(),
@@ -224,10 +224,18 @@ pub fn rows_in(page: &ResultPage, lang: OracleLang) -> ResultPage {
 /// The distinct files of `page`'s rows in `lang`: the files of
 /// [`rows_in`], without copying a row.
 pub fn files_in(page: &ResultPage, lang: OracleLang) -> BTreeSet<&str> {
-    page.rows
-        .iter()
-        .filter(|r| is_in(r, lang))
-        .map(|r| r.path.as_str())
+    lang_rows(page, lang).map(|r| r.path.as_str()).collect()
+}
+
+/// The `(pattern, language)` pairs `targets` score: a row of skim's
+/// `--ast <pattern>` answer in one of these pairs' languages is scored, any
+/// other row is unscored ([`unscored_in`]).
+pub fn scored_pairs<'a>(
+    targets: impl IntoIterator<Item = &'a StructuralTarget>,
+) -> BTreeSet<(&'a str, OracleLang)> {
+    targets
+        .into_iter()
+        .map(|t| (t.pattern.as_str(), t.lang))
         .collect()
 }
 
@@ -248,16 +256,14 @@ pub fn unscored_in<'p>(
         })
 }
 
-/// skim rows no `[[ast]]` entry scores ([`unscored_in`]), per pattern skim
-/// was called for (zero counts included).
+/// skim rows no `[[ast]]` entry scores ([`unscored_in`] over
+/// [`scored_pairs`]), per pattern skim was called for (zero counts
+/// included).
 pub fn unscored_rows<'a>(
     targets: impl IntoIterator<Item = &'a StructuralTarget>,
     patterns: &BTreeMap<String, AstPage>,
 ) -> BTreeMap<String, u64> {
-    let scored: BTreeSet<(&str, OracleLang)> = targets
-        .into_iter()
-        .map(|t| (t.pattern.as_str(), t.lang))
-        .collect();
+    let scored = scored_pairs(targets);
     patterns
         .iter()
         .map(|(pattern, call)| {
@@ -494,19 +500,23 @@ pub fn score_entry(
 /// guard would pass forever while measuring nothing.
 /// [`unexpected_oracle_matches`] keeps the flag honest.
 ///
+/// `rows` are skim's rows in the target's language. The gate applies this
+/// rule to every `[[ast]]` entry, and `golden-gen --ast` to every entry it
+/// could propose, so it never proposes one the gate would refuse.
+///
 /// # Errors
 ///
 /// The oracle has no query for the target.
-pub fn is_vacuous(
+pub fn is_vacuous<'r>(
     target: &StructuralTarget,
-    rows: &[ResultRow],
+    rows: impl IntoIterator<Item = &'r ResultRow>,
     answers: &OracleAnswers,
 ) -> anyhow::Result<bool> {
     let oracle = answers.definition(&target.pattern, target.lang)?;
     if target.expect_oracle_empty {
         return Ok(answers.scored_files(target.lang) == 0);
     }
-    Ok(rows.is_empty() && oracle.is_empty())
+    Ok(rows.into_iter().next().is_none() && oracle.is_empty())
 }
 
 /// The oracle's matches for an `[[ast]]` entry flagged `expect_oracle_empty`

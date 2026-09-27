@@ -1060,9 +1060,9 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
 
 #[test]
 fn evaluate_scores_ast_entries_against_the_structural_oracle() {
-    use crate::scoreboard::structural_metrics::{OracleAnswers, rows_in};
+    use crate::scoreboard::structural_metrics::OracleAnswers;
+    use crate::scoreboard::test_support::oracle;
     use crate::scoreboard::types::{AstCoverage, AstPage};
-    use rskim_oracle::structural::StructuralOracle;
 
     let repo = FixtureRepo::new();
     repo.write(
@@ -1118,21 +1118,14 @@ fn evaluate_scores_ast_entries_against_the_structural_oracle() {
         ("try-catch".to_string(), ast_page(Vec::new(), 1)),
     ]);
     let evidence = StructuralEvidence {
-        answers: OracleAnswers::compute(&StructuralOracle::new().unwrap(), universe.files())
-            .unwrap(),
+        answers: OracleAnswers::compute(oracle(), universe.files()).unwrap(),
         patterns,
     };
     let observations: Vec<EntryObservation> = plan
         .iter()
         .map(|q| {
             let t = q.structural_target().unwrap();
-            EntryObservation {
-                id: q.id.clone(),
-                full: rows_in(&evidence.patterns[&t.pattern].page, t.lang),
-                sweeps: Vec::new(),
-                limited: Vec::new(),
-                text: None,
-            }
+            EntryObservation::for_ast(&q.id, &evidence.patterns[&t.pattern], t.lang)
         })
         .collect();
 

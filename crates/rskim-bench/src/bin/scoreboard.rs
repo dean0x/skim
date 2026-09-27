@@ -27,7 +27,6 @@
 //!   no `report.json` / `report.md` in `--out` (`run` / `check` remove the
 //!   previous ones first).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -38,7 +37,8 @@ use rskim_oracle::structural::StructuralOracle;
 use rskim_bench::scoreboard::baseline::{Baseline, BlessDecision, BlessInputs, bless};
 use rskim_bench::scoreboard::catalog::skim_catalog;
 use rskim_bench::scoreboard::corpus::{
-    DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora, materialize_verified,
+    CorpusSpec, DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora,
+    materialize_verified,
 };
 use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
@@ -272,14 +272,7 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
         .context("creating the isolated HOME")?;
     let universe = Universe::compute(&root, &GitIsolation::new(home.path()))?;
     if args.ast {
-        return golden_gen_ast(
-            args,
-            &spec.name,
-            &spec.commit,
-            &root,
-            &universe,
-            home.path(),
-        );
+        return golden_gen_ast(args, spec, &root, &universe, home.path());
     }
     let candidates = golden_gen::generate(&spec.name, &universe, golden_gen::GENERATED_PER_CORPUS)?;
 
@@ -302,33 +295,28 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
 }
 
 /// `golden-gen --ast`: run the structural oracle over the universe, call
-/// skim once per catalog pattern, the gate's call set (sandboxed under
-/// `home`, as in `run`), and print the non-vacuous `[[ast]]` entries (a
-/// skim-only one as an `expect_oracle_empty` guard), after a comment listing
-/// the rows no proposed entry would score.
+/// skim once per catalog pattern through the gate's call loop (sandboxed
+/// under `home`, as in `run`), and print the non-vacuous `[[ast]]` entries
+/// (a skim-only one as an `expect_oracle_empty` guard), after a comment
+/// listing the rows no proposed entry would score.
 fn golden_gen_ast(
     args: &GoldenGenArgs,
-    corpus: &str,
-    commit: &str,
+    spec: &CorpusSpec,
     root: &Path,
     universe: &Universe,
     home: &Path,
 ) -> anyhow::Result<u8> {
+    let (corpus, commit) = (spec.name.as_str(), spec.commit.as_str());
     let skim_bin = resolve_skim_bin(&args.skim_bin)?;
     let oracle = StructuralOracle::new().context("compiling the structural oracle")?;
     let answers = OracleAnswers::compute(&oracle, universe.files()).context("structural oracle")?;
     let runner = SkimRunner::new(skim_bin, SkimSandbox::new(home));
     runner.build(root)?;
     let catalog = skim_catalog();
-    let skim = called_patterns(&catalog)
+    let skim = pipeline::call_patterns(&runner, root, called_patterns(&catalog))?
         .into_iter()
-        .map(|pattern| {
-            let (page, _) = runner
-                .ast_list(root, pattern)
-                .with_context(|| format!("--ast {pattern}"))?;
-            Ok((pattern.to_string(), page.page))
-        })
-        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        .map(|(pattern, (page, _))| (pattern, page))
+        .collect();
     let candidates = golden_gen::generate_ast(corpus, &catalog, &answers, &skim)?;
 
     println!(

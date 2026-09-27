@@ -5,7 +5,8 @@
 //! - every map is a [`BTreeMap`] or a struct (the workspace `serde_json` has
 //!   `preserve_order`, so insertion order would otherwise leak into output);
 //! - every list is sorted before it is stored;
-//! - floats are rounded to 4 decimal places ([`round4`]);
+//! - floats are rounded to 4 decimal places
+//!   ([`crate::scoreboard::fmt::round4`]);
 //! - paths are repo-relative, and nothing records a timestamp, a binary
 //!   version, or a machine path.
 //!
@@ -30,11 +31,6 @@ use crate::scoreboard::types::CheckId;
 
 /// `report.json` schema version; `bless` refuses any other.
 pub const REPORT_SCHEMA: u32 = 1;
-
-/// Round to 4 decimal places (report and baseline floats).
-pub fn round4(x: f64) -> f64 {
-    (x * 10_000.0).round() / 10_000.0
-}
 
 // ============================================================================
 // report.json
@@ -471,21 +467,7 @@ pub fn render_markdown(report: &Report, baseline: Option<&Baseline>) -> String {
         );
         structural_table(&mut md, &c.structural);
     }
-
-    if !report.uncovered_patterns.is_empty() {
-        let _ = writeln!(
-            md,
-            "## Uncovered structural patterns (manual dog-food, ADR-007)\n"
-        );
-        for p in &report.uncovered_patterns {
-            let cause = match p.cause {
-                UncoveredCause::NoOracle => "no oracle",
-                UncoveredCause::NoEntry => "no entry",
-            };
-            let _ = writeln!(md, "- `{}` ({cause}): {}", p.name, md_escape(&p.reason));
-        }
-        md.push('\n');
-    }
+    uncovered_section(&mut md, &report.uncovered_patterns);
 
     let _ = writeln!(md, "## Latency (INFO, never gated)\n");
     let _ = writeln!(md, "| corpus | calls | wall p50 ms | wall p95 ms |");
@@ -558,28 +540,8 @@ fn structural_table(md: &mut String, s: &StructuralReport) {
         "| entry | pattern | lang | class | oracle files | skim files | recall | precision | intent recall | intent precision | line on match |"
     );
     let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|");
-    let opt = |v: Option<f64>| v.map_or_else(|| "—".to_string(), fmt_value);
     for e in &s.entries {
-        let guard = if e.expect_oracle_empty {
-            FP_GUARD_MARKER
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            md,
-            "| `{}` | {} | {} | {}{guard} | {} | {} | {} | {} | {} | {} | {} |",
-            e.id,
-            e.pattern,
-            e.lang,
-            e.precision_class.as_str(),
-            e.oracle_files,
-            e.skim_files,
-            fmt_value(e.recall),
-            fmt_value(e.precision),
-            opt(e.intent_recall),
-            opt(e.intent_precision),
-            e.line_on_match
-        );
+        entry_row(md, e);
     }
     if s.entries.iter().any(|e| e.expect_oracle_empty) {
         let _ = writeln!(
@@ -600,6 +562,53 @@ fn structural_table(md: &mut String, s: &StructuralReport) {
             "\nUnscored `--ast` rows (a language no entry scores): {}",
             unscored.join(", ")
         );
+    }
+    md.push('\n');
+}
+
+/// One `[[ast]]` entry's row of [`structural_table`]; a false-positive
+/// guard's class cell carries [`FP_GUARD_MARKER`], and a measurement the
+/// entry has none of reads `—`.
+fn entry_row(md: &mut String, e: &StructuralSample) {
+    let guard = if e.expect_oracle_empty {
+        FP_GUARD_MARKER
+    } else {
+        ""
+    };
+    let opt = |v: Option<f64>| v.map_or_else(|| "—".to_string(), fmt_value);
+    let _ = writeln!(
+        md,
+        "| `{}` | {} | {} | {}{guard} | {} | {} | {} | {} | {} | {} | {} |",
+        e.id,
+        e.pattern,
+        e.lang,
+        e.precision_class.as_str(),
+        e.oracle_files,
+        e.skim_files,
+        fmt_value(e.recall),
+        fmt_value(e.precision),
+        opt(e.intent_recall),
+        opt(e.intent_precision),
+        e.line_on_match
+    );
+}
+
+/// The catalog patterns no structural entry scores, each with its cause and
+/// reason (nothing when every pattern is scored).
+fn uncovered_section(md: &mut String, uncovered: &[UncoveredPattern]) {
+    if uncovered.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        md,
+        "## Uncovered structural patterns (manual dog-food, ADR-007)\n"
+    );
+    for p in uncovered {
+        let cause = match p.cause {
+            UncoveredCause::NoOracle => "no oracle",
+            UncoveredCause::NoEntry => "no entry",
+        };
+        let _ = writeln!(md, "- `{}` ({cause}): {}", p.name, md_escape(&p.reason));
     }
     md.push('\n');
 }
@@ -628,13 +637,6 @@ fn md_escape(s: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
-
-    #[test]
-    fn round4_keeps_four_decimal_places() {
-        assert_eq!(round4(1.0 / 3.0), 0.3333);
-        assert_eq!(round4(2.0 / 3.0), 0.6667);
-        assert_eq!(round4(0.5), 0.5);
-    }
 
     #[test]
     fn gate_failure_line_names_check_and_ids() {

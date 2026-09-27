@@ -25,11 +25,13 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::Instant;
 
 use anyhow::Context;
+use rskim_oracle::structural::OracleLang;
 use serde_json::Value;
 
 use crate::scoreboard::MAX_PAGES;
 use crate::scoreboard::golden::{QueryFlags, pagination_bound, within_pagination_bound};
 use crate::scoreboard::metrics::PlannedQuery;
+use crate::scoreboard::structural_metrics::rows_in;
 use crate::scoreboard::types::{Arm, AstPage, EntryKind, ResultPage, StatsSnapshot};
 use crate::scoreboard::universe::GitIsolation;
 
@@ -209,6 +211,21 @@ pub struct EntryObservation {
     pub limited: Vec<(u32, ResultPage)>,
     /// Text-mode output (`[[ident]]` / `[[concept]]` only).
     pub text: Option<TextOutput>,
+}
+
+impl EntryObservation {
+    /// An `[[ast]]` entry's observation: the rows of its pattern's
+    /// `--ast <pattern>` answer `call` in `lang` ([`rows_in`]) as its full
+    /// list, and nothing else (the entry is never observed on its own).
+    pub fn for_ast(id: &str, call: &AstPage, lang: OracleLang) -> Self {
+        EntryObservation {
+            id: id.to_string(),
+            full: rows_in(&call.page, lang),
+            sweeps: Vec::new(),
+            limited: Vec::new(),
+            text: None,
+        }
+    }
 }
 
 /// An observation plus the timings of every call behind it.

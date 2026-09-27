@@ -1,17 +1,9 @@
 //! Unit tests for `structural_metrics.rs` (co-located file, `#[path]`-included).
 
-use std::sync::OnceLock;
-
 use super::*;
 use crate::scoreboard::golden::parse_golden;
-use crate::scoreboard::test_support::catalog;
+use crate::scoreboard::test_support::{catalog, oracle};
 use crate::scoreboard::types::VerifyMode;
-
-/// The oracle, compiled once for every test in this module.
-fn oracle() -> &'static StructuralOracle {
-    static ORACLE: OnceLock<StructuralOracle> = OnceLock::new();
-    ORACLE.get_or_init(|| StructuralOracle::new().expect("the oracle compiles"))
-}
 
 const NESTED: &str = "fn walk() {\n    for a in 0..2 {\n        for b in 0..2 {\n            work(a, b);\n        }\n    }\n}\n";
 const SINGLE: &str = "fn one() {\n    for i in 0..3 {\n        work(i);\n    }\n}\n";

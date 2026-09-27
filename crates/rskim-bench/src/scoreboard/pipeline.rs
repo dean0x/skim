@@ -35,6 +35,7 @@ use crate::scoreboard::catalog::{CatalogPattern, skim_catalog};
 use crate::scoreboard::corpus::{
     CorpusSource, CorpusSpec, find_corpus, load_corpora, materialize_verified,
 };
+use crate::scoreboard::fmt::round4;
 use crate::scoreboard::gate::{self, GateInputs, Ledger};
 use crate::scoreboard::golden::{
     IntegrityContext, LoadedGolden, check_integrity, golden_set_sha256, load_golden,
@@ -44,11 +45,11 @@ use crate::scoreboard::metrics::{
 };
 use crate::scoreboard::report::{
     AggregateReport, CorpusInfo, CorpusReport, CoverageReport, LatencyReport, LatencyStats,
-    REPORT_SCHEMA, Report, SkippedByReason, StructuralReport, UniverseReport, round4, tally,
+    REPORT_SCHEMA, Report, SkippedByReason, StructuralReport, UniverseReport, tally,
 };
 use crate::scoreboard::runner::{EntryObservation, SkimRunner, Timing};
 use crate::scoreboard::structural_metrics::{
-    OracleAnswers, StructuralEvidence, called_patterns, coverage_comparison, is_vacuous, rows_in,
+    OracleAnswers, StructuralEvidence, called_patterns, coverage_comparison, is_vacuous,
     uncovered_patterns, unexpected_oracle_matches,
 };
 use crate::scoreboard::types::{AstPage, StatsSnapshot};
@@ -209,11 +210,7 @@ pub fn run(
         .transpose()
         .context("compiling the structural oracle")?;
     for spec in &inputs.corpora {
-        let golden = inputs
-            .goldens
-            .get(&spec.name)
-            .with_context(|| format!("no golden file loaded for corpus {}", spec.name))?;
-        let run = run_corpus(spec, golden, inputs, source, runner, oracle.as_ref())
+        let run = run_corpus(spec, inputs, source, runner, oracle.as_ref())
             .with_context(|| format!("corpus {}", spec.name))?;
         latency.insert(spec.name.clone(), run.latency);
         corpora.push(run.report);
@@ -247,13 +244,16 @@ pub fn run(
 
 fn run_corpus(
     spec: &CorpusSpec,
-    golden: &LoadedGolden,
     inputs: &Inputs,
     source: &dyn CorpusSource,
     runner: &SkimRunner,
     oracle: Option<&StructuralOracle>,
 ) -> anyhow::Result<CorpusRun> {
     let name = spec.name.as_str();
+    let golden = inputs
+        .goldens
+        .get(name)
+        .with_context(|| format!("no golden file loaded for corpus {name}"))?;
     progress(name, "verifying the pinned clone");
     let root = materialize_verified(source, spec)?;
 
@@ -288,10 +288,12 @@ fn run_corpus(
     let report = corpus_report(
         spec,
         golden,
-        &universe,
-        &stats,
-        &eval,
-        &evidence,
+        &CorpusEvidence {
+            universe: &universe,
+            stats: &stats,
+            eval: &eval,
+            structural: &evidence,
+        },
         &inputs.ledger,
     )?;
     Ok(CorpusRun {
@@ -355,9 +357,35 @@ pub fn entries_noun(n: usize) -> &'static str {
     if n == 1 { "entry" } else { "entries" }
 }
 
+/// skim's `--ast <pattern>` full list and the call's timing for each of
+/// `patterns`, called once each, in order, and keyed by pattern: the loop
+/// behind both the gate's pattern calls and `golden-gen --ast`'s (every
+/// pattern of [`called_patterns`] in each), so the proposal is made from the
+/// same answers the gate scores.
+///
+/// # Errors
+///
+/// Any skim call error, naming the pattern.
+pub fn call_patterns(
+    runner: &SkimRunner,
+    root: &Path,
+    patterns: impl IntoIterator<Item = &'static str>,
+) -> anyhow::Result<BTreeMap<String, (AstPage, Timing)>> {
+    patterns
+        .into_iter()
+        .map(|pattern| {
+            let call = runner
+                .ast_list(root, pattern)
+                .with_context(|| format!("--ast {pattern}"))?;
+            Ok((pattern.to_string(), call))
+        })
+        .collect()
+}
+
 /// Run every call the plan needs. Each pattern of [`ast_calls`] is called
-/// once (`--ast <pattern>`, full list), in pattern order; an `[[ast]]`
-/// entry's observation is its pattern call's rows in its language.
+/// once (`--ast <pattern>`, full list), in pattern order
+/// ([`call_patterns`]); an `[[ast]]` entry's observation is its pattern
+/// call's rows in its language ([`EntryObservation::for_ast`]).
 ///
 /// # Errors
 ///
@@ -368,15 +396,12 @@ fn observe_plan(
     plan: &[PlannedQuery],
     catalog: &[CatalogPattern],
 ) -> anyhow::Result<PlanObservations> {
-    let calls = ast_calls(plan, catalog);
+    let calls = call_patterns(runner, root, ast_calls(plan, catalog))?;
     let mut timings = Vec::with_capacity(plan.len() + calls.len());
     let mut patterns: BTreeMap<String, AstPage> = BTreeMap::new();
-    for pattern in calls {
-        let (page, timing) = runner
-            .ast_list(root, pattern)
-            .with_context(|| format!("--ast {pattern}"))?;
+    for (pattern, (page, timing)) in calls {
         timings.push((format!("--ast {pattern}"), vec![timing]));
-        patterns.insert(pattern.to_string(), page);
+        patterns.insert(pattern, page);
     }
 
     let mut observations = Vec::with_capacity(plan.len());
@@ -385,13 +410,7 @@ fn observe_plan(
             let call = patterns
                 .get(&target.pattern)
                 .with_context(|| format!("entry {}: no --ast {} call", q.id, target.pattern))?;
-            observations.push(EntryObservation {
-                id: q.id.clone(),
-                full: rows_in(&call.page, target.lang),
-                sweeps: Vec::new(),
-                limited: Vec::new(),
-                text: None,
-            });
+            observations.push(EntryObservation::for_ast(&q.id, call, target.lang));
             continue;
         }
         let observed = runner
@@ -642,16 +661,30 @@ fn checked_plan(
     Ok(plan)
 }
 
+/// What one corpus's run observed and scored, for its report section: the
+/// oracle universe, skim's `--stats`, the evaluation and the structural
+/// evidence. They always travel together, so the next per-corpus input
+/// (#542's temporal oracle) is one more field here.
+struct CorpusEvidence<'a> {
+    universe: &'a Universe,
+    stats: &'a StatsSnapshot,
+    eval: &'a CorpusEvaluation,
+    structural: &'a StructuralEvidence,
+}
+
 /// One corpus's report section, with the ledger applied to its outcomes.
 fn corpus_report(
     spec: &CorpusSpec,
     golden: &LoadedGolden,
-    universe: &Universe,
-    stats: &StatsSnapshot,
-    eval: &CorpusEvaluation,
-    structural: &StructuralEvidence,
+    evidence: &CorpusEvidence<'_>,
     ledger: &Ledger,
 ) -> anyhow::Result<CorpusReport> {
+    let CorpusEvidence {
+        universe,
+        stats,
+        eval,
+        structural,
+    } = *evidence;
     let coverage = universe.coverage();
     Ok(CorpusReport {
         name: spec.name.clone(),
@@ -721,7 +754,7 @@ fn latency_stats(entries: &[(String, Vec<Timing>)]) -> LatencyStats {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
-    use crate::scoreboard::test_support::catalog;
+    use crate::scoreboard::test_support::{catalog, oracle};
 
     #[test]
     fn latency_uses_nearest_rank_percentiles_and_totals_each_entry() {
@@ -870,7 +903,6 @@ mod tests {
 
     #[test]
     fn a_vacuous_ast_entry_is_a_golden_error() {
-        use rskim_oracle::structural::StructuralOracle;
         let plan = plan_of(
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n\
              [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n\
@@ -878,7 +910,7 @@ mod tests {
         );
         // The oracle finds a Rust loop; there is no Go file at all.
         let answers = OracleAnswers::compute(
-            &StructuralOracle::new().unwrap(),
+            oracle(),
             [("src/a.rs", "fn f() {\n    for i in 0..2 {}\n}\n")],
         )
         .unwrap();
@@ -936,17 +968,12 @@ mod tests {
 
     #[test]
     fn the_vacuity_guard_refuses_observations_that_do_not_follow_the_plan() {
-        use rskim_oracle::structural::StructuralOracle;
         let plan = plan_of(
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n\
              [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n",
         );
         // No Go file: go-defer is vacuous unless skim returns a row for it.
-        let answers = OracleAnswers::compute(
-            &StructuralOracle::new().unwrap(),
-            [("src/a.rs", "fn f() {}\n")],
-        )
-        .unwrap();
+        let answers = OracleAnswers::compute(oracle(), [("src/a.rs", "fn f() {}\n")]).unwrap();
 
         // One observation short: an unchecked zip would never judge go-defer.
         let err = require_non_vacuous_structural(
@@ -1026,15 +1053,14 @@ mod tests {
 
     #[test]
     fn a_false_positive_guard_is_exempt_from_vacuity_but_its_flag_must_hold() {
-        use rskim_oracle::structural::StructuralOracle;
-        let oracle = StructuralOracle::new().unwrap();
+        let oracle = oracle();
         let plan = plan_of(
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\nexpect_oracle_empty = true\n\
              [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n",
         );
         // A Go file with no select and no defer: both oracles are empty.
         let no_select = OracleAnswers::compute(
-            &oracle,
+            oracle,
             [
                 ("src/a.rs", "fn f() {}\n"),
                 ("cmd/main.go", "package main\n\nfunc f() {}\n"),
@@ -1065,7 +1091,7 @@ mod tests {
 
         // With no scored Go file at all, the guard has nothing to guard: it
         // is vacuous too, and the message says why.
-        let no_go = OracleAnswers::compute(&oracle, [("src/a.rs", "fn f() {}\n")]).unwrap();
+        let no_go = OracleAnswers::compute(oracle, [("src/a.rs", "fn f() {}\n")]).unwrap();
         require_expected_empty_oracles(&flagged_only, &no_go).unwrap();
         let err = require_non_vacuous_structural(&flagged_only, &empty[..1], &no_go)
             .expect_err("a guard in a language the corpus has no scored file in measures nothing");
@@ -1084,7 +1110,7 @@ mod tests {
         // Once the oracle matches, the flag is stale: a golden error that
         // names the entry and a matched file, before skim is even run.
         let go = OracleAnswers::compute(
-            &oracle,
+            oracle,
             [(
                 "cmd/main.go",
                 "package main\n\nfunc f() {\n\tselect {}\n}\n",

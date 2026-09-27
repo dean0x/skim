@@ -23,22 +23,24 @@
 //! `Language::from_extension`, and nothing here scores skim.
 //!
 //! `[[ast]]` selection ([`generate_ast`]): every `(pattern, language)` the
-//! structural oracle covers, where the corpus has files of that language in
-//! its AST universe and the entry is non-vacuous (the oracle matches a file,
-//! or skim's `--ast <pattern>` returns a row in that language). The proposed
-//! precision class is `hard` when the catalog marks the pattern `exact`,
-//! `ratchet` otherwise ([`proposed_class`]); once frozen in the golden file,
-//! the class is never re-read from the catalog. An entry the oracle matches
-//! no file for exists only because skim returns one (a false positive), so it
-//! is proposed with `expect_oracle_empty = true`: a false-positive guard that
-//! stays scored after a fix empties skim's rows.
+//! structural oracle covers whose entry the gate would not refuse as vacuous
+//! (its own rule, [`is_vacuous`]): the oracle matches a file, or skim's
+//! `--ast <pattern>` returns a row in that language, and the corpus has a
+//! scored file in that language. The proposed precision class is `hard`
+//! when the catalog marks the pattern `exact`, `ratchet` otherwise
+//! ([`proposed_class`]); once frozen in the golden file, the class is never
+//! re-read from the catalog. An entry the oracle matches no file for exists
+//! only because skim returns one (a false positive), so it is proposed with
+//! `expect_oracle_empty = true`: a false-positive guard that stays scored
+//! after a fix empties skim's rows.
 //!
 //! `golden-gen --ast` calls skim for every catalog pattern
-//! ([`crate::scoreboard::structural_metrics::called_patterns`]), the call set
-//! the gate uses, and reports the rows no proposed entry would score
-//! ([`unscored_after`]) as a comment above the proposal.
+//! ([`crate::scoreboard::structural_metrics::called_patterns`]) through the
+//! gate's own call loop (`pipeline::call_patterns`), and reports the rows no
+//! proposed entry would score ([`unscored_after`], the gate's scored set) as
+//! a comment above the proposal.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Context;
@@ -47,11 +49,13 @@ use rskim_search::SearchField;
 
 use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
 use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
+use crate::scoreboard::fmt::sample;
 use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
-use crate::scoreboard::metrics::sample;
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
-use crate::scoreboard::structural_metrics::{OracleAnswers, files_in, unscored_in};
-use crate::scoreboard::types::{ResultPage, ResultRow};
+use crate::scoreboard::structural_metrics::{
+    OracleAnswers, StructuralTarget, files_in, is_vacuous, lang_rows, scored_pairs, unscored_in,
+};
+use crate::scoreboard::types::{AstPage, ResultRow};
 use crate::scoreboard::universe::Universe;
 
 /// Generated identifier entries per corpus.
@@ -260,16 +264,14 @@ pub fn render_toml(corpus: &str, candidates: &[Candidate]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AstCandidate {
     pub id: String,
-    pub pattern: String,
-    pub lang: OracleLang,
-    pub precision: PrecisionClass,
-    /// Files the oracle matches in `lang` (for the reviewer).
+    /// What the entry scores, as the gate will read it once frozen: its
+    /// `expect_oracle_empty` is set when the oracle matches no file, so the
+    /// entry guards skim's false positive (precision) only.
+    pub target: StructuralTarget,
+    /// Files the oracle matches in the target's language (for the reviewer).
     pub oracle_files: usize,
-    /// Distinct files skim's `--ast <pattern>` returns in `lang`.
+    /// Distinct files skim's `--ast <pattern>` returns in that language.
     pub skim_files: usize,
-    /// Propose `expect_oracle_empty = true`: the oracle matches no file, so
-    /// the entry guards skim's false positive (precision) only.
-    pub expect_oracle_empty: bool,
 }
 
 /// An `[[ast]]` id: `<corpus>-ast-<pattern>-<lang>`. It names the pair, not
@@ -291,12 +293,9 @@ pub fn proposed_class(catalog: &[CatalogPattern], pattern: &str) -> PrecisionCla
     }
 }
 
-/// Every covered `(pattern, language)` of `catalog` whose language has files
-/// in the corpus's AST universe, ordered by `(pattern, language name)`.
-fn present_pairs(
-    catalog: &[CatalogPattern],
-    answers: &OracleAnswers,
-) -> Vec<(&'static str, OracleLang)> {
+/// Every covered `(pattern, language)` of `catalog`, ordered by
+/// `(pattern, language name)`.
+fn covered_pairs(catalog: &[CatalogPattern]) -> Vec<(&'static str, OracleLang)> {
     let mut pairs: Vec<(&'static str, OracleLang)> = catalog_coverage(catalog)
         .into_iter()
         .filter_map(|(pattern, coverage)| match coverage {
@@ -304,15 +303,17 @@ fn present_pairs(
             PatternCoverage::Uncovered { .. } => None,
         })
         .flat_map(|(pattern, langs)| langs.into_iter().map(move |lang| (pattern, lang)))
-        .filter(|&(_, lang)| answers.scored_files(lang) > 0)
         .collect();
     pairs.sort_by(|a, b| (a.0, a.1.as_str()).cmp(&(b.0, b.1.as_str())));
     pairs
 }
 
 /// Propose `[[ast]]` entries (see the module docs) for the patterns of
-/// `catalog`. `skim` holds skim's `--ast <pattern>` full list per pattern
-/// called; a pattern not in it counts as no rows.
+/// `catalog`. `skim` holds skim's `--ast <pattern>` answer per pattern
+/// called; a pattern not in it counts as no rows. A pair is proposed only
+/// if the gate's vacuity rule ([`is_vacuous`]) passes it twice: as an
+/// ordinary entry (the oracle or skim finds a file), then as proposed (a
+/// false-positive guard needs a scored file in its language).
 ///
 /// # Errors
 ///
@@ -321,44 +322,51 @@ pub fn generate_ast(
     corpus: &str,
     catalog: &[CatalogPattern],
     answers: &OracleAnswers,
-    skim: &BTreeMap<String, ResultPage>,
+    skim: &BTreeMap<String, AstPage>,
 ) -> anyhow::Result<Vec<AstCandidate>> {
     let mut out = Vec::new();
-    for (pattern, lang) in present_pairs(catalog, answers) {
+    for (pattern, lang) in covered_pairs(catalog) {
+        let call = skim.get(pattern);
+        let rows = || call.into_iter().flat_map(|c| lang_rows(&c.page, lang));
+        let ordinary = StructuralTarget {
+            pattern: pattern.to_string(),
+            lang,
+            precision: proposed_class(catalog, pattern),
+            expect_oracle_empty: false,
+        };
+        if is_vacuous(&ordinary, rows(), answers)? {
+            continue;
+        }
         let oracle_files = answers.definition(pattern, lang)?.len();
-        let skim_files = skim
-            .get(pattern)
-            .map_or(0, |page| files_in(page, lang).len());
-        if oracle_files == 0 && skim_files == 0 {
+        let target = StructuralTarget {
+            expect_oracle_empty: oracle_files == 0,
+            ..ordinary
+        };
+        if is_vacuous(&target, rows(), answers)? {
             continue;
         }
         out.push(AstCandidate {
             id: ast_id(corpus, pattern, lang),
-            pattern: pattern.to_string(),
-            lang,
-            precision: proposed_class(catalog, pattern),
+            target,
             oracle_files,
-            skim_files,
-            expect_oracle_empty: oracle_files == 0,
+            skim_files: call.map_or(0, |c| files_in(&c.page, lang).len()),
         });
     }
     Ok(out)
 }
 
-/// skim rows no candidate scores ([`unscored_in`]), per called pattern with
-/// at least one, in pattern order: what the gate counts in
+/// skim rows no candidate scores ([`unscored_in`] over the candidates'
+/// [`scored_pairs`], as the gate reads them), per called pattern with at
+/// least one, in pattern order: what the gate counts in
 /// `structural.unscored_rows.<pattern>` once the proposal is frozen.
 pub fn unscored_after<'s>(
     candidates: &[AstCandidate],
-    skim: &'s BTreeMap<String, ResultPage>,
+    skim: &'s BTreeMap<String, AstPage>,
 ) -> Vec<(&'s str, Vec<&'s ResultRow>)> {
-    let scored: BTreeSet<(&str, OracleLang)> = candidates
-        .iter()
-        .map(|c| (c.pattern.as_str(), c.lang))
-        .collect();
+    let scored = scored_pairs(candidates.iter().map(|c| &c.target));
     skim.iter()
-        .map(|(pattern, page)| {
-            let rows: Vec<&ResultRow> = unscored_in(pattern, page, &scored).collect();
+        .map(|(pattern, call)| {
+            let rows: Vec<&ResultRow> = unscored_in(pattern, &call.page, &scored).collect();
             (pattern.as_str(), rows)
         })
         .filter(|(_, rows)| !rows.is_empty())
@@ -404,11 +412,11 @@ pub fn render_ast_toml(candidates: &[AstCandidate]) -> String {
             c.oracle_files,
             c.skim_files,
             toml_string(&c.id),
-            toml_string(&c.pattern),
-            toml_string(c.lang.as_str()),
-            toml_string(c.precision.as_str()),
+            toml_string(&c.target.pattern),
+            toml_string(c.target.lang.as_str()),
+            toml_string(c.target.precision.as_str()),
         ));
-        if c.expect_oracle_empty {
+        if c.target.expect_oracle_empty {
             out.push_str("expect_oracle_empty = true\n");
         }
     }
@@ -736,24 +744,31 @@ mod tests {
     // --- [[ast]] candidates --------------------------------------------------------
 
     fn ast_answers(files: &[(&str, &str)]) -> OracleAnswers {
-        let oracle = rskim_oracle::structural::StructuralOracle::new().unwrap();
-        OracleAnswers::compute(&oracle, files.iter().copied()).unwrap()
+        OracleAnswers::compute(
+            crate::scoreboard::test_support::oracle(),
+            files.iter().copied(),
+        )
+        .unwrap()
     }
 
-    fn skim_rows(paths: &[&str]) -> ResultPage {
-        ResultPage {
-            rows: paths
-                .iter()
-                .map(|p| crate::scoreboard::types::ResultRow {
-                    path: p.to_string(),
-                    score: 1.0,
-                    line: Some(1),
-                    snippet: Vec::new(),
-                })
-                .collect(),
-            has_more: false,
-            verify_mode: crate::scoreboard::types::VerifyMode::Substring,
-            degraded: Vec::new(),
+    /// skim's `--ast <pattern>` answer: one row per path, line 1.
+    fn skim_rows(paths: &[&str]) -> AstPage {
+        AstPage {
+            page: crate::scoreboard::types::ResultPage {
+                rows: paths
+                    .iter()
+                    .map(|p| crate::scoreboard::types::ResultRow {
+                        path: p.to_string(),
+                        score: 1.0,
+                        line: Some(1),
+                        snippet: Vec::new(),
+                    })
+                    .collect(),
+                has_more: false,
+                verify_mode: crate::scoreboard::types::VerifyMode::Substring,
+                degraded: Vec::new(),
+            },
+            coverage: crate::scoreboard::types::AstCoverage::default(),
         }
     }
 
@@ -827,8 +842,8 @@ mod tests {
             .iter()
             .map(|c| {
                 (
-                    c.pattern.as_str(),
-                    c.lang.as_str(),
+                    c.target.pattern.as_str(),
+                    c.target.lang.as_str(),
                     c.oracle_files,
                     c.skim_files,
                 )
@@ -876,13 +891,13 @@ mod tests {
         // false-positive guards.
         let guards: Vec<&str> = got
             .iter()
-            .filter(|c| c.expect_oracle_empty)
+            .filter(|c| c.target.expect_oracle_empty)
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(guards, ["skim-ast-try-catch-finally-javascript"]);
         assert!(
             got.iter()
-                .all(|c| c.expect_oracle_empty == (c.oracle_files == 0))
+                .all(|c| c.target.expect_oracle_empty == (c.oracle_files == 0))
         );
     }
 
@@ -956,12 +971,12 @@ mod tests {
         // skim's try-catch-finally row is a false positive: a guard entry.
         let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/a.ts"]))]);
         let got = generate_ast("skim", catalog(), &answers, &skim).unwrap();
-        assert!(got.iter().any(|c| c.expect_oracle_empty));
-        assert!(got.iter().any(|c| !c.expect_oracle_empty));
+        assert!(got.iter().any(|c| c.target.expect_oracle_empty));
+        assert!(got.iter().any(|c| !c.target.expect_oracle_empty));
         let rendered = render_ast_toml(&got);
         assert_eq!(
             rendered.matches("expect_oracle_empty = true").count(),
-            got.iter().filter(|c| c.expect_oracle_empty).count(),
+            got.iter().filter(|c| c.target.expect_oracle_empty).count(),
             "{rendered}"
         );
         let golden = parse_golden(&format!(
@@ -980,10 +995,10 @@ mod tests {
                 ),
                 (
                     candidate.id.as_str(),
-                    candidate.pattern.as_str(),
-                    candidate.lang,
-                    candidate.precision,
-                    candidate.expect_oracle_empty
+                    candidate.target.pattern.as_str(),
+                    candidate.target.lang,
+                    candidate.target.precision,
+                    candidate.target.expect_oracle_empty
                 )
             );
         }
