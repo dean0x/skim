@@ -355,9 +355,10 @@ pub fn load_golden(path: &Path) -> anyhow::Result<LoadedGolden> {
     Ok(LoadedGolden { file, sha256 })
 }
 
-/// Lowercase hex SHA-256 of [`structural::fingerprint`]: every registered
-/// oracle query (file name, post-filter, text), every intent spec, and the
-/// oracle's size cap.
+/// Lowercase hex SHA-256 of [`structural::fingerprint`]: every table the
+/// oracle's answers depend on — the size cap, the extension table, the
+/// body-element attribute kinds, every registered query (file name,
+/// post-filter, text) and every intent spec.
 pub fn structural_oracle_sha256() -> String {
     hex_sha256(structural::fingerprint().as_bytes())
 }

@@ -250,9 +250,10 @@ if rx.recv_timeout(KILL_GRACE).is_ok() { // KILL_GRACE = 2 s
   `rskim_search::all_patterns()`. The extension table, the AST-indexed language list and the 1 MiB **inclusive**
   cap are cited copies.
 - **The oracle is folded into the golden digest.** A file with `[[ast]]` entries hashes its bytes plus the SHA-256
-  of `structural::fingerprint()` (every `.scm`, post-filter, `INTENTS` spec, the cap). Editing any query moves the
-  `golden_sha256` of every `[[ast]]`-bearing corpus: "bless required", and `bless` refuses a report made with other
-  queries.
+  of `structural::fingerprint()` (every `.scm`, post-filter, `INTENTS` spec, the cap, every `EXT_CLASSES` row plus
+  `UNKNOWN_EXTENSION`, `ATTRIBUTE_KINDS`; rendered by `render_fingerprint` over explicit `OracleInputs`, so a test
+  can render an edited copy). Editing any of them moves the `golden_sha256` of every `[[ast]]`-bearing corpus:
+  "bless required", and `bless` refuses a report made with other queries.
 - **One skim call per (corpus, pattern)** (`observe_plan`), rows split by `structural::classify`, so `.tsx` is its
   own language. Rows in a language with no entry become `structural.unscored_rows.<pattern>` (a shrink regresses).
 - **`structural.coverage` is recorded per `[[ast]]` id** (HARD records are keyed `(id, check)`), so a coverage
@@ -266,7 +267,8 @@ if rx.recv_timeout(KILL_GRACE).is_ok() { // KILL_GRACE = 2 s
   `oracle files 0` candidate). A guard stays scored after the fix empties skim's rows (recall and precision read 1
   over an empty denominator), so fixing #546 turns `skim-ast-try-catch-finally-javascript`'s XFAIL into an XPASS:
   remove the ledger ids, keep the golden entry, bless (no reason needed). A guard whose oracle matches a file is exit
-  2 before skim runs (`require_expected_empty_oracles`), so the flag can never hide a recall loss.
+  2 before skim runs (`require_expected_empty_oracles`), so the flag can never hide a recall loss. The report marks
+  a guard (`StructuralSample.expect_oracle_empty`, serialized only when true; `<class>, FP guard` in report.md).
 - **`line_on_match` reads low by design**: skim anchors on the child that completes an edge (`catch_clause`,
   `class_body`, …); the oracle anchors on the construct. try-*, class-method, impl-method read 0. Not a bug.
 - **Cost**: the oracle is rayon-parallel, one parse per file; the structural share of a warm local run is about

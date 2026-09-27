@@ -1648,6 +1648,15 @@ fn a_false_positive_guard_survives_the_fix_and_catches_the_false_positive_return
         (&json!(1.0), &json!(1.0)),
         "an empty denominator reads as 1"
     );
+    // The report tells a fixed guard apart from an ordinary empty entry.
+    assert_eq!(entry["expect_oracle_empty"], json!(true));
+    let md = fs::read_to_string(h.out_dir.path().join("report.md")).unwrap();
+    assert!(
+        md.contains(&format!(
+            "| `{GUARD_ID}` | {GUARD_PATTERN} | rust | hard, FP guard | 0 | 0 |"
+        )),
+        "{md}"
+    );
 
     // Promote: remove the ledger entry, keep the golden entry; `xfail -> pass`
     // blesses without a reason.

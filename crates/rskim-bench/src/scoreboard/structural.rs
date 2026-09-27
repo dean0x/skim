@@ -18,10 +18,11 @@
 //!
 //! Each `(pattern, language)` pair has one query file,
 //! `crates/rskim-bench/scoreboard/structural/<pattern>.<lang>.scm`, compiled
-//! in with `include_str!` and hashed into the golden digest by the caller
-//! ([`query_sources`]), so editing a query forces a re-bless. `.tsx` files
-//! are parsed with the TSX grammar (ADR-003: the oracle is the real grammar),
-//! although skim parses them with the plain TypeScript grammar.
+//! in with `include_str!` and hashed into the golden digest ([`fingerprint`],
+//! with every other table an answer depends on), so editing a query forces a
+//! re-bless. `.tsx` files are parsed with the TSX grammar (ADR-003: the
+//! oracle is the real grammar), although skim parses them with the plain
+//! TypeScript grammar.
 //!
 //! Every query names one `@match` capture; the match line is the first
 //! (1-based) line of that node. Four patterns (six queries) carry a small
@@ -185,6 +186,7 @@ impl LangClass {
 }
 
 /// One row of the oracle's extension table.
+#[derive(Debug, Clone, Copy)]
 struct ExtClass {
     extensions: &'static [&'static str],
     class: LangClass,
@@ -291,6 +293,14 @@ const EXT_CLASSES: &[ExtClass] = &[
     },
 ];
 
+/// The class of a file whose extension is not in [`EXT_CLASSES`] (or that
+/// has none): skim does not know the language, so it never AST-indexes the
+/// file nor counts it toward the size cap.
+const UNKNOWN_EXTENSION: LangClass = LangClass::NotIndexed {
+    language: None,
+    size_capped: false,
+};
+
 /// Classify `path` by its extension (case-sensitive, as `Path::extension`
 /// reports it — skim does the same).
 pub fn classify(path: &str) -> LangClass {
@@ -301,10 +311,7 @@ pub fn classify(path: &str) -> LangClass {
             .find(|row| row.extensions.contains(&ext))
             .map(|row| row.class)
     })
-    .unwrap_or(LangClass::NotIndexed {
-        language: None,
-        size_capped: false,
-    })
+    .unwrap_or(UNKNOWN_EXTENSION)
 }
 
 // ============================================================================
@@ -547,17 +554,16 @@ impl QuerySource {
     }
 }
 
-/// The registry ordered by `(pattern, language name)`.
-fn sorted_queries() -> Vec<&'static OracleQuery> {
-    let mut queries: Vec<&'static OracleQuery> = QUERIES.iter().collect();
-    queries.sort_by_key(|q| (q.pattern, q.lang.as_str()));
-    queries
+/// `queries` ordered by `(pattern, language name)`.
+fn sorted_queries(queries: &[OracleQuery]) -> Vec<&OracleQuery> {
+    let mut sorted: Vec<&OracleQuery> = queries.iter().collect();
+    sorted.sort_by_key(|q| (q.pattern, q.lang.as_str()));
+    sorted
 }
 
-/// Every registered query, ordered by `(pattern, language name)` — the input
-/// for folding the `.scm` files into the golden digest.
+/// Every registered query, ordered by `(pattern, language name)`.
 pub fn query_sources() -> Vec<QuerySource> {
-    sorted_queries()
+    sorted_queries(QUERIES)
         .into_iter()
         .map(|q| QuerySource {
             pattern: q.pattern,
@@ -567,17 +573,67 @@ pub fn query_sources() -> Vec<QuerySource> {
         .collect()
 }
 
-/// A canonical rendering of the oracle's per-pattern definitions: every
-/// registered query (file name, post-filter, full text), every intent spec,
-/// and the size cap. The golden digest folds it in
-/// (`golden::structural_oracle_sha256`), so editing a query, a post-filter
-/// threshold or an intent's node kinds forces a re-bless. The extension
-/// table ([`classify`]) and the body-element rule ([`PostFilter`]'s
-/// attribute kinds) are not folded in: an edit to them that changes an answer
-/// shows up as a structural diff in the gate, like any `oracle.rs` edit.
+/// The tables the oracle's answers depend on, apart from the grammars
+/// themselves (pinned crate versions): what [`fingerprint`] renders. Factored
+/// out so a test can render an edited copy.
+struct OracleInputs<'a> {
+    /// [`AST_SIZE_CAP_BYTES`].
+    size_cap: u64,
+    /// [`EXT_CLASSES`].
+    ext_classes: &'a [ExtClass],
+    /// [`UNKNOWN_EXTENSION`].
+    unknown_extension: LangClass,
+    /// [`ATTRIBUTE_KINDS`].
+    attribute_kinds: &'a [&'a str],
+    /// [`QUERIES`].
+    queries: &'a [OracleQuery],
+    /// [`INTENTS`].
+    intents: &'a [IntentSpec],
+}
+
+/// The inputs compiled into the scoreboard.
+const ORACLE_INPUTS: OracleInputs<'static> = OracleInputs {
+    size_cap: AST_SIZE_CAP_BYTES,
+    ext_classes: EXT_CLASSES,
+    unknown_extension: UNKNOWN_EXTENSION,
+    attribute_kinds: ATTRIBUTE_KINDS,
+    queries: QUERIES,
+    intents: INTENTS,
+};
+
+/// A canonical rendering of every table the oracle's answers depend on: the
+/// size cap; the extension table ([`classify`]: every row's extensions and
+/// class, in table order, and the class of an unknown extension); the
+/// attribute kinds [`PostFilter`]'s body-element count skips; every
+/// registered query (file name, post-filter, full text), ordered by pattern
+/// and language name; and every intent spec. Each is written out explicitly
+/// (never through `Debug`), so the text is stable across toolchains. The
+/// golden digest folds it in (`golden::structural_oracle_sha256`), so an edit
+/// to any of them — a query, a post-filter threshold, an intent's node kinds,
+/// a file's language class or an attribute kind — forces a re-bless.
 pub fn fingerprint() -> String {
-    let mut out = format!("size-cap {AST_SIZE_CAP_BYTES}\n");
-    for q in sorted_queries() {
+    render_fingerprint(&ORACLE_INPUTS)
+}
+
+/// [`fingerprint`] over explicit inputs.
+fn render_fingerprint(inputs: &OracleInputs<'_>) -> String {
+    let mut out = format!("size-cap {}\n", inputs.size_cap);
+    for row in inputs.ext_classes {
+        out.push_str(&format!(
+            "ext [{}] {}\n",
+            row.extensions.join(" "),
+            class_fingerprint(row.class)
+        ));
+    }
+    out.push_str(&format!(
+        "ext-unknown {}\n",
+        class_fingerprint(inputs.unknown_extension)
+    ));
+    out.push_str(&format!(
+        "attribute-kinds [{}]\n",
+        inputs.attribute_kinds.join(" ")
+    ));
+    for q in sorted_queries(inputs.queries) {
         let filter = match q.filter {
             None => "none".to_string(),
             Some(PostFilter::Empty { capture }) => format!("empty @{capture}"),
@@ -590,7 +646,7 @@ pub fn fingerprint() -> String {
             q.source
         ));
     }
-    for spec in INTENTS {
+    for spec in inputs.intents {
         let langs: Vec<&str> = spec.langs.iter().map(|l| l.as_str()).collect();
         out.push_str(&format!(
             "intent {} langs [{}] loops [{}] boundaries [{}]\n",
@@ -601,6 +657,21 @@ pub fn fingerprint() -> String {
         ));
     }
     out
+}
+
+/// A [`LangClass`] as one fingerprint token sequence.
+fn class_fingerprint(class: LangClass) -> String {
+    match class {
+        LangClass::Oracle(lang) => format!("oracle {lang}"),
+        LangClass::Unscored { language } => format!("unscored {language}"),
+        LangClass::NotIndexed {
+            language,
+            size_capped,
+        } => format!(
+            "not-indexed {} size-capped {size_capped}",
+            language.unwrap_or("-")
+        ),
+    }
 }
 
 /// Whether the oracle covers a catalog pattern, and why not if it does not.

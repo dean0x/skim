@@ -536,7 +536,8 @@ fn ratchet_table(
 
 /// One corpus's structural table: per `[[ast]]` entry, the oracle and skim
 /// file counts, file-level recall / precision (and intent, for the nested
-/// loops), and the rows anchored on an oracle match line.
+/// loops), and the rows anchored on an oracle match line. A false-positive
+/// guard's class cell says so, and a legend under the table explains it.
 fn structural_table(md: &mut String, s: &StructuralReport) {
     if s.entries.is_empty() {
         return;
@@ -559,9 +560,14 @@ fn structural_table(md: &mut String, s: &StructuralReport) {
     let _ = writeln!(md, "|---|---|---|---|---|---|---|---|---|---|---|");
     let opt = |v: Option<f64>| v.map_or_else(|| "—".to_string(), fmt_value);
     for e in &s.entries {
+        let guard = if e.expect_oracle_empty {
+            FP_GUARD_MARKER
+        } else {
+            ""
+        };
         let _ = writeln!(
             md,
-            "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {}{guard} | {} | {} | {} | {} | {} | {} | {} |",
             e.id,
             e.pattern,
             e.lang,
@@ -573,6 +579,13 @@ fn structural_table(md: &mut String, s: &StructuralReport) {
             opt(e.intent_recall),
             opt(e.intent_precision),
             e.line_on_match
+        );
+    }
+    if s.entries.iter().any(|e| e.expect_oracle_empty) {
+        let _ = writeln!(
+            md,
+            "\nFP guard: a false-positive guard (`expect_oracle_empty = true`). Its oracle matches no file by \
+             declaration, so it guards precision only; oracle 0 / skim 0 is its fixed state."
         );
     }
     let unscored: Vec<String> = s
@@ -590,6 +603,9 @@ fn structural_table(md: &mut String, s: &StructuralReport) {
     }
     md.push('\n');
 }
+
+/// Appended to a false-positive guard's class cell in the structural table.
+const FP_GUARD_MARKER: &str = ", FP guard";
 
 fn fmt_value(v: f64) -> String {
     if v.fract() == 0.0 {
@@ -736,6 +752,7 @@ mod tests {
                 pattern: pattern.to_string(),
                 lang,
                 precision_class: PrecisionClass::Hard,
+                expect_oracle_empty: false,
                 oracle_files: 3,
                 skim_files: 4,
                 recall: 1.0,
@@ -764,6 +781,19 @@ mod tests {
                     OracleLang::TypeScript,
                     None,
                 ),
+                StructuralSample {
+                    expect_oracle_empty: true,
+                    oracle_files: 0,
+                    skim_files: 1,
+                    precision: 0.0,
+                    line_on_match: 0,
+                    ..entry(
+                        "skim-ast-try-catch-finally-javascript",
+                        "try-catch-finally",
+                        OracleLang::JavaScript,
+                        None,
+                    )
+                },
             ],
             unscored_rows: BTreeMap::from([
                 ("try-catch".to_string(), 0),
@@ -798,6 +828,11 @@ mod tests {
         let plain = entries[1].as_object().unwrap();
         for key in ["intent_files", "intent_recall", "intent_precision"] {
             assert!(!plain.contains_key(key), "{key} is omitted when None");
+        }
+        // A false-positive guard says so; an ordinary entry has no such key.
+        assert_eq!(entries[2]["expect_oracle_empty"], true);
+        for ordinary in [nested, plain] {
+            assert!(!ordinary.contains_key("expect_oracle_empty"));
         }
         assert_eq!(
             json["corpora"][0]["structural"]["coverage"]["oracle_over_cap"],
@@ -865,6 +900,17 @@ mod tests {
             .find(|l| l.starts_with("| `skim-ast-try-catch-typescript` "))
             .unwrap();
         assert!(plain.ends_with("| — | — | 2 |"), "{plain}");
+        // A false-positive guard is marked in its class cell and explained
+        // once under the table.
+        let guard = md
+            .lines()
+            .find(|l| l.starts_with("| `skim-ast-try-catch-finally-javascript` "))
+            .unwrap();
+        assert_eq!(
+            guard,
+            "| `skim-ast-try-catch-finally-javascript` | try-catch-finally | javascript | hard, FP guard | 0 | 1 | 1 | 0 | — | — | 0 |"
+        );
+        assert_eq!(md.matches("\nFP guard: ").count(), 1, "{md}");
         assert!(
             md.contains("Unscored `--ast` rows (a language no entry scores): rust-nested-loop 7")
         );
@@ -876,6 +922,18 @@ mod tests {
         // No structural section without [[ast]] entries.
         let plain_md = render_markdown(&minimal_report(), None);
         assert!(!plain_md.contains("Structural"), "{plain_md}");
+    }
+
+    #[test]
+    fn markdown_explains_fp_guards_only_when_an_entry_is_one() {
+        let mut r = structural_report();
+        r.corpora[0]
+            .structural
+            .entries
+            .retain(|e| !e.expect_oracle_empty);
+        let md = render_markdown(&r, None);
+        assert!(md.contains("### Structural (`--ast`)"), "{md}");
+        assert!(!md.contains("FP guard"), "{md}");
     }
 
     #[test]

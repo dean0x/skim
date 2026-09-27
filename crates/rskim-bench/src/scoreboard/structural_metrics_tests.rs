@@ -303,6 +303,7 @@ fn a_sample_measures_file_level_fractions_anchors_and_intent() {
             pattern: "rust-nested-loop".to_string(),
             lang: OracleLang::Rust,
             precision_class: PrecisionClass::Ratchet,
+            expect_oracle_empty: false,
             oracle_files: 2,
             skim_files: 3,
             recall: 1.0,
@@ -330,6 +331,28 @@ fn empty_denominators_read_as_one_and_patterns_without_intent_have_none() {
     let ts = target("try-catch", OracleLang::TypeScript, PrecisionClass::Hard);
     let missed = measure("x", &ts, &[], &a).unwrap();
     assert_eq!((missed.recall, missed.precision), (0.0, 1.0));
+}
+
+#[test]
+fn a_false_positive_guards_sample_says_it_is_one() {
+    let a = answers();
+    // A fixed guard reads oracle 0 / skim 0, like an ordinary empty entry:
+    // only the flag tells the two apart in the report.
+    let fixed = measure(
+        "x-ast-go-select-go",
+        &guard("go-select", OracleLang::Go),
+        &[],
+        &a,
+    )
+    .unwrap();
+    assert!(fixed.expect_oracle_empty);
+    assert_eq!((fixed.oracle_files, fixed.skim_files), (0, 0));
+    let plain = target("go-select", OracleLang::Go, PrecisionClass::Hard);
+    assert!(
+        !measure("x-ast-go-select-go", &plain, &[], &a)
+            .unwrap()
+            .expect_oracle_empty
+    );
 }
 
 #[test]

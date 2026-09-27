@@ -703,6 +703,7 @@ fn structural_sample(id: &str, class: PrecisionClass, intent: bool) -> Structura
         pattern: "rust-nested-loop".to_string(),
         lang: crate::scoreboard::structural::OracleLang::Rust,
         precision_class: class,
+        expect_oracle_empty: false,
         oracle_files: 4,
         skim_files: 5,
         recall: 1.0,

@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "golden_sha256": "dbbf5242b9d4d59c7da7e2b2eba14377966f86715f4380927d9c26df508de34f",
+  "golden_sha256": "2b38acc90815ab908ab1eb1a535b9fd0f7cf5c85180c26d72ca57a60d5f8f080",
   "corpora": {
     "flask": {
       "commit": "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392",
-      "golden_sha256": "5da916ca3b08822b375e7f1c65868b27cf7a09786f5010669ad0351f9cafee97",
+      "golden_sha256": "a28867f51bf371383dc166c1f3dcd873c424487a692f0dbd13bfd562b0b4135f",
       "hard": {
         "flask-C01": {
           "lexical.precision": "pass",
@@ -587,7 +587,7 @@
     },
     "ripgrep": {
       "commit": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
-      "golden_sha256": "0700860bc88d161a9528087e7c33de54d28dacb8e89e6704d989f135a8aedea3",
+      "golden_sha256": "18eeda17cfde1267059fe5672564b83c513dfe266c76f14b24f4fd2c1e26f70b",
       "hard": {
         "ripgrep-C01": {
           "lexical.precision": "pass",
@@ -1228,7 +1228,7 @@
     },
     "skim": {
       "commit": "b8a0a79463382347820f1c2572bde37b68e87c76",
-      "golden_sha256": "ef07dd21a6af638a0a851c065cffa96240bb6ac2938c2aed92fa5ae7325c78db",
+      "golden_sha256": "c9b29dadd79bb17cd8c540eb78197300d98f90cecbb27e431f587e5e779b1c30",
       "hard": {
         "skim-C01": {
           "lexical.precision": "pass",
@@ -2036,7 +2036,7 @@
     },
     "zod": {
       "commit": "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5",
-      "golden_sha256": "193f6c99fc61b003360689478ebfd727ab743fe8248a31e9465e8a23bd025639",
+      "golden_sha256": "cf4a2ff08645d8683a280440dfdac7c90996203a90ae1593d2c01a57e47df5c3",
       "hard": {
         "zod-C01": {
           "lexical.precision": "pass",

@@ -260,8 +260,11 @@ adds `expect_oracle_empty = true` to a candidate with `oracle files 0`. Review t
 - `unscored_rows` keeps rows the oracle cannot judge visible instead of dropping them. Like `oracle_less.full_rows`,
   a shrink is a regression.
 - `report.json` carries, under `corpora[i].structural`, each entry's `oracle_files`, `skim_files`, `recall`,
-  `precision`, the intent fields where they apply and `line_on_match`, plus the coverage comparison. The top level
-  carries `uncovered_patterns`. `report.md` has a "Structural (`--ast`)" table per corpus and the uncovered list.
+  `precision`, the intent fields where they apply and `line_on_match`, plus the coverage comparison. A
+  [false-positive guard](#false-positive-guards) also carries `"expect_oracle_empty": true`; the key is absent on
+  every other entry. The top level carries `uncovered_patterns`. `report.md` has a "Structural (`--ast`)" table per
+  corpus, where a guard's class reads `<class>, FP guard` with a one-line legend under the table, and the uncovered
+  list.
 - `[[prefix]]` and `[[pagination]]` entries with an `--ast` flag still check ordering, pagination and their row count.
 
 ### Vacuity guard
@@ -285,6 +288,8 @@ An entry whose oracle is empty exists only because skim returns a file the oracl
   the run stops with exit 2 before skim is called ("golden integrity failed: … declares `expect_oracle_empty = true`
   but the structural oracle matches …"). Remove the flag in a reviewed golden edit, then bless. The flag can never
   hide a recall loss.
+- The report says it is a guard (`"expect_oracle_empty": true` in `report.json`, `FP guard` in its `report.md`
+  class cell), so a fixed guard's oracle 0 / skim 0 does not read as an ordinary entry.
 - Unflagged entries keep the vacuity guard.
 
 When the fix lands (for #546, `skim-ast-try-catch-finally-javascript`), the ledgered `structural.precision` XPASSes.
@@ -301,10 +306,11 @@ Remove its ledger entry (keep the golden entry) and re-bless. `xfail -> pass` ne
 3. Add a fixture in `src/scoreboard/structural_tests.rs`: the catalog example (or a hand-written positive) must match
    on the expected lines, and a near-miss must not. The tests fail on a `.scm` file that is not registered, a
    registered query with no fixture, or a query that does not compile for its grammar.
-4. Run `check` and read the structural diff, then bless. The query text, the post-filters, the intent specs and the
-   size cap are hashed into the digest of every golden file with `[[ast]]` entries. Any edit therefore reads as
-   "golden file changed; bless required" on each of those corpora, and `bless` refuses a report made with other
-   queries.
+4. Run `check` and read the structural diff, then bless. The query text, the post-filters, the intent specs, the
+   size cap, the extension table (every row's class, and the class of an unknown extension) and the attribute kinds
+   the body-element count skips are hashed into the digest of every golden file with `[[ast]]` entries
+   (`structural::fingerprint`). Any edit therefore reads as "golden file changed; bless required" on each of those
+   corpora, and `bless` refuses a report made with other queries.
 
 A catalog pattern with neither a query nor a recorded reason fails a unit test, so a pattern added to skim cannot go
 unscored silently.

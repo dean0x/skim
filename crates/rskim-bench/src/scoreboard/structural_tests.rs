@@ -919,6 +919,118 @@ fn file_matches_reports_every_pattern_of_the_language() {
 }
 
 // ============================================================================
+// Golden fingerprint: every table an answer depends on
+// ============================================================================
+
+#[test]
+fn the_fingerprint_renders_the_compiled_in_inputs() {
+    assert_eq!(fingerprint(), render_fingerprint(&ORACLE_INPUTS));
+    assert_eq!(fingerprint(), fingerprint());
+}
+
+/// [`EXT_CLASSES`] with `edit` applied to the row that lists `ext`.
+fn edited_ext_table(ext: &str, edit: impl FnOnce(&mut ExtClass)) -> Vec<ExtClass> {
+    let mut table = EXT_CLASSES.to_vec();
+    let row = table
+        .iter_mut()
+        .find(|row| row.extensions.contains(&ext))
+        .unwrap_or_else(|| panic!("no extension-table row lists {ext:?}"));
+    edit(row);
+    table
+}
+
+#[test]
+fn any_extension_table_edit_changes_the_fingerprint() {
+    let base = fingerprint();
+    let with_table = |table: &[ExtClass]| {
+        render_fingerprint(&OracleInputs {
+            ext_classes: table,
+            ..ORACLE_INPUTS
+        })
+    };
+    let edits = [
+        (
+            "drop an extension",
+            edited_ext_table("cts", |row| row.extensions = &["ts", "mts"]),
+        ),
+        (
+            "parse .tsx with the TypeScript grammar",
+            edited_ext_table("tsx", |row| {
+                row.class = LangClass::Oracle(OracleLang::TypeScript);
+            }),
+        ),
+        (
+            "stop AST-indexing Java",
+            edited_ext_table("java", |row| {
+                row.class = LangClass::NotIndexed {
+                    language: Some("java"),
+                    size_capped: true,
+                };
+            }),
+        ),
+        (
+            "rename an unscored language",
+            edited_ext_table("rb", |row| {
+                row.class = LangClass::Unscored { language: "rbx" };
+            }),
+        ),
+        (
+            "stop counting Bash toward the size cap",
+            edited_ext_table("sh", |row| {
+                row.class = LangClass::NotIndexed {
+                    language: Some("bash"),
+                    size_capped: false,
+                };
+            }),
+        ),
+    ];
+    let mut seen = BTreeSet::from([base]);
+    for (what, table) in edits {
+        assert!(
+            seen.insert(with_table(&table)),
+            "{what}: fingerprint unchanged"
+        );
+    }
+    let dropped_row = &EXT_CLASSES[..EXT_CLASSES.len() - 1];
+    assert!(seen.insert(with_table(dropped_row)), "drop a row");
+
+    let unknown_counted = render_fingerprint(&OracleInputs {
+        unknown_extension: LangClass::NotIndexed {
+            language: None,
+            size_capped: true,
+        },
+        ..ORACLE_INPUTS
+    });
+    assert!(seen.insert(unknown_counted), "the unknown-extension class");
+}
+
+#[test]
+fn any_attribute_kind_edit_changes_the_fingerprint() {
+    let base = fingerprint();
+    let with_kinds = |kinds: &[&str]| {
+        render_fingerprint(&OracleInputs {
+            attribute_kinds: kinds,
+            ..ORACLE_INPUTS
+        })
+    };
+    assert_eq!(with_kinds(ATTRIBUTE_KINDS), base);
+    let mut seen = BTreeSet::from([base]);
+    for (what, kinds) in [
+        ("drop a kind", &["attribute_item"][..]),
+        (
+            "add a kind",
+            &["attribute_item", "inner_attribute_item", "macro_invocation"][..],
+        ),
+        ("no kinds", &[][..]),
+    ] {
+        assert!(
+            seen.insert(with_kinds(kinds)),
+            "{what}: fingerprint unchanged"
+        );
+    }
+}
+
+// ============================================================================
 // AC-3: independence from skim's AST search internals
 // ============================================================================
 

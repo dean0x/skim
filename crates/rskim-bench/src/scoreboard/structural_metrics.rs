@@ -317,6 +317,12 @@ pub struct StructuralSample {
     pub lang: OracleLang,
     /// The class the golden entry declares.
     pub precision_class: PrecisionClass,
+    /// The golden entry is a false-positive guard (`expect_oracle_empty =
+    /// true`): its oracle is empty by declaration, so `oracle_files` 0 is
+    /// expected and the entry guards precision only. Serialized only when
+    /// true, so an ordinary entry carries no such key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expect_oracle_empty: bool,
     /// Files with at least one definition-oracle match.
     pub oracle_files: u64,
     /// Distinct files skim returned in this language.
@@ -378,6 +384,7 @@ pub fn measure(
         pattern: target.pattern.clone(),
         lang: target.lang,
         precision_class: target.precision,
+        expect_oracle_empty: target.expect_oracle_empty,
         oracle_files: oracle.len() as u64,
         skim_files: skim.len() as u64,
         recall: ratio(hits, oracle.len()),
