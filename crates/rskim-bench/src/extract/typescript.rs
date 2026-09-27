@@ -92,17 +92,16 @@ fn collect_named_imports(
 ) {
     let mut cursor = named_imports_node.walk();
     for spec in named_imports_node.children(&mut cursor) {
-        if spec.kind() == "import_specifier" {
-            if let Some(name_node) = spec.child_by_field_name("name")
-                && let Ok(name) = name_node.utf8_text(bytes)
-            {
-                symbols.push(ExtractedSymbol {
-                    name: name.to_string(),
-                    file_path: Arc::clone(path),
-                    field: SearchField::ImportExport,
-                    byte_range: name_node.byte_range(),
-                });
-            }
+        if spec.kind() == "import_specifier"
+            && let Some(name_node) = spec.child_by_field_name("name")
+            && let Ok(name) = name_node.utf8_text(bytes)
+        {
+            symbols.push(ExtractedSymbol {
+                name: name.to_string(),
+                file_path: Arc::clone(path),
+                field: SearchField::ImportExport,
+                byte_range: name_node.byte_range(),
+            });
         }
     }
 }

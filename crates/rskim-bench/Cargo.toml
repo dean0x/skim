@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "cochange-validate"
 path = "src/bin/cochange_validate.rs"
 
+[[bin]]
+name = "scoreboard"
+path = "src/bin/scoreboard.rs"
+
 [lib]
 name = "rskim_bench"
 path = "src/lib.rs"
@@ -28,13 +32,16 @@ tree-sitter = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-python = { workspace = true }
 tree-sitter-go = { workspace = true }
+tree-sitter-typescript = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 
 [features]
 ## Expose `cochange::test_utils` helpers to integration tests and external test

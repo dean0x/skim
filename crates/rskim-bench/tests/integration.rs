@@ -464,14 +464,25 @@ fn extract_symbols_dispatch_integration() {
     );
     assert!(!go_symbols.is_empty(), "Go extraction should find symbols");
 
-    // Unsupported: should return empty
+    // TypeScript (.ts / .mts / .cts): should extract symbols
     let ts_symbols = rskim_bench::extract::extract_symbols(
         Path::new("test.ts"),
         "function test() {}",
         Language::TypeScript,
     );
     assert!(
-        ts_symbols.is_empty(),
+        !ts_symbols.is_empty(),
+        "TypeScript extraction should find symbols"
+    );
+
+    // Unsupported: should return empty
+    let java_symbols = rskim_bench::extract::extract_symbols(
+        Path::new("Test.java"),
+        "class Test {}",
+        Language::Java,
+    );
+    assert!(
+        java_symbols.is_empty(),
         "Unsupported language should return empty"
     );
 }

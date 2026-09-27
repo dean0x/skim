@@ -22,6 +22,7 @@ use rskim_search::SearchField;
 pub mod go;
 pub mod python;
 pub mod rust_lang;
+pub mod typescript;
 
 /// A named symbol extracted from a source file.
 #[derive(Debug, Clone)]
@@ -124,6 +125,13 @@ fn walk_nodes<F>(
 ///
 /// Returns an empty Vec for unsupported languages rather than an error —
 /// benchmark will simply skip those files.
+///
+/// `rskim_core::Language::TypeScript` covers `.ts`, `.mts`, `.cts` and `.tsx`,
+/// but `typescript::extract` parses with the plain TypeScript grammar
+/// (`LANGUAGE_TYPESCRIPT`), which cannot parse JSX. Only the
+/// [`TYPESCRIPT_EXTRACT_EXTENSIONS`] are extracted; `.tsx` (and any other
+/// path) yields an empty Vec rather than a garbage extraction from the wrong
+/// grammar.
 pub fn extract_symbols(
     path: &Path,
     content: &str,
@@ -133,6 +141,93 @@ pub fn extract_symbols(
         rskim_core::Language::Rust => rust_lang::extract(path, content),
         rskim_core::Language::Python => python::extract(path, content),
         rskim_core::Language::Go => go::extract(path, content),
+        rskim_core::Language::TypeScript => {
+            let parseable = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| TYPESCRIPT_EXTRACT_EXTENSIONS.contains(&e));
+            if parseable {
+                typescript::extract(path, content)
+            } else {
+                vec![]
+            }
+        }
         _ => vec![],
+    }
+}
+
+/// Extensions the plain TypeScript grammar parses (no `.tsx`: JSX needs the
+/// TSX grammar). Case-sensitive, like `rskim_core::Language::from_extension`.
+pub const TYPESCRIPT_EXTRACT_EXTENSIONS: &[&str] = &["ts", "mts", "cts"];
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod dispatch_tests {
+    use std::path::Path;
+
+    use rskim_search::SearchField;
+
+    use super::extract_symbols;
+
+    #[test]
+    fn dispatches_typescript_ts_to_typescript_extractor() {
+        let symbols = extract_symbols(
+            Path::new("lib.ts"),
+            "function add(a: number, b: number): number { return a + b; }",
+            rskim_core::Language::TypeScript,
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "add" && s.field == SearchField::FunctionSignature),
+            "extract_symbols should dispatch .ts to the typescript extractor"
+        );
+    }
+
+    #[test]
+    fn dispatches_module_typescript_extensions() {
+        for path in ["lib.mts", "lib.cts"] {
+            let symbols = extract_symbols(
+                Path::new(path),
+                "export function load(): void {}",
+                rskim_core::Language::TypeScript,
+            );
+            assert!(symbols.iter().any(|s| s.name == "load"), "{path}");
+        }
+    }
+
+    #[test]
+    fn typescript_needs_an_allow_listed_extension() {
+        for path in ["Dockerfile", "lib.TS", "lib.ts.bak"] {
+            let symbols = extract_symbols(
+                Path::new(path),
+                "function add(a: number): number { return a; }",
+                rskim_core::Language::TypeScript,
+            );
+            assert!(symbols.is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn skips_tsx_to_avoid_wrong_grammar() {
+        let symbols = extract_symbols(
+            Path::new("component.tsx"),
+            "function Widget(): number { return 1; }",
+            rskim_core::Language::TypeScript,
+        );
+        assert!(
+            symbols.is_empty(),
+            ".tsx must not be fed to the plain TypeScript grammar"
+        );
+    }
+
+    #[test]
+    fn unsupported_language_returns_empty() {
+        let symbols = extract_symbols(
+            Path::new("main.java"),
+            "class Main {}",
+            rskim_core::Language::Java,
+        );
+        assert!(symbols.is_empty());
     }
 }

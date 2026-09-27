@@ -1,0 +1,43 @@
+# Pinned corpora for the search scoreboard (#203).
+#
+# Loaded by `rskim_bench::scoreboard::corpus::load_corpora`, which applies
+# `rskim_research::config::load_corpus_config` (https:// URL, 40-hex SHA,
+# language) plus the scoreboard's own rules (lowercase SHA, unique names).
+#
+# Each repo is cloned with FULL history by
+# `rskim_research::clone::ensure_pinned_history_clone` into
+# `.bench-corpus/scoreboard/<name>` (gitignored via `.bench-corpus/`), a
+# directory separate from the `bench` / `cochange-validate` clones. `<name>`
+# is `extract_repo_name(url)` and also names `golden/<name>.toml`.
+#
+# Changing a SHA invalidates that corpus's golden file (its `commit` must match)
+# and requires a `bless`. The skim corpus is bumped only by hand, together with
+# a bless; it never tracks the live tree.
+
+[[repos]]
+url = "https://github.com/dean0x/skim"            # public; the corpus is data, the binary under test is the PR build
+commit = "b8a0a79463382347820f1c2572bde37b68e87c76"
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/BurntSushi/ripgrep"
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"   # = corpus.toml / ast-corpus.toml / cochange-corpus.toml
+language = "Rust"
+
+[[repos]]
+url = "https://github.com/pallets/flask"
+commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"   # = corpus.toml / cochange-corpus.toml (ast-corpus.toml pins 36e4a824…, not used)
+language = "Python"
+
+[[repos]]
+url = "https://github.com/colinhacks/zod"
+commit = "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5"   # = ast-corpus.toml
+language = "TypeScript"
+
+# Documented fallback for the TypeScript corpus (NOT active). Swap it in for
+# zod only if zod cannot be used; that needs a new golden/trpc.toml and a bless.
+#
+# [[repos]]
+# url = "https://github.com/trpc/trpc"
+# commit = "23c723cfeaf07da28a52a5c35c3dcccf96a47578"
+# language = "TypeScript"

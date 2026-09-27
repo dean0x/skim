@@ -72,7 +72,7 @@ use common::git_fixture::{git_commit, git_init, now_epoch, write_and_stage};
 ///
 /// AD-407-11: shallow-checkout guard for real-history parity tests — root
 /// cause of CI run 33906188121 where `fetch-depth: 1` caused git_total=1,
-/// making the ≥ 67 non-vacuous guard assert instead of the parity assertions.
+/// making the AC-5 non-vacuity guard assert instead of the parity assertions.
 fn is_shallow_checkout(repo_path: &Path) -> bool {
     // Signal 1: `git rev-parse --is-shallow-repository` (Git ≥ 2.15).
     if let Ok(out) = StdCommand::new("git")
@@ -1034,18 +1034,21 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
 // AC-5: dog-food risky ground truth on this repository  (SEARCH-ADR-007)
 // ============================================================================
 
-/// AC-5 (dog-food): on this repository at the wave HEAD, `skim search --risky
-/// --json` MUST report `total_commits` and `fix_commits` for
-/// `crates/rskim/src/cmd/search/query.rs` that match `git rev-list --count
-/// --no-merges HEAD -- <path>` and a case-insensitive word-boundary grep of
-/// commit subjects respectively (SEARCH-ADR-003, SEARCH-ADR-007).
+/// AC-5 (dog-food): on this repository, `skim search --risky --json` MUST
+/// report `total_commits` and `fix_commits` for `crates/rskim/src/main.rs`
+/// that match `git rev-list --count --no-merges --full-history HEAD -- <path>`
+/// and a case-insensitive word-boundary grep of the same commits' subjects
+/// respectively (SEARCH-ADR-003, SEARCH-ADR-007).
 ///
-/// The test MUST NOT hardcode either count, nor any absolute history depth
-/// derived from them; both are computed from git at run time, so the parity
-/// assertions self-calibrate as the repository moves. That the full-DAG walk
-/// is live falls out of matching git's `--full-history` count — it is not
-/// restated as a constant (see the NEGATIVE guard note at the end of the
-/// body for why a frozen value there is never an improvement).
+/// Every count is derived from git at run time; none is hardcoded, so the
+/// test holds across squash merges and future history.  Non-vacuity (PF-007)
+/// comes from the target's history: `main.rs` is touched by commits reachable
+/// only through a merge's second parent (merge `8335726`), so its full-DAG
+/// counts strictly exceed its first-parent counts.  The test asserts that
+/// precondition, then asserts skim reports the full-DAG counts and not the
+/// first-parent ones, so a regression to a first-parent walk fails it.  A
+/// file touched only by squash-merged PRs has identical counts under both
+/// walks and cannot serve as the target.
 ///
 /// Building the temporal index for the full workspace takes ~8 s on a warm
 /// OS page cache; this cost is accepted for the only dog-food test in the
@@ -1054,7 +1057,7 @@ fn test_ac9_build_and_risky_produce_no_stderr() {
 ///
 /// AD-407-1 (full-DAG walk replaces first-parent walk).
 #[test]
-fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
+fn test_ac5_dog_food_risky_matches_git_ground_truth() {
     // Resolve workspace root: CARGO_MANIFEST_DIR → crates/rskim → crates → root.
     let repo_root = {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1067,18 +1070,19 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
     };
 
     // Guard: skip on shallow checkouts — `git log` ground truth requires full
-    // history.  On a shallow clone, git_total would be 1 (or similarly tiny),
-    // causing the non-vacuous ≥ 67 assert below to fire instead of the parity
-    // assertions — which is what happened in CI run 33906188121.
-    // The `Test Suite` CI job now fetches full history (fetch-depth: 0); all
+    // history.  On a shallow clone the ground truth is truncated (git_total
+    // was 1 in CI run 33906188121), so the non-vacuity guards below would fire
+    // instead of the parity assertions.
+    // The `Test Suite` CI job fetches full history (fetch-depth: 0); all
     // other jobs keep the default shallow fetch (AD-407-11).
     if is_shallow_checkout(&repo_root) {
         eprintln!("skipped: shallow checkout, real-history parity test needs full history");
         return;
     }
 
-    // File under test (path relative to repo root, as skim returns it).
-    const TARGET: &str = "crates/rskim/src/cmd/search/query.rs";
+    // File under test (path relative to repo root, as skim returns it).  It
+    // must keep off-first-parent history; see the doc comment above.
+    const TARGET: &str = "crates/rskim/src/main.rs";
 
     // Guard: file must exist so the assertions below are non-vacuous.
     assert!(
@@ -1087,15 +1091,19 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
     );
 
     // ── Ground truth from git (SEARCH-ADR-003) ─────────────────────────────────────
+    //
+    // Each count is taken under two walks: `--full-history` (the full DAG skim
+    // walks, AD-407-1) and `--first-parent` (the walk it replaced, i.e. what a
+    // regressed walk would report).
 
     // total_commits: non-merge commits touching TARGET.
-    let git_total: u64 = {
+    let git_count = |walk: &str| -> u64 {
         let out = StdCommand::new("git")
             .args([
                 "rev-list",
                 "--count",
                 "--no-merges",
-                "--full-history",
+                walk,
                 "HEAD",
                 "--",
                 TARGET,
@@ -1103,7 +1111,10 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
             .current_dir(&repo_root)
             .output()
             .expect("git rev-list --count");
-        assert!(out.status.success(), "git rev-list failed for {TARGET}");
+        assert!(
+            out.status.success(),
+            "git rev-list {walk} failed for {TARGET}"
+        );
         String::from_utf8_lossy(&out.stdout)
             .trim()
             .parse()
@@ -1111,13 +1122,14 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
     };
 
     // fix_commits: non-merge subjects matching the same case-insensitive
-    // word-boundary pattern as is_fix_commit (temporal/mod.rs FIX_REGEX).
+    // word-boundary pattern as is_fix_commit (temporal/mod.rs FIX_REGEX),
+    // over the same walk as the matching total.
     //
     // `grep -c` prints the count and exits 0 (matches) or 1 (no matches).
     // parse() handles both — unwrap_or(0) is the zero-match safety net.
-    let git_fix: u64 = {
+    let git_fix_count = |walk: &str| -> u64 {
         let sh_cmd = format!(
-            r"git log --no-merges --format='%s' -- '{TARGET}' \
+            r"git log --no-merges {walk} --format='%s' -- '{TARGET}' \
               | grep -ciE '\b(fix|bug|hotfix|patch|revert)\b'"
         );
         let out = StdCommand::new("sh")
@@ -1132,56 +1144,29 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
             .unwrap_or(0)
     };
 
-    // Guard: verify git ground truth is non-trivial so a silent-empty result
-    // cannot make the parity assertions below vacuously pass (PF-016: a check
-    // whose finding set comes back empty reads as a clean bill of health).
-    //
-    // The floor is deliberately TINY and makes NO claim about history depth.
-    // It used to read `git_total >= 67`, calibrated against the pre-squash
-    // wave branch, and it rotted the instant that branch landed: PR #368 was
-    // squash-merged into b8a0a79, collapsing ~70 commits that each touched
-    // TARGET into a single commit. The same `git rev-list` still returns 75 on
-    // origin/wave/wave4-search but 5 on origin/main — and this file was ADDED
-    // by that squash commit, so the 67 it shipped with has never been
-    // satisfiable at any commit reachable from main. Do NOT "restore" it, and
-    // do NOT re-pin it to today's 5: any absolute history count written here
-    // rots again at the next squash-merge, or at the next commit that touches
-    // TARGET (PF-031: a test that reads repository history fails in ways no
-    // local run on the authoring branch can see).
-    //
-    // The real check is the self-calibrating `assert_eq!(skim_total, git_total)`
-    // below, which compares skim's own walk against git's CURRENT count. This
-    // floor only has to separate "git found real history" from "git found
-    // nothing": 0 means the rev-list came back empty or TARGET is misspelled
-    // (and would also make the fix_density division below 0/0 = NaN), 1 means a
-    // degenerate single-commit history, i.e. a shallow checkout that slipped
-    // past the is_shallow_checkout guard above. 2 is the smallest value that
-    // excludes both, so 2 is the floor.
-    assert!(
-        git_total >= 2,
-        "AC-5 guard: git_total ({git_total}) must be ≥ 2 — git found no usable \
-         history for {TARGET}, so the parity assertions below would pass \
-         vacuously. Check that TARGET names a tracked path and that this \
-         checkout carries real history. This floor is a vacuity guard, NOT a \
-         claim about how deep that history should be"
-    );
+    let git_total = git_count("--full-history");
+    let git_fix = git_fix_count("--full-history");
+    let git_fp_total = git_count("--first-parent");
+    let git_fp_fix = git_fix_count("--first-parent");
 
-    // Companion guard, same rot: this asserted `git_fix > 0` because TARGET had
-    // 2 fix-subject commits on the pre-squash wave branch. The squash rewrote
-    // all of them into one subject that the FIX_REGEX word-boundary pattern
-    // does not match, so git_fix is legitimately 0 on main today and `> 0` is
-    // unsatisfiable. The rot-proof invariant is the RELATION between the two
-    // counts: git_fix greps subjects out of `git log -- TARGET`, whose
-    // history-simplified commit set is a subset of the `--full-history` set
-    // git_total counts, so a git_fix above git_total means the pipeline counted
-    // something other than this path's subjects — which is the failure the
-    // `.unwrap_or(0)` above would otherwise swallow. Parity with skim is
-    // asserted by `assert_eq!(skim_fix, git_fix)` below.
+    // Guards: the ground truth must be non-trivial AND must tell the two walks
+    // apart, or the assertions below could pass vacuously (PF-007).
     assert!(
-        git_fix <= git_total,
-        "AC-5 guard: git_fix ({git_fix}) must be ≤ git_total ({git_total}) — \
-         the fix-subject grep counted more commits than exist for {TARGET}, so \
-         it is not reading this path's log"
+        git_fix > 0 && git_fix < git_total,
+        "AC-5 guard: {TARGET} must have both fix and non-fix commits so \
+         fix_density is non-trivial; git_fix={git_fix}, git_total={git_total}"
+    );
+    assert!(
+        git_total > git_fp_total,
+        "AC-5 guard: {TARGET} history must contain off-first-parent commits or \
+         parity cannot distinguish full-DAG from first-parent; \
+         full-DAG={git_total}, first-parent={git_fp_total}"
+    );
+    assert!(
+        git_fix > git_fp_fix,
+        "AC-5 guard: {TARGET} history must contain an off-first-parent fix \
+         commit or fix_commits parity cannot distinguish full-DAG from \
+         first-parent; full-DAG={git_fix}, first-parent={git_fp_fix}"
     );
 
     // ── Build temporal index ─────────────────────────────────────────────────
@@ -1236,6 +1221,21 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
         .as_f64()
         .expect("fix_density must be a float");
 
+    // NEGATIVE: skim must not report the first-parent counts.  Checked before
+    // parity so a regression to a first-parent walk is named as such rather
+    // than reported as a bare count mismatch; the guards above make both
+    // checks discriminating.
+    assert_ne!(
+        skim_total, git_fp_total,
+        "AC-5 NEGATIVE: total_commits equals the first-parent count \
+         ({git_fp_total}) — full-DAG walk not active (AD-407-1)"
+    );
+    assert_ne!(
+        skim_fix, git_fp_fix,
+        "AC-5 NEGATIVE: fix_commits equals the first-parent count \
+         ({git_fp_fix}) — full-DAG walk not active (AD-407-1)"
+    );
+
     assert_eq!(
         skim_total, git_total,
         "AC-5: total_commits for {TARGET} must match \
@@ -1245,7 +1245,7 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
     assert_eq!(
         skim_fix, git_fix,
         "AC-5: fix_commits for {TARGET} must match \
-         `git log --no-merges --format=%s | grep -ciE fix-pattern` \
+         `git log --no-merges --full-history --format=%s | grep -ciE fix-pattern` \
          (SEARCH-ADR-003); skim={skim_fix}, git={git_fix}"
     );
 
@@ -1256,29 +1256,6 @@ fn test_ac5_dog_food_risky_query_rs_matches_git_ground_truth() {
         "AC-5: fix_density {skim_density:.4} must be within 0.002 of \
          fix_commits/total_commits = {expected_density:.4}"
     );
-
-    // NEGATIVE guard (AD-407-1, full-DAG walk replaces first-parent walk):
-    // covered by the three self-calibrating assertions above, deliberately not
-    // restated as constants.
-    //
-    // This block used to assert `skim_total != 21`, `skim_fix != 2` and
-    // `skim_density > 0.10` — the first-parent values measured on the
-    // pre-squash wave branch. All three rotted with b8a0a79 (see the ground
-    // truth guard above): the live values are now 5 / 0 / 0.0, so the density
-    // floor FAILED a correct implementation, and the two frozen inequalities
-    // are landmines that fail one the day TARGET happens to reach 21 or 2
-    // commits. Restoring any of them re-arms that.
-    //
-    // A negative guard on these fields cannot add coverage in the first place.
-    // `assert_eq!(skim_total, git_total)` pins skim_total to exactly one value,
-    // so `assert_ne!(skim_total, X)` is implied whenever git_total != X and is
-    // a false failure whenever git_total == X — never useful, sometimes
-    // harmful. The same holds for skim_fix against `assert_eq!(skim_fix,
-    // git_fix)` and for skim_density against the 0.002 consistency assert.
-    // A first-parent walk is therefore already caught: it disagrees with
-    // git_total's `--full-history` count whenever the two differ (today 4 vs
-    // 5). When they do NOT differ, TARGET's history is linear and no assertion
-    // — constant or derived — can distinguish the two walks anyway.
 }
 
 // ============================================================================

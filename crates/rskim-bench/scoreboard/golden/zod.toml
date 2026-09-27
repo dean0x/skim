@@ -1,0 +1,394 @@
+# Golden set for the zod corpus (colinhacks/zod @ bbc68f99), #203.
+#
+# Frozen data: CI never regenerates it. Every def line was verified against
+# the pinned clone's raw bytes, and every concept's `relevant` regex was
+# written from the corpus source before any skim run (ADR-003). I-ids come
+# from `scoreboard golden-gen --corpus zod` (reviewed, then frozen). A
+# changed byte here changes golden_sha256 and requires a bless.
+
+corpus = "zod"
+commit = "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5"
+
+# --- identifiers: curated (def lines verified at bbc68f99) ------------------------
+
+[[ident]]
+id = "zod-L01"
+query = "JSONSchemaGenerator"
+def = { path = "packages/zod/src/v4/core/json-schema-generator.ts", line = 48 }
+origin = "curated"
+
+[[ident]]
+id = "zod-L02"
+query = "prettifyError"
+def = { path = "packages/zod/src/v4/core/errors.ts", line = 442 }
+origin = "curated"
+
+# Overloaded: the first overload signature is the definition line.
+[[ident]]
+id = "zod-L03"
+query = "treeifyError"
+def = { path = "packages/zod/src/v4/core/errors.ts", line = 345 }
+origin = "curated"
+
+[[ident]]
+id = "zod-L04"
+query = "flattenError"
+def = { path = "packages/zod/src/v4/core/errors.ts", line = 263 }
+origin = "curated"
+
+[[ident]]
+id = "zod-L05"
+query = "toJSONSchema"
+def = { path = "packages/zod/src/v4/core/json-schema-processors.ts", line = 613 }
+origin = "curated"
+
+# --- identifiers: generated (scoreboard golden-gen --corpus zod) -------------------
+
+# golden-gen: and-GT files: 2; order key 00de83da66a3
+[[ident]]
+id = "zod-I01"
+query = "$ZodPreprocessDef"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 4139 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 00e847c1f882
+[[ident]]
+id = "zod-I02"
+query = "$ZodTypeDiscriminable"
+def = { path = "packages/zod/src/v4/core/api.ts", line = 1215 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 00fdf4690f38
+[[ident]]
+id = "zod-I03"
+query = "$ZodIPv6Internals"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 795 }
+origin = "generated"
+
+# golden-gen: and-GT files: 31; order key 01c7f4a4e233
+[[ident]]
+id = "zod-I04"
+query = "returns"
+def = { path = "packages/zod/src/v3/types.ts", line = 3921 }
+origin = "generated"
+
+# golden-gen: and-GT files: 7; order key 027b295ef63c
+[[ident]]
+id = "zod-I05"
+query = "$ZodMap"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 3043 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 02947318c3f7
+[[ident]]
+id = "zod-I06"
+query = "ZodCoercedNumber"
+def = { path = "packages/zod/src/v4/classic/coerce.ts", line = 9 }
+origin = "generated"
+
+# golden-gen: and-GT files: 58; order key 02b1d0602267
+[[ident]]
+id = "zod-I07"
+query = "$ZodStringFormat"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 390 }
+origin = "generated"
+
+# golden-gen: and-GT files: 7; order key 02ee10a939ed
+[[ident]]
+id = "zod-I08"
+query = "$ZodCodec"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 4069 }
+origin = "generated"
+
+# golden-gen: and-GT files: 5; order key 0301223751bc
+[[ident]]
+id = "zod-I09"
+query = "$ZodIPv6"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 799 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 03a1a13734bb
+[[ident]]
+id = "zod-I10"
+query = "$ZodISODateTime"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 700 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 03be49cd646e
+[[ident]]
+id = "zod-I11"
+query = "arktype"
+def = { path = "packages/bench/libs.ts", line = 40 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 03f1c0bae481
+[[ident]]
+id = "zod-I12"
+query = "_positive"
+def = { path = "packages/zod/src/v4/core/api.ts", line = 916 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 0456491418cd
+[[ident]]
+id = "zod-I13"
+query = "$ZodNullInternals"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 1394 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0465ede56ae6
+[[ident]]
+id = "zod-I14"
+query = "isNANOID"
+def = { path = "packages/zod/src/v3/types.ts", line = 1282 }
+origin = "generated"
+
+# golden-gen: and-GT files: 28; order key 047624c08335
+[[ident]]
+id = "zod-I15"
+query = "Params"
+def = { path = "packages/zod/src/v4/core/api.ts", line = 8 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 04d4d2bb5edc
+[[ident]]
+id = "zod-I16"
+query = "$ZodIntersectionInternals"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 2458 }
+origin = "generated"
+
+# golden-gen: and-GT files: 19; order key 05e12312adf9
+[[ident]]
+id = "zod-I17"
+query = "implement"
+def = { path = "packages/zod/src/v3/types.ts", line = 3928 }
+origin = "generated"
+
+# golden-gen: and-GT files: 5; order key 06303e46c19b
+[[ident]]
+id = "zod-I18"
+query = "ZodEnumDef"
+def = { path = "packages/zod/src/v3/types.ts", line = 4049 }
+origin = "generated"
+
+# golden-gen: and-GT files: 8; order key 06517c049549
+[[ident]]
+id = "zod-I19"
+query = "$ZodUnknown"
+def = { path = "packages/zod/src/v4/core/schemas.ts", line = 1468 }
+origin = "generated"
+
+# golden-gen: and-GT files: 5; order key 0679fe5148a5
+[[ident]]
+id = "zod-I20"
+query = "ZodXID"
+def = { path = "packages/zod/src/v4/classic/schemas.ts", line = 818 }
+origin = "generated"
+
+# --- concepts (relevance declared up front) -------------------------------------------
+
+[[concept]]
+id = "zod-C01"
+query = "error map"
+relevant = '(?i)error[_\s-]*map'
+
+[[concept]]
+id = "zod-C02"
+query = "discriminated union"
+relevant = '(?i)discriminated[_\s-]*union'
+
+[[concept]]
+id = "zod-C03"
+query = "template literal"
+relevant = '(?i)template[_\s-]*literal'
+
+[[concept]]
+id = "zod-C04"
+query = "custom error"
+relevant = '(?i)custom[_\s-]*error|code:\s*["\x27]custom["\x27]'
+
+[[concept]]
+id = "zod-C05"
+query = "string format"
+relevant = '(?i)string[_\s-]*format'
+
+[[concept]]
+id = "zod-C06"
+query = "branded type"
+relevant = '(?i)\bbrand'
+
+# --- lexical edge cases ---------------------------------------------------------------
+
+[[lexical]]
+id = "zod-S01"
+query = "ZodType"
+category = "substr"
+
+[[lexical]]
+id = "zod-S02"
+query = "safeParse"
+category = "substr"
+
+[[lexical]]
+id = "zod-S03"
+query = "refine"
+category = "substr"
+
+[[lexical]]
+id = "zod-X01"
+query = "=>"
+category = "short"
+
+[[lexical]]
+id = "zod-X02"
+query = "z."
+category = "short"
+
+[[lexical]]
+id = "zod-X03"
+query = "z.object({"
+category = "punct"
+
+[[lexical]]
+id = "zod-X04"
+query = "?:"
+category = "punct"
+
+[[lexical]]
+id = "zod-X05"
+query = "<T extends"
+category = "punct"
+
+[[lexical]]
+id = "zod-X06"
+query = "...args"
+category = "punct"
+
+[[lexical]]
+id = "zod-X07"
+query = "@ts-expect-error"
+category = "punct"
+
+[[lexical]]
+id = "zod-K01"
+query = "Zod"
+category = "case"
+
+[[lexical]]
+id = "zod-K02"
+query = "ZOD"
+category = "case"
+
+[[lexical]]
+id = "zod-G01"
+query = "zod"
+category = "lang"
+lang = "json"
+
+[[lexical]]
+id = "zod-Z01"
+query = "qzvx_absent_symbol_7713"
+category = "zero-hit"
+
+[[lexical]]
+id = "zod-Z02"
+query = "error zzqqxxyy"
+category = "zero-hit"
+
+# --- phrase / near ----------------------------------------------------------------------
+
+[[lexical]]
+id = "zod-P01"
+query = "discriminated union"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "zod-P02"
+query = "export class ZodString"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "zod-P03"
+query = "error map"
+mode = "near"
+near = 3
+category = "near"
+
+[[lexical]]
+id = "zod-P04"
+query = "custom error"
+mode = "pnear"
+near = 3
+category = "near"
+
+[[lexical]]
+id = "zod-P05"
+query = "safeParse"
+mode = "phrase"
+category = "phrase"
+
+# --- pagination sweeps (L = 3, 7, 20; full count <= 3 x 63 = 189) ---------------------------
+
+[[pagination]]
+id = "zod-G001"
+query = "error map"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "zod-G002"
+query = "discriminated union"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "zod-G003"
+query = "custom error"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "zod-G004"
+query = "string format"
+flags = ["--phrase"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "zod-G005"
+query = "branded type"
+flags = ["--near", "3"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "zod-G006"
+query = "safeParse"
+flags = ["--hot"]
+limits = [3, 7, 20]
+
+# Single-token control.
+[[pagination]]
+id = "zod-G007"
+query = "ZodType"
+limits = [3, 7, 20]
+
+# --- prefix consistency ------------------------------------------------------------------
+
+[[prefix]]
+id = "zod-F001"
+query = "safeParse"
+flags = ["--hot"]
+limits = [5, 20]
+
+[[prefix]]
+id = "zod-F002"
+flags = ["--ast", "try-catch", "--hot"]
+limits = [5, 20]
+
+# Standalone --ast: also a #547 score-order (order.score_monotone) entry.
+[[prefix]]
+id = "zod-F003"
+flags = ["--ast", "switch-with-cases"]
+limits = [5, 20]
+
+[[prefix]]
+id = "zod-F004"
+query = "ZodType"
+limits = [5, 20]

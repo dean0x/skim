@@ -1,0 +1,402 @@
+# Golden set for the flask corpus (pallets/flask @ 7374c85d), #203.
+#
+# Frozen data: CI never regenerates it. Every def line was verified against
+# the pinned clone's raw bytes, and every concept's `relevant` regex was
+# written from the corpus source before any skim run (ADR-003). I-ids come
+# from `scoreboard golden-gen --corpus flask` (reviewed, then frozen). A
+# changed byte here changes golden_sha256 and requires a bless.
+#
+# flask's docs are .rst, which skim does not index, so the universe is
+# mostly Python (107 files at this commit).
+
+corpus = "flask"
+commit = "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392"
+
+# --- identifiers: curated (def lines verified at 7374c85d) ------------------------
+
+[[ident]]
+id = "flask-L01"
+query = "AppContext"
+def = { path = "src/flask/ctx.py", line = 260 }
+origin = "curated"
+
+[[ident]]
+id = "flask-L02"
+query = "jsonify"
+def = { path = "src/flask/json/__init__.py", line = 138 }
+origin = "curated"
+
+[[ident]]
+id = "flask-L03"
+query = "render_template"
+def = { path = "src/flask/templating.py", line = 136 }
+origin = "curated"
+
+[[ident]]
+id = "flask-L04"
+query = "FlaskGroup"
+def = { path = "src/flask/cli.py", line = 531 }
+origin = "curated"
+
+[[ident]]
+id = "flask-L05"
+query = "SecureCookieSessionInterface"
+def = { path = "src/flask/sessions.py", line = 284 }
+origin = "curated"
+
+[[ident]]
+id = "flask-L06"
+query = "DefaultJSONProvider"
+def = { path = "src/flask/json/provider.py", line = 124 }
+origin = "curated"
+
+# --- identifiers: generated (scoreboard golden-gen --corpus flask) -----------------
+
+# golden-gen: and-GT files: 2; order key 010068d07ba7
+[[ident]]
+id = "flask-I01"
+query = "test_login"
+def = { path = "examples/tutorial/tests/test_auth.py", line = 39 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 03ab08c891e6
+[[ident]]
+id = "flask-I02"
+query = "ConfigAttribute"
+def = { path = "src/flask/config.py", line = 20 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 04433783a8e0
+[[ident]]
+id = "flask-I03"
+query = "match_request"
+def = { path = "src/flask/ctx.py", line = 405 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 046d6df36f61
+[[ident]]
+id = "flask-I04"
+query = "from_mapping"
+def = { path = "src/flask/config.py", line = 304 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0593bd3e2847
+[[ident]]
+id = "flask-I05"
+query = "do_teardown_appcontext"
+def = { path = "src/flask/app.py", line = 1453 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0598a34fb6e1
+[[ident]]
+id = "flask-I06"
+query = "get_post"
+def = { path = "examples/tutorial/flaskr/blog.py", line = 28 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 09a2e8310a8b
+[[ident]]
+id = "flask-I07"
+query = "run_command"
+def = { path = "src/flask/cli.py", line = 935 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 0b6c6b2f41ec
+[[ident]]
+id = "flask-I08"
+query = "jinja_loader"
+def = { path = "src/flask/sansio/scaffold.py", line = 272 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0b711ce643a6
+[[ident]]
+id = "flask-I09"
+query = "getitem"
+def = { path = "tests/test_basic.py", line = 550 }
+origin = "generated"
+
+# golden-gen: and-GT files: 22; order key 0d12c9c9b8e9
+[[ident]]
+id = "flask-I10"
+query = "blueprint"
+def = { path = "src/flask/wrappers.py", line = 162 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 1014b4efc2c9
+[[ident]]
+id = "flask-I11"
+query = "SessionMixin"
+def = { path = "src/flask/sessions.py", line = 24 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 1145159bca3c
+[[ident]]
+id = "flask-I12"
+query = "handle_url_build_error"
+def = { path = "src/flask/sansio/app.py", line = 981 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 1164df9127f2
+[[ident]]
+id = "flask-I13"
+query = "get_namespace"
+def = { path = "src/flask/config.py", line = 323 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 1609ad72c5d5
+[[ident]]
+id = "flask-I14"
+query = "app_url_value_preprocessor"
+def = { path = "src/flask/sansio/blueprints.py", line = 673 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 169cdf348691
+[[ident]]
+id = "flask-I15"
+query = "jinja_env"
+def = { path = "src/flask/sansio/app.py", line = 467 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 16d1ad442217
+[[ident]]
+id = "flask-I16"
+query = "iter_blueprints"
+def = { path = "src/flask/sansio/app.py", line = 597 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 16de126adc18
+[[ident]]
+id = "flask-I17"
+query = "app_url_defaults"
+def = { path = "src/flask/sansio/blueprints.py", line = 685 }
+origin = "generated"
+
+# golden-gen: and-GT files: 12; order key 17b3964679fc
+[[ident]]
+id = "flask-I18"
+query = "expect"
+def = { path = "tests/test_basic.py", line = 580 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 17d133d54f18
+[[ident]]
+id = "flask-I19"
+query = "from_envvar"
+def = { path = "src/flask/config.py", line = 102 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 18a2a4a34531
+[[ident]]
+id = "flask-I20"
+query = "key_error"
+def = { path = "tests/test_user_error_handler.py", line = 48 }
+origin = "generated"
+
+# --- concepts (relevance declared up front) -------------------------------------------
+
+[[concept]]
+id = "flask-C01"
+query = "application context"
+relevant = '(?i)app(lication)?[_\s-]*context|app_ctx'
+
+[[concept]]
+id = "flask-C02"
+query = "request context"
+relevant = '(?i)request[_\s-]*context|req_ctx'
+
+[[concept]]
+id = "flask-C03"
+query = "error handler"
+relevant = '(?i)error[_\s-]*handler'
+
+[[concept]]
+id = "flask-C04"
+query = "test client"
+relevant = '(?i)test[_\s-]*client'
+
+[[concept]]
+id = "flask-C05"
+query = "secret key"
+relevant = '(?i)secret[_\s-]*key'
+
+[[concept]]
+id = "flask-C06"
+query = "config from"
+relevant = '(?i)from_(object|pyfile|envvar|mapping|file|prefixed_env)'
+
+# --- lexical edge cases ---------------------------------------------------------------
+
+[[lexical]]
+id = "flask-S01"
+query = "blueprint"
+category = "substr"
+
+[[lexical]]
+id = "flask-S02"
+query = "teardown"
+category = "substr"
+
+[[lexical]]
+id = "flask-S03"
+query = "jsonify"
+category = "substr"
+
+[[lexical]]
+id = "flask-X01"
+query = "db"
+category = "short"
+
+[[lexical]]
+id = "flask-X02"
+query = "if"
+category = "short"
+
+[[lexical]]
+id = "flask-X03"
+query = "@app.route("
+category = "punct"
+
+[[lexical]]
+id = "flask-X04"
+query = "**kwargs"
+category = "punct"
+
+[[lexical]]
+id = "flask-X05"
+query = "-> None"
+category = "punct"
+
+[[lexical]]
+id = "flask-X06"
+query = ":param"
+category = "punct"
+
+[[lexical]]
+id = "flask-X07"
+query = "__name__"
+category = "punct"
+
+[[lexical]]
+id = "flask-K01"
+query = "Flask"
+category = "case"
+
+[[lexical]]
+id = "flask-K02"
+query = "FLASK"
+category = "case"
+
+[[lexical]]
+id = "flask-G01"
+query = "flask"
+category = "lang"
+lang = "toml"
+
+[[lexical]]
+id = "flask-Z01"
+query = "qzvx_absent_symbol_7713"
+category = "zero-hit"
+
+[[lexical]]
+id = "flask-Z02"
+query = "error zzqqxxyy"
+category = "zero-hit"
+
+# --- phrase / near ----------------------------------------------------------------------
+
+[[lexical]]
+id = "flask-P01"
+query = "application context"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "flask-P02"
+query = "def url_for"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "flask-P03"
+query = "request context"
+mode = "near"
+near = 3
+category = "near"
+
+[[lexical]]
+id = "flask-P04"
+query = "secret key"
+mode = "pnear"
+near = 2
+category = "near"
+
+[[lexical]]
+id = "flask-P05"
+query = "Flask"
+mode = "phrase"
+category = "phrase"
+
+# --- pagination sweeps (L = 3, 7, 20; full count <= 3 x 63 = 189) ---------------------------
+
+[[pagination]]
+id = "flask-G001"
+query = "request context"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "flask-G002"
+query = "application context"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "flask-G003"
+query = "test client"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "flask-G004"
+query = "request context"
+flags = ["--phrase"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "flask-G005"
+query = "app context"
+flags = ["--near", "3"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "flask-G006"
+query = "config"
+flags = ["--hot"]
+limits = [3, 7, 20]
+
+# Single-token control.
+[[pagination]]
+id = "flask-G007"
+query = "session"
+limits = [3, 7, 20]
+
+# --- prefix consistency ------------------------------------------------------------------
+
+[[prefix]]
+id = "flask-F001"
+query = "def"
+flags = ["--hot"]
+limits = [5, 20]
+
+[[prefix]]
+id = "flask-F002"
+flags = ["--ast", "python-nested-loop", "--hot"]
+limits = [5, 20]
+
+# Standalone --ast: also a #547 score-order (order.score_monotone) entry.
+[[prefix]]
+id = "flask-F003"
+flags = ["--ast", "python-try-except"]
+limits = [5, 20]
+
+[[prefix]]
+id = "flask-F004"
+query = "request"
+limits = [5, 20]

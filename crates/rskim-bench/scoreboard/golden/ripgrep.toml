@@ -1,0 +1,404 @@
+# Golden set for the ripgrep corpus (BurntSushi/ripgrep @ 4519153e), #203.
+#
+# Frozen data: CI never regenerates it. Every def line was verified against
+# the pinned clone's raw bytes, and every concept's `relevant` regex was
+# written from the corpus source before any skim run (ADR-003). I-ids come
+# from `scoreboard golden-gen --corpus ripgrep` (reviewed, then frozen). A
+# changed byte here changes golden_sha256 and requires a bless.
+
+corpus = "ripgrep"
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
+
+# --- identifiers: curated (def lines verified at 4519153e) ------------------------
+
+[[ident]]
+id = "ripgrep-L01"
+query = "WalkBuilder"
+def = { path = "crates/ignore/src/walk.rs", line = 483 }
+origin = "curated"
+
+[[ident]]
+id = "ripgrep-L02"
+query = "GlobBuilder"
+def = { path = "crates/globset/src/glob.rs", line = 211 }
+origin = "curated"
+
+[[ident]]
+id = "ripgrep-L03"
+query = "StandardBuilder"
+def = { path = "crates/printer/src/standard.rs", line = 99 }
+origin = "curated"
+
+[[ident]]
+id = "ripgrep-L04"
+query = "HiArgs"
+def = { path = "crates/core/flags/hiargs.rs", line = 36 }
+origin = "curated"
+
+[[ident]]
+id = "ripgrep-L05"
+query = "SearchWorker"
+def = { path = "crates/core/search.rs", line = 230 }
+origin = "curated"
+
+[[ident]]
+id = "ripgrep-L06"
+query = "search_parallel"
+def = { path = "crates/core/main.rs", line = 160 }
+origin = "curated"
+
+# --- identifiers: generated (scoreboard golden-gen --corpus ripgrep) ---------------
+
+# golden-gen: and-GT files: 4; order key 002a72e08ff5
+[[ident]]
+id = "ripgrep-I01"
+query = "SinkContextKind"
+def = { path = "crates/searcher/src/sink.rs", line = 430 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 00666b7461d3
+[[ident]]
+id = "ripgrep-I02"
+query = "and_then"
+def = { path = "crates/core/flags/parse.rs", line = 36 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 0102d18ccaa1
+[[ident]]
+id = "ripgrep-I03"
+query = "add_bytes_printed"
+def = { path = "crates/printer/src/stats.rs", line = 92 }
+origin = "generated"
+
+# golden-gen: and-GT files: 9; order key 01c404d3e1aa
+[[ident]]
+id = "ripgrep-I04"
+query = "is_ignore"
+def = { path = "crates/ignore/src/lib.rs", line = 432 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 027814ef169a
+[[ident]]
+id = "ripgrep-I05"
+query = "long_glob"
+def = { path = "crates/globset/benches/bench.rs", line = 63 }
+origin = "generated"
+
+# golden-gen: and-GT files: 5; order key 02f40ee27e44
+[[ident]]
+id = "ripgrep-I06"
+query = "Version"
+def = { path = "crates/core/flags/defs.rs", line = 7294 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 035ae13a8e2d
+[[ident]]
+id = "ripgrep-I07"
+query = "ParseSizeError"
+def = { path = "crates/cli/src/human.rs", line = 6 }
+origin = "generated"
+
+# golden-gen: and-GT files: 8; order key 03898cf61e91
+[[ident]]
+id = "ripgrep-I08"
+query = "GlobSetBuilder"
+def = { path = "crates/globset/src/lib.rs", line = 566 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 03c8860a0152
+[[ident]]
+id = "ripgrep-I09"
+query = "many_short_regex_set"
+def = { path = "crates/globset/benches/bench.rs", line = 110 }
+origin = "generated"
+
+# golden-gen: and-GT files: 8; order key 04919fd6c261
+[[ident]]
+id = "ripgrep-I10"
+query = "size_limit"
+def = { path = "crates/regex/src/matcher.rs", line = 209 }
+origin = "generated"
+
+# golden-gen: and-GT files: 38; order key 04c32185f99b
+[[ident]]
+id = "ripgrep-I11"
+query = "output"
+def = { path = "tests/util.rs", line = 317 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 04e699b61fa4
+[[ident]]
+id = "ripgrep-I12"
+query = "has_command"
+def = { path = "crates/cli/src/decompress.rs", line = 191 }
+origin = "generated"
+
+# golden-gen: and-GT files: 9; order key 067bc075ac78
+[[ident]]
+id = "ripgrep-I13"
+query = "SearcherBuilder"
+def = { path = "crates/searcher/src/searcher/mod.rs", line = 298 }
+origin = "generated"
+
+# golden-gen: and-GT files: 49; order key 07f76c8fa7ab
+[[ident]]
+id = "ripgrep-I14"
+query = "example"
+def = { path = "crates/searcher/examples/search-stdin.rs", line = 17 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 08af60567f93
+[[ident]]
+id = "ripgrep-I15"
+query = "elapsed"
+def = { path = "crates/printer/src/stats.rs", line = 32 }
+origin = "generated"
+
+# golden-gen: and-GT files: 4; order key 08bab965911d
+[[ident]]
+id = "ripgrep-I16"
+query = "ByteSet"
+def = { path = "crates/matcher/src/lib.rs", line = 288 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 09ac0e00882a
+[[ident]]
+id = "ripgrep-I17"
+query = "new_regex"
+def = { path = "crates/globset/src/lib.rs", line = 271 }
+origin = "generated"
+
+# golden-gen: and-GT files: 56; order key 09b0826e37da
+[[ident]]
+id = "ripgrep-I18"
+query = "include"
+def = { path = "crates/searcher/src/testutil.rs", line = 505 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0a452e53ce19
+[[ident]]
+id = "ripgrep-I19"
+query = "nest_limit"
+def = { path = "crates/regex/src/matcher.rs", line = 256 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0a48a37816ef
+[[ident]]
+id = "ripgrep-I20"
+query = "ReadByLine"
+def = { path = "crates/searcher/src/searcher/glue.rs", line = 11 }
+origin = "generated"
+
+# --- concepts (relevance declared up front) -------------------------------------------
+
+[[concept]]
+id = "ripgrep-C01"
+query = "binary detection"
+relevant = '(?i)binary[_\s-]*detection'
+
+[[concept]]
+id = "ripgrep-C02"
+query = "line terminator"
+relevant = '(?i)line[_\s-]*terminator'
+
+[[concept]]
+id = "ripgrep-C03"
+query = "memory map"
+relevant = '(?i)mmap|memory[_\s-]*map'
+
+[[concept]]
+id = "ripgrep-C04"
+query = "hyperlink format"
+relevant = '(?i)hyperlink[_\s-]*format'
+
+[[concept]]
+id = "ripgrep-C05"
+query = "multiline search"
+relevant = '(?i)multi[_\s-]*line'
+
+[[concept]]
+id = "ripgrep-C06"
+query = "context lines"
+relevant = '(?i)(before|after)[_\s-]*context|context[_\s-]*lines?'
+
+[[concept]]
+id = "ripgrep-C07"
+query = "ignore rules"
+relevant = '(?i)gitignore|\.ignore\b|ignore[_\s-]*(rule|file|glob)s?'
+
+# --- lexical edge cases ---------------------------------------------------------------
+
+[[lexical]]
+id = "ripgrep-S01"
+query = "matcher"
+category = "substr"
+
+[[lexical]]
+id = "ripgrep-S02"
+query = "searcher"
+category = "substr"
+
+[[lexical]]
+id = "ripgrep-S03"
+query = "is_match"
+category = "substr"
+
+[[lexical]]
+id = "ripgrep-X01"
+query = "fn"
+category = "short"
+
+[[lexical]]
+id = "ripgrep-X02"
+query = "rg"
+category = "short"
+
+[[lexical]]
+id = "ripgrep-X03"
+query = "&[u8]"
+category = "punct"
+
+[[lexical]]
+id = "ripgrep-X04"
+query = "::default()"
+category = "punct"
+
+[[lexical]]
+id = "ripgrep-X05"
+query = "#[derive("
+category = "punct"
+
+[[lexical]]
+id = "ripgrep-X06"
+query = "--no-ignore"
+category = "punct"
+
+[[lexical]]
+id = "ripgrep-X07"
+query = "io::Result<()>"
+category = "punct"
+
+[[lexical]]
+id = "ripgrep-K01"
+query = "Glob"
+category = "case"
+
+[[lexical]]
+id = "ripgrep-K02"
+query = "GLOB"
+category = "case"
+
+[[lexical]]
+id = "ripgrep-G01"
+query = "grep-matcher"
+category = "lang"
+lang = "toml"
+
+[[lexical]]
+id = "ripgrep-Z01"
+query = "qzvx_absent_symbol_7713"
+category = "zero-hit"
+
+[[lexical]]
+id = "ripgrep-Z02"
+query = "error zzqqxxyy"
+category = "zero-hit"
+
+# --- phrase / near ----------------------------------------------------------------------
+
+[[lexical]]
+id = "ripgrep-P01"
+query = "line terminator"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "ripgrep-P02"
+query = "fn search_path"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "ripgrep-P03"
+query = "memory map"
+mode = "near"
+near = 3
+category = "near"
+
+[[lexical]]
+id = "ripgrep-P04"
+query = "binary detection"
+mode = "pnear"
+near = 3
+category = "near"
+
+[[lexical]]
+id = "ripgrep-P05"
+query = "Glob"
+mode = "phrase"
+category = "phrase"
+
+# --- pagination sweeps (L = 3, 7, 20; full count <= 3 x 63 = 189) ---------------------------
+
+[[pagination]]
+id = "ripgrep-G001"
+query = "binary detection"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "ripgrep-G002"
+query = "line terminator"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "ripgrep-G003"
+query = "ignore rules"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "ripgrep-G004"
+query = "line terminator"
+flags = ["--phrase"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "ripgrep-G005"
+query = "memory map"
+flags = ["--near", "3"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "ripgrep-G006"
+query = "matcher"
+flags = ["--hot"]
+limits = [3, 7, 20]
+
+# Single-token control.
+[[pagination]]
+id = "ripgrep-G007"
+query = "searcher"
+limits = [3, 7, 20]
+
+# --- prefix consistency ------------------------------------------------------------------
+
+[[prefix]]
+id = "ripgrep-F001"
+query = "fn"
+flags = ["--hot"]
+limits = [5, 20]
+
+[[prefix]]
+id = "ripgrep-F002"
+flags = ["--ast", "match-with-arms", "--hot"]
+limits = [5, 20]
+
+# Standalone --ast: also a #547 score-order (order.score_monotone) entry.
+[[prefix]]
+id = "ripgrep-F003"
+flags = ["--ast", "god-function"]
+limits = [5, 20]
+
+[[prefix]]
+id = "ripgrep-F004"
+query = "matcher"
+limits = [5, 20]

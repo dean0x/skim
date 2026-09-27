@@ -1,0 +1,77 @@
+# Known HARD failures of the search scoreboard (#203), each ledgered against a
+# filed ticket. A ledgered failure is XFAIL (the gate passes). A ledgered
+# (check, id) that PASSES is XPASS, which fails the gate: fix landed, so
+# remove its id from this file ("promote").
+#
+# Seeded from the first real run at skim b8a0a79 (2026-09-25), with the
+# exact failing ids copied from report.json. Every entry was classified
+# against the ticket's root cause, and the files the pages never show were
+# checked against raw bytes (`git grep -F`). Ids are assigned to a corpus by
+# their `<corpus>-` prefix.
+#
+# A NEW HARD failure is never added here without a filed ticket number.
+
+# --- #544: multi-word pagination ------------------------------------------------------
+# The candidate pool is cut to max(5 x limit, 100) + offset BEFORE
+# verification, but offset/limit are applied to VERIFIED rows. The tail of the
+# list is unreachable, and page boundaries depend on --limit. has_more is ORed
+# with the pre-verify "pool was capped" flag, so empty pages claim more.
+
+[[xfail]]
+issue = "#544"
+check = "pagination.complete"
+ids = ["skim-G001", "skim-G004", "zod-G001", "zod-G003"]
+note = "query.rs:670-693 pool cut before verification; files never shown on any page"
+
+[[xfail]]
+issue = "#544"
+check = "pagination.ordered"
+ids = ["skim-G001", "skim-G004", "zod-G001", "zod-G003"]
+note = "query.rs:670-693 + :1419-1425 skip/take on verified rows; concatenated pages != full list"
+
+[[xfail]]
+issue = "#544"
+check = "pagination.has_more_honest"
+ids = [
+    "skim-G001", "skim-G002", "skim-G003", "skim-G004",
+    "ripgrep-G001", "ripgrep-G002", "ripgrep-G003",
+    "zod-G001", "zod-G002", "zod-G003",
+]
+note = "query.rs:692 capped = pre-verify count == pool; :1433 ORs it into has_more (empty pages / last page claim more)"
+
+# --- #545: --hot with a text or --ast query ranks only a window --------------------------
+# resort_window(limit) = max(5 x limit, 100) rows are re-sorted by hotspot and
+# has_more is overwritten from that window: a --hot sweep reaches exactly 100
+# rows and stops, and a --limit N page is not the full list's first N.
+
+[[xfail]]
+issue = "#545"
+check = "pagination.complete"
+ids = ["skim-G007", "zod-G006"]
+note = "temporal.rs:462 resort_window caps text --hot at 100 rows (178 / 115 in the full list)"
+
+[[xfail]]
+issue = "#545"
+check = "pagination.ordered"
+ids = ["skim-G007", "zod-G006"]
+note = "temporal.rs:462 + mod.rs:1626-1630 window of lexical order re-sorted by hotspot"
+
+[[xfail]]
+issue = "#545"
+check = "pagination.has_more_honest"
+ids = ["skim-G007", "zod-G006"]
+note = "mod.rs:1744-1747 overwrites has_more from the window: false at row 100 of 178 / 115"
+
+[[xfail]]
+issue = "#545"
+check = "order.prefix_consistent"
+ids = ["skim-F001", "skim-F002", "zod-F001"]
+note = "text path mod.rs:1626-1630; --ast path ast.rs:275-280 + :329-339 (path-ordered window)"
+
+# --- #547: standalone --ast is ordered by path, not score -----------------------------------
+
+[[xfail]]
+issue = "#547"
+check = "order.score_monotone"
+ids = ["skim-F003", "ripgrep-F003", "flask-F003", "zod-F003"]
+note = "ast.rs:243-245 search_ast returns FileId (= path) order; nothing sorts by score"

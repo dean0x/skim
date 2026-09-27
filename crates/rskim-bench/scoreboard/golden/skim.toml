@@ -1,0 +1,447 @@
+# Golden set for the skim corpus (dean0x/skim @ b8a0a79), #203.
+#
+# Frozen data: CI never regenerates it. Every def line was verified against
+# the pinned clone's raw bytes, and every concept's `relevant` regex was
+# declared before any skim run (ADR-003). Seed ids (L/S/C/X/K/G/P) carry the
+# 2026-09-25 seed benchmark's ids; I-ids come from `scoreboard golden-gen
+# --corpus skim` (reviewed, then frozen). A changed byte here changes
+# golden_sha256 and requires a bless.
+
+corpus = "skim"
+commit = "b8a0a79463382347820f1c2572bde37b68e87c76"
+
+# --- identifiers: curated seeds (def lines verified at b8a0a79) -----------------
+
+[[ident]]
+id = "skim-L01"
+query = "check_staleness"
+def = { path = "crates/rskim/src/cmd/search/staleness.rs", line = 321 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L02"
+query = "extract_snippet_and_verify"
+def = { path = "crates/rskim/src/cmd/search/snippet.rs", line = 234 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L03"
+query = "query_substring_present"
+def = { path = "crates/rskim-search/src/types.rs", line = 693 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L04"
+query = "elision_marker"
+def = { path = "crates/rskim/src/output/mod.rs", line = 570 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L05"
+query = "strip_skim_wrappers_from_path"
+def = { path = "crates/rskim/src/main.rs", line = 762 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L06"
+query = "BuildLoudness"
+def = { path = "crates/rskim/src/cmd/search/temporal_build.rs", line = 81 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L07"
+query = "SEARCH_HELP_TEXT"
+def = { path = "crates/rskim/src/cmd/search/mod.rs", line = 2025 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L08"
+query = "command_needs_exact_bytes"
+def = { path = "crates/rskim/src/cmd/rewrite/compound.rs", line = 315 }
+origin = "seed"
+
+[[ident]]
+id = "skim-L09"
+query = "FileManifest"
+def = { path = "crates/rskim/src/cmd/search/manifest.rs", line = 409 }
+origin = "seed"
+
+# Substring of longer identifiers (is_word_byte_*), with a unique definition.
+[[ident]]
+id = "skim-S01"
+query = "is_word_byte"
+def = { path = "crates/rskim-search/src/lexical/tokenize.rs", line = 22 }
+origin = "seed"
+
+# --- identifiers: generated (scoreboard golden-gen --corpus skim) ------------------
+
+# golden-gen: and-GT files: 2; order key 0015df0a191d
+[[ident]]
+id = "skim-I01"
+query = "default_ast_weights_json_path"
+def = { path = "crates/rskim-research/src/ast_codegen.rs", line = 412 }
+origin = "generated"
+
+# golden-gen: and-GT files: 11; order key 00170425edf7
+[[ident]]
+id = "skim-I02"
+query = "emit_json_envelope"
+def = { path = "crates/rskim/src/cmd/execution.rs", line = 336 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 0021a48c8705
+[[ident]]
+id = "skim-I03"
+query = "to_tree_sitter"
+def = { path = "crates/rskim-core/src/types.rs", line = 289 }
+origin = "generated"
+
+# golden-gen: and-GT files: 5; order key 0040117b22e2
+[[ident]]
+id = "skim-I04"
+query = "PairEntry"
+def = { path = "crates/rskim-search/src/cochange/format.rs", line = 99 }
+origin = "generated"
+
+# golden-gen: and-GT files: 16; order key 0056ec61ec36
+[[ident]]
+id = "skim-I05"
+query = "try_rewrite"
+def = { path = "crates/rskim/src/cmd/rewrite/engine.rs", line = 35 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 005ecfc9745e
+[[ident]]
+id = "skim-I06"
+query = "extract_repo_name"
+def = { path = "crates/rskim-research/src/clone.rs", line = 100 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 0072edbb7b54
+[[ident]]
+id = "skim-I07"
+query = "read_cache_dir_env"
+def = { path = "crates/rskim/src/cache.rs", line = 60 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 007b3f3cb7ef
+[[ident]]
+id = "skim-I08"
+query = "test_ac24_advisory_early_return_before_sqlite_on_resolved_and_not_a_repo"
+def = { path = "crates/rskim/src/cmd/search/staleness_tests.rs", line = 4769 }
+origin = "generated"
+
+# golden-gen: and-GT files: 6; order key 0080d9900744
+[[ident]]
+id = "skim-I09"
+query = "is_bare_cat_pipeline"
+def = { path = "crates/rskim/src/cmd/rewrite/compound.rs", line = 948 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 00902fabf61d
+[[ident]]
+id = "skim-I10"
+query = "transform_toml"
+def = { path = "crates/rskim-core/src/transform/toml.rs", line = 45 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 00a6ff6b4d69
+[[ident]]
+id = "skim-I11"
+query = "run_json"
+def = { path = "crates/rskim/src/cmd/stats.rs", line = 148 }
+origin = "generated"
+
+# golden-gen: and-GT files: 9; order key 00bbb0817d0e
+[[ident]]
+id = "skim-I12"
+query = "run_build"
+def = { path = "crates/rskim/src/cmd/search/mod.rs", line = 897 }
+origin = "generated"
+
+# golden-gen: and-GT files: 5; order key 00ce426a2ff8
+[[ident]]
+id = "skim-I13"
+query = "remove_search_hooks"
+def = { path = "crates/rskim/src/cmd/search/hooks.rs", line = 369 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 00f09cf87798
+[[ident]]
+id = "skim-I14"
+query = "prepend_without"
+def = { path = "crates/rskim/src/cmd/dispatch.rs", line = 323 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 00fd39fb2276
+[[ident]]
+id = "skim-I15"
+query = "test_v6_header_rejected_with_please_rebuild_message"
+def = { path = "crates/rskim-search/src/index/format_tests.rs", line = 270 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 011b345fe36e
+[[ident]]
+id = "skim-I16"
+query = "ac14_relative_linearity_gate"
+def = { path = "crates/rskim-llm/tests/linearity.rs", line = 136 }
+origin = "generated"
+
+# golden-gen: and-GT files: 3; order key 012d5b027a7b
+[[ident]]
+id = "skim-I17"
+query = "get_providers"
+def = { path = "crates/rskim/src/cmd/session/mod.rs", line = 86 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 01593df29cd1
+[[ident]]
+id = "skim-I18"
+query = "render_insights_json"
+def = { path = "crates/rskim/src/cmd/heatmap/output.rs", line = 245 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 016bdd5654be
+[[ident]]
+id = "skim-I19"
+query = "count_files_recursive"
+def = { path = "crates/rskim/src/cmd/agents/util.rs", line = 19 }
+origin = "generated"
+
+# golden-gen: and-GT files: 2; order key 01838277e8ec
+[[ident]]
+id = "skim-I20"
+query = "UserController"
+def = { path = "tests/fixtures/typescript/mixed_priority.ts", line = 32 }
+origin = "generated"
+
+# --- concepts: the seed's queries and relevance regexes, verbatim ------------------
+
+[[concept]]
+id = "skim-C01"
+query = "build lock"
+relevant = '(?i)build[_\s-]*lock'
+
+[[concept]]
+id = "skim-C02"
+query = "temporal staleness check"
+relevant = '(?i)temporal[\w\s-]{0,30}stale|stale[\w\s-]{0,30}temporal'
+
+[[concept]]
+id = "skim-C03"
+query = "elision marker"
+relevant = '(?i)elision[_\s-]*marker'
+
+[[concept]]
+id = "skim-C04"
+query = "force raw marker"
+relevant = '(?i)force[_\s-]*raw'
+
+[[concept]]
+id = "skim-C05"
+query = "credential redaction"
+relevant = '(?i)redact'
+
+[[concept]]
+id = "skim-C06"
+query = "shallow clone"
+relevant = '(?i)shallow[_\s-]*(clone|repo|checkout|history)|is_shallow|unshallow'
+
+[[concept]]
+id = "skim-C07"
+query = "token budget cascade"
+relevant = '(?i)(token|budget)[\w\s-]{0,40}cascade|cascade[\w\s-]{0,40}(token|budget)'
+
+# --- lexical edge cases ---------------------------------------------------------------
+
+[[lexical]]
+id = "skim-S02"
+query = "verify_mode"
+category = "substr"
+
+[[lexical]]
+id = "skim-S03"
+query = "staleness"
+category = "substr"
+
+[[lexical]]
+id = "skim-S04"
+query = "tokenize"
+category = "substr"
+
+[[lexical]]
+id = "skim-X01"
+query = "fn"
+category = "short"
+
+[[lexical]]
+id = "skim-X02"
+query = "Ok"
+category = "short"
+
+[[lexical]]
+id = "skim-X03"
+query = "::new("
+category = "punct"
+
+[[lexical]]
+id = "skim-X04"
+query = "->"
+category = "punct"
+
+[[lexical]]
+id = "skim-X05"
+query = "#[test]"
+category = "punct"
+
+[[lexical]]
+id = "skim-X06"
+query = "&str"
+category = "punct"
+
+[[lexical]]
+id = "skim-X07"
+query = "-D warnings"
+category = "punct"
+
+[[lexical]]
+id = "skim-X08"
+query = "Option<&str>"
+category = "punct"
+
+[[lexical]]
+id = "skim-K01"
+query = "Staleness"
+category = "case"
+
+[[lexical]]
+id = "skim-K02"
+query = "STALENESS"
+category = "case"
+
+[[lexical]]
+id = "skim-G01"
+query = "rskim-core"
+category = "lang"
+lang = "toml"
+
+[[lexical]]
+id = "skim-G02"
+query = "staleness"
+category = "lang"
+lang = "markdown"
+
+[[lexical]]
+id = "skim-Z01"
+query = "qzvx_absent_symbol_7713"
+category = "zero-hit"
+
+# Multi-word zero-hit: the #544 report's `error zzqqxxyy` repro (one common word).
+[[lexical]]
+id = "skim-Z02"
+query = "error zzqqxxyy"
+category = "zero-hit"
+
+# --- phrase / near ----------------------------------------------------------------------
+
+[[lexical]]
+id = "skim-P01"
+query = "build lock"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "skim-P02"
+query = "fn check_staleness"
+mode = "phrase"
+category = "phrase"
+
+[[lexical]]
+id = "skim-P03"
+query = "temporal staleness"
+mode = "near"
+near = 5
+category = "near"
+
+[[lexical]]
+id = "skim-P04"
+query = "auto refresh stale"
+mode = "pnear"
+near = 4
+category = "near"
+
+[[lexical]]
+id = "skim-P05"
+query = "Result"
+mode = "phrase"
+category = "phrase"
+
+# --- pagination sweeps (L = 3, 7, 20; full count <= 3 x 63 = 189) ---------------------------
+
+[[pagination]]
+id = "skim-G001"
+query = "elision marker"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "skim-G002"
+query = "temporal staleness check"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "skim-G003"
+query = "credential redaction"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "skim-G004"
+query = "force raw marker"
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "skim-G005"
+query = "build lock"
+flags = ["--phrase"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "skim-G006"
+query = "temporal staleness"
+flags = ["--near", "5"]
+limits = [3, 7, 20]
+
+[[pagination]]
+id = "skim-G007"
+query = "build lock"
+flags = ["--hot"]
+limits = [3, 7, 20]
+
+# Single-token control (the seed's single-token sweeps were clean).
+[[pagination]]
+id = "skim-G008"
+query = "staleness"
+limits = [3, 7, 20]
+
+# --- prefix consistency: --limit N == the first N rows of the full list -------------------
+
+[[prefix]]
+id = "skim-F001"
+query = "fn"
+flags = ["--hot"]
+limits = [5, 20]
+
+[[prefix]]
+id = "skim-F002"
+flags = ["--ast", "match-with-arms", "--hot"]
+limits = [5, 20]
+
+# Standalone --ast: also the #547 score-order (order.score_monotone) entry.
+[[prefix]]
+id = "skim-F003"
+flags = ["--ast", "god-function"]
+limits = [5, 20]
+
+[[prefix]]
+id = "skim-F004"
+query = "staleness"
+limits = [5, 20]
