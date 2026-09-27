@@ -1,10 +1,10 @@
 {
   "schema": 1,
-  "golden_sha256": "347b65033385bae649317506721d405f61592ea6e0ac56e6a3ba08ff79420d2a",
+  "golden_sha256": "f343d3af0d85de85d59d6ae7082e1caca68950dd274c24921da34dbef6010610",
   "corpora": {
     "flask": {
       "commit": "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392",
-      "golden_sha256": "413fd7d38733db1c07015e83bc445a8eeee2405fd651d6454ecd63d6b96700b6",
+      "golden_sha256": "5da916ca3b08822b375e7f1c65868b27cf7a09786f5010669ad0351f9cafee97",
       "hard": {
         "flask-C01": {
           "lexical.precision": "pass",
@@ -530,6 +530,23 @@
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
+        },
+        "flask-ast-python-nested-loop-python": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "flask-ast-python-try-except-python": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "flask-ast-try-finally-python": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
         }
       },
       "ratchet": {
@@ -557,13 +574,20 @@
         "ident.mrr.baseline_count": 0.5616,
         "oracle_less.full_rows.flask-F002": 3.0,
         "oracle_less.full_rows.flask-F003": 18.0,
+        "structural.line_on_match.flask-ast-python-nested-loop-python": 3.0,
+        "structural.line_on_match.flask-ast-python-try-except-python": 0.0,
+        "structural.line_on_match.flask-ast-try-finally-python": 0.0,
+        "structural.precision.flask-ast-python-nested-loop-python": 1.0,
+        "structural.unscored_rows.python-nested-loop": 0.0,
+        "structural.unscored_rows.python-try-except": 0.0,
+        "structural.unscored_rows.try-finally": 0.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
     },
     "ripgrep": {
       "commit": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
-      "golden_sha256": "3aada68c1e451822926b40354192c46f5d021b743fb3598c9fea5478efa4ed8f",
+      "golden_sha256": "0700860bc88d161a9528087e7c33de54d28dacb8e89e6704d989f135a8aedea3",
       "hard": {
         "ripgrep-C01": {
           "lexical.precision": "pass",
@@ -1097,6 +1121,58 @@
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
+        },
+        "ripgrep-ast-empty-function-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "xfail",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-excessive-params-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-function-with-body-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-god-function-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-impl-method-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-match-with-arms-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-rust-nested-loop-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-rust-unsafe-block-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "ripgrep-ast-unhandled-result-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
         }
       },
       "ratchet": {
@@ -1124,13 +1200,35 @@
         "ident.mrr.baseline_count": 0.67,
         "oracle_less.full_rows.ripgrep-F002": 59.0,
         "oracle_less.full_rows.ripgrep-F003": 10.0,
+        "structural.intent_precision.ripgrep-ast-rust-nested-loop-rust": 0.3333,
+        "structural.intent_recall.ripgrep-ast-rust-nested-loop-rust": 0.9333,
+        "structural.line_on_match.ripgrep-ast-empty-function-rust": 1.0,
+        "structural.line_on_match.ripgrep-ast-excessive-params-rust": 6.0,
+        "structural.line_on_match.ripgrep-ast-function-with-body-rust": 73.0,
+        "structural.line_on_match.ripgrep-ast-god-function-rust": 10.0,
+        "structural.line_on_match.ripgrep-ast-impl-method-rust": 0.0,
+        "structural.line_on_match.ripgrep-ast-match-with-arms-rust": 59.0,
+        "structural.line_on_match.ripgrep-ast-rust-nested-loop-rust": 42.0,
+        "structural.line_on_match.ripgrep-ast-rust-unsafe-block-rust": 3.0,
+        "structural.line_on_match.ripgrep-ast-unhandled-result-rust": 60.0,
+        "structural.precision.ripgrep-ast-rust-nested-loop-rust": 1.0,
+        "structural.precision.ripgrep-ast-unhandled-result-rust": 1.0,
+        "structural.unscored_rows.empty-function": 0.0,
+        "structural.unscored_rows.excessive-params": 0.0,
+        "structural.unscored_rows.function-with-body": 0.0,
+        "structural.unscored_rows.god-function": 0.0,
+        "structural.unscored_rows.impl-method": 0.0,
+        "structural.unscored_rows.match-with-arms": 0.0,
+        "structural.unscored_rows.rust-nested-loop": 0.0,
+        "structural.unscored_rows.rust-unsafe-block": 0.0,
+        "structural.unscored_rows.unhandled-result": 0.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
     },
     "skim": {
       "commit": "b8a0a79463382347820f1c2572bde37b68e87c76",
-      "golden_sha256": "85caf3ea06481470fb2cf30140cfe55109bc5aae2e3fa832b485dbe51d5ba875",
+      "golden_sha256": "1391bf892c2ac278ccc38f9f5153496b7363366fe7328742100afe9408ad31fb",
       "hard": {
         "skim-C01": {
           "lexical.precision": "pass",
@@ -1724,6 +1822,137 @@
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
+        },
+        "skim-ast-call-in-loop-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-class-method-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-class-method-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-empty-catch-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-empty-function-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-excessive-params-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-function-with-body-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-god-function-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-impl-method-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-match-with-arms-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-method-with-body-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-method-with-body-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-numeric-literal-in-expression-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-rust-nested-loop-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-rust-unsafe-block-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-ternary-expression-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-try-catch-finally-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "xfail",
+          "structural.recall": "pass"
+        },
+        "skim-ast-try-catch-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-try-catch-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-try-finally-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-unhandled-result-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-unhandled-result-rust": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "skim-ast-unhandled-result-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
         }
       },
       "ratchet": {
@@ -1751,13 +1980,63 @@
         "ident.mrr.baseline_count": 0.7472,
         "oracle_less.full_rows.skim-F002": 270.0,
         "oracle_less.full_rows.skim-F003": 82.0,
+        "structural.intent_precision.skim-ast-rust-nested-loop-rust": 0.2842,
+        "structural.intent_recall.skim-ast-rust-nested-loop-rust": 0.9818,
+        "structural.line_on_match.skim-ast-call-in-loop-javascript": 2.0,
+        "structural.line_on_match.skim-ast-class-method-javascript": 0.0,
+        "structural.line_on_match.skim-ast-class-method-typescript": 0.0,
+        "structural.line_on_match.skim-ast-empty-catch-javascript": 1.0,
+        "structural.line_on_match.skim-ast-empty-function-rust": 25.0,
+        "structural.line_on_match.skim-ast-excessive-params-rust": 79.0,
+        "structural.line_on_match.skim-ast-function-with-body-rust": 439.0,
+        "structural.line_on_match.skim-ast-god-function-rust": 82.0,
+        "structural.line_on_match.skim-ast-impl-method-rust": 0.0,
+        "structural.line_on_match.skim-ast-match-with-arms-rust": 262.0,
+        "structural.line_on_match.skim-ast-method-with-body-javascript": 1.0,
+        "structural.line_on_match.skim-ast-method-with-body-typescript": 5.0,
+        "structural.line_on_match.skim-ast-numeric-literal-in-expression-javascript": 3.0,
+        "structural.line_on_match.skim-ast-rust-nested-loop-rust": 380.0,
+        "structural.line_on_match.skim-ast-rust-unsafe-block-rust": 12.0,
+        "structural.line_on_match.skim-ast-ternary-expression-javascript": 1.0,
+        "structural.line_on_match.skim-ast-try-catch-finally-javascript": 0.0,
+        "structural.line_on_match.skim-ast-try-catch-javascript": 0.0,
+        "structural.line_on_match.skim-ast-try-catch-typescript": 0.0,
+        "structural.line_on_match.skim-ast-try-finally-javascript": 0.0,
+        "structural.line_on_match.skim-ast-unhandled-result-javascript": 3.0,
+        "structural.line_on_match.skim-ast-unhandled-result-rust": 435.0,
+        "structural.line_on_match.skim-ast-unhandled-result-typescript": 4.0,
+        "structural.precision.skim-ast-call-in-loop-javascript": 1.0,
+        "structural.precision.skim-ast-numeric-literal-in-expression-javascript": 1.0,
+        "structural.precision.skim-ast-rust-nested-loop-rust": 1.0,
+        "structural.precision.skim-ast-ternary-expression-javascript": 1.0,
+        "structural.precision.skim-ast-unhandled-result-javascript": 1.0,
+        "structural.precision.skim-ast-unhandled-result-rust": 1.0,
+        "structural.precision.skim-ast-unhandled-result-typescript": 1.0,
+        "structural.unscored_rows.call-in-loop": 0.0,
+        "structural.unscored_rows.class-method": 0.0,
+        "structural.unscored_rows.empty-catch": 0.0,
+        "structural.unscored_rows.empty-function": 0.0,
+        "structural.unscored_rows.excessive-params": 0.0,
+        "structural.unscored_rows.function-with-body": 0.0,
+        "structural.unscored_rows.god-function": 0.0,
+        "structural.unscored_rows.impl-method": 0.0,
+        "structural.unscored_rows.match-with-arms": 0.0,
+        "structural.unscored_rows.method-with-body": 0.0,
+        "structural.unscored_rows.numeric-literal-in-expression": 0.0,
+        "structural.unscored_rows.rust-nested-loop": 0.0,
+        "structural.unscored_rows.rust-unsafe-block": 0.0,
+        "structural.unscored_rows.ternary-expression": 0.0,
+        "structural.unscored_rows.try-catch": 0.0,
+        "structural.unscored_rows.try-catch-finally": 0.0,
+        "structural.unscored_rows.try-finally": 0.0,
+        "structural.unscored_rows.unhandled-result": 5.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
     },
     "zod": {
       "commit": "bbc68f990c7e6a5e3f506c56fb04bd0279b9c9b5",
-      "golden_sha256": "18b58983da32e588a7cf44f1945a3ffad92cdca758c3c04163f1ac94e03650c2",
+      "golden_sha256": "193f6c99fc61b003360689478ebfd727ab743fe8248a31e9465e8a23bd025639",
       "hard": {
         "zod-C01": {
           "lexical.precision": "pass",
@@ -2275,6 +2554,105 @@
           "lexical.verify_mode": "pass",
           "order.score_monotone": "pass",
           "results.unique_paths": "pass"
+        },
+        "zod-ast-call-in-loop-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-call-in-loop-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-class-method-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-empty-catch-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-method-with-body-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-method-with-body-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-nested-loop-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-numeric-literal-in-expression-tsx": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-numeric-literal-in-expression-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-switch-with-cases-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-ternary-expression-tsx": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-ternary-expression-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-try-catch-tsx": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "xfail"
+        },
+        "zod-ast-try-catch-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-try-finally-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.precision": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-unhandled-result-javascript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
+        },
+        "zod-ast-unhandled-result-tsx": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "xfail"
+        },
+        "zod-ast-unhandled-result-typescript": {
+          "results.unique_paths": "pass",
+          "structural.coverage": "pass",
+          "structural.recall": "pass"
         }
       },
       "ratchet": {
@@ -2302,6 +2680,46 @@
         "ident.mrr.baseline_count": 0.756,
         "oracle_less.full_rows.zod-F002": 43.0,
         "oracle_less.full_rows.zod-F003": 56.0,
+        "structural.intent_precision.zod-ast-nested-loop-typescript": 1.0,
+        "structural.intent_recall.zod-ast-nested-loop-typescript": 0.125,
+        "structural.line_on_match.zod-ast-call-in-loop-javascript": 1.0,
+        "structural.line_on_match.zod-ast-call-in-loop-typescript": 38.0,
+        "structural.line_on_match.zod-ast-class-method-typescript": 0.0,
+        "structural.line_on_match.zod-ast-empty-catch-typescript": 7.0,
+        "structural.line_on_match.zod-ast-method-with-body-javascript": 1.0,
+        "structural.line_on_match.zod-ast-method-with-body-typescript": 49.0,
+        "structural.line_on_match.zod-ast-nested-loop-typescript": 1.0,
+        "structural.line_on_match.zod-ast-numeric-literal-in-expression-tsx": 2.0,
+        "structural.line_on_match.zod-ast-numeric-literal-in-expression-typescript": 119.0,
+        "structural.line_on_match.zod-ast-switch-with-cases-typescript": 56.0,
+        "structural.line_on_match.zod-ast-ternary-expression-tsx": 5.0,
+        "structural.line_on_match.zod-ast-ternary-expression-typescript": 68.0,
+        "structural.line_on_match.zod-ast-try-catch-tsx": 0.0,
+        "structural.line_on_match.zod-ast-try-catch-typescript": 0.0,
+        "structural.line_on_match.zod-ast-try-finally-typescript": 0.0,
+        "structural.line_on_match.zod-ast-unhandled-result-javascript": 1.0,
+        "structural.line_on_match.zod-ast-unhandled-result-tsx": 8.0,
+        "structural.line_on_match.zod-ast-unhandled-result-typescript": 270.0,
+        "structural.precision.zod-ast-call-in-loop-javascript": 1.0,
+        "structural.precision.zod-ast-call-in-loop-typescript": 1.0,
+        "structural.precision.zod-ast-numeric-literal-in-expression-tsx": 0.6667,
+        "structural.precision.zod-ast-numeric-literal-in-expression-typescript": 1.0,
+        "structural.precision.zod-ast-ternary-expression-tsx": 1.0,
+        "structural.precision.zod-ast-ternary-expression-typescript": 1.0,
+        "structural.precision.zod-ast-unhandled-result-javascript": 1.0,
+        "structural.precision.zod-ast-unhandled-result-tsx": 1.0,
+        "structural.precision.zod-ast-unhandled-result-typescript": 1.0,
+        "structural.unscored_rows.call-in-loop": 0.0,
+        "structural.unscored_rows.class-method": 0.0,
+        "structural.unscored_rows.empty-catch": 0.0,
+        "structural.unscored_rows.method-with-body": 0.0,
+        "structural.unscored_rows.nested-loop": 0.0,
+        "structural.unscored_rows.numeric-literal-in-expression": 0.0,
+        "structural.unscored_rows.switch-with-cases": 0.0,
+        "structural.unscored_rows.ternary-expression": 0.0,
+        "structural.unscored_rows.try-catch": 0.0,
+        "structural.unscored_rows.try-finally": 0.0,
+        "structural.unscored_rows.unhandled-result": 0.0,
         "universe.delta": 0.0,
         "universe.skipped_by_reason_mismatch": 0.0
       }
@@ -2338,6 +2756,106 @@
     "oracle_less.full_rows.skim-F003": 82.0,
     "oracle_less.full_rows.zod-F002": 43.0,
     "oracle_less.full_rows.zod-F003": 56.0,
+    "structural.intent_precision.ripgrep-ast-rust-nested-loop-rust": 0.3333,
+    "structural.intent_precision.skim-ast-rust-nested-loop-rust": 0.2842,
+    "structural.intent_precision.zod-ast-nested-loop-typescript": 1.0,
+    "structural.intent_recall.ripgrep-ast-rust-nested-loop-rust": 0.9333,
+    "structural.intent_recall.skim-ast-rust-nested-loop-rust": 0.9818,
+    "structural.intent_recall.zod-ast-nested-loop-typescript": 0.125,
+    "structural.line_on_match.flask-ast-python-nested-loop-python": 3.0,
+    "structural.line_on_match.flask-ast-python-try-except-python": 0.0,
+    "structural.line_on_match.flask-ast-try-finally-python": 0.0,
+    "structural.line_on_match.ripgrep-ast-empty-function-rust": 1.0,
+    "structural.line_on_match.ripgrep-ast-excessive-params-rust": 6.0,
+    "structural.line_on_match.ripgrep-ast-function-with-body-rust": 73.0,
+    "structural.line_on_match.ripgrep-ast-god-function-rust": 10.0,
+    "structural.line_on_match.ripgrep-ast-impl-method-rust": 0.0,
+    "structural.line_on_match.ripgrep-ast-match-with-arms-rust": 59.0,
+    "structural.line_on_match.ripgrep-ast-rust-nested-loop-rust": 42.0,
+    "structural.line_on_match.ripgrep-ast-rust-unsafe-block-rust": 3.0,
+    "structural.line_on_match.ripgrep-ast-unhandled-result-rust": 60.0,
+    "structural.line_on_match.skim-ast-call-in-loop-javascript": 2.0,
+    "structural.line_on_match.skim-ast-class-method-javascript": 0.0,
+    "structural.line_on_match.skim-ast-class-method-typescript": 0.0,
+    "structural.line_on_match.skim-ast-empty-catch-javascript": 1.0,
+    "structural.line_on_match.skim-ast-empty-function-rust": 25.0,
+    "structural.line_on_match.skim-ast-excessive-params-rust": 79.0,
+    "structural.line_on_match.skim-ast-function-with-body-rust": 439.0,
+    "structural.line_on_match.skim-ast-god-function-rust": 82.0,
+    "structural.line_on_match.skim-ast-impl-method-rust": 0.0,
+    "structural.line_on_match.skim-ast-match-with-arms-rust": 262.0,
+    "structural.line_on_match.skim-ast-method-with-body-javascript": 1.0,
+    "structural.line_on_match.skim-ast-method-with-body-typescript": 5.0,
+    "structural.line_on_match.skim-ast-numeric-literal-in-expression-javascript": 3.0,
+    "structural.line_on_match.skim-ast-rust-nested-loop-rust": 380.0,
+    "structural.line_on_match.skim-ast-rust-unsafe-block-rust": 12.0,
+    "structural.line_on_match.skim-ast-ternary-expression-javascript": 1.0,
+    "structural.line_on_match.skim-ast-try-catch-finally-javascript": 0.0,
+    "structural.line_on_match.skim-ast-try-catch-javascript": 0.0,
+    "structural.line_on_match.skim-ast-try-catch-typescript": 0.0,
+    "structural.line_on_match.skim-ast-try-finally-javascript": 0.0,
+    "structural.line_on_match.skim-ast-unhandled-result-javascript": 3.0,
+    "structural.line_on_match.skim-ast-unhandled-result-rust": 435.0,
+    "structural.line_on_match.skim-ast-unhandled-result-typescript": 4.0,
+    "structural.line_on_match.zod-ast-call-in-loop-javascript": 1.0,
+    "structural.line_on_match.zod-ast-call-in-loop-typescript": 38.0,
+    "structural.line_on_match.zod-ast-class-method-typescript": 0.0,
+    "structural.line_on_match.zod-ast-empty-catch-typescript": 7.0,
+    "structural.line_on_match.zod-ast-method-with-body-javascript": 1.0,
+    "structural.line_on_match.zod-ast-method-with-body-typescript": 49.0,
+    "structural.line_on_match.zod-ast-nested-loop-typescript": 1.0,
+    "structural.line_on_match.zod-ast-numeric-literal-in-expression-tsx": 2.0,
+    "structural.line_on_match.zod-ast-numeric-literal-in-expression-typescript": 119.0,
+    "structural.line_on_match.zod-ast-switch-with-cases-typescript": 56.0,
+    "structural.line_on_match.zod-ast-ternary-expression-tsx": 5.0,
+    "structural.line_on_match.zod-ast-ternary-expression-typescript": 68.0,
+    "structural.line_on_match.zod-ast-try-catch-tsx": 0.0,
+    "structural.line_on_match.zod-ast-try-catch-typescript": 0.0,
+    "structural.line_on_match.zod-ast-try-finally-typescript": 0.0,
+    "structural.line_on_match.zod-ast-unhandled-result-javascript": 1.0,
+    "structural.line_on_match.zod-ast-unhandled-result-tsx": 8.0,
+    "structural.line_on_match.zod-ast-unhandled-result-typescript": 270.0,
+    "structural.precision.flask-ast-python-nested-loop-python": 1.0,
+    "structural.precision.ripgrep-ast-rust-nested-loop-rust": 1.0,
+    "structural.precision.ripgrep-ast-unhandled-result-rust": 1.0,
+    "structural.precision.skim-ast-call-in-loop-javascript": 1.0,
+    "structural.precision.skim-ast-numeric-literal-in-expression-javascript": 1.0,
+    "structural.precision.skim-ast-rust-nested-loop-rust": 1.0,
+    "structural.precision.skim-ast-ternary-expression-javascript": 1.0,
+    "structural.precision.skim-ast-unhandled-result-javascript": 1.0,
+    "structural.precision.skim-ast-unhandled-result-rust": 1.0,
+    "structural.precision.skim-ast-unhandled-result-typescript": 1.0,
+    "structural.precision.zod-ast-call-in-loop-javascript": 1.0,
+    "structural.precision.zod-ast-call-in-loop-typescript": 1.0,
+    "structural.precision.zod-ast-numeric-literal-in-expression-tsx": 0.6667,
+    "structural.precision.zod-ast-numeric-literal-in-expression-typescript": 1.0,
+    "structural.precision.zod-ast-ternary-expression-tsx": 1.0,
+    "structural.precision.zod-ast-ternary-expression-typescript": 1.0,
+    "structural.precision.zod-ast-unhandled-result-javascript": 1.0,
+    "structural.precision.zod-ast-unhandled-result-tsx": 1.0,
+    "structural.precision.zod-ast-unhandled-result-typescript": 1.0,
+    "structural.unscored_rows.call-in-loop": 0.0,
+    "structural.unscored_rows.class-method": 0.0,
+    "structural.unscored_rows.empty-catch": 0.0,
+    "structural.unscored_rows.empty-function": 0.0,
+    "structural.unscored_rows.excessive-params": 0.0,
+    "structural.unscored_rows.function-with-body": 0.0,
+    "structural.unscored_rows.god-function": 0.0,
+    "structural.unscored_rows.impl-method": 0.0,
+    "structural.unscored_rows.match-with-arms": 0.0,
+    "structural.unscored_rows.method-with-body": 0.0,
+    "structural.unscored_rows.nested-loop": 0.0,
+    "structural.unscored_rows.numeric-literal-in-expression": 0.0,
+    "structural.unscored_rows.python-nested-loop": 0.0,
+    "structural.unscored_rows.python-try-except": 0.0,
+    "structural.unscored_rows.rust-nested-loop": 0.0,
+    "structural.unscored_rows.rust-unsafe-block": 0.0,
+    "structural.unscored_rows.switch-with-cases": 0.0,
+    "structural.unscored_rows.ternary-expression": 0.0,
+    "structural.unscored_rows.try-catch": 0.0,
+    "structural.unscored_rows.try-catch-finally": 0.0,
+    "structural.unscored_rows.try-finally": 0.0,
+    "structural.unscored_rows.unhandled-result": 5.0,
     "universe.delta": 0.0,
     "universe.skipped_by_reason_mismatch": 0.0
   },

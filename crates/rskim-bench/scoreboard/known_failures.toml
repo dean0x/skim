@@ -87,3 +87,30 @@ issue = "#546"
 check = "structural.precision"
 ids = ["skim-ast-try-catch-finally-javascript"]
 note = "npm/rskim/scripts/postinstall.js: try{}finally{} (:233/:271) wraps a separate try{}catch{} (:273/:275); no try has both clauses"
+
+# --- #571: .tsx is parsed with the TypeScript grammar -------------------------------------
+# Language::from_extension("tsx") is TypeScript (rskim-core/src/types.rs:57) and
+# to_tree_sitter() maps it to LANGUAGE_TYPESCRIPT (types.rs:291), so the AST
+# index and the verify gate never see the TSX grammar. JSX breaks that tree: in
+# _og.tsx the root is an ERROR node and no try_statement, catch_clause or
+# expression_statement exists. The structural oracle (#541) parses .tsx with
+# the TSX grammar (ADR-003 ground truth).
+
+[[xfail]]
+issue = "#571"
+check = "structural.recall"
+ids = ["zod-ast-try-catch-tsx", "zod-ast-unhandled-result-tsx"]
+note = "packages/docs/pages/api/_og.tsx: TSX try_statement :33, catch_clause :119, expression_statement :120; the TS parse is ERROR from the root"
+
+# --- #572: empty-function counts a `{ self }` body as empty ------------------------------
+# is_counted_child (ast_index/structural.rs:481-483) drops every kind in
+# PUNCTUATION_KIND_IDS, which includes the named `self` expression
+# (structural.rs:295), so a body whose only child is the tail expression `self`
+# counts 0 children and emits EMPTY_BODY (extract.rs:850-880). The oracle counts
+# named, non-extra children, as "a function item with an empty body" says.
+
+[[xfail]]
+issue = "#572"
+check = "structural.precision"
+ids = ["ripgrep-ast-empty-function-rust"]
+note = "crates/globset/src/glob.rs:84 `fn as_ref(&self) -> &Glob { self }` and crates/pcre2/src/matcher.rs:245 `{ self }` bodies"
