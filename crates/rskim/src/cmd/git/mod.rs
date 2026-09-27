@@ -264,7 +264,7 @@ pub(super) fn finalize_git_output_owned(
     duration: std::time::Duration,
 ) {
     if show_stats {
-        let (orig, comp) = crate::process::count_token_pair(&raw, &output);
+        let (orig, comp) = crate::tokens::count_token_pair(&raw, &output);
         crate::process::report_token_stats(orig, comp, "");
     }
     crate::analytics::try_record_command(rec, raw, output, label, duration);
@@ -291,7 +291,7 @@ pub(super) fn finalize_git_output_passthrough(
 ) {
     if show_stats {
         // ALLOC NOTE: count_token_pair borrows; no allocation here.
-        let (orig, comp) = crate::process::count_token_pair(&raw, &raw);
+        let (orig, comp) = crate::tokens::count_token_pair(&raw, &raw);
         crate::process::report_token_stats(orig, comp, "");
     }
     if rec.enabled {
@@ -356,7 +356,7 @@ pub(super) fn run_passthrough(
 /// Grouping these reduces the argument count to stay within Clippy's
 /// `too_many_arguments` limit while keeping all parameters documented together.
 ///
-/// # No `Default` — intentional (ADR-015 / D1)
+/// # No `Default` — intentional (ADR-011 / D1)
 ///
 /// `completeness` has no sensible default: a `--json` handler that does not
 /// state whether its envelope carries everything git produced is exactly the
@@ -491,7 +491,7 @@ where
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&result)
                 .map_err(|e| anyhow::anyhow!("failed to serialize result: {e}"))?;
-            // ADR-015 / D1 — the declaration comes from the caller
+            // ADR-011 / D1 — the declaration comes from the caller
             // (`ParsedCommandOptions::completeness`), because only the caller
             // knows what its parser modelled.  `elided` is `None`: these
             // parsers summarise into `operation`/`summary`/`details` with no
@@ -797,7 +797,7 @@ mod tests {
         duration: std::time::Duration,
     ) {
         if show_stats {
-            let (orig, comp) = crate::process::count_token_pair(raw, output);
+            let (orig, comp) = crate::tokens::count_token_pair(raw, output);
             crate::process::report_token_stats(orig, comp, "");
         }
         crate::analytics::try_record_command(

@@ -65,8 +65,8 @@ mod ac9_net_tests {
     /// unreachable/invalid endpoint (the loopback address, port 1), and asserts
     /// that the resulting error messages do not contain the key material.
     ///
-    /// Applies ADR-001 (fix all noticed issues regardless of scope) and testable
-    /// per PF-005 (acceptance criteria must be observable and testable, not doc-only).
+    /// Fixed when noticed rather than deferred, and testable per PF-005
+    /// (acceptance criteria must be observable and testable, not doc-only).
     ///
     /// Currently the invariant holds because:
     /// - `ureq 2.x` `Error::Status` / `Error::Transport` Display never includes

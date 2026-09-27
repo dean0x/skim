@@ -3,13 +3,30 @@
 //! ARCHITECTURE: Strip non-doc comments at module/class level while keeping all code intact.
 //! Preserves doc comments, comments inside function bodies, and shebangs.
 //!
-//! Token reduction target: 15-30%
+//! # Token reduction
+//!
+//! There is no figure for this mode, because none has been measured. The "15-30%"
+//! target this header used to state was never derived from a measurement, and nothing
+//! defends it: no test asserts a percentage for minimal mode (the only ratio
+//! assertions in the suite are two structure-mode checks on the JSON and YAML
+//! fixtures, and the minimal-mode tests assert only that the output is smaller than
+//! the input). ADR-007 and ADR-008 record the same provenance for pseudo's companion
+//! "30-50%" — an unsourced target copied out of an early commit and never re-derived.
+//!
+//! It also has a known counter-example. A file whose only comments are its module
+//! header now reduces by 0%, because #476 preserves that header in every language
+//! rather than in four; `tests/fixtures/sql/simple.sql` is exactly that file, which is
+//! why `test_sql_minimal_reduces_tokens` had to be repointed at `comments.sql`.
+//!
+//! Do not restate a number here until one exists and something that runs in CI
+//! defends it; a target nothing measures reads as a measurement.
 
 use crate::transform::literals::{
     collect_literal_ranges, in_protected, map_ranges_to_output, merge_ranges,
 };
 use crate::transform::utils::is_function_scope_kind;
 use crate::{Language, Result, SkimError, TransformConfig};
+use std::ops::Range;
 use tree_sitter::{Node, Tree};
 
 /// Maximum AST recursion depth to prevent stack overflow attacks
@@ -101,6 +118,13 @@ pub(crate) fn transform_minimal(
     let protected = map_ranges_to_output(&literal_ranges, &final_ranges);
 
     let after_removal = remove_ranges(source, &final_ranges)?;
+    // Fold the residue a stripped module-level comment leaves: the blank lines that
+    // flanked it are now adjacent, directly under the header #476 preserves, where a
+    // bounded view would spend its budget on them (ADR-016 makes `--max-lines N`
+    // exact, so the truncator cannot recover the slot). Minimal mode carries no line
+    // map through this function — `transform_tree_with_line_map` derives one by text
+    // matching afterwards — so only the text and the literal ranges move here.
+    let (after_removal, protected) = fold_leading_blank_run(after_removal, protected);
     let normalized = trim_and_normalize(&after_removal, &protected);
 
     Ok(normalized)
@@ -232,7 +256,7 @@ pub(crate) fn is_removable_comment(
     let should_preserve = is_shebang(node, source)
         || in_function_body
         || is_doc_comment(node, source, language, classification.go_doc_comment_starts)
-        || is_module_header_comment(node, language, classification.header_end_byte, depth);
+        || is_module_header_comment(node, classification.header_end_byte, depth);
     !should_preserve
 }
 
@@ -506,6 +530,31 @@ fn is_go_declaration(kind: &str) -> bool {
     )
 }
 
+/// Return `node_end` with a trailing `\n` excluded, so the byte sits *on* the
+/// line terminator rather than past it.
+///
+/// Nearly every comment grammar ends a line-comment node before the newline
+/// that terminates its line. tree-sitter-rust's external scanner is the
+/// exception: `process_line_doc_content` deliberately consumes the newline
+/// into `_line_doc_content` ("Include the newline in the doc content node.
+/// Line endings are useful for markdown injection."), so a `///` or `//!`
+/// node's `end_byte()` is one byte past its own line.
+///
+/// `compute_header_end_byte` detects a blank line by counting `\n` bytes in
+/// the gap between two consecutive children. With a swallowed newline the gap
+/// across a genuine blank line contains only one `\n`, the `> 1` test fails,
+/// and the header run continues through the blank line into an unrelated
+/// comment block. Normalising the anchor keeps the gap window starting at the
+/// line terminator for every grammar, whether or not it swallows the newline.
+///
+/// Returns `node_end` unchanged when it is 0 or does not follow a `\n`.
+fn end_byte_excluding_line_terminator(source: &str, node_end: usize) -> usize {
+    match node_end.checked_sub(1) {
+        Some(prev) if source.as_bytes().get(prev) == Some(&b'\n') => prev,
+        _ => node_end,
+    }
+}
+
 /// Compute the end byte of the module-level header comment block in a single O(N) forward pass.
 ///
 /// Returns the `end_byte()` of the last comment node that belongs to the
@@ -513,9 +562,18 @@ fn is_go_declaration(kind: &str) -> bool {
 /// no header comments.
 ///
 /// A header comment is a root-level named child that:
-/// 1. Belongs to a language with a header-comment convention (Python, Ruby, SQL, Bash).
+/// 1. Is a comment node in the given language (see `is_comment_node` — every
+///    tree-sitter code language this crate supports qualifies; #476).
 /// 2. Is part of a prefix run of comment nodes with no blank-line break
-///    (more than one `\n` in the byte gap between consecutive named children).
+///    (more than one `\n` in the byte gap between consecutive named children,
+///    measured from the *normalised* end of the previous node — see
+///    `end_byte_excluding_line_terminator` for why the raw `end_byte()` is
+///    not a safe anchor in every grammar).
+///
+/// A run that reaches the end of the sibling list without meeting a blank line
+/// or a non-comment node is a header in its entirety: a file that is nothing
+/// but comments (a licence block, a notes file) is all header, and returning a
+/// boundary of `0` for it would strip the file down to nothing.
 ///
 /// **Complexity:** O(N) — each root-level named child is visited exactly once via a
 /// `TreeCursor`, which is the only genuinely O(1)-per-step traversal in tree-sitter.
@@ -532,11 +590,6 @@ fn is_go_declaration(kind: &str) -> bool {
 /// - The forward pass stops at the first non-comment or blank-line gap and records
 ///   the end of the last accepted comment — exactly the same boundary.
 pub(crate) fn compute_header_end_byte(root: Node, source: &str, language: Language) -> usize {
-    match language {
-        Language::Python | Language::Ruby | Language::Sql | Language::Bash => {}
-        _ => return 0,
-    }
-
     let mut header_end: usize = 0;
     let mut prev_end: usize = 0;
 
@@ -552,7 +605,10 @@ pub(crate) fn compute_header_end_byte(root: Node, source: &str, language: Langua
         // node start means at least one blank line exists — the header block ends.
         // `prev_end > 0` is equivalent to `i > 0` in the old loop: prev_end stays
         // zero until the first comment is accepted, so the gap check is skipped for
-        // the very first child (no predecessor to form a gap against).
+        // the very first child (no predecessor to form a gap against). The
+        // normalisation below lowers prev_end by at most one byte and no grammar
+        // makes a bare "\n" a comment, so an accepted comment can never normalise
+        // back to the zero sentinel.
         if prev_end > 0 {
             let gap_start = prev_end;
             let gap_end = child.start_byte();
@@ -566,8 +622,15 @@ pub(crate) fn compute_header_end_byte(root: Node, source: &str, language: Langua
 
         // Extend the header only for comment nodes; any other node terminates it.
         if is_comment_node(child.kind(), language) {
+            // `header_end` keeps the RAW end byte. `is_module_header_comment`
+            // tests `node.end_byte() <= header_end_byte`, so the last accepted
+            // comment has to compare equal to it — normalising here would push
+            // the boundary one byte below that comment and strip it.
             header_end = child.end_byte();
-            prev_end = child.end_byte();
+            // `prev_end` keeps the NORMALISED end byte. Its only consumer is the
+            // blank-line gap window above, which is only meaningful when it
+            // starts at the line terminator.
+            prev_end = end_byte_excluding_line_terminator(source, child.end_byte());
         } else {
             break;
         }
@@ -602,23 +665,16 @@ pub(crate) fn build_newline_table(source: &str) -> Vec<usize> {
 /// file (direct children of the root node) with no blank-line break between them
 /// and no preceding non-comment sibling.
 ///
-/// Languages where this applies: Python, Ruby, SQL, and Bash — all use `#` or
-/// `--` comments at module level for shebangs, copyright, SPDX,
-/// `frozen_string_literal: true`, provenance markers, and FIXTURE/TESTS headers.
-/// No doc-comment convention exists for these languages (`is_doc_comment` returns
-/// `false`), so without this guard minimal/pseudo would strip them.
+/// Applies to every language `is_comment_node` recognizes (#476) — not just
+/// languages without a doc-comment convention (Python, Ruby, SQL, Bash, where
+/// `is_doc_comment` always returns `false`). A language that does have a
+/// doc-comment convention (e.g. `///`/`/**` in Rust, TypeScript, Java) still
+/// benefits: a plain non-doc leading comment — license text, a provenance
+/// marker — is preserved as the header even though it doesn't qualify as a
+/// doc comment.
 ///
 /// Pass `header_end_byte = 0` to disable (no comments classified as headers).
-fn is_module_header_comment(
-    node: Node,
-    language: Language,
-    header_end_byte: usize,
-    depth: usize,
-) -> bool {
-    match language {
-        Language::Python | Language::Ruby | Language::Sql | Language::Bash => {}
-        _ => return false,
-    }
+fn is_module_header_comment(node: Node, header_end_byte: usize, depth: usize) -> bool {
     // Must be a direct child of the root node. Root is walked at depth 0, so its
     // direct children are depth 1. O(1) integer compare — no parent() call needed.
     // A TSNode has no parent pointer; every parent() call re-walks the tree from
@@ -829,6 +885,179 @@ pub(crate) fn trim_and_normalize(source: &str, protected: &[(usize, usize)]) -> 
     result
 }
 
+/// The residue [`fold_leading_blank_run_with_line_map`] removes: every blank line of
+/// the body's first blank run except the first.
+#[derive(Debug)]
+struct LeadingBlankFold {
+    /// Line indices dropped from the body, 0-based, half-open.
+    lines: Range<usize>,
+    /// Byte range dropped from the body, half-open.
+    bytes: Range<usize>,
+}
+
+/// Fold the body's first blank-line run down to a single blank line.
+///
+/// ARCHITECTURE: stripping a module-level comment removes whole lines, so the blank
+/// line above the comment ends up adjacent to the blank line below it.  Neither was
+/// written next to the other — the run is removal residue.  Since #476 preserved the
+/// module header in every language, that residue sits directly under the header, which
+/// is the first thing a bounded view spends its budget on: `--max-lines 5` over
+/// `tests/fixtures/typescript/comments.ts` spent two of its four content slots on blank
+/// lines and put no body on screen at all.
+///
+/// The saving has to be made here, in the transform that produces the lines.
+/// `--max-lines N` is an exact bound (ADR-016), so the truncator cannot buy the slot
+/// back, and by the time it runs the output is a flat line vector in which residue and
+/// authored spacing are indistinguishable.
+///
+/// Scope, deliberately narrow:
+/// - Only the FIRST blank run that follows content is folded.  Every later run keeps
+///   `trim_and_normalize`'s 3+-to-2 cap, so body spacing below the header is untouched.
+/// - It folds to one blank line, not zero, so the header keeps its separation from the
+///   body.
+/// - A blank line whose position lies inside `protected` is inside a multi-line string
+///   literal and is never folded — the same blank test `trim_and_normalize` applies.
+///
+/// Known limitation: the pass cannot tell residue from an authored double blank line,
+/// so a body that opens with two authored blanks loses one.  Confining the rule to the
+/// first run bounds that to a single line per file.
+///
+/// ORDERING: this runs BEFORE `trim_and_normalize` and `normalize_line_map_blanks`, and
+/// folds the text, the line map and the protected ranges together.  Those two functions
+/// mirror each other line-for-line (PF-019) and neither is told about this rule, so
+/// folding upstream of both is what keeps them in sync.
+///
+/// Returns its inputs unchanged when no fold applies, so the common case allocates
+/// nothing.
+pub(crate) fn fold_leading_blank_run_with_line_map(
+    text: String,
+    line_map: Vec<usize>,
+    protected: Vec<(usize, usize)>,
+) -> (String, Vec<usize>, Vec<(usize, usize)>) {
+    let Some(fold) = find_leading_blank_fold(&text, &protected) else {
+        return (text, line_map, protected);
+    };
+
+    // A folded line is unprotected by construction (see `find_leading_blank_fold`), so
+    // no literal range can straddle the cut and the shift below is a clean partition.
+    debug_assert!(
+        protected
+            .iter()
+            .all(|&(s, e)| e <= fold.bytes.start || s >= fold.bytes.end),
+        "no literal range may straddle a folded blank line"
+    );
+
+    let shift = fold.bytes.end - fold.bytes.start;
+
+    let mut folded_text = String::with_capacity(text.len() - shift);
+    folded_text.push_str(&text[..fold.bytes.start]);
+    folded_text.push_str(&text[fold.bytes.end..]);
+
+    // The map carries one entry per line of `text`; drop the entries for the lines the
+    // fold removed so the two stay one-for-one.  The clamp keeps a caller that threads
+    // a shorter map (the no-map form below passes an empty one) from panicking.
+    let mut folded_map = line_map;
+    let drain_end = fold.lines.end.min(folded_map.len());
+    let drain_start = fold.lines.start.min(drain_end);
+    folded_map.drain(drain_start..drain_end);
+
+    let folded_protected = protected
+        .into_iter()
+        .map(|(s, e)| {
+            if s >= fold.bytes.end {
+                (s - shift, e - shift)
+            } else {
+                (s, e)
+            }
+        })
+        .collect();
+
+    (folded_text, folded_map, folded_protected)
+}
+
+/// [`fold_leading_blank_run_with_line_map`] for callers that keep no line map.
+///
+/// Minimal mode derives its map by text matching after the transform returns, so it has
+/// none to fold; the empty vector threaded through drains to nothing and is discarded.
+pub(crate) fn fold_leading_blank_run(
+    text: String,
+    protected: Vec<(usize, usize)>,
+) -> (String, Vec<(usize, usize)>) {
+    let (text, _empty, protected) =
+        fold_leading_blank_run_with_line_map(text, Vec::new(), protected);
+    (text, protected)
+}
+
+/// Locate the tail of the body's first blank-line run — every blank line after the
+/// first one.
+///
+/// Returns `None` when the body has no blank run after its first content line, or when
+/// that run is a single blank line and there is nothing to fold.  Blank lines BEFORE the
+/// first content line are left alone: `trim_and_normalize` already drops those entirely.
+fn find_leading_blank_fold(text: &str, protected: &[(usize, usize)]) -> Option<LeadingBlankFold> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut pos = 0usize;
+    let mut line_idx = 0usize;
+    let mut seen_content = false;
+    // Blank lines counted so far in the body's first blank run.
+    let mut blanks_in_run = 0usize;
+    // First line of the run's tail, set when the run's second blank line is reached.
+    let mut tail: Option<(usize, usize)> = None;
+
+    while pos < n {
+        let line_start = pos;
+
+        // Locate the newline that terminates this line.
+        let nl = bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(n, |i| pos + i);
+        // CRLF: the `\r` belongs to the line ending, not to the content.
+        let has_cr = nl > line_start && bytes[nl - 1] == b'\r';
+        let content_end = if has_cr { nl - 1 } else { nl };
+
+        // The blank test is `trim_and_normalize`'s, byte for byte: every byte is
+        // unprotected whitespace, and the line's own position is not inside a literal.
+        let mut trim_end = content_end;
+        while trim_end > line_start {
+            let b = bytes[trim_end - 1];
+            if (b == b' ' || b == b'\t') && !in_protected(trim_end - 1, protected) {
+                trim_end -= 1;
+            } else {
+                break;
+            }
+        }
+        let is_blank = trim_end == line_start && !in_protected(line_start, protected);
+
+        if is_blank && seen_content {
+            // The run's FIRST blank line survives the fold; every later one is residue.
+            blanks_in_run += 1;
+            if blanks_in_run == 2 {
+                tail = Some((line_idx, line_start));
+            }
+        } else if !is_blank {
+            if blanks_in_run > 0 {
+                // The first run is closed; every later run is out of scope.
+                return tail.map(|(l, b)| LeadingBlankFold {
+                    lines: l..line_idx,
+                    bytes: b..line_start,
+                });
+            }
+            seen_content = true;
+        }
+
+        pos = if nl < n { nl + 1 } else { n };
+        line_idx += 1;
+    }
+
+    // The run reaches the end of the body.
+    tail.map(|(l, b)| LeadingBlankFold {
+        lines: l..line_idx,
+        bytes: b..n,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // acceptable in tests
 mod tests {
@@ -839,8 +1068,10 @@ mod tests {
     // ========================================================================
     //
     // These tests exercise the forward-pass precomputation and the O(1) predicate.
-    // All cases use Python (simplest grammar for comment positioning); the
-    // dispatch rules are identical for Python, Ruby, SQL, and Bash.
+    // Most cases use Python (simplest grammar for comment positioning); the
+    // dispatch rules are language-agnostic (#476), so a few cases below use
+    // TypeScript and Rust to pin that the boundary logic holds outside Python
+    // too, and that comments.rs's non-header FIXTURE run stays unaffected.
 
     // Helper: parse Python source into a tree-sitter Tree.
     fn parse_python(source: &str) -> Tree {
@@ -959,13 +1190,21 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_header_end_byte_non_header_language_returns_zero() {
-        // TypeScript is not in the header-language set → always returns 0.
+    fn test_compute_header_end_byte_applies_to_every_language() {
+        // #476: header-comment preservation is no longer gated behind a
+        // four-language allowlist. TypeScript was NOT in the old allowlist and
+        // used to always return 0 here; it must now compute a real boundary,
+        // exactly like Python does, for the same leading-comment shape.
         let ts_source = "// comment\nconst x = 1;\n";
         let mut parser = crate::Parser::new(Language::TypeScript).unwrap();
         let tree = parser.parse(ts_source).unwrap();
+        let comment = nth_root_comment(&tree, 0);
         let heb = compute_header_end_byte(tree.root_node(), ts_source, Language::TypeScript);
-        assert_eq!(heb, 0, "non-header language must return 0");
+        assert_eq!(
+            heb,
+            comment.end_byte(),
+            "TypeScript must now compute a real header_end_byte for a leading comment"
+        );
     }
 
     // ── is_module_header_comment O(1) predicate (via compute_header_end_byte) ─
@@ -984,7 +1223,7 @@ mod tests {
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1 in the walker.
         assert!(
-            is_module_header_comment(comment, Language::Python, heb, 1),
+            is_module_header_comment(comment, heb, 1),
             "comment at byte 0 with no preceding siblings must be a module header"
         );
     }
@@ -998,7 +1237,7 @@ mod tests {
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1 in the walker.
         assert!(
-            is_module_header_comment(spdx, Language::Python, heb, 1),
+            is_module_header_comment(spdx, heb, 1),
             "comment contiguous with shebang must be identified as a module header"
         );
     }
@@ -1012,7 +1251,7 @@ mod tests {
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1; the byte comparison gates this (not depth).
         assert!(
-            !is_module_header_comment(non_header, Language::Python, heb, 1),
+            !is_module_header_comment(non_header, heb, 1),
             "comment after a blank-line break must NOT be a module header (should be stripped)"
         );
     }
@@ -1026,7 +1265,7 @@ mod tests {
         let heb = compute_header_end_byte(tree.root_node(), source, Language::Python);
         // Root children are at depth 1; heb=0 means no header (byte comparison fails).
         assert!(
-            !is_module_header_comment(comment, Language::Python, heb, 1),
+            !is_module_header_comment(comment, heb, 1),
             "comment following a code statement must NOT be a module header"
         );
     }
@@ -1063,8 +1302,151 @@ mod tests {
         // the depth guard is the real gate, not the byte comparison.
         let heb = usize::MAX;
         assert!(
-            !is_module_header_comment(body_comment, Language::Python, heb, 3),
+            !is_module_header_comment(body_comment, heb, 3),
             "inline body comment must NOT be a module header (depth != 1 guard fires)"
+        );
+    }
+
+    // ── Bounding test: comments.rs must NOT change under the #476 fix ───────
+    //
+    // The defect fixed here is a four-language allowlist gating header
+    // preservation. Removing that guard is only correct if it does not widen
+    // WHICH comments get classified as a header — only WHICH LANGUAGES the
+    // existing classification logic runs for. tests/fixtures/rust/comments.rs
+    // is the guard against over-reach: its `// FIXTURE:`/`// TESTS:` comment
+    // run is separated from the leading `//!` module-doc block by a blank
+    // line, so it must stay classified as non-header (STRIP) exactly as
+    // before, even though Rust is now a language the header logic runs for.
+
+    #[test]
+    fn test_rust_fixture_header_boundary_excludes_fixture_marker_run() {
+        let source = include_str!("../../../../tests/fixtures/rust/comments.rs");
+        let mut parser = crate::Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let heb = compute_header_end_byte(tree.root_node(), source, Language::Rust);
+
+        // The header run is only the two leading `//!` doc-comment lines; the
+        // blank line before `// FIXTURE:` must still break the run, so
+        // header_end_byte must land strictly before that marker.
+        let fixture_byte = source
+            .find("// FIXTURE:")
+            .expect("fixture: comments.rs must contain a `// FIXTURE:` marker");
+        assert!(
+            heb < fixture_byte,
+            "header_end_byte ({heb}) must end before the FIXTURE/TESTS run (byte {fixture_byte}); \
+             a blank-line break must still exclude it now that Rust is no longer guarded out"
+        );
+        assert!(
+            heb > 0,
+            "the leading //! module doc lines must still form a (non-empty) header run"
+        );
+        // Guard the other side of the boundary: an under-capture that stopped
+        // after the first `//!` line would also satisfy the two assertions above.
+        let second_doc_byte = source
+            .find("//! This describes the module")
+            .expect("fixture: comments.rs must contain a second leading `//!` line");
+        assert!(
+            heb > second_doc_byte,
+            "the header run must cover BOTH leading `//!` lines (header_end_byte={heb}, \
+             second line starts at byte {second_doc_byte})"
+        );
+    }
+
+    #[test]
+    fn test_compute_header_end_byte_rust_doc_comment_does_not_swallow_blank_line() {
+        // REGRESSION for the over-capture that the #476 allowlist removal exposed.
+        //
+        // tree-sitter-rust's external scanner consumes the terminating `\n` into
+        // `_line_doc_content`, so a `///`/`//!` node's end_byte() sits one byte
+        // PAST its own line. Anchoring the blank-line gap window at that raw end
+        // byte left only ONE `\n` visible across a genuine blank line, the `> 1`
+        // test failed, and the header run continued into the next comment block.
+        // See `end_byte_excluding_line_terminator`.
+        let source = "//! header\n\n// not the header\nfn f() {}\n";
+        let mut parser = crate::Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let heb = compute_header_end_byte(tree.root_node(), source, Language::Rust);
+
+        let non_header = source
+            .find("// not the header")
+            .expect("test source must contain the post-blank-line comment");
+        assert!(
+            heb < non_header,
+            "the blank line must terminate the header run even though the `//!` node's \
+             end_byte includes its own newline (header_end_byte={heb}, post-blank comment \
+             starts at byte {non_header})"
+        );
+        assert!(
+            heb > 0,
+            "the leading `//!` line must still be classified as a header run"
+        );
+    }
+
+    #[test]
+    fn test_compute_header_end_byte_rust_doc_run_spans_contiguous_lines() {
+        // Companion to the test above: the normalisation must not break the
+        // contiguous case. Two `///` lines with no blank between them are ONE
+        // header run, so the boundary must reach past the second line.
+        let source = "/// first\n/// second\n\n// stripped\nfn f() {}\n";
+        let mut parser = crate::Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let heb = compute_header_end_byte(tree.root_node(), source, Language::Rust);
+
+        let second = source.find("/// second").expect("second doc line");
+        let stripped = source.find("// stripped").expect("post-blank comment");
+        assert!(
+            heb > second && heb < stripped,
+            "header run must cover both `///` lines and stop at the blank line \
+             (header_end_byte={heb}, second line at {second}, post-blank at {stripped})"
+        );
+    }
+
+    #[test]
+    fn test_compute_header_end_byte_all_doc_comments_file_is_all_header() {
+        // A file that is nothing but a contiguous comment run has no blank line
+        // and no non-comment node to terminate the header, so the run IS the
+        // header in its entirety. Returning 0 here would strip the file to
+        // nothing — the opposite of what header preservation is for.
+        //
+        // Uses `//!` rather than `//` so every node in the run is one that
+        // swallows its own newline: the newline normalisation must not make a
+        // contiguous run look broken. `test_compute_header_end_byte_all_comments_file`
+        // covers the same shape for a grammar that does not swallow.
+        let source = "//! line one\n//! line two\n//! line three\n";
+        let mut parser = crate::Parser::new(Language::Rust).unwrap();
+        let tree = parser.parse(source).unwrap();
+        let heb = compute_header_end_byte(tree.root_node(), source, Language::Rust);
+
+        let last = source.find("//! line three").expect("third comment line");
+        assert!(
+            heb > last,
+            "an all-comments file must be header to its last line \
+             (header_end_byte={heb}, last line starts at byte {last})"
+        );
+    }
+
+    #[test]
+    fn test_rust_fixture_minimal_transform_unaffected_by_476_fix() {
+        // End-to-end companion to the boundary test above: run the actual
+        // minimal-mode transform and confirm comments.rs's observable output
+        // is unchanged — FIXTURE/TESTS still stripped, module doc still kept.
+        let source = include_str!("../../../../tests/fixtures/rust/comments.rs");
+        let result = crate::transform(source, Language::Rust, crate::Mode::Minimal)
+            .expect("comments.rs must transform successfully in minimal mode");
+        assert!(
+            !result.contains("// FIXTURE:"),
+            "comments.rs must be unaffected by the #476 language-agnostic fix: \
+             the FIXTURE marker must remain stripped, got:\n{result}"
+        );
+        assert!(
+            !result.contains("// TESTS:"),
+            "comments.rs must be unaffected by the #476 language-agnostic fix: \
+             the TESTS marker must remain stripped, got:\n{result}"
+        );
+        assert!(
+            result.contains("//! Module-level doc comment (KEEP)"),
+            "module doc comment must remain preserved (via is_doc_comment, unrelated \
+             to header classification), got:\n{result}"
         );
     }
 
@@ -1232,6 +1614,79 @@ mod tests {
         let input = "hello   \n\n\n\n\nworld  \n";
         let result = trim_and_normalize(input, &[]);
         assert_eq!(result, "hello\n\n\nworld\n");
+    }
+
+    // ========================================================================
+    // fold_leading_blank_run — the residue a stripped comment leaves (#476)
+    // ========================================================================
+
+    #[test]
+    fn test_fold_leading_blank_run_folds_two_blanks_to_one() {
+        let (text, protected) = fold_leading_blank_run("a\n\n\nb\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\nb\n");
+        assert!(protected.is_empty());
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_leaves_a_single_blank_alone() {
+        let (text, _) = fold_leading_blank_run("a\n\nb\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\nb\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_touches_only_the_first_run() {
+        // Later runs keep trim_and_normalize's 3+-to-2 cap: spacing below the header
+        // is out of scope, so the fold can never cost more than one line per file.
+        let (text, _) = fold_leading_blank_run("a\n\n\nb\n\n\nc\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\nb\n\n\nc\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_ignores_blanks_before_the_first_content_line() {
+        // trim_and_normalize drops those entirely, so claiming them here would make the
+        // fold mistake the body's real first run for a later one and skip it.
+        let (text, _) = fold_leading_blank_run("\n\na\n\n\nb\n".to_string(), Vec::new());
+        assert_eq!(text, "\n\na\n\nb\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_folds_a_run_that_ends_the_body() {
+        let (text, _) = fold_leading_blank_run("a\n\n\n".to_string(), Vec::new());
+        assert_eq!(text, "a\n\n");
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_never_folds_inside_a_literal() {
+        // A blank line inside a multi-line string is not blank by trim_and_normalize's
+        // test, and the fold applies the same one.
+        // Bytes: a=0 \n=1 \n=2 \n=3 b=4 \n=5 — the two inner newlines are literal body.
+        let (text, protected) = fold_leading_blank_run("a\n\n\nb\n".to_string(), vec![(2, 4)]);
+        assert_eq!(text, "a\n\n\nb\n");
+        assert_eq!(protected, vec![(2, 4)]);
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_shifts_protected_ranges_past_the_cut() {
+        // Bytes: a=0 \n=1 \n=2 \n=3 "=4 x=5 "=6 \n=7 — the literal body `x` is [5..6).
+        let (text, protected) = fold_leading_blank_run("a\n\n\n\"x\"\n".to_string(), vec![(5, 6)]);
+        assert_eq!(text, "a\n\n\"x\"\n");
+        assert_eq!(
+            protected,
+            vec![(4, 5)],
+            "one byte was cut before the range, so it moves down by one"
+        );
+    }
+
+    #[test]
+    fn test_fold_leading_blank_run_drops_the_matching_line_map_entry() {
+        // One entry per line: "a", blank, blank, "b".
+        let (text, map, _) = fold_leading_blank_run_with_line_map(
+            "a\n\n\nb\n".to_string(),
+            vec![1, 2, 7, 8],
+            Vec::new(),
+        );
+        assert_eq!(text, "a\n\nb\n");
+        assert_eq!(map, vec![1, 2, 8], "the folded line's entry goes with it");
     }
 
     #[test]
@@ -1795,11 +2250,55 @@ mod tests {
     }
 
     #[test]
+    fn test_large_doc_blocks_header_banner_mentions_no_other_section_marker() {
+        // TRIPWIRE for the "distinct marker per section" rule above.
+        //
+        // The banner is the fixture's module header, so it survives every mode
+        // verbatim. A section marker written into its PROSE would then satisfy
+        // (or defeat) the `contains()` checks in the section tests regardless of
+        // what the transform actually did to that section — a false failure in
+        // the `!contains` direction and, worse, a silent false PASS in the
+        // `contains` direction. Keep the banner free of every marker but its own.
+        let banner = LARGE_DOC_BLOCKS
+            .lines()
+            .take_while(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            banner.contains("SECTIONHDR_MODULEHEADER"),
+            "the header banner must carry its own marker, got:\n{banner}"
+        );
+        for marker in [
+            "SECTIONA_HEADERRUN",
+            "SECTIONB_KEEP",
+            "SECTIONB_STRIP",
+            "SECTIONC_BLANKBROKEN",
+            "SECTIOND_ADJACENT",
+            "SECTIONE_",
+        ] {
+            assert!(
+                !banner.contains(marker),
+                "the header banner must not mention `{marker}`: the banner is preserved \
+                 verbatim, so its prose — not the transform — would decide the section \
+                 tests' `contains()` checks. Banner:\n{banner}"
+            );
+        }
+    }
+
+    #[test]
     fn test_large_doc_blocks_sections_minimal() {
         let out = transform_go(LARGE_DOC_BLOCKS, true);
 
-        // Section A: leading run before `package main` — terminator is
-        // package_clause, not a declaration → every line STRIPPED.
+        // Section HDR: the fixture's own top-of-file run. Contiguous from byte
+        // 0, so it is the module header and is PRESERVED (#476).
+        assert!(
+            out.contains("SECTIONHDR_MODULEHEADER"),
+            "the top-of-file header run must be preserved"
+        );
+
+        // Section A: run before `package main`, separated from the header run by
+        // a blank line — terminator is package_clause, not a declaration, and it
+        // is not the module header → every line STRIPPED.
         assert!(
             !out.contains("SECTIONA_HEADERRUN"),
             "Section A (run before `package main`) must be stripped entirely"
@@ -1858,6 +2357,7 @@ mod tests {
         // mode the cat/head/tail rewrite selects for regular code files
         // (ADR-008), which makes it the production path for this predicate.
         let out = transform_go(LARGE_DOC_BLOCKS, false);
+        assert!(out.contains("SECTIONHDR_MODULEHEADER"));
         assert!(!out.contains("SECTIONA_HEADERRUN"));
         assert!(out.contains("SECTIONB_KEEP_0"));
         assert!(!out.contains("SECTIONB_STRIP_0"));
@@ -1968,10 +2468,19 @@ mod tests {
     // fixed overhead pulls it well below 2.0. The Go guards measure ~1.84–2.02,
     // so 2.5 would leave only ~25 % headroom and flake on a loaded machine.
 
-    /// N contiguous comments at the very top, then `package main`.
+    /// A one-line module header, a blank line, then N contiguous comments, then
+    /// `package main`.
     /// Worst case for the old walk: every comment walked the whole remaining run.
+    ///
+    /// The header line and the blank line after it are what keep the N-comment
+    /// run OUT of the module header (#476): a run that started at byte 0 would
+    /// be the header and be preserved, which would test header preservation
+    /// rather than the Go doc-comment rule this fixture exists for. The run is
+    /// still one contiguous sibling group at root level, so the pathological
+    /// shape the timing guards measure is unchanged.
     fn go_leading_run_source(n: usize) -> String {
-        let mut s = String::with_capacity(n * 26 + 64);
+        let mut s = String::with_capacity(n * 26 + 96);
+        s.push_str("// MODULEHEADER kept by header preservation\n\n");
         for i in 0..n {
             s.push_str(&format!("// leading run line {i}\n"));
         }
@@ -2054,13 +2563,20 @@ mod tests {
         let source = go_leading_run_source(n);
         let (_, elapsed_median) = time_go_minimal(&source);
 
-        // Behaviour assertion alongside the timing: the whole run precedes
+        // Behaviour assertion alongside the timing: the run precedes
         // `package main`, which is NOT an is_go_declaration kind, so every one
-        // of the N comments must be stripped.
+        // of the N comments must be stripped. The run sits below the module
+        // header (see `go_leading_run_source`), so header preservation does not
+        // rescue it.
         let out = transform_go(&source, true);
         assert!(
             !out.contains("// leading run line"),
-            "a leading comment run terminated by package_clause must be stripped entirely"
+            "a comment run terminated by package_clause must be stripped entirely"
+        );
+        // Companion: the top-of-file header line IS preserved (#476).
+        assert!(
+            out.contains("// MODULEHEADER kept by header preservation"),
+            "the top-of-file header line must be preserved"
         );
 
         // Absolute gate: uses MEDIAN of 5 samples (scaling_guard rule).

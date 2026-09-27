@@ -207,7 +207,7 @@ impl AstIndexReader {
         // The checksum covers idx_mmap[HEADER_SIZE..expected_idx_size],
         // the contiguous post-header payload (bigrams + trigrams + file_meta).
         //
-        // The dual lexical+AST index is one coherent unit (ADR-006), so this
+        // The dual lexical+AST index is one coherent unit (SEARCH-ADR-006), so this
         // reader carries the SAME validity-marker fast path as the lexical
         // reader (#376, AD-376-5): a marker proving byte-identity to a prior
         // verified open moves the full CRC32 off the --ast per-query hot path.

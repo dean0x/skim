@@ -20,12 +20,18 @@
 //! ## What these tests assert
 //!
 //! For each reported command:
-//!   - Run skim (the binary under test) and capture stdout length.
-//!   - Run the underlying tool directly and capture its stdout length.
-//!   - Assert: `skim_len <= raw_len` (never expand, #317 invariant).
+//!   - Run skim (the binary under test) and capture stdout bytes.
+//!   - Run the underlying tool directly and capture its stdout bytes.
+//!   - Assert the two byte strings are EQUAL.
 //!
-//! "Never expand" is the hard invariant — skim may be equal (passthrough) or
-//! strictly shorter (compression), but never longer than raw.
+//! Equality, not `skim_len <= raw_len`. Both commands covered here — `ls` and
+//! `wc` — route through pure-passthrough handlers (ADR-009: `parse_ls_impl` and
+//! the `wc` handler delegate to `passthrough_parse`), so raw is the whole
+//! contract in both directions. A `<=` bound admits a handler that silently
+//! SHRANK the output, which is the direction #317 actually forbids ("never show
+//! less than the raw tool") and the direction with no upper limit on the damage.
+//! Where a handler genuinely compresses, an equality assertion would be wrong
+//! and the test does not belong in this file.
 
 use std::fs;
 
@@ -43,12 +49,15 @@ fn skim_cmd() -> Command {
 // Report 7.1 — `skim ls -la <dir>` must not expand relative to raw `ls -la`
 // ============================================================================
 
-/// `skim ls -la <tiny_dir>` stdout must be ≤ raw `ls -la <tiny_dir>` stdout.
+/// `skim ls -la <tiny_dir>` stdout must be the exact bytes raw
+/// `ls -la <tiny_dir>` serves.
 ///
 /// This converts the unit-level guard logic into proof on the real reported
-/// regression (report 7.1).  A failure here means the net-savings guard is
-/// not firing on the `ls` command path, allowing skim to emit a larger output
-/// than the raw tool.
+/// regression (report 7.1).  Expansion means the net-savings guard is not
+/// firing on the `ls` command path; a shortfall means `ls` stopped being the
+/// byte-faithful passthrough ADR-009 makes it (`parse_ls_impl` delegates to
+/// `passthrough_parse`), which is how the pre-ADR-009 parser silently dropped
+/// entries and the native `total N` header at scale.
 #[test]
 #[cfg(unix)]
 fn no_expansion_ls_la_tiny_dir() {
@@ -74,22 +83,26 @@ fn no_expansion_ls_la_tiny_dir() {
     let skim_len = skim_output.stdout.len();
     let raw_len = raw_output.stdout.len();
 
-    // #317 invariant: skim must NEVER emit MORE bytes than raw.
-    assert!(
-        skim_len <= raw_len,
-        "report 7.1: skim ls -la expanded output\n  \
+    // #317 invariant, in its strong form: `ls` is a pure passthrough, so the
+    // served bytes must EQUAL raw, in both directions.
+    assert_eq!(
+        skim_output.stdout,
+        raw_output.stdout,
+        "report 7.1: skim ls -la diverged from raw ls -la\n  \
          raw={raw_len}B  skim={skim_len}B\n  \
          skim stdout={:?}\n  \
          raw stdout={:?}\n  \
-         This means the net-savings guard failed to fire on the ls path.",
+         Expanding means the net-savings guard failed to fire on the ls path; \
+         shrinking means the ls handler is no longer byte-faithful (ADR-009).",
         String::from_utf8_lossy(&skim_output.stdout),
         String::from_utf8_lossy(&raw_output.stdout)
     );
 }
 
-/// `skim ls <dir>` (without -la) also must not expand.
+/// `skim ls <dir>` (without -la) must also serve raw's exact bytes.
 ///
-/// Tests the basic `ls` compression path in addition to the `-la` variant.
+/// Covers the bare `ls` path alongside the `-la` variant; both reach the same
+/// pure-passthrough handler.
 #[test]
 #[cfg(unix)]
 fn no_expansion_ls_plain_tiny_dir() {
@@ -112,10 +125,15 @@ fn no_expansion_ls_plain_tiny_dir() {
     let skim_len = skim_output.stdout.len();
     let raw_len = raw_output.stdout.len();
 
-    assert!(
-        skim_len <= raw_len,
-        "report 7.1 (plain ls): skim expanded output\n  \
-         raw={raw_len}B  skim={skim_len}B",
+    assert_eq!(
+        skim_output.stdout,
+        raw_output.stdout,
+        "report 7.1 (plain ls): skim diverged from raw ls\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout)
     );
 }
 
@@ -123,10 +141,17 @@ fn no_expansion_ls_plain_tiny_dir() {
 // Report 7.2 — `skim wc -c` must not expand relative to raw `wc -c`
 // ============================================================================
 
-/// `skim wc -c` on a tiny/empty input must not expand relative to raw `wc -c`.
+/// `skim wc -c` on a tiny/empty input must serve the exact bytes raw `wc -c`
+/// serves.
 ///
 /// This converts the unit-level guard logic into proof on the real reported
 /// regression (report 7.2).
+///
+/// Asserted as EQUALITY, not `skim_len <= raw_len`. A non-expansion bound is
+/// satisfied by a handler that silently SHRANK the output, which is the
+/// direction #317 actually forbids ("never show less than the raw tool") — and
+/// `wc` emits only a count, with no accompanying view a reader could falsify a
+/// wrong number against.
 ///
 /// We use a tiny file (`"hello\n"`) passed as an argument so both skim and raw
 /// wc process the same input without depending on stdin piping in tests.
@@ -153,14 +178,17 @@ fn no_expansion_wc_c_tiny_input() {
     let skim_len = skim_output.stdout.len();
     let raw_len = raw_output.stdout.len();
 
-    // #317 invariant: never expand.
-    assert!(
-        skim_len <= raw_len,
-        "report 7.2: skim wc -c expanded output\n  \
+    // #317 invariant, in its strong form: on the passthrough family the served
+    // bytes must EQUAL raw, in both directions.
+    assert_eq!(
+        skim_output.stdout,
+        raw_output.stdout,
+        "report 7.2: skim wc -c diverged from raw wc -c\n  \
          raw={raw_len}B  skim={skim_len}B\n  \
          skim stdout={:?}\n  \
          raw stdout={:?}\n  \
-         This means the net-savings guard failed to fire on the wc path.",
+         Expanding means the net-savings guard failed to fire on the wc path; \
+         shrinking means the wc handler is not byte-faithful.",
         String::from_utf8_lossy(&skim_output.stdout),
         String::from_utf8_lossy(&raw_output.stdout)
     );
@@ -168,8 +196,10 @@ fn no_expansion_wc_c_tiny_input() {
 
 /// `skim wc -c` on an empty file (report 7.2, edge case).
 ///
-/// wc -c on empty file emits "0 <filename>" (7 bytes or so).
-/// skim must not expand this.
+/// `wc -c` on an empty file emits "0 <filename>". skim must serve those exact
+/// bytes — the empty-input edge is where a handler is most likely to emit its
+/// own "nothing to show" rendering instead of the tool's answer, and a `<=`
+/// bound would call that a pass.
 #[test]
 #[cfg(unix)]
 fn no_expansion_wc_c_empty_file() {
@@ -191,10 +221,15 @@ fn no_expansion_wc_c_empty_file() {
     let skim_len = skim_output.stdout.len();
     let raw_len = raw_output.stdout.len();
 
-    assert!(
-        skim_len <= raw_len,
-        "report 7.2 (empty file): skim wc -c expanded output\n  \
-         raw={raw_len}B  skim={skim_len}B",
+    assert_eq!(
+        skim_output.stdout,
+        raw_output.stdout,
+        "report 7.2 (empty file): skim wc -c diverged from raw wc -c\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout)
     );
 }
 
@@ -202,7 +237,11 @@ fn no_expansion_wc_c_empty_file() {
 // Extra: wc -l (report 7.2 variant — line count)
 // ============================================================================
 
-/// `skim wc -l` on a tiny input must not expand relative to raw `wc -l`.
+/// `skim wc -l` on a tiny input must serve the exact bytes raw `wc -l` serves.
+///
+/// The line-count variant of report 7.2. `wc -l` is the consumer #317's own
+/// prose names, and its output is a bare number with no view to falsify it
+/// against, so equality is the only assertion that means anything here.
 #[test]
 #[cfg(unix)]
 fn no_expansion_wc_l_tiny_input() {
@@ -224,10 +263,15 @@ fn no_expansion_wc_l_tiny_input() {
     let skim_len = skim_output.stdout.len();
     let raw_len = raw_output.stdout.len();
 
-    assert!(
-        skim_len <= raw_len,
-        "report 7.2 (wc -l): skim expanded output\n  \
-         raw={raw_len}B  skim={skim_len}B",
+    assert_eq!(
+        skim_output.stdout,
+        raw_output.stdout,
+        "report 7.2 (wc -l): skim diverged from raw wc -l\n  \
+         raw={raw_len}B  skim={skim_len}B\n  \
+         skim stdout={:?}\n  \
+         raw stdout={:?}",
+        String::from_utf8_lossy(&skim_output.stdout),
+        String::from_utf8_lossy(&raw_output.stdout)
     );
 }
 

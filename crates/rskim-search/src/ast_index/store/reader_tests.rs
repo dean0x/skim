@@ -533,7 +533,7 @@ fn a14_overflow_header_huge_bigram_count() {
 // v1 measured baseline: ~1.23×.  v2 adds structural n-grams and +10 bytes/file
 // meta overhead; expected v2 ratio ~1.3×.  Guard raised to <2.2× per PF-005:
 // relaxation justified by measured ratio + structural capability expansion.
-// Applies ADR-003 (grounded regression guard).  On-disk compression tracked
+// Applies SEARCH-ADR-003 (grounded regression guard).  On-disk compression tracked
 // in issue #273.
 // ============================================================================
 
@@ -627,7 +627,7 @@ fn ast_index_size_ratio() {
     // structural markers; a genuine O(files²) bloat regression would push
     // the ratio well above 2.2× and still fires.
     //
-    // ADR-003: regression guard must be empirically grounded.
+    // SEARCH-ADR-003: regression guard must be empirically grounded.
     //
     // ON-DISK COMPRESSION (delta encoding + VarInt / Roaring Bitmaps) that
     // would push the ratio well below 1× is tracked in issue #273.
@@ -1134,7 +1134,7 @@ fn ac2_decode_helpers_agree_on_known_buffer() {
 // #376 — validity-marker caching for the AST reader (AD-376-5, AC11)
 // ===========================================================================
 //
-// The dual lexical+AST index is one coherent unit (ADR-006), so the AST reader
+// The dual lexical+AST index is one coherent unit (SEARCH-ADR-006), so the AST reader
 // carries the SAME marker fast path as the lexical reader. These are the AC1 /
 // AC2 / AC5 / AC6 / AC8 analogues for `AstIndexReader::open`. NOTE: the AST CRC
 // covers the `.skidx` PAYLOAD (bytes [HEADER_SIZE..]); the marker also stats

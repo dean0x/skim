@@ -50,13 +50,13 @@ pub(crate) struct StringSpan {
 /// Panics in both debug and release builds if the span is inconsistent with `raw`:
 /// `span.start <= span.end && span.end <= raw.len()`.  A violated span cannot be
 /// triggered by untrusted input alone — it requires a code bug (e.g., passing a
-/// span derived from a different buffer).  Per ADR-006, an unrecoverable invariant
+/// span derived from a different buffer).  Per the fail-loud design constraint, an unrecoverable invariant
 /// violation must fail loud in release builds rather than silently producing wrong
 /// output or a cryptic index panic.  The only live call site (`mutate_anthropic`
 /// in `mutate.rs`) derives the span from `find_leaf_span(&body.raw_bytes, …)` and
 /// immediately calls `splice_replace(&body.raw_bytes, span, …)` on the same buffer,
 /// so the invariant holds by construction.  This matches the sibling `apply_leaf_mutation`
-/// which also uses `assert!` (not `debug_assert!`) for its index-bounds check (ADR-006).
+/// which also uses `assert!` (not `debug_assert!`) for its index-bounds check (unrecoverable invariant).
 ///
 /// # Errors
 ///
@@ -65,7 +65,7 @@ pub(crate) struct StringSpan {
 pub(crate) fn splice_replace(raw: &[u8], span: StringSpan, new_text: &str) -> Result<Vec<u8>> {
     assert!(
         span.start <= span.end && span.end <= raw.len(),
-        "splice_replace: span {span:?} is out of bounds for raw buffer of len {} (ADR-006)",
+        "splice_replace: span {span:?} is out of bounds for raw buffer of len {} (unrecoverable invariant)",
         raw.len()
     );
 
@@ -695,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "ADR-006")]
+    #[should_panic(expected = "unrecoverable invariant")]
     fn splice_replace_panics_on_out_of_bounds_span_in_release() {
         // assert! (not debug_assert!) fires in release builds for a span past raw.len().
         let raw = b"hi";

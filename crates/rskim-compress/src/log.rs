@@ -128,13 +128,13 @@ impl<T: Into<String>> ParseResult<T> {
 
 /// Whether log compression must be lossless (proxy egress) or may be lossy (CLI ingestion).
 ///
-/// # ADR-007 (L3 lossless egress)
+/// # L3-ADR-007 (L3 lossless egress)
 ///
 /// The CLI path is `Lossy` — it compresses for the agent's own ingest and the agent can
 /// re-read the original. The proxy path is `Lossless` — the downstream LLM only sees what
 /// the proxy forwards; any discard is unrecoverable.
 ///
-/// `Lossless` invariants (per ADR-007):
+/// `Lossless` invariants (per L3-ADR-007):
 /// - Timestamps: captured as min–max metadata; never silently stripped.
 /// - Dedup: case-sensitive keying; first-seen ordering preserved.
 /// - DEBUG/TRACE lines: included, never hidden.
@@ -355,7 +355,7 @@ pub struct LogFlags {
     /// Whether compression must be lossless (proxy egress) or may be lossy (CLI).
     ///
     /// Default: `Lossy` — all existing callers are unchanged. Set to `Lossless`
-    /// for the proxy egress path (see ADR-007 and `Losslessness` docs).
+    /// for the proxy egress path (see L3-ADR-007 and `Losslessness` docs).
     pub losslessness: Losslessness,
 }
 
@@ -459,7 +459,7 @@ enum FrameContext {
 /// Behaviour is identical to the original `cmd/log.rs::compress_log` in the
 /// rskim binary. The rskim binary's handler is re-pointed here (R1 / #327).
 ///
-/// # ADR-007 — Losslessness regime
+/// # L3-ADR-007 — Losslessness regime
 ///
 /// When `flags.losslessness == Losslessness::Lossless`, dispatches to
 /// `compress_log_lossless` — a content-preserving path that annotates
@@ -482,14 +482,14 @@ pub fn compress_log(input: &str, flags: &LogFlags) -> ParseResult<LogResult> {
 }
 
 // ============================================================================
-// Lossless mode entry point and helper functions (ADR-007)
+// Lossless mode entry point and helper functions (L3-ADR-007)
 // ============================================================================
 
 /// Lossless mode compression — content-preserving annotated form.
 ///
 /// Dispatched from `compress_log` when `flags.losslessness == Losslessness::Lossless`.
 ///
-/// # ADR-007 invariants
+/// # L3-ADR-007 invariants
 ///
 /// - JSON-structured logs: always `Passthrough` (extra fields beyond level+message
 ///   would be silently dropped — axes 7 and 8 / content-discarding).
@@ -546,7 +546,7 @@ fn strip_timestamp_lossless(line: &str, keep_timestamps: bool) -> (&str, Option<
 /// Returns `None` if flushing would require elision (>3 frames) — the caller
 /// must return `Passthrough` for the whole block. Returns `Some(())` otherwise.
 ///
-/// # ADR-007 — axes 5 and 6
+/// # L3-ADR-007 — axes 5 and 6
 ///
 /// Stack frame elision (keep-last-3 rule) and PENDING_STACK_CAP eviction are
 /// both content-discarding operations. If either would trigger, signal passthrough.
@@ -577,14 +577,14 @@ fn try_flush_stack_lossless(
 /// Returns `None` when any content-discarding operation would be required
 /// (stack elision, cap eviction, etc.). The caller returns `Passthrough`.
 ///
-/// Per ADR-007: annotations may summarize METADATA (timestamps→ranges,
+/// Per L3-ADR-007: annotations may summarize METADATA (timestamps→ranges,
 /// duplicates→counts) but CONTENT bytes are never discarded.
 ///
 /// # Line-count guard (P2-3 / Scrutinizer)
 ///
 /// If the input has more than [`MAX_INPUT_LINES`] lines, returns `None` immediately
 /// (whole-block passthrough). The `.take(MAX_INPUT_LINES)` loop below would silently
-/// discard all lines beyond the cap, violating ADR-007. Fence bodies are bounded by
+/// discard all lines beyond the cap, violating L3-ADR-007. Fence bodies are bounded by
 /// the 64 KiB block prefilter, keeping this check nearly always O(0) in practice.
 fn try_parse_regex_logs_lossless(input: &str, flags: &LogFlags) -> Option<LogResult> {
     // Guard: more lines than the cap → passthrough (no silent truncation on egress).
@@ -636,7 +636,7 @@ fn try_parse_regex_logs_lossless(input: &str, flags: &LogFlags) -> Option<LogRes
                 !pending_stack.is_empty(),
                 "FrameContext::PythonFrame requires a frame in pending_stack"
             );
-            // ADR-007 (content-discarding guard, same family as axes 5/6): appending
+            // L3-ADR-007 (content-discarding guard, same family as axes 5/6): appending
             // beyond the per-frame continuation cap would SILENTLY DROP this line's
             // content. In Lossless mode content is never discarded → signal
             // whole-block Passthrough (None), mirroring the PENDING_STACK_CAP eviction
@@ -2532,7 +2532,7 @@ mod tests {
     }
 
     // ============================================================================
-    // Lossless regime tests (Step 8 / ADR-007)
+    // Lossless regime tests (Step 8 / L3-ADR-007)
     //
     // One discriminating test per lossy axis. Each test fails if the axis "leaks"
     // into Lossless mode (i.e., the code silently applies a Lossy operation when
@@ -2735,7 +2735,7 @@ mod tests {
         /// Axis 6b (P0 regression, #427): a Python `File "..."` frame followed by
         /// MORE indented continuation lines than `MAX_CONTINUATIONS_PER_FRAME` must
         /// NOT silently drop the overflow line in Lossless mode. Dropping a
-        /// continuation line discards content on the egress path (ADR-007 violation);
+        /// continuation line discards content on the egress path (L3-ADR-007 violation);
         /// the whole block must fall through to Passthrough instead.
         ///
         /// Discriminating: before the fix, the 5th continuation line was appended-or-
@@ -2976,7 +2976,7 @@ mod tests {
 
         /// P2-3 (Scrutinizer): Lossless path with >MAX_INPUT_LINES lines must return
         /// Passthrough rather than silently truncating. Truncation is content-discarding
-        /// (ADR-007 violation); the whole block must fall through byte-identical instead.
+        /// (L3-ADR-007 violation); the whole block must fall through byte-identical instead.
         ///
         /// Discriminating: before the fix, `.take(MAX_INPUT_LINES)` silently dropped
         /// lines beyond the cap. This test asserts `is_passthrough()` and byte-identity,

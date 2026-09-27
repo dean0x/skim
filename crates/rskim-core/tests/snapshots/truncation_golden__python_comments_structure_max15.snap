@@ -7,7 +7,7 @@ expression: "snap(PYTHON_COMMENTS, Language::Python,\nTransformConfig::with_mode
 # ... (6 lines truncated)
 def add(x: int, y: int) -> int:
      {...}
-# ... (3 lines truncated)
+# ... (16 lines truncated)
 class Calculator:
     """A simple calculator class (KEEP)."""
 
@@ -16,4 +16,4 @@ class Calculator:
 
     def add(self, x: int) -> int:
          {...}
-# ... (9 lines truncated)
+# ... (12 lines truncated)

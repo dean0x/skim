@@ -6,6 +6,20 @@
 //! Exit codes:
 //!   0 = healthy (no drift detected)
 //!   1 = drift (unpinned hook, path/version/commit mismatch, or ≥1 commit behind HEAD)
+//!
+//! A hook that credibly declares dev mode (ADR-019 — `HOOK_DEV_MARKER` plus a
+//! `ScriptIntegrity::Verified` manifest) narrows that second row: the
+//! commit-equality gate is waived and a behind-HEAD count is demoted to an
+//! advisory `⚠` that still prints, so those two conditions stop contributing to
+//! exit 1. That demotion is clone-wide rather than per-agent — one agent's
+//! declaration demotes the behind-HEAD verdict for the entire run; see
+//! `HookSectionVerdict::any_dev_pinned` for the scope and why it is drawn
+//! there. A version mismatch, an unpinned hook and a tampered or unreadable
+//! script are drift regardless of mode; a binary-pin mismatch was already
+//! advisory for every mode (ADR-014). Every hook line a credible declaration can
+//! reach — advisory or drift — carries the literal `dev-pinned`, which is what
+//! makes `skim doctor | grep dev-pinned` a usable one-line CI guard even when
+//! the exit code is 1.
 
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
@@ -54,8 +68,8 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     println!();
 
     // 3. Hooks
-    let hook_drift = print_hook_section(compiled_version, compiled_commit)?;
-    if hook_drift {
+    let hooks = print_hook_section(compiled_version, compiled_commit)?;
+    if hooks.drift {
         drift = true;
     }
     println!();
@@ -72,7 +86,12 @@ pub(crate) fn run(args: &[String], _analytics: &AnalyticsConfig) -> anyhow::Resu
     println!();
 
     // 6. Staleness vs. repo HEAD
-    let staleness_drift = print_staleness_section(compiled_commit);
+    //
+    // Keyed on what the INSTALLED HOOKS declare (gathered in section 3), never on
+    // a flag: `skim doctor` takes no `--dev`, so the installed state is the only
+    // input it has. When no hook is dev-pinned this is `false` and the section
+    // behaves exactly as it always has.
+    let staleness_drift = print_staleness_section(compiled_commit, hooks.any_dev_pinned);
     if staleness_drift {
         drift = true;
     }
@@ -372,7 +391,7 @@ fn print_path_section(entries: &[PathEntry]) -> bool {
 /// - `Unreadable` → drift (`✗`).
 /// - `NoManifest` → advisory only (`⚠`), **not** drift — users who installed
 ///   before manifests existed have done nothing wrong and must not have their
-///   `skim doctor` exit-0 broken (applies ADR-004 backward-compat intent).
+///   `skim doctor` exit-0 broken (applies ADR-014 backward-compat intent).
 /// - `Verified`   → fall through to existing pin/currency logic.
 fn hook_status_line(
     facts: &crate::cmd::init::HookFacts,
@@ -388,6 +407,23 @@ fn hook_status_line(
 
     let hook_version = facts.hook_version.as_deref().unwrap_or("?");
     let hook_commit_str = facts.hook_commit.as_deref().unwrap_or("?");
+
+    // Whether this install's dev declaration may be acted on — the same single
+    // rule `skim init` and the staleness section route through, never a second
+    // reading of the marker (PF-016).
+    let dev_pinned =
+        crate::cmd::hooks::honour_dev_declaration(facts.hook_mode, &facts.script_integrity);
+    // Empty for every strict install, which is what keeps the lines below
+    // byte-identical to what they were before dev mode existed. When non-empty it
+    // carries BOTH commits: `commit {hook_commit_str}` earlier in the line is the
+    // one the install froze, and this is the one the running binary was built
+    // from — their distance is how old the dev install is, which is the whole
+    // reason the commit field keeps its real value instead of a placeholder.
+    let dev_note = if dev_pinned {
+        format!("  dev-pinned (binary commit {compiled_commit})")
+    } else {
+        String::new()
+    };
 
     // Gate on integrity first — verdict is derived from the manifest, not from
     // the hook bytes that a tamper would modify.
@@ -446,11 +482,21 @@ fn hook_status_line(
     };
 
     // NoManifest / Verified: check pin format and currency.
+    //
+    // Both branches below interpolate `{dev_note}`, and the two integrity
+    // branches above deliberately do not: `dev_pinned` is
+    // `honour_dev_declaration`, which requires `Verified`, so under `Tampered`
+    // and `Unreadable` the note is empty BY CONSTRUCTION and printing it there
+    // would imply a state no input can reach. These two are the drift verdicts a
+    // dev install can actually reach — a version mismatch is not waived by the
+    // marker, and neither is an unpinned script — and they are exactly where the
+    // `skim doctor | grep dev-pinned` guard would otherwise go silent: it would
+    // miss the dev install at the one moment the exit code is 1.
     if !facts.hook_uses_pinned_binary {
         return (
             true,
             append_advisory(format!(
-                "  ✗ {agent_cli_name}  installed (v{hook_version})  unpinned — \
+                "  ✗ {agent_cli_name}  installed (v{hook_version}){dev_note}  unpinned — \
                  run `./target/release/skim init --yes` to pin"
             )),
         );
@@ -467,12 +513,15 @@ fn hook_status_line(
             format!("version mismatch (hook: {hook_version}, binary: {compiled_version})")
         } else {
             // Pinned format confirmed + version matches → commit must differ.
+            // Unreachable while `dev_pinned` holds: the waiver is precisely the
+            // commit-equality gate (ADR-019), so a credible dev declaration that
+            // reaches this branch reached it on the version term.
             format!("commit mismatch (hook: {hook_commit_str}, binary: {compiled_commit})")
         };
         return (
             true,
             append_advisory(format!(
-                "  ✗ {agent_cli_name}  installed  pin: {pin}  [{reason}]  — \
+                "  ✗ {agent_cli_name}  installed{dev_note}  pin: {pin}  [{reason}]  — \
                  run `./target/release/skim init --yes` to update"
             )),
         );
@@ -488,7 +537,7 @@ fn hook_status_line(
         return (
             false,
             append_advisory(format!(
-                "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}  \
+                "  ⚠ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str}){dev_note}  pin: {pin}  \
                  [binary pin mismatch (hook: {pin}, running: {running})] — \
                  run `./target/release/skim init --yes` to update"
             )),
@@ -496,19 +545,79 @@ fn hook_status_line(
     }
 
     // Fully current (with or without manifest).
+    //
+    // A dev install lands here — the commit gate it waived is the one that would
+    // otherwise have diverted it — and must NOT render as `✓`. The whole point of
+    // a visible dev install is that it cannot masquerade as a clean one: the
+    // waiver bought exit 0, not a clean bill of health. `⚠` plus the literal
+    // `dev-pinned` is also what makes `skim doctor | grep dev-pinned` usable as a
+    // one-line CI guard — which is why every branch a credible declaration can
+    // reach carries the note, not just this one: the pin-mismatch branch (a
+    // second clone), the unpinned branch, and the currency branch (a version
+    // mismatch, which the marker does not waive and which exits 1). A guard that
+    // goes quiet on the drift verdicts is a guard that answers "is this machine
+    // on a dev pin?" wrongly at exactly the moment the answer matters.
     let pin = facts.hook_binary_pin.as_deref().unwrap_or("?");
+    let glyph = if dev_pinned { "⚠" } else { "✓" };
     (
         false,
         append_advisory(format!(
-            "  ✓ {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str})  pin: {pin}"
+            "  {glyph} {agent_cli_name}  installed (v{hook_version}, commit {hook_commit_str}){dev_note}  pin: {pin}"
         )),
     )
 }
 
-/// Print the hooks section and return true if any drift is detected.
-fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::Result<bool> {
+/// What the hooks section observed, for the sections that follow it.
+struct HookSectionVerdict {
+    /// True when at least one agent's hook contributes drift (exit 1).
+    drift: bool,
+    /// True when at least one INSTALLED hook credibly declares dev mode.
+    ///
+    /// "Credibly" is [`crate::cmd::hooks::honour_dev_declaration`]: the script
+    /// must declare the marker AND its manifest must verify. This is what the
+    /// staleness section keys off — `print_staleness_section` reads the compiled
+    /// commit and nothing about the install, so without this it could not see a
+    /// dev declaration at all.
+    ///
+    /// # Scope: clone-wide, not per-agent
+    ///
+    /// This is an OR across every supported agent, so ONE agent's dev pin demotes
+    /// [`staleness_verdict`] for the WHOLE RUN — including for hooks belonging to
+    /// other agents, and, on a machine that keeps parallel clones, for hooks
+    /// pinned to a different binary than the one being asked. A dev pin in one
+    /// clone's Cursor hook therefore silences the behind-HEAD signal that would
+    /// otherwise cover another clone's Claude hook. Only this section is affected:
+    /// [`hook_status_line`] is computed per agent, so each hook's own line still
+    /// reports that hook's own verdict, and `skim doctor | grep dev-pinned` names
+    /// exactly the agents that declare it.
+    ///
+    /// # Why it is not narrowed to the agent pinning the running binary
+    ///
+    /// Because the narrower rule would have to gate on
+    /// `HookFacts::pin_is_current`, and that field is deliberately a
+    /// display-without-gate signal (PF-015): ADR-014 holds binary provenance
+    /// advisory, never enforcing, and the pin-mismatch branch of
+    /// [`hook_status_line`] returns `⚠`/no-drift for exactly that reason.
+    /// Gating an exit code on it would promote the one signal both decisions
+    /// agreed to keep advisory. It would also flip a reachable state from exit 0
+    /// to exit 1 — a hook dev-pinned from another clone while this checkout is
+    /// behind HEAD — which is a contract change the demotion's own documentation
+    /// (README, CLAUDE.md) does not describe. The behind-HEAD count is measured
+    /// once, for the cwd repository, and is not a per-agent quantity to begin
+    /// with, so there is no per-agent verdict for a narrowed rule to key off.
+    any_dev_pinned: bool,
+}
+
+/// Print the hooks section and report what it observed.
+fn print_hook_section(
+    compiled_version: &str,
+    compiled_commit: &str,
+) -> anyhow::Result<HookSectionVerdict> {
     println!("Hooks");
-    let mut any_drift = false;
+    let mut verdict = HookSectionVerdict {
+        drift: false,
+        any_dev_pinned: false,
+    };
 
     for &agent in AgentKind::all_supported() {
         let facts = match crate::cmd::init::hook_facts(agent) {
@@ -520,10 +629,19 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
             }
         };
 
+        // A hook that is not registered never fires, so its script's declaration
+        // governs nothing — the mode is only honoured for an install that is
+        // actually wired up.
+        if facts.hook_installed
+            && crate::cmd::hooks::honour_dev_declaration(facts.hook_mode, &facts.script_integrity)
+        {
+            verdict.any_dev_pinned = true;
+        }
+
         let (drift, line) =
             hook_status_line(&facts, agent.cli_name(), compiled_version, compiled_commit);
         if drift {
-            any_drift = true;
+            verdict.drift = true;
         }
         println!("{line}");
 
@@ -533,7 +651,7 @@ fn print_hook_section(compiled_version: &str, compiled_commit: &str) -> anyhow::
         }
     }
 
-    Ok(any_drift)
+    Ok(verdict)
 }
 
 // ============================================================================
@@ -720,6 +838,63 @@ fn print_cache_section() {
 // Staleness vs. repo HEAD
 // ============================================================================
 
+/// An unparseable `git rev-list --count` result is not evidence of being up to
+/// date, so it is treated as at least one commit behind — preserving the
+/// `unwrap_or(true)` this branch used before the verdict was extracted.
+const UNPARSEABLE_COUNT_IS_BEHIND: u64 = 1;
+
+/// Decide the glyph and drift contribution for a behind-HEAD count.
+///
+/// Pure, so the policy is testable without a git repository — the surrounding
+/// section is four bounded subprocesses deep and cannot be unit-tested at all.
+///
+/// # Why dev mode demotes this to advisory
+///
+/// A behind-HEAD count is the one provenance signal whose own recommended remedy
+/// cannot clear it: `cargo build --release` re-stamps the binary at the commit it
+/// was built from, and HEAD moves again on the next commit, so for anyone
+/// mid-feature the count is never zero and `skim doctor` is permanently red. That
+/// is ADR-014's own rule — a provenance signal that cannot be repaired by the
+/// command it recommends is worse than no signal — applied to the check that
+/// breaks it. Demoted, not deleted: the line still prints the count, so the
+/// information survives and only its exit-code authority is withdrawn.
+///
+/// `dev_mode` comes from what the INSTALLED HOOKS declare, never from a flag:
+/// `skim doctor` has no `--dev` to read. When it is `false` every output of this
+/// function is what the section printed before it existed.
+fn staleness_verdict(commits_behind: u64, dev_mode: bool) -> (&'static str, bool) {
+    match (commits_behind, dev_mode) {
+        (0, _) => ("✓", false),
+        (_, false) => ("✗", true),
+        (_, true) => ("⚠", false),
+    }
+}
+
+/// The parenthetical printed beside a non-zero behind-HEAD count.
+///
+/// Paired with [`staleness_verdict`] and extracted for the same reason: the
+/// surrounding section is four bounded subprocesses deep, so the policy is only
+/// testable once it is out of it.
+///
+/// # Why the dev arm does not name the rebuild
+///
+/// `cargo build --release` is the remedy that clears this count for a strict
+/// install, and it is exactly the remedy a dev pin cannot use: the same argument
+/// [`staleness_verdict`] demotes the glyph for — the binary re-stamps at the
+/// commit it was built from and HEAD moves again on the next commit — also means
+/// the rebuild cannot make the line go away for anyone mid-feature. Printing it
+/// anyway would be an ineffective hatch advertised next to the signal it cannot
+/// clear, which is the shape ADR-011 forbids for elision markers, one layer over.
+/// The dev arm therefore states what the line IS (advisory) rather than offering
+/// a command that does not close it.
+fn behind_head_remedy(dev_mode: bool) -> &'static str {
+    if dev_mode {
+        "advisory only for a dev pin — the count returns on the next commit"
+    } else {
+        "rebuild: cargo build -p rskim --release"
+    }
+}
+
 /// Print the staleness section and return true if drift is detected.
 ///
 /// Staleness algorithm (B4):
@@ -729,8 +904,13 @@ fn print_cache_section() {
 ///   3. `git rev-list <sha>..HEAD --count` — number of commits between the
 ///      compiled SHA and HEAD.
 ///
+/// `dev_mode` demotes a non-zero count to an advisory (see [`staleness_verdict`]).
+/// It is the only term this section takes from the install, and every earlier
+/// gate — git present, inside a repo, SHA reachable — is evaluated before it,
+/// so a dev-pinned hook changes nothing about which branch is reached.
+///
 /// Every git invocation is bounded by [`SUBPROCESS_TIMEOUT`].
-fn print_staleness_section(compiled_commit: &str) -> bool {
+fn print_staleness_section(compiled_commit: &str, dev_mode: bool) -> bool {
     println!("Staleness  (binary vs. repo HEAD)");
 
     if compiled_commit == "unknown" {
@@ -834,19 +1014,21 @@ fn print_staleness_section(compiled_commit: &str) -> bool {
     .flatten();
 
     match count_str.as_deref() {
-        Some("0") | Some("") => {
-            println!("  ✓  up to date  (commit {compiled_commit} is HEAD)");
-            false
-        }
-        Some(n) => {
-            let drift = n.parse::<u64>().map(|v| v >= 1).unwrap_or(true);
-            if drift {
-                println!(
-                    "  ✗  {n} commit(s) behind HEAD  \
-                     (rebuild: cargo build -p rskim --release)"
-                );
+        Some(raw) => {
+            // An empty result is `git rev-list` reporting nothing in the range.
+            let behind = if raw.is_empty() {
+                0
             } else {
-                println!("  ✓  up to date  (commit {compiled_commit} is HEAD)");
+                raw.parse::<u64>().unwrap_or(UNPARSEABLE_COUNT_IS_BEHIND)
+            };
+            let (glyph, drift) = staleness_verdict(behind, dev_mode);
+            if behind == 0 {
+                println!("  {glyph}  up to date  (commit {compiled_commit} is HEAD)");
+            } else {
+                // `raw`, not `behind`: an unparseable count must still be shown
+                // verbatim rather than replaced by the fallback it was mapped to.
+                let remedy = behind_head_remedy(dev_mode);
+                println!("  {glyph}  {raw} commit(s) behind HEAD  ({remedy})");
             }
             drift
         }
@@ -896,6 +1078,8 @@ fn print_help() {
     println!("  All skim entries on $PATH with version and commit (→ marks the winner)");
     println!("  Hook installation state for each supported agent");
     println!("      Shows: path, version, commit, pinned binary, current/stale status");
+    println!("      A dev-pinned hook renders as `⚠ … dev-pinned (binary commit <sha>)`,");
+    println!("      never as `✓` — `skim doctor | grep dev-pinned` is the CI guard");
     println!("  Wrapper directory (~/.skim/bin) status and symlink count");
     println!("  Cache directory and analytics DB paths");
     println!("  Staleness vs. HEAD (run from the skim source directory for accurate results)");
@@ -903,6 +1087,9 @@ fn print_help() {
     println!("Exit codes:");
     println!("  0 = healthy");
     println!("  1 = drift (unpinned hook, version/commit mismatch, or ≥1 commit behind HEAD)");
+    println!("      — except when a hook is dev-pinned: behind-HEAD becomes advisory");
+    println!("      (⚠, exit 0) and the commit check is waived. Version mismatch,");
+    println!("      unpinned, tampered and unreadable stay drift.");
 }
 
 // ============================================================================
@@ -1062,6 +1249,7 @@ mod tests {
             hook_commit: Some("abc1234".to_string()),
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
+            hook_mode: crate::cmd::hooks::HookMode::Strict,
             hook_is_current: true,
             pin_is_current: true,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
@@ -1188,6 +1376,198 @@ mod tests {
         );
     }
 
+    // ---- hook_status_line: dev-pinned rendering ----
+    //
+    // The fixtures below all use hook commit `abc1234` with running commit
+    // `9f8e7d6`. That divergence with `hook_is_current: true` IS the dev
+    // scenario: the waiver is what let a commit mismatch stay "current", so the
+    // line must show both values rather than imply they agree.
+
+    /// A dev install reaches the same terminal branch a healthy strict install
+    /// does — the commit gate it waived is the one that would have diverted it —
+    /// and must not be rendered the same way. It keeps exit 0 (no drift) but
+    /// loses the `✓`: the waiver bought a green exit code, not a clean bill of
+    /// health, and a dev install that looks clean is the failure this rendering
+    /// exists to prevent.
+    #[test]
+    fn test_hook_status_line_dev_pinned_warns_and_never_checks() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(!drift, "a dev-pinned hook must not force exit 1: {line}");
+        assert!(
+            line.contains('⚠') && !line.contains('✓'),
+            "a dev install must render as a warning, never as healthy: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "`skim doctor | grep dev-pinned` is the CI guard; the literal must appear: {line}"
+        );
+    }
+
+    /// Both SHAs on one line: the commit the install froze and the commit the
+    /// running binary was built from. Their distance is how old the dev install
+    /// is — the readable form of ADR-014's ruling that dev mode keeps the REAL
+    /// commit instead of writing a placeholder into the field.
+    #[test]
+    fn test_hook_status_line_dev_pinned_prints_both_commits() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        let (_, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(
+            line.contains("commit abc1234"),
+            "the installed commit must be shown: {line}"
+        );
+        assert!(
+            line.contains("binary commit 9f8e7d6"),
+            "the running binary's commit must be shown alongside it: {line}"
+        );
+    }
+
+    /// A dev install in the wrong clone must still be greppable. The pin-mismatch
+    /// branch returns before the terminal one, so without the note on both
+    /// branches the CI guard would silently miss exactly the multi-clone case the
+    /// pin exists for.
+    #[test]
+    fn test_hook_status_line_dev_pinned_survives_a_pin_mismatch() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        facts.pin_is_current = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(!drift, "pin mismatch is advisory (C-1), dev or not: {line}");
+        assert!(
+            line.contains("binary pin mismatch"),
+            "the pin verdict must not be swallowed by the dev note: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "the dev note must survive the pin-mismatch branch: {line}"
+        );
+    }
+
+    /// documentation-13: the CI guard is `skim doctor | grep dev-pinned`, and the
+    /// one verdict it used to miss is the one that also exits 1. A dev pin does
+    /// NOT waive the version check (ADR-019 — commit equality and nothing else),
+    /// so a dev-pinned hook at the wrong version lands on the `✗` currency branch.
+    ///
+    /// RED before this: that line read `✗ … [version mismatch]` with no
+    /// `dev-pinned` token, so a CI job asking "is this machine on a dev pin?" got
+    /// "no" at precisely the moment the build was failing because of one.
+    #[test]
+    fn test_hook_status_line_dev_pinned_survives_a_version_mismatch() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        facts.hook_is_current = false;
+        // Compiled version differs from the fixture's hook version.
+        let (drift, line) = hook_status_line(&facts, "claude-code", "9.9.9", "9f8e7d6");
+
+        assert!(
+            drift,
+            "a version mismatch is drift, dev or not — the waiver is commit-only: {line}"
+        );
+        assert!(
+            line.contains("version mismatch"),
+            "the currency verdict must not be swallowed by the dev note: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "the CI guard must still see the dev pin on a drift verdict: {line}"
+        );
+    }
+
+    /// The same hole on the pin-format branch: an unpinned script is drift
+    /// regardless of mode, and a credible declaration on one must still be
+    /// greppable.
+    #[test]
+    fn test_hook_status_line_dev_pinned_survives_an_unpinned_script() {
+        let mut facts = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        facts.hook_uses_pinned_binary = false;
+        let (drift, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+
+        assert!(drift, "an unpinned hook is drift, dev or not: {line}");
+        assert!(
+            line.contains("unpinned"),
+            "the pin-format verdict must survive the dev note: {line}"
+        );
+        assert!(
+            line.contains("dev-pinned"),
+            "the CI guard must still see the dev pin on a drift verdict: {line}"
+        );
+    }
+
+    /// PF-016: the declaration is a line in the hook script, so it is only acted
+    /// on when the manifest verifies. Deleting the sidecar yields `NoManifest`,
+    /// which doctor deliberately does NOT treat as drift — so a "not Tampered"
+    /// gate would let anyone holding a write handle to the script self-assert dev
+    /// mode. This pins that the rendering refuses it.
+    #[test]
+    fn test_hook_status_line_dev_declaration_needs_a_verified_manifest() {
+        for integrity in [
+            crate::cmd::integrity::ScriptIntegrity::NoManifest,
+            crate::cmd::integrity::ScriptIntegrity::Tampered,
+            crate::cmd::integrity::ScriptIntegrity::Unreadable,
+        ] {
+            let label = format!("{integrity:?}");
+            let mut facts = make_installed_facts(integrity);
+            facts.hook_mode = crate::cmd::hooks::HookMode::Dev;
+            let (_, line) = hook_status_line(&facts, "claude-code", "2.11.0", "9f8e7d6");
+            assert!(
+                !line.contains("dev-pinned"),
+                "a declaration under {label} must not be honoured: {line}"
+            );
+        }
+    }
+
+    /// THE INVARIANT, on the doctor side: without a credible dev declaration the
+    /// rendering is what it always was. Asserted as an equality against the
+    /// strict column rather than by spot-checking substrings, across every
+    /// integrity state — so any future edit that leaks dev-mode text, a glyph or
+    /// a spacing change into the strict path fails here.
+    #[test]
+    fn test_hook_status_line_strict_column_is_unchanged_by_dev_mode() {
+        // `ScriptIntegrity` is deliberately not `Clone`, so each side of the pair
+        // gets a freshly constructed value from the same factory.
+        type MakeIntegrity = fn() -> crate::cmd::integrity::ScriptIntegrity;
+        let unhonoured: [(&str, MakeIntegrity); 3] = [
+            ("NoManifest", || {
+                crate::cmd::integrity::ScriptIntegrity::NoManifest
+            }),
+            ("Tampered", || {
+                crate::cmd::integrity::ScriptIntegrity::Tampered
+            }),
+            ("Unreadable", || {
+                crate::cmd::integrity::ScriptIntegrity::Unreadable
+            }),
+        ];
+
+        for (label, make) in unhonoured {
+            let strict = make_installed_facts(make());
+            let mut dev = make_installed_facts(make());
+            dev.hook_mode = crate::cmd::hooks::HookMode::Dev;
+
+            assert_eq!(
+                hook_status_line(&strict, "claude-code", "2.11.0", "9f8e7d6"),
+                hook_status_line(&dev, "claude-code", "2.11.0", "9f8e7d6"),
+                "an unhonoured declaration under {label} must be invisible"
+            );
+        }
+
+        // Verified is the one cell where they must DIFFER — otherwise the feature
+        // does nothing and the equalities above would pass vacuously.
+        let strict = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        let mut dev = make_installed_facts(crate::cmd::integrity::ScriptIntegrity::Verified);
+        dev.hook_mode = crate::cmd::hooks::HookMode::Dev;
+        assert_ne!(
+            hook_status_line(&strict, "claude-code", "2.11.0", "9f8e7d6"),
+            hook_status_line(&dev, "claude-code", "2.11.0", "9f8e7d6"),
+            "a credible dev declaration must change the line"
+        );
+    }
+
     #[test]
     fn test_hook_status_line_not_installed() {
         let facts = crate::cmd::init::HookFacts {
@@ -1196,6 +1576,7 @@ mod tests {
             hook_commit: None,
             hook_binary_pin: None,
             hook_uses_pinned_binary: false,
+            hook_mode: crate::cmd::hooks::HookMode::Strict,
             hook_is_current: false,
             pin_is_current: false,
             hook_script_path: std::path::PathBuf::from("/some/path/skim-rewrite.sh"),
@@ -1338,6 +1719,109 @@ mod tests {
         assert!(
             info.commit.is_none(),
             "non-skim binary must yield commit: None (--version has no 'skim ' prefix, --commit rejected)"
+        );
+    }
+
+    // ---- staleness_verdict ----
+
+    /// The invariant that makes this feature invisible to everyone who has not
+    /// opted in: with `dev_mode = false` every cell is what the section printed
+    /// and returned before `staleness_verdict` existed — `✓`/no-drift at zero,
+    /// `✗`/drift at any non-zero count.
+    #[test]
+    fn test_staleness_verdict_strict_is_unchanged_from_pre_dev_behaviour() {
+        assert_eq!(staleness_verdict(0, false), ("✓", false));
+        for behind in [1u64, 2, 7, 4096, u64::MAX] {
+            assert_eq!(
+                staleness_verdict(behind, false),
+                ("✗", true),
+                "a strict install {behind} commits behind HEAD must still be drift"
+            );
+        }
+    }
+
+    /// Dev mode demotes a non-zero count to an advisory: the glyph changes and
+    /// the drift contribution goes away, so this section stops forcing exit 1.
+    #[test]
+    fn test_staleness_verdict_dev_demotes_behind_head_to_advisory() {
+        for behind in [1u64, 2, 7, 4096, u64::MAX] {
+            assert_eq!(
+                staleness_verdict(behind, true),
+                ("⚠", false),
+                "a dev-pinned install {behind} commits behind HEAD must be advisory"
+            );
+        }
+    }
+
+    /// Dev mode demotes; it never promotes. An up-to-date binary reports exactly
+    /// the same thing in both modes, so turning dev on cannot make a healthy
+    /// install look worse.
+    #[test]
+    fn test_staleness_verdict_up_to_date_is_identical_in_both_modes() {
+        assert_eq!(staleness_verdict(0, true), staleness_verdict(0, false));
+        assert_eq!(staleness_verdict(0, true), ("✓", false));
+    }
+
+    /// documentation-19: the strict arm is byte-for-byte the parenthetical the
+    /// section printed before the remedy became a function, so nobody who has not
+    /// opted in sees a changed line.
+    #[test]
+    fn test_behind_head_remedy_strict_still_names_the_rebuild() {
+        assert_eq!(
+            behind_head_remedy(false),
+            "rebuild: cargo build -p rskim --release"
+        );
+    }
+
+    /// documentation-19: a dev pin must not be handed the one remedy that cannot
+    /// clear its count — `staleness_verdict` demotes the glyph for exactly that
+    /// reason, and a line reading `⚠ 7 commit(s) behind HEAD (rebuild: …)` would
+    /// re-advertise the hatch the demotion exists because of.
+    #[test]
+    fn test_behind_head_remedy_dev_does_not_advertise_the_rebuild() {
+        let remedy = behind_head_remedy(true);
+        assert!(
+            !remedy.contains("cargo build"),
+            "a dev pin's remedy must not name a command that cannot clear the count: {remedy}"
+        );
+        assert!(
+            remedy.contains("advisory"),
+            "the dev arm must say what the line is instead: {remedy}"
+        );
+    }
+
+    /// The two arms must stay distinguishable: collapsing them (in either
+    /// direction) silently restores the mismatch between the printed remedy and
+    /// what the dev path can achieve.
+    #[test]
+    fn test_behind_head_remedy_arms_differ() {
+        assert_ne!(behind_head_remedy(true), behind_head_remedy(false));
+    }
+
+    /// Dev mode waives the exit code, never the information: the count is still
+    /// reported, so `⚠` is only ever reachable alongside a printed count. This
+    /// pins that no input makes the function claim "up to date" for a non-zero
+    /// count in either mode.
+    #[test]
+    fn test_staleness_verdict_never_reports_current_when_behind() {
+        for dev_mode in [false, true] {
+            let (glyph, _) = staleness_verdict(1, dev_mode);
+            assert_ne!(
+                glyph, "✓",
+                "a binary behind HEAD must never render as up to date (dev_mode: {dev_mode})"
+            );
+        }
+    }
+
+    /// The fallback the print path maps an unparseable `git rev-list --count`
+    /// onto must land on the drift side under strict mode, preserving the
+    /// `unwrap_or(true)` it replaced.
+    #[test]
+    fn test_unparseable_count_fallback_is_drift_under_strict_mode() {
+        assert_eq!(
+            staleness_verdict(UNPARSEABLE_COUNT_IS_BEHIND, false),
+            ("✗", true),
+            "an unreadable count must not read as up to date"
         );
     }
 

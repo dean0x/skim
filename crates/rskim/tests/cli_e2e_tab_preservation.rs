@@ -1,7 +1,7 @@
 //! E2E tests proving that tab characters and ESC bytes survive the ANSI-strip step
 //! for the `gh` and `diff` wrappers (tab-parsing family), the `grep` and `rg`
 //! wrappers (passthrough search tools), and the passthrough-only `wc`, `ls`,
-//! `find`, `df`, `du`, and `ps` wrappers (ADR-014 / PF-006 fourth wave).
+//! `find`, `df`, `du`, and `ps` wrappers (ADR-009 / PF-006 fourth wave).
 //! Also covers `gh` exit-8 being treated as a parseable result rather than an
 //! unexpected failure.
 //!
@@ -363,7 +363,7 @@ fn test_rg_tab_content_preserved() {
 }
 
 // ============================================================================
-// Passthrough family: wc, ls, find, df, du, ps  (ADR-014 / PF-006 fourth wave)
+// Passthrough family: wc, ls, find, df, du, ps  (ADR-009 / PF-006 fourth wave)
 //
 // These wrappers return RawPassthrough — their parse_impl ignores its argument
 // and always returns ParseResult::RawPassthrough.  That means the bytes the
@@ -417,7 +417,7 @@ fn assert_byte_faithful_passthrough(tool: &str, args: &[&str], fixture: &str) {
     assert!(
         out.stdout.contains(&0x09_u8),
         "{tool}: TAB (0x09) must survive the ANSI-strip step — skip_ansi_strip must \
-         be true for passthrough wrappers (ADR-014 / PF-006); got bytes: {:?}",
+         be true for passthrough wrappers (ADR-009 / PF-006); got bytes: {:?}",
         out.stdout
     );
     assert!(

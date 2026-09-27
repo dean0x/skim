@@ -737,7 +737,7 @@ pub fn query_substring_present(content: &str, query: &str) -> bool {
 /// - Empty / whitespace-only query → `None` / `false`.
 /// - Multi-token AND: `Some(_)` ONLY when EVERY token is present.
 ///   Returning `Some` when only the first token is found would WIDEN the CLI
-///   verify gate and silently admit false-positive candidates (ADR-007).
+///   verify gate and silently admit false-positive candidates (SEARCH-ADR-007).
 /// - Case-sensitive byte-exact (AC12).
 ///
 /// # AD-396-4 — Bounded, allocation-free scan

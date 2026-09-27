@@ -118,7 +118,7 @@ pub(crate) struct HooksOutcome {
 /// so no redirection happens; only the `.git`-file indirection is followed).
 ///
 /// **Write-path security (AD-413-3 extension):** when `.git` is a FILE, the
-/// `gitdir:` pointer is untrusted, repository-controlled input (ADR-008).
+/// `gitdir:` pointer is untrusted, repository-controlled input (SEARCH-ADR-008).
 /// The resolver applies a two-stage gate before using any derived path as a
 /// write destination:
 ///

@@ -432,7 +432,7 @@ fn sync_cochanges_degrades_gracefully_over_capacity() {
 /// scores at the truncation boundary are common.  Ordering on score alone leaves
 /// the surviving rows at the mercy of `sort_unstable_by`'s arbitrary handling of
 /// equal elements, so two builds of the same repository could write different
-/// co-change tables — a nondeterministic cache artifact that ADR-007's dog-food
+/// co-change tables — a nondeterministic cache artifact that SEARCH-ADR-007's dog-food
 /// pass compares against ground truth (PF-012: determinism via a stable key).
 ///
 /// Discriminating: drop the two `.then_with(...)` clauses from `cochange_top_n`

@@ -6,13 +6,13 @@ expression: "snap(GO_COMMENTS, Language::Go,\nTransformConfig::with_mode(Mode::S
 // TESTS: Minimal mode comment stripping
 // ... (9 lines truncated)
 func Add(a int, b int) int  {...}
-// ... (5 lines truncated)
+// ... (9 lines truncated)
 type Calculator struct {
 	// Value field comment inside struct (STRIP - not a function body)
 	value int
 }
 // ... (4 lines truncated)
 func NewCalculator(value int) *Calculator  {...}
-// ... (2 lines truncated)
+// ... (5 lines truncated)
 func (c *Calculator) Add(x int) int  {...}
-// ... (9 lines truncated)
+// ... (11 lines truncated)

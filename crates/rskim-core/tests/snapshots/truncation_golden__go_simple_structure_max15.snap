@@ -4,13 +4,13 @@ expression: "snap(GO_SIMPLE, Language::Go,\nTransformConfig::with_mode(Mode::Str
 ---
 // ... (7 lines truncated)
 func Add(a int, b int) int  {...}
-// ... (1 line truncated)
+// ... (3 lines truncated)
 func Greet(name string) string  {...}
-// ... (1 line truncated)
+// ... (3 lines truncated)
 type Calculator struct {
     value int
 }
-// ... (3 lines truncated)
+// ... (5 lines truncated)
 type Computer interface {
     Compute(x int) int
 }

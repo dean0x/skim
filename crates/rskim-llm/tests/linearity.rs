@@ -3,7 +3,7 @@
 //! Asserts that parse+classify+serialize time scales linearly with body size —
 //! specifically: time(1MB) <= 15x time(100KB) AND time(10MB) <= 15x time(1MB).
 //!
-//! Per ADR-003, absolute timing gates (e.g. "must complete in <1ms") are forbidden
+//! Per L3-ADR-003, absolute timing gates (e.g. "must complete in <1ms") are forbidden
 //! because they are CI-runner-noise-dominated. This gate uses RELATIVE ratios measured
 //! in a single run on the same machine under the same load, which are stable across
 //! hardware. The 15x bound gives a 1.5x noise margin over the theoretical 10x for
@@ -127,7 +127,7 @@ fn min_time_cycle(input: &[u8]) -> u128 {
 /// (input buffer 1×, typed model ≤1×) after the single-parse refactor that
 /// eliminated the throwaway serde_json::Value intermediate.
 /// Wiring this as an enforced counting-allocator test (AC14) is tracked in a
-/// dedicated follow-up (tracked under #309 per ADR-004).  The
+/// dedicated follow-up (tracked under #309 per L3-ADR-004).  The
 /// isolated counting-allocator binary must not share the global allocator with
 /// parallel test threads.
 #[test]
@@ -157,7 +157,7 @@ fn ac14_relative_linearity_gate() {
     let ratio_1mb_vs_100kb = avg_1mb / avg_100kb;
     let ratio_10mb_vs_1mb = avg_10mb / avg_1mb;
 
-    // Log the ratios so the CI log shows the measured values (ADR-003: record
+    // Log the ratios so the CI log shows the measured values (L3-ADR-003: record
     // the ratios alongside the gate constants).
     eprintln!(
         "[AC14] parse+classify+serialize linearity ratios (min of {SAMPLES} samples):\

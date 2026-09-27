@@ -77,24 +77,35 @@ fn test_rewrite_with_env_var() {
 // Cargo toolchain
 // ============================================================================
 
+/// #317: a cargo toolchain override bails — exit 1 (Unhandled), no rewrite.
+///
+/// INVERTED.  This test formerly asserted `success()` plus stdout containing
+/// `skim cargo test +nightly`, pinning the defect: the toolchain was stripped to
+/// find the subcommand and re-appended after it, where `cargo test` takes it as
+/// the `[TESTNAME]` libtest filter — "ok. 0 passed; … filtered out", exit 0, on
+/// the default toolchain.  rustup honours `+toolchain` only as cargo's first
+/// argument, so there is no position for it in a rewrite; #317 takes the bail.
 #[test]
-fn test_rewrite_cargo_toolchain_nightly() {
+fn test_rewrite_cargo_toolchain_nightly_bails() {
     common::skim()
         .args(["rewrite", "cargo", "+nightly", "test"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("skim cargo test +nightly"));
+        .code(1)
+        .stdout(predicate::str::contains("skim").not());
 }
 
+/// #317: an env-var prefix does not hide the toolchain from the bail.
+///
+/// INVERTED for the same reason as the test above (it asserted
+/// `RUST_LOG=debug skim cargo test +nightly`).  The env-first ordering it also
+/// covered is asserted without a toolchain by `test_rewrite_with_env_var`.
 #[test]
-fn test_rewrite_env_var_with_toolchain() {
+fn test_rewrite_env_var_with_toolchain_bails() {
     common::skim()
         .args(["rewrite", "RUST_LOG=debug", "cargo", "+nightly", "test"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "RUST_LOG=debug skim cargo test +nightly",
-        ));
+        .code(1)
+        .stdout(predicate::str::contains("skim").not());
 }
 
 // ============================================================================

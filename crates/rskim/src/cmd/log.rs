@@ -143,7 +143,7 @@ pub(crate) fn run(
     // Issue 4: compute token counts before analytics to avoid re-tokenizing in
     // the background thread (avoids copying up to 64 MiB via raw_input.to_string()).
     let duration = start.elapsed();
-    let (raw_tokens, compressed_tokens) = crate::process::count_token_pair(raw_input, &compressed);
+    let (raw_tokens, compressed_tokens) = crate::tokens::count_token_pair(raw_input, &compressed);
 
     if flags.show_stats {
         crate::process::report_token_stats(raw_tokens, compressed_tokens, "");
@@ -326,7 +326,7 @@ fn emit_result(
 ) -> anyhow::Result<(String, exec::StdoutStatus)> {
     if flags.json_output {
         let json_str = result.to_json_envelope()?;
-        // ADR-015 / D1 declaration — derived from the tier
+        // ADR-011 / D1 declaration — derived from the tier
         // (`ParseResult::completeness`): `Passthrough` re-encodes the raw input
         // verbatim (`Reencoded`), while `Full`/`Degraded` carry a compressed
         // view (`Lossy`) — dedup collapses repeats, `--keep-debug`-less runs

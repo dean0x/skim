@@ -170,8 +170,14 @@ fn test_csharp_minimal_preserves_doc_comments() {
 
 #[test]
 fn test_csharp_minimal_strips_regular_comments() {
-    // Regular // comments at module level should be stripped
-    let source = "// This is a regular comment\nusing System;\npublic class Foo {\n    public void Bar() {\n        // inside body\n    }\n}\n";
+    // Regular // comments at module level should be stripped.
+    //
+    // The comment sits BELOW the first declaration on purpose: a comment
+    // contiguous from byte 0 is the module header and is preserved in every
+    // language under #476, which would test header preservation rather than the
+    // stripping this test exists for. See
+    // test_csharp_minimal_preserves_module_header for that half.
+    let source = "using System;\n\n// This is a regular comment\npublic class Foo {\n    public void Bar() {\n        // inside body\n    }\n}\n";
     let result = transform(source, Language::CSharp, Mode::Minimal).unwrap();
     assert!(
         !result.contains("regular comment"),
@@ -180,6 +186,18 @@ fn test_csharp_minimal_strips_regular_comments() {
     assert!(
         result.contains("inside body"),
         "in-body comments should be preserved, got:\n{result}"
+    );
+}
+
+#[test]
+fn test_csharp_minimal_preserves_module_header() {
+    // #476: the leading contiguous comment run is the module header and is
+    // preserved in every language, not just the four that used to be allowlisted.
+    let source = "// Copyright header line\nusing System;\n\npublic class Foo {\n}\n";
+    let result = transform(source, Language::CSharp, Mode::Minimal).unwrap();
+    assert!(
+        result.contains("// Copyright header line"),
+        "top-of-file header comment must be preserved, got:\n{result}"
     );
 }
 

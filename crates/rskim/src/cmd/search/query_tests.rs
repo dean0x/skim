@@ -998,7 +998,7 @@ fn test_blast_radius_empty_allowlist_returns_zero_results() {
 /// whose paths are all absent from the lexical manifest must ALSO return zero
 /// results — the blast-radius signal contributed nothing, so returning the plain
 /// lexical hit list under a `--blast-radius` flag would be a confident ranking
-/// that is not a blast radius (ADR-009).
+/// that is not a blast radius (SEARCH-ADR-009).
 ///
 /// Before #409 this case was covered by the same guard as the empty allowlist,
 /// because that guard tested the RESOLVED `HashSet<FileId>`.  #409 retyped it to
@@ -2644,7 +2644,7 @@ fn ac10_help_text_reflects_both_composite_paths_and_temporal_inert() {
 }
 
 // ============================================================================
-// AD-396 anchor-trust: E2E ground-truth tests (ADR-007 / AC1 / AC2 / AC6 /
+// AD-396 anchor-trust: E2E ground-truth tests (SEARCH-ADR-007 / AC1 / AC2 / AC6 /
 // AC7 / AC19)
 // ============================================================================
 
@@ -2703,7 +2703,7 @@ fn make_anchor_config(
     }
 }
 
-/// AC1 / AC2 / AC19 — ADR-007 anchor-trust ground truth: every result's
+/// AC1 / AC2 / AC19 — SEARCH-ADR-007 anchor-trust ground truth: every result's
 /// `line_number` must reference a line containing the query token.
 ///
 /// PF-007: the discriminating observable is that the file's actual line N
@@ -2729,7 +2729,7 @@ fn test_anchor_line_contains_query_token_ac1_ac2_ac19() {
         "AC1: 'authentic_fn' must be found in the corpus"
     );
 
-    // ADR-007 / AC19: for every result with Some(line_number), the file's
+    // SEARCH-ADR-007 / AC19: for every result with Some(line_number), the file's
     // actual line must contain the query token.
     for r in &output.results {
         if let Some(ln) = r.line_number {
@@ -2877,7 +2877,7 @@ fn test_multi_token_tier1_earliest_all_tokens_line_ac16() {
         r.line_number
     );
 
-    // ADR-007 ground truth: read the actual anchor line and confirm ≥1 token.
+    // SEARCH-ADR-007 ground truth: read the actual anchor line and confirm ≥1 token.
     let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
     let anchor_line = file_content
         .lines()
@@ -2885,11 +2885,11 @@ fn test_multi_token_tier1_earliest_all_tokens_line_ac16() {
         .unwrap_or("");
     assert!(
         anchor_line.contains("alfa_token") || anchor_line.contains("beta_token"),
-        "AC16/ADR-007: anchor line 3 must contain ≥1 query token; got: {anchor_line:?}"
+        "AC16/SEARCH-ADR-007: anchor line 3 must contain ≥1 query token; got: {anchor_line:?}"
     );
 }
 
-/// Compound `--ast <pattern> <text>` path — TEXT anchor trust (ADR-007 / Cross-Plan Amendment).
+/// Compound `--ast <pattern> <text>` path — TEXT anchor trust (SEARCH-ADR-007 / Cross-Plan Amendment).
 ///
 /// When `ast_scored` is `Some` (the compound text+AST path), the TEXT anchor
 /// must point to a line that CONTAINS the query token, not to the decoy line
@@ -2946,26 +2946,26 @@ fn test_compound_ast_path_text_anchor_trust_adr007() {
     let auth_result = output.results.iter().find(|r| r.path.contains("auth.rs"));
     assert!(
         auth_result.is_some(),
-        "compound anchor trust (ADR-007): auth.rs must be in results for \
+        "compound anchor trust (SEARCH-ADR-007): auth.rs must be in results for \
          query 'authentic_fn' on the compound path; got: {:?}",
         output.results.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
     let r = auth_result.unwrap();
 
-    // ADR-007 / PF-007: anchor must be line 2 (true match), NOT line 1 (decoy).
+    // SEARCH-ADR-007 / PF-007: anchor must be line 2 (true match), NOT line 1 (decoy).
     // Pre-#396, the compound path could carry a trigram-position anchor pointing
     // at the decoy comment; post-#396 it must use substring_first_anchor.
     assert_eq!(
         r.line_number,
         Some(2),
-        "compound anchor trust (ADR-007): line_number must be 2 \
+        "compound anchor trust (SEARCH-ADR-007): line_number must be 2 \
          ('pub fn authentic_fn(...)'); got {:?}. \
          Decoy is on line 1 ('// authentic prefix comment'). \
          A regression in the compound path's re-anchoring would land on line 1.",
         r.line_number
     );
 
-    // ADR-007 ground truth: confirm the actual file line contains the token.
+    // SEARCH-ADR-007 ground truth: confirm the actual file line contains the token.
     let file_content = fs::read_to_string(root.join(&r.path)).unwrap_or_default();
     let anchor_line = file_content
         .lines()
@@ -2973,7 +2973,7 @@ fn test_compound_ast_path_text_anchor_trust_adr007() {
         .unwrap_or("");
     assert!(
         anchor_line.contains("authentic_fn"),
-        "compound anchor trust (ADR-007): anchor line 2 must contain 'authentic_fn'; \
+        "compound anchor trust (SEARCH-ADR-007): anchor line 2 must contain 'authentic_fn'; \
          got: {anchor_line:?}"
     );
 }

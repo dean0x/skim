@@ -1,6 +1,6 @@
 //! Criterion benchmarks for `BlockRouter` — AC24 performance regression guard (#304).
 //!
-//! # Purpose (AC24 / ADR-003 / PF-005)
+//! # Purpose (AC24 / L3-ADR-003 / PF-005)
 //!
 //! These benches measure p99 router time over a small payload-profile fixture set
 //! (p50/p95 block sizes for each content class). The absolute ms figure is RECORDED
@@ -46,7 +46,7 @@
 //! | dup_key_scan             | TBD             | < 10ms (D7)     |
 //! | code_block_passthrough   | ~0.59ms         | < 1ms (P0.1)    |
 //!
-//! NOTE: p50/p95 code block baselines updated for P0.1 (ADR-007 lossless-only egress):
+//! NOTE: p50/p95 code block baselines updated for P0.1 (L3-ADR-007 lossless-only egress):
 //! code blocks now pass through byte-identical without any AST transform. The old
 //! ~0.2-5ms baselines were for the rskim-core tree-sitter engine; passthrough is an
 //! order of magnitude faster. Baselines above are estimates; re-measure after P0.1 lands.
@@ -59,7 +59,7 @@
 //! # D7 latency goal
 //!
 //! The absolute '<10ms combined proxy+engine' target from D7 is a DOCUMENTED GOAL,
-//! not a hard assertion (per ADR-003 / PF-005: no blind numeric gates). The bench
+//! not a hard assertion (per L3-ADR-003 / PF-005: no blind numeric gates). The bench
 //! records the actual measured time. If the median consistently exceeds 10ms, that
 //! is a signal to investigate the prefilter threshold or engine choice.
 //!
@@ -185,7 +185,7 @@ fn p95_json_block() -> String {
 /// (64 KiB), so the prefilter short-circuits and neither the engine nor
 /// `value_equivalent_raw` runs. 3 500 keys ≈ 57 KiB is the largest adversarial
 /// fixture that exercises the full minify + gate path under production prefilter
-/// constraints (per ADR-003 / PF-005: no hard assertions, documented goal only).
+/// constraints (per L3-ADR-003 / PF-005: no hard assertions, documented goal only).
 fn adversarial_many_key_json() -> String {
     let mut s = String::with_capacity(60_000);
     s.push_str("{\n");
@@ -234,7 +234,7 @@ fn dup_key_scan_json() -> String {
 /// for a 90 KiB fenced code block. Represents the largest-size code block expected
 /// in real chat payloads (p99.9 class).
 ///
-/// # P0.1 / ADR-007 baseline
+/// # P0.1 / L3-ADR-007 baseline
 ///
 /// Pre-P0.1 (rskim-core tree-sitter path): ~14.6 ms/90 KiB (measured at commit
 /// `9cb3020c`, 2026-07-11). Post-P0.1 (passthrough, O(1) in content size):
@@ -251,7 +251,7 @@ fn p99_fenced_code_90kb() -> String {
 
 /// Bench: p50 code block through the full router (N=1 passthrough path).
 ///
-/// Post-P0.1 (ADR-007): code blocks are always Passthrough. Exercises:
+/// Post-P0.1 (L3-ADR-007): code blocks are always Passthrough. Exercises:
 /// parse → compute_candidates (1) → engine_for_class → Passthrough →
 /// whole_request_check (no byte_gate, no mutate_block needed).
 fn bench_p50_code_block(c: &mut Criterion) {
@@ -367,9 +367,9 @@ fn bench_full_router_no_modification(c: &mut Criterion) {
 /// JSON engine (minify, ~1 KiB) → `value_equivalent_raw` (20 key comparisons) →
 /// byte_gate → `mutate_block`.
 ///
-/// # D7 / ADR-003
+/// # D7 / L3-ADR-003
 ///
-/// Combined proxy + engine target: < 10 ms (D7 documented goal; per ADR-003/PF-005,
+/// Combined proxy + engine target: < 10 ms (D7 documented goal; per L3-ADR-003/PF-005,
 /// this is a RECORDED figure, NOT a hard assertion). A median ≫ 10 ms signals a
 /// prefilter-threshold or engine-choice investigation.
 fn bench_json_minify_p50(c: &mut Criterion) {
@@ -419,7 +419,7 @@ fn bench_json_minify_p95(c: &mut Criterion) {
 ///
 /// See `adversarial_many_key_json()` for why 3 500 keys (not 10 000).
 ///
-/// # D7 latency goal (ADR-003 / PF-005)
+/// # D7 latency goal (L3-ADR-003 / PF-005)
 ///
 /// Combined proxy + engine target: < 10 ms. This bench records the empirical worst-case
 /// cost — NOT a hard assertion. If median > 10 ms consistently, investigate per-object
@@ -466,9 +466,9 @@ fn bench_dup_key_scan(c: &mut Criterion) {
     );
 }
 
-/// Bench: 90 KiB fenced code block → O(1) passthrough (ADR-007 baseline).
+/// Bench: 90 KiB fenced code block → O(1) passthrough (L3-ADR-007 baseline).
 ///
-/// Records the **new** passthrough cost after P0.1 (ADR-007 lossless-only egress):
+/// Records the **new** passthrough cost after P0.1 (L3-ADR-007 lossless-only egress):
 /// parse body → classify (`Class::Code`) → `EngineTarget::Passthrough` → return.
 /// No prefilter check, no AST transform, no `rskim-core` dependency.
 ///
@@ -479,7 +479,7 @@ fn bench_dup_key_scan(c: &mut Criterion) {
 /// | Pre-P0.1 (tst)  | ~14.6 ms       | rskim-core tree-sitter transform   |
 /// | Post-P0.1 (this) | < 0.2 ms est. | O(1) passthrough, no AST parse     |
 ///
-/// Per ADR-003 / PF-005: the "> 70× speedup" is a DOCUMENTED finding, not a hard
+/// Per L3-ADR-003 / PF-005: the "> 70× speedup" is a DOCUMENTED finding, not a hard
 /// assertion. Criterion regression warnings fire if a future change degrades the
 /// passthrough path significantly.
 fn bench_code_block_passthrough(c: &mut Criterion) {
@@ -508,12 +508,12 @@ fn bench_code_block_passthrough(c: &mut Criterion) {
 /// Three ERROR lines with different ISO-8601 timestamps → one deduplicated entry
 /// with `×3, [ts_min..ts_max]` annotation.
 ///
-/// # Baseline (Pass 5, ADR-003 / PF-005)
+/// # Baseline (Pass 5, L3-ADR-003 / PF-005)
 ///
 /// Recorded baseline: TBD (first run after Pass 5 lands).
 /// Regression gate: < 10ms combined proxy+engine (D7 latency goal).
 ///
-/// Per ADR-003 / PF-005: the baseline is a DOCUMENTED finding, not a blind numeric
+/// Per L3-ADR-003 / PF-005: the baseline is a DOCUMENTED finding, not a blind numeric
 /// assertion. Criterion regression warnings fire if the path degrades significantly.
 fn bench_log_lossless_proxy_block(c: &mut Criterion) {
     let log_content = "2024-01-01T10:00:00Z ERROR: connection refused\n\

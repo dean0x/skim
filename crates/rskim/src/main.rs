@@ -1170,10 +1170,18 @@ fn run_file_operation(analytics: &analytics::AnalyticsConfig) -> anyhow::Result<
             token_budget: args.tokens,
         },
         line_numbers: args.line_numbers,
+        // Single-input default. The multi-file shapes below opt in, because
+        // `multi.rs` emits ONE aggregate lossy-view marker per run rather than
+        // one per file (ADR-001 amendment: the guard charges the disclosure a
+        // file's own verdict causes, and in a batch that is none).
+        batch: false,
     };
 
     let multi_options = multi::MultiFileOptions {
-        process: process_options,
+        process: process::ProcessOptions {
+            batch: true,
+            ..process_options
+        },
         no_header: args.no_header,
         jobs: args.jobs,
         no_ignore: args.no_ignore,
@@ -1235,9 +1243,14 @@ fn process_single_arg(
     // produces a `Message` error with no source, which `chain()` cannot walk.
     //
     // consistency-3: the remedy line in the multi-file marker says
-    // "SKIM_PASSTHROUGH=1 for raw output", so every shape the marker can fire
-    // for must also work in passthrough mode.  Directories and globs are handled
-    // here so the remedy is literally reachable from any invocation that prints it.
+    // "SKIM_PASSTHROUGH=1 for full output" — `lossy_view_marker` resolves its
+    // remedy through `fidelity::remedy_for` with
+    // `passthrough_reproduces_argv: true`, which returns the canonical
+    // `output::ELISION_HINT` (pinned whole by
+    // `cli_transparency::test_multi_file_aggregate_marker_emitted_once`).
+    // Either way the marker names a hatch, so every shape it can fire for must
+    // also work in passthrough mode.  Directories and globs are handled here so
+    // the remedy is literally reachable from any invocation that prints it.
     if cmd::is_passthrough_mode() {
         use std::io::Write as _;
         let stdout = std::io::stdout();
@@ -1281,7 +1294,12 @@ fn process_single_arg(
         .unwrap_or_default()
         .display()
         .to_string();
-    let mode_str = format!("{:?}", Mode::from(args.mode)).to_lowercase();
+    // `Mode::name` is the canonical lowercase spelling (one match arm per
+    // variant in rskim-core). The marker `write_result_and_stats` prints, the
+    // cost `record_file_analytics` charges, the analytics `mode` column, and
+    // the guard charge inside `process::view_notice_absolute` all read it, so
+    // none of them can spell a mode differently from the others.
+    let mode_str = Mode::from(args.mode).name().to_string();
 
     if file == "-" {
         let result = process::process_stdin(process_options, args.filename.as_deref())?;
@@ -1330,6 +1348,20 @@ fn process_single_arg(
 ///
 /// `file_path` is `Some` for single-file ops (re-read on background thread) and
 /// `None` for stdin (buffer already captured in `result.stdin_raw`).
+///
+/// # Delivered cost
+///
+/// The disclosure charged here is rebuilt by `process::single_file_notice` —
+/// the same constructor `write_result_and_stats` just used to PRINT it, from
+/// the same mode spelling and the same `view_differs` — so the recorded cost is
+/// the emitted cost by construction. It is not re-derived from a per-mode table
+/// or re-estimated from the mode name; those agree until the marker text
+/// changes and then disagree silently.
+///
+/// Both call sites pair `write_result_and_stats` with this function on adjacent
+/// lines (stdin at the `-` branch, files just below it), which is what makes
+/// "the notice that was emitted" and "the notice that was charged" the same
+/// event rather than two events that usually coincide.
 fn record_file_analytics(
     enabled: bool,
     result: process::ProcessResult,
@@ -1339,6 +1371,10 @@ fn record_file_analytics(
     cwd: String,
     file_path: Option<PathBuf>,
 ) {
+    // Read before `result` is partially moved below.
+    let notice = process::single_file_notice(&mode_str, result.view_differs);
+    let served = result.served;
+
     // Determine counts variant: Known when both token counts are already computed
     // (i.e. --show-stats ran, or a count-carrying cache hit); Tokenize otherwise.
     let counts = match (result.original_tokens, result.transformed_tokens) {
@@ -1378,6 +1414,11 @@ fn record_file_analytics(
             original_cmd: cmd.to_string(),
             language,
             parse_tier,
+            notice,
+            // Single-file: the marker is per-file, so `notice: None` here is a
+            // measured zero rather than the batch regime's "not measured".
+            notice_measured: true,
+            served,
         }],
         analytics::FileOpCommon {
             mode: Some(mode_str),

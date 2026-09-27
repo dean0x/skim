@@ -2,9 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use super::flags::{DetectionEnv, InitFlags};
+use super::flags::DetectionEnv;
 use super::helpers::HOOK_SCRIPT_NAME;
-use crate::cmd::hooks::{HookProtocol, protocol_for_agent};
+use crate::cmd::hooks::{
+    HookMode, HookProtocol, honour_dev_declaration, parse_mode_from_script, protocol_for_agent,
+};
+use crate::cmd::integrity::{ScriptIntegrity, classify_script_integrity};
 
 /// Maximum settings.json size we'll read (10 MB). Anything larger is almost
 /// certainly not a real Claude Code settings file and could cause OOM.
@@ -31,6 +34,19 @@ pub(super) struct DetectedState {
     pub(super) hook_binary_pin: Option<String>,
     /// Whether the hook script uses the pinned binary format (exports `SKIM_HOOK_BINARY`).
     pub(super) hook_uses_pinned_binary: bool,
+    /// Install mode the hook script declares (`HOOK_DEV_MARKER`).
+    ///
+    /// `HookMode::Strict` when the script is absent or carries no marker.
+    pub(super) hook_mode: HookMode,
+    /// Integrity of the hook script against its SHA-256 manifest.
+    ///
+    /// Derived from the manifest — an artefact independent of the script bytes,
+    /// which are exactly what a tamper modifies (PF-016). Held on the detected
+    /// state so that [`DetectedState::hook_is_current`] and the `skim init` fast
+    /// path decide from the SAME classification: two separately-computed verdicts
+    /// could disagree across the gap between them, and the one that waives the
+    /// commit check must never be the more permissive of the two.
+    pub(super) script_integrity: ScriptIntegrity,
     /// If installing to one scope and the other scope also has a hook
     pub(super) dual_scope_warning: Option<String>,
     /// Existing non-skim hooks for the agent's tool matcher (plugin collision detection)
@@ -84,6 +100,21 @@ impl DetectedState {
     /// the hook may pin an older commit while the binary has a newer one. When
     /// `SKIM_GIT_COMMIT` is "unknown" (tarball builds) the commit check is
     /// skipped to avoid spurious "not current" verdicts on every invocation.
+    ///
+    /// # The dev waiver
+    ///
+    /// A hook script that credibly declares dev mode waives the commit-equality
+    /// check and NOTHING ELSE — version and pinned-format are still required, and
+    /// [`Self::pin_is_current`] is untouched. The commit string is the only term
+    /// that goes stale on its own: the pinned path keeps pointing at the same
+    /// file across an in-place rebuild, whereas the embedded SHA is frozen at
+    /// install time while HEAD moves, so re-stamping never converges for anyone
+    /// mid-feature (ADR-014's amendment, and its own rule that a signal which
+    /// cannot be repaired by the command it recommends is worse than no signal).
+    ///
+    /// "Credibly" is [`honour_dev_declaration`]: the waiver requires
+    /// `ScriptIntegrity::Verified`, so a marker hand-appended to a script whose
+    /// manifest was deleted does not reach it (PF-016).
     pub(super) fn hook_is_current(&self) -> bool {
         if !(self.hook_version.as_deref() == Some(&self.skim_version)
             && self.hook_uses_pinned_binary)
@@ -93,9 +124,10 @@ impl DetectedState {
 
         // B5c: also require that the hook's recorded commit matches the
         // compiled-in commit. Skip the check when the compiled commit is
-        // "unknown" (tarball/non-git build) — we have no reliable anchor.
+        // "unknown" (tarball/non-git build) — we have no reliable anchor, and
+        // when the installed hook credibly declares dev mode.
         let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
-        if compiled_commit != "unknown" {
+        if compiled_commit != "unknown" && !self.commit_gate_waived() {
             if let Some(ref hook_commit) = self.hook_commit {
                 if hook_commit != compiled_commit {
                     return false;
@@ -111,26 +143,81 @@ impl DetectedState {
 
         true
     }
+
+    /// Returns `true` when the installed hook's declaration waives the
+    /// commit-equality gate — the single site that reads the mode for enforcement.
+    pub(super) fn commit_gate_waived(&self) -> bool {
+        honour_dev_declaration(self.hook_mode, &self.script_integrity)
+    }
+
+    /// Returns `true` when the installed hook declares the mode THIS INVOCATION
+    /// is asking for.
+    ///
+    /// # Why this is separate from `hook_is_current`
+    ///
+    /// The two predicates answer questions with different inputs, and only one of
+    /// them has an answer for every caller. `hook_is_current` asks "is the
+    /// installed script the artefact this binary would produce", which is decided
+    /// entirely by what is on disk. `mode_matches` asks "is it the artefact this
+    /// COMMAND was asked to produce", which needs the request — and `skim doctor`
+    /// never has one: `init::hook_facts` hands [`detect_state`] an install scope
+    /// and nothing else, so there is no request anywhere on that path. Folding
+    /// this term into `hook_is_current` would therefore have to invent
+    /// `dev_requested = false` for doctor and report every dev-pinned hook
+    /// as stale with a commit mismatch — exit 1 on precisely the installs the
+    /// waiver exists to keep green, which is the whole feature defeated by a
+    /// predicate that cannot see the difference between "nobody asked for dev"
+    /// and "this caller cannot ask for anything".
+    ///
+    /// Keeping it separate is also what makes dev mode a property of the COMMAND
+    /// rather than sticky state (ADR-014): re-running the installer without the
+    /// flag finds a mismatch here and rewrites the script back to strict, so no
+    /// undo flag is needed.
+    /// The `bool → HookMode` mapping is [`HookMode::requested`], shared with
+    /// `install::create_hook_script`'s generator call: the predicate that decides
+    /// a rewrite is needed and the generator that performs it must read the flag
+    /// the same way, or `skim init --dev` writes a script it then judges wrong.
+    pub(super) fn mode_matches(&self, dev_requested: bool) -> bool {
+        self.hook_mode == HookMode::requested(dev_requested)
+    }
 }
 
+/// Detect the installed hook state for `agent` at the given install scope.
+///
+/// `project` is that scope — `true` for a project-level install (`<cwd>/.claude`
+/// and friends), `false` for the global one. It is the whole of what detection
+/// needs: it picks the config directory (through [`DetectionEnv::resolve`] and
+/// `HookProtocol::hook_config_dir`) and, by negation, the directory
+/// [`check_dual_scope`] looks in. Everything else reported here is read off the
+/// artefacts found there.
+///
+/// # Why the scope and not `&InitFlags`
+///
+/// So that a caller which is not performing an install cannot spell a request it
+/// is not making. `skim doctor` reaches detection through
+/// [`super::hook_facts`], and it has no `--dev`, `--force` or `--uninstall` to
+/// answer for; handed the whole struct it would have to supply all three, and a
+/// supplied `dev: false` would carry a correctness obligation on its own
+/// NON-USE — dischargeable only by a comment, and silent the moment detection
+/// grew a second read. One `bool` leaves nothing to fabricate and nothing to
+/// keep true. The argument order mirrors [`DetectionEnv::resolve`], and the two
+/// parameter types differ, so a transposed call is a compile error rather than a
+/// silent scope flip.
 pub(super) fn detect_state(
-    flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    project: bool,
     env: &DetectionEnv,
 ) -> anyhow::Result<DetectedState> {
     let skim_binary = super::helpers::resolve_skim_binary()?;
     let skim_version = env!("CARGO_PKG_VERSION").to_string();
-    let config_dir = env.resolve(agent, flags.project)?;
+    let config_dir = env.resolve(agent, project)?;
     let protocol = protocol_for_agent(agent);
 
     // Compute the hook artifact directory via the protocol seam.
     // For all agents except Copilot CLI this equals config_dir (passthrough).
     // For Copilot CLI it redirects to ~/.copilot (or $COPILOT_CONFIG_DIR).
-    let hook_config_dir = protocol.hook_config_dir(
-        &config_dir,
-        flags.project,
-        env.override_for(agent).is_some(),
-    );
+    let hook_config_dir =
+        protocol.hook_config_dir(&config_dir, project, env.override_for(agent).is_some());
 
     let settings_path = config_dir.join(protocol.config_filename());
     let settings_exists = settings_path.exists();
@@ -195,7 +282,7 @@ pub(super) fn detect_state(
     };
 
     // Dual-scope check (B5)
-    let dual_scope_warning = check_dual_scope(flags, agent, env)?;
+    let dual_scope_warning = check_dual_scope(agent, project, env)?;
 
     // Reuse the already-read hook script contents for pinned-binary detection.
     let hook_uses_pinned_binary = hook_script_contents
@@ -210,6 +297,26 @@ pub(super) fn detect_state(
     let hook_binary_pin = hook_script_contents
         .as_deref()
         .and_then(parse_binary_pin_from_script);
+    // Read from the same pre-read script text as the three parsers above, so a
+    // script cannot yield a mode and a pin that came from different reads.
+    // An absent script declares nothing, which is `Strict`.
+    let hook_mode = hook_script_contents
+        .as_deref()
+        .map(parse_mode_from_script)
+        .unwrap_or(HookMode::Strict);
+
+    // Classify the script against its SHA-256 manifest. Deliberately NOT derived
+    // from `hook_script_contents` above: the verdict must come from an artefact
+    // independent of the bytes under test (PF-016).
+    //
+    // `hook_config_dir` is the same directory `install::create_hook_script` passes
+    // to `write_hash_manifest`, for every agent — including Copilot, whose
+    // `hook_config_dir` redirects to `~/.copilot/` via `HookProtocol::hook_config_dir`.
+    let script_integrity = classify_script_integrity(
+        &hook_config_dir,
+        agent.cli_name(),
+        &hook_config_dir.join("hooks").join(HOOK_SCRIPT_NAME),
+    );
 
     Ok(DetectedState {
         skim_binary,
@@ -223,6 +330,8 @@ pub(super) fn detect_state(
         hook_commit,
         hook_binary_pin,
         hook_uses_pinned_binary,
+        hook_mode,
+        script_integrity,
         dual_scope_warning,
         existing_hooks,
         agent_cli_name: agent.cli_name(),
@@ -326,11 +435,11 @@ fn scan_existing_hooks(
 /// producing a false positive. A Copilot-aware dual-scope check can be added if
 /// needed in a future subtask.
 pub(super) fn check_dual_scope(
-    flags: &InitFlags,
     agent: crate::cmd::session::AgentKind,
+    project: bool,
     env: &DetectionEnv,
 ) -> anyhow::Result<Option<String>> {
-    let other_dir = if flags.project {
+    let other_dir = if project {
         // Installing project-level, check global
         env.resolve(agent, false)?
     } else {
@@ -356,16 +465,8 @@ pub(super) fn check_dual_scope(
         return Ok(None);
     }
 
-    let scope = if flags.project {
-        "globally"
-    } else {
-        "in project"
-    };
-    let uninstall_scope = if flags.project {
-        "--global"
-    } else {
-        "--project"
-    };
+    let scope = if project { "globally" } else { "in project" };
+    let uninstall_scope = if project { "--global" } else { "--project" };
     let path = other_settings.display();
     Ok(Some(format!(
         "skim hook is also installed {scope} ({path})\n  \
@@ -824,6 +925,8 @@ mod tests {
             hook_commit: Some("aaaaaaaastale".to_string()),
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
+            hook_mode: HookMode::Strict,
+            script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name: "claude-code",
@@ -859,6 +962,8 @@ mod tests {
             hook_commit,
             hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
             hook_uses_pinned_binary: true,
+            hook_mode: HookMode::Strict,
+            script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name: "claude-code",
@@ -982,6 +1087,383 @@ mod tests {
         );
     }
 
+    // ---- the dev waiver: mode + integrity ----
+
+    /// Build a state whose ONLY defect is a stale commit pin, parameterised on
+    /// the two inputs the waiver reads. Everything else is current, so any
+    /// `hook_is_current()` verdict below is attributable to the waiver alone.
+    fn state_with_stale_commit(mode: HookMode, integrity: ScriptIntegrity) -> DetectedState {
+        DetectedState {
+            skim_binary: std::path::PathBuf::from("/usr/local/bin/skim"),
+            skim_version: env!("CARGO_PKG_VERSION").to_string(),
+            config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            hook_config_dir: std::path::PathBuf::from("/tmp/test-config"),
+            settings_path: std::path::PathBuf::from("/tmp/test-config/settings.json"),
+            settings_exists: true,
+            hook_installed: true,
+            hook_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // A real-looking short SHA that is not this build's.
+            hook_commit: Some("0ddba11".to_string()),
+            hook_binary_pin: Some("/usr/local/bin/skim".to_string()),
+            hook_uses_pinned_binary: true,
+            hook_mode: mode,
+            script_integrity: integrity,
+            dual_scope_warning: None,
+            existing_hooks: vec![],
+            agent_cli_name: "claude-code",
+        }
+    }
+
+    /// THE security constraint of the dev waiver, stated as its whole truth
+    /// table: a stale commit is waived in exactly one cell, `Dev` + `Verified`.
+    ///
+    /// `NoManifest` is the cell that matters and the reason this is a table and
+    /// not a single assertion. Doctor's integrity match returns early for
+    /// `Tampered` and `Unreadable`, but deliberately lets `NoManifest` FALL
+    /// THROUGH to the pin and currency checks — so a marker hand-appended to the
+    /// script plus a deleted `{hooks}/skim-{agent}.sha256` reaches this predicate
+    /// with a declaration nobody verified. Gating on "not Tampered" would waive
+    /// the commit check for anyone who can write the hook file, turning a
+    /// declared property into a self-asserted one and silencing the one signal
+    /// that says which build is running (PF-016).
+    #[test]
+    fn test_hook_is_current_waives_stale_commit_only_for_dev_plus_verified() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if compiled_commit == "unknown" {
+            // Tarball build: the commit check is skipped outright, so there is no
+            // gate for the waiver to act on and every cell would be vacuously true.
+            return;
+        }
+
+        let grid = [
+            (HookMode::Dev, ScriptIntegrity::Verified, true),
+            (HookMode::Dev, ScriptIntegrity::NoManifest, false),
+            (HookMode::Dev, ScriptIntegrity::Tampered, false),
+            (HookMode::Dev, ScriptIntegrity::Unreadable, false),
+            (HookMode::Strict, ScriptIntegrity::Verified, false),
+            (HookMode::Strict, ScriptIntegrity::NoManifest, false),
+            (HookMode::Strict, ScriptIntegrity::Tampered, false),
+            (HookMode::Strict, ScriptIntegrity::Unreadable, false),
+        ];
+
+        for (mode, integrity, expected_current) in grid {
+            let label = format!("{mode:?} + {integrity:?}");
+            let state = state_with_stale_commit(mode, integrity);
+            assert_eq!(
+                state.hook_is_current(),
+                expected_current,
+                "stale commit under {label}: hook_is_current must be {expected_current}"
+            );
+        }
+    }
+
+    /// Named separately from the table above so the specific downgrade it blocks
+    /// survives any refactor of that table: appending the marker and deleting the
+    /// manifest must NOT buy a waiver.
+    #[test]
+    fn test_hook_is_current_dev_marker_without_manifest_does_not_waive() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if compiled_commit == "unknown" {
+            return;
+        }
+
+        let state = state_with_stale_commit(HookMode::Dev, ScriptIntegrity::NoManifest);
+        assert!(
+            !state.commit_gate_waived(),
+            "a dev declaration on an unverified script must not waive the commit gate"
+        );
+        assert!(
+            !state.hook_is_current(),
+            "deleting the manifest must not turn a stale commit into a current hook"
+        );
+    }
+
+    /// The waiver is scoped to the commit gate and nothing else. A dev-pinned,
+    /// verified script at the WRONG VERSION, or without the pinned-binary format,
+    /// is still not current — those terms are checked before the commit block and
+    /// the waiver never reaches them.
+    #[test]
+    fn test_dev_waiver_does_not_waive_version_or_pinned_format() {
+        let mut wrong_version = state_with_stale_commit(HookMode::Dev, ScriptIntegrity::Verified);
+        wrong_version.hook_version = Some("0.0.1-not-this-build".to_string());
+        assert!(
+            !wrong_version.hook_is_current(),
+            "the dev waiver must not waive the version check"
+        );
+
+        let mut unpinned = state_with_stale_commit(HookMode::Dev, ScriptIntegrity::Verified);
+        unpinned.hook_uses_pinned_binary = false;
+        assert!(
+            !unpinned.hook_is_current(),
+            "the dev waiver must not waive the pinned-binary format check"
+        );
+    }
+
+    /// `pin_is_current` is a separate predicate and the waiver must not reach it:
+    /// the binary PATH pin is the signal that actually decides which code runs,
+    /// and a dev install is exactly as obliged to point at the right file as a
+    /// strict one (ADR-014 demoted that signal to advisory; it did not remove it).
+    #[test]
+    fn test_dev_waiver_does_not_touch_pin_is_current() {
+        let mut state = state_with_stale_commit(HookMode::Dev, ScriptIntegrity::Verified);
+        state.hook_binary_pin = Some("/nowhere/that/exists/skim".to_string());
+        assert!(
+            !state.pin_is_current(),
+            "a dev declaration must not make a wrong binary pin read as current"
+        );
+    }
+
+    // ---- mode_matches ----
+
+    /// `mode_matches` compares the INSTALLED declaration against the REQUESTED
+    /// one, so it is false on both diagonals. The `Dev` installed / not requested
+    /// cell is the one that keeps dev mode from becoming sticky state: it is what
+    /// makes a plain `skim init` rewrite the script back to strict (ADR-014).
+    #[test]
+    fn test_mode_matches_compares_installed_against_requested() {
+        let dev = state_with_stale_commit(HookMode::Dev, ScriptIntegrity::Verified);
+        let strict = state_with_stale_commit(HookMode::Strict, ScriptIntegrity::Verified);
+
+        assert!(dev.mode_matches(true), "dev installed, dev requested");
+        assert!(
+            !dev.mode_matches(false),
+            "dev installed but not requested must be a mismatch, or dev mode is sticky"
+        );
+        assert!(
+            strict.mode_matches(false),
+            "strict installed, strict requested"
+        );
+        assert!(
+            !strict.mode_matches(true),
+            "strict installed, dev requested must be a mismatch"
+        );
+    }
+
+    /// `mode_matches` and `hook_is_current` must stay independent: a dev-pinned,
+    /// verified hook at a stale commit is CURRENT (waived) while simultaneously
+    /// NOT matching a strict request. Folding the mode term into
+    /// `hook_is_current` would collapse these two into one answer, and
+    /// `skim doctor` — whose path carries no request at all, so the folded term
+    /// could only ever be evaluated against `dev_requested = false` — would then
+    /// report every dev-pinned install as stale and exit 1.
+    #[test]
+    fn test_mode_matches_and_hook_is_current_are_independent() {
+        let compiled_commit = option_env!("SKIM_GIT_COMMIT").unwrap_or("unknown");
+        if compiled_commit == "unknown" {
+            return;
+        }
+
+        let state = state_with_stale_commit(HookMode::Dev, ScriptIntegrity::Verified);
+        assert!(
+            state.hook_is_current(),
+            "the waiver makes a dev-pinned verified hook current despite a stale commit"
+        );
+        assert!(
+            !state.mode_matches(false),
+            "the same state must still fail a strict request — this is the pair \
+             that a folded predicate could not represent"
+        );
+    }
+
+    // ---- hook mode: the dev marker is additive ----
+
+    /// The dev marker must be INVISIBLE to every parser that reads an installed
+    /// hook script. A binary that has never heard of `HookMode` has to read a
+    /// dev-pinned script's version, commit and binary pin exactly as it reads a
+    /// strict one — that is what makes the extra line purely additive, and what
+    /// makes an older binary's verdict (and its rewrite back to strict) safe.
+    ///
+    /// Driven through the real `generate_hook_script` output rather than a
+    /// hand-written fixture, so the parsers are exercised on the bytes
+    /// `skim init` actually writes (PF-015: a fixture-shaped test pins the
+    /// display layer, never the acquisition layer).
+    #[test]
+    fn test_dev_marker_is_invisible_to_every_script_parser() {
+        const PIN: &str = "/path/with spaces/target/release/skim";
+        let strict =
+            crate::cmd::hooks::generate_hook_script("2.11.0", "claude-code", PIN, HookMode::Strict);
+        // The real dev bytes, not a hand-appended marker: the generator's
+        // placement is part of what must be invisible.
+        let dev =
+            crate::cmd::hooks::generate_hook_script("2.11.0", "claude-code", PIN, HookMode::Dev);
+
+        // Guard against a vacuous pass: the parsers must actually be finding
+        // values, or the equalities below would be two `None`s agreeing
+        // (PF-016 — an empty finding set is not a clean bill of health).
+        assert_eq!(
+            parse_version_from_script(&dev).as_deref(),
+            Some("2.11.0"),
+            "a dev-pinned script must still carry a parseable version"
+        );
+        assert_eq!(
+            parse_binary_pin_from_script(&dev).as_deref(),
+            Some(PIN),
+            "a dev-pinned script must still carry a parseable binary pin"
+        );
+        assert!(
+            parse_commit_from_script(&dev).is_some(),
+            "a dev-pinned script must still carry a parseable commit"
+        );
+
+        assert_eq!(
+            parse_version_from_script(&strict),
+            parse_version_from_script(&dev),
+            "the dev marker must not change the parsed hook version"
+        );
+        assert_eq!(
+            parse_commit_from_script(&strict),
+            parse_commit_from_script(&dev),
+            "the dev marker must not change the parsed commit — a dev install keeps its REAL commit"
+        );
+        assert_eq!(
+            parse_binary_pin_from_script(&strict),
+            parse_binary_pin_from_script(&dev),
+            "the dev marker must not change the parsed binary pin"
+        );
+        assert_eq!(
+            uses_pinned_binary(&strict),
+            uses_pinned_binary(&dev),
+            "the dev marker must not change pinned-format detection"
+        );
+        assert!(
+            uses_pinned_binary(&dev),
+            "a dev-pinned script is still a pinned script"
+        );
+    }
+
+    /// The mode has to come from the ACQUISITION layer, not just the parser:
+    /// `detect_state` reads the installed script and records what it declares.
+    /// Without this, `parse_mode_from_script` could be perfect while nothing on
+    /// the path from the CLI ever calls it (PF-015 — enumerate the gates between
+    /// the entry point and the predicate; a predicate's own unit test proves
+    /// nothing about the path that reaches it).
+    #[test]
+    fn test_detect_state_records_the_declared_hook_mode() {
+        // Driven through the mode the GENERATOR was asked for, so this covers the
+        // whole path `skim init --dev` takes: flag → generator → installed bytes
+        // → detect_state → recorded mode.
+        for expected in [HookMode::Strict, HookMode::Dev] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hooks_dir = dir.path().join("hooks");
+            std::fs::create_dir_all(&hooks_dir).unwrap();
+            let generated = crate::cmd::hooks::generate_hook_script(
+                "2.11.0",
+                "claude-code",
+                "/usr/local/bin/skim",
+                expected,
+            );
+            std::fs::write(
+                hooks_dir.join(super::super::helpers::HOOK_SCRIPT_NAME),
+                generated,
+            )
+            .unwrap();
+
+            // Every axis points into the TempDir: detection only ever reads, but
+            // it must not read the developer's real config either (PF-017).
+            let env = DetectionEnv {
+                home_dir: Some(dir.path().to_path_buf()),
+                claude_config_dir: Some(dir.path().to_path_buf()),
+                cursor_config_dir: Some(dir.path().to_path_buf()),
+                gemini_config_dir: Some(dir.path().to_path_buf()),
+                copilot_config_dir: Some(dir.path().to_path_buf()),
+                codex_config_dir: Some(dir.path().to_path_buf()),
+                crush_config_dir: Some(dir.path().to_path_buf()),
+            };
+
+            let state =
+                detect_state(crate::cmd::session::AgentKind::ClaudeCode, false, &env).unwrap();
+
+            assert_eq!(
+                state.hook_mode, expected,
+                "detect_state must record the mode the installed script declares"
+            );
+            // The pin must survive the same read, so the mode is demonstrably
+            // acquired from the script the rest of the facts came from — not
+            // from a second, divergent source.
+            assert_eq!(
+                state.hook_binary_pin.as_deref(),
+                Some("/usr/local/bin/skim"),
+                "the pin must be parsed from the same script text as the mode"
+            );
+        }
+    }
+
+    /// The other half of the waiver's input has to be acquired too. The mode is
+    /// read from the script; the integrity verdict must NOT be — it comes from
+    /// the `.sha256` manifest, an artefact independent of the bytes under test
+    /// (PF-016). This drives `detect_state` over all three reachable states and
+    /// asserts the field it records, so `honour_dev_declaration` cannot be
+    /// perfect while the value reaching it is fabricated (PF-015).
+    #[test]
+    fn test_detect_state_records_script_integrity_from_the_manifest() {
+        // (write a manifest?, edit the script after writing it?) → expected verdict
+        for (write_manifest, edit_after, expected) in [
+            (false, false, ScriptIntegrity::NoManifest),
+            (true, false, ScriptIntegrity::Verified),
+            (true, true, ScriptIntegrity::Tampered),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hooks_dir = dir.path().join("hooks");
+            std::fs::create_dir_all(&hooks_dir).unwrap();
+            let script_path = hooks_dir.join(super::super::helpers::HOOK_SCRIPT_NAME);
+            // Every script here is generated IN dev mode: the point is that the
+            // declaration alone never moves the integrity verdict.
+            let generated = crate::cmd::hooks::generate_hook_script(
+                "2.11.0",
+                "claude-code",
+                "/usr/local/bin/skim",
+                HookMode::Dev,
+            );
+            std::fs::write(&script_path, generated).unwrap();
+
+            if write_manifest {
+                let hash = crate::cmd::integrity::compute_file_hash(&script_path).unwrap();
+                crate::cmd::integrity::write_hash_manifest(
+                    dir.path(),
+                    "claude-code",
+                    super::super::helpers::HOOK_SCRIPT_NAME,
+                    &hash,
+                )
+                .unwrap();
+            }
+            if edit_after {
+                // Edit the script AFTER the manifest was written over it.
+                let current = std::fs::read_to_string(&script_path).unwrap();
+                std::fs::write(&script_path, format!("{current}# edited\n")).unwrap();
+            }
+
+            let env = DetectionEnv {
+                home_dir: Some(dir.path().to_path_buf()),
+                claude_config_dir: Some(dir.path().to_path_buf()),
+                cursor_config_dir: Some(dir.path().to_path_buf()),
+                gemini_config_dir: Some(dir.path().to_path_buf()),
+                copilot_config_dir: Some(dir.path().to_path_buf()),
+                codex_config_dir: Some(dir.path().to_path_buf()),
+                crush_config_dir: Some(dir.path().to_path_buf()),
+            };
+
+            let state =
+                detect_state(crate::cmd::session::AgentKind::ClaudeCode, false, &env).unwrap();
+
+            assert_eq!(
+                state.hook_mode,
+                HookMode::Dev,
+                "every case here declares the marker, so the mode must be Dev"
+            );
+            assert_eq!(
+                state.script_integrity, expected,
+                "detect_state must record the manifest-derived integrity verdict"
+            );
+            // The declaration is present in all three, so `commit_gate_waived`
+            // tracks the integrity verdict and nothing else.
+            assert_eq!(
+                state.commit_gate_waived(),
+                expected == ScriptIntegrity::Verified,
+                "the waiver must follow the manifest, not the marker"
+            );
+        }
+    }
+
     // ---- parse_version_from_script ----
 
     #[test]
@@ -1023,6 +1505,8 @@ mod tests {
             hook_commit: None,
             hook_binary_pin: pin,
             hook_uses_pinned_binary: true,
+            hook_mode: HookMode::Strict,
+            script_integrity: ScriptIntegrity::NoManifest,
             dual_scope_warning: None,
             existing_hooks: vec![],
             agent_cli_name: "claude-code",

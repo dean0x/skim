@@ -7,7 +7,7 @@
 //!
 //! The full implementation is deferred to follow-up ticket **#336** because:
 //! 1. AC8 explicitly allows phasing ("may be phased separately").
-//! 2. No corpus-grounded lift measurement has been performed yet (ADR-003).
+//! 2. No corpus-grounded lift measurement has been performed yet (SEARCH-ADR-003).
 //! 3. Extracting shared type references / trait impls requires deeper AST
 //!    traversal than the existing import-graph and proximity signals.
 //!

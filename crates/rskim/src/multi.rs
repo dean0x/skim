@@ -280,16 +280,28 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
 
     // B3 / ADR-011 class 1: emit lossy-view marker unconditionally when any
     // file's view differs from raw bytes.  Previously gated on `SKIM_REWRITTEN_FROM`.
-    if view_differs_count > 0 {
-        let mode_str = format!("{:?}", options.process.mode).to_lowercase();
-        if let Some(marker) = crate::output::lossy_view_marker(
+    //
+    // ONE marker for the whole run, so there is exactly one disclosure cost to
+    // charge — and the same `EmittedNotice` is both printed here and handed to
+    // the analytics block below, which is what makes the charged cost the
+    // emitted cost rather than a reconstruction of it.
+    // `Mode::name` is the canonical lowercase spelling — the same one the
+    // single-file marker in `process::view_notice_absolute` and the analytics
+    // `mode` column use, so the aggregate marker below and the rows it is
+    // charged against cannot name the mode two different ways.
+    let mode_str = options.process.mode.name().to_string();
+    let aggregate_notice = if view_differs_count > 0 {
+        crate::output::emitted_notice_cost(
             crate::output::rewrite_origin().as_deref(),
             &mode_str,
             view_differs_count,
             total_paths,
-        ) {
-            eprintln!("{marker}");
-        }
+        )
+    } else {
+        None
+    };
+    if let Some(notice) = &aggregate_notice {
+        eprint!("{}", notice.line());
     }
 
     if options.process.show_stats && total_original_tokens > 0 {
@@ -315,12 +327,49 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
             .unwrap_or_default()
             .display()
             .to_string();
-        let mode = format!("{:?}", options.process.mode).to_lowercase();
 
+        // EVERY ROW OF A BATCH IS UNMEASURED, and that is the honest answer
+        // rather than a missing one.
+        //
+        // `aggregate_notice` above is ONE line of stderr for the whole RUN.
+        // `notice_tokens` and `notice_bytes` are PER-FILE columns and
+        // `token_savings` has no invocation dimension to hang a run-scoped
+        // measurement on, so there is no per-file number here that was ever
+        // emitted. Every encoding that produces one is a fabrication:
+        //
+        // - charge every differing row: the run is billed N times for one
+        //   emission;
+        // - split it N ways: per-file costs nobody emitted, which do not even
+        //   sum back cleanly under integer division;
+        // - charge the FIRST differing row via `Option::take` — what this did.
+        //   The run TOTAL was right, and the per-file attribution was not: after
+        //   a 40-file run one arbitrary file carried the entire disclosure cost
+        //   and 39 carried a measured ZERO, with nothing in any row marking the
+        //   regime (architecture-04).
+        //
+        // So the rows record `notice_measured: false`, which
+        // `analytics::file_op_notice_cost` maps to SQL NULL in BOTH columns —
+        // "not measured in this regime". BOTH matters:
+        // `AnalyticsDb::DELIVERED_ROW` selects on `notice_tokens IS NOT NULL`
+        // and `delivered_unmeasured_rows` counts `notice_bytes IS NOT NULL AND
+        // notice_tokens IS NULL`, so NULLing only the tokens would move the
+        // whole batch into a counter that exists to expose untokenisable
+        // DISCLOSURES. Two NULLs leave the batch out of both, which is where a
+        // run-scoped measurement belongs until the schema can carry one.
+        //
+        // What this gives up, stated plainly: the batch's real disclosure cost
+        // is now recorded NOWHERE, where before it was recorded once and
+        // mis-attributed. It is not silently zeroed — `notice: None` on every
+        // row would have done that, and a measured zero DELETES the cost from
+        // the delivered series and biases the headline UP (PF-036's favourable
+        // direction), which is worse than the mis-attribution it would fix. The
+        // rows still feed the continuity series through `raw_tokens` /
+        // `compressed_tokens`, and still record `served`.
         let rows: Vec<crate::analytics::FileOpRow> = results
             .into_iter()
             .filter_map(|(path, result)| {
                 let pr = result.ok()?; // skip Err entries
+                let served = pr.served;
                 let counts = match (pr.original_tokens, pr.transformed_tokens) {
                     (Some(raw), Some(comp)) => {
                         // --show-stats (or count-carrying cache hit): counts already known.
@@ -345,12 +394,17 @@ fn process_files(paths: Vec<PathBuf>, options: MultiFileOptions) -> anyhow::Resu
                     original_cmd: format!("skim {}", path.display()),
                     language: pr.language.map(|l| l.as_str().to_string()),
                     parse_tier: pr.parse_tier.map(str::to_string),
+                    // No per-file disclosure exists to carry, and the row says
+                    // so rather than claiming a zero — see the block above.
+                    notice: None,
+                    notice_measured: false,
+                    served,
                 })
             })
             .collect();
 
         let common = crate::analytics::FileOpCommon {
-            mode: Some(mode),
+            mode: Some(mode_str),
             project_path: cwd,
             session_id: options.session_id.clone(),
         };

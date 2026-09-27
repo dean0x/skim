@@ -45,7 +45,7 @@ name = "proptest_invariants"
 required-features = ["harness"]
 
 # AC21 relative-regression bench: default transform path on a >100KB body.
-# Per ADR-003: no absolute ms gate. The baseline is generated locally via:
+# Per L3-ADR-003: no absolute ms gate. The baseline is generated locally via:
 #   cargo bench -p rskim-contract --bench contract_throughput_bench -- --save-baseline <name>
 #   cargo bench -p rskim-contract --bench contract_throughput_bench -- --baseline <name>
 # A committed .bench-baselines/ baseline + CI wiring is a follow-up tracked in

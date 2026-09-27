@@ -1,4 +1,4 @@
-//! D1 — `--json` disclosure split (ADR-015 / ADR-011 class 1).
+//! D1 — `--json` disclosure split (ADR-011 class 1).
 //!
 //! Every `--json` exit now declares a `Completeness`.  A `Lossy` declaration
 //! owes the reader an unconditional stderr marker naming the tool and the

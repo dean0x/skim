@@ -26,7 +26,7 @@
 //!   - C4: anchor.rs + aweak.rs                (anchor+aweak pair, second joint commit)
 //!   - C5: anchor.rs only                      (solo — bumps anchor's total to 5)
 //!
-//! Derived Jaccard values (from git log --no-merges, per ADR-003):
+//! Derived Jaccard values (from git log --no-merges, per SEARCH-ADR-003):
 //!   anchor total = 5 (C1+C2+C3+C4+C5)
 //!   zstrong total = 3 (C1+C2+C3)
 //!   aweak total   = 2 (C1+C4)
@@ -416,12 +416,12 @@ fn ac409_1_temporal_weight_only_follows_jaccard() {
     }
 }
 
-/// AC-6 / ADR-007 — the composite `--weights 0,0,1` partner order MINUS THE SEED
+/// AC-6 / SEARCH-ADR-007 — the composite `--weights 0,0,1` partner order MINUS THE SEED
 /// must be byte-identical, in order, to the standalone `--blast-radius` order.
 ///
 /// This is the self-validating invariant: it holds under any population (from any
 /// commit DAG), so it does not depend on the specific Jaccard numbers derived above.
-/// It is therefore the ADR-007 dog-food pass condition for this ticket.
+/// It is therefore the SEARCH-ADR-007 dog-food pass condition for this ticket.
 #[test]
 fn ac409_2_composite_temporal_order_equals_standalone_blast_order() {
     let fixture = make_linear_fixture();
@@ -469,10 +469,10 @@ fn ac409_2_composite_temporal_order_equals_standalone_blast_order() {
         .collect();
 
     // AC-6: the two sequences must be byte-identical in order.
-    // This is the ADR-007 invariant and does not depend on specific Jaccard numbers.
+    // This is the SEARCH-ADR-007 invariant and does not depend on specific Jaccard numbers.
     assert_eq!(
         composite_partners, standalone_paths,
-        "AC-6 / ADR-007: composite --weights 0,0,1 partner order (minus seed) must equal \
+        "AC-6 / SEARCH-ADR-007: composite --weights 0,0,1 partner order (minus seed) must equal \
          standalone --blast-radius order; \
          composite_partners={composite_partners:?}, standalone={standalone_paths:?}"
     );

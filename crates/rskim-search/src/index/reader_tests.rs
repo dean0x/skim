@@ -986,14 +986,14 @@ fn test_1000_file_benchmark() {
 }
 
 // -----------------------------------------------------------------------
-// AC1: Grounded lexical index size-ratio guard (ADR-003 + PF-007)
+// AC1: Grounded lexical index size-ratio guard (SEARCH-ADR-003 + PF-007)
 // -----------------------------------------------------------------------
 
 /// AD-LXSZ-1: The #174 30% (0.30x) figure has no measured basis and is
 /// structurally impossible for an uncompressed per-occurrence inverted index
 /// (posting entries are 9 bytes each; the builder indexes every byte-window
 /// per file with no dedup; posting bytes scale at O(source) not a fraction
-/// of it). Per ADR-003 that target is replaced by a measured ratio guard
+/// of it). Per SEARCH-ADR-003 that target is replaced by a measured ratio guard
 /// modeled on ast_index_size_ratio (~1.23-1.3x measured, <2.2x guard,
 /// ast_index/store/reader_tests.rs:574-666) and issue #273.
 ///
@@ -1017,7 +1017,7 @@ fn test_1000_file_benchmark() {
 /// classified as `SearchField::Other`), which exercises only the single-field
 /// code path and misses the field-boundary delta-reset that the v4 codec adds.
 /// Building with a real multi-field field_map makes this guard representative
-/// of the production on-disk size (ADR-003: grounded in the actual path).
+/// of the production on-disk size (SEARCH-ADR-003: grounded in the actual path).
 #[test]
 fn test_lexical_index_size_ratio() {
     use crate::classify_source;
@@ -1090,7 +1090,7 @@ fn test_lexical_index_size_ratio() {
     //   - Industry uncompressed code-search trigram indexes (Zoekt, Sourcegraph)
     //     run 3-5x source bytes; v4 delta+varint brings skim below that range.
     //     The #174 <30% (0.30x) target has no empirical origin and is
-    //     structurally impossible (see AD-LXSZ-1 comment above). ADR-003 replaces it.
+    //     structurally impossible (see AD-LXSZ-1 comment above). SEARCH-ADR-003 replaces it.
     //   - v5 (#392, token_position added): each posting gains a 4th varint
     //     (delta_token_position), almost always 0 or 1 → ~1 extra byte/entry over
     //     the v4 ~3.5 B/entry average, i.e. an estimated v5 ratio ~4.4x
@@ -1108,9 +1108,9 @@ fn test_lexical_index_size_ratio() {
     //   - True sensitivity threshold: ~1.26x bloat (7.0 / 5.57 measured v7
     //     baseline). A genuine posting-list explosion (full revert to v3
     //     fixed-9-byte encoding gives 9.04x >> 7.0x) still definitively fires
-    //     the gate (ADR-003).
+    //     the gate (SEARCH-ADR-003).
     //
-    // ADR-003: regression guard must be empirically grounded, not the
+    // SEARCH-ADR-003: regression guard must be empirically grounded, not the
     // baseless 0.30x inherited from the original ticket text.
     const LEXICAL_SIZE_RATIO_CEILING: f64 = 7.0;
     assert!(
@@ -1149,7 +1149,7 @@ fn test_lexical_index_size_ratio() {
 }
 
 // -----------------------------------------------------------------------
-// AC2: Grounded query-latency guard on representative corpus (ADR-003 + PF-007)
+// AC2: Grounded query-latency guard on representative corpus (SEARCH-ADR-003 + PF-007)
 // Release-mode only: debug builds run under sanitizers and without
 // optimizations, making latency measurements meaningless.
 // -----------------------------------------------------------------------
@@ -1180,7 +1180,7 @@ fn test_lexical_index_size_ratio() {
 /// single-field path is neutral-to-conservative (one long posting run vs.
 /// several shorter ones), so the 50ms budget is not loosened by the switch;
 /// the fix aligns representativeness claims with the actual build path so both
-/// guards are grounded on the same production-representative corpus (ADR-003).
+/// guards are grounded on the same production-representative corpus (SEARCH-ADR-003).
 #[test]
 #[cfg(not(debug_assertions))]
 fn test_lexical_query_latency_representative_corpus() {
@@ -1197,7 +1197,7 @@ fn test_lexical_query_latency_representative_corpus() {
         .collect();
 
     // Build the index once using the production-representative classified path.
-    // This aligns with the sibling size test and with index.rs::run() (ADR-003).
+    // This aligns with the sibling size test and with index.rs::run() (SEARCH-ADR-003).
     {
         let mut builder = NgramIndexBuilder::new(dir.path().to_path_buf()).unwrap();
         for (i, src) in sources.iter().enumerate() {
@@ -1456,7 +1456,7 @@ fn test_ac6_result_set_non_regression_v4_codec() {
     // The #355 "gibberish matches ~100 files" regression (#174) fired because
     // common bigrams overlapped almost all files.  With v4 trigram codec the
     // gibberish ceiling is much lower.  We use a 5-file corpus here; gibberish
-    // must match at most 1 file (ADR-006 spirit: regression must not worsen).
+    // must match at most 1 file (SEARCH-ADR-006 spirit: regression must not worsen).
     //
     // Baseline ceiling for this 5-file corpus: 1.  A corpus-size-relative
     // ceiling (20%) rounds to 1 for N=5, and is tight enough to catch a
@@ -2434,17 +2434,17 @@ fn test_ac2_exact_token_filter_definer_ranks_above_test_helpers() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ADR-007: substring-only candidates must not be dropped before verify gate
+// SEARCH-ADR-007: substring-only candidates must not be dropped before verify gate
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// ADR-007 recall regression: `search_exact_intersection` must return a file
+/// SEARCH-ADR-007 recall regression: `search_exact_intersection` must return a file
 /// that contains the query **only** as a substring of longer identifiers, with
 /// no exact-token occurrences anywhere in the file.
 ///
 /// Previously the method applied `if !field_tf.iter().any(|&f| f > 0.0) {
 /// continue; }` which dropped such files before the caller's substring-verify
 /// gate (`resolve_paths_and_snippets_verified`) could confirm the match.  This
-/// violated ADR-007: `git grep check_staleness` returns a file containing
+/// violated SEARCH-ADR-007: `git grep check_staleness` returns a file containing
 /// `fn test_check_staleness_present() {}` even though `check_staleness` is a
 /// substring of `test_check_staleness_present` — not a standalone token.
 ///
@@ -2477,10 +2477,10 @@ fn test_adr007_pure_substring_only_match_returned() {
     let results = reader.search(&q).unwrap();
     let ids: Vec<u32> = results.iter().map(|r| r.file_id.0).collect();
 
-    // ADR-007: file 1 must appear because `git grep check_staleness` returns it.
+    // SEARCH-ADR-007: file 1 must appear because `git grep check_staleness` returns it.
     assert!(
         ids.contains(&1),
-        "ADR-007: file containing '{symbol}' only as a substring of \
+        "SEARCH-ADR-007: file containing '{symbol}' only as a substring of \
          'test_{symbol}_present' must appear in results; got {ids:?} — \
          the zero-field_tf early-continue was not removed from \
          search_exact_intersection"
@@ -2490,13 +2490,13 @@ fn test_adr007_pure_substring_only_match_returned() {
     // match (FileId 1) — BM25F score > 0.0 > 0.0 (substring score).
     assert!(
         ids.contains(&0),
-        "ADR-007: definer (FileId 0) must also be present; got {ids:?}"
+        "SEARCH-ADR-007: definer (FileId 0) must also be present; got {ids:?}"
     );
     let pos_definer = ids.iter().position(|&x| x == 0).unwrap();
     let pos_sub = ids.iter().position(|&x| x == 1).unwrap();
     assert!(
         pos_definer < pos_sub,
-        "ADR-007: definer (FileId 0) must rank above pure-substring file (FileId 1); \
+        "SEARCH-ADR-007: definer (FileId 0) must rank above pure-substring file (FileId 1); \
          got {ids:?} — definer at rank {} substring at rank {}",
         pos_definer + 1,
         pos_sub + 1
@@ -2601,7 +2601,7 @@ fn ac8_build_stamps_validity_marker() {
 /// WITHOUT touching the header.checksum field, MUST still open Ok — the full
 /// CRC32 is provably skipped on the fast path. This fails the moment the
 /// optimization is deleted, and is the deterministic regression sentinel
-/// standing in for a (banned, ADR-003) wall-clock latency assertion.
+/// standing in for a (banned, SEARCH-ADR-003) wall-clock latency assertion.
 #[test]
 fn ac1_fast_path_skips_crc_on_held_mtime_byteflip() {
     let dir = tmp_dir();

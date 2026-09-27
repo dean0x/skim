@@ -1,6 +1,6 @@
 // AC21 relative-regression criterion bench for rskim-contract.
 //
-// Per ADR-003: no absolute ms gate. AC21's gate is the code-path/dependency
+// Per L3-ADR-003: no absolute ms gate. AC21's gate is the code-path/dependency
 // assertion (`ac21_default_path_is_byte_length_only` in guardrail.rs, which
 // proves the default path never reaches canonicalization / re-serialization);
 // this bench is the AC21 "SHOULD" relative-regression tripwire on a >100KB body.

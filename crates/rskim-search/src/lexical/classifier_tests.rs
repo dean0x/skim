@@ -699,7 +699,7 @@ fn test_411_markdown_heading_is_type_definition() {
 // as a call site.  That contradicts Rust `struct Foo` (struct_item = priority 5
 // → TypeDefinition) and Python `class Foo` (class_definition = priority 5 →
 // TypeDefinition) for semantically-equivalent constructs.
-// (applies ADR-001: fix immediately; applies ADR-007: dog-food quality gate)
+// (applies SEARCH-ADR-001: fix immediately; applies SEARCH-ADR-007: dog-food quality gate)
 // -----------------------------------------------------------------------
 
 /// TS `class Foo {}` — the class name "Foo" must be TypeDefinition, NOT FunctionBody.
@@ -811,7 +811,7 @@ fn test_411_java_class_and_interface_both_typedefinition() {
         SearchField::TypeDefinition,
         "Java interface name must be TypeDefinition; got {iface_field:?}"
     );
-    // Both should be equal — cross-language consistency mandated by ADR-007.
+    // Both should be equal — cross-language consistency mandated by SEARCH-ADR-007.
     assert_eq!(
         class_field, iface_field,
         "Java `class` and `interface` names must rank at the same tier \

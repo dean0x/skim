@@ -14,7 +14,7 @@
 //!
 //! 2. **Never-inflate AND never-lose-information** — Per-transform-unit and
 //!    whole-request output bytes ≤ input bytes, and all active egress engines are
-//!    information-preserving (lossless-only per ADR-007/#427). The gate is a
+//!    information-preserving (lossless-only per L3-ADR-007/#427). The gate is a
 //!    byte-length comparison only — no tokenizer in the accept/reject path. No
 //!    tiny-payload exemption (unlike the L2 guardrail).
 //!
@@ -129,7 +129,7 @@
 //! - #325 — L2 guardrail migration follow-up (tracked, not done here).
 //! - #328 — conformance-harness registration for `rskim-llm`.
 //! - #342 — `DecisionRecord.reason` + token fields: shared schema coordination
-//!   between #301 (this crate, schema owner) and #305 (persistence), per ADR-004.
+//!   between #301 (this crate, schema owner) and #305 (persistence), per L3-ADR-004.
 //!   Adds [`log::OutcomeReason`] enum and `reason`/`tokens_in`/`tokens_out` fields
 //!   to [`log::DecisionRecord`], unblocking #304's full 5→3 reason mapping.
 

@@ -121,7 +121,7 @@ fn is_value_decl_kind(kind: &str) -> bool {
 /// [`map_identifier_to_field`] excludes these containers from the declaration check, and
 /// without this function the class *name* identifier falls through to
 /// [`SearchField::FunctionBody`] (call-site tier) — the cross-language inconsistency
-/// identified in the #411 review (applies ADR-007 dog-food gate; applies ADR-001
+/// identified in the #411 review (applies SEARCH-ADR-007 dog-food gate; applies SEARCH-ADR-001
 /// fix-immediately rule).
 ///
 /// This function corrects that by marking all priority-2 container kinds as declaration

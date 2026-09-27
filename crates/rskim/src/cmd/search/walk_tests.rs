@@ -678,7 +678,7 @@ fn test_walk_metadata_flat_corpus_order_unchanged() {
     assert_eq!(keys[2], "src/c.rs");
 }
 
-/// AC-10 / ADR-003: pin the pure-string contract of `normalize_rel_path`.
+/// AC-10 / SEARCH-ADR-003: pin the pure-string contract of `normalize_rel_path`.
 /// The helper only folds `\\`→`/`; it performs NO filesystem-style canonicalization
 /// (no leading-`./` strip, no `..` collapse). This test asserts that contract
 /// directly on two literal inputs (`foo` and `./foo`) — it does NOT build an index
@@ -699,7 +699,7 @@ fn test_normalize_rel_path_collision_two_forms_of_same_path() {
     // `./foo` is NOT collapsed to `foo`: `normalize_rel_path` only folds `\\`→`/`,
     // it does not strip a leading `./` (that is `temporal::normalize_blast_radius_path`'s
     // job). So the two forms produce DISTINCT keys here — the helper does pure
-    // string work with no filesystem normalization (AC-10 / ADR-003).
+    // string work with no filesystem normalization (AC-10 / SEARCH-ADR-003).
     let key_b = normalize_rel_path(Path::new("./foo"));
 
     assert_eq!(key_a, "foo", "normalize_rel_path('foo') must be 'foo'");

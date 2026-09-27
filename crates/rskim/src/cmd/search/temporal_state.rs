@@ -9,7 +9,7 @@
 //!
 //! Reads of `temporal.db` meta keys use a lightweight read-only SQLite connection
 //! (no WAL pragma, no permission reset, no migrations) rather than the full
-//! `TemporalDb::open` path. This is an intentional performance trade-off (ADR-003):
+//! `TemporalDb::open` path. This is an intentional performance trade-off (SEARCH-ADR-003):
 //! meta checks run on every query; the full open cost is justified only when data
 //! is actually read. Writes always go through the domain API (`TemporalDb::set_meta`,
 //! `temporal_build.rs`) — one key, one schema owner.
@@ -54,7 +54,7 @@ pub(super) enum ReanchorPolicy {
 /// Low-level primitive used by [`temporal_db_is_stale`] so that function can
 /// issue both its key reads against **one** connection — avoiding a second
 /// `db_path.exists()` stat + `Connection::open_with_flags` + `sqlite_master`
-/// schema parse per query (AC32 / ADR-003).
+/// schema parse per query (AC32 / SEARCH-ADR-003).
 ///
 /// Also used directly from [`read_temporal_meta`] so the query text lives in
 /// exactly one place.
@@ -83,7 +83,7 @@ fn read_meta_on(conn: &rusqlite::Connection, key: &str) -> Option<String> {
 ///
 /// Writes always go through `TemporalDb::set_meta` (domain API in `rskim-search`).
 /// This function uses an intentionally lighter open for read-path performance
-/// (ADR-003); both paths execute the same `SELECT value FROM meta WHERE key = ?1`
+/// (SEARCH-ADR-003); both paths execute the same `SELECT value FROM meta WHERE key = ?1`
 /// query. Keeping both in this module ensures schema drift is caught at review time.
 /// Test-only open counter — incremented each time `read_temporal_meta` reaches the
 /// SQLite open attempt (i.e. after the `exists()` guard passes).  Used by
@@ -143,7 +143,7 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
 ///    Only probed when `git_dir` is `Some`; absent `is_shallow` row
 ///    (pre-AD-414-14 DBs) skips the check.
 ///
-/// # Performance (ADR-003)
+/// # Performance (SEARCH-ADR-003)
 ///
 /// Opens ONE lightweight read-only SQLite connection (no WAL pragma, no
 /// permission reset, no migrations) and reads `META_GIT_HEAD`,
@@ -164,7 +164,7 @@ fn read_temporal_meta(cache_dir: &Path, key: &str) -> Option<String> {
 /// delete, or 2nd+ query after a temporal-less rebuild due to BUG A). This
 /// helper checks temporal.db's stored META_GIT_HEAD against the `current_head`
 /// already read at function entry in `auto_refresh_if_stale`. Self-heals the
-/// stuck-stale (deadbeef) case. Non-fatal by ADR-006/D5.
+/// stuck-stale (deadbeef) case. Non-fatal by SEARCH-ADR-006/D5.
 ///
 /// AD-TMP-3: production temporal staleness uses file-IO HEAD comparison here,
 /// not `check_temporal_staleness` from `temporal.rs` — that helper is
@@ -187,7 +187,7 @@ pub(super) fn temporal_db_is_stale(
     // Pre-diff: two `read_temporal_meta` calls each performed their own
     // `db_path.exists()` stat + `Connection::open_with_flags` + first-statement
     // `sqlite_master` schema parse — an avoidable +1 open on every query on the
-    // steady-state Current path (AC32 / ADR-003).
+    // steady-state Current path (AC32 / SEARCH-ADR-003).
     let conn = match rusqlite::Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -205,7 +205,7 @@ pub(super) fn temporal_db_is_stale(
     // AD-408-4: Check 2: data-version gate.
     // The DB is stale when the stored data_version is absent or numerically less
     // than TEMPORAL_DATA_VERSION, forcing a self-heal rebuild on the next query
-    // (applies ADR-006; mirrors the lexical/AST/manifest self-heal in
+    // (applies SEARCH-ADR-006; mirrors the lexical/AST/manifest self-heal in
     // check_staleness). Meta values are TEXT — version comparison is numeric to
     // correctly order multi-digit values (string compare mis-orders "10" vs "2").
     // An absent or non-integer stored value is treated as stale (pre-fix DB).
@@ -393,7 +393,7 @@ pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {
 // Non-fatal rebuild orchestrator
 // ============================================================================
 
-/// Rebuild `temporal.db` non-fatally, swallowing any error per ADR-006/D5.
+/// Rebuild `temporal.db` non-fatally, swallowing any error per SEARCH-ADR-006/D5.
 ///
 /// This is the single implementation of the D5 non-fatal-swallow contract that
 /// was previously duplicated in three structurally-divergent copies across
@@ -401,7 +401,7 @@ pub(super) fn anchor_state_on_db(db: &TemporalDb, root: &Path) -> AnchorState {
 /// (below). Centralising it prevents the copies from drifting independently —
 /// a single edit here updates all three call sites.
 ///
-/// # Contract (ADR-006/D5)
+/// # Contract (SEARCH-ADR-006/D5)
 ///
 /// - `rebuild_temporal` is always called for [`HeadState::Resolved`]; AD-414-22:
 ///   [`HeadState::Unresolved`] on an explicit build arm calls
@@ -539,7 +539,7 @@ pub(super) fn try_rebuild_temporal_nonfatal(
         reanchor,
         loudness,
     ) {
-        // Ignore temporal errors — they must not fail the lexical/AST query (ADR-006/D5).
+        // Ignore temporal errors — they must not fail the lexical/AST query (SEARCH-ADR-006/D5).
         if crate::debug::is_debug_enabled() {
             eprintln!("skim search [debug]: temporal {debug_label} error (non-fatal): {e}");
         }

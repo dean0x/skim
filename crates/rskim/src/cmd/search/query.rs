@@ -39,7 +39,7 @@ use super::types::{QueryConfig, QueryOutput, ResolvedResult};
 //
 // `candidate_pool(limit, k)` returns `max(limit * k, CANDIDATE_POOL_FLOOR)` so
 // every path uses the same floor policy.  Calibrating K per-path is tracked in
-// #361 per ADR-003 (grounded measurements before changing).
+// #361 per SEARCH-ADR-003 (grounded measurements before changing).
 //
 // Current values:
 //   LEXICAL_CANDIDATE_POOL_K = 5  (pure-lexical, with floor)
@@ -57,8 +57,8 @@ const CANDIDATE_POOL_FLOOR: usize = 100;
 ///
 /// AD-374-3: promoted to `pub(super)` module level so `ast.rs` can reuse this
 /// constant for the AST verify gate pool — single definition, no divergent
-/// AST-local fork (see #361 and ADR-003). Value = 5; unmeasured heuristic,
-/// tracked under #361 per ADR-003.
+/// AST-local fork (see #361 and SEARCH-ADR-003). Value = 5; unmeasured heuristic,
+/// tracked under #361 per SEARCH-ADR-003.
 pub(super) const LEXICAL_CANDIDATE_POOL_K: usize = 5;
 
 /// Compute the pre-verify candidate pool size for a given path K multiplier.
@@ -327,7 +327,7 @@ pub(super) fn positional_inert_notice(
 ///   word token so proximity to "other words" is vacuous.
 /// - `N < word_count - 1`: k distinct strictly-ascending positions span at least
 ///   k−1 word tokens, so no assignment can satisfy the window.  Silent zero
-///   results would be confusing; a stderr notice follows ADR-001 ("fail loud,
+///   results would be confusing; a stderr notice follows SEARCH-ADR-001 ("fail loud,
 ///   never silently").
 ///
 /// Not a hard error — exit code stays 0.  `text` is the trimmed query string.
@@ -818,7 +818,7 @@ fn run_compound_query(
     //
     // AD-356-1: restrict the lexical engine to the AST-matched FileId set so
     // `raw_lex` is exactly AST ∩ lexical-present — no qualifying file can fall
-    // beyond a `limit * K` cliff. We removed CANDIDATE_POOL_K (ADR-003: the
+    // beyond a `limit * K` cliff. We removed CANDIDATE_POOL_K (SEARCH-ADR-003: the
     // correct fix is to eliminate the cap, not retune it).
     //
     // AD-356-2: size sq.limit to the candidate set, NOT None. The reader's
@@ -838,7 +838,7 @@ fn run_compound_query(
     // Disjoint blast∩AST early-out: blast and AST sets are non-empty but share
     // no files.  Symmetric with the ast_fid_set.is_empty() guard above — both
     // guards prevent unnecessary reader/intersect work and make the intent
-    // explicit rather than relying on reader side-effect semantics (#356, ADR-003).
+    // explicit rather than relying on reader side-effect semantics (#356, SEARCH-ADR-003).
     if filter_set.is_empty() {
         return Ok(empty_output(config, &ctx, vm_label));
     }
@@ -965,7 +965,7 @@ fn run_compound_query(
 /// Resolves `config.blast_radius_paths` into a Jaccard-scored temporal layer
 /// and returns `None` when the blast radius contributes nothing to the fusion.
 ///
-/// `None` is returned in two cases (AD-413-16 / ADR-009):
+/// `None` is returned in two cases (AD-413-16 / SEARCH-ADR-009):
 /// - `Some(empty)` allowlist — the `AnchorDiffers` sentinel: the temporal DB
 ///   belongs to a different repository; the `paths_to_scored_file_ids` scan is
 ///   skipped because the mismatch notice was already emitted upstream.
@@ -1034,7 +1034,7 @@ fn run_blast_radius_composite_query(
     // Precondition: this function is only dispatched from the
     // `config.blast_radius_paths.is_some()` gate in `execute_query_with_manifest`.
     // `blast_temporal_layer` has a safe `?` fallback for None, but the assertion
-    // makes the invariant checkable rather than narrative (reliability.md; ADR-009).
+    // makes the invariant checkable rather than narrative (reliability.md; SEARCH-ADR-009).
     debug_assert!(
         config.blast_radius_paths.is_some(),
         "composite blast-radius arm requires a resolved allowlist \
@@ -1048,7 +1048,7 @@ fn run_blast_radius_composite_query(
         .composite_weights
         .unwrap_or_else(CompositeWeights::with_six_signal_defaults);
 
-    // AD-413-16 / ADR-009 unified early-out: `blast_temporal_layer` covers BOTH
+    // AD-413-16 / SEARCH-ADR-009 unified early-out: `blast_temporal_layer` covers BOTH
     // the `Some(empty)` AnchorDiffers sentinel (temporal DB belongs to a different
     // repository — mismatch notice already emitted by `resolve_blast_radius_paths`)
     // and the "allowlist non-empty but no path resolves to a FileId" case (all
@@ -1056,7 +1056,7 @@ fn run_blast_radius_composite_query(
     // disclosed by `paths_to_scored_file_ids` on stderr).  In either case the blast
     // radius contributes nothing to the fusion; returning zero results matches the
     // standalone temporal arm and avoids a confident ranking that is not a blast
-    // radius at all (ADR-009).  This check runs BEFORE the lexical search so an
+    // radius at all (SEARCH-ADR-009).  This check runs BEFORE the lexical search so an
     // unresolvable allowlist never triggers a wasted corpus-wide BM25F pass —
     // matching the early-out ordering of the standalone temporal arm.
     let Some(temporal_layer) = blast_temporal_layer(config, ctx.sorted) else {
@@ -1122,7 +1122,7 @@ fn run_blast_radius_composite_query(
     // The blast-radius path fuses only the lexical and co-change (temporal)
     // signals, so only those two layers are constructed here. The `ast` weight
     // (0.3 by default) and the extended signals (import_graph, dir_proximity,
-    // structural_coupling — all 0.0 by default per ADR-003) have no layer to
+    // structural_coupling — all 0.0 by default per SEARCH-ADR-003) have no layer to
     // apply to on this path; wiring the full text+AST+temporal compound dispatch
     // is tracked in #339.
     let layers: &[(Vec<(FileId, f64)>, f64)] = &[

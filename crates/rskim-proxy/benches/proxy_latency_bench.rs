@@ -3,7 +3,7 @@
 //! ## AD-PXY-16 — Profile-first RELATIVE regression guard (D7 — OVERRIDES fixed gate)
 //!
 //! The inherited absolute `<10ms` p99 figure has no measured basis on this
-//! machine (see ADR-003 / PF-005: the PRISM-hardware value is empirically
+//! machine (see L3-ADR-003 / PF-005: the PRISM-hardware value is empirically
 //! baseless here; rskim-core alone is ~14.6ms on a 3000-line file). This bench
 //! adopts the D7 resolution: **profile-first relative regression guard**.
 //!
@@ -77,7 +77,7 @@ use tokio::runtime::Runtime;
 ///   is structurally guaranteed to exceed this multiple (AC14 discriminating arm).
 ///
 /// Evidence basis: 3× is a conventional threshold for relative regression guards
-/// in latency-sensitive systems (see ADR-003: "documented multiple").
+/// in latency-sensitive systems (see L3-ADR-003: "documented multiple").
 ///
 /// The absolute design goal of `<10ms` (plan §3 / D7) is achievable on this
 /// machine; the relative guard is the enforcement mechanism.

@@ -33,7 +33,7 @@ fn test_default_weight_is_zero() {
     let w = CompositeWeights6::with_six_signal_defaults();
     assert_eq!(
         w.structural_coupling, 0.0,
-        "structural_coupling default weight must be 0.0 (ADR-003 gated, AC8b)"
+        "structural_coupling default weight must be 0.0 (SEARCH-ADR-003 gated, AC8b)"
     );
 }
 

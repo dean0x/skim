@@ -85,7 +85,7 @@ const _: () = assert!(
 /// variable-length delta+varint encoding (see `encode_postings_varint`). Old v3
 /// indexes self-heal via staleness detection: `check_staleness` compares the
 /// stored version against this constant and triggers a full rebuild when it is
-/// below the current value (ADR-006).
+/// below the current value (SEARCH-ADR-006).
 ///
 /// v4 → v5 (#392 / #380 Phase 2): `PostingEntry` gains a `token_position: u32`
 /// field (word-token ordinal) to support word/token-distance phrase / --near
@@ -93,7 +93,7 @@ const _: () = assert!(
 /// field is retained for snippets. Old v4 indexes self-heal the same way.
 ///
 /// With this constant exported, `check_staleness` (staleness.rs) can detect the
-/// mismatch first and self-heal automatically on the next query (ADR-006,
+/// mismatch first and self-heal automatically on the next query (SEARCH-ADR-006,
 /// Finding 9 / #355 and #358).
 pub const LEXICAL_INDEX_FORMAT_VERSION: u16 = index::LEXICAL_FORMAT_VERSION;
 

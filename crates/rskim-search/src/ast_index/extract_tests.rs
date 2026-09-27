@@ -517,7 +517,7 @@ fn crate_root_reexports_resolve() {
 // wall-clock `< 5ms` assertion here was a flaky pattern — a single un-warmed
 // call on a shared CI runner does not reliably bound latency. Replacing it
 // with a correctness-only smoke test that asserts the call completes and
-// produces non-empty output for a realistic input (applies ADR-001: don't
+// produces non-empty output for a realistic input (applies SEARCH-ADR-001: don't
 // silently cap coverage).
 
 #[test]
@@ -799,7 +799,7 @@ fn metrics_path_real_ngrams_match_weights_path() {
 //
 // Additional assertion: metrics.max_depth == u16::MAX.
 //
-// Applies ADR-003 (grounded regression guards); avoids PF-004 (u16 overflow).
+// Applies SEARCH-ADR-003 (grounded regression guards); avoids PF-004 (u16 overflow).
 
 #[test]
 fn metrics_path_u16_max_depth_no_panic_max_depth_recorded() {
@@ -1035,7 +1035,7 @@ fn weight_set_once_count_accumulates() {
 // This is the analogue of `metrics_path_real_ngrams_match_weights_path` (B_M1)
 // for the third traversal path — without it a future reorder in `run_extraction`
 // not mirrored in `synthetic_key_present` would pass CI while silently breaking
-// the ADR-006 single-source-of-truth guarantee.
+// the SEARCH-ADR-006 single-source-of-truth guarantee.
 //
 // Covers two scenarios:
 // - PRESENT: DEEP_NODE → bucket_label(0) is emitted by a depth-4 node stream

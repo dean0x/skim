@@ -200,7 +200,7 @@ pub(crate) fn run(
             }
             let (root, cache_dir) = resolve_root_and_cache(&flags.root_override)?;
             std::fs::create_dir_all(&cache_dir)?;
-            // ADR-006: refresh BOTH indexes before opening either engine.
+            // SEARCH-ADR-006: refresh BOTH indexes before opening either engine.
             // Finding 2 fix: destructure the HeadState returned by auto_refresh_if_stale
             // so we do not re-call git_head_state on the temporal-consuming path below.
             let (_outcome, manifest, head_state) = staleness::auto_refresh_if_stale(
@@ -937,7 +937,7 @@ fn run_build(
     // temporal), matching user expectation that "rebuild" rebuilds everything (#357 BUG A).
     // run_build goes through build_index directly, bypassing auto_refresh_if_stale where
     // the only other temporal hook lives, so temporal must be populated here too.
-    // Non-fatal by ADR-006/D5: a temporal failure must NOT fail the explicit build.
+    // Non-fatal by SEARCH-ADR-006/D5: a temporal failure must NOT fail the explicit build.
     // Step 7 wiring (a): classify HEAD state once, emit the advisory, then rebuild.
     // The `force` flag is intentionally NOT forwarded: rebuild_temporal always does a
     // full history walk (no cache) — see `parse_history(root, 0)` in
@@ -1472,7 +1472,7 @@ fn run_query(
     // The pure-lexical subpath passes the manifest to execute_query_with_manifest
     // so it skips its own internal refresh.
     //
-    // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
+    // SEARCH-ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
     // Finding 2 fix: destructure HeadState from auto_refresh_if_stale so the
     // temporal-consuming arms do not need a second git_head_state call.
@@ -1547,7 +1547,7 @@ fn run_query(
     // Applied at the FileId level inside execute_query (no path round-trip).
     //
     // IMPORTANT: auto_refresh_if_stale was already called above so the AST index
-    // is fresh before we open it here (applies ADR-006: self-heal ordering is
+    // is fresh before we open it here (applies SEARCH-ADR-006: self-heal ordering is
     // load-bearing).  The manifest from that call is passed into execute_query so
     // it skips a redundant refresh+load — each query path refreshes exactly once.
     //
@@ -1610,7 +1610,7 @@ fn run_query(
             (None, pre_loaded_manifest_from_refresh, None)
         };
 
-    // AD-403-6: degenerate --near diagnostic (fail loud, never silently — ADR-001).
+    // AD-403-6: degenerate --near diagnostic (fail loud, never silently — SEARCH-ADR-001).
     // Emitted here on the text-query path ONLY (has_text is true by construction).
     // Case (a): single-word query + --near N (N cannot constrain anything).
     // Case (b): N < word_count - 1 (structurally unsatisfiable; returns empty results
@@ -1894,7 +1894,7 @@ fn run_temporal_standalone(
     // bare --hot/--cold/--risky/--blast-radius never called auto_refresh_if_stale,
     // so temporal.db was never self-healed on these paths even though the false
     // comment above claimed it was guaranteed.
-    // ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
+    // SEARCH-ADR-006/D5: auto_refresh_if_stale propagates lexical errors as Err but
     // swallows temporal errors internally — callers only see lexical failures.
     // Finding 2 fix: destructure HeadState from auto_refresh_if_stale so we do
     // not re-call git_head_state for the advisory below.
@@ -3287,7 +3287,7 @@ mod tests {
     /// AC18 — the unresolvable-HEAD message must not repeat the "not a git repo"
     /// lie, must name BOTH remaining causes, and must carry the real ticket number.
     ///
-    /// AC18(c)/ADR-004: the `#481` literal is asserted against the constant itself,
+    /// AC18(c)/SEARCH-ADR-004: the `#481` literal is asserted against the constant itself,
     /// not against a regex for `#<n>`, so a placeholder ticket number or a renumber
     /// fails this test rather than shipping.
     #[test]
@@ -3306,7 +3306,7 @@ mod tests {
         );
         assert!(
             HEAD_UNRESOLVED_TEMPORAL_MSG.contains("#481"),
-            "AC18(c)/ADR-004: must cite the filed reftable ticket #481 verbatim"
+            "AC18(c)/SEARCH-ADR-004: must cite the filed reftable ticket #481 verbatim"
         );
         assert!(
             !SUBDIR_ROOT_TEMPORAL_MSG.contains("run 'skim search' on a git repo"),
@@ -3853,7 +3853,7 @@ mod tests {
         assert_eq!(
             result,
             ExitCode::SUCCESS,
-            "--rebuild on non-git dir must exit 0 (non-fatal temporal, ADR-006/D5)"
+            "--rebuild on non-git dir must exit 0 (non-fatal temporal, SEARCH-ADR-006/D5)"
         );
 
         let cache_dir = index::resolve_search_cache_dir(root).unwrap();

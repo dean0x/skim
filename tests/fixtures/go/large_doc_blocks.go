@@ -1,3 +1,7 @@
+// SECTIONHDR_MODULEHEADER: top-of-file header run - preserved (#476).
+// The blank line below terminates the header run, so the section that
+// follows is NOT part of it and stays subject to the Go doc-comment rule.
+
 // SECTIONA_HEADERRUN line 0
 // SECTIONA_HEADERRUN line 1
 // SECTIONA_HEADERRUN line 2

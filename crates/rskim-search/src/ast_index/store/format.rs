@@ -68,7 +68,7 @@ pub(crate) const SKAX_MAGIC: &[u8; 4] = b"SKAX";
 ///   invalidate every pre-#405 AST index.  A v2 index may contain empty
 ///   postings for files in the 100 KiB..1 MiB band that are now AST-eligible.
 ///   `check_staleness` detects `on_disk_version < FORMAT_VERSION` and triggers
-///   a full dual-index rebuild on the next AST-relevant invocation (ADR-006).
+///   a full dual-index rebuild on the next AST-relevant invocation (SEARCH-ADR-006).
 /// - Together with the `CACHE_FORMAT_VERSION` 1 -> 2 bump in `ast_cache.rs`,
 ///   this forces a COLD rebuild: the skcache is discarded so every file is
 ///   re-extracted from source under the new cap (without the cache bump the

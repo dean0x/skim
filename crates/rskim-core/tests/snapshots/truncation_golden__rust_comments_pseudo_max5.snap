@@ -5,5 +5,5 @@ expression: "snap(RUST_COMMENTS, Language::Rust,\nTransformConfig::with_mode(Mod
 //! Module-level doc comment (KEEP)
 //! This describes the module (KEEP)
 
-
+/// Function doc comment (KEEP)
 // ... (47 lines truncated)

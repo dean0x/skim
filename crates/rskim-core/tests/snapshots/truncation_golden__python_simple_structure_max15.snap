@@ -5,10 +5,10 @@ expression: "snap(PYTHON_SIMPLE, Language::Python,\nTransformConfig::with_mode(M
 # ... (5 lines truncated)
 def calculate_sum(a: int, b: int) -> int:
      {...}
-# ... (1 line truncated)
+# ... (3 lines truncated)
 def greet_user(name: str) -> str:
      {...}
-# ... (1 line truncated)
+# ... (3 lines truncated)
 class Calculator:
     def add(self, x: int, y: int) -> int:
          {...}
