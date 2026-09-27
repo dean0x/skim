@@ -348,11 +348,10 @@ pub fn load_golden(path: &Path) -> anyhow::Result<LoadedGolden> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading golden file {}", path.display()))?;
     let file = parse_golden(&raw).with_context(|| format!("in {}", path.display()))?;
-    let sha256 = golden_digest(
-        raw.as_bytes(),
-        !file.asts.is_empty(),
-        &structural_oracle_sha256(),
-    );
+    // The oracle fingerprint is rendered and hashed only for a file that
+    // folds it in.
+    let oracle = (!file.asts.is_empty()).then(structural_oracle_sha256);
+    let sha256 = golden_digest(raw.as_bytes(), oracle.as_deref());
     Ok(LoadedGolden { file, sha256 })
 }
 
@@ -364,16 +363,17 @@ pub fn structural_oracle_sha256() -> String {
     hex_sha256(structural::fingerprint().as_bytes())
 }
 
-/// A golden file's digest: the SHA-256 of its `raw` bytes, or — when the
-/// file has `[[ast]]` entries (`has_ast`) — the SHA-256 of the bytes, a
-/// separator and `oracle_sha256` ([`structural_oracle_sha256`]). The oracle
-/// queries are compiled into the scoreboard, so this is how an edit to one
-/// reaches the per-corpus `golden_sha256`: the gate then asks for a bless,
-/// and `bless` refuses a report made with other queries.
-pub fn golden_digest(raw: &[u8], has_ast: bool, oracle_sha256: &str) -> String {
-    if !has_ast {
+/// A golden file's digest: the SHA-256 of its `raw` bytes, or — for a file
+/// with `[[ast]]` entries, which passes `oracle_sha256`
+/// ([`structural_oracle_sha256`]) — the SHA-256 of the bytes, a separator
+/// and that digest. The oracle queries are compiled into the scoreboard, so
+/// this is how an edit to one reaches the per-corpus `golden_sha256`: the
+/// gate then asks for a bless, and `bless` refuses a report made with other
+/// queries.
+pub fn golden_digest(raw: &[u8], oracle_sha256: Option<&str>) -> String {
+    let Some(oracle_sha256) = oracle_sha256 else {
         return hex_sha256(raw);
-    }
+    };
     let mut hasher = Sha256::new();
     hasher.update(raw);
     hasher.update(b"\0structural-oracle\0");
@@ -1644,17 +1644,13 @@ limits = [5, 20]
     #[test]
     fn a_golden_file_with_ast_entries_folds_the_oracle_digest_into_its_own() {
         let raw = b"corpus = \"skim\"\n";
-        // No [[ast]] entry: the digest is the raw bytes' SHA-256, whatever the oracle.
-        assert_eq!(golden_digest(raw, false, "q1"), hex_sha256(raw));
-        assert_eq!(
-            golden_digest(raw, false, "q1"),
-            golden_digest(raw, false, "q2")
-        );
+        // No [[ast]] entry, so no oracle digest: the raw bytes' SHA-256.
+        assert_eq!(golden_digest(raw, None), hex_sha256(raw));
         // With [[ast]] entries: any change to the oracle changes the digest.
-        let with = golden_digest(raw, true, "q1");
+        let with = golden_digest(raw, Some("q1"));
         assert_ne!(with, hex_sha256(raw));
-        assert_ne!(with, golden_digest(raw, true, "q2"));
-        assert_eq!(with, golden_digest(raw, true, "q1"));
+        assert_ne!(with, golden_digest(raw, Some("q2")));
+        assert_eq!(with, golden_digest(raw, Some("q1")));
         assert_eq!(with.len(), 64);
     }
 
@@ -1698,7 +1694,7 @@ limits = [5, 20]
         std::fs::write(&structural_file, &with_ast).unwrap();
         assert_eq!(
             load_golden(&structural_file).unwrap().sha256,
-            golden_digest(with_ast.as_bytes(), true, &structural_oracle_sha256())
+            golden_digest(with_ast.as_bytes(), Some(&structural_oracle_sha256()))
         );
     }
 

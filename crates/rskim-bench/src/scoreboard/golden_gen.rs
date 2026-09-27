@@ -374,7 +374,9 @@ pub fn unscored_after<'s>(
 }
 
 /// TOML comment lines reporting [`unscored_after`] to the reviewer: each
-/// pattern's count and a sample of `path:line` rows, or `none`.
+/// pattern's count and a sample of `path:line` rows, or `none`. A row path
+/// is skim's output, so it is escaped ([`comment_safe`]) and can neither end
+/// its comment line nor reach the terminal as a control sequence.
 pub fn render_unscored_comment(unscored: &[(&str, Vec<&ResultRow>)]) -> String {
     if unscored.is_empty() {
         return "# golden-gen: skim rows no proposed entry scores: none\n".to_string();
@@ -386,9 +388,12 @@ pub fn render_unscored_comment(unscored: &[(&str, Vec<&ResultRow>)]) -> String {
     for (pattern, rows) in unscored {
         let located: Vec<String> = rows
             .iter()
-            .map(|r| match r.line {
-                Some(line) => format!("{}:{line}", r.path),
-                None => r.path.clone(),
+            .map(|r| {
+                let path = comment_safe(&r.path);
+                match r.line {
+                    Some(line) => format!("{path}:{line}"),
+                    None => path,
+                }
             })
             .collect();
         out.push_str(&format!(
@@ -398,6 +403,29 @@ pub fn render_unscored_comment(unscored: &[(&str, Vec<&ResultRow>)]) -> String {
         ));
     }
     out
+}
+
+/// `text` made safe inside a one-line `#` comment: every control character
+/// (a newline would end the comment and start TOML a reviewer might paste
+/// into golden; an ESC would reach the terminal), every Unicode
+/// bidirectional control (it reorders what the reviewer reads), and the
+/// backslash (so the escaping stays unambiguous) is written as its Rust
+/// escape: `\n`, `\u{1b}`, `\u{202e}`, `\\`. Anything else is kept as is.
+fn comment_safe(text: &str) -> String {
+    let escaped = |c: char| {
+        c.is_control()
+            || c == '\\'
+            || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    };
+    text.chars()
+        .fold(String::with_capacity(text.len()), |mut out, c| {
+            if escaped(c) {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+            out
+        })
 }
 
 /// TOML `[[ast]]` entries for `candidates`, each preceded by a review
@@ -963,6 +991,37 @@ mod tests {
             render_unscored_comment(&[]),
             "# golden-gen: skim rows no proposed entry scores: none\n"
         );
+    }
+
+    #[test]
+    fn a_row_path_cannot_break_out_of_its_comment_line() {
+        // A newline would end the comment and start TOML a reviewer might
+        // paste into golden; an ESC would reach the terminal; a bidi control
+        // would reorder what the reviewer reads.
+        let hostile = "src/a\n[[ast]]\nid = \"injected\"\r\x1b[2J\u{202e}.rs";
+        let page = skim_rows(&[hostile, "src\\b.rs", "src/plain.rs"]);
+        let rows: Vec<&ResultRow> = page.page.rows.iter().collect();
+        let comment = render_unscored_comment(&[("deep-nesting", rows)]);
+
+        assert_eq!(comment.lines().count(), 2, "{comment}");
+        assert!(comment.lines().all(|l| l.starts_with('#')), "{comment}");
+        assert!(
+            !comment.chars().any(|c| c.is_control() && c != '\n'),
+            "{comment:?}"
+        );
+        assert!(!comment.contains('\u{202e}'), "{comment:?}");
+        assert!(
+            comment.contains(
+                r#"#   deep-nesting 3: src/a\n[[ast]]\nid = "injected"\r\u{1b}[2J\u{202e}.rs:1, src\\b.rs:1, src/plain.rs:1"#
+            ),
+            "{comment}"
+        );
+        // A TOML parser sees comments only.
+        let golden = parse_golden(&format!(
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{comment}"
+        ))
+        .unwrap();
+        assert!(golden.asts.is_empty(), "{golden:?}");
     }
 
     #[test]

@@ -137,6 +137,38 @@ fn the_oracle_answers_every_registered_pair_over_the_universe() {
 }
 
 #[test]
+fn several_oracle_failures_report_the_first_failing_file_by_path_in_any_order() {
+    let result = |path: &'static str| -> (&'static str, anyhow::Result<u32>) {
+        if path.starts_with("ok") {
+            (path, Ok(7))
+        } else {
+            (path, Err(anyhow::anyhow!("structural oracle on {path}")))
+        }
+    };
+    for order in [
+        ["ok.rs", "src/b.rs", "src/a.rs", "src/c.rs"],
+        ["src/c.rs", "src/a.rs", "ok.rs", "src/b.rs"],
+        ["src/b.rs", "src/c.rs", "ok.rs", "src/a.rs"],
+    ] {
+        let err = first_failure_by_path(order.into_iter().map(result).collect()).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "3 universe files failed the structural oracle (the first by path is reported): \
+             structural oracle on src/a.rs",
+            "{order:?}"
+        );
+    }
+    // One failure: its own error, as is.
+    let one = first_failure_by_path(vec![result("ok.rs"), result("src/z.rs")]).unwrap_err();
+    assert_eq!(format!("{one:#}"), "structural oracle on src/z.rs");
+    // No failure: every file's report, in the order given.
+    assert_eq!(
+        first_failure_by_path(vec![result("ok2.rs"), result("ok1.rs")]).unwrap(),
+        vec![("ok2.rs", 7), ("ok1.rs", 7)]
+    );
+}
+
+#[test]
 fn the_oracle_answers_do_not_depend_on_file_order_or_threads() {
     let mut reversed = universe_files();
     reversed.reverse();
@@ -345,11 +377,23 @@ fn coverage_must_equal_the_oracle_over_cap_count_with_nothing_undetermined() {
         "{d}"
     );
 
+    // The cap in the message is rendered from the oracle's constant.
+    assert!(d.contains("over the 1 MiB AST cap"), "{d}");
+
     let clean_but_oracle_sees_one = check_coverage(&AstCoverage::default(), 1);
     assert!(detail(&clean_but_oracle_sees_one).contains("by language: none"));
 
     let undetermined = check_coverage(&skim(2, 3), 2);
     assert!(detail(&undetermined).contains("undetermined_files is 3"));
+}
+
+#[test]
+fn byte_sizes_read_in_mebibytes_only_when_whole() {
+    assert_eq!(byte_size(AST_SIZE_CAP_BYTES), "1 MiB");
+    assert_eq!(byte_size(5 * 1024 * 1024), "5 MiB");
+    assert_eq!(byte_size(100 * 1024), "102400 bytes");
+    assert_eq!(byte_size(1024 * 1024 + 1), "1048577 bytes");
+    assert_eq!(byte_size(0), "0 bytes");
 }
 
 // --- measurements ------------------------------------------------------------------------
@@ -634,8 +678,9 @@ fn uncovered_patterns_list_the_oracle_gaps_and_the_patterns_no_corpus_scores() {
     }
     assert_eq!(cause(&none, "try-catch"), Some(UncoveredCause::NoEntry));
     let reason = &none.iter().find(|p| p.name == "try-catch").unwrap().reason;
+    // The languages follow `OracleLang`'s order, not the alphabet.
     assert!(
-        reason.contains("javascript, tsx, typescript") || reason.contains("typescript"),
+        reason.contains("(the oracle covers it in: typescript, tsx, javascript)"),
         "{reason}"
     );
 

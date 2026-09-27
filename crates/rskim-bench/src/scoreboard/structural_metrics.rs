@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Context;
 use rayon::prelude::*;
 use rskim_oracle::structural::{
-    self, FileMatches, INTENTS, LangClass, OracleLang, OracleScratch, PatternCoverage,
-    StructuralOracle,
+    self, AST_SIZE_CAP_BYTES, FileMatches, INTENTS, LangClass, OracleLang, OracleScratch,
+    PatternCoverage, StructuralOracle,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,13 +56,20 @@ pub struct StructuralTarget {
 /// each match (sorted, de-duplicated). Files without a match are absent.
 pub type MatchFiles = BTreeMap<String, Vec<u32>>;
 
+/// Oracle answers keyed by `(pattern, lang)`: the pattern name from the
+/// oracle's own registry (`&'static str`), then the language its query runs
+/// on. Two levels rather than one tuple key, because a `(&'static str, _)`
+/// key cannot be looked up with a golden entry's shorter-lived `&str`
+/// without allocating, while a `&'static str` key can (`Borrow<str>`).
+type AnswerMap = BTreeMap<&'static str, BTreeMap<OracleLang, MatchFiles>>;
+
 /// The structural oracle's answers over one corpus's AST universe.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OracleAnswers {
     /// Every registered `(pattern, lang)` query, matched or not.
-    definition: BTreeMap<(String, OracleLang), MatchFiles>,
+    definition: AnswerMap,
     /// Every intent oracle's `(pattern, lang)`, matched or not.
-    intent: BTreeMap<(String, OracleLang), MatchFiles>,
+    intent: AnswerMap,
     /// Scored files (inside the AST universe) per oracle language.
     scored_files: BTreeMap<OracleLang, u64>,
     /// Universe files skim's size-cap accounting excludes
@@ -81,34 +88,46 @@ impl OracleAnswers {
     ///
     /// Any [`StructuralOracle::file_matches`] error (a parser that returns
     /// no tree, a query over the oracle's match limit), naming the file.
+    /// When several files fail, the first failing file in path order is
+    /// reported ([`first_failure_by_path`]), whatever order the workers
+    /// reached them in.
     pub fn compute<'a>(
         oracle: &StructuralOracle,
         files: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> anyhow::Result<Self> {
         let files: Vec<(&str, &str)> = files.into_iter().collect();
         let over_cap = structural::over_cap_count(files.iter().map(|&(p, t)| (p, t.len() as u64)));
-        let reports = files
+        let results: Vec<(&str, anyhow::Result<FileMatches>)> = files
             .par_iter()
             .map_init(OracleScratch::new, |scratch, &(path, text)| {
-                oracle.file_matches(scratch, path, text).map(|m| (path, m))
+                (path, oracle.file_matches(scratch, path, text))
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect();
+        let reports = first_failure_by_path(results)?;
 
         let mut answers = OracleAnswers {
             over_cap,
             ..OracleAnswers::default()
         };
+        // Pre-populated with the REGISTERED keys only: a registered pair with
+        // no match reads as empty, and an absent key still means "the oracle
+        // has no query for it", which `definition` reports as an error.
+        // Never seed any other key.
         for q in structural::query_sources() {
             answers
                 .definition
-                .entry((q.pattern.to_string(), q.lang))
+                .entry(q.pattern)
+                .or_default()
+                .entry(q.lang)
                 .or_default();
         }
         for spec in INTENTS {
             for &lang in spec.langs {
                 answers
                     .intent
-                    .entry((spec.pattern.to_string(), lang))
+                    .entry(spec.pattern)
+                    .or_default()
+                    .entry(lang)
                     .or_default();
             }
         }
@@ -134,14 +153,13 @@ impl OracleAnswers {
     /// The oracle has no query for `(pattern, lang)` (golden integrity
     /// rejects such an entry first).
     pub fn definition(&self, pattern: &str, lang: OracleLang) -> anyhow::Result<&MatchFiles> {
-        self.definition
-            .get(&(pattern.to_string(), lang))
+        lookup(&self.definition, pattern, lang)
             .with_context(|| format!("the structural oracle has no {lang} query for {pattern}"))
     }
 
     /// The intent oracle's matches for `(pattern, lang)`, if it has one.
     pub fn intent(&self, pattern: &str, lang: OracleLang) -> Option<&MatchFiles> {
-        self.intent.get(&(pattern.to_string(), lang))
+        lookup(&self.intent, pattern, lang)
     }
 
     /// Scored files (inside the AST universe) in `lang`.
@@ -156,17 +174,56 @@ impl OracleAnswers {
     }
 }
 
+/// `map`'s answer for `(pattern, lang)`; `None` when the oracle has no query
+/// for the pair.
+fn lookup<'m>(map: &'m AnswerMap, pattern: &str, lang: OracleLang) -> Option<&'m MatchFiles> {
+    map.get(pattern).and_then(|by_lang| by_lang.get(&lang))
+}
+
 fn insert_match(
-    map: &mut BTreeMap<(String, OracleLang), MatchFiles>,
-    pattern: &str,
+    map: &mut AnswerMap,
+    pattern: &'static str,
     lang: OracleLang,
     path: &str,
     lines: Vec<u32>,
 ) {
     if !lines.is_empty() {
-        map.entry((pattern.to_string(), lang))
+        map.entry(pattern)
+            .or_default()
+            .entry(lang)
             .or_default()
             .insert(path.to_string(), lines);
+    }
+}
+
+/// Every file's oracle result (`(path, result)`, in any order), or — when
+/// some file failed — the error of the first failing file in path order, so
+/// the error reported never depends on which rayon worker reached a failing
+/// file first. With more than one failure the error says how many files
+/// failed.
+///
+/// # Errors
+///
+/// Some file's result is an error.
+fn first_failure_by_path<T>(
+    results: Vec<(&str, anyhow::Result<T>)>,
+) -> anyhow::Result<Vec<(&str, T)>> {
+    let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+    let mut reports = Vec::with_capacity(results.len() - failed);
+    let mut first: Option<(&str, anyhow::Error)> = None;
+    for (path, result) in results {
+        match result {
+            Ok(report) => reports.push((path, report)),
+            Err(e) if first.as_ref().is_none_or(|(p, _)| path < *p) => first = Some((path, e)),
+            Err(_) => {}
+        }
+    }
+    match first {
+        None => Ok(reports),
+        Some((_, e)) if failed == 1 => Err(e),
+        Some((_, e)) => Err(e.context(format!(
+            "{failed} universe files failed the structural oracle (the first by path is reported)"
+        ))),
     }
 }
 
@@ -336,13 +393,14 @@ pub fn check_coverage(coverage: &AstCoverage, oracle_over_cap: u64) -> CheckOutc
             .collect();
         problems.push(format!(
             "ast_coverage.size_excluded_files is {} (by language: {}), the oracle counts {oracle_over_cap} \
-             universe file(s) over the 1 MiB AST cap",
+             universe file(s) over the {} AST cap",
             coverage.size_excluded_files,
             if by_lang.is_empty() {
                 "none".to_string()
             } else {
                 by_lang.join(", ")
-            }
+            },
+            byte_size(AST_SIZE_CAP_BYTES)
         ));
     }
     if coverage.undetermined_files > 0 {
@@ -355,6 +413,17 @@ pub fn check_coverage(coverage: &AstCoverage, oracle_over_cap: u64) -> CheckOutc
         CheckOutcome::Pass
     } else {
         CheckOutcome::fail(problems.join("; "))
+    }
+}
+
+/// A byte count for a message: whole mebibytes as `N MiB` (the AST size
+/// cap, [`AST_SIZE_CAP_BYTES`], reads `1 MiB`), anything else as `N bytes`.
+fn byte_size(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes > 0 && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -543,7 +612,8 @@ pub fn unexpected_oracle_matches<'a>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoverageComparison {
-    /// Universe files over the 1 MiB AST cap in a language skim's accounting
+    /// Universe files over the AST size cap
+    /// ([`structural::AST_SIZE_CAP_BYTES`]) in a language skim's accounting
     /// counts ([`structural::over_cap_count`]).
     pub oracle_over_cap: u64,
     /// Every distinct `ast_coverage.size_excluded_files` over this corpus's

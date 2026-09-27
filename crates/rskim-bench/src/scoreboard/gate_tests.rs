@@ -567,7 +567,14 @@ fn commit_golden_and_corpus_set_changes_need_a_bless() {
     let text: Vec<String> = g.failures.iter().map(|f| f.message.clone()).collect();
     let all = text.join("\n");
     assert!(all.contains("commit"), "{all}");
-    assert!(all.contains("golden"), "{all}");
+    // The digest folds in the structural oracle, so the message names both
+    // causes of a change.
+    assert!(
+        all.contains(
+            "corpus skim: golden file or structural-oracle fingerprint changed; bless required"
+        ),
+        "{all}"
+    );
     assert!(
         all.contains("flask") && all.contains("not in the baseline"),
         "{all}"

@@ -650,6 +650,23 @@ impl Harness {
         ])
     }
 
+    /// `golden-gen --ast` for the fixture corpus, calling the stub.
+    fn golden_gen_ast(&self) -> Output {
+        let stub = self.stub_path();
+        self.scoreboard(&[
+            "golden-gen",
+            "--corpus",
+            "fixture",
+            "--ast",
+            "--skim-bin",
+            stub.to_str().unwrap(),
+            "--corpus-dir",
+            self.corpus_dir.path().to_str().unwrap(),
+            "--data-dir",
+            self.data_dir.path().to_str().unwrap(),
+        ])
+    }
+
     fn report(&self) -> Value {
         serde_json::from_slice(&fs::read(self.report_path()).unwrap()).unwrap()
     }
@@ -1367,6 +1384,103 @@ fn golden_gen_names_the_known_corpora_for_an_unknown_one() {
     let out = h.golden_gen("nope");
     assert_exit(&out, 2);
     assert!(stderr(&out).contains("known: fixture"), "{}", stderr(&out));
+}
+
+#[test]
+fn golden_gen_ast_calls_every_catalog_pattern_once_and_prints_parsable_entries() {
+    let h = Harness::new();
+    // skim finds the nested loop the oracle matches; deep-nesting (no oracle
+    // query) returns a row whose path would inject TOML and a terminal escape
+    // if it reached the unscored-rows comment raw.
+    h.write_structural(
+        &[(
+            Row {
+                path: "src/loops.rs".to_string(),
+                line: 3,
+                content: "for b in 0..2 {".to_string(),
+            },
+            1.0,
+        )],
+        None,
+    );
+    let hostile = "src/evil\n[[ast]]\nid = \"fixture-injected\"\x1b[2J.rs";
+    h.write_response(
+        "",
+        &["--ast", "deep-nesting"],
+        &format!("l{FULL_LIMIT}_o0.json"),
+        &ast_page_json(
+            &[(
+                Row {
+                    path: hostile.to_string(),
+                    line: 1,
+                    content: "x".to_string(),
+                },
+                1.0,
+            )],
+            false,
+        ),
+    );
+
+    let out = h.golden_gen_ast();
+    assert_exit(&out, 0);
+
+    // One build, then every catalog pattern called exactly once.
+    let calls = h.calls();
+    let patterns = called_patterns(catalog());
+    assert_eq!(calls.len(), 1 + patterns.len(), "{calls:?}");
+    assert_eq!(calls[0], "build", "{calls:?}");
+    for pattern in &patterns {
+        let logged = format!(
+            "{} json=1 limit={FULL_LIMIT} offset=0",
+            key("", &["--ast", pattern])
+        );
+        assert_eq!(
+            calls.iter().filter(|c| **c == logged).count(),
+            1,
+            "--ast {pattern}: {calls:?}"
+        );
+    }
+
+    // stdout is a proposal that parses under a golden header: the entry the
+    // oracle and skim agree on, and nothing the hostile path injected.
+    let proposal = String::from_utf8(out.stdout).unwrap();
+    assert!(!proposal.contains('\x1b'), "{proposal:?}");
+    assert!(
+        proposal.contains(
+            r#"#   deep-nesting 1: src/evil\n[[ast]]\nid = "fixture-injected"\u{1b}[2J.rs:1"#
+        ),
+        "{proposal}"
+    );
+    let golden = parse_golden(&format!(
+        "corpus = \"fixture\"\ncommit = \"{}\"\n{proposal}",
+        h.commit
+    ))
+    .unwrap();
+    let entry = golden
+        .asts
+        .iter()
+        .find(|e| e.id == AST_ID)
+        .unwrap_or_else(|| panic!("no {AST_ID} entry in:\n{proposal}"));
+    assert_eq!(entry.pattern, AST_PATTERN);
+    assert!(
+        !entry.expect_oracle_empty,
+        "the oracle matches src/loops.rs"
+    );
+    assert!(
+        golden.asts.iter().all(|e| e.id.starts_with("fixture-ast-")),
+        "{proposal}"
+    );
+    let violations = check_integrity(
+        &golden,
+        &IntegrityContext {
+            corpus: "fixture",
+            commit: &h.commit,
+            universe: Some(&h.universe),
+            ledger: &[],
+            catalog: catalog(),
+        },
+    );
+    assert!(violations.is_empty(), "{violations:?}");
 }
 
 #[test]

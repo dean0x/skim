@@ -156,8 +156,10 @@ impl Inputs {
     }
 }
 
-/// SHA-256 of each named corpus's golden file on disk (names whose file is
-/// missing are left out), for `bless`.
+/// The golden digest ([`crate::scoreboard::golden::golden_digest`]) of each
+/// named corpus's golden file on disk — its bytes, with this scoreboard's
+/// structural-oracle fingerprint folded in when it has `[[ast]]` entries —
+/// for `bless` (names whose file is missing are left out).
 ///
 /// # Errors
 ///

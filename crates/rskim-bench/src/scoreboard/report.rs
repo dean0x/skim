@@ -66,7 +66,10 @@ pub struct Report {
 pub struct CorpusReport {
     pub name: String,
     pub commit: String,
-    /// SHA-256 of this corpus's golden file bytes.
+    /// This corpus's golden digest
+    /// ([`crate::scoreboard::golden::golden_digest`]): the SHA-256 of its
+    /// golden file's bytes, with the structural-oracle fingerprint folded in
+    /// when the file has `[[ast]]` entries.
     pub golden_sha256: String,
     pub universe: UniverseReport,
     pub coverage: CoverageReport,
