@@ -5,6 +5,9 @@ description: "Use when adding new recording paths, changing cache-directory reso
 category: domain-knowledge
 directories: ["crates/rskim/src/analytics", "crates/rskim/src"]
 referencedFiles:
+  - crates/rskim/src/cmd/security.rs
+  - crates/rskim/src/cmd/execution.rs
+  - crates/rskim/src/cmd/file/env.rs
   - crates/rskim/src/analytics/mod.rs
   - crates/rskim/src/analytics/schema.rs
   - crates/rskim/src/cache.rs
@@ -14,7 +17,7 @@ referencedFiles:
   - crates/rskim/src/multi.rs
   - crates/rskim/tests/common/mod.rs
 created: 2026-06-25
-updated: 2026-06-25
+updated: 2026-09-27
 ---
 
 # File-Op Analytics Recording & Cache-Dir Resolution
@@ -29,7 +32,7 @@ Two recording paths exist and must not be conflated: the **file-op path** (`reco
 
 Analytics are purely local and best-effort. They answer "how many tokens did skim save this week across all my projects?" No data leaves the machine. The recording model accepts that occasional rows are silently dropped (e.g. file deleted between main-thread run and background re-read) rather than blocking the primary output path.
 
-Each persisted row also contains `original_cmd` (the invoked skim command, truncated to 500 bytes at a UTF-8 boundary) and `project_path`. To prevent credential leakage, git handlers call `build_analytics_label` (`cmd/git/mod.rs`) which uses `scrub_credential_url` to redact credential-bearing URLs before the label is stored; db and infra handlers use `scrub_db_args`/`scrub_infra_args` for the same purpose.
+Each persisted row also contains `original_cmd` (the invoked skim command, truncated to 500 bytes at a UTF-8 boundary) and `project_path`. To prevent credential leakage, git handlers call `build_analytics_label` (`cmd/git/mod.rs`) which uses `scrub_credential_url` to redact credential-bearing URLs before the label is stored. Every other family goes through `format_analytics_label` (`cmd/execution.rs`, `cmd/security.rs`), whose gate is `"db" => scrub_db_args`, `"infra" | "build" | "test" | "pkg" => scrub_infra_args` — widened from `infra`-only so build tools' Java/Gradle properties, npm config-as-flags, and bare `NAME=VALUE` overrides are covered too. `lint` is deliberately left unscrubbed: all 13 supported lint tools were audited and accept no credential-bearing flag, so scrubbing would add false-positive risk for zero benefit (`test_format_analytics_label_lint_is_unscrubbed_by_design`). The generic `file` passthrough family (`cmd/file/passthrough_stream.rs`, e.g. `grep`/`rg`/`wc`) also falls outside the scrub gate — unaudited and untested for this specifically, but its registered programs carry no credential-shaped flags today.
 
 ## Core Business Rules
 
@@ -114,6 +117,29 @@ Migrations in `schema::run_migrations` are guarded by `PRAGMA user_version` and 
 
 `original_cmd` is truncated to 500 bytes (UTF-8 boundary-safe) before INSERT to bound row size.
 
+### `original_cmd` credential scrubbing (`format_analytics_label`)
+
+`format_analytics_label(family, program, rest)` (`cmd/execution.rs`) is the single gate between a wrapped tool's argv and the `original_cmd` label. Its match arm is `"db" => scrub_db_args(rest)`, `"infra" | "build" | "test" | "pkg" => scrub_infra_args(rest)`, `_ => rest.to_string()` — widened from `db`/`infra`-only so `build` (mvn/gradle/cargo), `test` (cargo/pytest/go test), and `pkg` (npm/pnpm/pip/cargo package ops) are covered.
+
+**HAZARD: `build`/`test`/`pkg` must never route to `scrub_db_args`.** `scrub_db_args`'s `SENSITIVE_FLAGS` contains `-p`, `-u`, `-U`, `-h` and `ATTACHED_PREFIXES` contains `-p`/`-u`/`-U` — DB-family semantics that would mangle `cargo test -p <crate>`, `pytest -p <plugin>`, and `make -p`. Negative-case tests pin this at both layers: `test_format_analytics_label_test_family_preserves_package_selector` / `_preserves_pytest_selectors` at the `format_analytics_label` level, and the broader `test_scrub_infra_args_build_and_test_selectors_unchanged` (`cmd/security.rs`) which pins `-p`, `-u`, `-U`, `-h`, `-k`, and more across build/test shapes.
+
+**`lint` is deliberately still unscrubbed**, pinned by `test_format_analytics_label_lint_is_unscrubbed_by_design`. All 13 lint tools (`biome`, `black`, `dprint`, `eslint`, `gofmt`, `golangci-lint`, `mypy`, `oxlint`, `prettier`, `rubocop`, `ruff`, `rustfmt`, `swiftlint`) were audited and have zero credential-accepting flags.
+
+`scrub_infra_args` (`cmd/security.rs`) now redacts five credential shapes via `classify_infra_token`, each landing on the `<name>=<value>` or space-separated branch:
+- `INFRA_SENSITIVE_FLAGS` — gained `--key` (for `cypress run --record --key`), `--auth-token`, `--api-token`, `--registry-token`, `--cert-password`, `--passphrase`. Bare `-k` was deliberately NOT added — `pytest -k <expr>` is a test selector.
+- `SENSITIVE_PROPERTY_FRAGMENTS` — substring match (case-insensitive) on `-D<name>=`/`-P<name>=` Java/Gradle property names (`-Dsonar.token=`, `-PmavenCentralPassword=`).
+- `SENSITIVE_PROPERTY_NAME_SUFFIXES` (`.key`, `.login`) — dot-anchored suffix match, a DIFFERENT rule from the fragment list and deliberately kept separate: the literal dot lives inside the list entry, so `-Psigning.key=` is redacted while `-Dsonar.projectKey=my-project` is preserved (the byte before `key` in `projectkey` is `t`, not `.`) and `-Dlogin.url=` is preserved (`login.url` does not end with `.login`). Folding `key`/`login` into the fragment list is the exact false-positive regression the separation prevents.
+- `NPM_CONFIG_SECRET_SUFFIXES` (`_authtoken`, `:_auth`, `:_password`) — covers npm's config-as-flag form `--//registry/:_authToken=`.
+- `is_sensitive_bare_assignment` — a bare `NAME=VALUE` override (`make deploy NPM_TOKEN=xyz`) whose name is a known secret, delegated to `is_sensitive_env_key` (below) rather than re-declaring a third secret-name list.
+
+**Cross-crate note:** `rskim-contract`'s `SENSITIVE_SUFFIXES`/`SENSITIVE_EXACT` could NOT be imported into `cmd::security`, because `rskim-contract` is `optional = true` behind the `proxy` Cargo feature in `crates/rskim/Cargo.toml` (it is unconditional only as a **dev-dependency**, which is why `crates/rskim/tests/contract_secret_list_sync.rs` compiles and cross-checks the two lists at test time). Importing it at the `cmd::security` call site would either make credential scrubbing vanish from default (non-`proxy`) builds or pull tokio/hyper/rustls into the default tree. Instead `cmd::file::env::is_sensitive_key` was promoted from private to `pub(crate)` and `is_sensitive_bare_assignment` delegates to it directly — same crate, no feature gate, no duplicated list (applies ADR-006).
+
+**Still unscrubbed by design, out of scope for `format_analytics_label`:** `crates/rskim/src/main.rs` (~line 1414, single-file path) and `crates/rskim/src/multi.rs` (~line 394, glob/dir batch path) build `original_cmd` directly from `cmd.to_string()` / `format!("skim {}", path.display())` and never call `format_analytics_label` — they carry file paths, not credential-bearing flags, so there is nothing for the gate to scrub.
+
+**Known limitations, documented in code:** both `scrub_db_args` and `scrub_infra_args` join argv then `split_whitespace()` again, so a secret containing a space (`-Dsonar.password=my pass`) leaves its tail (`pass`) in the label; and `scrub_infra_args`'s `-H`/`--header` branch (`RedactAuthHeader`) unconditionally consumes the next token for any literal `-H`, which can over-redact a benign argument on `build`/`test`/`pkg` where `-H` means something else. Both failure directions are the safe one — over-redaction, not leakage.
+
+`original_cmd` reaches exactly one persistent sink: `token_savings.original_cmd` (500-char truncated). Verified NOT to reach `hook.log`, stderr, or the session sidecar — no other call site in the crate touches the field. Read-back surfaces are `skim stats --format json` (`by_original_cmd`, untruncated) and the human table (`render_by_original_cmd`, truncated to `DISPLAY_CMD_LEN`).
+
 ## Error Handling and Recovery
 
 - `persist_record` opens a fresh `AnalyticsDb` connection each time; failure is silently discarded. This is intentional — analytics must never crash the main path.
@@ -128,7 +154,9 @@ Migrations in `schema::run_migrations` are guarded by `PRAGMA user_version` and 
 - **Adding a second `cache_root` resolver** — any new subsystem needing the cache dir must call `cache::cache_root` / `get_cache_dir`, not re-read `SKIM_CACHE_DIR` directly. Divergence breaks the cache-dir single-source-of-truth contract: `SKIM_CACHE_DIR` overrides affect some subsystems but not others, silently splitting state across directories.
 - **Mixing the two recording paths** — do not call `try_record_command` for file operations or `record_file_ops` for subcommand output. They set different `command_type` values and have different tokenization semantics.
 - **Running token counting on the main thread before stdout flush** — any BPE tokenization must happen in the background thread, after output is written.
-- **Adding a new wrapper that passes unscrubbed credentials via `original_cmd`** — any wrapper handling git URLs, database connection strings, or API tokens must scrub those values before passing the label to the analytics layer. Use `shared::scrub_credential_url` for URL-form credentials or a handler-specific scrub function (see `scrub_db_args`, `scrub_infra_args`). An unredacted credential is written verbatim to `~/.cache/skim/analytics.db` and retained for 90 days.
+- **Adding a new wrapper that passes unscrubbed credentials via `original_cmd`** — any wrapper handling git URLs, database connection strings, or API tokens must scrub those values before passing the label to the analytics layer. Use `shared::scrub_credential_url` for URL-form credentials or route the family through `format_analytics_label` with a handler-specific scrub function (see `scrub_db_args`, `scrub_infra_args`). An unredacted credential is written verbatim to `~/.cache/skim/analytics.db` and retained for 90 days.
+- **Routing a new `build`/`test`/`pkg` handler's family string to `scrub_db_args` instead of `scrub_infra_args`** — `scrub_db_args`'s `-p`/`-u`/`-U`/`-h` rules are DB-family semantics; on a build/test tool they mangle `cargo test -p <crate>`, `pytest -p <plugin>`, and `make -p`. `format_analytics_label`'s gate is `"db" => scrub_db_args`, `"infra" | "build" | "test" | "pkg" => scrub_infra_args` — a new family belongs on the right side of that match, never the left.
+- **Folding a `SENSITIVE_PROPERTY_NAME_SUFFIXES` entry (`.key`, `.login`) into `SENSITIVE_PROPERTY_FRAGMENTS`** — the fragment list matches anywhere in the name; a bare `key` or `login` fragment would swallow `-Dsonar.projectKey=my-project` and `-Dlogin.url=…`, which are not credentials. The two lists are separate on purpose.
 
 ## Gotchas
 
@@ -143,6 +171,9 @@ Migrations in `schema::run_migrations` are guarded by `PRAGMA user_version` and 
 
 - `crates/rskim/src/analytics/mod.rs` — all recording logic: `record_file_ops`, `record_fire_and_forget`, `register_thread`, `flush_pending`, `AnalyticsDb`, `AnalyticsConfig`, `FileCounts`, `FileOpRow`, `FileOpCommon`, `RawSource`
 - `crates/rskim/src/analytics/schema.rs` — forward-only SQLite migrations (v1–v3)
+- `crates/rskim/src/cmd/execution.rs` — `format_analytics_label()` (the family-keyed scrub gate: `db` / `infra`+`build`+`test`+`pkg` / unscrubbed `lint`)
+- `crates/rskim/src/cmd/security.rs` — `scrub_db_args`, `scrub_infra_args`, `classify_infra_token`, `INFRA_SENSITIVE_FLAGS`, `SENSITIVE_PROPERTY_FRAGMENTS`, `SENSITIVE_PROPERTY_NAME_SUFFIXES`, `NPM_CONFIG_SECRET_SUFFIXES`, `is_sensitive_bare_assignment`
+- `crates/rskim/src/cmd/file/env.rs` — `is_sensitive_key()` (`pub(crate)`; canonical secret-name list shared with `cmd::security` and cross-checked against `rskim_contract::log` by `tests/contract_secret_list_sync.rs`)
 - `crates/rskim/src/cache.rs` — `cache_root`, `cache_root_from`, `get_cache_dir` (single source of truth for cache-dir resolution)
 - `crates/rskim/src/cmd/hook_log.rs` — `CacheEnv` delegates to `cache_root_from`; hook.log rotation; demonstrates that the cache-dir fix is consistent across subsystems
 - `crates/rskim/src/main.rs` — `flush_pending()` call site; `AnalyticsConfig::from_process`; `record_file_analytics` helper; `parse_session_id`; `THREADS_SPAWNED` guard

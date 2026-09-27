@@ -5,7 +5,7 @@ description: "Use when modifying hook script generation, adding new agents, chan
 category: domain-knowledge
 directories: [crates/rskim/src/cmd/hooks, crates/rskim/src/cmd/init, crates/rskim/src/cmd/rewrite, crates/rskim/src/cmd/permissions]
 created: 2026-07-04
-updated: 2026-09-02
+updated: 2026-09-27
 ---
 
 # Agent Hook Install, Binary Pinning & Handshake (+ Permissions Seeding)
@@ -65,7 +65,17 @@ The `Surface` enum (`Explicit` | `Wrapper`) is compile-time enforced: `dispatch_
 Three predicates, in evaluation order:
 - **`is_capture_shape`**: command substitution `$(…)`, backticks, process substitution `<(…)` / `>(…)` → exact bytes required (also signals "tokenisation untrusted here")
 - **`stdout_redirected_to_file`**: any stdout redirect (`>`, `>>`, `1>`, `&>`) → exact bytes required
-- **`pipe_consumer_needs_exact_bytes`**: downstream stage is in `BYTE_EXACT_PIPE_CONSUMERS` (`tee`, `sha256sum`, `dd`, `base64`, …); also returns `true` for Bail splits that contain `|` (untrusted token stream + pipe → conservative)
+- **`pipe_consumer_needs_exact_bytes`**: downstream stage is in `BYTE_EXACT_PIPE_CONSUMERS`; also returns `true` for Bail splits that contain `|` (untrusted token stream + pipe → conservative)
+
+**`BYTE_EXACT_PIPE_CONSUMERS` has three categories, not two.** (1) PERSIST the stream verbatim to a destination of their own — `tee`, `dd`, `sponge`, `split`, `csplit`, `nc`, `socat`. (2) ARCHIVE/RE-ENCODE it — `gzip`, `bzip2`, `xz`, `zstd`, `base64`, `tar`, `openssl`, `base32`, `basenc`, `uuencode`, `lz4`, `lzma`, `lzop`, `compress`, `pigz`, `pbzip2`, `brotli`, `7z`, `zip`, plus the digests `cksum`, `md5sum`, `sha1sum`, `sha256sum`, `sha512sum`, `shasum`, `b2sum`, `crc32`. (3) **MEASURE, COMPARE, OR RENDER the exact bytes** — "the reader's question is about the bytes themselves, so a substituted stream answers a different question than the one asked": `wc`, `cmp`, `diff`, `od`, `xxd`, `hexdump`, `sum`, `md5`. `md5` is listed separately from the pre-existing `md5sum` because it is the BSD/macOS spelling — the only one macOS ships.
+
+Every category-3 entry has a measured defect behind it (producer `git log -n 40`, raw 115052 B / 2192 lines → skim 4119 B / 40 lines, exit 0, zero stderr, no marker): `wc -l` reported `40` instead of `2192`, `wc -c` reported `4118` instead of `115052`, `wc -w` reported `603` instead of `15893`; `cmp` and `diff` **exit 1 → exit 0** on genuinely-different inputs — a silent false "identical"; `sum` reported `14618 5` instead of `59617 113`; `xxd` at offset 0 read skim's `"0fb1"` instead of git's `"commit "`.
+
+**`nl` is deliberately EXCLUDED — the discriminator is falsifiability, not "reads bytes".** `nl` prints its line number beside the content it counted, so a reader handed a substituted stream can see the numbering doesn't match what it claims to number — the claim is falsifiable, which puts `nl` with `cat -n`/`head`/`grep -n` as a renderer. `wc` emits only the number with no accompanying view, so a wrong count is unfalsifiable. Pinned by `test_needs_exact_bytes_nl_renders_and_still_compresses`; a future reader "completing the set" by adding `nl` is the regression this pin exists to stop.
+
+**STRUCTURAL LIMIT, now documented on the constant's own rustdoc:** membership is keyed on the consumer's command head name alone (`segment_head`), so a flag-discriminated consumer is unrepresentable. `head -c 100` measures exact bytes and `cat -n` renders them, but neither can be listed without also denying bare `| head` and `| cat` — the two pipelines skim exists to compress. Those shapes stay compressed knowingly; closing them needs a per-flag key, not a new name in this list.
+
+**Surface reach — the denylist arms only the PATH-wrapper surface, and this is the most consequential fact about it.** `force_raw_requested` is consulted **only** inside the `detect_argv0_dispatch()` branch in `main.rs` (~line 1049), whose own comment states the `Subcommand` and `FileOperation` branches are intentionally NOT guarded. So `BYTE_EXACT_PIPE_CONSUMERS` — and every predicate in `command_needs_exact_bytes` — has no effect on the hook surface (which already refuses every pipeline via `is_bare_cat_pipeline`'s literal 2-segment destructuring) and no effect on the explicit surface (`skim git log -n 40 | wc -l` still returns `40` by design — typing `skim` yourself is the opt-in to the compressed view). The category-3 defects above are latent on a machine without `~/.skim/bin` and go live on `skim init --wrappers`; `wc` and `diff` are both in `wrapper_targets()`.
 
 ### The `| cat` Pipeline Exception
 
@@ -229,6 +239,8 @@ detect_state()
 **Sidecar reap clock.** Sidecars expire after 300 s (`FORCE_RAW_MAX_AGE`). A test that inspects sidecar behavior after 300 s will see it gone. The prior behavior was unbounded (no reap at all when no session id was set).
 
 **Five early returns in `run_hook_mode` skip `set_force_raw`.** SKIM_PASSTHROUGH, AwarenessOnly, stdin read error, JSON parse error, and missing command field all return before the marker is written or cleared. A marker written by the previous hook invocation survives until the next successful invocation or the 300 s reap — it can cause byte loss, not just missed compression.
+
+**A test asserting a classification is not evidence the classification was examined.** `test_needs_exact_bytes_reader_pipes_still_compress` (docstring: "The case that must not regress.") asserted `!command_needs_exact_bytes("git log | wc -l")` for the entire lifetime of `command_needs_exact_bytes`, while `compound.rs`'s own doc comment named `wc` among the tools whose input must not be compressed the whole time. When the defect was found, the assertion moved — inverted — into `test_needs_exact_bytes_byte_exact_pipe_consumers` as a positive case. Check a test's assertion against the surrounding doc comment, not just against itself.
 
 **`resolve_skim_binary()` is machine-dependent.** Green CI does not prove the three-site invariant — CI binaries have no symlinks. The failure appears on macOS with Homebrew installs or symlinked-bin layouts.
 
