@@ -23,9 +23,12 @@
 //! - [`golden_gen`] — `golden-gen`: candidate `[[ident]]` entries (a
 //!   reviewed proposal; uses `rskim_core::Language` only as the symbol
 //!   extractor's dispatch key, never scores skim).
-//! - [`structural`] — the structural oracle for `--ast` patterns (#541):
+//! - [`catalog`] — skim's `--ast` pattern catalog (the one read of
+//!   `rskim_search::all_patterns`, name / exact / example only) crossed with
+//!   the structural oracle's coverage. The structural oracle itself (#541:
 //!   tree-sitter queries encoding each catalog description, the nested-loop
-//!   intent oracles, and the oracle's own AST language table and size cap.
+//!   intent oracles, the oracle's own AST language table and size cap) is
+//!   the `rskim-oracle` crate, `rskim_oracle::structural`.
 //! - [`structural_metrics`] — scores skim's `--ast` answers against the
 //!   structural oracle: rows split by language, the `structural.*` HARD
 //!   checks, the per-entry measurements, `uncovered_patterns`.
@@ -47,6 +50,7 @@
 //! as a regression).
 
 pub mod baseline;
+pub mod catalog;
 pub mod corpus;
 pub mod gate;
 pub mod golden;
@@ -56,7 +60,6 @@ pub mod oracle;
 pub mod pipeline;
 pub mod report;
 pub mod runner;
-pub mod structural;
 pub mod structural_metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;

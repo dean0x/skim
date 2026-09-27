@@ -209,7 +209,7 @@ fn an_ast_entry_plans_a_standalone_ast_call_judged_by_the_structural_oracle() {
         q.structural_target(),
         Some(&StructuralTarget {
             pattern: "try-catch".to_string(),
-            lang: crate::scoreboard::structural::OracleLang::Tsx,
+            lang: rskim_oracle::structural::OracleLang::Tsx,
             precision: PrecisionClass::Hard,
             expect_oracle_empty: false,
         })
@@ -701,7 +701,7 @@ fn structural_sample(id: &str, class: PrecisionClass, intent: bool) -> Structura
     StructuralSample {
         id: id.to_string(),
         pattern: "rust-nested-loop".to_string(),
-        lang: crate::scoreboard::structural::OracleLang::Rust,
+        lang: rskim_oracle::structural::OracleLang::Rust,
         precision_class: class,
         expect_oracle_empty: false,
         oracle_files: 4,
@@ -1003,9 +1003,9 @@ fn evaluate_rejects_observations_that_do_not_follow_the_plan() {
 
 #[test]
 fn evaluate_scores_ast_entries_against_the_structural_oracle() {
-    use crate::scoreboard::structural::StructuralOracle;
     use crate::scoreboard::structural_metrics::{OracleAnswers, rows_in};
     use crate::scoreboard::types::{AstCoverage, AstPage};
+    use rskim_oracle::structural::StructuralOracle;
 
     let repo = FixtureRepo::new();
     repo.write(

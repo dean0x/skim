@@ -744,7 +744,7 @@ mod tests {
 
     fn structural_report() -> Report {
         use crate::scoreboard::golden::PrecisionClass;
-        use crate::scoreboard::structural::OracleLang;
+        use rskim_oracle::structural::OracleLang;
         let mut r = minimal_report();
         let entry =
             |id: &str, pattern: &str, lang, intent: Option<(u64, f64, f64)>| StructuralSample {

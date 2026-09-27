@@ -42,13 +42,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::Context;
+use rskim_oracle::structural::{OracleLang, PatternCoverage};
 use rskim_search::SearchField;
 
 use crate::extract::{TYPESCRIPT_EXTRACT_EXTENSIONS, extract_symbols};
+use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
 use crate::scoreboard::golden::{DefSite, PrecisionClass, hex_sha256};
 use crate::scoreboard::metrics::sample;
 use crate::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
-use crate::scoreboard::structural::{self, OracleLang, PatternCoverage};
 use crate::scoreboard::structural_metrics::{OracleAnswers, distinct_files, rows_in, unscored_in};
 use crate::scoreboard::types::{ResultPage, ResultRow};
 use crate::scoreboard::universe::Universe;
@@ -278,11 +279,11 @@ pub fn ast_id(corpus: &str, pattern: &str, lang: OracleLang) -> String {
     format!("{corpus}-ast-{pattern}-{lang}")
 }
 
-/// The class `golden-gen` proposes: `hard` when the catalog marks `pattern`
+/// The class `golden-gen` proposes: `hard` when `catalog` marks `pattern`
 /// `exact` (its n-grams are a reliable subset of every occurrence), else
 /// `ratchet`. The gate never calls this: the class is frozen in golden.
-pub fn proposed_class(pattern: &str) -> PrecisionClass {
-    let exact = structural::catalog_patterns().any(|p| p.name == pattern && p.exact);
+pub fn proposed_class(catalog: &[CatalogPattern], pattern: &str) -> PrecisionClass {
+    let exact = catalog.iter().any(|p| p.name == pattern && p.exact);
     if exact {
         PrecisionClass::Hard
     } else {
@@ -290,10 +291,13 @@ pub fn proposed_class(pattern: &str) -> PrecisionClass {
     }
 }
 
-/// Every covered `(pattern, language)` whose language has files in the
-/// corpus's AST universe, ordered by `(pattern, language name)`.
-fn present_pairs(answers: &OracleAnswers) -> Vec<(&'static str, OracleLang)> {
-    let mut pairs: Vec<(&'static str, OracleLang)> = structural::catalog_coverage()
+/// Every covered `(pattern, language)` of `catalog` whose language has files
+/// in the corpus's AST universe, ordered by `(pattern, language name)`.
+fn present_pairs(
+    catalog: &[CatalogPattern],
+    answers: &OracleAnswers,
+) -> Vec<(&'static str, OracleLang)> {
+    let mut pairs: Vec<(&'static str, OracleLang)> = catalog_coverage(catalog)
         .into_iter()
         .filter_map(|(pattern, coverage)| match coverage {
             PatternCoverage::Covered { langs } => Some((pattern, langs)),
@@ -306,20 +310,21 @@ fn present_pairs(answers: &OracleAnswers) -> Vec<(&'static str, OracleLang)> {
     pairs
 }
 
-/// Propose `[[ast]]` entries (see the module docs). `skim` holds skim's
-/// `--ast <pattern>` full list per pattern called; a pattern not in it
-/// counts as no rows.
+/// Propose `[[ast]]` entries (see the module docs) for the patterns of
+/// `catalog`. `skim` holds skim's `--ast <pattern>` full list per pattern
+/// called; a pattern not in it counts as no rows.
 ///
 /// # Errors
 ///
 /// A covered pair the oracle has no answer for (an oracle bug).
 pub fn generate_ast(
     corpus: &str,
+    catalog: &[CatalogPattern],
     answers: &OracleAnswers,
     skim: &BTreeMap<String, ResultPage>,
 ) -> anyhow::Result<Vec<AstCandidate>> {
     let mut out = Vec::new();
-    for (pattern, lang) in present_pairs(answers) {
+    for (pattern, lang) in present_pairs(catalog, answers) {
         let oracle_files = answers.definition(pattern, lang)?.len();
         let skim_files = skim
             .get(pattern)
@@ -331,7 +336,7 @@ pub fn generate_ast(
             id: ast_id(corpus, pattern, lang),
             pattern: pattern.to_string(),
             lang,
-            precision: proposed_class(pattern),
+            precision: proposed_class(catalog, pattern),
             oracle_files,
             skim_files,
             expect_oracle_empty: oracle_files == 0,
@@ -417,7 +422,7 @@ fn toml_string(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
-    use crate::scoreboard::test_support::FixtureRepo;
+    use crate::scoreboard::test_support::{FixtureRepo, catalog};
     use crate::scoreboard::universe::GitIsolation;
 
     fn site(name: &str, path: &str, line: u32) -> DefinitionSite {
@@ -719,6 +724,7 @@ mod tests {
                 commit: &sha,
                 universe: Some(&universe),
                 ledger: &[],
+                catalog: catalog(),
             },
         );
         assert!(violations.is_empty(), "{violations:?}");
@@ -727,7 +733,7 @@ mod tests {
     // --- [[ast]] candidates --------------------------------------------------------
 
     fn ast_answers(files: &[(&str, &str)]) -> OracleAnswers {
-        let oracle = crate::scoreboard::structural::StructuralOracle::new().unwrap();
+        let oracle = rskim_oracle::structural::StructuralOracle::new().unwrap();
         OracleAnswers::compute(&oracle, files.iter().copied()).unwrap()
     }
 
@@ -762,11 +768,37 @@ mod tests {
 
     #[test]
     fn the_proposed_class_follows_the_catalog_exact_flag() {
-        assert_eq!(proposed_class("try-catch"), PrecisionClass::Hard);
-        assert_eq!(proposed_class("try-catch-finally"), PrecisionClass::Hard);
-        assert_eq!(proposed_class("rust-nested-loop"), PrecisionClass::Ratchet);
-        assert_eq!(proposed_class("call-in-loop"), PrecisionClass::Ratchet);
-        assert_eq!(proposed_class("no-such-pattern"), PrecisionClass::Ratchet);
+        assert_eq!(proposed_class(catalog(), "try-catch"), PrecisionClass::Hard);
+        assert_eq!(
+            proposed_class(catalog(), "try-catch-finally"),
+            PrecisionClass::Hard
+        );
+        assert_eq!(
+            proposed_class(catalog(), "rust-nested-loop"),
+            PrecisionClass::Ratchet
+        );
+        assert_eq!(
+            proposed_class(catalog(), "call-in-loop"),
+            PrecisionClass::Ratchet
+        );
+        assert_eq!(
+            proposed_class(catalog(), "no-such-pattern"),
+            PrecisionClass::Ratchet
+        );
+        // The flag comes from the catalog passed in, not from skim's.
+        let flipped = [CatalogPattern {
+            name: "rust-nested-loop",
+            exact: true,
+            example: "",
+        }];
+        assert_eq!(
+            proposed_class(&flipped, "rust-nested-loop"),
+            PrecisionClass::Hard
+        );
+        assert_eq!(
+            proposed_class(&flipped, "try-catch"),
+            PrecisionClass::Ratchet
+        );
     }
 
     #[test]
@@ -787,7 +819,7 @@ mod tests {
         // skim returns the JS file for try-catch-finally although the oracle
         // does not match it: a skim-only entry is non-vacuous and proposed.
         let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/b.js"]))]);
-        let got = generate_ast("skim", &answers, &skim).unwrap();
+        let got = generate_ast("skim", catalog(), &answers, &skim).unwrap();
         let pairs: Vec<(&str, &str, usize, usize)> = got
             .iter()
             .map(|c| {
@@ -832,7 +864,10 @@ mod tests {
         let mut sorted = pairs.clone();
         sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         assert_eq!(pairs, sorted, "ordered by (pattern, language name)");
-        assert_eq!(generate_ast("skim", &answers, &skim).unwrap(), got);
+        assert_eq!(
+            generate_ast("skim", catalog(), &answers, &skim).unwrap(),
+            got
+        );
 
         // Exactly the entries the oracle matches nothing for are proposed as
         // false-positive guards.
@@ -876,7 +911,7 @@ mod tests {
                 skim_rows(&["web/a.ts", "web/b.tsx"]),
             ),
         ]);
-        let candidates = generate_ast("skim", &answers, &skim).unwrap();
+        let candidates = generate_ast("skim", catalog(), &answers, &skim).unwrap();
         let unscored = unscored_after(&candidates, &skim);
         let got: Vec<(&str, Vec<&str>)> = unscored
             .iter()
@@ -917,7 +952,7 @@ mod tests {
         let answers = ast_answers(&[("web/a.ts", "try {\n  go();\n} catch (e) {}\n")]);
         // skim's try-catch-finally row is a false positive: a guard entry.
         let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/a.ts"]))]);
-        let got = generate_ast("skim", &answers, &skim).unwrap();
+        let got = generate_ast("skim", catalog(), &answers, &skim).unwrap();
         assert!(got.iter().any(|c| c.expect_oracle_empty));
         assert!(got.iter().any(|c| !c.expect_oracle_empty));
         let rendered = render_ast_toml(&got);
@@ -956,6 +991,7 @@ mod tests {
                 commit: "b8a0a79463382347820f1c2572bde37b68e87c76",
                 universe: None,
                 ledger: &[],
+                catalog: catalog(),
             },
         );
         assert!(violations.is_empty(), "{violations:?}");

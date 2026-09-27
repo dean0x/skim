@@ -16,12 +16,13 @@ use std::path::Path;
 
 use anyhow::Context;
 use regex::Regex;
+use rskim_oracle::structural::{self, OracleLang, PatternCoverage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::scoreboard::MAX_PAGES;
+use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
 use crate::scoreboard::oracle::{LangFilter, LexicalQuery, MatchMode, ground_truth};
-use crate::scoreboard::structural::{self, OracleLang, PatternCoverage};
 use crate::scoreboard::types::{Arm, CheckId, EntryKind, VerifyMode};
 use crate::scoreboard::universe::Universe;
 
@@ -672,6 +673,10 @@ pub struct IntegrityContext<'a> {
     pub universe: Option<&'a Universe>,
     /// Ledger entries for this corpus.
     pub ledger: &'a [LedgerRef<'a>],
+    /// skim's pattern catalog
+    /// ([`crate::scoreboard::catalog::skim_catalog`]): every `[[ast]]`
+    /// pattern must be one of its names.
+    pub catalog: &'a [CatalogPattern],
 }
 
 /// One integrity violation.
@@ -767,7 +772,7 @@ pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<I
         v.entry_err(&e.id, check_prefix(e));
     }
     if !golden.asts.is_empty() {
-        let catalog = structural::catalog_coverage();
+        let catalog = catalog_coverage(ctx.catalog);
         for e in &golden.asts {
             v.entry_err(&e.id, check_ast(e, &catalog));
         }
@@ -954,7 +959,7 @@ fn check_ledger(golden: &GoldenFile, ledger: &[LedgerRef<'_>], v: &mut Violation
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
-    use crate::scoreboard::test_support::FixtureRepo;
+    use crate::scoreboard::test_support::{FixtureRepo, catalog};
     use crate::scoreboard::universe::{GitIsolation, Universe};
 
     const SHA: &str = "b8a0a79463382347820f1c2572bde37b68e87c76";
@@ -1010,6 +1015,7 @@ limits = [5, 20]
             commit: SHA,
             universe: None,
             ledger,
+            catalog: catalog(),
         }
     }
 
@@ -1521,6 +1527,7 @@ limits = [5, 20]
             commit: sha,
             universe: Some(universe),
             ledger: &[],
+            catalog: catalog(),
         };
         check_integrity(&golden(&src), &ctx)
     }

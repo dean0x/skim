@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 
 use super::*;
 use crate::scoreboard::golden::parse_golden;
+use crate::scoreboard::test_support::catalog;
 use crate::scoreboard::types::VerifyMode;
 
 /// The oracle, compiled once for every test in this module.
@@ -271,10 +272,10 @@ fn every_row_of_a_pattern_with_no_entry_is_unscored_even_in_an_oracle_language()
 
 #[test]
 fn skim_is_called_for_every_catalog_pattern_covered_or_not() {
-    let called = called_patterns();
-    let catalog: BTreeSet<&str> = structural::catalog_patterns().map(|p| p.name).collect();
-    assert_eq!(called.iter().copied().collect::<BTreeSet<_>>(), catalog);
-    assert_eq!(called.len(), catalog.len(), "each pattern once");
+    let called = called_patterns(catalog());
+    let names: BTreeSet<&str> = catalog().iter().map(|p| p.name).collect();
+    assert_eq!(called.iter().copied().collect::<BTreeSet<_>>(), names);
+    assert_eq!(called.len(), names.len(), "each pattern once");
     assert!(called.windows(2).all(|w| w[0] < w[1]), "sorted: {called:?}");
     // No oracle query, and oracle queries with no corpus entry, alike.
     for pattern in [
@@ -616,12 +617,12 @@ fn the_coverage_comparison_lists_each_distinct_skim_value() {
 
 #[test]
 fn uncovered_patterns_list_the_oracle_gaps_and_the_patterns_no_corpus_scores() {
-    let none = uncovered_patterns(std::iter::empty());
+    let none = uncovered_patterns(catalog(), std::iter::empty());
     let names: Vec<&str> = none.iter().map(|p| p.name.as_str()).collect();
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "sorted by name");
-    assert_eq!(names.len(), structural::catalog_patterns().count());
+    assert_eq!(names.len(), catalog().len());
     let cause = |list: &[UncoveredPattern], name: &str| {
         list.iter().find(|p| p.name == name).map(|p| p.cause)
     };
@@ -644,7 +645,7 @@ fn uncovered_patterns_list_the_oracle_gaps_and_the_patterns_no_corpus_scores() {
          [[ast]]\nid = \"skim-ast-try-catch-tsx\"\npattern = \"try-catch\"\nlang = \"tsx\"\nprecision = \"hard\"\n",
     )
     .unwrap();
-    let with_entry = uncovered_patterns([&golden]);
+    let with_entry = uncovered_patterns(catalog(), [&golden]);
     assert_eq!(
         cause(&with_entry, "try-catch"),
         None,

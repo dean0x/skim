@@ -16,21 +16,24 @@
 //! for every called pattern, 0 included, so a pattern's first unscored row is
 //! a visible RATCHET move.
 //!
-//! Like `structural.rs`, nothing here imports skim's AST search code: the
-//! expectations come from the oracle's tree-sitter queries only.
+//! Like the structural oracle (`rskim_oracle::structural`), nothing here
+//! imports skim's AST search code: the expectations come from the oracle's
+//! tree-sitter queries only. skim's pattern catalog arrives as a parameter
+//! ([`crate::scoreboard::catalog::skim_catalog`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use rayon::prelude::*;
+use rskim_oracle::structural::{
+    self, FileMatches, INTENTS, LangClass, OracleLang, PatternCoverage, StructuralOracle,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::scoreboard::catalog::{CatalogPattern, catalog_coverage};
 use crate::scoreboard::golden::{GoldenFile, PrecisionClass};
 use crate::scoreboard::metrics::sample;
 use crate::scoreboard::report::round4;
-use crate::scoreboard::structural::{
-    self, FileMatches, INTENTS, LangClass, OracleLang, PatternCoverage, StructuralOracle,
-};
 use crate::scoreboard::types::{AstCoverage, AstPage, CheckOutcome, ResultPage, ResultRow};
 
 // ============================================================================
@@ -174,11 +177,17 @@ pub struct StructuralEvidence {
 }
 
 /// The patterns skim is called for, once per corpus with an `[[ast]]` entry
-/// and by `golden-gen --ast`: every catalog pattern (sorted), whether or not
-/// the oracle covers it and whether or not the corpus has an entry for it. A
-/// pattern left out would have its rows neither scored nor counted.
-pub fn called_patterns() -> Vec<&'static str> {
-    structural::catalog_coverage().into_keys().collect()
+/// and by `golden-gen --ast`: every pattern of `catalog` (sorted, each once),
+/// whether or not the oracle covers it and whether or not the corpus has an
+/// entry for it. A pattern left out would have its rows neither scored nor
+/// counted.
+pub fn called_patterns(catalog: &[CatalogPattern]) -> Vec<&'static str> {
+    catalog
+        .iter()
+        .map(|p| p.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 // ============================================================================
@@ -541,7 +550,8 @@ pub fn coverage_comparison(evidence: &StructuralEvidence) -> Option<CoverageComp
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UncoveredCause {
-    /// The oracle has no query for it (`structural::catalog_coverage`).
+    /// The oracle has no query for it
+    /// ([`crate::scoreboard::catalog::catalog_coverage`]).
     NoOracle,
     /// The oracle has a query, but no corpus in the run has an `[[ast]]`
     /// entry for it.
@@ -558,17 +568,18 @@ pub struct UncoveredPattern {
     pub reason: String,
 }
 
-/// Every catalog pattern with no `[[ast]]` entry in `goldens` (the corpora
-/// of one run), sorted by name: those the oracle cannot encode, with the
-/// oracle's reason, and those it covers but no corpus scores.
+/// Every pattern of `catalog` with no `[[ast]]` entry in `goldens` (the
+/// corpora of one run), sorted by name: those the oracle cannot encode, with
+/// the oracle's reason, and those it covers but no corpus scores.
 pub fn uncovered_patterns<'a>(
+    catalog: &[CatalogPattern],
     goldens: impl IntoIterator<Item = &'a GoldenFile>,
 ) -> Vec<UncoveredPattern> {
     let entered: BTreeSet<&str> = goldens
         .into_iter()
         .flat_map(|g| g.asts.iter().map(|e| e.pattern.as_str()))
         .collect();
-    structural::catalog_coverage()
+    catalog_coverage(catalog)
         .into_iter()
         .filter_map(|(name, coverage)| match coverage {
             PatternCoverage::Uncovered { reason } => Some(UncoveredPattern {

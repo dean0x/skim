@@ -33,8 +33,10 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use rskim_oracle::structural::StructuralOracle;
 
 use rskim_bench::scoreboard::baseline::{Baseline, BlessDecision, BlessInputs, bless};
+use rskim_bench::scoreboard::catalog::skim_catalog;
 use rskim_bench::scoreboard::corpus::{
     DEFAULT_CORPUS_DIR, GitCorpusSource, find_corpus, load_corpora, materialize_verified,
 };
@@ -42,7 +44,6 @@ use rskim_bench::scoreboard::golden_gen;
 use rskim_bench::scoreboard::pipeline::{self, DataDir, Inputs};
 use rskim_bench::scoreboard::report::{GateStatus, Report, clear_outputs, total, write_outputs};
 use rskim_bench::scoreboard::runner::{SkimRunner, SkimSandbox};
-use rskim_bench::scoreboard::structural::StructuralOracle;
 use rskim_bench::scoreboard::structural_metrics::{OracleAnswers, called_patterns};
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 
@@ -318,7 +319,8 @@ fn golden_gen_ast(
     let answers = OracleAnswers::compute(&oracle, universe.files()).context("structural oracle")?;
     let runner = SkimRunner::new(skim_bin, SkimSandbox::new(home));
     runner.build(root)?;
-    let skim = called_patterns()
+    let catalog = skim_catalog();
+    let skim = called_patterns(&catalog)
         .into_iter()
         .map(|pattern| {
             let (page, _) = runner
@@ -327,7 +329,7 @@ fn golden_gen_ast(
             Ok((pattern.to_string(), page.page))
         })
         .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-    let candidates = golden_gen::generate_ast(corpus, &answers, &skim)?;
+    let candidates = golden_gen::generate_ast(corpus, &catalog, &answers, &skim)?;
 
     println!(
         "# golden-gen --ast proposal for corpus {corpus} at {commit} ({} entr{}; review, then freeze in golden/{corpus}.toml)",

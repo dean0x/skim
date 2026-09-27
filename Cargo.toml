@@ -6,6 +6,7 @@ members = [
     "crates/rskim-search",
     "crates/rskim-research",
     "crates/rskim-bench",
+    "crates/rskim-oracle",
     "crates/rskim-tokens",
     "crates/rskim-contract",
     "crates/rskim-llm",

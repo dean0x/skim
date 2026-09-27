@@ -28,8 +28,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use rskim_oracle::structural::StructuralOracle;
 
 use crate::scoreboard::baseline::Baseline;
+use crate::scoreboard::catalog::{CatalogPattern, skim_catalog};
 use crate::scoreboard::corpus::{
     CorpusSource, CorpusSpec, find_corpus, load_corpora, materialize_verified,
 };
@@ -45,7 +47,6 @@ use crate::scoreboard::report::{
     REPORT_SCHEMA, Report, SkippedByReason, StructuralReport, UniverseReport, round4, tally,
 };
 use crate::scoreboard::runner::{EntryObservation, SkimRunner, Timing};
-use crate::scoreboard::structural::StructuralOracle;
 use crate::scoreboard::structural_metrics::{
     OracleAnswers, StructuralEvidence, called_patterns, coverage_comparison, is_vacuous, rows_in,
     uncovered_patterns, unexpected_oracle_matches,
@@ -103,11 +104,14 @@ pub struct Inputs {
     pub baseline: Option<Baseline>,
     /// Whether every corpus in `corpora.toml` is covered.
     pub complete: bool,
+    /// skim's pattern catalog ([`skim_catalog`]), read once here and passed
+    /// to golden integrity, the `--ast` call set and `uncovered_patterns`.
+    pub catalog: Vec<CatalogPattern>,
 }
 
 impl Inputs {
     /// Load `corpora.toml`, the ledger, the covered corpora's golden files,
-    /// and the baseline (if any).
+    /// the baseline (if any), and skim's pattern catalog.
     ///
     /// # Errors
     ///
@@ -146,6 +150,7 @@ impl Inputs {
             ledger,
             baseline,
             complete,
+            catalog: skim_catalog(),
         })
     }
 }
@@ -231,7 +236,10 @@ pub fn run(
             ratchet: aggregate_ratchet,
         },
         corpora,
-        uncovered_patterns: uncovered_patterns(inputs.goldens.values().map(|g| &g.file)),
+        uncovered_patterns: uncovered_patterns(
+            &inputs.catalog,
+            inputs.goldens.values().map(|g| &g.file),
+        ),
         gate,
         latency: LatencyReport { corpora: latency },
     })
@@ -262,7 +270,7 @@ fn run_corpus(
     require_temporal_data(&plan, &stats)?;
 
     progress(name, &format!("running {} golden entries", plan.len()));
-    let observed = observe_plan(runner, &root, &plan)?;
+    let observed = observe_plan(runner, &root, &plan, &inputs.catalog)?;
     require_oracle_less_rows(&plan, &observed.observations)?;
     let evidence = StructuralEvidence {
         answers,
@@ -323,13 +331,13 @@ struct PlanObservations {
     patterns: BTreeMap<String, AstPage>,
 }
 
-/// The `--ast <pattern>` calls a corpus's plan makes: every catalog pattern
+/// The `--ast <pattern>` calls a corpus's plan makes: every pattern of `catalog`
 /// ([`called_patterns`]) when the plan has an `[[ast]]` entry, so no skim row
 /// escapes both the entries and `structural.unscored_rows.<pattern>`; none
 /// otherwise.
-fn ast_calls(plan: &[PlannedQuery]) -> Vec<&'static str> {
+fn ast_calls(plan: &[PlannedQuery], catalog: &[CatalogPattern]) -> Vec<&'static str> {
     if plan.iter().any(|q| q.structural_target().is_some()) {
-        called_patterns()
+        called_patterns(catalog)
     } else {
         Vec::new()
     }
@@ -346,8 +354,9 @@ fn observe_plan(
     runner: &SkimRunner,
     root: &Path,
     plan: &[PlannedQuery],
+    catalog: &[CatalogPattern],
 ) -> anyhow::Result<PlanObservations> {
-    let calls = ast_calls(plan);
+    let calls = ast_calls(plan, catalog);
     let mut timings = Vec::with_capacity(plan.len() + calls.len());
     let mut patterns: BTreeMap<String, AstPage> = BTreeMap::new();
     for pattern in calls {
@@ -590,6 +599,7 @@ fn checked_plan(
             commit: &spec.commit,
             universe: Some(universe),
             ledger: &refs,
+            catalog: &inputs.catalog,
         },
     )
     .iter()
@@ -690,6 +700,7 @@ fn latency_stats(entries: &[(String, Vec<Timing>)]) -> LatencyStats {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code — unwrap/expect acceptable for test assertions
 mod tests {
     use super::*;
+    use crate::scoreboard::test_support::catalog;
 
     #[test]
     fn latency_uses_nearest_rank_percentiles_and_totals_each_entry() {
@@ -838,7 +849,7 @@ mod tests {
 
     #[test]
     fn a_vacuous_ast_entry_is_a_golden_error() {
-        use crate::scoreboard::structural::StructuralOracle;
+        use rskim_oracle::structural::StructuralOracle;
         let plan = plan_of(
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\n\
              [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n\
@@ -884,8 +895,8 @@ mod tests {
             "[[ast]]\nid = \"skim-ast-rust-nested-loop-rust\"\npattern = \"rust-nested-loop\"\nlang = \"rust\"\nprecision = \"ratchet\"\n\
              [[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n",
         );
-        let calls = ast_calls(&with_ast);
-        assert_eq!(calls, called_patterns());
+        let calls = ast_calls(&with_ast, catalog());
+        assert_eq!(calls, called_patterns(catalog()));
         // Patterns with no entry in this corpus, and patterns no oracle
         // covers, are called too: their rows count as unscored.
         for pattern in [
@@ -902,12 +913,12 @@ mod tests {
             "[[prefix]]\nid = \"skim-F003\"\nflags = [\"--ast\", \"god-function\"]\nlimits = [5]\n\
              [[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n",
         );
-        assert!(ast_calls(&without).is_empty());
+        assert!(ast_calls(&without, catalog()).is_empty());
     }
 
     #[test]
     fn a_false_positive_guard_is_exempt_from_vacuity_but_its_flag_must_hold() {
-        use crate::scoreboard::structural::StructuralOracle;
+        use rskim_oracle::structural::StructuralOracle;
         let oracle = StructuralOracle::new().unwrap();
         let plan = plan_of(
             "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\nexpect_oracle_empty = true\n\

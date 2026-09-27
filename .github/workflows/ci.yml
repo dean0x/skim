@@ -316,7 +316,7 @@ jobs:
           # debug.rs, analytics/mod.rs and the analytics/schema.rs and
           # tokens.rs that module compiles in), the dispatch (main.rs), and
           # the rskim manifest.
-          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+          SEARCH_PATHS='^(crates/rskim-search/|crates/rskim/src/cmd/search/|crates/rskim/src/cmd/mod\.rs$|crates/rskim/src/main\.rs$|crates/rskim/src/debug\.rs$|crates/rskim/src/analytics/mod\.rs$|crates/rskim/src/analytics/schema\.rs$|crates/rskim/src/tokens\.rs$|crates/rskim/Cargo\.toml$|crates/rskim-core/|crates/rskim-bench/|crates/rskim-oracle/|crates/rskim-research/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
           case "$EVENT_NAME" in
             workflow_dispatch)
               search=true; reason="manual dispatch" ;;

@@ -29,7 +29,7 @@ use rskim_bench::scoreboard::MAX_PAGES;
 use rskim_bench::scoreboard::golden::{IntegrityContext, Origin, check_integrity, parse_golden};
 use rskim_bench::scoreboard::oracle::{LexicalQuery, MatchMode, ground_truth};
 use rskim_bench::scoreboard::structural_metrics::called_patterns;
-use rskim_bench::scoreboard::test_support::FixtureRepo;
+use rskim_bench::scoreboard::test_support::{FixtureRepo, catalog};
 use rskim_bench::scoreboard::universe::{GitIsolation, Universe};
 use serde_json::{Value, json};
 
@@ -326,7 +326,7 @@ impl Harness {
     /// a corpus with an `[[ast]]` entry calls skim for each of them. Tests
     /// override the patterns they are about.
     fn write_empty_pattern_calls(&self) {
-        for pattern in called_patterns() {
+        for pattern in called_patterns(catalog()) {
             self.write_response(
                 "",
                 &["--ast", pattern],
@@ -1355,6 +1355,7 @@ fn golden_gen_prints_integrity_clean_ident_candidates() {
             commit: &h.commit,
             universe: Some(&h.universe),
             ledger: &[],
+            catalog: catalog(),
         },
     );
     assert!(violations.is_empty(), "{violations:?}");
@@ -1541,7 +1542,7 @@ fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
     // call shares its argv with the standalone `--ast god-function` entry's
     // full list, so that key is logged twice).
     let calls = h.calls();
-    for pattern in called_patterns() {
+    for pattern in called_patterns(catalog()) {
         // The trailing space keeps `try-catch` from matching `try-catch-finally`.
         let logged = format!(
             "{} json=1 limit={FULL_LIMIT} ",
@@ -1556,7 +1557,7 @@ fn every_catalog_pattern_is_called_and_rows_no_entry_scores_are_counted() {
     let unscored = &report["corpora"][0]["structural"]["unscored_rows"];
     assert_eq!(
         unscored.as_object().unwrap().len(),
-        called_patterns().len(),
+        called_patterns(catalog()).len(),
         "{unscored}"
     );
     for (pattern, rows) in [

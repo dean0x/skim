@@ -16,9 +16,10 @@ referencedFiles:
   - crates/rskim-bench/src/scoreboard/universe.rs
   - crates/rskim-bench/src/scoreboard/report.rs
   - crates/rskim-bench/src/scoreboard/types.rs
-  - crates/rskim-bench/src/scoreboard/structural.rs
+  - crates/rskim-oracle/src/structural.rs
+  - crates/rskim-bench/src/scoreboard/catalog.rs
   - crates/rskim-bench/src/scoreboard/structural_metrics.rs
-  - crates/rskim-bench/scoreboard/structural/
+  - crates/rskim-oracle/queries/
   - crates/rskim-bench/src/scoreboard/corpus.rs
   - crates/rskim-bench/src/bin/scoreboard.rs
   - crates/rskim-bench/scoreboard/README.md
@@ -243,7 +244,7 @@ if rx.recv_timeout(KILL_GRACE).is_ok() { // KILL_GRACE = 2 s
 ### Structural oracle (#541)
 
 `structural.rs` runs one hand-written tree-sitter query per (pattern, language)
-(`scoreboard/structural/<pattern>.<lang>.scm`, `include_str!`ed into `QUERIES`) over the oracle universe;
+(`crates/rskim-oracle/queries/<pattern>.<lang>.scm`, `include_str!`ed into `QUERIES`) over the oracle universe;
 `structural_metrics.rs` turns its answers plus skim's `--ast` rows into checks. Couplings and traps:
 
 - **Independence is test-enforced here**, unlike `oracle.rs`: `structural_tests.rs` source-scans six files
@@ -445,8 +446,9 @@ A failed run therefore can never leave an older passing report for `bless --from
 - `crates/rskim-bench/src/scoreboard/oracle.rs`: independent predicates (and / phrase / near / pnear / lang), baselines, simulated `rg -n -F`.
 - `crates/rskim-bench/src/scoreboard/universe.rs`: the oracle's file universe mirroring the CLI walker, `GitIsolation`, coverage.
 - `crates/rskim-bench/src/scoreboard/types.rs`: `CheckId`, `Arm` envelopes, `ResultPage`, `StatsSnapshot`, `AstCoverage`.
-- `crates/rskim-bench/src/scoreboard/structural.rs` / `structural_metrics.rs`: the structural oracle (`QUERIES`, `UNCOVERED`, `INTENTS`, `fingerprint`) and its checks (`score_entry`, `is_vacuous`, `unexpected_oracle_matches`, `coverage_comparison`).
-- `crates/rskim-bench/scoreboard/structural/*.scm`: the oracle's queries, one per (pattern, language).
+- `crates/rskim-oracle/src/structural.rs` (the `rskim-oracle` crate) / `crates/rskim-bench/src/scoreboard/structural_metrics.rs`: the structural oracle (`QUERIES`, `UNCOVERED`, `INTENTS`, `fingerprint`) and its checks (`score_entry`, `is_vacuous`, `unexpected_oracle_matches`, `coverage_comparison`).
+- `crates/rskim-oracle/queries/*.scm`: the oracle's queries, one per (pattern, language).
+- `crates/rskim-bench/src/scoreboard/catalog.rs`: the one read of skim's pattern catalog (`skim_catalog`) and `catalog_coverage`.
 - `crates/rskim-bench/scoreboard/{corpora.toml,golden/*.toml,known_failures.toml,baseline.json}`: the data. `baseline.json` is written only by `bless`.
 - `crates/rskim-bench/tests/scoreboard.rs`: offline end-to-end tests with a stub skim.
 - `crates/rskim-research/src/clone.rs`: `ensure_pinned_history_clone`, `verify_pinned_clone`, the process-group timeout (`git_output_with_timeout`).

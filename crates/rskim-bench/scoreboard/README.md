@@ -9,6 +9,9 @@ It is the **required merge gate for search PRs** (owner decision 2026-09-25, ADR
 
 - Code: `crates/rskim-bench/src/scoreboard/`. The binary is `src/bin/scoreboard.rs`, and the offline tests are
   `tests/scoreboard.rs` (stub skim, fixture corpus, no network).
+- The structural oracle is its own crate, `crates/rskim-oracle/` (`src/structural.rs`), with its tree-sitter queries
+  in `crates/rskim-oracle/queries/<pattern>.<lang>.scm`, one per (pattern, language), compiled into the scoreboard
+  and hashed into the golden digest (see [Structural oracle](#structural-oracle)).
 - Data: this directory.
 
 | File | Holds |
@@ -16,7 +19,6 @@ It is the **required merge gate for search PRs** (owner decision 2026-09-25, ADR
 | `corpora.toml` | The four corpora (skim, ripgrep, flask, zod): URL, a 40-hex commit pin, and language |
 | `golden/<corpus>.toml` | The frozen golden queries for one corpus (`commit` must equal its pin) |
 | `known_failures.toml` | The ledger: known HARD failures, each tied to a filed ticket |
-| `structural/<pattern>.<lang>.scm` | The structural oracle's tree-sitter queries, one per (pattern, language), compiled into the scoreboard and hashed into the golden digest (see [Structural oracle](#structural-oracle)) |
 | `baseline.json` | The blessed state: every HARD outcome and RATCHET value, pins and golden hashes. Written only by `bless` |
 
 ## What it measures
@@ -193,15 +195,17 @@ Adding any entry changes the golden hash, so the next `check` says "bless requir
 
 ## Structural oracle
 
-`--ast` named patterns are scored by a structural oracle (#541), `src/scoreboard/structural.rs`. For each
-(pattern, language) it runs a hand-written tree-sitter query, `structural/<pattern>.<lang>.scm`, over every file of
-that language in the oracle's universe. The query encodes the pattern's catalog **description**, not skim's n-grams,
-on the real grammar: `.tsx` is parsed with the TSX grammar, although skim parses it as TypeScript (ADR-003).
+`--ast` named patterns are scored by a structural oracle (#541), the `rskim-oracle` crate
+(`crates/rskim-oracle/src/structural.rs`). For each (pattern, language) it runs a hand-written tree-sitter query,
+`crates/rskim-oracle/queries/<pattern>.<lang>.scm`, over every file of that language in the oracle's universe. The
+query encodes the pattern's catalog **description**, not skim's n-grams, on the real grammar: `.tsx` is parsed with
+the TSX grammar, although skim parses it as TypeScript (ADR-003).
 
-It takes only the pattern **names** from skim (`rskim_search::all_patterns()`). The extension-to-grammar table, the
-list of languages skim AST-indexes and the 1 MiB inclusive size cap are the oracle's own copies, with citations. A
-unit test fails if `structural.rs` or `structural_metrics.rs` imports skim's `ast_index`, `compound` or
-`linearize` code.
+It sees only the pattern **names** from skim: the scoreboard reads skim's catalog once
+(`rskim_search::all_patterns()`, in `src/scoreboard/catalog.rs`) and crosses the names with the oracle's registry. The
+extension-to-grammar table, the list of languages skim AST-indexes and the 1 MiB inclusive size cap are the oracle's
+own copies, with citations. `rskim-oracle` depends on no `rskim-*` crate: `crates/rskim-oracle/tests/independence.rs`
+fails on any dependency that is not on its allow-list.
 
 ### `[[ast]]` golden entries
 
@@ -306,15 +310,16 @@ Remove its ledger entry (keep the golden entry) and re-bless. `xfail -> pass` ne
 
 ### Adding or editing a query
 
-1. Write or edit `structural/<pattern>.<lang>.scm`. Open it with a comment naming the grammar version and quoting
-   the catalog description, and capture exactly one `@match` node: its first line is the match line.
-2. Register a new file in `QUERIES` in `src/scoreboard/structural.rs`, sorted by pattern and then language (a unit
-   test checks the order and pins the query count, so update the count too). Add a `PostFilter` only when the
-   description states a count (`empty-*`: zero body elements; `god-function`: at least 20; `excessive-params`: at
-   least 5).
-3. Add a fixture in `src/scoreboard/structural_tests.rs`: the catalog example (or a hand-written positive) must match
-   on the expected lines, and a near-miss must not. The tests fail on a `.scm` file that is not registered, a
-   registered query with no fixture, or a query that does not compile for its grammar.
+1. Write or edit `crates/rskim-oracle/queries/<pattern>.<lang>.scm`. Open it with a comment naming the grammar
+   version and quoting the catalog description, and capture exactly one `@match` node: its first line is the match
+   line.
+2. Register a new file in `QUERIES` in `crates/rskim-oracle/src/structural.rs`, sorted by pattern and then language
+   (a unit test checks the order and pins the query count, so update the count too). Add a `PostFilter` only when
+   the description states a count (`empty-*`: zero body elements; `god-function`: at least 20; `excessive-params`:
+   at least 5).
+3. Add a fixture in `crates/rskim-bench/src/scoreboard/catalog_tests.rs`: the catalog example (or a hand-written
+   positive) must match on the expected lines, and a near-miss must not. The tests fail on a `.scm` file that is not
+   registered, a registered query with no fixture, or a query that does not compile for its grammar.
 4. Run `check` and read the structural diff, then bless. The query text, the post-filters, the intent specs, the
    size cap, the extension table (every row's class, and the class of an unknown extension) and the attribute kinds
    the body-element count skips are hashed into the digest of every golden file with `[[ast]]` entries
@@ -358,7 +363,7 @@ Two jobs in `.github/workflows/ci.yml` run the gate: `changes` (**Detect Search 
   change set (`git diff --no-renames HEAD^1 HEAD` on the merge commit, so a file renamed out of a search path still
   counts as touching it) touches one of:
   - `crates/rskim-search/`, `crates/rskim/src/cmd/search/`, `crates/rskim-core/`, `crates/rskim-bench/`,
-    `crates/rskim-research/`;
+    `crates/rskim-oracle/`, `crates/rskim-research/`;
   - the `rskim` files outside `cmd/search/` that it depends on: `crates/rskim/src/cmd/mod.rs`
     (`is_repo_relative_safe`, `resolve_cache_dir`), `crates/rskim/src/debug.rs` (`is_debug_enabled`),
     `crates/rskim/src/analytics/mod.rs` (`AnalyticsConfig`) with the `crates/rskim/src/analytics/schema.rs` and

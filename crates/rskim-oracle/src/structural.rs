@@ -4,29 +4,28 @@
 //!
 //! # Independence
 //!
-//! Nothing here reuses skim's AST search stack — no linearization, n-gram,
-//! query engine or re-parse verify code. The one item taken from
-//! `rskim-search` is the pattern catalog, read in exactly one place:
-//! [`catalog_patterns`], which projects each entry to its name, `exact` flag
-//! and example snippet, never its n-gram tables. The oracle uses the NAMES,
-//! so a catalog pattern with no oracle query is listed as uncovered instead
-//! of silently skipped. Where the oracle must agree with skim (the extension
-//! table, the AST-indexed language list, the size cap) it keeps its OWN copy
-//! with a citation, so a policy change on skim's side shows up as a
-//! scoreboard diff (the `oracle.rs` / `universe.rs` convention). The unit
-//! tests enforce this with a source scan of the whole structural scoring
-//! path: this file, `structural_metrics.rs`, and every in-crate module they
-//! import, transitively.
+//! This crate depends on no `rskim-*` crate (`tests/independence.rs` checks
+//! every dependency table of its manifest), so nothing from skim's AST search
+//! stack — linearization, n-grams, the query engine, re-parse verification —
+//! can reach an answer. Not even skim's pattern catalog is an input: the
+//! oracle knows its own registry by pattern NAME ([`query_sources`],
+//! [`UNCOVERED`], [`coverage_of`]), and the scoreboard (`rskim-bench`) crosses
+//! it with the catalog it reads, so a catalog pattern with no oracle query is
+//! listed as uncovered instead of silently skipped. Where the oracle must
+//! agree with skim (the extension table, the AST-indexed language list, the
+//! size cap) it keeps its OWN copy with a citation, so a policy change on
+//! skim's side shows up as a scoreboard diff (the `oracle.rs` / `universe.rs`
+//! convention in `rskim-bench`).
 //!
 //! # Ground truth
 //!
 //! Each `(pattern, language)` pair has one query file,
-//! `crates/rskim-bench/scoreboard/structural/<pattern>.<lang>.scm`, compiled
-//! in with `include_str!` and hashed into the golden digest ([`fingerprint`],
-//! with every other table an answer depends on), so editing a query forces a
-//! re-bless. `.tsx` files are parsed with the TSX grammar (ADR-003: the
-//! oracle is the real grammar), although skim parses them with the plain
-//! TypeScript grammar.
+//! `crates/rskim-oracle/queries/<pattern>.<lang>.scm`, compiled in with
+//! `include_str!` and hashed into the scoreboard's golden digest
+//! ([`fingerprint`], with every other table an answer depends on), so editing
+//! a query forces a re-bless. `.tsx` files are parsed with the TSX grammar
+//! (ADR-003: the oracle is the real grammar), although skim parses them with
+//! the plain TypeScript grammar.
 //!
 //! Every query names one `@match` capture; the match line is the first
 //! (1-based) line of that node. Four patterns (six queries) carry a small
@@ -417,8 +416,8 @@ fn scm_file_name(pattern: &str, lang: OracleLang) -> String {
 
 /// Registry row: `(pattern, OracleLang variant, file-name language)` plus an
 /// optional post-filter. The query text is `include_str!`ed from
-/// `scoreboard/structural/<pattern>.<lang>.scm`; a unit test checks the file
-/// name matches [`OracleLang::as_str`] and that every file is registered.
+/// `queries/<pattern>.<lang>.scm`; a unit test checks the file name matches
+/// [`OracleLang::as_str`] and that every file is registered.
 macro_rules! oracle_query {
     ($pattern:literal, $lang:ident, $file_lang:literal) => {
         oracle_query!($pattern, $lang, $file_lang, None)
@@ -427,13 +426,7 @@ macro_rules! oracle_query {
         OracleQuery {
             pattern: $pattern,
             lang: OracleLang::$lang,
-            source: include_str!(concat!(
-                "../../scoreboard/structural/",
-                $pattern,
-                ".",
-                $file_lang,
-                ".scm"
-            )),
+            source: include_str!(concat!("../queries/", $pattern, ".", $file_lang, ".scm")),
             filter: $filter,
         }
     };
@@ -514,9 +507,9 @@ const QUERIES: &[OracleQuery] = &[
     oracle_query!("unhandled-result", TypeScript, "typescript"),
 ];
 
-/// Catalog patterns the oracle deliberately does not cover, with the reason.
-/// They stay under ADR-007 manual dog-food.
-const UNCOVERED: &[(&str, &str)] = &[
+/// Catalog patterns the oracle deliberately does not cover, as `(pattern
+/// name, reason)`. They stay under ADR-007 manual dog-food.
+pub const UNCOVERED: &[(&str, &str)] = &[
     (
         "deep-nesting",
         "synthetic threshold not stated exactly: \"depth >= 4\" does not say where depth \
@@ -535,8 +528,9 @@ const UNCOVERED: &[(&str, &str)] = &[
 ];
 
 /// The reason reported for a catalog pattern that is neither registered nor
-/// listed in `UNCOVERED` — a pattern added to skim's catalog after this
-/// oracle was written. A unit test keeps it from happening silently.
+/// listed in [`UNCOVERED`] — a pattern added to skim's catalog after this
+/// oracle was written. A test in `rskim-bench` keeps it from happening
+/// silently.
 pub const UNCLASSIFIED_REASON: &str =
     "no oracle query registered and no reason recorded (a catalog pattern newer than the oracle)";
 
@@ -612,9 +606,13 @@ const ORACLE_INPUTS: OracleInputs<'static> = OracleInputs {
 /// registered query (file name, post-filter, full text), ordered by pattern
 /// and language name; and every intent spec. Each is written out explicitly
 /// (never through `Debug`), so the text is stable across toolchains. The
-/// golden digest folds it in (`golden::structural_oracle_sha256`), so an edit
+/// golden digest folds it in (`rskim-bench`'s
+/// `golden::structural_oracle_sha256`), so an edit
 /// to any of them — a query, a post-filter threshold, an intent's node kinds,
 /// a file's language class or an attribute kind — forces a re-bless.
+///
+/// The text names query files, never directories, so moving the queries does
+/// not change it.
 pub fn fingerprint() -> String {
     render_fingerprint(&ORACLE_INPUTS)
 }
@@ -679,35 +677,10 @@ fn class_fingerprint(class: LangClass) -> String {
 }
 
 // ============================================================================
-// Skim's pattern catalog (the one input taken from skim)
+// Coverage by pattern name
 // ============================================================================
 
-/// One entry of skim's pattern catalog, as the scoreboard may see it. The
-/// n-gram tables that encode how skim matches the pattern are left out, so
-/// no oracle answer or score can depend on them (AC-3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CatalogPattern {
-    /// The `--ast` pattern name.
-    pub name: &'static str,
-    /// skim's `exact` flag, from which `golden-gen` proposes an entry's
-    /// precision class. No oracle answer or score reads it.
-    pub exact: bool,
-    /// The catalog's example snippet, which the oracle's fixture tests match.
-    pub example: &'static str,
-}
-
-/// skim's pattern catalog projected to [`CatalogPattern`], in catalog order:
-/// the scoreboard's only read of `rskim_search::all_patterns`. The
-/// independence test pins this body.
-pub fn catalog_patterns() -> impl Iterator<Item = CatalogPattern> {
-    rskim_search::all_patterns().iter().map(|p| CatalogPattern {
-        name: p.name,
-        exact: p.exact,
-        example: p.example,
-    })
-}
-
-/// Whether the oracle covers a catalog pattern, and why not if it does not.
+/// Whether the oracle covers a pattern name, and why not if it does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternCoverage {
     /// At least one oracle query exists; `langs` is sorted.
@@ -722,15 +695,11 @@ pub enum PatternCoverage {
     },
 }
 
-/// Coverage of every pattern in skim's catalog ([`catalog_patterns`]), keyed
-/// by pattern name.
-pub fn catalog_coverage() -> BTreeMap<&'static str, PatternCoverage> {
-    catalog_patterns()
-        .map(|p| (p.name, coverage_of(p.name)))
-        .collect()
-}
-
-fn coverage_of(pattern: &str) -> PatternCoverage {
+/// The oracle's coverage of `pattern`, from its own registry: the languages
+/// with a query, or else the [`UNCOVERED`] reason, or else
+/// [`UNCLASSIFIED_REASON`] (a name the oracle has no record of — a catalog
+/// pattern newer than the oracle).
+pub fn coverage_of(pattern: &str) -> PatternCoverage {
     let mut langs: Vec<OracleLang> = QUERIES
         .iter()
         .filter(|q| q.pattern == pattern)

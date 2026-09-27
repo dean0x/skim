@@ -4,12 +4,21 @@
 //!
 //! Compiled only under `#[cfg(test)]` or the `test-utils` feature, so unit
 //! tests here and the offline integration tests in `tests/` (#203 AC 3) share
-//! one fixture builder.
+//! one fixture builder, and skim's pattern catalog read once ([`catalog`]).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test support: fail loudly
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::LazyLock;
+
+use crate::scoreboard::catalog::{CatalogPattern, skim_catalog};
+
+/// skim's pattern catalog ([`skim_catalog`]), read once per test binary.
+pub fn catalog() -> &'static [CatalogPattern] {
+    static CATALOG: LazyLock<Vec<CatalogPattern>> = LazyLock::new(skim_catalog);
+    &CATALOG
+}
 
 /// A throwaway git repository plus an isolated `HOME` for every git command
 /// run against it, so the developer's global config (signing, hooks,
