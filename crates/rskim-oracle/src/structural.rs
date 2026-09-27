@@ -24,7 +24,12 @@
 //! `crates/rskim-oracle/queries/<pattern>.<lang>.scm`, compiled in with
 //! `include_str!` and hashed into the scoreboard's golden digest
 //! ([`fingerprint`], with every other table an answer depends on), so editing
-//! a query forces a re-bless. `.tsx` files are parsed with the TSX grammar
+//! a query forces a re-bless. Each query file's second line,
+//! `; Grammar: <crate> <version>`, names the grammar it was written against,
+//! and a test keeps it equal to the version the workspace `Cargo.lock`
+//! resolves: a grammar bump fails that test until the headers are edited,
+//! and the edit changes the digest, so the gate asks for a bless.
+//! `.tsx` files are parsed with the TSX grammar
 //! (ADR-003: the oracle is the real grammar), although skim parses them with
 //! the plain TypeScript grammar.
 //!
@@ -407,6 +412,15 @@ impl PostFilter {
             PostFilter::AtLeast { min, .. } => elements >= min,
         }
     }
+
+    /// The filter as [`fingerprint`] tokens: `empty @<capture>` or
+    /// `at-least <min> @<capture>`.
+    fn fingerprint(self) -> String {
+        match self {
+            PostFilter::Empty { capture } => format!("empty @{capture}"),
+            PostFilter::AtLeast { capture, min } => format!("at-least {min} @{capture}"),
+        }
+    }
 }
 
 /// Node kinds that annotate the next element instead of being one.
@@ -416,6 +430,7 @@ const ATTRIBUTE_KINDS: &[&str] = &["attribute_item", "inner_attribute_item"];
 const MATCH_CAPTURE: &str = "match";
 
 /// One registered oracle query.
+#[derive(Debug, Clone, Copy)]
 struct OracleQuery {
     pattern: &'static str,
     lang: OracleLang,
@@ -591,9 +606,10 @@ pub fn query_sources() -> Vec<QuerySource> {
         .collect()
 }
 
-/// The tables the oracle's answers depend on, apart from the grammars
-/// themselves (pinned crate versions): what [`fingerprint`] renders. Factored
-/// out so a test can render an edited copy.
+/// The tables the oracle's answers depend on: what [`fingerprint`] renders,
+/// through this type's `Display`. The grammars are not a table here; each
+/// query file's `; Grammar:` header carries their identity (module docs,
+/// "Ground truth"). Factored out so a test can render an edited copy.
 struct OracleInputs<'a> {
     /// [`AST_SIZE_CAP_BYTES`].
     size_cap: u64,
@@ -634,65 +650,65 @@ const ORACLE_INPUTS: OracleInputs<'static> = OracleInputs {
 /// The text names query files, never directories, so moving the queries does
 /// not change it.
 pub fn fingerprint() -> String {
-    render_fingerprint(&ORACLE_INPUTS)
+    ORACLE_INPUTS.to_string()
 }
 
-/// [`fingerprint`] over explicit inputs.
-fn render_fingerprint(inputs: &OracleInputs<'_>) -> String {
-    let mut out = format!("size-cap {}\n", inputs.size_cap);
-    for row in inputs.ext_classes {
-        out.push_str(&format!(
-            "ext [{}] {}\n",
-            row.extensions.join(" "),
-            class_fingerprint(row.class)
-        ));
+/// The [`fingerprint`] text of these inputs, one line per table row (a
+/// query's line is followed by its full text).
+impl std::fmt::Display for OracleInputs<'_> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(out, "size-cap {}", self.size_cap)?;
+        for row in self.ext_classes {
+            writeln!(
+                out,
+                "ext [{}] {}",
+                row.extensions.join(" "),
+                row.class.fingerprint()
+            )?;
+        }
+        writeln!(out, "ext-unknown {}", self.unknown_extension.fingerprint())?;
+        writeln!(out, "attribute-kinds [{}]", self.attribute_kinds.join(" "))?;
+        for q in sorted_queries(self.queries) {
+            let filter = q
+                .filter
+                .map_or_else(|| "none".to_string(), PostFilter::fingerprint);
+            writeln!(
+                out,
+                "query {} filter {filter} bytes {}\n{}",
+                q.file_name(),
+                q.source.len(),
+                q.source
+            )?;
+        }
+        for spec in self.intents {
+            let langs: Vec<&str> = spec.langs.iter().map(|l| l.as_str()).collect();
+            writeln!(
+                out,
+                "intent {} langs [{}] loops [{}] boundaries [{}]",
+                spec.pattern,
+                langs.join(" "),
+                spec.loop_kinds.join(" "),
+                spec.boundary_kinds.join(" ")
+            )?;
+        }
+        Ok(())
     }
-    out.push_str(&format!(
-        "ext-unknown {}\n",
-        class_fingerprint(inputs.unknown_extension)
-    ));
-    out.push_str(&format!(
-        "attribute-kinds [{}]\n",
-        inputs.attribute_kinds.join(" ")
-    ));
-    for q in sorted_queries(inputs.queries) {
-        let filter = match q.filter {
-            None => "none".to_string(),
-            Some(PostFilter::Empty { capture }) => format!("empty @{capture}"),
-            Some(PostFilter::AtLeast { capture, min }) => format!("at-least {min} @{capture}"),
-        };
-        out.push_str(&format!(
-            "query {} filter {filter} bytes {}\n{}\n",
-            q.file_name(),
-            q.source.len(),
-            q.source
-        ));
-    }
-    for spec in inputs.intents {
-        let langs: Vec<&str> = spec.langs.iter().map(|l| l.as_str()).collect();
-        out.push_str(&format!(
-            "intent {} langs [{}] loops [{}] boundaries [{}]\n",
-            spec.pattern,
-            langs.join(" "),
-            spec.loop_kinds.join(" "),
-            spec.boundary_kinds.join(" ")
-        ));
-    }
-    out
 }
 
-/// A [`LangClass`] as one fingerprint token sequence.
-fn class_fingerprint(class: LangClass) -> String {
-    match class {
-        LangClass::Oracle(lang) => format!("oracle {lang}"),
-        LangClass::Unscored { language } => format!("unscored {language}"),
-        LangClass::NotIndexed {
-            language,
-            size_capped,
-        } => format!(
-            "not-indexed {} size-capped {size_capped}",
-            language.unwrap_or("-")
-        ),
+impl LangClass {
+    /// The class as [`fingerprint`] tokens.
+    fn fingerprint(self) -> String {
+        match self {
+            LangClass::Oracle(lang) => format!("oracle {lang}"),
+            LangClass::Unscored { language } => format!("unscored {language}"),
+            LangClass::NotIndexed {
+                language,
+                size_capped,
+            } => format!(
+                "not-indexed {} size-capped {size_capped}",
+                language.unwrap_or("-")
+            ),
+        }
     }
 }
 

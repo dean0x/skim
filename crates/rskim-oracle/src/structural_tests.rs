@@ -133,7 +133,6 @@ fn query_sources_are_ordered_by_pattern_then_language_name() {
     let mut sorted = keys.clone();
     sorted.sort();
     assert_eq!(keys, sorted);
-    assert_eq!(keys.len(), 53);
     // The registry itself is kept in the same order, so a diff reads cleanly.
     let registry: Vec<(&str, &str)> = QUERIES
         .iter()
@@ -895,10 +894,60 @@ fn file_matches_reports_every_pattern_of_the_language() {
 // Golden fingerprint: every table an answer depends on
 // ============================================================================
 
+/// Renders each edited copy of the oracle inputs and asserts that its
+/// fingerprint differs from the compiled-in inputs' and from every other
+/// edit's, so each edit is proven to reach the golden digest on its own.
+fn assert_each_edit_changes_the_fingerprint<'a>(
+    edits: impl IntoIterator<Item = (&'a str, OracleInputs<'a>)>,
+) {
+    // No `..`: a field added to `OracleInputs` stops this from compiling
+    // until its author adds a test of edits to it below.
+    let OracleInputs {
+        size_cap: _,
+        ext_classes: _,
+        unknown_extension: _,
+        attribute_kinds: _,
+        queries: _,
+        intents: _,
+    } = ORACLE_INPUTS;
+    let mut seen = BTreeMap::from([(fingerprint(), "the compiled-in inputs")]);
+    for (what, inputs) in edits {
+        if let Some(earlier) = seen.insert(inputs.to_string(), what) {
+            panic!("{what}: the fingerprint is the same as for {earlier}");
+        }
+    }
+}
+
 #[test]
-fn the_fingerprint_renders_the_compiled_in_inputs() {
-    assert_eq!(fingerprint(), render_fingerprint(&ORACLE_INPUTS));
-    assert_eq!(fingerprint(), fingerprint());
+fn the_fingerprint_does_not_depend_on_the_registry_order() {
+    // The fingerprint sorts the queries, so only their content is an input.
+    let mut reordered = QUERIES.to_vec();
+    reordered.reverse();
+    let reordered = OracleInputs {
+        queries: &reordered,
+        ..ORACLE_INPUTS
+    };
+    assert_eq!(reordered.to_string(), fingerprint());
+}
+
+#[test]
+fn any_size_cap_edit_changes_the_fingerprint() {
+    assert_each_edit_changes_the_fingerprint([
+        (
+            "one byte more",
+            OracleInputs {
+                size_cap: AST_SIZE_CAP_BYTES + 1,
+                ..ORACLE_INPUTS
+            },
+        ),
+        (
+            "one byte less",
+            OracleInputs {
+                size_cap: AST_SIZE_CAP_BYTES - 1,
+                ..ORACLE_INPUTS
+            },
+        ),
+    ]);
 }
 
 /// [`EXT_CLASSES`] with `edit` applied to the row that lists `ext`.
@@ -914,91 +963,383 @@ fn edited_ext_table(ext: &str, edit: impl FnOnce(&mut ExtClass)) -> Vec<ExtClass
 
 #[test]
 fn any_extension_table_edit_changes_the_fingerprint() {
-    let base = fingerprint();
-    let with_table = |table: &[ExtClass]| {
-        render_fingerprint(&OracleInputs {
-            ext_classes: table,
-            ..ORACLE_INPUTS
-        })
+    let dropped_ext = edited_ext_table("cts", |row| row.extensions = &["ts", "mts"]);
+    let tsx_as_ts = edited_ext_table("tsx", |row| {
+        row.class = LangClass::Oracle(OracleLang::TypeScript);
+    });
+    let java_not_indexed = edited_ext_table("java", |row| {
+        row.class = LangClass::NotIndexed {
+            language: Some("java"),
+            size_capped: true,
+        };
+    });
+    let renamed_unscored = edited_ext_table("rb", |row| {
+        row.class = LangClass::Unscored { language: "rbx" };
+    });
+    let bash_uncapped = edited_ext_table("sh", |row| {
+        row.class = LangClass::NotIndexed {
+            language: Some("bash"),
+            size_capped: false,
+        };
+    });
+    let with_table = |ext_classes| OracleInputs {
+        ext_classes,
+        ..ORACLE_INPUTS
     };
-    let edits = [
-        (
-            "drop an extension",
-            edited_ext_table("cts", |row| row.extensions = &["ts", "mts"]),
-        ),
+    assert_each_edit_changes_the_fingerprint([
+        ("drop an extension", with_table(&dropped_ext)),
         (
             "parse .tsx with the TypeScript grammar",
-            edited_ext_table("tsx", |row| {
-                row.class = LangClass::Oracle(OracleLang::TypeScript);
-            }),
+            with_table(&tsx_as_ts),
         ),
-        (
-            "stop AST-indexing Java",
-            edited_ext_table("java", |row| {
-                row.class = LangClass::NotIndexed {
-                    language: Some("java"),
-                    size_capped: true,
-                };
-            }),
-        ),
-        (
-            "rename an unscored language",
-            edited_ext_table("rb", |row| {
-                row.class = LangClass::Unscored { language: "rbx" };
-            }),
-        ),
+        ("stop AST-indexing Java", with_table(&java_not_indexed)),
+        ("rename an unscored language", with_table(&renamed_unscored)),
         (
             "stop counting Bash toward the size cap",
-            edited_ext_table("sh", |row| {
-                row.class = LangClass::NotIndexed {
-                    language: Some("bash"),
-                    size_capped: false,
-                };
-            }),
+            with_table(&bash_uncapped),
         ),
-    ];
-    let mut seen = BTreeSet::from([base]);
-    for (what, table) in edits {
-        assert!(
-            seen.insert(with_table(&table)),
-            "{what}: fingerprint unchanged"
-        );
-    }
-    let dropped_row = &EXT_CLASSES[..EXT_CLASSES.len() - 1];
-    assert!(seen.insert(with_table(dropped_row)), "drop a row");
-
-    let unknown_counted = render_fingerprint(&OracleInputs {
-        unknown_extension: LangClass::NotIndexed {
-            language: None,
-            size_capped: true,
-        },
-        ..ORACLE_INPUTS
-    });
-    assert!(seen.insert(unknown_counted), "the unknown-extension class");
+        (
+            "drop a row",
+            with_table(&EXT_CLASSES[..EXT_CLASSES.len() - 1]),
+        ),
+        (
+            "count unknown extensions toward the size cap",
+            OracleInputs {
+                unknown_extension: LangClass::NotIndexed {
+                    language: None,
+                    size_capped: true,
+                },
+                ..ORACLE_INPUTS
+            },
+        ),
+    ]);
 }
 
 #[test]
 fn any_attribute_kind_edit_changes_the_fingerprint() {
-    let base = fingerprint();
-    let with_kinds = |kinds: &[&str]| {
-        render_fingerprint(&OracleInputs {
-            attribute_kinds: kinds,
-            ..ORACLE_INPUTS
-        })
+    let with_kinds = |attribute_kinds| OracleInputs {
+        attribute_kinds,
+        ..ORACLE_INPUTS
     };
-    assert_eq!(with_kinds(ATTRIBUTE_KINDS), base);
-    let mut seen = BTreeSet::from([base]);
-    for (what, kinds) in [
-        ("drop a kind", &["attribute_item"][..]),
+    assert_each_edit_changes_the_fingerprint([
+        ("drop a kind", with_kinds(&["attribute_item"][..])),
         (
             "add a kind",
-            &["attribute_item", "inner_attribute_item", "macro_invocation"][..],
+            with_kinds(&["attribute_item", "inner_attribute_item", "macro_invocation"][..]),
         ),
-        ("no kinds", &[][..]),
+        ("no kinds", with_kinds(&[][..])),
+    ]);
+}
+
+/// [`QUERIES`] with `edit` applied to the query registered as `file_name`.
+fn edited_queries(file_name: &str, edit: impl FnOnce(&mut OracleQuery)) -> Vec<OracleQuery> {
+    let mut queries = QUERIES.to_vec();
+    let query = queries
+        .iter_mut()
+        .find(|q| q.file_name() == file_name)
+        .unwrap_or_else(|| panic!("no query is registered as {file_name}"));
+    edit(query);
+    queries
+}
+
+#[test]
+fn any_query_edit_changes_the_fingerprint() {
+    let removed: Vec<OracleQuery> = QUERIES
+        .iter()
+        .filter(|q| q.file_name() != "try-catch.typescript.scm")
+        .copied()
+        .collect();
+    // Same length, one byte different: the text itself is fingerprinted,
+    // not only its length.
+    let text_edit = edited_queries("go-defer.go.scm", |q| {
+        let edited = q.source.replacen("@match", "@matcH", 1);
+        assert_eq!(edited.len(), q.source.len());
+        assert_ne!(edited, q.source);
+        q.source = edited.leak();
+    });
+    let other_grammar = edited_queries("go-defer.go.scm", |q| q.lang = OracleLang::Rust);
+    let filter_kind = edited_queries("empty-catch.tsx.scm", |q| {
+        q.filter = Some(PostFilter::AtLeast {
+            capture: "body",
+            min: 0,
+        });
+    });
+    let filter_capture = edited_queries("empty-catch.tsx.scm", |q| {
+        q.filter = Some(PostFilter::Empty { capture: "block" });
+    });
+    let filter_dropped = edited_queries("empty-function.rust.scm", |q| q.filter = None);
+    let filter_added = edited_queries("function-with-body.rust.scm", |q| {
+        q.filter = EMPTY_BODY_FILTER;
+    });
+    let params_threshold = edited_queries("excessive-params.rust.scm", |q| {
+        q.filter = Some(PostFilter::AtLeast {
+            capture: "params",
+            min: 6,
+        });
+    });
+    let body_threshold = edited_queries("god-function.rust.scm", |q| {
+        q.filter = Some(PostFilter::AtLeast {
+            capture: "body",
+            min: 19,
+        });
+    });
+    let with_queries = |queries| OracleInputs {
+        queries,
+        ..ORACLE_INPUTS
+    };
+    assert_each_edit_changes_the_fingerprint([
+        ("remove a query", with_queries(&removed)),
+        ("edit a query's text", with_queries(&text_edit)),
+        (
+            "move a query to another grammar",
+            with_queries(&other_grammar),
+        ),
+        ("change a post-filter's kind", with_queries(&filter_kind)),
+        (
+            "change a post-filter's capture",
+            with_queries(&filter_capture),
+        ),
+        ("drop a post-filter", with_queries(&filter_dropped)),
+        ("add a post-filter", with_queries(&filter_added)),
+        (
+            "change excessive-params' bound",
+            with_queries(&params_threshold),
+        ),
+        ("change god-function's bound", with_queries(&body_threshold)),
+    ]);
+}
+
+/// [`INTENTS`] with `edit` applied to the spec of `pattern`.
+fn edited_intents(pattern: &str, edit: impl FnOnce(&mut IntentSpec)) -> Vec<IntentSpec> {
+    let mut intents = INTENTS.to_vec();
+    let spec = intents
+        .iter_mut()
+        .find(|spec| spec.pattern == pattern)
+        .unwrap_or_else(|| panic!("no intent spec for {pattern}"));
+    edit(spec);
+    intents
+}
+
+#[test]
+fn any_intent_edit_changes_the_fingerprint() {
+    let removed: Vec<IntentSpec> = INTENTS
+        .iter()
+        .filter(|spec| spec.pattern != "nested-loop")
+        .copied()
+        .collect();
+    let renamed = edited_intents("rust-nested-loop", |spec| {
+        spec.pattern = "rust-loop-in-loop"
+    });
+    let lang_dropped = edited_intents("nested-loop", |spec| {
+        spec.langs = &[OracleLang::TypeScript, OracleLang::JavaScript];
+    });
+    let loop_dropped = edited_intents("nested-loop", |spec| {
+        spec.loop_kinds = &["for_statement", "for_in_statement", "while_statement"];
+    });
+    let loop_added = edited_intents("rust-nested-loop", |spec| {
+        spec.loop_kinds = &[
+            "for_expression",
+            "while_expression",
+            "loop_expression",
+            "match_expression",
+        ];
+    });
+    let boundary_dropped = edited_intents("rust-nested-loop", |spec| {
+        spec.boundary_kinds = &["function_item"];
+    });
+    let boundary_added = edited_intents("nested-loop", |spec| {
+        spec.boundary_kinds = &[
+            "function_declaration",
+            "function_expression",
+            "arrow_function",
+            "method_definition",
+            "generator_function",
+            "generator_function_declaration",
+            "class_body",
+        ];
+    });
+    let with_intents = |intents| OracleInputs {
+        intents,
+        ..ORACLE_INPUTS
+    };
+    assert_each_edit_changes_the_fingerprint([
+        ("remove an intent", with_intents(&removed)),
+        ("rename an intent", with_intents(&renamed)),
+        ("drop an intent language", with_intents(&lang_dropped)),
+        ("drop a loop kind", with_intents(&loop_dropped)),
+        ("add a loop kind", with_intents(&loop_added)),
+        ("drop a boundary kind", with_intents(&boundary_dropped)),
+        ("add a boundary kind", with_intents(&boundary_added)),
+    ]);
+}
+
+// ============================================================================
+// Grammar identity: each query names the grammar version Cargo.lock resolves
+// ============================================================================
+
+/// The grammar crate an oracle language parses with, and — for the crate
+/// that ships two grammars — the language constant
+/// ([`OracleLang::grammar`]).
+fn grammar_crate(lang: OracleLang) -> (&'static str, Option<&'static str>) {
+    match lang {
+        OracleLang::Rust => ("tree-sitter-rust", None),
+        OracleLang::Python => ("tree-sitter-python", None),
+        OracleLang::TypeScript => ("tree-sitter-typescript", Some("LANGUAGE_TYPESCRIPT")),
+        OracleLang::Tsx => ("tree-sitter-typescript", Some("LANGUAGE_TSX")),
+        OracleLang::JavaScript => ("tree-sitter-javascript", None),
+        OracleLang::Go => ("tree-sitter-go", None),
+    }
+}
+
+/// A string field of a `Cargo.lock` `[[package]]` entry.
+fn field<'v>(package: &'v toml::Value, key: &str) -> Option<&'v str> {
+    package.get(key).and_then(toml::Value::as_str)
+}
+
+/// The version the workspace `Cargo.lock` resolves for each dependency of
+/// this crate, read from this crate's lock entry: a dependency listed as
+/// `name version` (the lock holds several versions of it) carries its
+/// version, and a bare `name` is the lock's one package of that name.
+fn locked_dependency_versions() -> BTreeMap<String, String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let lock: toml::Table = raw
+        .parse()
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let packages = lock["package"].as_array().expect("Cargo.lock has packages");
+    let this = packages
+        .iter()
+        .find(|p| field(p, "name") == Some(env!("CARGO_PKG_NAME")))
+        .expect("Cargo.lock has an entry for this crate");
+    let dependencies = this["dependencies"].as_array().expect("its dependencies");
+    dependencies
+        .iter()
+        .map(|dependency| {
+            let dependency = dependency.as_str().expect("a dependency is a string");
+            let mut words = dependency.split(' ');
+            let name = words.next().expect("a dependency has a name").to_string();
+            let version = words.next().map_or_else(
+                || {
+                    let versions: Vec<&str> = packages
+                        .iter()
+                        .filter(|p| field(p, "name") == Some(name.as_str()))
+                        .filter_map(|p| field(p, "version"))
+                        .collect();
+                    assert_eq!(versions.len(), 1, "{name}: {versions:?}");
+                    versions[0].to_string()
+                },
+                str::to_string,
+            );
+            (name, version)
+        })
+        .collect()
+}
+
+/// What is wrong with `source`'s grammar header, if anything: its second
+/// line must be `; Grammar: <crate> <locked version>.`, with the language
+/// constant in parentheses before the full stop for a crate that ships two
+/// grammars, and no other line may start `; Grammar:`.
+fn grammar_header_problem(
+    source: &str,
+    lang: OracleLang,
+    locked: &BTreeMap<String, String>,
+) -> Option<String> {
+    let (krate, constant) = grammar_crate(lang);
+    let Some(version) = locked.get(krate) else {
+        return Some(format!("{krate} is not a locked dependency of this crate"));
+    };
+    let constant = constant.map_or_else(String::new, |c| format!(" ({c})"));
+    let expected = format!("; Grammar: {krate} {version}{constant}.");
+    let headers: Vec<(usize, &str)> = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("; Grammar:"))
+        .collect();
+    match headers.as_slice() {
+        [(1, header)] if *header == expected => None,
+        [(1, header)] => Some(format!("header {header:?}, expected {expected:?}")),
+        [] => Some(format!(
+            "no grammar header, expected {expected:?} on line 2"
+        )),
+        _ => Some(format!(
+            "grammar headers on lines {:?}, expected one on line 2",
+            headers.iter().map(|(i, _)| i + 1).collect::<Vec<_>>()
+        )),
+    }
+}
+
+#[test]
+fn every_query_names_the_grammar_version_cargo_lock_resolves() {
+    let locked = locked_dependency_versions();
+    let problems: Vec<String> = query_sources()
+        .iter()
+        .filter_map(|q| {
+            grammar_header_problem(q.source, q.lang, &locked)
+                .map(|problem| format!("{}: {problem}", q.file_name()))
+        })
+        .collect();
+    assert!(
+        problems.is_empty(),
+        "query grammar headers disagree with Cargo.lock (a grammar bump must edit every \
+         header it touches, which changes the golden digest and asks for a bless):\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn a_stale_missing_or_misplaced_grammar_header_is_a_problem() {
+    let locked = BTreeMap::from([
+        ("tree-sitter-rust".to_string(), "0.24.0".to_string()),
+        ("tree-sitter-typescript".to_string(), "0.23.2".to_string()),
+    ]);
+    let rust = |header: &str| format!("; Title.\n{header}\n(function_item) @match\n");
+    let current = rust("; Grammar: tree-sitter-rust 0.24.0.");
+    assert_eq!(
+        grammar_header_problem(&current, OracleLang::Rust, &locked),
+        None
+    );
+    for (what, source, lang) in [
+        (
+            "an older version",
+            rust("; Grammar: tree-sitter-rust 0.23.0."),
+            OracleLang::Rust,
+        ),
+        (
+            "another grammar crate",
+            rust("; Grammar: tree-sitter-go 0.24.0."),
+            OracleLang::Rust,
+        ),
+        (
+            "no header",
+            "; Title.\n(function_item) @match\n".to_string(),
+            OracleLang::Rust,
+        ),
+        (
+            "the header off line 2",
+            "; Title.\n;\n; Grammar: tree-sitter-rust 0.24.0.\n(function_item) @match\n"
+                .to_string(),
+            OracleLang::Rust,
+        ),
+        (
+            "a second header",
+            format!("{current}; Grammar: tree-sitter-rust 0.24.0.\n"),
+            OracleLang::Rust,
+        ),
+        (
+            "the other constant of a two-grammar crate",
+            "; Title.\n; Grammar: tree-sitter-typescript 0.23.2 (LANGUAGE_TYPESCRIPT).\n"
+                .to_string(),
+            OracleLang::Tsx,
+        ),
+        (
+            "a grammar that is not a locked dependency",
+            "; Title.\n; Grammar: tree-sitter-go 0.25.0.\n".to_string(),
+            OracleLang::Go,
+        ),
     ] {
         assert!(
-            seen.insert(with_kinds(kinds)),
-            "{what}: fingerprint unchanged"
+            grammar_header_problem(&source, lang, &locked).is_some(),
+            "{what}: accepted"
         );
     }
 }
