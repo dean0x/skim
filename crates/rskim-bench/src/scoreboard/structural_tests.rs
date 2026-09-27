@@ -1031,11 +1031,17 @@ fn any_attribute_kind_edit_changes_the_fingerprint() {
 // ============================================================================
 //
 // A source scan over the structural scoring path: `structural.rs`,
-// `structural_metrics.rs`, and every in-crate module they reach through a
-// path, transitively. The set is computed from the sources at test time, so
-// a new import widens the scan by itself. Skim's pattern catalog is read in
-// exactly one place, `catalog_patterns`, whose body is pinned below: no other
-// catalog field (the n-gram tables above all) can reach the scoreboard.
+// `structural_metrics.rs`, the crate root, and every in-crate module they
+// reach through a path, transitively. The set is computed from the sources at
+// test time, so a new import widens the scan by itself. Skim's pattern
+// catalog is read in exactly one place, `catalog_patterns`, whose body is
+// pinned below: no other catalog field (the n-gram tables above all) can
+// reach the scoreboard.
+//
+// Two rules also hold in every file outside the crate's `#[cfg(test)]` ones,
+// because they cover what no path leads to: no code or literal names skim's
+// AST search stack, and no file uses `include!`, `#[macro_export]` or
+// `#[macro_use]`.
 
 /// Where the scanned sources come from: the crate's `src/`, or an in-memory
 /// tree in the scanner's own tests. Paths are relative to `src/`.
@@ -1402,8 +1408,11 @@ fn resolve(sources: &dyn Sources, module: &[String], path: &[String]) -> Option<
     module_file(sources, &at)
 }
 
-/// Where the structural scoring path starts: the oracle and the scoring.
+/// Where the structural scoring path starts: the oracle and the scoring, and
+/// the crate root, scanned on its own account: an `extern crate … as` alias
+/// there joins every module's extern prelude, so no path leads back to it.
 const SCAN_ROOTS: &[&str] = &[
+    "lib.rs",
     "scoreboard/structural.rs",
     "scoreboard/structural_metrics.rs",
 ];
@@ -1439,9 +1448,14 @@ fn scan_set(sources: &dyn Sources, roots: &[&str]) -> BTreeMap<String, String> {
 // The rules
 // ---------------------------------------------------------------------------
 
-/// Names of skim's AST search stack (and its core crate): forbidden anywhere
-/// in a scanned file's code or literals.
-const FORBIDDEN_WORDS: &[&str] = &["ast_index", "compound", "linearize", "rskim_core"];
+/// Names of skim's AST search stack: forbidden in the code and literals of
+/// every file of the crate outside its `#[cfg(test)]` files, on the scoring
+/// path or not.
+const AST_STACK_WORDS: &[&str] = &["ast_index", "compound", "linearize"];
+
+/// Skim's core crate: forbidden on the scoring path as well. Elsewhere the
+/// BM25F harness and the golden generator name `rskim_core::Language`.
+const CORE_CRATE: &str = "rskim_core";
 
 /// Catalog `Pattern` members that encode how skim matches a pattern (its
 /// n-gram tables and their resolvers) or reach `rskim_core` (the example's
@@ -1515,15 +1529,22 @@ fn untested_child_modules(bare: &str) -> Vec<String> {
     found
 }
 
+/// The `words` that the code or literals of the file `rel` mention
+/// (`literal` is its [`CodeViews::literal`]), each as a violation.
+fn mentions(rel: &str, literal: &str, words: &[&str]) -> Vec<String> {
+    words
+        .iter()
+        .filter(|word| literal.contains(**word))
+        .map(|word| format!("{rel}: mentions `{word}`"))
+        .collect()
+}
+
 /// Every independence violation in the file `rel` (source `src`), naming
 /// only the `allowed` `rskim_search` items.
 fn independence_violations(rel: &str, src: &str, allowed: &[&str]) -> Vec<String> {
     let views = code_views(src);
-    let mut violations: Vec<String> = FORBIDDEN_WORDS
-        .iter()
-        .filter(|word| views.literal.contains(**word))
-        .map(|word| format!("{rel}: mentions `{word}`"))
-        .collect();
+    let mut violations = mentions(rel, &views.literal, AST_STACK_WORDS);
+    violations.extend(mentions(rel, &views.literal, &[CORE_CRATE]));
     for (at, _) in views.literal.match_indices("rskim_search") {
         let rest = &views.literal[at + "rskim_search".len()..];
         let item: String = rest
@@ -1550,6 +1571,62 @@ fn independence_violations(rel: &str, src: &str, allowed: &[&str]) -> Vec<String
         );
     }
     violations
+}
+
+/// Code a module gets without a path the scan could follow, in the tokens of
+/// a file's [`CodeViews::bare`]: `include!` splices another file in, and
+/// `#[macro_export]` or `#[macro_use]` make a macro defined in any file
+/// callable on the scoring path.
+fn pathless_code(toks: &[Tok]) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for (k, tok) in toks.iter().enumerate() {
+        let Tok::Ident(name) = tok else { continue };
+        match name.as_str() {
+            "include"
+                if toks.get(k + 1) == Some(&Tok::Punct('!'))
+                    && matches!(toks.get(k + 2), Some(Tok::Punct('(' | '[' | '{'))) =>
+            {
+                found.push("include!");
+            }
+            "macro_export" => found.push("#[macro_export]"),
+            "macro_use" => found.push("#[macro_use]"),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Every crate-wide violation in the file `rel` (source `src`): a mention of
+/// skim's AST search stack, or code brought in without a path.
+fn crate_wide_violations(rel: &str, src: &str) -> Vec<String> {
+    let views = code_views(src);
+    let mut violations = mentions(rel, &views.literal, AST_STACK_WORDS);
+    violations.extend(
+        pathless_code(&tokens(&views.bare))
+            .into_iter()
+            .map(|what| format!("{rel}: uses `{what}`")),
+    );
+    violations
+}
+
+/// Whether `rel` is compiled for tests only: an `x_tests.rs` whose sibling
+/// `x.rs` declares it `#[cfg(test)] … #[path = "x_tests.rs"] mod …;`. Any
+/// other file, whatever its name, is held to the crate-wide rules.
+fn is_cfg_test_file(sources: &dyn Sources, rel: &str) -> bool {
+    let Some(stem) = rel.strip_suffix("_tests.rs") else {
+        return false;
+    };
+    let declaring_file = format!("{stem}.rs");
+    if !sources.exists(&declaring_file) {
+        return false;
+    }
+    let file_name = rel.rsplit('/').next().unwrap_or(rel);
+    let declaring = squash(&code_views(&sources.read(&declaring_file)).literal);
+    let path_attribute = format!("#[path=\"{file_name}\"]mod");
+    declaring.match_indices(&path_attribute).any(|(at, _)| {
+        let item_start = declaring[..at].rfind([';', '{', '}']).map_or(0, |p| p + 1);
+        declaring[item_start..at].contains("#[cfg(test)]")
+    })
 }
 
 /// `src` with all whitespace removed: a layout-independent comparison.
@@ -1798,4 +1875,145 @@ fn the_scan_follows_every_in_crate_path_transitively() {
         ),
         ["scoreboard/d.rs: names `rskim_search::lookup_pattern as x;\n`"]
     );
+}
+
+#[test]
+fn the_crate_root_is_scanned_even_when_no_path_reaches_it() {
+    // An alias in the crate root joins every module's extern prelude, so
+    // `skim::…` on the scoring path is a path the scan cannot follow back to
+    // `lib.rs`: the crate root has to be scanned on its own account.
+    let tree: BTreeMap<&str, &str> = BTreeMap::from([
+        (
+            "lib.rs",
+            "extern crate rskim_search as skim;\npub mod scoreboard;\n",
+        ),
+        (
+            "scoreboard/mod.rs",
+            "pub mod structural;\npub mod structural_metrics;\n",
+        ),
+        (
+            "scoreboard/structural.rs",
+            "pub fn f() { skim::lookup_pattern(); }\n",
+        ),
+        ("scoreboard/structural_metrics.rs", "pub fn g() {}\n"),
+    ]);
+    let scanned = scan_set(&tree, SCAN_ROOTS);
+    assert!(
+        scanned.contains_key("lib.rs"),
+        "lib.rs is a scan root; scanned: {:?}",
+        scanned.keys()
+    );
+    assert_eq!(
+        independence_violations("lib.rs", &scanned["lib.rs"], SCORING_PATH_SKIM_ITEMS),
+        ["lib.rs: names `rskim_search as skim;\npub mod scoreboard;\n`"]
+    );
+}
+
+#[test]
+fn no_file_outside_the_tests_names_skims_ast_stack_or_brings_in_code_without_a_path() {
+    let sources = CrateSources::new();
+    let (tests, checked): (Vec<&String>, Vec<&String>) = sources
+        .files
+        .iter()
+        .partition(|rel| is_cfg_test_file(&sources, rel));
+    // Not vacuous: this file (whose fixtures name skim's AST stack) is the
+    // one kind left out, and the crate root, the binaries, the oracle and the
+    // `test-utils` support module are all held to the rules.
+    assert!(
+        tests
+            .iter()
+            .any(|rel| *rel == "scoreboard/structural_tests.rs"),
+        "{tests:?}"
+    );
+    assert!(
+        tests.iter().all(|rel| rel.ends_with("_tests.rs")),
+        "{tests:?}"
+    );
+    for rel in [
+        "lib.rs",
+        "main.rs",
+        "bin/scoreboard.rs",
+        "scoreboard/structural.rs",
+        "scoreboard/golden_gen.rs",
+        "scoreboard/test_support.rs",
+    ] {
+        assert!(checked.iter().any(|c| *c == rel), "{rel} in {checked:?}");
+    }
+    let violations: Vec<String> = checked
+        .iter()
+        .flat_map(|rel| crate_wide_violations(rel, &sources.read(rel)))
+        .collect();
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "outside the `#[cfg(test)]` files, no code or literal may name skim's AST search \
+         stack ({AST_STACK_WORDS:?}), and no file may use `include!`, `#[macro_export]` \
+         or `#[macro_use]`: each reaches the structural scoring path without a path the \
+         independence scan follows"
+    );
+}
+
+#[test]
+fn crate_wide_check_catches_pathless_code_and_ignores_comments_and_literals() {
+    let bad = [
+        "include!(\"qa_probe_inc.rs\");",
+        "std::include! { \"x.rs\" }",
+        "const X: u8 = include![\"x.rs\"];",
+        "#[macro_export]\nmacro_rules! probe { () => {} }",
+        "#[cfg_attr(all(), macro_export)] macro_rules! probe { () => {} }",
+        "#[macro_use]\nmod helpers;",
+        "let f = rskim_search::linearize_source;",
+        "use rskim_search::compound as c;",
+        "#[path = \"../../rskim-search/src/ast_index/mod.rs\"] mod p;",
+    ];
+    for code in bad {
+        assert!(!crate_wide_violations("x.rs", code).is_empty(), "{code}");
+    }
+    let fine = [
+        "// include!(\"x.rs\"), #[macro_export] and ast_index/linearize.rs",
+        "/* #[macro_use] compound */ let n = 1;",
+        "let s = \"include!(x.rs) #[macro_export]\";",
+        "let t = include_str!(\"x.txt\"); let b = include_bytes!(\"y.bin\");",
+        "macro_rules! local { () => {} }",
+        "let include = 1; let differs = include != 2;",
+        "let l = rskim_core::Language::Rust;",
+    ];
+    for code in fine {
+        assert_eq!(
+            crate_wide_violations("x.rs", code),
+            Vec::<String>::new(),
+            "{code}"
+        );
+    }
+}
+
+#[test]
+fn only_a_cfg_test_path_module_is_a_test_file() {
+    let tree: BTreeMap<&str, &str> = BTreeMap::from([
+        (
+            "a.rs",
+            "#[cfg(test)]\n#[allow(clippy::unwrap_used)] // test code\n\
+             #[path = \"a_tests.rs\"]\nmod tests;\n",
+        ),
+        ("a_tests.rs", ""),
+        ("b.rs", "#[path = \"b_tests.rs\"]\nmod tests;\n"),
+        ("b_tests.rs", ""),
+        (
+            "c.rs",
+            "#[cfg(test)]\nfn helper() {}\n#[path = \"c_tests.rs\"]\nmod tests;\n",
+        ),
+        ("c_tests.rs", ""),
+        (
+            "d.rs",
+            "// #[cfg(test)] #[path = \"d_tests.rs\"] mod tests;\n",
+        ),
+        ("d_tests.rs", ""),
+        ("e_tests.rs", ""),
+    ]);
+    let tests: Vec<&str> = tree
+        .keys()
+        .copied()
+        .filter(|rel| is_cfg_test_file(&tree, rel))
+        .collect();
+    assert_eq!(tests, ["a_tests.rs"]);
 }
