@@ -1001,6 +1001,21 @@ fn the_structural_scoring_module_is_independent_too() {
 }
 
 #[test]
+fn the_modules_the_structural_scoring_imports_are_independent_too() {
+    // structural_metrics.rs imports these; a re-export of skim's AST code
+    // from one of them would reach the scoring path without either file
+    // above naming it.
+    for (name, src) in [
+        ("golden.rs", include_str!("golden.rs")),
+        ("metrics.rs", include_str!("metrics.rs")),
+        ("report.rs", include_str!("report.rs")),
+        ("types.rs", include_str!("types.rs")),
+    ] {
+        assert_eq!(independence_violations(src), Vec::<String>::new(), "{name}");
+    }
+}
+
+#[test]
 fn independence_check_catches_imports_and_ignores_comments() {
     let bad = [
         "use rskim_search::ast_index::linearize_source;",

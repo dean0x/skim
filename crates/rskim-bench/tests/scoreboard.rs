@@ -1568,6 +1568,135 @@ fn a_vacuous_structural_entry_is_a_harness_error() {
     );
 }
 
+/// A false-positive guard (#546's shape): `rust-unsafe-block` in Rust, where
+/// the fixture has no unsafe block, so the oracle is empty by declaration.
+const GUARD_ID: &str = "fixture-ast-rust-unsafe-block-rust";
+const GUARD_PATTERN: &str = "rust-unsafe-block";
+const GUARD_ENTRY: &str = "\n[[ast]]\nid = \"fixture-ast-rust-unsafe-block-rust\"\n\
+                           pattern = \"rust-unsafe-block\"\nlang = \"rust\"\nprecision = \"hard\"\n\
+                           expect_oracle_empty = true\n";
+
+impl Harness {
+    /// Serve `--ast rust-unsafe-block`: a false positive on `src/loops.rs`
+    /// (`false_positive`), or nothing (the fixed state).
+    fn write_guard(&self, false_positive: bool) {
+        let rows: Vec<(Row, f64)> = false_positive
+            .then(|| Row {
+                path: "src/loops.rs".to_string(),
+                line: 1,
+                content: "fn walk() {".to_string(),
+            })
+            .into_iter()
+            .map(|r| (r, 1.0))
+            .collect();
+        self.write_response(
+            "",
+            &["--ast", GUARD_PATTERN],
+            &format!("l{FULL_LIMIT}_o0.json"),
+            &ast_page_json(&rows, false),
+        );
+    }
+}
+
+#[test]
+fn a_false_positive_guard_survives_the_fix_and_catches_the_false_positive_returning() {
+    let h = Harness::new();
+    h.write_golden_with(DEF_LINE, GUARD_ENTRY);
+    let ledger = format!(
+        "[[xfail]]\nissue = \"#9005\"\ncheck = \"structural.precision\"\nids = [\"{GUARD_ID}\"]\n"
+    );
+
+    // Today: skim returns a file the oracle rejects; the ledger excuses it.
+    h.write_guard(true);
+    h.write_ledger(&ledger);
+    h.bless_current();
+    let report = h.report();
+    assert_eq!(
+        outcome(&report, GUARD_ID, "structural.precision").as_deref(),
+        Some("xfail")
+    );
+    assert_eq!(
+        outcome(&report, GUARD_ID, "structural.recall").as_deref(),
+        Some("pass")
+    );
+    assert_exit(&h.check(), 0);
+
+    // The fix lands: skim returns nothing and the oracle finds nothing. The
+    // guard is not vacuous (no harness error): the ledgered check XPASSes.
+    h.write_guard(false);
+    let check = h.check();
+    assert_exit(&check, 1);
+    let err = stderr(&check);
+    assert!(!err.contains("vacuous"), "{err}");
+    assert_eq!(
+        outcome(&h.report(), GUARD_ID, "structural.precision").as_deref(),
+        Some("xpass")
+    );
+    let section = &h.report()["corpora"][0]["structural"]["entries"];
+    let entry = section
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == GUARD_ID)
+        .unwrap();
+    assert_eq!(
+        (&entry["oracle_files"], &entry["skim_files"]),
+        (&json!(0), &json!(0))
+    );
+    assert_eq!(
+        (&entry["recall"], &entry["precision"]),
+        (&json!(1.0), &json!(1.0)),
+        "an empty denominator reads as 1"
+    );
+
+    // Promote: remove the ledger entry, keep the golden entry; `xfail -> pass`
+    // blesses without a reason.
+    h.write_ledger("");
+    assert_exit(&h.check(), 1);
+    assert_exit(&h.bless(None), 0);
+    assert_exit(&h.check(), 0);
+
+    // The false positive comes back: the kept guard fails precision.
+    h.write_guard(true);
+    let check = h.check();
+    assert_exit(&check, 1);
+    let err = stderr(&check);
+    assert!(
+        err.contains(&format!("FAIL structural.precision [{GUARD_ID}]")),
+        "{err}"
+    );
+    assert!(err.contains("src/loops.rs"), "{err}");
+}
+
+#[test]
+fn a_false_positive_guard_whose_oracle_matches_is_a_harness_error() {
+    let h = Harness::new();
+    // rust-nested-loop's oracle matches src/loops.rs: the flag is stale.
+    h.write_golden_with(
+        DEF_LINE,
+        &format!("{AST_ENTRY}expect_oracle_empty = true\n"),
+    );
+    h.write_structural(&[], None);
+
+    let run = h.run();
+
+    assert_exit(&run, 2);
+    let err = stderr(&run);
+    assert!(err.contains("golden integrity failed"), "{err}");
+    assert!(err.contains("expect_oracle_empty"), "{err}");
+    assert!(err.contains(AST_ID), "{err}");
+    assert!(err.contains("src/loops.rs"), "{err}");
+    assert!(
+        h.calls().is_empty(),
+        "refused before skim runs: {:?}",
+        h.calls()
+    );
+    assert!(
+        !h.report_path().exists(),
+        "a harness error writes no report"
+    );
+}
+
 #[test]
 fn an_ast_entry_naming_a_pattern_the_oracle_cannot_score_is_a_harness_error() {
     let h = Harness::new();

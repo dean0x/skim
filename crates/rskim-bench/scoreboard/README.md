@@ -77,7 +77,7 @@ cargo run -p rskim-bench --bin scoreboard -- check --skim-bin target/release/ski
 |---|---|
 | `0` | Gate passed (`check`), the run finished (`run`), or the baseline was written (`bless`). |
 | `1` | Gate failure (`check`), or `bless` refused. |
-| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), an empty full list for an entry with no oracle (it would pass every check vacuously), a vacuous `[[ast]]` entry (see [Vacuity guard](#vacuity-guard)), a structural oracle failure (a parser that returns no tree, a query over its match limit), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
+| `2` | Harness error: network or clone verification, golden integrity, an invalid data file, a skim crash, timeout or unparsable output, temporal data that skim reports unusable (`--stats` `temporal_state` not `ready`, or `degraded[]` on a `--hot` / `--cold` / `--risky` / `--blast-radius` entry), an empty full list for an entry with no oracle (it would pass every check vacuously), a vacuous `[[ast]]` entry (see [Vacuity guard](#vacuity-guard)) or a stale `expect_oracle_empty` flag (see [False-positive guards](#false-positive-guards)), a structural oracle failure (a parser that returns no tree, a query over its match limit), or a corpus changed by the run. A harness error is never reported as a regression, and no report is written. |
 
 On a gate failure, stderr prints one `FAIL <check> [<ids>]: <message>` line per failure, and `report.md` lists them
 under "Gate failures".
@@ -211,17 +211,22 @@ id = "skim-ast-try-catch-finally-javascript"   # <corpus>-ast-<pattern>-<lang>
 pattern = "try-catch-finally"                  # a catalog name the oracle has a query for in `lang`
 lang = "javascript"                            # rust | python | typescript | tsx | javascript | go
 precision = "hard"                             # hard | ratchet
+expect_oracle_empty = true                     # optional, default false: a false-positive guard
 ```
 
 - There is one entry per (pattern, language) where the corpus has files in that language and the oracle or skim
   finds at least one of them.
+- `expect_oracle_empty = true` marks a **false-positive guard**: the oracle matches no file in `lang`, and the entry
+  exists because skim returns one it should not. It guards precision only (see
+  [False-positive guards](#false-positive-guards)).
 - `precision` is declared here and never re-read from the catalog. `golden-gen` proposes `hard` iff the catalog
   marks the pattern `exact`. Reclassifying an entry is a reviewed golden edit plus a bless.
 - skim is called once per (corpus, pattern): `skim search --root <clone> --json --limit 1000000 --ast <pattern>`.
   The rows are split by extension into languages, so each entry sees only its own language's rows.
 - Integrity errors (exit 2): an unknown `lang` or `precision`, a pattern that is not in the catalog, an uncovered
-  pattern, a language the pattern has no query for, or two entries for one (pattern, language). A `structural.*`
-  ledger entry may name only `[[ast]]` ids, and `structural.precision` only `hard` ones.
+  pattern, a language the pattern has no query for, two entries for one (pattern, language), a vacuous entry
+  ([Vacuity guard](#vacuity-guard)), or an `expect_oracle_empty` entry whose oracle matches a file. A
+  `structural.*` ledger entry may name only `[[ast]]` ids, and `structural.precision` only `hard` ones.
 
 To propose entries, build both binaries and run `golden-gen --ast`:
 
@@ -231,10 +236,10 @@ cargo build -p rskim-bench --bin scoreboard
 target/debug/scoreboard golden-gen --corpus zod --ast --skim-bin target/release/skim
 ```
 
-It prints one `[[ast]]` entry per candidate, each under a `# golden-gen: oracle files N; skim files M` comment. Review
-them, append them to `golden/<corpus>.toml`, then run `check` and bless. Ids are stable across regeneration. New
-entries bless without `--accept-regression`: their checks go `new -> pass` or `new -> xfail`, and neither is a
-downgrade.
+It prints one `[[ast]]` entry per candidate, each under a `# golden-gen: oracle files N; skim files M` comment, and
+adds `expect_oracle_empty = true` to a candidate with `oracle files 0`. Review them, append them to
+`golden/<corpus>.toml`, then run `check` and bless. Ids are stable across regeneration. New entries bless without
+`--accept-regression`: their checks go `new -> pass` or `new -> xfail`, and neither is a downgrade.
 
 ### Checks
 
@@ -263,10 +268,27 @@ downgrade.
 
 An `[[ast]]` entry where the oracle matches no file in its language AND skim returns no row there would pass every
 check without testing anything. It is a golden error, exit 2 ("golden integrity failed: N vacuous [[ast]] entr(y|ies)
-…"), and `golden-gen --ast` never proposes one. It can appear later: a pin bump can empty an entry, and so can a skim
-fix whose only effect on the entry was a false positive (fixing #546 empties `skim-ast-try-catch-finally-javascript`).
+…"), and `golden-gen --ast` never proposes one. It can appear later, for example when a pin bump empties an entry.
 Remove the entry together with its ledger ids and bless with `--accept-regression`, because a blessed check that no
-longer runs is a HARD downgrade.
+longer runs is a HARD downgrade. A false-positive guard is exempt (below).
+
+### False-positive guards
+
+An entry whose oracle is empty exists only because skim returns a file the oracle rejects: a false positive, such as
+`skim-ast-try-catch-finally-javascript` (#546). It declares `expect_oracle_empty = true`, and then:
+
+- It is scored even when skim returns no row either. That is the state a fix leaves, not a vacuous entry. With no
+  oracle file and no skim row, `recall` and `precision` both read 1 (an empty denominator reads as 1) and every
+  HARD check passes. If the false positive comes back, `structural.precision` fails again, so the entry keeps
+  guarding after the fix.
+- Its oracle must stay empty. If the oracle matches a file (after a pin bump or a query edit), the flag is stale and
+  the run stops with exit 2 before skim is called ("golden integrity failed: … declares `expect_oracle_empty = true`
+  but the structural oracle matches …"). Remove the flag in a reviewed golden edit, then bless. The flag can never
+  hide a recall loss.
+- Unflagged entries keep the vacuity guard.
+
+When the fix lands (for #546, `skim-ast-try-catch-finally-javascript`), the ledgered `structural.precision` XPASSes.
+Remove its ledger entry (keep the golden entry) and re-bless. `xfail -> pass` needs no `--accept-regression`.
 
 ### Adding or editing a query
 

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "golden_sha256": "f343d3af0d85de85d59d6ae7082e1caca68950dd274c24921da34dbef6010610",
+  "golden_sha256": "dbbf5242b9d4d59c7da7e2b2eba14377966f86715f4380927d9c26df508de34f",
   "corpora": {
     "flask": {
       "commit": "7374c85ddefc3f4b177a698ab9f0cbb6a5c0b392",
@@ -1228,7 +1228,7 @@
     },
     "skim": {
       "commit": "b8a0a79463382347820f1c2572bde37b68e87c76",
-      "golden_sha256": "1391bf892c2ac278ccc38f9f5153496b7363366fe7328742100afe9408ad31fb",
+      "golden_sha256": "ef07dd21a6af638a0a851c065cffa96240bb6ac2938c2aed92fa5ae7325c78db",
       "hard": {
         "skim-C01": {
           "lexical.precision": "pass",

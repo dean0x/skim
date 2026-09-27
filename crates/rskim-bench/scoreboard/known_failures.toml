@@ -81,6 +81,8 @@ note = "ast.rs:243-245 search_ast returns FileId (= path) order; nothing sorts b
 # and try_statement -> finally_clause (patterns.rs:288-301), and the verify gate
 # accepts a file where ANY one declared edge is real (compound/reparse.rs:139-230).
 # The structural oracle (#541) requires ONE try_statement carrying both clauses.
+# The golden entry is a false-positive guard (expect_oracle_empty): when #546 is
+# fixed this XPASSes; remove this entry, keep the golden entry, and re-bless.
 
 [[xfail]]
 issue = "#546"

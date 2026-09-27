@@ -21,7 +21,8 @@
 //! - `2` — harness error: clone verification, golden integrity, an invalid
 //!   data file, a skim crash / timeout / unparsable output, temporal data
 //!   skim reports unusable for entries that rank by it, a vacuous `[[ast]]`
-//!   entry, a structural oracle failure, a corpus changed by the run. A
+//!   entry or a stale `expect_oracle_empty` flag, a structural oracle
+//!   failure, a corpus changed by the run. A
 //!   harness error is never reported as a regression, and leaves
 //!   no `report.json` / `report.md` in `--out` (`run` / `check` remove the
 //!   previous ones first).
@@ -302,7 +303,7 @@ fn golden_gen(args: &GoldenGenArgs) -> anyhow::Result<u8> {
 /// `golden-gen --ast`: run the structural oracle over the universe, call
 /// skim once per pattern with a covered language present in the corpus
 /// (sandboxed under `home`, as in `run`), and print the non-vacuous
-/// `[[ast]]` entries.
+/// `[[ast]]` entries (a skim-only one as an `expect_oracle_empty` guard).
 fn golden_gen_ast(
     args: &GoldenGenArgs,
     corpus: &str,

@@ -79,6 +79,15 @@ fn target(pattern: &str, lang: OracleLang, precision: PrecisionClass) -> Structu
         pattern: pattern.to_string(),
         lang,
         precision,
+        expect_oracle_empty: false,
+    }
+}
+
+/// `target` declared a false-positive guard (`expect_oracle_empty = true`).
+fn guard(pattern: &str, lang: OracleLang) -> StructuralTarget {
+    StructuralTarget {
+        expect_oracle_empty: true,
+        ..target(pattern, lang, PrecisionClass::Hard)
     }
 }
 
@@ -358,6 +367,58 @@ fn an_entry_is_vacuous_only_when_the_oracle_and_skim_both_find_nothing() {
     assert!(!is_vacuous(&ts, &[], &a).unwrap(), "the oracle finds a.ts");
     let unknown = target("god-function", OracleLang::Go, PrecisionClass::Hard);
     assert!(is_vacuous(&unknown, &[], &a).is_err());
+}
+
+#[test]
+fn a_false_positive_guard_is_never_vacuous_and_its_flag_must_match_an_empty_oracle() {
+    let a = answers();
+    // The oracle finds no try/catch/finally anywhere in the universe.
+    let fp = guard("try-catch-finally", OracleLang::TypeScript);
+    assert!(
+        !is_vacuous(&fp, &[], &a).unwrap(),
+        "both empty is the fixed state"
+    );
+    assert!(!is_vacuous(&fp, &[row("web/a.ts", Some(1))], &a).unwrap());
+    assert_eq!(unexpected_oracle_matches(&fp, &a).unwrap(), None);
+    // A flag on an entry whose oracle matches is stale.
+    let stale = guard("try-catch", OracleLang::TypeScript);
+    assert_eq!(
+        unexpected_oracle_matches(&stale, &a).unwrap(),
+        Some(&files(&[("web/a.ts", &[1])]))
+    );
+    // Unflagged entries are never reported, whatever the oracle finds.
+    let plain = target("try-catch", OracleLang::TypeScript, PrecisionClass::Hard);
+    assert_eq!(unexpected_oracle_matches(&plain, &a).unwrap(), None);
+    assert!(unexpected_oracle_matches(&guard("god-function", OracleLang::Go), &a).is_err());
+}
+
+#[test]
+fn a_false_positive_guard_passes_when_skim_is_empty_and_fails_precision_on_a_row() {
+    let a = answers();
+    let evidence = |rows: Vec<ResultRow>| StructuralEvidence {
+        answers: a.clone(),
+        patterns: BTreeMap::from([("try-catch-finally".to_string(), call(rows, 1))]),
+    };
+    let fp = guard("try-catch-finally", OracleLang::TypeScript);
+
+    // Fixed: no row, nothing expected. Recall and precision read 1 (an empty
+    // denominator), and every HARD check passes.
+    let fixed = score_entry("skim-fp", &fp, &[], &evidence(Vec::new())).unwrap();
+    assert!(fixed.recall.is_pass() && fixed.precision.is_pass() && fixed.coverage.is_pass());
+    assert_eq!((fixed.sample.oracle_files, fixed.sample.skim_files), (0, 0));
+    assert_eq!((fixed.sample.recall, fixed.sample.precision), (1.0, 1.0));
+
+    // The false positive (back): precision fails and reads 0.
+    let rows = vec![row("web/a.ts", Some(1))];
+    let broken = score_entry("skim-fp", &fp, &rows, &evidence(rows.clone())).unwrap();
+    assert!(broken.recall.is_pass());
+    assert!(!broken.precision.is_pass());
+    assert!(
+        detail(&broken.precision).contains("web/a.ts"),
+        "{:?}",
+        broken.precision
+    );
+    assert_eq!(broken.sample.precision, 0.0);
 }
 
 // --- report sections -------------------------------------------------------------------------

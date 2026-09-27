@@ -28,7 +28,10 @@
 //! or skim's `--ast <pattern>` returns a row in that language). The proposed
 //! precision class is `hard` when the catalog marks the pattern `exact`,
 //! `ratchet` otherwise ([`proposed_class`]); once frozen in the golden file,
-//! the class is never re-read from the catalog.
+//! the class is never re-read from the catalog. An entry the oracle matches
+//! no file for exists only because skim returns one (a false positive), so it
+//! is proposed with `expect_oracle_empty = true`: a false-positive guard that
+//! stays scored after a fix empties skim's rows.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -257,6 +260,9 @@ pub struct AstCandidate {
     pub oracle_files: usize,
     /// Distinct files skim's `--ast <pattern>` returns in `lang`.
     pub skim_files: usize,
+    /// Propose `expect_oracle_empty = true`: the oracle matches no file, so
+    /// the entry guards skim's false positive (precision) only.
+    pub expect_oracle_empty: bool,
 }
 
 /// An `[[ast]]` id: `<corpus>-ast-<pattern>-<lang>`. It names the pair, not
@@ -335,13 +341,15 @@ pub fn generate_ast(
             precision: proposed_class(pattern),
             oracle_files,
             skim_files,
+            expect_oracle_empty: oracle_files == 0,
         });
     }
     Ok(out)
 }
 
 /// TOML `[[ast]]` entries for `candidates`, each preceded by a review
-/// comment with the oracle's and skim's file counts.
+/// comment with the oracle's and skim's file counts; a false-positive guard
+/// also gets `expect_oracle_empty = true`.
 pub fn render_ast_toml(candidates: &[AstCandidate]) -> String {
     let mut out = String::new();
     for c in candidates {
@@ -355,6 +363,9 @@ pub fn render_ast_toml(candidates: &[AstCandidate]) -> String {
             toml_string(c.lang.as_str()),
             toml_string(c.precision.as_str()),
         ));
+        if c.expect_oracle_empty {
+            out.push_str("expect_oracle_empty = true\n");
+        }
     }
     out
 }
@@ -787,16 +798,37 @@ mod tests {
         sorted.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         assert_eq!(pairs, sorted, "ordered by (pattern, language name)");
         assert_eq!(generate_ast("skim", &answers, &skim).unwrap(), got);
+
+        // Exactly the entries the oracle matches nothing for are proposed as
+        // false-positive guards.
+        let guards: Vec<&str> = got
+            .iter()
+            .filter(|c| c.expect_oracle_empty)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(guards, ["skim-ast-try-catch-finally-javascript"]);
+        assert!(
+            got.iter()
+                .all(|c| c.expect_oracle_empty == (c.oracle_files == 0))
+        );
     }
 
     #[test]
     fn rendered_ast_candidates_are_integrity_clean_golden_entries() {
         let answers = ast_answers(&[("web/a.ts", "try {\n  go();\n} catch (e) {}\n")]);
-        let got = generate_ast("skim", &answers, &BTreeMap::new()).unwrap();
-        assert!(!got.is_empty());
+        // skim's try-catch-finally row is a false positive: a guard entry.
+        let skim = BTreeMap::from([("try-catch-finally".to_string(), skim_rows(&["web/a.ts"]))]);
+        let got = generate_ast("skim", &answers, &skim).unwrap();
+        assert!(got.iter().any(|c| c.expect_oracle_empty));
+        assert!(got.iter().any(|c| !c.expect_oracle_empty));
+        let rendered = render_ast_toml(&got);
+        assert_eq!(
+            rendered.matches("expect_oracle_empty = true").count(),
+            got.iter().filter(|c| c.expect_oracle_empty).count(),
+            "{rendered}"
+        );
         let golden = parse_golden(&format!(
-            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{}",
-            render_ast_toml(&got)
+            "corpus = \"skim\"\ncommit = \"b8a0a79463382347820f1c2572bde37b68e87c76\"\n{rendered}"
         ))
         .unwrap();
         assert_eq!(golden.asts.len(), got.len());
@@ -806,13 +838,15 @@ mod tests {
                     entry.id.as_str(),
                     entry.pattern.as_str(),
                     entry.lang,
-                    entry.precision
+                    entry.precision,
+                    entry.expect_oracle_empty
                 ),
                 (
                     candidate.id.as_str(),
                     candidate.pattern.as_str(),
                     candidate.lang,
-                    candidate.precision
+                    candidate.precision,
+                    candidate.expect_oracle_empty
                 )
             );
         }

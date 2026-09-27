@@ -567,11 +567,14 @@ pub fn query_sources() -> Vec<QuerySource> {
         .collect()
 }
 
-/// A canonical rendering of everything besides the grammars that decides
-/// the oracle's answers: every registered query (file name, post-filter,
-/// full text), every intent spec, and the size cap. The golden digest folds
-/// it in (`golden::structural_oracle_sha256`), so editing a query, a
-/// post-filter threshold or an intent's node kinds forces a re-bless.
+/// A canonical rendering of the oracle's per-pattern definitions: every
+/// registered query (file name, post-filter, full text), every intent spec,
+/// and the size cap. The golden digest folds it in
+/// (`golden::structural_oracle_sha256`), so editing a query, a post-filter
+/// threshold or an intent's node kinds forces a re-bless. The extension
+/// table ([`classify`]) and the body-element rule ([`PostFilter`]'s
+/// attribute kinds) are not folded in: an edit to them that changes an answer
+/// shows up as a structural diff in the gate, like any `oracle.rs` edit.
 pub fn fingerprint() -> String {
     let mut out = format!("size-cap {AST_SIZE_CAP_BYTES}\n");
     for q in sorted_queries() {

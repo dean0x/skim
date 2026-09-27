@@ -243,6 +243,17 @@ pub struct AstEntry {
     /// The oracle language whose files this entry scores.
     pub lang: OracleLang,
     pub precision: PrecisionClass,
+    /// A false-positive guard: the oracle is expected to match no file in
+    /// `lang`, so the entry guards precision only (it exists because skim
+    /// returned a file the oracle rejects). Such an entry is scored even when
+    /// skim returns no row either — the state a fix of that false positive
+    /// leaves, where recall and precision both read 1 (an empty denominator)
+    /// and a returning false positive fails `structural.precision` again — so
+    /// it is exempt from the vacuity guard. An oracle match on a flagged entry
+    /// is a golden error (the flag is stale and would hide recall). Absent =
+    /// `false`; `golden-gen --ast` sets it on an entry whose oracle is empty.
+    #[serde(default)]
+    pub expect_oracle_empty: bool,
 }
 
 /// One corpus's golden file.
@@ -717,9 +728,11 @@ impl Violations {
 /// the query; every lexically-computable pagination entry's ground truth fits
 /// [`pagination_bound`]; every `zero-hit` entry's ground truth is empty.
 ///
-/// An `[[ast]]` entry where the oracle and skim both find nothing is also a
-/// golden error, but it needs skim's answer, so the pipeline checks it after
-/// the run (`pipeline::require_non_vacuous_structural`).
+/// Two `[[ast]]` golden errors need the structural oracle's answers, so the
+/// pipeline checks them: an entry flagged `expect_oracle_empty` whose oracle
+/// matches a file (`pipeline::require_expected_empty_oracles`, before skim
+/// runs), and an unflagged entry where the oracle and skim both find nothing
+/// (`pipeline::require_non_vacuous_structural`, after the run).
 pub fn check_integrity(golden: &GoldenFile, ctx: &IntegrityContext<'_>) -> Vec<IntegrityViolation> {
     let mut v = Violations(Vec::new());
 
@@ -1115,6 +1128,7 @@ limits = [5, 20]
                 pattern: "try-catch-finally".to_string(),
                 lang: OracleLang::JavaScript,
                 precision: PrecisionClass::Hard,
+                expect_oracle_empty: false,
             }
         );
         assert_eq!(g.asts[1].precision, PrecisionClass::Ratchet);
@@ -1124,6 +1138,25 @@ limits = [5, 20]
         );
         assert_eq!(g.ids().count(), 2);
         assert!(check_integrity(&g, &ctx(&[])).is_empty());
+    }
+
+    #[test]
+    fn expect_oracle_empty_is_an_optional_bool_that_defaults_to_false() {
+        let entry = ast("skim-A1", "try-catch-finally", "javascript", "hard");
+        let flagged = golden(&format!("{}{entry}expect_oracle_empty = true\n", header()));
+        assert!(flagged.asts[0].expect_oracle_empty);
+        let explicit = golden(&format!("{}{entry}expect_oracle_empty = false\n", header()));
+        assert!(!explicit.asts[0].expect_oracle_empty);
+        assert!(!golden(&format!("{}{entry}", header())).asts[0].expect_oracle_empty);
+        // The flag needs the oracle's answers, so schema integrity accepts it.
+        assert!(check_integrity(&flagged, &ctx(&[])).is_empty());
+        assert!(
+            parse_golden(&format!(
+                "{}{entry}expect_oracle_empty = \"yes\"\n",
+                header()
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -580,11 +580,16 @@ lang = "typescript"
 precision = "hard"
 
 # golden-gen: oracle files 0; skim files 1
+# A false-positive guard (#546): no JS file here has one try carrying both
+# clauses, so the oracle is empty by declaration and the entry guards precision
+# only. It stays after #546 is fixed (skim then returns nothing, which is not
+# vacuous for a guard); an oracle match would make the flag a golden error.
 [[ast]]
 id = "skim-ast-try-catch-finally-javascript"
 pattern = "try-catch-finally"
 lang = "javascript"
 precision = "hard"
+expect_oracle_empty = true
 
 # golden-gen: oracle files 1; skim files 1
 [[ast]]

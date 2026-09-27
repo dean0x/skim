@@ -262,6 +262,7 @@ pub fn plan(golden: &GoldenFile) -> anyhow::Result<Vec<PlannedQuery>> {
                 pattern: e.pattern.clone(),
                 lang: e.lang,
                 precision: e.precision,
+                expect_oracle_empty: e.expect_oracle_empty,
             })),
             limits: Vec::new(),
             target: Target::None,

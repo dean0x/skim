@@ -9,8 +9,10 @@
 //! can never apply), a skim crash / timeout / unparsable output, a temporal
 //! ranking skim reports it cannot apply (see [`require_temporal_data`]), an
 //! empty list for an entry with no oracle (see [`require_oracle_less_rows`]),
-//! a vacuous `[[ast]]` entry (see [`require_non_vacuous_structural`]), a
-//! structural oracle failure, or a corpus that changed under the run. Gate
+//! a vacuous `[[ast]]` entry (see [`require_non_vacuous_structural`]), an
+//! `[[ast]]` false-positive guard whose oracle matches a file (see
+//! [`require_expected_empty_oracles`]), a structural oracle failure, or a
+//! corpus that changed under the run. Gate
 //! failures are not errors — they are recorded in the report's `gate`
 //! section.
 //!
@@ -42,7 +44,8 @@ use crate::scoreboard::report::{
 use crate::scoreboard::runner::{EntryObservation, SkimRunner, Timing};
 use crate::scoreboard::structural::StructuralOracle;
 use crate::scoreboard::structural_metrics::{
-    OracleAnswers, StructuralEvidence, coverage_comparison, is_vacuous, rows_in, uncovered_patterns,
+    OracleAnswers, StructuralEvidence, coverage_comparison, is_vacuous, rows_in,
+    uncovered_patterns, unexpected_oracle_matches,
 };
 use crate::scoreboard::types::{AstPage, StatsSnapshot};
 use crate::scoreboard::universe::Universe;
@@ -248,6 +251,7 @@ fn run_corpus(
     universe.check_file_cap()?;
     let plan = checked_plan(spec, golden, inputs, &universe)?;
     let answers = structural_answers(name, &plan, &universe, oracle)?;
+    require_expected_empty_oracles(&plan, &answers)?;
 
     progress(name, "skim search --build");
     runner.build(&root)?;
@@ -460,7 +464,10 @@ pub fn require_oracle_less_rows(
 /// Every structural check passes on such an entry, so it measures nothing,
 /// and a regression that made skim return nothing there could never show.
 /// It is a golden error (`golden-gen` proposes only non-vacuous entries):
-/// remove the entry, or pick a corpus where the pattern occurs.
+/// remove the entry, or pick a corpus where the pattern occurs. A
+/// false-positive guard (`expect_oracle_empty = true`) is exempt: skim
+/// returning nothing is the fixed state it guards, and
+/// [`require_expected_empty_oracles`] keeps its oracle empty.
 ///
 /// # Errors
 ///
@@ -485,10 +492,59 @@ pub fn require_non_vacuous_structural(
     anyhow::bail!(
         "golden integrity failed: {} vacuous [[ast]] entr{} ({}): neither the structural oracle \
          nor skim finds a file in the entry's language, so every check would pass on nothing; \
-         remove the entry (golden-gen proposes only entries where the oracle or skim finds a file)",
+         remove the entry (golden-gen proposes only entries where the oracle or skim finds a file). \
+         An entry that guards a skim false positive the oracle rejects declares \
+         `expect_oracle_empty = true` and is exempt",
         vacuous.len(),
         if vacuous.len() == 1 { "y" } else { "ies" },
         vacuous.join(", ")
+    )
+}
+
+/// Refuse a stale false-positive guard: an `[[ast]]` entry declaring
+/// `expect_oracle_empty = true` whose structural oracle matches a file.
+///
+/// The flag exempts the entry from the vacuity guard because its oracle is
+/// empty by declaration. Once the oracle matches (a pin bump, an oracle
+/// edit), the entry measures recall too, and a flag left in place would keep
+/// excusing the both-empty state that hides a recall loss. It is a golden
+/// error, checked before skim runs (it needs only the oracle): remove the
+/// flag in a reviewed golden edit, then bless.
+///
+/// # Errors
+///
+/// Some flagged entry's oracle matches a file; the message names the entries
+/// and a matched file of each. Also an entry the oracle has no query for
+/// (integrity rejects that first).
+pub fn require_expected_empty_oracles(
+    plan: &[PlannedQuery],
+    answers: &OracleAnswers,
+) -> anyhow::Result<()> {
+    let mut stale = Vec::new();
+    for q in plan {
+        let Some(target) = q.structural_target() else {
+            continue;
+        };
+        if let Some(matches) = unexpected_oracle_matches(target, answers)? {
+            let first = matches.keys().next().map_or("", String::as_str);
+            stale.push(format!(
+                "{} ({} file(s), e.g. {first})",
+                q.id,
+                matches.len()
+            ));
+        }
+    }
+    if stale.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "golden integrity failed: {} [[ast]] entr{} declare{} `expect_oracle_empty = true` but the \
+         structural oracle matches: {}; the entry now measures recall, so remove the flag (a \
+         reviewed golden edit), then bless",
+        stale.len(),
+        if stale.len() == 1 { "y" } else { "ies" },
+        if stale.len() == 1 { "s" } else { "" },
+        stale.join("; ")
     )
 }
 
@@ -796,6 +852,61 @@ mod tests {
         let lexical =
             plan_of("[[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n");
         require_non_vacuous_structural(&lexical, &[observed("skim-Z01", 0)], &answers).unwrap();
+    }
+
+    #[test]
+    fn a_false_positive_guard_is_exempt_from_vacuity_but_its_flag_must_hold() {
+        use crate::scoreboard::structural::StructuralOracle;
+        let oracle = StructuralOracle::new().unwrap();
+        let plan = plan_of(
+            "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\nexpect_oracle_empty = true\n\
+             [[ast]]\nid = \"skim-ast-go-defer-go\"\npattern = \"go-defer\"\nlang = \"go\"\nprecision = \"hard\"\n",
+        );
+        // No Go file: both oracles are empty.
+        let no_go = OracleAnswers::compute(&oracle, [("src/a.rs", "fn f() {}\n")]).unwrap();
+        require_expected_empty_oracles(&plan, &no_go).unwrap();
+
+        // Both entries find nothing: the flagged one is the fixed state of a
+        // false positive and is scored; the unflagged one is still vacuous.
+        let empty = [
+            observed("skim-ast-go-select-go", 0),
+            observed("skim-ast-go-defer-go", 0),
+        ];
+        let err = require_non_vacuous_structural(&plan, &empty, &no_go)
+            .expect_err("the unflagged entry is vacuous");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("skim-ast-go-defer-go"), "{msg}");
+        assert!(
+            !msg.contains("skim-ast-go-select-go"),
+            "a guard is exempt: {msg}"
+        );
+        assert!(msg.contains("expect_oracle_empty"), "{msg}");
+        let flagged_only = plan_of(
+            "[[ast]]\nid = \"skim-ast-go-select-go\"\npattern = \"go-select\"\nlang = \"go\"\nprecision = \"hard\"\nexpect_oracle_empty = true\n",
+        );
+        require_non_vacuous_structural(&flagged_only, &empty[..1], &no_go).unwrap();
+
+        // Once the oracle matches, the flag is stale: a golden error that
+        // names the entry and a matched file, before skim is even run.
+        let go = OracleAnswers::compute(
+            &oracle,
+            [(
+                "cmd/main.go",
+                "package main\n\nfunc f() {\n\tselect {}\n}\n",
+            )],
+        )
+        .unwrap();
+        let err = require_expected_empty_oracles(&plan, &go)
+            .expect_err("the oracle finds a select statement");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("golden integrity failed"), "{msg}");
+        assert!(msg.contains("skim-ast-go-select-go"), "{msg}");
+        assert!(msg.contains("cmd/main.go"), "{msg}");
+        assert!(!msg.contains("skim-ast-go-defer-go"), "unflagged: {msg}");
+        // Entries without a structural oracle are not this guard's business.
+        let lexical =
+            plan_of("[[lexical]]\nid = \"skim-Z01\"\nquery = \"qqqq\"\ncategory = \"zero-hit\"\n");
+        require_expected_empty_oracles(&lexical, &go).unwrap();
     }
 
     #[test]

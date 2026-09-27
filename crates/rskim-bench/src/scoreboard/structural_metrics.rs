@@ -39,6 +39,9 @@ pub struct StructuralTarget {
     pub pattern: String,
     pub lang: OracleLang,
     pub precision: PrecisionClass,
+    /// The golden entry's `expect_oracle_empty`: a false-positive guard (see
+    /// [`is_vacuous`] and [`unexpected_oracle_matches`]).
+    pub expect_oracle_empty: bool,
 }
 
 /// The files one oracle query matched: path → the 1-based first line of
@@ -425,6 +428,12 @@ pub fn score_entry(
 /// returns no row in its language. Every check passes on such an entry, so it
 /// is a golden error, never a pass.
 ///
+/// A false-positive guard (`expect_oracle_empty`) is never vacuous: its
+/// oracle is empty by declaration, and skim returning nothing is the state it
+/// guards (recall and precision both read 1 over an empty denominator; a row
+/// fails `structural.precision`). [`unexpected_oracle_matches`] keeps the flag
+/// honest.
+///
 /// # Errors
 ///
 /// The oracle has no query for the target.
@@ -433,7 +442,24 @@ pub fn is_vacuous(
     rows: &[ResultRow],
     answers: &OracleAnswers,
 ) -> anyhow::Result<bool> {
-    Ok(rows.is_empty() && answers.definition(&target.pattern, target.lang)?.is_empty())
+    let oracle = answers.definition(&target.pattern, target.lang)?;
+    Ok(!target.expect_oracle_empty && rows.is_empty() && oracle.is_empty())
+}
+
+/// The oracle's matches for an `[[ast]]` entry flagged `expect_oracle_empty`
+/// when there are any: the flag is stale (the entry would measure recall while
+/// declaring it has none to measure), which is a golden error. `None` for an
+/// unflagged entry or an empty oracle.
+///
+/// # Errors
+///
+/// The oracle has no query for the target.
+pub fn unexpected_oracle_matches<'a>(
+    target: &StructuralTarget,
+    answers: &'a OracleAnswers,
+) -> anyhow::Result<Option<&'a MatchFiles>> {
+    let oracle = answers.definition(&target.pattern, target.lang)?;
+    Ok((target.expect_oracle_empty && !oracle.is_empty()).then_some(oracle))
 }
 
 // ============================================================================

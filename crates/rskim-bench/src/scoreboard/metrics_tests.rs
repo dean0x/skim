@@ -211,9 +211,19 @@ fn an_ast_entry_plans_a_standalone_ast_call_judged_by_the_structural_oracle() {
             pattern: "try-catch".to_string(),
             lang: crate::scoreboard::structural::OracleLang::Tsx,
             precision: PrecisionClass::Hard,
+            expect_oracle_empty: false,
         })
     );
     assert!(!q.measures_text());
+    // A false-positive guard carries its flag into the target and runs the
+    // same checks (precision is what it guards).
+    let guard = golden_with(&format!(
+        "{}expect_oracle_empty = true\n",
+        ast_entry("skim-A2", "try-catch-finally", "javascript", "hard")
+    ));
+    let q = &plan(&guard).unwrap()[0];
+    assert!(q.structural_target().unwrap().expect_oracle_empty);
+    assert!(q.runs(CheckId::StructuralPrecision) && q.runs(CheckId::StructuralRecall));
     // No other entry kind gets a structural target.
     let lexical =
         golden_with("[[lexical]]\nid = \"skim-X01\"\nquery = \"a\"\ncategory = \"substr\"\n");
